@@ -26,10 +26,12 @@ Aura is a high-fidelity, spatial media player built with Tauri 2.0. It integrate
 ### 3.2 tauri-plugin-mpv FFI Bridge
 - **Transparency**: Configure Tauri window with transparency and `window-vibrancy` (Mica/Acrylic/Vibrancy).
 - **FFI Layer**: Robust Rust FFI bridge to handle MPV commands and property observations.
+- **Subtitles**: Native support for ASS/SSA/SRT formats via libmpv, ensuring complex styling and font attachments are preserved.
 - **UI Overlay**: Implementation of transparent overlays that don't interrupt native MPV rendering performance.
 
 ### 3.3 visionOS Design Language
 - **Luminous Tinting**: Logic to extract primary colors from metadata posters and apply them as subtle tints to glass panels.
+- **Z-Axis Interaction**: Implement 'lift' and active edge-lighting on hover for all interactive components to emphasize spatial depth.
 - **Backdrop Blur**: Global utility for `backdrop-blur-3xl` and soft luminous neutrals.
 - **Seamless Blacks**: `vo=gpu-next` and true-black backgrounds to eliminate borders during video playback.
 
@@ -39,4 +41,5 @@ Aura is a high-fidelity, spatial media player built with Tauri 2.0. It integrate
 
 ## 4. Security
 - **Header Stripping**: Rust-side interceptor for all outbound addon requests.
+- **Tauri Capabilities**: Explicit use of Tauri's capability system to whitelist file and network access per module, brokered by the Rust backend.
 - **Local Privacy**: No telemetry or third-party tracking in the core architecture.

@@ -18,9 +18,13 @@ Aura is a high-fidelity media player built with Tauri 2.0 that adopts the sleek,
 ## Core Features
 - **Stremio Integration**: Full integration with `stremio-core` to manage addons, content catalogs, and user state.
 - **High-Performance Playback**: Utilizing `tauri-plugin-mpv` with custom Rust FFI bridges for stable, hardware-accelerated media playback.
+- **High-Fidelity Subtitles**: Native support for ASS/SSA/SRT formats via libmpv, preserving complex styling and font attachments.
 - **Spatial UI Design**: A desktop interface featuring floating glassmorphism panels, backdrop blurs, and luminous neutral tones inspired by spatial computing.
+- **Z-Axis Interaction**: Interactive elements utilize 'lift' and active edge-lighting on hover to emphasize spatial depth.
 - **Luminous Aesthetics**: UI overlays designed with transparency and true-black backgrounds to provide a premium, modern feel.
 - **Ambient Poster Treatment**: Smart fallback strategies for low-resolution assets, blurring them into ambient background environments.
+- **Security Auditability**: Explicit use of Tauri's capability system to strictly whitelist file and network access per module, brokered by the Rust backend.
+
 
 ## Technical Goals
 - **Rust Backend**: Efficient handling of `stremio-core` logic and media state management.
