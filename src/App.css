@@ -1,0 +1,54 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Luminous Neutral — glass tokens (rgba cannot live in tailwind.config.ts directly) */
+:root {
+  /* Glass surfaces — white at low opacity over true black */
+  --ln-glass-1: rgba(255, 255, 255, 0.04);
+  --ln-glass-2: rgba(255, 255, 255, 0.08);
+  --ln-glass-3: rgba(255, 255, 255, 0.14);
+
+  /* Luminous rims — 1px borders that catch ambient light */
+  --ln-rim-subtle:   rgba(255, 255, 255, 0.06);
+  --ln-rim-default:  rgba(255, 255, 255, 0.12);
+  --ln-rim-luminous: rgba(255, 255, 255, 0.22);
+
+  /* Accent glow */
+  --ln-accent-glow: rgba(91, 164, 255, 0.32);
+}
+
+/* Base reset — cinematic true-black, no background flicker on transparent window */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  color: #eaeaea;
+  font-family: "SF Pro Display", "SF Pro Text", -apple-system, BlinkMacSystemFont,
+    "Inter", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Utility layer — glass panel component shorthand */
+@layer components {
+  .glass-panel {
+    background: var(--ln-glass-2);
+    border: 1px solid var(--ln-rim-default);
+    backdrop-filter: blur(32px) saturate(1.8);
+    -webkit-backdrop-filter: blur(32px) saturate(1.8);
+  }
+
+  .glass-panel-elevated {
+    background: var(--ln-glass-3);
+    border: 1px solid var(--ln-rim-luminous);
+    backdrop-filter: blur(64px) saturate(2);
+    -webkit-backdrop-filter: blur(64px) saturate(2);
+  }
+}
