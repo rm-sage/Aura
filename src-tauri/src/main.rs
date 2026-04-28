@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    c_userssmcgrappdatalocaltempaura_scaffold_lib::run()
+    aura_lib::run();
 }
