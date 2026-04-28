@@ -1,49 +1,34 @@
 import { useState } from "react";
-import reactLogo from "./assets/react.svg";
 import { invoke } from "@tauri-apps/api/core";
-import "./App.css";
 
 function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+  const [status, setStatus] = useState("Aura Ready");
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
-  }
+  const runAuraTest = async () => {
+    setStatus("Loading Media...");
+    try {
+      // Use the exact filename from your terminal output
+      // Note: We use forward slashes or escaped backslashes
+      await invoke("load_video", { 
+        path: "C:/Users/Smcgr/Videos/briwisswell 04-28-26 () — V[17773859359302470926] L[2049128144626612225] S[332957953].mp4" 
+      });
+      setStatus("Playback Active");
+    } catch (err) {
+      console.error(err);
+      setStatus(`Error: ${err}`);
+    }
+  };
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
+    <main className="h-screen w-screen flex flex-col items-center justify-center glass-panel">
+      <h1 className="text-white text-2xl font-light mb-8 tracking-widest uppercase">Aura Engine Test</h1>
+      <button 
+        onClick={runAuraTest}
+        className="px-8 py-4 bg-white/10 hover:bg-white/20 border border-white/20 rounded-full text-white backdrop-blur-xl transition-all active:scale-95"
       >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
+        Play Latest Recording
+      </button>
+      <p className="mt-4 text-white/50 font-mono text-sm">{status}</p>
     </main>
   );
 }
