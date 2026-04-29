@@ -37,3 +37,6 @@ src-tauri/node_modules/
 # Logs
 logs
 *.log
+
+# Local Claude state (not for the repo)
+.claude/

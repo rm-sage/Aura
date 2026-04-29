@@ -2,8 +2,12 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Luminous Neutral — glass tokens (rgba cannot live in tailwind.config.ts directly) */
-:root {
+/* ------------------------------------------------------------------ */
+/* Theme tokens — scoped by [data-theme] on <html>                     */
+/* The defaults below = "mica" (and apply when no attribute is set).   */
+/* ------------------------------------------------------------------ */
+:root,
+:root[data-theme="mica"] {
   /* Glass surfaces — white at low opacity over true black */
   --ln-glass-1: rgba(255, 255, 255, 0.04);
   --ln-glass-2: rgba(255, 255, 255, 0.08);
@@ -16,6 +20,61 @@
 
   /* Accent glow */
   --ln-accent-glow: rgba(91, 164, 255, 0.32);
+
+  --ln-bg:           transparent;       /* lets Mica show through */
+  --ln-blur:         32px;
+  --ln-blur-elev:    64px;
+  --ln-saturate:     1.8;
+
+  /* Form-control palette (used by <select>/<option>, dropdowns, native pickers) */
+  --glass-bg:      rgba(20, 22, 28, 0.96);
+  --glass-bg-soft: rgba(34, 36, 44, 0.96);
+  --text-primary:  rgba(235, 236, 240, 0.92);
+  --text-muted:    rgba(235, 236, 240, 0.55);
+}
+
+:root[data-theme="glass"] {
+  --ln-glass-1: rgba(255, 255, 255, 0.07);
+  --ln-glass-2: rgba(255, 255, 255, 0.13);
+  --ln-glass-3: rgba(255, 255, 255, 0.20);
+
+  --ln-rim-subtle:   rgba(255, 255, 255, 0.10);
+  --ln-rim-default:  rgba(255, 255, 255, 0.18);
+  --ln-rim-luminous: rgba(255, 255, 255, 0.30);
+
+  --ln-accent-glow: rgba(91, 164, 255, 0.40);
+
+  --ln-bg:        rgba(10, 12, 18, 0.45);
+  --ln-blur:      48px;
+  --ln-blur-elev: 96px;
+  --ln-saturate:  2.2;
+
+  --glass-bg:      rgba(18, 20, 28, 0.94);
+  --glass-bg-soft: rgba(36, 38, 50, 0.94);
+  --text-primary:  rgba(240, 241, 245, 0.94);
+  --text-muted:    rgba(240, 241, 245, 0.6);
+}
+
+:root[data-theme="midnight"] {
+  --ln-glass-1: rgba(255, 255, 255, 0.025);
+  --ln-glass-2: rgba(255, 255, 255, 0.05);
+  --ln-glass-3: rgba(255, 255, 255, 0.08);
+
+  --ln-rim-subtle:   rgba(255, 255, 255, 0.05);
+  --ln-rim-default:  rgba(255, 255, 255, 0.09);
+  --ln-rim-luminous: rgba(255, 255, 255, 0.16);
+
+  --ln-accent-glow: rgba(91, 164, 255, 0.45);
+
+  --ln-bg:        #000000;     /* pure black for OLED */
+  --ln-blur:      0px;
+  --ln-blur-elev: 0px;
+  --ln-saturate:  1;
+
+  --glass-bg:      #0b0d12;
+  --glass-bg-soft: #16191f;
+  --text-primary:  rgba(245, 246, 250, 0.95);
+  --text-muted:    rgba(245, 246, 250, 0.55);
 }
 
 /* Base reset — cinematic true-black, no background flicker on transparent window */
@@ -28,8 +87,14 @@ html, body, #root {
   padding: 0;
   width: 100%;
   height: 100%;
-  background: transparent;
+  background: var(--ln-bg);
   color: #eaeaea;
+  /* Smooth theme swap */
+  transition: background-color 280ms ease;
+  /* Tell WebView2/Chromium this is a dark UI so form controls (inputs,
+     selects, scrollbars) render with dark-theme defaults instead of the
+     OS light-theme defaults, which would make white text invisible. */
+  color-scheme: dark;
   font-family: "SF Pro Display", "SF Pro Text", -apple-system, BlinkMacSystemFont,
     "Inter", system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
@@ -41,14 +106,272 @@ html, body, #root {
   .glass-panel {
     background: var(--ln-glass-2);
     border: 1px solid var(--ln-rim-default);
-    backdrop-filter: blur(32px) saturate(1.8);
-    -webkit-backdrop-filter: blur(32px) saturate(1.8);
+    backdrop-filter: blur(var(--ln-blur)) saturate(var(--ln-saturate));
+    -webkit-backdrop-filter: blur(var(--ln-blur)) saturate(var(--ln-saturate));
+    transition: background-color 280ms ease, border-color 280ms ease,
+                backdrop-filter 280ms ease;
   }
 
   .glass-panel-elevated {
     background: var(--ln-glass-3);
     border: 1px solid var(--ln-rim-luminous);
-    backdrop-filter: blur(64px) saturate(2);
-    -webkit-backdrop-filter: blur(64px) saturate(2);
+    backdrop-filter: blur(var(--ln-blur-elev)) saturate(calc(var(--ln-saturate) + 0.2));
+    -webkit-backdrop-filter: blur(var(--ln-blur-elev)) saturate(calc(var(--ln-saturate) + 0.2));
+    transition: background-color 280ms ease, border-color 280ms ease,
+                backdrop-filter 280ms ease;
   }
+
+  /* Horizontal scroll row — used by ContinueWatchingRow & DiscoveryRow */
+  .scroll-row {
+    overflow-x: auto;
+    overflow-y: hidden;
+    scroll-snap-type: x proximity;
+    scrollbar-width: none;
+  }
+  .scroll-row::-webkit-scrollbar { display: none; }
+
+  /* Theme cross-fade — applied briefly on data-theme changes */
+  @keyframes theme-fade-in {
+    from { opacity: 0.85; }
+    to   { opacity: 1; }
+  }
+  html[data-theme] body {
+    animation: theme-fade-in 320ms ease-out;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Aura Spectral Sweep — title-bar atmosphere                       */
+  /*                                                                  */
+  /* Seamless infinite loop: a SYMMETRIC gradient (A→B→C→B→A) drawn   */
+  /* at 200% the element width. We animate background-position from   */
+  /* 0% → 100% over 20s. Because the gradient endpoints carry the     */
+  /* same color, the keyframe wrap is visually identical to the start */
+  /* — no snap, no flicker. The GPU paints the gradient once and only */
+  /* shifts its scroll offset on every frame, so this is essentially  */
+  /* free even with shader work running in MPV.                       */
+  /* ---------------------------------------------------------------- */
+  @keyframes aura-sweep-anim {
+    0%   { background-position: 0%   50%; }
+    100% { background-position: 100% 50%; }
+  }
+
+  .aura-sweep {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: linear-gradient(
+      90deg,
+      rgba(91,  164, 255, 0.05)  0%,
+      rgba(180, 130, 255, 0.18) 25%,
+      rgba(120, 220, 200, 0.14) 50%,
+      rgba(180, 130, 255, 0.18) 75%,
+      rgba(91,  164, 255, 0.05) 100%
+    );
+    background-size: 200% 100%;
+    background-repeat: no-repeat;
+    animation: aura-sweep-anim 20s linear infinite;
+    mix-blend-mode: screen;
+    /* Compositor-only optimisation hint */
+    will-change: background-position;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* AURA wordmark — glass-textured letters                            */
+  /*                                                                  */
+  /* The text uses the same spectral gradient as the sweep behind it, */
+  /* clipped to glyph shapes. With a much higher opacity (so the      */
+  /* letters are always legible) and a slightly slower phase the      */
+  /* letters appear to be a window into a richer band of the same     */
+  /* spectrum, gently shifting as the sweep behind moves through.     */
+  /* ---------------------------------------------------------------- */
+  .aura-title {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.42em;
+    /* Letterform width compensation — uppercase tracking pushes glyphs
+       right, so we offset slightly to keep the visual center optical. */
+    padding-left: 0.42em;
+    text-transform: uppercase;
+
+    /* Glass spectrum — denser than the sweep so glyphs always read */
+    background: linear-gradient(
+      90deg,
+      rgba(180, 210, 255, 0.92)  0%,
+      rgba(220, 190, 255, 0.95) 25%,
+      rgba(190, 245, 230, 0.92) 50%,
+      rgba(220, 190, 255, 0.95) 75%,
+      rgba(180, 210, 255, 0.92) 100%
+    );
+    background-size: 200% 100%;
+    background-repeat: no-repeat;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+
+    /* Inner highlight + soft outer glow — gives letters volume even
+       though their fill is a moving translucent gradient. */
+    -webkit-text-stroke: 0.4px rgba(255, 255, 255, 0.08);
+    filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.35))
+            drop-shadow(0 0 6px rgba(91, 164, 255, 0.18));
+
+    /* Same loop period as the sweep so the gradient under the letters
+       progresses in lockstep with the bar; the visual is the bar's
+       spectrum animated through a glyph window. */
+    animation: aura-sweep-anim 20s linear infinite;
+    will-change: background-position;
+    user-select: none;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* GPU layer promotion + adaptive rendering                         */
+  /*                                                                  */
+  /* `gpu-layer` forces the browser to allocate a separate compositor */
+  /* layer per row so scrolling Row 5 doesn't trigger repaints in     */
+  /* Rows 1–4. `cv-auto` skips layout & paint for elements outside    */
+  /* the viewport while still allowing them to be focused/found.      */
+  /* contain-intrinsic-size reserves the rough row height up front so */
+  /* there's no layout-shift jitter as rows scroll into view.         */
+  /* ---------------------------------------------------------------- */
+  .gpu-layer {
+    will-change: transform;
+    transform: translateZ(0);
+    backface-visibility: hidden;
+  }
+
+  /* Skip layout & paint for off-screen rows. The intrinsic-size hint reflects
+     the new card geometry (~330 px image + title + spacing) so the scrollbar
+     doesn't twitch as rows fade in/out of the visible window. */
+  .cv-auto {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 420px;
+  }
+
+  .cv-auto-hero {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 480px;
+  }
+
+  /* Card-level paint containment. Cheaper than `gpu-layer` because we don't
+     spawn a new compositor surface per card — we only tell the browser that
+     repaints stay inside the card's box, which kills the row-wide repaint
+     storms that were causing scroll jank. */
+  .card-contain {
+    contain: layout paint style;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Calendar "Today" cell — glow with the Aura spectrum               */
+  /* ---------------------------------------------------------------- */
+  .cal-today {
+    box-shadow:
+      0 0 0 1px  rgba(91, 164, 255, 0.55),
+      0 0 14px 2px rgba(180, 130, 255, 0.28),
+      0 0 28px 6px rgba(120, 220, 200, 0.16);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Range inputs — shared base                                          */
+/* ------------------------------------------------------------------ */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+  outline: none;
+}
+
+/* Webkit thumb — shared */
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #ffffff;
+  margin-top: -4.5px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+  transition: transform 0.15s ease;
+}
+
+input[type="range"]:hover::-webkit-slider-thumb {
+  transform: scale(1.3);
+}
+
+/* Moz thumb — shared */
+input[type="range"]::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #ffffff;
+  border: none;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+}
+
+/* ------------------------------------------------------------------ */
+/* Progress (seek) range — accent-filled to the left of the thumb     */
+/* ------------------------------------------------------------------ */
+.progress-range::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 999px;
+  /* --progress is set inline as a percentage string */
+  background: linear-gradient(
+    to right,
+    rgba(91, 164, 255, 0.85) var(--progress, 0%),
+    rgba(255, 255, 255, 0.18) var(--progress, 0%)
+  );
+}
+
+.progress-range::-moz-range-track {
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+}
+
+/* ------------------------------------------------------------------ */
+/* Volume range — plain white track                                    */
+/* ------------------------------------------------------------------ */
+.volume-range::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.volume-range::-moz-range-track {
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+}
+
+/* ------------------------------------------------------------------ */
+/* Global select & option styling                                      */
+/*                                                                     */
+/* WebView2/Chromium honours `background-color` and `color` on <option>*/
+/* — without these, the OS picks a high-luminance default ("blinding   */
+/* white") that breaks the dark UI when the picker drops open.         */
+/*                                                                     */
+/* We pull from the theme-scoped --glass-bg / --text-primary tokens so */
+/* every theme (Mica/Glass/Midnight) keeps the dropdown legible.       */
+/* ------------------------------------------------------------------ */
+select {
+  background-color: transparent;
+  color: var(--text-primary);
+  color-scheme: dark; /* tells the engine to render the dropdown in dark */
+}
+
+select:focus {
+  outline: none;
+}
+
+select option {
+  background-color: var(--glass-bg);
+  color: var(--text-primary);
+  /* Some Chromium versions render selected/hovered options with the
+     system accent — keep it subtle and on-brand. */
+}
+
+select option:checked,
+select option:hover {
+  background-color: var(--glass-bg-soft);
+  color: var(--text-primary);
 }

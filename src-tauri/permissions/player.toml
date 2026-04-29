@@ -1,0 +1,87 @@
+# src-tauri/permissions/player.toml
+
+# ── Playback ──────────────────────────────────────────────────────────────────
+[[permission]]
+identifier = "allow-load-video"
+description = "Allows the frontend to load a video file into the MPV engine"
+commands.allow = ["load_video"]
+
+[[permission]]
+identifier = "allow-player-controls"
+description = "Allows the frontend to toggle pause, seek, set volume, and apply language defaults"
+commands.allow = ["toggle_pause", "seek_relative", "set_volume", "apply_lang_defaults"]
+
+# ── Stremio catalog ───────────────────────────────────────────────────────────
+[[permission]]
+identifier = "allow-fetch-catalog"
+description = "Allows the frontend to fetch items for a specific Stremio catalog"
+commands.allow = ["fetch_catalog"]
+
+[[permission]]
+identifier = "allow-addon-manifest"
+description = "Allows the frontend to retrieve an addon's full manifest"
+commands.allow = ["get_addon_manifest"]
+
+# ── Addon management ──────────────────────────────────────────────────────────
+[[permission]]
+identifier = "allow-addon-management"
+description = "Allows the frontend to add, remove, and list persisted addons (guest mode)"
+commands.allow = ["add_addon", "remove_addon", "list_addons"]
+
+# ── Authentication ────────────────────────────────────────────────────────────
+[[permission]]
+identifier = "allow-auth"
+description = "Allows the frontend to login, logout, and retrieve the current Stremio session"
+commands.allow = ["login", "logout", "get_session", "get_synced_addons"]
+
+# ── Global search & cloud sync (2.3) ──────────────────────────────────────────
+[[permission]]
+identifier = "allow-global-search"
+description = "Allows the frontend to run a concurrent global search across all search-enabled addons"
+commands.allow = ["global_search"]
+
+[[permission]]
+identifier = "allow-cloud-sync"
+description = "Allows the frontend to add/remove addons in the user's Stremio cloud account"
+commands.allow = ["cloud_add_addon", "cloud_remove_addon"]
+
+# ── Streaming bridge (2.4) ────────────────────────────────────────────────────
+[[permission]]
+identifier = "allow-streaming-bridge"
+description = "Allows the frontend to resolve stream URLs through the local bridge proxy"
+commands.allow = ["resolve_stream"]
+
+# ── Cinema Suite (2.6) ───────────────────────────────────────────────────────
+[[permission]]
+identifier = "allow-cinema-suite"
+description = "Allows the frontend to control shader profiles and read OSD stats"
+commands.allow = ["list_shader_profiles", "set_shader_profile", "get_shader_profile"]
+
+# ── Phase 3B: meta detail & library sync ─────────────────────────────────────
+[[permission]]
+identifier = "allow-meta-detail"
+description = "Allows the frontend to fetch full meta detail for an addon item"
+commands.allow = ["fetch_meta_detail"]
+
+[[permission]]
+identifier = "allow-library-sync"
+description = "Allows the frontend to read and write the user's Stremio library (Continue Watching + Library)"
+commands.allow = ["library_get", "library_put"]
+
+# ── Phase 3B: app settings (theme, defaults) ─────────────────────────────────
+[[permission]]
+identifier = "allow-settings"
+description = "Allows the frontend to read and update persistent app settings (theme, defaults, RPC, window)"
+commands.allow = ["get_settings", "set_theme", "update_settings"]
+
+# ── Phase 3C: scrobbling (AIOMetadata) ───────────────────────────────────────
+[[permission]]
+identifier = "allow-scrobble"
+description = "Allows the frontend to fire scrobble Start/Heartbeat/End events to the configured AIOMetadata addon"
+commands.allow = ["scrobble_start", "scrobble_heartbeat", "scrobble_end"]
+
+# ── Phase 3C: Discord Rich Presence ──────────────────────────────────────────
+[[permission]]
+identifier = "allow-discord-rpc"
+description = "Allows the frontend to publish or clear Discord rich presence"
+commands.allow = ["discord_set_presence", "discord_clear_presence"]

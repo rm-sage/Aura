@@ -79,17 +79,49 @@ pub fn check_mpv_dll() -> Result<(), String> {
 /// properties we want to observe so the plugin emits frontend events for them.
 pub fn init_mpv<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let mut initial_options: IndexMap<String, serde_json::Value> = IndexMap::new();
+
+    // ── Video ──────────────────────────────────────────────────────────────
     initial_options.insert("vo".into(), serde_json::json!("gpu-next"));
     initial_options.insert("hwdec".into(), serde_json::json!("auto-safe"));
     initial_options.insert("keepaspect".into(), serde_json::json!("yes"));
-    // Transparent background regions — lets Mica show through wherever the
-    // video frame doesn't paint (letterbox bars, paused overlay, etc.).
+    // Transparent letterbox lets Mica show through wherever video doesn't paint.
     initial_options.insert("background".into(), serde_json::json!("none"));
 
+    // ── HDR ────────────────────────────────────────────────────────────────
+    // target-colorspace-hint passes the display's native colorspace to the GPU
+    // compositor; tone-mapping=auto selects the best algorithm for the signal.
+    initial_options.insert("target-colorspace-hint".into(), serde_json::json!("yes"));
+    initial_options.insert("hdr-compute-peak".into(), serde_json::json!("yes"));
+    initial_options.insert("tone-mapping".into(), serde_json::json!("auto"));
+
+    // ── Audio passthrough (Dolby Atmos / DTS-X) ────────────────────────────
+    // audio-spdif enables bitstream passthrough for listed codecs.
+    // audio-exclusive gives MPV exclusive device access so the OS mixer doesn't
+    // down-mix the bitstream before it reaches the AVR/soundbar.
+    initial_options.insert(
+        "audio-spdif".into(),
+        serde_json::json!("ac3,dts,eac3,truehd,dts-hd"),
+    );
+    initial_options.insert("audio-exclusive".into(), serde_json::json!("yes"));
+
+    // ── Subtitles ──────────────────────────────────────────────────────────
+    initial_options.insert("sub-pos".into(), serde_json::json!("95"));
+    initial_options.insert("sub-font-size".into(), serde_json::json!("45"));
+    initial_options.insert("sub-border-size".into(), serde_json::json!("3"));
+    initial_options.insert("sub-shadow-offset".into(), serde_json::json!("2"));
+    initial_options.insert("sub-color".into(), serde_json::json!("#FFFFFFFF"));
+
+    // ── Observed properties ────────────────────────────────────────────────
     let mut observed_properties: IndexMap<String, String> = IndexMap::new();
+    // Playback state (used by the control bar)
     observed_properties.insert("pause".into(), "flag".into());
     observed_properties.insert("time-pos".into(), "double".into());
     observed_properties.insert("duration".into(), "double".into());
+    // OSD stats
+    observed_properties.insert("frame-drop-count".into(), "int64".into());
+    observed_properties.insert("dwidth".into(), "int64".into());
+    observed_properties.insert("dheight".into(), "int64".into());
+    observed_properties.insert("display-fps".into(), "double".into());
 
     let config = MpvConfig {
         initial_options,
