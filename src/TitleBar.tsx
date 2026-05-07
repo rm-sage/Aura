@@ -1,5 +1,9 @@
+// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 import { useEffect, useState, useCallback } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import Tooltip from "./Tooltip";
 
 // ---------------------------------------------------------------------------
 // TitleBar
@@ -56,9 +60,12 @@ const CloseIcon = () => (
 interface Props {
   /** Optional headline shown to the right of the Aura wordmark. */
   subtitle?: string;
+  /** When true, render the bar with a fully opaque background so the MPV
+   *  video painted into the window's content area doesn't bleed through. */
+  opaque?: boolean;
 }
 
-export default function TitleBar({ subtitle }: Props) {
+export default function TitleBar({ subtitle, opaque }: Props) {
   const [maximized, setMaximized] = useState(false);
 
   // Track maximize state so the icon flips between Maximize/Restore
@@ -84,18 +91,46 @@ export default function TitleBar({ subtitle }: Props) {
     getCurrentWindow().toggleMaximize();
   }, []);
 
+  // Explicit pointer-down → startDragging. Replaces `data-tauri-drag-region`
+  // because that CSS-only path was getting stuck on simple clicks: any
+  // single-click could leave the cursor "attached" to the title bar until
+  // the next pointer event because Tauri waits for movement to commit the
+  // drag and the WebView2 surface didn't always send the release back.
+  // Calling `startDragging()` directly forces the OS to take ownership of
+  // the gesture, and standard click/double-click behaviour stays intact.
+  const handlePointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return; // primary button only
+    if ((e.target as HTMLElement).closest("[data-no-drag]")) return;
+    getCurrentWindow().startDragging().catch(() => {});
+  }, []);
+
   return (
     <div
       className="relative flex items-center h-9 flex-shrink-0 select-none
                  border-b border-white/6 overflow-hidden"
-      style={{ background: "rgba(0,0,0,0.18)" }}
+      style={{
+        // During playback we paint a fully opaque pure-black strip so MPV
+        // doesn't bleed through the bar from below. Otherwise we leave it
+        // semi-transparent so Mica / Acrylic shows through.
+        background: opaque ? "rgba(0, 0, 0, 0.96)" : "rgba(0, 0, 0, 0.18)",
+        transition: "background 300ms ease, box-shadow 300ms ease",
+        // Cast a thin shadow downward when opaque so the boundary between
+        // bar and video reads cleanly.
+        boxShadow: opaque
+          ? "0 6px 16px -8px rgba(0, 0, 0, 0.85)"
+          : undefined,
+        zIndex: 10000, // always on top of the player overlay
+      }}
     >
       {/* Aura "Spectral Sweep" — GPU-composited gradient strip */}
       <div className="aura-sweep" aria-hidden />
 
-      {/* Drag region — fills the bar but lets buttons receive clicks */}
+      {/* Drag region — fills the bar but lets buttons receive clicks. We
+          drive drag explicitly via onPointerDown rather than the legacy
+          `data-tauri-drag-region` attribute (see comment on
+          handlePointerDown above). */}
       <div
-        data-tauri-drag-region
+        onPointerDown={handlePointerDown}
         onDoubleClick={handleDoubleClick}
         className="absolute inset-0 cursor-default"
       />
@@ -147,20 +182,21 @@ interface BtnProps {
 function TitleBarButton({ onClick, label, hover, hoverColor, children }: BtnProps) {
   const [hovered, setHovered] = useState(false);
   return (
-    <button
-      onClick={(e) => { e.stopPropagation(); onClick(); }}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      aria-label={label}
-      title={label}
-      className="flex items-center justify-center w-11 h-full transition-colors duration-100"
-      style={{
-        background: hovered ? hover : "transparent",
-        color: hovered && hoverColor ? hoverColor : "rgba(255,255,255,0.7)",
-        pointerEvents: "auto",
-      }}
-    >
-      {children}
-    </button>
+    <Tooltip text={label} pos="bottom">
+      <button
+        onClick={(e) => { e.stopPropagation(); onClick(); }}
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+        aria-label={label}
+        className="flex items-center justify-center w-11 h-full transition-colors duration-100"
+        style={{
+          background: hovered ? hover : "transparent",
+          color: hovered && hoverColor ? hoverColor : "rgba(255,255,255,0.7)",
+          pointerEvents: "auto",
+        }}
+      >
+        {children}
+      </button>
+    </Tooltip>
   );
 }

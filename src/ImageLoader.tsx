@@ -1,0 +1,180 @@
+// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import { useEffect, useRef, useState } from "react";
+
+// ---------------------------------------------------------------------------
+// ImageLoader — global graceful fade-in for every poster / backdrop / logo.
+//
+// Behaviour:
+//   • Pre-load: shimmer skeleton (animated linear-gradient) reserves the box.
+//   • onLoad:   image transitions opacity 0 → 1 over 300 ms, the skeleton
+//               cross-fades out simultaneously.
+//   • onError:  silent — the parent gets the placeholder via children fallback.
+//
+// Key invariant: the wrapper has the SAME box geometry whether the image is
+// loaded, loading, or errored. That kills layout shifts as images stream in
+// from the network.
+// ---------------------------------------------------------------------------
+
+export interface ImageLoaderProps {
+  src: string | null | undefined;
+  alt?: string;
+  draggable?: boolean;
+  decoding?: "async" | "sync" | "auto";
+  loading?: "eager" | "lazy";
+  /** Class on the OUTER box (controls geometry / aspect ratio). */
+  className?: string;
+  /** Class on the INNER <img> (controls object-fit / placement). */
+  imgClassName?: string;
+  /** Inline style on the inner <img>. */
+  imgStyle?: React.CSSProperties;
+  /** Optional class for the shimmer skeleton (defaults match the dark UI). */
+  skeletonClassName?: string;
+  /** Fired with the underlying HTMLImageElement on successful load. Useful for
+   *  measuring `naturalWidth` (e.g. low-res detection in the hero). */
+  onLoad?: (img: HTMLImageElement) => void;
+  /** Optional fallback content rendered when the image errors out. */
+  fallback?: React.ReactNode;
+}
+
+export default function ImageLoader({
+  src,
+  alt = "",
+  draggable,
+  decoding = "async",
+  loading = "lazy",
+  className,
+  imgClassName,
+  imgStyle,
+  skeletonClassName,
+  onLoad,
+  fallback,
+}: ImageLoaderProps) {
+  const [loaded, setLoaded] = useState(false);
+  const [errored, setErrored] = useState(false);
+  // `inView` controls whether we even set the <img>'s src. Native
+  // `loading="lazy"` mis-fires on tiles inside horizontally-scrolling
+  // rows: the initial IntersectionObserver check misses some entries,
+  // and the only thing that wakes them up is a later layout change
+  // (e.g. the hover :scale on the card), which is why poster tiles
+  // appeared blank until the user pointed at them. Custom observer
+  // below uses an explicit `rootMargin` of 600 px on every axis so
+  // anything within ~600 px of the viewport — including off-screen
+  // tiles in a horizontally-scrolled row — is pre-fetched.
+  const [inView, setInView] = useState(loading === "eager");
+  const wrapperRef = useRef<HTMLSpanElement>(null);
+  const ref = useRef<HTMLImageElement>(null);
+
+  // Reset state whenever the src changes so the new image fades in cleanly.
+  useEffect(() => {
+    setLoaded(false);
+    setErrored(false);
+    // If the browser already had this URL cached, `onLoad` may not fire.
+    // Detect that and short-circuit so we don't show an indefinite skeleton.
+    const img = ref.current;
+    if (img && img.complete && img.naturalWidth > 0) {
+      setLoaded(true);
+      onLoad?.(img);
+    }
+    // We deliberately exclude `onLoad` from deps — callers often pass an inline
+    // function. Resetting on src change is what matters here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [src]);
+
+  // Custom IntersectionObserver-driven lazy-load. Only runs when
+  // `loading="lazy"` (the default); `loading="eager"` short-circuits
+  // by initialising `inView=true` above. The 1200 px rootMargin
+  // (raised from 600 px) is wide enough to keep horizontal catalog
+  // rows pre-fetched even during fast flick-scrolls — at 600 px, a
+  // user dragging through CinemaRows quickly observed posters
+  // appearing blank until they slowed down because the IO fired
+  // AT +600 px and decode + paint took longer than the user took to
+  // pass through. Combined with the `image.decode()` step below,
+  // tiles enter the viewport with pixels already on the GPU.
+  useEffect(() => {
+    if (loading === "eager" || inView) return;
+    const node = wrapperRef.current;
+    if (!node) return;
+    if (typeof IntersectionObserver === "undefined") {
+      // Older WebView2 / non-browser environment — just load eagerly.
+      setInView(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            setInView(true);
+            observer.disconnect();
+            return;
+          }
+        }
+      },
+      { rootMargin: "1200px" },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [loading, inView]);
+
+  // Wrapper position is determined by the caller's className — we deliberately
+  // do NOT set `relative` here so callers passing `absolute inset-0` aren't
+  // overridden by Tailwind's utility ordering (position utilities resolve to
+  // whichever class wins the cascade, not the order in className).
+  return (
+    <span ref={wrapperRef} className={`block ${className ?? ""}`} style={{ overflow: "hidden" }}>
+      {/* Skeleton — visible until the image fires onLoad */}
+      {!loaded && !errored && (
+        <span
+          aria-hidden
+          className={`absolute inset-0 ${skeletonClassName ?? "image-loader-skeleton"}`}
+        />
+      )}
+
+      {src && !errored && inView && (
+        <img
+          ref={ref}
+          src={src}
+          alt={alt}
+          draggable={draggable}
+          decoding={decoding}
+          // Drop the native `loading` attribute — our IntersectionObserver
+          // above already gates when the <img> mounts. Setting `loading=lazy`
+          // here on top of our gate would just reintroduce the original
+          // mis-fire (an <img> mounted with src=set + loading=lazy still
+          // defers the actual fetch via the broken native path).
+          onLoad={(e) => {
+            const img = e.currentTarget;
+            // Wait for actual GPU decode before fading in. `onLoad`
+            // fires when bytes have arrived but `decoding="async"`
+            // means pixels are processed off the main thread; without
+            // the `image.decode()` await, fast scrolls would fade in
+            // while the browser was still rasterising and the user
+            // saw a momentary "blank tile that then filled in." For
+            // browsers that don't support .decode() (older WebView2
+            // builds), the catch path falls back to setLoaded(true)
+            // immediately so rendering still happens.
+            const finishLoad = () => {
+              setLoaded(true);
+              if (ref.current) onLoad?.(ref.current);
+            };
+            if (typeof img.decode === "function") {
+              img.decode().then(finishLoad).catch(finishLoad);
+            } else {
+              finishLoad();
+            }
+          }}
+          onError={() => setErrored(true)}
+          className={`block ${imgClassName ?? ""}`}
+          style={{
+            opacity: loaded ? 1 : 0,
+            transition: "opacity 300ms ease-out",
+            ...imgStyle,
+          }}
+        />
+      )}
+
+      {errored && fallback}
+    </span>
+  );
+}

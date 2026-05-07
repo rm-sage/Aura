@@ -1,3 +1,6 @@
+// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +15,41 @@ pub struct AddonEntry {
     pub url: String,
     pub name: String,
     pub has_search: bool,
+    /// Manifest-level `id` field — the addon author's stable identifier
+    /// (e.g. "com.linvo.cinemeta", "community.aiometadata"). Cached at
+    /// install/sync time so the frontend can build defaults that survive
+    /// instance changes (a user moving from one AIOMetadata host to
+    /// another keeps the same `manifest_id` even though the URL differs).
+    /// Default-empty for back-compat with existing addons.json files
+    /// pre-dating this field — those addons just won't participate in
+    /// id-based default matching until the next manifest refresh.
+    #[serde(default)]
+    pub manifest_id: String,
+    /// Distinct media types covered by this addon's catalogs (e.g., "movie",
+    /// "series", "anime"). Sourced from manifest.catalogs[].type.
+    /// Default-empty so older `addons.json` files load forward-compatibly.
+    #[serde(default)]
+    pub types: Vec<String>,
+    /// Stremio resources this addon exposes — drives the colored tag list in
+    /// the Addons UI ("stream", "subtitles", "meta", "catalog", …).
+    #[serde(default)]
+    pub resources: Vec<String>,
+    /// Manifest's stream-resource type list (the `types` field on the
+    /// resource object), if the addon advertised one. Empty = "any of
+    /// `types` above". Cached at install time so fetch_streams doesn't
+    /// have to re-probe the manifest on every request — that re-probe
+    /// was producing the "manifest fetch failed" cascade visible in the
+    /// user's logs whenever the network flapped, killing all stream
+    /// lookups even though we already had this metadata locally.
+    #[serde(default)]
+    pub stream_types: Vec<String>,
+    /// Manifest-level `idPrefixes` list. Same caching rationale.
+    #[serde(default)]
+    pub id_prefixes: Vec<String>,
+    /// Per-resource override of `idPrefixes` for the stream resource (the
+    /// stricter of the two wins inside fetch_streams).
+    #[serde(default)]
+    pub stream_id_prefixes: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

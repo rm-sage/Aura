@@ -1,8 +1,13 @@
+// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type { AddonEntry } from "../types";
 import type { UserSession } from "../LoginView";
 import LoginView from "../LoginView";
+import { openContextMenu } from "../ContextMenu";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -19,8 +24,49 @@ interface Props {
 }
 
 // ---------------------------------------------------------------------------
-// Search badge
+// Tag pill — distinct color per tag KIND so the eye can quickly tell at a
+// glance which addons cover Movies vs Series vs Subtitles, etc.
 // ---------------------------------------------------------------------------
+
+const TAG_PALETTE: Record<string, { bg: string; fg: string; border: string }> = {
+  // Catalog media types
+  movie:     { bg: "bg-blue-500/15",    fg: "text-blue-300",    border: "border-blue-400/30" },
+  movies:    { bg: "bg-blue-500/15",    fg: "text-blue-300",    border: "border-blue-400/30" },
+  series:    { bg: "bg-purple-500/15",  fg: "text-purple-300",  border: "border-purple-400/30" },
+  show:      { bg: "bg-purple-500/15",  fg: "text-purple-300",  border: "border-purple-400/30" },
+  anime:     { bg: "bg-pink-500/15",    fg: "text-pink-300",    border: "border-pink-400/30" },
+  channel:   { bg: "bg-amber-500/15",   fg: "text-amber-300",   border: "border-amber-400/30" },
+  channels:  { bg: "bg-amber-500/15",   fg: "text-amber-300",   border: "border-amber-400/30" },
+  tv:        { bg: "bg-amber-500/15",   fg: "text-amber-300",   border: "border-amber-400/30" },
+  music:     { bg: "bg-rose-500/15",    fg: "text-rose-300",    border: "border-rose-400/30" },
+  // Resources
+  catalog:   { bg: "bg-sky-500/15",     fg: "text-sky-300",     border: "border-sky-400/30" },
+  meta:      { bg: "bg-cyan-500/15",    fg: "text-cyan-300",    border: "border-cyan-400/30" },
+  stream:    { bg: "bg-emerald-500/15", fg: "text-emerald-300", border: "border-emerald-400/30" },
+  streams:   { bg: "bg-emerald-500/15", fg: "text-emerald-300", border: "border-emerald-400/30" },
+  subtitles: { bg: "bg-yellow-500/15",  fg: "text-yellow-300",  border: "border-yellow-400/30" },
+  subtitle:  { bg: "bg-yellow-500/15",  fg: "text-yellow-300",  border: "border-yellow-400/30" },
+};
+
+function tagColors(tag: string): { bg: string; fg: string; border: string } {
+  return (
+    TAG_PALETTE[tag.toLowerCase()] ?? {
+      bg: "bg-white/8", fg: "text-white/70", border: "border-white/15",
+    }
+  );
+}
+
+function TagPill({ label }: { label: string }) {
+  const c = tagColors(label);
+  return (
+    <span
+      className={`text-[9px] font-semibold tracking-wide uppercase px-1.5 py-0.5 rounded border
+                  ${c.bg} ${c.fg} ${c.border}`}
+    >
+      {label}
+    </span>
+  );
+}
 
 function SearchBadge() {
   return (
@@ -200,9 +246,41 @@ function AddonRow({
   };
 
   return (
-    <div className="group flex items-start gap-3 px-4 py-3 rounded-xl
-                    bg-white/3 border border-white/6 hover:bg-white/5
-                    transition-colors">
+    <div
+      className="group flex items-start gap-3 px-4 py-3 rounded-xl
+                 bg-white/3 border border-white/6 hover:bg-white/5
+                 transition-colors"
+      onContextMenu={(e) => {
+        e.preventDefault();
+        // The manifest URL is the install URL with /manifest.json appended.
+        const manifestUrl = addon.url.endsWith("/manifest.json")
+          ? addon.url
+          : `${addon.url.replace(/\/$/, "")}/manifest.json`;
+        // Stremio addon "Configure" pages live at <base>/configure
+        const configureUrl = addon.url.endsWith("/manifest.json")
+          ? addon.url.replace(/\/manifest\.json$/, "/configure")
+          : `${addon.url.replace(/\/$/, "")}/configure`;
+        openContextMenu(e.clientX, e.clientY, [
+          {
+            label: "Configure addon",
+            onClick: () => openUrl(configureUrl).catch(() => {}),
+          },
+          {
+            label: "Open manifest URL",
+            onClick: () => openUrl(manifestUrl).catch(() => {}),
+          },
+          {
+            label: "Copy manifest URL",
+            onClick: () => navigator.clipboard.writeText(manifestUrl).catch(() => {}),
+          },
+          {
+            label: "Remove addon",
+            onClick: handleRemove,
+            danger: true,
+          },
+        ]);
+      }}
+    >
       <div className="flex-1 min-w-0 space-y-1">
         <div className="flex items-center gap-2 flex-wrap">
           <p className="text-white/85 text-sm font-medium leading-tight">{addon.name}</p>
@@ -211,6 +289,16 @@ function AddonRow({
         <p className="text-white/30 text-xs font-mono truncate">
           {addon.url.replace(/^https?:\/\//, "")}
         </p>
+        {(addon.types?.length || addon.resources?.length) ? (
+          <div className="flex items-center gap-1.5 flex-wrap pt-1">
+            {(addon.types ?? []).map((t) => <TagPill key={`t:${t}`} label={t} />)}
+            {(addon.resources ?? [])
+              // Hide the implicit `catalog` resource if the addon already has
+              // catalog types listed — it's redundant noise.
+              .filter((r) => !(r.toLowerCase() === "catalog" && (addon.types ?? []).length > 0))
+              .map((r) => <TagPill key={`r:${r}`} label={r} />)}
+          </div>
+        ) : null}
       </div>
       <button
         onClick={handleRemove}

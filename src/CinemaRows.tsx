@@ -1,215 +1,489 @@
-import { useState, useRef, memo } from "react";
-import type { MetaPreview, LibraryItem } from "./types";
+// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import { memo, useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import type { MetaPreview, LibraryItem, AddonEntry, VideoEntry } from "./types";
+import ImageLoader from "./ImageLoader";
+import { useLibraryProgress } from "./LibraryContext";
+import WatchedBadge, { useWatchedVariant, WatchedBadgeStatic } from "./WatchedBadge";
+import { getManualWatchedState, useManualWatchedVersion } from "./manualWatched";
+import { getMetaDetailFallback } from "./metaCache";
+
+/** Per-catalog cache for the View-all popup. Keyed by
+ *  `${addonUrl}|${type}|${id}`. Persists across DiscoveryRow remounts
+ *  (e.g. settings tick re-bootstrapping the home rows) so a user who
+ *  has already loaded a row's full list doesn't re-trigger pagination
+ *  on subsequent clicks. Module-level Map; never cleared — cleared
+ *  state is unnecessary since up to ~100 items × handful of catalogs
+ *  is well under any sensible memory ceiling. */
+const catalogPaginationCache = new Map<string, MetaPreview[]>();
+/** Max items the View-all popup paginates to, mirroring the user's
+ *  spec ("up to 100 per catalog"). */
+const VIEW_ALL_TARGET = 100;
 
 // ---------------------------------------------------------------------------
-// Shared row scaffolding
+// Cinema rows.
 //
-// Performance notes:
-//   • cv-auto on RowShell skips layout + paint for off-screen rows.
-//   • We deliberately DO NOT promote each row to its own GPU layer; doing so
-//     spawns one compositor surface per row and the cross-row copy/composite
-//     cost was a net loss during fast vertical scrolls. Containment via
-//     content-visibility already isolates each row's paint.
-//   • All <img> are loading="lazy" decoding="async" — decode happens off the
-//     main thread.
-//   • The scroll arrows previously used .glass-panel-elevated (backdrop blur),
-//     which forces a full-area filter pass even while invisible (opacity:0).
-//     They now use a simple translucent black background — visually close,
-//     vastly cheaper.
+// DiscoveryRow uses a 10-column CSS Grid: exactly 10 cells per row regardless
+// of viewport. `HOME_VISIBLE - 1` catalog items + 1 "View All" card = a clean
+// 10-cell row. CardCount > 10 is impossible by construction.
+//
+// ContinueWatchingRow keeps a horizontal-scroll layout because 10 16:9
+// thumbnails per row would each be tiny on 1080p. CW thumbnails are
+// EXCLUSIVELY 16:9 background art (no portrait poster fallback).
 // ---------------------------------------------------------------------------
 
-// Layout tunables — tweak in one spot
-const DISCOVERY_W   = 220;     // portrait card width
-const CONTINUE_W    = 460;     // 16:9 card width
-const CARD_GAP_PX   = 22;      // horizontal gap between cards
+/** Discovery rows render exactly this many cells per row (9 items + ViewAll). */
+export const HOME_VISIBLE = 10;
+/** Continue Watching renders this many cells per row — auto-scales like
+ *  the discovery grid so cards always fill the available width regardless
+ *  of viewport. Capped at 8 because 16:9 thumbnails get illegibly small
+ *  past that on 1080p. */
+const CONTINUE_VISIBLE = 8;
 
-const ChevronLeft = () => (
-  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-    <path d="M15.41 16.59L10.83 12l4.58-4.59L14 6l-6 6 6 6z" />
-  </svg>
-);
-const ChevronRight = () => (
-  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-    <path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6z" />
-  </svg>
-);
+// ---------------------------------------------------------------------------
+// Continue Watching — 16:9 backdrop cards with progress bar.
+// Filters out items lacking a 16:9 background.
+// ---------------------------------------------------------------------------
 
-interface RowShellProps {
-  title: string;
-  subtitle?: string;
-  children: React.ReactNode;
+// libraryNormalize() in App's loadLibrary already collapses episode-level
+// rows into series-rooted entries — `item.id` here is canonical.
+//
+// Genres are pulled out of `state.genres` when present — Aura now writes
+// them on every library_put (libraryActions.buildChange /
+// libraryWriteProgress) so the anime gate downstream (right-click menus,
+// audio language defaults) keeps working even after the meta has been
+// stripped down to the Stremio library record. Historical entries
+// without state.genres pick them up the next time the user plays / re-
+// adds them.
+function libraryItemToMeta(item: LibraryItem): MetaPreview {
+  const stateGenres = (item.state ?? {}).genres;
+  const genres = Array.isArray(stateGenres)
+    ? stateGenres.filter((g): g is string => typeof g === "string")
+    : [];
+  return {
+    id:           item.id,
+    name:         item.name,
+    media_type:   item.media_type,
+    poster:       item.poster,
+    background:   item.background,
+    fanart:       null,
+    backdrop:     null,
+    logo:         item.logo,
+    release_info: item.year,
+    description:  null,
+    imdb_rating:  null,
+    genres,
+  };
 }
 
-function RowShell({ title, subtitle, children }: RowShellProps) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [hovered, setHovered] = useState(false);
+interface ContinueWatchingCardProps {
+  item: LibraryItem;
+  onSelect?: (meta: MetaPreview) => void;
+  /** Required for the segmented per-season progress bar — CW card
+   *  fetches its meta detail via the addon list to know how many
+   *  episodes the current season has. */
+  addons?: AddonEntry[];
+}
 
-  const scroll = (dir: -1 | 1) => {
-    const el = ref.current;
-    if (!el) return;
-    el.scrollBy({ left: dir * el.clientWidth * 0.85, behavior: "smooth" });
-  };
+// ---------------------------------------------------------------------------
+// SegmentedSeasonBar — for series / anime CW cards. Renders one segment
+// per episode in the resume episode's season; segments are colored:
+//   • emerald  — watched (manual mark OR position-implied)
+//   • amber    — currently watching (state.video_id resume hint)
+//   • white/15 — unwatched
+//
+// The "position-implied" rule: episodes earlier in the season than the
+// resume episode are treated as watched. Stremio doesn't track per-
+// episode timestamps in cloud library — this is the best signal we
+// have without forcing the user to manually mark every episode.
+// Manual marks always win, in either direction.
+// ---------------------------------------------------------------------------
 
+function SegmentedSeasonBar({
+  episodes, currentId,
+}: {
+  episodes: VideoEntry[];
+  currentId: string | null;
+}) {
+  // Subscribe to manual-watched changes so the bar repaints
+  // immediately when the user toggles a per-episode mark from the
+  // EpisodeRow context menu. useSyncExternalStore (via the
+  // useManualWatchedVersion helper) deduplicates the subscription
+  // bookkeeping vs. the previous useState+useEffect+tick combo,
+  // which mattered when 50 CW cards each carried their own bar.
+  void useManualWatchedVersion();
+
+  if (episodes.length === 0) return null;
+  const currentIdx = currentId
+    ? episodes.findIndex((v) => v.id === currentId)
+    : -1;
+
+  // Inset the bar from each side by the card's corner radius (rounded-xl
+  // = 12 px). Without this, the leftmost and rightmost segments get
+  // visually swallowed by the parent's curved corner — for a season
+  // with many episodes (segments only ~6-10 px wide), the first/last
+  // segment ends up rendering as a sliver or disappearing entirely.
+  // The 8 px inset is enough to clear the curvature on a 5 px-tall
+  // bar without leaving an obvious gap.
   return (
-    <section
-      className="relative px-6 cv-auto"
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-    >
-      <div className="flex items-baseline justify-between mb-3 px-1">
-        <h3 className="text-white/80 text-sm font-semibold tracking-wide">{title}</h3>
-        {subtitle && (
-          <p className="text-white/30 text-xs">{subtitle}</p>
-        )}
-      </div>
-
-      <div className="relative">
-        <div
-          ref={ref}
-          className="scroll-row flex pb-3"
-          style={{ gap: `${CARD_GAP_PX}px` }}
-        >
-          {children}
-        </div>
-
-        {/* Hover-only scroll arrows — cheap solid background, no backdrop blur */}
-        <button
-          onClick={() => scroll(-1)}
-          aria-label="Scroll left"
-          className={`absolute left-1 top-1/2 -translate-y-1/2 w-9 h-9 rounded-full
-                      flex items-center justify-center
-                      text-white/80 hover:text-white transition-opacity duration-200
-                      bg-black/55 border border-white/15
-                      ${hovered ? "opacity-100" : "opacity-0 pointer-events-none"}`}
-        >
-          <ChevronLeft />
-        </button>
-        <button
-          onClick={() => scroll(1)}
-          aria-label="Scroll right"
-          className={`absolute right-1 top-1/2 -translate-y-1/2 w-9 h-9 rounded-full
-                      flex items-center justify-center
-                      text-white/80 hover:text-white transition-opacity duration-200
-                      bg-black/55 border border-white/15
-                      ${hovered ? "opacity-100" : "opacity-0 pointer-events-none"}`}
-        >
-          <ChevronRight />
-        </button>
-      </div>
-    </section>
+    <div className="absolute left-2 right-2 bottom-1 h-[5px] flex gap-[1.5px] rounded-full overflow-hidden">
+      {episodes.map((ep, i) => {
+        const manual = getManualWatchedState(ep.id);
+        let cls: string;
+        if (manual === "watched") {
+          cls = "bg-emerald-400";
+        } else if (manual === "in-progress" || i === currentIdx) {
+          cls = "bg-amber-400";
+        } else if (currentIdx >= 0 && i < currentIdx) {
+          cls = "bg-emerald-400/85"; // implied-watched (earlier in season)
+        } else {
+          cls = "bg-white/15";
+        }
+        return <div key={ep.id} className={`flex-1 h-full ${cls}`} />;
+      })}
+    </div>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Continue Watching — 16:9 backdrop cards with progress bar
-// ---------------------------------------------------------------------------
+/** Pull the current season's episode list from the meta cache.
+ *  Returns null while fetching, returns [] for non-episodic items. */
+function useSeasonEpisodes(item: LibraryItem, addons: AddonEntry[] | undefined): VideoEntry[] | null {
+  const [eps, setEps] = useState<VideoEntry[] | null>(null);
+  const mediaType = (item.media_type ?? "").toLowerCase();
+  const isEpisodic = mediaType === "series" || mediaType === "anime";
 
-interface ContinueWatchingCardProps { item: LibraryItem }
+  useEffect(() => {
+    if (!isEpisodic || !addons || addons.length === 0) {
+      setEps([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const detail = await getMetaDetailFallback(addons, item.media_type, item.id);
+      if (cancelled) return;
+      if (!detail || !detail.videos || detail.videos.length === 0) {
+        setEps([]);
+        return;
+      }
+      // Resume episode tells us which season — IMDb-style episodes
+      // (`tt0903747:1:5`) carry "1" as the second segment. For
+      // prefix-style ids (kitsu/mal/anidb) there's typically no
+      // season concept, so we render every video as a single bar.
+      const videoId = (item.state ?? {}).video_id;
+      let season: number | null = null;
+      if (typeof videoId === "string") {
+        const parts = videoId.split(":");
+        if (parts.length >= 3) {
+          const maybeSeason = Number(parts[parts.length - 2]);
+          if (Number.isFinite(maybeSeason)) season = maybeSeason;
+        }
+      }
+      const seasonEps = season != null
+        ? detail.videos.filter((v) => v.season === season)
+        : detail.videos;
+      seasonEps.sort((a, b) => (a.episode ?? 0) - (b.episode ?? 0));
+      setEps(seasonEps);
+    })();
+    return () => { cancelled = true; };
+  }, [item.id, item.media_type, item.state?.video_id, isEpisodic, addons]);
+
+  return eps;
+}
+
+/** Inline title-suffix indicator for CW cards. Renders a small green
+ *  check (watched) or yellow dot (in-progress) next to the card title
+ *  when the meta has a manual mark or library-derived progress state.
+ *  The full poster overlay would be visually noisy on a 16:9 CW card,
+ *  so we use this slimmer text-aligned variant instead. */
+function CWTitleIndicator({ metaId, mediaType }: { metaId: string; mediaType: string }) {
+  const variant = useWatchedVariant(metaId, mediaType);
+  if (!variant) return null;
+  return (
+    <span className="inline-flex items-center align-middle ml-1.5">
+      <WatchedBadgeStatic variant={variant} />
+    </span>
+  );
+}
+
+/** Format an episode id as the SxxEyy / EPxx badge text. Pure
+ *  function over the wire-format id strings used by Stremio's library
+ *  state.video_id (tt-style, kitsu-style, mal-style). */
+function badgeForVideoId(vid: string | null | undefined): string | null {
+  if (typeof vid !== "string" || vid.length === 0) return null;
+  const parts = vid.split(":");
+  if (parts.length < 2) return null;
+  const last = parts[parts.length - 1];
+  const second = parts[parts.length - 2];
+  // IMDb style: parts = [tt0903747, season, episode]; series root has no
+  // letter prefix (numeric only after the leading tt).
+  if (parts.length >= 3 && /^\d+$/.test(second) && /^\d+$/.test(last)) {
+    const season = Number(second);
+    const ep = Number(last);
+    if (Number.isFinite(season) && Number.isFinite(ep)) {
+      return `S${String(season).padStart(2, "0")}E${String(ep).padStart(2, "0")}`;
+    }
+  }
+  // Prefix style (kitsu:/mal:/anidb:): parts = [provider, seriesNum, ep]
+  if (parts.length === 3 && /^\d+$/.test(last)) {
+    return `EP${String(Number(last)).padStart(2, "0")}`;
+  }
+  return null;
+}
+
+/** Compute the effective "resume" episode id for a library item,
+ *  accounting for manual watched marks. Stremio's library
+ *  state.video_id only updates on real playback, so when the user
+ *  manually marks the resume episode watched the CW tile would
+ *  otherwise remain stuck pointing at the just-watched episode.
+ *  Walks forward through the season's episode list to the next
+ *  non-watched entry; falls back to state.video_id when no
+ *  unwatched ep can be found OR the episode list isn't loaded yet.
+ *  Subscribes to manual-watched changes so the calling card
+ *  repaints the moment the user toggles a mark. */
+function useEffectiveResumeVideoId(
+  item: LibraryItem,
+  episodes: VideoEntry[] | null,
+): string | null {
+  void useManualWatchedVersion();
+  const baseId = (item.state ?? {}).video_id;
+  if (typeof baseId !== "string" || baseId.length === 0) return null;
+  if (getManualWatchedState(baseId) !== "watched") return baseId;
+  // Resume ep is manually-watched. Walk the season to find the next
+  // non-watched episode — that's where the user would resume.
+  if (!episodes || episodes.length === 0) return baseId;
+  const idx = episodes.findIndex((v) => v.id === baseId);
+  if (idx < 0) return baseId;
+  for (let i = idx + 1; i < episodes.length; i += 1) {
+    const ep = episodes[i];
+    if (getManualWatchedState(ep.id) === "watched") continue;
+    return ep.id;
+  }
+  return baseId;
+}
 
 const ContinueWatchingCard = memo(function ContinueWatchingCard(
-  { item }: ContinueWatchingCardProps
+  { item, onSelect, addons }: ContinueWatchingCardProps
 ) {
-  const [imgError, setImgError] = useState(false);
   const src = item.background ?? item.poster;
-  const showImage = src && !imgError;
 
-  // Progress (0..1) — derived from state.timeOffset / state.duration when both
-  // are present. Falls back to 0 when duration is unknown.
   const offset = typeof item.state?.timeOffset === "number" ? item.state.timeOffset : 0;
   const duration = typeof item.state?.duration === "number" ? item.state.duration : 0;
   const progress = duration > 0 ? Math.min(1, offset / duration) : 0;
+  const seasonEpisodes = useSeasonEpisodes(item, addons);
+  // Effective resume episode — falls forward across manually-watched
+  // entries so a freshly-marked episode causes the SxxEyy badge AND
+  // the segmented bar's "current" amber to advance to the next
+  // unwatched ep. Without this, the CW card stayed visually stuck on
+  // the just-marked episode.
+  const effectiveVideoId = useEffectiveResumeVideoId(item, seasonEpisodes);
+  const badge = badgeForVideoId(effectiveVideoId);
+  const useSegmented = seasonEpisodes != null && seasonEpisodes.length > 1;
 
   return (
     <div
-      className="group flex-shrink-0 cursor-pointer card-contain"
-      style={{ width: `${CONTINUE_W}px`, scrollSnapAlign: "start" }}
+      className="card-grow group relative cursor-pointer card-contain text-left
+                 focus-within:ring-2 focus-within:ring-ln-accent/60 rounded-xl"
+      data-meta-card={`${item.media_type}:${item.id}`}
     >
-      <div
-        className="relative overflow-hidden rounded-xl bg-white/5 border border-white/8"
-        style={{ aspectRatio: "16 / 9" }}
+      <button
+        type="button"
+        onClick={() => onSelect?.(libraryItemToMeta(item))}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          // `source: "cw"` lets App.tsx tailor the menu — CW cards
+          // show "Remove from Continue Watching" instead of "Remove
+          // from Library" since the user typically just wants to drop
+          // the row from their CW lineup.
+          window.dispatchEvent(new CustomEvent("aura:card-context", {
+            detail: { meta: libraryItemToMeta(item), x: e.clientX, y: e.clientY, source: "cw", item },
+          }));
+        }}
+        className="block w-full text-left rounded-xl focus:outline-none"
       >
-        {showImage ? (
-          <img
-            src={src!}
-            alt={item.name}
-            loading="lazy"
-            decoding="async"
-            onError={() => setImgError(true)}
-            draggable={false}
-            className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-105"
-          />
-        ) : (
-          <div className="w-full h-full flex items-center justify-center text-white/20">
-            <svg width="32" height="32" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-              <path d="M8 5v14l11-7z" />
-            </svg>
-          </div>
-        )}
+        <div
+          className="relative overflow-hidden rounded-xl bg-white/5 border border-white/8"
+          style={{ aspectRatio: "16 / 9" }}
+        >
+          {src ? (
+            <ImageLoader
+              src={src}
+              alt={item.name}
+              draggable={false}
+              className="absolute inset-0 w-full h-full"
+              imgClassName="w-full h-full object-cover"
+            />
+          ) : null}
 
-        {/* Bottom gradient + progress bar */}
-        <div className="absolute inset-x-0 bottom-0 h-1/3
-                        bg-gradient-to-t from-black/70 to-transparent" />
-        {progress > 0 && (
-          <div className="absolute inset-x-0 bottom-0 h-[3px] bg-white/15">
-            <div className="h-full bg-ln-accent" style={{ width: `${progress * 100}%` }} />
-          </div>
+          {/* SxxEyy badge — top-left, denotes the episode that will
+              actually be brought up when the card is clicked. Same
+              style as the calendar but scaled +25 % (10.5 → 13 px font,
+              padding bumped proportionally) so the SxxEyy reads
+              cleanly at sofa distance. */}
+          {badge && (
+            <span
+              className="absolute top-1.5 left-1.5 px-2 py-1 rounded
+                         bg-black/75 backdrop-blur-sm border border-white/15
+                         text-white/90 text-[13px] font-mono font-semibold
+                         tracking-wider tabular-nums"
+              aria-label={`Resume at ${badge}`}
+            >
+              {badge}
+            </span>
+          )}
+
+          <div className="absolute inset-x-0 bottom-0 h-1/3 bg-gradient-to-t from-black/70 to-transparent" />
+          {useSegmented ? (
+            // Per-episode segmented bar for series/anime — each segment
+            // is one episode in the current season. Falls back to the
+            // smooth bar below for movies and for series whose meta
+            // hasn't resolved yet (lazy fetch via metaCache).
+            <SegmentedSeasonBar
+              episodes={seasonEpisodes!}
+              currentId={effectiveVideoId}
+            />
+          ) : progress > 0 && (
+            <div className="absolute inset-x-0 bottom-0 h-[5px] bg-white/15">
+              <div className="h-full bg-ln-accent" style={{ width: `${progress * 100}%` }} />
+            </div>
+          )}
+        </div>
+        <p className="text-white/90 text-[17px] font-medium mt-2 leading-tight line-clamp-1 text-center">
+          {item.name}
+          <CWTitleIndicator metaId={item.id} mediaType={item.media_type} />
+        </p>
+        {item.year && (
+          <p className="text-white/35 text-[14px] mt-0.5 text-center font-mono">{item.year}</p>
         )}
-      </div>
-      <p className="text-white/85 text-sm font-medium mt-2.5 leading-tight line-clamp-1 text-center">
-        {item.name}
-      </p>
-      {item.year && (
-        <p className="text-white/35 text-xs mt-0.5 text-center">{item.year}</p>
-      )}
+      </button>
+
+      {/* Clear-from-Continue-Watching button. Visible on hover only so it
+          doesn't compete with the poster art at rest. App.tsx handles the
+          cloud-side library write via the 'aura:cw-clear' event. */}
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          window.dispatchEvent(new CustomEvent("aura:cw-clear", { detail: { item } }));
+        }}
+        title="Remove from Continue Watching"
+        aria-label="Remove from Continue Watching"
+        className="absolute top-2 right-2 w-7 h-7 rounded-full
+                   bg-black/70 text-white/85 hover:bg-black/90 hover:text-white
+                   border border-white/20
+                   opacity-0 group-hover:opacity-100 transition-opacity
+                   flex items-center justify-center
+                   focus:outline-none focus-visible:opacity-100"
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+          <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
+        </svg>
+      </button>
     </div>
   );
 });
 
 interface ContinueWatchingRowProps {
   items: LibraryItem[];
+  onSelectMeta?: (meta: MetaPreview) => void;
+  /** Forwarded to each card — needed for the segmented per-season
+   *  progress bar's lazy meta fetch. */
+  addons?: AddonEntry[];
 }
 
 export const ContinueWatchingRow = memo(function ContinueWatchingRow(
-  { items }: ContinueWatchingRowProps
+  { items, onSelectMeta, addons }: ContinueWatchingRowProps
 ) {
-  if (items.length === 0) return null;
+  const have16x9 = items.filter((i) => !!(i.background ?? i.poster));
+  if (have16x9.length === 0) return null;
+
+  // CONTINUE_VISIBLE caps the in-memory slice to the largest column
+  // count any breakpoint will render (8 = ultrawide). Viewports under
+  // 2400 px render 6 cards instead — the leftover slice is silently
+  // dropped at the grid level since column count is driven by the
+  // `--cw-cols` CSS var (set in App.css's media-query block).
+  const visible = have16x9.slice(0, CONTINUE_VISIBLE);
+
   return (
-    <RowShell title="Continue Watching" subtitle={`${items.length} in progress`}>
-      {items.map((item) => (
-        <ContinueWatchingCard key={item.id} item={item} />
-      ))}
-    </RowShell>
+    <section className="relative px-6">
+      <div className="flex items-baseline gap-3 mb-3 px-1">
+        <h3 className="aura-row-title text-2xl font-semibold tracking-tight">
+          Continue Watching
+        </h3>
+        <p className="text-white/65 text-[13px] font-mono tabular-nums tracking-wide">
+          <span className="text-white/85 font-semibold">{have16x9.length}</span>
+          <span className="ml-1 text-white/40">in progress</span>
+        </p>
+      </div>
+      <div
+        className="grid gap-3.5"
+        style={{ gridTemplateColumns: "repeat(var(--cw-cols, 8), minmax(0, 1fr))" }}
+      >
+        {visible.map((item) => (
+          <ContinueWatchingCard key={item.id} item={item} onSelect={onSelectMeta} addons={addons} />
+        ))}
+      </div>
+    </section>
   );
 });
 
 // ---------------------------------------------------------------------------
-// Discovery row — portrait posters (CatalogCard)
+// Discovery row — 10-column CSS Grid. 9 catalog items + 1 "View All" cell.
 // ---------------------------------------------------------------------------
 
-interface CatalogCardProps { meta: MetaPreview }
+interface CatalogCardProps {
+  meta: MetaPreview;
+  onSelect?: (meta: MetaPreview) => void;
+}
 
-export const CatalogCard = memo(function CatalogCard({ meta }: CatalogCardProps) {
-  const [imgError, setImgError] = useState(false);
-  const showImage = meta.poster && !imgError;
+export const CatalogCard = memo(function CatalogCard({ meta, onSelect }: CatalogCardProps) {
+  // Pull progress from the library context — drives the bottom progress
+  // bar (partial) and the corner check (watched). Both are rendered as
+  // unobtrusive overlays so they don't compete with the poster art.
+  const progress = useLibraryProgress(meta.id);
 
   return (
-    <div
-      className="group flex-shrink-0 cursor-pointer card-contain"
-      style={{ width: `${DISCOVERY_W}px`, scrollSnapAlign: "start" }}
+    <button
+      type="button"
+      onClick={() => onSelect?.(meta)}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        window.dispatchEvent(new CustomEvent("aura:card-context", {
+          detail: { meta, x: e.clientX, y: e.clientY },
+        }));
+      }}
+      className="card-grow group flex flex-col gap-2 cursor-pointer card-contain text-left
+                 focus:outline-none focus-visible:ring-2 focus-visible:ring-ln-accent/60 rounded-xl"
+      data-meta-card={`${meta.media_type}:${meta.id}`}
     >
       <div
         className="relative overflow-hidden rounded-xl bg-white/5 border border-white/8"
         style={{ aspectRatio: "2 / 3" }}
       >
-        {showImage ? (
-          <img
-            src={meta.poster!}
+        {meta.poster ? (
+          <ImageLoader
+            src={meta.poster}
             alt={meta.name}
-            loading="lazy"
-            decoding="async"
-            onError={() => setImgError(true)}
             draggable={false}
-            className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-[1.04]"
+            className="absolute inset-0 w-full h-full"
+            // `image-rendering: -webkit-optimize-contrast` nudges
+            // Chromium / WebView2 to use a sharper resampling kernel
+            // when downscaling. AIOMetadata's poster bitmaps bake the
+            // % rating circles + IMDb tag onto the poster, so the
+            // visible aliasing on those badges at 1080p is purely a
+            // downscale artifact — this hint mitigates it without
+            // changing the poster URL or asking for a higher-res
+            // variant. No effect on hi-DPR / ultrawide where the
+            // poster is rendered at or above its native resolution.
+            imgClassName="w-full h-full object-cover [image-rendering:-webkit-optimize-contrast]"
+            fallback={
+              <div className="absolute inset-0 flex items-center justify-center text-white/20">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                  <path d="M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4z" />
+                </svg>
+              </div>
+            }
           />
         ) : (
           <div className="w-full h-full flex items-center justify-center text-white/20">
@@ -218,14 +492,37 @@ export const CatalogCard = memo(function CatalogCard({ meta }: CatalogCardProps)
             </svg>
           </div>
         )}
+
+        {/* Watched / in-progress indicator — top-LEFT to avoid colliding
+            with the quality badge (4K / HDR / 1080p) the addon stamps
+            top-right and the rating tiles anchored bottom. Combines
+            manual marks with library-derived progress (manualWatched
+            wins when set). */}
+        <WatchedBadge
+          metaId={meta.id}
+          mediaType={meta.media_type}
+          className="absolute top-1.5 left-1.5"
+        />
+
+        {/* In-progress bar — bottom edge, only when partially watched
+            via library state. The badge above gives the AT-A-GLANCE
+            signal; this bar adds fine-grained position info. */}
+        {progress?.partial && (
+          <div className="absolute inset-x-0 bottom-0 h-[3px] bg-black/55">
+            <div
+              className="h-full bg-ln-accent"
+              style={{ width: `${progress.ratio * 100}%` }}
+            />
+          </div>
+        )}
       </div>
-      <p className="text-white/85 text-sm font-medium mt-2.5 leading-tight line-clamp-2 text-center">
+      <p className="text-white/90 text-[19px] font-medium leading-tight line-clamp-2 text-center">
         {meta.name}
       </p>
       {meta.release_info && (
-        <p className="text-white/35 text-xs mt-0.5 text-center">{meta.release_info}</p>
+        <p className="text-white/55 text-[15.5px] mt-0.5 text-center font-mono">{meta.release_info}</p>
       )}
-    </div>
+    </button>
   );
 });
 
@@ -233,33 +530,343 @@ interface DiscoveryRowProps {
   title: string;
   items: MetaPreview[];
   loading?: boolean;
+  onSelectMeta?: (meta: MetaPreview) => void;
+  /** Catalog identifiers — when set, View-all click triggers a
+   *  paginated fetch up to VIEW_ALL_TARGET (=100) items for the popup.
+   *  Search-result rows (which paginate via search-specific extras)
+   *  omit these and render only the items they were given. */
+  addonUrl?:    string;
+  catalogType?: string;
+  catalogId?:   string;
 }
 
 export const DiscoveryRow = memo(function DiscoveryRow(
-  { title, items, loading }: DiscoveryRowProps
+  { title, items, loading, onSelectMeta, addonUrl, catalogType, catalogId }: DiscoveryRowProps
 ) {
-  // Skeleton while loading
+  const [overflowOpen, setOverflowOpen]   = useState(false);
+  const [overflowItems, setOverflowItems] = useState<MetaPreview[] | null>(null);
+  const [overflowLoading, setOverflowLoading] = useState(false);
+
+  // Skeleton — render exactly 10 placeholder cells.
   if (loading && items.length === 0) {
     return (
-      <RowShell title={title}>
-        {Array.from({ length: 8 }).map((_, i) => (
+      <RowFrame title={title}>
+        {Array.from({ length: HOME_VISIBLE }).map((_, i) => (
           <div
             key={i}
-            className="flex-shrink-0 rounded-xl bg-white/5 animate-pulse"
-            style={{ width: `${DISCOVERY_W}px`, aspectRatio: "2 / 3" }}
+            className="rounded-xl bg-white/5 image-loader-skeleton"
+            style={{ aspectRatio: "2 / 3" }}
           />
         ))}
-      </RowShell>
+      </RowFrame>
     );
   }
 
   if (items.length === 0) return null;
 
+  // Defensive dedupe by `${media_type}:${id}`. Some addons (notably AI
+  // Search) occasionally return the same series twice in one catalog
+  // response — observed in production for "jjk" → series:tt12343534 ×2,
+  // which crashed React with "Encountered two children with the same
+  // key". First occurrence wins, preserving native order.
+  const seen = new Set<string>();
+  const dedupedItems: MetaPreview[] = [];
+  for (const m of items) {
+    const k = `${m.media_type}:${m.id}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    dedupedItems.push(m);
+  }
+
+  // The home row renders up to HOME_VISIBLE = 10 items. At 1080p only
+  // the first 8 are actually visible (CSS hides 9-10 via :nth-child),
+  // so we offer the View-all popup whenever the catalog has at least
+  // one item — the popup paginates up to 100 lazily on click. The
+  // count we show in the subtitle is `home-visible cap or higher`
+  // suffixed with `+` since we don't know the true total without
+  // paginating, and showing a bare "View all" feels under-informative.
+  const visible = dedupedItems.slice(0, HOME_VISIBLE);
+  const canPaginate = !!(addonUrl && catalogType && catalogId);
+  // A catalog row can still expand beyond what's loaded if it's wired
+  // to fetch_catalog_paginated. If it isn't (search rows), only show
+  // View all when the loaded items already exceed the visible cells.
+  const hasOverflow = canPaginate
+    ? dedupedItems.length > 0
+    : dedupedItems.length > 8;
+
+  const cacheKey = canPaginate
+    ? `${addonUrl}|${catalogType}|${catalogId}`
+    : null;
+
+  const handleViewAll = async () => {
+    setOverflowOpen(true);
+    if (!canPaginate || !cacheKey) {
+      // Search-style row — show the items already in hand.
+      setOverflowItems(dedupedItems);
+      return;
+    }
+    // Cached? Render immediately.
+    const cached = catalogPaginationCache.get(cacheKey);
+    if (cached) {
+      setOverflowItems(cached);
+      return;
+    }
+    setOverflowLoading(true);
+    try {
+      const more = await invoke<MetaPreview[]>("fetch_catalog_paginated", {
+        addonUrl,
+        catalogType,
+        catalogId,
+        target: VIEW_ALL_TARGET,
+      });
+      // Dedupe by id — fetch_catalog_paginated already does this in
+      // Rust but a cross-page collision could still slip through if
+      // items shifted upstream during pagination, so we re-check.
+      const popupSeen = new Set<string>();
+      const merged: MetaPreview[] = [];
+      for (const m of more) {
+        const k = `${m.media_type}:${m.id}`;
+        if (popupSeen.has(k)) continue;
+        popupSeen.add(k);
+        merged.push(m);
+      }
+      catalogPaginationCache.set(cacheKey, merged);
+      setOverflowItems(merged);
+    } catch {
+      // Fall back to the items we already have so the popup isn't
+      // blank on a transient network error.
+      setOverflowItems(dedupedItems);
+    } finally {
+      setOverflowLoading(false);
+    }
+  };
+
+  const closeOverflow = () => {
+    setOverflowOpen(false);
+    setOverflowItems(null);
+    setOverflowLoading(false);
+  };
+
   return (
-    <RowShell title={title}>
-      {items.map((meta) => (
-        <CatalogCard key={`${meta.media_type}:${meta.id}`} meta={meta} />
-      ))}
-    </RowShell>
+    <>
+      <RowFrame
+        title={title}
+        subtitle={hasOverflow ? "View all" : undefined}
+        onSubtitleClick={hasOverflow ? handleViewAll : undefined}
+      >
+        {visible.map((meta) => (
+          <CatalogCard
+            key={`${meta.media_type}:${meta.id}`}
+            meta={meta}
+            onSelect={onSelectMeta}
+          />
+        ))}
+      </RowFrame>
+      {overflowOpen && (
+        <CatalogOverlay
+          title={title}
+          items={overflowItems ?? dedupedItems}
+          loading={overflowLoading}
+          onClose={closeOverflow}
+          onSelectMeta={onSelectMeta}
+        />
+      )}
+    </>
   );
 });
+
+// ---------------------------------------------------------------------------
+// RowFrame — header + grid body. Subtitle becomes a clickable
+// "View all N →" affordance when an onSubtitleClick is provided.
+// ---------------------------------------------------------------------------
+
+function RowFrame({
+  title, subtitle, onSubtitleClick, children,
+}: {
+  title: string;
+  subtitle?: string;
+  onSubtitleClick?: () => void;
+  children: React.ReactNode;
+}) {
+  // Pull the digits out of the subtitle ("View all 24" → "24") so we
+  // can render the count in a brighter colour while keeping the
+  // surrounding label muted — same emphasis pattern the previous
+  // "<N> total" subtitle used.
+  const m = subtitle ? /^(.*?)(\d[\d,]*)(.*)$/.exec(subtitle) : null;
+  const subtitleContent = m ? (
+    <>
+      <span className="text-white/55">{m[1]}</span>
+      <span className="text-white/95 font-semibold">{m[2]}</span>
+      <span className="text-white/45">{m[3]}</span>
+      {onSubtitleClick && <span className="text-ln-accent ml-1">→</span>}
+    </>
+  ) : (
+    <>
+      <span className={onSubtitleClick ? "text-white/85" : "text-white/55"}>{subtitle}</span>
+      {onSubtitleClick && <span className="text-ln-accent ml-1">→</span>}
+    </>
+  );
+
+  return (
+    <section className="relative px-6">
+      <div className="flex items-baseline justify-between mb-3 px-1">
+        <h3 className="aura-row-title text-2xl font-semibold tracking-tight">{title}</h3>
+        {subtitle && (
+          onSubtitleClick ? (
+            <button
+              type="button"
+              onClick={onSubtitleClick}
+              className="text-[15px] font-mono tabular-nums tracking-wide
+                         hover:opacity-90 transition-opacity cursor-pointer
+                         bg-transparent p-0 border-0 focus:outline-none
+                         focus-visible:underline"
+            >
+              {subtitleContent}
+            </button>
+          ) : (
+            <p className="text-[15px] font-mono tabular-nums tracking-wide">
+              {subtitleContent}
+            </p>
+          )
+        )}
+      </div>
+      <div
+        className="grid aura-catalog-row"
+        // Column template + gap come from CSS vars in App.css. Ultrawide:
+        // 10 equal columns / 14 px gap. < 2400 px: 8 equal columns / 8 px
+        // gap with a :nth-child rule hiding items 9-10. Items beyond 8
+        // still mount in the React tree so the View-all popup has access
+        // to the full loaded list.
+        style={{
+          gridTemplateColumns: "var(--catalog-grid-template)",
+          gap: "var(--catalog-gap)",
+        }}
+      >
+        {children}
+      </div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CatalogOverlay — Stremio-style "View all" popup. Triggered from the
+// clickable subtitle on a DiscoveryRow; shows every item currently
+// loaded for that catalog in a multi-row poster grid. Sized larger on
+// ultrawide via CSS vars (--catalog-popup-w / -h / -cols) so the user
+// can see ~6 columns × 4-5 rows at once on a wide display, with a
+// tighter 4-column layout at 1080p.
+//
+// Animation + backdrop pattern mirrors CalendarView's DayOverlay so
+// the two surfaces feel consistent. ESC + click-outside both close.
+// ---------------------------------------------------------------------------
+
+function CatalogOverlay({
+  title, items, loading, onClose, onSelectMeta,
+}: {
+  title: string;
+  items: MetaPreview[];
+  /** When true the overlay shows a skeleton grid + "Loading…" subtitle.
+   *  Caller flips this on while the View-all paginated fetch is in
+   *  flight; the items prop is the placeholder list shown if pagination
+   *  fails. */
+  loading?: boolean;
+  onClose: () => void;
+  onSelectMeta?: (meta: MetaPreview) => void;
+}) {
+  const [opening, setOpening] = useState(true);
+
+  // Two rAF ticks = one painted frame; lets the initial opacity/scale
+  // commit before we transition to the entered state.
+  useEffect(() => {
+    const id = requestAnimationFrame(() =>
+      requestAnimationFrame(() => setOpening(false))
+    );
+    return () => cancelAnimationFrame(id);
+  }, []);
+
+  // ESC closes
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-[55] flex items-center justify-center p-6"
+      style={{
+        backgroundColor: opening ? "transparent" : "rgba(0,0,0,0.80)",
+        backdropFilter: opening ? "blur(0px)" : "blur(8px)",
+        transition: "background-color 200ms ease, backdrop-filter 200ms ease",
+      }}
+      onClick={onClose}
+    >
+      <div
+        className="glass-panel rounded-2xl flex flex-col overflow-hidden"
+        style={{
+          width:    "var(--catalog-popup-w)",
+          maxHeight: "var(--catalog-popup-h)",
+          opacity: opening ? 0 : 1,
+          transform: opening ? "scale(0.92)" : "scale(1)",
+          transition: "opacity 280ms 60ms cubic-bezier(0.2, 0.8, 0.2, 1), transform 280ms 60ms cubic-bezier(0.2, 0.8, 0.2, 1)",
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div className="flex items-start justify-between gap-4 px-6 py-5 shrink-0
+                        border-b border-white/8">
+          <div>
+            <h2 className="text-white/90 text-lg font-semibold tracking-tight">{title}</h2>
+            <p className="text-white/40 text-sm mt-0.5">
+              {loading
+                ? "Loading…"
+                : items.length === 1 ? "1 item" : `${items.length} items`}
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            aria-label="Close"
+            className="w-8 h-8 rounded-full glass-panel flex items-center justify-center
+                       text-white/50 hover:text-white transition-colors shrink-0 mt-0.5"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+              <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
+            </svg>
+          </button>
+        </div>
+
+        {/* Grid — column count comes from --catalog-popup-cols (6 ultrawide,
+            4 at 1080p). Each cell is a CatalogCard so click + right-click
+            menus + watched badges all work the same as in the home row.
+            While `loading` is true and we don't yet have any items, render
+            placeholder skeletons so the popup doesn't pop in empty before
+            content arrives. */}
+        <div
+          className="overflow-y-auto p-6"
+          style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
+        >
+          <div
+            className="grid gap-4"
+            style={{ gridTemplateColumns: "repeat(var(--catalog-popup-cols), minmax(0, 1fr))" }}
+          >
+            {loading && items.length === 0
+              ? Array.from({ length: 12 }).map((_, i) => (
+                  <div
+                    key={`skeleton-${i}`}
+                    className="rounded-xl bg-white/5 image-loader-skeleton"
+                    style={{ aspectRatio: "2 / 3" }}
+                  />
+                ))
+              : items.map((meta) => (
+                  <CatalogCard
+                    key={`${meta.media_type}:${meta.id}`}
+                    meta={meta}
+                    onSelect={onSelectMeta ? (m) => { onClose(); onSelectMeta(m); } : undefined}
+                  />
+                ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

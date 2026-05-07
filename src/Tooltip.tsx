@@ -1,0 +1,211 @@
+// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
+
+// ---------------------------------------------------------------------------
+// Tooltip — glass-styled, portal-rendered with viewport-edge collision.
+//
+// Wraps any single child element. On hover/focus, mounts a glass pill into
+// document.body and positions it with `position: fixed` using the trigger's
+// bounding rect. The previous CSS-only positioning ("right-full mr-2 top-1/2")
+// silently clipped at viewport edges and at any ancestor with `overflow:
+// hidden` — common on the title bar (drag region), stream rows (truncate
+// containers), and the nav rail (clip-path / overflow). Portaling sidesteps
+// all of that — the tip lays out in viewport coordinates, immune to
+// ancestor clipping, and flips to the opposite side when its preferred
+// placement would collide with a viewport edge.
+//
+// Click behaviour: clicking the wrapped element dismisses the tooltip
+// immediately (it does NOT linger over a button the user has just
+// activated). The dismissed state resets when the cursor leaves and
+// re-enters, so the next hover shows it again.
+//
+// Safe for buttons inside `data-tauri-drag-region`: pointer-events on the
+// floating tip are explicitly `none`, so it never interferes with the host
+// button's hit-testing or with drag-region detection.
+// ---------------------------------------------------------------------------
+
+export type TooltipPos = "right" | "left" | "top" | "bottom";
+
+interface Props {
+  text: string;
+  pos?: TooltipPos;
+  /** Show keyboard hint after the label (e.g. "Sign in · S"). */
+  shortcut?: string;
+  /** Display delay in ms — default 120 ms (matches macOS/Windows feel). */
+  delay?: number;
+  children: ReactNode;
+}
+
+const VIEWPORT_PAD = 8;
+const TIP_GAP      = 8;
+
+function clampToViewport(x: number, y: number, w: number, h: number): { x: number; y: number } {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  let nx = x;
+  let ny = y;
+  if (nx + w + VIEWPORT_PAD > vw) nx = vw - w - VIEWPORT_PAD;
+  if (ny + h + VIEWPORT_PAD > vh) ny = vh - h - VIEWPORT_PAD;
+  if (nx < VIEWPORT_PAD) nx = VIEWPORT_PAD;
+  if (ny < VIEWPORT_PAD) ny = VIEWPORT_PAD;
+  return { x: nx, y: ny };
+}
+
+function computePos(
+  preferred: TooltipPos,
+  anchor: DOMRect,
+  tipW: number,
+  tipH: number,
+): { left: number; top: number } {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+
+  // Compute the four candidate positions.
+  const candidates: Record<TooltipPos, { left: number; top: number; fits: boolean }> = {
+    top: {
+      left: anchor.left + anchor.width / 2 - tipW / 2,
+      top:  anchor.top - tipH - TIP_GAP,
+      fits: anchor.top - tipH - TIP_GAP >= VIEWPORT_PAD,
+    },
+    bottom: {
+      left: anchor.left + anchor.width / 2 - tipW / 2,
+      top:  anchor.bottom + TIP_GAP,
+      fits: anchor.bottom + tipH + TIP_GAP + VIEWPORT_PAD <= vh,
+    },
+    left: {
+      left: anchor.left - tipW - TIP_GAP,
+      top:  anchor.top + anchor.height / 2 - tipH / 2,
+      fits: anchor.left - tipW - TIP_GAP >= VIEWPORT_PAD,
+    },
+    right: {
+      left: anchor.right + TIP_GAP,
+      top:  anchor.top + anchor.height / 2 - tipH / 2,
+      fits: anchor.right + tipW + TIP_GAP + VIEWPORT_PAD <= vw,
+    },
+  };
+
+  // Try preferred first; if it fits, use it. Otherwise flip to the opposite
+  // axis-mate, then fall back to whichever candidate fits.
+  const opposite: Record<TooltipPos, TooltipPos> = {
+    top: "bottom", bottom: "top", left: "right", right: "left",
+  };
+  const order: TooltipPos[] = [preferred, opposite[preferred], "top", "bottom", "left", "right"];
+  let chosen = candidates[preferred];
+  for (const p of order) {
+    if (candidates[p].fits) { chosen = candidates[p]; break; }
+  }
+
+  // Final clamp keeps the tip inside the viewport even when no candidate
+  // fits perfectly (e.g. trigger glued to a corner with a wide tooltip).
+  const clamped = clampToViewport(chosen.left, chosen.top, tipW, tipH);
+  return { left: clamped.x, top: clamped.y };
+}
+
+export default function Tooltip({ text, pos = "right", shortcut, delay = 120, children }: Props) {
+  const triggerRef = useRef<HTMLSpanElement>(null);
+  const tipRef     = useRef<HTMLSpanElement>(null);
+  const [open, setOpen]         = useState(false);
+  const [dismissed, setDismissed] = useState(false);
+  const [coords, setCoords]     = useState<{ left: number; top: number; ready: boolean }>({
+    left: 0, top: 0, ready: false,
+  });
+  const showTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const cancelShow = () => {
+    if (showTimer.current) { clearTimeout(showTimer.current); showTimer.current = null; }
+  };
+
+  const scheduleShow = () => {
+    cancelShow();
+    showTimer.current = setTimeout(() => setOpen(true), delay);
+  };
+
+  const handleClickLike = () => {
+    setDismissed(true);
+    setOpen(false);
+    cancelShow();
+    requestAnimationFrame(() => {
+      const el = document.activeElement;
+      if (el instanceof HTMLElement) el.blur();
+    });
+  };
+
+  // Position computation. Re-runs whenever the tip is opened, the text
+  // changes (which can change the tip's measured width), or the window
+  // resizes. We render with `opacity:0` until the first measurement so
+  // the tip never visibly jumps from (0,0) to its real spot.
+  useLayoutEffect(() => {
+    if (!open || dismissed) {
+      setCoords((c) => c.ready ? { ...c, ready: false } : c);
+      return;
+    }
+    const trigger = triggerRef.current;
+    const tip     = tipRef.current;
+    if (!trigger || !tip) return;
+    const r = tip.getBoundingClientRect();
+    const a = trigger.getBoundingClientRect();
+    const { left, top } = computePos(pos, a, r.width, r.height);
+    setCoords({ left, top, ready: true });
+  }, [open, dismissed, pos, text, shortcut]);
+
+  // Keep position correct on resize / scroll while open.
+  useEffect(() => {
+    if (!open || dismissed) return;
+    const reposition = () => {
+      const trigger = triggerRef.current;
+      const tip     = tipRef.current;
+      if (!trigger || !tip) return;
+      const r = tip.getBoundingClientRect();
+      const a = trigger.getBoundingClientRect();
+      const { left, top } = computePos(pos, a, r.width, r.height);
+      setCoords({ left, top, ready: true });
+    };
+    window.addEventListener("resize", reposition);
+    window.addEventListener("scroll", reposition, true);
+    return () => {
+      window.removeEventListener("resize", reposition);
+      window.removeEventListener("scroll", reposition, true);
+    };
+  }, [open, dismissed, pos]);
+
+  return (
+    <span
+      ref={triggerRef}
+      className="relative inline-flex"
+      onClick={handleClickLike}
+      onContextMenu={handleClickLike}
+      onMouseEnter={() => { setDismissed(false); scheduleShow(); }}
+      onMouseLeave={() => { setDismissed(false); cancelShow(); setOpen(false); }}
+      onFocusCapture={() => { setDismissed(false); scheduleShow(); }}
+      onBlurCapture={() => { cancelShow(); setOpen(false); }}
+    >
+      {children}
+      {open && !dismissed && createPortal(
+        <span
+          ref={tipRef}
+          role="tooltip"
+          className="fixed z-[400] pointer-events-none whitespace-nowrap
+                     px-2.5 py-1.5 rounded-lg
+                     text-[11px] font-medium tracking-wide
+                     glass-panel-elevated
+                     transition-opacity duration-150"
+          style={{
+            color: "var(--text-primary)",
+            left: coords.left,
+            top:  coords.top,
+            opacity: coords.ready ? 1 : 0,
+          }}
+        >
+          {text}
+          {shortcut && (
+            <span className="ml-2 opacity-60 font-mono">{shortcut}</span>
+          )}
+        </span>,
+        document.body,
+      )}
+    </span>
+  );
+}

@@ -1,3 +1,6 @@
+// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -32,7 +35,9 @@ fn auth_client() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .https_only(true)
             .timeout(Duration::from_secs(15))
-            .user_agent("Aura/0.1")
+            .tcp_nodelay(true)
+            .tcp_keepalive(Duration::from_secs(60))
+            .user_agent("Aura/0.6.7")
             .build()
             .expect("Auth HTTP client init failed")
     })
@@ -94,7 +99,7 @@ fn store_session<R: Runtime>(
     Ok(())
 }
 
-fn load_session<R: Runtime>(app: &AppHandle<R>) -> Result<Option<UserSession>, String> {
+pub(crate) fn load_session<R: Runtime>(app: &AppHandle<R>) -> Result<Option<UserSession>, String> {
     // 1) Try the OS keyring first — it's the canonical store.
     match keyring_entry()?.get_password() {
         Ok(json) => {
@@ -236,7 +241,20 @@ pub async fn logout<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
 pub async fn get_session<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<Option<UserSession>, String> {
-    load_session(&app)
+    let result = load_session(&app);
+    // Diagnostic: when "not detecting I'm logged in" is reported, this
+    // tells us whether the keyring round-trip yields a session and
+    // whether `email` survived the serialise/deserialise cycle.
+    match &result {
+        Ok(Some(sess)) => crate::devlog!(
+            info, "auth",
+            "get_session → found, email_len={}, auth_key_len={}",
+            sess.email.len(), sess.auth_key.len(),
+        ),
+        Ok(None) => crate::devlog!(info, "auth", "get_session → no stored session"),
+        Err(e) => crate::devlog!(warn, "auth", "get_session → error: {}", e),
+    }
+    result
 }
 
 /// Fetch the user's installed addon list from the Stremio account API.
@@ -306,6 +324,17 @@ pub async fn get_synced_addons(auth_key: String) -> Result<Vec<AddonEntry>, Stri
                 })
                 .unwrap_or(false);
 
+            let types       = crate::stremio::extract_manifest_types(manifest);
+            let resources   = crate::stremio::extract_manifest_resources(manifest);
+            let id_prefixes = crate::stremio::extract_manifest_id_prefixes(manifest);
+            let (stream_types, stream_id_prefixes) =
+                crate::stremio::extract_stream_resource_info(manifest);
+            let manifest_id = manifest
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
             let transport_url = item
                 .get("transportUrl")
                 .and_then(|v| v.as_str())
@@ -318,7 +347,21 @@ pub async fn get_synced_addons(auth_key: String) -> Result<Vec<AddonEntry>, Stri
                 .trim_end_matches('/')
                 .to_string();
 
-            if base_url.is_empty() { None } else { Some(AddonEntry { url: base_url, name, has_search }) }
+            if base_url.is_empty() {
+                None
+            } else {
+                Some(AddonEntry {
+                    url: base_url,
+                    name,
+                    manifest_id,
+                    has_search,
+                    types,
+                    resources,
+                    stream_types,
+                    id_prefixes,
+                    stream_id_prefixes,
+                })
+            }
         })
         .collect();
 

@@ -31,6 +31,12 @@
   --glass-bg-soft: rgba(34, 36, 44, 0.96);
   --text-primary:  rgba(235, 236, 240, 0.92);
   --text-muted:    rgba(235, 236, 240, 0.55);
+
+  /* Skeleton shimmer — Mica surface can be light or dark depending on the
+     desktop wallpaper, so we use a mid-grey base with a stronger highlight
+     to ensure the sweep is always visible regardless of what shows through. */
+  --ln-skeleton-base:      rgba(128, 128, 128, 0.10);
+  --ln-skeleton-highlight: rgba(200, 200, 200, 0.32);
 }
 
 :root[data-theme="glass"] {
@@ -53,6 +59,11 @@
   --glass-bg-soft: rgba(36, 38, 50, 0.94);
   --text-primary:  rgba(240, 241, 245, 0.94);
   --text-muted:    rgba(240, 241, 245, 0.6);
+
+  /* Glass background is always dark-tinted so white-alpha stops read fine;
+     slightly higher than Mica because the backdrop is more consistently dark. */
+  --ln-skeleton-base:      rgba(255, 255, 255, 0.07);
+  --ln-skeleton-highlight: rgba(255, 255, 255, 0.24);
 }
 
 :root[data-theme="midnight"] {
@@ -75,6 +86,142 @@
   --glass-bg-soft: #16191f;
   --text-primary:  rgba(245, 246, 250, 0.95);
   --text-muted:    rgba(245, 246, 250, 0.55);
+
+  /* Midnight is always pure black — the original white-alpha recipe works
+     fine here; keep stops consistent in feel with glass/mica but expressed
+     as white-alpha because there's no colour bleed from a wallpaper. */
+  --ln-skeleton-base:      rgba(255, 255, 255, 0.05);
+  --ln-skeleton-highlight: rgba(255, 255, 255, 0.18);
+}
+
+/* ----------------------------------------------------------------------
+ * Tinted-dark themes. Each preserves the blue accent (the brand colour
+ * stays the same across all themes) but tints the surface palette so
+ * the app reads as a different overall mood. The Tailwind `ln-accent`
+ * color stays hard-coded — themes ONLY override surface tokens. This
+ * keeps every component that hard-codes the accent (progress bars,
+ * focus rings, primary CTAs) consistent, while users still get a
+ * meaningfully different look.
+ * ---------------------------------------------------------------------- */
+
+:root[data-theme="ember"] {
+  --ln-glass-1: rgba(255, 178, 110, 0.05);
+  --ln-glass-2: rgba(255, 178, 110, 0.09);
+  --ln-glass-3: rgba(255, 178, 110, 0.14);
+  --ln-rim-subtle:   rgba(255, 200, 140, 0.07);
+  --ln-rim-default:  rgba(255, 200, 140, 0.13);
+  --ln-rim-luminous: rgba(255, 200, 140, 0.22);
+  --ln-accent-glow: rgba(91, 164, 255, 0.40);
+  --ln-bg:        #100c08;
+  --ln-blur:      32px;
+  --ln-blur-elev: 64px;
+  --ln-saturate:  1.6;
+  --glass-bg:      rgba(28, 22, 18, 0.94);
+  --glass-bg-soft: rgba(44, 36, 28, 0.94);
+  --text-primary:  rgba(248, 240, 230, 0.94);
+  --text-muted:    rgba(248, 240, 230, 0.58);
+  --ln-skeleton-base:      rgba(255, 200, 140, 0.08);
+  --ln-skeleton-highlight: rgba(255, 220, 170, 0.22);
+}
+
+:root[data-theme="forest"] {
+  --ln-glass-1: rgba(120, 200, 160, 0.05);
+  --ln-glass-2: rgba(120, 200, 160, 0.09);
+  --ln-glass-3: rgba(120, 200, 160, 0.14);
+  --ln-rim-subtle:   rgba(140, 220, 180, 0.07);
+  --ln-rim-default:  rgba(140, 220, 180, 0.13);
+  --ln-rim-luminous: rgba(140, 220, 180, 0.22);
+  --ln-accent-glow: rgba(91, 164, 255, 0.38);
+  --ln-bg:        #0a1310;
+  --ln-blur:      32px;
+  --ln-blur-elev: 64px;
+  --ln-saturate:  1.7;
+  --glass-bg:      rgba(20, 32, 26, 0.94);
+  --glass-bg-soft: rgba(32, 50, 42, 0.94);
+  --text-primary:  rgba(238, 248, 240, 0.94);
+  --text-muted:    rgba(238, 248, 240, 0.58);
+  --ln-skeleton-base:      rgba(140, 220, 180, 0.08);
+  --ln-skeleton-highlight: rgba(170, 240, 200, 0.22);
+}
+
+:root[data-theme="rose"] {
+  --ln-glass-1: rgba(220, 150, 180, 0.05);
+  --ln-glass-2: rgba(220, 150, 180, 0.09);
+  --ln-glass-3: rgba(220, 150, 180, 0.14);
+  --ln-rim-subtle:   rgba(230, 170, 200, 0.07);
+  --ln-rim-default:  rgba(230, 170, 200, 0.13);
+  --ln-rim-luminous: rgba(230, 170, 200, 0.22);
+  --ln-accent-glow: rgba(91, 164, 255, 0.40);
+  --ln-bg:        #110a0e;
+  --ln-blur:      32px;
+  --ln-blur-elev: 64px;
+  --ln-saturate:  1.7;
+  --glass-bg:      rgba(32, 22, 28, 0.94);
+  --glass-bg-soft: rgba(48, 36, 44, 0.94);
+  --text-primary:  rgba(248, 238, 244, 0.94);
+  --text-muted:    rgba(248, 238, 244, 0.58);
+  --ln-skeleton-base:      rgba(230, 170, 200, 0.08);
+  --ln-skeleton-highlight: rgba(245, 195, 220, 0.22);
+}
+
+:root[data-theme="amethyst"] {
+  --ln-glass-1: rgba(170, 140, 230, 0.05);
+  --ln-glass-2: rgba(170, 140, 230, 0.09);
+  --ln-glass-3: rgba(170, 140, 230, 0.14);
+  --ln-rim-subtle:   rgba(190, 160, 240, 0.07);
+  --ln-rim-default:  rgba(190, 160, 240, 0.13);
+  --ln-rim-luminous: rgba(190, 160, 240, 0.22);
+  --ln-accent-glow: rgba(91, 164, 255, 0.42);
+  --ln-bg:        #0c0a14;
+  --ln-blur:      32px;
+  --ln-blur-elev: 64px;
+  --ln-saturate:  1.8;
+  --glass-bg:      rgba(24, 20, 36, 0.94);
+  --glass-bg-soft: rgba(40, 34, 56, 0.94);
+  --text-primary:  rgba(244, 240, 252, 0.94);
+  --text-muted:    rgba(244, 240, 252, 0.58);
+  --ln-skeleton-base:      rgba(190, 160, 240, 0.08);
+  --ln-skeleton-highlight: rgba(215, 190, 250, 0.22);
+}
+
+:root[data-theme="ocean"] {
+  --ln-glass-1: rgba(110, 200, 220, 0.05);
+  --ln-glass-2: rgba(110, 200, 220, 0.09);
+  --ln-glass-3: rgba(110, 200, 220, 0.14);
+  --ln-rim-subtle:   rgba(130, 220, 240, 0.07);
+  --ln-rim-default:  rgba(130, 220, 240, 0.13);
+  --ln-rim-luminous: rgba(130, 220, 240, 0.22);
+  --ln-accent-glow: rgba(91, 164, 255, 0.42);
+  --ln-bg:        #08101a;
+  --ln-blur:      32px;
+  --ln-blur-elev: 64px;
+  --ln-saturate:  1.8;
+  --glass-bg:      rgba(18, 28, 40, 0.94);
+  --glass-bg-soft: rgba(30, 44, 60, 0.94);
+  --text-primary:  rgba(238, 246, 252, 0.94);
+  --text-muted:    rgba(238, 246, 252, 0.58);
+  --ln-skeleton-base:      rgba(130, 220, 240, 0.08);
+  --ln-skeleton-highlight: rgba(160, 240, 255, 0.22);
+}
+
+:root[data-theme="solar"] {
+  --ln-glass-1: rgba(255, 210, 110, 0.05);
+  --ln-glass-2: rgba(255, 210, 110, 0.09);
+  --ln-glass-3: rgba(255, 210, 110, 0.14);
+  --ln-rim-subtle:   rgba(255, 220, 140, 0.07);
+  --ln-rim-default:  rgba(255, 220, 140, 0.13);
+  --ln-rim-luminous: rgba(255, 220, 140, 0.22);
+  --ln-accent-glow: rgba(91, 164, 255, 0.42);
+  --ln-bg:        #120e08;
+  --ln-blur:      32px;
+  --ln-blur-elev: 64px;
+  --ln-saturate:  1.8;
+  --glass-bg:      rgba(34, 26, 16, 0.94);
+  --glass-bg-soft: rgba(50, 40, 24, 0.94);
+  --text-primary:  rgba(252, 244, 226, 0.94);
+  --text-muted:    rgba(252, 244, 226, 0.58);
+  --ln-skeleton-base:      rgba(255, 220, 140, 0.08);
+  --ln-skeleton-highlight: rgba(255, 240, 175, 0.22);
 }
 
 /* Base reset — cinematic true-black, no background flicker on transparent window */
@@ -101,6 +248,35 @@ html, body, #root {
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* ---------------------------------------------------------------- */
+/* Global anti-highlight                                             */
+/*                                                                   */
+/* A native desktop app shouldn't behave like a webpage — letters    */
+/* shouldn't paint blue when you click-drag across them. We disable  */
+/* selection on <body> and re-enable only where typing/copying is    */
+/* meaningful: form fields, the DevConsole rows, and any element     */
+/* explicitly marked `.selectable`.                                  */
+/* ---------------------------------------------------------------- */
+body {
+  -webkit-user-select: none;
+  user-select: none;
+}
+input,
+textarea,
+select,
+[contenteditable="true"],
+.selectable,
+.selectable * {
+  -webkit-user-select: text;
+  user-select: text;
+}
+/* DevConsole — copying logs is the whole point */
+.dev-console,
+.dev-console * {
+  -webkit-user-select: text !important;
+  user-select: text !important;
+}
+
 /* Utility layer — glass panel component shorthand */
 @layer components {
   .glass-panel {
@@ -119,6 +295,205 @@ html, body, #root {
     -webkit-backdrop-filter: blur(var(--ln-blur-elev)) saturate(calc(var(--ln-saturate) + 0.2));
     transition: background-color 280ms ease, border-color 280ms ease,
                 backdrop-filter 280ms ease;
+  }
+
+  /* ----------------------------------------------------------------
+   * Player surfaces — frosted glass with a baked-in dark tint.
+   *
+   * The control bar and its menus sit over an arbitrary video frame
+   * (often a bright/white shot during scenes set on snow, sand, sky,
+   * etc.). A pure translucent white-glass surface would wash the text
+   * out completely on those frames. The trick borrowed from visionOS:
+   * layer a dark linear-gradient INSIDE the surface so the composited
+   * background is *guaranteed* dark even when the video behind is
+   * white, while a 30 px backdrop-blur + 180% saturate retains the
+   * "refracts the light behind it" feel the user is asking for.
+   *
+   * Two specular highlights sell the glass illusion:
+   *   1. inset top edge — a thin highlight that reads as a refraction
+   *      lip at the top of the surface
+   *   2. outer drop shadow — separates the panel from the video
+   * ---------------------------------------------------------------- */
+  .aura-glass-bar {
+    background:
+      linear-gradient(180deg,
+        rgba(0, 0, 0, 0.42),
+        rgba(0, 0, 0, 0.58));
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    backdrop-filter: blur(30px) saturate(180%);
+    -webkit-backdrop-filter: blur(30px) saturate(180%);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.10),
+      0 30px 60px -20px rgba(0, 0, 0, 0.85),
+      0 4px 12px rgba(0, 0, 0, 0.45);
+  }
+
+  .aura-glass-menu {
+    background:
+      linear-gradient(180deg,
+        rgba(8, 8, 10, 0.62),
+        rgba(8, 8, 10, 0.78));
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    backdrop-filter: blur(36px) saturate(180%);
+    -webkit-backdrop-filter: blur(36px) saturate(180%);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.12),
+      0 24px 48px rgba(0, 0, 0, 0.70);
+  }
+
+  /* ----------------------------------------------------------------
+   * Text legibility lift for player surfaces.
+   *
+   * The glass bar + menus already bake in a dark gradient overlay so
+   * the *surface* itself is dark on every video frame, but the menus
+   * still composite over high-contrast colourful frames (anime line
+   * art, fire, snow). A 1 px drop shadow at low opacity is invisible
+   * over the dark gradient yet adds enough contrast that small
+   * description text reads cleanly even when a bright detail bleeds
+   * through the panel. Applied to every descendant via universal
+   * selector — the cost is one extra paint per text run, negligible
+   * since the glass bar text reflows only on player open / close.
+   *
+   * `pointer-events` and other layout properties are deliberately not
+   * touched — text-shadow is paint-only.
+   * ---------------------------------------------------------------- */
+  .aura-glass-bar,
+  .aura-glass-bar *,
+  .aura-glass-menu,
+  .aura-glass-menu * {
+    text-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.55),
+      0 0 1px rgba(0, 0, 0, 0.45);
+  }
+  /* Disable shadow on form controls (range/checkbox/etc.) so it
+     doesn't bleed across the thumb glyphs the browser renders. */
+  .aura-glass-bar input,
+  .aura-glass-menu input {
+    text-shadow: none;
+  }
+
+  /* ----------------------------------------------------------------
+   * Player menu rows — hover/active treatment.
+   *
+   * Pairs with the glass surfaces above. The previous bg-white/8 hover
+   * was nearly invisible against the new translucent panels (and felt
+   * mushy on the old opaque ones too). bg-white/[0.16] reads clearly
+   * on every theme + a soft accent ring (1 px inset rgb(91,164,255))
+   * gives the row the same "lit-from-above" cue the sidebar's hover
+   * has, scaled down for narrower menu rows. Active uses ln-accent
+   * tint plus a 3 px left stripe so the user can spot the selection
+   * even from the corner of their eye.
+   * ---------------------------------------------------------------- */
+  .aura-menu-row {
+    position: relative;
+    transition: background-color 140ms ease, color 140ms ease,
+                box-shadow 200ms ease;
+  }
+  .aura-menu-row:hover {
+    background-color: rgba(255, 255, 255, 0.16);
+    color: #ffffff;
+    box-shadow: inset 0 0 0 1px rgba(91, 164, 255, 0.22);
+  }
+  .aura-menu-row.is-active {
+    background-color: rgba(91, 164, 255, 0.16);
+    color: var(--ln-accent, #5BA4FF);
+  }
+  .aura-menu-row.is-active::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 12%;
+    bottom: 12%;
+    width: 3px;
+    border-radius: 2px;
+    background: var(--ln-accent, #5BA4FF);
+    box-shadow: 0 0 8px rgba(91, 164, 255, 0.65);
+  }
+
+  /* ----------------------------------------------------------------
+   * .hover-glow — tight clockwise-traveling accent glow on hover.
+   *
+   * Used by: episode rows, stream rows. The glow is intentionally
+   * tight to the element (small blur, low spread) and the highlight
+   * appears to wrap around the perimeter via 4 directional shadows
+   * whose intensities cycle through the keyframe. The result reads
+   * like a thin band of light walking around the card.
+   *
+   * Pure box-shadow — no pseudo-elements, no extra wrappers, no
+   * layout impact.
+   * ---------------------------------------------------------------- */
+  .hover-glow {
+    transition: box-shadow 240ms ease, border-color 200ms ease,
+                background-color 200ms ease;
+  }
+  .hover-glow:hover {
+    animation: hover-glow-rotate 2.6s linear infinite;
+  }
+  /* Each keyframe weighs the four cardinal directions differently so
+   * the bright edge "travels" clockwise: top → right → bottom → left.
+   * Inset spread is kept small (3-6 px) for a tight halo, plus a 1 px
+   * accent ring that stays bright the entire time. */
+  @keyframes hover-glow-rotate {
+    0% {
+      box-shadow:
+        0 0 0 1px rgba(91, 164, 255, 0.45),
+        0 -6px 14px 0 rgba(91, 164, 255, 0.55),
+         6px 0   14px 0 rgba(91, 164, 255, 0.18),
+         0 6px  14px 0 rgba(91, 164, 255, 0.10),
+        -6px 0   14px 0 rgba(91, 164, 255, 0.18);
+    }
+    25% {
+      box-shadow:
+        0 0 0 1px rgba(91, 164, 255, 0.45),
+         0 -6px 14px 0 rgba(91, 164, 255, 0.18),
+         6px 0   14px 0 rgba(91, 164, 255, 0.55),
+         0  6px 14px 0 rgba(91, 164, 255, 0.18),
+        -6px 0   14px 0 rgba(91, 164, 255, 0.10);
+    }
+    50% {
+      box-shadow:
+        0 0 0 1px rgba(91, 164, 255, 0.45),
+         0 -6px 14px 0 rgba(91, 164, 255, 0.10),
+         6px 0   14px 0 rgba(91, 164, 255, 0.18),
+         0  6px 14px 0 rgba(91, 164, 255, 0.55),
+        -6px 0   14px 0 rgba(91, 164, 255, 0.18);
+    }
+    75% {
+      box-shadow:
+        0 0 0 1px rgba(91, 164, 255, 0.45),
+         0 -6px 14px 0 rgba(91, 164, 255, 0.18),
+         6px 0   14px 0 rgba(91, 164, 255, 0.10),
+         0  6px 14px 0 rgba(91, 164, 255, 0.18),
+        -6px 0   14px 0 rgba(91, 164, 255, 0.55);
+    }
+    100% {
+      box-shadow:
+        0 0 0 1px rgba(91, 164, 255, 0.45),
+         0 -6px 14px 0 rgba(91, 164, 255, 0.55),
+         6px 0   14px 0 rgba(91, 164, 255, 0.18),
+         0  6px 14px 0 rgba(91, 164, 255, 0.10),
+        -6px 0   14px 0 rgba(91, 164, 255, 0.18);
+    }
+  }
+
+  /* ----------------------------------------------------------------
+   * .card-grow — replaces the old "scale the IMG inside the box"
+   * trick (which cropped into the poster) with a transform on the
+   * whole card. Cards sit slightly inset by default (scale 0.94)
+   * so the hover state reads as a genuine "lift toward me" instead
+   * of a 4 % poster crop.
+   *
+   * The grid cell stays the same size — only the card contents
+   * shrink / grow within their cell, so neighbours don't shift.
+   * ---------------------------------------------------------------- */
+  .card-grow {
+    transform: scale(0.94);
+    transition: transform 280ms ease-out, filter 280ms ease-out;
+    transform-origin: center center;
+  }
+  .card-grow:hover {
+    transform: scale(1.02);
+    filter: drop-shadow(0 6px 22px rgba(0, 0, 0, 0.45));
   }
 
   /* Horizontal scroll row — used by ContinueWatchingRow & DiscoveryRow */
@@ -140,19 +515,32 @@ html, body, #root {
   }
 
   /* ---------------------------------------------------------------- */
-  /* Aura Spectral Sweep — title-bar atmosphere                       */
+  /* Aura Spectral Sweep — truly seamless tiled gradient               */
   /*                                                                  */
-  /* Seamless infinite loop: a SYMMETRIC gradient (A→B→C→B→A) drawn   */
-  /* at 200% the element width. We animate background-position from   */
-  /* 0% → 100% over 20s. Because the gradient endpoints carry the     */
-  /* same color, the keyframe wrap is visually identical to the start */
-  /* — no snap, no flicker. The GPU paints the gradient once and only */
-  /* shifts its scroll offset on every frame, so this is essentially  */
-  /* free even with shader work running in MPV.                       */
+  /* Used by:                                                          */
+  /*   • TitleBar `.aura-sweep`                                        */
+  /*   • TitleBar `.aura-title` (gradient text fill)                   */
+  /*   • App-wide `.aura-ambient` (whole-app backdrop, low opacity)    */
+  /*                                                                  */
+  /* Why the previous version jumped:                                  */
+  /*   The old keyframe used `background-repeat: no-repeat` and        */
+  /*   scrolled position 100 % → 0 %. With size 200 %, that scrolls    */
+  /*   the visible window from "right half of gradient" to "left half  */
+  /*   of gradient" — when the animation wrapped, the visible content  */
+  /*   instantly snapped back. Mirrored stops don't help: the visible  */
+  /*   colour at any given x changes between the two endpoints.        */
+  /*                                                                  */
+  /* The fix:                                                          */
+  /*   • `background-repeat: repeat-x` so the gradient tiles forever.  */
+  /*   • Mirrored stops (0 % and 100 % identical) → the seam between   */
+  /*     adjacent tiles is invisible.                                  */
+  /*   • Animate position 0 % → -200 % (one full tile width). After    */
+  /*     -200 % the next tile lines up exactly behind the current one  */
+  /*     because of the mirrored seams, so the wrap is invisible.      */
   /* ---------------------------------------------------------------- */
   @keyframes aura-sweep-anim {
-    0%   { background-position: 0%   50%; }
-    100% { background-position: 100% 50%; }
+    from { background-position: 0%    50%; }
+    to   { background-position: -200% 50%; }
   }
 
   .aura-sweep {
@@ -168,11 +556,60 @@ html, body, #root {
       rgba(91,  164, 255, 0.05) 100%
     );
     background-size: 200% 100%;
-    background-repeat: no-repeat;
+    background-repeat: repeat-x;
     animation: aura-sweep-anim 20s linear infinite;
     mix-blend-mode: screen;
-    /* Compositor-only optimisation hint */
     will-change: background-position;
+  }
+
+  .aura-ambient {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: -50;
+    background: linear-gradient(
+      90deg,
+      rgba(91,  164, 255, 0.06)  0%,
+      rgba(180, 130, 255, 0.10) 25%,
+      rgba(120, 220, 200, 0.08) 50%,
+      rgba(180, 130, 255, 0.10) 75%,
+      rgba(91,  164, 255, 0.06) 100%
+    );
+    background-size: 200% 100%;
+    background-repeat: repeat-x;
+    animation: aura-sweep-anim 36s linear infinite;
+    will-change: background-position;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Dither overlay — gradient banding mitigation for OLED/HDR       */
+  /*                                                                   */
+  /* WebView2 renders in SDR (8-bit). On OLED + HDR setups the per-   */
+  /* pixel contrast amplifies each colour step in a wide gradient into */
+  /* a visible vertical line. The SVG feTurbulence noise breaks each   */
+  /* step into per-pixel variation that the panel can't render as a    */
+  /* hard edge.                                                        */
+  /*                                                                   */
+  /* Uses fractalNoise (not turbulence) for softer grain, not crackle. */
+  /* mix-blend-mode: overlay makes the noise cancel out on uniform     */
+  /* areas while disrupting the transitions.                           */
+  /*                                                                   */
+  /* Applied to: .aura-sweep (title-bar gradient strip) and           */
+  /* .aura-ambient (full-viewport backdrop). Text-clipped gradients    */
+  /* (.aura-title, .aura-row-title etc.) are excluded — their gradient */
+  /* surface is masked to letterform shapes, no large flat region.     */
+  /* ---------------------------------------------------------------- */
+  .aura-sweep::after,
+  .aura-ambient::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n' x='0' y='0'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='1' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-repeat: repeat;
+    background-size: 200px 200px;
+    opacity: 0.04;
+    mix-blend-mode: overlay;
   }
 
   /* ---------------------------------------------------------------- */
@@ -203,7 +640,7 @@ html, body, #root {
       rgba(180, 210, 255, 0.92) 100%
     );
     background-size: 200% 100%;
-    background-repeat: no-repeat;
+    background-repeat: repeat-x;
     -webkit-background-clip: text;
     background-clip: text;
     color: transparent;
@@ -228,10 +665,13 @@ html, body, #root {
   /*                                                                  */
   /* `gpu-layer` forces the browser to allocate a separate compositor */
   /* layer per row so scrolling Row 5 doesn't trigger repaints in     */
-  /* Rows 1–4. `cv-auto` skips layout & paint for elements outside    */
-  /* the viewport while still allowing them to be focused/found.      */
-  /* contain-intrinsic-size reserves the rough row height up front so */
-  /* there's no layout-shift jitter as rows scroll into view.         */
+  /* Rows 1–4.                                                        */
+  /*                                                                  */
+  /* NOTE: `.cv-auto` was removed from CinemaRows section wrappers.  */
+  /* `content-visibility: auto` incorrectly classifies fully-visible  */
+  /* rows as off-screen in WebView2, which prevents `<img            */
+  /* loading="lazy">` children from fetching until the user hovers.  */
+  /* The home page is a small DOM — no measurable perf win from it.  */
   /* ---------------------------------------------------------------- */
   .gpu-layer {
     will-change: transform;
@@ -239,14 +679,9 @@ html, body, #root {
     backface-visibility: hidden;
   }
 
-  /* Skip layout & paint for off-screen rows. The intrinsic-size hint reflects
-     the new card geometry (~330 px image + title + spacing) so the scrollbar
-     doesn't twitch as rows fade in/out of the visible window. */
-  .cv-auto {
-    content-visibility: auto;
-    contain-intrinsic-size: auto 420px;
-  }
-
+  /* cv-auto-hero is kept ONLY for the HeroCarousel — it sits at the
+     very top of the page (always in the viewport) so the lazy-load
+     footgun doesn't apply, and it benefits from compositor isolation. */
   .cv-auto-hero {
     content-visibility: auto;
     contain-intrinsic-size: auto 480px;
@@ -268,6 +703,867 @@ html, body, #root {
       0 0 0 1px  rgba(91, 164, 255, 0.55),
       0 0 14px 2px rgba(180, 130, 255, 0.28),
       0 0 28px 6px rgba(120, 220, 200, 0.16);
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* ImageLoader shimmer skeleton                                      */
+  /* Subtle moving sheen so loading boxes feel alive without competing */
+  /* with the actual image when it lands.                              */
+  /* ---------------------------------------------------------------- */
+  @keyframes image-skeleton-shimmer {
+    0%   { background-position: -200% 0; }
+    100% { background-position:  200% 0; }
+  }
+  .image-loader-skeleton {
+    /* Stops reference per-theme vars so the shimmer is legible over any
+     * surface — light Mica wallpaper (mid-grey stops), dark glass, or pure
+     * OLED midnight (white-alpha stops). See the :root[data-theme] blocks for
+     * the concrete values behind --ln-skeleton-base / --ln-skeleton-highlight. */
+    background: linear-gradient(
+      90deg,
+      var(--ln-skeleton-base)      0%,
+      var(--ln-skeleton-highlight) 35%,
+      var(--ln-skeleton-highlight) 50%,
+      var(--ln-skeleton-highlight) 65%,
+      var(--ln-skeleton-base)      100%
+    );
+    background-size: 200% 100%;
+    animation: image-skeleton-shimmer 1.6s linear infinite;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* DetailView full-bleed backdrop skeleton                           */
+  /*                                                                   */
+  /* Replaces the global .image-loader-skeleton on the heroArt        */
+  /* ImageLoader in DetailView. The global shimmer is tuned for small  */
+  /* poster cards; over the full viewport it produces a harsh wipe    */
+  /* that bands on OLED/HDR. This variant uses:                        */
+  /*   1. Multiple large radial gradients in Aura's spectral palette   */
+  /*      (blue/violet/teal) so the "loading" state feels atmospheric. */
+  /*   2. Heavy blur(28px) — kills any remaining banding plateaus and  */
+  /*      softens the colour blobs into ambient light.                 */
+  /*   3. A slow drift keyframe (14 s, alternate) with per-blob offset */
+  /*      timings so the surface shifts like ambient light, not a wipe.*/
+  /*   4. The same SVG fractalNoise dither used on .aura-sweep::after  */
+  /*      breaks the remaining quantised colour steps into per-pixel   */
+  /*      noise so the panel's SDR renderer can't show hard edges.     */
+  /* ---------------------------------------------------------------- */
+  @keyframes detail-backdrop-drift {
+    0%   { background-position: 0%  0%,  0%  0%,  0%  0%,  0 0; }
+    100% { background-position: 8%  4%, -6%  8%,  4% -6%,  0 0; }
+  }
+
+  .detail-backdrop-skeleton {
+    position: absolute;
+    inset: 0;
+    background:
+      radial-gradient(circle at 20% 30%, rgb(91 164 255 / 0.20), transparent 55%),
+      radial-gradient(circle at 75% 65%, rgb(170 130 255 / 0.16), transparent 60%),
+      radial-gradient(circle at 50% 90%, rgb(80 200 220 / 0.12), transparent 55%),
+      rgb(8 10 14 / 1);
+    background-size: 100% 100%;
+    filter: blur(28px);
+    animation: detail-backdrop-drift 14s ease-in-out infinite alternate;
+  }
+
+  /* Dither noise overlay — same SVG turbulence as .aura-sweep::after */
+  .detail-backdrop-skeleton::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n' x='0' y='0'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='1' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-repeat: repeat;
+    background-size: 200px 200px;
+    opacity: 0.05;
+    mix-blend-mode: overlay;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Aura search progress bar — indeterminate glow under the input    */
+  /* Used by SearchBar while a query is in-flight.                    */
+  /* ---------------------------------------------------------------- */
+  @keyframes aura-search-progress {
+    0%   { transform: translateX(-100%); }
+    100% { transform: translateX(300%);  }
+  }
+  .aura-progress-track {
+    position: relative;
+    overflow: hidden;
+    background: rgba(255, 255, 255, 0.06);
+  }
+  .aura-progress-bar {
+    position: absolute;
+    inset-block: 0;
+    width: 33%;
+    background: linear-gradient(
+      90deg,
+      rgba(91, 164, 255, 0)   0%,
+      rgba(91, 164, 255, 0.85) 30%,
+      rgba(180, 130, 255, 0.95) 50%,
+      rgba(120, 220, 200, 0.85) 70%,
+      rgba(91, 164, 255, 0)   100%
+    );
+    filter: drop-shadow(0 0 6px rgba(120, 180, 255, 0.55));
+    animation: aura-search-progress 1.2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Calendar month-loading bar — indeterminate segment slides across  */
+  /* the full-width track while meta fetches are in-flight.            */
+  /* ---------------------------------------------------------------- */
+  @keyframes calendar-loading-bar {
+    0%   { transform: translateX(-40%); }
+    100% { transform: translateX(240%); }
+  }
+
+  @keyframes boot-icon-pulse {
+    0%,  100% { filter: drop-shadow(0 4px 18px rgba(91, 164, 255, 0.45)); }
+    50%        { filter: drop-shadow(0 4px 28px rgba(91, 164, 255, 0.75)); }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* .aura-glow — spectral-accent pill, the nav active-row indicator.  */
+  /*                                                                    */
+  /* Absolutely positioned inside each NavGroup's relative container,  */
+  /* sized ROW_H_PX tall × full width. Slides to the active row via    */
+  /* translateY driven by inline style from NavSidebar. The slight     */
+  /* spring overshoot (cubic-bezier 0.34 1.56 0.64 1) makes the pill  */
+  /* feel glassy and elastic.                                           */
+  /*                                                                    */
+  /* When the group doesn't own the active route, opacity collapses     */
+  /* to 0 via a quick 180 ms ease-out so it doesn't linger.            */
+  /*                                                                    */
+  /* aura-glow-pulse breathes the outer box-shadow gently (±15 % blur  */
+  /* and alpha) on a 3 s alternate loop so the pill reads as luminous  */
+  /* rather than static.                                                */
+  /* ---------------------------------------------------------------- */
+  .aura-glow {
+    position: absolute;
+    left: 0;
+    right: 0;
+    border-radius: 14px;
+    background:
+      linear-gradient(135deg,
+        rgb(91 164 255 / 0.22) 0%,
+        rgb(170 130 255 / 0.16) 60%,
+        rgb(80 200 220 / 0.10) 100%);
+    border: 1px solid rgb(91 164 255 / 0.35);
+    box-shadow:
+      inset 0 0 0 1px rgb(255 255 255 / 0.04),
+      0 0 22px rgb(91 164 255 / 0.28),
+      0 0 60px rgb(91 164 255 / 0.10);
+    pointer-events: none;
+    transition:
+      transform 380ms cubic-bezier(0.34, 1.56, 0.64, 1),
+      opacity   180ms ease-out;
+    will-change: transform, opacity;
+    animation: aura-glow-pulse 3s ease-in-out infinite alternate;
+  }
+
+  @keyframes aura-glow-pulse {
+    from { box-shadow:
+      inset 0 0 0 1px rgb(255 255 255 / 0.04),
+      0 0 18px rgb(91 164 255 / 0.22),
+      0 0 50px rgb(91 164 255 / 0.08); }
+    to   { box-shadow:
+      inset 0 0 0 1px rgb(255 255 255 / 0.06),
+      0 0 26px rgb(91 164 255 / 0.32),
+      0 0 70px rgb(91 164 255 / 0.12); }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* nav-tap — sidebar/profile micro-interaction                       */
+  /* Hover scales subtly up; pressed scales down — a tactile click cue */
+  /* without any layout shift (transform-only, GPU-composited).        */
+  /* ---------------------------------------------------------------- */
+  .nav-tap {
+    transition:
+      transform 140ms cubic-bezier(0.2, 0.8, 0.2, 1),
+      background-color 150ms ease,
+      color 150ms ease,
+      border-color 150ms ease;
+  }
+  .nav-tap:hover  { transform: scale(1.05); }
+  .nav-tap:active { transform: scale(0.95); }
+
+  /* ---------------------------------------------------------------- */
+  /* MPV transparent passthrough                                       */
+  /*                                                                   */
+  /* The shell ALWAYS uses a transparent background so the native MPV  */
+  /* window painted behind the WebView2 surface is visible at every    */
+  /* pixel that React doesn't explicitly cover. Per-component glass    */
+  /* surfaces (sidebar, control bar, etc.) keep their own backgrounds. */
+  /* ---------------------------------------------------------------- */
+  .aura-app-shell {
+    background: transparent !important;
+    position: relative;
+    z-index: 0;
+  }
+
+  /* When the player overlay's auto-hide fires, every descendant cursor
+     style (`cursor-pointer` on click targets, `cursor-grab` on the
+     scrubber, etc.) overrides a plain `cursor: none` on the root —
+     so the cursor stays visible even when the rest of the UI fades.
+     Adding this class to <html> wins via !important across the whole
+     subtree. PlayerOverlay toggles it in lockstep with the controls'
+     opacity. */
+  html.aura-cursor-hidden,
+  html.aura-cursor-hidden body,
+  html.aura-cursor-hidden * {
+    cursor: none !important;
+  }
+  /* When `.playing-video` is added to <html>/<body>/#root, force every
+     ancestor of MPV's render target transparent. This keeps theme-based
+     body backgrounds (especially Midnight's pure-black fill) from being
+     visible as a strip at the top once TitleBar unmounts. */
+  html.playing-video,
+  body.playing-video,
+  #root.playing-video,
+  html.playing-video body,
+  html.playing-video #root,
+  html.playing-video .aura-app-shell,
+  html[data-theme="midnight"].playing-video,
+  html[data-theme="midnight"].playing-video body {
+    background: transparent !important;
+  }
+
+
+  /* ---------------------------------------------------------------- */
+  /* aura-scrub-fill — animated spectral progress fill for the player  */
+  /* control-bar scrubber. Same mirrored A→B→C→B→A gradient as the    */
+  /* ambient sweep, but at 100 % opacity for a vibrant, blurred-edge   */
+  /* look. The sliding `background-position` gives it motion even when */
+  /* the user pauses playback.                                         */
+  /* ---------------------------------------------------------------- */
+  @keyframes aura-scrub-anim {
+    0%   { background-position: 0%   50%; }
+    100% { background-position: 200% 50%; }
+  }
+
+  /* Next-Up CTA enter animation — slide up from the bottom-right corner
+     with a small fade. 220 ms keeps it snappy without being jarring;
+     the user is already watching the screen, the CTA only needs to
+     announce itself, not perform. */
+  @keyframes next-up-rise {
+    0%   { transform: translateY(16px); opacity: 0; }
+    100% { transform: translateY(0);    opacity: 1; }
+  }
+  /* ----------------------------------------------------------------
+   * .aura-slider — restyled <input type="range"> matching the player
+   * scrubber's visual language.
+   *
+   * Cross-browser webkit/moz pseudos paint:
+   *   • the FILLED portion as an accent gradient with a soft glow
+   *   • the EMPTY portion as a dark inset blur for contrast
+   *   • the THUMB as a small luminous accent circle
+   *
+   * The component sets `--val` (0–100 %) inline so the gradient knows
+   * where to switch from filled to empty without scripting.
+   * ---------------------------------------------------------------- */
+  .aura-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 24px;
+    background: transparent;
+    cursor: pointer;
+    /* Avoid focus outline on the input box itself — the thumb glow is
+       enough visual indication. */
+    outline: none;
+  }
+
+  /* WEBKIT track. We layer two backgrounds:
+   *   1. A wide moving spectral gradient (shifts left→right, repeat-x, same
+   *      seamless math the title-bar sweep uses) — this gives the FILLED
+   *      portion its "alive" look.
+   *   2. A dark inset fill for the EMPTY portion behind it.
+   * The mask using --val is what reveals only the filled portion of the
+   * animated layer; the rest stays the dark color.
+   */
+  .aura-slider::-webkit-slider-runnable-track {
+    height: 6px;
+    border-radius: 999px;
+    /* TOP layer (drawn first in the stack): hard-stop dimmer band
+     * covering the unfilled portion. The previous version used
+     * `rgba(255,255,255,0.05)` which barely tinted the spectrum
+     * underneath — that's why the bar looked fully lit. We use a
+     * near-opaque dark fill now so anything past `var(--val)` reads
+     * as the empty/inactive track.
+     * BOTTOM layer: the animated spectral gradient. Visible only
+     * through the transparent left half of the top layer. */
+    background:
+      linear-gradient(to right,
+        transparent              0,
+        transparent              var(--val, 50%),
+        rgba(20, 22, 30, 0.92)   var(--val, 50%),
+        rgba(20, 22, 30, 0.92)   100%),
+      linear-gradient(90deg,
+        rgba(91,  164, 255, 0.95)  0%,
+        rgba(180, 130, 255, 0.92) 25%,
+        rgba(120, 220, 200, 0.90) 50%,
+        rgba(180, 130, 255, 0.92) 75%,
+        rgba(91,  164, 255, 0.95) 100%);
+    background-size: 100% 100%, 200% 100%;
+    background-repeat: no-repeat, repeat-x;
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 255, 255, 0.06),
+      inset 0 1px 3px rgba(0, 0, 0, 0.55),
+      0 0 12px rgba(91, 164, 255, calc(var(--val-frac, 0.5) * 0.45));
+    animation: aura-slider-fill-anim 14s linear infinite;
+  }
+  @keyframes aura-slider-fill-anim {
+    from { background-position: 0 0,    0%    50%; }
+    to   { background-position: 0 0,   -200%  50%; }
+  }
+  .aura-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    margin-top: -4px;        /* center 14 on a 6 track */
+    border-radius: 50%;
+    background: rgb(220, 232, 255);
+    box-shadow:
+      0 0 0 2px rgba(91, 164, 255, 0.45),
+      0 0 10px rgba(91, 164, 255, 0.7),
+      0 1px 2px rgba(0, 0, 0, 0.7);
+    border: none;
+    cursor: pointer;
+  }
+  .aura-slider:hover::-webkit-slider-thumb {
+    box-shadow:
+      0 0 0 3px rgba(91, 164, 255, 0.55),
+      0 0 14px rgba(91, 164, 255, 0.85),
+      0 1px 2px rgba(0, 0, 0, 0.7);
+  }
+
+  /* FIREFOX track + thumb (kept in lockstep with the webkit version) */
+  .aura-slider::-moz-range-track {
+    height: 6px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.05);
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 255, 255, 0.06),
+      inset 0 1px 3px rgba(0, 0, 0, 0.55);
+  }
+  .aura-slider::-moz-range-progress {
+    height: 6px;
+    border-radius: 999px;
+    background: linear-gradient(90deg,
+      rgba(91,  164, 255, 0.95)  0%,
+      rgba(180, 130, 255, 0.92) 25%,
+      rgba(120, 220, 200, 0.90) 50%,
+      rgba(180, 130, 255, 0.92) 75%,
+      rgba(91,  164, 255, 0.95) 100%);
+    background-size: 200% 100%;
+    background-repeat: repeat-x;
+    box-shadow: 0 0 10px rgba(91, 164, 255, 0.55);
+    animation: aura-slider-fill-anim 14s linear infinite;
+  }
+  .aura-slider::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: rgb(220, 232, 255);
+    box-shadow:
+      0 0 0 2px rgba(91, 164, 255, 0.45),
+      0 0 10px rgba(91, 164, 255, 0.7);
+    border: none;
+    cursor: pointer;
+  }
+
+  .aura-scrub-fill {
+    background: linear-gradient(
+      90deg,
+      rgba(91,  164, 255, 0.95)  0%,
+      rgba(180, 130, 255, 0.95) 25%,
+      rgba(120, 220, 200, 0.95) 50%,
+      rgba(180, 130, 255, 0.95) 75%,
+      rgba(91,  164, 255, 0.95) 100%
+    );
+    background-size: 200% 100%;
+    /* `repeat-x` is essential. The keyframes animate background-position
+       from 0% to 200%, sliding the gradient by 2× the container width
+       over each cycle — past the gradient's own bounds. With `no-repeat`
+       the bar visibly empties out toward the end of each loop and pops
+       back in when the keyframe restarts (the symptom: glow appears,
+       drifts off-screen leaving transparency behind, then reappears).
+       The gradient is symmetric (start colour == end colour) so tiling
+       joins seamlessly. */
+    background-repeat: repeat-x;
+    box-shadow: 0 0 14px rgba(91, 164, 255, 0.55),
+                0 0 6px  rgba(180, 130, 255, 0.45);
+    animation: aura-scrub-anim 6s linear infinite;
+    will-change: background-position, width;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* aura-hero-title — large gradient-fill treatment for the landing  */
+  /* page "Welcome to Aura" headline. Matches the title-bar wordmark. */
+  /* ---------------------------------------------------------------- */
+  .aura-hero-title {
+    font-family: "SF Pro Display", "Inter", system-ui, sans-serif;
+    font-size: 42px;
+    font-weight: 200;
+    letter-spacing: 0.05em;
+    line-height: 1.05;
+
+    background: linear-gradient(
+      90deg,
+      rgba(180, 210, 255, 0.95)  0%,
+      rgba(220, 190, 255, 0.95) 25%,
+      rgba(190, 245, 230, 0.92) 50%,
+      rgba(220, 190, 255, 0.95) 75%,
+      rgba(180, 210, 255, 0.95) 100%
+    );
+    background-size: 200% 100%;
+    background-repeat: repeat-x;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+
+    -webkit-text-stroke: 0.4px rgba(255, 255, 255, 0.10);
+    filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.45))
+            drop-shadow(0 0 14px rgba(91, 164, 255, 0.20));
+
+    animation: aura-sweep-anim 18s linear infinite;
+    will-change: background-position;
+    user-select: none;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* boot-splash-icon — slow glow pulse for the React boot overlay    */
+  /* Matches the static keyframe defined in index.html so the Layer A */
+  /* → Layer B hand-off is visually seamless.                         */
+  /* ---------------------------------------------------------------- */
+  .boot-splash-icon {
+    filter: drop-shadow(0 4px 18px rgba(91, 164, 255, 0.45));
+    animation: boot-icon-pulse 1.6s ease-in-out infinite;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* aura-logo-a — the branded glass "A".                              */
+  /* Spectral gradient clipped to the glyph + a thin inner stroke for */
+  /* the "lensing" effect, drop-shadowed twice for depth. Animates in */
+  /* lockstep with the title-bar wordmark.                             */
+  /* ---------------------------------------------------------------- */
+  .aura-logo-a {
+    font-family: "SF Pro Display", "Inter", system-ui, sans-serif;
+    font-weight: 800;
+    letter-spacing: -0.04em;
+    text-transform: uppercase;
+
+    background: linear-gradient(
+      90deg,
+      rgba(180, 210, 255, 0.95)  0%,
+      rgba(220, 190, 255, 0.95) 25%,
+      rgba(190, 245, 230, 0.92) 50%,
+      rgba(220, 190, 255, 0.95) 75%,
+      rgba(180, 210, 255, 0.95) 100%
+    );
+    background-size: 200% 100%;
+    background-repeat: repeat-x;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+
+    -webkit-text-stroke: 0.5px rgba(255, 255, 255, 0.18);
+    filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.45))
+            drop-shadow(0 0 10px rgba(91, 164, 255, 0.30));
+
+    animation: aura-sweep-anim 18s linear infinite;
+    will-change: background-position;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* aura-toast-pop — entry animation for the player's transient OSD  */
+  /* feedback (track changes, speed switches, etc.).                  */
+  /* ---------------------------------------------------------------- */
+  @keyframes aura-toast-pop {
+    0%   { opacity: 0; transform: translate(-50%, -8px) scale(0.95); }
+    100% { opacity: 1; transform: translate(-50%, 0)    scale(1.00); }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* aura-lib-card — Library grid card. Uses content-visibility:auto */
+  /* so off-screen cards are skipped during paint/layout, recovering */
+  /* a lot of scroll perf on large libraries (100+ cards). The       */
+  /* contain-intrinsic-size hint reserves a placeholder box so the   */
+  /* scrollbar height stays accurate while cards are virtualised.    */
+  /*                                                                  */
+  /* Order is `width height` — earlier this was reversed to          */
+  /* `320px 180px` which fed the browser the wrong placeholder       */
+  /* dimensions; off-screen cards reserved a wide-flat box and       */
+  /* scrolled into the visible area at a different size, forcing a   */
+  /* relayout every time. Numbers now match the actual 2:3 poster +  */
+  /* ~50 px label rows: 180 px × 320 px.                             */
+  /* ---------------------------------------------------------------- */
+  .aura-lib-card {
+    content-visibility: auto;
+    contain-intrinsic-size: 180px 320px;
+  }
+  /* When the user is scrolling we briefly disable the card's hover
+     transform-transition + filter-transition. The Library scroll
+     handler toggles this class on the wrapper so frames during an
+     active scroll skip the per-card transition setup that was
+     creating a GPU layer per card on every paint. */
+  .aura-lib-grid.aura-scrolling .aura-lib-card img,
+  .aura-lib-grid.aura-scrolling .aura-lib-card {
+    transition: none !important;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* aura-popup-bubble — thought-bubble notification popup over the   */
+  /* notifications bell. Phases:                                      */
+  /*                                                                  */
+  /*   enter   — bursts out from the bell with overshoot + wiggle +   */
+  /*             accent halo flash so the user actually notices it    */
+  /*   idle    — breathing loop with subtle accent-glow pulse         */
+  /*   exit    — visibly collapses INTO the bell (translate down +    */
+  /*             scale + rotate) instead of fading in place           */
+  /*                                                                  */
+  /* Tail dots are rendered as pseudo-elements + a sibling so they   */
+  /* can fade in slightly after the bubble pops, like a comic-book    */
+  /* "I'm thinking..." tail.                                          */
+  /* ---------------------------------------------------------------- */
+  .aura-popup-bubble {
+    position: absolute;
+    will-change: transform, opacity, filter;
+  }
+  .aura-popup-bubble::before,
+  .aura-popup-bubble::after {
+    content: "";
+    position: absolute;
+    background: rgba(0, 0, 0, 0.9);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 9999px;
+    backdrop-filter: blur(24px);
+  }
+  /* Larger lower dot — closer to the bell. */
+  .aura-popup-bubble::before {
+    width: 10px;
+    height: 10px;
+    left: 8px;
+    bottom: -10px;
+  }
+  /* Smaller dot — between the bubble and the larger one. */
+  .aura-popup-bubble::after {
+    width: 5px;
+    height: 5px;
+    left: 4px;
+    bottom: -16px;
+  }
+  /* Bursty entrance — starts from the bell's position (down-scaled to a
+     dot), pops up with a generous overshoot and a tiny tilt wiggle.
+     5-keyframe spring path so the bubble feels physical, not lerped. */
+  @keyframes aura-popup-enter {
+    0%   { opacity: 0; transform: translate(-12px, 48px) scale(0.05) rotate(-12deg); }
+    35%  { opacity: 1; transform: translate(2px, -8px) scale(1.18) rotate(4deg); }
+    55%  { transform: translate(-1px, 2px) scale(0.94) rotate(-2deg); }
+    75%  { transform: translate(0, -1px) scale(1.04) rotate(1deg); }
+    100% { transform: translate(0, 0) scale(1.00) rotate(0deg); }
+  }
+  /* Halo flash — accent-coloured ring that briefly pulses out from
+     the bubble during the entrance to draw the eye. Decays before
+     the breathe loop kicks in so the idle state stays calm. */
+  @keyframes aura-popup-halo {
+    0%   { opacity: 0; box-shadow: 0 0 0 0 rgba(91, 164, 255, 0.55); }
+    20%  { opacity: 1; box-shadow: 0 0 0 6px rgba(91, 164, 255, 0.55); }
+    60%  { opacity: 0.45; box-shadow: 0 0 0 14px rgba(91, 164, 255, 0); }
+    100% { opacity: 0; box-shadow: 0 0 0 14px rgba(91, 164, 255, 0); }
+  }
+  @keyframes aura-popup-tail-in {
+    0%, 25%   { opacity: 0; transform: translate(8px, 8px) scale(0.15); }
+    65%       { opacity: 1; transform: translate(-1px, -1px) scale(1.20); }
+    100%      { opacity: 1; transform: translate(0, 0) scale(1.00); }
+  }
+  /* Tail-collapse runs in REVERSE order from the bubble exit — small
+     dot vanishes first, then the larger one, both fading IN towards
+     the bell so the trail "retracts" before the bubble follows. */
+  @keyframes aura-popup-tail-out {
+    0%   { opacity: 1; transform: translate(0, 0) scale(1.00); }
+    100% { opacity: 0; transform: translate(2px, 6px) scale(0.20); }
+  }
+  /* Exit — the bubble actually flies BACK into the bell. Bell sits
+     at the lower-left of the bubble's container; we translate down
+     ~52 px (bubble-bottom → bell-centre), shrink to a dot, fade,
+     and add a slight counter-rotation so it feels like a deflating
+     paper bag rather than a hard cut. forwards keeps the final
+     frame so the parent unmount doesn't flash a snap. */
+  @keyframes aura-popup-exit {
+    0%   { opacity: 1; transform: translate(0, 0) scale(1.00) rotate(0deg); }
+    35%  { opacity: 1; transform: translate(-4px, 14px) scale(0.88) rotate(-3deg); }
+    100% { opacity: 0; transform: translate(-12px, 52px) scale(0.05) rotate(-15deg); }
+  }
+  /* Idle breathe — gentle vertical bob. Combined with the
+     accent-glow keyframe below for a subtle "alive" feel. */
+  @keyframes aura-popup-breathe {
+    0%, 100% { transform: translateY(0) scale(1.00); }
+    50%      { transform: translateY(-1px) scale(1.018); }
+  }
+  /* Idle accent glow — a quiet ring pulse so the bubble keeps
+     drawing the eye after the entrance halo has decayed. Slower
+     than the breathe so the two don't beat against each other. */
+  @keyframes aura-popup-glow {
+    0%, 100% { box-shadow: 0 18px 48px -14px rgba(0, 0, 0, 0.85),
+                            0 0 0 0 rgba(91, 164, 255, 0); }
+    50%      { box-shadow: 0 18px 48px -14px rgba(0, 0, 0, 0.85),
+                            0 0 24px 2px rgba(91, 164, 255, 0.22); }
+  }
+  .aura-popup-enter {
+    animation:
+      aura-popup-enter 520ms cubic-bezier(0.16, 1.18, 0.32, 1.16),
+      aura-popup-halo  720ms ease-out forwards;
+  }
+  .aura-popup-enter::before,
+  .aura-popup-enter::after {
+    animation: aura-popup-tail-in 480ms cubic-bezier(0.34, 1.56, 0.64, 1) backwards;
+    animation-delay: 220ms;
+  }
+  .aura-popup-enter::after {
+    animation-delay: 320ms;
+  }
+  .aura-popup-exit {
+    animation: aura-popup-exit 460ms cubic-bezier(0.5, -0.2, 0.7, 0.0) forwards;
+  }
+  .aura-popup-exit::before,
+  .aura-popup-exit::after {
+    animation: aura-popup-tail-out 280ms ease-in forwards;
+  }
+  .aura-popup-exit::after {
+    animation-delay: 0ms;
+  }
+  .aura-popup-exit::before {
+    animation-delay: 80ms;
+  }
+  .aura-popup-breathe {
+    animation:
+      aura-popup-breathe 2.4s ease-in-out infinite,
+      aura-popup-glow    3.6s ease-in-out infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .aura-popup-enter,
+    .aura-popup-exit,
+    .aura-popup-breathe { animation: none; }
+    .aura-popup-enter::before,
+    .aura-popup-enter::after,
+    .aura-popup-exit::before,
+    .aura-popup-exit::after { animation: none; opacity: 1; }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* aura-cast-fade — cross-fade for the detail-page cast block when */
+  /* the user changes season. The block is keyed on selectedSeason   */
+  /* so a season change remounts the wrapper, replaying this anim.   */
+  /* 180 ms feels snappy without looking instant.                    */
+  /* ---------------------------------------------------------------- */
+  @keyframes aura-cast-fade-in {
+    0%   { opacity: 0; transform: translateY(2px); }
+    100% { opacity: 1; transform: translateY(0); }
+  }
+  .aura-cast-fade {
+    animation: aura-cast-fade-in 180ms ease-out;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* aura-buffering-pulse — wrapper used when the buffering overlay   */
+  /* has a real logo image. Slow opacity / scale breathe so the user  */
+  /* knows playback is alive while the network catches up.            */
+  /* ---------------------------------------------------------------- */
+  .aura-buffering-pulse {
+    animation: aura-buffering-pulse 2.4s ease-in-out infinite;
+    will-change: opacity, transform;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* aura-buffering-text — fade-pulsing gradient title shown over MPV  */
+  /* while it's paused-for-cache. Reuses the title-bar wordmark fill  */
+  /* technique (background-clip: text + animated gradient).            */
+  /* ---------------------------------------------------------------- */
+  @keyframes aura-buffering-pulse {
+    0%, 100% { opacity: 0.55; transform: scale(0.985); }
+    50%      { opacity: 1.00; transform: scale(1.000); }
+  }
+  .aura-buffering-text {
+    background: linear-gradient(
+      90deg,
+      rgba(180, 210, 255, 0.95)  0%,
+      rgba(220, 190, 255, 0.95) 25%,
+      rgba(190, 245, 230, 0.95) 50%,
+      rgba(220, 190, 255, 0.95) 75%,
+      rgba(180, 210, 255, 0.95) 100%
+    );
+    background-size: 200% 100%;
+    background-repeat: repeat-x;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+    filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.65))
+            drop-shadow(0 0 16px rgba(91, 164, 255, 0.32));
+    animation:
+      aura-sweep-anim         16s linear infinite,
+      aura-buffering-pulse     2.4s ease-in-out infinite;
+    will-change: background-position, opacity, transform;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* aura-row-title — gradient-filled catalog row headers              */
+  /* Same spectral palette the title bar wordmark uses, animated in    */
+  /* lockstep with the sweep so the text feels alive when paused.      */
+  /* ---------------------------------------------------------------- */
+  .aura-row-title {
+    background: linear-gradient(
+      90deg,
+      rgba(180, 210, 255, 0.95)  0%,
+      rgba(220, 190, 255, 0.95) 25%,
+      rgba(190, 245, 230, 0.92) 50%,
+      rgba(220, 190, 255, 0.95) 75%,
+      rgba(180, 210, 255, 0.95) 100%
+    );
+    background-size: 200% 100%;
+    background-repeat: repeat-x;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+    filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.35))
+            drop-shadow(0 0 6px rgba(91, 164, 255, 0.16));
+    animation: aura-sweep-anim 20s linear infinite;
+    will-change: background-position;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* aura-update-* — entrance for the centered "Update Available"     */
+  /* modal. Backdrop fades in (no blur ramp — the blur snap is fine   */
+  /* and avoids a layout jitter on slow GPUs); card fades AND scales  */
+  /* up from 96 % to communicate "this is asking for your attention". */
+  /* ---------------------------------------------------------------- */
+  @keyframes aura-update-backdrop-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+  }
+  @keyframes aura-update-card-in {
+    from { opacity: 0; transform: scale(0.96); }
+    to   { opacity: 1; transform: scale(1.00); }
+  }
+  .aura-update-backdrop {
+    animation: aura-update-backdrop-in 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+  .aura-update-card {
+    animation: aura-update-card-in 280ms cubic-bezier(0.16, 1, 0.3, 1) both;
+    will-change: opacity, transform;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* aura-bell-* — notifications bell                                  */
+  /*                                                                  */
+  /* Hover: a quick wiggle (rotate sequence) on every mouseover.      */
+  /* New-notification: pulse + accent glow for ~3 s after addNotify   */
+  /* fires (the hasNew flag in NotificationsContext gates the class). */
+  /* Badge: bounce-in on first appear / count change.                 */
+  /* Panel: slide + fade in from below the bell.                      */
+  /* ---------------------------------------------------------------- */
+  @keyframes aura-bell-wiggle {
+    0%   { transform: rotate(0deg); }
+    20%  { transform: rotate(-10deg); }
+    50%  { transform: rotate(10deg); }
+    75%  { transform: rotate(-5deg); }
+    100% { transform: rotate(0deg); }
+  }
+  @keyframes aura-bell-pulse-glow {
+    0% {
+      transform: scale(1);
+      box-shadow:
+        0 0 0 0 rgba(91, 164, 255, 0.55),
+        0 0 0 0 rgba(91, 164, 255, 0.30);
+    }
+    50% {
+      transform: scale(1.10);
+      box-shadow:
+        0 0 14px 6px rgba(91, 164, 255, 0.45),
+        0 0 28px 14px rgba(91, 164, 255, 0.18);
+    }
+    100% {
+      transform: scale(1);
+      box-shadow:
+        0 0 0 0 rgba(91, 164, 255, 0),
+        0 0 0 0 rgba(91, 164, 255, 0);
+    }
+  }
+  @keyframes aura-bell-badge-pop {
+    0%   { transform: scale(0.4); opacity: 0; }
+    65%  { transform: scale(1.18); opacity: 1; }
+    100% { transform: scale(1.00); opacity: 1; }
+  }
+  @keyframes aura-bell-panel-in {
+    from { opacity: 0; transform: translateY(8px) scale(0.98); }
+    to   { opacity: 1; transform: translateY(0)   scale(1.00); }
+  }
+  @keyframes aura-bell-panel-out {
+    from { opacity: 1; transform: translateY(0)    scale(1.00); }
+    to   { opacity: 0; transform: translateY(10px) scale(0.96); }
+  }
+  .aura-bell-hover:hover {
+    animation: aura-bell-wiggle 0.6s ease-in-out;
+  }
+  .aura-bell-pulse {
+    animation: aura-bell-pulse-glow 1.5s ease-in-out 2;
+    will-change: transform, box-shadow;
+  }
+  .aura-bell-badge-pop {
+    animation: aura-bell-badge-pop 280ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
+    will-change: transform, opacity;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Recurring "you have unread mail" attention animation. Applied    */
+  /* whenever there's at least one DISMISSABLE unread notification    */
+  /* in the bell (ie. anything other than the always-pinned `update`  */
+  /* kind). The bell rings briefly every cycle and the count badge    */
+  /* bounces in lockstep — 5 s cycle gives a polite rhythm without    */
+  /* feeling like a slot machine.                                     */
+  /* ---------------------------------------------------------------- */
+  @keyframes aura-bell-ring {
+    /* Rest 0-70 % of the cycle; ring 70-90 %; settle 90-100 %.       */
+    0%, 70%, 100% { transform: rotate(0deg); }
+    73%           { transform: rotate(-14deg); }
+    76%           { transform: rotate( 12deg); }
+    79%           { transform: rotate( -8deg); }
+    82%           { transform: rotate(  5deg); }
+    85%           { transform: rotate( -3deg); }
+    88%           { transform: rotate(  0deg); }
+  }
+  @keyframes aura-bell-badge-bounce {
+    /* Bounce timed to the ring's peak (76-82 %) so badge + bell      */
+    /* read as one motion. */
+    0%, 70%, 100% { transform: scale(1); }
+    76%           { transform: scale(1.30); }
+    82%           { transform: scale(1.00); }
+  }
+  .aura-bell-ringing {
+    animation: aura-bell-ring 5s ease-in-out infinite;
+    transform-origin: 50% 18%;
+    will-change: transform;
+  }
+  .aura-bell-badge-bouncing {
+    animation: aura-bell-badge-bounce 5s ease-in-out infinite;
+    transform-origin: center;
+    will-change: transform;
+  }
+  .aura-bell-panel-in {
+    animation: aura-bell-panel-in 220ms cubic-bezier(0.16, 1, 0.3, 1) both;
+    transform-origin: bottom left;
+    will-change: opacity, transform;
+  }
+  .aura-bell-panel-out {
+    animation: aura-bell-panel-out 200ms cubic-bezier(0.4, 0.0, 1, 1) forwards;
+    transform-origin: bottom left;
+    will-change: opacity, transform;
+    pointer-events: none;
   }
 }
 
@@ -344,6 +1640,37 @@ input[type="range"]::-moz-range-thumb {
 }
 
 /* ------------------------------------------------------------------ */
+/* Filter / sort sliders — used by FilterBar (year range, rating min). */
+/*                                                                     */
+/* Same gradient-left / dim-right pattern as `.progress-range` so the  */
+/* filter sliders read consistently with the player's seek bar. The    */
+/* `--filter-progress` custom property is set inline by JS as a        */
+/* percentage string (e.g. `--filter-progress: 42%`) so the fill knows */
+/* where to stop. Browser default `accentColor` was producing the     */
+/* native track style — totally fine but visually inconsistent with    */
+/* the rest of Aura's sliders.                                         */
+/* ------------------------------------------------------------------ */
+.aura-filter-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(
+    to right,
+    rgba(91, 164, 255, 0.85) var(--filter-progress, 0%),
+    rgba(255, 255, 255, 0.16) var(--filter-progress, 0%)
+  );
+}
+.aura-filter-slider::-moz-range-track {
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.16);
+}
+.aura-filter-slider::-moz-range-progress {
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(91, 164, 255, 0.85);
+}
+
+/* ------------------------------------------------------------------ */
 /* Global select & option styling                                      */
 /*                                                                     */
 /* WebView2/Chromium honours `background-color` and `color` on <option>*/
@@ -374,4 +1701,113 @@ select option:checked,
 select option:hover {
   background-color: var(--glass-bg-soft);
   color: var(--text-primary);
+}
+
+/* ---------------------------------------------------------------------------
+   Home-view layout breakpoints — driven by CSS custom properties so the
+   React side stays oblivious to viewport size.
+
+   Defaults (no media query) target ULTRAWIDE / WQHD class displays —
+   the original sizing the layout was tuned against (ultrawide 3440 × 1440
+   was the dev baseline).
+
+   The `max-width: 2400px` query catches everything narrower (1080p,
+   1440p flat panels, and any non-ultrawide aspect at common laptop /
+   desktop sizes). We use a ceiling rather than min-width so that
+   nothing changes on the user's ultrawide reference setup, only on the
+   class of displays where the hero looked oversized + the CW row
+   looked cramped.
+
+     --hero-max-h / --hero-max-w → drive HeroCarousel's pixel ceilings.
+     --cw-cols                   → drives ContinueWatchingRow's grid
+                                   column count (8 → 6 makes each card
+                                   33 % wider at 1080p).
+   --------------------------------------------------------------------------- */
+:root {
+  --hero-max-h: min(60vh, 760px);
+  --hero-max-w: min(calc(60vh * 21 / 9), calc(760px * 21 / 9));
+  --cw-cols: 8;
+  /* Catalog row — 10 equal poster columns. */
+  --catalog-grid-template: repeat(10, minmax(0, 1fr));
+  --catalog-gap: 14px;             /* gap-3.5 */
+  /* Catalog popup ("View all 24") — sized larger on ultrawide so it
+     can comfortably fit a multi-row poster grid; smaller on 1080p
+     where viewport space is tight. */
+  --catalog-popup-w: min(1600px, 88vw);
+  --catalog-popup-h: 88vh;
+  --catalog-popup-cols: 6;          /* poster columns inside the popup grid */
+}
+
+@media (max-width: 2400px) {
+  :root {
+    --hero-max-h: min(50vh, 600px);
+    --hero-max-w: min(calc(50vh * 21 / 9), calc(600px * 21 / 9));
+    --cw-cols: 6;
+    /* 1080p: 8 equal poster columns. Items 9+ render in the React
+       tree (so the loaded `items` array stays consistent for the
+       View-All popup) but are hidden out-of-flow via :nth-child
+       below — keeps the home row a single line at 1920×1080 without
+       the React side needing to know about viewport. */
+    --catalog-grid-template: repeat(8, minmax(0, 1fr));
+    --catalog-gap: 8px;
+    --catalog-popup-w: min(1100px, 92vw);
+    --catalog-popup-h: 86vh;
+    --catalog-popup-cols: 4;
+  }
+  .aura-catalog-row > :nth-child(n+9) {
+    display: none;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Queue click pulse — brief shrink-then-restore on every Queue click.
+   The active pill (.aura-glow) handles the persistent active state for
+   Queue same as every other row; this pulse is a one-shot "click
+   acknowledged" cue tuned for Queue specifically, since Queue is
+   visually smaller than the rest of the sidebar rows and a regular
+   pill slide-in on its own reads as muted.
+   --------------------------------------------------------------------------- */
+.aura-queue-click-pulse {
+  animation: aura-queue-click-pulse 280ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+  transform-origin: center;
+  will-change: transform;
+}
+
+@keyframes aura-queue-click-pulse {
+  0%   { transform: scale(1);    }
+  45%  { transform: scale(0.92); }
+  100% { transform: scale(1);    }
+}
+
+/* ---------------------------------------------------------------- */
+/* Settings search — fade + slight rise when a section enters the    */
+/* visible set, so the filter feels responsive rather than abrupt.   */
+/* Triggered by toggling `.settings-section-enter` in JS, which adds */
+/* the class right after a forced reflow so the animation re-fires. */
+/* ---------------------------------------------------------------- */
+.settings-section-enter {
+  animation: settings-section-enter 220ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes settings-section-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0);   }
+}
+
+/* ---------------------------------------------------------------- */
+/* Settings search — visual ring around sections that match the     */
+/* current query so the user sees AT-A-GLANCE which sections are    */
+/* relevant after typing. Applied via JS to every section whose     */
+/* text content matches; cleared when the query is cleared.         */
+/*                                                                  */
+/* The inner panel (the bg-white/3 + border-white/8 block) is what  */
+/* gets the highlight, not the outer <section> — matching the       */
+/* visual chunk the user sees, and avoiding a halo around the       */
+/* uppercase title row above each panel.                            */
+/* ---------------------------------------------------------------- */
+.settings-section-matched > div {
+  border-color: rgba(91, 164, 255, 0.45);
+  box-shadow: 0 0 0 1px rgba(91, 164, 255, 0.18),
+              0 12px 32px rgba(91, 164, 255, 0.08);
+  transition: border-color 200ms ease-out, box-shadow 200ms ease-out;
 }

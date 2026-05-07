@@ -10,6 +10,17 @@ export default {
       screen: "100vw",
     },
     extend: {
+      // Tailwind's default opacity scale jumps in 5-point steps (..85/90/95/100)
+      // — `bg-black/97` produced NO css at all so player overlay submenus
+      // were rendering with a fully transparent background. Add the
+      // intermediate values we actually use so the JIT compiler emits them.
+      opacity: {
+        92: "0.92",
+        93: "0.93",
+        96: "0.96",
+        97: "0.97",
+        98: "0.98",
+      },
       colors: {
         // Luminous Neutral — visionOS / Apple TV+ cinematic palette.
         // Solid values for opaque surfaces; glass variants live as CSS vars in App.css.

@@ -1,6 +1,9 @@
-use std::collections::HashSet;
-use std::sync::OnceLock;
-use std::time::Duration;
+// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,11 +20,69 @@ const STREMIO_ACCOUNT_API: &str = "https://api.strem.io/api";
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 static ACCOUNT_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
+// Session-scoped manifest cache — avoids redundant /manifest.json fetches that
+// would otherwise fire on every home load, search, stream fetch, and subtitle
+// fetch. AIOStreams and other self-hosted addons build their manifest
+// dynamically (internal health checks per request) so repeated fetches show up
+// as high-frequency status hits in their logs.
+static MANIFEST_CACHE: OnceLock<Mutex<HashMap<String, ManifestCacheEntry>>> = OnceLock::new();
+const MANIFEST_TTL: Duration = Duration::from_secs(300); // 5-minute TTL
+
+struct ManifestCacheEntry {
+    wire:       WireManifest,
+    has_search: bool,
+    cached_at:  Instant,
+}
+
+fn manifest_cache() -> &'static Mutex<HashMap<String, ManifestCacheEntry>> {
+    MANIFEST_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// Per-addon catalog soft-fail cache.
+//
+// When fetch_catalog times out for addon X, the next 25 catalog requests
+// to the SAME addon (a typical AIOMetadata fan-out) would each separately
+// pay the 10 s timeout — turning a single hung addon into a 4-minute
+// home-page render. The fix: when a request fails with a timeout-class
+// error, stamp the addon URL with the failure time. Subsequent calls
+// within the cooldown window short-circuit to a fast error.
+//
+// COOLDOWN is intentionally short: an addon that recovers shouldn't stay
+// in the penalty box. 30 s is enough to drain a typical home-page fan-out
+// while still letting a recovered addon serve the next user-triggered
+// refresh (Home → swap to Library → back to Home).
+//
+// Only TIMEOUT-class failures stamp the cache. HTTP errors (4xx / 5xx)
+// from the addon are user-actionable and shouldn't poison subsequent
+// catalogs (a single misconfigured catalog id shouldn't suppress the
+// rest of the addon's offerings).
+static ADDON_FAIL_CACHE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+const ADDON_FAIL_COOLDOWN: Duration = Duration::from_secs(30);
+
+fn addon_fail_cache() -> &'static Mutex<HashMap<String, Instant>> {
+    ADDON_FAIL_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn is_addon_soft_failed(base: &str) -> bool {
+    let Ok(cache) = addon_fail_cache().lock() else { return false; };
+    cache.get(base)
+        .map(|stamped| stamped.elapsed() < ADDON_FAIL_COOLDOWN)
+        .unwrap_or(false)
+}
+
+fn mark_addon_failed(base: &str) {
+    if let Ok(mut cache) = addon_fail_cache().lock() {
+        cache.insert(base.to_string(), Instant::now());
+    }
+}
+
 fn client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(TIMEOUT)
-            .user_agent("Aura/0.1")
+            .tcp_nodelay(true)
+            .tcp_keepalive(Duration::from_secs(60))
+            .user_agent("Aura/0.6.7")
             .build()
             .expect("HTTP client init failed")
     })
@@ -33,7 +94,9 @@ fn account_client() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .https_only(true)
             .timeout(Duration::from_secs(15))
-            .user_agent("Aura/0.1")
+            .tcp_nodelay(true)
+            .tcp_keepalive(Duration::from_secs(60))
+            .user_agent("Aura/0.6.7")
             .build()
             .expect("Account HTTP client init failed")
     })
@@ -43,15 +106,31 @@ fn account_client() -> &'static reqwest::Client {
 // Stremio wire types
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct WireManifest {
+    /// Manifest-level `id` (stable across deployments of the same addon —
+    /// e.g. "com.linvo.cinemeta"). Optional in deserialization for
+    /// resilience against sloppy addons; defaults to "" when missing.
+    #[serde(default)]
+    id: String,
     name: String,
     catalogs: Vec<WireCatalogEntry>,
     #[serde(default)]
     resources: Vec<serde_json::Value>,
+    #[serde(default)]
+    types: Vec<String>,
+    /// Optional id-prefix gate. When non-empty, the addon only handles
+    /// requests whose id begins with one of these prefixes (canonical
+    /// Stremio addon-spec field). Used by `fetch_streams` to skip
+    /// addons that declare a stream resource for compatibility but
+    /// don't actually serve the prefix the user is looking for —
+    /// notably AI Search, which advertises stream + catalog but only
+    /// returns results for its own AI-generated catalog ids.
+    #[serde(default, rename = "idPrefixes")]
+    id_prefixes: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct WireCatalogEntry {
     #[serde(rename = "type")]
     media_type: String,
@@ -85,6 +164,9 @@ struct WireMeta {
     description: Option<String>,
     #[serde(rename = "imdbRating")]
     imdb_rating: Option<String>,
+    /// Optional genre list — drives the FilterBar genre chips.
+    #[serde(default)]
+    genres: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +178,19 @@ pub struct CatalogInfo {
     pub media_type: String,
     pub id: String,
     pub name: String,
+    /// Catalog requires a search query to return any items — exclude from
+    /// browseable home feeds.
+    #[serde(default)]
+    pub is_search_only: bool,
+    /// Catalog has a required `extra` parameter (other than `search`) that
+    /// has no `options` default — the addon can't return rows without a
+    /// user-supplied input. AIOMetadata's "enabled but hidden from home"
+    /// catalogs surface as this shape, as does Stremio's own convention
+    /// for "Discover-only" catalogs (e.g. genre-keyed lists where you
+    /// must pick a genre first). Filtered out of the home grid; still
+    /// available via the Discover tab.
+    #[serde(default)]
+    pub is_hidden_from_home: bool,
 }
 
 #[derive(Serialize)]
@@ -118,6 +213,84 @@ pub struct MetaPreview {
     pub release_info: Option<String>,
     pub description: Option<String>,
     pub imdb_rating: Option<String>,
+    pub genres: Vec<String>,
+}
+
+/// One row in `MetaDetail.cast_detailed` / `producer_detailed`. Mirrors
+/// the AIOMetadata `app_extras.cast` shape: a name plus optional
+/// character/role string and headshot URL. Frontend renders name +
+/// "as character" pairing inline and the photo on hover.
+#[derive(Clone, Serialize)]
+pub struct CastMember {
+    pub name: String,
+    pub character: Option<String>,
+    pub photo: Option<String>,
+}
+
+/// One per-season credit ensemble — sourced from
+/// `meta.app_extras.seasonCredits[<season>]` on TMDB / TVDB series.
+/// Absent on movies and on MAL-meta anime. The frontend swaps the
+/// detail page's cast block to this season's roster whenever the
+/// selected season changes.
+#[derive(Clone, Serialize, Default)]
+pub struct SeasonCredits {
+    pub name: Option<String>,
+    pub overview: Option<String>,
+    /// ISO date string (YYYY-MM-DD).
+    pub air_date: Option<String>,
+    pub poster: Option<String>,
+    pub cast: Vec<CastMember>,
+    pub crew: Vec<CrewMember>,
+}
+
+/// Crew entry — same shape as CastMember plus a `job` and optional
+/// `department`. Sourced from `app_extras.seasonCredits[s].crew`.
+#[derive(Clone, Serialize)]
+pub struct CrewMember {
+    pub name: String,
+    pub job: String,
+    pub department: Option<String>,
+    pub photo: Option<String>,
+}
+
+/// Show-level credits with per-season episode counts — TMDB-only.
+/// Used by the React-side hover overlay to classify each cast member
+/// as Main / Recurring / Guest based on `total_episode_count` over
+/// the show's total episode count.
+#[derive(Clone, Serialize, Default)]
+pub struct AggregateCredits {
+    pub cast: Vec<AggCast>,
+    pub crew: Vec<AggCrew>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct AggCast {
+    pub name: String,
+    pub character: Option<String>,
+    pub photo: Option<String>,
+    pub total_episode_count: u32,
+    pub roles: Vec<RoleSpan>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct AggCrew {
+    pub name: String,
+    pub department: Option<String>,
+    pub jobs: Vec<JobSpan>,
+    pub total_episode_count: u32,
+    pub photo: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct RoleSpan {
+    pub character: String,
+    pub episode_count: u32,
+}
+
+#[derive(Clone, Serialize)]
+pub struct JobSpan {
+    pub job: String,
+    pub episode_count: u32,
 }
 
 #[derive(Clone, Serialize)]
@@ -134,13 +307,186 @@ pub struct MetaDetail {
     pub released: Option<String>,
     pub runtime: Option<String>,
     pub imdb_rating: Option<String>,
+    pub genres: Vec<String>,
+    /// Cast names — capped to 20 entries, 64 chars each.
+    pub cast: Vec<String>,
+    /// Cast with character / role pairings + headshot URLs when the
+    /// addon emits the rich shape. Sourced from
+    /// `meta.app_extras.cast: [{ name, character, photo }]` (TMDB,
+    /// TVDB, TVmaze, MAL anime). For Kitsu anime / older cached
+    /// entries this is empty — UI falls back to `cast` (names only).
+    /// Capped to 20 entries.
+    pub cast_detailed: Vec<CastMember>,
+    /// Directors — capped to 20 entries.
+    pub director: Vec<String>,
+    /// Writers / creators — capped to 20 entries.
+    pub writer: Vec<String>,
+    /// Producers — capped to 20 entries (AIOMetadata `producers`/`producer`).
+    pub producer: Vec<String>,
+    /// Producer character/role pairings — same shape as cast_detailed,
+    /// populated from `app_extras.producers` on TVmaze series. Empty
+    /// otherwise. Capped to 20 entries.
+    pub producer_detailed: Vec<CastMember>,
+    /// Music composers — capped to 20 entries (`composers`/`composer`/`music`).
+    pub composer: Vec<String>,
+    /// Show / story creators — capped to 20 entries (`creators`/`creator`).
+    pub creator: Vec<String>,
+    /// Voice actors — capped to 20 entries. Sourced from anime-aware
+    /// addons (Kitsu / AniList / AIOMetadata anime catalogs) under
+    /// `voiceActors` / `voice_actors` / `voiceCast`. Empty for live-
+    /// action; live-action voice work shows under `cast` instead.
+    /// For MAL-meta anime, voice-actor character/role pairings live
+    /// in `cast_detailed` (same array — MAL's "cast" is the voice
+    /// ensemble paired to characters).
+    pub voice_actors: Vec<String>,
+    /// Production studios — capped to 20 entries. Most relevant for
+    /// anime and animated content (Studio Ghibli, MAPPA, etc.). Empty
+    /// when the addon doesn't expose `studios` / `studio`.
+    pub studios: Vec<String>,
+    /// Country of origin (best-effort string from addons that include it).
+    pub country: Option<String>,
+    /// ISO 639-1 original-audio language code (e.g. "ko", "ja", "en").
+    /// Sourced from AIOMetadata's `originalLanguage` field. Drives the
+    /// "original" token in the user's audio_priority preference list.
+    pub original_language: Option<String>,
+    /// ISO 3166-1 alpha-2 country codes (e.g. ["KR"], ["DE", "GB", "US"]).
+    /// Sourced from AIOMetadata's `productionCountries`. Used as a regional
+    /// tiebreaker when picking between dub variants (es-MX vs es-ES, etc.).
+    pub production_countries: Vec<String>,
+    /// Multi-source ratings: list of `{source, value}` (e.g. IMDb, RT, MAL).
+    pub ratings: Vec<RatingEntry>,
+    /// Episode / video list (series + anime). For movies this is empty.
+    /// IDs are preserved verbatim — addons need exact strings like
+    /// `kitsu:12345:1` or `tt0903747:1:5` to resolve episode-level streams.
+    pub videos: Vec<VideoEntry>,
+    /// MyAnimeList numeric id when the addon stamps one — sourced from
+    /// AIOMetadata's `_malId` / `app_extras.malId` / similar. Empty
+    /// for non-anime AND for anime addons that don't expose MAL ids.
+    /// Drives the AniSkip lookup on the React side.
+    pub mal_id: Option<u32>,
+    /// Kitsu numeric id when present. Future use: kitsu→mal mapping
+    /// fallback for AniSkip when mal_id is missing.
+    pub kitsu_id: Option<u32>,
+    /// AniDB numeric id when present. Future use: anidb→mal mapping
+    /// fallback for AniSkip.
+    pub anidb_id: Option<u32>,
+    /// Per-season cast/crew rosters. Keys are season numbers (TMDB /
+    /// TVDB convention — season 0 is specials, 1+ are the main run).
+    /// Empty on movies + MAL-meta anime + older cached entries that
+    /// pre-date AIOMetadata's `seasonCredits` payload. The React side
+    /// uses the currently-selected season to swap the detail-page
+    /// cast block; falls through to `cast_detailed` when this is
+    /// empty so older cached entries keep rendering.
+    pub season_credits: std::collections::BTreeMap<u32, SeasonCredits>,
+    /// Show-level aggregate credits — episode counts per actor /
+    /// crew member. TMDB-only. Powers the hover-overlay's
+    /// Main/Recurring/Guest tier classification.
+    pub aggregate_credits: Option<AggregateCredits>,
 }
 
+#[derive(Clone, Serialize)]
+pub struct VideoEntry {
+    /// EXACT addon id for this episode/video — passed verbatim to
+    /// `fetch_streams`. Do NOT mutate (no slugification, no encoding).
+    pub id: String,
+    pub title: String,
+    pub season: Option<i64>,
+    pub episode: Option<i64>,
+    pub released: Option<String>,
+    pub thumbnail: Option<String>,
+    pub overview: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct RatingEntry {
+    pub source: String,
+    pub value: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct StreamEntry {
+    /// Display name (e.g. "1080p HDR · 4.5 GB"). Always present.
+    pub title: String,
+    /// Source addon's display name — lets the UI group by provider.
+    pub addon_name: String,
+    /// Direct HTTP(S) URL to the stream. Mutually-exclusive with `info_hash`.
+    pub url: Option<String>,
+    /// Torrent info hash for magnet streams.
+    pub info_hash: Option<String>,
+    /// File index inside the torrent (defaults to 0 for single-file).
+    pub file_idx: Option<i64>,
+    /// Behavior hints from the addon (HDR, 4K, etc).
+    pub description: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// AIOStreams metadata payloads
+//
+// AIOStreams (https://github.com/Viren070/AIOStreams) returns a JSON object
+// alongside the canonical Stremio `streams` array containing four optional
+// arrays of structured messages:
+//   • errors      — fatal addon failures the user should see
+//   • warnings    — non-fatal issues (rate limit, partial result, etc.)
+//   • info        — informational notes
+//   • statistics  — per-fetch stats (latency, scraper counts, …)
+//
+// Each entry is shaped roughly like `{ title?: string, description: string }`
+// or `{ message: string }`. We capture both so the UI can render either.
+// Tagging each message with the originating addon's name lets the React panel
+// group messages by source the same way it groups streams.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Serialize)]
+pub struct StreamMessage {
+    /// Category — one of "error", "warning", "info", "stats". Allows the
+    /// frontend to colour-code without inspecting which array the entry came
+    /// from. Plain string keeps serialisation trivial across the boundary.
+    pub kind: String,
+    /// Optional short heading from AIOStreams (`title` field).
+    pub title: Option<String>,
+    /// Body text — falls back to `message` when `description` is absent.
+    pub description: String,
+    /// Source addon's display name.
+    pub addon_name: String,
+    /// `streamData.forced` from AIOStreams pseudo-streams. The patched fork
+    /// surfaces this on every statistic / error pseudo-stream so the UI can
+    /// keep rendering forced notices (e.g. the "Digital Release Filter"
+    /// warning, the disabled-stream-types removal-reasons entry) even when
+    /// the user has globally toggled "Show AIOStreams notices" off. False
+    /// for the named-array shape (errors / warnings / info / statistics)
+    /// since that path doesn't carry per-entry forced flags.
+    #[serde(default)]
+    pub forced: bool,
+}
+
+#[derive(Clone, Serialize, Default)]
+pub struct StreamMetadata {
+    pub errors: Vec<StreamMessage>,
+    pub warnings: Vec<StreamMessage>,
+    pub info: Vec<StreamMessage>,
+    pub stats: Vec<StreamMessage>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct StreamFetchResult {
+    pub streams: Vec<StreamEntry>,
+    pub metadata: StreamMetadata,
+}
+
+// IMPORTANT: All renames here are DESERIALIZE-ONLY so the Stremio cloud's
+// wire format ("_id", "type", "_mtime", "_ctime") is read into our snake-case
+// Rust fields, but when Tauri serialises the struct back to JSON for the
+// frontend it uses the Rust field names ("id", "media_type", "mtime",
+// "ctime"). Without the directional rename, Tauri was sending the wire
+// names and the React side's `i.id`, `i.media_type`, etc. were undefined —
+// breaking Library type filters (Movies / Series / Anime → 0), DetailView
+// opens (mediaType undefined → addons can't resolve), and the Calendar
+// (which keys off media_type to filter to series).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LibraryItem {
-    #[serde(rename = "_id")]
+    #[serde(rename(deserialize = "_id"))]
     pub id: String,
-    #[serde(rename = "type")]
+    #[serde(rename(deserialize = "type"))]
     pub media_type: String,
     pub name: String,
     pub poster: Option<String>,
@@ -151,9 +497,9 @@ pub struct LibraryItem {
     pub removed: bool,
     #[serde(default)]
     pub temp: bool,
-    #[serde(rename = "_ctime", default)]
+    #[serde(rename(deserialize = "_ctime"), default)]
     pub ctime: Option<String>,
-    #[serde(rename = "_mtime", default)]
+    #[serde(rename(deserialize = "_mtime"), default)]
     pub mtime: Option<String>,
     /// Free-form playback state object (timeOffset, video_id, etc.).
     /// Kept opaque so we can round-trip it back to the cloud unchanged.
@@ -196,7 +542,14 @@ fn sanitize_meta(m: WireMeta) -> MetaPreview {
         release_info: m.release_info.map(|s| cap(s, 32)),
         description:  m.description.map(|s| cap(s, 500)),
         imdb_rating:  m.imdb_rating.map(|s| cap(s, 8)),
+        genres:       sanitize_genres(m.genres),
     }
+}
+
+/// Cap genre count + per-string length so a malicious addon can't blow up
+/// our memory or the FilterBar's chip rendering.
+fn sanitize_genres(g: Vec<String>) -> Vec<String> {
+    g.into_iter().take(10).map(|s| cap(s, 32)).collect()
 }
 
 /// Pull a string field out of an arbitrary serde_json::Value with capping.
@@ -214,12 +567,72 @@ fn json_url(v: &serde_json::Value, field: &str) -> Option<String> {
 // URL helpers
 // ---------------------------------------------------------------------------
 
+/// Map a reqwest error to a single-word category so error logs read
+/// "[addon] catalog/foo timed out — <details>" instead of just dumping
+/// the multi-line nested cause chain. Goal: at a glance, distinguish
+/// "addon hung on its own dependency" (timeout) from "addon hostname
+/// is wrong" (connect / DNS) from "TLS cert mismatch" (builder), so
+/// future debugging doesn't require re-reading reqwest's internals.
+fn describe_reqwest_err(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout()                       { "timed out" }
+    else if e.is_connect()                  { "connect failed" }
+    else if e.is_decode()                   { "decode failed" }
+    else if e.is_redirect()                 { "redirect loop" }
+    else if e.is_request()                  { "request error" }
+    else if e.is_status()                   { "http status error" }
+    else if e.is_body()                     { "response body error" }
+    else if e.is_builder()                  { "builder error" }
+    else                                    { "send error" }
+}
+
+/// Reject obviously-malformed addon URLs before any network call. The Rust
+/// reqwest layer would also error on a bad URL, but doing the cheap structural
+/// checks here gives the user a precise message and prevents wasted DNS / TLS
+/// handshakes on URLs that can never be valid.
+///
+/// Loopback (127.0.0.1, localhost) is intentionally ALLOWED. Power users
+/// self-host addons like AIOMetadata / AIOStreams locally and need to point
+/// Aura at `http://127.0.0.1:11470/manifest.json` and similar. Aura is a
+/// desktop client, not a server — the SSRF surface that loopback rejection
+/// is meant to protect (cloud-metadata endpoints, internal services on a
+/// shared cluster) doesn't apply here.
 pub fn validate_url(url: &str) -> Result<(), String> {
-    if url.starts_with("http://") || url.starts_with("https://") {
-        Ok(())
-    } else {
-        Err("URL must use the http or https scheme".into())
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("URL is empty".into());
     }
+    // 2048 bytes is the de-facto Internet Explorer / RFC 3986 ceiling.
+    // Anything longer is virtually certain to be a malformed paste or
+    // an attempted exploit — safe to reject outright.
+    if url.len() > 2048 {
+        return Err("URL is too long (max 2048 characters)".into());
+    }
+    let host_and_rest = if let Some(rest) = url.strip_prefix("https://") {
+        rest
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        rest
+    } else {
+        return Err("URL must use the http:// or https:// scheme".into());
+    };
+    // Need SOMETHING after the scheme — `https://` alone is rejected.
+    let host = host_and_rest.split('/').next().unwrap_or("");
+    if host.is_empty() {
+        return Err("URL has no host component".into());
+    }
+    // Reject embedded credentials (`http://user:pass@host`). reqwest
+    // accepts these but they're a credential-leak vector via logs and
+    // backup exports, and a legitimate Stremio addon never needs them.
+    if host.contains('@') {
+        return Err("URL must not embed credentials (user:pass@…)".into());
+    }
+    // Block path traversal in the URL path. None of Aura's URL builders
+    // round-trip user input as a raw path segment, but defence-in-depth
+    // against an addon that returns a malicious meta record with a
+    // poster URL containing `../` is cheap.
+    if url.contains("/../") || url.ends_with("/..") {
+        return Err("URL contains a path-traversal segment".into());
+    }
+    Ok(())
 }
 
 /// Strip /manifest.json suffix and trailing slashes — used for deduplication
@@ -255,6 +668,17 @@ fn encode_query(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 async fn fetch_manifest(base: &str) -> Result<(WireManifest, bool), String> {
+    // Cache hit — avoids redundant network calls on home load, search, stream
+    // and subtitle fan-outs. Lock is dropped before any await point.
+    {
+        let cache = manifest_cache().lock().unwrap();
+        if let Some(entry) = cache.get(base) {
+            if entry.cached_at.elapsed() < MANIFEST_TTL {
+                return Ok((entry.wire.clone(), entry.has_search));
+            }
+        }
+    }
+
     let wire: WireManifest = client()
         .get(format!("{base}/manifest.json"))
         .send()
@@ -275,7 +699,18 @@ async fn fetch_manifest(base: &str) -> Result<(WireManifest, bool), String> {
         _ => false,
     });
 
-    Ok((wire, search_in_extra || search_in_resources))
+    let has_search = search_in_extra || search_in_resources;
+
+    {
+        let mut cache = manifest_cache().lock().unwrap();
+        cache.insert(base.to_string(), ManifestCacheEntry {
+            wire:       wire.clone(),
+            has_search,
+            cached_at:  Instant::now(),
+        });
+    }
+
+    Ok((wire, has_search))
 }
 
 /// Read the full addon collection from the Stremio account API.
@@ -352,11 +787,39 @@ fn map_api_error(err: &str) -> String {
 // Commands — addon management (guest mode)
 // ---------------------------------------------------------------------------
 
+/// Best-effort detection — does this URL/name look like an AIOMetadata
+/// addon? Used by the logger to pick the `[AIOMetadata]` label.
+fn looks_like_aiometadata(name: &str, url: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let u = url.to_ascii_lowercase();
+    n.contains("aiometadata") || n.contains("aio-metadata") || n.contains("aio metadata")
+        || u.contains("aiometadata") || u.contains("aio-metadata")
+}
+
+/// Pick a stable label for log lines so the DevConsole can be grep-filtered.
+/// Falls back to the addon's display name; AIOMetadata addons get the
+/// distinctive `AIOMetadata` label regardless of the user's display name.
+fn log_label(name: &str, url: &str) -> String {
+    if looks_like_aiometadata(name, url) {
+        "AIOMetadata".to_string()
+    } else if !name.is_empty() {
+        name.to_string()
+    } else {
+        url.to_string()
+    }
+}
+
 #[tauri::command]
 pub async fn get_addon_manifest(addon_url: String) -> Result<AddonManifest, String> {
     validate_url(&addon_url)?;
-    let base = addon_url.trim_end_matches('/');
-    let (wire, has_search) = fetch_manifest(base).await?;
+    let base = normalise_addon_base(&addon_url);
+    let (wire, has_search) = fetch_manifest(&base).await?;
+    let label = log_label(&wire.name, &base);
+    crate::devlog!(
+        info, "manifest",
+        "[{}] {} catalogs, has_search={}",
+        label, wire.catalogs.len(), has_search,
+    );
 
     let catalogs = wire
         .catalogs
@@ -365,11 +828,55 @@ pub async fn get_addon_manifest(addon_url: String) -> Result<AddonManifest, Stri
             let display_name = c
                 .name
                 .unwrap_or_else(|| format!("{} · {}", title_case(&c.media_type), c.id));
-            CatalogInfo { name: display_name, media_type: c.media_type, id: c.id }
+            let is_search_only = catalog_is_search_only(&c.extra);
+            let is_hidden_from_home = catalog_is_hidden_from_home(&c.extra);
+            CatalogInfo {
+                name:           display_name,
+                media_type:     c.media_type,
+                id:             c.id,
+                is_search_only,
+                is_hidden_from_home,
+            }
         })
         .collect();
 
     Ok(AddonManifest { name: wire.name, catalogs, has_search })
+}
+
+/// A catalog is "search-only" when one of its `extra` parameters is `search`
+/// AND that parameter is required — meaning the addon cannot return any
+/// items without a user-supplied query. Such catalogs don't belong in the
+/// browseable home feed.
+fn catalog_is_search_only(extras: &[serde_json::Value]) -> bool {
+    extras.iter().any(|ex| {
+        let is_search = ex.get("name").and_then(|v| v.as_str()) == Some("search");
+        let required = ex.get("isRequired").and_then(|v| v.as_bool()) == Some(true);
+        is_search && required
+    })
+}
+
+/// A catalog is "hidden from home" when it has a required `extra` parameter
+/// other than `search` that has no `options` default — the addon can't
+/// produce rows without a user-supplied filter (genre, year, etc.). This is
+/// Stremio's standard "Discover-only" pattern AND how AIOMetadata's
+/// "enabled but hidden from home" toggle surfaces in the manifest. Distinct
+/// from `is_search_only` so the Discover tab can offer these as picks.
+fn catalog_is_hidden_from_home(extras: &[serde_json::Value]) -> bool {
+    extras.iter().any(|ex| {
+        let name = ex.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if name == "search" || name.is_empty() { return false; }
+        let required = ex.get("isRequired").and_then(|v| v.as_bool()) == Some(true);
+        if !required { return false; }
+        // Required extras with a non-empty `options` array are still
+        // home-eligible — the addon can default to the first option.
+        // Required extras without options need user input.
+        let has_options = ex
+            .get("options")
+            .and_then(|v| v.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        !has_options
+    })
 }
 
 #[tauri::command]
@@ -378,15 +885,37 @@ pub async fn add_addon<R: tauri::Runtime>(
     url: String,
 ) -> Result<AddonEntry, String> {
     validate_url(&url)?;
-    let base = url.trim_end_matches('/').to_string();
+    // Normalise so users can paste either form (`…/stremio` OR
+    // `…/stremio/manifest.json`) and we always store a clean base.
+    let base = normalise_addon_base(&url);
     let (wire, has_search) = fetch_manifest(&base).await?;
 
     let mut list = addons::load(&app)?;
-    if list.iter().any(|a| a.url.trim_end_matches('/') == base) {
+    if list.iter().any(|a| normalise_addon_base(&a.url) == base) {
         return Err("Addon already added".into());
     }
 
-    let entry = AddonEntry { url: base, name: wire.name, has_search };
+    // Build types/resources from the manifest so the Addons UI can render
+    // colored tags without re-fetching the manifest. Also cache the
+    // stream-resource metadata + idPrefixes so fetch_streams doesn't have
+    // to re-probe the manifest on every request (a transient network
+    // failure during that re-probe was killing all stream lookups).
+    let types       = collect_wire_types(&wire);
+    let resources   = collect_wire_resources(&wire);
+    let id_prefixes = collect_wire_id_prefixes(&wire);
+    let (stream_types, stream_id_prefixes) = collect_wire_stream_resource_info(&wire);
+
+    let entry = AddonEntry {
+        url: base,
+        name: wire.name,
+        manifest_id: wire.id,
+        has_search,
+        types,
+        resources,
+        stream_types,
+        id_prefixes,
+        stream_id_prefixes,
+    };
     list.push(entry.clone());
     addons::save(&app, &list)?;
     Ok(entry)
@@ -414,28 +943,201 @@ pub async fn list_addons<R: tauri::Runtime>(
 // Commands — catalog browsing
 // ---------------------------------------------------------------------------
 
+/// Fetch one catalog page from a Stremio-compatible addon.
+///
+/// Optional params follow the Stremio extras path-segment protocol:
+///   /catalog/{type}/{id}.json                       — page 1 (default)
+///   /catalog/{type}/{id}/skip=100.json              — page 2 (offset 100)
+///   /catalog/{type}/{id}/genre=Action&skip=100.json — combined extras
+///
+/// `limit` slices the response client-side after JSON parse. The wire
+/// response from a typical AIOMetadata catalog is ~100 items per page;
+/// `limit` lets the Home view request "just enough for the 10/8 visible
+/// cells" without touching the wire format. Sanitisation only runs on
+/// the kept slice, so requesting limit=10 saves 90 metadata-validation
+/// passes per row.
 #[tauri::command]
 pub async fn fetch_catalog(
     addon_url: String,
     catalog_type: String,
     catalog_id: String,
+    skip: Option<u32>,
+    limit: Option<u32>,
 ) -> Result<Vec<MetaPreview>, String> {
     validate_url(&addon_url)?;
-    let base = addon_url.trim_end_matches('/');
-    let url = format!("{base}/catalog/{catalog_type}/{catalog_id}.json");
+    let base = normalise_addon_base(&addon_url);
+    let url = match skip {
+        Some(n) if n > 0 => {
+            format!("{base}/catalog/{catalog_type}/{catalog_id}/skip={n}.json")
+        }
+        _ => format!("{base}/catalog/{catalog_type}/{catalog_id}.json"),
+    };
+    let label = log_label("", &base);
+
+    // Soft-fail cache: if a recent timeout-class failure was stamped
+    // for this addon, fast-fail without paying another 10 s. Logged
+    // once per skip so the user can see *why* their home page is
+    // partial — and only logged at info-level since it's expected
+    // behaviour while the cooldown is active.
+    if is_addon_soft_failed(&base) {
+        crate::devlog!(
+            info, "catalog",
+            "[{}] {}/{} skipped (addon in 30s cooldown after recent timeout)",
+            label, catalog_type, catalog_id,
+        );
+        return Err(format!("Catalog skipped: addon {label} timed out recently"));
+    }
+
+    crate::devlog!(
+        info, "catalog",
+        "[{}] GET {} (skip={:?} limit={:?})",
+        label, url, skip, limit,
+    );
 
     let response: CatalogResponse = client()
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("Catalog fetch failed: {e}"))?
+        .map_err(|e| {
+            // Categorise the error so users / future-us can tell "addon
+            // timed out" from "DNS failure" from "TLS handshake error" at
+            // a glance. The reqwest Display impl produces nested-cause
+            // chains that are useful but verbose; we keep both.
+            let cat = describe_reqwest_err(&e);
+            crate::devlog!(
+                warn, "catalog", "[{}] {}/{} {} — {}",
+                label, catalog_type, catalog_id, cat, e,
+            );
+            // Stamp the addon for the cooldown window when the failure
+            // is timeout / connect class (transient infra). 4xx / 5xx
+            // HTTP statuses fall through to the error_for_status arm
+            // below and don't poison the cache.
+            if e.is_timeout() || e.is_connect() || e.is_request() {
+                mark_addon_failed(&base);
+            }
+            format!("Catalog fetch {cat}: {e}")
+        })?
         .error_for_status()
-        .map_err(|e| format!("Catalog HTTP error: {e}"))?
+        .map_err(|e| {
+            crate::devlog!(warn, "catalog", "[{}] HTTP {:?}", label, e.status());
+            format!("Catalog HTTP error: {e}")
+        })?
         .json()
         .await
-        .map_err(|e| format!("Catalog parse error: {e}"))?;
+        .map_err(|e| {
+            // Include the catalog id so the user can pinpoint which builder
+            // is returning malformed JSON — recurring "JSON parse error" with
+            // no identifier was useless for triage.
+            crate::devlog!(
+                warn, "catalog", "[{}] {}/{} JSON parse error: {}",
+                label, catalog_type, catalog_id, e,
+            );
+            format!("Catalog parse error: {e}")
+        })?;
 
-    Ok(response.metas.into_iter().map(sanitize_meta).collect())
+    let total = response.metas.len();
+    let metas: Vec<_> = match limit {
+        Some(n) => response.metas.into_iter().take(n as usize).collect(),
+        None    => response.metas,
+    };
+    let kept = metas.len();
+    crate::devlog!(
+        info, "catalog",
+        "[{}] {}/{} skip={} → {} item(s){}",
+        label, catalog_type, catalog_id,
+        skip.unwrap_or(0), kept,
+        if kept != total { format!(" (sliced from {total})") } else { String::new() },
+    );
+    Ok(metas.into_iter().map(sanitize_meta).collect())
+}
+
+/// Walk catalog pages until we have `target` items or the addon
+/// signals the end of the list. Stremio's catalog protocol uses
+/// `skip` as a path segment in increments of the addon's page size
+/// — for AIOMetadata that's 100 — so we step skip in 100s regardless
+/// of `target`. De-duplicates by id across pages because some
+/// catalogs (e.g. TMDB discover) drift between pages when items are
+/// added upstream during pagination.
+///
+/// End-of-list detection: per the Stremio addon spec, "stop when the
+/// response's metas array is empty or shorter than the previous page".
+/// We DON'T stop on the first short page (e.g. some addons return a
+/// curated 13-item first page but more on subsequent skips); we only
+/// stop when:
+///   • a page comes back empty, OR
+///   • a page is shorter than the previous page (paging converging
+///     on the end of the list), OR
+///   • a page added zero NEW items after dedupe (addon ignoring
+///     skip and returning the same payload every time — defensive
+///     stop, otherwise we'd loop until MAX_PAGES burning round-trips).
+///
+/// Returns the deduped, sliced-to-target list. Used by the Home View's
+/// "View all" popup to top off catalog rows that initially returned
+/// fewer than 100 items, so the popup always shows a meaningful slice.
+#[tauri::command]
+pub async fn fetch_catalog_paginated(
+    addon_url: String,
+    catalog_type: String,
+    catalog_id: String,
+    target: u32,
+) -> Result<Vec<MetaPreview>, String> {
+    const PAGE_SIZE: u32 = 100;
+    const MAX_PAGES: u32 = 10;
+
+    let mut accumulated: Vec<MetaPreview> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut prev_page_len: Option<usize> = None;
+
+    for page_idx in 0..MAX_PAGES {
+        if accumulated.len() >= target as usize { break; }
+        let skip = if page_idx == 0 { None } else { Some(page_idx * PAGE_SIZE) };
+        let page = fetch_catalog(
+            addon_url.clone(),
+            catalog_type.clone(),
+            catalog_id.clone(),
+            skip,
+            None,
+        )
+        .await?;
+        let page_len = page.len();
+
+        // Empty page = unambiguous end-of-list.
+        if page_len == 0 { break; }
+
+        let before = accumulated.len();
+        for m in page {
+            // De-dupe by `${media_type}:${id}` because a few catalogs
+            // (notably AI Search's combined feed) occasionally reach
+            // across pages with the same surface id.
+            let k = format!("{}:{}", m.media_type, m.id);
+            if seen.contains(&k) { continue; }
+            seen.insert(k);
+            accumulated.push(m);
+            if accumulated.len() >= target as usize { break; }
+        }
+        let added = accumulated.len() - before;
+
+        // Defensive: addon returned a non-empty page but every entry
+        // duplicated something we already had → addon is ignoring
+        // skip / paginating broken. Stop instead of looping.
+        if added == 0 { break; }
+
+        // Shorter than previous page → converging on end-of-list.
+        // First page has no prev to compare to, so we never bail
+        // out on it even if the addon returned (e.g.) 13 items.
+        if let Some(prev) = prev_page_len {
+            if page_len < prev { break; }
+        }
+        prev_page_len = Some(page_len);
+    }
+
+    accumulated.truncate(target as usize);
+    crate::devlog!(
+        info, "catalog",
+        "fetch_catalog_paginated {}/{} → {} item(s) (target={})",
+        catalog_type, catalog_id, accumulated.len(), target,
+    );
+    Ok(accumulated)
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +1220,141 @@ pub async fn global_search(
     Ok(all)
 }
 
+/// Per-addon-catalog search results. Each entry maps to a `<DiscoveryRow>`
+/// in the search view — the frontend renders one section per group and
+/// preserves manifest order per addon.
+#[derive(Clone, Serialize)]
+pub struct SearchGroup {
+    pub addon_name:   String,
+    pub addon_url:    String,
+    pub catalog_id:   String,
+    pub catalog_name: String,
+    pub media_type:   String,
+    pub items:        Vec<MetaPreview>,
+}
+
+/// Like `global_search`, but returns results grouped by addon + catalog so
+/// the search view can render Stremio-style discrete sections. Iterates
+/// addons in install order; per addon, iterates catalogs in manifest order.
+#[tauri::command]
+pub async fn global_search_grouped(
+    addons: Vec<AddonEntry>,
+    query: String,
+) -> Result<Vec<SearchGroup>, String> {
+    let query = query.trim().to_string();
+    if query.is_empty() {
+        return Ok(vec![]);
+    }
+    let search_addons: Vec<AddonEntry> = addons.into_iter().filter(|a| a.has_search).collect();
+    if search_addons.is_empty() {
+        crate::devlog!(warn, "search", "global_search_grouped: no search-enabled addons");
+        return Ok(vec![]);
+    }
+
+    let encoded = encode_query(&query);
+    crate::devlog!(
+        info,
+        "search",
+        "global_search_grouped query={query:?} across {} addon(s)",
+        search_addons.len()
+    );
+
+    // We keep ordering deterministic: spawn a numbered task per addon, await
+    // them in spawn-order so the resulting `Vec<SearchGroup>` reflects the
+    // user's installed-addon order.
+    let mut handles = Vec::with_capacity(search_addons.len());
+    for addon in search_addons {
+        let encoded = encoded.clone();
+        let handle = tokio::spawn(async move {
+            let base = normalise_addon_base(&addon.url);
+            let Ok((wire, _)) = fetch_manifest(&base).await else {
+                crate::devlog!(warn, "search", "[{}] manifest fetch failed", addon.name);
+                return Vec::<SearchGroup>::new();
+            };
+            let addon_name_str = wire.name.clone();
+
+            let mut out: Vec<SearchGroup> = Vec::new();
+            // Manifest order is preserved by virtue of iterating
+            // `wire.catalogs` in declaration order.
+            for c in wire.catalogs.iter() {
+                let supports_search = c.extra.iter().any(|ex| {
+                    ex.get("name").and_then(|v| v.as_str()) == Some("search")
+                });
+                if !supports_search { continue; }
+
+                let url = format!(
+                    "{base}/catalog/{ty}/{id}/search={encoded}.json",
+                    ty = c.media_type,
+                    id = c.id,
+                );
+                crate::devlog!(info, "search", "[{}] GET {url}", addon_name_str);
+                let items: Vec<MetaPreview> = match client().get(&url).send().await {
+                    Ok(resp) => {
+                        if !resp.status().is_success() {
+                            crate::devlog!(
+                                warn, "search",
+                                "[{}] {} → HTTP {}",
+                                addon_name_str, url, resp.status().as_u16(),
+                            );
+                            continue;
+                        }
+                        match resp.json::<CatalogResponse>().await {
+                            Ok(cr) => cr.metas.into_iter().map(sanitize_meta).collect(),
+                            Err(e) => {
+                                crate::devlog!(
+                                    warn, "search",
+                                    "[{}] {} JSON parse failed: {}",
+                                    addon_name_str, url, e,
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let cat = describe_reqwest_err(&e);
+                        crate::devlog!(
+                            warn, "search",
+                            "[{}] {} {} — {}",
+                            addon_name_str, url, cat, e,
+                        );
+                        continue;
+                    }
+                };
+                if items.is_empty() { continue; }
+
+                let display_name = c
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("{} · {}", title_case(&c.media_type), c.id));
+                crate::devlog!(
+                    info, "search",
+                    "[{}] {} → {} item(s)",
+                    addon_name_str, display_name, items.len(),
+                );
+                out.push(SearchGroup {
+                    addon_name:   addon_name_str.clone(),
+                    addon_url:    base.clone(),
+                    catalog_id:   c.id.clone(),
+                    catalog_name: display_name,
+                    media_type:   c.media_type.clone(),
+                    items,
+                });
+            }
+            out
+        });
+        handles.push(handle);
+    }
+
+    let mut all: Vec<SearchGroup> = Vec::new();
+    for h in handles {
+        if let Ok(groups) = h.await {
+            all.extend(groups);
+        }
+    }
+    crate::devlog!(info, "search", "global_search_grouped done: {} group(s)", all.len());
+    Ok(all)
+}
+
 // ---------------------------------------------------------------------------
 // Commands — cloud sync (Task 2.3)
 // ---------------------------------------------------------------------------
@@ -530,7 +1367,7 @@ pub async fn global_search(
 #[tauri::command]
 pub async fn cloud_add_addon(auth_key: String, url: String) -> Result<AddonEntry, String> {
     validate_url(&url)?;
-    let base = url.trim_end_matches('/').to_string();
+    let base = normalise_addon_base(&url);
 
     // One HTTP call: validates the addon AND gives us the full manifest JSON
     // that addonCollectionSet requires.
@@ -549,6 +1386,11 @@ pub async fn cloud_add_addon(auth_key: String, url: String) -> Result<AddonEntry
         .get("name")
         .and_then(|v| v.as_str())
         .ok_or("Manifest missing 'name'")?
+        .to_string();
+    let manifest_id = manifest_json
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
         .to_string();
 
     let has_search = manifest_json
@@ -588,7 +1430,23 @@ pub async fn cloud_add_addon(auth_key: String, url: String) -> Result<AddonEntry
     }));
 
     push_collection(&auth_key, collection).await?;
-    Ok(AddonEntry { url: base, name, has_search })
+
+    let types       = extract_manifest_types(&manifest_json);
+    let resources   = extract_manifest_resources(&manifest_json);
+    let id_prefixes = extract_manifest_id_prefixes(&manifest_json);
+    let (stream_types, stream_id_prefixes) = extract_stream_resource_info(&manifest_json);
+
+    Ok(AddonEntry {
+        url: base,
+        name,
+        manifest_id,
+        has_search,
+        types,
+        resources,
+        stream_types,
+        id_prefixes,
+        stream_id_prefixes,
+    })
 }
 
 /// Remove an addon from the user's Stremio cloud account by URL.
@@ -625,35 +1483,587 @@ pub async fn fetch_meta_detail(
     id: String,
 ) -> Result<MetaDetail, String> {
     validate_url(&addon_url)?;
-    let base = addon_url.trim_end_matches('/');
+    let base = normalise_addon_base(&addon_url);
     let url = format!("{base}/meta/{media_type}/{id}.json");
+    let label = log_label("", &base);
+
+    crate::devlog!(info, "meta", "[{}] GET {}", label, url);
 
     let json: serde_json::Value = client()
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("Meta fetch failed: {e}"))?
+        .map_err(|e| {
+            let cat = describe_reqwest_err(&e);
+            crate::devlog!(warn, "meta", "[{}] {} — {}", label, cat, e);
+            format!("Meta fetch {cat}: {e}")
+        })?
         .error_for_status()
-        .map_err(|e| format!("Meta HTTP error: {e}"))?
+        .map_err(|e| {
+            crate::devlog!(warn, "meta", "[{}] HTTP {:?}", label, e.status());
+            format!("Meta HTTP error: {e}")
+        })?
         .json()
         .await
-        .map_err(|e| format!("Meta parse error: {e}"))?;
+        .map_err(|e| {
+            crate::devlog!(warn, "meta", "[{}] JSON parse error: {}", label, e);
+            format!("Meta parse error: {e}")
+        })?;
 
-    let meta = json.get("meta").ok_or("Meta missing in response")?;
+    let meta = json.get("meta").ok_or_else(|| {
+        crate::devlog!(warn, "meta", "[{}] response missing `meta` key", label);
+        "Meta missing in response".to_string()
+    })?;
+
+    // ── Mapping summary ────────────────────────────────────────────────
+    // Surfacing what we resolved from this addon's meta blob makes it
+    // obvious in the DevConsole when a remote field is missing (e.g. the
+    // logo URL didn't come back, or the videos array was empty for a
+    // series id). Logged at INFO so it's visible without flipping debug.
+    let name_str  = meta.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+    let has_logo  = meta.get("logo").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
+    let has_bg    = meta.get("background").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
+    let has_post  = meta.get("poster").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
+    let video_ct  = meta.get("videos").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    let cast_ct       = meta.get("cast").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    let cast_extras_ct = meta.pointer("/app_extras/cast").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    let rating_ct     = meta.get("ratings").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    crate::devlog!(
+        info, "meta",
+        "[{}] mapped {:?} type={} poster={} bg={} logo={} videos={} cast={}+{}(app_extras) ratings={}",
+        label, name_str, media_type, has_post, has_bg, has_logo, video_ct, cast_ct, cast_extras_ct, rating_ct,
+    );
+
+    let genres   = string_array(meta, "genres",   10, 32);
+
+    // ── Cast / crew with AIOMetadata-shape fallbacks ───────────────────
+    // The canonical Stremio addon-spec is `meta.cast: string[]` at the
+    // top level (Cinemeta does this). AIOMetadata diverges: it puts
+    // rich credit objects under `meta.app_extras.cast` as
+    // `[{ name, character, photo }]` and emits `director` / `writer` as
+    // comma-joined strings. We try the canonical shape first (covers
+    // Cinemeta and any spec-compliant addon), then fall back to
+    // AIOMetadata's app_extras and comma-string shapes. Either path
+    // produces the same `Vec<String>` of names.
+    // Cap every credit array at 20 — the user explicitly requested
+    // "up to 20 of all types of cast meta". Old caps were a mix of
+    // 4 / 6 / 8 / 12 / 20 which truncated rich-cast titles
+    // (TMDB / TVDB) and hid voice ensembles on MAL anime.
+    let cast_detailed = cast_members_from_objects(
+        meta.pointer("/app_extras/cast"), 20, 64,
+    );
+    let cast = if !cast_detailed.is_empty() {
+        cast_detailed.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+    } else {
+        // No rich shape — fall back to top-level `cast` (names only,
+        // no character pairings). The Cinemeta path lands here.
+        string_array(meta, "cast", 20, 64)
+    };
+
+    let director = array_or_comma(meta, &["director", "directors"], 20, 64);
+    let writer   = array_or_comma(meta, &["writer",   "writers"],   20, 64);
+
+    // Producers: canonical array, OR AIOMetadata's app_extras.producers
+    // (TVmaze series only — same shape as app_extras.cast).
+    let producer_detailed = cast_members_from_objects(
+        meta.pointer("/app_extras/producers"), 20, 64,
+    );
+    let producer = if !producer_detailed.is_empty() {
+        producer_detailed.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+    } else {
+        string_array_any(meta, &["producers", "producer"], 20, 64)
+    };
+
+    // Composers / creators / voice_actors / studios: AIOMetadata never
+    // emits these as distinct top-level fields. We still try the
+    // candidate spellings so spec-compliant addons (Cinemeta, custom
+    // anime metadata) populate them when available.
+    let composer = string_array_any(meta, &["composers", "composer", "music"], 20, 64);
+    let creator  = string_array_any(meta, &["creators", "creator"], 20, 64);
+    let voice_actors = string_array_any(meta, &["voiceActors", "voice_actors", "voiceCast"], 20, 64);
+    let studios      = string_array_any(meta, &["studios", "studio", "studio_names"], 20, 64);
+
+    // Multi-source ratings: addons sometimes ship `imdbRating`, `imdb_rating`,
+    // `kpRating`, `malScore`, plus a structured `ratings` array of
+    // `{source, value}`. We collect both shapes into a single list so the
+    // detail view can render whatever is available without per-source code.
+    let mut ratings: Vec<RatingEntry> = Vec::new();
+    if let Some(arr) = meta.get("ratings").and_then(|v| v.as_array()) {
+        for entry in arr.iter().take(8) {
+            if let (Some(src), Some(val)) = (
+                entry.get("source").and_then(|v| v.as_str()),
+                entry.get("value").and_then(|v| v.as_str()),
+            ) {
+                ratings.push(RatingEntry {
+                    source: cap(src.to_string(), 32),
+                    value:  cap(val.to_string(), 16),
+                });
+            }
+        }
+    }
+    let scalar_ratings: &[(&str, &str)] = &[
+        ("imdbRating", "IMDb"),
+        ("kpRating",   "Kinopoisk"),
+        ("malScore",   "MAL"),
+    ];
+    for (key, label) in scalar_ratings {
+        if let Some(v) = meta.get(*key).and_then(|x| x.as_str()) {
+            if !v.is_empty() && !ratings.iter().any(|r| r.source == *label) {
+                ratings.push(RatingEntry {
+                    source: (*label).into(),
+                    value:  cap(v.to_string(), 16),
+                });
+            }
+        }
+    }
+
+    let videos = extract_videos(meta);
+
+    // ── External anime-database ids (AniSkip + future history sync) ────
+    // AIOMetadata stamps `_malId` / `_kitsuId` / `_anidbId` at top
+    // level for anime metas (also in app_extras under camelCase
+    // keys). Read whichever shape is present, parse to u32.
+    fn read_numeric_id(meta: &serde_json::Value, candidates: &[&str]) -> Option<u32> {
+        for k in candidates {
+            // Top-level
+            if let Some(v) = meta.get(*k) {
+                if let Some(n) = v.as_u64().and_then(|n| u32::try_from(n).ok()) { return Some(n); }
+                if let Some(s) = v.as_str() {
+                    if let Ok(n) = s.parse::<u32>() { return Some(n); }
+                }
+            }
+            // app_extras
+            if let Some(v) = meta.pointer(&format!("/app_extras/{k}")) {
+                if let Some(n) = v.as_u64().and_then(|n| u32::try_from(n).ok()) { return Some(n); }
+                if let Some(s) = v.as_str() {
+                    if let Ok(n) = s.parse::<u32>() { return Some(n); }
+                }
+            }
+        }
+        None
+    }
+    let mal_id   = read_numeric_id(meta, &["_malId",   "malId",   "mal_id"]);
+    let kitsu_id = read_numeric_id(meta, &["_kitsuId", "kitsuId", "kitsu_id"]);
+    let anidb_id = read_numeric_id(meta, &["_anidbId", "anidbId", "anidb_id"]);
+    crate::devlog!(
+        info, "meta",
+        "[{}] anime ids: mal={mal_id:?} kitsu={kitsu_id:?} anidb={anidb_id:?}",
+        label,
+    );
+
+    // ── AIOMetadata extensions ─────────────────────────────────────────
+    // `originalLanguage` is a single ISO 639-1 string. Try the canonical
+    // camelCase first, then fall back to snake_case (`original_language`)
+    // since some forks of AIOMetadata may emit either shape.
+    let original_language = meta
+        .get("originalLanguage")
+        .or_else(|| meta.get("original_language"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty() && s.len() <= 8);
+
+    // `productionCountries` is an array of ISO 3166-1 alpha-2 codes.
+    // Same camelCase / snake_case fallback. Cap to 8 entries.
+    let production_countries: Vec<String> = meta
+        .get("productionCountries")
+        .or_else(|| meta.get("production_countries"))
+        .or_else(|| meta.get("origin_country"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| !s.is_empty() && s.len() <= 4)
+                .take(8)
+                .map(|s| s.trim().to_uppercase())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // One diagnostic line per fetch so we can see whether AIOMetadata is
+    // actually surfacing the new fields. When `originalLanguage` is
+    // missing, dump the top-level meta keys so the user can see what
+    // AIOMetadata actually returned and report it back to the addon.
+    crate::devlog!(
+        info, "meta",
+        "[{}] aio fields: originalLanguage={:?} productionCountries={:?}",
+        label, original_language, production_countries,
+    );
+    if original_language.is_none() {
+        let keys: Vec<&str> = meta.as_object()
+            .map(|o| o.keys().map(|s| s.as_str()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        crate::devlog!(
+            warn, "meta",
+            "[{}] originalLanguage missing — meta keys present: {:?}",
+            label, keys,
+        );
+    }
+
+    // ── seasonCredits + aggregateCredits ────────────────────────────────
+    // TMDB / TVDB-only. AIOMetadata stamps these under `app_extras` for
+    // series; movies and MAL-meta anime never carry them. We parse
+    // tolerantly — any missing field collapses to None so the React
+    // side falls back to show-level cast cleanly.
+    let season_credits_raw = meta.pointer("/app_extras/seasonCredits");
+    let season_credits: std::collections::BTreeMap<u32, SeasonCredits> = season_credits_raw
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| {
+                    let season = k.parse::<u32>().ok()?;
+                    let entry = parse_season_credits(v)?;
+                    Some((season, entry))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let aggregate_credits_raw = meta.pointer("/app_extras/aggregateCredits");
+    let aggregate_credits: Option<AggregateCredits> = aggregate_credits_raw
+        .and_then(parse_aggregate_credits);
+
+    // Diagnostic: surface what the addon shipped vs what we parsed so
+    // the user can tell at a glance whether a "cast doesn't swap on
+    // season change" report is the addon not emitting seasonCredits
+    // for that title vs Aura failing to parse it.
+    let agg_cast_count = aggregate_credits.as_ref().map(|a| a.cast.len()).unwrap_or(0);
+    crate::devlog!(
+        info, "meta",
+        "[{}] credits: seasonCredits raw={} parsed={} season(s) aggregateCredits raw={} parsed_cast={}",
+        label,
+        season_credits_raw.is_some(),
+        season_credits.len(),
+        aggregate_credits_raw.is_some(),
+        agg_cast_count,
+    );
 
     Ok(MetaDetail {
-        id:           json_str(meta, "id", 128).unwrap_or_default(),
+        id:           json_str(meta, "id", 256).unwrap_or_default(),
         name:         json_str(meta, "name", 200).unwrap_or_default(),
         media_type:   json_str(meta, "type", 32).unwrap_or_default(),
         poster:       json_url(meta, "poster"),
         background:   json_url(meta, "background"),
         logo:         json_url(meta, "logo"),
-        description:  json_str(meta, "description", 1500),
-        release_info: json_str(meta, "releaseInfo", 32),
-        released:     json_str(meta, "released", 32),
-        runtime:      json_str(meta, "runtime", 16),
+        description:  json_str(meta, "description", 4000),
+        release_info: json_str(meta, "releaseInfo", 64),
+        released:     json_str(meta, "released", 64),
+        runtime:      json_str(meta, "runtime", 32),
         imdb_rating:  json_str(meta, "imdbRating", 8),
+        genres,
+        cast,
+        cast_detailed,
+        director,
+        writer,
+        producer,
+        producer_detailed,
+        composer,
+        voice_actors,
+        studios,
+        creator,
+        country:      json_str(meta, "country", 64),
+        original_language,
+        production_countries,
+        ratings,
+        videos,
+        mal_id,
+        kitsu_id,
+        anidb_id,
+        season_credits,
+        aggregate_credits,
     })
+}
+
+/// Parse one season's `{cast, crew, name, overview, airDate, poster}`
+/// payload into our typed `SeasonCredits`. Caps mirror the show-level
+/// extractor (20 entries × 64 chars per field) so a TMDB series with
+/// 60+ guest stars can't blow up memory. Returns `None` if the value
+/// isn't an object so the BTreeMap parse loop drops it cleanly.
+fn parse_season_credits(v: &serde_json::Value) -> Option<SeasonCredits> {
+    let obj = v.as_object()?;
+    let str_field = |k: &str, max: usize| -> Option<String> {
+        obj.get(k).and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| cap(s.to_string(), max))
+    };
+    let cast = cast_members_from_objects(obj.get("cast"), 20, 64);
+    let crew: Vec<CrewMember> = obj.get("crew")
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| {
+                    let name = c.get("name").and_then(|n| n.as_str())?;
+                    if name.is_empty() { return None; }
+                    let job  = c.get("job").and_then(|n| n.as_str()).unwrap_or("");
+                    if job.is_empty() { return None; }
+                    let department = c.get("department").and_then(|d| d.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| cap(s.to_string(), 64));
+                    let photo = c.get("photo").and_then(|p| p.as_str())
+                        .filter(|s| !s.is_empty())
+                        .and_then(|s| sanitize_url(Some(s.to_string())));
+                    Some(CrewMember {
+                        name: cap(name.to_string(), 64),
+                        job:  cap(job.to_string(), 64),
+                        department,
+                        photo,
+                    })
+                })
+                .take(20)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(SeasonCredits {
+        name:     str_field("name", 200),
+        overview: str_field("overview", 4000),
+        air_date: str_field("airDate", 32),
+        poster:   sanitize_url(str_field("poster", 512)),
+        cast,
+        crew,
+    })
+}
+
+/// Parse `app_extras.aggregateCredits` (TMDB-only) into our typed
+/// `AggregateCredits`. Returns `None` when the payload isn't an object
+/// so the caller can fall through to the show-level cast cleanly.
+fn parse_aggregate_credits(v: &serde_json::Value) -> Option<AggregateCredits> {
+    let obj = v.as_object()?;
+    let cast: Vec<AggCast> = obj.get("cast")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let name = c.get("name").and_then(|n| n.as_str())?;
+                    if name.is_empty() { return None; }
+                    let character = c.get("character").and_then(|n| n.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| cap(s.to_string(), 128));
+                    let photo = c.get("photo").and_then(|p| p.as_str())
+                        .filter(|s| !s.is_empty())
+                        .and_then(|s| sanitize_url(Some(s.to_string())));
+                    let total_episode_count = c.get("totalEpisodeCount")
+                        .and_then(|n| n.as_u64())
+                        .and_then(|n| u32::try_from(n).ok())
+                        .unwrap_or(0);
+                    let roles: Vec<RoleSpan> = c.get("roles")
+                        .and_then(|x| x.as_array())
+                        .map(|rs| rs.iter().filter_map(|r| {
+                            let character = r.get("character").and_then(|c| c.as_str())
+                                .filter(|s| !s.is_empty())?;
+                            let episode_count = r.get("episodeCount")
+                                .and_then(|n| n.as_u64())
+                                .and_then(|n| u32::try_from(n).ok())
+                                .unwrap_or(0);
+                            Some(RoleSpan {
+                                character: cap(character.to_string(), 128),
+                                episode_count,
+                            })
+                        }).take(10).collect())
+                        .unwrap_or_default();
+                    Some(AggCast {
+                        name: cap(name.to_string(), 64),
+                        character,
+                        photo,
+                        total_episode_count,
+                        roles,
+                    })
+                })
+                .take(40)
+                .collect()
+        })
+        .unwrap_or_default();
+    let crew: Vec<AggCrew> = obj.get("crew")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let name = c.get("name").and_then(|n| n.as_str())?;
+                    if name.is_empty() { return None; }
+                    let department = c.get("department").and_then(|d| d.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| cap(s.to_string(), 64));
+                    let photo = c.get("photo").and_then(|p| p.as_str())
+                        .filter(|s| !s.is_empty())
+                        .and_then(|s| sanitize_url(Some(s.to_string())));
+                    let total_episode_count = c.get("totalEpisodeCount")
+                        .and_then(|n| n.as_u64())
+                        .and_then(|n| u32::try_from(n).ok())
+                        .unwrap_or(0);
+                    let jobs: Vec<JobSpan> = c.get("jobs")
+                        .and_then(|x| x.as_array())
+                        .map(|js| js.iter().filter_map(|j| {
+                            let job = j.get("job").and_then(|j| j.as_str())
+                                .filter(|s| !s.is_empty())?;
+                            let episode_count = j.get("episodeCount")
+                                .and_then(|n| n.as_u64())
+                                .and_then(|n| u32::try_from(n).ok())
+                                .unwrap_or(0);
+                            Some(JobSpan {
+                                job: cap(job.to_string(), 64),
+                                episode_count,
+                            })
+                        }).take(10).collect())
+                        .unwrap_or_default();
+                    Some(AggCrew {
+                        name: cap(name.to_string(), 64),
+                        department,
+                        jobs,
+                        total_episode_count,
+                        photo,
+                    })
+                })
+                .take(40)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(AggregateCredits { cast, crew })
+}
+
+/// Parse an addon's `videos` array into typed entries. Episode IDs are
+/// preserved verbatim — `kitsu:12345:1`, `tt0903747:1:5`, etc. — because
+/// addons key streams off these strings exactly.
+fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
+    let Some(arr) = meta.get("videos").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .take(2000) // generous cap; long-running anime can have 1000+ episodes
+        .filter_map(|v| {
+            // ID is required — without it we can't fetch streams.
+            let raw_id = v.get("id").and_then(|x| x.as_str())?;
+            // Cap at 256 — preserves the longest realistic episode IDs without
+            // truncating multi-segment forms. We DON'T strip colons, slashes,
+            // or other addon-specific path tokens.
+            let id = cap(raw_id.to_string(), 256);
+
+            // Name fallback hierarchy: title → name → "Episode N"
+            let title = v
+                .get("title").and_then(|x| x.as_str())
+                .or_else(|| v.get("name").and_then(|x| x.as_str()))
+                .map(|s| cap(s.into(), 240))
+                .unwrap_or_default();
+
+            Some(VideoEntry {
+                id,
+                title,
+                season:    v.get("season")  .and_then(|x| x.as_i64()),
+                episode:   v.get("episode") .and_then(|x| x.as_i64()),
+                released:  json_str(v, "released",     64),
+                thumbnail: json_url(v, "thumbnail"),
+                overview:  json_str(v, "overview", 600),
+            })
+        })
+        .collect()
+}
+
+/// Helper — pull a string array from arbitrary serde_json::Value, capping
+/// per-element length and total entry count.
+fn string_array(v: &serde_json::Value, field: &str, max: usize, per_entry: usize) -> Vec<String> {
+    v.get(field)
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str().map(|s| cap(s.to_string(), per_entry)))
+                .take(max)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Try a list of candidate field names in order; first one whose value is a
+/// non-empty array of strings wins. Used for crew fields that AIOMetadata and
+/// other addons spell differently (`producers` vs `producer`, etc.).
+fn string_array_any(
+    v: &serde_json::Value,
+    candidates: &[&str],
+    max: usize,
+    per_entry: usize,
+) -> Vec<String> {
+    for field in candidates {
+        let out = string_array(v, field, max, per_entry);
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    Vec::new()
+}
+
+/// Parse a comma-joined string field ("Tim Burton, John Doe") into a vec.
+/// AIOMetadata emits `director` and `writer` in this shape for live-action
+/// titles instead of the canonical Stremio array — caller falls back to
+/// this when `string_array` returned empty.
+fn comma_split(v: &serde_json::Value, field: &str, max: usize, per_entry: usize) -> Vec<String> {
+    v.get(field)
+        .and_then(|x| x.as_str())
+        .map(|s| {
+            s.split(", ")
+                .map(|x| x.trim())
+                .filter(|x| !x.is_empty())
+                .take(max)
+                .map(|x| cap(x.to_string(), per_entry))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+/// Combined "array OR comma-joined string" reader. Used for fields like
+/// `director` / `writer` where AIOMetadata ships a comma-joined string
+/// for live-action and an empty array for anime, while other addons
+/// (Cinemeta, etc.) ship a real array. Tries the array form across
+/// every candidate first, then falls back to comma-split on each in order.
+fn array_or_comma(
+    v: &serde_json::Value,
+    candidates: &[&str],
+    max: usize,
+    per_entry: usize,
+) -> Vec<String> {
+    let arr = string_array_any(v, candidates, max, per_entry);
+    if !arr.is_empty() {
+        return arr;
+    }
+    for field in candidates {
+        let split = comma_split(v, field, max, per_entry);
+        if !split.is_empty() {
+            return split;
+        }
+    }
+    Vec::new()
+}
+
+/// Rich variant — preserves the character /
+/// role and headshot URL alongside each name. Mirrors AIOMetadata's
+/// `app_extras.cast: [{ name, character, photo }]` shape directly.
+/// Empty fields collapse to `None` so the frontend can decide whether
+/// to render an "as character" suffix or a hover photo.
+fn cast_members_from_objects(
+    arr: Option<&serde_json::Value>,
+    max: usize,
+    per_entry: usize,
+) -> Vec<CastMember> {
+    arr.and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|o| {
+                    let name = o.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    if name.is_empty() { return None; }
+                    let character = o.get("character")
+                        .and_then(|c| c.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| cap(s.to_string(), per_entry));
+                    let photo = o.get("photo")
+                        .and_then(|p| p.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| sanitize_url(Some(s.to_string())))
+                        .flatten();
+                    Some(CastMember {
+                        name: cap(name.to_string(), per_entry),
+                        character,
+                        photo,
+                    })
+                })
+                .take(max)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -726,23 +2136,57 @@ pub async fn library_put(
     auth_key: String,
     changes: Vec<serde_json::Value>,
 ) -> Result<(), String> {
+    // Per-change diagnostic line. Helps the user (via DevConsole) confirm
+    // exactly which records hit the wire and what flags they carried —
+    // particularly useful when an "I clicked remove but it's still there"
+    // problem turns out to be a stale cache vs. a failed write.
+    for change in &changes {
+        let id = change.get("_id").and_then(|v| v.as_str()).unwrap_or("?");
+        let removed = change
+            .get("removed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let temp = change
+            .get("temp")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mtime = change
+            .get("_mtime")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let kind = if removed { "REMOVE" } else { "PUT" };
+        crate::devlog!(
+            info,
+            "library",
+            "{} id={} temp={} mtime={}",
+            kind, id, temp, mtime
+        );
+    }
+
     let body = serde_json::json!({
         "authKey":    auth_key,
         "collection": "libraryItem",
         "changes":    changes,
     });
 
-    let raw = account_client()
+    let resp = account_client()
         .post(format!("{STREMIO_ACCOUNT_API}/datastorePut"))
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Network error: {e}"))?
+        .map_err(|e| {
+            crate::devlog!(warn, "library", "datastorePut network error: {}", e);
+            format!("Network error: {e}")
+        })?
         .error_for_status()
         .map_err(|e| {
-            if e.status().map(|s| s.as_u16()) == Some(401) { SESSION_EXPIRED.into() }
+            let status = e.status().map(|s| s.as_u16()).unwrap_or(0);
+            crate::devlog!(warn, "library", "datastorePut HTTP {}: {}", status, e);
+            if status == 401 { SESSION_EXPIRED.into() }
             else { format!("HTTP error: {e}") }
-        })?
+        })?;
+
+    let raw = resp
         .text()
         .await
         .map_err(|e| format!("Response read error: {e}"))?;
@@ -751,10 +2195,832 @@ pub async fn library_put(
         serde_json::from_str(&raw).map_err(|e| format!("JSON parse error: {e}"))?;
 
     if let Some(err) = json.get("error").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        crate::devlog!(warn, "library", "datastorePut API error: {}", err);
         return Err(map_api_error(err));
     }
 
+    crate::devlog!(info, "library", "datastorePut OK ({} changes)", changes.len());
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Commands — stream aggregation (Phase 5 Detail View)
+//
+// Fans out across every installed addon that exposes the `stream` resource,
+// fetching `/stream/{type}/{id}.json` in parallel. Results are sanitized,
+// deduplicated by (url | infoHash), and tagged with the source addon's name
+// so the UI can group by provider.
+// ---------------------------------------------------------------------------
+
+/// Normalise an addon URL into a clean *base* form (no trailing slash, no
+/// `/manifest.json` suffix). Used as a defensive guard so addons that were
+/// stored with `/manifest.json` in the URL still resolve cleanly when we
+/// build `/stream/...` paths off them.
+fn normalise_addon_base(url: &str) -> String {
+    url.trim()
+        .trim_end_matches('/')
+        .trim_end_matches("/manifest.json")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Cached-metadata version of the stream-resource gate — used by
+/// fetch_streams so we don't have to re-fetch every addon's manifest on
+/// every request. Reads `resources` / `stream_types` / `id_prefixes` /
+/// `stream_id_prefixes` straight off the persisted AddonEntry. Returns
+/// `(supports, declared_stream_types_for_logging)`.
+fn addon_entry_supports_stream_for(
+    addon: &AddonEntry,
+    media_type: &str,
+    id: &str,
+) -> (bool, Option<Vec<String>>) {
+    let has_stream = addon
+        .resources
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case("stream"));
+    if !has_stream {
+        return (false, None);
+    }
+    // The stream resource's per-resource `types` (if declared) takes
+    // precedence; otherwise fall back to the manifest-level `types`.
+    let supported = if !addon.stream_types.is_empty() {
+        &addon.stream_types
+    } else {
+        &addon.types
+    };
+    let declared = if !addon.stream_types.is_empty() {
+        Some(addon.stream_types.clone())
+    } else {
+        None
+    };
+    let type_ok = supported.is_empty()
+        || supported.iter().any(|t| t.eq_ignore_ascii_case(media_type));
+    if !type_ok {
+        return (false, declared);
+    }
+    // idPrefixes gate. Per-resource override > manifest-level. Empty list
+    // = "accepts every prefix".
+    let prefixes: &Vec<String> = if !addon.stream_id_prefixes.is_empty() {
+        &addon.stream_id_prefixes
+    } else {
+        &addon.id_prefixes
+    };
+    if !prefixes.is_empty()
+        && !prefixes.iter().any(|p| id.starts_with(p))
+    {
+        return (false, declared);
+    }
+    (true, declared)
+}
+
+/// Per-task return type for the addon fan-out — the streams plus the four
+/// AIOStreams metadata arrays from a single addon's response.
+struct AddonFetchOutput {
+    streams: Vec<StreamEntry>,
+    errors: Vec<StreamMessage>,
+    warnings: Vec<StreamMessage>,
+    info: Vec<StreamMessage>,
+    stats: Vec<StreamMessage>,
+}
+
+impl AddonFetchOutput {
+    fn empty() -> Self {
+        Self {
+            streams: Vec::new(),
+            errors: Vec::new(),
+            warnings: Vec::new(),
+            info: Vec::new(),
+            stats: Vec::new(),
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn fetch_streams(
+    addons: Vec<AddonEntry>,
+    media_type: String,
+    id: String,
+) -> Result<StreamFetchResult, String> {
+    if addons.is_empty() {
+        crate::devlog!(warn, "streams", "fetch_streams: no addons installed");
+        return Ok(StreamFetchResult {
+            streams: vec![],
+            metadata: StreamMetadata::default(),
+        });
+    }
+    // 256 fits the longest realistic IDs (multi-segment anime / episode forms
+    // like `kitsu:12345:1` or `tt0903747:1:5`) without ever truncating valid
+    // input. We DO NOT strip colons, slashes, or other addon-specific tokens —
+    // addons key streams off the exact id string.
+    let safe_type = cap(media_type, 64);
+    let safe_id   = cap(id, 256);
+
+    crate::devlog!(
+        info,
+        "streams",
+        "fetch_streams type={safe_type} id={safe_id} addons={}",
+        addons.len()
+    );
+
+    let mut set: tokio::task::JoinSet<AddonFetchOutput> = tokio::task::JoinSet::new();
+
+    for addon in addons {
+        let media_type = safe_type.clone();
+        let id         = safe_id.clone();
+        set.spawn(async move {
+            let base = normalise_addon_base(&addon.url);
+            let label = log_label(&addon.name, &base);
+
+            // Use the AddonEntry's CACHED manifest metadata. We used to
+            // re-fetch the manifest on every fetch_streams call which made
+            // a single transient network failure cascade into "no streams
+            // found" for every addon, including ones that were perfectly
+            // healthy. The cache is populated at addon install time
+            // (add_addon / cloud_add_addon / get_synced_addons) so we
+            // already know each addon's resources, types, and idPrefixes.
+            let (supports, declared) = addon_entry_supports_stream_for(&addon, &media_type, &id);
+            if !supports {
+                if declared.is_some() {
+                    crate::devlog!(
+                        info,
+                        "streams",
+                        "[{}] declares stream types {:?}, skipping {} {} (type or id-prefix mismatch)",
+                        label, declared.unwrap_or_default(), media_type, id
+                    );
+                } else {
+                    crate::devlog!(
+                        info,
+                        "streams",
+                        "[{}] has no stream resource, skipping",
+                        label
+                    );
+                }
+                return AddonFetchOutput::empty();
+            }
+            let addon_name = addon.name.clone();
+
+            let url = format!("{base}/stream/{media_type}/{id}.json");
+            crate::devlog!(info, "streams", "[{}] GET {}", label, url);
+
+            // Per-request 35 s timeout overrides the global 10 s default.
+            // AIOStreams orchestrators (TorBox Search, MediaFusion, etc.)
+            // can take 25-30 s upstream when one of their backing
+            // scrapers is timing out — a 10 s client cap turned those
+            // into spurious "no streams found" failures even though the
+            // server would have eventually responded. 35 s is generous
+            // enough to cover the worst observed AIOStreams latency
+            // without making the UI feel hung when an addon is genuinely
+            // unreachable.
+            let resp = match client()
+                .get(&url)
+                .timeout(Duration::from_secs(35))
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let cat = describe_reqwest_err(&e);
+                    crate::devlog!(
+                        warn,
+                        "streams",
+                        "[{}] {} — {}",
+                        label, cat, e
+                    );
+                    return AddonFetchOutput::empty();
+                }
+            };
+            let status = resp.status();
+            if !status.is_success() {
+                crate::devlog!(
+                    warn,
+                    "streams",
+                    "[{}] HTTP {} for {}",
+                    label, status.as_u16(), url
+                );
+                return AddonFetchOutput::empty();
+            }
+
+            let json = match resp.json::<serde_json::Value>().await {
+                Ok(j) => j,
+                Err(e) => {
+                    crate::devlog!(
+                        warn,
+                        "streams",
+                        "[{}] JSON parse failed: {}",
+                        label, e
+                    );
+                    return AddonFetchOutput::empty();
+                }
+            };
+
+            // Parse AIOStreams metadata payloads. The structured /api/search
+            // endpoint exposes named arrays (errors / warnings / info /
+            // statistics) at the top level; the public Stremio addon
+            // endpoint instead interleaves these into the `streams` array
+            // as pseudo-streams keyed by `streamData.type` (statistic |
+            // error). We accept BOTH shapes here so the user sees notices
+            // regardless of which endpoint the addon is configured to expose.
+            let mut errors   = collect_messages(&json, "errors",     "error",   &addon_name);
+            let mut warnings = collect_messages(&json, "warnings",   "warning", &addon_name);
+            let info         = collect_messages(&json, "info",       "info",    &addon_name);
+            let mut stats    = {
+                // Both `statistics` and `stats` have appeared in the wild —
+                // accept either, preferring the more specific name.
+                let mut s = collect_messages(&json, "statistics", "stats",   &addon_name);
+                if s.is_empty() {
+                    s = collect_messages(&json, "stats", "stats", &addon_name);
+                }
+                s
+            };
+
+            let (playable_jsons, pseudo_notices) = match json
+                .get("streams")
+                .and_then(|v| v.as_array())
+            {
+                Some(arr) => partition_aio_pseudo_streams(arr, &addon_name),
+                None => (Vec::new(), Vec::new()),
+            };
+            // Route partitioned pseudo-streams into the matching metadata
+            // bucket — the existing UI reads from these four arrays.
+            for n in pseudo_notices {
+                match n.kind.as_str() {
+                    "error"   => errors.push(n),
+                    "warning" => warnings.push(n),
+                    _         => stats.push(n), // "stats" is the info-blue bucket
+                }
+            }
+
+            let raw_count = playable_jsons.len();
+            let kept: Vec<StreamEntry> = playable_jsons
+                .iter()
+                .take(80)
+                .filter_map(|s| sanitize_stream(s, &addon_name))
+                .collect();
+            crate::devlog!(
+                info,
+                "streams",
+                "[{}] → {} streams (raw {}, kept {})",
+                label, kept.len(), raw_count, kept.len()
+            );
+
+            if !errors.is_empty() || !warnings.is_empty() || !info.is_empty() || !stats.is_empty() {
+                crate::devlog!(
+                    info,
+                    "streams",
+                    "[{}] AIOStreams metadata: {} errors, {} warnings, {} info, {} stats",
+                    label, errors.len(), warnings.len(), info.len(), stats.len()
+                );
+            }
+
+            AddonFetchOutput { streams: kept, errors, warnings, info, stats }
+        });
+    }
+
+    let mut all: Vec<StreamEntry> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut metadata = StreamMetadata::default();
+    while let Some(task_result) = set.join_next().await {
+        if let Ok(out) = task_result {
+            for s in out.streams {
+                let key = s
+                    .url
+                    .clone()
+                    .or_else(|| s.info_hash.clone())
+                    .unwrap_or_else(|| s.title.clone());
+                if seen.insert(key) {
+                    all.push(s);
+                }
+            }
+            metadata.errors.extend(out.errors);
+            metadata.warnings.extend(out.warnings);
+            metadata.info.extend(out.info);
+            metadata.stats.extend(out.stats);
+        }
+    }
+
+    crate::devlog!(
+        info,
+        "streams",
+        "fetch_streams done: {} unique streams (msgs: {}E/{}W/{}I/{}S)",
+        all.len(),
+        metadata.errors.len(),
+        metadata.warnings.len(),
+        metadata.info.len(),
+        metadata.stats.len(),
+    );
+    Ok(StreamFetchResult { streams: all, metadata })
+}
+
+/// Pluck an AIOStreams-style metadata array from the response and convert it
+/// into typed StreamMessage values. Each entry may be:
+///   • `{ title?, description?, message? }` object form, OR
+///   • a bare string (treated as the description).
+/// Empty / unparseable entries are silently dropped. Cap at 16 messages per
+/// kind per addon so a malicious response can't blow up the panel.
+fn collect_messages(
+    root: &serde_json::Value,
+    field: &str,
+    kind: &str,
+    addon_name: &str,
+) -> Vec<StreamMessage> {
+    let Some(arr) = root.get(field).and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .take(16)
+        .filter_map(|entry| {
+            let (title, description) = match entry {
+                serde_json::Value::String(s) => (None, s.trim().to_string()),
+                serde_json::Value::Object(_) => {
+                    let title = entry
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .map(|s| cap(s.trim().to_string(), 200))
+                        .filter(|s| !s.is_empty());
+                    let description = entry
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| entry.get("message").and_then(|v| v.as_str()))
+                        .or_else(|| entry.get("text").and_then(|v| v.as_str()))
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default();
+                    (title, description)
+                }
+                _ => return None,
+            };
+            // Skip rows with no usable text in either field.
+            if title.is_none() && description.is_empty() {
+                return None;
+            }
+            Some(StreamMessage {
+                kind: kind.to_string(),
+                title,
+                description: cap(description, 1024),
+                addon_name: cap(addon_name.to_string(), 64),
+                forced: false,
+            })
+        })
+        .collect()
+}
+
+/// Partition AIOStreams pseudo-streams (statistic / error) out of the
+/// streams array. The Stremio addon endpoint (/stream/...) interleaves
+/// these into the streams list with `streamData.type = "statistic" | "error"`
+/// — they have no `url` / `infoHash` so sanitize_stream would drop them
+/// silently, hiding the "Digital Release Filter" / "Removal Reasons"
+/// warnings the user wants to see. We extract them BEFORE sanitize_stream
+/// runs and route them into the existing metadata buckets:
+///
+///   • streamData.type == "error"     → metadata.errors
+///   • statistic + category="filter"  → metadata.warnings (warning icon)
+///   • statistic + category="timing"  → metadata.stats    (info icon, blue)
+///   • statistic + category="addon"   → split by leading title-emoji
+///       — 🟠 partial-success      → metadata.errors
+///       — 🟢 clean / others       → metadata.stats
+///
+/// Category is read directly from `streamData.category` on the patched
+/// AIOStreams fork (post-feat-surface-category-and-forced); falls back
+/// to title-pattern inference for upstream / older instances. `forced`
+/// is read from `streamData.forced` so the UI can keep showing notices
+/// the user explicitly cannot suppress.
+///
+/// Returns `(playable_streams_json, notices)`. Caller feeds
+/// `playable_streams_json` into the existing sanitize loop.
+fn partition_aio_pseudo_streams(
+    raw_streams: &[serde_json::Value],
+    addon_name: &str,
+) -> (Vec<serde_json::Value>, Vec<StreamMessage>) {
+    let mut playable: Vec<serde_json::Value> = Vec::with_capacity(raw_streams.len());
+    let mut notices:  Vec<StreamMessage>     = Vec::new();
+    for entry in raw_streams.iter() {
+        let stream_data = entry.get("streamData").and_then(|v| v.as_object());
+        let pseudo_type = stream_data
+            .and_then(|o| o.get("type"))
+            .and_then(|v| v.as_str());
+        match pseudo_type {
+            Some("error") => {
+                let (title, desc) = stream_data
+                    .and_then(|o| o.get("error"))
+                    .and_then(|e| e.as_object())
+                    .map(|e| {
+                        let t = e.get("title").and_then(|v| v.as_str()).unwrap_or("Addon error").to_string();
+                        let d = e.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        (t, d)
+                    })
+                    .unwrap_or_else(|| {
+                        // Fall back to the pseudo-stream's own name / description.
+                        let t = entry.get("name").and_then(|v| v.as_str()).unwrap_or("Addon error").to_string();
+                        let d = entry.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        (t, d)
+                    });
+                let forced = stream_data
+                    .and_then(|o| o.get("forced"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                notices.push(StreamMessage {
+                    kind: "error".to_string(),
+                    title: Some(cap(title, 200)),
+                    description: cap(desc, 1024),
+                    addon_name: cap(addon_name.to_string(), 64),
+                    forced,
+                });
+            }
+            Some("statistic") => {
+                let title_raw = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let description = entry.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                let category_wire = stream_data
+                    .and_then(|o| o.get("category"))
+                    .and_then(|v| v.as_str());
+                let forced = stream_data
+                    .and_then(|o| o.get("forced"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let category = category_wire
+                    .and_then(parse_aio_category)
+                    .unwrap_or_else(|| infer_aio_stat_category(title_raw));
+                let kind = match category {
+                    AioCategory::Filter => "warning",
+                    AioCategory::Timing => "stats",
+                    AioCategory::Addon  => {
+                        // Leading emoji disambiguates: 🟠 = partial scrape (has errors), 🟢 = clean
+                        if title_raw.trim_start().starts_with('🟠')
+                            || title_raw.trim_start().starts_with('🔴')
+                        {
+                            "error"
+                        } else {
+                            "stats"
+                        }
+                    }
+                };
+                notices.push(StreamMessage {
+                    kind: kind.to_string(),
+                    title: Some(cap(title_raw.trim().to_string(), 200)),
+                    description: cap(description.trim().to_string(), 4096),
+                    addon_name: cap(addon_name.to_string(), 64),
+                    forced,
+                });
+            }
+            _ => {
+                playable.push(entry.clone());
+            }
+        }
+    }
+    (playable, notices)
+}
+
+#[derive(Copy, Clone, Debug)]
+enum AioCategory { Addon, Filter, Timing }
+
+fn parse_aio_category(s: &str) -> Option<AioCategory> {
+    match s {
+        "addon"  => Some(AioCategory::Addon),
+        "filter" => Some(AioCategory::Filter),
+        "timing" => Some(AioCategory::Timing),
+        _        => None,
+    }
+}
+
+/// Title-pattern fallback for older AIOStreams instances that don't
+/// surface streamData.category. Strips the leading emoji cluster, then
+/// matches on the bare phrase. Anything unrecognised falls into Filter
+/// since that bucket renders under the warning icon — safer than
+/// burying an unknown notice in the info bucket.
+fn infer_aio_stat_category(title: &str) -> AioCategory {
+    let bare = strip_leading_emoji(title.trim()).trim();
+    if bare.ends_with("Scrape Summary") {
+        return AioCategory::Addon;
+    }
+    match bare {
+        "Pipeline Timing"
+        | "Filter Breakdown"
+        | "Precompute Breakdown"
+        | "Service Wrap Breakdown" => AioCategory::Timing,
+
+        "Removal Reasons"
+        | "Included Reasons"
+        | "Digital Release Filter" => AioCategory::Filter,
+
+        _ => AioCategory::Filter, // unknown future stat → safest bucket
+    }
+}
+
+/// Strip one leading emoji cluster (the producers in AIOStreams use
+/// 🔍 📅 🚫 ⏱️ ⚙️ 🔗 🟢 🟠 🔴) plus any combining variation selector
+/// and the immediately-following whitespace. Lightweight: walks the
+/// string and discards prefix codepoints that look like emoji.
+fn strip_leading_emoji(s: &str) -> &str {
+    let mut iter = s.char_indices();
+    let mut end = 0;
+    while let Some((i, c)) = iter.next() {
+        let is_emoji_prefix = (c as u32) >= 0x1F300       // misc symbols / pictographs +
+            || (c as u32) >= 0x2600 && (c as u32) <= 0x27BF // misc + dingbats
+            || c == '\u{FE0F}'                             // variation selector-16
+            || c == '\u{200D}';                            // ZWJ
+        if !is_emoji_prefix && !c.is_whitespace() {
+            return &s[i..];
+        }
+        end = i + c.len_utf8();
+    }
+    &s[end..]
+}
+
+fn sanitize_stream(s: &serde_json::Value, addon_name: &str) -> Option<StreamEntry> {
+    // Title is the primary display string; fall back to "name" then "<addon>".
+    let raw_title = s
+        .get("title")
+        .and_then(|v| v.as_str())
+        .or_else(|| s.get("name").and_then(|v| v.as_str()))
+        .unwrap_or(addon_name);
+    // Generous cap — addons like Torrentio pack resolution / codec / size /
+    // seeder counts into multi-line titles. The frontend wants every byte for
+    // chip-parsing; we trust the addon's content here.
+    let title = cap(raw_title.to_string(), 1024);
+
+    let url = s.get("url").and_then(|v| v.as_str()).map(String::from);
+    let info_hash = s.get("infoHash").and_then(|v| v.as_str()).map(String::from);
+
+    // A usable stream needs at least one of these.
+    if url.is_none() && info_hash.is_none() {
+        return None;
+    }
+
+    let url = url.and_then(|u| {
+        let lower = u.to_lowercase();
+        if (lower.starts_with("http://") || lower.starts_with("https://")) && u.len() <= 4096 {
+            Some(u)
+        } else {
+            None
+        }
+    });
+
+    Some(StreamEntry {
+        title,
+        addon_name: cap(addon_name.to_string(), 64),
+        url,
+        info_hash:  info_hash.map(|h| cap(h, 80)),
+        file_idx:   s.get("fileIdx").and_then(|v| v.as_i64()),
+        description: s
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| cap(s.to_string(), 1024)),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Manifest tag helpers — drive the colored tag list in the Addons UI.
+// ---------------------------------------------------------------------------
+
+fn collect_wire_types(wire: &WireManifest) -> Vec<String> {
+    let mut out: Vec<String> = wire.types.iter().map(|t| cap(t.clone(), 32)).collect();
+    // Some manifests omit `types` and only declare them on each catalog.
+    for c in &wire.catalogs {
+        let t = cap(c.media_type.clone(), 32);
+        if !out.iter().any(|x| x.eq_ignore_ascii_case(&t)) {
+            out.push(t);
+        }
+    }
+    out.into_iter().take(8).collect()
+}
+
+fn collect_wire_resources(wire: &WireManifest) -> Vec<String> {
+    wire.resources
+        .iter()
+        .filter_map(|r| match r {
+            serde_json::Value::String(s) => Some(cap(s.clone(), 32)),
+            serde_json::Value::Object(o) => o.get("name").and_then(|v| v.as_str()).map(|s| cap(s.into(), 32)),
+            _ => None,
+        })
+        .take(8)
+        .collect()
+}
+
+/// Public helper consumed by `auth.rs::get_synced_addons` — extracts the
+/// `types` array from a raw manifest JSON value.
+pub fn extract_manifest_types(manifest: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = manifest
+        .get("types")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| cap(s.into(), 32))).collect())
+        .unwrap_or_default();
+
+    if let Some(cats) = manifest.get("catalogs").and_then(|v| v.as_array()) {
+        for c in cats {
+            if let Some(t) = c.get("type").and_then(|v| v.as_str()) {
+                let t = cap(t.into(), 32);
+                if !out.iter().any(|x| x.eq_ignore_ascii_case(&t)) {
+                    out.push(t);
+                }
+            }
+        }
+    }
+
+    out.into_iter().take(8).collect()
+}
+
+/// Public helper — extracts the `resources` array (string or `{name, …}`
+/// object form) from a raw manifest JSON value.
+pub fn extract_manifest_resources(manifest: &serde_json::Value) -> Vec<String> {
+    manifest
+        .get("resources")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| match r {
+                    serde_json::Value::String(s) => Some(cap(s.clone(), 32)),
+                    serde_json::Value::Object(o) => o
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| cap(s.into(), 32)),
+                    _ => None,
+                })
+                .take(8)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Manifest-level `idPrefixes` from a raw manifest JSON.
+pub fn extract_manifest_id_prefixes(manifest: &serde_json::Value) -> Vec<String> {
+    manifest
+        .get("idPrefixes")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| cap(s.into(), 32))).collect())
+        .unwrap_or_default()
+}
+
+/// Per-resource overrides for the `stream` resource — its declared types
+/// and idPrefixes — from a raw manifest. Either may be empty if the
+/// resource is just a bare string ("stream") rather than the object form.
+pub fn extract_stream_resource_info(
+    manifest: &serde_json::Value,
+) -> (Vec<String>, Vec<String>) {
+    let mut types: Vec<String> = Vec::new();
+    let mut prefixes: Vec<String> = Vec::new();
+    if let Some(arr) = manifest.get("resources").and_then(|v| v.as_array()) {
+        for r in arr {
+            if let serde_json::Value::Object(o) = r {
+                let name_match = o
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.eq_ignore_ascii_case("stream"))
+                    .unwrap_or(false);
+                if !name_match { continue; }
+                if let Some(ts) = o.get("types").and_then(|v| v.as_array()) {
+                    types = ts.iter().filter_map(|v| v.as_str().map(|s| cap(s.into(), 32))).collect();
+                }
+                if let Some(ps) = o.get("idPrefixes").and_then(|v| v.as_array()) {
+                    prefixes = ps.iter().filter_map(|v| v.as_str().map(|s| cap(s.into(), 32))).collect();
+                }
+                break;
+            }
+        }
+    }
+    (types, prefixes)
+}
+
+fn collect_wire_id_prefixes(wire: &WireManifest) -> Vec<String> {
+    wire.id_prefixes.iter().map(|t| cap(t.clone(), 32)).take(16).collect()
+}
+
+fn collect_wire_stream_resource_info(wire: &WireManifest) -> (Vec<String>, Vec<String>) {
+    for r in &wire.resources {
+        if let serde_json::Value::Object(o) = r {
+            let name_match = o
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.eq_ignore_ascii_case("stream"))
+                .unwrap_or(false);
+            if !name_match { continue; }
+            let types = o.get("types").and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|t| t.as_str().map(|s| cap(s.into(), 32))).collect())
+                .unwrap_or_default();
+            let prefixes = o.get("idPrefixes").and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|t| t.as_str().map(|s| cap(s.into(), 32))).collect())
+                .unwrap_or_default();
+            return (types, prefixes);
+        }
+    }
+    (Vec::new(), Vec::new())
+}
+
+// ---------------------------------------------------------------------------
+// External subtitles — companion to fetch_streams.
+//
+// Fans out across every addon that exposes the `subtitles` resource and pulls
+// `/subtitles/{type}/{id}.json`. The frontend pipes the resulting URLs to
+// MPV via `sub-add`. Lighter wrapper than the OpenSubtitles API: no auth, no
+// downloads — addons return direct .srt/.vtt URLs.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Serialize)]
+pub struct ExternalSubtitle {
+    /// Direct https URL to a .srt/.vtt file.
+    pub url: String,
+    /// 2/3-letter language code (best-effort, blank if not provided).
+    pub lang: String,
+    /// Source addon's display name.
+    pub addon_name: String,
+    /// Optional release/title hint shown in the picker.
+    pub label: Option<String>,
+}
+
+fn manifest_has_subtitle_resource(wire: &WireManifest) -> bool {
+    wire.resources.iter().any(|r| match r {
+        serde_json::Value::String(s) => s.eq_ignore_ascii_case("subtitles"),
+        serde_json::Value::Object(o) => o
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.eq_ignore_ascii_case("subtitles"))
+            .unwrap_or(false),
+        _ => false,
+    })
+}
+
+#[tauri::command]
+pub async fn fetch_external_subtitles(
+    addons: Vec<AddonEntry>,
+    media_type: String,
+    id: String,
+) -> Result<Vec<ExternalSubtitle>, String> {
+    if addons.is_empty() {
+        return Ok(vec![]);
+    }
+    let safe_type = cap(media_type, 32);
+    let safe_id   = cap(id, 128);
+
+    let mut set: tokio::task::JoinSet<Vec<ExternalSubtitle>> = tokio::task::JoinSet::new();
+    for addon in addons {
+        let media_type = safe_type.clone();
+        let id         = safe_id.clone();
+        set.spawn(async move {
+            let base = normalise_addon_base(&addon.url);
+
+            let Ok((wire, _)) = fetch_manifest(&base).await else { return vec![]; };
+            let label = log_label(&wire.name, &base);
+            if !manifest_has_subtitle_resource(&wire) {
+                return vec![];
+            }
+            let addon_name = wire.name.clone();
+
+            let url = format!("{base}/subtitles/{media_type}/{id}.json");
+            crate::devlog!(info, "subtitles", "[{}] GET {}", label, url);
+            let Ok(resp) = client().get(&url).send().await else {
+                crate::devlog!(warn, "subtitles", "[{}] request failed", label);
+                return vec![];
+            };
+            let Ok(resp) = resp.error_for_status() else {
+                crate::devlog!(warn, "subtitles", "[{}] HTTP error", label);
+                return vec![];
+            };
+            let Ok(json) = resp.json::<serde_json::Value>().await else {
+                crate::devlog!(warn, "subtitles", "[{}] JSON parse failed", label);
+                return vec![];
+            };
+
+            let Some(arr) = json.get("subtitles").and_then(|v| v.as_array()) else {
+                crate::devlog!(info, "subtitles", "[{}] no `subtitles` array", label);
+                return vec![];
+            };
+
+            let kept: Vec<ExternalSubtitle> = arr.iter()
+                .take(40)
+                .filter_map(|s| sanitize_external_subtitle(s, &addon_name))
+                .collect();
+            crate::devlog!(info, "subtitles", "[{}] → {} subtitle(s)", label, kept.len());
+            kept
+        });
+    }
+
+    let mut all: Vec<ExternalSubtitle> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    while let Some(task_result) = set.join_next().await {
+        if let Ok(items) = task_result {
+            for s in items {
+                if seen.insert(s.url.clone()) {
+                    all.push(s);
+                }
+            }
+        }
+    }
+
+    Ok(all)
+}
+
+fn sanitize_external_subtitle(s: &serde_json::Value, addon_name: &str) -> Option<ExternalSubtitle> {
+    let url_raw = s.get("url").and_then(|v| v.as_str())?;
+    let lower = url_raw.to_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return None;
+    }
+    if url_raw.len() > 4096 {
+        return None;
+    }
+    Some(ExternalSubtitle {
+        url:        url_raw.to_string(),
+        lang:       s.get("lang").and_then(|v| v.as_str()).map(|s| cap(s.into(), 16)).unwrap_or_default(),
+        addon_name: cap(addon_name.into(), 64),
+        label:      s.get("name").and_then(|v| v.as_str()).map(|s| cap(s.into(), 120)),
+    })
 }
 
 // ---------------------------------------------------------------------------

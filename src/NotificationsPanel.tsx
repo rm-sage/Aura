@@ -1,0 +1,354 @@
+// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import { useMemo } from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import {
+  useNotifications,
+  type Notification,
+  type NotificationKind,
+} from "./NotificationsContext";
+
+// ---------------------------------------------------------------------------
+// NotificationsPanel — anchored ABOVE the bell (bottom-12 left-3 in absolute
+// coords on the bell's parent). Glass-styled card with header + scrollable
+// item list. Click rows to dispatch open-meta (release/episode) or open the
+// release URL (update). Update items don't have a dismiss button per spec.
+// ---------------------------------------------------------------------------
+
+interface Props {
+  onClose: () => void;
+  /** True while the parent is playing the close animation — flips the
+   *  panel from the entrance class (.aura-bell-panel-in) to the exit
+   *  class (.aura-bell-panel-out) so it visibly retracts toward the
+   *  bell instead of vanishing on unmount. */
+  closing?: boolean;
+}
+
+export default function NotificationsPanel({ onClose, closing }: Props) {
+  const {
+    notifications,
+    markRead,
+    dismissAll,
+    dismissNotification,
+  } = useNotifications();
+
+  // Sort newest-first for display. The store keeps insertion order, but
+  // we re-sort here in case loadFromStorage returned them out of order.
+  const sorted = useMemo(
+    () => [...notifications].sort((a, b) => b.createdAt - a.createdAt),
+    [notifications],
+  );
+
+  // "Dismiss all" applies to anything that ISN'T an `update` entry —
+  // updates remain on the list per the kind-doc contract. The button
+  // disables when there's nothing left to dismiss.
+  const hasDismissable = notifications.some((n) => n.kind !== "update");
+
+  return (
+    <div
+      data-notifications-panel
+      className={[
+        "absolute bottom-12 left-0",
+        "w-[380px] max-h-[480px]",
+        "rounded-2xl overflow-hidden",
+        "bg-white/[0.07] backdrop-blur-xl",
+        "border border-white/10",
+        "shadow-2xl",
+        "flex flex-col",
+        closing ? "aura-bell-panel-out" : "aura-bell-panel-in",
+      ].join(" ")}
+      role="dialog"
+      aria-label="Notifications"
+    >
+      {/* Header */}
+      <div className="flex-shrink-0 flex items-center justify-between px-4 py-3 border-b border-white/10">
+        <div className="text-sm font-semibold text-white/90 tracking-wide">
+          Notifications
+        </div>
+        <button
+          type="button"
+          onClick={() => { if (hasDismissable) dismissAll(); }}
+          disabled={!hasDismissable}
+          className={[
+            "text-xs px-2 py-1 rounded-md transition-colors",
+            hasDismissable
+              ? "text-white/70 hover:text-white hover:bg-white/10"
+              : "text-white/30 cursor-default",
+          ].join(" ")}
+        >
+          Dismiss all
+        </button>
+      </div>
+
+      {/* Body */}
+      <div
+        className="flex-1 min-h-0 overflow-y-auto"
+        style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.10) transparent" }}
+      >
+        {sorted.length === 0 ? (
+          <div className="px-4 py-8 text-center text-xs text-white/40">
+            No notifications
+          </div>
+        ) : (
+          <ul className="divide-y divide-white/10">
+            {sorted.map((n) => (
+              <NotificationRow
+                key={n.id}
+                notification={n}
+                onActivate={() => {
+                  // Mark read on activation regardless of kind.
+                  markRead(n.id);
+                  if (n.kind === "update") {
+                    const url = (n.data?.htmlUrl as string | undefined) ?? null;
+                    if (url) openUrl(url).catch(() => {});
+                    return;
+                  }
+                  // release / episode → open detail in the app, then
+                  // auto-dismiss: the user has already acted on the
+                  // notification, so leaving it in the panel makes the
+                  // bell badge feel sticky.
+                  const metaId = n.data?.metaId as string | undefined;
+                  const videoId = n.data?.videoId as string | undefined;
+                  const mediaType = n.data?.mediaType as string | undefined;
+                  if (metaId) {
+                    window.dispatchEvent(new CustomEvent("aura:open-meta", {
+                      detail: { metaId, videoId, mediaType },
+                    }));
+                    dismissNotification(n.id);
+                    onClose();
+                  } else {
+                    // No metaId to navigate to (warning / error / notice
+                    // / success without a target) — still dismiss on
+                    // activation so the user can clear the row by
+                    // clicking through it.
+                    dismissNotification(n.id);
+                  }
+                }}
+                onDismiss={() => dismissNotification(n.id)}
+              />
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// NotificationRow
+// ---------------------------------------------------------------------------
+
+interface RowProps {
+  notification: Notification;
+  onActivate: () => void;
+  onDismiss: () => void;
+}
+
+/** Per-kind tone palette. Centralised so the row, the unread accent
+ *  bar, the hover background, and the icon all stay in sync. */
+function toneFor(kind: NotificationKind) {
+  switch (kind) {
+    case "warning":
+      return {
+        hoverBg: "hover:bg-amber-400/10",
+        bar:     "bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.55)]",
+        icon:    "text-amber-300",
+      };
+    case "error":
+      return {
+        hoverBg: "hover:bg-rose-400/10",
+        bar:     "bg-rose-400 shadow-[0_0_6px_rgba(251,113,133,0.55)]",
+        icon:    "text-rose-300",
+      };
+    case "success":
+      return {
+        hoverBg: "hover:bg-emerald-400/10",
+        bar:     "bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.55)]",
+        icon:    "text-emerald-300",
+      };
+    case "notice":
+      return {
+        hoverBg: "hover:bg-ln-accent/10",
+        bar:     "bg-ln-accent shadow-[0_0_6px_rgba(91,164,255,0.5)]",
+        icon:    "text-ln-accent/95",
+      };
+    default:
+      // release / episode / update — neutral white-on-default styling.
+      return {
+        hoverBg: "hover:bg-white/[0.08]",
+        bar:     "bg-ln-accent shadow-[0_0_6px_rgba(91,164,255,0.5)]",
+        icon:    "text-white/70",
+      };
+  }
+}
+
+function NotificationRow({ notification, onActivate, onDismiss }: RowProps) {
+  const { id, kind, title, subtitle, createdAt, read } = notification;
+  const tone = toneFor(kind);
+  return (
+    <li
+      key={id}
+      className={[
+        "group relative flex items-start gap-3 px-4 py-3",
+        "cursor-pointer",
+        "transition-colors duration-150",
+        tone.hoverBg,
+        read ? "opacity-70" : "",
+      ].filter(Boolean).join(" ")}
+      onClick={onActivate}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onActivate();
+        }
+      }}
+    >
+      {/* Unread accent bar — colour drawn from the tone palette */}
+      {!read && (
+        <span
+          aria-hidden
+          className={`absolute left-0 top-3 bottom-3 w-[3px] rounded-r-full ${tone.bar}`}
+        />
+      )}
+      <div className={`flex-shrink-0 mt-0.5 ${tone.icon}`}>
+        <KindIcon kind={kind} />
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="text-sm text-white/90 leading-tight truncate">
+          {title}
+        </div>
+        {subtitle && (
+          <div className="text-xs text-white/55 leading-snug mt-0.5 line-clamp-2">
+            {subtitle}
+          </div>
+        )}
+        <div className="text-[10px] text-white/35 mt-1.5 uppercase tracking-wider">
+          {relativeTime(createdAt)}
+        </div>
+      </div>
+      {kind !== "update" && (
+        <button
+          type="button"
+          aria-label="Dismiss notification"
+          onClick={(e) => {
+            e.stopPropagation();
+            onDismiss();
+          }}
+          className={[
+            "flex-shrink-0 self-start mt-0.5",
+            "h-6 w-6 rounded-md",
+            "text-white/40 hover:text-white hover:bg-white/[0.12]",
+            "opacity-0 group-hover:opacity-100",
+            "transition-opacity duration-150",
+            "flex items-center justify-center",
+          ].join(" ")}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="h-3.5 w-3.5">
+            <path d="M6 6 L18 18 M18 6 L6 18" />
+          </svg>
+        </button>
+      )}
+    </li>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// KindIcon
+// ---------------------------------------------------------------------------
+
+function KindIcon({ kind }: { kind: NotificationKind }) {
+  const cls = "h-4 w-4";
+  if (kind === "release") {
+    // clapperboard
+    return (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className={cls}>
+        <path d="M3 8 L21 8 L21 20 L3 20 Z" />
+        <path d="M3 8 L7 4 L11 8" />
+        <path d="M9 8 L13 4" />
+        <path d="M15 8 L19 4" />
+      </svg>
+    );
+  }
+  if (kind === "episode") {
+    // tv glyph
+    return (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className={cls}>
+        <rect x="3" y="6" width="18" height="13" rx="2" />
+        <path d="M8 21 L16 21" />
+        <path d="M8 6 L12 2 L16 6" />
+      </svg>
+    );
+  }
+  if (kind === "warning") {
+    // exclamation triangle
+    return (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className={cls}>
+        <path d="M12 3 L22 20 L2 20 Z" />
+        <path d="M12 10 L12 14" />
+        <circle cx="12" cy="17" r="0.6" fill="currentColor" />
+      </svg>
+    );
+  }
+  if (kind === "error") {
+    // bordered circle with X
+    return (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className={cls}>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M9 9 L15 15 M15 9 L9 15" />
+      </svg>
+    );
+  }
+  if (kind === "success") {
+    // checkmark in a circle
+    return (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className={cls}>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M8 12.5 L11 15.5 L16 9.5" />
+      </svg>
+    );
+  }
+  if (kind === "notice") {
+    // info "i" in a circle
+    return (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className={cls}>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 11 L12 16" />
+        <circle cx="12" cy="8" r="0.6" fill="currentColor" />
+      </svg>
+    );
+  }
+  // update — download/upload arrow
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className={cls}>
+      <path d="M12 4 L12 16" />
+      <path d="M7 11 L12 16 L17 11" />
+      <path d="M5 20 L19 20" />
+    </svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// relativeTime — local helper to avoid pulling in date-fns. "Just now",
+// "5m ago", "2h ago", "3d ago", or the locale date string for older entries.
+// ---------------------------------------------------------------------------
+
+function relativeTime(ts: number): string {
+  const diff = Date.now() - ts;
+  if (diff < 0) return "Just now";
+  const sec = Math.floor(diff / 1000);
+  if (sec < 45) return "Just now";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 7) return `${day}d ago`;
+  try {
+    return new Date(ts).toLocaleDateString();
+  } catch {
+    return `${day}d ago`;
+  }
+}

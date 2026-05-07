@@ -4,18 +4,36 @@
 [[permission]]
 identifier = "allow-load-video"
 description = "Allows the frontend to load a video file into the MPV engine"
-commands.allow = ["load_video"]
+commands.allow = ["load_video", "stop_video"]
 
 [[permission]]
 identifier = "allow-player-controls"
-description = "Allows the frontend to toggle pause, seek, set volume, and apply language defaults"
-commands.allow = ["toggle_pause", "seek_relative", "set_volume", "apply_lang_defaults"]
+description = "Allows the frontend to toggle pause, seek, set volume / speed, switch audio + subtitle tracks, query state, and apply language defaults"
+commands.allow = [
+  "toggle_pause",
+  "seek_relative",
+  "seek_absolute",
+  "set_volume",
+  "set_speed",
+  "set_audio_track",
+  "set_subtitle_track",
+  "set_subtitle_visibility",
+  "set_panscan",
+  "get_tracks",
+  "get_property",
+  "refresh_video",
+  "apply_lang_defaults",
+  "apply_hdr_settings",
+  "apply_subtitle_style",
+  "set_subtitle_position_runtime",
+  "set_native_fullscreen",
+]
 
 # ── Stremio catalog ───────────────────────────────────────────────────────────
 [[permission]]
 identifier = "allow-fetch-catalog"
 description = "Allows the frontend to fetch items for a specific Stremio catalog"
-commands.allow = ["fetch_catalog"]
+commands.allow = ["fetch_catalog", "fetch_catalog_paginated"]
 
 [[permission]]
 identifier = "allow-addon-manifest"
@@ -38,7 +56,7 @@ commands.allow = ["login", "logout", "get_session", "get_synced_addons"]
 [[permission]]
 identifier = "allow-global-search"
 description = "Allows the frontend to run a concurrent global search across all search-enabled addons"
-commands.allow = ["global_search"]
+commands.allow = ["global_search", "global_search_grouped"]
 
 [[permission]]
 identifier = "allow-cloud-sync"
@@ -71,8 +89,62 @@ commands.allow = ["library_get", "library_put"]
 # ── Phase 3B: app settings (theme, defaults) ─────────────────────────────────
 [[permission]]
 identifier = "allow-settings"
-description = "Allows the frontend to read and update persistent app settings (theme, defaults, RPC, window)"
-commands.allow = ["get_settings", "set_theme", "update_settings"]
+description = "Allows the frontend to read and update persistent app settings (theme, defaults, RPC, window, keybindings, subtitle keys)"
+commands.allow = ["get_settings", "set_theme", "update_settings", "reset_settings", "set_settings_scope"]
+
+# ── AniSkip (anime OP/ED skip-time fetcher) ─────────────────────────────────
+[[permission]]
+identifier = "allow-aniskip"
+description = "Allows the frontend to fetch op/ed/recap skip-time windows from the AniSkip API for anime titles"
+commands.allow = ["fetch_skip_windows", "set_skip_windows", "get_skip_windows", "resolve_mal_id", "resolve_mal_id_by_title", "detect_silence_intervals"]
+
+# ── Phase 4: OpenSubtitles ────────────────────────────────────────────────────
+[[permission]]
+identifier = "allow-subtitles"
+description = "Allows the frontend to search OpenSubtitles, download .srt files, and inject them into MPV"
+commands.allow = ["search_subtitles", "download_subtitle", "add_subtitle_to_mpv"]
+
+# ── Phase 6.0.5: OMDb ratings ────────────────────────────────────────────────
+[[permission]]
+identifier = "allow-omdb-ratings"
+description = "Allows the frontend to query the user's OMDb key for Rotten Tomatoes / Metacritic critic scores"
+commands.allow = ["fetch_omdb_ratings"]
+
+# ── Multi-source ratings aggregator ─────────────────────────────────────────
+[[permission]]
+identifier = "allow-aggregate-ratings"
+description = "Allows the frontend to query OMDb + Jikan (MAL) and any other ratings backend Aura adds, returning a unified list"
+commands.allow = ["fetch_aggregate_ratings"]
+
+# ── User-data backups (Queue / History / manual marks / settings snapshot) ──
+[[permission]]
+identifier = "allow-user-backups"
+description = "Allows the frontend to create, list, read, and delete on-disk snapshots of the user's localStorage-backed data"
+commands.allow = [
+  "create_user_backup",
+  "list_user_backups",
+  "read_user_backup",
+  "delete_user_backup",
+  "user_backup_storage_used",
+]
+
+# ── Phase 4: SMTC (Windows media controls) ───────────────────────────────────
+[[permission]]
+identifier = "allow-smtc"
+description = "Allows the frontend to push now-playing metadata + playback state to Windows SMTC"
+commands.allow = ["smtc_set_metadata", "smtc_set_playback", "smtc_clear"]
+
+# ── Phase 5: stream aggregation ──────────────────────────────────────────────
+[[permission]]
+identifier = "allow-stream-fetch"
+description = "Allows the frontend to fetch per-meta streams across all installed addons"
+commands.allow = ["fetch_streams"]
+
+# ── Phase 5.5: external subtitles fan-out ────────────────────────────────────
+[[permission]]
+identifier = "allow-external-subtitles"
+description = "Allows the frontend to fetch external subtitle URLs from installed subtitle-resource addons"
+commands.allow = ["fetch_external_subtitles"]
 
 # ── Phase 3C: scrobbling (AIOMetadata) ───────────────────────────────────────
 [[permission]]
@@ -85,3 +157,40 @@ commands.allow = ["scrobble_start", "scrobble_heartbeat", "scrobble_end"]
 identifier = "allow-discord-rpc"
 description = "Allows the frontend to publish or clear Discord rich presence"
 commands.allow = ["discord_set_presence", "discord_clear_presence"]
+
+# ── Per-title persistence (volume / shader / audio / sub) ────────────────────
+[[permission]]
+identifier = "allow-per-title-state"
+description = "Allows the frontend to read and write per-title playback preferences (volume, shader, audio language, subtitle language)"
+commands.allow = ["get_title_state", "set_title_state"]
+
+# ── Local stats (hours watched, etc.) ────────────────────────────────────────
+[[permission]]
+identifier = "allow-stats"
+description = "Allows the frontend to read and bump local-only fun stats (hours watched, streams played)"
+commands.allow = ["get_stats", "bump_stat"]
+
+# ── Disk / cache storage management ──────────────────────────────────────────
+[[permission]]
+identifier = "allow-storage-management"
+description = "Allows the frontend to inspect and clear Aura's on-disk caches and logs"
+commands.allow = ["get_storage_report", "clear_storage_item"]
+
+# ── DevConsole tools (debug commands) ──────────────────────────────────────
+# `dev_force_panic` is the only entry today — invoked from DevConsole's
+# `panic` command to verify the Sentry crash-reporting pipeline. The
+# command deliberately crashes a worker thread; consumers should treat
+# it accordingly (no production code should ever call it).
+[[permission]]
+identifier = "allow-dev-tools"
+description = "Allows the frontend to invoke DevConsole-only debug commands (e.g. force-panic for Sentry verification)"
+commands.allow = ["dev_force_panic"]
+
+# ── Crash reporting (Sentry consent + DSN — scope-independent) ─────────────
+# Stored outside the per-account settings layer so opting in once
+# applies to every Stremio account on the same install. See
+# src-tauri/src/crash_reporting.rs for the storage layout.
+[[permission]]
+identifier = "allow-crash-reporting"
+description = "Allows the frontend to read and write the global Sentry consent state and DSN"
+commands.allow = ["get_crash_reporting", "set_crash_reporting"]

@@ -1,3 +1,6 @@
+// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 import { createContext, useContext, useEffect, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ThemeId, AppSettings } from "./types";
@@ -9,10 +12,17 @@ import type { ThemeId, AppSettings } from "./types";
 // CSS can scope tokens by theme without per-component logic. Persists the
 // choice via the Rust `set_theme` command on each change.
 //
-// Themes:
-//   • mica     — leverages Windows 11 native translucent material (default)
-//   • glass    — high-translucency frosted effect, custom CSS only
-//   • midnight — high-contrast pure-black, OLED-optimized, no vibrancy
+// Themes (canonical list — keep in sync with App.css `:root[data-theme=...]`
+// blocks and `ThemeId` in `types.ts`):
+//   • mica     — Windows 11 native translucent material (default)
+//   • glass    — high-translucency frosted, custom CSS only
+//   • midnight — pure black, OLED-optimised, no vibrancy
+//   • ember    — warm amber on charcoal
+//   • forest   — emerald accent on slate
+//   • rose     — soft rose on plum-grey
+//   • amethyst — violet on indigo-black
+//   • ocean    — teal accent on midnight blue
+//   • solar    — golden sunburst on warm dark
 // ---------------------------------------------------------------------------
 
 interface ThemeContext {
@@ -30,16 +40,37 @@ const Ctx = createContext<ThemeContext>({
 export const useTheme = () => useContext(Ctx);
 
 export const THEME_LABELS: Record<ThemeId, string> = {
-  mica: "Mica · Windows 11",
-  glass: "Glass · High Translucency",
+  mica:     "Mica · Windows 11",
+  glass:    "Glass · High Translucency",
   midnight: "Midnight · OLED Black",
+  ember:    "Ember · Warm Amber",
+  forest:   "Forest · Emerald Slate",
+  rose:     "Rose · Plum Grey",
+  amethyst: "Amethyst · Violet Indigo",
+  ocean:    "Ocean · Teal Midnight",
+  solar:    "Solar · Sunburst Dark",
 };
 
 export const THEME_DESCRIPTIONS: Record<ThemeId, string> = {
-  mica: "Leverages the native Windows 11 translucent backdrop.",
-  glass: "Custom high-blur frosted layers, more vivid translucency.",
+  mica:     "Leverages the native Windows 11 translucent backdrop.",
+  glass:    "Custom high-blur frosted layers, more vivid translucency.",
   midnight: "Pure black, high contrast — designed for OLED displays.",
+  ember:    "Warm amber accent on charcoal — cosy late-evening palette.",
+  forest:   "Emerald accent on deep slate — calm, naturalistic feel.",
+  rose:     "Soft rose accent on plum-grey — muted and warm.",
+  amethyst: "Violet accent on indigo-black — moody and saturated.",
+  ocean:    "Teal accent on midnight blue — cool and crisp.",
+  solar:    "Golden sunburst accent on warm dark — bright accent, dim base.",
 };
+
+const VALID_THEME_IDS: readonly ThemeId[] = [
+  "mica", "glass", "midnight",
+  "ember", "forest", "rose", "amethyst", "ocean", "solar",
+];
+
+function isValidThemeId(value: unknown): value is ThemeId {
+  return typeof value === "string" && (VALID_THEME_IDS as readonly string[]).includes(value);
+}
 
 function applyTheme(theme: ThemeId) {
   document.documentElement.setAttribute("data-theme", theme);
@@ -57,7 +88,7 @@ export default function ThemeEngine({ children }: Props) {
   useEffect(() => {
     invoke<AppSettings>("get_settings")
       .then((s) => {
-        const t: ThemeId = s.theme === "glass" || s.theme === "midnight" ? s.theme : "mica";
+        const t: ThemeId = isValidThemeId(s.theme) ? s.theme : "mica";
         setThemeState(t);
         applyTheme(t);
       })

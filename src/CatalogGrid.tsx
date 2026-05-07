@@ -1,3 +1,6 @@
+// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 import { useState, useEffect, memo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { MetaPreview } from "./types";

@@ -27,6 +27,13 @@ src-tauri/gen/
 src-tauri/target/
 src-tauri/node_modules/
 
+# Closed-source helper crate. The compiled binary lives at
+# src-tauri/target/{debug,release}/aura-bridge.exe and the source
+# is maintained in a separate private repo. The runtime spawn path
+# in lib.rs handles a missing binary gracefully (HTTPS streams
+# bypass the bridge entirely; only plain-HTTP playback degrades).
+aura-bridge/
+
 # IDEs
 .vscode/
 .idea/
@@ -38,5 +45,21 @@ src-tauri/node_modules/
 logs
 *.log
 
-# Local Claude state (not for the repo)
+# AI Assistants state (not for the repo)
 .claude/
+.gemini/
+.gemini_security/
+
+# Tauri auto-updater signing key — PRIVATE, never commit.
+# The .pub counterpart is referenced from src-tauri/tauri.conf.json
+# (plugins.updater.pubkey) and is safe to check in.
+aura-updater.key
+*.minisign.key
+TAURI_SIGNING_*.key
+
+# Local backups of user data (manual snapshots created by the
+# in-app Settings → Backups panel). These contain the user's
+# library mirror, manual watched marks, history log, and
+# AuraSettings — checked into the repo would leak personal state.
+backups/
+*.aura-backup.json

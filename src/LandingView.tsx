@@ -1,5 +1,9 @@
+// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 import { useState } from "react";
 import LoginView, { type UserSession } from "./LoginView";
+import auraIcon from "./assets/aura-icon.png";
 
 // ---------------------------------------------------------------------------
 // LandingView — first-run / signed-out entry experience
@@ -33,7 +37,7 @@ export default function LandingView({ onSignedIn, onContinueGuest }: Props) {
   const [showLogin, setShowLogin] = useState(false);
 
   return (
-    <div className="absolute inset-0 flex items-center justify-center overflow-hidden">
+    <div className="flex-1 relative flex items-center justify-center overflow-hidden">
       {/* Atmospheric background — uses the same Aura sweep concept, but
           full-screen, super slow, very subtle. */}
       <div className="absolute inset-0 pointer-events-none">
@@ -51,28 +55,53 @@ export default function LandingView({ onSignedIn, onContinueGuest }: Props) {
         />
       </div>
 
-      {/* Center column */}
-      <div className="relative z-10 w-full max-w-md mx-auto px-8 flex flex-col gap-8 text-center">
+      {/* Center column — narrow on purpose so buttons + copy don't
+          stretch across an ultrawide display. 320 px keeps the action
+          stack feeling like a focused dialog rather than a banner. */}
+      <div className="relative z-10 w-full max-w-[320px] mx-auto px-6 flex flex-col gap-7 text-center">
         {/* Brand */}
-        <div className="flex flex-col items-center gap-4">
-          <div className="w-14 h-14 rounded-2xl bg-ln-accent/15 border border-ln-accent/30
-                          flex items-center justify-center shadow-glass-edge">
-            <span className="text-ln-accent text-2xl font-bold tracking-tight">A</span>
+        <div className="flex flex-col items-center gap-5">
+          {/* Big glass-morphism A — refracts the moving spectral
+              backdrop. Wrapped in a soft glow ring so it reads as a
+              luminous mark even on extremely dark themes. */}
+          <div className="relative flex items-center justify-center w-24 h-24">
+            <span
+              aria-hidden
+              className="absolute inset-0 rounded-3xl"
+              style={{
+                background: "radial-gradient(circle at center, rgba(91,164,255,0.18) 0%, rgba(0,0,0,0) 65%)",
+                filter: "blur(8px)",
+              }}
+            />
+            <img
+              src={auraIcon}
+              alt="Aura"
+              width={92}
+              height={92}
+              className="relative drop-shadow-[0_4px_18px_rgba(91,164,255,0.45)]"
+              draggable={false}
+            />
           </div>
-          <h1 className="text-white text-3xl font-light tracking-wide">Welcome to Aura</h1>
-          <p className="text-white/45 text-sm leading-relaxed max-w-xs">
-            A cinematic media player with Stremio addon support, MPV playback,
-            and a focus on craft.
+
+          {/* "Welcome to Aura" — hero treatment using the same gradient-
+              fill clipping as the title-bar wordmark. A separate
+              `aura-hero-title` class keeps the size + spacing distinct. */}
+          <h1 className="aura-hero-title">Welcome to Aura</h1>
+
+          <p className="text-white/55 text-[13.5px] leading-relaxed font-light">
+            A cinematic media player for the Stremio ecosystem with addon
+            support, native MPV playback, and many custom features.
           </p>
         </div>
 
-        {/* Action stack */}
-        <div className="flex flex-col gap-3 mt-2">
+        {/* Action stack — buttons size to content + a comfortable
+            click target rather than the column width. */}
+        <div className="flex flex-col items-center gap-2.5 mt-1">
           <button
             onClick={() => setShowLogin(true)}
-            className="group relative w-full px-5 py-4 rounded-2xl
+            className="group relative px-5 py-2.5 rounded-xl
                        bg-ln-accent/80 hover:bg-ln-accent active:scale-[0.99]
-                       text-white text-sm font-medium transition-all
+                       text-white text-[13px] font-medium transition-all
                        flex items-center justify-center gap-2.5
                        shadow-glass-edge"
           >
@@ -82,9 +111,9 @@ export default function LandingView({ onSignedIn, onContinueGuest }: Props) {
 
           <button
             onClick={onContinueGuest}
-            className="group w-full px-5 py-4 rounded-2xl
+            className="group px-5 py-2.5 rounded-xl
                        bg-white/5 border border-white/10 hover:bg-white/8
-                       text-white/75 hover:text-white/90 text-sm
+                       text-white/75 hover:text-white/90 text-[13px]
                        transition-all flex items-center justify-center gap-2.5"
           >
             <GuestIcon />
@@ -96,7 +125,7 @@ export default function LandingView({ onSignedIn, onContinueGuest }: Props) {
         <p className="text-white/25 text-xs leading-relaxed">
           Signing in syncs your addons and library across devices.
           Tokens are stored using your OS keyring with platform-native
-          encryption — never in plaintext.
+          encryption.
         </p>
       </div>
 

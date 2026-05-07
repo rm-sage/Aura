@@ -1,3 +1,6 @@
+// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -46,8 +49,9 @@ export default function LoginView({ onSuccess, onGuest }: Props) {
   return (
     /* Full-screen dim overlay */
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-      {/* Glass card */}
-      <div className="glass-panel-elevated rounded-3xl px-8 py-9 w-full max-w-sm mx-4
+      {/* Glass card — narrowed from max-w-sm (384) to 320 so the
+          inputs feel proportional on ultrawide displays. */}
+      <div className="glass-panel-elevated rounded-3xl px-7 py-8 w-full max-w-[320px] mx-4
                       shadow-glass-edge flex flex-col gap-6">
         {/* Header */}
         <div className="flex flex-col gap-1.5">

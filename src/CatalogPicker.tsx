@@ -1,7 +1,16 @@
+// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 export interface CatalogInfo {
   media_type: string;
   id: string;
   name: string;
+  is_search_only: boolean;
+  /** Catalog is enabled on the addon but flagged as Discover-only (a
+   *  required `extra` parameter has no default, so it can't render
+   *  without user input). HomeView filters these out; the Discover
+   *  tab shows them alongside home-eligible catalogs. */
+  is_hidden_from_home: boolean;
 }
 
 interface Props {

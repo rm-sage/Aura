@@ -1,9 +1,10 @@
 [package]
 name = "aura"
-version = "0.1.0"
-description = "Aura — visionOS Media Player"
+version = "0.6.7"
+description = "Aura — Cinematic Media Player"
 authors = ["rm-sage"]
 edition = "2021"
+license = "AGPL-3.0-or-later"
 
 [lib]
 name = "aura_lib"
@@ -13,7 +14,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon", "image-png", "unstable"] }
 tauri-plugin-opener = "2"
 tauri-plugin-libmpv = "0.3"
 window-vibrancy = "0.5"
@@ -22,10 +23,84 @@ indexmap = { version = "2", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-keyring = "3"
+# Platform-native backends MUST be enabled explicitly — keyring v3
+# ships no default features, so a bare `keyring = "3"` resolves to the
+# in-memory mock backend that loses every value between app launches.
+# That manifested as "I have to log into Stremio every time I start
+# Aura". The three feature flags below pick the canonical OS keystore
+# on each target:
+#   • windows-native  → Windows Credential Manager (DPAPI-encrypted)
+#   • apple-native    → macOS Keychain
+#   • linux-native-sync-persistent → Linux Secret Service (sync API)
+keyring = { version = "3", features = [
+  "windows-native",
+  "apple-native",
+  "linux-native-sync-persistent",
+] }
 zeroize = "1"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "macros"] }
-axum = "0.7"
-futures-util = "0.3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "macros", "process", "io-util", "time"] }
 tauri-plugin-deep-link = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-shell = "2"
+# Auto-updater. Requires signed update payloads (signed via `pnpm tauri
+# signer sign` at release time, verified with the public key set in
+# tauri.conf.json under `plugins.updater.pubkey`). Without that key
+# pair the plugin still loads but the checks return errors. See
+# PRODUCTION.md for the full setup procedure.
+tauri-plugin-updater = "2"
+# Persists each window's last position + size to disk and restores on launch.
+# Auto-listens to move/resize events; we wire it in lib.rs and call its
+# `restore_state` setup hook so the main window opens at the user's last
+# bounds before the loading screen paints.
+tauri-plugin-window-state = "2"
 discord-rich-presence = "0.2"
+souvlaki = "0.7"
+raw-window-handle = "0.5"
+
+# Crash & error reporting (opt-in via consent dialog at first run; see
+# CrashReportingConsent.tsx + crash_reporting.rs).
+# `default-features = false` peels off the default `native-tls` so the
+# transport reuses the same `rustls` stack that reqwest is already
+# pulling in (line 25). `panic` registers a panic hook, `backtrace`
+# attaches stack frames, `contexts` adds OS/runtime info to events.
+sentry = { version = "0.46", default-features = false, features = [
+  "panic",
+  "contexts",
+  "backtrace",
+  "reqwest",
+  "rustls",
+] }
+# Native crash capture for the things the plain `sentry` crate can't
+# see: SIGSEGV / STATUS_ACCESS_VIOLATION coming out of libmpv, the
+# Crashpad-style segfault family. `sentry-rust-minidump` self-spawns
+# the Aura executable in "crash reporter" mode (recognised by a
+# private CLI flag the crate sets up); the reporter waits for a
+# crash notification from the main process via IPC, captures a
+# minidump, and uploads it to Sentry as an attachment alongside the
+# panic-hook event. No external handler binary to bundle — the same
+# binary plays both roles.
+sentry-rust-minidump = "0.14"
+
+# Windows shell COM bindings — used by win32.rs to signal fullscreen state
+# to the taskbar via ITaskbarList2::MarkFullscreenWindow. The crate is
+# already in our transitive dep graph (Tauri pulls it in at this exact
+# version), so adding it as a direct dep with explicit features doesn't
+# introduce a new compile-time cost.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
+
+# Release-profile debug info — needed for Sentry to symbolicate the
+# minidumps captured by `sentry-rust-minidump`. Without this the PDB
+# next to aura.exe contains no line-table info, and Sentry would
+# render every native crash as raw addresses (`0x7FF6B4A91234`)
+# instead of `lib.rs:1234`. "limited" produces line tables only
+# (no full type info), which keeps the PDB ~3-5 MB instead of 30+ MB
+# while still resolving to source locations. `strip = false`
+# preserves the symbol table in the EXE itself for backtrace fallback.
+[profile.release]
+debug = "limited"
+strip = false
