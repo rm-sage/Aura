@@ -38,41 +38,96 @@ fn manifest_cache() -> &'static Mutex<HashMap<String, ManifestCacheEntry>> {
     MANIFEST_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-// Per-addon catalog soft-fail cache.
+// Per-CATALOG soft-fail cache.
 //
-// When fetch_catalog times out for addon X, the next 25 catalog requests
-// to the SAME addon (a typical AIOMetadata fan-out) would each separately
-// pay the 10 s timeout — turning a single hung addon into a 4-minute
-// home-page render. The fix: when a request fails with a timeout-class
-// error, stamp the addon URL with the failure time. Subsequent calls
-// within the cooldown window short-circuit to a fast error.
+// History: this used to be a per-ADDON cache that stamped the whole
+// addon URL when ANY catalog failed. AIOMetadata has 34 catalogs, so
+// a single slow `flixpatrol.aggregate.movie` request would poison the
+// addon for 30 s — every other catalog (top, trending, mdblist,
+// streaming.*) returned "addon in cooldown" instantly even though the
+// addon itself was healthy. End-user view: the entire addon's rows
+// disappeared from Home. The current shape keys the cache on
+// (url, type, id) so a slow catalog only mutes ITSELF; the other 33
+// keep serving normally.
 //
-// COOLDOWN is intentionally short: an addon that recovers shouldn't stay
-// in the penalty box. 30 s is enough to drain a typical home-page fan-out
-// while still letting a recovered addon serve the next user-triggered
-// refresh (Home → swap to Library → back to Home).
+// Stale-response fallback: when a catalog times out but we have a
+// successful response cached within `CATALOG_STALE_TTL`, return that
+// instead of an error. The user sees the previous payload — slightly
+// out of date but vastly better than an empty row — and the cooldown
+// still rate-limits retries upstream.
 //
-// Only TIMEOUT-class failures stamp the cache. HTTP errors (4xx / 5xx)
-// from the addon are user-actionable and shouldn't poison subsequent
-// catalogs (a single misconfigured catalog id shouldn't suppress the
-// rest of the addon's offerings).
+// Only TIMEOUT-class failures stamp the fail cache. HTTP errors
+// (4xx / 5xx) are user-actionable (misconfigured catalog id, etc.)
+// and shouldn't suppress retries.
 static ADDON_FAIL_CACHE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 const ADDON_FAIL_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Successful-catalog-response cache. Same key shape as the fail cache
+/// (`{url}|{type}/{id}`). 10-minute TTL: longer than the 5-minute
+/// manifest cache because catalog ITEMS change less frequently than
+/// the manifest's addon-id list, AND because the whole point is to
+/// give the home page something to render when a refresh fails.
+static CATALOG_OK_CACHE: OnceLock<Mutex<HashMap<String, (Instant, Vec<MetaPreview>)>>> =
+    OnceLock::new();
+const CATALOG_STALE_TTL: Duration = Duration::from_secs(600);
+
+fn fail_key(base: &str, catalog_type: &str, catalog_id: &str) -> String {
+    format!("{base}|{catalog_type}/{catalog_id}")
+}
 
 fn addon_fail_cache() -> &'static Mutex<HashMap<String, Instant>> {
     ADDON_FAIL_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn is_addon_soft_failed(base: &str) -> bool {
+fn catalog_ok_cache() -> &'static Mutex<HashMap<String, (Instant, Vec<MetaPreview>)>> {
+    CATALOG_OK_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn is_catalog_soft_failed(base: &str, catalog_type: &str, catalog_id: &str) -> bool {
+    let key = fail_key(base, catalog_type, catalog_id);
     let Ok(cache) = addon_fail_cache().lock() else { return false; };
-    cache.get(base)
+    cache.get(&key)
         .map(|stamped| stamped.elapsed() < ADDON_FAIL_COOLDOWN)
         .unwrap_or(false)
 }
 
-fn mark_addon_failed(base: &str) {
+fn mark_catalog_failed(base: &str, catalog_type: &str, catalog_id: &str) {
+    let key = fail_key(base, catalog_type, catalog_id);
     if let Ok(mut cache) = addon_fail_cache().lock() {
-        cache.insert(base.to_string(), Instant::now());
+        cache.insert(key, Instant::now());
+    }
+}
+
+/// Pull the last successful response if it's within the stale TTL.
+/// Returned vec is cloned so we don't hold the cache lock across an
+/// await.
+fn cached_catalog_metas(
+    base: &str,
+    catalog_type: &str,
+    catalog_id: &str,
+) -> Option<Vec<MetaPreview>> {
+    let key = fail_key(base, catalog_type, catalog_id);
+    let cache = catalog_ok_cache().lock().ok()?;
+    let (stamp, metas) = cache.get(&key)?;
+    if stamp.elapsed() < CATALOG_STALE_TTL {
+        Some(metas.clone())
+    } else {
+        None
+    }
+}
+
+fn store_catalog_metas(
+    base: &str,
+    catalog_type: &str,
+    catalog_id: &str,
+    metas: &[MetaPreview],
+) {
+    if metas.is_empty() {
+        return; // never cache an empty payload — that's a no-op
+    }
+    let key = fail_key(base, catalog_type, catalog_id);
+    if let Ok(mut cache) = catalog_ok_cache().lock() {
+        cache.insert(key, (Instant::now(), metas.to_vec()));
     }
 }
 
@@ -82,7 +137,7 @@ fn client() -> &'static reqwest::Client {
             .timeout(TIMEOUT)
             .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(60))
-            .user_agent("Aura/0.6.7")
+            .user_agent("Aura/0.6.6")
             .build()
             .expect("HTTP client init failed")
     })
@@ -96,7 +151,7 @@ fn account_client() -> &'static reqwest::Client {
             .timeout(Duration::from_secs(15))
             .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(60))
-            .user_agent("Aura/0.6.7")
+            .user_agent("Aura/0.6.6")
             .build()
             .expect("Account HTTP client init failed")
     })
@@ -138,6 +193,13 @@ struct WireCatalogEntry {
     name: Option<String>,
     #[serde(default)]
     extra: Vec<serde_json::Value>,
+    /// AIOMetadata extension: explicit "Show on Home Board" toggle from
+    /// the addon's configure UI. `Some(true)` = visible, `Some(false)` =
+    /// hidden, `None` = field absent (other addons / older AIOMetadata
+    /// builds — fall back to the `extra`-based heuristic in
+    /// `catalog_is_hidden_from_home`).
+    #[serde(default, rename = "showInHome")]
+    show_in_home: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -829,7 +891,17 @@ pub async fn get_addon_manifest(addon_url: String) -> Result<AddonManifest, Stri
                 .name
                 .unwrap_or_else(|| format!("{} · {}", title_case(&c.media_type), c.id));
             let is_search_only = catalog_is_search_only(&c.extra);
-            let is_hidden_from_home = catalog_is_hidden_from_home(&c.extra);
+            // showInHome (AIOMetadata extension) is the AUTHORITATIVE
+            // signal when present: `Some(false)` means the user has
+            // explicitly toggled the catalog off the home board. Fall
+            // through to the extras-based heuristic only when the field
+            // is absent (other addons that follow the standard Stremio
+            // "required-genre" convention for Discover-only catalogs).
+            let is_hidden_from_home = match c.show_in_home {
+                Some(true) => false,
+                Some(false) => true,
+                None => catalog_is_hidden_from_home(&c.extra),
+            };
             CatalogInfo {
                 name:           display_name,
                 media_type:     c.media_type,
@@ -974,18 +1046,28 @@ pub async fn fetch_catalog(
     };
     let label = log_label("", &base);
 
-    // Soft-fail cache: if a recent timeout-class failure was stamped
-    // for this addon, fast-fail without paying another 10 s. Logged
-    // once per skip so the user can see *why* their home page is
-    // partial — and only logged at info-level since it's expected
-    // behaviour while the cooldown is active.
-    if is_addon_soft_failed(&base) {
+    // Soft-fail cache: if THIS specific catalog timed out recently,
+    // skip the network call to avoid paying another 10 s timeout. The
+    // cooldown is per-(addon, catalog) so a slow catalog only mutes
+    // ITSELF — sibling catalogs from the same addon keep loading
+    // normally. If we have a stale-but-cached payload for this
+    // catalog, return it instead of an error so the home row stays
+    // populated with the previous data while the cooldown drains.
+    if is_catalog_soft_failed(&base, &catalog_type, &catalog_id) {
+        if let Some(stale) = cached_catalog_metas(&base, &catalog_type, &catalog_id) {
+            crate::devlog!(
+                info, "catalog",
+                "[{}] {}/{} cooldown — serving {} stale item(s) from cache",
+                label, catalog_type, catalog_id, stale.len(),
+            );
+            return Ok(stale);
+        }
         crate::devlog!(
             info, "catalog",
-            "[{}] {}/{} skipped (addon in 30s cooldown after recent timeout)",
+            "[{}] {}/{} skipped (catalog in 30s cooldown after recent timeout, no cache)",
             label, catalog_type, catalog_id,
         );
-        return Err(format!("Catalog skipped: addon {label} timed out recently"));
+        return Err(format!("Catalog skipped: {catalog_type}/{catalog_id} timed out recently"));
     }
 
     crate::devlog!(
@@ -994,37 +1076,41 @@ pub async fn fetch_catalog(
         label, url, skip, limit,
     );
 
-    let response: CatalogResponse = client()
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| {
-            // Categorise the error so users / future-us can tell "addon
-            // timed out" from "DNS failure" from "TLS handshake error" at
-            // a glance. The reqwest Display impl produces nested-cause
-            // chains that are useful but verbose; we keep both.
+    // Live fetch. Network-class failures fall through to the stale
+    // cache (when available) so a flaky upstream doesn't blank out
+    // the home row that previously had data.
+    let resp = match client().get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
             let cat = describe_reqwest_err(&e);
             crate::devlog!(
                 warn, "catalog", "[{}] {}/{} {} — {}",
                 label, catalog_type, catalog_id, cat, e,
             );
-            // Stamp the addon for the cooldown window when the failure
-            // is timeout / connect class (transient infra). 4xx / 5xx
-            // HTTP statuses fall through to the error_for_status arm
-            // below and don't poison the cache.
             if e.is_timeout() || e.is_connect() || e.is_request() {
-                mark_addon_failed(&base);
+                mark_catalog_failed(&base, &catalog_type, &catalog_id);
+                if let Some(stale) = cached_catalog_metas(&base, &catalog_type, &catalog_id) {
+                    crate::devlog!(
+                        info, "catalog",
+                        "[{}] {}/{} live fetch failed ({}) — serving {} stale item(s)",
+                        label, catalog_type, catalog_id, cat, stale.len(),
+                    );
+                    return Ok(stale);
+                }
             }
-            format!("Catalog fetch {cat}: {e}")
-        })?
-        .error_for_status()
-        .map_err(|e| {
+            return Err(format!("Catalog fetch {cat}: {e}"));
+        }
+    };
+    let resp = match resp.error_for_status() {
+        Ok(r) => r,
+        Err(e) => {
             crate::devlog!(warn, "catalog", "[{}] HTTP {:?}", label, e.status());
-            format!("Catalog HTTP error: {e}")
-        })?
-        .json()
-        .await
-        .map_err(|e| {
+            return Err(format!("Catalog HTTP error: {e}"));
+        }
+    };
+    let response: CatalogResponse = match resp.json().await {
+        Ok(r) => r,
+        Err(e) => {
             // Include the catalog id so the user can pinpoint which builder
             // is returning malformed JSON — recurring "JSON parse error" with
             // no identifier was useless for triage.
@@ -1032,8 +1118,9 @@ pub async fn fetch_catalog(
                 warn, "catalog", "[{}] {}/{} JSON parse error: {}",
                 label, catalog_type, catalog_id, e,
             );
-            format!("Catalog parse error: {e}")
-        })?;
+            return Err(format!("Catalog parse error: {e}"));
+        }
+    };
 
     let total = response.metas.len();
     let metas: Vec<_> = match limit {
@@ -1048,7 +1135,17 @@ pub async fn fetch_catalog(
         skip.unwrap_or(0), kept,
         if kept != total { format!(" (sliced from {total})") } else { String::new() },
     );
-    Ok(metas.into_iter().map(sanitize_meta).collect())
+    let sanitized: Vec<MetaPreview> = metas.into_iter().map(sanitize_meta).collect();
+    // Stash successful first-page responses into the stale-fallback
+    // cache so a future timeout/cooldown for THIS catalog can serve
+    // the previous payload instead of an empty row. Only first-page
+    // responses are cached because subsequent pages aren't useful as
+    // a standalone fallback (the user would see "items 100-200" with
+    // no items 1-99 visible).
+    if skip.unwrap_or(0) == 0 {
+        store_catalog_metas(&base, &catalog_type, &catalog_id, &sanitized);
+    }
+    Ok(sanitized)
 }
 
 /// Walk catalog pages until we have `target` items or the addon
@@ -1081,16 +1178,27 @@ pub async fn fetch_catalog_paginated(
     catalog_id: String,
     target: u32,
 ) -> Result<Vec<MetaPreview>, String> {
-    const PAGE_SIZE: u32 = 100;
+    // Stremio addons disagree on page size — AIOMetadata returns 100,
+    // AI Search returns ~10, Cinemeta returns 100, mdblist 50, etc.
+    // The previous implementation hardcoded `skip` increments at 100,
+    // which silently skipped over items 11-99 on a 10-item-per-page
+    // addon (each call landed on item 101, returning the back half of
+    // the catalog with the front half missing). We now infer the step
+    // from the FIRST response's length and reuse it on every
+    // subsequent call. HARD_PAGE_LIMIT bounds the inferred step so a
+    // misbehaving addon returning "all items in one page" doesn't
+    // produce a step of 1000+.
+    const HARD_PAGE_LIMIT: u32 = 100;
     const MAX_PAGES: u32 = 10;
 
     let mut accumulated: Vec<MetaPreview> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut prev_page_len: Option<usize> = None;
+    let mut step: u32 = HARD_PAGE_LIMIT;
 
     for page_idx in 0..MAX_PAGES {
         if accumulated.len() >= target as usize { break; }
-        let skip = if page_idx == 0 { None } else { Some(page_idx * PAGE_SIZE) };
+        let skip = if page_idx == 0 { None } else { Some(page_idx * step) };
         let page = fetch_catalog(
             addon_url.clone(),
             catalog_type.clone(),
@@ -1100,6 +1208,17 @@ pub async fn fetch_catalog_paginated(
         )
         .await?;
         let page_len = page.len();
+
+        // First-page step inference: clamp to [1, HARD_PAGE_LIMIT]. We
+        // only narrow the step when the addon's first page is smaller
+        // than the default — never wider — because returning more than
+        // 100 items in a single response would more often be a bug than
+        // a feature, and stepping by it would inflate later request
+        // skip values into addon-rejection territory.
+        if page_idx == 0 && page_len > 0 {
+            let observed = (page_len as u32).max(1);
+            step = observed.min(HARD_PAGE_LIMIT);
+        }
 
         // Empty page = unambiguous end-of-list.
         if page_len == 0 { break; }
@@ -1134,8 +1253,8 @@ pub async fn fetch_catalog_paginated(
     accumulated.truncate(target as usize);
     crate::devlog!(
         info, "catalog",
-        "fetch_catalog_paginated {}/{} → {} item(s) (target={})",
-        catalog_type, catalog_id, accumulated.len(), target,
+        "fetch_catalog_paginated {}/{} → {} item(s) (target={}, step={})",
+        catalog_type, catalog_id, accumulated.len(), target, step,
     );
     Ok(accumulated)
 }

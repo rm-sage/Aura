@@ -107,27 +107,31 @@ const PROFILES: &[(u8, &str, ShaderChain, &str)] = &[
             "Anime4K_Upscale_CNN_x2_M.glsl",
         ],
         "Anime4K v4 — Mode B+B. Double-soft-restore for noisy material that needs aggressive cleanup before upscale."),
+    // Mode C and C+C used to reference Anime4K_Restore_GAN_*.glsl, but
+    // the canonical Anime4K v4 release doesn't ship a "Restore_GAN" step
+    // — Mode C uses the combined upscale+denoise shader
+    // (Upscale_Denoise_CNN_x2_*) as its single processing step instead.
+    // The old chains failed with "shader file not found" for every user
+    // because the GAN files literally don't exist upstream. Replaced
+    // with the canonical Mode C / C+C definitions.
     (11, "Anime4K Mode C",
         &[
             "Anime4K_Clamp_Highlights.glsl",
-            "Anime4K_Restore_GAN_UL.glsl",
-            "Anime4K_Upscale_CNN_x2_VL.glsl",
+            "Anime4K_Upscale_Denoise_CNN_x2_VL.glsl",
             "Anime4K_AutoDownscalePre_x2.glsl",
             "Anime4K_AutoDownscalePre_x4.glsl",
             "Anime4K_Upscale_CNN_x2_M.glsl",
         ],
-        "Anime4K v4 — Mode C. GAN-based restore — sharpest of the single-restore modes. Best for clean Blu-ray sources where the source already has fine detail."),
+        "Anime4K v4 — Mode C. Combined denoise + upscale in one step. Sharpest of the single-pass modes; best for clean Blu-ray sources where fine detail is already present."),
     (12, "Anime4K Mode C+C",
         &[
             "Anime4K_Clamp_Highlights.glsl",
-            "Anime4K_Restore_GAN_UL.glsl",
-            "Anime4K_Upscale_CNN_x2_VL.glsl",
+            "Anime4K_Upscale_Denoise_CNN_x2_VL.glsl",
             "Anime4K_AutoDownscalePre_x2.glsl",
             "Anime4K_AutoDownscalePre_x4.glsl",
-            "Anime4K_Restore_GAN_M.glsl",
-            "Anime4K_Upscale_CNN_x2_M.glsl",
+            "Anime4K_Upscale_Denoise_CNN_x2_M.glsl",
         ],
-        "Anime4K v4 — Mode C+C. Double GAN-restore. Heaviest GPU cost; use only on a strong dGPU. Maximum sharpness on already-clean source material."),
+        "Anime4K v4 — Mode C+C. Double denoise + upscale chain. Heaviest GPU cost; use only on a strong dGPU. Maximum sharpness on already-clean source material."),
 ];
 
 #[derive(Serialize, Clone)]

@@ -1,8 +1,9 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { createContext, useContext, useMemo, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import type { LibraryItem } from "./types";
+import { getManualWatchedState, onManualWatchedChange } from "./manualWatched";
 
 // ---------------------------------------------------------------------------
 // LibraryContext — exposes a (id) → LibraryItem lookup for components that
@@ -232,8 +233,33 @@ export function useEpisodeProgress(
   episodeId: string,
 ): ProgressInfo | null {
   const { byId } = useContext(LibraryCtx);
+  // Subscribe to manual-watched changes so flipping an episode to
+  // "watched" (right-click → Mark as Watched, or via the auto-advance
+  // path on completion) immediately clears the partial-progress bar
+  // and the WatchedBadge upgrades to the green check. Without this
+  // the bar stuck around because nothing on the library side had
+  // changed — only manualWatched did.
+  const [manual, setManual] = useState(() => getManualWatchedState(episodeId));
+  useEffect(() => {
+    setManual(getManualWatchedState(episodeId));
+    return onManualWatchedChange(() => {
+      setManual(getManualWatchedState(episodeId));
+    });
+  }, [episodeId]);
+
   const item = byId.get(seriesId);
   if (!item) return null;
+
+  // Manual-watched wins: clear the bar even if state.timeOffset still
+  // says "halfway through". The user's flag is the authoritative
+  // signal and overrides any lingering library progress (which the
+  // auto-advance path also tries to zero, but datastorePut is
+  // eventually consistent and a stale read can keep timeOffset > 0
+  // for several seconds).
+  if (manual === "watched") {
+    return { ratio: 1, watched: true, partial: false };
+  }
+
   const state = item.state ?? {};
   if (state.video_id === episodeId) return progressFromState(state);
   const resumeId = typeof state.video_id === "string" ? state.video_id : null;

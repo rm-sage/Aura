@@ -1,7 +1,8 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
+import { FilterBar, applyFilters, DEFAULT_FILTERS, type FilterState } from "./FilterBar";
 import { invoke } from "@tauri-apps/api/core";
 import type { MetaPreview, LibraryItem, AddonEntry, VideoEntry } from "./types";
 import ImageLoader from "./ImageLoader";
@@ -774,6 +775,14 @@ function CatalogOverlay({
   onSelectMeta?: (meta: MetaPreview) => void;
 }) {
   const [opening, setOpening] = useState(true);
+  // Shared filter / sort state for the overlay grid. Mirrors the
+  // pattern used by Library / Queue / Discover so the affordance feels
+  // identical across browseable surfaces.
+  const [filters, setFilters] = useState<FilterState>(DEFAULT_FILTERS);
+  const filteredItems = useMemo(
+    () => applyFilters(items, filters),
+    [items, filters],
+  );
 
   // Two rAF ticks = one painted frame; lets the initial opacity/scale
   // commit before we transition to the entered state.
@@ -820,7 +829,9 @@ function CatalogOverlay({
             <p className="text-white/40 text-sm mt-0.5">
               {loading
                 ? "Loading…"
-                : items.length === 1 ? "1 item" : `${items.length} items`}
+                : filteredItems.length === items.length
+                  ? (items.length === 1 ? "1 item" : `${items.length} items`)
+                  : `${filteredItems.length} of ${items.length} items`}
             </p>
           </div>
           <button
@@ -835,36 +846,49 @@ function CatalogOverlay({
           </button>
         </div>
 
-        {/* Grid — column count comes from --catalog-popup-cols (6 ultrawide,
-            4 at 1080p). Each cell is a CatalogCard so click + right-click
-            menus + watched badges all work the same as in the home row.
-            While `loading` is true and we don't yet have any items, render
-            placeholder skeletons so the popup doesn't pop in empty before
-            content arrives. */}
+        {/* Body — grid + filter sidebar. The grid column count comes
+            from --catalog-popup-cols (6 ultrawide, 4 at 1080p). The
+            FilterBar sits in a flex sibling so the grid reflows around
+            it on narrower windows; on smaller windows we fall back to
+            grid-only via the same xl:block pattern other views use. */}
         <div
-          className="overflow-y-auto p-6"
-          style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
+          className="flex-1 min-h-0 flex overflow-hidden"
         >
           <div
-            className="grid gap-4"
-            style={{ gridTemplateColumns: "repeat(var(--catalog-popup-cols), minmax(0, 1fr))" }}
+            className="flex-1 overflow-y-auto p-6"
+            style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
           >
-            {loading && items.length === 0
-              ? Array.from({ length: 12 }).map((_, i) => (
-                  <div
-                    key={`skeleton-${i}`}
-                    className="rounded-xl bg-white/5 image-loader-skeleton"
-                    style={{ aspectRatio: "2 / 3" }}
-                  />
-                ))
-              : items.map((meta) => (
-                  <CatalogCard
-                    key={`${meta.media_type}:${meta.id}`}
-                    meta={meta}
-                    onSelect={onSelectMeta ? (m) => { onClose(); onSelectMeta(m); } : undefined}
-                  />
-                ))}
+            <div
+              className="grid gap-4"
+              style={{ gridTemplateColumns: "repeat(var(--catalog-popup-cols), minmax(0, 1fr))" }}
+            >
+              {loading && items.length === 0
+                ? Array.from({ length: 12 }).map((_, i) => (
+                    <div
+                      key={`skeleton-${i}`}
+                      className="rounded-xl bg-white/5 image-loader-skeleton"
+                      style={{ aspectRatio: "2 / 3" }}
+                    />
+                  ))
+                : filteredItems.map((meta) => (
+                    <CatalogCard
+                      key={`${meta.media_type}:${meta.id}`}
+                      meta={meta}
+                      onSelect={onSelectMeta ? (m) => { onClose(); onSelectMeta(m); } : undefined}
+                    />
+                  ))}
+            </div>
+            {!loading && filteredItems.length === 0 && items.length > 0 && (
+              <div className="text-center py-10 text-white/55 text-sm">
+                No items match the current filter.
+              </div>
+            )}
           </div>
+          {items.length > 0 && (
+            <div className="hidden xl:flex flex-col p-4 pt-0 pl-0 shrink-0">
+              <FilterBar items={items} state={filters} onChange={setFilters} />
+            </div>
+          )}
         </div>
       </div>
     </div>

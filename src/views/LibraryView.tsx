@@ -165,13 +165,40 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
     () => buckets.all.map(libraryItemToMeta),
     [buckets.all],
   );
-  const filteredMetaIds = useMemo(() => {
-    const allowed = new Set(applyFilters(filteredAsMeta, extraFilters).map((m) => m.id));
-    return allowed;
-  }, [filteredAsMeta, extraFilters]);
+  // Run the FilterBar's filter + sort over the projected metas. The
+  // returned ORDER drives the displayed list when extraFilters.sort
+  // is non-default (Rating / Year / A→Z); otherwise the LibraryView's
+  // own Sort dropdown wins. This way both controls stay functional and
+  // the FilterBar's sort buttons aren't dead clicks.
+  const filterApplied = useMemo(
+    () => applyFilters(filteredAsMeta, extraFilters),
+    [filteredAsMeta, extraFilters],
+  );
+  const filteredMetaIds = useMemo(
+    () => new Set(filterApplied.map((m) => m.id)),
+    [filterApplied],
+  );
+  const filterBarOrderIndex = useMemo(() => {
+    const m = new Map<string, number>();
+    filterApplied.forEach((meta, i) => m.set(meta.id, i));
+    return m;
+  }, [filterApplied]);
 
   const sorted = useMemo(() => {
     const arr = filtered.filter((it) => filteredMetaIds.has(it.id));
+    // FilterBar override: when the user picks a non-default Sort By
+    // button on the sidebar, that order wins over the LibraryView
+    // header's Sort dropdown. The two controls do different things
+    // (header sort: ctime/mtime, alpha; FilterBar sort: rating/year/
+    // alpha) and the FilterBar feels broken if its sort buttons
+    // visibly do nothing — so when the user touches the FilterBar
+    // they get their pick.
+    if (extraFilters.sort !== "default") {
+      arr.sort((a, b) =>
+        (filterBarOrderIndex.get(a.id) ?? 0) - (filterBarOrderIndex.get(b.id) ?? 0),
+      );
+      return arr;
+    }
     switch (sort) {
       case "alpha":
         arr.sort((a, b) => (a.name ?? "").localeCompare(b.name ?? ""));
@@ -187,7 +214,7 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
         break;
     }
     return arr;
-  }, [filtered, sort]);
+  }, [filtered, sort, extraFilters.sort, filteredMetaIds, filterBarOrderIndex]);
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">

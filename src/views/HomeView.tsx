@@ -400,24 +400,65 @@ export default function HomeView({
     [addons, settingsTick],
   );
 
-  // Source for the hero — first row's first ~5 items that have any landscape art.
+  // User-chosen hero catalog override. When set, the hero band fetches
+  // its OWN copy of the catalog (independent of the home grid's row
+  // pipeline) so the user can pin a Discover-only / hidden-from-home
+  // catalog as the hero source without surfacing it in the grid below.
+  // `null` means "fall back to first row" (the default since 0.6.x).
+  const heroCatalogPref = useMemo(
+    () => loadAuraSettings().heroCatalog,
+    [settingsTick],
+  );
+  const [heroOverrideItems, setHeroOverrideItems] = useState<MetaPreview[] | null>(null);
+  const [heroOverrideLabel, setHeroOverrideLabel] = useState<string | null>(null);
+  useEffect(() => {
+    if (!heroCatalogPref) {
+      setHeroOverrideItems(null);
+      setHeroOverrideLabel(null);
+      return;
+    }
+    let cancelled = false;
+    invoke<MetaPreview[]>("fetch_catalog", {
+      addonUrl:    heroCatalogPref.addonUrl,
+      catalogType: heroCatalogPref.mediaType,
+      catalogId:   heroCatalogPref.catalogId,
+    })
+      .then((items) => { if (!cancelled) setHeroOverrideItems(items); })
+      .catch(() => { if (!cancelled) setHeroOverrideItems([]); });
+    invoke<{ name: string; catalogs: { id: string; media_type: string; name: string }[] }>(
+      "get_addon_manifest",
+      { addonUrl: heroCatalogPref.addonUrl },
+    )
+      .then((m) => {
+        if (cancelled) return;
+        const cat = m.catalogs.find((c) =>
+          c.id === heroCatalogPref.catalogId && c.media_type === heroCatalogPref.mediaType,
+        );
+        if (cat) setHeroOverrideLabel(withTypeSuffix(cat.name, cat.media_type));
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [heroCatalogPref]);
+
+  // Source for the hero — override catalog when configured, otherwise
+  // the first browseable row's first ~5 art-bearing items.
   const heroItemsRaw: MetaPreview[] = useMemo(() => {
-    const first = rows.find((r) => r.items.length > 0);
-    if (!first) return [];
-    return first.items
+    const source = heroOverrideItems ?? rows.find((r) => r.items.length > 0)?.items ?? [];
+    return source
       .filter((it) => it.background ?? it.fanart ?? it.backdrop ?? it.poster)
       .slice(0, 5);
-  }, [rows]);
+  }, [heroOverrideItems, rows]);
 
   /** Display name of the catalog the hero is pulled from — surfaces
    *  as a subtle top-left chip on the hero card so the user knows
    *  which row contributed the current selection. Empty when there's
    *  no resolved source row. */
   const heroSourceLabel: string | null = useMemo(() => {
+    if (heroOverrideLabel) return heroOverrideLabel;
     const first = rows.find((r) => r.items.length > 0);
     if (!first) return null;
     return withTypeSuffix(first.catalog.name, first.catalog.media_type);
-  }, [rows]);
+  }, [heroOverrideLabel, rows]);
 
   // Catalog responses don't carry the `logo` field — only meta-detail does.
   // Without this, the hero falls back to plain `<h2>{name}</h2>` instead of

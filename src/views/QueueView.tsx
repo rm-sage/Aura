@@ -116,14 +116,21 @@ function QueueViewBody({ library, onSelectMeta }: Props) {
     }
     return out;
   }, [orderedIds, libIndex]);
-  const visibleIds = useMemo(
-    () => new Set(applyFilters(queuedAsMeta, filters).map((m) => m.id)),
+  // applyFilters returns the items in the FilterBar's chosen sort
+  // order — so we use THAT order when the sort axis is non-default,
+  // and fall back to the user's manual drag order otherwise. The two
+  // modes coexist: drag = "default", FilterBar Sort By = override.
+  const filterApplied = useMemo(
+    () => applyFilters(queuedAsMeta, filters),
     [queuedAsMeta, filters],
   );
-  const filteredOrderedIds = useMemo(
-    () => orderedIds.filter((id) => visibleIds.has(id)),
-    [orderedIds, visibleIds],
-  );
+  const filteredOrderedIds = useMemo(() => {
+    if (filters.sort !== "default") {
+      return filterApplied.map((m) => m.id);
+    }
+    const visible = new Set(filterApplied.map((m) => m.id));
+    return orderedIds.filter((id) => visible.has(id));
+  }, [orderedIds, filterApplied, filters.sort]);
 
   const sensors = useSensors(
     // 6 px activation distance — clicks under 6 px don't trigger a

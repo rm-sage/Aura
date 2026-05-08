@@ -127,7 +127,16 @@ export function markNotAnimeId(_id: string): void {
 }
 
 export function isAnimeMeta(
-  meta: { media_type: string; id: string; genres?: string[] | null }
+  meta: {
+    media_type: string;
+    id: string;
+    genres?: string[] | null;
+    /** AIOMetadata's `originalLanguage` field (ISO 639-1). Optional —
+     *  callers that don't have a MetaDetail may omit. */
+    original_language?: string | null;
+    /** AIOMetadata's `productionCountries` (ISO 3166-1 alpha-2 codes). */
+    production_countries?: string[] | null;
+  }
 ): boolean {
   if ((meta.media_type ?? "").toLowerCase() === "anime") return true;
   const id = (meta.id ?? "").toLowerCase();
@@ -152,6 +161,21 @@ export function isAnimeMeta(
         if (t === "series" || t === "anime") return true;
       }
     }
+  }
+  // Localised fallback — IMDb-id'd anime films (Chainsaw Man, Jujutsu
+  // Kaisen, Cosmic Princess Kaguya) routinely lack mal/kitsu/anidb
+  // anchors AND the catalog response sometimes doesn't surface their
+  // "Animation" genre. AIOMetadata's `originalLanguage` + `productionCountries`
+  // pair (ja + JP) is a reliable proxy: virtually every Japanese-
+  // language Japanese-produced theatrical title in the addon ecosystem
+  // is anime in practice, because live-action JP films barely register
+  // on the IMDb-id'd catalogs. False-positive risk is non-zero (some
+  // live-action JP films do exist on TMDB) but the cosmetic mis-tag
+  // is preferable to systematically missing every anime film.
+  const ol = (meta.original_language ?? "").toLowerCase();
+  const pcs = meta.production_countries ?? [];
+  if (ol === "ja" && pcs.some((c) => (c ?? "").toUpperCase() === "JP")) {
+    return true;
   }
   // Last-resort fallback: the localStorage cache populated by
   // DetailView whenever it resolves a meta detail with the Anime

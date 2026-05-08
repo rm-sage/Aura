@@ -720,6 +720,22 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
 
             {/* Dense meta strip */}
             <div className="flex items-center gap-3 flex-wrap text-[14px] font-mono uppercase tracking-[0.14em]">
+              {/* Anime chip leads the strip when applicable so the
+                  classification reads first; the type chip (Movies /
+                  Series) follows. Detection now folds in the meta-
+                  detail's originalLanguage + productionCountries, which
+                  catches IMDb-id'd anime films that lack mal/kitsu/
+                  anidb anchors (Chainsaw Man, Jujutsu Kaisen, etc.). */}
+              {isAnimeMeta({
+                media_type:           detail?.media_type ?? meta.media_type,
+                id:                   meta.id,
+                genres:               detail?.genres ?? meta.genres ?? null,
+                original_language:    detail?.original_language ?? null,
+                production_countries: detail?.production_countries ?? null,
+              }) && (
+                <span className="px-2.5 py-1 rounded-sm bg-pink-500/15 border border-pink-400/30
+                                 text-pink-300 text-[12px] font-semibold">Anime</span>
+              )}
               <span className="px-2.5 py-1 rounded-sm bg-white/12 border border-white/18
                                text-white/85 text-[12px] font-semibold">
                 {typeLabel(detail?.media_type ?? meta.media_type)}
@@ -785,10 +801,6 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
                 );
               })()}
               {detail?.runtime && <Stat label="Runtime" value={detail.runtime} />}
-              {isAnimeMeta(meta) && (
-                <span className="px-2.5 py-1 rounded-sm bg-pink-500/15 border border-pink-400/30
-                                 text-pink-300 text-[12px] font-semibold">Anime</span>
-              )}
             </div>
 
             {/* Ratings row — surfaced as its own tile band below the

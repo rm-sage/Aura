@@ -58,6 +58,13 @@ export interface AuraSettings {
    *  Anti-spoiler aid for thrillers / mystery / anime where the
    *  thumbnail itself reveals plot beats. Default false. */
   blurUnwatchedThumbnails: boolean;
+  /** Catalog source for the Home hero carousel. `null` = use the
+   *  first browseable catalog row (the default since 0.6.x). When set,
+   *  this catalog drives the hero rotation regardless of whether it's
+   *  hidden from the home grid — letting the user surface a curated
+   *  list (AIOMetadata's "AI Recommendations", a custom mdblist, etc.)
+   *  in the hero band without cluttering the home grid below. */
+  heroCatalog: { addonUrl: string; mediaType: string; catalogId: string } | null;
 }
 
 export const DEFAULT_AURA_SETTINGS: AuraSettings = {
@@ -70,6 +77,7 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   hideCastSpoilers: false,
   showAioStreamsNotices: true,
   blurUnwatchedThumbnails: false,
+  heroCatalog: null,
 };
 
 // Module-level memoization snapshot. loadAuraSettings is called many
@@ -122,6 +130,13 @@ function readFromStorage(): AuraSettings {
       blurUnwatchedThumbnails: typeof parsed.blurUnwatchedThumbnails === "boolean"
         ? parsed.blurUnwatchedThumbnails
         : false,
+      heroCatalog: parsed.heroCatalog
+        && typeof parsed.heroCatalog === "object"
+        && typeof (parsed.heroCatalog as Record<string, unknown>).addonUrl === "string"
+        && typeof (parsed.heroCatalog as Record<string, unknown>).mediaType === "string"
+        && typeof (parsed.heroCatalog as Record<string, unknown>).catalogId === "string"
+        ? (parsed.heroCatalog as AuraSettings["heroCatalog"])
+        : null,
     };
   } catch {
     return { ...DEFAULT_AURA_SETTINGS };

@@ -60,21 +60,63 @@ async function bootstrapSentry() {
     if (!dsn) return;
     Sentry.init({
       dsn,
-      // No automatic PII capture — usernames, cookies, and the SDK's
-      // own ip_address attachment are all off here. The Sentry ingest
-      // server can ALSO derive an IP from the inbound TCP connection
-      // (independent of the SDK), which is why we additionally:
-      //   1. set `event.user = { id: undefined, ip_address: "0.0.0.0" }`
-      //      in `beforeSend` so the SDK explicitly forbids any IP value
-      //   2. strip `event.request` (which can carry headers / origin)
-      //      and `event.contexts.geo` (server-side geolocation)
-      // The matching project-level "Prevent Storing of IP Addresses"
-      // toggle in Sentry → Settings → Security & Privacy is the
-      // belt-and-braces server-side equivalent.
+      // ── Privacy ────────────────────────────────────────────────────
+      // SDK-level: no automatic PII attachment.
+      // Server-level: pair this with the project-level "Prevent
+      // Storing of IP Addresses" toggle in Sentry → Settings →
+      // Security & Privacy.
       sendDefaultPii: false,
-      tracesSampleRate: 0,
+
+      // ── Tracing (performance) ─────────────────────────────────────
+      // 10 % of events get a transaction trace attached. Tauri's IPC
+      // bridge makes most "spans" worth tracing local — set higher if
+      // you want to debug a specific UI hot path, or 0 to disable
+      // entirely. browserTracingIntegration auto-instruments fetch /
+      // history navigations.
+      tracesSampleRate: 0.1,
+      integrations: [
+        Sentry.browserTracingIntegration(),
+        Sentry.browserProfilingIntegration(),
+        // Replay: records DOM mutations + network metadata so an
+        // Issue can be played back as a video. Heavy masking by
+        // default (every text node redacted, every input blocked) so
+        // a session replay never exfiltrates a real password or
+        // stream URL. Tune the sample rates if you want broader
+        // coverage; the current 10 % session / 100 % on-error is a
+        // common starting point.
+        Sentry.replayIntegration({
+          maskAllText:  true,
+          blockAllMedia: true,
+        }),
+        // Console capture → Logs surface in Sentry. The integration
+        // name in @sentry/react v8 is `captureConsoleIntegration`
+        // (Sentry's Logs feature consumes these). Without it, Logs
+        // view stays empty even when devs use console.error.
+        Sentry.captureConsoleIntegration({
+          levels: ["error", "warn", "info", "debug"],
+        }),
+      ],
+
+      // ── Replay sampling ───────────────────────────────────────────
+      // 0.1 = record 10 % of sessions for replay; 1.0 = record EVERY
+      // session that produces an error. The on-error rate is the
+      // valuable one — it catches the lead-up to a crash even when
+      // the user wasn't part of the rolling sample.
+      replaysSessionSampleRate: 0.1,
+      replaysOnErrorSampleRate: 1.0,
+
+      // ── Profiling sampling ────────────────────────────────────────
+      // Conditional on a session being traced (so profilesSampleRate
+      // multiplies tracesSampleRate). 1.0 here = "profile every
+      // sampled trace"; the effective rate is therefore 10 %.
+      profilesSampleRate: 1.0,
+
       release: import.meta.env.VITE_APP_VERSION as string | undefined,
       beforeSend(event) {
+        // Privacy clamp: Sentry's ingest server can derive an IP from
+        // the inbound TCP connection independently of the SDK — set
+        // ip_address explicitly here so the server has nothing to
+        // fall back on. Strip request + geo for the same reason.
         if (event.user) {
           event.user.ip_address = "0.0.0.0";
           delete event.user.email;

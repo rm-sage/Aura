@@ -135,7 +135,7 @@ fn client() -> &'static reqwest::Client {
             // full reconnect (TCP + TLS handshake) per host.
             .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(60))
-            .user_agent("Aura/0.6.7")
+            .user_agent("Aura/0.6.6")
             .build()
             .expect("AniSkip client init failed")
     })

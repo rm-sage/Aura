@@ -27,6 +27,14 @@ interface AddonManifest {
   has_search: boolean;
 }
 
+/** Composite key for a catalog: the bare `id` is NOT unique (Cinemeta
+ *  exposes "top" / "year" / "imdbRating" for both movies and series),
+ *  so combining `media_type` + `id` gives the disambiguator React needs
+ *  for stable reconciliation in the dropdown options list. */
+function catalogKey(c: { media_type: string; id: string }): string {
+  return `${c.media_type}:${c.id}`;
+}
+
 interface Props {
   addons: AddonEntry[];
   onSelectMeta?: (meta: MetaPreview) => void;
@@ -91,7 +99,7 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
         // requires a query). Hidden-from-home catalogs ARE valid here,
         // which is the whole reason this view exists.
         const firstCatalog = m.catalogs.find((c) => !c.is_search_only);
-        setSelectedCatalogId(firstCatalog?.id ?? null);
+        setSelectedCatalogId(firstCatalog ? catalogKey(firstCatalog) : null);
       })
       .catch((e) => {
         if (cancelled) return;
@@ -102,8 +110,12 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
   }, [selectedAddonUrl]);
 
   const selectedAddon = catalogAddons.find((a) => a.url === selectedAddonUrl) ?? null;
+  // selectedCatalogId is `${media_type}:${id}` so two catalogs that
+  // share the bare id (e.g. Cinemeta's "top" exposed for both movies
+  // and series) round-trip distinctly through React's reconciler. Use
+  // `catalogKey` to encode and decode at the lookup boundary.
   const selectedCatalog =
-    manifest?.catalogs.find((c) => c.id === selectedCatalogId) ?? null;
+    manifest?.catalogs.find((c) => catalogKey(c) === selectedCatalogId) ?? null;
 
   // Fetch the catalog whenever a new (addon, catalog) pair settles.
   useEffect(() => {
@@ -116,10 +128,16 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
     setItems(null);
     setItemsErr(null);
     setFilters(DEFAULT_FILTERS);
-    invoke<MetaPreview[]>("fetch_catalog", {
+    // Use the paginated fetch with target=100 so the Discover view shows
+    // every item the addon will produce, up to a sane cap. The previous
+    // single-page fetch was returning whatever the addon's natural page
+    // size was — 10 for AI Search, 14-47 for Cinemeta, etc. — which felt
+    // half-empty even though the catalog had more behind it.
+    invoke<MetaPreview[]>("fetch_catalog_paginated", {
       addonUrl:    selectedAddon.url,
       catalogType: selectedCatalog.media_type,
       catalogId:   selectedCatalog.id,
+      target:      100,
     })
       .then((r) => { if (!cancelled) setItems(r); })
       .catch((e) => {
@@ -176,7 +194,11 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
               options={(manifest?.catalogs ?? [])
                 .filter((c) => !c.is_search_only)
                 .map((c) => ({
-                  id:    c.id,
+                  // Composite key disambiguates same-id catalogs across
+                  // media types (Cinemeta's "top" appears for both
+                  // movies and series — bare-id keying made React warn
+                  // about duplicate keys).
+                  id:    catalogKey(c),
                   label: c.name,
                   hint:  c.media_type,
                   badge: c.is_hidden_from_home ? "hidden from home" : undefined,

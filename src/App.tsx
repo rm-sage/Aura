@@ -30,6 +30,7 @@ import SourcePopupHost from "./SourcePopup";
 import DevConsole from "./DevConsole";
 import UpdatePopup from "./UpdatePopup";
 import CrashReportingConsent from "./CrashReportingConsent";
+import ResumePrompt, { type PendingResume } from "./ResumePrompt";
 import { checkForUpdate, isNewer, type ReleaseInfo } from "./updater";
 import { advanceWatchedAfter } from "./autoAdvance";
 import { clearAutoBumped } from "./autoBumped";
@@ -262,6 +263,16 @@ function usePlayback(_playerActive: boolean) {
   const [paused, setPaused]       = useState(true);
   const [volume, setVolume]       = useState(50);
   const [speed, setSpeed]         = useState(1);
+  // Stream-broken detector. MPV silently uninits its video output
+  // when a seek hits a network outage and the demuxer flips to EOF
+  // (canonical aura-mpv.log signature: "EOF code: 1" → "vo/...win32
+  // uninit"). The webview is still alive but every player command
+  // is a no-op — user sees Aura's background under transparent
+  // controls that don't respond. We detect the dead state by
+  // tracking the last `time-pos` heartbeat: if playback was active,
+  // not paused, and we haven't received an update in
+  // BROKEN_STALE_MS, surface a recovery prompt.
+  const [streamBroken, setStreamBroken] = useState(false);
   // Initial buffering=true so the loading overlay is visible from the
   // very first paint after the user clicks play, all the way through
   // the gap between MPV's loadfile completing (duration > 0) and our
@@ -345,9 +356,16 @@ function usePlayback(_playerActive: boolean) {
     console.info(`[load] +${dt}ms ${name}${dataStr}`);
   }, []);
 
+  // Last received `time-pos` event timestamp — drives the broken-
+  // stream detector below. Updated on every `time` payload that
+  // contains a numeric value (NOT just non-zero ones, so a paused
+  // file that's still receiving heartbeats counts as alive).
+  const lastTimeUpdateAtRef = useRef<number>(0);
+
   useEffect(() => {
     const p = listen<PlaybackPayload>("playback-update", ({ payload }) => {
       if (typeof payload.time === "number") {
+        lastTimeUpdateAtRef.current = Date.now();
         setTime(payload.time);
         // First-frame latch: any time > 0 reading means MPV has
         // started producing frames for the current file. Once
@@ -359,6 +377,11 @@ function usePlayback(_playerActive: boolean) {
           }
           setFirstFrameSeen(true);
           setBuffering(false);
+          // Any heartbeat clears the broken-stream flag — playback
+          // self-recovered (mpv reconnected, or the user successfully
+          // reloaded). The recovery overlay's listener uses the same
+          // ref so the latch resets symmetrically.
+          setStreamBroken(false);
         }
       }
       if (typeof payload.duration === "number") {
@@ -376,6 +399,28 @@ function usePlayback(_playerActive: boolean) {
     });
     return () => { p.then((fn) => fn()).catch(() => {}); };
   }, [logLoadEvent]);
+
+  // Stale-heartbeat detector. Wakes once a second; flags the stream
+  // broken when time-pos hasn't ticked in BROKEN_STALE_MS while we
+  // were genuinely playing (firstFrameSeen + !paused). The recovery
+  // overlay shown by PlayerOverlay reads this and offers a Reload
+  // button that re-invokes handlePlayStream with the current target
+  // and the last-known time as the resume offset.
+  useEffect(() => {
+    const BROKEN_STALE_MS = 8000;
+    const id = window.setInterval(() => {
+      const last = lastTimeUpdateAtRef.current;
+      if (last === 0) return;
+      // Only meaningful while playback was actually rolling. paused-
+      // for-cache buffering is its own state with its own UI.
+      if (paused) return;
+      if (!firstFrameSeen) return;
+      if (Date.now() - last >= BROKEN_STALE_MS) {
+        setStreamBroken(true);
+      }
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [paused, firstFrameSeen]);
 
   /** Reset playback state for a new load_video call. Called from the
    *  parent right before invoking load_video so every fresh playback
@@ -415,6 +460,7 @@ function usePlayback(_playerActive: boolean) {
 
   return {
     time, duration, paused, volume, speed, buffering, bufferPct, eof, firstFrameSeen,
+    streamBroken, setStreamBroken,
     togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
     notifyNewLoad, logLoadEvent,
   };
@@ -471,6 +517,13 @@ export default function App() {
 
   // ── Library (Continue Watching + Calendar source) ──
   const [library, setLibrary] = useState<LibraryItem[]>([]);
+  // Resume-from-progress prompt: when handlePlayStream sees a saved
+  // timeOffset for the target, it sets `pendingResume` to a deferred
+  // pair of resolvers (onResume / onStartOver). The prompt component
+  // shows the choice + a 15 s auto-resume countdown, and whichever
+  // button the user picks resolves the promise → handlePlayStream
+  // continues with the appropriate start_seconds for load_video.
+  const [pendingResume, setPendingResume] = useState<PendingResume | null>(null);
   /** Raw, un-normalized library straight from library_get. Held alongside
    *  the normalized `library` purely so removal flows can target every
    *  contributing record (phantom episode-level rows that the normalizer
@@ -508,6 +561,7 @@ export default function App() {
   //     runs while a stream is loaded.
   const {
     time, duration, paused, volume, speed, buffering, bufferPct, eof, firstFrameSeen,
+    streamBroken, setStreamBroken,
     togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
     notifyNewLoad, logLoadEvent,
   } = usePlayback(isPlayerActive);
@@ -610,6 +664,58 @@ export default function App() {
         // updates state.timeOffset, with no further suppression.
         const targetSeriesId = target.series_id ?? target.id;
         if (targetSeriesId) clearAutoBumped(targetSeriesId);
+
+        // ── Resume-from-progress prompt ──────────────────────────────
+        // Look up the library record for the SERIES root (movies key
+        // on `id` directly). When the addon has a saved timeOffset
+        // for this exact episode (or movie), and that offset is
+        // non-trivial, ask the user whether to resume or start over.
+        // Movies / standalone files: target.id IS the library key.
+        // Series: state.video_id stores the resume episode and we
+        //         only show the prompt when the user is loading that
+        //         exact episode — picking a different episode means
+        //         "I want to play this one fresh".
+        const RESUME_MIN_OFFSET_SECONDS = 60;
+        const RESUME_NEAR_END_RATIO     = 0.95;
+        let resumeSeconds: number | null = null;
+        let resumeDuration: number | null = null;
+        const libRow = library.find((i) => i.id === targetSeriesId);
+        if (libRow) {
+          const st = libRow.state ?? {};
+          const off = typeof st.timeOffset === "number" ? st.timeOffset : 0;
+          const dur = typeof st.duration === "number" ? st.duration : 0;
+          // Series resume only counts when the user is opening the
+          // SAME video that was last played; opening a different
+          // episode in the same series should start at 0.
+          const sameEpisode =
+            target.media_type === "movie"
+              ? true
+              : (typeof st.video_id === "string" && st.video_id === target.id);
+          if (sameEpisode && off >= RESUME_MIN_OFFSET_SECONDS) {
+            // If the user finished the file (>= 95 % through), don't
+            // re-prompt them to "resume" the last 30 seconds — they
+            // just want to rewatch from the start.
+            if (dur === 0 || off / dur < RESUME_NEAR_END_RATIO) {
+              resumeSeconds  = off;
+              resumeDuration = dur > 0 ? dur : null;
+            }
+          }
+        }
+
+        let resumeAt: number | null = null;
+        if (resumeSeconds != null) {
+          resumeAt = await new Promise<number | null>((resolve) => {
+            setPendingResume({
+              resumeSeconds:   resumeSeconds!,
+              durationSeconds: resumeDuration,
+              title:           target.name,
+              episodeTag:      target.episode ?? null,
+              onResume:    () => { setPendingResume(null); resolve(resumeSeconds); },
+              onStartOver: () => { setPendingResume(null); resolve(null); },
+            });
+          });
+        }
+
         const raw = stream.url ?? `magnet:?xt=urn:btih:${stream.info_hash}`;
         // Reset playback state BEFORE load_video so the loading overlay
         // covers the entire window between user click and first frame.
@@ -659,9 +765,16 @@ export default function App() {
         }
 
         const t0load = Date.now();
-        await invoke("load_video", { path: resolved });
+        await invoke("load_video", {
+          path:           resolved,
+          // resumeAt is null when the user picked "Start over" or the
+          // saved offset didn't meet the prompt threshold. mpv treats
+          // a missing start_seconds as 0 (play from the beginning).
+          startSeconds:   resumeAt ?? null,
+        });
         logLoadEvent("load_video returned (MPV accepted loadfile)", {
           dt: Date.now() - t0load,
+          resumeAt,
         });
         // Position MPV viewport immediately (offset below the 36 px title bar
         // in windowed mode). At this point MPV's vo hasn't created its
@@ -3001,6 +3114,78 @@ export default function App() {
               user picks a stream (before MPV has a duration). The overlay
               owns the entire viewport minus the title bar; controls are
               auto-hidden after 3 s of mouse idle. */}
+      {/* Stream-broken recovery. Triggered by usePlayback's stale-
+          heartbeat detector — the canonical aura-mpv.log signature is
+          a seek that hits a DNS / TCP failure and ends with mpv's vo
+          uninit'ing, leaving the user staring at Aura's background
+          with controls that don't respond to anything. The Reload
+          button hands the SAME resolved stream URL back to load_video
+          with the last-known time as the resume offset; Exit drops
+          out to the detail view so the user can pick a different
+          stream. Sits ABOVE PlayerOverlay so the user can't
+          accidentally interact with the dead controls. */}
+      {streamBroken && isPlayerActive && (
+        <div
+          className="fixed inset-0 z-[1400] flex items-center justify-center
+                     bg-black/75 backdrop-blur-md animate-[fade-in_120ms_ease-out]"
+        >
+          <div className="aura-glass-menu rounded-2xl max-w-[420px] w-[92%] p-6 text-white">
+            <h2 className="text-[16px] font-semibold tracking-tight mb-2">
+              Stream connection lost
+            </h2>
+            <p className="text-white/70 text-[13px] leading-relaxed mb-5">
+              Aura hasn't received a playback heartbeat in 8 s. The most common
+              cause is a transient DNS / TCP failure during a seek — try
+              reloading from your last position, or exit and pick another
+              source.
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => { setStreamBroken(false); handleExitPlayback(); }}
+                className="px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
+                           text-white/85 bg-white/[0.06] border border-white/12
+                           hover:bg-white/[0.10] hover:text-white transition-colors"
+              >
+                Exit player
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  if (!activeStreamUrl) {
+                    setStreamBroken(false);
+                    handleExitPlayback();
+                    return;
+                  }
+                  // Snapshot the resume offset BEFORE notifyNewLoad
+                  // resets `time` to 0. Sub-1s offsets aren't worth
+                  // a "resume" — the seek-and-buffer dance would
+                  // dominate the experience and the user wouldn't
+                  // notice the position difference anyway.
+                  const resumeAt = time > 1 ? time : null;
+                  setStreamBroken(false);
+                  notifyNewLoad();
+                  try {
+                    await invoke("load_video", {
+                      path: activeStreamUrl,
+                      startSeconds: resumeAt,
+                    });
+                  } catch (e) {
+                    console.error("Reload failed", e);
+                  }
+                }}
+                className="px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
+                           text-ln-accent bg-ln-accent/15 border border-ln-accent/35
+                           hover:bg-ln-accent/25 hover:border-ln-accent/55
+                           transition-colors"
+              >
+                Reload stream
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {isPlayerActive && (
         <PlayerOverlay
           activeTarget={activeTarget}
@@ -3157,6 +3342,12 @@ export default function App() {
           persisted `crash_reporting_consent` setting is `null` (the user
           has never been asked). Self-dismisses on either choice. */}
       <CrashReportingConsent />
+
+      {/* Resume-from-progress prompt. Set by handlePlayStream when the
+          target has a non-trivial saved timeOffset; the user picks
+          Resume / Start over and the modal vanishes. Auto-resumes
+          after 15 s of inaction. */}
+      <ResumePrompt pending={pendingResume} />
     </div>
     </NotificationsProvider>
     </LibraryProvider>

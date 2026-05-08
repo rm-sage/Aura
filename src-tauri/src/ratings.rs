@@ -47,7 +47,7 @@ fn client() -> &'static reqwest::Client {
             .timeout(TIMEOUT)
             .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(60))
-            .user_agent("Aura/0.6.7 ratings-aggregator")
+            .user_agent("Aura/0.6.6 ratings-aggregator")
             .build()
             .expect("Ratings HTTP client init failed")
     })

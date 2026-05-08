@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useState, useEffect, useLayoutEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -606,6 +606,115 @@ interface UnifiedHomePickerProps {
   filter?: (a: AddonEntry) => boolean;
   title?: string;
   description?: string;
+}
+
+// ---------------------------------------------------------------------------
+// HeroCatalogPicker — two cascading selects (Addon → Catalog) that
+// pin a specific catalog as the source for the Home hero band. Lists
+// EVERY catalog the addon exposes (including is_hidden_from_home), so
+// the user can lift a Discover-only catalog like AIOMetadata's "AI
+// Recommendations" into the hero rotation without surfacing it in the
+// home grid below. Picking "Default" clears the override and the hero
+// falls back to the first browseable row's items (the 0.6.x default).
+// ---------------------------------------------------------------------------
+
+function HeroCatalogPicker({
+  addons, value, onChange,
+}: {
+  addons: AddonEntry[];
+  value: { addonUrl: string; mediaType: string; catalogId: string } | null;
+  onChange: (next: { addonUrl: string; mediaType: string; catalogId: string } | null) => void;
+}) {
+  const catalogAddons: AddonEntry[] = useMemo(
+    () => addons.filter((a) => (a.resources ?? []).includes("catalog")),
+    [addons],
+  );
+  const [selectedUrl, setSelectedUrl] = useState<string | null>(value?.addonUrl ?? null);
+  const [manifest, setManifest] = useState<{
+    catalogs: { id: string; media_type: string; name: string; is_search_only: boolean }[];
+  } | null>(null);
+
+  // Re-fetch the chosen addon's manifest whenever the picker switches
+  // to a different addon. 5-min Rust-side cache makes repeat picks
+  // snappy after the first resolution.
+  useEffect(() => {
+    if (!selectedUrl) { setManifest(null); return; }
+    let cancelled = false;
+    invoke<typeof manifest>("get_addon_manifest", { addonUrl: selectedUrl })
+      .then((m) => { if (!cancelled) setManifest(m); })
+      .catch(() => { if (!cancelled) setManifest(null); });
+    return () => { cancelled = true; };
+  }, [selectedUrl]);
+
+  const browseable = (manifest?.catalogs ?? []).filter((c) => !c.is_search_only);
+
+  return (
+    <div className="space-y-2">
+      <p className="text-white/85 text-sm font-medium">Hero Carousel Source</p>
+      <p className="text-white/40 text-xs leading-relaxed">
+        Catalog whose items rotate in the Home hero band. Hidden-from-home
+        catalogs are valid picks — useful for surfacing curated lists
+        (AIOMetadata's AI Recommendations, mdblist, Trakt user lists)
+        as the hero source without cluttering the grid below. Default
+        falls back to your first browseable row.
+      </p>
+      <div className="flex flex-wrap gap-2 items-center">
+        <select
+          value={selectedUrl ?? ""}
+          onChange={(e) => {
+            const url = e.target.value || null;
+            setSelectedUrl(url);
+            if (!url) onChange(null);
+          }}
+          className="bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-xs
+                     outline-none focus:border-white/25 transition-colors min-w-[180px]"
+          style={{ color: "var(--text-primary)" }}
+        >
+          <option value="">— Default (first row) —</option>
+          {catalogAddons.map((a) => (
+            <option key={a.url} value={a.url}>{a.name}</option>
+          ))}
+        </select>
+        {selectedUrl && (
+          <select
+            value={value && value.addonUrl === selectedUrl
+              ? `${value.mediaType}:${value.catalogId}` : ""}
+            onChange={(e) => {
+              if (!selectedUrl || !e.target.value) { onChange(null); return; }
+              const [mediaType, catalogId] = e.target.value.split(":", 2);
+              if (mediaType && catalogId) {
+                onChange({ addonUrl: selectedUrl, mediaType, catalogId });
+              }
+            }}
+            className="bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-xs
+                       outline-none focus:border-white/25 transition-colors min-w-[200px]"
+            style={{ color: "var(--text-primary)" }}
+          >
+            <option value="">— Pick a catalog —</option>
+            {browseable.map((c) => (
+              <option
+                key={`${c.media_type}:${c.id}`}
+                value={`${c.media_type}:${c.id}`}
+              >
+                {c.name} ({c.media_type})
+              </option>
+            ))}
+          </select>
+        )}
+        {value && (
+          <button
+            type="button"
+            onClick={() => { setSelectedUrl(null); onChange(null); }}
+            className="px-3 py-1.5 rounded-lg border border-white/15 bg-white/5
+                       text-white/80 text-[11px] font-medium hover:bg-white/10
+                       transition-colors"
+          >
+            Reset
+          </button>
+        )}
+      </div>
+    </div>
+  );
 }
 
 function UnifiedHomeSourcesPicker({
@@ -2534,6 +2643,12 @@ export default function SettingsView({ addons }: Props) {
               value={aura.defaultMetadataAddonUrl}
               options={addonOptions}
               onChange={(v) => setLocal({ defaultMetadataAddonUrl: v })}
+            />
+            <div className="h-px bg-white/6" />
+            <HeroCatalogPicker
+              addons={addons}
+              value={aura.heroCatalog}
+              onChange={(v) => setLocal({ heroCatalog: v })}
             />
           </Section>
 

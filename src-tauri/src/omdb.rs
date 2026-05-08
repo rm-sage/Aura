@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 const OMDB_API: &str = "https://www.omdbapi.com/";
 const TIMEOUT: Duration = Duration::from_secs(10);
-const USER_AGENT: &str = "Aura/0.6.7";
+const USER_AGENT: &str = "Aura/0.6.6";
 
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 

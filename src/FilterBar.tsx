@@ -169,7 +169,7 @@ function FilterBarInner({ items, state, onChange }: Props) {
 
   return (
     <aside
-      className="flex-shrink-0 w-72 glass-panel rounded-2xl p-4 self-start"
+      className="flex-shrink-0 w-72 aura-glass-menu rounded-2xl p-4 self-start"
       style={{ position: "sticky", top: 0 }}
     >
       <button

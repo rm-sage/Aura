@@ -46,7 +46,7 @@ fn client() -> &'static reqwest::Client {
             .timeout(TIMEOUT)
             .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(60))
-            .user_agent("Aura/0.6.7 scrobble")
+            .user_agent("Aura/0.6.6 scrobble")
             .build()
             .expect("Scrobble HTTP client init failed")
     })
@@ -256,7 +256,7 @@ pub fn shutdown_blocking() {
         // Bounded short timeout — never hold up shutdown more than 2 s.
         let cli = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
-            .user_agent("Aura/0.6.7 scrobble")
+            .user_agent("Aura/0.6.6 scrobble")
             .build()
             .ok()?;
         cli.post(&url).json(&body).send().await.ok()

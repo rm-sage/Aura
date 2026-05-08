@@ -302,9 +302,25 @@ impl Default for PlaybackState {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-async fn load_video(app: tauri::AppHandle, path: String) -> Result<(), String> {
+async fn load_video(
+    app: tauri::AppHandle,
+    path: String,
+    // Optional resume position in seconds. When set, the loadfile
+    // command passes `start=X` as an MPV option so playback begins at
+    // that offset without a separate seek round-trip. Drives the
+    // resume-from-progress prompt: when the user picks "Resume" the
+    // frontend hands over the saved state.timeOffset; "Start over"
+    // omits the field (Tauri maps undefined / missing → None). None
+    // / 0 / NaN all mean "play from the beginning" — matches the
+    // previous behaviour.
+    start_seconds: Option<f64>,
+) -> Result<(), String> {
     let normalised = path.replace('\\', "/");
-    crate::devlog!(info, "player", "load_video: {normalised}");
+    crate::devlog!(
+        info, "player",
+        "load_video: {normalised} (start={:?})",
+        start_seconds,
+    );
     let t_start = std::time::Instant::now();
     tauri::async_runtime::spawn_blocking(move || {
         // Defensive re-init: if the MPV instance has been destroyed for any
@@ -325,13 +341,27 @@ async fn load_video(app: tauri::AppHandle, path: String) -> Result<(), String> {
         // a previous file doesn't carry over and require a manual click.
         let _ = mpv.set_property("pause", &serde_json::json!(false), "main");
 
+        // Build the loadfile arg list. The 4th positional arg is a
+        // KEY=VALUE option string that mpv applies to the loaded file
+        // for the duration of this playback (no global state mutation).
+        // We use `start=X` to seek to the resume offset atomically with
+        // the load — vs. a post-load seek_absolute which would briefly
+        // play frames from t=0 and then jump.
         let t_load = std::time::Instant::now();
-        mpv.command(
-            "loadfile",
-            &vec![serde_json::json!(normalised), serde_json::json!("replace")],
-            "main",
-        )
-        .map_err(|e| e.to_string())?;
+        let mut args: Vec<serde_json::Value> = vec![
+            serde_json::json!(normalised),
+            serde_json::json!("replace"),
+        ];
+        if let Some(t) = start_seconds.filter(|v| v.is_finite() && *v > 0.0) {
+            // mpv accepts `start=12.34` (seconds) directly. The 3rd
+            // positional arg `0` is the file index — required to be
+            // present when we want to pass an options string in the
+            // 4th slot, even on a single-file load.
+            args.push(serde_json::json!(0));
+            args.push(serde_json::json!(format!("start={t}")));
+        }
+        mpv.command("loadfile", &args, "main")
+            .map_err(|e| e.to_string())?;
         crate::devlog!(
             info, "player",
             "load_video step: loadfile accepted at +{}ms (mpv command returned)",
@@ -1022,6 +1052,11 @@ fn init_sentry_if_consented() -> Option<sentry::ClientInitGuard> {
         // Stack traces on every event — vital for diagnosing the
         // libmpv-adjacent panics this app is most likely to surface.
         attach_stacktrace: true,
+        // 10 % of Tauri commands get a transaction trace attached so
+        // the Sentry Performance / Traces tab gets non-empty data.
+        // Higher = more bandwidth + more storage; raise temporarily
+        // when chasing a specific perf regression.
+        traces_sample_rate: 0.1,
         // SDK-side PII off. Sentry's ingest server can still derive an
         // IP from the inbound HTTPS connection independently of the
         // SDK, so we also clamp ip_address + clear geo / request blocks

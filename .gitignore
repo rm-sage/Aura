@@ -1,16 +1,10 @@
-﻿# Node.js
+# ─── Dependencies / build ──────────────────────────────────────────────────
 node_modules/
+.pnpm-debug.log*
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-.pnpm-debug.log*
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
 
-# Build artifacts
 dist/
 build/
 out/
@@ -19,36 +13,23 @@ out/
 /target/
 **/*.rs.bk
 Cargo.lock
-
-# Tauri
 src-tauri/target/
 src-tauri/binaries/
 src-tauri/gen/
-src-tauri/target/
 src-tauri/node_modules/
 
-# Closed-source helper crate. The compiled binary lives at
-# src-tauri/target/{debug,release}/aura-bridge.exe and the source
-# is maintained in a separate private repo. The runtime spawn path
-# in lib.rs handles a missing binary gracefully (HTTPS streams
-# bypass the bridge entirely; only plain-HTTP playback degrades).
+# ─── Closed-source helper crate ────────────────────────────────────────────
+# aura-bridge lives in a separate private repo; the compiled binary is
+# staged into src-tauri/target/{debug,release}/ at build time. The
+# runtime spawn path in lib.rs handles a missing binary gracefully.
 aura-bridge/
 
-# IDEs
-.vscode/
-.idea/
-*.swp
-*.swo
-.DS_Store
-
-# Logs
-logs
-*.log
-
-# AI Assistants state (not for the repo)
-.claude/
-.gemini/
-.gemini_security/
+# ─── Environment / secrets ─────────────────────────────────────────────────
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 
 # Tauri auto-updater signing key — PRIVATE, never commit.
 # The .pub counterpart is referenced from src-tauri/tauri.conf.json
@@ -57,9 +38,52 @@ aura-updater.key
 *.minisign.key
 TAURI_SIGNING_*.key
 
-# Local backups of user data (manual snapshots created by the
-# in-app Settings → Backups panel). These contain the user's
-# library mirror, manual watched marks, history log, and
-# AuraSettings — checked into the repo would leak personal state.
+# ─── Editors / OS ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+*.tmp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Logs ──────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ─── AI assistants ─────────────────────────────────────────────────────────
+.claude/
+.gemini/
+.gemini_security/
+.cursor/
+
+# ─── Internal planning artifacts (not part of the shipped product) ─────────
+# conductor/ holds style guides, tracks, and product workflow docs from
+# earlier development phases. Useful locally but don't belong in the
+# repo of the shipped app.
+conductor/
+
+# ─── Local user-data backups ───────────────────────────────────────────────
+# Manual snapshots created by the in-app Settings → Backups panel.
+# Contain the user's library mirror, watched marks, history log, and
+# AuraSettings — committed would leak personal state.
 backups/
 *.aura-backup.json
+
+# ─── Upscaling shaders ─────────────────────────────────────────────────────
+# Anime4K, FSRCNNX, RAVU, etc. are licensed separately and total tens
+# of MB of GLSL across the supported chains. Users download once per
+# clone per src-tauri/shaders/README.txt. The README is checked in;
+# shader files themselves are not.
+src-tauri/shaders/*.glsl
+src-tauri/shaders/*.hook
+!src-tauri/shaders/README.txt
+
+# ─── Sentry build artifacts ────────────────────────────────────────────────
+# .sentryclirc may carry org / project / token after `sentry-cli login`;
+# Aura already reads those from .env.local but the CLI sometimes writes
+# its own. Defensive ignore.
+.sentryclirc
