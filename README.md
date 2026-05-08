@@ -1,6 +1,6 @@
 # Aura
 
-A cinematic, glass-morphic desktop media player for Windows, built on
+A cinematic desktop media player for Windows, built on
 Tauri 2 + React 19 + libmpv. Consumes the Stremio addon ecosystem.
 
 ## Status
