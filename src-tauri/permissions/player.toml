@@ -152,6 +152,17 @@ identifier = "allow-scrobble"
 description = "Allows the frontend to fire scrobble Start/Heartbeat/End events to the configured AIOMetadata addon"
 commands.allow = ["scrobble_start", "scrobble_heartbeat", "scrobble_end"]
 
+# ── Trakt + AniList direct-scrobble OAuth (replaces AIOMetadata) ─────────────
+[[permission]]
+identifier = "allow-scrobble-auth"
+description = "Allows the frontend to read/write/clear OAuth tokens for the direct Trakt and AniList scrobble path, and to compute the authorize URL the user's browser should open."
+commands.allow = [
+  "get_scrobble_auth_status",
+  "set_scrobble_auth_token",
+  "clear_scrobble_auth_token",
+  "scrobble_oauth_authorize_url",
+]
+
 # ── Phase 3C: Discord Rich Presence ──────────────────────────────────────────
 [[permission]]
 identifier = "allow-discord-rpc"

@@ -133,7 +133,11 @@ const ChevronIcon = ({ open }: { open: boolean }) => (
 );
 
 function FilterBarInner({ items, state, onChange }: Props) {
-  const [open, setOpen] = useState(true);
+  // Default to collapsed so the panel doesn't overlap nearby controls
+  // (Library's Sort dropdown, Queue's drag affordance) until the user
+  // explicitly opens it. The chevron + "Filter & Sort" label still
+  // signals it's there.
+  const [open, setOpen] = useState(false);
   const genres = useMemo(() => collectGenres(items), [items]);
 
   // Bounds for the year slider — clamp to actual data when present

@@ -13,6 +13,7 @@ import {
   downloadBlobAsFile,
   parseImportInput,
   readImportFile,
+  resolveProviders,
 } from "../settingsTransfer";
 import {
   applyBackupPayload,
@@ -24,6 +25,7 @@ import {
   type BackupMeta,
 } from "../userDataBackup";
 import type { AddonEntry, ThemeId, KeybindAction } from "../types";
+import type { UserSession } from "../LoginView";
 import { KEYBIND_ACTIONS } from "../types";
 import { useTheme, THEME_LABELS, THEME_DESCRIPTIONS } from "../ThemeEngine";
 import { findAIOMetadataAddon } from "../aiometadata";
@@ -854,9 +856,13 @@ interface AuraStats {
 // ---------------------------------------------------------------------------
 
 function BackupRestoreSection({
-  backend, onApply, onResetComplete,
+  backend, addons, onApply, onResetComplete,
 }: {
   backend: BackendSettings;
+  /** Installed addons. Required so the export can encode provider /
+   *  hero-catalog URLs as manifest_ids and the import can resolve
+   *  them back to URLs against the importing user's installed list. */
+  addons: AddonEntry[];
   onApply: (patch: Partial<BackendSettings>) => Promise<void>;
   /** Fires after a successful full reset so the parent can refresh its
    *  local snapshot from the backend's new defaults. */
@@ -907,19 +913,21 @@ function BackupRestoreSection({
     const blob = buildExportBlob(
       backend as unknown as Record<string, unknown>,
       loadAuraSettings() as unknown as Record<string, unknown>,
+      addons,
     );
     setExportText(blobToBase64(blob));
     setStatus({ kind: "ok", message: "Export string ready — copy or download." });
-  }, [backend]);
+  }, [backend, addons]);
 
   const downloadFile = useCallback(() => {
     const blob = buildExportBlob(
       backend as unknown as Record<string, unknown>,
       loadAuraSettings() as unknown as Record<string, unknown>,
+      addons,
     );
     downloadBlobAsFile(blob);
     setStatus({ kind: "ok", message: "Downloaded settings file." });
-  }, [backend]);
+  }, [backend, addons]);
 
   const applyText = useCallback(async (raw: string) => {
     const blob = parseImportInput(raw);
@@ -929,12 +937,14 @@ function BackupRestoreSection({
     }
     try {
       await onApply(blob.backend as Partial<BackendSettings>);
-      // Apply the Aura-side portable subset. Import is additive: any
-      // field present in the blob overwrites; missing fields keep
-      // their current value.
+      // Aura-side portable subset. Import is additive: any field
+      // present in the blob overwrites; missing fields keep their
+      // current value. Provider lists go through resolveProviders so
+      // the imported manifest_ids resolve to the importing user's
+      // actual addon URLs (and unresolvable ids drop with a count).
+      const current = loadAuraSettings();
+      const next = { ...current };
       if (blob.aura) {
-        const current = loadAuraSettings();
-        const next = { ...current };
         if (typeof blob.aura.hideCastSpoilers === "boolean") {
           next.hideCastSpoilers = blob.aura.hideCastSpoilers;
         }
@@ -944,14 +954,28 @@ function BackupRestoreSection({
         if (typeof blob.aura.blurUnwatchedThumbnails === "boolean") {
           next.blurUnwatchedThumbnails = blob.aura.blurUnwatchedThumbnails;
         }
-        if (next !== current) saveAuraSettings(next);
       }
-      const fields = Object.keys(blob.backend).length + Object.keys(blob.aura).length;
-      setStatus({ kind: "ok", message: `Imported ${fields} setting${fields === 1 ? "" : "s"}.` });
+      const { aura: providerAura, unresolved } = resolveProviders(blob.providers, addons);
+      // Each resolved provider field overlays the current Aura
+      // settings. The resolveProviders return shape uses the same
+      // field names as AuraSettings, so a direct merge applies.
+      Object.assign(next, providerAura);
+      saveAuraSettings(next);
+      const fields =
+        Object.keys(blob.backend).length
+        + Object.keys(blob.aura ?? {}).length
+        + Object.keys(providerAura).length;
+      const tail = unresolved > 0
+        ? ` (${unresolved} provider id${unresolved === 1 ? "" : "s"} skipped — not installed)`
+        : "";
+      setStatus({
+        kind: "ok",
+        message: `Imported ${fields} setting${fields === 1 ? "" : "s"}${tail}.`,
+      });
     } catch (e) {
       setStatus({ kind: "error", message: `Import failed: ${String(e)}` });
     }
-  }, [onApply]);
+  }, [onApply, addons]);
 
   const onPickFile = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -2262,19 +2286,134 @@ function KeybindRow({ label, description, code, onChange }: KeybindRowProps) {
   );
 }
 
-function ManagedByAIOBadge() {
+// ---------------------------------------------------------------------------
+// ScrobbleAuthRow — one row in the new Trakt + AniList Settings section.
+// Shows connection state ("Not connected" or "Connected as <user>"), a
+// Connect button that opens the OAuth authorize URL in the user's
+// default browser, and a Disconnect button when authenticated. The
+// connection state is read on mount + whenever `aura:scrobble-auth-
+// changed` fires (the deep-link handler in App.tsx dispatches it
+// after persisting a token, the Disconnect handler dispatches it
+// after clearing one).
+//
+// `scope` is the first 12 chars of the Stremio auth_key (or "guest"),
+// matching the keyring layout in scrobble_auth.rs. Sharing a scope
+// across components keeps the displayed status in sync with the
+// stored token regardless of which Stremio account is signed in.
+// ---------------------------------------------------------------------------
+
+interface ScrobbleAuthSummary {
+  username: string | null;
+  expires_at: number | null;
+  stale: boolean;
+}
+
+function ScrobbleAuthRow({
+  service, authKey, description,
+}: {
+  service: "trakt" | "anilist";
+  authKey: string | null;
+  description: string;
+}) {
+  const scope = authKey ? authKey.slice(0, 12) : "guest";
+  const [status, setStatus] = useState<ScrobbleAuthSummary | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(() => {
+    invoke<{ trakt: ScrobbleAuthSummary | null; anilist: ScrobbleAuthSummary | null }>(
+      "get_scrobble_auth_status",
+      { scope },
+    )
+      .then((s) => setStatus(service === "trakt" ? s.trakt : s.anilist))
+      .catch(() => setStatus(null));
+  }, [scope, service]);
+
+  useEffect(() => {
+    refresh();
+    const onChanged = () => refresh();
+    window.addEventListener("aura:scrobble-auth-changed", onChanged);
+    return () => window.removeEventListener("aura:scrobble-auth-changed", onChanged);
+  }, [refresh]);
+
+  const connect = useCallback(async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const url = await invoke<string>("scrobble_oauth_authorize_url", { service, scope });
+      const { openUrl } = await import("@tauri-apps/plugin-opener");
+      await openUrl(url);
+    } catch (e) {
+      showAppToast(`Couldn't open ${service} auth URL: ${String(e)}`, { duration: 5000 });
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, service, scope]);
+
+  const disconnect = useCallback(async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await invoke("clear_scrobble_auth_token", { service, scope });
+      window.dispatchEvent(new CustomEvent("aura:scrobble-auth-changed"));
+    } catch (e) {
+      showAppToast(`Disconnect failed: ${String(e)}`, { duration: 5000 });
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, service, scope]);
+
+  const label = service === "trakt" ? "Trakt" : "AniList";
+  const connected = !!status;
+
   return (
-    <span
-      className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px]
-                 font-semibold uppercase tracking-wider
-                 bg-ln-accent/15 text-ln-accent border border-ln-accent/30"
-      title="This setting is automatically managed because the AIOMetadata addon is installed."
-    >
-      <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-        <path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8z" />
-      </svg>
-      Managed by AIOMetadata
-    </span>
+    <div className="space-y-2">
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex-1 min-w-0">
+          <p className="text-white/85 text-sm font-medium">{label}</p>
+          <p className="text-white/55 text-xs leading-relaxed">{description}</p>
+        </div>
+        <div className="flex-shrink-0 flex flex-col items-end gap-1.5">
+          {connected ? (
+            <>
+              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px]
+                                font-semibold uppercase tracking-wider
+                                bg-emerald-500/15 text-emerald-300 border border-emerald-400/30">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                {status?.username ? `Connected · ${status.username}` : "Connected"}
+              </span>
+              <button
+                type="button"
+                onClick={disconnect}
+                disabled={busy}
+                className="px-3 py-1 rounded-lg border border-white/15 bg-white/5
+                           text-white/75 text-[11px] font-medium tracking-wide
+                           hover:bg-rose-500/15 hover:text-rose-200 hover:border-rose-300/40
+                           transition-colors disabled:opacity-50"
+              >
+                Disconnect
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={connect}
+              disabled={busy}
+              className="px-3 py-1 rounded-lg border border-ln-accent/35 bg-ln-accent/15
+                         text-ln-accent text-[11px] font-medium tracking-wide
+                         hover:bg-ln-accent/25 hover:border-ln-accent/55
+                         transition-colors disabled:opacity-50"
+            >
+              Connect {label}
+            </button>
+          )}
+        </div>
+      </div>
+      {status?.stale && (
+        <p className="text-amber-400/80 text-xs">
+          Token expires soon — reconnect to refresh.
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -2284,6 +2423,7 @@ function ManagedByAIOBadge() {
 
 interface Props {
   addons: AddonEntry[];
+  session: UserSession | null;
 }
 
 const LANG_OPTIONS = [
@@ -2303,7 +2443,7 @@ interface CrashReportingConfig {
   dsn: string;
 }
 
-export default function SettingsView({ addons }: Props) {
+export default function SettingsView({ addons, session }: Props) {
   const [aura, setAura] = useState<AuraSettings>(loadAuraSettings);
   const [backend, setBackend] = useState<BackendSettings | null>(null);
   // Crash reporting consent + DSN live in a global sidecar (not the
@@ -3076,28 +3216,31 @@ export default function SettingsView({ addons }: Props) {
             </Section>
           )}
 
-          {/* Scrobbling */}
+          {/* Scrobbling — direct Trakt + AniList OAuth.
+              Replaces the AIOMetadata-addon scrobble path with a
+              direct connection to each provider. Tokens are stored in
+              the OS keyring per Stremio account so signing out and
+              back in keeps the connection. Connect opens the user's
+              default browser; the VPS proxy at aura.animasec.dev
+              completes the OAuth dance and deep-links the token back
+              into Aura. */}
           {backend && (
-            <Section id="sec-scrobble" title="Scrobbling (AIOMetadata)">
-              <SettingText
-                label="Scrobble addon URL"
-                description={
-                  aioAddon
-                    ? "AIOMetadata is installed — Aura is locked onto its endpoint for Trakt / AniList progress reporting."
-                    : "Optional. When set AND scrobbling is enabled below, Aura sends a single completion event to this AIOMetadata-compatible endpoint when an episode crosses the watched threshold (80 % progress AND ≥ 5 min of fresh playback). The Trakt-style live 'check-in' was removed in favour of this end-only flow."
-                }
-                value={backend.scrobble_addon_url}
-                placeholder="https://example.com/aiometadata"
-                disabled={!!aioAddon}
-                badge={aioAddon ? <ManagedByAIOBadge /> : null}
-                onChange={(v) => patchBackend({ scrobble_addon_url: v.trim() })}
-                validate={!aioAddon ? (v) => /^https?:\/\/.+/.test(v.trim()) ? "valid" : "invalid" : undefined}
-                validationHint="Must be a valid HTTP or HTTPS URL."
+            <Section id="sec-scrobble" title="Trakt & AniList">
+              <ScrobbleAuthRow
+                service="trakt"
+                authKey={session?.auth_key ?? null}
+                description="Trakt receives playback progress for movies and series. Aura logs in directly via OAuth — no addon required. The Trakt scrobble events fire at the same thresholds as before (start ≥ 120 s of real playback, end at 80 % + ≥ 5 min)."
+              />
+              <div className="h-px bg-white/6" />
+              <ScrobbleAuthRow
+                service="anilist"
+                authKey={session?.auth_key ?? null}
+                description="AniList tracks anime episode progress. When connected, Aura updates your AniList list as you finish episodes. Detected automatically for anime targets; movies and live-action use Trakt instead."
               />
               <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Enable scrobbling"
-                description="Master switch. When off, Aura sends NO scrobble traffic regardless of the URL above — useful for pausing scrobbling without re-entering the URL later. Default off; existing settings.json files with a configured URL keep their previous behaviour on first upgrade."
+                description="Master switch. When off, Aura sends NO scrobble traffic to either provider — useful for pausing scrobbling without disconnecting your accounts."
                 value={backend.scrobble_enabled}
                 onChange={(v) => patchBackend({ scrobble_enabled: v })}
               />
@@ -3188,6 +3331,7 @@ export default function SettingsView({ addons }: Props) {
           {backend && (
             <BackupRestoreSection
               backend={backend}
+              addons={addons}
               onApply={async (patch) => { await patchBackend(patch); }}
               onResetComplete={() => {
                 // Force the SettingsView to re-pull fresh backend

@@ -146,19 +146,19 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
         aspectRatio: "21 / 9",
         maxHeight: HERO_MAX_HEIGHT,
         maxWidth: HERO_MAX_WIDTH,
-        // Soft alpha-fade edges. Toned down compared to the first
-        // pass — the previous 12 % top / 4 % side fades were eating
-        // into the lower-left description block (long synopses turned
-        // into a half-faded block on the bottom edge). Now: a 6 % top
-        // bleed for the search-bar handoff, ~5 % bottom into the page
-        // background, ~2 % side nibbles. Header / description / arrows
-        // all sit comfortably in the fully-opaque region.
+        // Soft alpha-fade edges with an S-curve falloff. The previous
+        // shape (transparent → black at hard 6 % / 2 % stops) read as
+        // a sharp line on the inside of the fade where it met the
+        // artwork. Adding a half-opacity midpoint (50 % black at the
+        // mid-fade) smooths the transition into a gentle gradient
+        // instead of an abrupt edge — backdrop art now bleeds into
+        // the page background instead of cutting off.
         WebkitMaskImage:
-          "linear-gradient(to bottom, transparent 0%, black 6%, black 95%, transparent 100%), " +
-          "linear-gradient(to right, transparent 0%, black 2%, black 98%, transparent 100%)",
+          "linear-gradient(to bottom, transparent 0%, rgba(0,0,0,0.5) 3%, black 10%, black 90%, rgba(0,0,0,0.5) 97%, transparent 100%), " +
+          "linear-gradient(to right, transparent 0%, rgba(0,0,0,0.5) 1.2%, black 5%, black 95%, rgba(0,0,0,0.5) 98.8%, transparent 100%)",
         maskImage:
-          "linear-gradient(to bottom, transparent 0%, black 6%, black 95%, transparent 100%), " +
-          "linear-gradient(to right, transparent 0%, black 2%, black 98%, transparent 100%)",
+          "linear-gradient(to bottom, transparent 0%, rgba(0,0,0,0.5) 3%, black 10%, black 90%, rgba(0,0,0,0.5) 97%, transparent 100%), " +
+          "linear-gradient(to right, transparent 0%, rgba(0,0,0,0.5) 1.2%, black 5%, black 95%, rgba(0,0,0,0.5) 98.8%, transparent 100%)",
         WebkitMaskComposite: "source-in" as React.CSSProperties["WebkitMaskComposite"],
         // Standards property — newer Chromium / Safari support `intersect`.
         maskComposite: "intersect",

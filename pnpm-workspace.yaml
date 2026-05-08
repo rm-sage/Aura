@@ -1,2 +1,6 @@
 allowBuilds:
+  # @sentry/cli's postinstall downloads the platform-specific sentry-cli
+  # binary that the release.ps1 script invokes for PDB symbol upload.
+  # Without this allowance, pnpm 11 errors in non-interactive shells.
+  '@sentry/cli': true
   esbuild: true

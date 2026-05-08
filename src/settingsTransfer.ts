@@ -7,31 +7,50 @@
 // upload, OR a base64 string that pastes cleanly into any messenger.
 //
 // SCOPE
-//   Only addon-INDEPENDENT settings round-trip. Anything that names a
-//   specific addon URL (catalog / stream / search provider lists, the
-//   scrobble addon URL, the meta provider override) is excluded — those
-//   are environment-specific and would point at addons that may not exist
-//   on the importing machine. The user explicitly asked for this split
-//   ("things like catalog/stream providers shouldn't be affected").
+//   Three buckets:
+//     1. backend  — addon-independent BackendSettings (theme, RPC, audio,
+//                   subtitles, keybindings, omdb_api_key, …)
+//     2. aura     — addon-independent localStorage prefs (detail-page
+//                   toggles like hideCastSpoilers / blurUnwatchedThumbnails)
+//     3. providers — addon-DEPENDENT prefs encoded by manifest_id INSTEAD
+//                    of URL. On import, each id is resolved against the
+//                    importing user's installed addons; ids that don't
+//                    match an installed addon are silently dropped (the
+//                    user can install the missing addon then re-import).
+//                    Covers the home / metadata / stream / search
+//                    provider lists AND the hero carousel source. This
+//                    lets a user who has e.g. AIOMetadata installed on
+//                    both machines round-trip their preferred provider
+//                    ordering without leaking machine-specific URLs.
 //
-// SHAPE
+// SHAPE (v2)
 //   {
-//     version: 1,                 // schema version; bump when adding fields
-//     exportedAt: "<ISO-8601>",   // diagnostic only; never used for merge
-//     backend: { ... },           // subset of BackendSettings
-//     aura:    { ... }            // currently empty; aura settings are
-//                                 // all addon-URL-keyed (excluded above)
+//     version: 2,                 // bumped from 1 when providers added
+//     exportedAt: "<ISO-8601>",
+//     backend:   { ... },         // unchanged
+//     aura:      { ... },         // unchanged
+//     providers: {                // NEW — id-keyed, addon-dependent
+//       defaultHomeAddonId:        string | null,
+//       additionalHomeAddonIds:    string[],
+//       defaultMetadataAddonId:    string | null,
+//       streamAddonIds:            string[] | null,
+//       searchAddonIds:            string[] | null,
+//       searchSuggestionAddonIds:  string[] | null,
+//       heroCatalog: { addonId, mediaType, catalogId } | null
+//     }
 //   }
 //
 // IMPORT MERGE STRATEGY
-//   For each portable backend field present in the blob, overwrite the
-//   current value via patchBackend. Unknown fields (forward-compat from
-//   future versions) are silently dropped. Missing fields keep their
-//   current value. There's no "reset to defaults" mode — that would be
-//   a separate action.
+//   - backend / aura: shallow-overwrite by field. Unknown fields dropped.
+//   - providers: each id resolved to the installed addon's URL via
+//     manifest_id match; unresolvable ids dropped from the imported list
+//     (preserving the relative order of the resolvable ones).
+//
+// V1 BLOBS still parse — providers block is missing, so providers stay
+// at their current values on the importing side. No-op forward-compat.
 // ---------------------------------------------------------------------------
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 /** Backend fields safe to round-trip across installs. Anything keyed by
  *  addon URL (scrobble_addon_url) is intentionally absent. */
@@ -83,6 +102,22 @@ const PORTABLE_AURA_FIELDS = [
 ] as const;
 export type PortableAuraField = typeof PORTABLE_AURA_FIELDS[number];
 
+/** Provider lists encoded by addon manifest_id (NOT url). On import,
+ *  each id is resolved against the importing user's installed addon
+ *  list; ids that don't match an installed manifest_id are dropped
+ *  with a warning. This lets the same Stremio user round-trip "I want
+ *  AIOMetadata first then Cinemeta" between machines without each
+ *  machine needing the same hostname / port for the addon. */
+export interface PortableProvidersBlob {
+  defaultHomeAddonId:        string | null;
+  additionalHomeAddonIds:    string[];
+  defaultMetadataAddonId:    string | null;
+  streamAddonIds:            string[] | null;
+  searchAddonIds:            string[] | null;
+  searchSuggestionAddonIds:  string[] | null;
+  heroCatalog:               { addonId: string; mediaType: string; catalogId: string } | null;
+}
+
 export interface SettingsBlob {
   version: number;
   exportedAt: string;
@@ -90,6 +125,62 @@ export interface SettingsBlob {
   /** Addon-independent Aura-side settings (localStorage). Only fields
    *  in PORTABLE_AURA_FIELDS are round-tripped. */
   aura: Partial<Record<PortableAuraField, unknown>>;
+  /** Addon-DEPENDENT prefs encoded by manifest_id. v1 blobs lack this
+   *  block; the importer treats absence as "leave provider lists alone". */
+  providers?: PortableProvidersBlob;
+}
+
+/** Minimal AddonEntry shape needed for URL ↔ manifest_id resolution.
+ *  Decoupled from the full type so this module stays import-light. */
+interface AddonRef {
+  url: string;
+  manifest_id: string;
+}
+
+/** URL → manifest_id (or `null` when the url isn't installed). */
+function urlToId(url: string | null, addons: AddonRef[]): string | null {
+  if (!url) return null;
+  const match = addons.find((a) => a.url === url);
+  return match?.manifest_id || null;
+}
+
+/** Build the providers block by resolving every URL field to its
+ *  manifest_id. URLs that don't match an installed addon (e.g. the
+ *  user removed it after picking it as default) drop to null. */
+function buildProvidersBlob(
+  aura: Record<string, unknown>,
+  addons: AddonRef[],
+): PortableProvidersBlob {
+  const ids = (urls: unknown): string[] | null => {
+    if (urls == null) return null;
+    if (!Array.isArray(urls)) return null;
+    const out: string[] = [];
+    for (const u of urls) {
+      if (typeof u !== "string") continue;
+      const id = urlToId(u, addons);
+      if (id) out.push(id);
+    }
+    return out;
+  };
+
+  let heroCatalog: PortableProvidersBlob["heroCatalog"] = null;
+  const hc = aura.heroCatalog as { addonUrl: string; mediaType: string; catalogId: string } | null | undefined;
+  if (hc && typeof hc === "object" && hc.addonUrl && hc.mediaType && hc.catalogId) {
+    const addonId = urlToId(hc.addonUrl, addons);
+    if (addonId) {
+      heroCatalog = { addonId, mediaType: hc.mediaType, catalogId: hc.catalogId };
+    }
+  }
+
+  return {
+    defaultHomeAddonId:       urlToId(aura.defaultHomeAddonUrl as string | null, addons),
+    additionalHomeAddonIds:   ids(aura.additionalHomeAddonUrls) ?? [],
+    defaultMetadataAddonId:   urlToId(aura.defaultMetadataAddonUrl as string | null, addons),
+    streamAddonIds:           ids(aura.streamAddonUrls),
+    searchAddonIds:           ids(aura.searchAddonUrls),
+    searchSuggestionAddonIds: ids(aura.searchSuggestionAddonUrls),
+    heroCatalog,
+  };
 }
 
 /** Strip a backend snapshot down to the portable subset. Anything not in
@@ -97,6 +188,7 @@ export interface SettingsBlob {
 export function buildExportBlob(
   backend: Record<string, unknown>,
   aura: Record<string, unknown> = {},
+  addons: AddonRef[] = [],
 ): SettingsBlob {
   const portable: Partial<Record<PortableBackendField, unknown>> = {};
   for (const key of PORTABLE_BACKEND_FIELDS) {
@@ -111,7 +203,86 @@ export function buildExportBlob(
     exportedAt: new Date().toISOString(),
     backend:    portable,
     aura:       auraPortable,
+    providers:  buildProvidersBlob(aura, addons),
   };
+}
+
+/** Resolved import patch ready for direct apply. URLs have already been
+ *  matched against the importing user's installed addons; ids that
+ *  didn't resolve are dropped from the lists. Caller hands `aura` and
+ *  `backend` to its respective updaters (setLocal / patchBackend). */
+export interface ResolvedImport {
+  backend: Partial<Record<PortableBackendField, unknown>>;
+  aura: Record<string, unknown>;
+  /** Diagnostic — counts of provider ids that didn't match an installed
+   *  addon. Surfaces as a toast so the user knows why a partial import
+   *  happened. */
+  unresolvedCount: number;
+}
+
+/** id → url (or null). Inverse of `urlToId`. */
+function idToUrl(id: string | null, addons: AddonRef[]): string | null {
+  if (!id) return null;
+  const match = addons.find((a) => a.manifest_id === id);
+  return match?.url || null;
+}
+
+/** Apply the providers block to the importing user's addon list.
+ *  Returns an aura-shape patch with URLs resolved + a count of ids
+ *  that couldn't be matched. */
+export function resolveProviders(
+  providers: PortableProvidersBlob | undefined,
+  addons: AddonRef[],
+): { aura: Record<string, unknown>; unresolved: number } {
+  if (!providers) return { aura: {}, unresolved: 0 };
+  let unresolved = 0;
+  const resolveList = (ids: string[] | null): string[] | null => {
+    if (ids == null) return null;
+    const out: string[] = [];
+    for (const id of ids) {
+      const url = idToUrl(id, addons);
+      if (url) out.push(url);
+      else unresolved += 1;
+    }
+    return out;
+  };
+
+  const aura: Record<string, unknown> = {};
+  if (providers.defaultHomeAddonId !== undefined) {
+    const url = idToUrl(providers.defaultHomeAddonId, addons);
+    if (url) aura.defaultHomeAddonUrl = url;
+    else if (providers.defaultHomeAddonId) unresolved += 1;
+  }
+  if (providers.additionalHomeAddonIds) {
+    aura.additionalHomeAddonUrls = resolveList(providers.additionalHomeAddonIds) ?? [];
+  }
+  if (providers.defaultMetadataAddonId !== undefined) {
+    const url = idToUrl(providers.defaultMetadataAddonId, addons);
+    if (url) aura.defaultMetadataAddonUrl = url;
+    else if (providers.defaultMetadataAddonId) unresolved += 1;
+  }
+  if (providers.streamAddonIds !== undefined) {
+    aura.streamAddonUrls = resolveList(providers.streamAddonIds);
+  }
+  if (providers.searchAddonIds !== undefined) {
+    aura.searchAddonUrls = resolveList(providers.searchAddonIds);
+  }
+  if (providers.searchSuggestionAddonIds !== undefined) {
+    aura.searchSuggestionAddonUrls = resolveList(providers.searchSuggestionAddonIds);
+  }
+  if (providers.heroCatalog) {
+    const url = idToUrl(providers.heroCatalog.addonId, addons);
+    if (url) {
+      aura.heroCatalog = {
+        addonUrl: url,
+        mediaType: providers.heroCatalog.mediaType,
+        catalogId: providers.heroCatalog.catalogId,
+      };
+    } else {
+      unresolved += 1;
+    }
+  }
+  return { aura, unresolved };
 }
 
 /** Pretty-printed JSON for the file download / textarea. Indent=2 keeps
@@ -181,11 +352,52 @@ export function parseImportInput(raw: string): SettingsBlob | null {
     if (key in auraRaw) aura[key] = auraRaw[key];
   }
 
+  // Providers — only present in v2+ blobs. Validate each field;
+  // anything malformed gets dropped silently rather than failing the
+  // whole import.
+  let providers: PortableProvidersBlob | undefined;
+  const provRaw = obj.providers && typeof obj.providers === "object"
+    ? obj.providers as Record<string, unknown>
+    : null;
+  if (provRaw) {
+    const stringOrNull = (v: unknown): string | null =>
+      typeof v === "string" && v.length > 0 ? v : null;
+    const stringArrOrNull = (v: unknown): string[] | null => {
+      if (v == null) return null;
+      if (!Array.isArray(v)) return null;
+      return v.filter((x): x is string => typeof x === "string");
+    };
+    let heroCatalog: PortableProvidersBlob["heroCatalog"] = null;
+    const hcRaw = provRaw.heroCatalog as Record<string, unknown> | null | undefined;
+    if (
+      hcRaw && typeof hcRaw === "object"
+      && typeof hcRaw.addonId === "string"
+      && typeof hcRaw.mediaType === "string"
+      && typeof hcRaw.catalogId === "string"
+    ) {
+      heroCatalog = {
+        addonId: hcRaw.addonId,
+        mediaType: hcRaw.mediaType,
+        catalogId: hcRaw.catalogId,
+      };
+    }
+    providers = {
+      defaultHomeAddonId:       stringOrNull(provRaw.defaultHomeAddonId),
+      additionalHomeAddonIds:   stringArrOrNull(provRaw.additionalHomeAddonIds) ?? [],
+      defaultMetadataAddonId:   stringOrNull(provRaw.defaultMetadataAddonId),
+      streamAddonIds:           stringArrOrNull(provRaw.streamAddonIds),
+      searchAddonIds:           stringArrOrNull(provRaw.searchAddonIds),
+      searchSuggestionAddonIds: stringArrOrNull(provRaw.searchSuggestionAddonIds),
+      heroCatalog,
+    };
+  }
+
   return {
     version:    SCHEMA_VERSION,
     exportedAt: typeof obj.exportedAt === "string" ? obj.exportedAt : "",
     backend,
     aura,
+    providers,
   };
 }
 

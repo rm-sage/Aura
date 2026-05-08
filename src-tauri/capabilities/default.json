@@ -39,6 +39,7 @@
     "allow-library-sync",
     "allow-settings",
     "allow-scrobble",
+    "allow-scrobble-auth",
     "allow-discord-rpc",
     "allow-subtitles",
     "allow-omdb-ratings",

@@ -32,6 +32,7 @@ mod omdb;
 mod player;
 mod ratings;
 mod scrobble;
+mod scrobble_auth;
 mod per_title;
 mod settings;
 mod silencedetect;
@@ -1569,6 +1570,11 @@ pub fn run() {
             scrobble::scrobble_start,
             scrobble::scrobble_heartbeat,
             scrobble::scrobble_end,
+            // ── Trakt + AniList OAuth (direct scrobble, replaces AIOMetadata) ──
+            scrobble_auth::get_scrobble_auth_status,
+            scrobble_auth::set_scrobble_auth_token,
+            scrobble_auth::clear_scrobble_auth_token,
+            scrobble_auth::scrobble_oauth_authorize_url,
             // ── Phase 3C: Discord RPC ─────────────────────────────────────────
             window_logic::discord_set_presence,
             window_logic::discord_clear_presence,

@@ -322,7 +322,11 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
           surfaces. Only renders once at least one library item exists so
           we don't show an empty filter panel on a fresh install. */}
       {aggregateMeta.length > 0 && (
-        <div className="absolute right-6 top-24 z-20 hidden xl:block">
+        // top-44 (176 px) clears the Library header's title + Sort
+        // dropdown + media-type filter pills. top-24 (the default
+        // used by simpler views) was overlapping the Sort dropdown
+        // since both wanted the right edge of the header band.
+        <div className="absolute right-6 top-44 z-20 hidden xl:block">
           <FilterBar items={aggregateMeta} state={extraFilters} onChange={setExtraFilters} />
         </div>
       )}

@@ -27,6 +27,10 @@
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },
+  "pnpm": {
+    "onlyBuiltDependencies": ["@sentry/cli"],
+    "ignoredBuiltDependencies": []
+  },
   "devDependencies": {
     "@sentry/vite-plugin": "^5.2.1",
     "@tauri-apps/cli": "^2",

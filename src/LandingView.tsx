@@ -55,10 +55,10 @@ export default function LandingView({ onSignedIn, onContinueGuest }: Props) {
         />
       </div>
 
-      {/* Center column — narrow on purpose so buttons + copy don't
-          stretch across an ultrawide display. 320 px keeps the action
-          stack feeling like a focused dialog rather than a banner. */}
-      <div className="relative z-10 w-full max-w-[320px] mx-auto px-6 flex flex-col gap-7 text-center">
+      {/* Center column — wide enough that the title + description don't
+          wrap aggressively, but the button stack inside stays modest
+          (the buttons themselves size to content, not to the column). */}
+      <div className="relative z-10 w-full max-w-[480px] mx-auto px-6 flex flex-col gap-7 text-center">
         {/* Brand */}
         <div className="flex flex-col items-center gap-5">
           {/* Big glass-morphism A — refracts the moving spectral
@@ -99,9 +99,9 @@ export default function LandingView({ onSignedIn, onContinueGuest }: Props) {
         <div className="flex flex-col items-center gap-2.5 mt-1">
           <button
             onClick={() => setShowLogin(true)}
-            className="group relative px-5 py-2.5 rounded-xl
+            className="group relative px-6 py-3 rounded-xl
                        bg-ln-accent/80 hover:bg-ln-accent active:scale-[0.99]
-                       text-white text-[13px] font-medium transition-all
+                       text-white text-[14px] font-medium transition-all
                        flex items-center justify-center gap-2.5
                        shadow-glass-edge"
           >
@@ -111,9 +111,9 @@ export default function LandingView({ onSignedIn, onContinueGuest }: Props) {
 
           <button
             onClick={onContinueGuest}
-            className="group px-5 py-2.5 rounded-xl
+            className="group px-6 py-3 rounded-xl
                        bg-white/5 border border-white/10 hover:bg-white/8
-                       text-white/75 hover:text-white/90 text-[13px]
+                       text-white/75 hover:text-white/90 text-[14px]
                        transition-all flex items-center justify-center gap-2.5"
           >
             <GuestIcon />

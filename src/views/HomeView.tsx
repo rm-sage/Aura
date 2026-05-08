@@ -446,7 +446,7 @@ export default function HomeView({
     const source = heroOverrideItems ?? rows.find((r) => r.items.length > 0)?.items ?? [];
     return source
       .filter((it) => it.background ?? it.fanart ?? it.backdrop ?? it.poster)
-      .slice(0, 5);
+      .slice(0, 10);
   }, [heroOverrideItems, rows]);
 
   /** Display name of the catalog the hero is pulled from — surfaces

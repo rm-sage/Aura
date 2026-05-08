@@ -1941,14 +1941,73 @@ export default function App() {
   }, [library, session, handleLibraryToggle]);
 
   // ── Load synced or local addons ──
+  // Defensive cache layer for the cloud addon list. Each auth_key gets
+  // its own localStorage entry; on every successful sync we stash the
+  // result. The bug we're guarding against: a fresh sign-in on a
+  // second device occasionally returns a SHORTER addon list from the
+  // /api/addonCollectionGet endpoint (suspected Stremio API race —
+  // cloud_add_addon's read-modify-write has no concurrency token, so
+  // a near-simultaneous write from device A while device B is
+  // adding can land a partial collection in storage). Without this
+  // cache, device B's view replaces a working list with the partial
+  // one and the user thinks their addons vanished. With this cache,
+  // we keep showing the previous list when the new one is suspiciously
+  // smaller and surface a warning so the user can choose to re-sync.
+  const cloudAddonCacheKey = useCallback(
+    (authKey: string) => `aura:cloud-addons-cache:${authKey.slice(0, 12)}`,
+    [],
+  );
   const loadSyncedAddons = useCallback(async (sess: UserSession) => {
+    const key = cloudAddonCacheKey(sess.auth_key);
+    let cached: AddonEntry[] | null = null;
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) cached = parsed as AddonEntry[];
+      }
+    } catch { /* corrupt cache — ignore */ }
+
     try {
       const synced = await invoke<AddonEntry[]>("get_synced_addons", { authKey: sess.auth_key });
+      // Suspicion check: a fresh fetch returning empty OR fewer than half
+      // the previously-cached count is almost always a sync glitch
+      // rather than a real user-driven wipe. Treat it as transient and
+      // keep the cache; the user can manually refresh to re-attempt.
+      if (
+        cached
+        && cached.length >= 2
+        && synced.length < Math.floor(cached.length / 2)
+      ) {
+        console.warn(
+          `[addons] cloud sync returned ${synced.length} addons; cache had ${cached.length}. ` +
+          `Keeping cached list to avoid a destructive wipe — re-open the Addons tab to retry.`,
+        );
+        showAppToast(
+          `Cloud sync returned ${synced.length} addons (${cached.length} cached). ` +
+          `Showing cached list to be safe.`,
+          { duration: 5000 },
+        );
+        setAddons(cached);
+        return;
+      }
       setAddons(synced);
+      // Persist the latest healthy fetch so future sessions on this
+      // device have a fallback. JSON.stringify is cheap for the typical
+      // <30 addons most users have.
+      try { localStorage.setItem(key, JSON.stringify(synced)); } catch { /* quota */ }
     } catch (err) {
-      if (String(err) === SESSION_EXPIRED) await handleSessionExpired();
+      if (String(err) === SESSION_EXPIRED) {
+        await handleSessionExpired();
+      } else if (cached) {
+        // Network failure during initial sync — fall back to whatever
+        // we cached last time so the Addons tab and home rows aren't
+        // empty while the user troubleshoots.
+        console.warn(`[addons] cloud sync failed; falling back to cache (${cached.length} addons).`);
+        setAddons(cached);
+      }
     }
-  }, [handleSessionExpired]);
+  }, [cloudAddonCacheKey, handleSessionExpired]);
 
   const loadLocalAddons = useCallback(() => {
     invoke<AddonEntry[]>("list_addons").then(setAddons).catch(() => {});
@@ -2843,6 +2902,47 @@ export default function App() {
     const p = listen<string>("deep-link", ({ payload }) => {
       try {
         const url = new URL(payload);
+        // OAuth callback from the VPS proxy at aura.animasec.dev. The
+        // proxy exchanges the provider's authorization code for an
+        // access_token (using the client_secret it holds), then
+        // redirects the browser at `aura://oauth/{trakt,anilist}?...`
+        // with the token + refresh + expires + username in query
+        // params. We persist the token via the Tauri command and
+        // surface a toast so the user knows the connection landed.
+        if (url.hostname === "oauth") {
+          const service = url.pathname.replace(/^\//, "").toLowerCase();
+          if (service !== "trakt" && service !== "anilist") return;
+          const access_token  = url.searchParams.get("token");
+          const refresh_token = url.searchParams.get("refresh");
+          const expiresStr    = url.searchParams.get("expires");
+          const username      = url.searchParams.get("user");
+          const stateScope    = url.searchParams.get("state") ?? "guest";
+          if (!access_token) {
+            showAppToast(`${service} OAuth callback missing token`, { duration: 5000 });
+            return;
+          }
+          const expires_at = expiresStr ? Number(expiresStr) : null;
+          invoke("set_scrobble_auth_token", {
+            service,
+            scope: stateScope,
+            accessToken:  access_token,
+            refreshToken: refresh_token ?? null,
+            expiresAt:    Number.isFinite(expires_at) ? expires_at : null,
+            username:     username ?? null,
+          })
+            .then(() => {
+              showAppToast(
+                `Connected to ${service.charAt(0).toUpperCase() + service.slice(1)}` +
+                (username ? ` as ${username}` : ""),
+                { duration: 4000 },
+              );
+              window.dispatchEvent(new CustomEvent("aura:scrobble-auth-changed"));
+            })
+            .catch((err) => {
+              showAppToast(`${service} token store failed: ${String(err)}`, { duration: 6000 });
+            });
+          return;
+        }
         if (url.hostname === "search") {
           const q = url.searchParams.get("q") ?? "";
           if (q) {
@@ -3095,7 +3195,7 @@ export default function App() {
           <QueueView library={library} onSelectMeta={openDetail} />
         )}
         {activeView === "settings" && (
-          <SettingsView addons={addons} />
+          <SettingsView addons={addons} session={session} />
         )}
       </div>
 

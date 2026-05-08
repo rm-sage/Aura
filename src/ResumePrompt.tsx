@@ -1,15 +1,18 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 
 // ---------------------------------------------------------------------------
 // ResumePrompt — small modal shown right before a stream loads when the
 // library carries a non-trivial timeOffset for the target. Two choices:
-//   • Resume from saved position (default — auto-confirms after 15 s)
+//   • Resume from saved position
 //   • Start over from the beginning
 //
 // Mounted at the app root; visibility is driven by `pendingResume` props.
+// Waits for explicit user input — no auto-confirm timer (the user
+// decided the countdown felt rushed and removed the auto-resume path).
+// Esc / Enter are still wired so keyboard users don't have to click.
 // ---------------------------------------------------------------------------
 
 export interface PendingResume {
@@ -27,8 +30,6 @@ export interface PendingResume {
   onStartOver: () => void;
 }
 
-const AUTO_RESUME_AFTER_S = 15;
-
 function formatTime(totalSeconds: number): string {
   const s = Math.max(0, Math.floor(totalSeconds));
   const h = Math.floor(s / 3600);
@@ -39,29 +40,9 @@ function formatTime(totalSeconds: number): string {
 }
 
 export default function ResumePrompt({ pending }: { pending: PendingResume | null }) {
-  const [secondsLeft, setSecondsLeft] = useState(AUTO_RESUME_AFTER_S);
-
-  // Reset countdown each time a new prompt arrives. Tick every second
-  // until 0; auto-confirms on hit.
-  useEffect(() => {
-    if (!pending) return;
-    setSecondsLeft(AUTO_RESUME_AFTER_S);
-    const id = window.setInterval(() => {
-      setSecondsLeft((n) => {
-        if (n <= 1) {
-          window.clearInterval(id);
-          pending.onResume();
-          return 0;
-        }
-        return n - 1;
-      });
-    }, 1000);
-    return () => window.clearInterval(id);
-  }, [pending]);
-
   // Esc = start over (same as the explicit button — picking the more
   // destructive option requires either a click OR an explicit Esc).
-  // Enter = resume immediately (skip the countdown).
+  // Enter = resume.
   useEffect(() => {
     if (!pending) return;
     const onKey = (e: KeyboardEvent) => {
@@ -155,13 +136,10 @@ export default function ResumePrompt({ pending }: { pending: PendingResume | nul
                        transition-colors"
           >
             Resume from {formatTime(pending.resumeSeconds)}
-            <span className="ml-2 text-ln-accent/65 font-mono text-[11px] tabular-nums">
-              ({secondsLeft}s)
-            </span>
           </button>
         </div>
         <p className="text-white/35 text-[11px] mt-3 text-center">
-          Auto-resumes in {secondsLeft}s · Enter to resume now · Esc to start over
+          Enter to resume · Esc to start over
         </p>
       </div>
     </div>
