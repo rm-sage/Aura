@@ -2715,7 +2715,7 @@ function StreamsPanel({
 }) {
   const subtitle = isEpisodic && activeVideo
     ? (activeVideo.season != null && activeVideo.episode != null
-        ? `S${String(activeVideo.season).padStart(2, "0")} · E${String(activeVideo.episode).padStart(2, "0")} — ${activeVideo.title}`
+        ? `S${String(activeVideo.season).padStart(2, "0")} · E${String(activeVideo.episode).padStart(2, "0")} · ${activeVideo.title}`
         : activeVideo.title)
     : null;
 
@@ -3272,7 +3272,7 @@ function StreamRow({
             </Tooltip>
           )}
           {parsed.proxyState === "off" && (
-            <Tooltip text="Direct delivery — addon's proxy is off for this stream" pos="top">
+            <Tooltip text="Direct delivery; addon's proxy is off for this stream" pos="top">
               <ChipPill kind="proxy-off" label="⛉" />
             </Tooltip>
           )}

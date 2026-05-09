@@ -82,7 +82,7 @@ fn spawn_bridge_subprocess() {
     let Some(path) = chosen else {
         crate::devlog!(
             warn, "bridge",
-            "aura-bridge binary not found alongside the Aura executable — plain-HTTP stream proxying is disabled. HTTPS streams continue to work as normal (they bypass the bridge entirely)."
+            "aura-bridge binary not found alongside the Aura executable; plain-HTTP stream proxying is disabled. HTTPS streams continue to work as normal (they bypass the bridge entirely)."
         );
         return;
     };
@@ -1259,6 +1259,36 @@ pub fn run() {
         )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_libmpv::init())
+        // Single-instance MUST be registered BEFORE the deep-link
+        // plugin so the deep-link plugin can hook into it and forward
+        // `aura://` URLs from secondary processes back to the primary.
+        // Without it the OS scheme handler spawns a fresh aura.exe
+        // per deep-link click and neither instance ends up applying
+        // the OAuth token. The callback fires on the running primary
+        // instance whenever a second one is launched; we focus the
+        // main window. The single-instance plugin's `deep-link`
+        // feature hooks into tauri_plugin_deep_link BEFORE this
+        // callback runs (see tauri-plugin-single-instance's `init`
+        // wrapper) so the URL forwarding is automatic.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+            use tauri::Manager;
+            // Log unconditionally so we can tell from DevConsole /
+            // stderr whether the OS actually dispatched the
+            // secondary process, separate from whether the deep-link
+            // plugin then propagated the URL. argv[0] is the
+            // executable path; argv[1..] is what we care about for
+            // the `aura://` URL.
+            crate::devlog!(
+                info, "lib",
+                "single-instance second-process args ({} total): {:?} cwd={cwd}",
+                argv.len(), argv,
+            );
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_shell::init())
@@ -1272,6 +1302,32 @@ pub fn run() {
             // ── DevLog — install first so subsequent setup steps can log ──
             devlog::install(app.handle());
             crate::devlog!(info, "lib", "Aura setup begin");
+
+            // ── Deep-link scheme registration ──────────────────────────────
+            // The Windows NSIS installer registers `aura://` and
+            // `stremio://` in HKCU\Software\Classes when the user
+            // installs Aura, so OAuth deep-links Just Work for shipped
+            // builds. But `pnpm tauri dev` never runs the installer,
+            // so the scheme is unknown to the OS — the system browser
+            // shows "Prevented navigation due to unknown protocol"
+            // when the proxy 302s to `aura://oauth/{provider}`.
+            // Registering at runtime in debug-Windows + Linux fixes
+            // dev mode without disturbing release behaviour. macOS is
+            // bundle-only (the .app's Info.plist registers it; no
+            // runtime API). Linux always needs runtime registration
+            // — the .desktop file path varies by distro.
+            #[cfg(any(target_os = "linux", all(debug_assertions, target_os = "windows")))]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                if let Err(e) = app.deep_link().register_all() {
+                    crate::devlog!(
+                        warn, "lib",
+                        "deep-link register_all failed: {e} — aura:// links may not route to this build",
+                    );
+                } else {
+                    crate::devlog!(info, "lib", "deep-link schemes registered (dev mode)");
+                }
+            }
 
             // ── DLL pre-flight ─────────────────────────────────────────────
             player::check_mpv_dll().map_err(|e| {
@@ -1367,11 +1423,31 @@ pub fn run() {
             // ── Deep-link handler ─────────────────────────────────────────
             // Emits `deep-link` events to the frontend for both aura:// and
             // stremio:// protocol URLs so the UI can route them.
+            //
+            // tauri-plugin-deep-link v2 emits this event with payload
+            // `Vec<String>` (the list of URLs the OS handed the
+            // process). The earlier code tried to deserialize as
+            // `String`, which silently failed on every event — the
+            // URL never reached the frontend, so OAuth deep-links
+            // looked like "nothing happened" even though
+            // single-instance had correctly forwarded the URL from
+            // the secondary process. Iterating the vec preserves the
+            // existing per-URL `deep-link` event the React side
+            // listens for, so App.tsx's handler doesn't change.
             {
                 let handle = app.handle().clone();
                 app.listen("deep-link://new-url", move |event| {
-                    if let Ok(url) = serde_json::from_str::<String>(event.payload()) {
-                        handle.emit("deep-link", url).ok();
+                    let payload = event.payload();
+                    if let Ok(urls) = serde_json::from_str::<Vec<String>>(payload) {
+                        for url in urls {
+                            crate::devlog!(info, "lib", "deep-link arrived: {url}");
+                            handle.emit("deep-link", url).ok();
+                        }
+                    } else {
+                        crate::devlog!(
+                            warn, "lib",
+                            "deep-link event payload not Vec<String>: {payload}",
+                        );
                     }
                 });
             }
@@ -1485,6 +1561,64 @@ pub fn run() {
                         if !update.is_empty() {
                             handle.emit("playback-update", serde_json::Value::Object(update)).ok();
                         }
+                    }
+                    "end-file" => {
+                        // libmpv fires this when a file finishes playing —
+                        // either naturally (eof), via stop/quit, OR because
+                        // loading failed (DNS / TCP / demuxer init / codec
+                        // unsupported). The "error" reason is the case the
+                        // frontend cares about: without this bridge, a
+                        // load-time failure leaves the user staring at
+                        // Aura's background while MPV silently uninits its
+                        // video output — the stale-heartbeat detector
+                        // can't fire because no first frame ever arrived.
+                        //
+                        // The libmpv-wrapper FFI emits this with the
+                        // `reason` field as either a string ("error",
+                        // "eof", …) or an integer matching mpv's
+                        // mpv_end_file_reason enum (0=eof / 2=stop /
+                        // 3=quit / 4=error / 5=redirect). Normalize to a
+                        // string for the frontend.
+                        let data = ev.get("data").or(Some(&ev));
+                        let reason: Option<String> = data
+                            .and_then(|d| d.get("reason"))
+                            .map(|r| {
+                                if let Some(s) = r.as_str() {
+                                    s.to_string()
+                                } else if let Some(n) = r.as_i64() {
+                                    match n {
+                                        0 => "eof".to_string(),
+                                        2 => "stop".to_string(),
+                                        3 => "quit".to_string(),
+                                        4 => "error".to_string(),
+                                        5 => "redirect".to_string(),
+                                        other => format!("unknown({})", other),
+                                    }
+                                } else {
+                                    r.to_string()
+                                }
+                            });
+                        let error_code: Option<i64> = data
+                            .and_then(|d| d.get("error"))
+                            .and_then(|e| e.as_i64());
+
+                        crate::devlog!(
+                            info, "player",
+                            "end-file reason={:?} error={:?}",
+                            reason, error_code
+                        );
+
+                        let mut out = serde_json::Map::new();
+                        if let Some(r) = reason {
+                            out.insert("reason".into(), serde_json::Value::String(r));
+                        }
+                        if let Some(e) = error_code {
+                            out.insert(
+                                "error".into(),
+                                serde_json::Value::Number(serde_json::Number::from(e)),
+                            );
+                        }
+                        handle.emit("playback-end", serde_json::Value::Object(out)).ok();
                     }
                     _ => {}
                 }

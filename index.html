@@ -24,7 +24,11 @@
         backdrop-filter: blur(12px);
         -webkit-backdrop-filter: blur(12px);
         z-index: 99999;
-        pointer-events: none;
+        /* Capture pointer events so clicks can't reach React elements
+           that may already be painted underneath (LandingView, login
+           form, etc.). BootSplash.tsx removes this element on mount
+           and takes over with the same backdrop. */
+        pointer-events: auto;
         user-select: none;
       }
 

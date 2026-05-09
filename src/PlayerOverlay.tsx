@@ -723,7 +723,7 @@ function PanscanButton({ activeTarget }: { activeTarget: ActiveScrobbleTarget | 
 
   return (
     <Tooltip
-      text="Fill Screen — zoom & crop to remove letterbox / pillarbox bars"
+      text="Fill Screen: zoom and crop to remove letterbox / pillarbox bars"
       pos="top"
       shortcut="Z"
     >

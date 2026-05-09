@@ -72,7 +72,14 @@ export default function BootSplash({ visible }: Props) {
         backdropFilter: "blur(12px)",
         WebkitBackdropFilter: "blur(12px)",
         zIndex: 99999,
-        pointerEvents: "none",
+        // Block click-through while the splash is over the React tree.
+        // The previous `none` value let the user click LandingView /
+        // login fields through the opaque backdrop because they were
+        // already painted underneath; now the splash captures input
+        // for its full visible lifetime. Switches to `none` only once
+        // the fade has started so the underlying UI is interactive
+        // the instant it appears (no 400 ms dead window).
+        pointerEvents: fading ? "none" : "auto",
         userSelect: "none",
         opacity: fading ? 0 : 1,
         transition: fading ? "opacity 400ms ease" : "none",

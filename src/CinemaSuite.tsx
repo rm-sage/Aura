@@ -68,14 +68,14 @@ interface OsdStats {
 // ---------------------------------------------------------------------------
 
 function fmtBitrate(bps: number): string {
-  if (!bps || bps <= 0) return "—";
+  if (!bps || bps <= 0) return "n/a";
   if (bps >= 1_000_000) return `${(bps / 1_000_000).toFixed(2)} Mbps`;
   if (bps >= 1_000)     return `${(bps / 1_000).toFixed(0)} Kbps`;
   return `${bps.toFixed(0)} bps`;
 }
 
 function fmtBytes(n: number): string {
-  if (!n || n <= 0) return "—";
+  if (!n || n <= 0) return "n/a";
   if (n >= 1024 * 1024 * 1024) return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
   if (n >= 1024 * 1024)        return `${(n / 1024 / 1024).toFixed(1)} MB`;
   if (n >= 1024)               return `${(n / 1024).toFixed(0)} KB`;
@@ -83,7 +83,7 @@ function fmtBytes(n: number): string {
 }
 
 function fmtSecs(n: number): string {
-  if (!n || n <= 0) return "—";
+  if (!n || n <= 0) return "n/a";
   if (n >= 60) return `${Math.floor(n / 60)}m ${Math.round(n % 60)}s`;
   return `${n.toFixed(1)} s`;
 }
@@ -114,7 +114,7 @@ function StatSection({ label }: { label: string }) {
 function OsdOverlay({ stats, topPx }: { stats: OsdStats; topPx: number }) {
   const fpsValue = stats.display_fps > 0
     ? stats.display_fps.toFixed(2)
-    : (stats.estimated_vf_fps > 0 ? stats.estimated_vf_fps.toFixed(2) : "—");
+    : (stats.estimated_vf_fps > 0 ? stats.estimated_vf_fps.toFixed(2) : "n/a");
   const containerFps = stats.container_fps > 0 ? stats.container_fps.toFixed(2) : null;
   return (
     <div
@@ -140,10 +140,10 @@ function OsdOverlay({ stats, topPx }: { stats: OsdStats; topPx: number }) {
       <StatSection label="Video" />
       <StatRow
         label="Resolution"
-        value={stats.video_width > 0 ? `${stats.video_width}×${stats.video_height}` : "—"}
+        value={stats.video_width > 0 ? `${stats.video_width}×${stats.video_height}` : "n/a"}
       />
-      <StatRow label="Codec" value={stats.video_codec || "—"} />
-      <StatRow label="Format" value={stats.video_format || "—"} />
+      <StatRow label="Codec" value={stats.video_codec || "n/a"} />
+      <StatRow label="Format" value={stats.video_format || "n/a"} />
       <StatRow
         label="FPS (display)"
         value={containerFps && containerFps !== fpsValue
@@ -153,10 +153,10 @@ function OsdOverlay({ stats, topPx }: { stats: OsdStats; topPx: number }) {
       <StatRow label="Bitrate" value={fmtBitrate(stats.video_bitrate)} />
 
       <StatSection label="Audio" />
-      <StatRow label="Track" value={stats.audio_track || "—"} />
-      <StatRow label="Codec" value={stats.audio_codec || "—"} />
+      <StatRow label="Track" value={stats.audio_track || "n/a"} />
+      <StatRow label="Codec" value={stats.audio_codec || "n/a"} />
       <StatRow label="Bitrate" value={fmtBitrate(stats.audio_bitrate)} />
-      <StatRow label="Device" value={stats.audio_device || "—"} />
+      <StatRow label="Device" value={stats.audio_device || "n/a"} />
       {stats.sub_track && (
         <StatRow label="Subtitle" value={stats.sub_track} />
       )}

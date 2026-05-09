@@ -229,6 +229,31 @@
   box-sizing: border-box;
 }
 
+/* No-bounce overscroll on actual scroll containers — Tailwind
+   `overflow-{,x-,y-}{auto,scroll}` utilities. This pins each
+   scrollable region to a hard stop at its edges so trackpads can't
+   rubber-band past them.
+   ─────────────────────────────────────────────────────────────────
+   Critical: do NOT use `* { overscroll-behavior: none }`. CSS treats
+   `overflow: hidden` as a scroll container for the purposes of this
+   property, and the codebase uses `overflow-hidden` extensively for
+   rounded-corner clips on cards, thumbnails, table rows, etc. With
+   the universal rule, those clipped wrappers all capture wheel
+   events and block them from bubbling up to the real scrollable
+   ancestor — manifesting as "scroll stops working when I hover an
+   image" / "Settings storage table eats my mousewheel". The
+   utility-class allowlist below targets only the elements that
+   actually scroll, leaving overflow-hidden wrappers transparent to
+   wheel propagation. */
+.overflow-auto,
+.overflow-scroll,
+.overflow-x-auto,
+.overflow-x-scroll,
+.overflow-y-auto,
+.overflow-y-scroll {
+  overscroll-behavior: none;
+}
+
 html, body, #root {
   margin: 0;
   padding: 0;
@@ -236,6 +261,11 @@ html, body, #root {
   height: 100%;
   background: var(--ln-bg);
   color: #eaeaea;
+  /* Kill the document-level rubber-band/bounce on trackpad overscroll.
+     Aura is a desktop app — pages should hit a hard stop at their
+     edges, not slide into the void and snap back like a webpage. The
+     rule below catches every nested scroll container too. */
+  overscroll-behavior: none;
   /* Smooth theme swap */
   transition: background-color 280ms ease;
   /* Tell WebView2/Chromium this is a dark UI so form controls (inputs,

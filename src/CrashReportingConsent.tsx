@@ -67,8 +67,8 @@ export default function CrashReportingConsent() {
       window.dispatchEvent(new CustomEvent("aura:player-toast", {
         detail: {
           message: consented
-            ? "Crash reporting enabled — restart Aura to start sending reports"
-            : "Crash reporting declined — you can change this in Settings later",
+            ? "Crash reporting enabled. Restart Aura to start sending reports."
+            : "Crash reporting declined. You can change this in Settings later.",
         },
       }));
       window.dispatchEvent(new CustomEvent("aura:crash-reporting-changed"));
@@ -106,7 +106,7 @@ export default function CrashReportingConsent() {
 
         <p className="text-[13.5px] leading-relaxed text-white/80 mb-3">
           Aura can send anonymised crash reports to the developer when something
-          unexpected happens — uncaught errors, panics, and stack traces. This
+          unexpected happens: uncaught errors, panics, and stack traces. This
           helps fix bugs faster and is the same feedback channel most modern
           desktop apps use.
         </p>

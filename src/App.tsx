@@ -422,6 +422,55 @@ function usePlayback(_playerActive: boolean) {
     return () => window.clearInterval(id);
   }, [paused, firstFrameSeen]);
 
+  // ── Load-failure detector ──
+  // The stale-heartbeat detector above only catches mid-play stalls
+  // (firstFrameSeen=true + heartbeat went silent). A DNS / TCP /
+  // demuxer failure during the INITIAL load never reaches that path
+  // because no first frame ever arrives. MPV signals this via the
+  // `end-file` event with reason="error"; the Rust bridge forwards
+  // it as `playback-end` so we can flip streamBroken regardless of
+  // whether playback ever actually started.
+  //
+  // The aura-mpv.log signature is the comet.animasec.dev DNS-fail
+  // case: ffmpeg "Failed to open ...", ytdl_hook fallback also
+  // fails, "finished playback, loading failed (reason 4)", then
+  // vo/gpu-next/win32 uninit. Without this listener, MPV's video
+  // output is gone but Aura has no way to know.
+  useEffect(() => {
+    const p = listen<{ reason?: string; error?: number }>("playback-end", ({ payload }) => {
+      const reason = payload?.reason ?? "";
+      // "error" is the only failure mode worth surfacing — "eof",
+      // "stop", and "quit" are all expected user-initiated paths.
+      // "redirect" is internal to MPV's playlist handling and never
+      // reaches the user.
+      if (reason === "error") {
+        console.warn("[playback] end-file reason=error", payload);
+        setStreamBroken(true);
+      }
+    });
+    return () => { p.then((fn) => fn()).catch(() => {}); };
+  }, []);
+
+  // Belt-and-suspenders watchdog: if loadStartedAtRef has been non-
+  // zero for >LOAD_TIMEOUT_MS and firstFrameSeen is still false, the
+  // load is wedged (e.g. silent network hang where no end-file event
+  // ever fires). Surface the recovery overlay anyway. The 45 s
+  // window is long enough that slow CDNs handing over the first 4K
+  // frame don't false-positive.
+  useEffect(() => {
+    if (firstFrameSeen) return;
+    const LOAD_TIMEOUT_MS = 45000;
+    const id = window.setInterval(() => {
+      const start = loadStartedAtRef.current;
+      if (start === 0) return;
+      if (Date.now() - start >= LOAD_TIMEOUT_MS) {
+        console.warn("[playback] load watchdog: no first frame in 45 s");
+        setStreamBroken(true);
+      }
+    }, 2000);
+    return () => window.clearInterval(id);
+  }, [firstFrameSeen]);
+
   /** Reset playback state for a new load_video call. Called from the
    *  parent right before invoking load_video so every fresh playback
    *  session — first or Nth — starts in the "loading" state and the
@@ -429,6 +478,7 @@ function usePlayback(_playerActive: boolean) {
   const notifyNewLoad = useCallback(() => {
     loadStartedAtRef.current = Date.now();
     loadEventsSeenRef.current = new Set();
+    lastTimeUpdateAtRef.current = 0;
     lastCacheBufferLogRef.current = null;
     console.info("[load] +0ms notifyNewLoad — fresh load sequence begins");
     setBuffering(true);
@@ -436,6 +486,13 @@ function usePlayback(_playerActive: boolean) {
     setTime(0);
     setDuration(0);
     setEof(false);
+    // Reset the broken-stream latch so a stale flag from the
+    // previous load doesn't keep the recovery overlay visible
+    // while the new stream is still loading. Both manual paths
+    // (Reload button, Exit button) clear it explicitly too — this
+    // is the catch-all for the "user picked a different stream"
+    // path through handlePlayStream.
+    setStreamBroken(false);
   }, []);
 
   const togglePause   = useCallback(() => invoke("toggle_pause").catch(() => {}), []);
@@ -1981,7 +2038,7 @@ export default function App() {
       ) {
         console.warn(
           `[addons] cloud sync returned ${synced.length} addons; cache had ${cached.length}. ` +
-          `Keeping cached list to avoid a destructive wipe — re-open the Addons tab to retry.`,
+          `Keeping cached list to avoid a destructive wipe; re-open the Addons tab to retry.`,
         );
         showAppToast(
           `Cloud sync returned ${synced.length} addons (${cached.length} cached). ` +
@@ -2116,7 +2173,16 @@ export default function App() {
   }, []);
 
   // ── Scrobble lifecycle (no-ops while activeTarget is null) ──
-  useScrobble({ active: activeTarget, playback: { time, duration, paused } });
+  // `scope` keys the per-account Trakt token in the keyring, matching
+  // the layout in scrobble_auth.rs (first 12 chars of auth_key, or
+  // "guest" when signed out). scrobble.rs reads this off the session
+  // it receives at scrobble_start time.
+  const scrobbleScope = session?.auth_key ? session.auth_key.slice(0, 12) : "guest";
+  useScrobble({
+    active: activeTarget,
+    playback: { time, duration, paused },
+    scope: scrobbleScope,
+  });
 
   // ── Custom keybindings — global keydown → action handlers ──
   // Note: `fullscreen` is now wired through the lifted toggleFullscreen so
@@ -2916,11 +2982,21 @@ export default function App() {
           const refresh_token = url.searchParams.get("refresh");
           const expiresStr    = url.searchParams.get("expires");
           const username      = url.searchParams.get("user");
-          const stateScope    = url.searchParams.get("state") ?? "guest";
           if (!access_token) {
             showAppToast(`${service} OAuth callback missing token`, { duration: 5000 });
             return;
           }
+          // Recover the scope SettingsView stashed under the per-
+          // provider pending slot when the user clicked Connect.
+          // The proxy's deep-link doesn't round-trip any
+          // identifier, so this slot is the only way to know which
+          // Stremio account to write the token under. Falling back
+          // to "guest" covers edge cases (manual nav to
+          // aura://oauth/..., user restarted Aura mid-flow) without
+          // dropping the token.
+          const stashKey   = `aura:oauth:pending:${service}`;
+          const stateScope = sessionStorage.getItem(stashKey) ?? "guest";
+          sessionStorage.removeItem(stashKey);
           const expires_at = expiresStr ? Number(expiresStr) : null;
           invoke("set_scrobble_auth_token", {
             service,
@@ -3214,16 +3290,17 @@ export default function App() {
               user picks a stream (before MPV has a duration). The overlay
               owns the entire viewport minus the title bar; controls are
               auto-hidden after 3 s of mouse idle. */}
-      {/* Stream-broken recovery. Triggered by usePlayback's stale-
-          heartbeat detector — the canonical aura-mpv.log signature is
-          a seek that hits a DNS / TCP failure and ends with mpv's vo
-          uninit'ing, leaving the user staring at Aura's background
-          with controls that don't respond to anything. The Reload
-          button hands the SAME resolved stream URL back to load_video
-          with the last-known time as the resume offset; Exit drops
-          out to the detail view so the user can pick a different
-          stream. Sits ABOVE PlayerOverlay so the user can't
-          accidentally interact with the dead controls. */}
+      {/* Stream-broken recovery. Triggered by THREE detectors in
+          usePlayback: (a) stale-heartbeat — firstFrameSeen + no
+          time-pos ticks for 8 s (mid-play stall, e.g. seek into a
+          dead chunk); (b) playback-end with reason=error — MPV
+          aborted the load (DNS / TCP / demuxer / codec failure);
+          (c) load watchdog — no first frame after 45 s (silent
+          network hang). All three converge on the same overlay:
+          Reload re-invokes load_video with the last-known time as
+          the resume offset; Exit drops out to the detail view.
+          Sits ABOVE PlayerOverlay so the user can't accidentally
+          interact with the dead controls underneath. */}
       {streamBroken && isPlayerActive && (
         <div
           className="fixed inset-0 z-[1400] flex items-center justify-center
@@ -3231,13 +3308,12 @@ export default function App() {
         >
           <div className="aura-glass-menu rounded-2xl max-w-[420px] w-[92%] p-6 text-white">
             <h2 className="text-[16px] font-semibold tracking-tight mb-2">
-              Stream connection lost
+              {firstFrameSeen ? "Stream connection lost" : "Stream unavailable"}
             </h2>
             <p className="text-white/70 text-[13px] leading-relaxed mb-5">
-              Aura hasn't received a playback heartbeat in 8 s. The most common
-              cause is a transient DNS / TCP failure during a seek — try
-              reloading from your last position, or exit and pick another
-              source.
+              {firstFrameSeen
+                ? "Aura hasn't received a playback heartbeat in 8 s. The most common cause is a transient DNS / TCP failure during a seek. Try reloading from your last position, or exit and pick another source."
+                : "Aura couldn't open the stream. The addon's host may be down or unreachable (DNS / TCP failure). Try reloading, or exit and pick a different source."}
             </p>
             <div className="flex justify-end gap-2">
               <button
@@ -3523,7 +3599,7 @@ function NotificationsBridge({
         const feature = payload?.feature ?? "Optional script";
         const reason  = payload?.reason  ?? "unknown error";
         const subtitle =
-          `${feature} couldn't be loaded into MPV — Aura started without it. ` +
+          `${feature} couldn't be loaded into MPV. Aura started without it. ` +
           `OP/ED auto-skip will be inactive for this session. ` +
           `Restart Aura to retry. (Detail: ${reason})`;
         addNotification({
@@ -3533,7 +3609,7 @@ function NotificationsBridge({
           title: `${feature} unavailable`,
           subtitle,
         });
-        showAppToast(`${feature} unavailable — see notifications bell for details`, {
+        showAppToast(`${feature} unavailable; see notifications bell for details`, {
           tone: "danger",
           duration: 6000,
         });

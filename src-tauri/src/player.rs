@@ -488,7 +488,7 @@ pub fn init_mpv<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
                 ),
                 Err(e) => crate::devlog!(
                     warn, "player",
-                    "load-script failed: {} — OP/ED auto-skip dormant", e
+                    "load-script failed: {}; OP/ED auto-skip dormant", e
                 ),
             }
         });

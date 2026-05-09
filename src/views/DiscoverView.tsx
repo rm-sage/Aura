@@ -166,7 +166,7 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
               Discover
             </h1>
             <p className="text-white/35 text-sm mt-1">
-              Browse every catalog your addons expose — including the ones
+              Browse every catalog your addons expose, including the ones
               hidden from your home page.
             </p>
           </div>
@@ -211,14 +211,14 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
           {manifestErr && (
             <div className="glass-panel rounded-2xl px-5 py-4 border border-red-400/25">
               <p className="text-red-300/85 text-xs font-mono break-all">
-                Couldn't load addon manifest — {manifestErr}
+                Couldn't load addon manifest: {manifestErr}
               </p>
             </div>
           )}
           {itemsErr && (
             <div className="glass-panel rounded-2xl px-5 py-4 border border-red-400/25">
               <p className="text-red-300/85 text-xs font-mono break-all">
-                Couldn't load catalog — {itemsErr}
+                Couldn't load catalog: {itemsErr}
               </p>
             </div>
           )}

@@ -116,7 +116,7 @@ export default function SourcePopupHost() {
     try { localStorage.setItem(FIRST_POPUP_TOAST_KEY, "1"); } catch {}
     window.dispatchEvent(
       new CustomEvent(POPUP_FIRST_HINT_EVENT, {
-        detail: { message: "Source loaded inside Aura · press ESC or click outside the panel to close." },
+        detail: { message: "Source loaded inside Aura. Press Esc or click outside the panel to close." },
       }),
     );
   }, [active]);

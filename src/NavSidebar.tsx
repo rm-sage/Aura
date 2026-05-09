@@ -154,7 +154,7 @@ export default function NavSidebar({
     : (loggedIn ? "Stremio account" : null);
   const profileTitle = loggedIn
     ? `Signed in as ${userNickname ?? identityLabel ?? "Stremio account"}`
-    : "Guest — click to sign in";
+    : "Guest. Click to sign in.";
 
   // Profile popover open state
   const [profileOpen, setProfileOpen] = useState(false);
@@ -581,7 +581,7 @@ function ProfilePopover({
           <span className={`w-2 h-2 rounded-full ${loggedIn ? "bg-emerald-400" : "bg-white/30"}`}
                 style={{ boxShadow: loggedIn ? "0 0 6px rgba(110,231,183,0.7)" : undefined }} />
           <p className="text-white/85 text-[12.5px]">
-            {loggedIn ? "Synced to Stremio cloud" : "Local only — sign in to sync"}
+            {loggedIn ? "Synced to Stremio cloud" : "Local only. Sign in to sync."}
           </p>
         </div>
       </div>

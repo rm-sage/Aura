@@ -287,7 +287,7 @@ const COMMANDS: DevCommand[] = [
   {
     name: "throw",
     usage: "throw [message]",
-    description: "Throw an unhandled Error — verifies frontend Sentry capture",
+    description: "Throw an unhandled Error to verify frontend Sentry capture",
     run: (args, ctx) => {
       const msg = args.trim() || "DevConsole-triggered error (Sentry test)";
       ctx.push({
@@ -303,12 +303,12 @@ const COMMANDS: DevCommand[] = [
   {
     name: "panic",
     usage: "panic [message]",
-    description: "Force a Rust panic — verifies backend Sentry capture (app may exit)",
+    description: "Force a Rust panic to verify backend Sentry capture (app may exit)",
     run: async (args, ctx) => {
       const msg = args.trim();
       ctx.push({
         ts: Date.now(), level: "warn", source: "console",
-        message: `Forcing Rust panic — Aura may exit. Open Sentry → Issues to verify.`,
+        message: `Forcing Rust panic. Aura may exit. Open Sentry → Issues to verify.`,
       });
       try {
         await invoke("dev_force_panic", { message: msg.length > 0 ? msg : null });
@@ -334,7 +334,7 @@ const COMMANDS: DevCommand[] = [
   {
     name: "eval",
     usage: "eval <expression>",
-    description: "Evaluate a JavaScript expression (POWER USER — runs in app context)",
+    description: "Evaluate a JavaScript expression (power user; runs in app context)",
     run: (args, ctx) => {
       if (!args.trim()) {
         ctx.push({
@@ -897,7 +897,7 @@ export default function DevConsole() {
             value={input}
             onChange={(e) => { setInput(e.target.value); setHistoryCursor(null); }}
             onKeyDown={onPromptKey}
-            placeholder="type a command — try `help`, `throw`, or `panic`"
+            placeholder="type a command, e.g. `help`, `throw`, or `panic`"
             spellCheck={false}
             autoComplete="off"
             autoCorrect="off"

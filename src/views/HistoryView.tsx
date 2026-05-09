@@ -101,8 +101,8 @@ function HistoryViewBody({ onSelectMeta }: Props) {
           {entries.length === 0 ? (
             <div className="glass-panel rounded-2xl px-6 py-10 text-center">
               <p className="text-white/55 text-sm">
-                Watch something to start a history. Manual mark-as-watched
-                entries don't appear here — only auto-tracked plays do.
+                Watch something to start a history. Only auto-tracked plays
+                appear here; manual mark-as-watched entries don't.
               </p>
             </div>
           ) : (

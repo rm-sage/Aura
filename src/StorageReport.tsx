@@ -64,7 +64,7 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
   {
     prefix:      "aura:manual-state:",
     label:       "Manual watched + queue",
-    description: "Per-account `watched` / `in-progress` / `planned` marks. Includes the Queue tab's order. Local-only — clearing wipes every manual mark you've ever set.",
+    description: "Per-account watched, in-progress, and planned marks plus the Queue tab's order. Local-only; clearing wipes every manual mark you've ever set.",
     destructive: true,
   },
   {
@@ -82,7 +82,7 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
   {
     prefix:      "aura:notifications:scanner-state",
     label:       "Episode scanner seen-ids",
-    description: "Per-series record of episode ids the scanner has already seen. Clearing causes the next scan pass to re-seed from current addon state — a one-shot grace that fires no notifications, then resumes normal new-episode detection. Safe.",
+    description: "Per-series record of episode ids the scanner has already seen. Clearing causes the next scan pass to re-seed from current addon state (a one-shot grace that fires no notifications), then resumes normal new-episode detection. Safe.",
     destructive: false,
   },
   {
@@ -112,19 +112,19 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
   {
     prefix:      "aura:omdb-cache:v1",
     label:       "OMDb ratings cache",
-    description: "Rotten Tomatoes / Metacritic critic scores fetched via OMDb. 7-day TTL — scores rarely change. Re-fetches on next detail open after expiry. Safe to clear.",
+    description: "Rotten Tomatoes and Metacritic critic scores fetched via OMDb. 7-day TTL; scores rarely change. Re-fetches on next detail open after expiry. Safe to clear.",
     destructive: false,
   },
   {
     prefix:      "aura:aniskip-cache:v1",
     label:       "AniSkip op/ed window cache",
-    description: "Per-episode opening / ending / recap skip windows fetched from the AniSkip API. 30-day TTL — windows for an aired episode are immutable once committed. Safe to clear.",
+    description: "Per-episode opening, ending, and recap skip windows fetched from the AniSkip API. 30-day TTL; windows for an aired episode are immutable once committed. Safe to clear.",
     destructive: false,
   },
 ];
 
 function formatBytes(n: number): string {
-  if (n === 0) return "—";
+  if (n === 0) return "0 B";
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(2)} MB`;
@@ -246,7 +246,7 @@ export default function StorageReport() {
         <div className="flex items-baseline justify-between">
           <p className="text-white/85 text-sm font-semibold tracking-wide">Disk files</p>
           <p className="text-white/45 text-xs font-mono tabular-nums">
-            {diskReport ? `Total: ${formatBytes(diskReport.total_bytes)}` : "—"}
+            {diskReport ? `Total: ${formatBytes(diskReport.total_bytes)}` : ""}
           </p>
         </div>
         <div className="divide-y divide-white/8 rounded-md border border-white/10 overflow-hidden">

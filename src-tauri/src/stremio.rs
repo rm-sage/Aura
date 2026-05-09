@@ -1084,7 +1084,7 @@ pub async fn fetch_catalog(
         Err(e) => {
             let cat = describe_reqwest_err(&e);
             crate::devlog!(
-                warn, "catalog", "[{}] {}/{} {} — {}",
+                warn, "catalog", "[{}] {}/{} {}: {}",
                 label, catalog_type, catalog_id, cat, e,
             );
             if e.is_timeout() || e.is_connect() || e.is_request() {
@@ -1433,7 +1433,7 @@ pub async fn global_search_grouped(
                         let cat = describe_reqwest_err(&e);
                         crate::devlog!(
                             warn, "search",
-                            "[{}] {} {} — {}",
+                            "[{}] {} {}: {}",
                             addon_name_str, url, cat, e,
                         );
                         continue;
@@ -1614,7 +1614,7 @@ pub async fn fetch_meta_detail(
         .await
         .map_err(|e| {
             let cat = describe_reqwest_err(&e);
-            crate::devlog!(warn, "meta", "[{}] {} — {}", label, cat, e);
+            crate::devlog!(warn, "meta", "[{}] {}: {}", label, cat, e);
             format!("Meta fetch {cat}: {e}")
         })?
         .error_for_status()
@@ -1813,7 +1813,7 @@ pub async fn fetch_meta_detail(
             .unwrap_or_default();
         crate::devlog!(
             warn, "meta",
-            "[{}] originalLanguage missing — meta keys present: {:?}",
+            "[{}] originalLanguage missing; meta keys present: {:?}",
             label, keys,
         );
     }
@@ -2502,7 +2502,7 @@ pub async fn fetch_streams(
                     crate::devlog!(
                         warn,
                         "streams",
-                        "[{}] {} — {}",
+                        "[{}] {}: {}",
                         label, cat, e
                     );
                     return AddonFetchOutput::empty();

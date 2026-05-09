@@ -108,6 +108,11 @@ interface Options {
   active: ActiveScrobbleTarget | null;
   /** Latest playback snapshot from the playback-update event stream. */
   playback: PlaybackSnapshot;
+  /** Stremio auth_key prefix (first 12 chars) or "guest" — keys the
+   *  per-account Trakt / AniList token in the OS keyring. scrobble.rs
+   *  needs this to fire /scrobble/stop with the right token. App.tsx
+   *  derives it from the active session before mounting the hook. */
+  scope: string;
   /** Optional override for the start warmup, in seconds. Defaults to
    *  START_WARMUP_S_DEFAULT (120). Surfaced as a Settings knob so
    *  users hitting addon-side over-scrobbling can lengthen the
@@ -121,6 +126,7 @@ interface Options {
 export function useScrobble({
   active,
   playback,
+  scope,
   startWarmupSecs,
   completeWarmupSecs,
 }: Options) {
@@ -264,6 +270,7 @@ export function useScrobble({
           episode: active.episode ?? null,
           title: active.name,
           is_anime: isAnimeMeta(active),
+          scope,
         },
         duration: playback.duration,
       }).catch(() => {});

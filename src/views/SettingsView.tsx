@@ -28,7 +28,6 @@ import type { AddonEntry, ThemeId, KeybindAction } from "../types";
 import type { UserSession } from "../LoginView";
 import { KEYBIND_ACTIONS } from "../types";
 import { useTheme, THEME_LABELS, THEME_DESCRIPTIONS } from "../ThemeEngine";
-import { findAIOMetadataAddon } from "../aiometadata";
 import { prettyBinding, formatBinding } from "../useKeybindings";
 import {
   loadAuraSettings,
@@ -163,7 +162,7 @@ function SettingDropdown({
           paddingRight: "36px",
         }}
       >
-        {!required && <option value="">— System default —</option>}
+        {!required && <option value="">System default</option>}
         {options.map((opt) => (
           <option key={opt.value} value={opt.value}>
             {opt.label}
@@ -410,8 +409,8 @@ function SubLangFilterInput({
     <div className="space-y-2">
       <p className="text-white/75 text-sm font-medium">Subtitle picker languages</p>
       <p className="text-white/35 text-xs -mt-1">
-        Comma-separated 2-letter ISO codes (en, es, ja, …). Limits which languages
-        appear in the in-player subtitle picker. Empty = show every language.
+        Comma-separated 2-letter ISO codes (en, es, ja). Limits which languages
+        appear in the in-player subtitle picker. Empty shows every language.
       </p>
       <input
         type="text"
@@ -473,8 +472,8 @@ function AudioPriorityInput({
       <p className="text-white/35 text-xs -mt-1">
         Ordered list. <span className="font-mono text-white/55">original</span> resolves to the
         title's <span className="font-mono">originalLanguage</span> from AIOMetadata; ISO 639-1
-        codes (en, ja, es, …) match by language tag. English is always appended as a
-        final fallback. Default <span className="font-mono">original, en</span>.
+        codes (en, ja, es) match by language tag. English is always appended as a
+        final fallback. Default: <span className="font-mono">original, en</span>.
       </p>
       <input
         type="text"
@@ -655,7 +654,7 @@ function HeroCatalogPicker({
       <p className="text-white/85 text-sm font-medium">Hero Carousel Source</p>
       <p className="text-white/40 text-xs leading-relaxed">
         Catalog whose items rotate in the Home hero band. Hidden-from-home
-        catalogs are valid picks — useful for surfacing curated lists
+        catalogs are valid picks, useful for surfacing curated lists
         (AIOMetadata's AI Recommendations, mdblist, Trakt user lists)
         as the hero source without cluttering the grid below. Default
         falls back to your first browseable row.
@@ -672,7 +671,7 @@ function HeroCatalogPicker({
                      outline-none focus:border-white/25 transition-colors min-w-[180px]"
           style={{ color: "var(--text-primary)" }}
         >
-          <option value="">— Default (first row) —</option>
+          <option value="">Default (first row)</option>
           {catalogAddons.map((a) => (
             <option key={a.url} value={a.url}>{a.name}</option>
           ))}
@@ -692,7 +691,7 @@ function HeroCatalogPicker({
                        outline-none focus:border-white/25 transition-colors min-w-[200px]"
             style={{ color: "var(--text-primary)" }}
           >
-            <option value="">— Pick a catalog —</option>
+            <option value="">Pick a catalog</option>
             {browseable.map((c) => (
               <option
                 key={`${c.media_type}:${c.id}`}
@@ -723,7 +722,7 @@ function UnifiedHomeSourcesPicker({
   addons, primaryUrl, additionalUrls, onChange,
   filter,
   title = "Home Catalog Sources",
-  description = "Drag to reorder. The first addon is the primary — its catalogs lead Home.",
+  description = "Drag to reorder. The first addon is the primary; its catalogs lead Home.",
 }: UnifiedHomePickerProps) {
   const visibleAddons = filter ? addons.filter(filter) : addons;
   const orderedUrls = [
@@ -790,7 +789,7 @@ function UnifiedHomeSourcesPicker({
 
           {selectedAddons.length === 0 && (
             <p className="text-white/30 text-xs italic px-1 py-2">
-              No sources added — select from Available below.
+              No sources added. Select from Available below.
             </p>
           )}
 
@@ -916,7 +915,7 @@ function BackupRestoreSection({
       addons,
     );
     setExportText(blobToBase64(blob));
-    setStatus({ kind: "ok", message: "Export string ready — copy or download." });
+    setStatus({ kind: "ok", message: "Export string ready. Copy or download." });
   }, [backend, addons]);
 
   const downloadFile = useCallback(() => {
@@ -932,7 +931,7 @@ function BackupRestoreSection({
   const applyText = useCallback(async (raw: string) => {
     const blob = parseImportInput(raw);
     if (!blob) {
-      setStatus({ kind: "error", message: "Couldn't parse — paste a valid export string or JSON." });
+      setStatus({ kind: "error", message: "Couldn't parse. Paste a valid export string or JSON." });
       return;
     }
     try {
@@ -966,7 +965,7 @@ function BackupRestoreSection({
         + Object.keys(blob.aura ?? {}).length
         + Object.keys(providerAura).length;
       const tail = unresolved > 0
-        ? ` (${unresolved} provider id${unresolved === 1 ? "" : "s"} skipped — not installed)`
+        ? ` (${unresolved} provider id${unresolved === 1 ? "" : "s"} skipped, not installed)`
         : "";
       setStatus({
         kind: "ok",
@@ -994,9 +993,8 @@ function BackupRestoreSection({
       <p className="text-white/55 text-xs leading-relaxed">
         Export portable settings (theme, audio / subtitles, keybindings, Discord
         RPC, anime-skip modes, etc.) as a file or pasteable string. Catalog,
-        stream, and search-provider lists are intentionally NOT included so an
-        import on a fresh install doesn't try to point at addons that aren't
-        there.
+        stream, and search-provider lists are intentionally excluded so an
+        import on a fresh install doesn't point at addons that aren't there.
       </p>
 
       {/* ── Export ── */}
@@ -1057,7 +1055,7 @@ function BackupRestoreSection({
         <textarea
           value={importText}
           onChange={(e) => setImportText(e.target.value)}
-          placeholder="Paste an export string here…"
+          placeholder="Paste an export string here"
           className="w-full h-24 bg-black/40 border border-white/10 rounded-md px-3 py-2
                      text-[11px] font-mono text-white/85 outline-none
                      focus:border-white/25 transition-colors resize-none break-all"
@@ -1128,10 +1126,10 @@ function BackupRestoreSection({
       <div className="space-y-2">
         <p className="text-rose-300/95 text-sm font-medium">Reset all settings</p>
         <p className="text-white/45 text-xs leading-relaxed">
-          Wipes every setting back to defaults — theme, audio / subtitle prefs,
-          keybindings, Discord RPC, anime-skip modes, AND your catalog /
-          stream / search provider lists. Installed addons themselves are
-          NOT removed. There is no undo.
+          Wipes every setting back to defaults: theme, audio / subtitle prefs,
+          keybindings, Discord RPC, anime-skip modes, and your catalog /
+          stream / search provider lists. Installed addons themselves are not
+          removed. There is no undo.
         </p>
         <button
           type="button"
@@ -1221,7 +1219,7 @@ function LocalDataBackupsSubsection() {
         setStatus({ kind: "ok", message: "Snapshot created." });
         await refresh();
       } else {
-        setStatus({ kind: "error", message: "Snapshot failed — see DevConsole for details." });
+        setStatus({ kind: "error", message: "Snapshot failed. See DevConsole for details." });
       }
     } finally {
       setBusy(false);
@@ -1264,7 +1262,7 @@ function LocalDataBackupsSubsection() {
       // the user surfaced before the BackupMeta camelCase fix landed.
       const ok = await deleteSnapshot(meta.scope, meta.fileName);
       if (!ok) {
-        setStatus({ kind: "error", message: "Delete failed — see DevConsole." });
+        setStatus({ kind: "error", message: "Delete failed. See DevConsole." });
         return;
       }
       setStatus({ kind: "ok", message: "Snapshot deleted." });
@@ -1282,7 +1280,7 @@ function LocalDataBackupsSubsection() {
     return `${bytes} B`;
   };
   const fmtTimestamp = (ms: number) => {
-    if (!ms) return "—";
+    if (!ms) return "-";
     const d = new Date(ms);
     const yyyy = d.getFullYear();
     const mm = String(d.getMonth() + 1).padStart(2, "0");
@@ -1354,7 +1352,7 @@ function LocalDataBackupsSubsection() {
           <code className="font-mono text-white/55 mx-1">backups/</code>
           in Aura's app-data folder.
           {" "}<strong className="text-white/65">Manual</strong> snapshots
-          (Create snapshot now / pre-restore safety copies) live in a
+          (Create snapshot now, plus pre-restore safety copies) live in a
           separate ledger from{" "}
           <strong className="text-white/65">auto</strong> snapshots
           (every 30 s after a change), so the auto sweep can never
@@ -1727,7 +1725,7 @@ function CheckForUpdatesButton() {
 }
 
 function fmtHrs(secs: number | undefined): string {
-  if (!secs || secs < 60) return "—";
+  if (!secs || secs < 60) return "-";
   const h = Math.floor(secs / 3600);
   const m = Math.floor((secs % 3600) / 60);
   if (h === 0) return `${m}m`;
@@ -2009,7 +2007,7 @@ const TOC_GROUPS: TocGroup[] = [
     label: "Integrations",
     sections: [
       { id: "sec-discord",         label: "Discord Rich Presence" },
-      { id: "sec-scrobble",        label: "Scrobbling (AIOMetadata)" },
+      { id: "sec-scrobble",        label: "Trakt & AniList" },
       { id: "sec-api-keys",        label: "API Keys" },
       { id: "sec-crash-reporting", label: "Crash Reporting" },
     ],
@@ -2280,7 +2278,7 @@ function KeybindRow({ label, description, code, onChange }: KeybindRowProps) {
                       : "bg-white/8 text-white/75 border border-white/12"
                     }`}
       >
-        {capturing ? "Press a key…" : code ? prettyBinding(code) : "—"}
+        {capturing ? "Press a key…" : code ? prettyBinding(code) : "Unbound"}
       </kbd>
     </button>
   );
@@ -2318,6 +2316,25 @@ function ScrobbleAuthRow({
   const scope = authKey ? authKey.slice(0, 12) : "guest";
   const [status, setStatus] = useState<ScrobbleAuthSummary | null>(null);
   const [busy, setBusy] = useState(false);
+  /** Set true while we're waiting for the OAuth deep-link to return.
+   *  Drives the "Waiting for authorization…" UI plus the 120 s
+   *  timeout. Cleared by: deep-link arriving (`aura:scrobble-auth-
+   *  changed` fires after set_scrobble_auth_token), the user
+   *  clicking Cancel, or the timeout. */
+  const [pending, setPending] = useState(false);
+  /** setTimeout handle for the waiting-window. Stored in a ref so
+   *  the cancel/success paths can clear it without depending on
+   *  React state cycles. */
+  const timeoutRef = useRef<number | null>(null);
+
+  const clearWaiting = useCallback(() => {
+    setPending(false);
+    if (timeoutRef.current !== null) {
+      window.clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+    sessionStorage.removeItem(`aura:oauth:pending:${service}`);
+  }, [service]);
 
   const refresh = useCallback(() => {
     invoke<{ trakt: ScrobbleAuthSummary | null; anilist: ScrobbleAuthSummary | null }>(
@@ -2330,24 +2347,63 @@ function ScrobbleAuthRow({
 
   useEffect(() => {
     refresh();
-    const onChanged = () => refresh();
+    // Deep-link arrival: App.tsx persists the token via
+    // set_scrobble_auth_token, then dispatches this window event. We
+    // refetch status (flip to Connected) AND clear the waiting flag
+    // so the UI exits the "Waiting for authorization…" state. The
+    // event fires for BOTH providers, but the refetch is cheap and
+    // the waiting clear is per-provider.
+    const onChanged = () => {
+      refresh();
+      clearWaiting();
+    };
     window.addEventListener("aura:scrobble-auth-changed", onChanged);
-    return () => window.removeEventListener("aura:scrobble-auth-changed", onChanged);
-  }, [refresh]);
+    return () => {
+      window.removeEventListener("aura:scrobble-auth-changed", onChanged);
+      // Component unmount: drop any in-flight timeout so it doesn't
+      // fire against a dead component.
+      if (timeoutRef.current !== null) {
+        window.clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+    };
+  }, [refresh, clearWaiting]);
 
   const connect = useCallback(async () => {
-    if (busy) return;
+    if (busy || pending) return;
     setBusy(true);
     try {
-      const url = await invoke<string>("scrobble_oauth_authorize_url", { service, scope });
+      sessionStorage.setItem(`aura:oauth:pending:${service}`, scope);
+      const url = await invoke<string>("scrobble_oauth_authorize_url", { service });
       const { openUrl } = await import("@tauri-apps/plugin-opener");
       await openUrl(url);
+      // Browser is open — flip into waiting state. The proxy's CSRF
+      // state has a 10 min TTL on the server side; 120 s on the
+      // client side is the integration doc's recommendation, long
+      // enough for a normal "click through Trakt's auth page" flow
+      // but short enough that an abandoned tab doesn't leave the
+      // Settings UI stuck in "Waiting…" forever.
+      setPending(true);
+      timeoutRef.current = window.setTimeout(() => {
+        timeoutRef.current = null;
+        setPending(false);
+        sessionStorage.removeItem(`aura:oauth:pending:${service}`);
+        showAppToast(
+          `${service === "trakt" ? "Trakt" : "AniList"} authorization didn't complete. Try again.`,
+          { duration: 6000 },
+        );
+      }, 120_000);
     } catch (e) {
+      sessionStorage.removeItem(`aura:oauth:pending:${service}`);
       showAppToast(`Couldn't open ${service} auth URL: ${String(e)}`, { duration: 5000 });
     } finally {
       setBusy(false);
     }
-  }, [busy, service, scope]);
+  }, [busy, pending, service, scope]);
+
+  const cancelPending = useCallback(() => {
+    clearWaiting();
+  }, [clearWaiting]);
 
   const disconnect = useCallback(async () => {
     if (busy) return;
@@ -2373,7 +2429,26 @@ function ScrobbleAuthRow({
           <p className="text-white/55 text-xs leading-relaxed">{description}</p>
         </div>
         <div className="flex-shrink-0 flex flex-col items-end gap-1.5">
-          {connected ? (
+          {pending ? (
+            <>
+              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px]
+                                font-semibold uppercase tracking-wider
+                                bg-amber-500/15 text-amber-200 border border-amber-400/30">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                Waiting for authorization…
+              </span>
+              <button
+                type="button"
+                onClick={cancelPending}
+                className="px-3 py-1 rounded-lg border border-white/15 bg-white/5
+                           text-white/75 text-[11px] font-medium tracking-wide
+                           hover:bg-white/10 hover:text-white
+                           transition-colors"
+              >
+                Cancel
+              </button>
+            </>
+          ) : connected ? (
             <>
               <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px]
                                 font-semibold uppercase tracking-wider
@@ -2408,9 +2483,9 @@ function ScrobbleAuthRow({
           )}
         </div>
       </div>
-      {status?.stale && (
+      {status?.stale && !pending && (
         <p className="text-amber-400/80 text-xs">
-          Token expires soon — reconnect to refresh.
+          Token expires soon. Reconnect to refresh.
         </p>
       )}
     </div>
@@ -2451,9 +2526,6 @@ export default function SettingsView({ addons, session }: Props) {
   // login / logout. See src-tauri/src/crash_reporting.rs.
   const [crashConfig, setCrashConfig] = useState<CrashReportingConfig | null>(null);
   const { theme, setTheme } = useTheme();
-
-  // Detect AIOMetadata in the user's installed addons
-  const aioAddon = findAIOMetadataAddon(addons);
 
   // Track whether we've finished the first mount so the initial backend
   // load + the first localStorage hydration don't fire a "Settings saved"
@@ -2549,15 +2621,6 @@ export default function SettingsView({ addons, session }: Props) {
       // ignore — UI keeps its optimistic state
     }
   }, [queueSavedToast]);
-
-  // Auto-lock scrobble URL to AIOMetadata when present and the user hasn't
-  // pinned a different URL yet (or has previously pinned to AIO).
-  useEffect(() => {
-    if (!backend || !aioAddon) return;
-    if (backend.scrobble_addon_url !== aioAddon.url) {
-      patchBackend({ scrobble_addon_url: aioAddon.url });
-    }
-  }, [aioAddon, backend, patchBackend]);
 
   const setLocal = (patch: Partial<AuraSettings>) =>
     setAura((prev) => ({ ...prev, ...patch }));
@@ -2748,7 +2811,7 @@ export default function SettingsView({ addons, session }: Props) {
                 <span className="font-mono text-ln-accent ml-2">"{searchQuery.trim()}"</span>
               </p>
               <p className="text-white/40 text-xs">
-                Try fewer or shorter terms — the search is forgiving but needs the
+                Try fewer or shorter terms. The search is forgiving but needs the
                 characters to appear in order.
               </p>
             </div>
@@ -2885,14 +2948,14 @@ export default function SettingsView({ addons, session }: Props) {
           <Section id="sec-detail-page" title="Detail Page">
             <SettingToggle
               label="Hide cast episode counts"
-              description="Some shows treat regular vs. guest billing as a plot beat (deaths, returns, surprise cameos). Turn this on to keep the per-actor episode count + tier hidden when hovering the cast list. Falls back to a name-only hover card."
+              description="Some shows treat regular vs. guest billing as a plot beat (deaths, returns, surprise cameos). When on, the cast hover card shows just the name; per-actor episode counts and tier are hidden."
               value={aura.hideCastSpoilers}
               onChange={(v) => setLocal({ hideCastSpoilers: v })}
             />
             <div className="h-px bg-white/6" />
             <SettingToggle
               label="Show AIOStreams notices"
-              description="Surface filter / timing / scrape-summary notices and addon errors as small icon badges over the streams panel. Notices the addon flags as un-suppressible (e.g. the Digital Release Filter warning, disabled-stream-types removal reasons) keep showing even when this is off."
+              description="Show filter, timing, and scrape-summary notices plus addon errors as small icon badges over the streams panel. Notices the addon flags as un-suppressible (e.g. the Digital Release Filter warning) always show, regardless of this toggle."
               value={aura.showAioStreamsNotices}
               onChange={(v) => setLocal({ showAioStreamsNotices: v })}
             />
@@ -2992,7 +3055,7 @@ export default function SettingsView({ addons, session }: Props) {
             <Section id="sec-subtitle-defaults" title="Subtitles · Defaults">
               <SettingDropdown
                 label="Subtitle language"
-                description="Loaded automatically when subtitles are available. Applied to all titles — per-title overrides cover the rare exception."
+                description="Loaded automatically when subtitles are available. Applied to all titles; per-title overrides cover the rare exception."
                 value={backend.subtitle_language}
                 options={LANG_OPTIONS}
                 required
@@ -3051,7 +3114,7 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SettingText
                 label="Background colour"
-                description="Box behind the text. Final 2 hex digits are alpha — #00000000 = no background."
+                description="Box behind the text. Final 2 hex digits are alpha; #00000000 means no background."
                 value={backend.subtitle_back_color}
                 placeholder="#00000000"
                 onChange={(v) => patchBackend({ subtitle_back_color: v.trim() })}
@@ -3082,14 +3145,14 @@ export default function SettingsView({ addons, session }: Props) {
               </p>
               <SkipModeRow
                 label="Openings (OP)"
-                description="Skip the OP — most users want this on auto."
+                description="Skip the OP. Most users want this on auto."
                 value={backend.skip_op_mode}
                 onChange={(v) => patchBackend({ skip_op_mode: v })}
               />
               <div className="h-px bg-white/6" />
               <SkipModeRow
                 label="Endings (ED)"
-                description="Endings often contain next-episode previews — prompt by default."
+                description="Endings often contain next-episode previews; prompt by default."
                 value={backend.skip_ed_mode}
                 onChange={(v) => patchBackend({ skip_ed_mode: v })}
               />
@@ -3229,7 +3292,7 @@ export default function SettingsView({ addons, session }: Props) {
               <ScrobbleAuthRow
                 service="trakt"
                 authKey={session?.auth_key ?? null}
-                description="Trakt receives playback progress for movies and series. Aura logs in directly via OAuth — no addon required. The Trakt scrobble events fire at the same thresholds as before (start ≥ 120 s of real playback, end at 80 % + ≥ 5 min)."
+                description="Trakt receives playback progress for movies and series. Aura logs in directly via OAuth, no addon required. Scrobble events fire at start (after 120 s of real playback) and end (80 % progress with at least 5 min watched)."
               />
               <div className="h-px bg-white/6" />
               <ScrobbleAuthRow
@@ -3240,7 +3303,7 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Enable scrobbling"
-                description="Master switch. When off, Aura sends NO scrobble traffic to either provider — useful for pausing scrobbling without disconnecting your accounts."
+                description="Master switch. When off, Aura sends no scrobble traffic to either provider, useful for pausing without disconnecting your accounts."
                 value={backend.scrobble_enabled}
                 onChange={(v) => patchBackend({ scrobble_enabled: v })}
               />
@@ -3261,7 +3324,7 @@ export default function SettingsView({ addons, session }: Props) {
             <Section id="sec-api-keys" title="API Keys">
               <SettingText
                 label="OMDb API key"
-                description="Used to enrich Detail-page ratings with Rotten Tomatoes and Metacritic critic scores. Aura does NOT ship a default key — register a free one at omdbapi.com (1,000 requests/day, ~30 s signup) and paste it here. Leave empty to disable OMDb; addon-supplied ratings and the MAL aggregator still render without it. The key is round-tripped via Settings export so it follows you across installs."
+                description="Enriches Detail-page ratings with Rotten Tomatoes and Metacritic critic scores. Aura does not ship a default key; register a free one at omdbapi.com (1,000 requests/day, ~30 s signup) and paste it here. Leave empty to disable OMDb; addon-supplied ratings and the MAL aggregator still render without it. The key is included in Settings export so it follows you across installs."
                 value={backend.omdb_api_key}
                 placeholder="e.g. 1a2b3c4d"
                 onChange={(v) => patchBackend({ omdb_api_key: v.trim() })}
@@ -3279,7 +3342,7 @@ export default function SettingsView({ addons, session }: Props) {
             <Section id="sec-crash-reporting" title="Crash Reporting">
               <SettingToggle
                 label="Send crash reports"
-                description="When enabled, Aura sends anonymised crash reports (error message, stack trace, OS / app version) to the developer's Sentry endpoint. No PII — usernames, IP addresses, file paths, and stream URLs are never included. Reports help fix bugs that would otherwise vanish on the user's machine without anyone knowing. Toggling takes effect on next app restart."
+                description="When enabled, Aura sends anonymised crash reports (error message, stack trace, OS / app version) to the developer's Sentry endpoint. No PII: usernames, IP addresses, file paths, and stream URLs are never included. Reports help fix bugs that would otherwise vanish silently on the user's machine. Takes effect on next app restart."
                 value={crashConfig.consent === true}
                 onChange={(v) => patchCrashConfig({ consent: v })}
               />
@@ -3306,7 +3369,7 @@ export default function SettingsView({ addons, session }: Props) {
             <Section id="sec-performance" title="Performance">
               <SettingToggle
                 label="Hardware acceleration"
-                description="Lets WebView2 use the GPU for rendering. Turn off if you see laggy scrolling on a multi-monitor / ultrawide setup with low CPU+GPU usage — a sign the OS compositor is the bottleneck rather than render workload. Restart Aura after toggling for the change to take effect."
+                description="Lets WebView2 use the GPU for rendering. Turn off if you see laggy scrolling on a multi-monitor / ultrawide setup with low CPU and GPU usage; that's a sign the OS compositor is the bottleneck rather than render workload. Restart Aura after toggling."
                 value={backend.gpu_acceleration}
                 onChange={(v) => patchBackend({ gpu_acceleration: v })}
               />
