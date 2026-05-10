@@ -62,7 +62,30 @@ CREATE INDEX idx_scope_updated ON sync_blobs (scope_hash, updated_at DESC);
 
 This is the simplest viable shape. Postgres would also work but adds
 ops overhead; sync traffic is small (a few KB per blob, low write rate)
-so SQLite handles it comfortably.
+so SQLite handles it comfortably. The migration to Postgres is cheap
+if you ever need multi-instance HA: one table, one `JSONB` column,
+handler logic ports verbatim.
+
+**Required PRAGMAs at startup.** Defaults will surprise you with write
+latency under concurrent reads; set both before serving traffic:
+
+```sql
+PRAGMA journal_mode = WAL;       -- readers don't block writers
+PRAGMA synchronous  = NORMAL;    -- one fsync per checkpoint, not per txn
+PRAGMA busy_timeout = 5000;      -- 5s to wait for the writer mutex
+PRAGMA foreign_keys = ON;        -- enforce constraints if you add any
+```
+
+`journal_mode=WAL` is the load-bearing one: with the default `DELETE`
+journaling, a long-running read blocks every writer (and vice versa),
+which would surface as 30s+ tail latency on PUTs the moment a client
+runs the GET-list during the same second.
+
+**Backup.** Use SQLite's online backup API (`sqlite3_backup_init` /
+`.backup` in the CLI) rather than `cp` of the live db file: the latter
+captures a torn snapshot if a write is in flight. A nightly cron of
+`sqlite3 sync.db ".backup '/var/backups/sync.db.$(date +%F)'"` is
+sufficient given the write volume; rotate to keep ~14 days.
 
 **ETag derivation:** `sha256_hex(data)[..16]` (16 lowercase hex chars). Collision risk is irrelevant for optimistic concurrency at this size.
 
