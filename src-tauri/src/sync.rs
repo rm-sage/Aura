@@ -1,7 +1,10 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Aura Proxy v2 sync client.
+//! Aura Cloud sync client (proxy still hosted on aura.animasec.dev,
+//! "Aura Cloud" is the user-facing name for the per-account state
+//! sync feature; "proxy" persists in the codebase only as the
+//! historical name of the Go service that powers it).
 //!
 //! Round-trips per-account state (settings, queue + manual marks, recent
 //! searches, per-title preferences, AniList ID cache, etc.) through the

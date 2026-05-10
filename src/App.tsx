@@ -2119,7 +2119,7 @@ export default function App() {
     // auto-snapshots land under the right user-<hash> directory and
     // a restore from Settings lists the user's actual snapshots.
     setAutoBackupScope(scope);
-    // Cloud sync (Aura Proxy v2) is per-account: drop ETags from any
+    // Cloud sync (Aura Cloud) is per-account: drop ETags from any
     // previous account so the next push doesn't carry a stale ETag,
     // and trigger a pull-all to seed the new account's local state
     // from whatever is on the proxy (fresh-device restore path). We
@@ -2142,7 +2142,7 @@ export default function App() {
     }
   }, []);
 
-  // ── Cloud sync orchestration (Aura Proxy v2) ──
+  // ── Cloud sync orchestration (Aura Cloud) ──
   // Install push triggers once on mount and keep a 5-minute background
   // pull running so changes from another signed-in device land without
   // a sign-in cycle. Both are no-ops in guest mode (sync.rs returns

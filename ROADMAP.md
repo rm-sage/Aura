@@ -511,7 +511,7 @@ A grab-bag of post-5.8 work that isn't gated to a single rendering / IPC milesto
 
 ---
 
-## Phase 7: Aura Proxy v2 - Account-Scoped Sync 🟡
+## Phase 7: Aura Cloud - Account-Scoped Sync 🟡
 
 Push and pull every per-account piece of Aura state through the existing
 `aura.animasec.dev` proxy so signing in to Aura on a fresh machine restores

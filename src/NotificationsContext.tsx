@@ -168,21 +168,71 @@ function loadFromStorage(): Notification[] {
   }
 }
 
-/** Cap to MAX_ITEMS, but never silently drop the most recent update. We
- *  preserve the single newest kind:'update' (if any) plus the 199 most-recent
- *  others, sorted by createdAt desc. */
+/** Eviction policy:
+ *
+ *    1. Notifications the user has NOT dismissed never fall out of the
+ *       buffer due to the soft `MAX_ITEMS` cap. Per the user's intent,
+ *       the bell should hold every undismissed item until they take
+ *       care of it. A separate hard cap (`ABSOLUTE_MAX`) prevents
+ *       runaway growth in pathological cases (a misbehaving addon
+ *       fanning out 5,000 episode releases) — at that point even
+ *       undismissed items get evicted oldest-first.
+ *
+ *    2. Dismissed notifications fill any slots left under `MAX_ITEMS`
+ *       after counting undismissed. They're evicted newest-first
+ *       below that line, then disappear entirely if undismissed
+ *       already saturates `MAX_ITEMS`.
+ *
+ *    3. The single newest `kind: 'update'` entry is always kept, even
+ *       if otherwise it would fall outside the cap. Updates aren't
+ *       dismissable through the normal flow (the bell panel preserves
+ *       them across `dismissAll`) so they need an explicit guard
+ *       against eviction by the volume-cap path.
+ */
+const ABSOLUTE_MAX = 1000;
+
 function capItems(items: Notification[]): Notification[] {
-  if (items.length <= MAX_ITEMS) return items;
+  // Always serve in newest-first order downstream.
   const sorted = [...items].sort((a, b) => b.createdAt - a.createdAt);
-  // Find newest update — if absent, just slice the head.
-  const newestUpdateIdx = sorted.findIndex((n) => n.kind === "update");
-  if (newestUpdateIdx === -1 || newestUpdateIdx < MAX_ITEMS) {
-    return sorted.slice(0, MAX_ITEMS);
+  if (sorted.length <= MAX_ITEMS) return sorted;
+
+  const undismissed = sorted.filter((n) => !n.dismissed);
+  const dismissed   = sorted.filter((n) =>  n.dismissed);
+
+  // Hard ceiling on undismissed too, but a generous one. Without
+  // this an addon misbehaving (1000s of episode releases) could
+  // grow the persisted blob past the proxy's per-account quota.
+  const keptUndismissed = undismissed.slice(0, ABSOLUTE_MAX);
+
+  // Slots remaining for dismissed AFTER seating the undismissed.
+  // Negative when undismissed alone exceeds the soft cap; treat as 0
+  // (drop dismissed entirely until undismissed shrinks).
+  const slotsLeft = Math.max(0, MAX_ITEMS - keptUndismissed.length);
+  let kept = [...keptUndismissed, ...dismissed.slice(0, slotsLeft)];
+
+  // Newest-update guard: if an update fell out of `kept` but still
+  // exists in the source, swap the oldest non-update kept item for
+  // it. Updates are intentionally non-dismissable through `dismissAll`
+  // so the user needs to explicitly action them; the cap shouldn't
+  // silently bury one.
+  const newestUpdate = sorted.find((n) => n.kind === "update");
+  if (newestUpdate && !kept.some((k) => k.id === newestUpdate.id)) {
+    // Find the slot to give up: oldest non-update kept entry. If
+    // every kept entry is an update, the cap is already update-only
+    // and nothing needs to move.
+    const giveUpIdx = (() => {
+      for (let i = kept.length - 1; i >= 0; i--) {
+        if (kept[i].kind !== "update") return i;
+      }
+      return -1;
+    })();
+    if (giveUpIdx >= 0) {
+      kept = [...kept.slice(0, giveUpIdx), ...kept.slice(giveUpIdx + 1), newestUpdate];
+      // Re-sort to maintain newest-first ordering for downstream consumers.
+      kept.sort((a, b) => b.createdAt - a.createdAt);
+    }
   }
-  // Newest update fell outside the cap — keep it and trim the others.
-  const head = sorted.slice(0, MAX_ITEMS - 1);
-  head.push(sorted[newestUpdateIdx]);
-  return head;
+  return kept;
 }
 
 export function NotificationsProvider({ children }: { children: ReactNode }) {
@@ -212,9 +262,21 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
   // Persist on every change. Cheap (≤200 items) and saves us from re-deriving
   // the list on remount. Also fires the change event the cloud sync layer
   // listens for to debounce a push to the proxy's `notifications` namespace.
+  //
+  // The serialized blob is compared against the last-persisted snapshot
+  // before writing. Without this guard, the rehydrate path (sync layer
+  // writes localStorage + fires `aura:notifications-rehydrate` → we
+  // setNotifications(loadFromStorage()) → this effect runs) would
+  // re-write the identical blob AND re-dispatch
+  // `aura:notifications-changed`, which schedules a wasted push round-
+  // trip to the server with the data the server just gave us.
+  const lastPersistedRef = useRef<string | null>(null);
   useEffect(() => {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(notifications));
+      const serialized = JSON.stringify(notifications);
+      if (serialized === lastPersistedRef.current) return;
+      lastPersistedRef.current = serialized;
+      localStorage.setItem(STORAGE_KEY, serialized);
       try { window.dispatchEvent(new CustomEvent("aura:notifications-changed")); } catch {}
     } catch {
       // quota exceeded / private mode — non-fatal

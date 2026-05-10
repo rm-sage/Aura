@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { loadAuraSettings, saveAuraSettings, type AuraSettings, DEFAULT_AURA_SETTINGS } from "./auraSettings";
 
 // ---------------------------------------------------------------------------
-// Aura Proxy v2 sync orchestrator (frontend)
+// Aura Cloud sync orchestrator (frontend)
 //
 // Round-trips per-account state through the proxy under a sha256-derived
 // scope hash that the Rust side derives from the active Stremio
@@ -222,36 +222,56 @@ interface NotificationEntry {
    *  sort + cap behaved as insertion-order with a silent 200→100 truncation
    *  on every cross-device pull. Use createdAt; fall back to 0. */
   createdAt?: number;
+  /** User-action flags. Mirrored to the proxy so a dismiss on one
+   *  device propagates to the others on next pull. Eviction during
+   *  the merge cap respects `dismissed` the same way the local
+   *  capItems does. */
+  dismissed?: boolean;
+  read?: boolean;
   [k: string]: unknown;
 }
 
 /** Match NotificationsContext::MAX_ITEMS so a sync round-trip can't
  *  silently halve the user's bell ring buffer. The two layers MUST
- *  agree on this number. */
+ *  agree on this number, AND the eviction policy must mirror — see
+ *  the local capItems for the rationale. */
 const NOTIFICATION_MAX = 200;
+/** Hard ceiling on undismissed entries even within the sync merge.
+ *  Above this we drop oldest undismissed too — matches the local
+ *  ABSOLUTE_MAX guard against runaway growth from a misbehaving
+ *  addon spam. */
+const NOTIFICATION_ABSOLUTE_MAX = 1000;
 
 const mergeNotifications: MergeFn<NotificationEntry[]> = (local, server) => {
   // Union with deduplication on (kind, id) — `createdAt` is excluded
   // from the key because the same logical notification can have
   // different timestamps on two devices that scanned the same episode
-  // a few seconds apart. (kind, id) is the stable identity. Sort by
-  // createdAt descending, then truncate to the same cap the local
-  // store enforces.
+  // a few seconds apart. (kind, id) is the stable identity. On
+  // conflict, prefer the newer-createdAt entry — that carries the
+  // user's most recent read/dismissed flag state.
   const all = [...(server ?? []), ...(local ?? [])];
   const byKey = new Map<string, NotificationEntry>();
   for (const entry of all) {
     const key = `${entry.kind ?? ""}::${entry.id ?? ""}`;
     const prev = byKey.get(key);
-    // On collision, keep the entry with the newer `createdAt` so user-
-    // touched fields (read/dismissed flags) from the most-recent
-    // device aren't reverted by older identical entries.
     if (!prev || (entry.createdAt ?? 0) > (prev.createdAt ?? 0)) {
       byKey.set(key, entry);
     }
   }
-  const out = Array.from(byKey.values());
-  out.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
-  return out.slice(0, NOTIFICATION_MAX);
+  const sorted = Array.from(byKey.values())
+    .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+  if (sorted.length <= NOTIFICATION_MAX) return sorted;
+
+  // Eviction: undismissed items survive the soft cap (subject to the
+  // absolute max). Dismissed items fill remaining slots newest-first.
+  // Mirror of capItems in NotificationsContext — keeping these in
+  // lock-step is the only way a cross-device merge doesn't silently
+  // drop notifications the user hasn't acknowledged.
+  const undismissed = sorted.filter((n) => !n.dismissed);
+  const dismissed   = sorted.filter((n) =>  n.dismissed);
+  const keptUndismissed = undismissed.slice(0, NOTIFICATION_ABSOLUTE_MAX);
+  const slotsLeft = Math.max(0, NOTIFICATION_MAX - keptUndismissed.length);
+  return [...keptUndismissed, ...dismissed.slice(0, slotsLeft)];
 };
 
 // manualWatched.ts persists as Array<[id, state]> pairs to preserve
