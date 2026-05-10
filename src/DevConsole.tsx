@@ -334,35 +334,40 @@ const COMMANDS: DevCommand[] = [
   {
     name: "scrobble",
     usage: "scrobble",
-    description: "Fire a test scrobble against the current stream (Trakt + AniList per same gates as scrobble_end). Requires an active stream.",
+    description: "Fire a test scrobble against the current stream (Trakt + AniList per same gates as scrobble_end). Requires an active stream — works the moment the player is open, no warmup wait.",
     run: async (_args, ctx) => {
+      // Dispatch an event App.tsx listens for; the listener has the
+      // current activeTarget + playback snapshot in scope and runs
+      // the actual invoke. Returns a Promise via the event detail so
+      // we can await the result and print it here. This indirection
+      // lets the DevConsole live as a leaf component without prop-
+      // threading activeTarget through every parent.
+      type Result = {
+        ok: boolean;
+        message: string;
+        level: "info" | "warn" | "error";
+      };
       try {
-        // Dynamic import keeps the Tauri core off the DevConsole's
-        // initial chunk; the console mounts on every session and most
-        // users never trigger this command.
-        const { invoke } = await import("@tauri-apps/api/core");
-        interface TestResult {
-          session_active: boolean;
-          id: string | null;
-          media_type: string | null;
-          is_anime: boolean;
-          trakt_fired: boolean;
-          anilist_fired: boolean;
-          message: string;
-        }
-        const r = await invoke<TestResult>("scrobble_test_fire");
-        if (!r.session_active) {
-          ctx.push({
-            ts: Date.now(), level: "warn", source: "console",
-            message: r.message,
-          });
-          return;
-        }
+        const result = await new Promise<Result>((resolve) => {
+          // 5s timeout in case App.tsx isn't mounted (e.g. console
+          // opened mid-tear-down). The listener clears the timeout
+          // on its own resolve; we clear it on response.
+          const timeout = setTimeout(() => resolve({
+            ok: false,
+            level: "error",
+            message: "scrobble test timed out (App.tsx listener didn't respond)",
+          }), 5000);
+          window.dispatchEvent(new CustomEvent("aura:devlogs-scrobble-test", {
+            detail: {
+              respond: (r: Result) => { clearTimeout(timeout); resolve(r); },
+            },
+          }));
+        });
         ctx.push({
           ts: Date.now(),
-          level: r.trakt_fired || r.anilist_fired ? "info" : "warn",
+          level: result.level,
           source: "console",
-          message: r.message,
+          message: result.message,
         });
       } catch (e) {
         ctx.push({

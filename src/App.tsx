@@ -2230,6 +2230,72 @@ export default function App() {
     playback: { time, duration, paused },
     scope: scrobbleScope,
   });
+
+  // ── DevConsole `scrobble` test command bridge ──
+  // The console fires `aura:devlogs-scrobble-test` with a `respond`
+  // callback in the event detail; we have activeTarget + the live
+  // playback snapshot in scope here, so we build the ScrobbleSession
+  // shape (matching what scrobble_start would have populated) and
+  // hand it to scrobble_test_fire. This bypasses the 120s warmup
+  // gate that prevents session_slot from being populated for
+  // genuine real-user-watching scenarios — testing should fire
+  // immediately, not after 2 minutes.
+  useEffect(() => {
+    interface ScrobbleTestResp {
+      ok: boolean;
+      message: string;
+      level: "info" | "warn" | "error";
+    }
+    interface TestEventDetail {
+      respond: (r: ScrobbleTestResp) => void;
+    }
+    interface RustResult {
+      session_active: boolean;
+      trakt_fired: boolean;
+      anilist_fired: boolean;
+      message: string;
+    }
+    const handler = async (e: Event) => {
+      const detail = (e as CustomEvent<TestEventDetail>).detail;
+      if (!detail?.respond) return;
+      if (!activeTarget) {
+        detail.respond({
+          ok: false,
+          level: "warn",
+          message: "no active stream - open a video first, then run `scrobble`",
+        });
+        return;
+      }
+      try {
+        const session = {
+          imdb_id:    activeTarget.id,
+          media_type: activeTarget.media_type,
+          episode:    activeTarget.episode ?? null,
+          title:      activeTarget.name,
+          is_anime:   isAnimeMeta(activeTarget),
+          scope:      scrobbleScope,
+        };
+        const r = await invoke<RustResult>("scrobble_test_fire", {
+          session,
+          time,
+          duration,
+        });
+        detail.respond({
+          ok: r.trakt_fired || r.anilist_fired,
+          level: r.trakt_fired || r.anilist_fired ? "info" : "warn",
+          message: r.message,
+        });
+      } catch (err) {
+        detail.respond({
+          ok: false,
+          level: "error",
+          message: `scrobble test failed: ${String(err)}`,
+        });
+      }
+    };
+    window.addEventListener("aura:devlogs-scrobble-test", handler);
+    return () => window.removeEventListener("aura:devlogs-scrobble-test", handler);
+  }, [activeTarget, scrobbleScope, time, duration]);
   // Scrobble-auth bell alerts run inside NotificationsBridge — see
   // its useScrobbleAuthAlerts(authKey) call below. Mounting them here
   // would crash because useNotifications() requires being inside the

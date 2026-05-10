@@ -413,53 +413,75 @@ pub struct ScrobbleTestResult {
 // ---------------------------------------------------------------------------
 // DevConsole test command
 //
-// Fires the same scrobble paths that scrobble_end uses, against the
-// CURRENT session_slot, but DOES NOT take the session — so it can be
-// invoked repeatedly during testing without breaking subsequent real
-// scrobble_end calls. Requires that load_video has been called for
-// the active stream (otherwise session_slot is None and the call
-// short-circuits with an explanatory message).
+// Fires the same scrobble paths that scrobble_end uses, but bypasses
+// the elapsed-time warmup gates so the user can verify their
+// Trakt/AniList wiring without having to actually watch 120+ seconds
+// of every test stream.
+//
+// Session source preference:
+//   1. The frontend can pass a fully-formed `session` (built from its
+//      `activeTarget` + active scope). This is the path the
+//      DevConsole's `scrobble` command uses, since `activeTarget`
+//      is always present the moment `load_video` returns — well
+//      before the 120s START_WARMUP_S that gates the real
+//      `scrobble_start` from populating `session_slot`.
+//   2. If `session` is None, fall back to the live `session_slot`.
+//      This is the "user manually watched 2+ minutes and then ran
+//      the test command" path; convenient when both work.
+//   3. If neither is available, return a friendly "no active stream"
+//      message so the DevConsole user understands what happened.
 //
 // Honors the same gates as scrobble_end:
-//   - settings.scrobble_enabled
 //   - Trakt token present (skipped silently if not connected)
 //   - AniList: is_anime + token present + resolvable IMDB id
 //
-// Pretends time = 95% of duration so Trakt's /sync/history records as
-// a normal completion instead of the 0%-watched edge case the test
-// might land in if the user pauses early. duration is taken from the
-// last_playback snapshot the heartbeat keeps fresh.
+// Pretends time = 95% of duration so Trakt's /sync/history records
+// as a normal completion instead of the 0%-watched edge case. If
+// the caller passes a real `time` / `duration` we use those instead.
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
 pub async fn scrobble_test_fire<R: Runtime>(
     app: AppHandle<R>,
+    session: Option<ScrobbleSession>,
+    time: Option<f64>,
+    duration: Option<f64>,
 ) -> Result<ScrobbleTestResult, String> {
-    let sess = match session_slot().lock().map_err(|e| e.to_string())?.clone() {
-        Some(s) => s,
-        None => {
-            return Ok(ScrobbleTestResult {
-                session_active: false,
-                id: None, media_type: None, is_anime: false,
-                trakt_fired: false, anilist_fired: false,
-                message: "no active stream - load_video has not been called".into(),
-            });
+    // Source the session: caller-provided (DevConsole path) wins over
+    // the live slot because it's available before the 120s warmup.
+    let sess = if let Some(s) = session {
+        s
+    } else {
+        match session_slot().lock().map_err(|e| e.to_string())?.clone() {
+            Some(s) => s,
+            None => {
+                return Ok(ScrobbleTestResult {
+                    session_active: false,
+                    id: None, media_type: None, is_anime: false,
+                    trakt_fired: false, anilist_fired: false,
+                    message: "no active stream - either load_video hasn't been called \
+                              or the frontend didn't pass an activeTarget".into(),
+                });
+            }
         }
     };
 
     let scope = sess.scope.clone();
+    // Prefer caller-supplied time/duration (DevConsole reads MPV's
+    // playback snapshot from React state and forwards it). Fall back
+    // to the heartbeat-tracked last_playback slot, then to a
+    // synthetic 95%/100% pair so the wire call still goes out even
+    // before duration has been observed.
     let (last_time, last_duration) = last_playback_slot()
         .lock().map(|g| *g).unwrap_or((0.0, 0.0));
-    // Pretend completion so /sync/history records as fully watched.
-    // If duration is unknown (loadfile happened but duration event
-    // hasn't fired yet — rare) we synthesize a 95%/100% pair so the
-    // wire call still goes out for testing.
-    let (test_time, test_duration) = if last_duration > 0.0 {
-        (last_duration * 0.95, last_duration)
-    } else if last_time > 0.0 {
-        (last_time, (last_time / 0.95).max(1.0))
-    } else {
-        (95.0, 100.0)
+    let supplied_dur = duration.filter(|d| d.is_finite() && *d > 0.0);
+    let supplied_time = time.filter(|t| t.is_finite() && *t >= 0.0);
+    let (test_time, test_duration) = match (supplied_time, supplied_dur) {
+        (Some(t), Some(d)) => (t.min(d * 0.95).max(d * 0.95), d),
+        (_, Some(d))       => (d * 0.95, d),
+        _ if last_duration > 0.0 => (last_duration * 0.95, last_duration),
+        _ if last_time > 0.0     => (last_time, (last_time / 0.95).max(1.0)),
+        _                  => (95.0, 100.0),
     };
 
     let trakt_will_fire = parse_trakt_target(&sess.imdb_id, &sess.media_type).is_some()
