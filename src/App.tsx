@@ -3238,6 +3238,14 @@ export default function App() {
       addons={addons}
       library={library}
       authKey={session?.auth_key ?? null}
+      // Suppress the floating popup bubble while the user is in
+      // playback OR has DetailView open. The notification still
+      // lands in the bell's ring buffer and badge count, but the
+      // bubble would either be hidden (playback unmounts the bell)
+      // or distracting (over the DetailView's tech-noir layout).
+      // The most-recently-suppressed candidate is shown the next
+      // time the user navigates back to a bell-visible surface.
+      popupSuppressed={isPlayerActive || selectedMeta != null}
       onOpenMeta={(metaId, mediaType) => {
         // Reconstruct a MetaPreview from the LibraryItem when available
         // (covers the scanner's episode notifications since they always
@@ -3662,7 +3670,7 @@ export default function App() {
 // ---------------------------------------------------------------------------
 
 function NotificationsBridge({
-  addons, library, authKey,
+  addons, library, authKey, popupSuppressed,
   onOpenMeta,
 }: {
   addons: AddonEntry[];
@@ -3670,9 +3678,20 @@ function NotificationsBridge({
   /** First-12-char prefix is derived inside the alerts hook; pass the
    *  raw auth_key (or null when signed out / guest). */
   authKey: string | null;
+  /** True while playback is active or DetailView is open. Forwarded
+   *  to NotificationsContext so the popup bubble is held until the
+   *  user navigates back to a bell-visible surface. */
+  popupSuppressed: boolean;
   onOpenMeta: (metaId: string, mediaType?: string) => void;
 }) {
-  const { addNotification } = useNotifications();
+  const { addNotification, setPopupSuppressed } = useNotifications();
+  // Mirror the prop into the context whenever it flips. Doing this
+  // here (inside the provider tree) is the only way App.tsx can
+  // reach setPopupSuppressed without lifting the provider above
+  // App's hook chain.
+  useEffect(() => {
+    setPopupSuppressed(popupSuppressed);
+  }, [popupSuppressed, setPopupSuppressed]);
   // Scrobble-auth bell alerts: surfaces expired Trakt / AniList tokens
   // in the bell so the user notices without opening Settings. Mounted
   // here (inside NotificationsProvider) so its useNotifications() call

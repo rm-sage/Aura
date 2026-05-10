@@ -73,6 +73,16 @@ interface NotificationsCtxValue {
    *  to open the panel). Distinct from `dismissNotification`, which
    *  removes the notification from the list entirely. */
   dismissPopup: () => void;
+  /** Suppress popup display while the bell isn't visible (during
+   *  stream playback, while the DetailView is open, anywhere else
+   *  the bubble would be either hidden or distracting). The
+   *  notification itself still lands in the ring buffer; only the
+   *  floating bubble is held. When suppression flips false again,
+   *  the most-recently-suppressed candidate (if any) gets shown so
+   *  the user doesn't completely miss new arrivals — but a flurry
+   *  of N suppressed candidates collapses to one popup since the
+   *  user only needs the freshest signal. */
+  setPopupSuppressed: (suppressed: boolean) => void;
   markRead: (id: string) => void;
   markAllRead: () => void;
   dismissNotification: (id: string) => void;
@@ -185,6 +195,19 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
    *  POPUP_LIFETIME_MS or on user dismissal. */
   const [popup, setPopup] = useState<Notification | null>(null);
   const popupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Suppression flag + queued popup candidate. The flag is mirrored
+  // into a ref so addNotification can read it synchronously without
+  // re-rendering the whole tree on every flip. The queued popup is
+  // the LAST candidate we'd have shown while suppressed; on
+  // un-suppress we surface that one (multiple while-suppressed
+  // candidates collapse to the freshest). Cleared when the queued
+  // popup is shown OR when the user navigates away from the bell-
+  // visible surface again before we get a chance to show it.
+  // Ref-only: suppression is read synchronously inside addNotification
+  // and the toggle drains the queue itself — no consumer needs to
+  // re-render on a flip, so a state would just churn the tree.
+  const popupSuppressedRef = useRef(false);
+  const queuedPopupRef = useRef<Notification | null>(null);
 
   // Persist on every change. Cheap (≤200 items) and saves us from re-deriving
   // the list on remount. Also fires the change event the cloud sync layer
@@ -260,6 +283,17 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
       dismissed: n.dismissed ?? false,
     };
     if (!popupCandidate.read && !popupCandidate.dismissed) {
+      // Suppressed (player active, DetailView open, etc.): queue
+      // the candidate so the user sees it the next time the bell
+      // becomes visible. Multiple while-suppressed candidates
+      // collapse to the freshest — bell badge counts still reflect
+      // every individual notification, but we don't want to chase
+      // the user with a backlog of 5 popups when they exit a
+      // 30-minute stream.
+      if (popupSuppressedRef.current) {
+        queuedPopupRef.current = popupCandidate;
+        return;
+      }
       // First-load grace: while the boot splash is still up the
       // popup would render behind it (the splash sits at z-9999,
       // the bell at z-30) and disappear before the user ever sees
@@ -290,6 +324,33 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
         setPopup(popupCandidate);
         popupTimerRef.current = null;
       }, wait);
+    }
+  }, []);
+
+  /** Setter exposed via context. Updates BOTH the ref (for synchronous
+   *  reads inside addNotification) and the state (so React subscribers
+   *  re-render). On a true→false transition AND a queued popup
+   *  exists, drain it through the same coalesce timer the live path
+   *  uses — that way the popup respects the bell's animation budget
+   *  even when it surfaces from a backlog. */
+  const setPopupSuppressed = useCallback((suppressed: boolean) => {
+    const prev = popupSuppressedRef.current;
+    popupSuppressedRef.current = suppressed;
+    if (prev && !suppressed && queuedPopupRef.current) {
+      const queued = queuedPopupRef.current;
+      queuedPopupRef.current = null;
+      if (popupTimerRef.current) clearTimeout(popupTimerRef.current);
+      popupTimerRef.current = setTimeout(() => {
+        setPopup(queued);
+        popupTimerRef.current = null;
+      }, POPUP_COALESCE_MS);
+    } else if (suppressed && popupTimerRef.current) {
+      // Suppressing while a deferred (timer-pending) popup is armed:
+      // cancel it and queue the candidate instead. Prevents the timer
+      // from firing setPopup mid-stream after the user just navigated
+      // INTO the player.
+      clearTimeout(popupTimerRef.current);
+      popupTimerRef.current = null;
     }
   }, []);
 
@@ -341,6 +402,7 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
       popup,
       addNotification,
       dismissPopup,
+      setPopupSuppressed,
       markRead,
       markAllRead,
       dismissNotification,
@@ -349,7 +411,8 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
     }),
     [
       notifications, unreadCount, hasNew, popup,
-      addNotification, dismissPopup, markRead, markAllRead,
+      addNotification, dismissPopup, setPopupSuppressed,
+      markRead, markAllRead,
       dismissNotification, dismissAll, clearDismissed,
     ],
   );
