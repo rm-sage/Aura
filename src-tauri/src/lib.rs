@@ -32,6 +32,7 @@ mod omdb;
 mod player;
 mod ratings;
 mod scrobble;
+mod scrobble_anilist;
 mod scrobble_auth;
 mod per_title;
 mod settings;
@@ -1277,11 +1278,18 @@ pub fn run() {
             // secondary process, separate from whether the deep-link
             // plugin then propagated the URL. argv[0] is the
             // executable path; argv[1..] is what we care about for
-            // the `aura://` URL.
+            // the `aura://` URL — but argv may contain an OAuth
+            // callback whose `token=` / `refresh=` params are
+            // long-lived bearer secrets, so each entry routes through
+            // `redact_oauth_url` before hitting the log.
+            let redacted: Vec<String> = argv
+                .iter()
+                .map(|a| crate::scrobble_auth::redact_oauth_url(a))
+                .collect();
             crate::devlog!(
                 info, "lib",
                 "single-instance second-process args ({} total): {:?} cwd={cwd}",
-                argv.len(), argv,
+                argv.len(), redacted,
             );
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.show();
@@ -1328,6 +1336,14 @@ pub fn run() {
                     crate::devlog!(info, "lib", "deep-link schemes registered (dev mode)");
                 }
             }
+
+            // ── AniList ID cache ──────────────────────────────────────────
+            // Loads the persistent cache that maps Aura's IMDB show ids to
+            // AniList media ids. Loaded once at startup; written through on
+            // every cache miss in scrobble_anilist::save_progress. Empty /
+            // missing file is fine (just an empty cache).
+            scrobble_anilist::init_cache(app.handle());
+
 
             // ── DLL pre-flight ─────────────────────────────────────────────
             player::check_mpv_dll().map_err(|e| {
@@ -1440,7 +1456,14 @@ pub fn run() {
                     let payload = event.payload();
                     if let Ok(urls) = serde_json::from_str::<Vec<String>>(payload) {
                         for url in urls {
-                            crate::devlog!(info, "lib", "deep-link arrived: {url}");
+                            // Redact tokens for log (the original URL still goes
+                            // to the frontend handler — App.tsx needs the live
+                            // params to persist the token to the keyring).
+                            crate::devlog!(
+                                info, "lib",
+                                "deep-link arrived: {}",
+                                crate::scrobble_auth::redact_oauth_url(&url),
+                            );
                             handle.emit("deep-link", url).ok();
                         }
                     } else {
@@ -1709,6 +1732,9 @@ pub fn run() {
             scrobble_auth::set_scrobble_auth_token,
             scrobble_auth::clear_scrobble_auth_token,
             scrobble_auth::scrobble_oauth_authorize_url,
+            scrobble_auth::scrobble_oauth_device_begin,
+            scrobble_auth::scrobble_oauth_device_poll,
+            scrobble_auth::open_oauth_popup_webview,
             // ── Phase 3C: Discord RPC ─────────────────────────────────────────
             window_logic::discord_set_presence,
             window_logic::discord_clear_presence,

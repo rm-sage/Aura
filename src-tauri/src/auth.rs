@@ -1,12 +1,21 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+// PathBuf and Manager are used only in cfg-gated code paths (the
+// keyring fallback that writes to disk on platforms where the OS
+// keyring isn't usable). The release profile sometimes flags them as
+// "unused" because the conditional code is dead in that build's
+// feature set; allow_unused covers both builds without splitting the
+// import block.
+#[allow(unused_imports)]
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, Runtime};
+#[allow(unused_imports)]
+use tauri::Manager;
+use tauri::{AppHandle, Runtime};
 use zeroize::Zeroizing;
 
 use crate::addons::AddonEntry;

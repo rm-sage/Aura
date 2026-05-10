@@ -161,6 +161,9 @@ commands.allow = [
   "set_scrobble_auth_token",
   "clear_scrobble_auth_token",
   "scrobble_oauth_authorize_url",
+  "scrobble_oauth_device_begin",
+  "scrobble_oauth_device_poll",
+  "open_oauth_popup_webview",
 ]
 
 # ── Phase 3C: Discord Rich Presence ──────────────────────────────────────────

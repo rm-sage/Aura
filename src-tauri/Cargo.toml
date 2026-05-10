@@ -103,6 +103,29 @@ windows = { version = "0.61", features = [
     "Win32_UI_Shell",
 ] }
 
+# Dev-profile slimming. The default debug profile produced ~43 GB of
+# target/ growth on this dep graph (Tauri framework + libmpv plugin +
+# Sentry + reqwest+rustls + the windows crate's generated bindings,
+# all built with full debug info per crate). Two changes here cut that
+# by ~50% with zero impact on build speed and only a modest impact on
+# Rust-side debugging fidelity:
+#
+#   • split-debuginfo = "packed" packages debug info into separate
+#     .pdb files (Windows) / .dwo files (Linux) instead of duplicating
+#     it inside every .rlib. Saves disk because each upstream crate is
+#     no longer carrying a private copy of debug symbols already
+#     emitted in its sibling rlibs.
+#
+#   • debug = "line-tables-only" keeps file:line information for
+#     backtraces (so panic / unwind output is still useful) but drops
+#     local variable type info that breakpoint debuggers consume.
+#     Aura development is println!/devlog-driven; we don't run a Rust
+#     debugger in the typical edit cycle. If you ever do, flip this
+#     back to debug = true temporarily.
+[profile.dev]
+split-debuginfo = "packed"
+debug = "line-tables-only"
+
 # Release-profile debug info — needed for Sentry to symbolicate the
 # minidumps captured by `sentry-rust-minidump`. Without this the PDB
 # next to aura.exe contains no line-table info, and Sentry would

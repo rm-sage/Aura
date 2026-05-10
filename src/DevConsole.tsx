@@ -840,8 +840,10 @@ export default function DevConsole() {
           the user can type immediately. */}
       <div className="relative flex-shrink-0 border-t border-white/10">
         {/* Autocomplete dropdown — only when there's something to suggest
-            and the user hasn't moved past the command name yet. */}
-        {suggestions.length > 0 && !insideArgs && (
+            and the user hasn't moved past the command name yet.
+            Suppressed in production builds since the prompt input is
+            also gone there. */}
+        {!import.meta.env.PROD && suggestions.length > 0 && !insideArgs && (
           <div
             role="listbox"
             aria-label="Command suggestions"
@@ -890,27 +892,46 @@ export default function DevConsole() {
           </div>
         )}
 
-        <div className="flex items-center gap-2 px-4 py-2 bg-black/30">
-          <span aria-hidden className="text-ln-accent text-[13px] font-mono leading-none">›</span>
-          <input
-            ref={inputRef}
-            value={input}
-            onChange={(e) => { setInput(e.target.value); setHistoryCursor(null); }}
-            onKeyDown={onPromptKey}
-            placeholder="type a command, e.g. `help`, `throw`, or `panic`"
-            spellCheck={false}
-            autoComplete="off"
-            autoCorrect="off"
-            autoCapitalize="off"
-            className="flex-1 bg-transparent border-0 outline-none
-                       text-[12px] font-mono text-white/90 placeholder:text-white/30"
-          />
-          {historyRef.current.length > 0 && (
-            <span className="text-[10px] text-white/30 tabular-nums select-none">
-              ↑ history ({historyRef.current.length})
+        {/* Production builds ship the DevConsole as a read-only log
+            viewer. The command prompt is dev-only because several
+            commands deliberately trigger crashes / panics / native
+            errors for telemetry verification (`throw`, `panic`,
+            `dev_force_panic`, `eval`); leaving them reachable in a
+            shipped binary lets curious users generate spurious Sentry
+            events and break their own session for fun. Vite stamps
+            `import.meta.env.PROD` at build time so this whole branch
+            tree-shakes out of release bundles. */}
+        {import.meta.env.PROD ? (
+          <div className="flex items-center gap-2 px-4 py-2 bg-black/30">
+            <span aria-hidden className="text-white/30 text-[13px] font-mono leading-none">›</span>
+            <span className="flex-1 text-[11.5px] font-mono text-white/35 italic select-none">
+              Read-only in release builds. Commands are available in
+              development.
             </span>
-          )}
-        </div>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 px-4 py-2 bg-black/30">
+            <span aria-hidden className="text-ln-accent text-[13px] font-mono leading-none">›</span>
+            <input
+              ref={inputRef}
+              value={input}
+              onChange={(e) => { setInput(e.target.value); setHistoryCursor(null); }}
+              onKeyDown={onPromptKey}
+              placeholder="type a command, e.g. `help`, `throw`, or `panic`"
+              spellCheck={false}
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
+              className="flex-1 bg-transparent border-0 outline-none
+                         text-[12px] font-mono text-white/90 placeholder:text-white/30"
+            />
+            {historyRef.current.length > 0 && (
+              <span className="text-[10px] text-white/30 tabular-nums select-none">
+                ↑ history ({historyRef.current.length})
+              </span>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

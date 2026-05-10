@@ -89,6 +89,16 @@ export interface ActiveScrobbleTarget {
   episode_title?: string;
   /** Stylized logo URL — used by the buffering overlay. */
   logo?: string | null;
+  /** Anime-detection signals — passed to `isAnimeMeta` so the AniList
+   *  scrobble path correctly fires for IMDB-id'd anime served by
+   *  Cinemeta (Frieren, Demon Slayer, etc.). Without these the
+   *  detector only saw `media_type=series` + `id=tt...`, neither of
+   *  which signal anime, and AniList scrobbling silently no-op'd for
+   *  most anime in practice. Sourced from the `scoring` object that
+   *  handlePlayStream already builds for the audio-track scorer. */
+  genres?: string[] | null;
+  original_language?: string | null;
+  production_countries?: string[] | null;
 }
 
 export function activeTargetFromMeta(
@@ -100,6 +110,11 @@ export function activeTargetFromMeta(
     media_type: meta.media_type,
     name: meta.name,
     episode,
+    // Carry every anime-detection signal the meta has so AniList
+    // scrobbling fires for IMDB-id'd anime.
+    genres: (meta as Partial<MetaDetail>).genres ?? null,
+    original_language: (meta as Partial<MetaDetail>).original_language ?? null,
+    production_countries: (meta as Partial<MetaDetail>).production_countries ?? null,
   };
 }
 

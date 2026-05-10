@@ -131,7 +131,10 @@ unsafe extern "system" fn cb(child: *mut c_void, _lparam: isize) -> i32 {
         let class = class_name_lower(get_class_name, child);
         if is_webview_host(&class) {
             SKIPPED.with(|c| c.set(c.get() + 1));
-            crate::devlog!(info, "win32", "skip child '{}' (webview host)", class);
+            // debug-level: this fires for every webview / Tauri helper
+            // window on every focus event. Useful when diagnosing
+            // child-window enumeration; just noise day-to-day.
+            crate::devlog!(debug, "win32", "skip child '{}' (webview host)", class);
             return 1;
         }
         crate::devlog!(info, "win32", "resize child '{}' → ({},{},{},{})",
@@ -197,10 +200,23 @@ pub fn resize_mpv_child_to_parent(parent_hwnd: isize, y_offset: i32) {
         let resized = RESIZED.with(|c| c.get());
         let skipped = SKIPPED.with(|c| c.get());
         CTX.with(|c| c.set(None));
-        crate::devlog!(info, "win32",
-            "resize_mpv_child y_offset={} client={}x{} → resized={} skipped={}",
-            y_offset, width, height, resized, skipped
-        );
+        // Demote to debug when there's no MPV child to resize (the
+        // common case while the user is browsing without a stream
+        // playing — focus / resize events still trigger this path
+        // but it's a no-op). Stays at info when we actually moved
+        // something so the diagnostic value is preserved during
+        // playback fullscreen / window resize.
+        if resized > 0 {
+            crate::devlog!(info, "win32",
+                "resize_mpv_child y_offset={} client={}x{} resized={} skipped={}",
+                y_offset, width, height, resized, skipped
+            );
+        } else {
+            crate::devlog!(debug, "win32",
+                "resize_mpv_child y_offset={} client={}x{} (no MPV child to resize, skipped={})",
+                y_offset, width, height, skipped
+            );
+        }
     }
 }
 

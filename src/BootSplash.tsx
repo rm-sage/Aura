@@ -61,17 +61,24 @@ export default function BootSplash({ visible }: Props) {
         alignItems: "center",
         justifyContent: "center",
         gap: 20,
-        // FULLY opaque dark backdrop. The previous 97% alpha let ~3% of
-        // the React tree behind it bleed through, which on OLED with HDR
-        // tone-mapping turned bright LandingView gradients and home-page
-        // hero art into visible flashes. A pure rgb solid prevents any
-        // bleed-through. The blur stays as a finishing touch in case the
-        // backdrop is ever made translucent again, but with 1.0 alpha it
-        // has nothing to blur.
-        background: "rgb(8, 10, 14)",
+        // FULLY opaque, theme-coordinated backdrop. The CSS variable
+        // is defined per :root[data-theme=...] block in App.css so the
+        // splash matches the surface the user is about to land in.
+        // Solid (alpha = 1) is non-negotiable: even 3 % bleed-through
+        // lights up bright LandingView gradients on OLED + HDR before
+        // the splash fades. Fallback `rgb(8, 10, 14)` covers the
+        // pre-CSS frame on a hard reload.
+        background: "var(--aura-splash-bg, rgb(8, 10, 14))",
         backdropFilter: "blur(12px)",
         WebkitBackdropFilter: "blur(12px)",
-        zIndex: 99999,
+        // Z-band: below the TitleBar (z 10000) so window controls
+        // stay on top and remain interactable, but above everything
+        // else mounted concurrently — including ResizeHandles
+        // (z 9000), AmbientAura (z auto), and the app shell content
+        // (z auto). Pure-opaque background combined with this z value
+        // means nothing else in the React tree shows through during
+        // the splash window.
+        zIndex: 9500,
         // Block click-through while the splash is over the React tree.
         // The previous `none` value let the user click LandingView /
         // login fields through the opaque backdrop because they were

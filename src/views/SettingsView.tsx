@@ -2303,7 +2303,13 @@ function KeybindRow({ label, description, code, onChange }: KeybindRowProps) {
 interface ScrobbleAuthSummary {
   username: string | null;
   expires_at: number | null;
+  /** Token is approaching expiry (provider-specific window: 7d for
+   *  AniList, 24h for Trakt). Soft warning. */
   stale: boolean;
+  /** Token has already lapsed. Hard reconnect required: AniList
+   *  cannot refresh, Trakt's refresh endpoint is not yet wired
+   *  through the proxy. */
+  expired: boolean;
 }
 
 function ScrobbleAuthRow({
@@ -2314,18 +2320,33 @@ function ScrobbleAuthRow({
   description: string;
 }) {
   const scope = authKey ? authKey.slice(0, 12) : "guest";
+  const label = service === "trakt" ? "Trakt" : "AniList";
+  // Trakt supports OAuth 2.0 device flow (RFC 8628), which sidesteps
+  // the browser → custom-URL-scheme → OS handler chain that broke on
+  // Firefox + Aura's dev build. AniList doesn't expose device-flow
+  // endpoints, so it stays on the legacy authorize-URL + deep-link
+  // path until upstream changes.
+  const useDeviceFlow = service === "trakt";
+
   const [status, setStatus] = useState<ScrobbleAuthSummary | null>(null);
   const [busy, setBusy] = useState(false);
-  /** Set true while we're waiting for the OAuth deep-link to return.
-   *  Drives the "Waiting for authorization…" UI plus the 120 s
-   *  timeout. Cleared by: deep-link arriving (`aura:scrobble-auth-
-   *  changed` fires after set_scrobble_auth_token), the user
-   *  clicking Cancel, or the timeout. */
+  // Auth-code (deep-link) waiting state — only used by AniList now.
   const [pending, setPending] = useState(false);
-  /** setTimeout handle for the waiting-window. Stored in a ref so
-   *  the cancel/success paths can clear it without depending on
-   *  React state cycles. */
   const timeoutRef = useRef<number | null>(null);
+
+  // Device-flow state. When set, the row renders the user_code +
+  // verification URL + Cancel button, and a poll loop runs until the
+  // proxy returns Authorized (clears) / Expired / Denied / Error.
+  interface DeviceFlowState {
+    user_code:        string;
+    verification_url: string;
+    device_code:      string;
+    /** Wall-clock ms when the device_code expires. */
+    expires_at:       number;
+    /** Polling interval in ms (start at server-suggested, may grow on slow_down). */
+    interval_ms:      number;
+  }
+  const [deviceFlow, setDeviceFlow] = useState<DeviceFlowState | null>(null);
 
   const clearWaiting = useCallback(() => {
     setPending(false);
@@ -2347,21 +2368,17 @@ function ScrobbleAuthRow({
 
   useEffect(() => {
     refresh();
-    // Deep-link arrival: App.tsx persists the token via
-    // set_scrobble_auth_token, then dispatches this window event. We
-    // refetch status (flip to Connected) AND clear the waiting flag
-    // so the UI exits the "Waiting for authorization…" state. The
-    // event fires for BOTH providers, but the refetch is cheap and
-    // the waiting clear is per-provider.
+    // Deep-link arrival (AniList path): App.tsx persists the token,
+    // then dispatches this event. Device-flow polling dispatches the
+    // same event after a successful poll.
     const onChanged = () => {
       refresh();
       clearWaiting();
+      setDeviceFlow(null);
     };
     window.addEventListener("aura:scrobble-auth-changed", onChanged);
     return () => {
       window.removeEventListener("aura:scrobble-auth-changed", onChanged);
-      // Component unmount: drop any in-flight timeout so it doesn't
-      // fire against a dead component.
       if (timeoutRef.current !== null) {
         window.clearTimeout(timeoutRef.current);
         timeoutRef.current = null;
@@ -2369,41 +2386,184 @@ function ScrobbleAuthRow({
     };
   }, [refresh, clearWaiting]);
 
-  const connect = useCallback(async () => {
-    if (busy || pending) return;
-    setBusy(true);
-    try {
-      sessionStorage.setItem(`aura:oauth:pending:${service}`, scope);
-      const url = await invoke<string>("scrobble_oauth_authorize_url", { service });
-      const { openUrl } = await import("@tauri-apps/plugin-opener");
-      await openUrl(url);
-      // Browser is open — flip into waiting state. The proxy's CSRF
-      // state has a 10 min TTL on the server side; 120 s on the
-      // client side is the integration doc's recommendation, long
-      // enough for a normal "click through Trakt's auth page" flow
-      // but short enough that an abandoned tab doesn't leave the
-      // Settings UI stuck in "Waiting…" forever.
-      setPending(true);
-      timeoutRef.current = window.setTimeout(() => {
-        timeoutRef.current = null;
-        setPending(false);
-        sessionStorage.removeItem(`aura:oauth:pending:${service}`);
+  // Device-flow poll loop. Runs while `deviceFlow` is set, polls the
+  // proxy at the server-suggested interval, dispatches scrobble-auth-
+  // changed on success (which clears `deviceFlow` via the listener
+  // above). Honours `slow_down` by adding 5 s to the interval.
+  useEffect(() => {
+    if (!deviceFlow) return;
+    let cancelled = false;
+    let intervalMs = deviceFlow.interval_ms;
+    let timer: number | null = null;
+
+    const tick = async () => {
+      if (cancelled) return;
+      if (Date.now() >= deviceFlow.expires_at) {
+        setDeviceFlow(null);
         showAppToast(
-          `${service === "trakt" ? "Trakt" : "AniList"} authorization didn't complete. Try again.`,
+          `${label} authorization timed out. The code expired before you finished. Try again.`,
           { duration: 6000 },
         );
-      }, 120_000);
+        return;
+      }
+      try {
+        const resp = await invoke<{ status: string; username?: string | null; message?: string }>(
+          "scrobble_oauth_device_poll",
+          { service, scope, deviceCode: deviceFlow.device_code },
+        );
+        if (cancelled) return;
+        switch (resp.status) {
+          case "authorized":
+            window.dispatchEvent(new CustomEvent("aura:scrobble-auth-changed"));
+            showAppToast(
+              `Connected to ${label}${resp.username ? ` as ${resp.username}` : ""}`,
+              { duration: 4000 },
+            );
+            return;
+          case "pending":
+            break;
+          case "slow_down":
+            intervalMs = Math.min(intervalMs + 5000, 30000);
+            break;
+          case "expired":
+            setDeviceFlow(null);
+            showAppToast(
+              `${label} code expired before authorization completed. Try again.`,
+              { duration: 5000 },
+            );
+            return;
+          case "denied":
+            setDeviceFlow(null);
+            showAppToast(`${label} authorization was denied.`, { duration: 5000 });
+            return;
+          case "error":
+          default:
+            setDeviceFlow(null);
+            showAppToast(
+              `${label} auth failed: ${resp.message || resp.status}`,
+              { duration: 6000 },
+            );
+            return;
+        }
+      } catch (e) {
+        // Network blip: don't kill the flow, just keep polling on
+        // schedule. The expires_at gate will end the loop if we never
+        // reach the proxy again.
+        console.warn(`[scrobble] device poll failed:`, e);
+      }
+      if (!cancelled) {
+        timer = window.setTimeout(tick, intervalMs);
+      }
+    };
+
+    timer = window.setTimeout(tick, deviceFlow.interval_ms);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [deviceFlow, service, scope, label]);
+
+  const connect = useCallback(async () => {
+    if (busy || pending || deviceFlow) return;
+    setBusy(true);
+    try {
+      // Both providers route their auth UI through the in-app
+      // SourcePopup (a child Tauri Webview) instead of the system
+      // browser. This sidesteps a class of browser bugs around
+      // automatic redirects to non-HTTP custom schemes (Firefox
+      // silently dropping `aura://` 302s, etc.) and keeps the entire
+      // flow inside Aura's process. AniList additionally registers a
+      // navigation interceptor on the popup so the proxy's terminal
+      // `aura://oauth/anilist?...` redirect is caught and re-emitted
+      // as a `deep-link` event — the existing App.tsx handler then
+      // persists the token through the same code path the OS scheme
+      // handler would have taken. Trakt doesn't need the interceptor
+      // because device-flow polling drives auth detection.
+      const { openOAuthPopup } = await import("../SourcePopup");
+
+      if (useDeviceFlow) {
+        // Trakt: device-flow path. No deep-link involvement; we poll.
+        const begin = await invoke<{
+          user_code:        string;
+          verification_url: string;
+          device_code:      string;
+          expires_in:       number;
+          interval:         number;
+        }>("scrobble_oauth_device_begin", { service });
+        setDeviceFlow({
+          user_code:        begin.user_code,
+          verification_url: begin.verification_url,
+          device_code:      begin.device_code,
+          expires_at:       Date.now() + begin.expires_in * 1000,
+          interval_ms:      Math.max(2000, begin.interval * 1000),
+        });
+        // Open the activation page so the user can paste/type the code
+        // immediately. The popup self-closes when the device-flow poll
+        // returns Authorized (via the aura:scrobble-auth-changed event
+        // SourcePopup listens for in OAuth mode).
+        openOAuthPopup(begin.verification_url, `Connect to ${label}`);
+      } else {
+        // AniList: authorize-URL + deep-link path, but the deep-link
+        // is intercepted inside the popup webview rather than handed
+        // off to the OS scheme handler via the system browser.
+        sessionStorage.setItem(`aura:oauth:pending:${service}`, scope);
+        const url = await invoke<string>("scrobble_oauth_authorize_url", { service });
+        openOAuthPopup(url, `Connect to ${label}`, {
+          interceptPrefix: `aura://oauth/${service}`,
+        });
+        setPending(true);
+        // Safety timer — if the user closes the popup without
+        // authorizing (or the proxy never redirects to the intercept
+        // prefix), we still want the row's "Connecting…" state to
+        // clear. Keeps the existing 2-minute window.
+        timeoutRef.current = window.setTimeout(() => {
+          timeoutRef.current = null;
+          setPending(false);
+          sessionStorage.removeItem(`aura:oauth:pending:${service}`);
+          showAppToast(
+            `${label} authorization didn't complete. Try again.`,
+            { duration: 6000 },
+          );
+        }, 120_000);
+      }
     } catch (e) {
       sessionStorage.removeItem(`aura:oauth:pending:${service}`);
-      showAppToast(`Couldn't open ${service} auth URL: ${String(e)}`, { duration: 5000 });
+      showAppToast(`Couldn't start ${label} auth: ${String(e)}`, { duration: 5000 });
     } finally {
       setBusy(false);
     }
-  }, [busy, pending, service, scope]);
+  }, [busy, pending, deviceFlow, service, scope, useDeviceFlow, label]);
 
   const cancelPending = useCallback(() => {
     clearWaiting();
+    setDeviceFlow(null);
   }, [clearWaiting]);
+
+  const copyUserCode = useCallback(async () => {
+    if (!deviceFlow) return;
+    try {
+      await navigator.clipboard.writeText(deviceFlow.user_code);
+      showAppToast("Code copied", { duration: 2000 });
+    } catch {
+      // Clipboard API may be blocked; non-fatal — code is still
+      // visible on screen for the user to type manually.
+    }
+  }, [deviceFlow]);
+
+  const reopenVerification = useCallback(async () => {
+    if (!deviceFlow) return;
+    try {
+      // Reopen the activation page in the same in-app popup the
+      // initial Connect click used. The device-flow poll in the
+      // background continues polling regardless of which popup is
+      // visible; we just need to make the activation URL accessible
+      // again if the user dismissed the first popup.
+      const { openOAuthPopup } = await import("../SourcePopup");
+      openOAuthPopup(deviceFlow.verification_url, `Connect to ${label}`);
+    } catch (e) {
+      showAppToast(`Couldn't open ${deviceFlow.verification_url}: ${String(e)}`, { duration: 5000 });
+    }
+  }, [deviceFlow, label]);
 
   const disconnect = useCallback(async () => {
     if (busy) return;
@@ -2418,7 +2578,6 @@ function ScrobbleAuthRow({
     }
   }, [busy, service, scope]);
 
-  const label = service === "trakt" ? "Trakt" : "AniList";
   const connected = !!status;
 
   return (
@@ -2429,7 +2588,26 @@ function ScrobbleAuthRow({
           <p className="text-white/55 text-xs leading-relaxed">{description}</p>
         </div>
         <div className="flex-shrink-0 flex flex-col items-end gap-1.5">
-          {pending ? (
+          {deviceFlow ? (
+            <>
+              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px]
+                                font-semibold uppercase tracking-wider
+                                bg-amber-500/15 text-amber-200 border border-amber-400/30">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                Awaiting authorization
+              </span>
+              <button
+                type="button"
+                onClick={cancelPending}
+                className="px-3 py-1 rounded-lg border border-white/15 bg-white/5
+                           text-white/75 text-[11px] font-medium tracking-wide
+                           hover:bg-white/10 hover:text-white
+                           transition-colors"
+              >
+                Cancel
+              </button>
+            </>
+          ) : pending ? (
             <>
               <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px]
                                 font-semibold uppercase tracking-wider
@@ -2446,6 +2624,26 @@ function ScrobbleAuthRow({
                            transition-colors"
               >
                 Cancel
+              </button>
+            </>
+          ) : connected && status?.expired ? (
+            <>
+              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px]
+                                font-semibold uppercase tracking-wider
+                                bg-rose-500/15 text-rose-300 border border-rose-400/30">
+                <span className="w-1.5 h-1.5 rounded-full bg-rose-400" />
+                {status?.username ? `Expired · ${status.username}` : "Expired"}
+              </span>
+              <button
+                type="button"
+                onClick={connect}
+                disabled={busy}
+                className="px-3 py-1 rounded-lg border border-ln-accent/35 bg-ln-accent/15
+                           text-ln-accent text-[11px] font-medium tracking-wide
+                           hover:bg-ln-accent/25 hover:border-ln-accent/55
+                           transition-colors disabled:opacity-50"
+              >
+                Reconnect
               </button>
             </>
           ) : connected ? (
@@ -2483,9 +2681,57 @@ function ScrobbleAuthRow({
           )}
         </div>
       </div>
-      {status?.stale && !pending && (
+      {deviceFlow && (
+        <div className="mt-2 rounded-lg border border-amber-400/25 bg-amber-500/[0.06]
+                        p-3 flex flex-col sm:flex-row sm:items-center gap-3">
+          <div className="flex-1 min-w-0">
+            <p className="text-white/70 text-[11px] leading-snug mb-1">
+              Open Trakt and enter this code to authorize Aura. Aura will
+              connect automatically once you click Allow.
+            </p>
+            <div className="flex items-center gap-2">
+              <code className="font-mono tracking-[0.25em] text-[15px]
+                               text-amber-200 bg-black/30 rounded px-2.5 py-1
+                               border border-amber-400/20 select-all">
+                {deviceFlow.user_code}
+              </code>
+              <button
+                type="button"
+                onClick={copyUserCode}
+                className="px-2.5 py-1 rounded-md border border-white/15 bg-white/5
+                           text-white/75 text-[10.5px] font-medium tracking-wide
+                           hover:bg-white/10 hover:text-white transition-colors"
+              >
+                Copy
+              </button>
+              <button
+                type="button"
+                onClick={reopenVerification}
+                className="px-2.5 py-1 rounded-md border border-white/15 bg-white/5
+                           text-white/75 text-[10.5px] font-medium tracking-wide
+                           hover:bg-white/10 hover:text-white transition-colors"
+              >
+                Open Trakt
+              </button>
+            </div>
+            <p className="text-white/40 text-[10.5px] mt-1.5 truncate">
+              {deviceFlow.verification_url}
+            </p>
+          </div>
+        </div>
+      )}
+      {status?.expired && !pending && !deviceFlow && (
+        <p className="text-rose-400/90 text-xs">
+          {service === "anilist"
+            ? "AniList token expired. AniList does not support refresh, so click Connect to re-authorize."
+            : "Trakt token expired. Click Connect to re-authorize."}
+        </p>
+      )}
+      {status?.stale && !status?.expired && !pending && !deviceFlow && (
         <p className="text-amber-400/80 text-xs">
-          Token expires soon. Reconnect to refresh.
+          {service === "anilist"
+            ? "AniList token expires within a week. Reconnect to extend (no automatic renewal)."
+            : "Token expires soon. Reconnect to refresh."}
         </p>
       )}
     </div>

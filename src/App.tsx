@@ -38,6 +38,7 @@ import { mirrorWatchedFromCloud, pushItemWatched } from "./watchedSync";
 import { onWatchedSync } from "./manualWatched";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useScrobble, type ActiveScrobbleTarget } from "./useScrobble";
+import { useScrobbleAuthAlerts } from "./useScrobbleAuthAlerts";
 import { useKeybindings } from "./useKeybindings";
 import { libraryToggle, libraryRemoveAll, libraryWriteProgress, libraryClearProgress } from "./libraryActions";
 import { libraryItemSeriesId } from "./libraryNormalize";
@@ -1046,6 +1047,13 @@ export default function App() {
           episode:       target.episode,
           episode_title: target.episode_title,
           logo,
+          // Carry the scoring signals through to scrobble's anime
+          // detector. Without these the AniList path saw
+          // `genres=undefined` for every Cinemeta IMDB session and
+          // short-circuited at `if !sess.is_anime` in scrobble.rs.
+          genres:               target.scoring?.genres ?? null,
+          original_language:    target.scoring?.original_language ?? null,
+          production_countries: target.scoring?.production_countries ?? null,
         });
         setActiveScoringMeta(target.scoring ?? null);
         // Intentionally NOT closing the DetailView here. Keeping
@@ -2183,6 +2191,10 @@ export default function App() {
     playback: { time, duration, paused },
     scope: scrobbleScope,
   });
+  // Scrobble-auth bell alerts run inside NotificationsBridge — see
+  // its useScrobbleAuthAlerts(authKey) call below. Mounting them here
+  // would crash because useNotifications() requires being inside the
+  // <NotificationsProvider> tree, which doesn't wrap App.
 
   // ── Custom keybindings — global keydown → action handlers ──
   // Note: `fullscreen` is now wired through the lifted toggleFullscreen so
@@ -3121,6 +3133,7 @@ export default function App() {
       addons={addons}
       library={library}
       activeView={activeView}
+      authKey={session?.auth_key ?? null}
       onOpenMeta={(metaId, mediaType) => {
         // Reconstruct a MetaPreview from the LibraryItem when available
         // (covers the scanner's episode notifications since they always
@@ -3545,15 +3558,24 @@ export default function App() {
 // ---------------------------------------------------------------------------
 
 function NotificationsBridge({
-  addons, library, activeView,
+  addons, library, activeView, authKey,
   onOpenMeta,
 }: {
   addons: AddonEntry[];
   library: LibraryItem[];
   activeView: NavView;
+  /** First-12-char prefix is derived inside the alerts hook; pass the
+   *  raw auth_key (or null when signed out / guest). */
+  authKey: string | null;
   onOpenMeta: (metaId: string, mediaType?: string) => void;
 }) {
   const { addNotification } = useNotifications();
+  // Scrobble-auth bell alerts: surfaces expired Trakt / AniList tokens
+  // in the bell so the user notices without opening Settings. Mounted
+  // here (inside NotificationsProvider) so its useNotifications() call
+  // resolves the context. The earlier App-body placement crashed at
+  // first render — the provider hadn't been entered yet.
+  useScrobbleAuthAlerts(authKey);
 
   // aura:update-dismissed-to-bell — owned by another agent's auto-updater.
   // Detail shape is documented in NotificationsContext: { tagName, htmlUrl,

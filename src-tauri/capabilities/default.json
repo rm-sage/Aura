@@ -1,8 +1,9 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability for the Aura main window",
+  "description": "Default capability for the Aura main window. Scoped via both `windows` AND `webviews` so the IPC bridge is only granted to the main React webview — child popup webviews (label prefix `aura-source-popup-*`, used by SourcePopup.tsx for external sources and by the OAuth popup) load untrusted external HTTPS pages and must not be able to invoke any Tauri command. Without the explicit `webviews` field these child webviews would inherit the parent window's capabilities.",
   "windows": ["main"],
+  "webviews": ["main"],
   "permissions": [
     "core:default",
     "opener:default",

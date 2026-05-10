@@ -22,6 +22,11 @@
   --ln-accent-glow: rgba(91, 164, 255, 0.32);
 
   --ln-bg:           transparent;       /* lets Mica show through */
+  /* Boot-splash backdrop. Always opaque (alpha=1 — even 3 % bleed-
+     through lights up bright LandingView gradients on OLED + HDR
+     before fade). Per-theme so the splash matches the surface
+     palette the user is about to land in. */
+  --aura-splash-bg:  #08101a;
   --ln-blur:         32px;
   --ln-blur-elev:    64px;
   --ln-saturate:     1.8;
@@ -51,6 +56,7 @@
   --ln-accent-glow: rgba(91, 164, 255, 0.40);
 
   --ln-bg:        rgba(10, 12, 18, 0.45);
+  --aura-splash-bg: #0a0c12;
   --ln-blur:      48px;
   --ln-blur-elev: 96px;
   --ln-saturate:  2.2;
@@ -78,6 +84,7 @@
   --ln-accent-glow: rgba(91, 164, 255, 0.45);
 
   --ln-bg:        #000000;     /* pure black for OLED */
+  --aura-splash-bg: #000000;
   --ln-blur:      0px;
   --ln-blur-elev: 0px;
   --ln-saturate:  1;
@@ -113,6 +120,7 @@
   --ln-rim-luminous: rgba(255, 200, 140, 0.22);
   --ln-accent-glow: rgba(91, 164, 255, 0.40);
   --ln-bg:        #100c08;
+  --aura-splash-bg: #100c08;
   --ln-blur:      32px;
   --ln-blur-elev: 64px;
   --ln-saturate:  1.6;
@@ -133,6 +141,7 @@
   --ln-rim-luminous: rgba(140, 220, 180, 0.22);
   --ln-accent-glow: rgba(91, 164, 255, 0.38);
   --ln-bg:        #0a1310;
+  --aura-splash-bg: #0a1310;
   --ln-blur:      32px;
   --ln-blur-elev: 64px;
   --ln-saturate:  1.7;
@@ -153,6 +162,7 @@
   --ln-rim-luminous: rgba(230, 170, 200, 0.22);
   --ln-accent-glow: rgba(91, 164, 255, 0.40);
   --ln-bg:        #110a0e;
+  --aura-splash-bg: #110a0e;
   --ln-blur:      32px;
   --ln-blur-elev: 64px;
   --ln-saturate:  1.7;
@@ -173,6 +183,7 @@
   --ln-rim-luminous: rgba(190, 160, 240, 0.22);
   --ln-accent-glow: rgba(91, 164, 255, 0.42);
   --ln-bg:        #0c0a14;
+  --aura-splash-bg: #0c0a14;
   --ln-blur:      32px;
   --ln-blur-elev: 64px;
   --ln-saturate:  1.8;
@@ -193,6 +204,7 @@
   --ln-rim-luminous: rgba(130, 220, 240, 0.22);
   --ln-accent-glow: rgba(91, 164, 255, 0.42);
   --ln-bg:        #08101a;
+  --aura-splash-bg: #08101a;
   --ln-blur:      32px;
   --ln-blur-elev: 64px;
   --ln-saturate:  1.8;
@@ -213,6 +225,7 @@
   --ln-rim-luminous: rgba(255, 220, 140, 0.22);
   --ln-accent-glow: rgba(91, 164, 255, 0.42);
   --ln-bg:        #120e08;
+  --aura-splash-bg: #120e08;
   --ln-blur:      32px;
   --ln-blur-elev: 64px;
   --ln-saturate:  1.8;

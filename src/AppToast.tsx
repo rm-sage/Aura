@@ -5,18 +5,24 @@ import { useEffect, useState } from "react";
 
 // ---------------------------------------------------------------------------
 // AppToast — global toast surface for non-player surfaces (Settings, Addons,
-// Library, etc.). The PlayerOverlay has its own in-player toast positioned
-// over the video; this one renders in the bottom-right of the viewport
-// where it's visible from any tab.
+// Library, OAuth flows, etc.). The PlayerOverlay has its own in-player toast
+// (FlyUpToast) anchored at the click location for volume / skip / pause
+// feedback; that one is unchanged. This host renders at top-centre of the
+// viewport so non-player toasts are immediately visible from any tab, with
+// a brief flash + glow on entry to draw the eye.
 //
 // Trigger from any component via `showAppToast("message")`. The host below
 // listens for the matching event and stacks up to MAX_VISIBLE toasts at a
-// time — older ones drop off the top as new ones arrive.
+// time. Older ones drop off the bottom as new ones arrive at the top.
 // ---------------------------------------------------------------------------
 
 const EVENT = "aura:app-toast";
 const MAX_VISIBLE = 3;
-const DEFAULT_DURATION_MS = 2200;
+/** Default visible duration. Bumped from the original 2.2s so users have
+ *  comfortable read time on multi-line messages. The flash + glow on entry
+ *  draws attention quickly; the longer dwell prevents a glance-away from
+ *  missing the content. */
+const DEFAULT_DURATION_MS = 4500;
 
 export type ToastTone = "default" | "success" | "danger";
 
@@ -79,17 +85,56 @@ export default function AppToastHost() {
 
   return (
     <div
-      className="fixed z-[300] flex flex-col gap-2 pointer-events-none"
+      className="fixed left-1/2 -translate-x-1/2 z-[300] flex flex-col items-center gap-2 pointer-events-none"
       style={{
-        // Bottom-right with safe gutter; the PlayerOverlay toast sits at
-        // top-center so the two never collide.
-        right: 20,
-        bottom: 20,
+        // Top-centre, sat below the title bar (36px) with a small
+        // gutter. Player overlay's FlyUpToast tracks the cursor so
+        // they don't collide; if both happen to render together,
+        // FlyUpToast at z-[250] sits behind this z-[300] surface.
+        top: 56,
       }}
     >
       {toasts.map((t) => (
         <ToastItem key={t.id} toast={t} />
       ))}
+      <style>{`
+        @keyframes aura-app-toast-flash {
+          0%   { opacity: 0; transform: translateY(-12px) scale(0.94);
+                 box-shadow: 0 0 0 0 rgba(91, 164, 255, 0); }
+          18%  { opacity: 1; transform: translateY(0)     scale(1.04);
+                 box-shadow: 0 8px 24px -4px rgba(91, 164, 255, 0.55),
+                             0 0 0 6px rgba(91, 164, 255, 0.18); }
+          32%  { transform: translateY(0) scale(1);
+                 box-shadow: 0 8px 24px -4px rgba(91, 164, 255, 0.40),
+                             0 0 0 0 rgba(91, 164, 255, 0); }
+          100% { opacity: 1; transform: translateY(0) scale(1);
+                 box-shadow: 0 8px 24px -4px rgba(0, 0, 0, 0.55); }
+        }
+        @keyframes aura-app-toast-flash-success {
+          0%   { opacity: 0; transform: translateY(-12px) scale(0.94);
+                 box-shadow: 0 0 0 0 rgba(110, 231, 183, 0); }
+          18%  { opacity: 1; transform: translateY(0)     scale(1.04);
+                 box-shadow: 0 8px 24px -4px rgba(110, 231, 183, 0.55),
+                             0 0 0 6px rgba(110, 231, 183, 0.18); }
+          32%  { transform: translateY(0) scale(1);
+                 box-shadow: 0 8px 24px -4px rgba(110, 231, 183, 0.40),
+                             0 0 0 0 rgba(110, 231, 183, 0); }
+          100% { opacity: 1; transform: translateY(0) scale(1);
+                 box-shadow: 0 8px 24px -4px rgba(0, 0, 0, 0.55); }
+        }
+        @keyframes aura-app-toast-flash-danger {
+          0%   { opacity: 0; transform: translateY(-12px) scale(0.94);
+                 box-shadow: 0 0 0 0 rgba(251, 113, 133, 0); }
+          18%  { opacity: 1; transform: translateY(0)     scale(1.04);
+                 box-shadow: 0 8px 24px -4px rgba(251, 113, 133, 0.55),
+                             0 0 0 6px rgba(251, 113, 133, 0.18); }
+          32%  { transform: translateY(0) scale(1);
+                 box-shadow: 0 8px 24px -4px rgba(251, 113, 133, 0.40),
+                             0 0 0 0 rgba(251, 113, 133, 0); }
+          100% { opacity: 1; transform: translateY(0) scale(1);
+                 box-shadow: 0 8px 24px -4px rgba(0, 0, 0, 0.55); }
+        }
+      `}</style>
     </div>
   );
 }
@@ -97,31 +142,35 @@ export default function AppToastHost() {
 function ToastItem({ toast }: { toast: ToastEntry }) {
   const accent =
     toast.tone === "success"
-      ? "border-emerald-300/35 bg-emerald-300/5"
+      ? "border-emerald-300/45 bg-emerald-300/5"
       : toast.tone === "danger"
-        ? "border-rose-300/35 bg-rose-300/5"
-        : "border-white/15 bg-white/5";
+        ? "border-rose-300/45 bg-rose-300/5"
+        : "border-ln-accent/35 bg-ln-accent/5";
+  const animName =
+    toast.tone === "success"
+      ? "aura-app-toast-flash-success"
+      : toast.tone === "danger"
+        ? "aura-app-toast-flash-danger"
+        : "aura-app-toast-flash";
 
   return (
     <div
       role="status"
       aria-live="polite"
       className={`pointer-events-auto px-4 py-2.5 rounded-xl
-                  bg-black/85 backdrop-blur-2xl shadow-glass-edge
+                  bg-black/85 backdrop-blur-2xl
                   border ${accent}
                   text-white/90 text-[13px] tracking-wide leading-snug
-                  min-w-[220px] max-w-[420px]`}
+                  min-w-[260px] max-w-[440px] text-center`}
       style={{
-        animation: "aura-app-toast-in 220ms cubic-bezier(0.34, 1.56, 0.64, 1)",
+        // Flash entry: 520ms total. Longer than the old 220ms so the
+        // glow halo registers; ramps to a quiet drop-shadow afterward
+        // so multiple stacked toasts don't strobe.
+        animation: `${animName} 520ms cubic-bezier(0.22, 1, 0.36, 1)`,
+        animationFillMode: "both",
       }}
     >
       {toast.message}
-      <style>{`
-        @keyframes aura-app-toast-in {
-          from { opacity: 0; transform: translateY(8px) scale(0.97); }
-          to   { opacity: 1; transform: translateY(0)   scale(1); }
-        }
-      `}</style>
     </div>
   );
 }

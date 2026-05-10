@@ -444,7 +444,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     // (the JS-side useScrobble cleanup never ran because
                     // React doesn't get a teardown when the process
                     // exits via app.exit). Capped at 2 s internally.
-                    crate::scrobble::shutdown_blocking();
+                    crate::scrobble::shutdown_blocking(&handle);
                     shutdown_mpv_sync(&handle);
                     clear_presence_inner();
                     // Reap the streaming-bridge subprocess so it doesn't

@@ -23,28 +23,55 @@ use crate::settings;
 // the full flow.
 //
 // Wire format (per Trakt API v2):
-//   POST https://api.trakt.tv/scrobble/stop
+//   POST https://api.trakt.tv/sync/history
 //   Headers: Authorization: Bearer <token>, trakt-api-version: 2,
 //            trakt-api-key: <client_id>, Content-Type: application/json
 //   Body for movies:
-//     { "movie": { "ids": { "imdb": "tt0111161" } }, "progress": 95.0 }
+//     { "movies":   [{ "ids": { "imdb": "tt0111161" } }] }
 //   Body for episodes:
-//     { "show": { "ids": { "imdb": "tt0903747" } },
-//       "episode": { "season": 1, "number": 5 },
-//       "progress": 95.0 }
+//     { "shows":    [{
+//         "ids":     { "imdb": "tt0903747" },
+//         "seasons": [{
+//           "number":   1,
+//           "episodes": [{ "number": 5 }]
+//         }]
+//       }] }
 //
-// Trakt converts /scrobble/stop with progress >= 80% into a "watched"
-// entry on the user's history; below that threshold it's recorded as
-// "paused". Aura only fires /scrobble/stop on session-end with auto-
-// complete already gated to >= 80% (see useScrobble.ts), so the wire
-// path always intends "mark watched".
+// Why `/sync/history` and not `/scrobble/stop`?
 //
-// AniList scrobbling is intentionally not wired yet — AniList tracks
-// progress by AniList media id, but Aura's session ids come from
-// Stremio addons (IMDB / Kitsu / etc.). Wiring up an id mapping is a
-// separate task; until then the AniList token is stored but unused at
-// runtime. Most anime listed via Cinemeta DOES have an IMDB id, so
-// Trakt scrobbling covers the bulk of the catalogue regardless.
+//   1. `/scrobble/stop` is designed to terminate an in-progress scrobble
+//      session opened via `/scrobble/start`. Aura deliberately skips
+//      `/scrobble/start` (it would put the user on Trakt's public
+//      "currently watching" feed for every preview attempt), so calling
+//      `/stop` standalone is supported by Trakt but inconsistent: it
+//      returns 409 Conflict on the second call within 30 minutes for
+//      the same item, and the implicit "intent" semantics are awkward
+//      when there was no prior start.
+//
+//   2. `/sync/history` is the canonical "add this to watched history"
+//      endpoint. It's idempotent in the right way (multiple plays
+//      produce multiple history entries the user can inspect) and
+//      doesn't depend on Trakt's scrobble session state at all.
+//
+//   3. AIOMetadata uses `/checkin` (which both scrobbles AND adds to
+//      history) for the same reason — `/scrobble/stop` is unreliable
+//      for "I just finished this" semantics. We picked `/sync/history`
+//      over `/checkin` because Aura's stricter completion gates
+//      (80% + 5 min elapsed in useScrobble.ts) already mean we only
+//      fire on a confirmed completion, so the public-feed effect of
+//      `/checkin` adds no value over a plain history write.
+//
+// Aura only fires this on session-end with auto-complete already gated
+// to >= 80% (see useScrobble.ts), so the wire path always intends
+// "mark watched".
+//
+// AniList scrobbling is wired through scrobble_anilist.rs — IMDB id
+// resolves to AniList media id via title search + a persistent cache.
+// `is_anime` on the session drives whether it fires; the anime
+// detector in `aiometadata.ts` needs the meta's genre / original
+// language / production country signals, all of which are now carried
+// on `ActiveScrobbleTarget` so Cinemeta-supplied IMDB anime
+// (Frieren, Demon Slayer, etc.) flows through correctly.
 //
 // All scrobble traffic is best-effort: failures are logged via
 // `crate::devlog!` but never propagate to the user. The scrobble
@@ -159,34 +186,46 @@ fn parse_trakt_target(id: &str, media_type: &str) -> Option<TraktTarget> {
     }
 }
 
-fn build_stop_body(target: &TraktTarget, progress_pct: f64) -> serde_json::Value {
+/// Build the `/sync/history` body for marking a target as watched.
+/// Trakt accepts top-level `movies`, `shows`, and `episodes` arrays;
+/// for episodes we use the nested `shows[].seasons[].episodes[]` shape
+/// which lets us key the show by IMDB id and the episode by S/E
+/// numbers without needing the Trakt-internal episode id.
+fn build_history_body(target: &TraktTarget) -> serde_json::Value {
     match target {
         TraktTarget::Movie { imdb } => serde_json::json!({
-            "movie":    { "ids": { "imdb": imdb } },
-            "progress": progress_pct,
+            "movies": [{ "ids": { "imdb": imdb } }],
         }),
         TraktTarget::Episode { show_imdb, season, number } => serde_json::json!({
-            "show":     { "ids": { "imdb": show_imdb } },
-            "episode":  { "season": season, "number": number },
-            "progress": progress_pct,
+            "shows": [{
+                "ids":     { "imdb": show_imdb },
+                "seasons": [{
+                    "number":   season,
+                    "episodes": [{ "number": number }],
+                }],
+            }],
         }),
     }
 }
 
 // ---------------------------------------------------------------------------
-// Trakt /scrobble/stop — async path, called from scrobble_end
+// Trakt /sync/history — async path, called from scrobble_end
 // ---------------------------------------------------------------------------
 
-async fn trakt_scrobble_stop(scope: &str, sess: &ScrobbleSession, time: f64, duration: f64) {
+async fn trakt_sync_history(scope: &str, sess: &ScrobbleSession, time: f64, duration: f64) {
     let Some(token) = scrobble_auth::read_token_for("trakt", scope) else {
         // No connected Trakt account — silently no-op. AniList-only
         // users land here, as do guest sessions.
+        crate::devlog!(
+            info, "scrobble",
+            "Trakt /sync/history skipped: no token for scope={scope}",
+        );
         return;
     };
     let Some(target) = parse_trakt_target(&sess.imdb_id, &sess.media_type) else {
         crate::devlog!(
             warn, "scrobble",
-            "Trakt /scrobble/stop skipped: id format unsupported: {} (type={})",
+            "Trakt /sync/history skipped: id format unsupported: {} (type={})",
             sess.imdb_id, sess.media_type,
         );
         return;
@@ -197,10 +236,10 @@ async fn trakt_scrobble_stop(scope: &str, sess: &ScrobbleSession, time: f64, dur
     } else {
         0.0
     };
-    let body = build_stop_body(&target, progress_pct);
+    let body = build_history_body(&target);
 
     let res = client()
-        .post(format!("{TRAKT_API}/scrobble/stop"))
+        .post(format!("{TRAKT_API}/sync/history"))
         .header("Authorization", format!("Bearer {}", token.access_token))
         .header("Content-Type", "application/json")
         .header("trakt-api-version", "2")
@@ -211,10 +250,14 @@ async fn trakt_scrobble_stop(scope: &str, sess: &ScrobbleSession, time: f64, dur
 
     match res {
         Ok(r) if r.status().is_success() => {
+            // Trakt's /sync/history response includes an `added` /
+            // `not_found` breakdown — we don't parse it, but logging
+            // the status code is enough for users to verify in
+            // DevConsole that the call landed (201 Created on success).
             crate::devlog!(
                 info, "scrobble",
-                "Trakt /scrobble/stop OK ({:.0}%) for {}",
-                progress_pct, sess.imdb_id,
+                "Trakt /sync/history OK (status={}, {:.0}% watched) for {}",
+                r.status().as_u16(), progress_pct, sess.imdb_id,
             );
         }
         Ok(r) if r.status().as_u16() == 401 => {
@@ -237,7 +280,7 @@ async fn trakt_scrobble_stop(scope: &str, sess: &ScrobbleSession, time: f64, dur
         Ok(r) => {
             crate::devlog!(
                 warn, "scrobble",
-                "Trakt /scrobble/stop status {}",
+                "Trakt /sync/history status {}",
                 r.status().as_u16(),
             );
         }
@@ -248,7 +291,7 @@ async fn trakt_scrobble_stop(scope: &str, sess: &ScrobbleSession, time: f64, dur
             // Truncate to category-only — `e.to_string()` may include
             // the request URL with the bearer token in headers if a
             // future log-formatter swap brings header dumps along.
-            crate::devlog!(warn, "scrobble", "Trakt /scrobble/stop {category}");
+            crate::devlog!(warn, "scrobble", "Trakt /sync/history {category}");
         }
     }
 }
@@ -263,14 +306,20 @@ pub async fn scrobble_start<R: Runtime>(
     session: ScrobbleSession,
     duration: f64,
 ) -> Result<(), String> {
+    crate::devlog!(
+        info, "scrobble",
+        "scrobble_start: id={} type={} ep={:?} title=\"{}\" anime={} scope={} duration={:.0}s",
+        session.imdb_id, session.media_type, session.episode,
+        session.title, session.is_anime, session.scope, duration,
+    );
     *session_slot().lock().map_err(|e| e.to_string())? = Some(session);
     record_playback(0.0, duration);
     // Intentionally no HTTP fires here. Trakt's /scrobble/start would
     // put the user on the public "currently watching" feed, which
     // earlier feedback flagged as too eager — flipping an episode the
     // user is previewing into the public feed before they decided to
-    // commit. Only /scrobble/stop fires on completion (>= 80% +
-    // useScrobble's elapsed-time floor).
+    // commit. The /sync/history POST fires on completion only (>= 80%
+    // + useScrobble's elapsed-time floor).
     Ok(())
 }
 
@@ -286,7 +335,7 @@ pub async fn scrobble_heartbeat<R: Runtime>(
 
 #[tauri::command]
 pub async fn scrobble_end<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     time: f64,
     duration: f64,
 ) -> Result<(), String> {
@@ -304,7 +353,37 @@ pub async fn scrobble_end<R: Runtime>(
     }
 
     let scope = sess.scope.clone();
-    trakt_scrobble_stop(&scope, &sess, time, duration).await;
+    let progress = if duration > 0.0 { (time / duration * 100.0).clamp(0.0, 100.0) } else { 0.0 };
+    crate::devlog!(
+        info, "scrobble",
+        "scrobble_end: id={} progress={:.0}% anime={} scope={} - dispatching to providers",
+        sess.imdb_id, progress, sess.is_anime, scope,
+    );
+    // Trakt: covers movies + IMDB-id'd series (most of the catalogue).
+    trakt_sync_history(&scope, &sess, time, duration).await;
+    // AniList: separate provider, separate keyring entry, separate
+    // failure mode. Internally no-ops when sess.is_anime is false or
+    // no AniList token is stored, so calling it unconditionally is
+    // cheap. We treat its outcome as best-effort the same way Trakt
+    // does — a 401 clears the keyring entry so Settings reflects
+    // "expired, reconnect" on next refresh.
+    match crate::scrobble_anilist::save_progress(&app, &scope, &sess).await {
+        Ok(()) => {}
+        Err(crate::scrobble_anilist::AnilistError::Unauthorized) => {
+            crate::devlog!(
+                warn, "scrobble",
+                "AniList 401/403 - clearing token for scope={scope} (user must reconnect)",
+            );
+            crate::scrobble_auth::clear_token_for("anilist", &scope);
+        }
+        Err(crate::scrobble_anilist::AnilistError::NotFound) => {
+            // Anime not on AniList, or search returned no candidates.
+            // Common; not actionable.
+        }
+        Err(e) => {
+            crate::devlog!(warn, "scrobble", "AniList save failed: {e}");
+        }
+    }
     Ok(())
 }
 
@@ -321,7 +400,7 @@ pub async fn scrobble_end<R: Runtime>(
 // can't hold up app shutdown.
 // ---------------------------------------------------------------------------
 
-pub fn shutdown_blocking() {
+pub fn shutdown_blocking<R: Runtime>(app: &AppHandle<R>) {
     let taken = match session_slot().lock() {
         Ok(mut g) => g.take(),
         Err(_) => return,
@@ -342,33 +421,64 @@ pub fn shutdown_blocking() {
     };
 
     let scope = sess.scope.clone();
-    let Some(target) = parse_trakt_target(&sess.imdb_id, &sess.media_type) else { return; };
-    let Some(token) = scrobble_auth::read_token_for("trakt", &scope) else { return; };
 
-    crate::devlog!(
-        info, "scrobble",
-        "shutdown_blocking — flushing Trakt /scrobble/stop for {} ({:.0}%)",
-        sess.imdb_id, progress_pct,
-    );
+    // ── Trakt flush ────────────────────────────────────────────────
+    // Mirrors `trakt_sync_history` above but with a 2s timeout so a
+    // slow / unreachable Trakt API can't hold up app shutdown. We
+    // re-build the client locally rather than reusing the OnceLock
+    // singleton because reqwest's per-request timeout overrides the
+    // builder's, and we want a tighter ceiling than the 8s runtime
+    // default for the shutdown path specifically.
+    if let (Some(target), Some(token)) = (
+        parse_trakt_target(&sess.imdb_id, &sess.media_type),
+        scrobble_auth::read_token_for("trakt", &scope),
+    ) {
+        crate::devlog!(
+            info, "scrobble",
+            "shutdown_blocking flushing Trakt /sync/history for {} ({:.0}%)",
+            sess.imdb_id, progress_pct,
+        );
+        let body = build_history_body(&target);
+        let _ = tauri::async_runtime::block_on(async move {
+            let cli = reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .https_only(true)
+                .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " scrobble"))
+                .build()
+                .ok()?;
+            cli.post(format!("{TRAKT_API}/sync/history"))
+                .header("Authorization", format!("Bearer {}", token.access_token))
+                .header("Content-Type", "application/json")
+                .header("trakt-api-version", "2")
+                .header("trakt-api-key", scrobble_auth::TRAKT_CLIENT_ID)
+                .json(&body)
+                .send()
+                .await
+                .ok()
+        });
+    }
 
-    let body = build_stop_body(&target, progress_pct);
-
-    let _ = tauri::async_runtime::block_on(async move {
-        // Bounded short timeout — never hold up shutdown more than 2 s.
-        let cli = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .https_only(true)
-            .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " scrobble"))
-            .build()
-            .ok()?;
-        cli.post(format!("{TRAKT_API}/scrobble/stop"))
-            .header("Authorization", format!("Bearer {}", token.access_token))
-            .header("Content-Type", "application/json")
-            .header("trakt-api-version", "2")
-            .header("trakt-api-key", scrobble_auth::TRAKT_CLIENT_ID)
-            .json(&body)
-            .send()
+    // ── AniList flush ──────────────────────────────────────────────
+    // Best-effort, capped at 2 s. AniList is async + GraphQL so it's
+    // a different code path from Trakt's bare HTTP POST. We reuse
+    // save_progress (which internally no-ops for non-anime / no
+    // token) wrapped in a tokio timeout so the shutdown handler
+    // can't hang on a stuck network.
+    if sess.is_anime && scrobble_auth::read_token_for("anilist", &scope).is_some() {
+        crate::devlog!(
+            info, "scrobble",
+            "shutdown_blocking flushing AniList progress for \"{}\"",
+            sess.title,
+        );
+        let app_clone = app.clone();
+        let sess_clone = sess.clone();
+        let scope_clone = scope.clone();
+        let _ = tauri::async_runtime::block_on(async move {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                crate::scrobble_anilist::save_progress(&app_clone, &scope_clone, &sess_clone),
+            )
             .await
-            .ok()
-    });
+        });
+    }
 }

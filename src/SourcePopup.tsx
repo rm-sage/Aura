@@ -5,6 +5,8 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { Webview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 // ---------------------------------------------------------------------------
 // SourcePopup — in-app modal that hosts a Tauri child Webview loading an
@@ -40,6 +42,24 @@ const OPEN_EVENT = "aura:open-source-popup";
 interface SourceState {
   url: string;
   title: string;
+  /** OAuth-mode descriptor. When set, the popup:
+   *
+   *    • spawns the child webview from Rust (so we can register an
+   *      `on_navigation` handler that intercepts `interceptPrefix`
+   *      navigations and re-emits them as `deep-link` events — see
+   *      `open_oauth_popup_webview` in scrobble_auth.rs); and
+   *    • auto-closes when `aura:scrobble-auth-changed` fires, so the
+   *      user doesn't have to manually dismiss the popup after auth
+   *      succeeds (whether by deep-link interception for AniList or
+   *      by device-flow polling for Trakt).
+   *
+   *  Omitting `interceptPrefix` (Trakt's case) skips navigation
+   *  interception and lets the device-flow polling drive auth
+   *  detection — the popup is just a convenient in-app browser tab
+   *  for entering the user_code on trakt.tv/activate. */
+  oauth?: {
+    interceptPrefix?: string;
+  };
 }
 
 let _setActive: ((s: SourceState | null) => void) | null = null;
@@ -55,6 +75,25 @@ export function openSourcePopup(url: string, title: string): void {
   _setActive({ url, title });
 }
 
+/** Open `url` inside the popup in OAuth mode. The popup self-closes on
+ *  `aura:scrobble-auth-changed`; pass `interceptPrefix` (e.g.
+ *  `aura://oauth/anilist`) to also intercept navigations to that scheme
+ *  and re-emit them as `deep-link` events instead of letting WebView2
+ *  hand them off to the OS scheme handler. Trakt callers can omit
+ *  `interceptPrefix` — device-flow polling drives auth detection
+ *  separately. */
+export function openOAuthPopup(
+  url: string,
+  title: string,
+  opts: { interceptPrefix?: string } = {},
+): void {
+  if (!_setActive) {
+    console.warn("[source-popup] openOAuthPopup called but no host is mounted");
+    return;
+  }
+  _setActive({ url, title, oauth: { interceptPrefix: opts.interceptPrefix } });
+}
+
 export function closeSourcePopup(): void {
   if (_setActive) _setActive(null);
 }
@@ -62,8 +101,14 @@ export function closeSourcePopup(): void {
 export default function SourcePopupHost() {
   const [active, setActive] = useState<SourceState | null>(null);
   const [opening, setOpening] = useState(false);
+  // Live host of the page currently rendered inside the OAuth popup.
+  // Only set in OAuth mode (the Rust spawn emits `popup-nav:<label>`
+  // events on every top-level navigation). The non-OAuth flow leaves
+  // this null and the header just shows the static title.
+  const [navHost, setNavHost] = useState<string | null>(null);
   const placeholderRef = useRef<HTMLDivElement>(null);
   const webviewRef = useRef<Webview | null>(null);
+  const activeLabelRef = useRef<string | null>(null);
   // Each spawn gets a unique label so a quick re-open doesn't reuse a
   // half-torn-down webview.
   const labelCounterRef = useRef(0);
@@ -123,6 +168,14 @@ export default function SourcePopupHost() {
 
   // Spawn / tear down the child webview. We do this in a layout effect
   // so the placeholder's geometry is final before we measure.
+  //
+  // OAuth mode takes a different spawn path: the JS `new Webview()` API
+  // can't register an `on_navigation` handler, so we delegate to the
+  // Rust `open_oauth_popup_webview` command which builds the child
+  // webview with the navigation interceptor wired up. We then attach a
+  // JS-side handle via `Webview.getByLabel()` so the same
+  // setPosition/setSize/close machinery downstream works for both
+  // spawn paths uniformly.
   useLayoutEffect(() => {
     let cancelled = false;
     if (!active) {
@@ -136,33 +189,120 @@ export default function SourcePopupHost() {
 
     const main = getCurrentWindow();
     const label = `aura-source-popup-${++labelCounterRef.current}-${Date.now()}`;
+    activeLabelRef.current = label;
+    setNavHost(null);
     const rect = placeholder.getBoundingClientRect();
+    const x = rect.left;
+    const y = rect.top;
+    const width = Math.max(1, Math.round(rect.width));
+    const height = Math.max(1, Math.round(rect.height));
 
-    const wv = new Webview(main, label, {
-      url: active.url,
-      x: rect.left,
-      y: rect.top,
-      width: Math.max(1, Math.round(rect.width)),
-      height: Math.max(1, Math.round(rect.height)),
-      userAgent: POPUP_USER_AGENT,
-    });
-    webviewRef.current = wv;
+    let captured: Webview | null = null;
 
-    wv.once("tauri://error", (e) => {
-      console.warn(`[source-popup] webview error: ${JSON.stringify(e.payload)}`);
-      if (!cancelled) setActive(null);
-    });
+    if (active.oauth) {
+      invoke("open_oauth_popup_webview", {
+        label,
+        url: active.url,
+        x,
+        y,
+        width,
+        height,
+        interceptPrefix: active.oauth.interceptPrefix ?? null,
+      })
+        .then(async () => {
+          if (cancelled) return;
+          // Adopt a JS-side handle so the resize observer + close path
+          // below work the same way as the JS-spawned popup.
+          const wv = await Webview.getByLabel(label);
+          if (cancelled || !wv) return;
+          webviewRef.current = wv;
+          captured = wv;
+        })
+        .catch((err) => {
+          console.warn(`[source-popup] oauth spawn failed: ${String(err)}`);
+          if (!cancelled) setActive(null);
+        });
+    } else {
+      const wv = new Webview(main, label, {
+        url: active.url,
+        x,
+        y,
+        width,
+        height,
+        userAgent: POPUP_USER_AGENT,
+      });
+      webviewRef.current = wv;
+      captured = wv;
+
+      wv.once("tauri://error", (e) => {
+        console.warn(`[source-popup] webview error: ${JSON.stringify(e.payload)}`);
+        if (!cancelled) setActive(null);
+      });
+    }
 
     return () => {
       cancelled = true;
       // Close the live ref AND the variable we captured at spawn time.
       // Different events trigger different orderings; either ref might
-      // already be null by the time cleanup runs.
+      // already be null by the time cleanup runs. For OAuth spawns the
+      // adoption is async, so `captured` may still be null when we
+      // unmount fast — fall back to a fresh getByLabel lookup so an
+      // orphaned child webview doesn't survive the modal close.
       const live = webviewRef.current;
       webviewRef.current = null;
-      const target = live ?? wv;
-      if (target) target.close().catch(() => {});
+      activeLabelRef.current = null;
+      const target = live ?? captured;
+      if (target) {
+        target.close().catch(() => {});
+      } else {
+        Webview.getByLabel(label)
+          .then((wv) => wv?.close().catch(() => {}))
+          .catch(() => {});
+      }
     };
+  }, [active]);
+
+  // OAuth mode — subscribe to the per-popup `popup-nav:<label>` event
+  // emitted by the Rust spawn on every allowed top-level navigation.
+  // We only resolve the host (no path / query), so the OAuth state
+  // token in the proxy's start URL never crosses the bridge here. The
+  // header renders this as a "currently on: <host>" security chip so
+  // the user can spot a mid-flow phishing redirect that they couldn't
+  // see otherwise (the popup webview has no URL bar of its own).
+  useEffect(() => {
+    if (!active?.oauth) return;
+    const label = activeLabelRef.current;
+    if (!label) return;
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    listen<string>(`popup-nav:${label}`, (e) => {
+      if (cancelled) return;
+      setNavHost(e.payload || null);
+    })
+      .then((u) => {
+        if (cancelled) u();
+        else unlisten = u;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+      setNavHost(null);
+    };
+  }, [active]);
+
+  // OAuth mode auto-close — fires whether AniList's deep-link intercept
+  // landed a token or Trakt's device-flow poll did. We dispatch the
+  // close on the next animation frame so the toast that the connect
+  // flow shows isn't immediately covered by the popup teardown
+  // animation; small touch but reads better.
+  useEffect(() => {
+    if (!active?.oauth) return;
+    const onAuth = () => {
+      requestAnimationFrame(() => setActive(null));
+    };
+    window.addEventListener("aura:scrobble-auth-changed", onAuth);
+    return () => window.removeEventListener("aura:scrobble-auth-changed", onAuth);
   }, [active]);
 
   // Track the placeholder's geometry: any time the modal resizes (user
@@ -230,12 +370,28 @@ export default function SourcePopupHost() {
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header — title + close button. Matches DayOverlay's header
-            so the two modals feel like the same component. */}
+            so the two modals feel like the same component. In OAuth
+            mode we surface the live host as a security chip next to
+            the title — the popup webview has no URL bar, so this is
+            the only place the user can see what site they're about to
+            enter credentials into. */}
         <div className="flex items-center justify-between gap-4 px-6 py-4 shrink-0
                         border-b border-white/8">
-          <h2 className="text-white/90 text-lg font-semibold tracking-tight truncate">
-            {active.title}
-          </h2>
+          <div className="flex items-center gap-3 min-w-0 flex-1">
+            <h2 className="text-white/90 text-lg font-semibold tracking-tight truncate">
+              {active.title}
+            </h2>
+            {active.oauth && navHost ? (
+              <span
+                className="text-[11px] font-mono uppercase tracking-wider px-2 py-0.5
+                           rounded-md bg-white/8 text-white/60 border border-white/10
+                           shrink-0"
+                title="Current page host. Verify this matches the OAuth provider before entering credentials."
+              >
+                {navHost}
+              </span>
+            ) : null}
+          </div>
           <button
             onClick={close}
             aria-label="Close"
