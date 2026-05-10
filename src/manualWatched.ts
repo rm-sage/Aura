@@ -131,6 +131,19 @@ export function setManualWatchedScope(scope: string | null): void {
   window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
 }
 
+/** Re-read the localStorage-backed map for the current scope into the
+ *  in-memory mirror. Called by the cloud sync layer (sync.ts) after it
+ *  writes a merged blob: without this, `_activeMap` stays at its pre-
+ *  pull contents and consumers of `getManualWatchedState` /
+ *  `getPlannedQueue` see stale data until the next page reload. The
+ *  function also fires the CHANGE_EVENT so subscribed components
+ *  re-render with the freshly loaded values. */
+export function reloadManualWatchedFromStorage(): void {
+  _activeMap = loadFromStorage(_activeScope);
+  _hydrated = true;
+  window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
+}
+
 /** Returns "watched" / "in-progress" / null for `id`. */
 export function getManualWatchedState(id: string): ManualWatchedState | null {
   if (!id) return null;

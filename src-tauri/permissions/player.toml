@@ -164,6 +164,8 @@ commands.allow = [
   "scrobble_oauth_device_begin",
   "scrobble_oauth_device_poll",
   "open_oauth_popup_webview",
+  "get_anilist_id_map",
+  "set_anilist_id_map",
 ]
 
 # ── Phase 3C: Discord Rich Presence ──────────────────────────────────────────
@@ -175,8 +177,8 @@ commands.allow = ["discord_set_presence", "discord_clear_presence"]
 # ── Per-title persistence (volume / shader / audio / sub) ────────────────────
 [[permission]]
 identifier = "allow-per-title-state"
-description = "Allows the frontend to read and write per-title playback preferences (volume, shader, audio language, subtitle language)"
-commands.allow = ["get_title_state", "set_title_state"]
+description = "Allows the frontend to read and write per-title playback preferences (volume, shader, audio language, subtitle language). Bulk get_all/set_all variants are used by the cloud sync layer (sync.rs) to round-trip the entire map for proxy storage."
+commands.allow = ["get_title_state", "set_title_state", "get_all_title_state", "set_all_title_state"]
 
 # ── Local stats (hours watched, etc.) ────────────────────────────────────────
 [[permission]]
@@ -200,7 +202,25 @@ identifier = "allow-dev-tools"
 description = "Allows the frontend to invoke DevConsole-only debug commands (e.g. force-panic for Sentry verification)"
 commands.allow = ["dev_force_panic"]
 
-# ── Crash reporting (Sentry consent + DSN — scope-independent) ─────────────
+# ── Aura Proxy v2: per-account cloud sync ──────────────────────────────────
+# Round-trips per-account state (settings, manual marks, queue, recent
+# searches, per-title preferences, AniList ID cache) through the
+# aura.animasec.dev proxy under a sha256-derived scope hash. Library
+# data continues to ride on Stremio's own cloud. See sync.rs for the
+# full namespace list and ROADMAP §7 for the wire contract.
+[[permission]]
+identifier = "allow-sync"
+description = "Allows the frontend to read and write per-account state through the Aura Proxy sync namespaces."
+commands.allow = [
+  "sync_status",
+  "sync_pull",
+  "sync_pull_all",
+  "sync_push",
+  "sync_delete",
+  "sync_purge",
+]
+
+# ── Crash reporting (Sentry consent + DSN, scope-independent) ──────────────
 # Stored outside the per-account settings layer so opting in once
 # applies to every Stremio account on the same install. See
 # src-tauri/src/crash_reporting.rs for the storage layout.

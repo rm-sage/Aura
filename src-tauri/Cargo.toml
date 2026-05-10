@@ -66,6 +66,13 @@ tauri-plugin-window-state = "2"
 discord-rich-presence = "0.2"
 souvlaki = "0.7"
 raw-window-handle = "0.5"
+# SHA-256 — used by sync.rs to derive the per-account scope hash from
+# the Stremio auth_key. The proxy never sees the raw auth_key; the hash
+# is what authenticates every PUT/GET against the per-account blob set.
+# Pulled at the smallest semver-compatible footprint (no asm/avx
+# features) since hash throughput isn't on any hot path here.
+sha2 = "0.10"
+hex = "0.4"
 
 # Crash & error reporting (opt-in via consent dialog at first run; see
 # CrashReportingConsent.tsx + crash_reporting.rs).

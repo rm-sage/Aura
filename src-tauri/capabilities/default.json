@@ -55,6 +55,7 @@
     "allow-aniskip",
     "allow-dev-tools",
     "allow-crash-reporting",
+    "allow-sync",
     "updater:default"
   ]
 }

@@ -42,6 +42,7 @@ mod storage;
 mod streaming;
 mod stremio;
 mod subtitles;
+mod sync;
 mod tray;
 #[cfg(target_os = "windows")]
 mod win32;
@@ -1735,6 +1736,16 @@ pub fn run() {
             scrobble_auth::scrobble_oauth_device_begin,
             scrobble_auth::scrobble_oauth_device_poll,
             scrobble_auth::open_oauth_popup_webview,
+            sync::sync_status,
+            sync::sync_pull,
+            sync::sync_pull_all,
+            sync::sync_push,
+            sync::sync_delete,
+            sync::sync_purge,
+            per_title::get_all_title_state,
+            per_title::set_all_title_state,
+            scrobble_anilist::get_anilist_id_map,
+            scrobble_anilist::set_anilist_id_map,
             // ── Phase 3C: Discord RPC ─────────────────────────────────────────
             window_logic::discord_set_presence,
             window_logic::discord_clear_presence,

@@ -44,6 +44,7 @@ import { libraryToggle, libraryRemoveAll, libraryWriteProgress, libraryClearProg
 import { libraryItemSeriesId } from "./libraryNormalize";
 import { sourcesForMeta, openInPopupBrowser } from "./externalSources";
 import { setManualWatchedScope, getManualWatchedState, setManualWatchedState } from "./manualWatched";
+import { syncPullAll, installSyncTriggers, startBackgroundPull, clearSyncEtags, setSyncActiveScope } from "./sync";
 import { setHistoryScope, addHistoryEntry } from "./historyStore";
 import { setAutoBackupScope, startAutoBackup } from "./userDataBackup";
 import NextUpCta from "./NextUpCta";
@@ -2109,12 +2110,41 @@ export default function App() {
     // auto-snapshots land under the right user-<hash> directory and
     // a restore from Settings lists the user's actual snapshots.
     setAutoBackupScope(scope);
+    // Cloud sync (Aura Proxy v2) is per-account: drop ETags from any
+    // previous account so the next push doesn't carry a stale ETag,
+    // and trigger a pull-all to seed the new account's local state
+    // from whatever is on the proxy (fresh-device restore path). We
+    // also publish the active scope to sync.ts so writeLocal can pick
+    // the right `aura:manual-state:user-<hex>` key on a fresh-device
+    // first login (where no localStorage entry exists yet to scan
+    // for). We skip the pull for guest mode (sync requires a Stremio
+    // session) but still publish the scope and clear ETags so the
+    // transition to guest doesn't leak prior-account state.
+    clearSyncEtags();
+    setSyncActiveScope(scope);
+    if (authKey && authKey.trim()) {
+      void syncPullAll();
+    }
     try {
       await invoke("set_settings_scope", { authKey });
     } catch {
       // Best-effort: a failure here just means the previous scope keeps
-      // serving — we don't want to block sign-in or surface an error.
+      // serving; we don't want to block sign-in or surface an error.
     }
+  }, []);
+
+  // ── Cloud sync orchestration (Aura Proxy v2) ──
+  // Install push triggers once on mount and keep a 5-minute background
+  // pull running so changes from another signed-in device land without
+  // a sign-in cycle. Both are no-ops in guest mode (sync.rs returns
+  // early when no Stremio auth_key is present), so they're safe to
+  // mount unconditionally. The pull-on-login itself is wired through
+  // applySettingsScope above so it fires immediately on auth-state
+  // changes rather than waiting for the next 5-minute tick.
+  useEffect(() => {
+    installSyncTriggers();
+    const teardown = startBackgroundPull();
+    return teardown;
   }, []);
 
   // ── Auto-backup boot ──

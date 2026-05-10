@@ -126,5 +126,48 @@ pub async fn set_title_state<R: Runtime>(
 
     // Persist outside the lock so disk I/O doesn't block other readers.
     save_to_disk(&app, &snapshot);
+    // Fire a JS-side change event for sync.ts to debounce + push.
+    use tauri::Emitter;
+    let _ = app.emit("title-state-changed", ());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Bulk get/set used by the cloud sync layer (sync.rs).
+//
+// These let `sync_pull_all` lift the entire map out of the local file
+// for a push, and let an inbound merge result write the merged state
+// back in one shot. The single-entry get_title_state / set_title_state
+// commands above are still the primary read/write path during normal
+// playback; bulk operations only fire on sync events.
+// ---------------------------------------------------------------------------
+
+/// Snapshot the full title-state map. Used by sync push to forward
+/// the user's per-title preferences (volume / shader / lang choices)
+/// to the proxy. Empty map is a valid response and means "no per-
+/// title overrides yet".
+#[tauri::command]
+pub async fn get_all_title_state<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<HashMap<String, TitleState>, String> {
+    ensure_loaded(&app);
+    let guard = cache().lock().map_err(|e| e.to_string())?;
+    Ok(guard.clone())
+}
+
+/// Replace the title-state map with the given snapshot. Used by sync
+/// pull when the proxy returns a merged version. The replacement is
+/// total: keys not in `state` are dropped from the in-memory map AND
+/// from disk. Callers MUST pass the post-merge result, not a delta.
+#[tauri::command]
+pub async fn set_all_title_state<R: Runtime>(
+    app: AppHandle<R>,
+    state: HashMap<String, TitleState>,
+) -> Result<(), String> {
+    {
+        let mut guard = cache().lock().map_err(|e| e.to_string())?;
+        *guard = state.clone();
+    }
+    save_to_disk(&app, &state);
     Ok(())
 }

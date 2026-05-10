@@ -116,6 +116,53 @@ fn save_cache<R: Runtime>(app: &AppHandle<R>, cache: &IdCache) {
     if let Ok(json) = serde_json::to_string_pretty(cache) {
         let _ = std::fs::write(&path, json);
     }
+    // Notify the frontend that the cache changed so sync.ts can debounce
+    // a push. We can't take an AppHandle in the helper signature for
+    // every caller without churn; the Emitter call below relies on the
+    // handle the caller already passed in.
+    use tauri::Emitter;
+    let _ = app.emit("anilist-id-map-changed", ());
+}
+
+// ---------------------------------------------------------------------------
+// Bulk get/set used by the cloud sync layer (sync.rs).
+//
+// The IdCache struct is private (its shape is internal to AniList
+// scrobbling) so the bulk commands round-trip serde_json::Value
+// instead. Sync layer treats it as opaque JSON; the merge strategy in
+// sync.ts unions the two `by_show` maps with a "more episodes wins"
+// disambiguation for multi-season collisions.
+// ---------------------------------------------------------------------------
+
+/// Snapshot the entire cache as JSON for the sync push path.
+#[tauri::command]
+pub async fn get_anilist_id_map() -> Result<serde_json::Value, String> {
+    let guard = cache_lock().lock().map_err(|e| e.to_string())?;
+    serde_json::to_value(&*guard).map_err(|e| e.to_string())
+}
+
+/// Replace the cache with the given snapshot. Used by sync pull when
+/// the proxy returns a merged version. Total replacement: any entries
+/// not in `map` are dropped from in-memory and from disk.
+#[tauri::command]
+pub async fn set_anilist_id_map<R: Runtime>(
+    app: AppHandle<R>,
+    map: serde_json::Value,
+) -> Result<(), String> {
+    let parsed: IdCache = serde_json::from_value(map).map_err(|e| e.to_string())?;
+    // Take the write AND the snapshot inside one critical section.
+    // Dropping the lock between the two created a window where an
+    // in-flight scrobble lookup could mutate the cache after our
+    // assignment but before our snapshot, and the disk write would
+    // then either include the racing mutation (mostly harmless) or
+    // overwrite a fresh in-memory entry with stale data (silent loss).
+    let snapshot = {
+        let mut guard = cache_lock().lock().map_err(|e| e.to_string())?;
+        *guard = parsed;
+        guard.by_show.clone()
+    };
+    save_cache(&app, &IdCache { by_show: snapshot });
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

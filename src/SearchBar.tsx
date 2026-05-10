@@ -81,6 +81,10 @@ function loadRecents(): string[] {
 function saveRecents(list: string[]) {
   try {
     localStorage.setItem(RECENT_KEY, JSON.stringify(list.slice(0, RECENT_MAX)));
+    // Notify the cloud sync layer so it can debounce a push to the
+    // proxy's `recent-searches` namespace. Wrapped in a try because
+    // CustomEvent isn't available in test/SSR contexts.
+    try { window.dispatchEvent(new CustomEvent("aura:recent-searches-changed")); } catch {}
   } catch { /* ignore quota errors */ }
 }
 

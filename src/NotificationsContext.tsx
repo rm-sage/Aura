@@ -180,14 +180,30 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
   const popupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Persist on every change. Cheap (≤200 items) and saves us from re-deriving
-  // the list on remount.
+  // the list on remount. Also fires the change event the cloud sync layer
+  // listens for to debounce a push to the proxy's `notifications` namespace.
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(notifications));
+      try { window.dispatchEvent(new CustomEvent("aura:notifications-changed")); } catch {}
     } catch {
       // quota exceeded / private mode — non-fatal
     }
   }, [notifications]);
+
+  // Cloud-sync rehydrate: when sync.ts merges a pulled blob into
+  // localStorage it fires `aura:notifications-rehydrate` to ask us to
+  // refresh React state from disk. Without this the merged
+  // notifications wouldn't appear in the bell until the next reload
+  // (the persistence effect above is write-only). Distinct event name
+  // from `aura:notifications-changed` so we don't loop on our own writes.
+  useEffect(() => {
+    const onRehydrate = () => {
+      try { setNotifications(loadFromStorage()); } catch {}
+    };
+    window.addEventListener("aura:notifications-rehydrate", onRehydrate);
+    return () => window.removeEventListener("aura:notifications-rehydrate", onRehydrate);
+  }, []);
 
   const addNotification = useCallback<NotificationsCtxValue["addNotification"]>((n) => {
     const id = n.id ?? `${n.kind}:${n.title}`;

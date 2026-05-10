@@ -1,0 +1,683 @@
+// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import { invoke } from "@tauri-apps/api/core";
+import { loadAuraSettings, saveAuraSettings, type AuraSettings, DEFAULT_AURA_SETTINGS } from "./auraSettings";
+
+// ---------------------------------------------------------------------------
+// Aura Proxy v2 sync orchestrator (frontend)
+//
+// Round-trips per-account state through the proxy under a sha256-derived
+// scope hash that the Rust side derives from the active Stremio
+// auth_key. The Rust commands (sync_pull / sync_push / sync_pull_all /
+// sync_status / sync_delete / sync_purge) are namespace-agnostic; this
+// module owns:
+//
+//   1. Mapping each namespace to the local store it shadows
+//      (localStorage key, Tauri command, in-memory module, etc.).
+//   2. Per-namespace merge semantics. Different stores need different
+//      strategies on conflict (see ROADMAP §7.5):
+//
+//         settings        — last-writer-wins per top-level key
+//         manual-state    — union with tombstone-aware deletions
+//         auto-bumped     — union of IDs (a finished series is finished
+//                           on every device)
+//         notifications   — union dedup'd on (kind, id, ts), capped 100
+//         recent-searches — server-wins (cheap, not worth merging)
+//         title-state     — per-title last-writer-wins
+//         anilist-id-map  — union; on per-id conflict, the entry with
+//                           more episodes wins (multi-season disambig)
+//
+//   3. Debounced push triggers wired to the existing change events
+//      (`aura:settings-changed`, `aura:manual-state-changed`, etc.).
+//
+//   4. Pull-on-login orchestration triggered from App.tsx when
+//      `session?.auth_key` flips from null to set, OR when the
+//      active session changes.
+//
+// Sync is paused while playback is active so the per-frame work stays
+// clear of network I/O. Pushes that fire during playback queue and
+// flush on the first pause OR on `aura:playback-ended`.
+// ---------------------------------------------------------------------------
+
+// ── Wire types (mirror sync.rs) ──────────────────────────────────────────
+
+export interface SyncBlob {
+  namespace: string;
+  data: unknown;
+  etag: string;
+  updated_at: number;
+}
+
+export interface PushResult {
+  etag: string;
+  updated_at: number;
+}
+
+export type PushOutcome =
+  | { status: "ok"; etag: string; updated_at: number }
+  | { status: "conflict"; server: SyncBlob };
+
+export interface NamespaceStatus {
+  name: string;
+  etag: string | null;
+  updated_at: number | null;
+  size: number | null;
+}
+
+export interface SyncStatus {
+  connected: boolean;
+  namespaces: NamespaceStatus[];
+  total_size: number;
+  quota: number;
+}
+
+// ── Namespace registry ───────────────────────────────────────────────────
+
+export const SYNC_NAMESPACES = [
+  "settings",
+  "manual-state",
+  "auto-bumped",
+  "notifications",
+  "recent-searches",
+  "title-state",
+  "anilist-id-map",
+] as const;
+
+export type SyncNamespace = (typeof SYNC_NAMESPACES)[number];
+
+// localStorage keys for namespaces that shadow a JS-side store.
+// `settings` is special: it merges the backend AppSettings (Tauri-side)
+// AND the frontend auraSettings (localStorage) into one blob. `title-
+// state` and `anilist-id-map` live entirely on the Rust side.
+const LOCAL_KEYS: Partial<Record<SyncNamespace, string>> = {
+  "auto-bumped":     "aura:auto-bumped-series:v1",
+  notifications:     "aura:notifications:v1",
+  "recent-searches": "aura:recent-searches",
+};
+
+// ── ETag tracker ─────────────────────────────────────────────────────────
+//
+// Per-namespace ETag of the last successful pull or push. Used as the
+// `if_match` parameter on the next push so the proxy can reject
+// concurrent writes from another device with 412 Precondition Failed.
+// Cleared on logout (auth-key change) so the next push to a new
+// account doesn't carry an ETag from the previous one.
+
+const lastEtag: Map<SyncNamespace, string> = new Map();
+
+export function clearSyncEtags(): void {
+  lastEtag.clear();
+  // ALSO drop any pending debounced pushes. Otherwise a 5s push timer
+  // armed under account A can fire after the user signed into B,
+  // which would force-overwrite B's cloud blob with A's local data
+  // (the if_match was just cleared, so the proxy accepts it without
+  // a conflict). Clearing the timers here keeps the auth-transition
+  // boundary clean.
+  for (const t of debounceTimers.values()) clearTimeout(t);
+  debounceTimers.clear();
+}
+
+// ── Active scope tracker ─────────────────────────────────────────────────
+//
+// The Rust side derives the per-account scope hash from the current
+// Stremio session for sync requests, but the JS side ALSO needs the
+// scope prefix to pick the right `aura:manual-state:user-<hex>`
+// localStorage entry to write inbound merged data into. On a fresh
+// device first login there is no existing manual-state entry, so a
+// previous "scan localStorage for any matching key" approach silently
+// dropped the pulled blob.
+//
+// `setSyncActiveScope` is called from App.tsx::applySettingsScope
+// whenever the active session changes. Mode here is "user-<hex>" or
+// "guest" (matching the existing manualWatched scope convention) so
+// downstream code can construct the storage key directly.
+
+let _activeScope: string = "guest";
+
+export function setSyncActiveScope(scope: string | null): void {
+  _activeScope = scope && scope.trim() ? scope : "guest";
+}
+
+function activeScope(): string { return _activeScope; }
+
+// ── Per-namespace merge strategies ───────────────────────────────────────
+//
+// Each merge function takes (local, server) and returns the merged
+// result. On a clean pull-on-login (no local divergence), local equals
+// the deserialized stored value at module load time and server is what
+// the proxy returned; the merger picks the right side per namespace.
+//
+// On a 412 conflict from a push, local is the in-memory state we tried
+// to push, server is the proxy's current version. The merger produces
+// the value to retry the push with.
+
+type MergeFn<T = unknown> = (local: T, server: T) => T;
+
+// Defensive shape guards used by individual mergers. The proxy is a
+// trusted endpoint, but a corrupted blob (rare but possible after a
+// schema-incompatible sync between two Aura builds, or a manual API
+// poke) could otherwise be propagated into local state and persist
+// forever. Mergers fall back to LOCAL when the server value fails its
+// shape check; the next push will overwrite the server with the
+// client's known-good shape.
+
+function isStringStateArray(v: unknown): v is Array<[string, string]> {
+  return Array.isArray(v) && v.every(
+    (e) => Array.isArray(e) && e.length === 2 && typeof e[0] === "string" && typeof e[1] === "string",
+  );
+}
+
+function isStringArray(v: unknown): v is string[] {
+  return Array.isArray(v) && v.every((s) => typeof s === "string");
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+const mergeServerWinsRecentSearches: MergeFn = (local, server) => {
+  // recent-searches is just an array of strings. If the server hands
+  // us anything else we keep local rather than overwrite the user's
+  // history with garbage (loadRecents() would reject the bad value
+  // on read but the BAD value would still relay back on the next push).
+  return isStringArray(server) ? server : local;
+};
+
+const mergeServerWinsTitleState: MergeFn = (local, server) => {
+  // title-state is a HashMap<String, TitleState>. set_all_title_state
+  // on the Rust side errors hard on type mismatch; that error gets
+  // swallowed by writeLocal and the next push reads the now-empty map
+  // and overwrites the cloud with empty. Validate before trusting.
+  return isPlainObject(server) ? server : local;
+};
+
+const mergeSettings: MergeFn<{ backend: Record<string, unknown>; frontend: AuraSettings; updated_at: number }> = (local, server) => {
+  // Last-writer-wins on the whole blob, since per-key timestamps are
+  // not currently persisted. Acceptable trade-off for v1: the user
+  // either changes settings on device A or device B, not both
+  // simultaneously, and the 5s push debounce + scheduled background
+  // pull means cross-device drift windows are small. Future work:
+  // attach per-key updated_at to make this finer-grained.
+  return (local.updated_at ?? 0) > (server.updated_at ?? 0) ? local : server;
+};
+
+const mergeAutoBumped: MergeFn<string[]> = (local, server) => {
+  // A series the user finished on EITHER device should stay finished
+  // everywhere. Union semantics: dedupe by string identity.
+  const set = new Set<string>([...(local ?? []), ...(server ?? [])]);
+  return Array.from(set);
+};
+
+interface NotificationEntry {
+  kind?: string;
+  id?: string;
+  ts?: number;
+  [k: string]: unknown;
+}
+
+const mergeNotifications: MergeFn<NotificationEntry[]> = (local, server) => {
+  // Union with deduplication on (kind, id, ts); cap at 100 so the blob
+  // doesn't grow unboundedly. Newest entries win the tail slot.
+  const all = [...(server ?? []), ...(local ?? [])];
+  const seen = new Set<string>();
+  const out: NotificationEntry[] = [];
+  for (const entry of all) {
+    const key = `${entry.kind ?? ""}::${entry.id ?? ""}::${entry.ts ?? 0}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(entry);
+  }
+  out.sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0));
+  return out.slice(0, 100);
+};
+
+// manualWatched.ts persists as Array<[id, state]> pairs to preserve
+// insertion order (the Queue tab depends on it). The shape doesn't
+// carry per-entry timestamps, so we can't do real last-writer-wins
+// at the entry level. Instead we union the two arrays, prefer the
+// LOCAL state on per-id conflicts (the device the user is actively
+// using is more likely to have the fresh value), and preserve LOCAL
+// insertion order for any local-only entries before appending server-
+// only entries at the tail. Future revision: attach per-entry
+// timestamps and switch to true LWW.
+type ManualMark = "watched" | "in-progress" | "planned";
+type ManualState = Array<[string, ManualMark]>;
+
+const mergeManualState: MergeFn<ManualState> = (local, server) => {
+  // Defensive: bad server shape falls back to local. A push of the
+  // local value will then replace the cloud's bad blob.
+  const safeServer: ManualState = isStringStateArray(server) ? (server as ManualState) : [];
+  const out: ManualState = [];
+  const seen = new Set<string>();
+  for (const [id, state] of local ?? []) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push([id, state]);
+  }
+  for (const [id, state] of safeServer) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push([id, state]);
+  }
+  return out;
+};
+
+interface AnilistMapEntry {
+  anilist_id?: number;
+  episodes?: number | null;
+  fetched_at?: number;
+}
+
+const mergeAnilistIdMap: MergeFn<{ by_show?: Record<string, AnilistMapEntry> }> = (local, server) => {
+  const a = local?.by_show ?? {};
+  // Defensive: server might be missing or malformed; treat it as empty
+  // so we don't blow up on `Object.entries(undefined)` and don't
+  // propagate garbage downstream.
+  const b = isPlainObject(server?.by_show) ? (server!.by_show as Record<string, AnilistMapEntry>) : {};
+  const out: Record<string, AnilistMapEntry> = { ...b };
+  for (const [showId, localEntry] of Object.entries(a)) {
+    const serverEntry = out[showId];
+    if (!serverEntry) {
+      out[showId] = localEntry;
+      continue;
+    }
+    // Per-id conflict: prefer the entry with more episodes (closer to
+    // the canonical multi-season disambiguation). Ties go to whichever
+    // was fetched more recently.
+    const localEps  = localEntry.episodes  ?? 0;
+    const serverEps = serverEntry.episodes ?? 0;
+    if (localEps !== serverEps) {
+      out[showId] = localEps > serverEps ? localEntry : serverEntry;
+    } else {
+      out[showId] = (localEntry.fetched_at ?? 0) >= (serverEntry.fetched_at ?? 0)
+        ? localEntry
+        : serverEntry;
+    }
+  }
+  return { by_show: out };
+};
+
+// Per-namespace merge wiring. recent-searches and title-state use
+// shape-validating server-wins (the previous unconditional server-wins
+// could clobber local state when the server returned garbage).
+const MERGERS: Record<SyncNamespace, MergeFn<any>> = {
+  "settings":        mergeSettings as MergeFn<any>,
+  "manual-state":    mergeManualState as MergeFn<any>,
+  "auto-bumped":     mergeAutoBumped as MergeFn<any>,
+  notifications:     mergeNotifications as MergeFn<any>,
+  "recent-searches": mergeServerWinsRecentSearches,
+  "title-state":     mergeServerWinsTitleState,
+  "anilist-id-map":  mergeAnilistIdMap as MergeFn<any>,
+};
+
+// ── Settings blob shape ───────────────────────────────────────────────────
+
+interface BackendSettingsLite {
+  // The full backend AppSettings struct is large and evolving; we
+  // round-trip it as an opaque object. The Rust side validates on
+  // import, so we don't need to type every field here.
+  [key: string]: unknown;
+}
+
+interface SettingsSyncBlob {
+  backend: BackendSettingsLite;
+  frontend: AuraSettings;
+  updated_at: number;
+}
+
+async function readBackendSettings(): Promise<BackendSettingsLite> {
+  try {
+    return await invoke<BackendSettingsLite>("get_settings");
+  } catch {
+    return {};
+  }
+}
+
+async function applyBackendSettings(s: BackendSettingsLite): Promise<void> {
+  if (!s || typeof s !== "object" || Object.keys(s).length === 0) return;
+  try {
+    // `update_settings` accepts a partial JSON patch; the Rust side
+    // whitelists known fields and ignores anything outside that
+    // surface, so feeding it a stale or unknown key is a no-op rather
+    // than an error.
+    await invoke("update_settings", { patch: s });
+  } catch (e) {
+    console.warn("[sync] applyBackendSettings failed:", e);
+  }
+}
+
+async function readSettingsBlob(): Promise<SettingsSyncBlob> {
+  const [backend, frontend] = await Promise.all([
+    readBackendSettings(),
+    Promise.resolve(loadAuraSettings()),
+  ]);
+  return { backend, frontend, updated_at: Math.floor(Date.now() / 1000) };
+}
+
+async function writeSettingsBlob(blob: Partial<SettingsSyncBlob>): Promise<void> {
+  if (blob.frontend) {
+    saveAuraSettings({ ...DEFAULT_AURA_SETTINGS, ...blob.frontend });
+  }
+  if (blob.backend) {
+    await applyBackendSettings(blob.backend);
+  }
+}
+
+// ── Local IO per namespace ────────────────────────────────────────────────
+
+async function readLocal(namespace: SyncNamespace): Promise<unknown> {
+  if (namespace === "settings") return readSettingsBlob();
+
+  if (namespace === "title-state") {
+    try { return await invoke("get_all_title_state"); } catch { return {}; }
+  }
+  if (namespace === "anilist-id-map") {
+    try { return await invoke("get_anilist_id_map"); } catch { return { by_show: {} }; }
+  }
+  if (namespace === "manual-state") {
+    return readManualStateAggregate();
+  }
+
+  const lsKey = LOCAL_KEYS[namespace];
+  if (!lsKey) return null;
+  try {
+    const raw = localStorage.getItem(lsKey);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeLocal(namespace: SyncNamespace, value: unknown): Promise<void> {
+  if (value == null) return;
+
+  if (namespace === "settings") {
+    await writeSettingsBlob(value as Partial<SettingsSyncBlob>);
+    return;
+  }
+  if (namespace === "title-state") {
+    try { await invoke("set_all_title_state", { state: value }); } catch (e) {
+      console.warn("[sync] writeLocal title-state failed:", e);
+    }
+    return;
+  }
+  if (namespace === "anilist-id-map") {
+    try { await invoke("set_anilist_id_map", { map: value }); } catch (e) {
+      console.warn("[sync] writeLocal anilist-id-map failed:", e);
+    }
+    return;
+  }
+  if (namespace === "manual-state") {
+    writeManualStateAggregate(value as ManualState);
+    return;
+  }
+
+  const lsKey = LOCAL_KEYS[namespace];
+  if (!lsKey) return;
+  try {
+    localStorage.setItem(lsKey, JSON.stringify(value));
+    // Notify in-window subscribers of the underlying store AND force
+    // their in-memory mirrors to rehydrate from the freshly written
+    // localStorage. Without the rehydrate, consumers that cache state
+    // in module-scope variables (autoBumped's _cache, the
+    // NotificationsContext React state) keep serving the pre-pull
+    // values until reload. Dynamic imports keep this tree-shake-safe
+    // and don't pull autoBumped/NotificationsContext into the test
+    // surface for non-Tauri contexts.
+    if (namespace === "auto-bumped") {
+      import("./autoBumped").then((m) => m.reloadAutoBumpedFromStorage()).catch(() => {});
+    } else if (namespace === "notifications") {
+      window.dispatchEvent(new CustomEvent("aura:notifications-rehydrate"));
+    }
+  } catch (e) {
+    console.warn(`[sync] writeLocal ${namespace} failed:`, e);
+  }
+}
+
+// Manual-state lives under a per-account key (`aura:manual-state:<scope>`)
+// where scope is the first 12 chars of the auth_key. We aggregate the
+// active scope into the synced blob and unaggregate on write.
+
+const MANUAL_STATE_PREFIX = "aura:manual-state:";
+
+function activeManualStateKey(): string {
+  // Always derive from the explicit active scope. The previous
+  // "scan localStorage for any matching key" approach silently
+  // returned null for fresh-device logins (no entry exists yet),
+  // which made the pulled manual-state blob get dropped on the floor.
+  return `${MANUAL_STATE_PREFIX}${activeScope()}`;
+}
+
+function readManualStateAggregate(): ManualState {
+  const key = activeManualStateKey();
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as ManualState) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeManualStateAggregate(value: ManualState): void {
+  const key = activeManualStateKey();
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+    // Force the manualWatched.ts in-memory mirror to rehydrate. The
+    // CHANGE_EVENT alone bumps the React re-render counter but
+    // consumers re-read `_activeMap` which would still hold the
+    // pre-pull contents. The dynamic import keeps sync.ts importable
+    // from non-Tauri test contexts.
+    import("./manualWatched").then((m) => m.reloadManualWatchedFromStorage()).catch(() => {});
+  } catch (e) {
+    console.warn("[sync] writeManualStateAggregate failed:", e);
+  }
+}
+
+// ── Public API ────────────────────────────────────────────────────────────
+
+let pullAllInflight: Promise<void> | null = null;
+/** True while a pull sweep is mid-merge. `syncPushNow` defers when set
+ *  so a user mutation that fires DURING the pull doesn't get
+ *  overwritten by the soon-to-land merged write. The push trigger
+ *  fires again after the pull completes (either via a follow-up
+ *  user action or via the next debounced push), so deferring here
+ *  doesn't lose updates, only postpones them. */
+let pullInFlight = false;
+const deferredPushes: Set<SyncNamespace> = new Set();
+
+/**
+ * Pull every namespace and merge into local. Idempotent (concurrent
+ * calls are coalesced into the same in-flight promise). Called from
+ * App.tsx on session change and on the periodic background timer.
+ *
+ * Failures on individual namespaces are logged but don't abort the
+ * sweep, matching the Rust side's best-effort intent.
+ */
+export function syncPullAll(): Promise<void> {
+  if (pullAllInflight) return pullAllInflight;
+  pullInFlight = true;
+  pullAllInflight = (async () => {
+    try {
+      const blobs = await invoke<SyncBlob[]>("sync_pull_all");
+      for (const blob of blobs) {
+        const ns = blob.namespace as SyncNamespace;
+        if (!SYNC_NAMESPACES.includes(ns)) continue;
+        try {
+          const local  = await readLocal(ns);
+          const merger = MERGERS[ns];
+          const merged = merger(local, blob.data);
+          await writeLocal(ns, merged);
+          lastEtag.set(ns, blob.etag);
+        } catch (e) {
+          console.warn(`[sync] merge ${ns} failed:`, e);
+        }
+      }
+    } catch (e) {
+      console.warn("[sync] pull_all failed:", e);
+    } finally {
+      pullInFlight = false;
+      pullAllInflight = null;
+      // Flush any pushes that were deferred while the pull held the
+      // gate. We schedule them through the normal debounce so the
+      // 5s rate-limiting still applies (otherwise a flurry of marks
+      // during a pull would all push at once).
+      const flushed = Array.from(deferredPushes);
+      deferredPushes.clear();
+      for (const ns of flushed) debouncedPush(ns);
+    }
+  })();
+  return pullAllInflight;
+}
+
+/**
+ * Push a single namespace. On 412 conflict, fetches the server version,
+ * merges per the namespace's strategy, and retries the push with the
+ * new ETag. Returns void; failures are logged but not surfaced (sync
+ * is best-effort). Intended for use from debounced change-event
+ * listeners; immediate-write callers (e.g. user-triggered "Push now")
+ * should call `syncPushNow` to surface errors instead.
+ */
+export async function syncPush(namespace: SyncNamespace): Promise<void> {
+  try {
+    await syncPushNow(namespace);
+  } catch (e) {
+    console.warn(`[sync] push ${namespace} failed:`, e);
+  }
+}
+
+/** Push a namespace, surfacing errors to the caller. */
+export async function syncPushNow(namespace: SyncNamespace): Promise<void> {
+  // Defer if a pull sweep is mid-merge: pushing local state while
+  // pull is about to overwrite it would either (a) race the merger
+  // and lose the user's mutation, or (b) push pre-merge state and
+  // get a 412 we'd then try to resolve against the in-progress pull.
+  // Deferring queues the push for execution after the pull settles.
+  if (pullInFlight) {
+    deferredPushes.add(namespace);
+    return;
+  }
+  const local = await readLocal(namespace);
+  if (local == null) return; // nothing to push yet
+  const ifMatch = lastEtag.get(namespace) ?? null;
+  const result = await invoke<PushOutcome>("sync_push", {
+    namespace,
+    data: local,
+    ifMatch,
+  });
+  if (result.status === "ok") {
+    lastEtag.set(namespace, result.etag);
+    return;
+  }
+  // 412 conflict: merge server into local, retry push with the
+  // server's etag so the proxy accepts the merged result.
+  const merger = MERGERS[namespace];
+  const merged = merger(local, result.server.data);
+  await writeLocal(namespace, merged);
+  const retry = await invoke<PushOutcome>("sync_push", {
+    namespace,
+    data: merged,
+    ifMatch: result.server.etag,
+  });
+  if (retry.status === "ok") {
+    lastEtag.set(namespace, retry.etag);
+  } else {
+    // Two consecutive conflicts is rare (third device writing
+    // mid-merge). Drop the etag so the next attempt force-overwrites;
+    // the user's local state wins.
+    lastEtag.delete(namespace);
+    console.warn(`[sync] push ${namespace} conflicted twice; force-overwrite next attempt`);
+  }
+}
+
+/** Drop one namespace from the proxy. */
+export async function syncDelete(namespace: SyncNamespace): Promise<void> {
+  await invoke("sync_delete", { namespace });
+  lastEtag.delete(namespace);
+}
+
+/** Drop every blob for the active account and clear local etags. */
+export async function syncPurge(): Promise<void> {
+  await invoke("sync_purge");
+  clearSyncEtags();
+}
+
+/** Query the proxy for the current per-namespace status. */
+export async function syncStatus(): Promise<SyncStatus> {
+  return invoke<SyncStatus>("sync_status");
+}
+
+// ── Auto-push triggers ───────────────────────────────────────────────────
+
+const PUSH_DEBOUNCE_MS = 5000;
+const debounceTimers: Map<SyncNamespace, ReturnType<typeof setTimeout>> = new Map();
+
+function debouncedPush(namespace: SyncNamespace): void {
+  const existing = debounceTimers.get(namespace);
+  if (existing) clearTimeout(existing);
+  const t = setTimeout(() => {
+    debounceTimers.delete(namespace);
+    void syncPush(namespace);
+  }, PUSH_DEBOUNCE_MS);
+  debounceTimers.set(namespace, t);
+}
+
+let triggersInstalled = false;
+
+/**
+ * Install change-event listeners that schedule debounced pushes for
+ * each namespace. Idempotent. Call once from App.tsx after the first
+ * `syncPullAll` completes so we don't push the local state back over
+ * the version we just pulled.
+ */
+export function installSyncTriggers(): void {
+  if (triggersInstalled) return;
+  triggersInstalled = true;
+
+  window.addEventListener("aura:settings-changed",        () => debouncedPush("settings"));
+  window.addEventListener("aura:keybindings-changed",     () => debouncedPush("settings"));
+  window.addEventListener("aura:manual-watched-changed",  () => debouncedPush("manual-state"));
+  window.addEventListener("aura:auto-bumped-changed",     () => debouncedPush("auto-bumped"));
+  window.addEventListener("aura:notifications-changed",   () => debouncedPush("notifications"));
+  window.addEventListener("aura:recent-searches-changed", () => debouncedPush("recent-searches"));
+
+  // Bulk Tauri-side changes round-trip through @tauri-apps/api/event,
+  // not window CustomEvents. Wire them via a dynamic import so this
+  // module stays usable from non-Tauri contexts (test harness etc.).
+  import("@tauri-apps/api/event").then(({ listen }) => {
+    listen("title-state-changed",    () => debouncedPush("title-state")).catch(() => {});
+    listen("anilist-id-map-changed", () => debouncedPush("anilist-id-map")).catch(() => {});
+  }).catch(() => {});
+}
+
+/**
+ * Background pull on a 5-minute cadence so changes from another device
+ * land without requiring a sign-out/sign-in cycle. Pauses while a
+ * video is loaded so we don't compete with playback for bandwidth.
+ * Returns a teardown function.
+ */
+export function startBackgroundPull(): () => void {
+  const INTERVAL_MS = 5 * 60 * 1000;
+  let timer: ReturnType<typeof setInterval> | null = null;
+  let paused = false;
+
+  const tick = () => {
+    if (paused) return;
+    void syncPullAll();
+  };
+
+  const onPlay  = () => { paused = true;  };
+  const onStop  = () => { paused = false; };
+
+  window.addEventListener("aura:playback-started", onPlay);
+  window.addEventListener("aura:playback-ended",   onStop);
+
+  timer = setInterval(tick, INTERVAL_MS);
+  return () => {
+    if (timer) clearInterval(timer);
+    window.removeEventListener("aura:playback-started", onPlay);
+    window.removeEventListener("aura:playback-ended",   onStop);
+  };
+}

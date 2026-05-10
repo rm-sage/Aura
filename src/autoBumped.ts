@@ -96,3 +96,14 @@ export function onAutoBumpedChange(callback: () => void): () => void {
   window.addEventListener(CHANGE_EVENT, callback);
   return () => window.removeEventListener(CHANGE_EVENT, callback);
 }
+
+/** Force the in-memory cache to re-read from localStorage. Called by
+ *  the cloud sync layer (sync.ts) after it merges a pulled blob into
+ *  storage; without this, `isAutoBumped` would still consult the
+ *  pre-pull `_cache` and consumers (CW filter) would show stale
+ *  inclusion / exclusion state until reload. */
+export function reloadAutoBumpedFromStorage(): void {
+  _cache = null;
+  load();
+  window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
+}
