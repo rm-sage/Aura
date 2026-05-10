@@ -133,6 +133,16 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
     const anime: LibraryItem[] = [];
     for (const i of items) {
       if (!i || i.removed) continue;
+      // Skip auto-tracked entries (Stremio's `temp: true` flag,
+      // written by libraryWriteProgress after PROGRESS_WARMUP_S of
+      // playback). These are how CW gets its "I never explicitly
+      // saved this, but it remembers where I left off" behavior — they
+      // belong in Continue Watching but NOT in the Library view, which
+      // should reflect explicit user intent (Add to Library, Mark as
+      // Planned). The CW row reads library directly with its own
+      // filter so excluding temp here doesn't affect CW. Matches
+      // Stremio's official client semantics.
+      if (i.temp) continue;
       all.push(i);
       const mt = (i.media_type ?? "").toLowerCase();
       if (mt === "movie")  movie.push(i);
@@ -431,13 +441,13 @@ const LibraryCard = memo(function LibraryCard({
             <span className="text-white/40 text-[10px] uppercase tracking-wider">
               {typeLabel(item.media_type ?? "other")}
             </span>
-            {item.year && (
-              <>
-                <span className="text-white/20">·</span>
-                <span className="text-white/40 text-[10px]">{item.year}</span>
-              </>
-            )}
           </div>
+          {/* Year intentionally omitted from the card meta line: not
+              every library item carries a parsed `year` (older Stremio
+              cloud entries can land without `release_info` populated),
+              and a sometimes-present sometimes-absent year reads as a
+              data bug rather than design. The detail page meta strip
+              still surfaces release info when it has it. */}
         </div>
       </button>
 

@@ -320,12 +320,13 @@ fn pause_mpv<R: Runtime>(app: &AppHandle<R>) {
 fn shutdown_mpv_sync<R: Runtime>(app: &AppHandle<R>) {
     let mpv = app.mpv();
     // 1. Mute first so any in-flight audio buffers don't squeak through
-    //    the device-close path (a known cause of "stuck" exclusive locks).
-    let _ = mpv.command(
-        "set_property",
-        &vec![serde_json::json!("mute"), serde_json::json!(true)],
-        "main",
-    );
+    //    the device-close path (a known cause of "stuck" exclusive
+    //    locks). Per CLAUDE.md landmine #1 the `command("set_property",
+    //    ...)` form silently no-ops on this libmpv build, so the older
+    //    spelling here was failing to actually mute — defeating the
+    //    WASAPI lock-protection this whole shutdown sequence exists
+    //    for. Use the dedicated set_property FFI path.
+    let _ = mpv.set_property("mute", &serde_json::json!(true), "main");
     // 2. Stop the loadfile. This unlinks the demuxer and releases the AO.
     let _ = mpv.command("stop", &Vec::<serde_json::Value>::new(), "main");
     // 3. Tear down the MPV instance. The plugin's `destroy` calls

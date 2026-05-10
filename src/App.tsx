@@ -2034,6 +2034,15 @@ export default function App() {
       }
     } catch { /* corrupt cache — ignore */ }
 
+    // Warm-start: paint the cached list IMMEDIATELY so home / addons
+    // tab populate on the first frame, then refetch in the background
+    // and replace if the cloud has changed. Mirrors the loadLibrary
+    // pattern (App.tsx:1456-1466). Without this, every silent session
+    // restore from the keyring path paid the full Stremio
+    // addonCollectionGet round-trip before any UI rendered, even
+    // when nothing had changed since the previous run.
+    if (cached) setAddons(cached);
+
     try {
       const synced = await invoke<AddonEntry[]>("get_synced_addons", { authKey: sess.auth_key });
       // Suspicion check: a fresh fetch returning empty OR fewer than half
@@ -3162,7 +3171,6 @@ export default function App() {
     <NotificationsBridge
       addons={addons}
       library={library}
-      activeView={activeView}
       authKey={session?.auth_key ?? null}
       onOpenMeta={(metaId, mediaType) => {
         // Reconstruct a MetaPreview from the LibraryItem when available
@@ -3588,12 +3596,11 @@ export default function App() {
 // ---------------------------------------------------------------------------
 
 function NotificationsBridge({
-  addons, library, activeView, authKey,
+  addons, library, authKey,
   onOpenMeta,
 }: {
   addons: AddonEntry[];
   library: LibraryItem[];
-  activeView: NavView;
   /** First-12-char prefix is derived inside the alerts hook; pass the
    *  raw auth_key (or null when signed out / guest). */
   authKey: string | null;
@@ -3692,7 +3699,6 @@ function NotificationsBridge({
     <NotificationsScanner
       addons={addons}
       library={library}
-      activeView={activeView}
     />
   );
 }

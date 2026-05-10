@@ -162,8 +162,24 @@ function useSeasonEpisodes(item: LibraryItem, addons: AddonEntry[] | undefined):
     }
     let cancelled = false;
     (async () => {
-      const detail = await getMetaDetailFallback(addons, item.media_type, item.id);
+      // Some library items get added under one media_type but only
+      // resolve their episode list under the other (the dual-indexed
+      // anime case: an IMDb-id'd anime saved under media_type=series
+      // via Cinemeta, but its episode list lives on a Kitsu/AniList
+      // addon that only responds to type=anime). The first attempt
+      // uses the stored type; if that returns no videos, retry with
+      // the alternate. Without this, the CW card silently falls
+      // through to the thin progress-bar render path because the
+      // segmented bar requires a video list to draw the segments.
+      let detail = await getMetaDetailFallback(addons, item.media_type, item.id);
       if (cancelled) return;
+      const altType = mediaType === "series" ? "anime"
+                    : mediaType === "anime"  ? "series"
+                    : null;
+      if ((!detail || !detail.videos || detail.videos.length === 0) && altType) {
+        detail = await getMetaDetailFallback(addons, altType, item.id);
+        if (cancelled) return;
+      }
       if (!detail || !detail.videos || detail.videos.length === 0) {
         setEps([]);
         return;

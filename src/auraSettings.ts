@@ -65,6 +65,17 @@ export interface AuraSettings {
    *  list (AIOMetadata's "AI Recommendations", a custom mdblist, etc.)
    *  in the hero band without cluttering the home grid below. */
   heroCatalog: { addonUrl: string; mediaType: string; catalogId: string } | null;
+  /** Episode-notification gate: when true, the bell only fires for a
+   *  new episode if NotificationsScanner can confirm at least one
+   *  stream exists for it (via fetch_streams against the user's
+   *  installed addons). Off by default because it adds a per-episode
+   *  HTTP fanout to every scan; on for users whose addon mix
+   *  occasionally publishes "released" episodes that have no
+   *  scrapable source for hours/days, who'd rather hear about it
+   *  later than have the bell light up with a dead-end notification.
+   *  Result of the stream check is cached locally (12h TTL) so a
+   *  re-scan over the same episode doesn't refire the network call. */
+  notifyOnlyWithStreams: boolean;
 }
 
 export const DEFAULT_AURA_SETTINGS: AuraSettings = {
@@ -78,6 +89,7 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   showAioStreamsNotices: true,
   blurUnwatchedThumbnails: false,
   heroCatalog: null,
+  notifyOnlyWithStreams: false,
 };
 
 // Module-level memoization snapshot. loadAuraSettings is called many
@@ -129,6 +141,9 @@ function readFromStorage(): AuraSettings {
         : true,
       blurUnwatchedThumbnails: typeof parsed.blurUnwatchedThumbnails === "boolean"
         ? parsed.blurUnwatchedThumbnails
+        : false,
+      notifyOnlyWithStreams: typeof parsed.notifyOnlyWithStreams === "boolean"
+        ? parsed.notifyOnlyWithStreams
         : false,
       heroCatalog: parsed.heroCatalog
         && typeof parsed.heroCatalog === "object"

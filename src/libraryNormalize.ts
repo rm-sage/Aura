@@ -117,6 +117,33 @@ export function normalizeLibrary(raw: LibraryItem[]): LibraryItem[] {
     } else if (stateSource) {
       state = stateSource.state as Record<string, unknown>;
     }
+    // Canonicalize state.timeOffset and state.duration to SECONDS.
+    //
+    // Stremio's official protocol stores these in MILLISECONDS — every
+    // first-party client (web, Android, TV) writes ms-scale values.
+    // Aura historically wrote seconds (the libmpv-native unit), so a
+    // mixed library can carry both. The Resume-where-you-left-off
+    // popup was reading the raw ms values as seconds and showing
+    // "9:10:33 / 683:23:12 - 1% in" for a 41-minute episode (ratio
+    // correct, magnitudes 1000x off).
+    //
+    // Heuristic: a real `duration` for any media doesn't exceed
+    // ~24 hours in seconds (86,400). When duration crosses that, the
+    // record is in ms; convert both fields together so the ratio is
+    // preserved. Aura-written-in-seconds records pass through
+    // unchanged. The write side now writes ms too (libraryActions),
+    // so over time every record converges to the Stremio convention
+    // and this heuristic becomes a no-op for that account.
+    const SECONDS_IN_DAY = 86_400;
+    const rawDuration = typeof state.duration === "number" ? state.duration : 0;
+    const rawOffset   = typeof state.timeOffset === "number" ? state.timeOffset : 0;
+    if (rawDuration > SECONDS_IN_DAY) {
+      state = {
+        ...state,
+        duration:   rawDuration / 1000,
+        timeOffset: rawOffset   / 1000,
+      };
+    }
 
     out.push({
       id:         seriesId,

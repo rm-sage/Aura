@@ -1980,6 +1980,7 @@ const TOC_GROUPS: TocGroup[] = [
       { id: "sec-streams",     label: "Stream Providers" },
       { id: "sec-search",      label: "Search Providers" },
       { id: "sec-detail-page", label: "Detail Page" },
+      { id: "sec-notifications", label: "Notifications" },
     ],
   },
   {
@@ -3211,6 +3212,23 @@ export default function SettingsView({ addons, session }: Props) {
               description="Hide episode thumbnails behind a blur until the episode is marked watched (manually or auto-derived from playback progress). Useful for thrillers, mystery shows, and anime where the thumbnail itself spoils the episode."
               value={aura.blurUnwatchedThumbnails}
               onChange={(v) => setLocal({ blurUnwatchedThumbnails: v })}
+            />
+          </Section>
+
+          {/* ── Notifications ─────────────────────────────────────────────
+              The bell's "new episode aired" notifications are scheduled
+              by NotificationsScanner against your library's series/anime
+              entries. By default the scanner notifies the moment an
+              addon publishes a recently-released episode; this toggle
+              additionally gates on stream availability for users whose
+              addon mix occasionally publishes episodes hours or days
+              before any source becomes scrapable. */}
+          <Section id="sec-notifications" title="Notifications">
+            <SettingToggle
+              label="Only notify when a stream is available"
+              description="When on, the bell waits to fire a new-episode notification until at least one playable stream is found across your installed addons. Adds a small per-episode network check at scan time (cached for 12 hours so re-scans are free). Off by default: the bell fires the moment an episode is marked released, even if scrapers haven't caught up yet."
+              value={aura.notifyOnlyWithStreams}
+              onChange={(v) => setLocal({ notifyOnlyWithStreams: v })}
             />
           </Section>
 

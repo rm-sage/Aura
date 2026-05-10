@@ -332,6 +332,47 @@ const COMMANDS: DevCommand[] = [
     },
   },
   {
+    name: "scrobble",
+    usage: "scrobble",
+    description: "Fire a test scrobble against the current stream (Trakt + AniList per same gates as scrobble_end). Requires an active stream.",
+    run: async (_args, ctx) => {
+      try {
+        // Dynamic import keeps the Tauri core off the DevConsole's
+        // initial chunk; the console mounts on every session and most
+        // users never trigger this command.
+        const { invoke } = await import("@tauri-apps/api/core");
+        interface TestResult {
+          session_active: boolean;
+          id: string | null;
+          media_type: string | null;
+          is_anime: boolean;
+          trakt_fired: boolean;
+          anilist_fired: boolean;
+          message: string;
+        }
+        const r = await invoke<TestResult>("scrobble_test_fire");
+        if (!r.session_active) {
+          ctx.push({
+            ts: Date.now(), level: "warn", source: "console",
+            message: r.message,
+          });
+          return;
+        }
+        ctx.push({
+          ts: Date.now(),
+          level: r.trakt_fired || r.anilist_fired ? "info" : "warn",
+          source: "console",
+          message: r.message,
+        });
+      } catch (e) {
+        ctx.push({
+          ts: Date.now(), level: "error", source: "console",
+          message: `scrobble test failed: ${String(e)}`,
+        });
+      }
+    },
+  },
+  {
     name: "eval",
     usage: "eval <expression>",
     description: "Evaluate a JavaScript expression (power user; runs in app context)",

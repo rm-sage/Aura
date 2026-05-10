@@ -55,7 +55,19 @@ export default function BootSplash({ visible }: Props) {
       aria-hidden
       style={{
         position: "fixed",
-        inset: 0,
+        // Skip the top 36px so the TitleBar (rendered as a flex child of
+        // aura-app-shell) stays visible and interactable through boot.
+        // Without this top offset the splash sat at the same stacking
+        // level as the title bar and visually erased it; the previous
+        // "z 10000 keeps controls on top" comment relied on a stacking
+        // context the title bar's `position: relative` parent never
+        // actually established. Leaving the top strip uncovered also
+        // means the user sees the real title bar's glass material
+        // immediately rather than a "starting up" placeholder.
+        top: 36,
+        left: 0,
+        right: 0,
+        bottom: 0,
         display: "flex",
         flexDirection: "column",
         alignItems: "center",
@@ -67,17 +79,19 @@ export default function BootSplash({ visible }: Props) {
         // Solid (alpha = 1) is non-negotiable: even 3 % bleed-through
         // lights up bright LandingView gradients on OLED + HDR before
         // the splash fades. Fallback `rgb(8, 10, 14)` covers the
-        // pre-CSS frame on a hard reload.
+        // pre-CSS frame on a hard reload. The animated `.aura-ambient`
+        // overlay layered on top (see below) gives Mica + the rest of
+        // the themes the same gentle moving gradient the active app
+        // body has, so the visual transition into the post-boot UI is
+        // continuous instead of "solid-color → suddenly-animated".
         background: "var(--aura-splash-bg, rgb(8, 10, 14))",
         backdropFilter: "blur(12px)",
         WebkitBackdropFilter: "blur(12px)",
-        // Z-band: below the TitleBar (z 10000) so window controls
-        // stay on top and remain interactable, but above everything
-        // else mounted concurrently — including ResizeHandles
-        // (z 9000), AmbientAura (z auto), and the app shell content
-        // (z auto). Pure-opaque background combined with this z value
-        // means nothing else in the React tree shows through during
-        // the splash window.
+        // Z-band: above ResizeHandles (z 9000) and the app shell, below
+        // the TitleBar's stacking-context line so the title bar shows
+        // through the `top: 36` cutout above. Pure-opaque background
+        // (PLUS the cutout) combined with this z value means nothing
+        // else in the React tree shows through during the splash window.
         zIndex: 9500,
         // Block click-through while the splash is over the React tree.
         // The previous `none` value let the user click LandingView /
@@ -93,6 +107,20 @@ export default function BootSplash({ visible }: Props) {
         willChange: "opacity",
       }}
     >
+      {/* Animated ambient gradient layered on top of the solid theme
+          base. Mirrors the `.aura-ambient` element the post-boot app
+          body uses so the splash visually matches the destination
+          theme — Mica's gentle violet/teal sweep, Ember's warm amber
+          drift, etc. `position: absolute; inset: 0;` overrides the
+          fixed-positioned `.aura-ambient` selector so the gradient is
+          contained within the splash's cutout (top: 36 onwards) and
+          doesn't paint over the title bar slot. */}
+      <div
+        className="aura-ambient"
+        style={{ position: "absolute", inset: 0, zIndex: -1 }}
+        aria-hidden
+      />
+
       {/* Icon — slow pulse on the drop-shadow signals "loading" */}
       <img
         src={auraIcon}

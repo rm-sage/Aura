@@ -30,6 +30,44 @@ const omdbCache = new PersistentCache<{ source: string; value: string }[]>({
   ttlMs:      7 * 24 * 60 * 60 * 1000,
   maxEntries: 800,
 });
+
+// Short-lived in-memory cache for fetch_streams results, keyed by the
+// same composite that drives the dedupedInvoke key (addon URL set +
+// media_type + targetId). Survives DetailView remounts so the user
+// closing and reopening the same episode within a couple of minutes
+// doesn't pay another 5-30s multi-addon stream fan-out — that's the
+// #1 perceived-latency hit on the Detail flow per the audit.
+//
+// In-memory only (no localStorage persistence): debrid CDN URLs
+// expire on the order of hours/days, so a session restart should
+// re-validate. 3 minutes is short enough that the link the user
+// clicks on the second open is still valid; long enough to cover
+// natural navigate-back behavior.
+interface CachedStreams {
+  result: StreamFetchResult;
+  ts: number;
+}
+const STREAM_CACHE_TTL_MS = 3 * 60 * 1000;
+const STREAM_CACHE_MAX = 32;
+const streamCache = new Map<string, CachedStreams>();
+function streamCachePut(key: string, result: StreamFetchResult): void {
+  // Soft cap: drop the oldest entry when full so we don't grow
+  // unboundedly across a long session of clicking around.
+  if (streamCache.size >= STREAM_CACHE_MAX) {
+    const oldestKey = streamCache.keys().next().value;
+    if (oldestKey != null) streamCache.delete(oldestKey);
+  }
+  streamCache.set(key, { result, ts: Date.now() });
+}
+function streamCacheGet(key: string): StreamFetchResult | null {
+  const hit = streamCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > STREAM_CACHE_TTL_MS) {
+    streamCache.delete(key);
+    return null;
+  }
+  return hit.result;
+}
 import { useEpisodeProgress, useResumeVideoId } from "../LibraryContext";
 import SpectralPulse from "../SpectralPulse";
 import WatchedBadge, { useWatchedVariant } from "../WatchedBadge";
@@ -524,6 +562,23 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
     // hashed via JSON to keep it stable; addon order doesn't change
     // within a render batch so JSON.stringify is sufficient.
     const queryKey = `streams:${meta.media_type}:${targetId}:${queryAddons.map((a) => a.url).join("|")}`;
+
+    // 3-minute in-memory cache — closing and reopening the same
+    // episode shouldn't refetch from every addon. Skips both the
+    // network fanout and the spinner.
+    const cached = streamCacheGet(queryKey);
+    if (cached) {
+      if (Array.isArray(cached)) {
+        setStreams(cached as unknown as StreamEntry[]);
+        setStreamMeta({ errors: [], warnings: [], info: [], stats: [] });
+      } else {
+        setStreams(cached.streams ?? []);
+        setStreamMeta(cached.metadata ?? { errors: [], warnings: [], info: [], stats: [] });
+      }
+      setStreamsLoading(false);
+      return () => { cancelled = true; };
+    }
+
     dedupedInvoke(queryKey, () => invoke<StreamFetchResult>("fetch_streams", {
       addons:    queryAddons,
       mediaType: meta.media_type,
@@ -531,6 +586,7 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
     }))
       .then((r) => {
         if (cancelled) return;
+        streamCachePut(queryKey, r);
         // Tauri may emit either the new `{ streams, metadata }` envelope or
         // (for the brief moment a stale dev build is running) the legacy
         // `StreamEntry[]` array. Defensive-decode either shape so a hot

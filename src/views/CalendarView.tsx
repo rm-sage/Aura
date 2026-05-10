@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useState, useEffect, useRef, useMemo } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import type { LibraryItem, AddonEntry, MetaDetail, MetaPreview, VideoEntry } from "../types";
 import { loadAuraSettings } from "../auraSettings";
 import { resolveDefaultMetaUrl } from "../addonDefaults";
+import { getMetaDetail } from "../metaCache";
 import ImageLoader from "../ImageLoader";
 
 // ---------------------------------------------------------------------------
@@ -136,15 +136,15 @@ function PosterShimmer() {
 // CalendarView
 // ---------------------------------------------------------------------------
 
-// Module-level meta cache shared across CalendarView mounts. Without this
-// the user navigating Library → Home → Calendar fires a fresh fetch_meta_detail
-// for every library item every time Calendar mounts (100+ HTTP requests just
-// to land on the page). Cached entries are valid for 24 h — release dates
-// don't churn that fast and a stale day-cell is way better than 100 round-trips
-// per view.
-interface CachedMeta { detail: MetaDetail | null; ts: number }
-const META_TTL_MS = 24 * 60 * 60 * 1000;
-const calendarMetaCache = new Map<string, CachedMeta>();
+// CalendarView routes meta fetches through the shared `metaCache.ts`
+// module — same persistent 4h-for-episodic / 7d-for-movie TTL the
+// HomeView, DetailView, and NotificationsScanner use. Previously this
+// file maintained its OWN parallel `calendarMetaCache` Map that
+// bypassed the persistent cache, so a fresh app start always paid
+// 100+ HTTP round-trips to fill the calendar even though the meta
+// was already on disk from a prior session. The shared cache also
+// dedupes concurrent calls (`dedupedInvoke`) so two views asking
+// for the same item at the same time fire one network request.
 
 export default function CalendarView({ library, addons, onSelectMeta }: Props) {
   const [details, setDetails] = useState<Map<string, MetaDetail | null>>(new Map());
@@ -169,56 +169,30 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
     return addons[0] ?? null;
   }, [addons]);
 
-  // Fetch detail for every library item, with a module-level 24 h cache so
-  // re-mounting Calendar doesn't replay every HTTP round-trip.
+  // Fetch detail for every library item via the shared metaCache —
+  // hits from prior sessions / other views land instantly, misses
+  // fan out concurrently with concurrency 4.
   useEffect(() => {
     if (!metaAddon || library.length === 0) {
       setDetails(new Map());
       return;
     }
     let cancelled = false;
-
-    // Seed the local map with cached hits so the day cells light up
-    // instantly on remount even before any fresh fetches resolve.
-    const seed = new Map<string, MetaDetail | null>();
-    const now = Date.now();
-    const stale: LibraryItem[] = [];
-    for (const item of library) {
-      const key = `${metaAddon.url}::${item.media_type}::${item.id}`;
-      const hit = calendarMetaCache.get(key);
-      if (hit && now - hit.ts < META_TTL_MS) {
-        seed.set(item.id, hit.detail);
-      } else {
-        stale.push(item);
-      }
-    }
-    setDetails(seed);
-
-    if (stale.length === 0) return;
     setLoading(true);
 
     (async () => {
-      const next = new Map<string, MetaDetail | null>(seed);
+      const next = new Map<string, MetaDetail | null>();
       const concurrency = 4;
       let cursor = 0;
       const worker = async () => {
         while (!cancelled) {
           const i = cursor++;
-          if (i >= stale.length) return;
-          const item = stale[i];
-          const key = `${metaAddon.url}::${item.media_type}::${item.id}`;
-          try {
-            const d = await invoke<MetaDetail>("fetch_meta_detail", {
-              addonUrl: metaAddon.url,
-              mediaType: item.media_type,
-              id: item.id,
-            });
-            next.set(item.id, d);
-            calendarMetaCache.set(key, { detail: d, ts: Date.now() });
-          } catch {
-            next.set(item.id, null);
-            calendarMetaCache.set(key, { detail: null, ts: Date.now() });
-          }
+          if (i >= library.length) return;
+          const item = library[i];
+          // getMetaDetail handles cache + dedupe + null-on-error.
+          const d = await getMetaDetail(metaAddon, item.media_type, item.id)
+            .catch(() => null);
+          next.set(item.id, d);
         }
       };
       await Promise.all(Array.from({ length: concurrency }, worker));

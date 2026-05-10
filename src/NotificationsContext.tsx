@@ -99,6 +99,13 @@ const NEW_PULSE_MS = 3000;
  *  immediately. Module-level so React StrictMode's double mount
  *  doesn't double the wait. */
 const POPUP_BOOT_GRACE_MS = 5_000;
+/** Coalesce window: when the scanner fires N notifications across an
+ *  async loop, each addNotification schedules a setPopup. React's
+ *  auto-batch breaks across `await` boundaries so without a coalesce
+ *  the user sees the popup chase through every entry. We always
+ *  schedule the popup behind a short timer (latest add wins by
+ *  resetting the timer) so a batch lands as one final popup. */
+const POPUP_COALESCE_MS = 150;
 const APP_BOOT_AT = Date.now();
 
 const NotificationsCtx = createContext<NotificationsCtxValue | null>(null);
@@ -265,19 +272,24 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
       // the popup, which caused an instant unmount and skipped the
       // exit animation entirely. The bubble calls dismissPopup() once
       // its exit keyframe completes.
+      //
+      // Plus a short coalesce window (POPUP_COALESCE_MS) so a batch of
+      // N notifications fired across an async loop (the scanner walks
+      // items with an `await` stagger between each fetch_meta_detail)
+      // collapses to just the LAST popup. Without this, a fresh-
+      // install scan that surfaces 4 episodes from one show would
+      // visibly chase the user with 4 sequential popups; React's
+      // auto-batch doesn't help across await boundaries.
       const sinceBoot = Date.now() - APP_BOOT_AT;
-      const wait = sinceBoot < POPUP_BOOT_GRACE_MS
+      const bootWait = sinceBoot < POPUP_BOOT_GRACE_MS
         ? POPUP_BOOT_GRACE_MS - sinceBoot
         : 0;
-      if (wait > 0) {
-        if (popupTimerRef.current) clearTimeout(popupTimerRef.current);
-        popupTimerRef.current = setTimeout(() => {
-          setPopup(popupCandidate);
-          popupTimerRef.current = null;
-        }, wait);
-      } else {
+      const wait = Math.max(bootWait, POPUP_COALESCE_MS);
+      if (popupTimerRef.current) clearTimeout(popupTimerRef.current);
+      popupTimerRef.current = setTimeout(() => {
         setPopup(popupCandidate);
-      }
+        popupTimerRef.current = null;
+      }, wait);
     }
   }, []);
 

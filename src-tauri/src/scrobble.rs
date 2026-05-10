@@ -387,6 +387,134 @@ pub async fn scrobble_end<R: Runtime>(
     Ok(())
 }
 
+/// Outcome of a `scrobble_test_fire` call. Surfaced to the DevConsole
+/// command so the user can see exactly what fired.
+#[derive(Clone, Debug, Serialize)]
+pub struct ScrobbleTestResult {
+    /// Was a session loaded (`load_video` had run)?
+    pub session_active: bool,
+    /// Item id the test fired against (for series this is the EPISODE
+    /// id, e.g. `tt0903747:1:5`; for movies it's the bare imdb id).
+    pub id: Option<String>,
+    /// "anime" / "series" / "movie".
+    pub media_type: Option<String>,
+    /// True when the session was tagged as anime (drives the AniList
+    /// branch). The DevConsole prints this so the user can reason
+    /// about why AniList fired or didn't.
+    pub is_anime: bool,
+    /// Did Trakt fire (token present + parseable target)?
+    pub trakt_fired: bool,
+    /// Did AniList fire (token present + is_anime + resolvable id)?
+    pub anilist_fired: bool,
+    /// Human-readable summary the DevConsole prints verbatim.
+    pub message: String,
+}
+
+// ---------------------------------------------------------------------------
+// DevConsole test command
+//
+// Fires the same scrobble paths that scrobble_end uses, against the
+// CURRENT session_slot, but DOES NOT take the session — so it can be
+// invoked repeatedly during testing without breaking subsequent real
+// scrobble_end calls. Requires that load_video has been called for
+// the active stream (otherwise session_slot is None and the call
+// short-circuits with an explanatory message).
+//
+// Honors the same gates as scrobble_end:
+//   - settings.scrobble_enabled
+//   - Trakt token present (skipped silently if not connected)
+//   - AniList: is_anime + token present + resolvable IMDB id
+//
+// Pretends time = 95% of duration so Trakt's /sync/history records as
+// a normal completion instead of the 0%-watched edge case the test
+// might land in if the user pauses early. duration is taken from the
+// last_playback snapshot the heartbeat keeps fresh.
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn scrobble_test_fire<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<ScrobbleTestResult, String> {
+    let sess = match session_slot().lock().map_err(|e| e.to_string())?.clone() {
+        Some(s) => s,
+        None => {
+            return Ok(ScrobbleTestResult {
+                session_active: false,
+                id: None, media_type: None, is_anime: false,
+                trakt_fired: false, anilist_fired: false,
+                message: "no active stream - load_video has not been called".into(),
+            });
+        }
+    };
+
+    let scope = sess.scope.clone();
+    let (last_time, last_duration) = last_playback_slot()
+        .lock().map(|g| *g).unwrap_or((0.0, 0.0));
+    // Pretend completion so /sync/history records as fully watched.
+    // If duration is unknown (loadfile happened but duration event
+    // hasn't fired yet — rare) we synthesize a 95%/100% pair so the
+    // wire call still goes out for testing.
+    let (test_time, test_duration) = if last_duration > 0.0 {
+        (last_duration * 0.95, last_duration)
+    } else if last_time > 0.0 {
+        (last_time, (last_time / 0.95).max(1.0))
+    } else {
+        (95.0, 100.0)
+    };
+
+    let trakt_will_fire = parse_trakt_target(&sess.imdb_id, &sess.media_type).is_some()
+        && scrobble_auth::read_token_for("trakt", &scope).is_some();
+    let anilist_will_fire = sess.is_anime
+        && scrobble_auth::read_token_for("anilist", &scope).is_some();
+
+    crate::devlog!(
+        info, "scrobble",
+        "scrobble_test_fire: id={} type={} anime={} scope={} test_progress={:.0}%",
+        sess.imdb_id, sess.media_type, sess.is_anime, scope,
+        if test_duration > 0.0 { test_time / test_duration * 100.0 } else { 0.0 },
+    );
+
+    trakt_sync_history(&scope, &sess, test_time, test_duration).await;
+    let anilist_outcome = crate::scrobble_anilist::save_progress(&app, &scope, &sess).await;
+    if let Err(crate::scrobble_anilist::AnilistError::Unauthorized) = anilist_outcome {
+        crate::devlog!(
+            warn, "scrobble",
+            "AniList 401/403 - clearing token for scope={scope} (user must reconnect)",
+        );
+        crate::scrobble_auth::clear_token_for("anilist", &scope);
+    }
+
+    let trakt_msg = if trakt_will_fire { "fired".to_string() }
+                    else { "skipped (no token or unsupported id)".to_string() };
+    let anilist_msg = if anilist_will_fire {
+        match &anilist_outcome {
+            Ok(()) => "fired".to_string(),
+            Err(crate::scrobble_anilist::AnilistError::NotFound)
+                => "skipped (not on AniList)".to_string(),
+            Err(e) => format!("failed: {e}"),
+        }
+    } else if !sess.is_anime {
+        "skipped (session not flagged as anime)".to_string()
+    } else {
+        "skipped (no AniList token)".to_string()
+    };
+    let message = format!(
+        "test scrobble fired for \"{}\" ({} {}). Trakt: {}, AniList: {}",
+        sess.title, sess.media_type,
+        sess.episode.as_deref().unwrap_or(""),
+        trakt_msg, anilist_msg,
+    );
+    Ok(ScrobbleTestResult {
+        session_active: true,
+        id: Some(sess.imdb_id),
+        media_type: Some(sess.media_type),
+        is_anime: sess.is_anime,
+        trakt_fired: trakt_will_fire,
+        anilist_fired: anilist_will_fire && anilist_outcome.is_ok(),
+        message,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Synchronous shutdown helper — called from window_logic's CloseRequested
 // handler before app.exit(0) so Trakt sees the stop signal even on hard

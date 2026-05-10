@@ -137,11 +137,23 @@ export async function libraryWriteProgress(
   const mtime = nowIso();
 
   // Merge state — preserve unknown keys (Stremio round-trips opaque state).
+  //
+  // Stremio's protocol stores `timeOffset` and `duration` in
+  // MILLISECONDS. Every first-party Stremio client (web, Android, TV)
+  // writes ms-scale values. Aura historically wrote seconds (the
+  // libmpv-native unit), which broke cross-client compatibility AND
+  // fed the Resume-where-you-left-off popup numbers that were 1000x
+  // too large when the record had been touched by another client (or
+  // 1000x too small to other clients reading our writes). Multiply
+  // here so every Aura write matches the convention; the read side
+  // (libraryNormalize.ts) auto-converts inbound records of either
+  // unit so legacy Aura-written-in-seconds records still display
+  // correctly during the transition.
   const prevState = (existing?.state ?? {}) as Record<string, unknown>;
   const nextState: Record<string, unknown> = {
     ...prevState,
-    timeOffset: time,
-    duration,
+    timeOffset: Math.round(time * 1000),
+    duration:   Math.round(duration * 1000),
   };
   if (isEpisode) {
     // Stremio's resume hint — picks the episode the user was last on.

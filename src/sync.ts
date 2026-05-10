@@ -108,6 +108,10 @@ const lastEtag: Map<SyncNamespace, string> = new Map();
 
 export function clearSyncEtags(): void {
   lastEtag.clear();
+  // Reset the pull min-interval guard too — a fresh account swap
+  // should pull immediately, not wait out a 30s floor that was set
+  // by the previous account's pull.
+  lastPullCompletedAt = 0;
   // ALSO drop any pending debounced pushes. Otherwise a 5s push timer
   // armed under account A can fire after the user signed into B,
   // which would force-overwrite B's cloud blob with A's local data
@@ -212,24 +216,42 @@ const mergeAutoBumped: MergeFn<string[]> = (local, server) => {
 interface NotificationEntry {
   kind?: string;
   id?: string;
-  ts?: number;
+  /** Persisted notifications carry `createdAt` (NotificationsContext shape).
+   *  `ts` was the previous merger's expectation but no producer ever emits it,
+   *  so reading from it here meant every entry collapsed to ts=0 and the
+   *  sort + cap behaved as insertion-order with a silent 200→100 truncation
+   *  on every cross-device pull. Use createdAt; fall back to 0. */
+  createdAt?: number;
   [k: string]: unknown;
 }
 
+/** Match NotificationsContext::MAX_ITEMS so a sync round-trip can't
+ *  silently halve the user's bell ring buffer. The two layers MUST
+ *  agree on this number. */
+const NOTIFICATION_MAX = 200;
+
 const mergeNotifications: MergeFn<NotificationEntry[]> = (local, server) => {
-  // Union with deduplication on (kind, id, ts); cap at 100 so the blob
-  // doesn't grow unboundedly. Newest entries win the tail slot.
+  // Union with deduplication on (kind, id) — `createdAt` is excluded
+  // from the key because the same logical notification can have
+  // different timestamps on two devices that scanned the same episode
+  // a few seconds apart. (kind, id) is the stable identity. Sort by
+  // createdAt descending, then truncate to the same cap the local
+  // store enforces.
   const all = [...(server ?? []), ...(local ?? [])];
-  const seen = new Set<string>();
-  const out: NotificationEntry[] = [];
+  const byKey = new Map<string, NotificationEntry>();
   for (const entry of all) {
-    const key = `${entry.kind ?? ""}::${entry.id ?? ""}::${entry.ts ?? 0}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(entry);
+    const key = `${entry.kind ?? ""}::${entry.id ?? ""}`;
+    const prev = byKey.get(key);
+    // On collision, keep the entry with the newer `createdAt` so user-
+    // touched fields (read/dismissed flags) from the most-recent
+    // device aren't reverted by older identical entries.
+    if (!prev || (entry.createdAt ?? 0) > (prev.createdAt ?? 0)) {
+      byKey.set(key, entry);
+    }
   }
-  out.sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0));
-  return out.slice(0, 100);
+  const out = Array.from(byKey.values());
+  out.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+  return out.slice(0, NOTIFICATION_MAX);
 };
 
 // manualWatched.ts persists as Array<[id, state]> pairs to preserve
@@ -416,6 +438,28 @@ async function writeLocal(namespace: SyncNamespace, value: unknown): Promise<voi
   const lsKey = LOCAL_KEYS[namespace];
   if (!lsKey) return;
   try {
+    // Notifications need an extra union step at write time. Between
+    // the syncPullAll readLocal at the top of the merge and this
+    // writeLocal here, the scanner can fire a fresh addNotification
+    // (or an update can land via the dismiss-to-bell flow) which
+    // persisted to localStorage AND rendered to React. Writing the
+    // pre-add merged value would then clobber the freshly-written
+    // disk row, AND the rehydrate event would push the clobbered
+    // value back into React state. Re-reading current disk and
+    // unioning closes the race. Other namespaces don't have
+    // concurrent producers (settings/auto-bumped/recent-searches all
+    // write in response to user actions, never autonomously while a
+    // pull is in flight), so the extra read is targeted.
+    if (namespace === "notifications") {
+      const currentRaw = localStorage.getItem(lsKey);
+      const current: unknown[] = currentRaw ? (JSON.parse(currentRaw) as unknown[]) : [];
+      if (Array.isArray(current) && current.length > 0) {
+        value = mergeNotifications(
+          current as NotificationEntry[],
+          value as NotificationEntry[],
+        );
+      }
+    }
     localStorage.setItem(lsKey, JSON.stringify(value));
     // Notify in-window subscribers of the underlying store AND force
     // their in-memory mirrors to rehydrate from the freshly written
@@ -488,6 +532,18 @@ let pullAllInflight: Promise<void> | null = null;
 let pullInFlight = false;
 const deferredPushes: Set<SyncNamespace> = new Set();
 
+/** Min interval between pulls of the SAME scope. The 5-min background
+ *  tick is fine, but `applySettingsScope(authKey)` can fire repeatedly
+ *  during auth churn (logout → login, session-expired retry, etc.)
+ *  and each call kicks `syncPullAll` — without a guard you'd see
+ *  back-to-back pulls within seconds. The coalesce-while-in-flight
+ *  guard above only helps if calls overlap; this floor handles the
+ *  back-to-back case. Cleared whenever `clearSyncEtags` runs (which
+ *  is always paired with an account change), so a real account
+ *  switch isn't deferred by a recent same-account pull. */
+const PULL_MIN_INTERVAL_MS = 30_000;
+let lastPullCompletedAt = 0;
+
 /**
  * Pull every namespace and merge into local. Idempotent (concurrent
  * calls are coalesced into the same in-flight promise). Called from
@@ -498,6 +554,14 @@ const deferredPushes: Set<SyncNamespace> = new Set();
  */
 export function syncPullAll(): Promise<void> {
   if (pullAllInflight) return pullAllInflight;
+  // Min-interval guard: if a successful pull completed less than
+  // PULL_MIN_INTERVAL_MS ago (and the account hasn't changed since,
+  // which would have called clearSyncEtags and reset the timestamp),
+  // skip. This prevents auth-churn (logout/login, session-expired
+  // refresh) from kicking back-to-back pulls.
+  if (Date.now() - lastPullCompletedAt < PULL_MIN_INTERVAL_MS) {
+    return Promise.resolve();
+  }
   pullInFlight = true;
   pullAllInflight = (async () => {
     try {
@@ -520,6 +584,7 @@ export function syncPullAll(): Promise<void> {
     } finally {
       pullInFlight = false;
       pullAllInflight = null;
+      lastPullCompletedAt = Date.now();
       // Flush any pushes that were deferred while the pull held the
       // gate. We schedule them through the normal debounce so the
       // 5s rate-limiting still applies (otherwise a flurry of marks

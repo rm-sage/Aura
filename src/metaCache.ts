@@ -34,7 +34,27 @@ interface CacheEntry {
   ts: number;
 }
 
-const TTL_MS = 24 * 60 * 60 * 1000;
+/** Two-tier TTL: series and anime gain new episodes as they air, so a
+ *  24-hour cache (the previous behavior) means a weekly-airing show
+ *  could lag a full day behind the addon's view of "what's released".
+ *  The notification scanner runs every 30 min but routes through this
+ *  cache, so the TTL was the floor for "how stale can my bell be".
+ *
+ *  Movies are essentially immutable — title / runtime / cast almost
+ *  never change post-release — so a week-long TTL keeps re-opens of
+ *  the same DetailView free for the longest realistic re-engagement
+ *  window without giving up correctness.
+ *
+ *  The chosen split: 4h for episodic, 7d for movies. */
+const TTL_EPISODIC_MS = 4 * 60 * 60 * 1000;
+const TTL_MOVIE_MS    = 7 * 24 * 60 * 60 * 1000;
+function ttlFor(mediaType: string): number {
+  const t = mediaType.toLowerCase();
+  return (t === "series" || t === "anime") ? TTL_EPISODIC_MS : TTL_MOVIE_MS;
+}
+/** Used by the hydrate / persist pruning paths: anything older than the
+ *  longest TTL is unconditionally stale regardless of media type. */
+const TTL_MAX_MS = TTL_MOVIE_MS;
 const STORAGE_KEY = "aura:meta-cache:v1";
 const MAX_ENTRIES = 1500;
 const PERSIST_DEBOUNCE_MS = 500;
@@ -56,7 +76,7 @@ const cache = new Map<string, CacheEntry>();
       if (!Array.isArray(entry) || entry.length !== 2) continue;
       const [k, v] = entry;
       if (typeof k !== "string" || !v || typeof v.ts !== "number") continue;
-      if (now - v.ts >= TTL_MS) continue;
+      if (now - v.ts >= TTL_MAX_MS) continue;
       cache.set(k, v);
     }
   } catch { /* corrupt blob — start fresh */ }
@@ -101,7 +121,7 @@ export async function getMetaDetail(
 ): Promise<MetaDetail | null> {
   const key = cacheKey(addon.url, mediaType, id);
   const hit = cache.get(key);
-  if (hit && Date.now() - hit.ts < TTL_MS) return hit.detail;
+  if (hit && Date.now() - hit.ts < ttlFor(mediaType)) return hit.detail;
 
   const fetched = await dedupedInvoke(`meta:${key}`, () =>
     invoke<MetaDetail>("fetch_meta_detail", {

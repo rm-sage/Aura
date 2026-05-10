@@ -360,8 +360,17 @@ async fn load_video(
             // positional arg `0` is the file index — required to be
             // present when we want to pass an options string in the
             // 4th slot, even on a single-file load.
+            //
+            // Clamp to 7 days and force fixed (non-scientific) notation.
+            // is_finite filters NaN/inf, but extreme magnitudes
+            // (1e308, etc.) print as `1e308` which mpv's option parser
+            // rejects, propagating as a hard loadfile error rather than
+            // a graceful resume failure. A corrupted library row is
+            // the realistic source. 7 days * 86400 covers every
+            // plausible media duration.
+            let clamped = t.min(86_400.0 * 7.0);
             args.push(serde_json::json!(0));
-            args.push(serde_json::json!(format!("start={t}")));
+            args.push(serde_json::json!(format!("start={clamped:.3}")));
         }
         mpv.command("loadfile", &args, "main")
             .map_err(|e| e.to_string())?;
@@ -448,12 +457,29 @@ async fn set_volume(app: tauri::AppHandle, volume: f64) -> Result<(), String> {
 /// Generic property reader — used by the React side as a polling fallback
 /// when MPV's observe-property channel doesn't deliver a particular field.
 /// Returns the JSON-encoded property value.
+///
+/// Rejects `(name, format)` pairs known to crash this libmpv build:
+/// any `format=node` request and any read of `track-list` regardless
+/// of format both hit the same dispatch-table fault documented as
+/// CLAUDE.md landmine #3 (`mpv_wrapper_get_property+0xa71`,
+/// `movsxd rax, [rcx+rax*4]` derefs -1). Legitimate callers use
+/// `string` / `double` / `flag` / `int64` and never need
+/// `track-list` here (the dedicated `get_tracks` command exists for
+/// that and rate-limits its use through the tracksReady effect in
+/// PlayerOverlay). The deny-list is the only thing standing between
+/// a future caller (or a copy-pasted snippet) and a hard crash.
 #[tauri::command]
 async fn get_property(
     app: tauri::AppHandle,
     name: String,
     format: String,
 ) -> Result<serde_json::Value, String> {
+    if format.eq_ignore_ascii_case("node") {
+        return Err("get_property: format=node is unsafe on this libmpv build (landmine #3)".into());
+    }
+    if name == "track-list" {
+        return Err("get_property: track-list reads must go through get_tracks (landmine #3)".into());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         app.mpv()
             .get_property(name, format, "main")
@@ -1736,6 +1762,7 @@ pub fn run() {
             scrobble_auth::scrobble_oauth_device_begin,
             scrobble_auth::scrobble_oauth_device_poll,
             scrobble_auth::open_oauth_popup_webview,
+            scrobble::scrobble_test_fire,
             sync::sync_status,
             sync::sync_pull,
             sync::sync_pull_all,
