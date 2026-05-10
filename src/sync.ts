@@ -242,6 +242,20 @@ const NOTIFICATION_MAX = 200;
  *  addon spam. */
 const NOTIFICATION_ABSOLUTE_MAX = 1000;
 
+/** Drop `kind: "update"` entries from a notifications blob in either
+ *  direction. Update notifications announce the version of the local
+ *  Aura install — Device A sitting on 0.6.6 should not advertise its
+ *  pending 0.6.7 update to Device B (which might already be on 0.6.8
+ *  or higher). The auto-updater on each device produces its own
+ *  device-local update notification at the right time; nothing about
+ *  cross-device sync helps here. The local store still keeps update
+ *  entries (the persist effect writes the full list including them),
+ *  this filter only gates the cloud round-trip. */
+function stripUpdateKinds(blob: NotificationEntry[] | null | undefined): NotificationEntry[] {
+  if (!Array.isArray(blob)) return [];
+  return blob.filter((n) => n.kind !== "update");
+}
+
 const mergeNotifications: MergeFn<NotificationEntry[]> = (local, server) => {
   // Union with deduplication on (kind, id) — `createdAt` is excluded
   // from the key because the same logical notification can have
@@ -249,7 +263,13 @@ const mergeNotifications: MergeFn<NotificationEntry[]> = (local, server) => {
   // a few seconds apart. (kind, id) is the stable identity. On
   // conflict, prefer the newer-createdAt entry — that carries the
   // user's most recent read/dismissed flag state.
-  const all = [...(server ?? []), ...(local ?? [])];
+  //
+  // Update notifications are filtered out before merging: the cloud
+  // path doesn't carry them. Local update entries (held only in the
+  // user's local store via the persist effect) are NOT included in
+  // `local` here either — the wrapper around `mergeNotifications`
+  // strips updates before the merger ever sees them.
+  const all = [...stripUpdateKinds(server), ...stripUpdateKinds(local)];
   const byKey = new Map<string, NotificationEntry>();
   for (const entry of all) {
     const key = `${entry.kind ?? ""}::${entry.id ?? ""}`;
@@ -474,10 +494,28 @@ async function writeLocal(namespace: SyncNamespace, value: unknown): Promise<voi
       const currentRaw = localStorage.getItem(lsKey);
       const current: unknown[] = currentRaw ? (JSON.parse(currentRaw) as unknown[]) : [];
       if (Array.isArray(current) && current.length > 0) {
-        value = mergeNotifications(
+        // Preserve local update notifications across the merge:
+        // mergeNotifications strips kind:"update" by design (updates
+        // are device-local, see stripUpdateKinds), so a naive merge
+        // would silently drop the user's pending update banner the
+        // moment a sync pull rehydrates the buffer.
+        const localUpdates = (current as NotificationEntry[])
+          .filter((n) => n.kind === "update");
+        const merged = mergeNotifications(
           current as NotificationEntry[],
           value as NotificationEntry[],
         );
+        // Re-attach local updates after the merge. Keep dedup-by-id
+        // behavior so a repeat add isn't doubled (defensive — the
+        // merge shouldn't have re-introduced any update entry given
+        // stripUpdateKinds, but guard anyway).
+        const seen = new Set(merged.map((n) => `${n.kind}::${n.id ?? ""}`));
+        for (const u of localUpdates) {
+          const key = `update::${u.id ?? ""}`;
+          if (!seen.has(key)) merged.push(u);
+        }
+        merged.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+        value = merged;
       }
     }
     localStorage.setItem(lsKey, JSON.stringify(value));
@@ -633,6 +671,20 @@ export async function syncPush(namespace: SyncNamespace): Promise<void> {
   }
 }
 
+/** Sanitize a local blob before sending it to the cloud. The
+ *  notifications namespace is the only one with device-local data
+ *  the proxy must never see — `kind: "update"` entries announce the
+ *  current device's pending Aura release and would surface stale
+ *  banners on every other device on next pull. Strip them here so
+ *  the wire blob is cross-device-portable; the local store keeps
+ *  the full list including updates. */
+function sanitizeForPush(namespace: SyncNamespace, local: unknown): unknown {
+  if (namespace === "notifications" && Array.isArray(local)) {
+    return (local as NotificationEntry[]).filter((n) => n.kind !== "update");
+  }
+  return local;
+}
+
 /** Push a namespace, surfacing errors to the caller. */
 export async function syncPushNow(namespace: SyncNamespace): Promise<void> {
   // Defer if a pull sweep is mid-merge: pushing local state while
@@ -649,7 +701,7 @@ export async function syncPushNow(namespace: SyncNamespace): Promise<void> {
   const ifMatch = lastEtag.get(namespace) ?? null;
   const result = await invoke<PushOutcome>("sync_push", {
     namespace,
-    data: local,
+    data: sanitizeForPush(namespace, local),
     ifMatch,
   });
   if (result.status === "ok") {
@@ -663,7 +715,7 @@ export async function syncPushNow(namespace: SyncNamespace): Promise<void> {
   await writeLocal(namespace, merged);
   const retry = await invoke<PushOutcome>("sync_push", {
     namespace,
-    data: merged,
+    data: sanitizeForPush(namespace, merged),
     ifMatch: result.server.etag,
   });
   if (retry.status === "ok") {

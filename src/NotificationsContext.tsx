@@ -313,12 +313,31 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
         read: n.read ?? false,
         dismissed: n.dismissed ?? false,
       };
+      // Update notifications collapse to a single live entry: when a
+      // newer Aura release arrives the prior `update:vX.Y.Z`
+      // notification should be replaced rather than coexist with
+      // the new `update:vX.Y.Z+1`. Dedup-by-id can't catch this
+      // because the ids are intentionally version-suffixed (so the
+      // same release isn't re-added on every poll). Drop any other
+      // update entries before seating the incoming one.
+      let base = prev;
+      if (n.kind === "update") {
+        base = prev.filter((p) => p.kind !== "update" || p.id === id);
+      }
       let merged: Notification[];
-      if (existing >= 0) {
-        merged = [...prev];
-        merged[existing] = { ...next, createdAt: prev[existing].createdAt };
+      const existingInBase = base.findIndex((p) => p.id === id);
+      if (existingInBase >= 0) {
+        merged = [...base];
+        merged[existingInBase] = { ...next, createdAt: base[existingInBase].createdAt };
+      } else if (existing >= 0 && n.kind !== "update") {
+        // Same-id rehydrate path for non-update kinds (couldn't take
+        // the simpler branch above because we may have filtered
+        // updates out of `base`). Preserve original createdAt.
+        merged = [...base];
+        const fresh: Notification = { ...next, createdAt: prev[existing].createdAt };
+        merged.unshift(fresh);
       } else {
-        merged = [next, ...prev];
+        merged = [next, ...base];
       }
       return capItems(merged);
     });
