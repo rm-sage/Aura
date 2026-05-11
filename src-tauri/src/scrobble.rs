@@ -114,6 +114,20 @@ pub struct ScrobbleSession {
     /// at scrobble_start time; we cache it on the session so /end can
     /// fire the right token even after the user has navigated away.
     pub scope: String,
+    /// Authoritative season number from the VideoEntry the user
+    /// actually clicked in the episode picker. When present, preferred
+    /// over the ID-parsed value for the Trakt payload (the two can
+    /// disagree when AIOMetadata's metadata provider produces absolute
+    /// vs multi-season numbering inconsistently — common for anime
+    /// where the stream id may be TMDB-multi-season while the
+    /// VideoEntry's display numbers are TVDB-absolute, or vice-versa).
+    /// `None` for movies and for older targets that don't supply it.
+    #[serde(default)]
+    pub season: Option<u32>,
+    /// Authoritative episode number, paired with `season` above. Same
+    /// disambiguation purpose.
+    #[serde(default)]
+    pub episode_num: Option<u32>,
 }
 
 static SESSION: OnceLock<Mutex<Option<ScrobbleSession>>> = OnceLock::new();
@@ -162,6 +176,7 @@ fn record_playback(time: f64, duration: f64) {
 // and adding non-IMDB id resolution is a separate task.
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Debug, PartialEq)]
 enum TraktTarget {
     Movie { imdb: String },
     Episode { show_imdb: String, season: u32, number: u32 },
@@ -183,6 +198,45 @@ fn parse_trakt_target(id: &str, media_type: &str) -> Option<TraktTarget> {
             })
         }
         _ => None,
+    }
+}
+
+/// Build the primary + optional fallback Trakt targets for a session.
+///
+/// AIOMetadata can produce dual-numbering inconsistencies depending on
+/// the selected metadata provider for anime — the stream id may carry
+/// one season/episode tuple (e.g. TMDB multi-season `tt22248376:2:3`)
+/// while the VideoEntry's `season` / `episode` fields carry another
+/// (TVDB absolute `S1E31` for the same physical episode). Trakt
+/// indexes by TVDB ordering for anime, so the "right" payload depends
+/// on whether Trakt's catalog uses absolute or multi-season for that
+/// show. Rather than guess, we send the VideoEntry's authoritative
+/// numbers first; if Trakt reports `not_found`, the wrapper retries
+/// with the ID-parsed alternate.
+///
+/// Returns:
+///   • Primary  — what to send first (VideoEntry override if present,
+///     else the ID-parsed value).
+///   • Fallback — a different target to retry with on not_found; None
+///     when the two would be identical (no retry needed) or when the
+///     session has no usable id (skip path).
+fn trakt_targets(sess: &ScrobbleSession) -> (Option<TraktTarget>, Option<TraktTarget>) {
+    let from_id = parse_trakt_target(&sess.imdb_id, &sess.media_type);
+    let from_override = match (&from_id, sess.season, sess.episode_num) {
+        (Some(TraktTarget::Episode { show_imdb, .. }), Some(s), Some(e)) => {
+            Some(TraktTarget::Episode {
+                show_imdb: show_imdb.clone(),
+                season: s,
+                number: e,
+            })
+        }
+        _ => None,
+    };
+    match (from_override, from_id) {
+        (Some(o), Some(i)) if o == i => (Some(o), None),
+        (Some(o), Some(i))            => (Some(o), Some(i)),
+        (Some(o), None)               => (Some(o), None),
+        (None,    i)                  => (i, None),
     }
 }
 
@@ -212,35 +266,62 @@ fn build_history_body(target: &TraktTarget) -> serde_json::Value {
 // Trakt /sync/history — async path, called from scrobble_end
 // ---------------------------------------------------------------------------
 
-async fn trakt_sync_history(scope: &str, sess: &ScrobbleSession, time: f64, duration: f64) {
-    let Some(token) = scrobble_auth::read_token_for("trakt", scope) else {
-        // No connected Trakt account — silently no-op. AniList-only
-        // users land here, as do guest sessions.
-        crate::devlog!(
-            info, "scrobble",
-            "Trakt /sync/history skipped: no token for scope={scope}",
-        );
-        return;
-    };
-    let Some(target) = parse_trakt_target(&sess.imdb_id, &sess.media_type) else {
-        crate::devlog!(
-            warn, "scrobble",
-            "Trakt /sync/history skipped: id format unsupported: {} (type={})",
-            sess.imdb_id, sess.media_type,
-        );
-        return;
-    };
+/// Structured outcome of one /sync/history POST attempt. Distinguishes
+/// "Trakt accepted AND added the row" from "Trakt accepted but said
+/// not_found" so the retry-on-fallback path and the scrobble-test
+/// command can both surface the difference.
+#[derive(Clone, Copy, Debug)]
+enum TraktSyncOutcome {
+    /// Trakt's response body had `added.episodes > 0` (or `added.movies`)
+    /// — actually written to history.
+    Added,
+    /// Trakt accepted the payload (201) but the show/episode wasn't in
+    /// their catalog under that numbering. Caller may retry with an
+    /// alternate (season, number) tuple.
+    NotFound,
+    /// HTTP-level failure (4xx other than 401, 5xx, network blip, etc.).
+    /// Distinct from NotFound: doesn't trigger the dual-numbering retry
+    /// because the cause isn't a metadata mismatch.
+    HttpError,
+    /// 401 — token expired/revoked. Caller is responsible for clearing.
+    Unauthorized,
+}
 
-    let progress_pct = if duration > 0.0 {
-        (time / duration * 100.0).clamp(0.0, 100.0)
-    } else {
-        0.0
-    };
-    let body = build_history_body(&target);
+/// Public summary used by `scrobble_test_fire` so the DevConsole toast
+/// can say "fired" vs "not_found" vs "failed" instead of the generic
+/// "fired" that masked silent misses for the entire dual-numbered
+/// anime catalog.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TraktSyncResult {
+    Fired,        // Primary or fallback added a row.
+    NotFound,     // Both attempts (or single attempt with no fallback) returned not_found.
+    Skipped,      // No token / unsupported id / movie pre-checks failed.
+    Failed,       // HTTP error or network blip.
+}
 
+#[derive(Deserialize)]
+struct TraktSyncResponseAdded { #[serde(default)] episodes: u32, #[serde(default)] movies: u32 }
+#[derive(Deserialize)]
+struct TraktSyncResponseNotFound {
+    #[serde(default)] episodes: Vec<serde_json::Value>,
+    #[serde(default)] movies:   Vec<serde_json::Value>,
+}
+#[derive(Deserialize)]
+struct TraktSyncResponseBody {
+    #[serde(default)] added:     Option<TraktSyncResponseAdded>,
+    #[serde(default)] not_found: Option<TraktSyncResponseNotFound>,
+}
+
+/// Single POST to /sync/history with the given target. Returns the
+/// structured outcome; the caller decides whether to retry with a
+/// fallback target (dual-numbering) or surface the result as final.
+async fn trakt_sync_history_once(
+    token_bearer: &str, target: &TraktTarget, sess: &ScrobbleSession, progress_pct: f64,
+) -> TraktSyncOutcome {
+    let body = build_history_body(target);
     let res = client()
         .post(format!("{TRAKT_API}/sync/history"))
-        .header("Authorization", format!("Bearer {}", token.access_token))
+        .header("Authorization", format!("Bearer {token_bearer}"))
         .header("Content-Type", "application/json")
         .header("trakt-api-version", "2")
         .header("trakt-api-key", scrobble_auth::TRAKT_CLIENT_ID)
@@ -250,48 +331,130 @@ async fn trakt_sync_history(scope: &str, sess: &ScrobbleSession, time: f64, dura
 
     match res {
         Ok(r) if r.status().is_success() => {
-            // Trakt's /sync/history response includes an `added` /
-            // `not_found` breakdown — we don't parse it, but logging
-            // the status code is enough for users to verify in
-            // DevConsole that the call landed (201 Created on success).
-            crate::devlog!(
-                info, "scrobble",
-                "Trakt /sync/history OK (status={}, {:.0}% watched) for {}",
-                r.status().as_u16(), progress_pct, sess.imdb_id,
-            );
+            // Parse `added` vs `not_found` from the response body. Trakt
+            // accepts syntactically valid payloads even when the show or
+            // episode isn't in their catalog (silent miss). The earlier
+            // status-only handler treated those as success — that's the
+            // bug this whole refactor fixes.
+            let status = r.status().as_u16();
+            let body: Result<TraktSyncResponseBody, _> = r.json().await;
+            let (added_n, not_found_n) = match &body {
+                Ok(b) => {
+                    let added = b.added.as_ref().map(|a| a.episodes + a.movies).unwrap_or(0);
+                    let nf = b.not_found.as_ref()
+                        .map(|n| (n.episodes.len() + n.movies.len()) as u32)
+                        .unwrap_or(0);
+                    (added, nf)
+                }
+                Err(_) => (0, 0),
+            };
+            if added_n > 0 {
+                crate::devlog!(
+                    info, "scrobble",
+                    "Trakt /sync/history OK (status={}, {:.0}% watched, added={}) for {}",
+                    status, progress_pct, added_n, sess.imdb_id,
+                );
+                TraktSyncOutcome::Added
+            } else if not_found_n > 0 {
+                crate::devlog!(
+                    warn, "scrobble",
+                    "Trakt /sync/history accepted but not_found (status={}, not_found={}) for {} \
+                     — show/episode not in Trakt's catalog under this numbering",
+                    status, not_found_n, sess.imdb_id,
+                );
+                TraktSyncOutcome::NotFound
+            } else {
+                // 201 with no body or unparseable body — assume Added so
+                // we don't false-flag a legitimate scrobble. Documented
+                // catch-all per Trakt's spec where well-formed requests
+                // always return one of the two breakdowns.
+                crate::devlog!(
+                    info, "scrobble",
+                    "Trakt /sync/history OK (status={}, response body unparseable, treating as added) for {}",
+                    status, sess.imdb_id,
+                );
+                TraktSyncOutcome::Added
+            }
         }
         Ok(r) if r.status().as_u16() == 401 => {
-            // Token revoked / expired. Clear the keyring entry so the
-            // Settings UI picks it up as Disconnected on next refresh
-            // (the per-session refetch in ScrobbleAuthRow runs on
-            // mount + on `aura:scrobble-auth-changed`). The next
-            // Connect flow re-prompts cleanly. We deliberately don't
-            // emit a Tauri event here — a mid-playback dialog "your
-            // Trakt token expired" would be more disruptive than
-            // useful, and the user discovers the disconnected state
-            // when they next open Settings.
             crate::devlog!(
                 warn, "scrobble",
-                "Trakt 401: clearing token for scope={} (user must reconnect)",
-                scope,
+                "Trakt 401: token expired/revoked (will clear, user must reconnect)",
             );
-            scrobble_auth::clear_token_for("trakt", scope);
+            TraktSyncOutcome::Unauthorized
         }
         Ok(r) => {
-            crate::devlog!(
-                warn, "scrobble",
-                "Trakt /sync/history status {}",
-                r.status().as_u16(),
-            );
+            crate::devlog!(warn, "scrobble", "Trakt /sync/history status {}", r.status().as_u16());
+            TraktSyncOutcome::HttpError
         }
         Err(e) => {
             let category = if e.is_timeout() { "timeout" }
                 else if e.is_connect() { "connect" }
                 else { "send" };
-            // Truncate to category-only — `e.to_string()` may include
-            // the request URL with the bearer token in headers if a
-            // future log-formatter swap brings header dumps along.
             crate::devlog!(warn, "scrobble", "Trakt /sync/history {category}");
+            TraktSyncOutcome::HttpError
+        }
+    }
+}
+
+async fn trakt_sync_history(scope: &str, sess: &ScrobbleSession, time: f64, duration: f64) -> TraktSyncResult {
+    let Some(token) = scrobble_auth::read_token_for("trakt", scope) else {
+        crate::devlog!(
+            info, "scrobble",
+            "Trakt /sync/history skipped: no token for scope={scope}",
+        );
+        return TraktSyncResult::Skipped;
+    };
+    let (primary, fallback) = trakt_targets(sess);
+    let Some(primary) = primary else {
+        crate::devlog!(
+            warn, "scrobble",
+            "Trakt /sync/history skipped: id format unsupported: {} (type={})",
+            sess.imdb_id, sess.media_type,
+        );
+        return TraktSyncResult::Skipped;
+    };
+
+    let progress_pct = if duration > 0.0 {
+        (time / duration * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+
+    let primary_outcome = trakt_sync_history_once(
+        &token.access_token, &primary, sess, progress_pct,
+    ).await;
+
+    match primary_outcome {
+        TraktSyncOutcome::Added => TraktSyncResult::Fired,
+        TraktSyncOutcome::Unauthorized => {
+            scrobble_auth::clear_token_for("trakt", scope);
+            TraktSyncResult::Failed
+        }
+        TraktSyncOutcome::HttpError => TraktSyncResult::Failed,
+        TraktSyncOutcome::NotFound => {
+            // Dual-numbering retry. The fallback target is the
+            // ID-parsed alternate (when the primary came from a
+            // VideoEntry override). If they're identical or there's no
+            // alternate, no retry — surface NotFound as final.
+            let Some(fallback) = fallback else {
+                return TraktSyncResult::NotFound;
+            };
+            crate::devlog!(
+                info, "scrobble",
+                "Trakt not_found on primary numbering — retrying with fallback (S/E from id-parse)",
+            );
+            match trakt_sync_history_once(
+                &token.access_token, &fallback, sess, progress_pct,
+            ).await {
+                TraktSyncOutcome::Added       => TraktSyncResult::Fired,
+                TraktSyncOutcome::NotFound    => TraktSyncResult::NotFound,
+                TraktSyncOutcome::HttpError   => TraktSyncResult::Failed,
+                TraktSyncOutcome::Unauthorized => {
+                    scrobble_auth::clear_token_for("trakt", scope);
+                    TraktSyncResult::Failed
+                }
+            }
         }
     }
 }
@@ -484,19 +647,18 @@ pub async fn scrobble_test_fire<R: Runtime>(
         _                  => (95.0, 100.0),
     };
 
-    let trakt_will_fire = parse_trakt_target(&sess.imdb_id, &sess.media_type).is_some()
-        && scrobble_auth::read_token_for("trakt", &scope).is_some();
     let anilist_will_fire = sess.is_anime
         && scrobble_auth::read_token_for("anilist", &scope).is_some();
 
     crate::devlog!(
         info, "scrobble",
-        "scrobble_test_fire: id={} type={} anime={} scope={} test_progress={:.0}%",
+        "scrobble_test_fire: id={} type={} anime={} scope={} test_progress={:.0}% season={:?} ep={:?}",
         sess.imdb_id, sess.media_type, sess.is_anime, scope,
         if test_duration > 0.0 { test_time / test_duration * 100.0 } else { 0.0 },
+        sess.season, sess.episode_num,
     );
 
-    trakt_sync_history(&scope, &sess, test_time, test_duration).await;
+    let trakt_result = trakt_sync_history(&scope, &sess, test_time, test_duration).await;
     let anilist_outcome = crate::scrobble_anilist::save_progress(&app, &scope, &sess).await;
     if let Err(crate::scrobble_anilist::AnilistError::Unauthorized) = anilist_outcome {
         crate::devlog!(
@@ -506,8 +668,12 @@ pub async fn scrobble_test_fire<R: Runtime>(
         crate::scrobble_auth::clear_token_for("anilist", &scope);
     }
 
-    let trakt_msg = if trakt_will_fire { "fired".to_string() }
-                    else { "skipped (no token or unsupported id)".to_string() };
+    let trakt_msg = match trakt_result {
+        TraktSyncResult::Fired    => "fired".to_string(),
+        TraktSyncResult::NotFound => "not_found (S/E mismatch with Trakt catalog)".to_string(),
+        TraktSyncResult::Skipped  => "skipped (no token or unsupported id)".to_string(),
+        TraktSyncResult::Failed   => "failed (network or HTTP error)".to_string(),
+    };
     let anilist_msg = if anilist_will_fire {
         match &anilist_outcome {
             Ok(()) => "fired".to_string(),
@@ -531,7 +697,7 @@ pub async fn scrobble_test_fire<R: Runtime>(
         id: Some(sess.imdb_id),
         media_type: Some(sess.media_type),
         is_anime: sess.is_anime,
-        trakt_fired: trakt_will_fire,
+        trakt_fired: trakt_result == TraktSyncResult::Fired,
         anilist_fired: anilist_will_fire && anilist_outcome.is_ok(),
         message,
     })
@@ -579,8 +745,14 @@ pub fn shutdown_blocking<R: Runtime>(app: &AppHandle<R>) {
     // singleton because reqwest's per-request timeout overrides the
     // builder's, and we want a tighter ceiling than the 8s runtime
     // default for the shutdown path specifically.
+    // Use the same primary-target selection as the live path so the
+    // VideoEntry's authoritative season/episode is preferred over the
+    // ID-parsed alternate. Fire-and-forget; no retry on `not_found`
+    // here because the shutdown path can't wait on the response body
+    // parse + a second round-trip.
+    let (primary_target, _fallback) = trakt_targets(&sess);
     if let (Some(target), Some(token)) = (
-        parse_trakt_target(&sess.imdb_id, &sess.media_type),
+        primary_target,
         scrobble_auth::read_token_for("trakt", &scope),
     ) {
         crate::devlog!(

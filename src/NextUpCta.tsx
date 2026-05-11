@@ -23,9 +23,11 @@
 //     an opt-in setting if there's demand.
 // ---------------------------------------------------------------------------
 
+import { useEffect, useRef, useState } from "react";
 import ImageLoader from "./ImageLoader";
 import type { VideoEntry } from "./types";
 import { formatEpisodeTag } from "./nextUp";
+import { loadAuraSettings } from "./auraSettings";
 
 interface Props {
   /** The next episode metadata. Provides the title + thumbnail. */
@@ -53,6 +55,75 @@ export default function NextUpCta({
 }: Props) {
   const tag = formatEpisodeTag(episode);
   const title = (episode.title ?? "").trim() || "Untitled episode";
+
+  // ── Opt-in auto-advance ─────────────────────────────────────────────
+  // When the user has flipped `autoAdvanceNextEpisode` ON in Settings,
+  // arm a countdown the moment the CTA mounts with a resolved playable
+  // stream (loading === false AND noStream === false). The countdown
+  // shows as a thin progress bar across the bottom of the card and the
+  // primary CTA button gains a "Playing in Ns…" label. Any cancel
+  // signal (mouse move in the viewport, key press, mouseenter on the
+  // card itself) clears the timer and the CTA reverts to its standard
+  // "Play next episode" state — the user can still click manually.
+  //
+  // Settings are read once at mount via the existing loadAuraSettings
+  // memoized snapshot; we deliberately don't subscribe to mid-session
+  // setting changes because the active countdown is tied to the
+  // moment-of-truth surfacing of the CTA, and reacting to a setting
+  // flip mid-countdown would either restart or abort in surprising
+  // ways. The user opts in at the level of "the next time NextUp
+  // surfaces, use auto-advance." Next surface honours the new value.
+  const settings = loadAuraSettings();
+  const initialSeconds = Math.max(5, Math.min(30, Math.round(settings.autoAdvanceDelaySeconds)));
+  const autoArmed = settings.autoAdvanceNextEpisode && !loading && !noStream;
+
+  const [remaining, setRemaining] = useState<number | null>(autoArmed ? initialSeconds : null);
+  // `cancelled` latches once the user has expressed any cancel intent
+  // so we don't restart the countdown if `autoArmed` flickers true again
+  // (e.g. a `loading=true → false` cycle while the user was actively
+  // moving the mouse). One cancel = no auto for this CTA instance.
+  const cancelledRef = useRef(false);
+
+  useEffect(() => {
+    if (!autoArmed) return;
+    if (cancelledRef.current) return;
+    if (remaining === null) {
+      setRemaining(initialSeconds);
+      return;
+    }
+    if (remaining <= 0) {
+      onPlay();
+      return;
+    }
+    const id = window.setTimeout(() => setRemaining((s) => (s === null ? null : s - 1)), 1000);
+    return () => window.clearTimeout(id);
+  }, [autoArmed, remaining, initialSeconds, onPlay]);
+
+  // Cancel signals: any pointer move on the document, any keydown,
+  // hover into the CTA card itself (the user is reading / about to
+  // act), or the explicit dismiss button. Arrow / Escape / Tab all
+  // count — the user touched the keyboard. We listen at the window
+  // scope while the countdown is armed and detach when it isn't.
+  useEffect(() => {
+    if (remaining === null) return;
+    const cancel = () => {
+      cancelledRef.current = true;
+      setRemaining(null);
+    };
+    window.addEventListener("pointermove", cancel, { passive: true });
+    window.addEventListener("keydown", cancel);
+    window.addEventListener("wheel", cancel, { passive: true });
+    return () => {
+      window.removeEventListener("pointermove", cancel);
+      window.removeEventListener("keydown", cancel);
+      window.removeEventListener("wheel", cancel);
+    };
+  }, [remaining]);
+
+  const countdownActive = remaining !== null && remaining > 0;
+  const fillPct = countdownActive
+    ? Math.max(0, Math.min(100, ((initialSeconds - remaining) / initialSeconds) * 100))
+    : 0;
 
   return (
     <div
@@ -135,13 +206,24 @@ export default function NextUpCta({
             type="button"
             disabled={loading}
             onClick={onPlay}
-            className="w-full px-3 py-1.5 rounded-lg
+            className="relative w-full px-3 py-1.5 rounded-lg overflow-hidden
                        border border-ln-accent/45 bg-ln-accent/20
                        text-ln-accent text-[12px] font-semibold tracking-wide
                        hover:bg-ln-accent/30 transition-colors
                        disabled:opacity-55 disabled:cursor-progress
                        flex items-center justify-center gap-2"
           >
+            {/* Auto-advance countdown fill — paints behind the button
+                label as a thin growing bar so the user sees the timer
+                at a glance without cluttering the layout. Linear 1s
+                steps, no easing, so it reads as a real clock. */}
+            {countdownActive && (
+              <span
+                aria-hidden
+                className="absolute inset-y-0 left-0 bg-ln-accent/25 transition-[width] duration-1000 ease-linear"
+                style={{ width: `${fillPct}%` }}
+              />
+            )}
             {loading ? (
               <>
                 <svg
@@ -156,6 +238,13 @@ export default function NextUpCta({
                 </svg>
                 Resolving stream…
               </>
+            ) : countdownActive ? (
+              <span className="relative flex items-center gap-2">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                  <path d="M8 5v14l11-7z" />
+                </svg>
+                Playing next in {remaining}s — move to cancel
+              </span>
             ) : (
               <>
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>

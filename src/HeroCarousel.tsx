@@ -146,19 +146,26 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
         aspectRatio: "21 / 9",
         maxHeight: HERO_MAX_HEIGHT,
         maxWidth: HERO_MAX_WIDTH,
-        // Soft alpha-fade edges with an S-curve falloff. The previous
-        // shape (transparent → black at hard 6 % / 2 % stops) read as
-        // a sharp line on the inside of the fade where it met the
-        // artwork. Adding a half-opacity midpoint (50 % black at the
-        // mid-fade) smooths the transition into a gentle gradient
-        // instead of an abrupt edge — backdrop art now bleeds into
-        // the page background instead of cutting off.
+        // Narrow alpha-fade edges. Previously the bottom fade ran from
+        // black at 90 % to transparent at 100 % — a 10 % band that ate
+        // into the text region (the title + synopsis live in the bottom
+        // ~5 %), and on dark-natured artwork the soft fade read as a
+        // visible vertical band where the alpha dropped to ~50 %.
+        // Narrowed to 1.5–2 % bands on every side so:
+        //   1. The text sits inside the fully-opaque region (no fade-
+        //      over-text), making the existing text-shadow do all the
+        //      legibility lifting cleanly.
+        //   2. The seam where the mask meets the page background is
+        //      ~5× smaller — barely perceptible on dark images and
+        //      essentially invisible on bright ones.
+        // The 50 %-alpha midpoint is kept to avoid a hard line — just
+        // packed into a much tighter range.
         WebkitMaskImage:
-          "linear-gradient(to bottom, transparent 0%, rgba(0,0,0,0.5) 3%, black 10%, black 90%, rgba(0,0,0,0.5) 97%, transparent 100%), " +
-          "linear-gradient(to right, transparent 0%, rgba(0,0,0,0.5) 1.2%, black 5%, black 95%, rgba(0,0,0,0.5) 98.8%, transparent 100%)",
+          "linear-gradient(to bottom, transparent 0%, rgba(0,0,0,0.5) 1%, black 2%, black 98%, rgba(0,0,0,0.5) 99%, transparent 100%), " +
+          "linear-gradient(to right, transparent 0%, rgba(0,0,0,0.5) 0.5%, black 1.5%, black 98.5%, rgba(0,0,0,0.5) 99.5%, transparent 100%)",
         maskImage:
-          "linear-gradient(to bottom, transparent 0%, rgba(0,0,0,0.5) 3%, black 10%, black 90%, rgba(0,0,0,0.5) 97%, transparent 100%), " +
-          "linear-gradient(to right, transparent 0%, rgba(0,0,0,0.5) 1.2%, black 5%, black 95%, rgba(0,0,0,0.5) 98.8%, transparent 100%)",
+          "linear-gradient(to bottom, transparent 0%, rgba(0,0,0,0.5) 1%, black 2%, black 98%, rgba(0,0,0,0.5) 99%, transparent 100%), " +
+          "linear-gradient(to right, transparent 0%, rgba(0,0,0,0.5) 0.5%, black 1.5%, black 98.5%, rgba(0,0,0,0.5) 99.5%, transparent 100%)",
         WebkitMaskComposite: "source-in" as React.CSSProperties["WebkitMaskComposite"],
         // Standards property — newer Chromium / Safari support `intersect`.
         maskComposite: "intersect",
@@ -211,9 +218,34 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
         </div>
       )}
 
+      {/* Localised legibility ramp — a soft radial-ish gradient anchored
+          to the bottom-left corner of the hero, sized to cover the title
+          + synopsis column without touching the rest of the image. Gives
+          the text a darker pedestal on dark-natured backdrops (cave
+          scenes, night shots, low-key cinematography) where the existing
+          text-shadow alone reads as visible glow against the source
+          darkness. On bright backdrops the gradient blends into the
+          natural shadow gradient of the image and is essentially
+          invisible. Independent of the mask fades above — that fix
+          addresses the page-edge seam; this one addresses text-on-image
+          legibility. pointer-events: none so it doesn't intercept the
+          wrapper's click-to-detail handler. */}
+      <div
+        aria-hidden
+        className="absolute inset-0 pointer-events-none"
+        style={{
+          background:
+            "linear-gradient(to top right, " +
+              "rgba(0,0,0,0.55) 0%, " +
+              "rgba(0,0,0,0.40) 20%, " +
+              "rgba(0,0,0,0.20) 40%, " +
+              "transparent 65%)",
+        }}
+      />
+
       {/* Hero text overlay — bare typography anchored bottom-LEFT of
-          the hero box. No glass card; the shadow does the legibility
-          heavy-lifting. Restricted to a left-anchored column so long
+          the hero box. No glass card; the shadow + the legibility ramp
+          above do the work. Restricted to a left-anchored column so long
           synopses don't sprawl across the whole hero, and pulled tight
           to the bottom-left corner with `justify-start` + `items-end`
           so the block feels intentionally placed rather than centred. */}

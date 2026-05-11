@@ -4,6 +4,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import Tooltip from "./Tooltip";
+import SyncStatusChip from "./SyncStatusChip";
 
 // ---------------------------------------------------------------------------
 // TitleBar
@@ -148,7 +149,16 @@ export default function TitleBar({ subtitle, opaque }: Props) {
         )}
       </div>
 
-      {/* Spacer pushes window controls to the right (left side intentionally blank) */}
+      {/* Sync status chip — left of the spacer, anchored to the start of
+          the bar. Reflects Aura Cloud connection + freshness at a glance
+          (gray cloud = guest, green check = recently synced, amber alert
+          = stale, rose X = error). Click jumps to Settings → Cloud Sync
+          (sec-cloud-sync) once that section ships. */}
+      <div className="relative flex items-stretch h-full pl-2" data-no-drag>
+        <SyncStatusChip />
+      </div>
+
+      {/* Spacer pushes window controls to the right */}
       <div className="flex-1" />
 
       {/* Window controls — pointer-events forced auto so they sit above the drag layer */}

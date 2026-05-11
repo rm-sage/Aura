@@ -1,8 +1,9 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { invoke } from "@tauri-apps/api/core";
 import {
   useNotifications,
   type Notification,
@@ -186,6 +187,48 @@ function toneFor(kind: NotificationKind) {
 function NotificationRow({ notification, onActivate, onDismiss }: RowProps) {
   const { id, kind, title, subtitle, createdAt, read } = notification;
   const tone = toneFor(kind);
+
+  // Inline action surface — currently scoped to AniList token-expiry
+  // notifications so the user can re-auth without leaving the panel.
+  // Trakt has refresh tokens and a device-flow that requires UI to
+  // display the user_code, so its alerts still route through Settings
+  // (the user clicks the row to dismiss + opens Settings → Trakt
+  // section manually). AniList's authorize-URL flow fits a single
+  // button: open the OAuth popup, which intercepts the redirect and
+  // re-emits the deep-link that scrobble_auth picks up.
+  const expiredProvider =
+    notification.data?.kind === "scrobble-auth-expired"
+      ? (notification.data?.provider as string | undefined)
+      : undefined;
+  const expiredScope = notification.data?.scope as string | undefined;
+  const showReconnect = expiredProvider === "anilist" && !!expiredScope;
+  const [reconnecting, setReconnecting] = useState(false);
+
+  const handleReconnect = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (reconnecting || !expiredScope) return;
+    setReconnecting(true);
+    try {
+      // Mirrors the SettingsView → ScrobbleAuthRow → AniList branch:
+      // stash the scope so the deep-link handler can route the token
+      // to the right keyring slot, fetch the authorize URL, open the
+      // OAuth popup with the redirect interceptor. Success closes the
+      // popup and dispatches `aura:scrobble-auth-changed`; the
+      // useScrobbleAuthAlerts watcher then removes this notification
+      // automatically since the token is no longer expired.
+      sessionStorage.setItem(`aura:oauth:pending:anilist`, expiredScope);
+      const url = await invoke<string>("scrobble_oauth_authorize_url", { service: "anilist" });
+      const { openOAuthPopup } = await import("./SourcePopup");
+      openOAuthPopup(url, "Reconnect AniList", {
+        interceptPrefix: `aura://oauth/anilist`,
+      });
+    } catch (err) {
+      console.warn("[notifications] AniList reconnect failed:", err);
+    } finally {
+      setReconnecting(false);
+    }
+  };
+
   return (
     <li
       key={id}
@@ -224,6 +267,21 @@ function NotificationRow({ notification, onActivate, onDismiss }: RowProps) {
           <div className="text-xs text-white/55 leading-snug mt-0.5 line-clamp-2">
             {subtitle}
           </div>
+        )}
+        {showReconnect && (
+          <button
+            type="button"
+            onClick={handleReconnect}
+            disabled={reconnecting}
+            className="mt-2 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md
+                       text-[11px] font-medium tracking-wide
+                       bg-amber-500/15 hover:bg-amber-500/25
+                       text-amber-200 hover:text-amber-100
+                       border border-amber-400/35 hover:border-amber-400/55
+                       transition-colors disabled:opacity-50"
+          >
+            {reconnecting ? "Opening…" : "Reconnect AniList"}
+          </button>
         )}
         <div className="text-[10px] text-white/35 mt-1.5 uppercase tracking-wider">
           {relativeTime(createdAt)}

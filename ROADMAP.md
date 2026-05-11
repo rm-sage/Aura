@@ -48,7 +48,7 @@ Platform keyring, `Zeroizing<String>` password scrubbing, `https_only` auth clie
 
 > **Architecture note:** When a session is active, Stremio account API is the source of truth for addon persistence. Local `addons.json` is read and written only in guest mode.
 
-### 2.4 OS Deep Linking ✅ (route table) / 🟡 (signing)
+### 2.4 OS Deep Linking ✅
 
 - [x] `tauri-plugin-deep-link` registered; `aura://` and `stremio://` protocol schemes configured
 - [x] Incoming URL forwarded to frontend as `deep-link` Tauri event
@@ -56,7 +56,7 @@ Platform keyring, `Zeroizing<String>` password scrubbing, `https_only` auth clie
 - [x] `stremio://detail/{type}/{id}` (and `aura://detail/<type>/<id>` alias): routes to DetailView with a stub MetaPreview, full meta detail filled in by DetailView's own fetch
 - [x] `aura://oauth/{trakt,anilist}?...`: OAuth callback handler (see Phase 6.x scrobble auth)
 - [x] Auto-updater wired: `tauri-plugin-updater` registered with `endpoints` pointing at `github.com/rm-sage/Aura/releases/latest/download/latest.json`; `updater.ts` + `updaterPlugin.ts` perform the version check
-  - [ ] Update signing keypair: `pubkey` in `tauri.conf.json` is still the placeholder. Per `PRODUCTION.md`, generating a real keypair is blocked on Authenticode code signing (Tauri's updater rejects unsigned payloads)
+- [x] Update signing keypair: real minisign keypair generated; `tauri.conf.json::plugins.updater.pubkey` carries the production public key (key id `B632D9CFF50F9FDD`); `bundle.createUpdaterArtifacts: true` ships a matching `.sig` next to every release installer; `scripts/release.ps1` runs `pnpm tauri signer sign` against the bundled output. Authenticode / EV code signing (for SmartScreen, separate from updater payload signing) remains opt-in and is tracked in 6.0.x Open
 
 ### 2.5 Cinema Suite and Performance Overlay ✅
 
@@ -69,7 +69,7 @@ Platform keyring, `Zeroizing<String>` password scrubbing, `https_only` auth clie
 - [x] `vo=gpu-next`, `target-colorspace-hint=yes`, `hdr-compute-peak=yes`, `tone-mapping=auto`
 - [x] Dolby Atmos / DTS-X audio passthrough (`audio-spdif`, `audio-exclusive=yes`): opt-in via Settings (off by default to avoid WASAPI device lock)
 - [x] Subtitle defaults (pos 95, size 45, border 3, shadow 2)
-- [ ] Shader files: place in `src-tauri/shaders/` (see `shaders/README.txt` for download links + per-mode required filenames)
+- [x] Shader files committed under `src-tauri/shaders/` (all twelve Anime4K v4 chains plus FSR / FSRCNNX / KrigBilateral / RAVU / SSimSuperRes) and bundled via `tauri.conf.json::bundle.resources`
 
 ---
 
@@ -502,16 +502,92 @@ A grab-bag of post-5.8 work that isn't gated to a single rendering / IPC milesto
 - [x] AniList save_progress: title search → media id resolve → SaveMediaListEntry mutation; per-show id cache persisted to disk; only updates if our episode > existing progress
 - [x] Token redaction in three log sites (single-instance argv, deep-link arrival, popup intercept) so `token=<redacted>` lands in `aura-mpv.log` instead of the live JWT
 
+### 6.0.x AniSkip OP/ED/recap skip ✅
+
+- [x] `aniskip.rs` + `src-tauri/scripts/skip-windows.lua`: OP / ED / mixed-op / recap window fetch (AniSkip API, 24h negative cache, 30d positive `PersistentCache` keyed `mal:ep:treatMixed`). JSON written to MPV's `user-data/aura/skip-windows` property and consumed by the Lua observer that performs the seek (auto) or surfaces a "Skip …" toast (manual)
+- [x] Settings → Anime OP / ED Skip exposes `skip_op_mode`, `skip_ed_mode`, `skip_recap_mode`, and `skip_treat_mixed_op_as_op`. Each kind is off / manual / auto
+- [x] `silencedetect.rs`: ffmpeg-fallback silence-boundary detector for streams without AniSkip data AND without chapter markers. Shells out to `ffmpeg -af silencedetect`, parses stderr `silence_start` / `silence_end`, returns intervals
+- [x] Chapter-merge guardrail: `App.tsx::mergeChapterSkipWindows` reads MPV's `chapter-list` in `string` format only (CLAUDE.md landmine #3 — `node` format hits the dispatch-table fault on this libmpv build)
+
+### 6.0.x Discover / History / Queue views ✅
+
+- [x] `<DiscoverView />`: Addon → Catalog dual pill selector; surfaces every catalog including the "enabled but hidden from home" set (`catalog_is_hidden_from_home` detects them via required-without-default extras like AIOMetadata's calendar-videos / schedule). FilterBar sidebar reused
+- [x] `<HistoryView />`: Trakt-style automatic-watches feed (entries created at exit-playback when ≥ 85 % progress OR ≥ 5 min elapsed; manual marks excluded by contract). Scope-keyed `aura:history:<scope>` with 1000-entry cap; day-grouped with cumulative runtime totals; per-entry hover-X remove + "Clear history" wipe
+- [x] `<QueueView />`: ordered list of items marked "planned". `@dnd-kit` drag reorder (PointerSensor with 6 px activation distance so Remove clicks don't accidentally start a drag; KeyboardSensor for accessibility). Reorder persists via `setManualWatchedOrder` and rides Aura Cloud's `manual-state` namespace
+- [x] Both views integrate `FilterBar` (year / rating / genre / sort) so the existing filtering muscle works on personal feeds, not just discovery
+
+### 6.0.x Watched marks + auto-bumped + auto-advance + Next-Up CTA ✅
+
+- [x] `manualWatched.ts`: four-state per-id mark (watched / in-progress / planned / null); persisted under `aura:manual-state:<scope>`; legacy binary schema migrated on load
+- [x] `<WatchedBadge />` + `<WatchedCheck />`: glass overlay icons on every tile across the app (green check for watched, yellow dot for in-progress, blue bookmark for planned)
+- [x] `watchedSync.ts`: only the "watched" state pushes to Stremio cloud (via `state.aura_watched` + a `timeOffset` bump for movies); series-root only, episodes stay local. PULL never clobbers explicit local marks
+- [x] `autoBumped.ts`: when a series the user already finished gets new aired episodes, the id lands in `aura:auto-bumped-series:v1` (cross-scope set) and the first new episode auto-marks in-progress. Continue Watching filter suppresses the row until the user re-engages (plays an ep / changes the mark / manually marks the new one watched)
+- [x] `autoAdvance.ts`: after a watched episode, mark the next aired one in-progress (cross-season aware; specials handled separately). Series-root "watched" gate requires every aired episode watched (upcoming episodes excluded so a currently-airing series never auto-flips to "watched" prematurely)
+- [x] `nextUp.ts` + `<NextUpCta />`: resolves the next episode (cross-season rollover supported) and pre-fetches its highest-priority stream. Floating bottom-right card surfaces during the final stretch (lead-time configurable, or end-of-ED chapter, whichever first). Explicit click; no silent auto-advance yet (deferred)
+- [x] `<ResumePrompt />`: pre-load modal when the library carries non-trivial `state.timeOffset`. Two choices: Resume (default) or Start over. Esc / Enter map to start-over / resume; no auto-confirm timer. ms-vs-s normalization in `libraryNormalize.ts` for legacy seconds-written records
+
+### 6.0.x Notifications system ✅
+
+- [x] `NotificationsContext` ring buffer (soft cap 200; absolute hard cap 1000); seven kinds (release / episode / update / notice / success / warning / error). Undismissed entries never evicted by the soft cap — only dismissed entries compete for slots
+- [x] `<NotificationsBell />` (bottom-left chrome) pulses on unread; click toggles `<NotificationsPanel />` (glass card anchored above). Popup defer: when the bell isn't on a visible surface (mid-playback, modal open) the popup waits and surfaces when the bell next mounts
+- [x] `<NotificationsScanner />`: global 30-min interval (runs in every view, not just Home — earlier gate was the user-visible bug). 30-day recent-release window for first-scan seeding; optional `notifyOnlyWithStreams` toggle gates on `fetch_streams` returning at least one playable result (12 h availability cache). Coalesces popups (150 ms window) so a fresh install never chases the user with N popups for a single show
+- [x] Persistence + cloud round-trip: full list to `aura:notifications:v1`; cloud sync via the `notifications` namespace with `(kind, id)`-dedup, undismissed-first eviction, and a re-read-disk-and-union write guard so a scanner fire mid-pull can't be clobbered by the merged write
+- [x] Update notifications are non-dismissable individually (they have to be acted on by clicking through to the release URL); "Dismiss all" excludes them
+
+### 6.0.x Per-title state + Stats panel ✅
+
+- [x] `per_title.rs::TITLE_STATE`: per-id cache (`{media_type}:{id}` → `{volume, shader_profile, audio_lang, sub_lang}`); persists to `<app_data>/per-title.json`; survives episode replays and applies to sibling episodes within the same series. Bulk `get_all_title_state` / `set_all_title_state` so Aura Cloud's `title-state` namespace can round-trip the whole map
+- [x] `stats.rs`: lightweight local counters persisted to `<app_data>/stats.json` (`watched_movie_secs`, `watched_anime_secs`, `streams_played`, `home_view_secs`); written from `useScrobble` + view-mount effects; surfaced in Settings → About. Local-only — never pushed to Aura Cloud
+
+### 6.0.x In-app OAuth popup + AniList scrobble ✅
+
+(supplements the earlier 6.0.x Scrobble OAuth entry — these landed on top of the proxy device-flow scaffold)
+
+- [x] AniList authorization flow runs inside an in-app Tauri `WebviewWindow` (`open_oauth_popup_webview`); intercepts `aura://oauth/anilist?...` via `on_navigation`, re-emits as a `deep-link` event, never round-trips through the user's default browser. Origin-gated to honour `aura://oauth/*` only when the prior page was the proxy host; live security chip shows the current host
+- [x] `scrobble_anilist.rs`: title-search → AniList media id resolve → `SaveMediaListEntry` mutation. Per-show id cache persisted to `<app_data>/anilist-id-cache.json`. No-op when the saved AniList progress already exceeds ours (no clobbering for users who scrobble from multiple clients)
+- [x] `useScrobbleAuthAlerts.ts`: per-scope token-expiry watcher (`get_scrobble_auth_status`); fires warning notifications on Trakt / AniList 401s; rechecks on `focus` + `deep-link` events for mid-session token death
+- [x] Scrobble test command: `DevConsole > scrobble` (Rust `scrobble_test_fire`) — fires Trakt `/sync/history` + AniList `SaveMediaListEntry` against the live session WITHOUT consuming it, synthesizes 95 % progress, reports per-provider fired/skipped status with rationale (no token, not flagged anime, unsupported id, etc.)
+
+### 6.0.x System tray + window state + boot splash + resize handles ✅
+
+- [x] `tray.rs`: always-installed tray icon (Show / Quit menu, left-click brings the main window to focus). Optional `minimize_to_tray_on_close` setting routes the close button into hide-to-tray
+- [x] `tauri-plugin-window-state`: position + size + maximize state restored on launch; the `restore_state` setup hook runs before BootSplash paints so the window opens at the previous bounds
+- [x] `<BootSplash />`: full-window glass card during startup + Stremio session restore; carries the same ambient gradient layer so the theme stays continuous through to the post-boot UI. Title bar slot kept uncovered (top:36px) so the chrome stays interactive during boot
+- [x] `<ResizeHandles />`: invisible hit-targets on each edge + corner routing pointer-down through `getCurrentWindow().startResizeDragging(...)` since the title bar uses custom chrome (no native Windows edge-resize)
+
+### 6.0.x DevConsole REPL ✅
+
+- [x] `:` command line at the bottom of the console; tab-completion against the verb table; commands: `help`, `clear`, `pause` / `resume`, `search <q>`, `unfilter`, `level <name> <on|off>`, `info|warn|error|debug <msg>`, `throw [msg]` (JS Sentry test), `panic [msg]` (Rust `dev_force_panic`), `eval <expr>`, `version`, `scrobble` (live-session test fire, see scrobble OAuth section)
+
+### 6.0.x Crash reporting (production) ✅
+
+- [x] `sentry 0.46` + `sentry-rust-minidump 0.14`: Crashpad-style native crash capture self-spawns the Aura binary in "reporter" mode (recognised by a private CLI flag the crate registers) so no external handler binary needs to be bundled. JS side uses `@sentry/react` — both bootstraps gated on consent
+- [x] First-run consent dialog (`<CrashReportingConsent />`); decision persists in `<app_data>/crash-reporting.json` (scope-independent so opting in survives Stremio account switches)
+- [x] Hardcoded production DSN ships with the bundle; `SENTRY_DSN` / `VITE_SENTRY_DSN` env vars override for fork builds. `before_send` strips IP / geo / request on both ends; pair with the project-level "Prevent Storing of IP Addresses" toggle
+- [x] `pnpm release` wraps signed Tauri build + PDB symbol upload via `scripts/release.ps1`; `profile.release.debug = "limited"` keeps PDBs ~3–5 MB while still resolving line tables for symbolication
+
 ### 6.0.x Open
 
-- [ ] SMTC Next / Previous → queue advance: media-key events arrive but aren't routed; needs decision on queue semantics first (next planned vs next episode in current series)
-- [ ] Update payload signing: `pubkey` in `tauri.conf.json` is still the placeholder; blocked on Authenticode code signing (per `PRODUCTION.md`, user opted out of EV/OV cert acquisition for now)
-- [x] Crash reporting receiver: Sentry SDK wired in (Rust panic hook + JS error capture), gated on a first-run consent dialog (`CrashReportingConsent.tsx`). User pastes their own DSN in Settings → Integrations → Crash Reporting (or builds with `SENTRY_DSN` / `VITE_SENTRY_DSN` baked in). Defaults to off until consent is given
-- [ ] Settings encryption / OS keyring migration: Stremio auth tokens + OMDb key currently live in plaintext `settings.json`; threat model is "single-user desktop, OS-level filesystem trust" so non-blocking, but the migration is the right move for shared-PC scenarios
+- [ ] SMTC Next / Previous → queue advance: media-key events arrive at App.tsx but aren't routed into the queue / next-episode advance yet. Needs a one-line decision on semantics first — probably "queue first, then `nextUp.findNextEpisode` as fallback when the queue is empty"
+- [ ] Silent auto-advance toggle: `<NextUpCta />` currently requires an explicit click. A user-opt-in setting that auto-fires `playNext` N seconds after the ED chapter (or last-N-second mark) would close the muscle-memory gap for binge sessions
+- [ ] AniList re-auth UX: AniList has no refresh tokens, so a 401 mid-session means the next scrobble silently no-ops until the user manually re-connects. `useScrobbleAuthAlerts` fires a warning notification on first detection, but a one-tap "Reconnect AniList" button inside that notification (instead of routing through Settings) would close the loop
+- [ ] Cloud Sync settings panel (Phase 7.7): sync engine + all seven namespaces are live but Settings has no dedicated section yet. Needs per-namespace last-pull / last-push / server-size readout, a "Pull now" button, and a "Clear cloud sync data" destructive action (calls `sync_purge`)
+- [ ] Authenticode / EV code signing: separate from the (now-completed) minisign updater payload signing. The produced installer still trips SmartScreen on first run because it isn't signed against an EV/OV cert. Per `PRODUCTION.md` the user opted out of EV cert acquisition for now; revisit when audience scales
+- [ ] Secret-key migration to OS keyring: Stremio auth tokens already live in the OS keyring (DPAPI via `keyring 3`); OMDb / OpenSubtitles API keys still sit in plaintext `settings.json`. Threat model is "single-user desktop, OS-level filesystem trust" so non-blocking, but the migration is the right move for shared-PC scenarios
+- [x] Crash reporting receiver: Sentry SDK wired in (Rust panic hook + JS error capture + native minidump capture), gated on a first-run consent dialog (`CrashReportingConsent.tsx`)
 
 ---
 
-## Phase 7: Aura Cloud - Account-Scoped Sync 🟡
+## Phase 7: Aura Cloud — Account-Scoped Sync ✅ (sync engine) / 🟡 (settings panel)
+
+**Status:** the sync client (`src-tauri/src/sync.rs`) and orchestrator (`src/sync.ts`)
+are live. All seven namespaces round-trip on the proxy (`aura.animasec.dev/sync/v1/`):
+`settings`, `manual-state`, `auto-bumped`, `notifications`, `recent-searches`,
+`title-state`, `anilist-id-map`. Pull-on-login + 5-min background pull + 5s push
+debounce across every change event. ETag optimistic concurrency with per-namespace
+merge strategies (last-writer-wins, union, dedup-cap). The remaining open item is
+the user-facing Settings panel described in §7.7 — sync currently runs silently
+without a status surface. The original spec below stands as the design contract.
 
 Push and pull every per-account piece of Aura state through the existing
 `aura.animasec.dev` proxy so signing in to Aura on a fresh machine restores
@@ -675,6 +751,104 @@ The proxy maintainer needs:
 - Quota enforcement: before every PUT, sum the existing per-namespace sizes for the scope and reject if `existing_total - existing_namespace_size + new_size > 10MB`
 - Rate limiter: token bucket per `(scope, remote_addr)`, 60 req/min, leaky-bucket replenishment
 - GC sweep: nightly cron deletes scope rows whose `MAX(updated_at)` is older than 365 days
+
+---
+
+## Phase 8: Onboarding, Player QoL, Chrome Polish, Search Hardening 🔴
+
+A grab-bag of user-facing initiatives captured in the 2026-05-11 audit
+session. Most are independent and can ship one-by-one as time allows;
+the onboarding wizard is the biggest single arc. Every item below has a
+matching entry in the in-session task tracker — refer there for the
+implementation-level notes and edge-case checklists.
+
+**Cross-cutting requirement:** every item in this phase carries a
+"thoroughly tested" gate. New features must have their edge cases
+exercised before being marked complete — see the per-item notes for
+specific scenarios to walk through. The onboarding wizard in particular
+has a long edge-case list (resume-after-quit, partial install state,
+update vs reinstall detection, etc.) that needs every branch hit
+before it can ship.
+
+### 8.1 First-run onboarding wizard 🔴
+
+Guided post-login flow that runs ONLY on a true fresh install (not on
+version updates). Three pages, each independently skippable with
+forward + back navigation:
+
+1. Import existing Aura settings string / file (reuses `settingsTransfer.ts`)
+2. No-addon-dependent setup: language priorities, theme, OMDb / OpenSubtitles keys (optional with "where do I get this?" link), scrobble connect (Trakt + AniList), AniSkip modes, Discord RPC consent
+3. Recommended addon set — AIOMetadata, AIOStreams, Cinemeta (fallback), OpenSubtitles v3 / PRO. No download / configure walkthrough (defer to each addon's configure page). Includes a notice that this page can be reopened anytime from Addons → ↻ "Reopen onboarding addons"
+
+Resume-after-quit semantics: persist the cursor + per-step state to
+`<app_data>/onboarding.json` on every navigation. On startup, if that
+file exists, jump straight to the saved step. Delete on completion.
+Includes per-step partial state (e.g. half-set language picker) so a
+mid-page exit doesn't lose the user's in-progress choices.
+
+### 8.2 Hero edge-blur graceful handling 🔴
+
+`HeroCarousel.tsx:153-161`'s dual mask-gradients produce visible hard
+rectangles on dark-natured backdrops (caves, night shots) and the
+bottom-vertical fade collides with the title + synopsis text. Options
+under evaluation: dominant-color sampling to skew the mask toward the
+backdrop's tone; narrower mask edges; relocate text out of the
+gradient region; backdrop-filter blur strip behind only the text
+bounding box; conditional side-vignettes gated on text placement.
+
+### 8.3 Player overlay quality of life 🔴
+
+- A/V sync + subtitle delay sliders (`audio-delay`, `sub-delay`) with persistent `per_title.rs` calibration
+- Audio loudness normalization (`af=loudnorm`) toggle — Settings → Video & Audio AND a new "More" / three-dots menu on the control bar
+- Frame-step / frame-back-step bound to `,` and `.` by default, rebindable via Settings → Keybindings
+
+The three-dots menu becomes the generic home for low-frequency advanced
+controls (loudness, panscan, screenshot, etc.) as they land.
+
+### 8.4 Search reliability + progressive results 🔴
+
+- Fix spurious AI home catalogs firing during search (`aisearch.home.0.movie` + `aisearch.home.1.series` fire on every search submit despite the user being on the Search view, not Home — per 2026-05-11 backend logs)
+- Fix periodic home-catalog reloads while idling on Home
+- Replace one-shot `global_search_grouped` await with progressive per-group display: each row gets its own skeleton until that group resolves, instead of the whole grid waiting for the slowest addon
+
+### 8.5 Chrome surface polish 🔴
+
+- Notifications bell badge count (drives off `unreadCount` in `NotificationsContext`)
+- Sync-status chip in the title bar — gray cloud (guest) / spinner (mid-pull) / green check / amber stale / rose error, with a tooltip showing last-sync timestamp; click opens the new Cloud Sync settings panel
+- Honor `prefers-reduced-motion` across the Aura sweep, AmbientAura, sidebar pill, bell pulse, BootSplash gradient, and HeroCarousel auto-advance. Add a Settings → Appearance "Reduce motion" toggle for users on platforms where the OS pref is too broad
+
+### 8.6 Addons view polish 🔴
+
+- Per-addon Refresh manifest button (`↻` icon, calls `get_addon_manifest` with cache-bypass)
+- Replace AddonsView's "Remove" text with a styled icon (themed + animated, matched to the new Refresh icon as a paired button pack)
+- Reopen-onboarding button on the page (links to step 3 of the wizard only)
+
+### 8.7 Scrobble auth UX 🔴
+
+- Surface precise token expiry dates in Settings → Trakt & AniList ("Expires <date>" + relative qualifier, amber when ≤ 3 days, rose + Reconnect button when expired). Backend's `expires_at: Option<u64>` is already populated — frontend formatting only
+- "Reconnect AniList" inline action inside the warning notification fired by `useScrobbleAuthAlerts` (already tracked separately in 6.0.x Open as the AniList re-auth UX item)
+
+### 8.8 Watched-marks menu reorganization 🔴
+
+Reshape the right-click watched menu from seven flat items into two
+top-level clickable parents ("Mark as Watched", "Mark as In Progress")
+with hover-submenus for the bulk variants (this & below, this & above,
+all, unmark this & above, unmark all). Requires extending
+`ContextMenu.tsx` with `submenu?: ContextMenuItem[]` and reusing the
+existing edge-clamp logic so the submenu flips left at viewport edges.
+
+### 8.9 OpenSubtitles file-hash matching 🔴
+
+`subtitles.rs::search_subtitles` currently searches by query + year +
+imdb_id. OpenSubtitles' most reliable mode is the 64-bit Sub-DownloadHash
+(first 64 KB + last 64 KB summed as 8-byte little-endian words, mod
+2^64) — hash-matched cue files are virtually always frame-accurate to
+that exact release. New Tauri command `compute_opensubtitles_hash(url)`
+does the Range GETs against the resolved URL (HTTPS direct, HTTP via
+the local axum bridge). `<SubtitlePicker />` includes the hash +
+`moviebytesize` in the search payload; hash-matched results bubble to
+the top with a "Hash match" badge. Falls back to query-based search on
+any Range / TLS failure.
 
 ---
 

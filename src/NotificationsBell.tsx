@@ -22,8 +22,20 @@ import NotificationsPanel from "./NotificationsPanel";
 const PANEL_CLOSE_MS = 200;
 
 export default function NotificationsBell() {
-  const { notifications, unreadCount, hasNew, popup, dismissPopup, markRead } = useNotifications();
+  const { notifications, unreadCount, hasNew, popup, dismissPopup, markRead, markAllRead } = useNotifications();
   const [open, setOpen] = useState(false);
+
+  // Treat panel-open as a global mark-read. The user has actively
+  // surfaced the panel; whatever they see there counts as seen for
+  // the purpose of the badge. Individual dismiss still works for
+  // hiding entries from the list, but the badge clears immediately
+  // so the bell stops drawing the eye while the user is reading.
+  const openPanel = useCallback(() => {
+    setOpen((wasOpen) => {
+      if (!wasOpen) markAllRead();
+      return !wasOpen;
+    });
+  }, [markAllRead]);
   /** When true, the panel is in the middle of its out-animation —
    *  still mounted, but pointer-events disabled and visually
    *  collapsing. setOpen(false) and clearing this flag both run on
@@ -108,7 +120,7 @@ export default function NotificationsBell() {
       <button
         type="button"
         data-notifications-bell
-        onClick={() => setOpen((o) => !o)}
+        onClick={openPanel}
         aria-label={
           unreadCount > 0
             ? `Notifications (${unreadCount} unread)`

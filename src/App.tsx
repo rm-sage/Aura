@@ -43,7 +43,7 @@ import { useKeybindings } from "./useKeybindings";
 import { libraryToggle, libraryRemoveAll, libraryWriteProgress, libraryClearProgress } from "./libraryActions";
 import { libraryItemSeriesId } from "./libraryNormalize";
 import { sourcesForMeta, openInPopupBrowser } from "./externalSources";
-import { setManualWatchedScope, getManualWatchedState, setManualWatchedState } from "./manualWatched";
+import { setManualWatchedScope, getManualWatchedState, setManualWatchedState, getPlannedQueue } from "./manualWatched";
 import { syncPullAll, installSyncTriggers, startBackgroundPull, clearSyncEtags, setSyncActiveScope } from "./sync";
 import { setHistoryScope, addHistoryEntry } from "./historyStore";
 import { setAutoBackupScope, startAutoBackup } from "./userDataBackup";
@@ -707,6 +707,8 @@ export default function App() {
         name: string;
         episode?: string;
         episode_title?: string;
+        season?: number;
+        episode_num?: number;
         scoring?: {
           original_language: string | null;
           production_countries: string[];
@@ -1047,6 +1049,11 @@ export default function App() {
           name:          target.name,
           episode:       target.episode,
           episode_title: target.episode_title,
+          // Authoritative numeric S/E from the picker — thread through
+          // so scrobble.rs's Trakt payload uses the same numbers the
+          // user clicked on, sidestepping ID-string parse mismatches.
+          season:        target.season,
+          episode_num:   target.episode_num,
           logo,
           // Carry the scoring signals through to scrobble's anime
           // detector. Without these the AniList path saw
@@ -1148,6 +1155,75 @@ export default function App() {
     return () => {
       window.removeEventListener("aura:keybindings-changed", onChange);
       window.removeEventListener("aura:settings-changed", onChange);
+    };
+  }, []);
+
+  // ── Session-changed broadcast ──
+  // Decoupled components (SyncStatusChip in the title bar, profile
+  // popover, etc.) need to know when the active Stremio session
+  // changes so they can refresh their cloud-side state without
+  // waiting for the next poll cycle. Single useEffect that fires on
+  // every session transition (sign-in, sign-out, account switch).
+  // Carries the auth_key prefix (or null) in detail so subscribers
+  // can decide whether to clear local cached state too.
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent("aura:session-changed", {
+      detail: { authKey: session?.auth_key ?? null },
+    }));
+  }, [session]);
+
+  // ── Settings-deep-link router ──
+  // Components that aren't in the NavSidebar's prop tree (TitleBar's
+  // SyncStatusChip, NotificationsPanel action items, etc.) can request
+  // a jump to a specific Settings section via:
+  //   window.dispatchEvent(new CustomEvent("aura:open-settings", {
+  //     detail: { section: "sec-cloud-sync" }
+  //   }))
+  // We route the user to Settings; the section anchor is consumed by
+  // SettingsView's TOC scroll-spy which will scroll the matching
+  // section into view on next paint if `section` is non-empty.
+  useEffect(() => {
+    const onOpen = (e: Event) => {
+      const detail = (e as CustomEvent<{ section?: string }>).detail;
+      setActiveCatalog(null);
+      setActiveView("settings");
+      if (detail?.section && typeof detail.section === "string") {
+        // Defer scroll until SettingsView has mounted (one paint is
+        // enough; useEffect inside SettingsView runs on its mount).
+        // Encode the requested anchor in the URL hash so SettingsView's
+        // scroll-spy can pick it up regardless of whether the user is
+        // already on Settings (no remount).
+        window.location.hash = detail.section;
+      }
+    };
+    window.addEventListener("aura:open-settings", onOpen);
+    return () => window.removeEventListener("aura:open-settings", onOpen);
+  }, []);
+
+  // ── Reduced-motion attribute live-updater ──
+  // main.tsx runs the initial application synchronously before React
+  // mounts, so the first paint already carries the right attribute.
+  // This effect keeps the attribute in sync with:
+  //   • OS-level `prefers-reduced-motion` changes (user flips the OS
+  //     toggle without restarting Aura)
+  //   • Aura-level `reduceMotion` setting changes (user toggles via
+  //     Settings → Appearance — dispatches `aura:settings-changed`)
+  // Lazy import (`require` style via dynamic) would defeat the
+  // tree-shake, so we import statically from auraSettings; the
+  // function is a one-line DOM write so the bundle cost is trivial.
+  useEffect(() => {
+    let importedApply: (() => void) | null = null;
+    import("./auraSettings").then((mod) => {
+      importedApply = mod.applyReducedMotionAttribute;
+      importedApply();
+    });
+    const apply = () => importedApply?.();
+    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    mq.addEventListener("change", apply);
+    window.addEventListener("aura:settings-changed", apply);
+    return () => {
+      mq.removeEventListener("change", apply);
+      window.removeEventListener("aura:settings-changed", apply);
     };
   }, []);
 
@@ -1371,6 +1447,8 @@ export default function App() {
       name:          activeTarget.name,
       episode:       tag,
       episode_title: ep.title ?? undefined,
+      season:        ep.season ?? undefined,
+      episode_num:   ep.episode ?? undefined,
     };
     setNextUpInfo(null);
     await handlePlayStream(nextUpInfo.stream, target);
@@ -2274,6 +2352,12 @@ export default function App() {
           title:      activeTarget.name,
           is_anime:   isAnimeMeta(activeTarget),
           scope:      scrobbleScope,
+          // Authoritative numeric S/E from the VideoEntry. scrobble.rs
+          // prefers these over the ID-string parse so the Trakt payload
+          // matches what the user actually clicked in the picker — the
+          // critical disambiguation for dual-numbered anime.
+          season:      activeTarget.season ?? null,
+          episode_num: activeTarget.episode_num ?? null,
         };
         const r = await invoke<RustResult>("scrobble_test_fire", {
           session,
@@ -2359,6 +2443,19 @@ export default function App() {
         if (!isPlayerActive) return;
         window.dispatchEvent(new CustomEvent("aura:toggle-panscan"));
       },
+      // Frame-step: nudge one frame at a time. MPV auto-pauses on
+      // frame-step / frame-back-step so no separate pause toggle is
+      // required. Gated on isPlayerActive so the bindings stay free
+      // outside playback (no false-pause if the user types "," on
+      // the home page).
+      "frame-step-back":    () => {
+        if (!isPlayerActive) return;
+        invoke("frame_step", { forward: false }).catch(() => {});
+      },
+      "frame-step-forward": () => {
+        if (!isPlayerActive) return;
+        invoke("frame_step", { forward: true }).catch(() => {});
+      },
       // Anime4K v4 chord shortcuts. Defaults Ctrl+1..6 + Ctrl+0;
       // user-rebindable via Settings → Keybindings.
       "anime4k-a":        () => applyAnime4KProfile(7,  "Anime4K Mode A"),
@@ -2378,11 +2475,66 @@ export default function App() {
   // (the OS Next button does nothing rather than e.g. jumping to a
   // planned-queue entry, which would surprise users who don't know
   // their queue is wired to media keys).
+  // Queue advance fallback — when the current show has no more episodes
+  // to step to, hop to the next planned-queue entry's S01E01 so the
+  // user's media-key Next never dead-ends mid-binge. Only fires when
+  // the current series is in the queue (otherwise casual not-queued
+  // playback isn't redirected somewhere unexpected). Returns true when
+  // it successfully loaded the queued show's first episode, false
+  // otherwise (caller surfaces the original "No next episode" toast).
+  const advanceToQueueNext = useCallback(async (currentRoot: string): Promise<boolean> => {
+    const queue = getPlannedQueue();
+    const idx = queue.indexOf(currentRoot);
+    if (idx < 0 || idx + 1 >= queue.length) return false;
+    const nextRootId = queue[idx + 1];
+    if (!nextRootId) return false;
+
+    // Queue entries don't carry their media_type — probe series/anime/
+    // movie in that order. The meta cache short-circuits subsequent
+    // attempts when an earlier one succeeds.
+    for (const candidateType of ["series", "anime", "movie"] as const) {
+      const detail = await getMetaDetailFallback(addons, candidateType, nextRootId).catch(() => null);
+      if (!detail) continue;
+      const videos = (detail.videos ?? []).filter((v) => v && v.id);
+      // First aired episode (season > 0 to skip Specials), else first
+      // entry, else the meta id itself for movies.
+      const firstEp = videos.find((v) => (v.season ?? 0) > 0) ?? videos[0];
+      const targetId = firstEp?.id ?? nextRootId;
+      const stream = await pickFirstStreamForEpisode(addons, candidateType, targetId);
+      if (!stream) continue;
+      const epTag =
+        firstEp && firstEp.season != null && firstEp.episode != null
+          ? `S${String(firstEp.season).padStart(2, "0")}E${String(firstEp.episode).padStart(2, "0")}`
+          : undefined;
+      await handlePlayStream(stream, {
+        id:            targetId,
+        series_id:     nextRootId,
+        media_type:    candidateType,
+        name:          detail.name ?? "",
+        episode:       epTag,
+        episode_title: firstEp?.title ?? undefined,
+        season:        firstEp?.season ?? undefined,
+        episode_num:   firstEp?.episode ?? undefined,
+      });
+      return true;
+    }
+    return false;
+  }, [addons, handlePlayStream]);
+
   const stepEpisode = useCallback(async (direction: 1 | -1) => {
     const target = activeTarget;
     if (!target) return;
     const isSeries = target.media_type === "series" || target.media_type === "anime";
-    if (!isSeries) return;
+    if (!isSeries) {
+      // Movies / non-episodic: there's no "previous episode" semantic,
+      // but media-key Next still meaningfully advances through a queue
+      // of planned items if the current movie is in it.
+      if (direction === 1) {
+        const rootId = target.series_id ?? target.id;
+        if (rootId) await advanceToQueueNext(rootId);
+      }
+      return;
+    }
     const seriesId = target.series_id ?? target.id;
     if (!seriesId) return;
     try {
@@ -2392,6 +2544,13 @@ export default function App() {
         ? findNextEpisode(detail, target.id)
         : findPreviousEpisode(detail, target.id);
       if (!candidate) {
+        // Out of episodes in the current series. On Next, fall back to
+        // the planned queue — if the user explicitly queued this series
+        // alongside others, advance to the next entry's S01E01.
+        // Previous stays a no-op (going backward through the queue
+        // doesn't match a sensible media-key semantic — "Previous"
+        // means "earlier in what I'm currently watching").
+        if (direction === 1 && await advanceToQueueNext(seriesId)) return;
         window.dispatchEvent(new CustomEvent("aura:player-toast", {
           detail: { message: direction === 1 ? "No next episode" : "No previous episode" },
         }));
@@ -2417,11 +2576,13 @@ export default function App() {
         name:         target.name,
         episode:      ep,
         episode_title: candidate.title ?? undefined,
+        season:        candidate.season ?? undefined,
+        episode_num:   candidate.episode ?? undefined,
       });
     } catch (err) {
       console.warn("[smtc] step episode failed:", err);
     }
-  }, [addons, activeTarget, handlePlayStream]);
+  }, [addons, activeTarget, handlePlayStream, advanceToQueueNext]);
 
   useEffect(() => {
     const p = listen<string>("smtc-event", ({ payload }) => {

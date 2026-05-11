@@ -25,6 +25,14 @@ import ReactDOM from "react-dom/client";
 import * as Sentry from "@sentry/react";
 import { invoke } from "@tauri-apps/api/core";
 import App from "./App";
+import { applyReducedMotionAttribute } from "./auraSettings";
+
+// Synchronous reduced-motion gate, fired BEFORE React mounts so the
+// initial paint already carries `<html data-reduced-motion="true|false">`.
+// Without this, OS-pref users would see the BootSplash ambient sweep
+// for ~200ms while JS catches up. Live updates are wired in App.tsx via
+// matchMedia + aura:settings-changed subscriptions.
+applyReducedMotionAttribute();
 
 // ---------------------------------------------------------------------------
 // Sentry — initialised before React mounts ONLY when the user has opted in

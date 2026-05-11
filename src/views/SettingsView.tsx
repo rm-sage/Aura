@@ -1582,6 +1582,68 @@ function NextUpLeadTimeRow({
   );
 }
 
+/** Countdown-seconds selector for the Auto-advance toggle. Same chip
+ *  + number-input pattern as NextUpLeadTimeRow, but a tighter range
+ *  ([5, 30]) since the user has consciously opted into auto-advance —
+ *  zero would be "skip immediately" (not useful), >30 would be no
+ *  better than the standard manual CTA. Default 10 is a comfortable
+ *  middle ground that gives time to grab the remote / mouse. */
+function AutoAdvanceDelayRow({
+  value, onChange,
+}: { value: number; onChange: (v: number) => void }) {
+  const PRESETS = [5, 10, 15, 20, 30];
+  const clamped = Math.max(5, Math.min(30, value));
+  return (
+    <div className="space-y-2">
+      <div>
+        <p className="text-white/75 text-sm font-medium">Auto-advance delay</p>
+        <p className="text-white/35 text-xs mt-0.5">
+          Seconds the Next-Up card waits before auto-firing. Any
+          mouse / keyboard / scroll input cancels the countdown so
+          you only get auto-advance when you're genuinely away from
+          the player.
+        </p>
+      </div>
+      <div className="flex items-center gap-2 flex-wrap">
+        {PRESETS.map((p) => {
+          const active = clamped === p;
+          return (
+            <button
+              key={p}
+              type="button"
+              onClick={() => onChange(p)}
+              className={[
+                "px-3 py-1 rounded-full text-[12px] font-medium border transition-colors",
+                active
+                  ? "bg-ln-accent/20 text-ln-accent border-ln-accent/40"
+                  : "bg-white/5 text-white/65 border-white/10 hover:bg-white/10",
+              ].join(" ")}
+            >
+              {p}s
+            </button>
+          );
+        })}
+        <div className="flex items-center gap-2 ml-1 text-[12px]">
+          <input
+            type="number"
+            min={5}
+            max={30}
+            value={clamped}
+            onChange={(e) => {
+              const n = Number(e.target.value);
+              if (Number.isFinite(n)) onChange(Math.max(5, Math.min(30, Math.round(n))));
+            }}
+            className="w-16 bg-white/5 border border-white/10 rounded-lg px-2 py-1
+                       text-white/85 outline-none focus:border-white/25 transition-colors
+                       text-center tabular-nums"
+          />
+          <span className="text-white/40">seconds</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AboutSection({ addonCount }: { addonCount: number }) {
   const [stats, setStats] = useState<AuraStats | null>(null);
   useEffect(() => {
@@ -2313,6 +2375,38 @@ interface ScrobbleAuthSummary {
   expired: boolean;
 }
 
+/** Format a Unix-seconds expiry into a "Mon DD, YYYY · HH:MM" string in
+ *  the user's locale + timezone. Returns `null` if the timestamp is
+ *  outside any sane range (NaN, 0, etc.) so the caller can fall back
+ *  to "No expiry reported". */
+function formatExpiryAbsolute(expiresAt: number | null): string | null {
+  if (expiresAt == null) return null;
+  const date = new Date(expiresAt * 1000);
+  if (Number.isNaN(date.getTime()) || date.getTime() <= 0) return null;
+  return date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+}
+
+/** Pick the coarsest reasonable unit so the relative qualifier reads
+ *  naturally ("in 23 days" rather than "in 1987200 seconds"). Uses
+ *  `Intl.RelativeTimeFormat` with `numeric: "always"` so the output is
+ *  always quantitative ("1 day ago", never "yesterday") — matches the
+ *  precision the task asked for. */
+function formatExpiryRelative(diffMs: number): string {
+  const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "always" });
+  const sec = Math.round(diffMs / 1000);
+  if (Math.abs(sec) < 60)  return rtf.format(sec, "second");
+  const min = Math.round(diffMs / 60_000);
+  if (Math.abs(min) < 60)  return rtf.format(min, "minute");
+  const hr  = Math.round(diffMs / 3_600_000);
+  if (Math.abs(hr)  < 24)  return rtf.format(hr,  "hour");
+  const day = Math.round(diffMs / 86_400_000);
+  if (Math.abs(day) < 30)  return rtf.format(day, "day");
+  const mon = Math.round(diffMs / (86_400_000 * 30));
+  if (Math.abs(mon) < 12)  return rtf.format(mon, "month");
+  const yr  = Math.round(diffMs / (86_400_000 * 365));
+  return rtf.format(yr, "year");
+}
+
 function ScrobbleAuthRow({
   service, authKey, description,
 }: {
@@ -2334,6 +2428,16 @@ function ScrobbleAuthRow({
   // Auth-code (deep-link) waiting state — only used by AniList now.
   const [pending, setPending] = useState(false);
   const timeoutRef = useRef<number | null>(null);
+  // 60s tick driving the "expires in N days" relative qualifier. Without
+  // this, the Settings page could sit open for hours showing a stale
+  // "in 23 days" line that should read "in 22 days". Only ticks when
+  // an expiring token is connected — guests / non-expiring tokens skip.
+  const [tickNow, setTickNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!status || status.expires_at == null) return;
+    const id = window.setInterval(() => setTickNow(Date.now()), 60_000);
+    return () => window.clearInterval(id);
+  }, [status]);
 
   // Device-flow state. When set, the row renders the user_code +
   // verification URL + Cancel button, and a poll loop runs until the
@@ -2635,6 +2739,21 @@ function ScrobbleAuthRow({
                 <span className="w-1.5 h-1.5 rounded-full bg-rose-400" />
                 {status?.username ? `Expired · ${status.username}` : "Expired"}
               </span>
+              {/* Absolute + relative expiry timestamp for the expired
+                  branch. Useful diagnostic ("why am I being asked to
+                  reconnect now?") and grounds the rose badge in a
+                  concrete date. */}
+              {(() => {
+                const absolute = formatExpiryAbsolute(status?.expires_at ?? null);
+                if (!absolute || status?.expires_at == null) return null;
+                const relative = formatExpiryRelative(status.expires_at * 1000 - tickNow);
+                return (
+                  <div className="text-[10px] leading-tight text-right text-rose-300/80">
+                    <div>Expired {absolute}</div>
+                    <div className="text-rose-300/60">{relative}</div>
+                  </div>
+                );
+              })()}
               <button
                 type="button"
                 onClick={connect}
@@ -2655,6 +2774,33 @@ function ScrobbleAuthRow({
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
                 {status?.username ? `Connected · ${status.username}` : "Connected"}
               </span>
+              {/* Live expiry readout. Amber when the token enters the
+                  provider-specific stale window (7d AniList / 24h Trakt)
+                  so the user notices before it lapses; neutral otherwise.
+                  Renders "No expiry reported" for providers that issue
+                  non-expiring tokens (AniList Implicit Grant, etc.) so
+                  the absence of a date is explained rather than hidden. */}
+              {(() => {
+                if (status?.expires_at == null) {
+                  return (
+                    <div className="text-[10px] leading-tight text-right text-white/35">
+                      No expiry reported
+                    </div>
+                  );
+                }
+                const absolute = formatExpiryAbsolute(status.expires_at);
+                if (!absolute) return null;
+                const relative = formatExpiryRelative(status.expires_at * 1000 - tickNow);
+                const tone = status.stale
+                  ? { primary: "text-amber-300/90", secondary: "text-amber-300/70" }
+                  : { primary: "text-white/55",     secondary: "text-white/35"     };
+                return (
+                  <div className={`text-[10px] leading-tight text-right ${tone.primary}`}>
+                    <div>Expires {absolute}</div>
+                    <div className={tone.secondary}>{relative}</div>
+                  </div>
+                );
+              })()}
               <button
                 type="button"
                 onClick={disconnect}
@@ -3213,6 +3359,13 @@ export default function SettingsView({ addons, session }: Props) {
               value={aura.blurUnwatchedThumbnails}
               onChange={(v) => setLocal({ blurUnwatchedThumbnails: v })}
             />
+            <div className="h-px bg-white/6" />
+            <SettingToggle
+              label="Blur selected episode synopsis"
+              description="Hide the per-episode synopsis text that appears below the show synopsis when you select an episode. Click to reveal per episode. Watched episodes always show their synopsis without blur — the content's no longer a spoiler. Useful for mystery / thriller / weekly-airing anime where the per-episode description gives away plot beats."
+              value={aura.blurEpisodeSynopsis}
+              onChange={(v) => setLocal({ blurEpisodeSynopsis: v })}
+            />
           </Section>
 
           {/* ── Notifications ─────────────────────────────────────────────
@@ -3269,6 +3422,22 @@ export default function SettingsView({ addons, session }: Props) {
                 value={backend.next_up_lead_seconds ?? 60}
                 onChange={(v) => patchBackend({ next_up_lead_seconds: v })}
               />
+              <div className="h-px bg-white/6" />
+              <SettingToggle
+                label="Auto-advance to next episode"
+                description="When the Next-Up card surfaces, automatically start the next episode after a short countdown. Mouse movement, any key press, scrolling, or the dismiss button cancels the countdown — you only get the auto-jump when you're genuinely afk during the credits. Default off."
+                value={aura.autoAdvanceNextEpisode}
+                onChange={(v) => setLocal({ autoAdvanceNextEpisode: v })}
+              />
+              {aura.autoAdvanceNextEpisode && (
+                <>
+                  <div className="h-px bg-white/6" />
+                  <AutoAdvanceDelayRow
+                    value={aura.autoAdvanceDelaySeconds}
+                    onChange={(v) => setLocal({ autoAdvanceDelaySeconds: v })}
+                  />
+                </>
+              )}
               <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Audio passthrough (bitstream)"
@@ -3473,6 +3642,27 @@ export default function SettingsView({ addons, session }: Props) {
               options={themeOptions}
               required
               onChange={(v) => v && setTheme(v as ThemeId)}
+            />
+            <div className="h-px bg-white/6" />
+            {/* Reduced motion — disables Aura's decorative infinite-loop
+                animations (title bar sweep, ambient backdrop drift,
+                sidebar pill pulse, bell ring + badge bounce, popup
+                breathe, hover-glow rotate). Loading bars, buffering
+                pulses, popup enter/exit transitions, and skeleton
+                shimmer stay on — they convey work-in-progress. The
+                attribute is applied synchronously before React mounts
+                so OS-pref users never see the BootSplash sweep. */}
+            <SettingDropdown
+              label="Reduce motion"
+              description="Disable Aura's decorative ambient animations (title-bar sweep, backdrop drift, sidebar glow pulse, bell ring + bounce). Auto follows the OS setting; Always forces motion off regardless of OS; Never forces motion on even if the OS asked for reduce."
+              value={aura.reduceMotion}
+              options={[
+                { value: "auto",   label: "Auto — follow OS setting" },
+                { value: "always", label: "Always reduce" },
+                { value: "never",  label: "Never reduce" },
+              ]}
+              required
+              onChange={(v) => v && setLocal({ reduceMotion: v as AuraSettings["reduceMotion"] })}
             />
           </Section>
 

@@ -87,6 +87,16 @@ export interface ActiveScrobbleTarget {
   /** The episode's own title (separate field so the OSD can render
    *  S01E05 — "The Big Heist" cleanly). */
   episode_title?: string;
+  /** Authoritative numeric season from the VideoEntry the user clicked.
+   *  Passed through to scrobble.rs so Trakt's /sync/history receives
+   *  the picker's numbering directly instead of relying on the ID
+   *  string-parse. Needed because AIOMetadata can produce dual-
+   *  numbering inconsistencies (id says `:2:3` while video.season=1,
+   *  video.episode=31 for the same physical episode). When omitted,
+   *  the Rust side falls back to ID parsing (current behavior).
+   *  Movies leave both fields undefined. */
+  season?: number;
+  episode_num?: number;
   /** Stylized logo URL — used by the buffering overlay. */
   logo?: string | null;
   /** Anime-detection signals — passed to `isAnimeMeta` so the AniList
@@ -286,6 +296,12 @@ export function useScrobble({
           title: active.name,
           is_anime: isAnimeMeta(active),
           scope,
+          // Authoritative numbers from the VideoEntry the user clicked.
+          // scrobble.rs prefers these over the ID-string parse when
+          // building the Trakt payload — fixes dual-numbering anime
+          // where the stream id and the displayed S/E disagree.
+          season:      active.season ?? null,
+          episode_num: active.episode_num ?? null,
         },
         duration: playback.duration,
       }).catch(() => {});

@@ -1854,3 +1854,49 @@ select option:hover {
               0 12px 32px rgba(91, 164, 255, 0.08);
   transition: border-color 200ms ease-out, box-shadow 200ms ease-out;
 }
+
+/* ---------------------------------------------------------------- */
+/* Reduced motion — disables decorative infinite-loop animations    */
+/* when `<html data-reduced-motion="true">` is set by App.tsx /     */
+/* main.tsx based on the effective value of `auraSettings.reduce-   */
+/* Motion` ("auto" honours the OS `prefers-reduced-motion: reduce`  */
+/* media query; "always" forces on; "never" forces off).            */
+/*                                                                  */
+/* Functional state-conveying animations (loading bars, buffering   */
+/* pulse, skeleton shimmer, popup enter/exit, toast pop) are NOT in */
+/* the disable list — they communicate work-in-progress that users  */
+/* on reduced-motion still benefit from seeing. Only purely         */
+/* decorative ambient loops + bell-attention loops are silenced.    */
+/* ---------------------------------------------------------------- */
+html[data-reduced-motion="true"] .aura-sweep,
+html[data-reduced-motion="true"] .aura-sweep::after,
+html[data-reduced-motion="true"] .aura-ambient,
+html[data-reduced-motion="true"] .aura-ambient::after,
+html[data-reduced-motion="true"] .aura-glow,
+html[data-reduced-motion="true"] .aura-bell-ringing,
+html[data-reduced-motion="true"] .aura-bell-badge-bouncing,
+html[data-reduced-motion="true"] .aura-popup-breathe,
+html[data-reduced-motion="true"] .hover-glow:hover {
+  animation: none !important;
+}
+
+/* ---------------------------------------------------------------- */
+/* Addon row action icons — Refresh + Remove. Inline animations     */
+/* used by AddonsView's RefreshIcon (rotates during the cache-bust  */
+/* manifest re-fetch) and SpinnerDot (pulses while a removal is     */
+/* in flight). Defined here rather than inline so the reduced-      */
+/* motion override picks them up alongside the other ambient        */
+/* animations.                                                      */
+/* ---------------------------------------------------------------- */
+@keyframes addon-refresh-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+@keyframes addon-spinner-pulse {
+  0%, 100% { opacity: 0.45; transform: scale(0.9); }
+  50%      { opacity: 1;    transform: scale(1.1); }
+}
+html[data-reduced-motion="true"] [style*="addon-refresh-spin"],
+html[data-reduced-motion="true"] [style*="addon-spinner-pulse"] {
+  animation: none !important;
+}

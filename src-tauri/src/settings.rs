@@ -314,6 +314,11 @@ pub fn default_keybindings() -> HashMap<String, String> {
     // unused by other defaults and matches the convention used by
     // standalone mpv's input.conf for "zoom-style" toggles.
     m.insert("toggle-panscan".into(),  "KeyZ".into());
+    // Frame-step defaults — `,` and `.` match VLC + standalone mpv's
+    // input.conf convention so the muscle-memory transfers. Anime fans
+    // hit these constantly for sakuga inspection / sub-timing checks.
+    m.insert("frame-step-back".into(),    "Comma".into());
+    m.insert("frame-step-forward".into(), "Period".into());
     // Anime4K v4 chord defaults — match the Stremio Community v5
     // bindings the user is migrating from. Ctrl+0 disables upscaling
     // entirely (sets profile 0 / "None").

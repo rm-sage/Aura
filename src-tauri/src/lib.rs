@@ -435,6 +435,26 @@ async fn seek_relative(app: tauri::AppHandle, seconds: f64) -> Result<(), String
     .map_err(|e| e.to_string())?
 }
 
+/// Step exactly one frame forward (`forward = true`) or backward
+/// (`forward = false`) and pause. Wraps MPV's `frame-step` /
+/// `frame-back-step` commands. `frame-back-step` is somewhat slow per
+/// MPV's docs (the demuxer has to seek and decode forward to the
+/// previous frame) but is precise enough for the muscle-memory `,` / `.`
+/// shortcut anime fans expect from VLC / standalone mpv. Issued as a
+/// plain command without args — no property poll, so the libmpv state-
+/// transition landmines (CLAUDE.md #3) don't apply here.
+#[tauri::command]
+async fn frame_step(app: tauri::AppHandle, forward: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cmd = if forward { "frame-step" } else { "frame-back-step" };
+        app.mpv()
+            .command(cmd, &vec![], "main")
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn set_volume(app: tauri::AppHandle, volume: f64) -> Result<(), String> {
     crate::devlog!(info, "player", "set_volume({volume})");
@@ -594,6 +614,47 @@ async fn set_audio_track(app: tauri::AppHandle, track: serde_json::Value) -> Res
             .set_property("aid", &serde_json::json!(track_str), "main")
             .map_err(|e| {
                 crate::devlog!(warn, "player", "set_audio_track failed: {e}");
+                e.to_string()
+            })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Nudge audio sync forward or backward relative to the video stream.
+/// Wraps MPV's `audio-delay` property (seconds, f64). Positive values
+/// delay the audio; negative values advance it. Clamped to ±10 s to
+/// keep the UI's number input from accepting absurd inputs that would
+/// confuse the user — beyond that range the user almost certainly
+/// has a worse problem than mistimed audio.
+#[tauri::command]
+async fn set_audio_delay(app: tauri::AppHandle, seconds: f64) -> Result<(), String> {
+    let clamped = seconds.clamp(-10.0, 10.0);
+    crate::devlog!(info, "player", "set_audio_delay({clamped:.3})");
+    tauri::async_runtime::spawn_blocking(move || {
+        app.mpv()
+            .set_property("audio-delay", &serde_json::json!(clamped), "main")
+            .map_err(|e| {
+                crate::devlog!(warn, "player", "set_audio_delay failed: {e}");
+                e.to_string()
+            })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Nudge subtitle sync forward or backward. Wraps MPV's `sub-delay`
+/// property (seconds, f64). Positive = subs appear later; negative =
+/// subs appear earlier. Same ±10 s clamp as `set_audio_delay`.
+#[tauri::command]
+async fn set_subtitle_delay(app: tauri::AppHandle, seconds: f64) -> Result<(), String> {
+    let clamped = seconds.clamp(-10.0, 10.0);
+    crate::devlog!(info, "player", "set_subtitle_delay({clamped:.3})");
+    tauri::async_runtime::spawn_blocking(move || {
+        app.mpv()
+            .set_property("sub-delay", &serde_json::json!(clamped), "main")
+            .map_err(|e| {
+                crate::devlog!(warn, "player", "set_subtitle_delay failed: {e}");
                 e.to_string()
             })
     })
@@ -1682,11 +1743,14 @@ pub fn run() {
             stop_video,
             toggle_pause,
             seek_relative,
+            frame_step,
             set_volume,
             set_speed,
             seek_absolute,
             set_audio_track,
+            set_audio_delay,
             set_subtitle_track,
+            set_subtitle_delay,
             set_subtitle_visibility,
             set_panscan,
             dev_force_panic,
@@ -1714,6 +1778,7 @@ pub fn run() {
             stremio::fetch_catalog,
             stremio::fetch_catalog_paginated,
             stremio::get_addon_manifest,
+            stremio::refresh_addon_manifest,
             // ── Addon management (guest) ─────────────────────────────────────
             stremio::add_addon,
             stremio::remove_addon,

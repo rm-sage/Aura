@@ -195,6 +195,16 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
   const [streamsLoading, setStreamsLoading] = useState(false);
   const [opening, setOpening]               = useState(true);
   const [activeVideo, setActiveVideo]       = useState<VideoEntry | null>(null);
+  // Per-episode "user has clicked through the spoiler blur" set. Keyed
+  // by VideoEntry.id; non-persisted (resets when DetailView unmounts).
+  // Cleared when activeVideo changes so each newly-selected episode
+  // starts blurred again on a fresh selection — matches the user's
+  // minimum-friction spoiler contract (protect by default, easy to
+  // bypass per-episode for the current session).
+  const [revealedSynopses, setRevealedSynopses] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    setRevealedSynopses(new Set());
+  }, [activeVideo?.id]);
   // Ref to the streams-panel aside — used by StreamMetaBadges to anchor
   // its portal-rendered badge cluster in the gutter outside the panel.
   const asideRef = useRef<HTMLElement>(null);
@@ -668,6 +678,11 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
         : undefined)
       : undefined,
     episode_title: video?.title ?? undefined,
+    // Numeric pass-through for scrobble.rs's dual-numbering Trakt
+    // payload. The picker's VideoEntry numbers are authoritative —
+    // they're what the user selected and what the toast displays.
+    season:      video?.season ?? undefined,
+    episode_num: video?.episode ?? undefined,
   });
 
   // When user picks an episode → flip the panel to streams.
@@ -934,6 +949,32 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
                 {detail?.description ?? meta.description}
               </p>
             )}
+
+            {/* Per-episode synopsis — surfaces below the show synopsis
+                whenever the user has selected an episode in EpisodePane
+                AND that episode carries an `overview`. Optionally
+                blurred behind a "Click to reveal" gate (user setting in
+                Detail Page section). Watched episodes auto-bypass the
+                blur. Unmounts cleanly when nothing is selected or the
+                episode has no overview text. */}
+            <EpisodeSynopsisSection
+              activeVideo={activeVideo}
+              isWatched={
+                activeVideo
+                  ? getManualWatchedState(activeVideo.id) === "watched"
+                  : false
+              }
+              revealed={
+                activeVideo ? revealedSynopses.has(activeVideo.id) : false
+              }
+              onReveal={(id) => {
+                setRevealedSynopses((prev) => {
+                  const next = new Set(prev);
+                  next.add(id);
+                  return next;
+                });
+              }}
+            />
 
             {/* Genre chips */}
             {detail?.genres && detail.genres.length > 0 && (
@@ -1220,6 +1261,99 @@ function classifyCastTier(episodeCount: number, totalShowEpisodes: number): Cast
 
 function castTierLabel(tier: CastTier): string {
   return tier === "main" ? "Main cast" : tier === "recurring" ? "Recurring" : "Guest";
+}
+
+/** Renders the per-episode synopsis section that lives below the show
+ *  synopsis on the detail page. Surfaces only when the user has
+ *  selected an episode in EpisodePane AND that episode has a non-empty
+ *  `overview`. Optionally blurred behind a "Click to reveal" gate
+ *  (per `auraSettings.blurEpisodeSynopsis`). Watched episodes bypass
+ *  the blur — the content's no longer a spoiler by definition. */
+function EpisodeSynopsisSection({
+  activeVideo, isWatched, revealed, onReveal,
+}: {
+  activeVideo: VideoEntry | null;
+  isWatched: boolean;
+  revealed: boolean;
+  onReveal: (id: string) => void;
+}) {
+  // Subscribe to the settings toggle so flipping it in the Settings
+  // panel takes effect without a refresh.
+  const [blurOn, setBlurOn] = useState(() => loadAuraSettings().blurEpisodeSynopsis);
+  useEffect(() => {
+    const sync = () => setBlurOn(loadAuraSettings().blurEpisodeSynopsis);
+    window.addEventListener("aura:settings-changed", sync);
+    return () => window.removeEventListener("aura:settings-changed", sync);
+  }, []);
+
+  if (!activeVideo) return null;
+  const overview = (activeVideo.overview ?? "").trim();
+  if (!overview) return null;
+
+  // Heading sub-line — "S02E03 — Title" so the user can confirm which
+  // episode they selected when they're looking at the synopsis (the
+  // EpisodePane may have scrolled or the user navigated via NextUp).
+  const s = activeVideo.season;
+  const e = activeVideo.episode;
+  const seCode =
+    s != null && e != null
+      ? `S${String(s).padStart(2, "0")}E${String(e).padStart(2, "0")}`
+      : null;
+  const title = (activeVideo.title ?? "").trim();
+  const subLine = seCode && title ? `${seCode} — ${title}` : seCode ?? title;
+
+  const shouldBlur = blurOn && !isWatched && !revealed;
+
+  return (
+    <section className="space-y-2 pt-1" aria-label="Selected episode synopsis">
+      <div>
+        <p className="text-white/45 text-[10px] font-mono uppercase tracking-[0.22em]">
+          Episode synopsis
+        </p>
+        {subLine && (
+          <p className="text-white/55 text-[12px] mt-0.5 font-mono">
+            {subLine}
+          </p>
+        )}
+      </div>
+      <div className="relative max-w-prose">
+        <p
+          className={[
+            "text-white/75 text-[15px] leading-relaxed transition-[filter] duration-200",
+            shouldBlur ? "select-none" : "selectable",
+          ].join(" ")}
+          style={{
+            filter: shouldBlur ? "blur(8px) saturate(120%)" : "none",
+            // user-select: none defence against highlight-to-bypass when
+            // blurred. The Tailwind `select-none` class handles it; the
+            // inline `userSelect` mirror is for browsers that ignore the
+            // class on text inside :is() selectors.
+            userSelect: shouldBlur ? "none" : "text",
+          }}
+        >
+          {overview}
+        </p>
+        {shouldBlur && (
+          <button
+            type="button"
+            onClick={() => onReveal(activeVideo.id)}
+            aria-label="Reveal episode synopsis"
+            className="absolute inset-0 flex items-center justify-center
+                       text-white/75 hover:text-white
+                       transition-colors group"
+          >
+            <span className="px-3 py-1.5 rounded-full
+                             bg-black/65 backdrop-blur-sm
+                             border border-white/15 group-hover:border-ln-accent/50
+                             text-[12px] font-medium tracking-wide
+                             shadow-[0_2px_12px_rgba(0,0,0,0.55)]">
+              Click to reveal spoilers
+            </span>
+          </button>
+        )}
+      </div>
+    </section>
+  );
 }
 
 /** Promote a string-only credit list to enriched entries (no character /

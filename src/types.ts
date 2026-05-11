@@ -311,6 +311,8 @@ export type KeybindAction =
   | "toggle-subtitles"
   | "fullscreen"
   | "toggle-panscan"
+  | "frame-step-forward"
+  | "frame-step-back"
   // Anime4K v4 reference modes — bound to Ctrl+1..6 by default,
   // mirroring the Stremio Community v5 / canonical Anime4K bindings.
   // Ctrl+0 disables upscaling (sets profile 0 / "None").
@@ -333,6 +335,8 @@ export const KEYBIND_ACTIONS: { id: KeybindAction; label: string; description: s
   { id: "toggle-subtitles", label: "Toggle Subtitles",     description: "Open or close the subtitle picker" },
   { id: "fullscreen",       label: "Toggle Fullscreen",    description: "Maximize / restore the window" },
   { id: "toggle-panscan",   label: "Toggle Panscan (Fill Screen)", description: "Zoom-and-crop the video to fill the screen on its constrained axis — useful for 21:9 content on a 16:9 monitor (or vice-versa). Off = letterbox / pillarbox." },
+  { id: "frame-step-back",    label: "Step One Frame Back",    description: "Nudge playback back by exactly one frame and pause. Useful for catching subtitle timing, screenshot precision, or anime sakuga inspection." },
+  { id: "frame-step-forward", label: "Step One Frame Forward", description: "Advance playback by exactly one frame and pause. Pair with the back-step binding to scrub frame-by-frame." },
   { id: "anime4k-a",        label: "Anime4K · Mode A",     description: "High-quality restore + upscale" },
   { id: "anime4k-b",        label: "Anime4K · Mode B",     description: "Soft restore for noisy sources" },
   { id: "anime4k-c",        label: "Anime4K · Mode C",     description: "GAN-based restore — sharpest of the three" },

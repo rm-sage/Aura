@@ -12,11 +12,14 @@ description = "Allows the frontend to toggle pause, seek, set volume / speed, sw
 commands.allow = [
   "toggle_pause",
   "seek_relative",
+  "frame_step",
   "seek_absolute",
   "set_volume",
   "set_speed",
   "set_audio_track",
+  "set_audio_delay",
   "set_subtitle_track",
+  "set_subtitle_delay",
   "set_subtitle_visibility",
   "set_panscan",
   "get_tracks",
@@ -37,8 +40,8 @@ commands.allow = ["fetch_catalog", "fetch_catalog_paginated"]
 
 [[permission]]
 identifier = "allow-addon-manifest"
-description = "Allows the frontend to retrieve an addon's full manifest"
-commands.allow = ["get_addon_manifest"]
+description = "Allows the frontend to retrieve an addon's full manifest (including the cache-bypass `refresh_addon_manifest` variant used by the per-addon Refresh button)"
+commands.allow = ["get_addon_manifest", "refresh_addon_manifest"]
 
 # ── Addon management ──────────────────────────────────────────────────────────
 [[permission]]

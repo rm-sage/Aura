@@ -8,6 +8,8 @@ import type { AddonEntry } from "../types";
 import type { UserSession } from "../LoginView";
 import LoginView from "../LoginView";
 import { openContextMenu } from "../ContextMenu";
+import { showAppToast } from "../AppToast";
+import Tooltip from "../Tooltip";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -229,6 +231,7 @@ function AddonRow({
   onSessionExpired: () => void;
 }) {
   const [removing, setRemoving] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
 
   const handleRemove = async () => {
     setRemoving(true);
@@ -242,6 +245,28 @@ function AddonRow({
     } catch (e) {
       if (String(e) === "SESSION_EXPIRED") onSessionExpired();
       setRemoving(false);
+    }
+  };
+
+  // Force a fresh manifest fetch (bypassing the 5-min MANIFEST_CACHE
+  // TTL). Surfaces newly-added catalogs on self-hosted AIOMetadata
+  // without forcing a remove + re-add cycle. Toast on success with the
+  // catalog count so the user gets concrete feedback; toast + shake on
+  // error so a network blip is obvious without burying the chip.
+  const handleRefresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      const manifest = await invoke<{ catalogs: unknown[]; name?: string }>(
+        "refresh_addon_manifest",
+        { addonUrl: addon.url },
+      );
+      const count = Array.isArray(manifest.catalogs) ? manifest.catalogs.length : 0;
+      showAppToast(`Refreshed ${addon.name} — ${count} catalog${count === 1 ? "" : "s"}`, { duration: 2500 });
+    } catch (e) {
+      showAppToast(`Couldn't refresh ${addon.name}: ${String(e)}`, { duration: 4000 });
+    } finally {
+      setRefreshing(false);
     }
   };
 
@@ -300,17 +325,103 @@ function AddonRow({
           </div>
         ) : null}
       </div>
-      <button
-        onClick={handleRemove}
-        disabled={removing}
-        aria-label={`Remove ${addon.name}`}
-        className="opacity-0 group-hover:opacity-100 flex-shrink-0 px-2.5 py-1 rounded-lg
-                   text-white/40 hover:text-white/80 hover:bg-white/10 text-xs
-                   transition-all disabled:opacity-20"
-      >
-        {removing ? "…" : "Remove"}
-      </button>
+      {/* Paired icon buttons — Refresh + Remove. Both hidden until the
+          row is hovered, mirroring the previous text-button reveal
+          pattern. Refresh re-fetches the manifest with the cache bust;
+          spinner animation while in flight. Remove uses a rose-tinted
+          hover so the destructive action reads visually. */}
+      <div className="flex-shrink-0 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+        <Tooltip text={refreshing ? "Refreshing…" : "Refresh manifest"} pos="bottom">
+          <button
+            type="button"
+            onClick={handleRefresh}
+            disabled={refreshing || removing}
+            aria-label={`Refresh ${addon.name}`}
+            className="w-7 h-7 flex items-center justify-center rounded-lg
+                       text-white/45 hover:text-white hover:bg-white/8
+                       transition-colors disabled:opacity-40 disabled:hover:bg-transparent
+                       active:scale-95 active:bg-white/12"
+          >
+            <RefreshIcon spinning={refreshing} />
+          </button>
+        </Tooltip>
+        <Tooltip text={removing ? "Removing…" : "Remove addon"} pos="bottom">
+          <button
+            type="button"
+            onClick={handleRemove}
+            disabled={removing || refreshing}
+            aria-label={`Remove ${addon.name}`}
+            className="w-7 h-7 flex items-center justify-center rounded-lg
+                       text-white/45 hover:text-rose-300 hover:bg-rose-500/12
+                       transition-colors disabled:opacity-40 disabled:hover:bg-transparent
+                       active:scale-95"
+          >
+            {removing ? <SpinnerDot /> : <CloseIcon />}
+          </button>
+        </Tooltip>
+      </div>
     </div>
+  );
+}
+
+/** Refresh glyph — circular arrow that rotates while a refresh is in
+ *  flight. Stroke-based so it inherits text colour from the parent
+ *  button's hover/focus state. */
+function RefreshIcon({ spinning }: { spinning: boolean }) {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={{
+        animation: spinning ? "addon-refresh-spin 0.9s linear infinite" : "none",
+        transformOrigin: "center",
+      }}
+      aria-hidden
+    >
+      <path d="M3 12a9 9 0 0 1 15.4-6.36L21 8" />
+      <polyline points="21 3 21 8 16 8" />
+      <path d="M21 12a9 9 0 0 1-15.4 6.36L3 16" />
+      <polyline points="3 21 3 16 8 16" />
+    </svg>
+  );
+}
+
+/** Close (X) glyph used as the redesigned Remove icon. */
+function CloseIcon() {
+  return (
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <line x1="6" y1="6" x2="18" y2="18" />
+      <line x1="18" y1="6" x2="6" y2="18" />
+    </svg>
+  );
+}
+
+/** Single-dot spinner shown in the Remove button while a removal is
+ *  in flight — distinct from the Refresh spinner so the user knows
+ *  which action is mid-air if they trigger one then the other. */
+function SpinnerDot() {
+  return (
+    <div
+      className="w-2 h-2 rounded-full bg-current"
+      style={{ animation: "addon-spinner-pulse 0.9s ease-in-out infinite" }}
+      aria-hidden
+    />
   );
 }
 

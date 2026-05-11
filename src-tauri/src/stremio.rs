@@ -871,6 +871,27 @@ fn log_label(name: &str, url: &str) -> String {
     }
 }
 
+/// Force a fresh manifest fetch, bypassing the 5-minute MANIFEST_CACHE
+/// TTL. Used by the per-addon "Refresh" button in AddonsView so users
+/// can pick up newly-added catalogs (typical for self-hosted
+/// AIOMetadata where catalogs are toggled in the addon's configure
+/// page) without removing and re-adding the addon. The shape matches
+/// `get_addon_manifest` so callers can reuse the same response type.
+#[tauri::command]
+pub async fn refresh_addon_manifest(addon_url: String) -> Result<AddonManifest, String> {
+    validate_url(&addon_url)?;
+    let base = normalise_addon_base(&addon_url);
+    // Drop the cached entry BEFORE the refetch so the very next call
+    // sees the cache miss and hits the network. We also drop any
+    // catalog-level success caches keyed against this base so the
+    // refresh actually surfaces the new state on next home load.
+    manifest_cache().lock().unwrap().remove(&base);
+    let prefix = format!("{base}|");
+    if let Ok(mut ok)   = catalog_ok_cache().lock()   { ok.retain(|k, _| !k.starts_with(&prefix)); }
+    if let Ok(mut fail) = addon_fail_cache().lock()   { fail.retain(|k, _| !k.starts_with(&prefix)); }
+    get_addon_manifest(addon_url).await
+}
+
 #[tauri::command]
 pub async fn get_addon_manifest(addon_url: String) -> Result<AddonManifest, String> {
     validate_url(&addon_url)?;

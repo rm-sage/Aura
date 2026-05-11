@@ -76,6 +76,36 @@ export interface AuraSettings {
    *  Result of the stream check is cached locally (12h TTL) so a
    *  re-scan over the same episode doesn't refire the network call. */
   notifyOnlyWithStreams: boolean;
+  /** Reduced-motion policy. `"auto"` (default) honours the OS-level
+   *  `prefers-reduced-motion` media query — most users get exactly the
+   *  experience they configured at the OS level. `"always"` forces
+   *  decorative loops off regardless of OS pref (useful on platforms
+   *  where the OS toggle is too coarse — Windows ties it to "Show
+   *  animations in Windows" which also disables useful UI affordances
+   *  the user might want to keep). `"never"` forces motion on even
+   *  when the OS asked for reduce (useful for users who set OS reduce
+   *  for a specific app but want Aura's atmosphere). */
+  reduceMotion: "auto" | "always" | "never";
+  /** When true, the Next-Up CTA auto-fires `playNext` after
+   *  `autoAdvanceDelaySeconds` of inactivity once the card surfaces.
+   *  Default false — auto-advance is opt-in to avoid the "I was
+   *  reading the credits and it skipped" friction class. Mouse
+   *  movement inside the player, the Escape key, or explicit dismiss
+   *  cancels the countdown. */
+  autoAdvanceNextEpisode: boolean;
+  /** Countdown in seconds before silent auto-advance fires (when
+   *  `autoAdvanceNextEpisode === true`). Clamped to [5, 30] on load
+   *  to guarantee the user always has a window to cancel. */
+  autoAdvanceDelaySeconds: number;
+  /** Blur the selected episode's per-episode synopsis on the detail
+   *  page until the user clicks to reveal. Spoiler protection for
+   *  per-episode overview text. Watched episodes are NEVER blurred
+   *  (the user has already seen the content — no spoiler risk by
+   *  definition) regardless of this toggle. Default false so the
+   *  synopsis shows by default on a fresh install; users who care
+   *  about spoilers flip this on. Mirrors the opt-in shape of
+   *  `blurUnwatchedThumbnails`. */
+  blurEpisodeSynopsis: boolean;
 }
 
 export const DEFAULT_AURA_SETTINGS: AuraSettings = {
@@ -90,6 +120,10 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   blurUnwatchedThumbnails: false,
   heroCatalog: null,
   notifyOnlyWithStreams: false,
+  reduceMotion: "auto",
+  autoAdvanceNextEpisode: false,
+  autoAdvanceDelaySeconds: 10,
+  blurEpisodeSynopsis: false,
 };
 
 // Module-level memoization snapshot. loadAuraSettings is called many
@@ -145,6 +179,20 @@ function readFromStorage(): AuraSettings {
       notifyOnlyWithStreams: typeof parsed.notifyOnlyWithStreams === "boolean"
         ? parsed.notifyOnlyWithStreams
         : false,
+      reduceMotion:
+        parsed.reduceMotion === "always" || parsed.reduceMotion === "never"
+          ? parsed.reduceMotion
+          : "auto",
+      autoAdvanceNextEpisode: typeof parsed.autoAdvanceNextEpisode === "boolean"
+        ? parsed.autoAdvanceNextEpisode
+        : false,
+      autoAdvanceDelaySeconds: typeof parsed.autoAdvanceDelaySeconds === "number"
+        && Number.isFinite(parsed.autoAdvanceDelaySeconds)
+        ? Math.max(5, Math.min(30, Math.round(parsed.autoAdvanceDelaySeconds)))
+        : 10,
+      blurEpisodeSynopsis: typeof parsed.blurEpisodeSynopsis === "boolean"
+        ? parsed.blurEpisodeSynopsis
+        : false,
       heroCatalog: parsed.heroCatalog
         && typeof parsed.heroCatalog === "object"
         && typeof (parsed.heroCatalog as Record<string, unknown>).addonUrl === "string"
@@ -183,4 +231,33 @@ export function saveAuraSettings(s: AuraSettings) {
   cached = null; // bust cache before listeners run so they read fresh values
   // Same-window components don't see `storage` events; emit a custom one.
   window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
+}
+
+// ---------------------------------------------------------------------------
+// Reduced-motion runtime gate
+//
+// Centralises the policy that translates `auraSettings.reduceMotion` +
+// the OS `prefers-reduced-motion` media query into a boolean the CSS
+// can act on. `applyReducedMotionAttribute()` writes `<html
+// data-reduced-motion="true|false">` so the CSS selectors in App.css
+// only need to look at one source of truth. Mounted from main.tsx
+// (synchronous, before React paints — eliminates the BootSplash flash
+// for OS-pref users) AND re-fired by App.tsx on `aura:settings-changed`
+// + `matchMedia` change events so live toggles take effect immediately.
+// ---------------------------------------------------------------------------
+
+export function effectiveReducedMotion(): boolean {
+  if (typeof window === "undefined") return false;
+  const pref = loadAuraSettings().reduceMotion;
+  if (pref === "always") return true;
+  if (pref === "never")  return false;
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+export function applyReducedMotionAttribute(): void {
+  if (typeof document === "undefined") return;
+  document.documentElement.setAttribute(
+    "data-reduced-motion",
+    effectiveReducedMotion() ? "true" : "false",
+  );
 }

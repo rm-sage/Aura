@@ -484,6 +484,12 @@ pub async fn save_progress<R: Runtime>(
         return Ok(());
     };
 
+    crate::devlog!(
+        info, "scrobble",
+        "AniList resolve: show=\"{}\" id={} episode_num={} (sess.season={:?} sess.episode_num={:?})",
+        sess.title, show_id, episode_num, sess.season, sess.episode_num,
+    );
+
     // 1. Cache lookup. Treat the cache as authoritative when its
     // episode count is consistent with what we're trying to save.
     let cached = cache_lock()
@@ -491,21 +497,64 @@ pub async fn save_progress<R: Runtime>(
         .ok()
         .and_then(|g| g.by_show.get(show_id).cloned());
 
-    let media = if let Some(c) = &cached {
-        let consistent = c.episodes.map(|e| e >= episode_num).unwrap_or(true);
-        if consistent {
-            // Refresh mediaListEntry so the pre-flight skip works.
-            fetch_media(&access, c.anilist_id).await?
-        } else {
-            // The cached entry doesn't have enough episodes for our
-            // episode_num. Likely a multi-season case where the
-            // cached id was season 1 and we're now on season 2+.
-            // Re-search to pick a different match.
+    // Resolve to an AniList MediaInfo. Three layered strategies, each
+    // surfacing a clear log line so the DevConsole shows which path
+    // produced the result (or NotFound) without the user having to
+    // re-instrument the binary.
+    //
+    //   • Cached + consistent → fetch_media on the cached id. If that
+    //     comes back NotFound (stale / wrong cache) we DON'T bail —
+    //     we fall through to search. Earlier behavior surfaced NotFound
+    //     here even when the show genuinely existed on AniList, which
+    //     manifested as "skipped (not on AniList)" for valid anime
+    //     whose cached id had drifted.
+    //   • Cached + inconsistent → re-search (the cached entry doesn't
+    //     have enough episodes for our ep number).
+    //   • Uncached → search.
+    let media = match &cached {
+        Some(c) if c.episodes.map(|e| e >= episode_num).unwrap_or(true) => {
+            crate::devlog!(
+                info, "scrobble",
+                "AniList cache hit: show={} → anilist_id={} (episodes={:?})",
+                show_id, c.anilist_id, c.episodes,
+            );
+            match fetch_media(&access, c.anilist_id).await {
+                Ok(m) => m,
+                Err(AnilistError::NotFound) => {
+                    crate::devlog!(
+                        warn, "scrobble",
+                        "AniList cached id {} returned NotFound — falling back to title search for \"{}\"",
+                        c.anilist_id, sess.title,
+                    );
+                    search_and_pick(&access, &sess.title, episode_num).await?
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Some(c) => {
+            crate::devlog!(
+                info, "scrobble",
+                "AniList cache inconsistent: cached episodes={:?} < requested ep={} — re-searching",
+                c.episodes, episode_num,
+            );
             search_and_pick(&access, &sess.title, episode_num).await?
         }
-    } else {
-        search_and_pick(&access, &sess.title, episode_num).await?
+        None => {
+            crate::devlog!(
+                info, "scrobble",
+                "AniList cache miss for show={} — searching by title \"{}\"",
+                show_id, sess.title,
+            );
+            search_and_pick(&access, &sess.title, episode_num).await?
+        }
     };
+
+    crate::devlog!(
+        info, "scrobble",
+        "AniList resolved: show={} → anilist_id={} (episodes={:?}, current_list_progress={:?})",
+        show_id, media.id, media.episodes,
+        media.media_list_entry.as_ref().map(|e| e.progress),
+    );
 
     // 2. Persist mapping (write-through cache).
     let needs_persist = cached.as_ref().map(|c| c.anilist_id) != Some(media.id);
@@ -561,22 +610,108 @@ pub async fn save_progress<R: Runtime>(
 /// runner). Falls back to the first result if no candidate clears that
 /// bar — better to attempt a save than return NotFound for matches the
 /// search did rank.
+/// Generate progressively more permissive search variants from a title.
+/// AniList's search algorithm is sensitive to punctuation in ways that
+/// real-world titles trip over — "Frieren: Beyond Journey's End" returns
+/// zero candidates while "Frieren" returns the show as the top hit. We
+/// try the original first (best precision), then strip punctuation, then
+/// fall back to the first clause before a delimiter, then the first
+/// word. Dedupes so we never re-query AniList with the same string.
+///
+/// Order matters: less-specific variants risk matching the wrong show
+/// (a one-word query like "Sword" could resolve to half a dozen distinct
+/// anime). We accept that risk only after more-specific variants have
+/// genuinely failed.
+fn title_search_variants(title: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push_unique = |s: String| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() { return; }
+        if out.iter().any(|existing| existing.eq_ignore_ascii_case(trimmed)) { return; }
+        out.push(trimmed.to_string());
+    };
+
+    push_unique(title.to_string());
+
+    // Strip ASCII + curly punctuation. Keep alphanumerics, spaces, and
+    // non-Latin scripts (so a Japanese title stays usable).
+    let stripped: String = title
+        .chars()
+        .map(|c| match c {
+            ':' | ';' | ',' | '.' | '!' | '?' | '–' | '—' | '-'
+            | '\'' | '"' | '`' | '’' | '‘' | '“' | '”'
+            | '(' | ')' | '[' | ']' | '{' | '}' => ' ',
+            _ => c,
+        })
+        .collect();
+    let stripped_normalized = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    push_unique(stripped_normalized);
+
+    // First clause — text before the first `:`, `–`, `—`, ` - `, or `(`.
+    // Many anime sequel titles read "{Show}: {Subtitle}" or
+    // "{Show} - Season 2"; the lead clause is usually the canonical
+    // searchable form.
+    for delim in [':', '–', '—', '('] {
+        if let Some(idx) = title.find(delim) {
+            push_unique(title[..idx].to_string());
+            break;
+        }
+    }
+    if let Some(idx) = title.find(" - ") {
+        push_unique(title[..idx].to_string());
+    }
+
+    // Final fallback — the first word. Most useful for one-name brands
+    // (Frieren, Naruto, Bleach) where the franchise IS the show on
+    // AniList's catalogue. Risks false-matching for generic words but
+    // only fires when nothing else found anything.
+    if let Some(first_word) = title.split_whitespace().next() {
+        push_unique(first_word.to_string());
+    }
+
+    out
+}
+
 async fn search_and_pick(
     token:       &str,
     title:       &str,
     episode_num: u32,
 ) -> Result<MediaInfo, AnilistError> {
-    let candidates = search_anilist(token, title).await?;
-    if candidates.is_empty() {
-        return Err(AnilistError::NotFound);
+    let variants = title_search_variants(title);
+    for (i, variant) in variants.iter().enumerate() {
+        let candidates = search_anilist(token, variant).await?;
+        if candidates.is_empty() {
+            crate::devlog!(
+                info, "scrobble",
+                "AniList search variant {}/{}: \"{}\" → 0 candidates",
+                i + 1, variants.len(), variant,
+            );
+            continue;
+        }
+        crate::devlog!(
+            info, "scrobble",
+            "AniList search variant {}/{}: \"{}\" → {} candidate(s): [{}]",
+            i + 1, variants.len(), variant, candidates.len(),
+            candidates.iter()
+                .map(|m| format!("id={} eps={:?}", m.id, m.episodes))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        let pick = candidates
+            .iter()
+            .find(|m| m.episodes.map(|e| e >= episode_num).unwrap_or(true))
+            .or_else(|| candidates.first())
+            .cloned();
+        if let Some(pick) = pick {
+            return Ok(pick);
+        }
     }
-    let pick = candidates
-        .iter()
-        .find(|m| m.episodes.map(|e| e >= episode_num).unwrap_or(true))
-        .or_else(|| candidates.first())
-        .cloned()
-        .ok_or(AnilistError::NotFound)?;
-    Ok(pick)
+    crate::devlog!(
+        warn, "scrobble",
+        "AniList search exhausted {} variant(s) for title=\"{}\" — returning NotFound",
+        variants.len(), title,
+    );
+    Err(AnilistError::NotFound)
 }
 
 fn now_secs() -> u64 {
