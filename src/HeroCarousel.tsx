@@ -94,6 +94,20 @@ const ChevronRight = () => (
 );
 
 function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
+  // Per-item "logo image failed to load" set. Falls back to the
+  // text-title rendering path for that item, sidestepping the
+  // broken-image glyph the browser would otherwise paint next to the
+  // alt text. Keyed by item id so a working logo for the next slide
+  // isn't suppressed by a previous item's failure.
+  const [logoFailed, setLogoFailed] = useState<Set<string>>(new Set());
+  const markLogoFailed = (id: string) => {
+    setLogoFailed((prev) => {
+      if (prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+  };
   const [index, setIndex] = useState(0);
   const [hovered, setHovered] = useState(false);
   /** Indices where we've detected a dual-layer fallback (low-res or portrait-only). */
@@ -273,11 +287,11 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
             role={onSelect ? "button" : undefined}
             tabIndex={onSelect ? 0 : undefined}
           >
-            {current.logo ? (
+            {current.logo && !logoFailed.has(current.id) ? (
               <div className="flex items-end gap-4 mb-3 flex-wrap">
                 <img
                   src={current.logo}
-                  alt={current.name}
+                  alt=""
                   draggable={false}
                   className="max-h-24 object-contain object-left"
                   style={{
@@ -285,6 +299,16 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
                     filter:
                       "drop-shadow(0 4px 14px rgba(0,0,0,0.85)) drop-shadow(0 0 22px rgba(0,0,0,0.4))",
                   }}
+                  // Logo URLs can 404 or return malformed image data (CDN
+                  // churn, deleted Fanart.tv entries, etc.). Flip into the
+                  // text-title branch on error so the user sees the show
+                  // name instead of the browser's broken-image glyph + alt
+                  // text. Empty alt above means the broken-image state
+                  // doesn't ALSO leak the title — the text branch below
+                  // owns that. Once flipped for an id, stays flipped for
+                  // the rest of the carousel session (no retry-on-render
+                  // thrash).
+                  onError={() => markLogoFailed(current.id)}
                 />
                 {current.release_info && (
                   <span

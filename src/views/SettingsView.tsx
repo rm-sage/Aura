@@ -108,18 +108,36 @@ interface BackendSettings {
 // Reusable setting controls
 // ---------------------------------------------------------------------------
 
-/** Forgiving subsequence match — every char of `needle` must appear in
- *  `hay` IN ORDER, not necessarily contiguous. Both inputs should already
- *  be lowercased by the caller. Used by the Settings search bar so users
- *  can type "subfsz" and still find "Subtitle Font Size" without typing
- *  the words verbatim. */
-function fuzzySubseq(needle: string, hay: string): boolean {
-  if (!needle) return true;
-  let i = 0;
-  for (let j = 0; j < hay.length && i < needle.length; j++) {
-    if (hay.charCodeAt(j) === needle.charCodeAt(i)) i += 1;
-  }
-  return i === needle.length;
+/** Tight per-row matcher used by the Settings search bar. Replaces the
+ *  earlier forgiving subsequence match (`fuzzySubseq`) that accepted
+ *  "subfsz" → "Subtitle Font Size" and ended up matching every section
+ *  on the page for generic queries.
+ *
+ *  Rules (all inputs pre-lowercased):
+ *    • Each whitespace-separated token must match independently (AND).
+ *    • A token matches if it is a substring of the label OR a prefix
+ *      of any word in the label OR a substring of the description.
+ *    • Empty query returns true (matches everything; caller decides
+ *      what to do with that).
+ *
+ *  Accepts: "subtitle" → "Subtitle Font Size" (substring of label),
+ *           "sub font" → "Subtitle Font Size" (prefix of each word),
+ *           "subt" → "Subtitle Font Size" (prefix).
+ *  Rejects: "subfsz" → no token is a contiguous match anywhere. */
+function matchesSettingRow(query: string, label: string, description: string): boolean {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  const tokens = q.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return true;
+  const lab = label.toLowerCase();
+  const desc = description.toLowerCase();
+  const labelWords = lab.split(/[^a-z0-9]+/i).filter(Boolean);
+  return tokens.every((t) => {
+    if (lab.includes(t)) return true;
+    if (labelWords.some((w) => w.startsWith(t))) return true;
+    if (desc.includes(t)) return true;
+    return false;
+  });
 }
 
 interface DropdownProps {
@@ -138,7 +156,12 @@ function SettingDropdown({
   label, description, value, options, onChange, required, disabled, badge,
 }: DropdownProps) {
   return (
-    <div className="space-y-2">
+    <div
+      className="space-y-2"
+      data-settings-row=""
+      data-settings-label={label}
+      data-settings-description={description}
+    >
       <div>
         <div className="flex items-center gap-2">
           <p className="text-white/75 text-sm font-medium">{label}</p>
@@ -182,7 +205,12 @@ interface ToggleProps {
 
 function SettingToggle({ label, description, value, onChange }: ToggleProps) {
   return (
-    <div className="flex items-center justify-between gap-4">
+    <div
+      className="flex items-center justify-between gap-4"
+      data-settings-row=""
+      data-settings-label={label}
+      data-settings-description={description}
+    >
       <div className="flex-1 min-w-0">
         <p className="text-white/75 text-sm font-medium">{label}</p>
         <p className="text-white/35 text-xs mt-0.5">{description}</p>
@@ -220,7 +248,12 @@ function SkipModeRow({
     { id: "auto",   label: "Auto",   tone: "text-emerald-300" },
   ];
   return (
-    <div className="flex items-center justify-between gap-4">
+    <div
+      className="flex items-center justify-between gap-4"
+      data-settings-row=""
+      data-settings-label={label}
+      data-settings-description={description}
+    >
       <div className="flex-1 min-w-0">
         <p className="text-white/75 text-sm font-medium">{label}</p>
         <p className="text-white/35 text-xs mt-0.5">{description}</p>
@@ -269,7 +302,12 @@ function SettingText({
 }: TextInputProps) {
   const validState = validate && value.length > 0 ? validate(value) : null;
   return (
-    <div className="space-y-2">
+    <div
+      className="space-y-2"
+      data-settings-row=""
+      data-settings-label={label}
+      data-settings-description={description}
+    >
       <div className="flex items-center gap-2">
         <p className="text-white/75 text-sm font-medium">{label}</p>
         {badge}
@@ -1531,7 +1569,12 @@ function NextUpLeadTimeRow({
   const PRESETS = [0, 30, 60, 90, 120];
   const clamped = Math.max(0, Math.min(300, value));
   return (
-    <div className="space-y-2">
+    <div
+      className="space-y-2"
+      data-settings-row=""
+      data-settings-label="Next-Up lead time"
+      data-settings-description="Seconds before an episode ends to surface the Next Up card during series / anime playback. Set to 0 to disable the prompt entirely. The card never appears for movies or for the last aired episode of a series."
+    >
       <div>
         <p className="text-white/75 text-sm font-medium">Next-Up lead time</p>
         <p className="text-white/35 text-xs mt-0.5">
@@ -1594,7 +1637,12 @@ function AutoAdvanceDelayRow({
   const PRESETS = [5, 10, 15, 20, 30];
   const clamped = Math.max(5, Math.min(30, value));
   return (
-    <div className="space-y-2">
+    <div
+      className="space-y-2"
+      data-settings-row=""
+      data-settings-label="Auto-advance delay"
+      data-settings-description="Seconds the Next-Up card waits before auto-firing. Any mouse / keyboard / scroll input cancels the countdown."
+    >
       <div>
         <p className="text-white/75 text-sm font-medium">Auto-advance delay</p>
         <p className="text-white/35 text-xs mt-0.5">
@@ -3072,68 +3120,61 @@ export default function SettingsView({ addons, session }: Props) {
   useLayoutEffect(() => {
     const root = scrollRef.current;
     if (!root) return;
-    const sections = Array.from(root.querySelectorAll<HTMLElement>('section[id^="sec-"]'));
-    const q = searchQuery.trim().toLowerCase();
-    const wasFiltered = matchCountRef.current !== null && matchCountRef.current !== sections.length;
+    // Cleanup the legacy section-level highlight in case a previous
+    // build of this code left one on a re-render boundary. Cheap
+    // belt-and-braces.
+    root.querySelectorAll(".settings-section-matched").forEach((s) =>
+      s.classList.remove("settings-section-matched"));
+
+    const rows = Array.from(root.querySelectorAll<HTMLElement>("[data-settings-row]"));
+    const q = searchQuery.trim();
     if (!q) {
-      sections.forEach((s) => {
-        s.style.display = "";
-        s.classList.remove("settings-section-matched");
-        if (wasFiltered) {
-          // Re-animate when CLEARING an active filter so the now-visible
-          // sections fade back in cleanly. Skip on initial mount (when no
-          // filter was active) to avoid a one-time stutter.
-          s.classList.remove("settings-section-enter");
-          void s.offsetWidth; // force reflow so the animation re-triggers
-          s.classList.add("settings-section-enter");
-        }
-      });
-      matchCountRef.current = sections.length;
+      rows.forEach((r) => r.classList.remove("settings-row-matched"));
+      matchCountRef.current = 0;
       setMatchCount(null);
       setMatchedIds([]);
       setCurrentMatchIdx(-1);
       return;
     }
-    const tokens = q.split(/\s+/).filter(Boolean);
     let matches = 0;
     const matchedNow: string[] = [];
-    for (const s of sections) {
-      const haystack = (s.textContent ?? "").toLowerCase();
-      const ok = tokens.every((t) => fuzzySubseq(t, haystack));
-      const wasHidden = s.style.display === "none";
-      s.style.display = ok ? "" : "none";
+    rows.forEach((r, idx) => {
+      const label       = r.getAttribute("data-settings-label") ?? "";
+      const description = r.getAttribute("data-settings-description") ?? "";
+      const ok = matchesSettingRow(q, label, description);
       if (ok) {
         matches += 1;
-        matchedNow.push(s.id);
-        s.classList.add("settings-section-matched");
-        if (wasHidden) {
-          s.classList.remove("settings-section-enter");
-          void s.offsetWidth;
-          s.classList.add("settings-section-enter");
-        }
+        // DOM-position-based id — stable within a render and unique
+        // even if two settings happen to share a label.
+        matchedNow.push(String(idx));
+        r.classList.add("settings-row-matched");
       } else {
-        s.classList.remove("settings-section-matched");
+        r.classList.remove("settings-row-matched");
       }
-    }
+    });
     matchCountRef.current = matches;
     setMatchCount(matches);
     setMatchedIds(matchedNow);
-    // Reset to the first match when the matched-list changes — feels
-    // right because the user typically wants to start at the top of
-    // results after a query change.
+    // Reset to the first match when the matched-list changes — the
+    // user typically wants to start at the top of results.
     setCurrentMatchIdx(matchedNow.length > 0 ? 0 : -1);
   }, [searchQuery]);
 
   // Auto-scroll to the focused match. Runs whenever the index moves
-  // (prev / next clicks) or the matched-list changes. The smooth
-  // scrollIntoView respects the `scroll-mt-6` utility on Section.
+  // (prev / next clicks) or the matched-list changes. Each id in
+  // `matchedIds` is a DOM-position index into the row NodeList; we
+  // re-query the rows here rather than holding refs because rows
+  // can unmount/remount across renders (conditionally-rendered
+  // sections like AutoAdvanceDelayRow).
   useEffect(() => {
     if (currentMatchIdx < 0) return;
-    const id = matchedIds[currentMatchIdx];
-    if (!id) return;
-    const el = scrollRef.current?.querySelector<HTMLElement>(`#${id}`);
+    const idxStr = matchedIds[currentMatchIdx];
+    if (!idxStr) return;
+    const rowIdx = Number(idxStr);
+    const rows = scrollRef.current?.querySelectorAll<HTMLElement>("[data-settings-row]");
+    const el = rows?.[rowIdx];
     if (!el) return;
-    el.scrollIntoView({ behavior: "smooth", block: "start" });
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [currentMatchIdx, matchedIds]);
 
   const stepMatch = useCallback((delta: 1 | -1) => {

@@ -272,7 +272,7 @@ function AddonRow({
 
   return (
     <div
-      className="group flex items-start gap-3 px-4 py-3 rounded-xl
+      className="group flex items-center gap-3 px-4 py-3 rounded-xl
                  bg-white/3 border border-white/6 hover:bg-white/5
                  transition-colors"
       onContextMenu={(e) => {
@@ -325,22 +325,27 @@ function AddonRow({
           </div>
         ) : null}
       </div>
-      {/* Paired icon buttons — Refresh + Remove. Both hidden until the
-          row is hovered, mirroring the previous text-button reveal
-          pattern. Refresh re-fetches the manifest with the cache bust;
-          spinner animation while in flight. Remove uses a rose-tinted
-          hover so the destructive action reads visually. */}
-      <div className="flex-shrink-0 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+      {/* Paired icon buttons — Refresh + Remove. Larger glass-styled
+          targets, vertically centred against the row, persistent (no
+          hover-to-reveal) so the affordances are always discoverable.
+          Refresh uses the accent palette to match Aura's primary
+          actions; Remove uses rose hover for the destructive intent. */}
+      <div className="flex-shrink-0 flex items-center gap-2 self-center">
         <Tooltip text={refreshing ? "Refreshing…" : "Refresh manifest"} pos="bottom">
           <button
             type="button"
             onClick={handleRefresh}
             disabled={refreshing || removing}
             aria-label={`Refresh ${addon.name}`}
-            className="w-7 h-7 flex items-center justify-center rounded-lg
-                       text-white/45 hover:text-white hover:bg-white/8
-                       transition-colors disabled:opacity-40 disabled:hover:bg-transparent
-                       active:scale-95 active:bg-white/12"
+            className="w-10 h-10 flex items-center justify-center rounded-xl
+                       bg-white/[0.04] border border-white/10
+                       text-white/65 hover:text-ln-accent
+                       hover:bg-ln-accent/12 hover:border-ln-accent/40
+                       hover:shadow-[0_0_0_3px_rgba(91,164,255,0.08),0_4px_14px_-6px_rgba(91,164,255,0.45)]
+                       transition-all duration-150
+                       disabled:opacity-40 disabled:hover:bg-white/[0.04]
+                       disabled:hover:border-white/10 disabled:hover:shadow-none
+                       active:scale-95 active:bg-ln-accent/18"
           >
             <RefreshIcon spinning={refreshing} />
           </button>
@@ -351,10 +356,15 @@ function AddonRow({
             onClick={handleRemove}
             disabled={removing || refreshing}
             aria-label={`Remove ${addon.name}`}
-            className="w-7 h-7 flex items-center justify-center rounded-lg
-                       text-white/45 hover:text-rose-300 hover:bg-rose-500/12
-                       transition-colors disabled:opacity-40 disabled:hover:bg-transparent
-                       active:scale-95"
+            className="w-10 h-10 flex items-center justify-center rounded-xl
+                       bg-white/[0.04] border border-white/10
+                       text-white/65 hover:text-rose-300
+                       hover:bg-rose-500/12 hover:border-rose-400/40
+                       hover:shadow-[0_0_0_3px_rgba(244,63,94,0.08),0_4px_14px_-6px_rgba(244,63,94,0.45)]
+                       transition-all duration-150
+                       disabled:opacity-40 disabled:hover:bg-white/[0.04]
+                       disabled:hover:border-white/10 disabled:hover:shadow-none
+                       active:scale-95 active:bg-rose-500/20"
           >
             {removing ? <SpinnerDot /> : <CloseIcon />}
           </button>
@@ -370,8 +380,8 @@ function AddonRow({
 function RefreshIcon({ spinning }: { spinning: boolean }) {
   return (
     <svg
-      width="14"
-      height="14"
+      width="18"
+      height="18"
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
@@ -396,8 +406,8 @@ function RefreshIcon({ spinning }: { spinning: boolean }) {
 function CloseIcon() {
   return (
     <svg
-      width="13"
-      height="13"
+      width="17"
+      height="17"
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
@@ -443,9 +453,14 @@ export default function AddonsView({
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
       <div
-        className="flex-1 overflow-y-auto px-6 py-6 space-y-6"
+        className="flex-1 overflow-y-auto px-6 py-6"
         style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
       >
+        {/* Centred reading column — caps the page width on ultrawide
+            displays so rows don't sprawl across the entire viewport.
+            Matches the Settings page's column treatment for a
+            consistent "configuration surface" feel across the app. */}
+        <div className="mx-auto w-full max-w-3xl space-y-6">
         {/* Page header */}
         <div>
           <h1 className="text-white/85 text-xl font-light tracking-wide">Addons</h1>
@@ -494,6 +509,7 @@ export default function AddonsView({
             </div>
           )}
         </section>
+        </div>
       </div>
 
       {/* Login modal */}

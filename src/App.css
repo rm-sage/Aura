@@ -1838,21 +1838,26 @@ select option:hover {
 }
 
 /* ---------------------------------------------------------------- */
-/* Settings search — visual ring around sections that match the     */
-/* current query so the user sees AT-A-GLANCE which sections are    */
-/* relevant after typing. Applied via JS to every section whose     */
-/* text content matches; cleared when the query is cleared.         */
+/* Settings search — per-row accent ring on the SPECIFIC setting    */
+/* that matched the current query, scoped tight enough that a       */
+/* general query doesn't light up the whole page.                   */
 /*                                                                  */
-/* The inner panel (the bg-white/3 + border-white/8 block) is what  */
-/* gets the highlight, not the outer <section> — matching the       */
-/* visual chunk the user sees, and avoiding a halo around the       */
-/* uppercase title row above each panel.                            */
+/* Drawn as an inset ring + soft surrounding glow on the row's      */
+/* wrapper div (the element carrying [data-settings-row]). Padding  */
+/* is added so the ring doesn't sit flush against the row content;  */
+/* the inverse padding offset is applied so the layout doesn't      */
+/* shift when the class is added / removed.                         */
 /* ---------------------------------------------------------------- */
-.settings-section-matched > div {
-  border-color: rgba(91, 164, 255, 0.45);
-  box-shadow: 0 0 0 1px rgba(91, 164, 255, 0.18),
-              0 12px 32px rgba(91, 164, 255, 0.08);
-  transition: border-color 200ms ease-out, box-shadow 200ms ease-out;
+.settings-row-matched {
+  position: relative;
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  margin: -0.5rem -0.75rem;
+  background: rgba(91, 164, 255, 0.06);
+  box-shadow: inset 0 0 0 1px rgba(91, 164, 255, 0.42),
+              0 0 0 4px rgba(91, 164, 255, 0.10),
+              0 8px 22px -8px rgba(91, 164, 255, 0.30);
+  transition: background-color 180ms ease-out, box-shadow 180ms ease-out;
 }
 
 /* ---------------------------------------------------------------- */

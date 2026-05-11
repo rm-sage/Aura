@@ -697,191 +697,6 @@ function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | n
 // (e.g. a 21:9 movie's fill setting would re-apply to a 16:9 episode).
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// DelayMenu — inline ±0.1 s nudges for MPV's audio-delay and sub-delay
-// properties, surfaced as a small popover off the control bar. Closes
-// the gap between "addon audio/subs are slightly off" and "have to
-// drop to OS mpv to fix it." Per-stream session state — resets to 0
-// on stream change so an offset from one source doesn't carry into
-// the next.
-// ---------------------------------------------------------------------------
-
-function DelayMenu({ activeTarget }: { activeTarget: ActiveScrobbleTarget | null }) {
-  const [open, setOpen] = useState(false);
-  const [audio, setAudio] = useState(0);  // seconds, signed
-  const [subs, setSubs]   = useState(0);
-  const rootRef = useRef<HTMLDivElement | null>(null);
-
-  // Reset on stream change. We DO NOT explicitly invoke the Rust
-  // setters here — MPV resets these properties on its own with each
-  // loadfile, and an unnecessary IPC call during stream-change can
-  // race against the load. Trust the loadfile reset.
-  useEffect(() => {
-    setAudio(0);
-    setSubs(0);
-  }, [activeTarget?.id]);
-
-  // Click-outside / Esc close.
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (!rootRef.current) return;
-      if (!rootRef.current.contains(e.target as Node)) setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
-    window.addEventListener("mousedown", onDown);
-    window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("mousedown", onDown);
-      window.removeEventListener("keydown", onKey);
-    };
-  }, [open]);
-
-  const nudgeAudio = (delta: number) => {
-    const next = Math.max(-10, Math.min(10, +(audio + delta).toFixed(3)));
-    setAudio(next);
-    invoke("set_audio_delay", { seconds: next }).catch(() => {});
-  };
-  const nudgeSubs = (delta: number) => {
-    const next = Math.max(-10, Math.min(10, +(subs + delta).toFixed(3)));
-    setSubs(next);
-    invoke("set_subtitle_delay", { seconds: next }).catch(() => {});
-  };
-  const resetAudio = () => {
-    setAudio(0);
-    invoke("set_audio_delay", { seconds: 0 }).catch(() => {});
-  };
-  const resetSubs = () => {
-    setSubs(0);
-    invoke("set_subtitle_delay", { seconds: 0 }).catch(() => {});
-  };
-
-  const fmt = (s: number) => {
-    if (s === 0) return "0.0 s";
-    const sign = s > 0 ? "+" : "−";
-    return `${sign}${Math.abs(s).toFixed(1)} s`;
-  };
-
-  // Indicator dot when either delay is non-zero — at-a-glance signal
-  // that a calibration is in effect for the current stream.
-  const dirty = audio !== 0 || subs !== 0;
-
-  return (
-    <div className="relative" ref={rootRef}>
-      <Tooltip text="A/V sync — nudge audio / subtitle delay" pos="top">
-        <button
-          onClick={() => setOpen((v) => !v)}
-          aria-label="A/V sync nudges"
-          aria-pressed={open}
-          className={`relative flex items-center justify-center w-10 h-10 rounded-full
-                      transition-colors duration-150 flex-shrink-0
-                      ${open || dirty
-                        ? "bg-ln-accent/25 text-ln-accent"
-                        : "text-white/80 hover:text-white hover:bg-white/12 active:bg-white/20"
-                      }`}
-        >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-               strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-            <circle cx="12" cy="12" r="9" />
-            <path d="M12 7v5l3 2" />
-          </svg>
-          {dirty && (
-            <span aria-hidden className="absolute top-1 right-1 w-1.5 h-1.5 rounded-full bg-ln-accent" />
-          )}
-        </button>
-      </Tooltip>
-      {open && (
-        <div
-          className="absolute bottom-12 right-0 z-[10002]
-                     w-[260px] p-3 rounded-xl
-                     bg-black/85 backdrop-blur-2xl
-                     border border-white/12
-                     shadow-[0_18px_48px_rgba(0,0,0,0.65)]
-                     space-y-3"
-          onClick={(e) => e.stopPropagation()}
-        >
-          <div className="text-white/45 text-[10px] font-mono uppercase tracking-[0.22em]">
-            A / V sync
-          </div>
-          <DelayRow
-            label="Audio"
-            value={audio}
-            onMinus={() => nudgeAudio(-0.1)}
-            onPlus={() => nudgeAudio(+0.1)}
-            onReset={resetAudio}
-            fmt={fmt}
-          />
-          <DelayRow
-            label="Subtitles"
-            value={subs}
-            onMinus={() => nudgeSubs(-0.1)}
-            onPlus={() => nudgeSubs(+0.1)}
-            onReset={resetSubs}
-            fmt={fmt}
-          />
-          <p className="text-white/40 text-[10.5px] leading-snug">
-            Negative = play earlier · Positive = play later. Resets on stream change.
-          </p>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function DelayRow({
-  label, value, onMinus, onPlus, onReset, fmt,
-}: {
-  label: string;
-  value: number;
-  onMinus: () => void;
-  onPlus:  () => void;
-  onReset: () => void;
-  fmt: (s: number) => string;
-}) {
-  return (
-    <div className="space-y-1.5">
-      <div className="flex items-center justify-between text-[12px]">
-        <span className="text-white/75 font-medium">{label}</span>
-        <span className="text-white/55 font-mono tabular-nums">{fmt(value)}</span>
-      </div>
-      <div className="flex items-center gap-1.5">
-        <DelayBtn label="−0.1 s" onClick={onMinus} />
-        <DelayBtn label="+0.1 s" onClick={onPlus} />
-        <button
-          type="button"
-          onClick={onReset}
-          disabled={value === 0}
-          className="px-2 py-1 ml-auto rounded-md
-                     text-[10.5px] font-medium tracking-wide
-                     bg-white/5 text-white/55 border border-white/10
-                     hover:bg-white/10 hover:text-white
-                     disabled:opacity-35 disabled:hover:bg-white/5 disabled:hover:text-white/55
-                     transition-colors"
-        >
-          Reset
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function DelayBtn({ label, onClick }: { label: string; onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="flex-1 px-1.5 py-1 rounded-md
-                 text-[11px] font-mono tabular-nums
-                 bg-white/8 text-white/85 border border-white/12
-                 hover:bg-white/14 hover:text-white
-                 active:scale-95
-                 transition-all"
-    >
-      {label}
-    </button>
-  );
-}
-
 function PanscanButton({ activeTarget }: { activeTarget: ActiveScrobbleTarget | null }) {
   const [on, setOn] = useState(false);
 
@@ -1291,6 +1106,41 @@ export default function PlayerOverlay({
   /** Local "subtitles muted" flag tracked separately because MPV's
    *  `sub-visibility=no` doesn't surface as a track-list change. */
   const [subsMuted, setSubsMuted] = useState(false);
+
+  // ── A/V sync nudges ──
+  // Lifted into PlayerOverlay scope so both the audio and sub track
+  // menus can host their respective delay row inline. MPV resets these
+  // properties on each `loadfile`, so a stream change naturally zeroes
+  // the underlying state too — we just need to mirror that in React so
+  // the displayed value matches.
+  const [audioDelay, setAudioDelay] = useState(0);
+  const [subDelay,   setSubDelay]   = useState(0);
+  useEffect(() => {
+    setAudioDelay(0);
+    setSubDelay(0);
+  }, [activeTarget?.id]);
+  const nudgeAudioDelay = useCallback((delta: number) => {
+    setAudioDelay((prev) => {
+      const next = Math.max(-10, Math.min(10, +(prev + delta).toFixed(3)));
+      invoke("set_audio_delay", { seconds: next }).catch(() => {});
+      return next;
+    });
+  }, []);
+  const nudgeSubDelay = useCallback((delta: number) => {
+    setSubDelay((prev) => {
+      const next = Math.max(-10, Math.min(10, +(prev + delta).toFixed(3)));
+      invoke("set_subtitle_delay", { seconds: next }).catch(() => {});
+      return next;
+    });
+  }, []);
+  const resetAudioDelay = useCallback(() => {
+    setAudioDelay(0);
+    invoke("set_audio_delay", { seconds: 0 }).catch(() => {});
+  }, []);
+  const resetSubDelay = useCallback(() => {
+    setSubDelay(0);
+    invoke("set_subtitle_delay", { seconds: 0 }).catch(() => {});
+  }, []);
 
   // ── Toast (transient feedback over the player) ──
   const [toast, setToast] = useState<string | null>(null);
@@ -2087,6 +1937,13 @@ export default function PlayerOverlay({
                 } catch {}
               }}
               emptyHint="No audio tracks reported yet"
+              delay={{
+                label: "Audio sync",
+                value: audioDelay,
+                onMinus: () => nudgeAudioDelay(-0.1),
+                onPlus:  () => nudgeAudioDelay(+0.1),
+                onReset: resetAudioDelay,
+              }}
             />
 
             {/* Subtitle tracks — embedded MPV tracks merged with external
@@ -2193,6 +2050,13 @@ export default function PlayerOverlay({
                 } catch {}
               }}
               emptyHint="No subtitle tracks"
+              delay={{
+                label: "Subtitle sync",
+                value: subDelay,
+                onMinus: () => nudgeSubDelay(-0.1),
+                onPlus:  () => nudgeSubDelay(+0.1),
+                onReset: resetSubDelay,
+              }}
             />
 
             {/* Subtitle styling — same six controls as Settings, inline. */}
@@ -2201,17 +2065,10 @@ export default function PlayerOverlay({
             {/* Shader / upscaler */}
             <ShaderPicker activeTarget={activeTarget} />
 
-            {/* Panscan / fill-screen toggle — for ultrawide vs 16:9 mismatches */}
+            {/* Panscan / fill-screen toggle — for ultrawide vs 16:9 mismatches.
+                Sits just left of Fullscreen so the two screen-shape controls
+                are spatially grouped. */}
             <PanscanButton activeTarget={activeTarget} />
-
-            {/* A/V sync nudges — ±0.1 s audio + subtitle delay */}
-            <DelayMenu activeTarget={activeTarget} />
-
-            {/* Gear menu — copy link, download, external player, restart */}
-            <MoreMenu
-              streamUrl={streamUrl}
-              onRestart={() => seekAbsolute(0)}
-            />
 
             {/* Fullscreen */}
             <Tooltip text={isFullscreen ? "Exit fullscreen (F / Esc)" : "Fullscreen (F)"} pos="top">
@@ -2227,6 +2084,14 @@ export default function PlayerOverlay({
                 {isFullscreen ? <ExitFullscreenIcon /> : <FullscreenIcon />}
               </button>
             </Tooltip>
+
+            {/* Three-dots / gear menu — Copy link, Download, External
+                player, Restart. Anchored to the far right so it reads as
+                the bar's catch-all "more" affordance. */}
+            <MoreMenu
+              streamUrl={streamUrl}
+              onRestart={() => seekAbsolute(0)}
+            />
           </div>
         </div>
       </div>
@@ -2533,7 +2398,7 @@ interface TrackMenuExtra {
 
 function TrackMenu({
   label, tooltip, icon, tracks, onPick, extraItems, emptyHint,
-  isOff, onOff, allowOff = true,
+  isOff, onOff, allowOff = true, delay,
 }: {
   label: string;
   tooltip: string;
@@ -2548,6 +2413,18 @@ function TrackMenu({
   onOff?: () => void;
   /** Set to false to hide the Off option (e.g. audio tracks). Defaults true. */
   allowOff?: boolean;
+  /** Optional inline sync-nudge row. When set, renders ±0.1 s / Reset
+   *  controls at the bottom of the dropdown — used to merge the
+   *  audio-delay and sub-delay calibration into the corresponding
+   *  track menu (saves a dedicated button in the control bar and
+   *  groups conceptually-paired controls). */
+  delay?: {
+    label: string;
+    value: number;
+    onMinus: () => void;
+    onPlus:  () => void;
+    onReset: () => void;
+  };
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -2680,6 +2557,56 @@ function TrackMenu({
                   {it.label}
                 </button>
               ))}
+            </>
+          )}
+
+          {delay && (
+            <>
+              <div className="my-1 mx-3 h-px bg-white/8" />
+              <div className="px-4 py-2 space-y-1.5">
+                <div className="flex items-center justify-between text-[11.5px]">
+                  <span className="text-white/55 font-mono uppercase tracking-[0.16em]">
+                    {delay.label}
+                  </span>
+                  <span className="text-white/70 font-mono tabular-nums">
+                    {delay.value === 0
+                      ? "0.0 s"
+                      : `${delay.value > 0 ? "+" : "−"}${Math.abs(delay.value).toFixed(1)} s`}
+                  </span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={delay.onMinus}
+                    className="flex-1 px-1.5 py-1 rounded-md text-[11px] font-mono tabular-nums
+                               bg-white/8 text-white/85 border border-white/12
+                               hover:bg-white/14 hover:text-white active:scale-95 transition-all"
+                  >
+                    −0.1 s
+                  </button>
+                  <button
+                    type="button"
+                    onClick={delay.onPlus}
+                    className="flex-1 px-1.5 py-1 rounded-md text-[11px] font-mono tabular-nums
+                               bg-white/8 text-white/85 border border-white/12
+                               hover:bg-white/14 hover:text-white active:scale-95 transition-all"
+                  >
+                    +0.1 s
+                  </button>
+                  <button
+                    type="button"
+                    onClick={delay.onReset}
+                    disabled={delay.value === 0}
+                    className="px-2 py-1 ml-auto rounded-md text-[10.5px] font-medium tracking-wide
+                               bg-white/5 text-white/55 border border-white/10
+                               hover:bg-white/10 hover:text-white
+                               disabled:opacity-35 disabled:hover:bg-white/5 disabled:hover:text-white/55
+                               transition-colors"
+                  >
+                    Reset
+                  </button>
+                </div>
+              </div>
             </>
           )}
         </div>
