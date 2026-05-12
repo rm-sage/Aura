@@ -457,6 +457,14 @@ pub struct VideoEntry {
     pub released: Option<String>,
     pub thumbnail: Option<String>,
     pub overview: Option<String>,
+    /// AIOMetadata emits a per-episode kind classification for anime:
+    /// `"filler"`, `"recap"`, or `"normal"` (we also accept `"canon"`
+    /// and `"mixed"` as historical aliases — both fold to `normal`).
+    /// Aura paints a banner on the episode row in DetailView and the
+    /// next-up auto-advance can be configured to skip filler/recap.
+    /// `None` = upstream didn't emit the field (movies, non-anime
+    /// series, older addons without the patch).
+    pub episode_kind: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -2082,6 +2090,28 @@ fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
                 .map(|s| cap(s.into(), 240))
                 .unwrap_or_default();
 
+            // Episode kind — AIOMetadata's split-season patch emits
+            // `episodeKind` (camelCase) as one of "filler" / "recap" /
+            // "normal" / "canon" / "mixed". We also accept a JSON-shape
+            // fallback: a `filler: true` boolean field, or a `recap: true`
+            // boolean field, mapping each to the matching kind. Anything
+            // we don't recognise drops to None so the UI can render the
+            // standard row.
+            let episode_kind = v
+                .get("episodeKind")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_lowercase())
+                .filter(|s| matches!(s.as_str(), "filler" | "recap" | "normal" | "canon" | "mixed"))
+                .or_else(|| {
+                    if v.get("filler").and_then(|x| x.as_bool()).unwrap_or(false) {
+                        Some("filler".to_string())
+                    } else if v.get("recap").and_then(|x| x.as_bool()).unwrap_or(false) {
+                        Some("recap".to_string())
+                    } else {
+                        None
+                    }
+                });
+
             Some(VideoEntry {
                 id,
                 title,
@@ -2090,6 +2120,7 @@ fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
                 released:  json_str(v, "released",     64),
                 thumbnail: json_url(v, "thumbnail"),
                 overview:  json_str(v, "overview", 600),
+                episode_kind,
             })
         })
         .collect()

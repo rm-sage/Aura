@@ -201,6 +201,13 @@ export interface VideoEntry {
   released: string | null;
   thumbnail: string | null;
   overview: string | null;
+  /** AIOMetadata's per-episode kind classification for anime:
+   *  `"filler"` / `"recap"` / `"normal"` / `"canon"` / `"mixed"`. Aura
+   *  paints a banner on the episode row in DetailView and the
+   *  next-up auto-advance can be configured to skip filler/recap.
+   *  `null` = upstream didn't emit the field (movies, non-anime
+   *  series, older addons without the patch). */
+  episode_kind: string | null;
 }
 
 export interface StreamEntry {

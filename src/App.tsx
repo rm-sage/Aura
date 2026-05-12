@@ -974,13 +974,29 @@ export default function App() {
             // menus, audio-language defaults) classify it correctly
             // before DetailView is ever opened.
             markAnimeId(seriesId);
-            // Episode number from the last segment of target.id.
-            const parts = target.id.split(":");
-            const episodeNum = Number(parts[parts.length - 1]);
+            // Episode number for AniSkip lookup. Prefer VideoEntry's
+            // ABSOLUTE episode number (`target.episode_num`) over the
+            // id-derived per-season number. After AIOMetadata's split-
+            // season patch, the id encodes cour-relative episode (e.g.
+            // `tt…:2:7` = cour 2 ep 7), but AniSkip is keyed by MAL
+            // anime id, and most multi-cour anime share a single MAL
+            // entry whose episode count is the absolute show-wide
+            // count. Sending the cour-relative 7 fetches the WRONG
+            // timings (cour 1 ep 7's OP) — exactly the Frieren cour-2
+            // misskip the user was seeing. Falling back to id-parse
+            // covers shows whose VideoEntry lacks episode_num.
+            const idParts = target.id.split(":");
+            const idEpisode = Number(idParts[idParts.length - 1]);
+            const episodeNum = Number.isFinite(target.episode_num as number)
+              ? (target.episode_num as number)
+              : idEpisode;
             if (!Number.isFinite(episodeNum)) {
               console.info(`[aniskip] skip — couldn't parse episode from ${target.id}`);
               return;
             }
+            console.info(
+              `[aniskip] episode resolution: id-derived=${idEpisode}, absolute=${target.episode_num}, using=${episodeNum}`,
+            );
             // Settings drive the per-window auto/prompt/off decision.
             let settings: BackendSettingsLite | null = null;
             try { settings = await invoke<BackendSettingsLite>("get_settings"); } catch {}

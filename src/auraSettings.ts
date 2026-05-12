@@ -115,6 +115,20 @@ export interface AuraSettings {
    *  toggle change; both the Settings panel and the in-player
    *  three-dots menu surface the same setting. */
   loudnessNormalization: boolean;
+  /** Next-Up CTA: skip filler / recap episodes when computing the
+   *  next-up target. Source field: AIOMetadata's per-episode
+   *  `episodeKind`. Default `"none"` so users on non-anime content
+   *  (or who explicitly want every episode) get the unchanged
+   *  behaviour. Modes:
+   *    • `"none"`    — never skip (default).
+   *    • `"filler"`  — skip filler, keep recap.
+   *    • `"recap"`   — skip recap, keep filler.
+   *    • `"both"`    — skip both kinds; resume on the next
+   *                    canon/normal/mixed episode.
+   *  Sits near the AniSkip OP/ED controls in the player section of
+   *  Settings since it's a stylistic cousin of "skip the boring
+   *  bits". */
+  nextUpSkipFillerRecap: "none" | "filler" | "recap" | "both";
 }
 
 export const DEFAULT_AURA_SETTINGS: AuraSettings = {
@@ -134,6 +148,7 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   autoAdvanceDelaySeconds: 10,
   blurEpisodeSynopsis: false,
   loudnessNormalization: false,
+  nextUpSkipFillerRecap: "none",
 };
 
 // Module-level memoization snapshot. loadAuraSettings is called many
@@ -206,6 +221,12 @@ function readFromStorage(): AuraSettings {
       loudnessNormalization: typeof parsed.loudnessNormalization === "boolean"
         ? parsed.loudnessNormalization
         : false,
+      nextUpSkipFillerRecap:
+        parsed.nextUpSkipFillerRecap === "filler"
+          || parsed.nextUpSkipFillerRecap === "recap"
+          || parsed.nextUpSkipFillerRecap === "both"
+          ? parsed.nextUpSkipFillerRecap
+          : "none",
       heroCatalog: parsed.heroCatalog
         && typeof parsed.heroCatalog === "object"
         && typeof (parsed.heroCatalog as Record<string, unknown>).addonUrl === "string"

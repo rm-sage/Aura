@@ -2265,6 +2265,26 @@ const EpisodeRow = ({
           className="absolute top-1.5 left-1.5"
         />
 
+        {/* Filler / recap banner — top-RIGHT of the thumbnail. Source
+            field: AIOMetadata's `episodeKind`. Filler = red (you
+            usually want to skip / deprioritise these), recap = yellow
+            (informational; sometimes useful for cold returns). Canon
+            / normal / mixed render nothing — banner space stays empty
+            so non-anime detail pages and untagged episodes don't gain
+            a stripe. */}
+        {(video.episode_kind === "filler" || video.episode_kind === "recap") && (
+          <span
+            className={`absolute top-1.5 right-1.5 px-1.5 py-0.5 rounded text-[9px]
+                        font-semibold tracking-[0.14em] uppercase border
+                        ${video.episode_kind === "filler"
+                          ? "bg-rose-500/85 text-white border-rose-300/30 shadow-[0_2px_6px_rgba(244,63,94,0.4)]"
+                          : "bg-amber-400/85 text-amber-950 border-amber-200/40 shadow-[0_2px_6px_rgba(251,191,36,0.4)]"
+                        }`}
+          >
+            {video.episode_kind}
+          </span>
+        )}
+
         {/* Progress overlay — bottom of the thumbnail when partially watched. */}
         {progress?.partial && (
           <div className="absolute inset-x-0 bottom-0 h-[3px] bg-black/55">
