@@ -1338,15 +1338,27 @@ function EpisodeSynopsisSection({
             type="button"
             onClick={() => onReveal(activeVideo.id)}
             aria-label="Reveal episode synopsis"
-            className="absolute inset-0 flex items-center justify-center
-                       text-white/75 hover:text-white
-                       transition-colors group"
+            // No always-visible chip — the blurred text itself is the
+            // affordance. Hovering surfaces a small tooltip above the
+            // pointer with the "Click to reveal spoilers" prompt, so
+            // the chip doesn't obscure the synopsis while the user is
+            // deciding. `peer` doesn't help here (the tooltip is a
+            // child) so we use `group` + `group-hover:` to keep the
+            // tooltip CSS-only.
+            className="absolute inset-0 cursor-pointer group"
           >
-            <span className="px-3 py-1.5 rounded-full
-                             bg-black/65 backdrop-blur-sm
-                             border border-white/15 group-hover:border-ln-accent/50
-                             text-[12px] font-medium tracking-wide
-                             shadow-[0_2px_12px_rgba(0,0,0,0.55)]">
+            <span
+              aria-hidden
+              className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2
+                         opacity-0 group-hover:opacity-100
+                         pointer-events-none whitespace-nowrap
+                         px-2.5 py-1 rounded-md
+                         bg-black/80 backdrop-blur-sm
+                         border border-white/20 text-white/90
+                         text-[11.5px] font-medium tracking-wide
+                         shadow-[0_2px_12px_rgba(0,0,0,0.55)]
+                         transition-opacity duration-150"
+            >
               Click to reveal spoilers
             </span>
           </button>

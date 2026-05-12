@@ -56,15 +56,23 @@ export function isOnboardingComplete(): boolean {
 }
 
 /** Persist the completion flag and drop any per-step progress state.
- *  Idempotent — calling on an already-completed install is a no-op. */
-export function markOnboardingComplete(): void {
+ *  Returns `true` when this call flipped state from incomplete →
+ *  complete (i.e. the user is finishing onboarding for the FIRST time),
+ *  `false` when the flag was already set (reopen-addons flow, manual
+ *  re-run, etc.). Callers use the return to gate first-run-only side
+ *  effects like the post-completion scrobble notification. */
+export function markOnboardingComplete(): boolean {
   try {
+    const wasAlreadyComplete = localStorage.getItem(COMPLETED_KEY) === "true";
     localStorage.setItem(COMPLETED_KEY, "true");
     localStorage.removeItem(PROGRESS_KEY);
+    return !wasAlreadyComplete;
   } catch {
     // localStorage unavailable (private browsing mode / quota error /
     // etc.) — the wizard will re-fire on next launch. Acceptable
-    // degradation; the user clicks through it again.
+    // degradation; the user clicks through it again. Treat as
+    // "first time" so the notification still fires.
+    return true;
   }
 }
 

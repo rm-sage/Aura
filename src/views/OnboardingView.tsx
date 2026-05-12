@@ -125,9 +125,18 @@ export default function OnboardingView({
   }, []);
 
   const handleFinish = useCallback(() => {
-    markOnboardingComplete();
+    // markOnboardingComplete returns true only on the very FIRST
+    // completion (not on reopen-addons flows). Use that signal to
+    // fire a one-time scrobble-discovery notification — the in-wizard
+    // "Track what you watch" section was removed because users
+    // routinely skipped past it; surfacing the hint as a bell-badge
+    // entry after onboarding finishes gets discovered more reliably.
+    const wasFirstCompletion = markOnboardingComplete();
+    if (wasFirstCompletion && session?.auth_key) {
+      window.dispatchEvent(new CustomEvent("aura:notify-scrobble-onboarding"));
+    }
     onComplete();
-  }, [onComplete]);
+  }, [onComplete, session]);
 
   // Animated step transitions — fade + slight slide. Honors the
   // reduced-motion gate via the existing `data-reduced-motion`
@@ -195,7 +204,6 @@ export default function OnboardingView({
             <SettingsStep
               draft={progress.settingsDraft ?? {}}
               onDraftChange={(draft) => setProgress((p) => ({ ...p, settingsDraft: draft }))}
-              session={session}
               onBack={() => setStep(0)}
               onSkip={() => skipStep("settings")}
               onContinue={() => setStep(2)}
@@ -345,11 +353,10 @@ const LANG_OPTIONS = [
 ];
 
 function SettingsStep({
-  draft, onDraftChange, session, onBack, onSkip, onContinue,
+  draft, onDraftChange, onBack, onSkip, onContinue,
 }: {
   draft: Record<string, unknown>;
   onDraftChange: (next: Record<string, unknown>) => void;
-  session: UserSession | null;
   onBack: () => void;
   onSkip: () => void;
   onContinue: () => void;
@@ -488,50 +495,12 @@ function SettingsStep({
           </div>
         </div>
 
-        {/* Scrobble connect — only meaningful when signed into Stremio.
-            OAuth (device flow for Trakt, deep-link for AniList) lives
-            entirely inside Settings → Trakt & AniList; reproducing it
-            here would duplicate non-trivial flow. Instead we offer a
-            one-click jump that finishes the wizard and drops the user
-            on the scrobble settings section, so they can connect
-            immediately after onboarding without re-finding the page. */}
-        {session?.auth_key && (
-          <>
-            <div className="h-px bg-white/6" />
-            <div className="space-y-2">
-              <p className="text-white/75 text-sm font-medium">Track what you watch</p>
-              <p className="text-white/35 text-xs leading-relaxed">
-                Connect Trakt and AniList to sync watch progress automatically.
-                Aura scrobbles on episode completion (80 % + ≥ 5 min watched).
-              </p>
-              <button
-                type="button"
-                onClick={() => {
-                  // Finish the wizard outright — OAuth lives in
-                  // Settings; once the user lands there, the wizard
-                  // shouldn't pop back over the page. App.tsx watches
-                  // `aura:onboarding-finish` and flips onboardingActive
-                  // off; we also fire the settings-deep-link event so
-                  // the user arrives directly on the scrobble section.
-                  markOnboardingComplete();
-                  window.dispatchEvent(new CustomEvent("aura:onboarding-finish"));
-                  window.dispatchEvent(new CustomEvent("aura:open-settings", {
-                    detail: { section: "sec-scrobble" },
-                  }));
-                }}
-                className="mt-1 inline-flex items-center gap-2
-                           px-3 py-1.5 rounded-lg border border-ln-accent/40
-                           bg-ln-accent/12 text-ln-accent text-[11.5px] font-semibold
-                           hover:bg-ln-accent/22 transition-colors"
-              >
-                Open Trakt &amp; AniList settings →
-              </button>
-              <p className="text-white/40 text-[11.5px] italic pt-1">
-                Or skip — scrobbling stays off until you opt in from Settings.
-              </p>
-            </div>
-          </>
-        )}
+        {/* Scrobble hint was previously surfaced as an in-wizard
+            section ("Track what you watch") with a button that jumped
+            to Settings. Replaced by a post-completion notification
+            (see App.tsx's onboarding-finish listener) so first-run
+            users discover scrobbling without it cluttering the
+            settings step. */}
       </div>
 
       <footer className="flex items-center justify-between gap-3 pt-2">

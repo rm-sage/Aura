@@ -56,7 +56,7 @@ Platform keyring, `Zeroizing<String>` password scrubbing, `https_only` auth clie
 - [x] `stremio://detail/{type}/{id}` (and `aura://detail/<type>/<id>` alias): routes to DetailView with a stub MetaPreview, full meta detail filled in by DetailView's own fetch
 - [x] `aura://oauth/{trakt,anilist}?...`: OAuth callback handler (see Phase 6.x scrobble auth)
 - [x] Auto-updater wired: `tauri-plugin-updater` registered with `endpoints` pointing at `github.com/rm-sage/Aura/releases/latest/download/latest.json`; `updater.ts` + `updaterPlugin.ts` perform the version check
-- [x] Update signing keypair: real minisign keypair generated; `tauri.conf.json::plugins.updater.pubkey` carries the production public key (key id `B632D9CFF50F9FDD`); `bundle.createUpdaterArtifacts: true` ships a matching `.sig` next to every release installer; `scripts/release.ps1` runs `pnpm tauri signer sign` against the bundled output. Authenticode / EV code signing (for SmartScreen, separate from updater payload signing) remains opt-in and is tracked in 6.0.x Open
+- [x] Update signing keypair: real minisign keypair generated; `tauri.conf.json::plugins.updater.pubkey` carries the production public key (key id `B632D9CFF50F9FDD`); `bundle.createUpdaterArtifacts: true` ships a matching `.sig` next to every release installer; `scripts/release.ps1` runs `pnpm tauri signer sign` against the bundled output. Authenticode / EV code signing is intentionally not on the roadmap — installers ship unsigned and rely on the SmartScreen "Run anyway" path
 
 ### 2.5 Cinema Suite and Performance Overlay ✅
 
@@ -572,7 +572,6 @@ A grab-bag of post-5.8 work that isn't gated to a single rendering / IPC milesto
 - [ ] Silent auto-advance toggle: `<NextUpCta />` currently requires an explicit click. A user-opt-in setting that auto-fires `playNext` N seconds after the ED chapter (or last-N-second mark) would close the muscle-memory gap for binge sessions
 - [ ] AniList re-auth UX: AniList has no refresh tokens, so a 401 mid-session means the next scrobble silently no-ops until the user manually re-connects. `useScrobbleAuthAlerts` fires a warning notification on first detection, but a one-tap "Reconnect AniList" button inside that notification (instead of routing through Settings) would close the loop
 - [ ] Cloud Sync settings panel (Phase 7.7): sync engine + all seven namespaces are live but Settings has no dedicated section yet. Needs per-namespace last-pull / last-push / server-size readout, a "Pull now" button, and a "Clear cloud sync data" destructive action (calls `sync_purge`)
-- [ ] Authenticode / EV code signing: separate from the (now-completed) minisign updater payload signing. The produced installer still trips SmartScreen on first run because it isn't signed against an EV/OV cert. Per `PRODUCTION.md` the user opted out of EV cert acquisition for now; revisit when audience scales
 - [ ] Secret-key migration to OS keyring: Stremio auth tokens already live in the OS keyring (DPAPI via `keyring 3`); OMDb / OpenSubtitles API keys still sit in plaintext `settings.json`. Threat model is "single-user desktop, OS-level filesystem trust" so non-blocking, but the migration is the right move for shared-PC scenarios
 - [x] Crash reporting receiver: Sentry SDK wired in (Rust panic hook + JS error capture + native minidump capture), gated on a first-run consent dialog (`CrashReportingConsent.tsx`)
 
@@ -805,11 +804,10 @@ bounding box; conditional side-vignettes gated on text placement.
 The three-dots menu becomes the generic home for low-frequency advanced
 controls (loudness, panscan, screenshot, etc.) as they land.
 
-### 8.4 Search reliability + progressive results 🔴
+### 8.4 Search reliability + progressive results 🟡
 
-- Fix spurious AI home catalogs firing during search (`aisearch.home.0.movie` + `aisearch.home.1.series` fire on every search submit despite the user being on the Search view, not Home — per 2026-05-11 backend logs)
-- Fix periodic home-catalog reloads while idling on Home
-- Replace one-shot `global_search_grouped` await with progressive per-group display: each row gets its own skeleton until that group resolves, instead of the whole grid waiting for the slowest addon
+- [x] Spurious AI home catalogs firing on idle setting saves: `aura:settings-changed` now carries `detail.keys` so HomeView only re-fetches when home-relevant fields actually change
+- [ ] Replace one-shot `global_search_grouped` await with progressive per-group display: each row gets its own skeleton until that group resolves, instead of the whole grid waiting for the slowest addon
 
 ### 8.5 Chrome surface polish 🔴
 

@@ -4080,6 +4080,27 @@ function NotificationsBridge({
     return () => window.removeEventListener("aura:update-dismissed-to-bell", handler);
   }, [addNotification]);
 
+  // aura:notify-scrobble-onboarding — fired by OnboardingView.handleFinish
+  // ONLY on the FIRST completion (markOnboardingComplete returns true).
+  // Replaces the in-wizard "Track what you watch" section that was
+  // routinely skipped past; surfacing scrobble support as a one-time
+  // bell-badge entry after the user lands on the home view gets
+  // discovered more reliably. Stable id makes a re-fire on rapid
+  // remount idempotent.
+  useEffect(() => {
+    const onPing = () => {
+      addNotification({
+        id: "notice:scrobble-onboarding",
+        kind: "notice",
+        title: "Track your watch history",
+        subtitle: "Connect Trakt and AniList to sync watch progress automatically. Click to open the scrobble settings.",
+        data: { settingsSection: "sec-scrobble" },
+      });
+    };
+    window.addEventListener("aura:notify-scrobble-onboarding", onPing);
+    return () => window.removeEventListener("aura:notify-scrobble-onboarding", onPing);
+  }, [addNotification]);
+
   // aura:script-fallback — fired by the Rust player::init_mpv when its
   // first init attempt fails and the retry-without-script succeeds. We
   // surface this as a one-time amber warning in the bell PLUS a top-

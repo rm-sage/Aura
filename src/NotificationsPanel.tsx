@@ -105,6 +105,21 @@ export default function NotificationsPanel({ onClose, closing }: Props) {
                     if (url) openUrl(url).catch(() => {});
                     return;
                   }
+                  // notice → settings deep-link path (e.g. the post-
+                  // onboarding scrobble discovery notification). When
+                  // `data.settingsSection` is set, route through the
+                  // existing `aura:open-settings` event so the user
+                  // lands on the matching section's anchor and the
+                  // notification is auto-dismissed.
+                  const settingsSection = n.data?.settingsSection as string | undefined;
+                  if (settingsSection) {
+                    window.dispatchEvent(new CustomEvent("aura:open-settings", {
+                      detail: { section: settingsSection },
+                    }));
+                    dismissNotification(n.id);
+                    onClose();
+                    return;
+                  }
                   // release / episode → open detail in the app, then
                   // auto-dismiss: the user has already acted on the
                   // notification, so leaving it in the panel makes the

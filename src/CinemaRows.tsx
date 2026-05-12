@@ -197,9 +197,20 @@ function useSeasonEpisodes(item: LibraryItem, addons: AddonEntry[] | undefined):
           if (Number.isFinite(maybeSeason)) season = maybeSeason;
         }
       }
-      const seasonEps = season != null
+      // Filter to the resume episode's season when we can determine
+      // it. If the filter returns nothing — common for AIOMetadata-
+      // patched shows where the video_id encodes the split-season cour
+      // (`:2:6`) but the meta.videos[] entries still use the merged
+      // shape (`v.season === 1` for the same content) — fall back to
+      // the full episode list so the segmented bar still draws.
+      // Without this fallback the CW card silently downgraded to the
+      // thin linear bar for every split-season anime.
+      let seasonEps = season != null
         ? detail.videos.filter((v) => v.season === season)
         : detail.videos;
+      if (seasonEps.length === 0 && detail.videos.length > 0) {
+        seasonEps = detail.videos;
+      }
       seasonEps.sort((a, b) => (a.episode ?? 0) - (b.episode ?? 0));
       setEps(seasonEps);
     })();

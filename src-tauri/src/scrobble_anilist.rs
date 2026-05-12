@@ -547,9 +547,22 @@ pub async fn save_progress<R: Runtime>(
         );
         return Ok(());
     };
-    let Some(episode_num) = parse_episode_num(&sess.imdb_id, &sess.media_type) else {
+    let Some(parsed_episode) = parse_episode_num(&sess.imdb_id, &sess.media_type) else {
         return Ok(());
     };
+    // Prefer the VideoEntry-authoritative absolute episode number (set
+    // by App.tsx from active.episode_num) over the id-string's trailing
+    // segment. After AIOMetadata's split-season patch, the id encodes
+    // cour-relative episodes (e.g. `tt…:2:6` for absolute ep 34); but
+    // AniList for most multi-cour anime has a SINGLE entry covering all
+    // cours with a flat 1..N episode list, so sending the cour-relative
+    // value (6) silently misaligns with whatever AniList has (where 6
+    // is cour 1 ep 6, not cour 2 ep 6).
+    //
+    // Fallback to the id-parse when sess.episode_num is missing — that
+    // path covers movies and older addons whose VideoEntry doesn't
+    // populate the field.
+    let episode_num: u32 = sess.episode_num.unwrap_or(parsed_episode);
 
     // Prefer the id-string season over sess.season for multi-cour
     // lookup. After AIOMetadata's split-season patch, `tt…:N:M` carries
@@ -662,34 +675,50 @@ pub async fn save_progress<R: Runtime>(
         }
     }
 
-    // 3. Don't clobber user-tracked progress that's ahead of us.
+    // 3. Clamp the candidate to the entry's total. The candidate
+    //    (`episode_num`) is the user's absolute ep number; for split-
+    //    cour anime the chosen anilist_id may only cover a slice of
+    //    the absolute range. AniList rejects `progress > episodes`, so
+    //    clamping turns "user watched ep 34 of a 28-ep entry" into
+    //    "save 28 + mark COMPLETED" — the right semantic for someone
+    //    who's finished what AniList tracks under this id.
+    let to_save = match media.episodes {
+        Some(total) if episode_num > total => total,
+        _ => episode_num,
+    };
+
+    // 4. Don't clobber user-tracked progress that's ahead of us.
+    //    Compare against the clamped value — otherwise a user on ep 34
+    //    of a 28-ep entry with list_progress=20 would get skipped
+    //    forever (34 > 20 passes, but the save would write 28 since
+    //    clamp also applies on write).
     let existing = media
         .media_list_entry
         .as_ref()
         .map(|e| e.progress)
         .unwrap_or(0);
-    if existing >= episode_num {
+    if existing >= to_save {
         crate::devlog!(
             info, "scrobble",
-            "AniList: progress already {existing} (>= our {episode_num}); skipping save",
+            "AniList: progress already {existing} (>= clamped {to_save}, raw episode={episode_num}); skipping save",
         );
         return Ok(());
     }
 
-    // 4. Status: COMPLETED if we know the total and we're at or past it.
+    // 5. Status: COMPLETED if we know the total and we're at or past it.
     let status = match media.episodes {
-        Some(total) if episode_num >= total => "COMPLETED",
+        Some(total) if to_save >= total => "COMPLETED",
         _ => "CURRENT",
     };
 
-    // 5. Save.
-    save_media_list_entry(&access, media.id, episode_num, status).await?;
+    // 6. Save.
+    save_media_list_entry(&access, media.id, to_save, status).await?;
 
     let total_str = media.episodes.map(|e| e.to_string()).unwrap_or_else(|| "?".into());
     crate::devlog!(
         info, "scrobble",
-        "AniList: saved {}/{} ({}) for \"{}\" (anilist_id={})",
-        episode_num, total_str, status, sess.title, media.id,
+        "AniList: saved {}/{} ({}) for \"{}\" (anilist_id={}, raw episode={episode_num})",
+        to_save, total_str, status, sess.title, media.id,
     );
     Ok(())
 }

@@ -2090,27 +2090,49 @@ fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
                 .map(|s| cap(s.into(), 240))
                 .unwrap_or_default();
 
-            // Episode kind — AIOMetadata's split-season patch emits
-            // `episodeKind` (camelCase) as one of "filler" / "recap" /
-            // "normal" / "canon" / "mixed". We also accept a JSON-shape
-            // fallback: a `filler: true` boolean field, or a `recap: true`
-            // boolean field, mapping each to the matching kind. Anything
-            // we don't recognise drops to None so the UI can render the
+            // Episode kind — try several field-name conventions used by
+            // anime-meta addons:
+            //   • `episodeKind`            (Aura's preferred wire name)
+            //   • `episode_kind` / `kind`  (snake_case + bare)
+            //   • `episodeType` / `episode_type`  (alt naming some
+            //     anime addons borrow from Jikan/AniList where each
+            //     episode carries a type tag)
+            //   • boolean `filler: true` / `recap: true`            //
+            // Accepted vocabulary: filler / recap / canon / normal /
+            // mixed. Anything else drops to None so the UI renders the
             // standard row.
-            let episode_kind = v
-                .get("episodeKind")
-                .and_then(|x| x.as_str())
+            let string_kind = ["episodeKind", "episode_kind", "kind", "episodeType", "episode_type"]
+                .iter()
+                .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
                 .map(|s| s.to_lowercase())
-                .filter(|s| matches!(s.as_str(), "filler" | "recap" | "normal" | "canon" | "mixed"))
-                .or_else(|| {
-                    if v.get("filler").and_then(|x| x.as_bool()).unwrap_or(false) {
-                        Some("filler".to_string())
-                    } else if v.get("recap").and_then(|x| x.as_bool()).unwrap_or(false) {
-                        Some("recap".to_string())
-                    } else {
-                        None
-                    }
-                });
+                .filter(|s| matches!(s.as_str(), "filler" | "recap" | "normal" | "canon" | "mixed"));
+            let episode_kind = string_kind.or_else(|| {
+                if v.get("filler").and_then(|x| x.as_bool()).unwrap_or(false) {
+                    Some("filler".to_string())
+                } else if v.get("recap").and_then(|x| x.as_bool()).unwrap_or(false) {
+                    Some("recap".to_string())
+                } else {
+                    None
+                }
+            });
+            // One-shot diagnostic per call: log which fields the addon
+            // actually populated so we can see why kind=None when
+            // expected. Only fires for entries that DIDN'T resolve a
+            // kind to avoid log spam on well-tagged videos.
+            if episode_kind.is_none() {
+                let has_fields = ["episodeKind", "episode_kind", "kind", "episodeType", "episode_type", "filler", "recap"]
+                    .iter()
+                    .filter(|k| v.get(*k).is_some())
+                    .map(|k| *k)
+                    .collect::<Vec<_>>();
+                if !has_fields.is_empty() {
+                    let raw = has_fields.iter().map(|k| format!("{k}={:?}", v.get(*k))).collect::<Vec<_>>().join(" ");
+                    crate::devlog!(
+                        info, "meta",
+                        "extract_videos: episode_kind unresolved despite present fields: {raw}",
+                    );
+                }
+            }
 
             Some(VideoEntry {
                 id,
