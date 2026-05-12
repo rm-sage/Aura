@@ -451,6 +451,56 @@ fn parse_episode_num(id: &str, media_type: &str) -> Option<u32> {
 // Public entry point
 // ---------------------------------------------------------------------------
 
+/// Resolution helper extracted from the inline cache-or-search match in
+/// `save_progress` so the new id-map path can fall through cleanly when
+/// its fetch_media returns NotFound or the wrong-season heuristic miss.
+/// Mirrors the legacy three-branch cache/search behaviour exactly.
+async fn resolve_via_cache_or_search(
+    access: &str,
+    cached: &Option<CachedMedia>,
+    title: &str,
+    show_id: &str,
+    episode_num: u32,
+) -> Result<MediaInfo, AnilistError> {
+    match cached {
+        Some(c) if c.episodes.map(|e| e >= episode_num).unwrap_or(true) => {
+            crate::devlog!(
+                info, "scrobble",
+                "AniList cache hit: show={} → anilist_id={} (episodes={:?})",
+                show_id, c.anilist_id, c.episodes,
+            );
+            match fetch_media(access, c.anilist_id).await {
+                Ok(m) => Ok(m),
+                Err(AnilistError::NotFound) => {
+                    crate::devlog!(
+                        warn, "scrobble",
+                        "AniList cached id {} returned NotFound — falling back to title search for \"{}\"",
+                        c.anilist_id, title,
+                    );
+                    search_and_pick(access, title, episode_num).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Some(c) => {
+            crate::devlog!(
+                info, "scrobble",
+                "AniList cache inconsistent: cached episodes={:?} < requested ep={} — re-searching",
+                c.episodes, episode_num,
+            );
+            search_and_pick(access, title, episode_num).await
+        }
+        None => {
+            crate::devlog!(
+                info, "scrobble",
+                "AniList cache miss for show={} — searching by title \"{}\"",
+                show_id, title,
+            );
+            search_and_pick(access, title, episode_num).await
+        }
+    }
+}
+
 /// Save scrobble progress to AniList for the given session. No-op when:
 ///   * `sess.is_anime` is false
 ///   * No AniList token is stored for `scope`
@@ -490,6 +540,23 @@ pub async fn save_progress<R: Runtime>(
         sess.title, show_id, episode_num, sess.season, sess.episode_num,
     );
 
+    // 0. Fribb/anime-lists ID-map fast path. Single hash lookup; no
+    //    network round-trip. Skipped silently when the map is empty
+    //    (uncached / niche show / map not warmed yet). When the show
+    //    has multiple AniList ids (multi-season anime), the map's
+    //    `season - 1` index heuristic picks the corresponding entry;
+    //    if we still pick the wrong one (heuristic miss), the
+    //    AniList `progress > episodes` guard down-stream rejects the
+    //    save and the caller falls back through search-and-pick.
+    let id_map_anilist_id = crate::anime_id_map::lookup(show_id, sess.season);
+    if let Some(anilist_id) = id_map_anilist_id {
+        crate::devlog!(
+            info, "scrobble",
+            "AniList id-map hit: show={} → anilist_id={} (skipping title search)",
+            show_id, anilist_id,
+        );
+    }
+
     // 1. Cache lookup. Treat the cache as authoritative when its
     // episode count is consistent with what we're trying to save.
     let cached = cache_lock()
@@ -497,56 +564,45 @@ pub async fn save_progress<R: Runtime>(
         .ok()
         .and_then(|g| g.by_show.get(show_id).cloned());
 
-    // Resolve to an AniList MediaInfo. Three layered strategies, each
+    // Resolve to an AniList MediaInfo. Four layered strategies, each
     // surfacing a clear log line so the DevConsole shows which path
     // produced the result (or NotFound) without the user having to
     // re-instrument the binary.
     //
-    //   • Cached + consistent → fetch_media on the cached id. If that
-    //     comes back NotFound (stale / wrong cache) we DON'T bail —
-    //     we fall through to search. Earlier behavior surfaced NotFound
-    //     here even when the show genuinely existed on AniList, which
-    //     manifested as "skipped (not on AniList)" for valid anime
-    //     whose cached id had drifted.
+    //   • ID-map hit → fetch_media against the Fribb-mapped anilist_id.
+    //     On NotFound (rare; stale Fribb data), fall through to cache /
+    //     search same as the cached-but-stale path.
+    //   • Cached + consistent → fetch_media on the cached id. NotFound
+    //     here falls back to search (stale on-disk cache).
     //   • Cached + inconsistent → re-search (the cached entry doesn't
     //     have enough episodes for our ep number).
     //   • Uncached → search.
-    let media = match &cached {
-        Some(c) if c.episodes.map(|e| e >= episode_num).unwrap_or(true) => {
-            crate::devlog!(
-                info, "scrobble",
-                "AniList cache hit: show={} → anilist_id={} (episodes={:?})",
-                show_id, c.anilist_id, c.episodes,
-            );
-            match fetch_media(&access, c.anilist_id).await {
-                Ok(m) => m,
-                Err(AnilistError::NotFound) => {
-                    crate::devlog!(
-                        warn, "scrobble",
-                        "AniList cached id {} returned NotFound — falling back to title search for \"{}\"",
-                        c.anilist_id, sess.title,
-                    );
-                    search_and_pick(&access, &sess.title, episode_num).await?
-                }
-                Err(e) => return Err(e),
+    let media = if let Some(id_anilist) = id_map_anilist_id {
+        match fetch_media(&access, id_anilist).await {
+            Ok(m) if m.episodes.map(|e| e >= episode_num).unwrap_or(true) => m,
+            Ok(_) => {
+                // Wrong season picked by the heuristic — episode count
+                // can't accommodate the requested episode. Drop through
+                // to the cache / search path which has its own consistency
+                // guards.
+                crate::devlog!(
+                    info, "scrobble",
+                    "AniList id-map entry {id_anilist} has insufficient episodes for ep {episode_num} \
+                     — falling through to cache/search (multi-season heuristic miss)",
+                );
+                resolve_via_cache_or_search(&access, &cached, &sess.title, show_id, episode_num).await?
             }
+            Err(AnilistError::NotFound) => {
+                crate::devlog!(
+                    warn, "scrobble",
+                    "AniList id-map entry {id_anilist} returned NotFound — falling through to cache/search",
+                );
+                resolve_via_cache_or_search(&access, &cached, &sess.title, show_id, episode_num).await?
+            }
+            Err(e) => return Err(e),
         }
-        Some(c) => {
-            crate::devlog!(
-                info, "scrobble",
-                "AniList cache inconsistent: cached episodes={:?} < requested ep={} — re-searching",
-                c.episodes, episode_num,
-            );
-            search_and_pick(&access, &sess.title, episode_num).await?
-        }
-        None => {
-            crate::devlog!(
-                info, "scrobble",
-                "AniList cache miss for show={} — searching by title \"{}\"",
-                show_id, sess.title,
-            );
-            search_and_pick(&access, &sess.title, episode_num).await?
-        }
+    } else {
+        resolve_via_cache_or_search(&access, &cached, &sess.title, show_id, episode_num).await?
     };
 
     crate::devlog!(

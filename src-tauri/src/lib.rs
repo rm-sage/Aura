@@ -27,6 +27,7 @@ mod backup;
 mod cinema;
 mod crash_reporting;
 mod devlog;
+mod anime_id_map;
 mod api_keyring;
 mod media_controls;
 mod omdb;
@@ -1449,6 +1450,19 @@ pub fn run() {
             // the keyring is already populated. See `api_keyring.rs`
             // for the full migration semantics.
             api_keyring::migrate_from_settings(app.handle());
+
+            // ── Anime ID map warm-up (Fribb/anime-lists) ──
+            // Background load + refresh of the imdb→anilist map used
+            // by scrobble_anilist's resolver. Spawned on the async
+            // runtime so a network round-trip doesn't block setup.
+            // Non-blocking — resolver returns None until the map
+            // arrives, which gracefully falls back to title search.
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    anime_id_map::warm_cache(handle).await;
+                });
+            }
 
             // ── Deep-link scheme registration ──────────────────────────────
             // The Windows NSIS installer registers `aura://` and

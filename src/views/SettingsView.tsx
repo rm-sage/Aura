@@ -2636,6 +2636,7 @@ const TOC_GROUPS: TocGroup[] = [
     sections: [
       { id: "sec-discord",         label: "Discord Rich Presence" },
       { id: "sec-scrobble",        label: "Trakt & AniList" },
+      { id: "sec-cloud-sync",      label: "Cloud Sync" },
       { id: "sec-api-keys",        label: "API Keys" },
       { id: "sec-crash-reporting", label: "Crash Reporting" },
     ],
