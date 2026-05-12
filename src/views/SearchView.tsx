@@ -12,35 +12,35 @@ import ErrorBoundary from "../ErrorBoundary";
 // other transient remount) was double-invoking the search effect, which
 // fired TWO identical addon round-trips for every query — visible in
 // the rust:search logs as exact-duplicate GETs. Keying live promises by
-// the trimmed query lets both effect runs share the same promise: the
-// SECOND invocation gets the in-flight one back, so only one HTTP
-// request hits the addon network. Promises clear themselves on
+// `<addon_url>::<trimmed-query>` lets both effect runs share the same
+// promise: the SECOND invocation gets the in-flight one back, so only
+// one HTTP request hits the addon network. Promises clear themselves on
 // settle so a fresh search of the same term still re-fetches.
 const inflightSearches = new Map<string, Promise<SearchGroup[]>>();
 
-function runDedupedSearch(addons: AddonEntry[], query: string): Promise<SearchGroup[]> {
-  const existing = inflightSearches.get(query);
+function runDedupedAddonSearch(addon: AddonEntry, query: string): Promise<SearchGroup[]> {
+  const key = `${addon.url}::${query}`;
+  const existing = inflightSearches.get(key);
   if (existing) return existing;
-  const p = invoke<SearchGroup[]>("global_search_grouped", { addons, query })
+  const p = invoke<SearchGroup[]>("search_addon_grouped", { addon, query })
     .finally(() => {
-      // Drop the entry only if it still references THIS promise — a
-      // newer search of the same string would have replaced it, and
-      // we don't want a still-in-flight one cleared.
-      if (inflightSearches.get(query) === p) {
-        inflightSearches.delete(query);
+      if (inflightSearches.get(key) === p) {
+        inflightSearches.delete(key);
       }
     });
-  inflightSearches.set(query, p);
+  inflightSearches.set(key, p);
   return p;
 }
 
 // ---------------------------------------------------------------------------
 // SearchView — Stremio-style per-addon-catalog grouped search.
 //
-// Calls `global_search_grouped`, which returns one entry per (addon, catalog)
-// in installed-addon order + manifest order. Each group renders as its own
-// 10-column DiscoveryRow with a "View All" card that opens the dedicated
-// catalog deep-view scoped to that search.
+// Fans out one `search_addon_grouped` call per search-enabled addon in
+// parallel. Each addon's rows arrive independently and populate the
+// view as they land — the slowest addon no longer holds back the
+// fastest. While an addon is still searching, its installed-order
+// position is reserved by a `pending` placeholder so groups never
+// reorder mid-search.
 // ---------------------------------------------------------------------------
 
 interface Props {
@@ -57,33 +57,83 @@ export default function SearchView(props: Props) {
   );
 }
 
+/** Tracks one search-capable addon's contribution to the result set.
+ *  `state` advances pending → settled (either with groups or with an
+ *  empty array on error / no matches). The `addon` field carries the
+ *  installed-order anchor so the rendered list preserves manifest
+ *  order regardless of arrival order. */
+interface AddonSearchSlot {
+  addon:  AddonEntry;
+  state:  "pending" | "settled";
+  groups: SearchGroup[];
+}
+
 function SearchViewBody({ addons, query, onSelectMeta }: Props) {
-  const [groups, setGroups]   = useState<SearchGroup[] | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [slots, setSlots] = useState<AddonSearchSlot[] | null>(null);
   const lastQueryRef = useRef<string>("");
 
   useEffect(() => {
     const trimmed = query.trim();
     lastQueryRef.current = trimmed;
-    if (!trimmed) { setGroups(null); return; }
+    if (!trimmed) { setSlots(null); return; }
+    const searchAddons = addons.filter((a) => a.has_search);
+    if (searchAddons.length === 0) { setSlots([]); return; }
+
     let cancelled = false;
-    setLoading(true);
-    // Goes through the dedupe layer above so a doubled effect fires only
-    // ONE network round-trip even though both effect bodies await the
-    // result. The cancelled flag still gates state writes from the
-    // pre-cleanup invocation so we don't end up with stale results.
-    runDedupedSearch(addons, trimmed)
-      .then((g) => { if (!cancelled && lastQueryRef.current === trimmed) setGroups(g); })
-      .catch(() => { if (!cancelled && lastQueryRef.current === trimmed) setGroups([]); })
-      .finally(() => { if (!cancelled && lastQueryRef.current === trimmed) setLoading(false); });
+    // Seed every addon as pending so the user sees the row count
+    // immediately — preserves installed-addon order regardless of
+    // which addon finishes first.
+    setSlots(searchAddons.map((a) => ({ addon: a, state: "pending", groups: [] })));
+
+    // Fan out — one call per addon. Each settles independently.
+    // We update only the slot for the addon that just resolved,
+    // leaving every other slot untouched (key by addon.url so
+    // identity is stable across re-renders).
+    searchAddons.forEach((addon) => {
+      runDedupedAddonSearch(addon, trimmed)
+        .then((groups) => {
+          if (cancelled || lastQueryRef.current !== trimmed) return;
+          setSlots((prev) => {
+            if (!prev) return prev;
+            const next = prev.map((s) =>
+              s.addon.url === addon.url
+                ? { ...s, state: "settled" as const, groups }
+                : s,
+            );
+            return next;
+          });
+        })
+        .catch(() => {
+          if (cancelled || lastQueryRef.current !== trimmed) return;
+          setSlots((prev) => {
+            if (!prev) return prev;
+            return prev.map((s) =>
+              s.addon.url === addon.url
+                ? { ...s, state: "settled" as const, groups: [] }
+                : s,
+            );
+          });
+        });
+    });
+
     return () => { cancelled = true; };
   }, [addons, query]);
 
-  // Total result count across all groups (for header).
-  const totalItems = useMemo(
-    () => (groups ?? []).reduce((s, g) => s + g.items.length, 0),
-    [groups],
+  // Derived view of the addon→groups map. Walks slots in installed
+  // order so groups always render in the same per-addon position no
+  // matter which addon finished first.
+  const orderedGroups = useMemo<SearchGroup[]>(
+    () => (slots ?? []).flatMap((s) => s.groups),
+    [slots],
   );
+  const totalItems = useMemo(
+    () => orderedGroups.reduce((s, g) => s + g.items.length, 0),
+    [orderedGroups],
+  );
+  const pendingCount = (slots ?? []).filter((s) => s.state === "pending").length;
+  const settledCount = (slots ?? []).filter((s) => s.state === "settled").length;
+  const totalAddons = (slots ?? []).length;
+  const stillSearching = pendingCount > 0;
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
@@ -99,22 +149,34 @@ function SearchViewBody({ addons, query, onSelectMeta }: Props) {
             </h1>
             <p className="text-white/45 text-xs font-mono tracking-wider truncate">
               “{query}”
-              {!loading && groups && (
+              {slots && totalAddons > 0 && (
                 <span className="text-white/30 ml-2">
-                  · {totalItems} result{totalItems === 1 ? "" : "s"} across {groups.length} catalog{groups.length === 1 ? "" : "s"}
+                  {stillSearching
+                    ? `· ${settledCount}/${totalAddons} addon${totalAddons === 1 ? "" : "s"} searched`
+                    : `· ${totalItems} result${totalItems === 1 ? "" : "s"} across ${orderedGroups.length} catalog${orderedGroups.length === 1 ? "" : "s"}`
+                  }
                 </span>
               )}
-              {loading && <span className="text-white/30 ml-2">· searching…</span>}
             </p>
           </div>
 
-          {loading && (groups === null || groups.length === 0) && (
-            <div className="px-6">
+          {/* Top-of-list shimmer while at least one addon hasn't
+              landed AND no groups have arrived yet. Once even one
+              group has landed, the shimmer collapses — the user sees
+              a partial result instead of an opaque skeleton. */}
+          {stillSearching && orderedGroups.length === 0 && (
+            <div className="px-6 space-y-3">
               <div className="h-px bg-gradient-to-r from-transparent via-ln-accent/60 to-transparent animate-pulse" />
+              <p className="text-white/40 text-xs px-1">
+                Searching across {totalAddons} addon{totalAddons === 1 ? "" : "s"}…
+              </p>
             </div>
           )}
 
-          {!loading && groups && groups.length === 0 && (
+          {/* Empty state — only when ALL addons settled AND every one
+              returned zero groups. Lets the user know the search
+              actually completed rather than is silently still going. */}
+          {slots && !stillSearching && orderedGroups.length === 0 && (
             <div className="mx-6 my-6 glass-panel rounded-2xl px-6 py-10 text-center">
               <p className="text-white/55 text-sm">
                 No results from any installed search-capable addon.
@@ -122,10 +184,12 @@ function SearchViewBody({ addons, query, onSelectMeta }: Props) {
             </div>
           )}
 
-          {/* Sections — DiscoveryRow per (addon, catalog), in native order */}
-          {groups && groups.length > 0 && (
+          {/* Results — one DiscoveryRow per (addon, catalog). Renders
+              as soon as the matching addon's call resolves; pending
+              addons leave a gap that fills in when they land. */}
+          {orderedGroups.length > 0 && (
             <div className="pt-2 pb-10 space-y-8">
-              {groups.map((g) => (
+              {orderedGroups.map((g) => (
                 <DiscoveryRow
                   key={`${g.addon_url}|${g.media_type}-${g.catalog_id}`}
                   title={withTypeSuffix(g.catalog_name, g.media_type)}
@@ -134,6 +198,18 @@ function SearchViewBody({ addons, query, onSelectMeta }: Props) {
                   onSelectMeta={onSelectMeta}
                 />
               ))}
+              {/* Trailing shimmer when at least one addon is still
+                  pending — signals "more results may still arrive
+                  below" instead of leaving the user wondering whether
+                  the visible groups are everything. */}
+              {stillSearching && (
+                <div className="px-6">
+                  <div className="h-px bg-gradient-to-r from-transparent via-ln-accent/40 to-transparent animate-pulse" />
+                  <p className="text-white/35 text-[11px] mt-2 text-center font-mono tracking-wider uppercase">
+                    {pendingCount} addon{pendingCount === 1 ? "" : "s"} still searching…
+                  </p>
+                </div>
+              )}
             </div>
           )}
         </div>

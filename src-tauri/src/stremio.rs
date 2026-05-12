@@ -1381,6 +1381,102 @@ pub struct SearchGroup {
     pub items:        Vec<MetaPreview>,
 }
 
+/// Search ONE addon's catalogs and return its groups. Splits the existing
+/// `global_search_grouped` per-addon body into a standalone command so the
+/// frontend can fan out N parallel calls (one per addon) and populate each
+/// row independently as it completes — progressive display instead of the
+/// "wait for the slowest addon" one-shot pattern.
+///
+/// Returns the addon's search-capable catalog groups in manifest order. An
+/// empty Vec means: addon has no search-capable catalogs OR every catalog
+/// returned zero items OR the manifest fetch failed (the warn devlog
+/// captures the failure cause). Callers can treat empty as "this addon
+/// contributed nothing" without distinguishing the underlying cause.
+#[tauri::command]
+pub async fn search_addon_grouped(
+    addon: AddonEntry,
+    query: String,
+) -> Result<Vec<SearchGroup>, String> {
+    let query = query.trim().to_string();
+    if query.is_empty() || !addon.has_search {
+        return Ok(vec![]);
+    }
+    let encoded = encode_query(&query);
+    let base = normalise_addon_base(&addon.url);
+    let Ok((wire, _)) = fetch_manifest(&base).await else {
+        crate::devlog!(warn, "search", "[{}] manifest fetch failed", addon.name);
+        return Ok(vec![]);
+    };
+    let addon_name_str = wire.name.clone();
+
+    let mut out: Vec<SearchGroup> = Vec::new();
+    for c in wire.catalogs.iter() {
+        let supports_search = c.extra.iter().any(|ex| {
+            ex.get("name").and_then(|v| v.as_str()) == Some("search")
+        });
+        if !supports_search { continue; }
+
+        let url = format!(
+            "{base}/catalog/{ty}/{id}/search={encoded}.json",
+            ty = c.media_type,
+            id = c.id,
+        );
+        crate::devlog!(info, "search", "[{}] GET {url}", addon_name_str);
+        let items: Vec<MetaPreview> = match client().get(&url).send().await {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    crate::devlog!(
+                        warn, "search",
+                        "[{}] {} → HTTP {}",
+                        addon_name_str, url, resp.status().as_u16(),
+                    );
+                    continue;
+                }
+                match resp.json::<CatalogResponse>().await {
+                    Ok(cr) => cr.metas.into_iter().map(sanitize_meta).collect(),
+                    Err(e) => {
+                        crate::devlog!(
+                            warn, "search",
+                            "[{}] {} JSON parse failed: {}",
+                            addon_name_str, url, e,
+                        );
+                        continue;
+                    }
+                }
+            }
+            Err(e) => {
+                let cat = describe_reqwest_err(&e);
+                crate::devlog!(
+                    warn, "search",
+                    "[{}] {} {}: {}",
+                    addon_name_str, url, cat, e,
+                );
+                continue;
+            }
+        };
+        if items.is_empty() { continue; }
+
+        let display_name = c
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("{} · {}", title_case(&c.media_type), c.id));
+        crate::devlog!(
+            info, "search",
+            "[{}] {} → {} item(s)",
+            addon_name_str, display_name, items.len(),
+        );
+        out.push(SearchGroup {
+            addon_name:   addon_name_str.clone(),
+            addon_url:    base.clone(),
+            catalog_id:   c.id.clone(),
+            catalog_name: display_name,
+            media_type:   c.media_type.clone(),
+            items,
+        });
+    }
+    Ok(out)
+}
+
 /// Like `global_search`, but returns results grouped by addon + catalog so
 /// the search view can render Stremio-style discrete sections. Iterates
 /// addons in install order; per addon, iterates catalogs in manifest order.

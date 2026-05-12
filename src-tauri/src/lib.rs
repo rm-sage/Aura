@@ -1872,6 +1872,7 @@ pub fn run() {
             // ── Global search & cloud sync (2.3) ────────────────────────────
             stremio::global_search,
             stremio::global_search_grouped,
+            stremio::search_addon_grouped,
             stremio::cloud_add_addon,
             stremio::cloud_remove_addon,
             // ── Auth ────────────────────────────────────────────────────────
