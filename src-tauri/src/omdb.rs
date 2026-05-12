@@ -83,14 +83,20 @@ pub async fn fetch_omdb_ratings(imdb_id: String) -> Result<Vec<OmdbRating>, Stri
         return Ok(vec![]);
     }
 
-    let key = crate::settings::snapshot().omdb_api_key.trim().to_string();
-    if key.is_empty() {
-        crate::devlog!(info, "omdb", "skipped — no OMDb API key configured");
-        return Ok(vec![]);
-    }
-
+    // Keyring-first lookup with a fallback to settings.json (for the
+    // brief window between an upgrade and the migration running). The
+    // resolver's `Zeroizing<String>` wraps the in-process copy so it's
+    // wiped on drop; we deref to &str inline rather than copying.
+    let key_z = match crate::api_keyring::resolve("omdb") {
+        Some(k) if !k.is_empty() => k,
+        _ => {
+            crate::devlog!(info, "omdb", "skipped — no OMDb API key configured");
+            return Ok(vec![]);
+        }
+    };
+    let key: &str = &key_z;
     let url = format!("{OMDB_API}?apikey={key}&i={imdb_id}&r=json&tomatoes=true");
-    crate::devlog!(info, "omdb", "GET {url}", url = url.replace(key.as_str(), "***"));
+    crate::devlog!(info, "omdb", "GET {url}", url = url.replace(key, "***"));
 
     let resp = match client().get(&url).send().await {
         Ok(r) => r,

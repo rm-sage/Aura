@@ -1165,6 +1165,17 @@ export default function App() {
     };
   }, []);
 
+  // ── Show-login event listener ──
+  // Components without a direct callback prop to surface the LoginView
+  // (e.g. Settings → Cloud Sync's guest-state Sign-In button) dispatch
+  // `aura:show-login` and we surface the modal here. Cheap; one
+  // listener, one setter call.
+  useEffect(() => {
+    const onShow = () => setShowLogin(true);
+    window.addEventListener("aura:show-login", onShow);
+    return () => window.removeEventListener("aura:show-login", onShow);
+  }, []);
+
   // ── Session-changed broadcast ──
   // Decoupled components (SyncStatusChip in the title bar, profile
   // popover, etc.) need to know when the active Stremio session

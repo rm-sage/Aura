@@ -27,6 +27,7 @@ mod backup;
 mod cinema;
 mod crash_reporting;
 mod devlog;
+mod api_keyring;
 mod media_controls;
 mod omdb;
 mod player;
@@ -1440,6 +1441,15 @@ pub fn run() {
             devlog::install(app.handle());
             crate::devlog!(info, "lib", "Aura setup begin");
 
+            // ── API key migration: settings.json → OS keyring ──
+            // One-shot per launch. Moves plaintext OMDb / OpenSubtitles
+            // keys from settings.json into the keyring (DPAPI / Keychain
+            // / Secret Service) and clears the settings.json fields.
+            // Idempotent — no-op when there's nothing to migrate AND
+            // the keyring is already populated. See `api_keyring.rs`
+            // for the full migration semantics.
+            api_keyring::migrate_from_settings(app.handle());
+
             // ── Deep-link scheme registration ──────────────────────────────
             // The Windows NSIS installer registers `aura://` and
             // `stremio://` in HKCU\Software\Classes when the user
@@ -1870,6 +1880,10 @@ pub fn run() {
             scrobble_auth::scrobble_oauth_device_poll,
             scrobble_auth::open_oauth_popup_webview,
             scrobble::scrobble_test_fire,
+            // ── API keys (OS keyring) ─────────────────────────────────────────
+            api_keyring::get_api_key,
+            api_keyring::set_api_key,
+            api_keyring::clear_api_key,
             sync::sync_status,
             sync::sync_pull,
             sync::sync_pull_all,

@@ -9,8 +9,6 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_libmpv::MpvExt;
 
-use crate::settings;
-
 // ---------------------------------------------------------------------------
 // OpenSubtitles bridge — api.opensubtitles.com REST v1
 //
@@ -73,10 +71,13 @@ pub async fn search_subtitles(
     imdb_id: Option<String>,
     languages: Option<String>,
 ) -> Result<Vec<SubtitleEntry>, String> {
-    let cfg = settings::snapshot();
-    if cfg.opensubtitles_api_key.trim().is_empty() {
-        return Err("OpenSubtitles API key not configured".into());
-    }
+    // Keyring-first resolution, with settings.json fallback during the
+    // migration window. Zeroizing wrapper wipes the in-process copy on
+    // drop; deref &str inline for the header.
+    let key_z = crate::api_keyring::resolve("opensubtitles")
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| "OpenSubtitles API key not configured".to_string())?;
+    let key: &str = &key_z;
 
     let mut params: Vec<(&str, String)> = Vec::new();
     if let Some(q) = query.as_ref().filter(|s| !s.is_empty()) {
@@ -98,7 +99,7 @@ pub async fn search_subtitles(
     let url = format!("{OS_API}/subtitles");
     let raw = client()
         .get(&url)
-        .header("Api-Key", cfg.opensubtitles_api_key.as_str())
+        .header("Api-Key", key)
         .query(&params)
         .send()
         .await
@@ -177,16 +178,16 @@ pub async fn download_subtitle<R: Runtime>(
     app: AppHandle<R>,
     file_id: i64,
 ) -> Result<String, String> {
-    let cfg = settings::snapshot();
-    if cfg.opensubtitles_api_key.trim().is_empty() {
-        return Err("OpenSubtitles API key not configured".into());
-    }
+    let key_z = crate::api_keyring::resolve("opensubtitles")
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| "OpenSubtitles API key not configured".to_string())?;
+    let key: &str = &key_z;
 
     // Step 1: ask OpenSubtitles for a download link
     let body = serde_json::json!({ "file_id": file_id });
     let raw = client()
         .post(format!("{OS_API}/download"))
-        .header("Api-Key", cfg.opensubtitles_api_key.as_str())
+        .header("Api-Key", key)
         .header("Content-Type", "application/json")
         .json(&body)
         .send()

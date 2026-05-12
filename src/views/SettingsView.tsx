@@ -946,25 +946,51 @@ function BackupRestoreSection({
     }
   };
 
-  const buildAndShow = useCallback(() => {
+  // Read API keys from the OS keyring + merge them onto the backend
+  // snapshot just for the export blob. The migration cleared the
+  // settings.json fields so the raw `backend` would export empty
+  // strings; this hydration restores backup parity (a portable
+  // export gets the user's keys round-trippable to a fresh device).
+  // Stays async since `get_api_key` is a Tauri command; calling
+  // sites await the blob.
+  const hydrateBackendWithKeyringKeys = useCallback(async (): Promise<Record<string, unknown>> => {
+    const merged: Record<string, unknown> = { ...(backend as unknown as Record<string, unknown>) };
+    for (const name of ["omdb", "opensubtitles"] as const) {
+      try {
+        const v = await invoke<string>("get_api_key", { name });
+        if (v && v.trim()) {
+          merged[`${name}_api_key`] = v;
+        }
+      } catch {
+        // Keyring unavailable on this platform — keep the merged value
+        // (possibly empty from the migrated settings.json) so the
+        // export still ships *something*.
+      }
+    }
+    return merged;
+  }, [backend]);
+
+  const buildAndShow = useCallback(async () => {
+    const hydratedBackend = await hydrateBackendWithKeyringKeys();
     const blob = buildExportBlob(
-      backend as unknown as Record<string, unknown>,
+      hydratedBackend,
       loadAuraSettings() as unknown as Record<string, unknown>,
       addons,
     );
     setExportText(blobToBase64(blob));
     setStatus({ kind: "ok", message: "Export string ready. Copy or download." });
-  }, [backend, addons]);
+  }, [hydrateBackendWithKeyringKeys, addons]);
 
-  const downloadFile = useCallback(() => {
+  const downloadFile = useCallback(async () => {
+    const hydratedBackend = await hydrateBackendWithKeyringKeys();
     const blob = buildExportBlob(
-      backend as unknown as Record<string, unknown>,
+      hydratedBackend,
       loadAuraSettings() as unknown as Record<string, unknown>,
       addons,
     );
     downloadBlobAsFile(blob);
     setStatus({ kind: "ok", message: "Downloaded settings file." });
-  }, [backend, addons]);
+  }, [hydrateBackendWithKeyringKeys, addons]);
 
   const applyText = useCallback(async (raw: string) => {
     const blob = parseImportInput(raw);
@@ -973,7 +999,31 @@ function BackupRestoreSection({
       return;
     }
     try {
-      await onApply(blob.backend as Partial<BackendSettings>);
+      // Redirect imported API keys away from settings.json (where
+      // they'd remain readable to anyone with filesystem access) and
+      // into the OS keyring. We mutate a copy of blob.backend so the
+      // backend patch sent to onApply has the key fields stripped.
+      const backendPatch = { ...(blob.backend as Record<string, unknown>) };
+      const omdbKey = typeof backendPatch.omdb_api_key === "string"
+        ? backendPatch.omdb_api_key as string : "";
+      const opensubKey = typeof backendPatch.opensubtitles_api_key === "string"
+        ? backendPatch.opensubtitles_api_key as string : "";
+      delete backendPatch.omdb_api_key;
+      delete backendPatch.opensubtitles_api_key;
+
+      await onApply(backendPatch as Partial<BackendSettings>);
+
+      // Now write the imported keys to the keyring. Best-effort —
+      // if the keyring fails (Linux without Secret Service), nothing
+      // is left in settings.json either (the user can re-paste the
+      // key manually). Skip empty values so we don't overwrite an
+      // existing keyring entry with nothing.
+      if (omdbKey.trim()) {
+        await invoke("set_api_key", { name: "omdb", value: omdbKey.trim() }).catch(() => {});
+      }
+      if (opensubKey.trim()) {
+        await invoke("set_api_key", { name: "opensubtitles", value: opensubKey.trim() }).catch(() => {});
+      }
       // Aura-side portable subset. Import is additive: any field
       // present in the blob overwrites; missing fields keep their
       // current value. Provider lists go through resolveProviders so
@@ -1690,6 +1740,473 @@ function AutoAdvanceDelayRow({
       </div>
     </div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// KeyringApiKeyInput — text input backed directly by the OS keyring
+// (via the Rust api_keyring commands). Reads on mount; writes on every
+// blur / Enter to avoid hammering the keyring on every keystroke.
+// Wrapped with the same data-settings-row attributes as SettingText so
+// the search highlighter picks it up.
+// ---------------------------------------------------------------------------
+
+function KeyringApiKeyInput({
+  name, label, description, placeholder,
+}: {
+  name: "omdb" | "opensubtitles";
+  label: string;
+  description: string;
+  placeholder?: string;
+}) {
+  const [value, setValue] = useState<string>("");
+  const [persisted, setPersisted] = useState<string>("");
+  const [revealed, setRevealed] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+
+  // Load initial value from the keyring.
+  useEffect(() => {
+    let cancelled = false;
+    invoke<string>("get_api_key", { name })
+      .then((v) => {
+        if (cancelled) return;
+        setValue(v ?? "");
+        setPersisted(v ?? "");
+        setLoaded(true);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setLoaded(true);
+      });
+    return () => { cancelled = true; };
+  }, [name]);
+
+  const commit = useCallback(() => {
+    const trimmed = value.trim();
+    if (trimmed === persisted) return;
+    invoke("set_api_key", { name, value: trimmed })
+      .then(() => setPersisted(trimmed))
+      .catch((e) => {
+        console.warn(`[settings] set_api_key(${name}) failed:`, e);
+      });
+  }, [name, value, persisted]);
+
+  // Masked vs revealed — masked is the default since these are
+  // credentials. The "Show" button flips to plain text. Clearing the
+  // input still works whether or not it's revealed.
+  const masked = !revealed && value.length > 0
+    ? "•".repeat(Math.min(value.length, 32))
+    : value;
+
+  return (
+    <div
+      className="space-y-2"
+      data-settings-row=""
+      data-settings-label={label}
+      data-settings-description={description}
+    >
+      <div className="flex items-center gap-2">
+        <p className="text-white/75 text-sm font-medium">{label}</p>
+        <span className="px-1.5 py-0.5 rounded text-[9px] font-mono uppercase tracking-wider
+                         bg-emerald-500/15 text-emerald-300/90 border border-emerald-400/25">
+          Keyring
+        </span>
+      </div>
+      <p className="text-white/35 text-xs -mt-1">{description}</p>
+      <div className="relative">
+        <input
+          type={revealed ? "text" : "password"}
+          value={revealed ? value : masked}
+          placeholder={placeholder}
+          disabled={!loaded}
+          onChange={(e) => setValue(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              (e.target as HTMLInputElement).blur();
+            }
+          }}
+          spellCheck={false}
+          autoComplete="off"
+          className={`w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 pr-20
+                      text-sm font-mono placeholder:text-white/25 outline-none
+                      focus:border-white/25 transition-colors
+                      ${!loaded ? "opacity-50" : ""}`}
+          style={{ color: "var(--text-primary)" }}
+        />
+        <button
+          type="button"
+          onClick={() => setRevealed((r) => !r)}
+          disabled={value.length === 0}
+          className="absolute right-2 top-1/2 -translate-y-1/2
+                     px-2 py-1 rounded-md text-[10.5px] font-medium tracking-wide
+                     bg-white/5 text-white/55 border border-white/10
+                     hover:bg-white/10 hover:text-white
+                     disabled:opacity-30 disabled:hover:bg-white/5
+                     transition-colors"
+        >
+          {revealed ? "Hide" : "Show"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CloudSyncSection — diagnostic + control surface for Aura Cloud sync.
+//
+// Three top-level states based on `sync_status()`:
+//   • Guest — no Stremio session → no sync available. Show a card with
+//     a "Sign in" CTA (dispatches `aura:show-login` for App.tsx to
+//     surface the LoginView modal).
+//   • Connected, empty — connected but no namespaces have been written
+//     yet. Show a "you're set up, nothing pushed yet" message + the
+//     Pull Now / Clear actions (so the user can manually pull state
+//     from another device).
+//   • Connected, active — full namespace table with last-updated +
+//     size per row, total/quota footer, Pull / Purge actions.
+//
+// Polls `sync_status` every 30 s while mounted, re-fetches immediately
+// on `aura:settings-changed` + `aura:session-changed`, and on any
+// user-triggered push/pull/purge action.
+// ---------------------------------------------------------------------------
+
+interface SyncNamespaceStatus {
+  name: string;
+  etag: string | null;
+  updated_at: number | null;
+  size: number | null;
+}
+interface SyncStatusResp {
+  connected: boolean;
+  namespaces: SyncNamespaceStatus[];
+  total_size: number;
+  quota: number;
+}
+
+/** Friendly per-namespace labels. Falls back to the raw name when an
+ *  unknown namespace appears (forward-compat with a future namespace
+ *  the proxy returns before this map is updated). */
+const NAMESPACE_LABEL: Record<string, string> = {
+  "settings":         "App settings",
+  "manual-state":     "Watched marks & queue",
+  "auto-bumped":      "Auto-bumped series",
+  "notifications":    "Notifications",
+  "recent-searches":  "Recent searches",
+  "title-state":      "Per-title preferences",
+  "anilist-id-map":   "AniList ID cache",
+};
+
+function CloudSyncSection({ authKey }: { authKey: string | null }) {
+  const [status, setStatus] = useState<SyncStatusResp | null>(null);
+  const [errored, setErrored] = useState(false);
+  const [busyAction, setBusyAction] = useState<null | "pull" | "purge" | "push">(null);
+  const [purgeConfirm, setPurgeConfirm] = useState(false);
+  // Tick for relative-time labels — refreshes every 30 s so "5 minutes
+  // ago" stays current. Cheap; the relative formatter is O(1).
+  const [tickNow, setTickNow] = useState(() => Date.now());
+
+  const refresh = useCallback(async () => {
+    try {
+      const s = await invoke<SyncStatusResp>("sync_status");
+      setStatus(s);
+      setErrored(false);
+    } catch {
+      setErrored(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const pollId = window.setInterval(() => { void refresh(); }, 30_000);
+    const tickId = window.setInterval(() => setTickNow(Date.now()), 30_000);
+    const onSignal = () => { void refresh(); };
+    window.addEventListener("aura:settings-changed", onSignal);
+    window.addEventListener("aura:session-changed",  onSignal);
+    return () => {
+      window.clearInterval(pollId);
+      window.clearInterval(tickId);
+      window.removeEventListener("aura:settings-changed", onSignal);
+      window.removeEventListener("aura:session-changed",  onSignal);
+    };
+  }, [refresh]);
+
+  const handlePullNow = useCallback(async () => {
+    if (busyAction) return;
+    setBusyAction("pull");
+    try {
+      const { syncPullAll } = await import("../sync");
+      await syncPullAll();
+      showAppToast("Cloud Sync pulled successfully", { duration: 2500 });
+      await refresh();
+    } catch (e) {
+      showAppToast(`Pull failed: ${String(e)}`, { duration: 4000 });
+    } finally {
+      setBusyAction(null);
+    }
+  }, [busyAction, refresh]);
+
+  const handlePushNamespace = useCallback(async (ns: string) => {
+    if (busyAction) return;
+    setBusyAction("push");
+    try {
+      const { syncPushNow } = await import("../sync");
+      // The sync module's namespace literal type is union-restricted;
+      // cast at the boundary since we already validated against the
+      // server's response (which only returns canonical names).
+      await syncPushNow(ns as Parameters<typeof syncPushNow>[0]);
+      showAppToast(`Pushed ${NAMESPACE_LABEL[ns] ?? ns}`, { duration: 2000 });
+      await refresh();
+    } catch (e) {
+      showAppToast(`Push failed: ${String(e)}`, { duration: 4000 });
+    } finally {
+      setBusyAction(null);
+    }
+  }, [busyAction, refresh]);
+
+  const handlePurge = useCallback(async () => {
+    if (busyAction) return;
+    setPurgeConfirm(false);
+    setBusyAction("purge");
+    try {
+      const { syncPurge } = await import("../sync");
+      await syncPurge();
+      showAppToast("Cloud Sync data cleared", { duration: 2500 });
+      await refresh();
+    } catch (e) {
+      showAppToast(`Purge failed: ${String(e)}`, { duration: 4000 });
+    } finally {
+      setBusyAction(null);
+    }
+  }, [busyAction, refresh]);
+
+  // ── Guest state ───────────────────────────────────────────────────
+  if (!authKey || (status && !status.connected)) {
+    return (
+      <div
+        data-settings-row=""
+        data-settings-label="Cloud Sync"
+        data-settings-description="Aura Cloud sync — requires Stremio sign-in to enable per-account state sync."
+        className="space-y-2"
+      >
+        <p className="text-white/55 text-sm leading-relaxed">
+          Cloud Sync requires a Stremio account. Sign in to keep your
+          settings, queue, manual marks, AniList ID cache, and
+          notifications in sync across devices.
+        </p>
+        <p className="text-white/35 text-xs leading-relaxed">
+          Library / watch progress are not synced here — Stremio's own
+          cloud handles those. The Aura proxy never sees your raw
+          auth_key; a SHA-256 hash computed locally is what
+          authenticates each request.
+        </p>
+        <button
+          type="button"
+          onClick={() => window.dispatchEvent(new CustomEvent("aura:show-login"))}
+          className="mt-1 px-3 py-1.5 rounded-lg border border-ln-accent/45 bg-ln-accent/15
+                     text-ln-accent text-[12px] font-semibold tracking-wide
+                     hover:bg-ln-accent/25 transition-colors"
+        >
+          Sign in to Stremio
+        </button>
+      </div>
+    );
+  }
+
+  // ── Loading / error state ─────────────────────────────────────────
+  if (!status) {
+    return (
+      <div
+        data-settings-row=""
+        data-settings-label="Cloud Sync"
+        data-settings-description="Aura Cloud sync status loading."
+        className="text-white/40 text-xs"
+      >
+        {errored ? (
+          <div className="space-y-2">
+            <p>Couldn't reach Aura Cloud.</p>
+            <button
+              type="button"
+              onClick={() => void refresh()}
+              className="px-3 py-1.5 rounded-md border border-white/15 bg-white/5 text-white/75
+                         hover:bg-white/10 transition-colors text-[11px] font-medium"
+            >
+              Retry
+            </button>
+          </div>
+        ) : (
+          <p>Loading sync status…</p>
+        )}
+      </div>
+    );
+  }
+
+  // ── Connected (with or without namespaces) ────────────────────────
+  const lastSyncMs = (() => {
+    if (!status.namespaces.length) return null;
+    const max = status.namespaces.reduce(
+      (acc, ns) => (ns.updated_at && ns.updated_at > acc ? ns.updated_at : acc),
+      0,
+    );
+    return max > 0 ? max * 1000 : null;
+  })();
+  const quotaPctTotal = status.quota > 0 ? (status.total_size / status.quota) * 100 : 0;
+
+  return (
+    <div
+      data-settings-row=""
+      data-settings-label="Cloud Sync"
+      data-settings-description="Per-namespace last pull / push / size; Pull now and Clear cloud sync data actions."
+      className="space-y-3"
+    >
+      {/* Top status line */}
+      <div className="flex items-center justify-between gap-3 text-[12px]">
+        <span className="text-white/75 font-medium">
+          {lastSyncMs ? `Last activity ${formatAgo(tickNow - lastSyncMs)}` : "Connected — no data yet"}
+        </span>
+        <span className="text-white/35 font-mono tabular-nums">
+          {formatBytes(status.total_size)} / {formatBytes(status.quota)}
+        </span>
+      </div>
+
+      {/* Approaching-quota hint */}
+      {quotaPctTotal >= 95 && (
+        <p className="text-amber-300/85 text-[11px]">
+          Approaching the 10 MB per-account quota. Consider clearing old data via the destructive action below.
+        </p>
+      )}
+
+      {/* Namespace table */}
+      {status.namespaces.length > 0 && (
+        <div className="rounded-lg border border-white/8 divide-y divide-white/6">
+          {status.namespaces.map((ns) => {
+            const ago = ns.updated_at ? formatAgo(tickNow - ns.updated_at * 1000) : "Never";
+            const sizeKb = ns.size != null ? formatBytes(ns.size) : "—";
+            const overQuota = ns.size != null && ns.size > 1024 * 1024 * 0.95;
+            return (
+              <div key={ns.name}
+                   className="flex items-center justify-between gap-3 px-3 py-2 text-[12px]">
+                <div className="min-w-0 flex-1">
+                  <p className="text-white/85 font-medium truncate">
+                    {NAMESPACE_LABEL[ns.name] ?? ns.name}
+                  </p>
+                  <p className="text-white/40 text-[10.5px] mt-0.5">
+                    {ago} · <span className={overQuota ? "text-amber-300/80" : ""}>{sizeKb}</span>
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={busyAction !== null}
+                  onClick={() => void handlePushNamespace(ns.name)}
+                  className="px-2 py-1 rounded-md text-[10.5px] font-medium tracking-wide
+                             bg-white/5 text-white/65 border border-white/10
+                             hover:bg-white/10 hover:text-white
+                             disabled:opacity-40 disabled:cursor-not-allowed
+                             transition-colors"
+                >
+                  {busyAction === "push" ? "…" : "Push"}
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Actions row */}
+      <div className="flex items-center gap-2 pt-1">
+        <button
+          type="button"
+          disabled={busyAction !== null}
+          onClick={() => void handlePullNow()}
+          className="px-3 py-1.5 rounded-lg border border-ln-accent/40 bg-ln-accent/15
+                     text-ln-accent text-[11.5px] font-semibold tracking-wide
+                     hover:bg-ln-accent/25 transition-colors
+                     disabled:opacity-50 disabled:cursor-progress"
+        >
+          {busyAction === "pull" ? "Pulling…" : "Pull now"}
+        </button>
+        <button
+          type="button"
+          disabled={busyAction !== null || status.namespaces.length === 0}
+          onClick={() => setPurgeConfirm(true)}
+          className="px-3 py-1.5 rounded-lg border border-rose-400/35 bg-rose-500/10
+                     text-rose-300/95 text-[11.5px] font-medium tracking-wide
+                     hover:bg-rose-500/20 hover:border-rose-400/50
+                     disabled:opacity-40 disabled:cursor-not-allowed
+                     transition-colors"
+        >
+          Clear cloud sync data
+        </button>
+      </div>
+
+      {/* Privacy footer */}
+      <p className="text-white/35 text-[10.5px] leading-relaxed pt-2 border-t border-white/6">
+        Cloud Sync uses a derived hash of your Stremio auth_key (SHA-256,
+        computed locally, never sent) as the storage key. The proxy
+        never sees your raw auth_key. Library / watch progress are not
+        synced here — Stremio's own cloud handles those.
+      </p>
+
+      {/* Purge confirm modal */}
+      {purgeConfirm && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="max-w-[400px] mx-4 rounded-2xl bg-black/90 border border-white/12 p-5 space-y-3
+                          shadow-[0_18px_42px_-12px_rgba(0,0,0,0.75)]">
+            <h3 className="text-white/95 text-sm font-semibold tracking-wide">Clear cloud sync data?</h3>
+            <p className="text-white/55 text-xs leading-relaxed">
+              This permanently deletes all your synced data on the Aura Cloud proxy.
+              Local state stays intact — your settings, queue, and marks remain on
+              this device. Other devices will pull this device's state on their next
+              sync.
+            </p>
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setPurgeConfirm(false)}
+                className="px-3 py-1.5 rounded-lg border border-white/15 bg-white/5
+                           text-white/75 text-[11px] font-medium hover:bg-white/10
+                           transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void handlePurge()}
+                className="px-3 py-1.5 rounded-lg border border-rose-400/45 bg-rose-500/20
+                           text-rose-200 text-[11px] font-semibold hover:bg-rose-500/30
+                           transition-colors"
+              >
+                Clear data
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "0 KB";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function formatAgo(diffMs: number): string {
+  if (diffMs < 0) return "just now";
+  const sec = Math.round(diffMs / 1000);
+  if (sec < 45)  return "just now";
+  const min = Math.round(diffMs / 60_000);
+  if (min < 60)  return `${min} min ago`;
+  const hr  = Math.round(diffMs / 3_600_000);
+  if (hr < 24)   return `${hr}h ago`;
+  const day = Math.round(diffMs / 86_400_000);
+  if (day < 30)  return `${day}d ago`;
+  const mon = Math.round(diffMs / (86_400_000 * 30));
+  if (mon < 12)  return `${mon}mo ago`;
+  const yr  = Math.round(diffMs / (86_400_000 * 365));
+  return `${yr}y ago`;
 }
 
 function AboutSection({ addonCount }: { addonCount: number }) {
@@ -3820,6 +4337,14 @@ export default function SettingsView({ addons, session }: Props) {
             </Section>
           )}
 
+          {/* Cloud Sync — diagnostic + manual controls for the
+              per-account state sync (Phase 7). Engine runs silently in
+              the background; this section surfaces last-pull / last-
+              push / size per namespace plus on-demand Pull / Purge. */}
+          <Section id="sec-cloud-sync" title="Cloud Sync">
+            <CloudSyncSection authKey={session?.auth_key ?? null} />
+          </Section>
+
           {/* API keys — currently just OMDb. Other third-party services
               that need a key (OpenSubtitles, etc.) can plug into this
               section as they get re-introduced. Aura no longer ships
@@ -3832,12 +4357,18 @@ export default function SettingsView({ addons, session }: Props) {
               installs. */}
           {backend && (
             <Section id="sec-api-keys" title="API Keys">
-              <SettingText
+              <KeyringApiKeyInput
+                name="omdb"
                 label="OMDb API key"
-                description="Enriches Detail-page ratings with Rotten Tomatoes and Metacritic critic scores. Aura does not ship a default key; register a free one at omdbapi.com (1,000 requests/day, ~30 s signup) and paste it here. Leave empty to disable OMDb; addon-supplied ratings and the MAL aggregator still render without it. The key is included in Settings export so it follows you across installs."
-                value={backend.omdb_api_key}
+                description="Enriches Detail-page ratings with Rotten Tomatoes and Metacritic critic scores. Aura does not ship a default key; register a free one at omdbapi.com (1,000 requests/day, ~30 s signup) and paste it here. Leave empty to disable OMDb; addon-supplied ratings and the MAL aggregator still render without it. Stored securely in the OS keyring."
                 placeholder="e.g. 1a2b3c4d"
-                onChange={(v) => patchBackend({ omdb_api_key: v.trim() })}
+              />
+              <div className="h-px bg-white/6" />
+              <KeyringApiKeyInput
+                name="opensubtitles"
+                label="OpenSubtitles API key"
+                description="Unlocks the in-player subtitle picker that queries OpenSubtitles' REST API. Register a free account at opensubtitles.com (the .com REST API, not the legacy .org XML-RPC) and find your key under Profile → Consumer. Leave empty to disable; addon-supplied subtitles still work without it. Stored securely in the OS keyring."
+                placeholder="e.g. 1a2b3c4dXyZ…"
               />
             </Section>
           )}
