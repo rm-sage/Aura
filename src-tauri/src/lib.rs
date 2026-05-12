@@ -1900,6 +1900,7 @@ pub fn run() {
             // ── Phase 4: OpenSubtitles ────────────────────────────────────────
             subtitles::search_subtitles,
             subtitles::download_subtitle,
+            subtitles::compute_opensubtitles_hash,
             subtitles::add_subtitle_to_mpv,
             // ── Phase 4: SMTC ─────────────────────────────────────────────────
             media_controls::smtc_set_metadata,

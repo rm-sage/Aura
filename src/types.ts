@@ -257,6 +257,11 @@ export interface SubtitleEntry {
   fps: number | null;
   download_count: number | null;
   hearing_impaired: boolean;
+  /** OpenSubtitles flagged this entry as a MovieHash match against
+   *  the supplied moviehash + moviebytesize. Frame-accurate to that
+   *  release; surfaced in the picker as a "Hash match" badge and
+   *  bubbled to the top of the results list. */
+  moviehash_match?: boolean;
 }
 
 export interface LibraryState {

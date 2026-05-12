@@ -44,6 +44,152 @@ fn client() -> &'static reqwest::Client {
 }
 
 // ---------------------------------------------------------------------------
+// OpenSubtitles MovieHash — compute via Range GETs against the
+// resolved stream URL. Algorithm (per opensubtitles.org wiki):
+//
+//   1. Read the first 64 KB of the file.
+//   2. Read the last  64 KB of the file.
+//   3. Treat each 64 KB block as 8 192 little-endian u64 values, sum
+//      them (wrapping). Result is a single u64.
+//   4. Add the file's total byte size to the running sum (wrapping).
+//   5. Encode the resulting u64 as a 16-character zero-padded lowercase
+//      hexadecimal string.
+//
+// Returned to the frontend alongside the file's byte size — both are
+// required for OpenSubtitles' `moviehash` + `moviebytesize` query
+// parameters.
+// ---------------------------------------------------------------------------
+
+const HASH_CHUNK_BYTES: u64 = 64 * 1024;
+
+#[derive(Clone, Serialize)]
+pub struct OpenSubtitlesHash {
+    /// 16-char lowercase hex, zero-padded.
+    pub hash: String,
+    /// Total file size in bytes — feeds the `moviebytesize` parameter.
+    pub bytesize: u64,
+}
+
+fn sum_chunk_as_u64(buf: &[u8]) -> u64 {
+    let mut sum: u64 = 0;
+    let mut i = 0;
+    while i + 8 <= buf.len() {
+        let val = u64::from_le_bytes([
+            buf[i], buf[i + 1], buf[i + 2], buf[i + 3],
+            buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7],
+        ]);
+        sum = sum.wrapping_add(val);
+        i += 8;
+    }
+    sum
+}
+
+#[tauri::command]
+pub async fn compute_opensubtitles_hash(url: String) -> Result<OpenSubtitlesHash, String> {
+    if url.is_empty() {
+        return Err("compute_opensubtitles_hash: empty url".into());
+    }
+    // Magnet / non-HTTP URLs aren't usable here — we'd need a torrent
+    // engine to read the bytes, which Aura intentionally doesn't ship.
+    // Bail early so the frontend skips the hash and falls back to
+    // query-based search.
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("compute_opensubtitles_hash: only http(s) URLs supported".into());
+    }
+
+    // Discover the file size via Range: bytes=0-(CHUNK-1). The
+    // Content-Range header in the 206 response carries the total size
+    // as `bytes 0-N/TOTAL`. Cheaper than a HEAD (some debrid hosts
+    // don't accept HEAD) and combines the first-chunk read with the
+    // probe.
+    let head_resp = client()
+        .get(&url)
+        .header("Range", format!("bytes=0-{}", HASH_CHUNK_BYTES - 1))
+        .send()
+        .await
+        .map_err(|e| format!("hash: first-chunk request failed: {e}"))?;
+
+    let status = head_resp.status();
+    if status.as_u16() != 206 {
+        return Err(format!(
+            "hash: server doesn't honour Range requests (got {} for first-chunk)",
+            status.as_u16()
+        ));
+    }
+    let content_range = head_resp
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| "hash: response missing Content-Range header".to_string())?
+        .to_string();
+    // `bytes 0-65535/87654321` → parse the `/TOTAL` tail.
+    let total: u64 = content_range
+        .split('/')
+        .nth(1)
+        .ok_or_else(|| format!("hash: malformed Content-Range '{content_range}'"))?
+        .trim()
+        .parse()
+        .map_err(|e| format!("hash: bad total in Content-Range '{content_range}': {e}"))?;
+
+    if total < HASH_CHUNK_BYTES * 2 {
+        // Files smaller than 128 KB — the hash algorithm strictly
+        // requires two non-overlapping 64 KB blocks. Edge case for
+        // shorts / trailers; bail and let the frontend fall back to
+        // query-based search.
+        return Err(format!(
+            "hash: file too small ({} bytes < 128 KB minimum)",
+            total
+        ));
+    }
+
+    let first_bytes = head_resp
+        .bytes()
+        .await
+        .map_err(|e| format!("hash: first-chunk read failed: {e}"))?;
+    if (first_bytes.len() as u64) < HASH_CHUNK_BYTES {
+        return Err(format!(
+            "hash: first chunk truncated ({} bytes < {} expected)",
+            first_bytes.len(), HASH_CHUNK_BYTES
+        ));
+    }
+    let first_sum = sum_chunk_as_u64(&first_bytes);
+
+    // Last 64 KB via a second Range request. `bytes=(total - CHUNK)-(total - 1)`.
+    let tail_start = total - HASH_CHUNK_BYTES;
+    let last_resp = client()
+        .get(&url)
+        .header("Range", format!("bytes={tail_start}-{}", total - 1))
+        .send()
+        .await
+        .map_err(|e| format!("hash: last-chunk request failed: {e}"))?;
+    if last_resp.status().as_u16() != 206 {
+        return Err(format!(
+            "hash: server failed last-chunk Range (got {})",
+            last_resp.status().as_u16()
+        ));
+    }
+    let last_bytes = last_resp
+        .bytes()
+        .await
+        .map_err(|e| format!("hash: last-chunk read failed: {e}"))?;
+    if (last_bytes.len() as u64) < HASH_CHUNK_BYTES {
+        return Err(format!(
+            "hash: last chunk truncated ({} bytes < {} expected)",
+            last_bytes.len(), HASH_CHUNK_BYTES
+        ));
+    }
+    let last_sum = sum_chunk_as_u64(&last_bytes);
+
+    let combined = first_sum.wrapping_add(last_sum).wrapping_add(total);
+    let hex = format!("{combined:016x}");
+    crate::devlog!(
+        info, "subtitles",
+        "OS hash computed: {hex} ({} bytes)", total
+    );
+    Ok(OpenSubtitlesHash { hash: hex, bytesize: total })
+}
+
+// ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
@@ -58,6 +204,14 @@ pub struct SubtitleEntry {
     pub fps: Option<f64>,
     pub download_count: Option<i64>,
     pub hearing_impaired: bool,
+    /// True when OpenSubtitles flagged this entry as a MovieHash match
+    /// against the supplied `moviehash` + `moviebytesize`. Hash-matched
+    /// entries are frame-accurate to that specific release; the UI
+    /// surfaces a "Hash match" badge so the user picks them first.
+    /// False for entries that came back via query / IMDB / year
+    /// matching, OR when no hash was supplied to the search.
+    #[serde(default)]
+    pub moviehash_match: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +224,8 @@ pub async fn search_subtitles(
     year: Option<i32>,
     imdb_id: Option<String>,
     languages: Option<String>,
+    moviehash: Option<String>,
+    moviebytesize: Option<u64>,
 ) -> Result<Vec<SubtitleEntry>, String> {
     // Keyring-first resolution, with settings.json fallback during the
     // migration window. Zeroizing wrapper wipes the in-process copy on
@@ -95,6 +251,20 @@ pub async fn search_subtitles(
     }
     let langs = languages.unwrap_or_else(|| "en".to_string());
     params.push(("languages", langs));
+
+    // OpenSubtitles' MovieHash matcher — when both `moviehash` and
+    // `moviebytesize` are present, frame-accurate hash-matched results
+    // bubble to the top of the response. Skipped silently when either
+    // is missing or when the hash computation failed (we still fall
+    // back to title / IMDB / year matching, which is what the function
+    // does pre-hash).
+    if let (Some(h), Some(size)) = (
+        moviehash.as_ref().filter(|s| !s.is_empty()),
+        moviebytesize.filter(|n| *n > 0),
+    ) {
+        params.push(("moviehash", h.clone()));
+        params.push(("moviebytesize", size.to_string()));
+    }
 
     let url = format!("{OS_API}/subtitles");
     let raw = client()
@@ -158,8 +328,17 @@ fn parse_search_response(raw: &str) -> Result<Vec<SubtitleEntry>, String> {
                 .get("hearing_impaired")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            moviehash_match: attrs
+                .get("moviehash_match")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         });
     }
+    // Hash-matched entries are frame-accurate to the played file —
+    // surface them first so the user picks them by default. Stable
+    // sort preserves OpenSubtitles' original ordering within each
+    // group (typically by download_count desc).
+    out.sort_by(|a, b| b.moviehash_match.cmp(&a.moviehash_match));
     Ok(out)
 }
 

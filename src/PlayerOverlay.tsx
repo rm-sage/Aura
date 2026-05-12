@@ -2133,6 +2133,7 @@ export default function PlayerOverlay({
             ? activeTarget.id
             : undefined
         }
+        streamUrl={streamUrl}
         onClose={() => setSubsOpen(false)}
       />
 

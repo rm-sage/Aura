@@ -106,7 +106,7 @@ commands.allow = ["fetch_skip_windows", "set_skip_windows", "get_skip_windows", 
 [[permission]]
 identifier = "allow-subtitles"
 description = "Allows the frontend to search OpenSubtitles, download .srt files, and inject them into MPV"
-commands.allow = ["search_subtitles", "download_subtitle", "add_subtitle_to_mpv"]
+commands.allow = ["search_subtitles", "download_subtitle", "add_subtitle_to_mpv", "compute_opensubtitles_hash"]
 
 # ── Phase 6.0.5: OMDb ratings ────────────────────────────────────────────────
 [[permission]]
