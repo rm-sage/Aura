@@ -201,16 +201,24 @@ function useSeasonEpisodes(item: LibraryItem, addons: AddonEntry[] | undefined):
       // it. If the filter returns nothing — common for AIOMetadata-
       // patched shows where the video_id encodes the split-season cour
       // (`:2:6`) but the meta.videos[] entries still use the merged
-      // shape (`v.season === 1` for the same content) — fall back to
-      // the full episode list so the segmented bar still draws.
-      // Without this fallback the CW card silently downgraded to the
-      // thin linear bar for every split-season anime.
+      // shape (`v.season === 1` for the same content), and for the
+      // kitsu/mal/anidb prefix-style ids that don't carry a true
+      // season slot — fall back to the full episode list so the
+      // segmented bar still draws.
       let seasonEps = season != null
         ? detail.videos.filter((v) => v.season === season)
         : detail.videos;
       if (seasonEps.length === 0 && detail.videos.length > 0) {
         seasonEps = detail.videos;
       }
+      // Always strip season 0 (specials / OVAs / extras). The CW
+      // segmented bar represents the user's main watch arc — specials
+      // air out-of-band and inflating the segment count with them
+      // makes the bar misrepresent main-run progress (e.g. Frieren's
+      // 28 main-run episodes balloon to 38 when 10 specials are
+      // included). The detail page's EpisodesPanel still shows the
+      // specials season explicitly via the dropdown.
+      seasonEps = seasonEps.filter((v) => (v.season ?? 0) !== 0);
       seasonEps.sort((a, b) => (a.episode ?? 0) - (b.episode ?? 0));
       setEps(seasonEps);
     })();

@@ -2169,7 +2169,7 @@ fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
     let Some(arr) = meta.get("videos").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
-    arr.iter()
+    let videos: Vec<VideoEntry> = arr.iter()
         .take(2000) // generous cap; long-running anime can have 1000+ episodes
         .filter_map(|v| {
             // ID is required — without it we can't fetch streams.
@@ -2186,17 +2186,15 @@ fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
                 .map(|s| cap(s.into(), 240))
                 .unwrap_or_default();
 
-            // Episode kind — try several field-name conventions used by
-            // anime-meta addons:
-            //   • `episodeKind`            (Aura's preferred wire name)
-            //   • `episode_kind` / `kind`  (snake_case + bare)
-            //   • `episodeType` / `episode_type`  (alt naming some
-            //     anime addons borrow from Jikan/AniList where each
-            //     episode carries a type tag)
-            //   • boolean `filler: true` / `recap: true`            //
-            // Accepted vocabulary: filler / recap / canon / normal /
-            // mixed. Anything else drops to None so the UI renders the
-            // standard row.
+            // Episode kind — AIOMetadata's canonical contract emits
+            // top-level booleans `filler: bool` and `recap: bool` on
+            // every video (never undefined). We also accept a small
+            // family of historical string aliases (`episodeKind`,
+            // `episode_kind`, `kind`, `episodeType`, `episode_type`)
+            // for addons that follow the Jikan/AniList per-episode
+            // type-tag convention, mapping the canonical vocabulary
+            // (filler / recap / canon / normal / mixed). Unknown
+            // strings drop to None so the UI renders the standard row.
             let string_kind = ["episodeKind", "episode_kind", "kind", "episodeType", "episode_type"]
                 .iter()
                 .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
@@ -2211,24 +2209,6 @@ fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
                     None
                 }
             });
-            // One-shot diagnostic per call: log which fields the addon
-            // actually populated so we can see why kind=None when
-            // expected. Only fires for entries that DIDN'T resolve a
-            // kind to avoid log spam on well-tagged videos.
-            if episode_kind.is_none() {
-                let has_fields = ["episodeKind", "episode_kind", "kind", "episodeType", "episode_type", "filler", "recap"]
-                    .iter()
-                    .filter(|k| v.get(*k).is_some())
-                    .map(|k| *k)
-                    .collect::<Vec<_>>();
-                if !has_fields.is_empty() {
-                    let raw = has_fields.iter().map(|k| format!("{k}={:?}", v.get(*k))).collect::<Vec<_>>().join(" ");
-                    crate::devlog!(
-                        info, "meta",
-                        "extract_videos: episode_kind unresolved despite present fields: {raw}",
-                    );
-                }
-            }
 
             Some(VideoEntry {
                 id,
@@ -2241,7 +2221,33 @@ fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
                 episode_kind,
             })
         })
-        .collect()
+        .collect();
+
+    // Summary log: how many of the parsed videos carry a recognised
+    // filler/recap kind. Lets the user see at a glance whether the
+    // wire actually emits truthy flags — useful when banners aren't
+    // appearing (either the addon's sending all-false or the addon
+    // doesn't carry the field at all). Also surfaces the presence/
+    // absence of the canonical field names so a wire-shape mismatch
+    // is diagnosable without the per-episode noise the previous log
+    // produced.
+    if !videos.is_empty() {
+        let filler_count = videos.iter().filter(|v| v.episode_kind.as_deref() == Some("filler")).count();
+        let recap_count  = videos.iter().filter(|v| v.episode_kind.as_deref() == Some("recap")).count();
+        let canonical_keys_present = arr.first()
+            .map(|first| ["filler", "recap"]
+                .iter()
+                .filter(|k| first.get(*k).is_some())
+                .map(|k| *k)
+                .collect::<Vec<_>>())
+            .unwrap_or_default();
+        crate::devlog!(
+            info, "meta",
+            "extract_videos: parsed {} videos ({} filler, {} recap); canonical fields on first entry: {:?}",
+            videos.len(), filler_count, recap_count, canonical_keys_present,
+        );
+    }
+    videos
 }
 
 /// Helper — pull a string array from arbitrary serde_json::Value, capping
