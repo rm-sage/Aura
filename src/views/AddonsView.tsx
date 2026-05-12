@@ -10,6 +10,7 @@ import LoginView from "../LoginView";
 import { openContextMenu } from "../ContextMenu";
 import { showAppToast } from "../AppToast";
 import Tooltip from "../Tooltip";
+import { requestReopenAddons } from "../onboarding";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -485,9 +486,26 @@ export default function AddonsView({
 
         {/* Add new */}
         <section className="space-y-3">
-          <h2 className="text-white/40 text-xs font-semibold tracking-[0.1em] uppercase">
-            Add Addon
-          </h2>
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="text-white/40 text-xs font-semibold tracking-[0.1em] uppercase">
+              Add Addon
+            </h2>
+            {/* Lets users revisit just the recommended-addons step of
+                the first-run wizard without re-running import / settings.
+                Fires `aura:onboarding-reopen-addons`; App.tsx remounts
+                OnboardingView at step 2. */}
+            <button
+              type="button"
+              onClick={() => requestReopenAddons()}
+              className="text-[10px] font-medium tracking-wide uppercase
+                         text-white/45 hover:text-ln-accent
+                         transition-colors px-2 py-1 rounded
+                         hover:bg-ln-accent/10"
+              title="Reopen the recommended-addons step of the first-run wizard"
+            >
+              Suggested addons
+            </button>
+          </div>
           <AddAddonForm
             session={session}
             onAdd={onAdd}

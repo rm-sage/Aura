@@ -21,6 +21,8 @@ import ThemeEngine from "./ThemeEngine";
 import TitleBar from "./TitleBar";
 import LandingView from "./LandingView";
 import LoginView from "./LoginView";
+import OnboardingView from "./views/OnboardingView";
+import { isOnboardingComplete } from "./onboarding";
 import PlayerOverlay from "./PlayerOverlay";
 import AmbientAura from "./AmbientAura";
 import ContextMenuHost, { openContextMenu } from "./ContextMenu";
@@ -571,6 +573,12 @@ export default function App() {
   const [landingDismissed, setLandingDismissed] = useState(false);
   /** Controls the LoginView modal independently of the landing screen. */
   const [showLogin, setShowLogin] = useState(false);
+  /** First-run wizard: dismisses to false once the user finishes/skips the
+   *  flow OR if a completed flag was already on disk from a prior install.
+   *  `onboardingStartAddons` flips true when AddonsView fires the
+   *  "Reopen onboarding addons" event so the wizard remounts at step 2. */
+  const [onboardingActive, setOnboardingActive] = useState<boolean>(() => !isOnboardingComplete());
+  const [onboardingStartAddons, setOnboardingStartAddons] = useState(false);
 
   // ── Addons ──
   const [addons, setAddons] = useState<AddonEntry[]>([]);
@@ -1174,6 +1182,20 @@ export default function App() {
     const onShow = () => setShowLogin(true);
     window.addEventListener("aura:show-login", onShow);
     return () => window.removeEventListener("aura:show-login", onShow);
+  }, []);
+
+  // ── Reopen-onboarding-addons event listener ──
+  // AddonsView's "Reopen onboarding addons" button fires
+  // `aura:onboarding-reopen-addons`; remount the wizard at step 2 so the
+  // user can revisit just the suggested-addons page without re-running
+  // steps 0 (import) and 1 (settings).
+  useEffect(() => {
+    const onReopen = () => {
+      setOnboardingStartAddons(true);
+      setOnboardingActive(true);
+    };
+    window.addEventListener("aura:onboarding-reopen-addons", onReopen);
+    return () => window.removeEventListener("aura:onboarding-reopen-addons", onReopen);
   }, []);
 
   // ── Session-changed broadcast ──
@@ -3498,6 +3520,21 @@ export default function App() {
         <LandingView
           onSignedIn={handleLoginSuccess}
           onContinueGuest={handleContinueGuest}
+        />
+      ) : onboardingActive && !isPlayerActive ? (
+        <OnboardingView
+          session={session}
+          addons={addons}
+          startAtAddons={onboardingStartAddons}
+          onAddonInstalled={(entry) => {
+            setAddons((prev) =>
+              prev.some((a) => a.url === entry.url) ? prev : [...prev, entry]
+            );
+          }}
+          onComplete={() => {
+            setOnboardingActive(false);
+            setOnboardingStartAddons(false);
+          }}
         />
       ) : (
       <div
