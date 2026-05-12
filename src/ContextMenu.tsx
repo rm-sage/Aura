@@ -41,6 +41,15 @@ export interface ActionMenuItem extends BaseItem {
   tone?: MenuTone;
   /** Legacy alias for tone="danger". Kept so older call sites keep working. */
   danger?: boolean;
+  /** Optional hover-submenu. When provided, the row gains a chevron
+   *  indicator and opens the listed items on hover. Clicking the row
+   *  itself STILL fires `onClick` + closes the menu — distinct from a
+   *  pure `kind: "submenu"` row, which has no clickable action of its
+   *  own. Used for "clickable parent with bulk variants" patterns
+   *  (watched-marks: click "Mark as Watched" to mark the clicked
+   *  episode, OR hover the same row to reach "Mark this & below /
+   *  above / all"). */
+  submenu?: ContextMenuItem[];
 }
 
 export interface SubmenuMenuItem extends BaseItem {
@@ -284,17 +293,28 @@ function ContextMenuRender({ x, y, items, onClose }: RenderProps) {
             </button>
           );
         }
-        // action
+        // action — may also carry an optional hover-submenu (the
+        // "clickable parent + bulk variants" pattern).
         const tone = item.tone ?? (item.danger ? "danger" : "default");
+        const hasSubmenu = Array.isArray(item.submenu) && item.submenu.length > 0;
+        const isOpen = hasSubmenu && openSub?.idx === idx;
         return (
           <button
             key={`act-${idx}`}
             role="menuitem"
+            aria-haspopup={hasSubmenu ? "menu" : undefined}
+            aria-expanded={hasSubmenu ? isOpen : undefined}
             disabled={item.disabled}
-            onMouseEnter={() => {
-              // Hovering an action with no submenu should close any open one.
-              if (openSub) scheduleCloseSub();
+            onMouseEnter={(e) => {
+              if (hasSubmenu && !item.disabled) {
+                const rect = e.currentTarget.getBoundingClientRect();
+                scheduleOpenSub(idx, rect);
+              } else if (openSub) {
+                // Hovering a non-submenu action closes any open submenu.
+                scheduleCloseSub();
+              }
             }}
+            onMouseLeave={() => { if (hasSubmenu) scheduleCloseSub(); }}
             onClick={() => {
               if (item.disabled) return;
               item.onClick();
@@ -302,26 +322,44 @@ function ContextMenuRender({ x, y, items, onClose }: RenderProps) {
             }}
             className={`w-full flex items-center gap-2.5 px-3.5 py-2 text-left text-[13px]
                         transition-all duration-150
-                        ${rowToneClasses(tone, item.disabled)}`}
+                        ${rowToneClasses(tone, item.disabled)}
+                        ${isOpen ? "bg-white/8" : ""}`}
           >
             {item.icon && <span className="flex-shrink-0 opacity-90">{item.icon}</span>}
             <span className="flex-1 truncate">{item.label}</span>
+            {hasSubmenu && (
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"
+                   className="flex-shrink-0 text-white/40" aria-hidden>
+                <path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6z" />
+              </svg>
+            )}
           </button>
         );
       })}
 
-      {openSub != null && items[openSub.idx]?.kind === "submenu" &&
-        createPortal(
+      {openSub != null && (() => {
+        const parent = items[openSub.idx];
+        // Both a kind:"submenu" row and a kind:"action" row with a
+        // non-empty `submenu` field can drive the child menu. Resolve
+        // the items list from whichever variant is present.
+        const subItems: ContextMenuItem[] | null =
+          parent?.kind === "submenu"
+            ? parent.items
+            : (parent?.kind === "action" || parent?.kind === undefined) && Array.isArray((parent as ActionMenuItem).submenu)
+              ? (parent as ActionMenuItem).submenu!
+              : null;
+        if (!subItems) return null;
+        return createPortal(
           <Submenu
             parentRect={openSub.rect}
-            items={(items[openSub.idx] as SubmenuMenuItem).items}
+            items={subItems}
             onActivate={onClose}
             onMouseEnter={cancelSubTimer}
             onMouseLeave={scheduleCloseSub}
           />,
           document.body,
-        )
-      }
+        );
+      })()}
 
       <style>{`
         @keyframes ctx-menu-in {

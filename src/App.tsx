@@ -51,6 +51,7 @@ import NextUpCta from "./NextUpCta";
 import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPreviousEpisode } from "./nextUp";
 import { getMetaDetailFallback } from "./metaCache";
 import { PersistentCache } from "./persistentCache";
+import { loadAuraSettings } from "./auraSettings";
 
 interface AniSkipResult {
   found: boolean;
@@ -865,6 +866,12 @@ export default function App() {
           // Re-push the user's subtitle styling so a freshly-loaded
           // file inherits the saved size / colour / position / etc.
           invoke("apply_subtitle_style").catch(() => {});
+          // Loudness normalization re-applies on every stream load.
+          // Read fresh — the toggle (Settings or player's three-dots
+          // menu) writes through saveAuraSettings which busts the
+          // module-level snapshot, so this returns the current value.
+          const { loudnessNormalization } = loadAuraSettings();
+          invoke("set_audio_loudnorm", { enabled: !!loudnessNormalization }).catch(() => {});
         }, 1500);
 
         // ── Anime OP/ED skip windows ──

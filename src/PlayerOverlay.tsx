@@ -22,6 +22,7 @@ import type { ExternalSubtitle, TrackEntry } from "./types";
 import { setTitleState } from "./titleState";
 import { pickDefaultAudio, type ScoringMeta } from "./audioScoring";
 import { prettyBinding } from "./useKeybindings";
+import { loadAuraSettings, saveAuraSettings } from "./auraSettings";
 
 // ---------------------------------------------------------------------------
 // Menu-open tracker — child menus (TrackMenu, SpeedMenu, ShaderPicker,
@@ -212,6 +213,17 @@ const ExternalIcon = () => (
 const RestartIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
     <path d="M17.65 6.35A7.958 7.958 0 0 0 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0 1 12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" />
+  </svg>
+);
+const LoudnormIcon = () => (
+  // Compact audio-level bars — four vertical bars at varying heights
+  // suggesting "evened out" levels. Visually distinct from VolumeIcon's
+  // speaker glyph.
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+    <rect x="3"  y="10" width="3" height="8" rx="0.5" />
+    <rect x="8"  y="6"  width="3" height="12" rx="0.5" />
+    <rect x="13" y="8"  width="3" height="10" rx="0.5" />
+    <rect x="18" y="11" width="3" height="7"  rx="0.5" />
   </svg>
 );
 
@@ -2643,6 +2655,17 @@ function MoreMenu({
 }) {
   const [open, setOpen] = useState(false);
   const [flash, setFlash] = useState<string | null>(null);
+  // Mirror loudnessNormalization from auraSettings. Read fresh on mount
+  // + every aura:settings-changed so flipping in Settings updates the
+  // in-menu state without a remount. Toggling here writes back through
+  // saveAuraSettings (which busts the module-level cache and re-fires
+  // the event), so Settings and the player stay in lock-step.
+  const [loudness, setLoudness] = useState(() => loadAuraSettings().loudnessNormalization);
+  useEffect(() => {
+    const sync = () => setLoudness(loadAuraSettings().loudnessNormalization);
+    window.addEventListener("aura:settings-changed", sync);
+    return () => window.removeEventListener("aura:settings-changed", sync);
+  }, []);
   const ref = useRef<HTMLDivElement>(null);
   useMenuOpenSync(open);
 
@@ -2654,6 +2677,15 @@ function MoreMenu({
     window.addEventListener("mousedown", handler);
     return () => window.removeEventListener("mousedown", handler);
   }, [open]);
+
+  const toggleLoudness = () => {
+    const next = !loudness;
+    setLoudness(next);
+    const current = loadAuraSettings();
+    saveAuraSettings({ ...current, loudnessNormalization: next });
+    invoke("set_audio_loudnorm", { enabled: next }).catch(() => {});
+    showFlash(next ? "Loudness normalization on" : "Loudness normalization off");
+  };
 
   const showFlash = (msg: string) => {
     setFlash(msg);
@@ -2713,6 +2745,36 @@ function MoreMenu({
             disabled={!streamUrl}
             onClick={() => { openExternal(); setOpen(false); }}
           />
+          <div className="my-1 mx-3 h-px bg-white/8" />
+          {/* Audio loudness normalization — in-player mirror of the
+              Settings → Video & Audio → "Loudness normalization"
+              toggle. Stays in sync with the Settings UI via the
+              auraSettings event bus. */}
+          <button
+            type="button"
+            onClick={toggleLoudness}
+            className="w-full flex items-center gap-3 px-4 py-2 text-left text-[13px]
+                       text-white/85 hover:text-white hover:bg-white/[0.16]
+                       transition-colors"
+            role="switch"
+            aria-checked={loudness}
+          >
+            <span className="text-white/55 flex-shrink-0">
+              <LoudnormIcon />
+            </span>
+            <span className="flex-1">Normalize loudness</span>
+            <span
+              aria-hidden
+              className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0
+                          ${loudness ? "bg-ln-accent/80" : "bg-white/15"}`}
+            >
+              <span
+                className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-md
+                           transition-transform duration-150"
+                style={{ transform: loudness ? "translateX(16px)" : "translateX(0)" }}
+              />
+            </span>
+          </button>
           {flash && (
             <div className="px-4 py-1.5 text-[11px] font-mono text-ln-accent/85 border-t border-white/8 mt-1">
               {flash}

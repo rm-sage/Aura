@@ -106,6 +106,15 @@ export interface AuraSettings {
    *  about spoilers flip this on. Mirrors the opt-in shape of
    *  `blurUnwatchedThumbnails`. */
   blurEpisodeSynopsis: boolean;
+  /** EBU R128 audio loudness normalization. When on, MPV's `af`
+   *  property holds `@loudnorm:loudnorm=I=-23:LRA=7:TP=-2:dynamic=true`
+   *  so streams from different sources level to a consistent
+   *  perceived volume. Auto-disabled (UI-side) when audio passthrough
+   *  is active — bitstream output bypasses the audio filter graph.
+   *  Default false (opt-in). Re-applies on every stream load AND on
+   *  toggle change; both the Settings panel and the in-player
+   *  three-dots menu surface the same setting. */
+  loudnessNormalization: boolean;
 }
 
 export const DEFAULT_AURA_SETTINGS: AuraSettings = {
@@ -124,6 +133,7 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   autoAdvanceNextEpisode: false,
   autoAdvanceDelaySeconds: 10,
   blurEpisodeSynopsis: false,
+  loudnessNormalization: false,
 };
 
 // Module-level memoization snapshot. loadAuraSettings is called many
@@ -192,6 +202,9 @@ function readFromStorage(): AuraSettings {
         : 10,
       blurEpisodeSynopsis: typeof parsed.blurEpisodeSynopsis === "boolean"
         ? parsed.blurEpisodeSynopsis
+        : false,
+      loudnessNormalization: typeof parsed.loudnessNormalization === "boolean"
+        ? parsed.loudnessNormalization
         : false,
       heroCatalog: parsed.heroCatalog
         && typeof parsed.heroCatalog === "object"

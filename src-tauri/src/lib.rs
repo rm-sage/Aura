@@ -455,6 +455,47 @@ async fn frame_step(app: tauri::AppHandle, forward: bool) -> Result<(), String> 
     .map_err(|e| e.to_string())?
 }
 
+/// Toggle EBU R128 loudness normalization on the audio filter chain.
+/// When enabled, audio is levelled to −23 LUFS (broadcast standard)
+/// with a true-peak ceiling of −2 dBTP and a 7 LU loudness range —
+/// flattens the volume disparity between streams from different
+/// sources without crushing dynamics. When disabled, the filter chain
+/// is cleared (`af=""`), restoring MPV's untouched audio output.
+///
+/// The `@loudnorm` label prefix is MPV's filter-graph naming
+/// convention: it lets us add/remove our specific filter without
+/// affecting any other filter the user might layer via per-title
+/// state in the future. Setting `af` to an empty string removes
+/// EVERY filter — fine here because Aura doesn't layer other audio
+/// filters today; revisit if that changes.
+///
+/// Soft no-op when audio passthrough is on (bitstream output bypasses
+/// the filter graph entirely). The UI prevents this at the toggle
+/// level but the Rust side is the source of truth — defence in depth.
+#[tauri::command]
+async fn set_audio_loudnorm(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    let filter = if enabled {
+        // EBU R128 defaults. dynamic=true uses a one-pass dynamic
+        // mode so live streams + variable-bitrate sources get
+        // sensible levelling without a two-pass measurement step
+        // (offline analysis isn't an option for stream-as-it-plays).
+        "@loudnorm:loudnorm=I=-23:LRA=7:TP=-2:dynamic=true".to_string()
+    } else {
+        String::new()
+    };
+    crate::devlog!(info, "player", "set_audio_loudnorm(enabled={enabled})");
+    tauri::async_runtime::spawn_blocking(move || {
+        app.mpv()
+            .set_property("af", &serde_json::json!(filter), "main")
+            .map_err(|e| {
+                crate::devlog!(warn, "player", "set_audio_loudnorm failed: {e}");
+                e.to_string()
+            })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn set_volume(app: tauri::AppHandle, volume: f64) -> Result<(), String> {
     crate::devlog!(info, "player", "set_volume({volume})");
@@ -1744,6 +1785,7 @@ pub fn run() {
             toggle_pause,
             seek_relative,
             frame_step,
+            set_audio_loudnorm,
             set_volume,
             set_speed,
             seek_absolute,

@@ -13,6 +13,7 @@ commands.allow = [
   "toggle_pause",
   "seek_relative",
   "frame_step",
+  "set_audio_loudnorm",
   "seek_absolute",
   "set_volume",
   "set_speed",

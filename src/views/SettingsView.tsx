@@ -3491,6 +3491,21 @@ export default function SettingsView({ addons, session }: Props) {
                   Restart Aura for audio passthrough to take effect.
                 </p>
               )}
+              <div className="h-px bg-white/6" />
+              <SettingToggle
+                label="Loudness normalization"
+                description={
+                  backend.audio_passthrough
+                    ? "Disabled while audio passthrough is active — bitstream output bypasses the audio filter chain. Turn passthrough off to use loudness normalization."
+                    : "EBU R128 loudness normalization for consistent volume across sources. Levels are normalized to −23 LUFS with a true-peak ceiling of −2 dBTP and a 7 LU loudness range. Adds ~100 ms of latency on stream load."
+                }
+                value={aura.loudnessNormalization && !backend.audio_passthrough}
+                onChange={(v) => {
+                  if (backend.audio_passthrough) return;
+                  setLocal({ loudnessNormalization: v });
+                  invoke("set_audio_loudnorm", { enabled: v }).catch(() => {});
+                }}
+              />
             </Section>
           )}
 

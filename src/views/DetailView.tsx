@@ -2118,49 +2118,12 @@ const EpisodeRow = ({
         };
 
         type Item = Parameters<typeof openContextMenu>[2][number];
-        const items: Item[] = [
-          {
-            kind: "action",
-            label: isWatched ? "Unmark Watched" : "Mark as Watched",
-            tone: "success",
-            icon: checkIcon,
-            onClick: () => {
-              const next = isWatched ? null : "watched";
-              setManualWatchedState(video.id, next);
-              showFlyUpToast(
-                next ? `Marked watched · ${epLabel}` : `Unmarked · ${epLabel}`,
-                { x, y, tone: next ? "success" : "default" },
-              );
-              // Transition into "watched" → auto-advance to the next
-              // episode (or mark series complete if this was the last).
-              // Reverse direction (unmark) doesn't trigger advance.
-              if (next === "watched") {
-                window.dispatchEvent(new CustomEvent("aura:auto-advance-watched", {
-                  detail: { seriesId, episodeId: video.id, mediaType: seriesMediaType },
-                }));
-              }
-            },
-          },
-          {
-            kind: "action",
-            label: isProgress ? "Unmark In Progress" : "Mark as In Progress",
-            tone: "warning",
-            icon: <span className="inline-block w-[10px] h-[10px] rounded-full bg-current" />,
-            onClick: () => {
-              const next = isProgress ? null : "in-progress";
-              setManualWatchedState(video.id, next);
-              showFlyUpToast(
-                next ? `Marked in progress · ${epLabel}` : `Unmarked · ${epLabel}`,
-                { x, y, tone: next ? "success" : "default" },
-              );
-            },
-          },
-        ];
 
-        // Only inject the divider + bulk block if at least one bulk
-        // option survives the context filter — keeps the menu compact
-        // for single-episode series and the first episode of a season
-        // with no other watched episodes.
+        // Bulk "watched" variants — collected as a sub-list so they can
+        // hang off "Mark as Watched" as a hover-submenu instead of
+        // cluttering the parent menu. Each entry is gated on "does this
+        // bulk operation actually change anything" so a fully-watched
+        // season doesn't show "Mark all as watched" with no effect.
         const bulkItems: Item[] = [];
         if (belowSet.length > 0 && anyOtherUnwatched(belowSet)) {
           bulkItems.push({
@@ -2213,9 +2176,54 @@ const EpisodeRow = ({
             onClick: bulkAction(allSet, null, "all in season"),
           });
         }
-        if (bulkItems.length > 0) {
-          items.push({ kind: "divider" }, ...bulkItems);
-        }
+
+        const items: Item[] = [
+          {
+            kind: "action",
+            label: isWatched ? "Unmark Watched" : "Mark as Watched",
+            tone: "success",
+            icon: checkIcon,
+            onClick: () => {
+              const next = isWatched ? null : "watched";
+              setManualWatchedState(video.id, next);
+              showFlyUpToast(
+                next ? `Marked watched · ${epLabel}` : `Unmarked · ${epLabel}`,
+                { x, y, tone: next ? "success" : "default" },
+              );
+              // Transition into "watched" → auto-advance to the next
+              // episode (or mark series complete if this was the last).
+              // Reverse direction (unmark) doesn't trigger advance.
+              if (next === "watched") {
+                window.dispatchEvent(new CustomEvent("aura:auto-advance-watched", {
+                  detail: { seriesId, episodeId: video.id, mediaType: seriesMediaType },
+                }));
+              }
+            },
+            // Hover-submenu carries the bulk variants — click the parent
+            // for the single-episode action, hover for the season-wide
+            // operations. Omitted when no bulk operation would have an
+            // effect (already-handled inside bulkItems gating).
+            submenu: bulkItems.length > 0 ? bulkItems : undefined,
+          },
+          {
+            kind: "action",
+            label: isProgress ? "Unmark In Progress" : "Mark as In Progress",
+            tone: "warning",
+            icon: <span className="inline-block w-[10px] h-[10px] rounded-full bg-current" />,
+            onClick: () => {
+              const next = isProgress ? null : "in-progress";
+              setManualWatchedState(video.id, next);
+              showFlyUpToast(
+                next ? `Marked in progress · ${epLabel}` : `Unmarked · ${epLabel}`,
+                { x, y, tone: next ? "success" : "default" },
+              );
+            },
+            // No bulk in-progress semantic exists today — keep the row
+            // a flat action. If users start asking for "mark this & below
+            // as in-progress" (rare for binge planning), add a submenu
+            // shape here mirroring the Watched parent.
+          },
+        ];
 
         openContextMenu(x, y, items);
       }}
