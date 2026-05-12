@@ -539,7 +539,7 @@ function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | n
       <button
         onClick={() => setOpen((v) => !v)}
         title="Upscaling / Shader Profile"
-        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium
+        className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-xs font-medium
                     transition-all duration-150 border
                     ${open || active !== 0
                       ? "bg-ln-accent/20 text-ln-accent border-ln-accent/30"
@@ -1859,11 +1859,11 @@ export default function PlayerOverlay({
           </div>
 
           {/* ── Button row — order: Rewind ▶ Play/Pause ▶ Forward ── */}
-          {/* gap-2 (8 px) gives every adjacent control pair the same
-              visual breathing room — was gap-1.5 (6 px) which left
-              wider pill buttons (speed, shader) feeling cramped
-              against their round neighbours. */}
-          <div className="flex items-center gap-2 mt-1">
+          {/* gap-1.5 (6 px) keeps the row tight; pill buttons (Speed,
+              Shader) carry less horizontal padding (px-2.5 vs px-3)
+              so they don't visually bloat against the round neighbours
+              and the rhythm stays even across the bar. */}
+          <div className="flex items-center gap-1.5 mt-1">
             <IconButton
               onClick={() => seekRelative(-10)}
               label="Skip back 10 seconds"
@@ -2354,7 +2354,7 @@ function SpeedMenu({
         <button
           onClick={() => setOpen((v) => !v)}
           aria-label="Playback speed"
-          className={`flex items-center gap-1.5 px-3 h-10 rounded-full
+          className={`flex items-center gap-1.5 px-2.5 h-10 rounded-full
                       transition-colors
                       ${open || speed !== 1
                         ? "bg-ln-accent/20 text-ln-accent"
