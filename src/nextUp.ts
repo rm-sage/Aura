@@ -51,10 +51,27 @@ function isEpisodeAired(v: VideoEntry, now = Date.now()): boolean {
  * sorted list). This matches the inference rule in LibraryContext:
  * specials and main run are independent watch tracks.
  */
+/** Episode-kind filter governing whether filler / recap episodes are
+ *  eligible candidates for "next up". Sourced from
+ *  `AuraSettings.nextUpSkipFillerRecap`; passed in so this module
+ *  stays settings-agnostic. */
+export type SkipFillerRecapMode = "none" | "filler" | "recap" | "both";
+
+/** Does the candidate's `episode_kind` pass the user's skip filter? */
+function passesKindFilter(kind: string | null | undefined, mode: SkipFillerRecapMode): boolean {
+  if (mode === "none") return true;
+  if (!kind) return true;
+  // Normalised AIOMetadata vocabulary: filler / recap / canon / normal / mixed.
+  if (mode === "filler") return kind !== "filler";
+  if (mode === "recap")  return kind !== "recap";
+  return kind !== "filler" && kind !== "recap";
+}
+
 export function findNextEpisode(
   detail: MetaDetail,
   currentEpisodeId: string,
   now: number = Date.now(),
+  skipMode: SkipFillerRecapMode = "none",
 ): VideoEntry | null {
   if (!detail || !Array.isArray(detail.videos) || detail.videos.length === 0) {
     return null;
@@ -71,6 +88,11 @@ export function findNextEpisode(
     // Cross-track jump (specials ↔ main run) — skip.
     if (candidateInSpecials !== currentInSpecials) continue;
     if (!isEpisodeAired(candidate, now)) continue;
+    // User-driven filler / recap skip. When the user has the toggle
+    // off (skipMode === "none") the filter is a no-op; when on, we
+    // walk forward until a non-skipped candidate appears, falling off
+    // the end → null when everything remaining is filler/recap.
+    if (!passesKindFilter(candidate.episode_kind, skipMode)) continue;
     return candidate;
   }
   return null;
@@ -141,10 +163,11 @@ export async function resolveNextEpisode(
   mediaType: string,
   seriesId: string,
   currentEpisodeId: string,
+  skipMode: SkipFillerRecapMode = "none",
 ): Promise<{ detail: MetaDetail; next: VideoEntry } | null> {
   const detail = await getMetaDetailFallback(addons, mediaType, seriesId);
   if (!detail) return null;
-  const next = findNextEpisode(detail, currentEpisodeId);
+  const next = findNextEpisode(detail, currentEpisodeId, Date.now(), skipMode);
   if (!next) return null;
   return { detail, next };
 }

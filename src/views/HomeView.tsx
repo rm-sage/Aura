@@ -43,7 +43,7 @@ const CATALOG_ID_DENYLIST = new Set<string>([
 import SearchBar from "../SearchBar";
 import SearchView from "./SearchView";
 import { findAIOMetadataAddon, withTypeSuffix } from "../aiometadata";
-import { loadAuraSettings, type AuraSettings } from "../auraSettings";
+import { loadAuraSettings, type AuraSettings, HOME_RELEVANT_SETTING_KEYS, settingsChangeIncludes } from "../auraSettings";
 import {
   resolveDefaultUrls,
   DEFAULT_HOME_ORDER,
@@ -255,11 +255,24 @@ export default function HomeView({
     return () => clearTimeout(t);
   }, [bootstrapped]);
 
-  // Listen for cross-component settings changes (storage events fire from
-  // other windows; we also re-load when SettingsView mutates by tagging a
-  // custom event in auraSettings).
+  // Listen for cross-component settings changes. Only home-relevant
+  // setting keys (default-home-addon, additional-home-addons, hero
+  // catalog override, stream addon list) bump settingsTick — flips
+  // like subtitle styling, loudness normalization, reduce motion,
+  // theme, etc. all dispatch `aura:settings-changed` too, and without
+  // this filter every unrelated flip caused a full re-fetch of the
+  // entire home grid (visible as the AIOMetadata "AI Recommendations"
+  // catalog re-firing on subtitle-style saves and similar idle
+  // events). Legacy emitters that don't carry detail.keys still
+  // trigger via the settingsChangeIncludes default-to-true guard.
   useEffect(() => {
-    const onChange = () => setSettingsTick((t) => t + 1);
+    const onChange = (e: Event) => {
+      if (e.type === "aura:settings-changed"
+          && !settingsChangeIncludes(e, HOME_RELEVANT_SETTING_KEYS)) {
+        return;
+      }
+      setSettingsTick((t) => t + 1);
+    };
     window.addEventListener("aura:settings-changed", onChange);
     window.addEventListener("storage", onChange);
     return () => {

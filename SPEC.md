@@ -1,4 +1,4 @@
-# Aura: visionOS Media Player Specification
+# Aura: Cinematic Media Player Specification
 
 ## Tech Stack
 - **Platform:** Tauri 2.0 (Rust backend, React + TS frontend)

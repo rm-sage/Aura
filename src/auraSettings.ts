@@ -260,11 +260,70 @@ if (typeof window !== "undefined") {
   });
 }
 
+/** Diff two AuraSettings shallowly. Used by saveAuraSettings to emit a
+ *  keyed change event so listeners can ignore irrelevant flips —
+ *  e.g. HomeView shouldn't re-fetch all home catalogs when the user
+ *  toggles subtitle styling or loudness normalization. Returns the
+ *  list of top-level keys whose values differ. Deep objects (like
+ *  `heroCatalog`) are compared via JSON serialization since shallow
+ *  reference inequality after a save is the common case. */
+function diffSettings(prev: AuraSettings | null, next: AuraSettings): string[] {
+  if (!prev) return Object.keys(next);
+  const changed: string[] = [];
+  for (const key of Object.keys(next) as (keyof AuraSettings)[]) {
+    const a = prev[key];
+    const b = next[key];
+    if (a === b) continue;
+    // Arrays + objects → JSON compare (cheap for the small shapes
+    // Aura's settings carry). Doesn't handle Date / Map / Set, but
+    // none of AuraSettings's fields use those.
+    if (typeof a === "object" || typeof b === "object") {
+      if (JSON.stringify(a) === JSON.stringify(b)) continue;
+    }
+    changed.push(key);
+  }
+  return changed;
+}
+
 export function saveAuraSettings(s: AuraSettings) {
+  // Snapshot prior state BEFORE the write so we can compute a
+  // meaningful diff for the CHANGE_EVENT. Without this, the event
+  // would always fire with the "everything maybe changed" semantic
+  // and every HomeView mount would re-fetch the entire grid on every
+  // unrelated setting flip (subtitle styling, loudness, motion, etc.).
+  const prior = cached ?? readFromStorage();
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
   cached = null; // bust cache before listeners run so they read fresh values
+  const changed = diffSettings(prior, s);
   // Same-window components don't see `storage` events; emit a custom one.
-  window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
+  // `detail.keys` is an array of top-level field names that actually
+  // changed. Listeners can early-return when no field they care about
+  // is in the array; absence of `detail` falls back to the legacy
+  // "everything changed" semantic so older listeners keep working.
+  window.dispatchEvent(new CustomEvent(CHANGE_EVENT, { detail: { keys: changed } }));
+}
+
+/** Home-relevant AuraSettings keys. Listeners that drive expensive
+ *  fetches (catalog grid, hero override) early-return when the
+ *  CHANGE_EVENT's `detail.keys` doesn't include any of these. */
+export const HOME_RELEVANT_SETTING_KEYS = new Set<keyof AuraSettings>([
+  "defaultHomeAddonUrl",
+  "defaultMetadataAddonUrl",
+  "additionalHomeAddonUrls",
+  "streamAddonUrls",
+  "heroCatalog",
+]);
+
+/** Helper: does a CHANGE_EVENT carry at least one key from the supplied
+ *  whitelist? When `detail.keys` is missing (legacy emitters), defaults
+ *  to true so we don't silently break unrelated paths. */
+export function settingsChangeIncludes(
+  event: Event,
+  whitelist: Set<keyof AuraSettings>,
+): boolean {
+  const detail = (event as CustomEvent<{ keys?: string[] }>).detail;
+  if (!detail || !Array.isArray(detail.keys)) return true;
+  return detail.keys.some((k) => whitelist.has(k as keyof AuraSettings));
 }
 
 // ---------------------------------------------------------------------------

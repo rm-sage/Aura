@@ -4177,6 +4177,30 @@ export default function SettingsView({ addons, session }: Props) {
                 value={backend.skip_treat_mixed_op_as_op}
                 onChange={(v) => patchBackend({ skip_treat_mixed_op_as_op: v })}
               />
+              <div className="h-px bg-white/6" />
+              {/* Next-Up filler/recap skip — lives here because users
+                  who care about OP/ED skipping typically also care
+                  about not auto-advancing into filler. Requires
+                  AIOMetadata's per-episode `episodeKind` field; older
+                  metadata addons emit nothing for this field and the
+                  filter becomes a no-op (every candidate passes). */}
+              <SettingDropdown
+                label="Next-Up skip filler / recap"
+                description="When computing the next episode (Next-Up card and SMTC Next media key), skip episodes AIOMetadata has flagged as filler or recap. Episodes without a flag pass through unchanged."
+                value={aura.nextUpSkipFillerRecap}
+                required
+                options={[
+                  { value: "none",   label: "Don't skip" },
+                  { value: "filler", label: "Skip filler" },
+                  { value: "recap",  label: "Skip recap" },
+                  { value: "both",   label: "Skip both" },
+                ]}
+                onChange={(v) => {
+                  if (v === "none" || v === "filler" || v === "recap" || v === "both") {
+                    setLocal({ nextUpSkipFillerRecap: v });
+                  }
+                }}
+              />
             </Section>
           )}
 

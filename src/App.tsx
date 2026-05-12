@@ -1448,7 +1448,7 @@ export default function App() {
     const currentId = activeTarget.id;
 
     void (async () => {
-      const next = await resolveNextEpisode(addons, mediaType, seriesId, currentId);
+      const next = await resolveNextEpisode(addons, mediaType, seriesId, currentId, loadAuraSettings().nextUpSkipFillerRecap);
       if (!next) {
         // No further aired episode — leave the CTA unmounted. The
         // resolved-for guard prevents another lookup until the user
@@ -1508,7 +1508,7 @@ export default function App() {
     const mediaType = activeTarget.media_type;
     const currentId = activeTarget.id;
     void (async () => {
-      const next = await resolveNextEpisode(addons, mediaType, seriesId, currentId);
+      const next = await resolveNextEpisode(addons, mediaType, seriesId, currentId, loadAuraSettings().nextUpSkipFillerRecap);
       if (!next) return;
       const stream = await pickFirstStreamForEpisode(addons, mediaType, next.next.id);
       if (nextUpResolvedFor.current === currentId) {
@@ -2704,8 +2704,12 @@ export default function App() {
     try {
       const detail = await getMetaDetailFallback(addons, target.media_type, seriesId);
       if (!detail) return;
+      // SMTC Next honours the user's filler/recap skip preference;
+      // SMTC Previous walks backward through the watch order unfiltered
+      // since "Previous" means "go back" — skipping past filler going
+      // backward would surprise users who just hit Next.
       const candidate = direction === 1
-        ? findNextEpisode(detail, target.id)
+        ? findNextEpisode(detail, target.id, Date.now(), loadAuraSettings().nextUpSkipFillerRecap)
         : findPreviousEpisode(detail, target.id);
       if (!candidate) {
         // Out of episodes in the current series. On Next, fall back to
