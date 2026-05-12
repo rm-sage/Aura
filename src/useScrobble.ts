@@ -157,6 +157,16 @@ export function useScrobble({
 }: Options) {
   const startedFor = useRef<string | null>(null);   // session id we already started
   const completed = useRef<boolean>(false);         // suppress duplicate ends
+  /** Session keys that have already auto-completed in THIS hook
+   *  lifetime. After a scrobble_end fires from the completion branch,
+   *  `startedFor` resets to null so a subsequent tick would normally
+   *  re-enter the start-warmup branch (elapsed time is still high) and
+   *  immediately re-complete. That's how Trakt ended up with 6× entries
+   *  for one episode. This set holds the keys we've already completed,
+   *  and the start branch refuses to re-arm for any key in it. Cleared
+   *  on hook unmount (the wrapping useRef survives across renders but
+   *  not full unmount). */
+  const completedFor = useRef<Set<string>>(new Set());
   /** Elapsed playback time accumulated for the CURRENT session, in
    *  seconds. Reset on session change / unmount. Drives both the
    *  scrobble_start warmup and the auto-complete floor — a seek (or
@@ -283,6 +293,7 @@ export function useScrobble({
     // fans HTTP traffic to the addon (it just sets local state).
     if (
       startedFor.current !== sessionKey &&
+      !completedFor.current.has(sessionKey) &&
       playback.duration > 0 &&
       elapsedThisSession.current >= startWarmup
     ) {
@@ -322,6 +333,11 @@ export function useScrobble({
       elapsedThisSession.current >= completeWarmup
     ) {
       completed.current = true;
+      // Remember this key — endSession resets startedFor + completed to
+      // null/false, which without the completedFor gate above would let
+      // the start branch immediately re-arm and re-complete on the next
+      // tick.
+      completedFor.current.add(sessionKey);
       endSession(playback.time, playback.duration);
       // Auto-advance: dispatch an event the App listens for and routes
       // to advanceWatchedAfter (which needs addon list access — we

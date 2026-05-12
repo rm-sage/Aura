@@ -772,9 +772,14 @@ export default function App() {
           }
         }
 
-        let resumeAt: number | null = null;
+        // Sentinel value the prompt's Cancel path resolves with. Caller
+        // (below) checks the awaited value against this to short-circuit
+        // the entire play flow — no resolve_stream, no load_video, no
+        // history entry. Esc + outside-click on the modal route here.
+        const RESUME_CANCELLED = Symbol("resume-cancelled");
+        let resumeAt: number | null | typeof RESUME_CANCELLED = null;
         if (resumeSeconds != null) {
-          resumeAt = await new Promise<number | null>((resolve) => {
+          resumeAt = await new Promise<number | null | typeof RESUME_CANCELLED>((resolve) => {
             setPendingResume({
               resumeSeconds:   resumeSeconds!,
               durationSeconds: resumeDuration,
@@ -782,8 +787,15 @@ export default function App() {
               episodeTag:      target.episode ?? null,
               onResume:    () => { setPendingResume(null); resolve(resumeSeconds); },
               onStartOver: () => { setPendingResume(null); resolve(null); },
+              onCancel:    () => { setPendingResume(null); resolve(RESUME_CANCELLED); },
             });
           });
+          if (resumeAt === RESUME_CANCELLED) {
+            // User dismissed the prompt — abort cleanly. No notifyNewLoad,
+            // no resolve_stream, no MPV load_video. The UI returns to
+            // whatever it was showing before the click.
+            return;
+          }
         }
 
         const raw = stream.url ?? `magnet:?xt=urn:btih:${stream.info_hash}`;
@@ -1196,6 +1208,20 @@ export default function App() {
     };
     window.addEventListener("aura:onboarding-reopen-addons", onReopen);
     return () => window.removeEventListener("aura:onboarding-reopen-addons", onReopen);
+  }, []);
+
+  // ── Finish-onboarding event listener ──
+  // The wizard's "Open Trakt & AniList settings" jump finishes the
+  // wizard outright (markOnboardingComplete already fired in the
+  // button) and dispatches this event so we unmount the OnboardingView
+  // and let the settings-deep-link router land the user on Settings.
+  useEffect(() => {
+    const onFinish = () => {
+      setOnboardingActive(false);
+      setOnboardingStartAddons(false);
+    };
+    window.addEventListener("aura:onboarding-finish", onFinish);
+    return () => window.removeEventListener("aura:onboarding-finish", onFinish);
   }, []);
 
   // ── Session-changed broadcast ──

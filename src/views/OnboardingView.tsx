@@ -17,7 +17,7 @@ import {
 import { parseImportInput, type SettingsBlob } from "../settingsTransfer";
 import type { UserSession } from "../LoginView";
 import type { AddonEntry, ThemeId } from "../types";
-import { THEME_LABELS, THEME_DESCRIPTIONS } from "../ThemeEngine";
+import { THEME_LABELS, THEME_DESCRIPTIONS, useTheme } from "../ThemeEngine";
 
 // ---------------------------------------------------------------------------
 // OnboardingView — three-step first-run wizard.
@@ -145,7 +145,10 @@ export default function OnboardingView({
              style={{ background: "radial-gradient(120% 80% at 50% 60%, transparent 30%, rgba(0,0,0,0.55) 95%)" }} />
       </div>
 
-      <div className="relative z-10 w-full max-w-2xl px-6 py-8 space-y-6">
+      <div
+        className="relative z-10 w-full px-6 py-8 space-y-6"
+        style={{ maxWidth: "min(640px, 92%)" }}
+      >
         {/* Top bar — progress dots + skip-all on the right */}
         <div className="flex items-center justify-between">
           <StepDots step={progress.step} />
@@ -354,6 +357,11 @@ function SettingsStep({
   // Typed view onto the free-form draft bag.
   const typed = draft as SettingsDraft;
   const patch = (k: keyof SettingsDraft, v: unknown) => onDraftChange({ ...draft, [k]: v });
+  // Live theme application — pick a theme and Aura swaps the live
+  // ThemeEngine immediately so the user can preview before committing.
+  // Persisted to backend on Continue (see commitToBackend).
+  const { setTheme } = useTheme();
+  const pickTheme = (t: ThemeId) => { setTheme(t); patch("theme", t); };
 
   const commitToBackend = async () => {
     // Anime language defaults + global defaults → backend AppSettings
@@ -417,7 +425,7 @@ function SettingsStep({
                 <button
                   key={t}
                   type="button"
-                  onClick={() => patch("theme", t)}
+                  onClick={() => pickTheme(t)}
                   className={`px-3 py-2 rounded-lg text-[11.5px] font-medium tracking-wide
                               border transition-colors text-left
                               ${active
@@ -480,7 +488,13 @@ function SettingsStep({
           </div>
         </div>
 
-        {/* Scrobble connect — only meaningful when signed into Stremio */}
+        {/* Scrobble connect — only meaningful when signed into Stremio.
+            OAuth (device flow for Trakt, deep-link for AniList) lives
+            entirely inside Settings → Trakt & AniList; reproducing it
+            here would duplicate non-trivial flow. Instead we offer a
+            one-click jump that finishes the wizard and drops the user
+            on the scrobble settings section, so they can connect
+            immediately after onboarding without re-finding the page. */}
         {session?.auth_key && (
           <>
             <div className="h-px bg-white/6" />
@@ -489,11 +503,31 @@ function SettingsStep({
               <p className="text-white/35 text-xs leading-relaxed">
                 Connect Trakt and AniList to sync watch progress automatically.
                 Aura scrobbles on episode completion (80 % + ≥ 5 min watched).
-                You can connect later from Settings → Trakt &amp; AniList.
               </p>
-              <p className="text-white/40 text-[11.5px] italic">
-                Skip this step and Aura still works — Trakt / AniList scrobbling
-                just stays off until you opt in.
+              <button
+                type="button"
+                onClick={() => {
+                  // Finish the wizard outright — OAuth lives in
+                  // Settings; once the user lands there, the wizard
+                  // shouldn't pop back over the page. App.tsx watches
+                  // `aura:onboarding-finish` and flips onboardingActive
+                  // off; we also fire the settings-deep-link event so
+                  // the user arrives directly on the scrobble section.
+                  markOnboardingComplete();
+                  window.dispatchEvent(new CustomEvent("aura:onboarding-finish"));
+                  window.dispatchEvent(new CustomEvent("aura:open-settings", {
+                    detail: { section: "sec-scrobble" },
+                  }));
+                }}
+                className="mt-1 inline-flex items-center gap-2
+                           px-3 py-1.5 rounded-lg border border-ln-accent/40
+                           bg-ln-accent/12 text-ln-accent text-[11.5px] font-semibold
+                           hover:bg-ln-accent/22 transition-colors"
+              >
+                Open Trakt &amp; AniList settings →
+              </button>
+              <p className="text-white/40 text-[11.5px] italic pt-1">
+                Or skip — scrobbling stays off until you opt in from Settings.
               </p>
             </div>
           </>

@@ -447,6 +447,23 @@ fn parse_episode_num(id: &str, media_type: &str) -> Option<u32> {
     }
 }
 
+/// Parse the season number from the session id (`<show>:<season>:<ep>`).
+/// Used to pick the season-specific AniList entry for multi-cour anime
+/// — AIOMetadata's split-season patch encodes the cour into this slot,
+/// and that's a more reliable cour signal than the frontend
+/// VideoEntry's `season` field (which can carry the library's merged
+/// shape for shows that Stremio collapses to "season 1, 35 episodes").
+fn parse_season_num(id: &str, media_type: &str) -> Option<u32> {
+    if media_type == "movie" {
+        return None;
+    }
+    let parts: Vec<&str> = id.split(':').collect();
+    match parts.as_slice() {
+        [_, s, _] => s.parse().ok(),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -534,10 +551,21 @@ pub async fn save_progress<R: Runtime>(
         return Ok(());
     };
 
+    // Prefer the id-string season over sess.season for multi-cour
+    // lookup. After AIOMetadata's split-season patch, `tt…:N:M` carries
+    // the authoritative cour index in N. The VideoEntry-side
+    // `sess.season` lags for shows Stremio renders as "season 1, all
+    // episodes" — we'd pick the wrong AniList entry every time. Fall
+    // back to sess.season only when the id slot is missing.
+    let id_season = parse_season_num(&sess.imdb_id, &sess.media_type);
+    let lookup_season = id_season.or(sess.season);
+
     crate::devlog!(
         info, "scrobble",
-        "AniList resolve: show=\"{}\" id={} episode_num={} (sess.season={:?} sess.episode_num={:?})",
-        sess.title, show_id, episode_num, sess.season, sess.episode_num,
+        "AniList resolve: show=\"{}\" id={} episode_num={} \
+         (id_season={:?} sess.season={:?} → lookup_season={:?}; sess.episode_num={:?})",
+        sess.title, show_id, episode_num,
+        id_season, sess.season, lookup_season, sess.episode_num,
     );
 
     // 0. Fribb/anime-lists ID-map fast path. Single hash lookup; no
@@ -548,7 +576,7 @@ pub async fn save_progress<R: Runtime>(
     //    if we still pick the wrong one (heuristic miss), the
     //    AniList `progress > episodes` guard down-stream rejects the
     //    save and the caller falls back through search-and-pick.
-    let id_map_anilist_id = crate::anime_id_map::lookup(show_id, sess.season);
+    let id_map_anilist_id = crate::anime_id_map::lookup(show_id, lookup_season);
     if let Some(anilist_id) = id_map_anilist_id {
         crate::devlog!(
             info, "scrobble",
@@ -557,12 +585,16 @@ pub async fn save_progress<R: Runtime>(
         );
     }
 
-    // 1. Cache lookup. Treat the cache as authoritative when its
-    // episode count is consistent with what we're trying to save.
+    // 1. Cache lookup. Keyed by show + season so multi-cour anime
+    // (Frieren, Demon Slayer, Mushoku Tensei …) doesn't ping-pong a
+    // single show_id slot between cours' anilist_ids on alternating
+    // saves. Movies and single-cour shows fall back to season=0, which
+    // gives them a stable single key just like before.
+    let cache_key = format!("{}:{}", show_id, lookup_season.unwrap_or(0));
     let cached = cache_lock()
         .lock()
         .ok()
-        .and_then(|g| g.by_show.get(show_id).cloned());
+        .and_then(|g| g.by_show.get(&cache_key).cloned());
 
     // Resolve to an AniList MediaInfo. Four layered strategies, each
     // surfacing a clear log line so the DevConsole shows which path
@@ -612,12 +644,14 @@ pub async fn save_progress<R: Runtime>(
         media.media_list_entry.as_ref().map(|e| e.progress),
     );
 
-    // 2. Persist mapping (write-through cache).
+    // 2. Persist mapping (write-through cache). Use the same composite
+    // key as the read above so multi-cour shows store one entry per
+    // cour.
     let needs_persist = cached.as_ref().map(|c| c.anilist_id) != Some(media.id);
     if needs_persist {
         if let Ok(mut g) = cache_lock().lock() {
             g.by_show.insert(
-                show_id.to_string(),
+                cache_key.clone(),
                 CachedMedia {
                     anilist_id: media.id,
                     episodes:   media.episodes,

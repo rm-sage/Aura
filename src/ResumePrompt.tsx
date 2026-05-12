@@ -5,14 +5,17 @@ import { useEffect } from "react";
 
 // ---------------------------------------------------------------------------
 // ResumePrompt — small modal shown right before a stream loads when the
-// library carries a non-trivial timeOffset for the target. Two choices:
-//   • Resume from saved position
-//   • Start over from the beginning
+// library carries a non-trivial timeOffset for the target. Three exit
+// paths now:
+//   • Resume from saved position (button)
+//   • Start over from the beginning (button)
+//   • Cancel — dismiss without playing (Esc OR click outside the panel)
 //
-// Mounted at the app root; visibility is driven by `pendingResume` props.
-// Waits for explicit user input — no auto-confirm timer (the user
-// decided the countdown felt rushed and removed the auto-resume path).
-// Esc / Enter are still wired so keyboard users don't have to click.
+// The Enter / Esc keyboard shortcuts for Resume / Start-over have been
+// removed; both keys would routinely fire as a side effect of typing
+// elsewhere on the page right before a click landed, leading to silent
+// "wrong choice" outcomes. Cancel is the only key-bound action now, and
+// it just dismisses the prompt — no playback ensues.
 // ---------------------------------------------------------------------------
 
 export interface PendingResume {
@@ -24,10 +27,14 @@ export interface PendingResume {
   title: string;
   /** Optional episode tag (S01E05) shown next to the title. */
   episodeTag?: string | null;
-  /** Called when the user picks Resume (or the auto-resume timer fires). */
+  /** Called when the user picks Resume. */
   onResume: () => void;
   /** Called when the user picks Start over. */
   onStartOver: () => void;
+  /** Called when the user dismisses the prompt (Esc / click outside).
+   *  Caller is expected to abort the in-progress play flow — no stream
+   *  is started in this branch. */
+  onCancel: () => void;
 }
 
 function formatTime(totalSeconds: number): string {
@@ -40,20 +47,17 @@ function formatTime(totalSeconds: number): string {
 }
 
 export default function ResumePrompt({ pending }: { pending: PendingResume | null }) {
-  // Esc = start over (same as the explicit button — picking the more
-  // destructive option requires either a click OR an explicit Esc).
-  // Enter = resume.
+  // Esc → cancel (dismiss without starting playback). Enter no longer
+  // bound — accidental Enter from typing-elsewhere would silently auto-
+  // resume otherwise. Both buttons remain click-only for the
+  // resume/start-over choice.
   useEffect(() => {
     if (!pending) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
         e.stopPropagation();
-        pending.onStartOver();
-      } else if (e.key === "Enter") {
-        e.preventDefault();
-        e.stopPropagation();
-        pending.onResume();
+        pending.onCancel();
       }
     };
     window.addEventListener("keydown", onKey, true);
@@ -71,6 +75,10 @@ export default function ResumePrompt({ pending }: { pending: PendingResume | nul
       role="dialog"
       aria-modal="true"
       aria-labelledby="resume-prompt-title"
+      // Backdrop click → cancel. We compare e.target to e.currentTarget
+      // so a click inside the panel doesn't propagate as "outside" by
+      // accident.
+      onClick={(e) => { if (e.target === e.currentTarget) pending.onCancel(); }}
       className="fixed inset-0 z-[1500] flex items-center justify-center
                  bg-black/70 backdrop-blur-md animate-[fade-in_120ms_ease-out]"
     >
@@ -129,7 +137,6 @@ export default function ResumePrompt({ pending }: { pending: PendingResume | nul
           <button
             type="button"
             onClick={pending.onResume}
-            autoFocus
             className="px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
                        text-ln-accent bg-ln-accent/15 border border-ln-accent/35
                        hover:bg-ln-accent/25 hover:border-ln-accent/55
@@ -139,7 +146,7 @@ export default function ResumePrompt({ pending }: { pending: PendingResume | nul
           </button>
         </div>
         <p className="text-white/35 text-[11px] mt-3 text-center">
-          Enter to resume · Esc to start over
+          Esc or click outside to cancel
         </p>
       </div>
     </div>
