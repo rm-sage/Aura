@@ -45,7 +45,7 @@ import { useKeybindings } from "./useKeybindings";
 import { libraryToggle, libraryRemoveAll, libraryWriteProgress, libraryClearProgress } from "./libraryActions";
 import { libraryItemSeriesId } from "./libraryNormalize";
 import { sourcesForMeta, openInPopupBrowser } from "./externalSources";
-import { setManualWatchedScope, getManualWatchedState, setManualWatchedState, getPlannedQueue } from "./manualWatched";
+import { setManualWatchedScope, getManualWatchedState, setManualWatchedState, setManualWatchedMany, getPlannedQueue } from "./manualWatched";
 import { syncPullAll, installSyncTriggers, startBackgroundPull, clearSyncEtags, setSyncActiveScope } from "./sync";
 import { setHistoryScope, addHistoryEntry } from "./historyStore";
 import { setAutoBackupScope, startAutoBackup } from "./userDataBackup";
@@ -2137,11 +2137,40 @@ export default function App() {
         ),
         onClick: () => {
           const next = isWatched ? null : "watched";
+          // Series-level flip is synchronous so the UI updates
+          // instantly. For series, also fan out to every episode under
+          // the title so the detail-page episode rows + Continue
+          // Watching reflect the bulk change. We fetch the meta detail
+          // async to avoid blocking the menu close — episode marks
+          // arrive a few hundred ms later when AIOMetadata's response
+          // lands. Movies have no `videos[]` so the fan-out is a
+          // no-op for them; gating on media_type avoids the round-trip
+          // entirely.
           setManualWatchedState(meta.id, next);
           showFlyUpToast(
             next ? `Marked watched · ${meta.name}` : `Unmarked · ${meta.name}`,
             { x, y, tone: next ? "success" : "default" },
           );
+          if (meta.media_type === "series" || meta.media_type === "anime") {
+            void (async () => {
+              try {
+                const detail = await getMetaDetailFallback(addons, meta.media_type, meta.id);
+                const episodeIds = (detail?.videos ?? [])
+                  .map((v) => v.id)
+                  .filter((id): id is string => typeof id === "string" && id.length > 0);
+                if (episodeIds.length > 0) {
+                  // setManualWatchedMany dedupes per-id no-ops, so an
+                  // already-watched episode within the series doesn't
+                  // generate a sync diff or a CHANGE_EVENT redraw.
+                  setManualWatchedMany(episodeIds, next);
+                }
+              } catch {
+                // Best-effort — if meta fetch fails, the series-level
+                // mark stays but episode-level fan-out doesn't happen.
+                // User can right-click in DetailView to mark individually.
+              }
+            })();
+          }
         },
       });
       items.push({
