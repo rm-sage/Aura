@@ -461,38 +461,58 @@ async fn frame_step(app: tauri::AppHandle, forward: bool) -> Result<(), String> 
 /// When enabled, audio is levelled to −23 LUFS (broadcast standard)
 /// with a true-peak ceiling of −2 dBTP and a 7 LU loudness range —
 /// flattens the volume disparity between streams from different
-/// sources without crushing dynamics. When disabled, the filter chain
-/// is cleared (`af=""`), restoring MPV's untouched audio output.
+/// sources without crushing dynamics.
 ///
-/// The `@loudnorm` label prefix is MPV's filter-graph naming
-/// convention: it lets us add/remove our specific filter without
-/// affecting any other filter the user might layer via per-title
-/// state in the future. Setting `af` to an empty string removes
-/// EVERY filter — fine here because Aura doesn't layer other audio
-/// filters today; revisit if that changes.
+/// Implementation notes (from a stream-silencing regression):
+///   • Use `change-list af toggle @loudnorm:loudnorm=…` instead of
+///     `set af "…"`. The latter REPLACES the entire filter graph
+///     in-place during playback, which on this libmpv build re-inits
+///     the audio output and frequently leaves it muted or with no
+///     track selected (the filter graph rebuilds before the aid
+///     dispatch can reattach). `change-list … toggle` does an
+///     incremental graph mutation that keeps the audio chain hot.
+///   • Drop `dynamic=true` — not a documented loudnorm parameter; the
+///     filter still initialises but the unknown option may push the
+///     graph into a degraded state where output samples don't reach
+///     the audio device. The base `I/LRA/TP` triple is sufficient.
+///   • The `@loudnorm` label prefix is the change-list selector — if
+///     it's already in the chain, toggle removes it; if it's absent,
+///     toggle adds it. Idempotent regardless of caller state.
 ///
 /// Soft no-op when audio passthrough is on (bitstream output bypasses
 /// the filter graph entirely). The UI prevents this at the toggle
 /// level but the Rust side is the source of truth — defence in depth.
 #[tauri::command]
 async fn set_audio_loudnorm(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
-    let filter = if enabled {
-        // EBU R128 defaults. dynamic=true uses a one-pass dynamic
-        // mode so live streams + variable-bitrate sources get
-        // sensible levelling without a two-pass measurement step
-        // (offline analysis isn't an option for stream-as-it-plays).
-        "@loudnorm:loudnorm=I=-23:LRA=7:TP=-2:dynamic=true".to_string()
-    } else {
-        String::new()
-    };
     crate::devlog!(info, "player", "set_audio_loudnorm(enabled={enabled})");
     tauri::async_runtime::spawn_blocking(move || {
-        app.mpv()
-            .set_property("af", &serde_json::json!(filter), "main")
-            .map_err(|e| {
-                crate::devlog!(warn, "player", "set_audio_loudnorm failed: {e}");
-                e.to_string()
-            })
+        let mpv = app.mpv();
+        // Always remove first so repeat calls don't stack duplicate
+        // labelled filters (App.tsx re-fires this on every load_video
+        // to honor the persisted setting). `remove` is a no-op when
+        // the label isn't present; ignore its error.
+        let _ = mpv.command(
+            "af",
+            &vec![serde_json::json!("remove"), serde_json::json!("@loudnorm")],
+            "main",
+        );
+        if !enabled {
+            return Ok(());
+        }
+        // Add the labelled loudnorm filter. The `@loudnorm` label is
+        // the handle we use to remove it later.
+        mpv.command(
+            "af",
+            &vec![
+                serde_json::json!("add"),
+                serde_json::json!("@loudnorm:loudnorm=I=-23:LRA=7:TP=-2"),
+            ],
+            "main",
+        )
+        .map_err(|e| {
+            crate::devlog!(warn, "player", "set_audio_loudnorm failed: {e}");
+            e.to_string()
+        })
     })
     .await
     .map_err(|e| e.to_string())?

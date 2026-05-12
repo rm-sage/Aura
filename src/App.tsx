@@ -491,6 +491,15 @@ function usePlayback(_playerActive: boolean) {
     setTime(0);
     setDuration(0);
     setEof(false);
+    // Reset paused to false at load time. MPV's default behaviour on
+    // loadfile is "play immediately"; on this libmpv build the initial
+    // pause property fires `paused=true` during loadfile then no follow-
+    // up event because pause never actually flips (MPV stayed in
+    // "playing" the whole time). Without this reset the play/pause
+    // icon stays stuck on Play until the user manually toggles. We
+    // assume "playing" here; if the user has the stream set to start
+    // paused (rare) the next property-change event will correct us.
+    setPaused(false);
     // Reset the broken-stream latch so a stale flag from the
     // previous load doesn't keep the recovery overlay visible
     // while the new stream is still loading. Both manual paths
@@ -1501,6 +1510,50 @@ export default function App() {
   const onNextUpPlay = useCallback(async () => {
     if (!nextUpInfo || !activeTarget || !nextUpInfo.stream) return;
     const seriesId = activeTarget.series_id ?? activeTarget.id;
+
+    // ── Record CURRENT episode into history before advancing ──
+    // handlePlayStream swaps the active target without going through
+    // handleExitPlayback, which is where the history-append normally
+    // fires. Without this block, an episode finished via "Play next
+    // episode" never lands in the History view (or in any of the
+    // downstream consumers — recommendations, etc.). Mirrors the gate
+    // in handleExitPlayback: meaningful = ≥ 80% AND ≥ 5 min watched.
+    {
+      const { time: watched, duration: dur } = playbackRef.current;
+      const meaningfulRatio = dur > 0 && watched / dur >= 0.80;
+      const meaningfulTime  = watched >= 5 * 60;
+      const playedEpisodeId = activeTarget.id;
+      const isSeriesEpisode = activeTarget.series_id != null && activeTarget.series_id !== activeTarget.id;
+      if (meaningfulRatio && meaningfulTime && playedEpisodeId) {
+        let season: number | null = null;
+        let episode: number | null = null;
+        if (isSeriesEpisode) {
+          const parts = playedEpisodeId.split(":");
+          if (parts.length >= 3) {
+            const s = Number(parts[parts.length - 2]);
+            const e = Number(parts[parts.length - 1]);
+            if (Number.isFinite(s)) season = s;
+            if (Number.isFinite(e)) episode = e;
+          }
+        }
+        const libRecord = library.find((i) => i.id === seriesId) ?? null;
+        addHistoryEntry({
+          id:            playedEpisodeId,
+          parent_id:     isSeriesEpisode ? seriesId : undefined,
+          name:          activeTarget.name,
+          media_type:    activeTarget.media_type,
+          poster:        libRecord?.poster ?? selectedMeta?.poster ?? null,
+          background:    libRecord?.background ?? selectedMeta?.background ?? null,
+          season,
+          episode,
+          episode_title: activeTarget.episode_title ?? null,
+          played_at:     new Date().toISOString(),
+          duration:      dur || undefined,
+          watched_seconds: watched,
+        });
+      }
+    }
+
     const ep = nextUpInfo.episode;
     const tag =
       ep.season != null && ep.episode != null
@@ -1520,7 +1573,7 @@ export default function App() {
     await handlePlayStream(nextUpInfo.stream, target);
     // Allow the new target's CTA to arm when its own end approaches.
     nextUpResolvedFor.current = null;
-  }, [nextUpInfo, activeTarget]);
+  }, [nextUpInfo, activeTarget, library, selectedMeta]);
 
   const onNextUpDismiss = useCallback(() => {
     if (activeTarget) {
@@ -3670,7 +3723,12 @@ export default function App() {
           interact with the dead controls underneath. */}
       {streamBroken && isPlayerActive && (
         <div
-          className="fixed inset-0 z-[1400] flex items-center justify-center
+          // z-[10500] sits above PlayerOverlay's z-[9999] click-capture
+          // layer AND its z-[10000] submenu portals. Without this,
+          // clicks on the Reload / Exit buttons pass through to
+          // PlayerOverlay's video-click handler (togglePause) instead
+          // of landing on the modal.
+          className="fixed inset-0 z-[10500] flex items-center justify-center
                      bg-black/75 backdrop-blur-md animate-[fade-in_120ms_ease-out]"
         >
           <div className="aura-glass-menu rounded-2xl max-w-[420px] w-[92%] p-6 text-white">
