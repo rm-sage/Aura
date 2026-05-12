@@ -458,9 +458,16 @@ export default function AddonsView({
       >
         {/* Centred reading column — caps the page width on ultrawide
             displays so rows don't sprawl across the entire viewport.
-            Matches the Settings page's column treatment for a
-            consistent "configuration surface" feel across the app. */}
-        <div className="mx-auto w-full max-w-3xl space-y-6">
+            Inline maxWidth because tailwind.config.ts strips all
+            max-w-* utilities (Aura targets fluid ultrawide layouts by
+            default), and the Settings page uses the same inline-style
+            pattern for its own column. min(960px, 92%) keeps the
+            column wide enough for long manifest URLs while still
+            sitting centred on a 21:9 / 32:9 display. */}
+        <div
+          className="mx-auto w-full space-y-6"
+          style={{ maxWidth: "min(960px, 92%)" }}
+        >
         {/* Page header */}
         <div>
           <h1 className="text-white/85 text-xl font-light tracking-wide">Addons</h1>

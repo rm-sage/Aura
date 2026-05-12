@@ -157,9 +157,21 @@ const FullscreenIcon = () => (
   </svg>
 );
 const PanscanIcon = () => (
-  <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-    {/* Outer corner brackets pointing outward = "fill viewport" */}
-    <path d="M3 3h7v2H5v5H3V3zm18 0v7h-2V5h-5V3h7zM3 21v-7h2v5h5v2H3zm18 0h-7v-2h5v-5h2v7z" />
+  // Distinct from FullscreenIcon's corner-brackets motif: a horizontal
+  // screen frame (the visible viewport) with a TALLER filled rectangle
+  // overflowing top and bottom (the video, which gets cropped to fill
+  // the screen's constrained axis). Reads as "video is bigger than
+  // screen → fill by cropping" — exactly what panscan does — and is
+  // immediately visually different from fullscreen's outward-pointing
+  // corner-bracket motif.
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+       strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+    {/* Outer letterbox / viewport rectangle */}
+    <rect x="2.5" y="7" width="19" height="10" rx="1.2" />
+    {/* Inner video frame — taller than the viewport (overflows top + bottom) */}
+    <rect x="6" y="3.5" width="12" height="17" rx="1" fill="currentColor"
+          fillOpacity="0.42" stroke="none" />
+    <rect x="6" y="3.5" width="12" height="17" rx="1" />
   </svg>
 );
 const ExitFullscreenIcon = () => (
@@ -1847,7 +1859,11 @@ export default function PlayerOverlay({
           </div>
 
           {/* ── Button row — order: Rewind ▶ Play/Pause ▶ Forward ── */}
-          <div className="flex items-center gap-1.5 mt-1">
+          {/* gap-2 (8 px) gives every adjacent control pair the same
+              visual breathing room — was gap-1.5 (6 px) which left
+              wider pill buttons (speed, shader) feeling cramped
+              against their round neighbours. */}
+          <div className="flex items-center gap-2 mt-1">
             <IconButton
               onClick={() => seekRelative(-10)}
               label="Skip back 10 seconds"
