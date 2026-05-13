@@ -3,6 +3,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { loadAuraSettings, saveAuraSettings, getSettingsUpdatedAt, setSettingsUpdatedAt, bumpSettingsUpdatedAt, type AuraSettings, DEFAULT_AURA_SETTINGS } from "./auraSettings";
+import { encryptForCloud, decryptFromCloud, isEncryptedBlob, type EncryptedBlob } from "./syncCrypto";
 
 // ---------------------------------------------------------------------------
 // Aura Cloud sync orchestrator (frontend)
@@ -386,6 +387,74 @@ interface SettingsSyncBlob {
   backend: BackendSettingsLite;
   frontend: AuraSettings;
   updated_at: number;
+  /** Encrypted third-party API keys (OMDb, OpenSubtitles).
+   *
+   *  Carried INSIDE the settings blob rather than as its own
+   *  namespace specifically to avoid a coordinated proxy deploy —
+   *  the proxy enforces a namespace allow-list (see
+   *  docs/AURA_PROXY_V2_SPEC.md §4) so a new namespace would
+   *  require a server-side rollout. Piggy-backing keeps it desktop-
+   *  only.
+   *
+   *  Plaintext shape under the AES-GCM ciphertext:
+   *    { omdb?: string, opensubtitles?: string }
+   *
+   *  Devices that haven't yet backfilled user_id (offline first
+   *  launch, /getUser failure) can't decrypt and gracefully drop
+   *  the field — the local keyring is the source of truth in that
+   *  case. */
+  api_keys?: EncryptedBlob;
+}
+
+/** Names of the API keys we sync. Mirror of `SUPPORTED_KEYS` in
+ *  `src-tauri/src/api_keyring.rs`. If you add a key on the Rust side,
+ *  list it here too — the encryption layer just sees the JSON shape
+ *  but the read/write paths use this list explicitly. */
+const SYNCED_API_KEYS = ["omdb", "opensubtitles"] as const;
+type SyncedApiKeyName = typeof SYNCED_API_KEYS[number];
+
+interface ApiKeysPlaintext {
+  omdb?: string;
+  opensubtitles?: string;
+}
+
+/** Pull the user_id off the keyring-resident session. Returns null
+ *  when the session isn't present (guest mode) or hasn't yet
+ *  backfilled user_id (offline first launch after upgrade). */
+async function activeUserId(): Promise<string | null> {
+  try {
+    const sess = await invoke<{ user_id?: string | null } | null>("get_session");
+    const id = sess?.user_id;
+    return typeof id === "string" && id.length > 0 ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readApiKeyBundle(): Promise<ApiKeysPlaintext> {
+  const out: ApiKeysPlaintext = {};
+  for (const name of SYNCED_API_KEYS) {
+    try {
+      const v = await invoke<string>("get_api_key", { name });
+      if (typeof v === "string" && v.length > 0) out[name as SyncedApiKeyName] = v;
+    } catch {
+      // Keyring miss / unsupported name — skip silently.
+    }
+  }
+  return out;
+}
+
+async function writeApiKeyBundle(plain: ApiKeysPlaintext): Promise<void> {
+  for (const name of SYNCED_API_KEYS) {
+    const v = plain[name as SyncedApiKeyName];
+    // Empty / undefined → clear the local keyring entry so a cross-
+    // device "deleted on the other side" survives the round-trip.
+    try {
+      await invoke("set_api_key", { name, value: v ?? "" });
+    } catch (e) {
+      console.warn(`[sync] writeApiKeyBundle ${name} failed:`, e);
+    }
+  }
 }
 
 async function readBackendSettings(): Promise<BackendSettingsLite> {
@@ -410,10 +479,24 @@ async function applyBackendSettings(s: BackendSettingsLite): Promise<void> {
 }
 
 async function readSettingsBlob(): Promise<SettingsSyncBlob> {
-  const [backend, frontend] = await Promise.all([
+  const [backend, frontend, userId, apiKeys] = await Promise.all([
     readBackendSettings(),
     Promise.resolve(loadAuraSettings()),
+    activeUserId(),
+    readApiKeyBundle(),
   ]);
+  let api_keys: EncryptedBlob | undefined;
+  // Encrypt only when we have a user_id (cross-device-stable key
+  // derivation input) AND at least one API key set locally. Guests
+  // and pre-backfill sessions ride along with api_keys omitted —
+  // the local keyring stays the source of truth on this device.
+  if (userId && (apiKeys.omdb || apiKeys.opensubtitles)) {
+    try {
+      api_keys = await encryptForCloud(JSON.stringify(apiKeys), userId);
+    } catch (e) {
+      console.warn(`[sync] api-keys encrypt failed: ${String(e)}`);
+    }
+  }
   // updated_at is the persisted "last user-modified locally"
   // timestamp, NOT Date.now(). Stamping it on every read meant the
   // mergeSettings last-writer-wins comparison always picked local
@@ -421,7 +504,7 @@ async function readSettingsBlob(): Promise<SettingsSyncBlob> {
   // settings were pulled, merged, then silently discarded. Bumps
   // happen in saveAuraSettings (frontend) and in the settings-
   // changed listener installed by installSyncTriggers (backend).
-  return { backend, frontend, updated_at: getSettingsUpdatedAt() };
+  return { backend, frontend, updated_at: getSettingsUpdatedAt(), api_keys };
 }
 
 async function writeSettingsBlob(blob: Partial<SettingsSyncBlob>): Promise<void> {
@@ -433,6 +516,25 @@ async function writeSettingsBlob(blob: Partial<SettingsSyncBlob>): Promise<void>
   }
   if (blob.backend) {
     await applyBackendSettings(blob.backend);
+  }
+  // Decrypt the API-keys blob (if present) and persist the
+  // contained values to the local OS keyring. Silently skips when
+  // the blob is malformed, the schema version is unknown, or the
+  // user_id isn't available locally — a fresh-device pull that
+  // arrives before the user_id backfill completes can land
+  // briefly in this state; the next pull (post-backfill) catches
+  // up.
+  if (blob.api_keys && isEncryptedBlob(blob.api_keys)) {
+    const userId = await activeUserId();
+    if (userId) {
+      try {
+        const pt = await decryptFromCloud(blob.api_keys, userId);
+        const parsed = JSON.parse(pt) as ApiKeysPlaintext;
+        await writeApiKeyBundle(parsed);
+      } catch (e) {
+        console.warn(`[sync] api-keys decrypt/apply failed: ${String(e)}`);
+      }
+    }
   }
   // Inherit the server's authoritative timestamp so the NEXT pull
   // sees `local.updated_at === server.updated_at` (tie → server
@@ -804,6 +906,13 @@ export function installSyncTriggers(): void {
 
   window.addEventListener("aura:settings-changed",        () => debouncedPush("settings"));
   window.addEventListener("aura:keybindings-changed",     () => debouncedPush("settings"));
+  // API-key changes ride along with the settings blob (the
+  // encrypted api_keys field is built inside readSettingsBlob).
+  // Treat as a settings change for both timestamp + push purposes.
+  window.addEventListener("aura:api-keys-changed", () => {
+    bumpSettingsUpdatedAt();
+    debouncedPush("settings");
+  });
   window.addEventListener("aura:manual-watched-changed",  () => debouncedPush("manual-state"));
   window.addEventListener("aura:auto-bumped-changed",     () => debouncedPush("auto-bumped"));
   window.addEventListener("aura:notifications-changed",   () => debouncedPush("notifications"));

@@ -1021,11 +1021,17 @@ function BackupRestoreSection({
       // is left in settings.json either (the user can re-paste the
       // key manually). Skip empty values so we don't overwrite an
       // existing keyring entry with nothing.
+      let apiKeysTouched = false;
       if (omdbKey.trim()) {
         await invoke("set_api_key", { name: "omdb", value: omdbKey.trim() }).catch(() => {});
+        apiKeysTouched = true;
       }
       if (opensubKey.trim()) {
         await invoke("set_api_key", { name: "opensubtitles", value: opensubKey.trim() }).catch(() => {});
+        apiKeysTouched = true;
+      }
+      if (apiKeysTouched) {
+        window.dispatchEvent(new CustomEvent("aura:api-keys-changed"));
       }
       // Aura-side portable subset. Import is additive: any field
       // present in the blob overwrites; missing fields keep their
@@ -1787,7 +1793,13 @@ function KeyringApiKeyInput({
     const trimmed = value.trim();
     if (trimmed === persisted) return;
     invoke("set_api_key", { name, value: trimmed })
-      .then(() => setPersisted(trimmed))
+      .then(() => {
+        setPersisted(trimmed);
+        // Tell the cloud-sync layer the local keyring changed so it
+        // re-builds the settings blob (which now carries an
+        // encrypted api_keys field) and debounces a push.
+        window.dispatchEvent(new CustomEvent("aura:api-keys-changed"));
+      })
       .catch((e) => {
         console.warn(`[settings] set_api_key(${name}) failed:`, e);
       });
