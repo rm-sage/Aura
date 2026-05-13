@@ -378,6 +378,107 @@ const COMMANDS: DevCommand[] = [
     },
   },
   {
+    name: "notifytest",
+    usage: "notifytest <imdb_id>",
+    description: "Force a notifications-system test for one library series. Clears Aura's local 'seen episodes' record for the id, fetches the fresh cloud release signal, and triggers a library refresh — the scanner should then see cloud's last_aired as newer than its local state and fire a notification. Per release-search-spec § notification-test guide.",
+    run: async (args, ctx) => {
+      const imdbId = args.trim();
+      if (!imdbId) {
+        ctx.push({
+          ts: Date.now(), level: "warn", source: "console",
+          message: "Usage: notifytest <imdb_id>  (e.g. notifytest tt22248376)",
+        });
+        return;
+      }
+      if (!imdbId.startsWith("tt")) {
+        ctx.push({
+          ts: Date.now(), level: "warn", source: "console",
+          message: `notifytest: id ${imdbId} doesn't look like an IMDb id (expected tt-prefix)`,
+        });
+        return;
+      }
+      const SCANNER_STATE_KEY = "aura:notifications:scanner-state";
+      // Step 1 — clear the scanner's seen-episodes record for this id
+      // so the next scan treats every video in the addon's feed as
+      // "first contact" and re-evaluates against the recent-release
+      // window. The localStorage shape is documented in
+      // NotificationsScanner.tsx.
+      let cleared = false;
+      try {
+        const raw = localStorage.getItem(SCANNER_STATE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw) as Record<string, { lastChecked: number; seenVideoIds: string[] }>;
+          if (parsed && typeof parsed === "object" && parsed[imdbId]) {
+            delete parsed[imdbId];
+            localStorage.setItem(SCANNER_STATE_KEY, JSON.stringify(parsed));
+            cleared = true;
+          }
+        }
+      } catch (e) {
+        ctx.push({
+          ts: Date.now(), level: "warn", source: "console",
+          message: `notifytest: failed to clear scanner state — ${String(e)}`,
+        });
+      }
+      ctx.push({
+        ts: Date.now(), level: "info", source: "console",
+        message: cleared
+          ? `notifytest: cleared scanner state for ${imdbId}`
+          : `notifytest: no prior scanner state for ${imdbId} (will treat as first scan)`,
+      });
+
+      // Step 2 — fetch the cloud release signal so we can log what
+      // cloud thinks the latest episode is. This also seeds the
+      // release-signal store so any consumer that reads from it sees
+      // fresh data immediately.
+      try {
+        const { fetchReleaseSignal } = await import("./releaseSearch");
+        const signal = await fetchReleaseSignal(imdbId);
+        if (!signal) {
+          ctx.push({
+            ts: Date.now(), level: "warn", source: "console",
+            message: `notifytest: cloud has no signal for ${imdbId} (queued or not yet polled — try nudging via library refresh first)`,
+          });
+        } else {
+          const la = signal.last_aired;
+          const na = signal.next_aired;
+          ctx.push({
+            ts: Date.now(), level: "info", source: "console",
+            message:
+              `notifytest cloud(${imdbId}): ` +
+              `last_aired=${la ? `${la.id} aired ${la.aired_at}` : "(none)"} ` +
+              `next_aired=${na ? `${na.id} aired ${na.aired_at}` : "(none)"} ` +
+              `polled_at=${signal.polled_at} ` +
+              `episode_kinds.length=${signal.episode_kinds.length}`,
+          });
+        }
+      } catch (e) {
+        ctx.push({
+          ts: Date.now(), level: "error", source: "console",
+          message: `notifytest: cloud fetch failed — ${String(e)}`,
+        });
+      }
+
+      // Step 3 — kick the library refresh. App.tsx listens for
+      // aura:library-changed → loadLibrary → reconcileLibraryReleaseSignals.
+      // The scanner separately polls on a 30-min timer; we also fire
+      // its own change listener so it re-evaluates right now rather
+      // than waiting for the next tick.
+      window.dispatchEvent(new CustomEvent("aura:library-changed"));
+      ctx.push({
+        ts: Date.now(), level: "info", source: "console",
+        message: "notifytest: fired aura:library-changed — watch for a notification in the bell within ~10s.",
+      });
+      ctx.push({
+        ts: Date.now(), level: "info", source: "console",
+        message:
+          "If nothing fires: (a) confirm the cloud signal above shows a recent last_aired, " +
+          "(b) confirm the title is actually in your library, " +
+          "(c) check that the addon's meta returns the same recent episode (scanner uses addon probe, not the cloud signal directly).",
+      });
+    },
+  },
+  {
     name: "eval",
     usage: "eval <expression>",
     description: "Evaluate a JavaScript expression (power user; runs in app context)",

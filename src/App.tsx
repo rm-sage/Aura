@@ -85,6 +85,7 @@ import { normalizeLibrary } from "./libraryNormalize";
 import { LibraryProvider } from "./LibraryContext";
 import { NotificationsProvider, useNotifications } from "./NotificationsContext";
 import NotificationsBell from "./NotificationsBell";
+import LibraryRefreshButton from "./LibraryRefreshButton";
 import NotificationsScanner from "./NotificationsScanner";
 import { getTitleState } from "./titleState";
 import { isAnimeMeta, markAnimeId } from "./aiometadata";
@@ -3906,6 +3907,11 @@ export default function App() {
           main tab (Home, Library, Calendar, Addons, Settings); the
           NotificationsProvider above keeps state continuous. */}
       <NotificationsBell />
+      {/* Manual library refresh — sits next to the bell. Same fixed
+          bottom-left anchoring inherits the player-hidden behaviour
+          for free, and the button mounts on every main tab because
+          it's a body-level child same as the bell. */}
+      <LibraryRefreshButton library={library} />
 
       </div>
       )}

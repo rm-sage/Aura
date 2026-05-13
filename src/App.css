@@ -1897,6 +1897,13 @@ html[data-reduced-motion="true"] .hover-glow:hover {
   from { transform: rotate(0deg); }
   to   { transform: rotate(360deg); }
 }
+/* Reused for LibraryRefreshButton's spinner — same shape, separate
+   name so the bell + addon refresh paths can diverge in cadence later
+   without disturbing each other. */
+@keyframes aura-refresh-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
 @keyframes addon-spinner-pulse {
   0%, 100% { opacity: 0.45; transform: scale(0.9); }
   50%      { opacity: 1;    transform: scale(1.1); }
