@@ -940,14 +940,60 @@ export default function App() {
             // typically has NO anime ids populated. Without the title
             // fallback the AniSkip feature silently does nothing for
             // most series.
-            let malId: number | null = detail?.mal_id ?? null;
+            // Resolve the COUR-SPECIFIC MAL id. AniSkip keys by MAL
+            // anime id and MAL splits multi-cour shows into separate
+            // entries — Frieren's cour 1 is MAL 52991 (eps 1-28), cour
+            // 2 is MAL 59978 (eps 1-10 LOCAL). Querying cour 1's MAL
+            // id with the absolute episode 37 returns 404 (cour 1 ends
+            // at 28); querying cour 2's MAL id with local episode 9
+            // returns the correct timings.
+            //
+            // Resolution priority:
+            //   1. Anime-prefix video id (kitsu/mal/anidb/anilist) →
+            //      extract the cour-specific show id from target.id
+            //      and resolve via yuna.moe. AIOMetadata's cour-
+            //      aggregation patch encodes the cour-specific
+            //      provider id directly, so this is exact.
+            //   2. detail.mal_id / detail.kitsu_id / detail.anidb_id /
+            //      detail.anilist_id — show-root anime ids from the
+            //      meta detail. These are typically cour 1's ids for
+            //      multi-cour shows, so they only match for cour 1
+            //      playback.
+            //   3. Title-based Jikan search — last-resort fuzzy match.
+            //
+            // AIOMetadata may also stamp the cour-specific malId
+            // directly on the video as `mal_id` — we'd accept that
+            // if AIOMetadata starts emitting it, but the wire shape
+            // is parsed off the video id below.
+            let malId: number | null = null;
+            const tryResolve = async (src: "kitsu" | "anidb" | "anilist", id: number | null | undefined) => {
+              if (!id) return null;
+              try {
+                return await invoke<number | null>("resolve_mal_id", { source: src, id });
+              } catch { return null; }
+            };
+            // Step 1 — parse cour-specific show id from target.id.
+            // `kitsu:49240:9` → ("kitsu", 49240); `mal:59978:9` is
+            // already the MAL id (no round-trip needed).
+            const idSegments = target.id.split(":");
+            if (idSegments.length === 3) {
+              const provider = idSegments[0].toLowerCase();
+              const showId = Number(idSegments[1]);
+              if (Number.isFinite(showId)) {
+                if (provider === "mal") {
+                  malId = showId;
+                } else if (provider === "kitsu" || provider === "anidb" || provider === "anilist") {
+                  malId = await tryResolve(provider as "kitsu" | "anidb" | "anilist", showId);
+                }
+              }
+            }
+            // Step 2 — meta-detail anime ids. Only hit when step 1
+            // didn't resolve (legacy tt-style ids or unrecognised
+            // prefix).
             if (!malId) {
-              const tryResolve = async (src: "kitsu" | "anidb" | "anilist", id: number | null | undefined) => {
-                if (!id) return null;
-                try {
-                  return await invoke<number | null>("resolve_mal_id", { source: src, id });
-                } catch { return null; }
-              };
+              malId = detail?.mal_id ?? null;
+            }
+            if (!malId) {
               malId = await tryResolve("kitsu",   detail?.kitsu_id)
                    ?? await tryResolve("anidb",   detail?.anidb_id)
                    ?? await tryResolve("anilist", (detail as { anilist_id?: number | null } | null)?.anilist_id);
@@ -974,56 +1020,34 @@ export default function App() {
             // menus, audio-language defaults) classify it correctly
             // before DetailView is ever opened.
             markAnimeId(seriesId);
-            // Episode number for AniSkip lookup. AniSkip is keyed by
-            // MAL anime id, and most multi-cour anime share a SINGLE
-            // MAL entry whose episode list is the show-wide absolute
-            // numbering (1..N flat). After AIOMetadata's cour-
-            // aggregation patch, VideoEntry's `episode` is now COUR-
-            // RELATIVE (e.g. S02E09 carries episode=9), so we must
-            // convert back to absolute by summing earlier cours'
-            // episode counts. Without this, Frieren S02E09 sends ep=9
-            // and fetches cour 1 ep 9's OP timings — exactly the
-            // mis-skip the user is seeing.
+            // Episode number for AniSkip lookup. AniSkip indexes by
+            // MAL anime id + LOCAL episode (1-based within that MAL
+            // entry, NOT show-wide absolute). MAL splits multi-cour
+            // shows into separate entries — Frieren cour 2 is MAL
+            // 59978 with episodes 1-10 LOCAL (= global 29-38).
+            // Querying cour 1's MAL id with absolute 37 → 404; cour 2's
+            // MAL id with local 9 → correct timings.
             //
-            // Resolution order:
-            //   1. Have season + cour-relative episode AND a detail
-            //      with a videos list → sum episodes in earlier
-            //      cours (season < current) and add the current
-            //      episode number. Excludes season 0 specials.
-            //   2. Fall back to VideoEntry's `episode_num` as-is
-            //      (legacy single-season shows where it's already
-            //      absolute, and movies where it's 1).
-            //   3. Fall back to id-derived trailing segment.
+            // The malId resolution above already picked the cour-
+            // specific entry by parsing the cour-specific show id
+            // from target.id, so the matching episode here is
+            // VideoEntry's `episode_num` (which is cour-relative for
+            // cour-aggregated shows). Falls back to id-derived
+            // trailing segment for shows whose VideoEntry lacks the
+            // field.
             const idParts = target.id.split(":");
             const idEpisode = Number(idParts[idParts.length - 1]);
-            const courRelativeEp = Number.isFinite(target.episode_num as number)
+            const episodeNum = Number.isFinite(target.episode_num as number)
               ? (target.episode_num as number)
-              : (Number.isFinite(idEpisode) ? idEpisode : NaN);
-            const courSeason = Number.isFinite(target.season as number)
-              ? (target.season as number)
-              : null;
-            let absoluteEp = courRelativeEp;
-            if (
-              courSeason != null && courSeason > 1
-              && Number.isFinite(courRelativeEp)
-              && detail?.videos && detail.videos.length > 0
-            ) {
-              // Sum episodes in earlier main-run cours. Specials
-              // (season 0) are excluded — they air out-of-band and
-              // AniSkip's flat absolute numbering doesn't count them.
-              const priorCourEps = detail.videos.filter(
-                (v) => (v.season ?? 0) > 0 && (v.season ?? 0) < courSeason,
-              ).length;
-              absoluteEp = priorCourEps + courRelativeEp;
-            }
-            const episodeNum = absoluteEp;
+              : idEpisode;
             if (!Number.isFinite(episodeNum)) {
               console.info(`[aniskip] skip — couldn't parse episode from ${target.id}`);
               return;
             }
             console.info(
-              `[aniskip] episode resolution: id-derived=${idEpisode}, cour-rel=${courRelativeEp}, ` +
-              `season=${courSeason}, absolute=${absoluteEp}, using=${episodeNum}`,
+              `[aniskip] episode resolution: id-derived=${idEpisode}, ` +
+              `cour-relative=${target.episode_num}, using=${episodeNum} ` +
+              `(against mal=${malId})`,
             );
             // Settings drive the per-window auto/prompt/off decision.
             let settings: BackendSettingsLite | null = null;
