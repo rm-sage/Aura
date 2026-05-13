@@ -327,13 +327,20 @@ export default function AniSkipMenu({
                  w-[460px] max-w-[92vw] text-white/85"
       onClick={(e) => e.stopPropagation()}
     >
-      <div className="flex items-center justify-between px-4 pt-3 pb-2 border-b border-white/8">
-        <h3 className="text-[13px] font-semibold tracking-wide">AniSkip</h3>
+      {/* Header — title centered with the close button absolute-
+          positioned so its 24 px footprint doesn't shift the title
+          off-center. Letterspacing + uppercase tones match the
+          column subheaders below for visual consistency with the
+          rest of the player's submenus. */}
+      <div className="relative px-4 pt-3 pb-2 border-b border-white/8">
+        <h3 className="text-white/85 text-[11.5px] font-semibold uppercase tracking-[0.18em] text-center">
+          AniSkip
+        </h3>
         <button
           type="button"
           onClick={onClose}
           aria-label="Close AniSkip menu"
-          className="w-6 h-6 rounded text-white/55 hover:text-white hover:bg-white/12
+          className="absolute top-2.5 right-2.5 w-6 h-6 rounded text-white/55 hover:text-white hover:bg-white/12
                      flex items-center justify-center transition-colors"
         >
           <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
@@ -527,7 +534,7 @@ export default function AniSkipMenu({
 
       {/* ── Skip-mode toggles (full-width row) ───────────────────── */}
       <div className="px-4 pb-3 pt-1 border-t border-white/8">
-        <p className="text-white/60 text-[11px] font-semibold uppercase tracking-wider mb-2">
+        <p className="text-white/60 text-[11px] font-semibold uppercase tracking-[0.18em] mb-2 text-center">
           Skip behaviour
         </p>
         <div className="space-y-1.5">
@@ -580,8 +587,13 @@ function ModeRow({
     { id: "auto",   label: "Auto",   tone: "text-emerald-300" },
   ];
   return (
-    <div className="flex items-center justify-between gap-4">
-      <span className="text-[12px] text-white/85 flex-shrink-0">{label}</span>
+    // Center the label+toggle pair as a unit instead of pinning the
+    // toggle to the right edge — at 460px panel width the previous
+    // justify-between layout left a huge gap between e.g. "Opening"
+    // and the pill group. Fixed-width label keeps the rows aligned
+    // vertically; gap-3 sits the toggle right next to the label.
+    <div className="flex items-center justify-center gap-3">
+      <span className="text-[12px] text-white/85 flex-shrink-0 w-[68px] text-right">{label}</span>
       <div
         className="flex-shrink-0 inline-flex rounded-full overflow-hidden
                    bg-white/5 border border-white/10 p-0.5 gap-0.5"
