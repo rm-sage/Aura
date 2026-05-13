@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tauri_plugin_libmpv::MpvExt;
 
 // ---------------------------------------------------------------------------
@@ -52,6 +53,12 @@ struct ApiResult {
     #[serde(rename = "episodeLength", default)]
     #[allow(dead_code)]
     episode_length: f64,
+    /// AniSkip's per-row identifier. Required for the vote endpoint
+    /// (`POST /v2/skip-times/vote/{skip_id}`). Optional in the parse
+    /// because older API responses occasionally omit it for synthetic
+    /// rows; voting on those is a no-op anyway.
+    #[serde(rename = "skipId", default)]
+    skip_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -73,6 +80,12 @@ pub struct SkipWindow {
     /// "aniskip" for now. Future "chapter" / "silencedetect" sources
     /// will share this struct so the Lua side can priority-rank.
     pub source: String,
+    /// AniSkip per-row identifier passed through unchanged when the
+    /// source is "aniskip". `None` for non-AniSkip windows (chapter,
+    /// silencedetect) — they don't have a server-side identity to
+    /// vote against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -238,9 +251,10 @@ pub async fn fetch_skip_windows(
                 };
                 SkipWindow {
                     kind,
-                    start:  r.interval.start_time,
-                    end:    r.interval.end_time,
-                    source: "aniskip".into(),
+                    start:   r.interval.start_time,
+                    end:     r.interval.end_time,
+                    source:  "aniskip".into(),
+                    skip_id: r.skip_id,
                 }
             })
             .collect();
@@ -577,6 +591,12 @@ pub struct PreparedWindow {
     pub end: f64,
     pub source: String,
     pub auto: bool,
+    /// AniSkip per-row identifier (when source == "aniskip"). React's
+    /// AniSkipMenu reads this to call vote_skip_time. Omitted in the
+    /// wire format when None so the Lua script doesn't see an
+    /// unexpected field.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub skip_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -642,4 +662,172 @@ pub async fn set_skip_windows<R: Runtime>(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+// ---------------------------------------------------------------------------
+// Submitter id — persistent UUID v4 stamped on every POST to AniSkip
+// so the server can dedupe per-user spam and offer per-submitter
+// moderation. Stored next to the cache so it survives reinstalls of
+// the same user-data dir; regenerated when missing or unparseable.
+// ---------------------------------------------------------------------------
+
+fn submitter_id_path<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
+    let dir = app.path().app_data_dir().ok()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("aniskip-submitter-id.txt"))
+}
+
+fn read_or_create_submitter_id<R: Runtime>(app: &AppHandle<R>) -> String {
+    let path = match submitter_id_path(app) {
+        Some(p) => p,
+        None => return uuid::Uuid::new_v4().to_string(),
+    };
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let trimmed = text.trim();
+        // Validate that the stored value is a parseable UUID. Bogus
+        // contents (truncation, manual edits) fall through to fresh
+        // generation rather than uploading junk to AniSkip.
+        if uuid::Uuid::parse_str(trimmed).is_ok() {
+            return trimmed.to_string();
+        }
+    }
+    let fresh = uuid::Uuid::new_v4().to_string();
+    let _ = std::fs::write(&path, &fresh);
+    fresh
+}
+
+// ---------------------------------------------------------------------------
+// POST /v2/skip-times/{mal_id}/{episode} — submit a new OP/ED window.
+//
+// Body shape (camelCase per AniSkip's wire format):
+//   {
+//     "skipType": "op" | "ed" | "mixed-op" | "recap",
+//     "providerName": "Aura",
+//     "startTime": 90.0,
+//     "endTime":   180.0,
+//     "episodeLength": 1440.0,
+//     "submitterId": "<uuid-v4>"
+//   }
+//
+// Returns a JSON envelope with `{ message, success, skipId }` on
+// success. We surface skipId so the caller can immediately upvote
+// the user's own submission if AniSkip's policy permits.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SubmitSkipResult {
+    pub success: bool,
+    pub skip_id: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SubmitResponse {
+    #[serde(default)] message: Option<String>,
+    #[serde(default)] success: Option<bool>,
+    #[serde(default, rename = "skipId")] skip_id: Option<String>,
+    #[serde(default, rename = "skip_id")] skip_id_alt: Option<String>,
+}
+
+#[tauri::command]
+pub async fn submit_skip_time<R: Runtime>(
+    app: AppHandle<R>,
+    mal_id: u32,
+    episode: u32,
+    skip_type: String,
+    start_time: f64,
+    end_time: f64,
+    episode_length: f64,
+) -> Result<SubmitSkipResult, String> {
+    // Server-side sanity gates the wire layer enforces too, but
+    // catching them locally produces a friendlier error than a 400
+    // from AniSkip.
+    if !matches!(skip_type.as_str(), "op" | "ed" | "mixed-op" | "recap") {
+        return Err(format!("invalid skip_type: {skip_type}"));
+    }
+    if !start_time.is_finite() || !end_time.is_finite() {
+        return Err("start_time and end_time must be finite".into());
+    }
+    if end_time <= start_time {
+        return Err("end_time must be greater than start_time".into());
+    }
+    if start_time < 0.0 {
+        return Err("start_time must be non-negative".into());
+    }
+
+    let submitter_id = read_or_create_submitter_id(&app);
+    let url = format!("{ANISKIP_BASE}/skip-times/{mal_id}/{episode}");
+    let body = serde_json::json!({
+        "skipType":      skip_type,
+        "providerName":  concat!("Aura/", env!("CARGO_PKG_VERSION")),
+        "startTime":     start_time,
+        "endTime":       end_time,
+        "episodeLength": episode_length.max(0.0),
+        "submitterId":   submitter_id,
+    });
+
+    crate::devlog!(
+        info, "aniskip",
+        "POST {url} skipType={skip_type} start={start_time:.2} end={end_time:.2} length={episode_length:.2}",
+    );
+
+    let resp = client().post(&url).json(&body).send().await
+        .map_err(|e| {
+            crate::devlog!(warn, "aniskip", "submit request failed: {e}");
+            format!("AniSkip submit error: {e}")
+        })?;
+    let status = resp.status();
+    let raw = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        crate::devlog!(
+            warn, "aniskip",
+            "submit HTTP {} for mal={mal_id} ep={episode}: {}",
+            status.as_u16(), raw.chars().take(400).collect::<String>(),
+        );
+        return Err(format!("AniSkip HTTP {}: {raw}", status.as_u16()));
+    }
+    let parsed: SubmitResponse = serde_json::from_str(&raw).unwrap_or(SubmitResponse {
+        message: None, success: Some(true), skip_id: None, skip_id_alt: None,
+    });
+    let success = parsed.success.unwrap_or(true);
+    let skip_id = parsed.skip_id.or(parsed.skip_id_alt);
+    let message = parsed.message.unwrap_or_else(|| "Submitted".to_string());
+    crate::devlog!(
+        info, "aniskip",
+        "submit OK status={} success={} skip_id={:?} message={}",
+        status.as_u16(), success, skip_id, message,
+    );
+    // Invalidate the cached query so the next fetch picks up the
+    // freshly-submitted window without waiting for AniSkip's
+    // server-side cache to expire.
+    cache().lock().unwrap().remove(&cache_key(mal_id, episode));
+    Ok(SubmitSkipResult { success, skip_id, message })
+}
+
+// ---------------------------------------------------------------------------
+// POST /v2/skip-times/vote/{skip_id} — upvote / downvote a submission.
+// Body: { "voteType": "upvote" | "downvote" }
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn vote_skip_time(skip_id: String, vote_type: String) -> Result<bool, String> {
+    if !matches!(vote_type.as_str(), "upvote" | "downvote") {
+        return Err(format!("invalid vote_type: {vote_type}"));
+    }
+    let url = format!("{ANISKIP_BASE}/skip-times/vote/{skip_id}");
+    let body = serde_json::json!({ "voteType": vote_type });
+    crate::devlog!(info, "aniskip", "POST {url} voteType={vote_type}");
+    let resp = client().post(&url).json(&body).send().await
+        .map_err(|e| format!("AniSkip vote error: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let raw = resp.text().await.unwrap_or_default();
+        crate::devlog!(
+            warn, "aniskip",
+            "vote HTTP {} for skip_id={skip_id}: {}",
+            status.as_u16(), raw.chars().take(400).collect::<String>(),
+        );
+        return Err(format!("AniSkip HTTP {}", status.as_u16()));
+    }
+    Ok(true)
 }

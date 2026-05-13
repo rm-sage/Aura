@@ -100,7 +100,7 @@ commands.allow = ["get_settings", "set_theme", "update_settings", "reset_setting
 [[permission]]
 identifier = "allow-aniskip"
 description = "Allows the frontend to fetch op/ed/recap skip-time windows from the AniSkip API for anime titles"
-commands.allow = ["fetch_skip_windows", "set_skip_windows", "get_skip_windows", "resolve_mal_id", "resolve_mal_id_by_title", "detect_silence_intervals"]
+commands.allow = ["fetch_skip_windows", "set_skip_windows", "get_skip_windows", "resolve_mal_id", "resolve_mal_id_by_title", "detect_silence_intervals", "submit_skip_time", "vote_skip_time"]
 
 # ── Phase 4: OpenSubtitles ────────────────────────────────────────────────────
 [[permission]]

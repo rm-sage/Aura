@@ -73,6 +73,12 @@ raw-window-handle = "0.5"
 # features) since hash throughput isn't on any hot path here.
 sha2 = "0.10"
 hex = "0.4"
+# UUID v4 — used by aniskip.rs to mint the per-install submitterId
+# AniSkip wants stamped on every POST /v2/skip-times submission. The
+# id is persisted to <app_data>/aniskip-submitter-id.txt and reused
+# across sessions so AniSkip's anti-spam dedupe sees a stable
+# identity per Aura install.
+uuid = { version = "1", features = ["v4"] }
 
 # Crash & error reporting (opt-in via consent dialog at first run; see
 # CrashReportingConsent.tsx + crash_reporting.rs).

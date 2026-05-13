@@ -1898,6 +1898,8 @@ pub fn run() {
             // ── AniSkip (anime OP/ED skip-time fetcher) ──
             aniskip::fetch_skip_windows,
             aniskip::set_skip_windows,
+            aniskip::submit_skip_time,
+            aniskip::vote_skip_time,
             aniskip::get_skip_windows,
             aniskip::resolve_mal_id,
             aniskip::resolve_mal_id_by_title,

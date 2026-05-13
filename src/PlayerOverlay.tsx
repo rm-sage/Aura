@@ -23,6 +23,7 @@ import { setTitleState } from "./titleState";
 import { pickDefaultAudio, type ScoringMeta } from "./audioScoring";
 import { prettyBinding } from "./useKeybindings";
 import { loadAuraSettings, saveAuraSettings } from "./auraSettings";
+import AniSkipMenu from "./AniSkipMenu";
 
 // ---------------------------------------------------------------------------
 // Menu-open tracker — child menus (TrackMenu, SpeedMenu, ShaderPicker,
@@ -1121,6 +1122,13 @@ export default function PlayerOverlay({
   const displayTime = scrubValue ?? time;
   const progress = duration > 0 ? (displayTime / duration) * 100 : 0;
 
+  // AniSkip OP/ED/recap windows for the current episode. Surfaced as
+  // amber bands on the scrubber so the user can see where skip
+  // boundaries land before crossing them. Same hook used elsewhere
+  // for the SkipWindowButton + auto-skip logic — single source of
+  // truth, no duplicate fetch.
+  const skipWindowsForScrub = useSkipWindows();
+
   // Track lists — polled every 500 ms because we trimmed `track-list /
   // aid / sid` out of the property-observer set in Phase 6.0.2 (those
   // formats broke the entire observation channel on this libmpv build).
@@ -1867,6 +1875,7 @@ export default function PlayerOverlay({
                 setScrubValue(null);
               }}
               progressPct={progress}
+              segments={skipWindowsForScrub}
             />
           </div>
 
@@ -2119,6 +2128,10 @@ export default function PlayerOverlay({
             <MoreMenu
               streamUrl={streamUrl}
               onRestart={() => seekAbsolute(0)}
+              activeTarget={activeTarget}
+              time={time}
+              duration={duration}
+              skipWindows={skipWindowsForScrub}
             />
           </div>
         </div>
@@ -2149,7 +2162,7 @@ export default function PlayerOverlay({
 // ---------------------------------------------------------------------------
 
 function Scrubber({
-  value, max, progressPct, onScrubStart, onScrub, onScrubEnd,
+  value, max, progressPct, onScrubStart, onScrub, onScrubEnd, segments,
 }: {
   value: number;
   max: number;
@@ -2157,10 +2170,22 @@ function Scrubber({
   onScrubStart: () => void;
   onScrub: (v: number) => void;
   onScrubEnd: (v: number) => void;
+  /** AniSkip OP/ED/recap windows for the current episode. Rendered as
+   *  amber bands overlaid on the scrub fill so the user can see where
+   *  skip boundaries land. Hovering shows the kind + timestamps. */
+  segments?: AuraSkipWindow[];
 }) {
   const trackRef = useRef<HTMLDivElement>(null);
   const [dragging, setDragging] = useState(false);
   const [hoverPct, setHoverPct] = useState<number | null>(null);
+  // Hovered segment + cursor x in track-relative px so the tooltip
+  // can anchor near the pointer instead of jumping band-to-band on
+  // wide windows. Updated on segment-band pointer move; cleared on
+  // band leave AND on full-track leave.
+  const [hoveredSegment, setHoveredSegment] = useState<{
+    seg: AuraSkipWindow;
+    leftPct: number;
+  } | null>(null);
 
   const pctFromEvent = useCallback((clientX: number): number => {
     const el = trackRef.current;
@@ -2190,13 +2215,49 @@ function Scrubber({
     onScrubEnd(pctFromEvent(e.clientX) * max);
   };
 
+  // Format mm:ss / h:mm:ss for the tooltip timestamps.
+  const fmtTime = (sec: number): string => {
+    const s = Math.max(0, Math.floor(sec));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const r = s % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
+    return `${m}:${String(r).padStart(2, "0")}`;
+  };
+
+  // Filter segments to those that are within-duration AND have a
+  // sane width — guards against malformed AniSkip rows (start > end,
+  // negative timestamps) that would otherwise render as garbled
+  // bands.
+  const drawableSegments = useMemo(() => {
+    if (!segments || max <= 0) return [];
+    return segments
+      .filter((s) => s.end > s.start && s.end > 0 && s.start < max)
+      .map((s) => ({
+        ...s,
+        leftPct:  Math.max(0,  (s.start / max) * 100),
+        widthPct: Math.min(100, ((s.end - s.start) / max) * 100),
+      }))
+      .filter((s) => s.widthPct > 0.05);
+  }, [segments, max]);
+
+  // Band colours — amber regardless of mode (the user wants a
+  // single recognisable colour); slightly higher opacity when auto-
+  // skip is armed so the user knows the bar will fire automatically
+  // there. Mounted ABOVE the gradient scrub fill so the band stays
+  // visible while the fill animates underneath.
+  const bandClassFor = (auto: boolean) =>
+    auto
+      ? "bg-amber-400/85 shadow-[0_0_6px_rgba(251,191,36,0.55)]"
+      : "bg-amber-400/65";
+
   return (
     <div
       ref={trackRef}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
-      onPointerLeave={() => setHoverPct(null)}
+      onPointerLeave={() => { setHoverPct(null); setHoveredSegment(null); }}
       className="relative h-6 flex items-center group cursor-pointer select-none"
     >
       {/* Track (background) */}
@@ -2218,6 +2279,25 @@ function Scrubber({
         style={{ left: 0, width: `${progressPct}%` }}
       />
 
+      {/* AniSkip segment bands — rendered above the fill so the
+          amber stands out against the green gradient. Each band is
+          a pointer-events-auto sliver that captures hover so the
+          tooltip can anchor; the underlying scrub click still works
+          because the band sits on a SEPARATE pointer handler that
+          stops propagation only for hover state updates. Pointer
+          down still bubbles to the scrubber's onPointerDown so
+          clicking a band seeks into it. */}
+      {drawableSegments.map((s, i) => (
+        <div
+          key={`${s.type}:${s.start}:${i}`}
+          aria-hidden
+          onPointerEnter={() => setHoveredSegment({ seg: s, leftPct: s.leftPct + s.widthPct / 2 })}
+          onPointerLeave={() => setHoveredSegment((h) => h && h.seg === s ? null : h)}
+          className={`absolute h-1 rounded-full group-hover:h-1.5 transition-all duration-150 ${bandClassFor(s.auto)}`}
+          style={{ left: `${s.leftPct}%`, width: `${s.widthPct}%` }}
+        />
+      ))}
+
       {/* Thumb */}
       <div
         aria-hidden
@@ -2229,6 +2309,42 @@ function Scrubber({
           opacity: dragging || progressPct > 0 ? 1 : 0,
         }}
       />
+
+      {/* Segment hover tooltip — anchored above the band's centre
+          so it reads as part of that specific window. Glass-style
+          panel with the kind + start/end + duration. The aniskip
+          source line is included so the user can tell community-
+          submitted from local-chapter-detected windows at a glance. */}
+      {hoveredSegment && (
+        <div
+          className="absolute bottom-full mb-3 pointer-events-none
+                     aura-glass-menu rounded-md px-3 py-2 text-[11.5px]
+                     min-w-[160px] z-10"
+          style={{
+            left: `${hoveredSegment.leftPct}%`,
+            transform: "translateX(-50%)",
+          }}
+        >
+          <div className="text-white font-semibold tracking-wide">
+            {skipKindLabel(hoveredSegment.seg.type)}
+            {hoveredSegment.seg.type === "mixed-op" && (
+              <span className="text-white/45 font-normal ml-1.5">(mixed)</span>
+            )}
+          </div>
+          <div className="text-white/75 font-mono tabular-nums mt-0.5">
+            {fmtTime(hoveredSegment.seg.start)} – {fmtTime(hoveredSegment.seg.end)}
+          </div>
+          <div className="text-white/45 text-[10px] mt-0.5">
+            {(hoveredSegment.seg.end - hoveredSegment.seg.start).toFixed(1)}s
+            {hoveredSegment.seg.source && hoveredSegment.seg.source !== "aniskip" && (
+              <span className="ml-2">· source: {hoveredSegment.seg.source}</span>
+            )}
+            {hoveredSegment.seg.auto && (
+              <span className="ml-2 text-amber-300/80">· auto-skip</span>
+            )}
+          </div>
+        </div>
+      )}
 
       <span className="sr-only">{Math.round(value)} of {Math.round(max)} seconds</span>
     </div>
@@ -2649,12 +2765,17 @@ function TrackMenu({
 // ---------------------------------------------------------------------------
 
 function MoreMenu({
-  streamUrl, onRestart,
+  streamUrl, onRestart, activeTarget, time, duration, skipWindows,
 }: {
   streamUrl: string | null;
   onRestart: () => void;
+  activeTarget: ActiveScrobbleTarget | null;
+  time: number;
+  duration: number;
+  skipWindows: AuraSkipWindow[];
 }) {
   const [open, setOpen] = useState(false);
+  const [aniskipOpen, setAniskipOpen] = useState(false);
   const [flash, setFlash] = useState<string | null>(null);
   // Mirror loudnessNormalization from auraSettings. Read fresh on mount
   // + every aura:settings-changed so flipping in Settings updates the
@@ -2721,11 +2842,30 @@ function MoreMenu({
         </button>
       </Tooltip>
 
+      {/* AniSkip submit / vote / mode-toggle popover. Rendered as a
+          sibling of the MoreMenu list so it can stay open even when the
+          parent menu collapses (and so its own click handlers don't
+          collide with MoreMenu's outside-click handler). */}
+      <AniSkipMenu
+        open={aniskipOpen}
+        onClose={() => setAniskipOpen(false)}
+        activeTarget={activeTarget}
+        time={time}
+        duration={duration}
+        windows={skipWindows}
+      />
+
       {open && (
         <div className="absolute bottom-full mb-2 right-0 min-w-[240px]
                         rounded-xl py-1.5 z-50
                         aura-glass-menu
                         shadow-glass-edge">
+          <MoreItem
+            icon={<MoreIcon />}
+            label="AniSkip segments"
+            onClick={() => { setAniskipOpen(true); setOpen(false); }}
+          />
+          <div className="my-1 mx-3 h-px bg-white/8" />
           <MoreItem icon={<RestartIcon />}  label="Restart from beginning" onClick={() => { onRestart(); setOpen(false); }} />
           <div className="my-1 mx-3 h-px bg-white/8" />
           <MoreItem
@@ -2906,6 +3046,10 @@ interface AuraSkipWindow {
   end:    number;
   source: string;
   auto:   boolean;
+  /** AniSkip per-row identifier — present only when source ===
+   *  "aniskip". Threaded through so the AniSkipMenu can call
+   *  vote_skip_time without re-fetching. */
+  skip_id?: string | null;
 }
 
 /** Reactive skip-windows store. The Rust side owns the canonical

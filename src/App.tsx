@@ -57,7 +57,7 @@ import { loadAuraSettings } from "./auraSettings";
 
 interface AniSkipResult {
   found: boolean;
-  windows: { kind: string; start: number; end: number; source: string }[];
+  windows: { kind: string; start: number; end: number; source: string; skip_id?: string | null }[];
 }
 
 // 30-day cache for AniSkip windows. Once an episode has aired, its
@@ -1093,11 +1093,12 @@ export default function App() {
               const prepared = result.windows
                 .filter((w) => modeFor(w.kind) !== "off")
                 .map((w) => ({
-                  type:   w.kind,
-                  start:  w.start,
-                  end:    w.end,
-                  source: w.source,
-                  auto:   modeFor(w.kind) === "auto",
+                  type:    w.kind,
+                  start:   w.start,
+                  end:     w.end,
+                  source:  w.source,
+                  auto:    modeFor(w.kind) === "auto",
+                  skip_id: w.skip_id ?? null,
                 }));
               if (prepared.length > 0) {
                 await invoke("set_skip_windows", { payload: { windows: prepared } });
