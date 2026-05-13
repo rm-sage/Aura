@@ -102,6 +102,14 @@ interface ContinueWatchingCardProps {
 // Manual marks always win, in either direction.
 // ---------------------------------------------------------------------------
 
+/** Past this episode count the per-episode segments become slivers
+ *  too thin to visually parse — at 50 eps on a typical CW tile each
+ *  segment renders at ~3-4 px wide, and the gap-between-segments
+ *  eats most of that. Switch to a continuous gradient bar at this
+ *  threshold; everything below remains segmented since each segment
+ *  is wide enough to communicate per-episode state cleanly. */
+const SEGMENTED_BAR_EPISODE_CAP = 50;
+
 function SegmentedSeasonBar({
   episodes, currentId,
 }: {
@@ -117,6 +125,14 @@ function SegmentedSeasonBar({
   void useManualWatchedVersion();
 
   if (episodes.length === 0) return null;
+
+  // Beyond the segment-count cap, hand off to the continuous bar.
+  // Avoids visual mush from 60+ slivers on long-runners (One Piece,
+  // Naruto, Detective Conan).
+  if (episodes.length > SEGMENTED_BAR_EPISODE_CAP) {
+    return <ContinuousProgressBar episodes={episodes} currentId={currentId} />;
+  }
+
   const currentIdx = currentId
     ? episodes.findIndex((v) => v.id === currentId)
     : -1;
@@ -144,6 +160,85 @@ function SegmentedSeasonBar({
         }
         return <div key={ep.id} className={`flex-1 h-full ${cls}`} />;
       })}
+    </div>
+  );
+}
+
+/** Long-runner alternative to SegmentedSeasonBar. Renders one continuous
+ *  bar with a green-to-amber gradient ending at the in-progress
+ *  episode's position. Watched-only ranges (no current in-progress) get
+ *  a solid green fill; the gradient is only painted when there's a real
+ *  "you are here" position to mark. The unwatched remainder uses the
+ *  same white/15 background colour the segmented version's empty
+ *  segments use, so the visual language stays consistent.
+ *
+ *  Position math walks the episode list once to find the rightmost
+ *  "engaged" episode (watched / in-progress / implied-watched). The
+ *  gradient's amber tip sits at the in-progress episode's right edge
+ *  when one exists — that's the "yellow at the end of the green bar"
+ *  the user asked for. */
+function ContinuousProgressBar({
+  episodes, currentId,
+}: {
+  episodes: VideoEntry[];
+  currentId: string | null;
+}) {
+  void useManualWatchedVersion();
+  if (episodes.length === 0) return null;
+  const total = episodes.length;
+  const currentIdx = currentId
+    ? episodes.findIndex((v) => v.id === currentId)
+    : -1;
+
+  // Walk forward — for each episode, count it as "engaged" when it's
+  // manually watched, manually in-progress, OR earlier than the
+  // current-resume index (implied watched, mirrors the segmented
+  // bar's tinted-emerald slot). engagedThroughIdx tracks the
+  // rightmost engaged episode; the bar fills up to (idx + 1) / total.
+  let engagedThroughIdx = -1;
+  for (let i = 0; i < total; i += 1) {
+    const manual = getManualWatchedState(episodes[i].id);
+    const engaged =
+      manual === "watched"
+      || manual === "in-progress"
+      || (currentIdx >= 0 && i <= currentIdx);
+    if (engaged) engagedThroughIdx = i;
+  }
+  if (engagedThroughIdx < 0) {
+    // Nothing engaged yet — render the empty track only so the bar
+    // height stays consistent with the segmented version.
+    return (
+      <div className="absolute left-2 right-2 bottom-1 h-[5px] rounded-full overflow-hidden bg-white/15" />
+    );
+  }
+
+  // Fill width in percent — round to one decimal to avoid sub-pixel
+  // jitter on resize while still tracking per-episode granularity on
+  // shows up to ~1000 eps.
+  const fillPct = Math.min(100, ((engagedThroughIdx + 1) / total) * 100);
+  // Gradient stop where amber begins. The amber band represents
+  // "in-progress" and sits at the rightmost ~12% of the green fill —
+  // enough to read as a distinct yellow tip without looking like a
+  // separate segment. When there's no in-progress (every engaged
+  // episode is manually watched, no resume position), use a flat
+  // green so the bar reads "fully consumed" rather than "still
+  // watching".
+  const hasInProgress = currentIdx >= 0
+    || episodes.some((ep) => getManualWatchedState(ep.id) === "in-progress");
+  const fillStyle: React.CSSProperties = hasInProgress
+    ? {
+        width: `${fillPct}%`,
+        background:
+          "linear-gradient(to right, rgb(52,211,153) 0%, rgb(52,211,153) 88%, rgb(251,191,36) 100%)",
+      }
+    : {
+        width: `${fillPct}%`,
+        background: "rgb(52,211,153)",
+      };
+
+  return (
+    <div className="absolute left-2 right-2 bottom-1 h-[5px] rounded-full overflow-hidden bg-white/15">
+      <div aria-hidden className="h-full" style={fillStyle} />
     </div>
   );
 }
