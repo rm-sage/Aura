@@ -40,10 +40,12 @@ import type { ReleaseAired } from "./releaseSearch";
 //     truly first scan.
 //
 // Periodic refresh: in addition to reacting to store version bumps,
-// the scanner refreshes signals on a 7-minute interval while the app
-// is open (§6.0 "5–10 min recommended"). The cloud serves these from
-// cache cheaply; the §10.1 batch-ETag short-circuit will land later
-// to reduce the bandwidth further.
+// the scanner refreshes signals on a 5-minute interval while the app
+// is open (§6.0 "5–10 min recommended" — bottom of the band per user
+// preference, so newly-aired episodes surface as fast as the cloud
+// poller can confirm them). The cloud serves these from cache
+// cheaply; the §10.1 batch-ETag short-circuit will land later to
+// reduce the bandwidth further.
 //
 // Stream-availability gate: when `notifyOnlyWithStreams` is on, the
 // scanner records new episodes as "pending stream check" instead of
@@ -79,7 +81,7 @@ const SCANNER_VERSION_KEY = "aura:notifications:scanner-version";
 const CURRENT_SCANNER_VERSION = "3";
 const STREAM_AVAILABILITY_KEY = "aura:notifications:stream-availability";
 const STREAM_AVAILABILITY_TTL_MS = 12 * 60 * 60 * 1000;
-const PERIODIC_REFRESH_MS = 7 * 60 * 1000;
+const PERIODIC_REFRESH_MS = 5 * 60 * 1000;
 const STREAM_RECHECK_MS = 15 * 60 * 1000;
 const PENDING_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 
