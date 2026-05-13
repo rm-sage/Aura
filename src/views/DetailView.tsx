@@ -178,6 +178,68 @@ const ExternalIcon = () => (
 
 type PanelMode = "episodes" | "streams";
 
+/** Resolve a (possibly stale-shape) episode id to the matching VideoEntry
+ *  in the current `videos` array. Three layers of matching cover the
+ *  shapes Aura library state may carry after addon migrations:
+ *
+ *    1. Direct id equality — the current path.
+ *    2. (season, episode) tuple match for tt-prefixed ids whose shape
+ *       still matches AIOMetadata's emitted ids (`tt…:S:E`) but whose
+ *       VALUES no longer match because cour-aggregation changed the
+ *       canonical id. Example: pre-cour-split `tt…:2:6` against a new
+ *       `kitsu:49240:6` with `v.season=2`, `v.episode=6` — direct
+ *       match fails, tuple match succeeds.
+ *    3. Absolute-episode fallback for pre-cour-split merged ids
+ *       (`tt…:1:34` where 34 is the absolute episode count, not
+ *       cour-relative). Walks the main-run videos in `(season,
+ *       episode)` order and returns the Nth entry. Imperfect — for
+ *       users with shape-2 state-ids whose tuple match fails, this
+ *       returns a different episode — but the next playback writes
+ *       a current-shape id so the heuristic only matters during the
+ *       single migration window per library entry.
+ *
+ *  Returns null when nothing plausible matches. Callers should treat
+ *  that as "no resume hint" and fall through to the first-episode
+ *  default. */
+function resolveResumeEpisode(
+  targetId: string | null | undefined,
+  videos: VideoEntry[] | null | undefined,
+): VideoEntry | null {
+  if (!targetId || !videos || videos.length === 0) return null;
+  // Direct.
+  const direct = videos.find((v) => v.id === targetId);
+  if (direct) return direct;
+  // Tuple — tt-prefixed only since anime-prefix ids have a provider
+  // show id in their middle slot, not a season number.
+  const parts = targetId.split(":");
+  if (parts.length >= 3 && targetId.startsWith("tt")) {
+    const season = Number(parts[parts.length - 2]);
+    const episode = Number(parts[parts.length - 1]);
+    if (Number.isFinite(season) && Number.isFinite(episode)) {
+      const tuple = videos.find(
+        (v) => (v.season ?? 0) === season && (v.episode ?? 0) === episode,
+      );
+      if (tuple) return tuple;
+      // Absolute fallback — pre-cour-split shape where season is the
+      // collapsed "1" and episode is the absolute count. Walk the
+      // main-run list in canonical (season, episode) order and pick
+      // the Nth entry (1-indexed).
+      const mainRun = videos
+        .filter((v) => (v.season ?? 0) > 0)
+        .slice()
+        .sort((a, b) => {
+          const sa = a.season ?? 0;
+          const sb = b.season ?? 0;
+          if (sa !== sb) return sa - sb;
+          return (a.episode ?? 0) - (b.episode ?? 0);
+        });
+      const absolute = mainRun[episode - 1];
+      if (absolute) return absolute;
+    }
+  }
+  return null;
+}
+
 export default function DetailView(props: Props) {
   return (
     <ErrorBoundary scope="DetailView">
@@ -618,11 +680,18 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
   // active episode yet, snap the active episode to the resume one. This
   // makes the streams panel "Now playing: S01E05" caption render properly
   // and the metadata-display logic light up downstream.
+  //
+  // Routed through resolveResumeEpisode so a stale-shape id from the
+  // library state (e.g. `tt22248376:1:34` written before cour
+  // aggregation) still anchors to the right VideoEntry in the new
+  // multi-cour shape. Without this fallback the streams pane caption
+  // stayed blank for users whose CW entries pre-date the AIOMetadata
+  // patch.
   useEffect(() => {
     if (activeVideo) return;
     if (!isEpisodic) return;
     if (!resumeVideoId) return;
-    const v = detail?.videos?.find((x) => x.id === resumeVideoId) ?? null;
+    const v = resolveResumeEpisode(resumeVideoId, detail?.videos);
     if (v) setActiveVideo(v);
   }, [detail?.videos, resumeVideoId, isEpisodic, activeVideo]);
 
@@ -2355,11 +2424,18 @@ function EpisodesPanel({
   // THAT video over the default "first non-special season" pick — the
   // user just exited playback on it; landing on a different season
   // would defeat the whole point.
-  const targetSeason = useMemo(() => {
-    if (!scrollToVideoId) return null;
-    const v = videos.find((x) => x.id === scrollToVideoId);
-    return v?.season ?? null;
-  }, [videos, scrollToVideoId]);
+  //
+  // Routed through resolveResumeEpisode so stale-shape ids (legacy
+  // library entries written before cour aggregation) still anchor to
+  // the right cour. The resolved id is what the scroll DOM query
+  // actually looks up below, so this matches the row in the rendered
+  // list too.
+  const resolvedScrollTarget = useMemo(
+    () => resolveResumeEpisode(scrollToVideoId, videos),
+    [videos, scrollToVideoId],
+  );
+  const targetSeason = resolvedScrollTarget?.season ?? null;
+  const resolvedScrollId = resolvedScrollTarget?.id ?? null;
 
   const [season, setSeason] = useState<number>(() => {
     if (targetSeason != null) return targetSeason;
@@ -2423,14 +2499,21 @@ function EpisodesPanel({
   // appears a moment later.
   const listRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    if (!scrollToVideoId) return;
+    // Prefer the resolved id (handles stale-shape library entries via
+    // the tuple / absolute fallback in resolveResumeEpisode). Falls
+    // back to scrollToVideoId when no resolution is available — that
+    // path is unlikely to find a row, but it preserves the original
+    // behavior for current-shape ids the helper hasn't yet resolved
+    // (e.g. before `videos` arrived).
+    const targetId = resolvedScrollId ?? scrollToVideoId;
+    if (!targetId) return;
     const list = listRef.current;
     if (!list) return;
     let done = false;
     const tryScroll = () => {
       if (done) return true;
       const row = list.querySelector<HTMLElement>(
-        `[data-episode-id="${CSS.escape(scrollToVideoId)}"]`,
+        `[data-episode-id="${CSS.escape(targetId)}"]`,
       );
       if (!row) return false;
       // scrollTop math: anchor the row to the top of the scroll viewport.
@@ -2459,7 +2542,7 @@ function EpisodesPanel({
       clearInterval(interval);
       clearTimeout(stop);
     };
-  }, [scrollToVideoId, season, inSeason.length, onScrollHandled]);
+  }, [scrollToVideoId, resolvedScrollId, season, inSeason.length, onScrollHandled]);
 
   return (
     <>
