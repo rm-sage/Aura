@@ -46,7 +46,7 @@ const PosterCard = memo(function PosterCard({ meta }: { meta: MetaPreview }) {
       </div>
 
       <div className="px-0.5">
-        <p className="text-white/85 text-sm font-medium leading-tight line-clamp-2 text-center">{meta.name}</p>
+        <p className="text-white/85 text-sm font-medium leading-tight line-clamp-2 text-center" title={meta.name}>{meta.name}</p>
         {meta.release_info && (
           <p className="text-white/40 text-xs mt-0.5 text-center">{meta.release_info}</p>
         )}

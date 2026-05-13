@@ -143,6 +143,14 @@ export default function AniSkipMenu({
     setMalResolving(true);
     setMalId(null);
     (async () => {
+      // Each step logs its outcome so the DevConsole can tell us
+      // exactly which path failed when "MAL id not resolvable"
+      // appears. Filter `[aniskip]` to follow the chain.
+      console.info(
+        `[aniskip] menu resolving MAL for id=${activeTarget.id} ` +
+        `series_id=${activeTarget.series_id} season=${activeTarget.season} ` +
+        `episode_num=${activeTarget.episode_num}`,
+      );
       // Step 1: anime-prefix video id (kitsu:N / mal:N / anidb:N /
       // anilist:N). AIOMetadata's cour-aggregation patch encodes the
       // cour-specific provider id directly, so this is the most
@@ -153,6 +161,7 @@ export default function AniSkipMenu({
         const showId = Number(segs[1]);
         if (Number.isFinite(showId)) {
           if (provider === "mal") {
+            console.info(`[aniskip] step 1: mal: prefix → ${showId}`);
             if (!cancelled) { setMalId(showId); setMalResolving(false); }
             return;
           }
@@ -161,23 +170,27 @@ export default function AniSkipMenu({
               const m = await invoke<number | null>("resolve_mal_id", {
                 source: provider, id: showId,
               });
+              console.info(`[aniskip] step 1: ${provider}=${showId} → resolve_mal_id → ${m}`);
               if (typeof m === "number") {
                 if (!cancelled) { setMalId(m); setMalResolving(false); }
                 return;
               }
-            } catch {
+            } catch (e) {
+              console.warn(`[aniskip] step 1: ${provider}=${showId} → resolve_mal_id threw: ${e}`);
               // fall through to the cour-aware tt-style fallback
             }
           }
         }
+      } else {
+        console.info(`[aniskip] step 1: skipped (id ${activeTarget.id} not a 3-segment shape)`);
       }
       // Step 2: tt-style fallback using the series-root IMDb id plus
       // the cour number. resolve_cour_mal_id walks the Fribb anime-id
       // map, picks the per-cour row by `season - 1` index, returns
       // its `mal_id`. Covers cour 2+ episodes whose video id is
-      // tt-prefixed (e.g. `tt22248376:2:1` for Frieren cour 2 ep 1
-      // when AIOMetadata's wire format still carries the IMDb shape
-      // for some entries).
+      // tt-prefixed (e.g. `tt22248376:2:1`) AND the case where step 1's
+      // yuna.moe lookup returns null because the cour-specific
+      // kitsu id isn't in yuna.moe's dataset yet (recent anime).
       const seriesImdb = activeTarget.series_id && activeTarget.series_id.startsWith("tt")
         ? activeTarget.series_id
         : (activeTarget.id.startsWith("tt") ? activeTarget.id.split(":")[0] : null);
@@ -187,15 +200,45 @@ export default function AniSkipMenu({
             imdbId: seriesImdb,
             season: activeTarget.season ?? null,
           });
+          console.info(
+            `[aniskip] step 2: resolve_cour_mal_id(${seriesImdb}, season=${activeTarget.season}) → ${m}`,
+          );
+          if (typeof m === "number") {
+            if (!cancelled) { setMalId(m); setMalResolving(false); }
+            return;
+          }
+        } catch (e) {
+          console.warn(`[aniskip] step 2: resolve_cour_mal_id threw: ${e}`);
+        }
+      } else {
+        console.info(`[aniskip] step 2: skipped (no tt-prefixed series_id)`);
+      }
+      // Step 3: title-based Jikan search as last resort. Slower (one
+      // HTTP round-trip per call) but covers shows Fribb hasn't
+      // indexed AND whose video id provider isn't in yuna.moe. For
+      // multi-cour anime this returns the cour 1 MAL — wrong for
+      // cour 2 submissions, so we only fire it for S1 episodes where
+      // the cour-root MAL IS the right answer.
+      const season = activeTarget.season ?? 1;
+      if (season <= 1 && activeTarget.name) {
+        try {
+          const m = await invoke<number | null>("resolve_mal_id_by_title", {
+            title: activeTarget.name,
+            year: null,
+          });
+          console.info(`[aniskip] step 3: resolve_mal_id_by_title("${activeTarget.name}") → ${m}`);
           if (!cancelled) {
             setMalId(typeof m === "number" ? m : null);
             setMalResolving(false);
           }
           return;
-        } catch {
-          // fall through
+        } catch (e) {
+          console.warn(`[aniskip] step 3: resolve_mal_id_by_title threw: ${e}`);
         }
+      } else {
+        console.info(`[aniskip] step 3: skipped (season=${season} > 1, would resolve cour 1)`);
       }
+      console.warn(`[aniskip] all resolution steps failed — submission unavailable`);
       if (!cancelled) { setMalId(null); setMalResolving(false); }
     })();
     return () => { cancelled = true; };

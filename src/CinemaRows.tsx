@@ -575,7 +575,10 @@ const ContinueWatchingCard = memo(function ContinueWatchingCard(
             </div>
           )}
         </div>
-        <p className="text-white/90 text-[17px] font-medium mt-2 leading-tight line-clamp-1 text-center">
+        <p
+          className="text-white/90 text-[17px] font-medium mt-2 leading-tight line-clamp-1 text-center"
+          title={item.name}
+        >
           {item.name}
           <CWTitleIndicator metaId={item.id} mediaType={item.media_type} />
         </p>
@@ -742,7 +745,16 @@ export const CatalogCard = memo(function CatalogCard({ meta, onSelect }: Catalog
           </div>
         )}
       </div>
-      <p className="text-white/90 text-[19px] font-medium leading-tight line-clamp-2 text-center">
+      {/* Native browser tooltip surfaces the full title when the
+          rendered text gets clipped by line-clamp-2 — common for
+          sequel-heavy anime ("Demon Slayer: Kimetsu no Yaiba — Infinity
+          Castle (Movie 2)") and long localized show names. Cheap
+          universal solution; no extra components / no per-cell event
+          handlers. Same pattern wired into CW + Library tiles below. */}
+      <p
+        className="text-white/90 text-[19px] font-medium leading-tight line-clamp-2 text-center"
+        title={meta.name}
+      >
         {meta.name}
       </p>
       {meta.release_info && (
