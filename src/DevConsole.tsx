@@ -437,33 +437,44 @@ const COMMANDS: DevCommand[] = [
         return;
       }
       const SCANNER_STATE_KEY = "aura:notifications:scanner-state";
-      // Step 1 — clear the scanner's seen-episodes record for this id
-      // so the next scan treats every video in the addon's feed as
-      // "first contact" and re-evaluates against the recent-release
-      // window. The localStorage shape is documented in
-      // NotificationsScanner.tsx.
-      let cleared = false;
+      // Step 1 — seed the scanner state so the next scan takes the
+      // *diff* branch (not the cold-install first-scan branch which
+      // silently seeds without firing). Specifically:
+      //   • lastChecked = 1   → > 0, so isFirstScan = false
+      //   • seenVideoIds = [] → every recent_aired ep counts as "new"
+      //   • lastNotifiedAt = 0 → every ep passes the watermark check
+      //   • pendingStreamCheck = undefined → start fresh
+      // The scanner will then evaluate the cloud's recent_aired list
+      // and fire on any episode the user hasn't already played past
+      // in their library (the librarySaysSeen gate still applies; see
+      // the warning emitted below).
+      const SEEDED_STATE = {
+        lastChecked: 1,
+        seenVideoIds: [],
+        lastNotifiedAt: 0,
+      };
+      let seeded = false;
       try {
         const raw = localStorage.getItem(SCANNER_STATE_KEY);
-        if (raw) {
-          const parsed = JSON.parse(raw) as Record<string, { lastChecked: number; seenVideoIds: string[] }>;
-          if (parsed && typeof parsed === "object" && parsed[imdbId]) {
-            delete parsed[imdbId];
-            localStorage.setItem(SCANNER_STATE_KEY, JSON.stringify(parsed));
-            cleared = true;
-          }
+        const parsed = raw
+          ? (JSON.parse(raw) as Record<string, unknown>)
+          : ({} as Record<string, unknown>);
+        if (parsed && typeof parsed === "object") {
+          parsed[imdbId] = SEEDED_STATE;
+          localStorage.setItem(SCANNER_STATE_KEY, JSON.stringify(parsed));
+          seeded = true;
         }
       } catch (e) {
         ctx.push({
           ts: Date.now(), level: "warn", source: "console",
-          message: `notifytest: failed to clear scanner state — ${String(e)}`,
+          message: `notifytest: failed to seed scanner state — ${String(e)}`,
         });
       }
       ctx.push({
         ts: Date.now(), level: "info", source: "console",
-        message: cleared
-          ? `notifytest: cleared scanner state for ${imdbId}`
-          : `notifytest: no prior scanner state for ${imdbId} (will treat as first scan)`,
+        message: seeded
+          ? `notifytest: seeded scanner state for ${imdbId} (diff branch armed; librarySaysSeen still applies)`
+          : `notifytest: could not seed scanner state for ${imdbId}`,
       });
 
       // Step 2 — fetch the cloud release signal so we can log what
@@ -511,9 +522,11 @@ const COMMANDS: DevCommand[] = [
       ctx.push({
         ts: Date.now(), level: "info", source: "console",
         message:
-          "If nothing fires: (a) confirm the cloud signal above shows a last_aired the scanner hasn't seen, " +
-          "(b) confirm the title is in your library AND tt-prefixed (cloud is imdb-keyed; kitsu/mal/anidb library entries won't fire), " +
-          "(c) confirm `releaseSearchEnabled` is on in Settings — Cloud Sync section.",
+          "If nothing fires: (a) confirm the title is in your library AND tt-prefixed (cloud is imdb-keyed), " +
+          "(b) confirm `releaseSearchEnabled` is on in Settings → Cloud Sync, " +
+          "(c) librarySaysSeen suppresses the fire when your library `state.video_id` is at/past the cloud's last_aired episode — " +
+          "for an end-to-end test, pick an id whose latest cloud episode is AHEAD of where you've watched, " +
+          "or temporarily mark the show as unwatched.",
       });
     },
   },
