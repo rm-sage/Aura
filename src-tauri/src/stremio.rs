@@ -1827,6 +1827,29 @@ pub async fn fetch_meta_detail(
     let voice_actors = string_array_any(meta, &["voiceActors", "voice_actors", "voiceCast"], 20, 64);
     let studios      = string_array_any(meta, &["studios", "studio", "studio_names"], 20, 64);
 
+    // Diagnostic — surfaces what fields the addon actually emitted when
+    // BOTH cast and voice_actors come back empty. Logs the top-level
+    // meta keys plus any keys under `app_extras` so a "no cast on the
+    // detail page" report can be triaged against the wire shape
+    // without instrumenting further. Only fires on the empty-cast path
+    // (no log noise on well-tagged metas).
+    if cast.is_empty() && voice_actors.is_empty() {
+        let mut top_keys: Vec<String> = meta.as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        top_keys.sort();
+        let app_extras_keys: Vec<String> = meta.get("app_extras")
+            .and_then(|v| v.as_object())
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        let id = meta.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        crate::devlog!(
+            info, "meta",
+            "build_meta_detail({}): empty cast/voice_actors. top keys: {:?}; app_extras keys: {:?}",
+            id, top_keys, app_extras_keys,
+        );
+    }
+
     // Multi-source ratings: addons sometimes ship `imdbRating`, `imdb_rating`,
     // `kpRating`, `malScore`, plus a structured `ratings` array of
     // `{source, value}`. We collect both shapes into a single list so the
