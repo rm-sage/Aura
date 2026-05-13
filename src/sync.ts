@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { invoke } from "@tauri-apps/api/core";
-import { loadAuraSettings, saveAuraSettings, type AuraSettings, DEFAULT_AURA_SETTINGS } from "./auraSettings";
+import { loadAuraSettings, saveAuraSettings, getSettingsUpdatedAt, setSettingsUpdatedAt, bumpSettingsUpdatedAt, type AuraSettings, DEFAULT_AURA_SETTINGS } from "./auraSettings";
 
 // ---------------------------------------------------------------------------
 // Aura Cloud sync orchestrator (frontend)
@@ -414,15 +414,33 @@ async function readSettingsBlob(): Promise<SettingsSyncBlob> {
     readBackendSettings(),
     Promise.resolve(loadAuraSettings()),
   ]);
-  return { backend, frontend, updated_at: Math.floor(Date.now() / 1000) };
+  // updated_at is the persisted "last user-modified locally"
+  // timestamp, NOT Date.now(). Stamping it on every read meant the
+  // mergeSettings last-writer-wins comparison always picked local
+  // (NOW > whatever the server pushed earlier), so the cloud's
+  // settings were pulled, merged, then silently discarded. Bumps
+  // happen in saveAuraSettings (frontend) and in the settings-
+  // changed listener installed by installSyncTriggers (backend).
+  return { backend, frontend, updated_at: getSettingsUpdatedAt() };
 }
 
 async function writeSettingsBlob(blob: Partial<SettingsSyncBlob>): Promise<void> {
   if (blob.frontend) {
-    saveAuraSettings({ ...DEFAULT_AURA_SETTINGS, ...blob.frontend });
+    // fromCloud: true suppresses the bumpSettingsUpdatedAt() inside
+    // saveAuraSettings — we want the local stamp to inherit the
+    // server's updated_at below, not re-stamp to "right now".
+    saveAuraSettings({ ...DEFAULT_AURA_SETTINGS, ...blob.frontend }, { fromCloud: true });
   }
   if (blob.backend) {
     await applyBackendSettings(blob.backend);
+  }
+  // Inherit the server's authoritative timestamp so the NEXT pull
+  // sees `local.updated_at === server.updated_at` (tie → server
+  // wins in the merger? No, equal returns server too because the
+  // strict `>` check fails). Either way, subsequent pulls won't
+  // re-clobber.
+  if (typeof blob.updated_at === "number" && blob.updated_at > 0) {
+    setSettingsUpdatedAt(blob.updated_at);
   }
 }
 
@@ -772,6 +790,17 @@ let triggersInstalled = false;
 export function installSyncTriggers(): void {
   if (triggersInstalled) return;
   triggersInstalled = true;
+
+  // Bump the persisted settings updated_at on every local change
+  // event — covers manual-dispatch sites (SettingsView's
+  // update_settings invoke, AniSkipMenu, PlayerOverlay,
+  // userDataBackup restore) that don't route through saveAuraSettings.
+  // Skipped when detail.fromCloud is true so the cloud-pull write
+  // path doesn't fight the merger.
+  window.addEventListener("aura:settings-changed", (e) => {
+    const detail = (e as CustomEvent<{ fromCloud?: boolean }>).detail;
+    if (!detail?.fromCloud) bumpSettingsUpdatedAt();
+  });
 
   window.addEventListener("aura:settings-changed",        () => debouncedPush("settings"));
   window.addEventListener("aura:keybindings-changed",     () => debouncedPush("settings"));

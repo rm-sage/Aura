@@ -15,6 +15,43 @@
 
 const SETTINGS_KEY = "aura:settings:v1";
 const CHANGE_EVENT = "aura:settings-changed";
+/** Persistent "this user last modified settings at" stamp.
+ *
+ *  Used as `updated_at` on the cloud-sync `settings` blob so the
+ *  last-writer-wins merger has a real anchor point. Previously the
+ *  blob was stamped to Date.now() inside readSettingsBlob, which
+ *  meant local always won the merge — the cloud's settings were
+ *  pulled successfully then silently discarded.
+ *
+ *  Bumped by `bumpSettingsUpdatedAt()` (called from saveAuraSettings
+ *  and from a sync-side listener on backend changes); replaced
+ *  verbatim by the cloud-pull path so future readLocal calls reflect
+ *  the cloud's authoritative timestamp. */
+const SETTINGS_UPDATED_AT_KEY = "aura:settings-updated-at";
+
+export function getSettingsUpdatedAt(): number {
+  try {
+    const raw = localStorage.getItem(SETTINGS_UPDATED_AT_KEY);
+    if (!raw) return 0;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+export function setSettingsUpdatedAt(unixSeconds: number): void {
+  try {
+    localStorage.setItem(SETTINGS_UPDATED_AT_KEY, String(Math.floor(unixSeconds)));
+  } catch {
+    // localStorage write failure is non-fatal — the next bump retries
+    // and the merger gracefully degrades to "treat local as 0".
+  }
+}
+
+export function bumpSettingsUpdatedAt(): void {
+  setSettingsUpdatedAt(Math.floor(Date.now() / 1000));
+}
 
 export interface AuraSettings {
   /** URL of the addon whose catalogs lead the Home view. */
@@ -297,7 +334,7 @@ function diffSettings(prev: AuraSettings | null, next: AuraSettings): string[] {
   return changed;
 }
 
-export function saveAuraSettings(s: AuraSettings) {
+export function saveAuraSettings(s: AuraSettings, opts?: { fromCloud?: boolean }) {
   // Snapshot prior state BEFORE the write so we can compute a
   // meaningful diff for the CHANGE_EVENT. Without this, the event
   // would always fire with the "everything maybe changed" semantic
@@ -307,12 +344,21 @@ export function saveAuraSettings(s: AuraSettings) {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
   cached = null; // bust cache before listeners run so they read fresh values
   const changed = diffSettings(prior, s);
+  // Stamp the user-modified timestamp for cloud-sync last-writer-wins.
+  // Skip when the write originates from a cloud pull — those carry the
+  // server's authoritative updated_at, applied separately by sync.ts.
+  // Without the skip, every pull-and-save would re-stamp the local
+  // blob with Date.now() and the merger would always pick local on the
+  // very next pull (the original "settings never sync" symptom).
+  if (!opts?.fromCloud && changed.length > 0) {
+    bumpSettingsUpdatedAt();
+  }
   // Same-window components don't see `storage` events; emit a custom one.
   // `detail.keys` is an array of top-level field names that actually
   // changed. Listeners can early-return when no field they care about
   // is in the array; absence of `detail` falls back to the legacy
   // "everything changed" semantic so older listeners keep working.
-  window.dispatchEvent(new CustomEvent(CHANGE_EVENT, { detail: { keys: changed } }));
+  window.dispatchEvent(new CustomEvent(CHANGE_EVENT, { detail: { keys: changed, fromCloud: opts?.fromCloud ?? false } }));
 }
 
 /** Home-relevant AuraSettings keys. Listeners that drive expensive
