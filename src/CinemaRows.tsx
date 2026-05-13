@@ -376,7 +376,18 @@ const ContinueWatchingCard = memo(function ContinueWatchingCard(
   // unwatched ep. Without this, the CW card stayed visually stuck on
   // the just-marked episode.
   const effectiveVideoId = useEffectiveResumeVideoId(item, seasonEpisodes);
-  const badge = badgeForVideoId(effectiveVideoId);
+  // Prefer the VideoEntry's (season, episode) when the episode list has
+  // resolved — this gives a uniform `S01E06` badge regardless of whether
+  // the underlying id is IMDb-shape (`tt…:1:6`) or anime-prefix-shape
+  // (`kitsu:50023:6`, which doesn't encode the season in the id at all).
+  // Falls back to the id-string parse during the brief window before
+  // the meta detail fetch completes.
+  const currentEp = effectiveVideoId
+    ? seasonEpisodes?.find((v) => v.id === effectiveVideoId)
+    : null;
+  const badge = (currentEp && currentEp.season != null && currentEp.episode != null)
+    ? `S${String(currentEp.season).padStart(2, "0")}E${String(currentEp.episode).padStart(2, "0")}`
+    : badgeForVideoId(effectiveVideoId);
   const useSegmented = seasonEpisodes != null && seasonEpisodes.length > 1;
 
   return (
