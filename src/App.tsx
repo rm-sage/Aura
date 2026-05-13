@@ -2528,6 +2528,20 @@ export default function App() {
           // critical disambiguation for dual-numbered anime.
           season:      activeTarget.season ?? null,
           episode_num: activeTarget.episode_num ?? null,
+          // Series-root IMDb id, kept separate from imdb_id (which now
+          // carries the kitsu/mal/anidb-shaped video id after the
+          // AIOMetadata IMDb-anime patch). Mirrors the shape useScrobble
+          // sends for the live-playback path — without it, Trakt
+          // scrobble bails on "id format unsupported" because
+          // parse_trakt_target can't extract a show anchor from a
+          // non-tt video id, and the series_imdb_id fallback in
+          // scrobble.rs::trakt_targets has nothing to work with.
+          series_imdb_id:
+            activeTarget.series_id && activeTarget.series_id.startsWith("tt")
+              ? activeTarget.series_id
+              : (activeTarget.id.startsWith("tt")
+                  ? activeTarget.id.split(":")[0]
+                  : null),
         };
         const r = await invoke<RustResult>("scrobble_test_fire", {
           session,
