@@ -3175,7 +3175,14 @@ function ScrobbleAuthRow({
         // immediately. The popup self-closes when the device-flow poll
         // returns Authorized (via the aura:scrobble-auth-changed event
         // SourcePopup listens for in OAuth mode).
-        openOAuthPopup(begin.verification_url, `Connect to ${label}`);
+        //
+        // Surface the user_code as a chip in the popup header (and on
+        // the floating minimize pill) so it's always visible alongside
+        // trakt.tv/activate — no need to dismiss or minimize the
+        // popup just to read the code.
+        openOAuthPopup(begin.verification_url, `Connect to ${label}`, {
+          userCode: begin.user_code,
+        });
       } else {
         // AniList: authorize-URL + deep-link path, but the deep-link
         // is intercepted inside the popup webview rather than handed
@@ -3233,7 +3240,9 @@ function ScrobbleAuthRow({
       // visible; we just need to make the activation URL accessible
       // again if the user dismissed the first popup.
       const { openOAuthPopup } = await import("../SourcePopup");
-      openOAuthPopup(deviceFlow.verification_url, `Connect to ${label}`);
+      openOAuthPopup(deviceFlow.verification_url, `Connect to ${label}`, {
+        userCode: deviceFlow.user_code,
+      });
     } catch (e) {
       showAppToast(`Couldn't open ${deviceFlow.verification_url}: ${String(e)}`, { duration: 5000 });
     }

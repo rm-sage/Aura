@@ -56,9 +56,15 @@ interface SourceState {
    *  Omitting `interceptPrefix` (Trakt's case) skips navigation
    *  interception and lets the device-flow polling drive auth
    *  detection — the popup is just a convenient in-app browser tab
-   *  for entering the user_code on trakt.tv/activate. */
+   *  for entering the user_code on trakt.tv/activate.
+   *
+   *  `userCode` is the device-flow code surfaced as a copyable chip
+   *  in the popup header AND in the minimized floating pill, so the
+   *  user can always see what to paste into trakt.tv/activate
+   *  without having to dismiss or minimize the popup first. */
   oauth?: {
     interceptPrefix?: string;
+    userCode?: string;
   };
 }
 
@@ -85,13 +91,17 @@ export function openSourcePopup(url: string, title: string): void {
 export function openOAuthPopup(
   url: string,
   title: string,
-  opts: { interceptPrefix?: string } = {},
+  opts: { interceptPrefix?: string; userCode?: string } = {},
 ): void {
   if (!_setActive) {
     console.warn("[source-popup] openOAuthPopup called but no host is mounted");
     return;
   }
-  _setActive({ url, title, oauth: { interceptPrefix: opts.interceptPrefix } });
+  _setActive({
+    url,
+    title,
+    oauth: { interceptPrefix: opts.interceptPrefix, userCode: opts.userCode },
+  });
 }
 
 export function closeSourcePopup(): void {
@@ -106,6 +116,18 @@ export default function SourcePopupHost() {
   // events on every top-level navigation). The non-OAuth flow leaves
   // this null and the header just shows the static title.
   const [navHost, setNavHost] = useState<string | null>(null);
+  // Minimized — collapses the backdrop+card to a floating pill at
+  // bottom-right while keeping the child webview alive offscreen so
+  // OAuth flow state (cookies, in-progress page, etc) doesn't reset
+  // when the user looks at something underneath. The user_code
+  // banner in SettingsView (and the user_code chip in the pill
+  // below) is the typical reason — Trakt's device flow expects the
+  // code to be visible alongside trakt.tv/activate.
+  const [minimized, setMinimized] = useState(false);
+  // Reset minimized whenever the popup re-opens, otherwise a stale
+  // `minimized: true` could persist across an open/close cycle and
+  // hide the next popup behind nothing.
+  useEffect(() => { if (!active) setMinimized(false); }, [active]);
   const placeholderRef = useRef<HTMLDivElement>(null);
   const webviewRef = useRef<Webview | null>(null);
   const activeLabelRef = useRef<string | null>(null);
@@ -318,6 +340,17 @@ export default function SourcePopupHost() {
     const sync = () => {
       const wv = webviewRef.current;
       if (!wv) return;
+      // When minimized, push the webview far off-screen with a 1×1
+      // size so it can't receive clicks or paint over the floating
+      // pill, but still keep its DOM state (cookies, in-progress
+      // OAuth page) alive for when the user restores. setPosition +
+      // setSize are both LogicalPosition/LogicalSize so DPI scaling
+      // is consistent with the in-card path below.
+      if (minimized) {
+        wv.setPosition(new LogicalPosition(-10000, -10000)).catch(() => {});
+        wv.setSize(new LogicalSize(1, 1)).catch(() => {});
+        return;
+      }
       const r = placeholder.getBoundingClientRect();
       wv.setPosition(new LogicalPosition(r.left, r.top)).catch(() => {});
       wv.setSize(new LogicalSize(Math.max(1, r.width), Math.max(1, r.height))).catch(() => {});
@@ -336,20 +369,35 @@ export default function SourcePopupHost() {
       window.removeEventListener("resize", schedule);
       if (raf != null) cancelAnimationFrame(raf);
     };
-  }, [active]);
+  }, [active, minimized]);
 
   const close = useCallback(() => setActive(null), []);
+  /** Minimize: collapse the modal to a floating pill, keep the
+   *  webview alive offscreen. The sync useEffect re-runs on the
+   *  `minimized` dep so the webview snaps to the offscreen rect
+   *  immediately, no animation frame wait. */
+  const minimize = useCallback(() => setMinimized(true), []);
+  /** Restore from the pill — same sync re-run brings the webview
+   *  back to the placeholder's geometry. */
+  const restore  = useCallback(() => setMinimized(false), []);
 
   if (!active) return null;
 
   return (
-    // Backdrop — full viewport, dim + blur. Click closes.
+    <>
+    {/* Backdrop + card — kept mounted while minimized (so the child
+        webview's placeholder rect stays measurable), made invisible
+        and click-through via opacity:0 / pointer-events:none. The
+        webview itself is moved offscreen in the sync function so
+        clicks on the underlying UI pass through cleanly. */}
     <div
       className="fixed inset-0 z-[260] flex items-center justify-center p-6"
       style={{
         backgroundColor: opening ? "transparent" : "rgba(0,0,0,0.78)",
         backdropFilter: opening ? "blur(0px)" : "blur(8px)",
         transition: "background-color 200ms ease, backdrop-filter 200ms ease",
+        opacity: minimized ? 0 : 1,
+        pointerEvents: minimized ? "none" : "auto",
       }}
       onClick={close}
     >
@@ -369,18 +417,29 @@ export default function SourcePopupHost() {
         }}
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Header — title + close button. Matches DayOverlay's header
-            so the two modals feel like the same component. In OAuth
-            mode we surface the live host as a security chip next to
-            the title — the popup webview has no URL bar, so this is
-            the only place the user can see what site they're about to
-            enter credentials into. */}
+        {/* Header — title + chips + minimize + close. In OAuth mode
+            we surface the live host (anti-phishing) AND the device-
+            flow user_code (so it's visible alongside trakt.tv/activate
+            without having to dismiss the popup). The popup webview
+            has no URL bar of its own, so the header is the only
+            place the user can see what site they're entering
+            credentials into. */}
         <div className="flex items-center justify-between gap-4 px-6 py-4 shrink-0
                         border-b border-white/8">
           <div className="flex items-center gap-3 min-w-0 flex-1">
             <h2 className="text-white/90 text-lg font-semibold tracking-tight truncate">
               {active.title}
             </h2>
+            {active.oauth?.userCode ? (
+              <span
+                className="text-[12px] font-mono tracking-[0.18em] px-2.5 py-1
+                           rounded-md bg-amber-500/10 text-amber-200 border border-amber-400/25
+                           shrink-0 select-all"
+                title="Enter this code in the loaded page to authorize Aura."
+              >
+                {active.oauth.userCode}
+              </span>
+            ) : null}
             {active.oauth && navHost ? (
               <span
                 className="text-[11px] font-mono uppercase tracking-wider px-2 py-0.5
@@ -392,6 +451,17 @@ export default function SourcePopupHost() {
               </span>
             ) : null}
           </div>
+          <button
+            onClick={minimize}
+            aria-label="Minimize"
+            title="Minimize — keep the popup running, see what's underneath. Click the floating pill at bottom-right to restore."
+            className="w-8 h-8 rounded-full glass-panel flex items-center justify-center
+                       text-white/55 hover:text-white transition-colors shrink-0 mr-1"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+              <rect x="5" y="14" width="14" height="2" rx="1" />
+            </svg>
+          </button>
           <button
             onClick={close}
             aria-label="Close"
@@ -411,5 +481,49 @@ export default function SourcePopupHost() {
         <div ref={placeholderRef} className="flex-1 bg-black rounded-b-2xl" />
       </div>
     </div>
+
+    {/* Floating pill — visible only when minimized. Bottom-right of
+        the viewport, above everything else. Click anywhere on the
+        pill body to restore the popup; the inline X button closes
+        without restoring (so the user can finish the OAuth flow
+        out-of-band and just dismiss the leftover popup). */}
+    {minimized && (
+      <button
+        type="button"
+        onClick={restore}
+        aria-label="Restore popup"
+        className="fixed bottom-4 right-4 z-[270] glass-panel-elevated
+                   rounded-full px-4 py-2.5 flex items-center gap-3
+                   text-left shadow-glass-edge hover:bg-white/[0.06]
+                   transition-colors max-w-[min(420px,80vw)]"
+      >
+        <span className="text-white/85 text-sm font-medium truncate">
+          {active.title}
+        </span>
+        {active.oauth?.userCode && (
+          <span
+            className="text-[12px] font-mono tracking-[0.18em] px-2 py-0.5
+                       rounded-md bg-amber-500/15 text-amber-200 border border-amber-400/30
+                       shrink-0 select-all"
+            onClick={(e) => e.stopPropagation()}
+            title="Device-flow code. Click the pill to restore the popup; this chip stays selectable so you can copy without expanding."
+          >
+            {active.oauth.userCode}
+          </span>
+        )}
+        <span
+          role="button"
+          aria-label="Close"
+          onClick={(e) => { e.stopPropagation(); close(); }}
+          className="w-6 h-6 rounded-full flex items-center justify-center
+                     text-white/55 hover:text-white hover:bg-white/10 shrink-0 cursor-pointer"
+        >
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+            <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
+          </svg>
+        </span>
+      </button>
+    )}
+    </>
   );
 }

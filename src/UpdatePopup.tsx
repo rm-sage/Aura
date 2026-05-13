@@ -23,13 +23,20 @@
 // rather than inline styles so we share the @layer-components scoping
 // and theme cross-fade behaviour with the rest of the app.
 
-import { useEffect } from "react";
-import type { ReleaseInfo } from "./updater";
+import { useEffect, useState } from "react";
+import type { UpdateInfo } from "./updaterPlugin";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 interface Props {
-  release:        ReleaseInfo;
+  release:        UpdateInfo;
   currentVersion: string;
-  onUpdate:       () => void;
+  /** Primary action — kicks off the in-app signed download + install
+   *  via the tauri-plugin-updater. The popup manages its own busy
+   *  state during the call. Returns true on success (the app
+   *  relaunches automatically, so the success branch typically never
+   *  paints) and false on any failure; an error string is rendered
+   *  inline when false. */
+  onUpdate:       () => Promise<boolean>;
   onDismiss:      () => void;
 }
 
@@ -59,35 +66,66 @@ export default function UpdatePopup({
   onUpdate,
   onDismiss,
 }: Props) {
+  /** True while the plugin is downloading + verifying + installing.
+   *  Disables the action buttons and swaps the Install label for
+   *  "Installing…". Success branch typically never paints because
+   *  the plugin relaunches the app on completion. */
+  const [installing, setInstalling] = useState(false);
+  /** Non-null when the download/install path failed (signature
+   *  mismatch, network outage, write permission, etc). Surfaced
+   *  inline above the action row so the user has a recovery hint
+   *  before falling back to the GitHub release page. */
+  const [installError, setInstallError] = useState<string | null>(null);
+
   // Esc handler — mounted only while this popup is up, so we don't have
   // to coordinate with the global keybinding system in useKeybindings.
+  // While installing, Esc is suppressed so the user can't accidentally
+  // dismiss mid-download (the plugin holds open file handles that we'd
+  // rather see finish).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        if (installing) return;
         e.stopPropagation();
         onDismiss();
       }
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [onDismiss]);
+  }, [onDismiss, installing]);
 
-  const notes = truncateNotes(release.body);
+  const notes = truncateNotes(release.body ?? "");
+  // Plugin's UpdateInfo carries a bare version like "0.6.9"; surface
+  // it with the conventional "v" prefix to match the GitHub release
+  // page and the user's mental model of release tags.
+  const targetTag = `v${release.version}`;
+  const releasePageUrl = `https://github.com/rm-sage/Aura/releases/tag/${targetTag}`;
+
+  const handleInstall = async () => {
+    if (installing) return;
+    setInstallError(null);
+    setInstalling(true);
+    try {
+      const ok = await onUpdate();
+      if (!ok) {
+        setInstallError("Install failed — the signed download or signature check didn't succeed. Use \"View on GitHub\" to download the installer manually.");
+      }
+    } catch (e) {
+      setInstallError(String(e));
+    } finally {
+      setInstalling(false);
+    }
+  };
 
   return (
     <div
       role="dialog"
       aria-modal="true"
       aria-labelledby="aura-update-title"
-      // Backdrop layer — fixed full-viewport, dims everything behind, click
-      // to dismiss. z-[60] sits above the standard UI but BELOW the player
-      // overlay (z-[9999]) so a popup that fires while a stream loads
-      // never paints over MPV.
       className="aura-update-backdrop fixed inset-0 z-[60] flex items-center
                  justify-center bg-black/60 backdrop-blur-md"
       onClick={(e) => {
-        // Only treat clicks that originated on the backdrop itself as a
-        // dismiss — clicks that bubble up from the card shouldn't close.
+        if (installing) return;
         if (e.target === e.currentTarget) onDismiss();
       }}
     >
@@ -109,7 +147,7 @@ export default function UpdatePopup({
           <p className="text-white/55 text-xs tracking-wide">
             Aura {currentVersion}
             <span className="px-1.5 text-white/35">→</span>
-            <span className="text-white/85 font-medium">{release.tagName}</span>
+            <span className="text-white/85 font-medium">{targetTag}</span>
           </p>
         </div>
 
@@ -125,28 +163,51 @@ export default function UpdatePopup({
           </div>
         )}
 
-        {/* Actions — Dismiss on the left (subtle), Update on the right
-            (primary accent). Order intentional: primary action sits where
-            users expect it on Windows (right edge of the dialog). */}
-        <div className="flex items-center justify-end gap-2 pt-1">
+        {/* Inline error — rendered between notes and actions so the
+            user sees the failure context before deciding whether to
+            retry or fall back to the browser. */}
+        {installError && (
+          <div className="rounded-lg border border-red-400/30 bg-red-500/8 px-3 py-2">
+            <p className="text-red-200/90 text-[11px] leading-snug">{installError}</p>
+          </div>
+        )}
+
+        <div className="flex items-center justify-between gap-2 pt-1">
           <button
             type="button"
-            onClick={onDismiss}
-            className="px-4 py-2 rounded-xl text-sm text-white/60
-                       hover:text-white/90 hover:bg-white/[0.05]
+            onClick={() => openUrl(releasePageUrl).catch(() => {})}
+            disabled={installing}
+            className="px-3 py-2 rounded-xl text-[11px] text-white/45
+                       hover:text-white/75 hover:bg-white/[0.04]
+                       disabled:opacity-40 disabled:cursor-not-allowed
                        transition-colors"
           >
-            Dismiss
+            View on GitHub
           </button>
-          <button
-            type="button"
-            onClick={onUpdate}
-            className="px-4 py-2 rounded-xl text-sm font-medium text-white
-                       bg-ln-accent/80 hover:bg-ln-accent active:scale-95
-                       transition-all shadow-accent-glow"
-          >
-            Update
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onDismiss}
+              disabled={installing}
+              className="px-4 py-2 rounded-xl text-sm text-white/60
+                         hover:text-white/90 hover:bg-white/[0.05]
+                         disabled:opacity-40 disabled:cursor-not-allowed
+                         transition-colors"
+            >
+              Dismiss
+            </button>
+            <button
+              type="button"
+              onClick={handleInstall}
+              disabled={installing}
+              className="px-4 py-2 rounded-xl text-sm font-medium text-white
+                         bg-ln-accent/80 hover:bg-ln-accent active:scale-95
+                         disabled:opacity-60 disabled:cursor-progress
+                         transition-all shadow-accent-glow"
+            >
+              {installing ? "Installing…" : "Install"}
+            </button>
+          </div>
         </div>
       </div>
     </div>

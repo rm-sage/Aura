@@ -33,12 +33,12 @@ import DevConsole from "./DevConsole";
 import UpdatePopup from "./UpdatePopup";
 import CrashReportingConsent from "./CrashReportingConsent";
 import ResumePrompt, { type PendingResume } from "./ResumePrompt";
-import { checkForUpdate, isNewer, type ReleaseInfo } from "./updater";
+import { isNewer } from "./updater";
+import { checkForUpdatePlugin, downloadAndInstallUpdatePlugin, type UpdateInfo } from "./updaterPlugin";
 import { advanceWatchedAfter } from "./autoAdvance";
 import { clearAutoBumped } from "./autoBumped";
 import { mirrorWatchedFromCloud, pushItemWatched } from "./watchedSync";
 import { onWatchedSync } from "./manualWatched";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { useScrobble, type ActiveScrobbleTarget } from "./useScrobble";
 import { useScrobbleAuthAlerts } from "./useScrobbleAuthAlerts";
 import { useKeybindings } from "./useKeybindings";
@@ -567,7 +567,7 @@ export default function App() {
   // `pendingUpdate` is non-null only when a newer release has been
   // detected AND the user hasn't already dismissed that exact tag to the
   // notifications bell. The popup mounts on the truthy state.
-  const [pendingUpdate, setPendingUpdate] = useState<ReleaseInfo | null>(null);
+  const [pendingUpdate, setPendingUpdate] = useState<UpdateInfo | null>(null);
   // Throttle ref — Date.now() of the most recent release-API hit. The
   // home-view effect short-circuits if the last check was < 5 min ago.
   const lastUpdateCheckRef = useRef<number>(0);
@@ -1963,7 +1963,7 @@ export default function App() {
 
     let cancelled = false;
     (async () => {
-      const release = await checkForUpdate(APP_VERSION);
+      const release = await checkForUpdatePlugin();
       if (cancelled || !release) return;
       // Only show the popup if (a) nothing was previously dismissed, or
       // (b) the new tag is strictly newer than what was dismissed. The
@@ -1973,7 +1973,7 @@ export default function App() {
         try { return localStorage.getItem(UPDATE_DISMISSED_KEY); }
         catch { return null; }
       })();
-      if (!dismissed || isNewer(release.tagName, dismissed)) {
+      if (!dismissed || isNewer(release.version, dismissed)) {
         setPendingUpdate(release);
       }
     })();
@@ -4122,26 +4122,35 @@ export default function App() {
           release={pendingUpdate}
           currentVersion={APP_VERSION}
           onUpdate={async () => {
-            // Open the GitHub release page in the user's default browser.
-            // No signing infrastructure → no in-app binary swap; the user
-            // downloads + runs the new installer themselves.
-            await openUrl(pendingUpdate.htmlUrl).catch(() => {});
-            setPendingUpdate(null);
+            // Signed in-app download + install via tauri-plugin-updater.
+            // The plugin verifies the minisign signature on latest.json
+            // BEFORE writing to disk, downloads the installer, runs it
+            // silently, and relaunches the app. Success branch typically
+            // never reaches setPendingUpdate(null) because the relaunch
+            // tears down the React tree first; the assignment is here
+            // for the rare path where the plugin returns true but
+            // relaunch is suppressed (debug builds, manifest-driven
+            // installMode change, etc).
+            const ok = await downloadAndInstallUpdatePlugin();
+            if (ok) setPendingUpdate(null);
+            return ok;
           }}
           onDismiss={() => {
             // Persist the dismissed tag so the popup doesn't fire again
             // for the same release. The notifications bell (owned by a
             // separate task) listens for this event and surfaces the
             // dismissed update inside its menu.
+            const tagName = `v${pendingUpdate.version}`;
+            const htmlUrl = `https://github.com/rm-sage/Aura/releases/tag/${tagName}`;
             try {
-              localStorage.setItem(UPDATE_DISMISSED_KEY, pendingUpdate.tagName);
+              localStorage.setItem(UPDATE_DISMISSED_KEY, tagName);
             } catch { /* private mode / quota / disabled storage — best effort */ }
             window.dispatchEvent(new CustomEvent("aura:update-dismissed-to-bell", {
               detail: {
-                tagName:     pendingUpdate.tagName,
-                htmlUrl:     pendingUpdate.htmlUrl,
-                body:        pendingUpdate.body,
-                publishedAt: pendingUpdate.publishedAt,
+                tagName,
+                htmlUrl,
+                body:        pendingUpdate.body ?? "",
+                publishedAt: pendingUpdate.date ?? "",
               },
             }));
             setPendingUpdate(null);
