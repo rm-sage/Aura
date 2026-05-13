@@ -990,8 +990,15 @@ function BackupRestoreSection({
       loadAuraSettings() as unknown as Record<string, unknown>,
       addons,
     );
-    downloadBlobAsFile(blob);
-    setStatus({ kind: "ok", message: "Downloaded settings file." });
+    try {
+      const path = await downloadBlobAsFile(blob);
+      if (path) {
+        setStatus({ kind: "ok", message: `Saved settings to ${path}.` });
+      }
+      // path === null → user canceled the Save dialog; no toast.
+    } catch (e) {
+      setStatus({ kind: "error", message: `Save failed: ${String(e)}` });
+    }
   }, [hydrateBackendWithKeyringKeys, addons]);
 
   const applyText = useCallback(async (raw: string) => {

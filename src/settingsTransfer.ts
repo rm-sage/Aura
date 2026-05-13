@@ -401,24 +401,23 @@ export function parseImportInput(raw: string): SettingsBlob | null {
   };
 }
 
-/** Trigger a browser download of a JSON file containing the blob. Uses a
- *  blob URL; works inside the Tauri webview without needing the dialog
- *  plugin. Filename includes the export timestamp so multiple exports
- *  don't clobber each other in the user's Downloads folder. */
-export function downloadBlobAsFile(blob: SettingsBlob): void {
+/** Save the blob as a JSON file via the native Win32 "Save As…"
+ *  dialog. Routes through the same `save_text_with_dialog` Rust
+ *  command the DevConsole log download uses, so the user always
+ *  gets to pick the folder + filename instead of having the file
+ *  silently land in WebView2's default Downloads location.
+ *
+ *  Returns the chosen path on success, `null` when the user
+ *  cancels the dialog, and rejects on IO / IPC failure. */
+export async function downloadBlobAsFile(blob: SettingsBlob): Promise<string | null> {
+  const { invoke } = await import("@tauri-apps/api/core");
   const json = blobToJsonString(blob);
-  const file = new Blob([json], { type: "application/json" });
-  const url = URL.createObjectURL(file);
   const stamp = blob.exportedAt.replace(/[:.]/g, "-").slice(0, 19);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `aura-settings-${stamp}.json`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  // Defer revocation so Chrome has time to start the download — the
-  // navigation kicks off async; revoking immediately can race the start.
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  const result = await invoke<string | null>("save_text_with_dialog", {
+    content: json,
+    defaultName: `aura-settings-${stamp}.json`,
+  });
+  return result;
 }
 
 /** Read a user-picked file via FileReader. Returns the string contents
