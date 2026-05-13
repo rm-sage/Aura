@@ -103,11 +103,18 @@ export default function SpectralPulse({
           phase. Fixed-size box so the rotating elements don't push
           surrounding layout. */}
       <div
-        className="relative gpu-layer"
+        className="relative"
         style={{
           width: size,
           height: size,
           animation: `spectral-breathe ${breathe}s ease-in-out infinite`,
+          // Promote to compositor manually instead of using the
+          // `gpu-layer` class — that class sets a static
+          // `transform: translateZ(0)` which conflicts with the
+          // animated transform on this wrapper. willChange alone is
+          // enough to hint to the browser without locking in a
+          // static transform.
+          willChange: "transform",
         }}
       >
         <span style={discStyle(`rgba(99, 102, 241, 1)`, 0)}    aria-hidden /> {/* indigo */}
@@ -120,17 +127,15 @@ export default function SpectralPulse({
           Loading…
         </p>
       )}
-
-      <style>{`
-        @keyframes spectral-orbit {
-          0%   { transform: rotate(0deg)   translateX(var(--orbit)) rotate(0deg); }
-          100% { transform: rotate(360deg) translateX(var(--orbit)) rotate(-360deg); }
-        }
-        @keyframes spectral-breathe {
-          0%, 100% { transform: scale(0.85); }
-          50%      { transform: scale(1.15); }
-        }
-      `}</style>
+      {/* Keyframes for spectral-orbit / spectral-breathe live in
+          App.css. Previously they were declared inline via a React-
+          rendered `<style>` tag, but React 19's stylesheet hoisting
+          (`<style>` elements rendered inside components are
+          deduplicated and relocated by React) broke the binding so
+          the keyframes were no longer in scope when the animation
+          rule tried to resolve them. With no keyframes, all three
+          discs sat statically at the centre point and the colours
+          blended to a single bluish blob. */}
     </div>
   );
 }

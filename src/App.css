@@ -1412,6 +1412,28 @@ select,
   }
 
   /* ---------------------------------------------------------------- */
+  /* SpectralPulse — three orbiting blurred discs + breathing wrapper. */
+  /* Lives in the stream-loading panel and inline as a "still         */
+  /* discovering" badge once partial results arrive.                  */
+  /*                                                                  */
+  /* Previously these keyframes were declared inline via a React-     */
+  /* rendered `<style>` tag inside the SpectralPulse component.       */
+  /* React 19's automatic stylesheet management (the new <style>      */
+  /* hoisting + deduplication) broke that binding — the keyframe      */
+  /* rules ended up out of scope by the time the animation tried to   */
+  /* resolve them, so all three discs sat static at the centre and    */
+  /* their colours blended into a single bluish blob.                 */
+  /* ---------------------------------------------------------------- */
+  @keyframes spectral-orbit {
+    0%   { transform: rotate(0deg)   translateX(var(--orbit)) rotate(0deg); }
+    100% { transform: rotate(360deg) translateX(var(--orbit)) rotate(-360deg); }
+  }
+  @keyframes spectral-breathe {
+    0%, 100% { transform: scale(0.85); }
+    50%      { transform: scale(1.15); }
+  }
+
+  /* ---------------------------------------------------------------- */
   /* aura-buffering-pulse — wrapper used when the buffering overlay   */
   /* has a real logo image. Slow opacity / scale breathe so the user  */
   /* knows playback is alive while the network catches up.            */
