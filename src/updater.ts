@@ -3,18 +3,20 @@
 
 // updater.ts ────────────────────────────────────────────────────────────────
 //
-// Lightweight GitHub Releases poller. Aura does NOT ship the
-// tauri-plugin-updater (we have no signing keys and don't bundle delta
-// patches). Instead, we hit the public GitHub Releases API for the latest
-// tag and — if it's strictly newer than the running app's package.json
-// version — surface a popup that, on confirmation, opens the release page
-// in the user's default browser via `@tauri-apps/plugin-opener`.
+// LEGACY GitHub Releases poller — the one-click in-app updater path
+// lives in `updaterPlugin.ts` (Tauri plugin, signed download + auto-
+// relaunch). This file is now kept only for `isNewer` (a pure
+// MAJOR.MINOR.PATCH triplet comparator) and the `ReleaseInfo` shape
+// the notifications bell still consumes for dismissed-update entries.
 //
-// All errors are swallowed. The check returns `null` for any non-success
-// outcome (network failure, no releases yet, malformed JSON, older or equal
-// tag). The check must NEVER throw — the caller fires it from a useEffect
-// in App.tsx and unhandled rejections during boot would surface as red
-// console noise on every Home visit.
+// The plugin handles "is there a newer release?" via the same
+// latest.json endpoint baked into tauri.conf.json, then verifies the
+// minisign signature and installs in-app. This file's GitHub REST
+// fetcher is therefore unused on the hot path; it's preserved as a
+// thin module so callers that want the unsigned "open in browser"
+// fallback (`UpdatePopup`'s View on GitHub link) can resolve the
+// release URL without a second network call. Pruning it is a
+// future-cleanup TODO once nothing imports `checkForUpdate`.
 //
 // `tag_name` is normalised by stripping a single leading "v" (so `v0.6.7`
 // and `0.6.7` compare equally). Pre-release suffixes (e.g. `0.7.0-beta.1`)
