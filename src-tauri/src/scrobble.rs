@@ -353,6 +353,17 @@ struct TraktSyncResponseAdded { #[serde(default)] episodes: u32, #[serde(default
 struct TraktSyncResponseNotFound {
     #[serde(default)] episodes: Vec<serde_json::Value>,
     #[serde(default)] movies:   Vec<serde_json::Value>,
+    /// Show-level miss: Trakt couldn't find the show under the
+    /// supplied imdb id at all. Distinct from episode-level miss
+    /// (show exists but the requested S/E doesn't). When present,
+    /// the whole scrobble is a no-op regardless of episode count.
+    #[serde(default)] shows:    Vec<serde_json::Value>,
+    /// Season-level miss for sync/history payloads that key by
+    /// season instead of episode. Included for completeness — Aura
+    /// doesn't currently send season-keyed payloads but the field
+    /// keeps the catch-all `not_found_n` count accurate if a
+    /// future call shape does.
+    #[serde(default)] seasons:  Vec<serde_json::Value>,
 }
 #[derive(Deserialize)]
 struct TraktSyncResponseBody {
@@ -385,12 +396,20 @@ async fn trakt_sync_history_once(
             // status-only handler treated those as success — that's the
             // bug this whole refactor fixes.
             let status = r.status().as_u16();
-            let body: Result<TraktSyncResponseBody, _> = r.json().await;
+            // Read raw text first so the diagnostic on parse failure
+            // can dump what Trakt actually sent — previously the
+            // "unparseable, treating as added" branch ate every silent
+            // miss because `r.json()` consumed the body and we had
+            // nothing to show.
+            let raw = r.text().await.unwrap_or_default();
+            let body: Result<TraktSyncResponseBody, _> = serde_json::from_str(&raw);
             let (added_n, not_found_n) = match &body {
                 Ok(b) => {
-                    let added = b.added.as_ref().map(|a| a.episodes + a.movies).unwrap_or(0);
+                    let added = b.added.as_ref()
+                        .map(|a| a.episodes + a.movies)
+                        .unwrap_or(0);
                     let nf = b.not_found.as_ref()
-                        .map(|n| (n.episodes.len() + n.movies.len()) as u32)
+                        .map(|n| (n.shows.len() + n.seasons.len() + n.episodes.len() + n.movies.len()) as u32)
                         .unwrap_or(0);
                     (added, nf)
                 }
@@ -404,24 +423,40 @@ async fn trakt_sync_history_once(
                 );
                 TraktSyncOutcome::Added
             } else if not_found_n > 0 {
+                let preview: String = raw.chars().take(400).collect();
                 crate::devlog!(
                     warn, "scrobble",
                     "Trakt /sync/history accepted but not_found (status={}, not_found={}) for {} \
-                     — show/episode not in Trakt's catalog under this numbering",
-                    status, not_found_n, sess.imdb_id,
+                     — show/episode not in Trakt's catalog under this numbering. body: {}",
+                    status, not_found_n, sess.imdb_id, preview,
+                );
+                TraktSyncOutcome::NotFound
+            } else if body.is_err() {
+                // Parse failed AND no added/not_found extracted —
+                // surface the raw body so the cause is diagnosable
+                // (truncated to 400 chars to keep the log usable).
+                // Treated as a NotFound so the retry path engages
+                // instead of silently false-flagging the scrobble.
+                let preview: String = raw.chars().take(400).collect();
+                crate::devlog!(
+                    warn, "scrobble",
+                    "Trakt /sync/history body parse failed (status={}) for {}: {} — treating as not_found so the retry fallback can engage",
+                    status, sess.imdb_id, preview,
                 );
                 TraktSyncOutcome::NotFound
             } else {
-                // 201 with no body or unparseable body — assume Added so
-                // we don't false-flag a legitimate scrobble. Documented
-                // catch-all per Trakt's spec where well-formed requests
-                // always return one of the two breakdowns.
+                // Successfully parsed but both counters are zero. This
+                // shouldn't happen with Trakt's documented response
+                // shape, but if it does, surface the body and treat
+                // as not_found so we don't silently mark unwritten
+                // scrobbles as "fired".
+                let preview: String = raw.chars().take(400).collect();
                 crate::devlog!(
-                    info, "scrobble",
-                    "Trakt /sync/history OK (status={}, response body unparseable, treating as added) for {}",
-                    status, sess.imdb_id,
+                    warn, "scrobble",
+                    "Trakt /sync/history returned zero added AND zero not_found (status={}) for {}: {} — treating as not_found",
+                    status, sess.imdb_id, preview,
                 );
-                TraktSyncOutcome::Added
+                TraktSyncOutcome::NotFound
             }
         }
         Ok(r) if r.status().as_u16() == 401 => {

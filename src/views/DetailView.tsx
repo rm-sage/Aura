@@ -1136,6 +1136,13 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
             streamMeta={streamMeta}
             streamsLoading={streamsLoading}
             groupedStreams={groupedStreams}
+            // detail===null is the only signal Aura has for "meta
+            // fetch still in flight". As soon as ANY addon returns,
+            // detail flips to a value and the shimmer collapses;
+            // even an empty videos[] then reads as "addon genuinely
+            // returned no episodes" (the existing message) rather
+            // than "still loading".
+            metaLoading={detail === null}
             onPickEpisode={handlePickEpisode}
             onBackToEpisodes={() => {
               // Re-arm the same scroll target the EpisodesPanel uses when
@@ -2016,6 +2023,13 @@ interface PanelProps {
   streamMeta: StreamMetadata;
   streamsLoading: boolean;
   groupedStreams: [string, StreamEntry[]][];
+  /** True while the parent's meta-detail fetch is still in flight
+   *  with no addon having returned yet. Lets the EpisodesPanel
+   *  render a shimmer skeleton instead of the "No episode list
+   *  returned" message — cold-cache anime with 1000+ episodes can
+   *  take 10-30 s to resolve on the first open and the previous
+   *  empty-state read as "broken". */
+  metaLoading: boolean;
   onPickEpisode: (v: VideoEntry) => void;
   onBackToEpisodes: () => void;
   onPlay: (s: StreamEntry) => void;
@@ -2032,7 +2046,7 @@ interface PanelProps {
 
 function UnifiedPanel({
   mode, isEpisodic, seriesId, seriesMediaType, videos, activeVideo, streams, streamMeta, streamsLoading,
-  groupedStreams, onPickEpisode, onBackToEpisodes, onPlay, onCopy, onPlayExternal,
+  groupedStreams, metaLoading, onPickEpisode, onBackToEpisodes, onPlay, onCopy, onPlayExternal,
   scrollToVideoId, onScrollHandled,
 }: PanelProps) {
   // The streams panel needs `position: relative` so the floating AIOStreams
@@ -2071,6 +2085,7 @@ function UnifiedPanel({
             onPick={onPickEpisode}
             scrollToVideoId={scrollToVideoId}
             onScrollHandled={onScrollHandled}
+            metaLoading={metaLoading}
           />
         </div>
       ) : (
@@ -2405,10 +2420,12 @@ const EpisodeRow = ({
 
 function EpisodesPanel({
   seriesId, seriesMediaType, videos, activeVideo, onPick, scrollToVideoId, onScrollHandled,
+  metaLoading,
 }: {
   seriesId: string;
   seriesMediaType: string;
   videos: VideoEntry[];
+  metaLoading?: boolean;
   activeVideo: VideoEntry | null;
   onPick: (v: VideoEntry) => void;
   scrollToVideoId?: string | null;
@@ -2551,7 +2568,42 @@ function EpisodesPanel({
         right={`${videos.length} total`}
       />
       <div className="pl-5 pr-4 py-3 flex-1 min-h-0 flex flex-col">
-        {videos.length === 0 ? (
+        {videos.length === 0 && metaLoading ? (
+          // Cold-cache meta fetch in flight. AIOMetadata's cour-
+          // aggregated walker can take 10-30 s on 1000+ ep shows
+          // (One Piece, Naruto, Detective Conan) because it has to
+          // hit each cour's kitsu-anime-* cache and merge. Surface
+          // an animated skeleton so the user knows the page is
+          // still loading instead of being broken — previously
+          // this rendered "No episode list returned by the addon"
+          // which was misleading.
+          <div className="space-y-3" aria-label="Loading episodes" role="status">
+            <div className="h-px bg-gradient-to-r from-transparent via-ln-accent/55 to-transparent animate-pulse" />
+            <p className="text-white/55 text-[12px] italic">
+              Loading episodes — this can take a moment for long-running anime.
+            </p>
+            {/* Row-shaped skeleton placeholders. 5 rows is enough to
+                signal "list is coming" without dominating the panel,
+                and the pulse keeps the eye engaged so the wait
+                doesn't feel hung. */}
+            {[0, 1, 2, 3, 4].map((i) => (
+              <div
+                key={i}
+                className="flex items-stretch gap-4 px-3 py-3.5 rounded-md
+                           border border-transparent"
+              >
+                <div
+                  className="w-40 rounded bg-white/8 animate-pulse"
+                  style={{ aspectRatio: "16 / 9" }}
+                />
+                <div className="flex-1 min-w-0 flex flex-col justify-center gap-2">
+                  <div className="h-3 w-20 rounded bg-white/8 animate-pulse" />
+                  <div className="h-4 w-3/4 rounded bg-white/8 animate-pulse" />
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : videos.length === 0 ? (
           <p className="text-white/50 text-[13px] italic">
             No episode list returned by the addon.
           </p>

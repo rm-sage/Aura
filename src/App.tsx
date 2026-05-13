@@ -974,28 +974,56 @@ export default function App() {
             // menus, audio-language defaults) classify it correctly
             // before DetailView is ever opened.
             markAnimeId(seriesId);
-            // Episode number for AniSkip lookup. Prefer VideoEntry's
-            // ABSOLUTE episode number (`target.episode_num`) over the
-            // id-derived per-season number. After AIOMetadata's split-
-            // season patch, the id encodes cour-relative episode (e.g.
-            // `tt…:2:7` = cour 2 ep 7), but AniSkip is keyed by MAL
-            // anime id, and most multi-cour anime share a single MAL
-            // entry whose episode count is the absolute show-wide
-            // count. Sending the cour-relative 7 fetches the WRONG
-            // timings (cour 1 ep 7's OP) — exactly the Frieren cour-2
-            // misskip the user was seeing. Falling back to id-parse
-            // covers shows whose VideoEntry lacks episode_num.
+            // Episode number for AniSkip lookup. AniSkip is keyed by
+            // MAL anime id, and most multi-cour anime share a SINGLE
+            // MAL entry whose episode list is the show-wide absolute
+            // numbering (1..N flat). After AIOMetadata's cour-
+            // aggregation patch, VideoEntry's `episode` is now COUR-
+            // RELATIVE (e.g. S02E09 carries episode=9), so we must
+            // convert back to absolute by summing earlier cours'
+            // episode counts. Without this, Frieren S02E09 sends ep=9
+            // and fetches cour 1 ep 9's OP timings — exactly the
+            // mis-skip the user is seeing.
+            //
+            // Resolution order:
+            //   1. Have season + cour-relative episode AND a detail
+            //      with a videos list → sum episodes in earlier
+            //      cours (season < current) and add the current
+            //      episode number. Excludes season 0 specials.
+            //   2. Fall back to VideoEntry's `episode_num` as-is
+            //      (legacy single-season shows where it's already
+            //      absolute, and movies where it's 1).
+            //   3. Fall back to id-derived trailing segment.
             const idParts = target.id.split(":");
             const idEpisode = Number(idParts[idParts.length - 1]);
-            const episodeNum = Number.isFinite(target.episode_num as number)
+            const courRelativeEp = Number.isFinite(target.episode_num as number)
               ? (target.episode_num as number)
-              : idEpisode;
+              : (Number.isFinite(idEpisode) ? idEpisode : NaN);
+            const courSeason = Number.isFinite(target.season as number)
+              ? (target.season as number)
+              : null;
+            let absoluteEp = courRelativeEp;
+            if (
+              courSeason != null && courSeason > 1
+              && Number.isFinite(courRelativeEp)
+              && detail?.videos && detail.videos.length > 0
+            ) {
+              // Sum episodes in earlier main-run cours. Specials
+              // (season 0) are excluded — they air out-of-band and
+              // AniSkip's flat absolute numbering doesn't count them.
+              const priorCourEps = detail.videos.filter(
+                (v) => (v.season ?? 0) > 0 && (v.season ?? 0) < courSeason,
+              ).length;
+              absoluteEp = priorCourEps + courRelativeEp;
+            }
+            const episodeNum = absoluteEp;
             if (!Number.isFinite(episodeNum)) {
               console.info(`[aniskip] skip — couldn't parse episode from ${target.id}`);
               return;
             }
             console.info(
-              `[aniskip] episode resolution: id-derived=${idEpisode}, absolute=${target.episode_num}, using=${episodeNum}`,
+              `[aniskip] episode resolution: id-derived=${idEpisode}, cour-rel=${courRelativeEp}, ` +
+              `season=${courSeason}, absolute=${absoluteEp}, using=${episodeNum}`,
             );
             // Settings drive the per-window auto/prompt/off decision.
             let settings: BackendSettingsLite | null = null;
