@@ -3,10 +3,91 @@
 A cinematic desktop media player for Windows, built on
 Tauri 2 + React 19 + libmpv. Consumes the Stremio addon ecosystem.
 
+## Features
+
+**Playback & playlist**
+
+- libmpv embedded as a child window — full hardware decode, custom GLSL
+  shaders, per-track audio / subtitle / video selection, loudness
+  normalization (`loudnorm` filter), AI-detected silence trim.
+- Native Win32 fullscreen (`WS_POPUP` + monitor rect) — proper exclusive
+  appearance, not the work-area rect Tauri's `setFullscreen` produces.
+- Continue Watching with segmented per-season progress bars (long-runners
+  flip to a gradient bar past 50 episodes), AIOMetadata-aware specials
+  hiding, and series-rooted library writes that match the Stremio cloud
+  schema.
+
+**Stremio account & sync**
+
+- Stremio login (email/password + in-app OAuth popup) with credentials
+  stored in the OS keyring (Windows Credential Manager via DPAPI).
+- Library, Continue Watching, Calendar all read from a single normalized
+  Stremio mirror — per-episode legacy entries collapsed at the loadLibrary
+  boundary, so all three surfaces see consistent state.
+- **Aura Cloud Sync** (Aura Proxy v2) — per-account state mirrored across
+  installs: API keys, settings, notification history, and the Phase 9
+  release-search signal feed. ETag-conditional batch fetches keep traffic
+  minimal.
+
+**Notifications**
+
+- Cloud-driven release signals: scanner walks `recent_aired` arrays for
+  stacked notifications, cross-checks library `state.video_id` so completed
+  shows don't re-notify, and persists across reboots.
+- Optional "only notify when a stream is available" gate with a deferred
+  re-check timer.
+- Manual library refresh button next to the bell, with a 2-second cooldown
+  and per-id nudge to the release poller.
+
+**Scrobble**
+
+- Trakt and AniList scrobble pipelines, both OAuth-authenticated through
+  the in-app popup.
+- Cour-aware: anime aggregated by AIOMetadata as multi-season shows
+  scrobble to the correct cour-specific MAL entry, with an absolute-S1
+  fallback for shows Trakt indexes under one season.
+- Dedup and history-pause aware.
+
+**Anime tooling**
+
+- AniSkip integration — auto-skip / prompt / off modes, scrub-bar OP/ED
+  band visualisation, in-app submission and 3-second-cooldown voting
+  forms, cour-specific MAL resolution via Fribb → yuna.moe → AniList GraphQL
+  fallback chain.
+- AIOMetadata `filler` / `recap` flags surface as detail-page banners and
+  optional auto-skip in Next-Up.
+
+**Subtitles**
+
+- OpenSubtitles file-hash matching (the same 16-byte block hash Stremio
+  Web uses).
+- External subtitles fan-out from addons, with one-click attach to the
+  running mpv instance.
+
+**OS integration**
+
+- Discord Rich Presence (browse + playback) with per-title blocklist.
+- Windows SMTC (System Media Transport Controls) — play/pause/seek from
+  the volume flyout, lock screen, and headset buttons.
+- Auto-updater (signed via minisign) with `latest.json` manifest hosted on
+  GitHub Releases.
+
+**Developer / power-user**
+
+- F12 DevConsole — ring-buffer log viewer with level filters, search,
+  copy / download to file, and a typed command prompt (`notifytest`,
+  `clear`, `pause`, etc.).
+- Opt-in crash reporting (Sentry) — JS render errors + native
+  STATUS_ACCESS_VIOLATION minidumps. Dev builds are gated out, only
+  release builds with explicit consent ship anything.
+- First-run onboarding wizard (Stremio import, suggested addons, settings).
+
 ## Status
 
-Active development. See `ROADMAP.md` for the feature pipeline and
-`HANDOFF.md` for the running design / forensic notes.
+Feature-complete as of 0.6.7 — the core surface (playback, library,
+notifications, sync, scrobble, AniSkip, OpenSubtitles, onboarding) is
+shipped. Subsequent work is polish, regression fixes, and the items in
+`ROADMAP.md`. See `HANDOFF.md` for running design / forensic notes.
 
 ## Building from source
 
