@@ -246,24 +246,30 @@ function CWTitleIndicator({ metaId, mediaType }: { metaId: string; mediaType: st
 /** Format an episode id as the SxxEyy / EPxx badge text. Pure
  *  function over the wire-format id strings used by Stremio's library
  *  state.video_id (tt-style, kitsu-style, mal-style). */
+const ANIME_ID_PREFIXES = new Set(["kitsu", "mal", "anidb", "anilist"]);
 function badgeForVideoId(vid: string | null | undefined): string | null {
   if (typeof vid !== "string" || vid.length === 0) return null;
   const parts = vid.split(":");
   if (parts.length < 2) return null;
-  const last = parts[parts.length - 1];
+  const first  = parts[0];
+  const last   = parts[parts.length - 1];
   const second = parts[parts.length - 2];
-  // IMDb style: parts = [tt0903747, season, episode]; series root has no
-  // letter prefix (numeric only after the leading tt).
-  if (parts.length >= 3 && /^\d+$/.test(second) && /^\d+$/.test(last)) {
+  // Anime-provider prefix style: parts = [provider, seriesNum, ep].
+  // CHECK THIS FIRST — without the prefix gate, the IMDb branch's
+  // "both-segments-numeric" test would catch `kitsu:50023:6` and render
+  // "S50023E06" (provider show id mis-treated as a season).
+  if (parts.length >= 3 && ANIME_ID_PREFIXES.has(first.toLowerCase()) && /^\d+$/.test(last)) {
+    return `EP${String(Number(last)).padStart(2, "0")}`;
+  }
+  // IMDb style: parts = [tt0903747, season, episode]; gated on the
+  // tt-prefix so that the all-numeric check doesn't capture anime
+  // ids whose first segment isn't a recognised provider name.
+  if (first.startsWith("tt") && parts.length >= 3 && /^\d+$/.test(second) && /^\d+$/.test(last)) {
     const season = Number(second);
     const ep = Number(last);
     if (Number.isFinite(season) && Number.isFinite(ep)) {
       return `S${String(season).padStart(2, "0")}E${String(ep).padStart(2, "0")}`;
     }
-  }
-  // Prefix style (kitsu:/mal:/anidb:): parts = [provider, seriesNum, ep]
-  if (parts.length === 3 && /^\d+$/.test(last)) {
-    return `EP${String(Number(last)).padStart(2, "0")}`;
   }
   return null;
 }
