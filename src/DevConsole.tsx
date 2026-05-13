@@ -1086,7 +1086,20 @@ export default function DevConsole() {
 
 function Row({ entry }: { entry: LogEntry }) {
   const s = LEVEL_STYLE[entry.level];
-  const time = new Date(entry.ts).toISOString().slice(11, 23); // HH:MM:SS.mmm
+  // Local-clock HH:MM:SS.mmm — matches what the user reads off the
+  // OS clock. Was toISOString().slice(11, 23) which fixed the
+  // display to UTC and required mental offset to correlate with
+  // outside-app timestamps (logs from the cloud, OS notifications,
+  // etc.). The arithmetic locale-padding is more verbose than
+  // `toLocaleTimeString` but guarantees consistent HH:MM:SS.mmm
+  // formatting regardless of the system locale (some locales pad
+  // to e.g. "13:05:07 PM" with AM/PM).
+  const d = new Date(entry.ts);
+  const time =
+    `${String(d.getHours()).padStart(2, "0")}:` +
+    `${String(d.getMinutes()).padStart(2, "0")}:` +
+    `${String(d.getSeconds()).padStart(2, "0")}.` +
+    `${String(d.getMilliseconds()).padStart(3, "0")}`;
 
   return (
     <div data-log-row className="flex items-start gap-3 py-0.5 border-b border-white/4">
