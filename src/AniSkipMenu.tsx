@@ -143,134 +143,35 @@ export default function AniSkipMenu({
     setMalResolving(true);
     setMalId(null);
     (async () => {
-      // Each step logs its outcome so the DevConsole can tell us
-      // exactly which path failed when "MAL id not resolvable"
-      // appears. Filter `[aniskip]` to follow the chain.
-      console.info(
-        `[aniskip] menu resolving MAL for id=${activeTarget.id} ` +
-        `series_id=${activeTarget.series_id} season=${activeTarget.season} ` +
-        `episode_num=${activeTarget.episode_num}`,
-      );
-      // Step 1: anime-prefix video id (kitsu:N / mal:N / anidb:N /
-      // anilist:N). AIOMetadata's cour-aggregation patch encodes the
-      // cour-specific provider id directly, so this is the most
-      // accurate path when present.
-      const segs = activeTarget.id.split(":");
-      if (segs.length === 3) {
-        const provider = segs[0].toLowerCase();
-        const showId = Number(segs[1]);
-        if (Number.isFinite(showId)) {
-          if (provider === "mal") {
-            console.info(`[aniskip] step 1: mal: prefix → ${showId}`);
-            if (!cancelled) { setMalId(showId); setMalResolving(false); }
-            return;
-          }
-          if (provider === "kitsu" || provider === "anidb" || provider === "anilist") {
-            try {
-              const m = await invoke<number | null>("resolve_mal_id", {
-                source: provider, id: showId,
-              });
-              console.info(`[aniskip] step 1: ${provider}=${showId} → resolve_mal_id → ${m}`);
-              if (typeof m === "number") {
-                if (!cancelled) { setMalId(m); setMalResolving(false); }
-                return;
-              }
-            } catch (e) {
-              console.warn(`[aniskip] step 1: ${provider}=${showId} → resolve_mal_id threw: ${e}`);
-              // fall through to the cour-aware tt-style fallback
-            }
-          }
-        }
-      } else {
-        console.info(`[aniskip] step 1: skipped (id ${activeTarget.id} not a 3-segment shape)`);
-      }
-      // Step 2: tt-style fallback using the series-root IMDb id plus
-      // the cour number. resolve_cour_mal_id walks the Fribb anime-id
-      // map, picks the per-cour row by `season - 1` index, returns
-      // its `mal_id`. Covers cour 2+ episodes whose video id is
-      // tt-prefixed (e.g. `tt22248376:2:1`) AND the case where step 1's
-      // yuna.moe lookup returns null because the cour-specific
-      // kitsu id isn't in yuna.moe's dataset yet (recent anime).
+      // Single server-side call walks the entire resolution chain
+      // (anime-prefix → yuna.moe mal/anilist → Fribb mal/anilist →
+      // AniList idMal → title search). Per-step diagnostics live in
+      // the Rust devlog under `[aniskip]` so DevConsole still shows
+      // which path resolved the id.
       const seriesImdb = activeTarget.series_id && activeTarget.series_id.startsWith("tt")
         ? activeTarget.series_id
         : (activeTarget.id.startsWith("tt") ? activeTarget.id.split(":")[0] : null);
-      if (seriesImdb) {
-        try {
-          const m = await invoke<number | null>("resolve_cour_mal_id", {
-            imdbId: seriesImdb,
-            season: activeTarget.season ?? null,
-          });
-          console.info(
-            `[aniskip] step 2: resolve_cour_mal_id(${seriesImdb}, season=${activeTarget.season}) → ${m}`,
-          );
-          if (typeof m === "number") {
-            if (!cancelled) { setMalId(m); setMalResolving(false); }
-            return;
-          }
-        } catch (e) {
-          console.warn(`[aniskip] step 2: resolve_cour_mal_id threw: ${e}`);
+      console.info(
+        `[aniskip] menu resolving MAL for id=${activeTarget.id} ` +
+        `series_imdb=${seriesImdb} season=${activeTarget.season} ` +
+        `episode_num=${activeTarget.episode_num}`,
+      );
+      try {
+        const m = await invoke<number | null>("resolve_mal_for_aniskip", {
+          targetId:   activeTarget.id,
+          seriesImdb,
+          season:     activeTarget.season ?? null,
+          title:      activeTarget.name ?? null,
+        });
+        console.info(`[aniskip] resolve_mal_for_aniskip → ${m}`);
+        if (!cancelled) {
+          setMalId(typeof m === "number" ? m : null);
+          setMalResolving(false);
         }
-      } else {
-        console.info(`[aniskip] step 2: skipped (no tt-prefixed series_id)`);
+      } catch (e) {
+        console.warn(`[aniskip] resolve_mal_for_aniskip threw: ${e}`);
+        if (!cancelled) { setMalId(null); setMalResolving(false); }
       }
-      // Step 2b: Fribb-cour anilist_id → AniList GraphQL `idMal`.
-      // Fribb's per-cour rows for recent anime sometimes carry the
-      // anilist_id slot but leave the mal_id slot empty (Frieren cour 2
-      // is the canonical case — Fribb has anilist=182255 mapped to
-      // tt22248376 cour 2, no MAL filled in). AniList itself stores
-      // `idMal` on every Media record, so chaining through this
-      // recovers the MAL id without depending on yuna.moe / Fribb
-      // having backfilled the mapping.
-      if (seriesImdb) {
-        try {
-          const anilistId = await invoke<number | null>("resolve_cour_anilist_id", {
-            imdbId: seriesImdb,
-            season: activeTarget.season ?? null,
-          });
-          console.info(
-            `[aniskip] step 2b: resolve_cour_anilist_id(${seriesImdb}, season=${activeTarget.season}) → ${anilistId}`,
-          );
-          if (typeof anilistId === "number") {
-            const m = await invoke<number | null>("resolve_anilist_to_mal", {
-              anilistId,
-            });
-            console.info(`[aniskip] step 2b: resolve_anilist_to_mal(${anilistId}) → ${m}`);
-            if (typeof m === "number") {
-              if (!cancelled) { setMalId(m); setMalResolving(false); }
-              return;
-            }
-          }
-        } catch (e) {
-          console.warn(`[aniskip] step 2b: threw: ${e}`);
-        }
-      }
-      // Step 3: title-based Jikan search as last resort. Slower (one
-      // HTTP round-trip per call) but covers shows Fribb hasn't
-      // indexed AND whose video id provider isn't in yuna.moe. For
-      // multi-cour anime this returns the cour 1 MAL — wrong for
-      // cour 2 submissions, so we only fire it for S1 episodes where
-      // the cour-root MAL IS the right answer.
-      const season = activeTarget.season ?? 1;
-      if (season <= 1 && activeTarget.name) {
-        try {
-          const m = await invoke<number | null>("resolve_mal_id_by_title", {
-            title: activeTarget.name,
-            year: null,
-          });
-          console.info(`[aniskip] step 3: resolve_mal_id_by_title("${activeTarget.name}") → ${m}`);
-          if (!cancelled) {
-            setMalId(typeof m === "number" ? m : null);
-            setMalResolving(false);
-          }
-          return;
-        } catch (e) {
-          console.warn(`[aniskip] step 3: resolve_mal_id_by_title threw: ${e}`);
-        }
-      } else {
-        console.info(`[aniskip] step 3: skipped (season=${season} > 1, would resolve cour 1)`);
-      }
-      console.warn(`[aniskip] all resolution steps failed — submission unavailable`);
-      if (!cancelled) { setMalId(null); setMalResolving(false); }
     })();
     return () => { cancelled = true; };
   }, [open, activeTarget]);
@@ -355,18 +256,55 @@ export default function AniSkipMenu({
     }
   }, [malId, courEpisode, formType, startInput, endInput, duration]);
 
+  // Per-skip vote state: tracks the user's last vote direction so the
+  // button styling can highlight it AND so the cooldown disables both
+  // arrows for ~3 seconds after a click. AniSkip's server-side likely
+  // dedupes by submitterId, but client-side cooldown prevents the
+  // spam-clicking pattern entirely (the buttons are physically
+  // unclickable during the window). Map is per-render; resets on
+  // menu remount which is fine — votes always go through the server's
+  // dedupe anyway.
+  const [voteState, setVoteState] = useState<Record<string, {
+    last: "upvote" | "downvote" | null;
+    cooldownUntil: number;
+  }>>({});
+  const VOTE_COOLDOWN_MS = 3000;
+
   const handleVote = useCallback(async (
     skipId: string | null | undefined,
     voteType: "upvote" | "downvote",
   ) => {
     if (!skipId) { showFlash("No skip id for this row"); return; }
+    const now = Date.now();
+    const prev = voteState[skipId];
+    if (prev && now < prev.cooldownUntil) {
+      const wait = Math.ceil((prev.cooldownUntil - now) / 1000);
+      showFlash(`Wait ${wait}s before voting again`);
+      return;
+    }
+    // Optimistically lock the buttons for both arrows on this skip
+    // before the network call settles. Server-side rejections still
+    // surface via the flash toast; the cooldown is purely about
+    // preventing accidental double-clicks / spam.
+    setVoteState((m) => ({
+      ...m,
+      [skipId]: { last: voteType, cooldownUntil: now + VOTE_COOLDOWN_MS },
+    }));
     try {
       await invoke<boolean>("vote_skip_time", { skipId, voteType });
       showFlash(voteType === "upvote" ? "Upvoted" : "Downvoted");
     } catch (err) {
       showFlash(String(err) || "Vote failed");
+      // On failure roll back the optimistic lock so the user can
+      // retry immediately — the network blip shouldn't force a 3s
+      // wait.
+      setVoteState((m) => {
+        const next = { ...m };
+        delete next[skipId];
+        return next;
+      });
     }
-  }, []);
+  }, [voteState]);
 
   if (!open) return null;
 
@@ -432,36 +370,52 @@ export default function AniSkipMenu({
                     <p className="text-amber-300/80 text-[10px] mt-0.5">auto-skip</p>
                   )}
                 </div>
-                {w.source === "aniskip" && w.skip_id && (
-                  <div className="flex flex-col gap-0.5 flex-shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => handleVote(w.skip_id, "upvote")}
-                      aria-label="Upvote segment"
-                      title="Upvote segment"
-                      className="w-6 h-6 rounded text-ln-accent/85 hover:text-ln-accent
-                                 hover:bg-ln-accent/15 transition-colors
-                                 flex items-center justify-center"
-                    >
-                      <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                        <path d="M7 14l5-5 5 5z" />
-                      </svg>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleVote(w.skip_id, "downvote")}
-                      aria-label="Downvote segment"
-                      title="Downvote segment"
-                      className="w-6 h-6 rounded text-white/55 hover:text-rose-300
-                                 hover:bg-rose-500/12 transition-colors
-                                 flex items-center justify-center"
-                    >
-                      <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                        <path d="M7 10l5 5 5-5z" />
-                      </svg>
-                    </button>
-                  </div>
-                )}
+                {w.source === "aniskip" && w.skip_id && (() => {
+                  const vs = voteState[w.skip_id];
+                  const onCooldown = vs ? Date.now() < vs.cooldownUntil : false;
+                  const lastUp   = vs?.last === "upvote";
+                  const lastDown = vs?.last === "downvote";
+                  return (
+                    <div className="flex flex-col gap-0.5 flex-shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => handleVote(w.skip_id, "upvote")}
+                        disabled={onCooldown}
+                        aria-label="Upvote segment"
+                        aria-pressed={lastUp}
+                        title={onCooldown ? "Cooling down…" : "Upvote segment"}
+                        className={`w-6 h-6 rounded transition-colors flex items-center justify-center
+                                    ${lastUp
+                                      ? "text-ln-accent bg-ln-accent/20"
+                                      : "text-ln-accent/85 hover:text-ln-accent hover:bg-ln-accent/15"}
+                                    disabled:opacity-45 disabled:cursor-not-allowed
+                                    disabled:hover:bg-transparent`}
+                      >
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                          <path d="M7 14l5-5 5 5z" />
+                        </svg>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleVote(w.skip_id, "downvote")}
+                        disabled={onCooldown}
+                        aria-label="Downvote segment"
+                        aria-pressed={lastDown}
+                        title={onCooldown ? "Cooling down…" : "Downvote segment"}
+                        className={`w-6 h-6 rounded transition-colors flex items-center justify-center
+                                    ${lastDown
+                                      ? "text-rose-300 bg-rose-500/15"
+                                      : "text-white/55 hover:text-rose-300 hover:bg-rose-500/12"}
+                                    disabled:opacity-45 disabled:cursor-not-allowed
+                                    disabled:hover:bg-transparent`}
+                      >
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                          <path d="M7 10l5 5 5-5z" />
+                        </svg>
+                      </button>
+                    </div>
+                  );
+                })()}
               </div>
             </div>
           ))}

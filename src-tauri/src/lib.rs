@@ -1901,6 +1901,7 @@ pub fn run() {
             aniskip::submit_skip_time,
             aniskip::vote_skip_time,
             aniskip::resolve_anilist_to_mal,
+            aniskip::resolve_mal_for_aniskip,
             anime_id_map::resolve_cour_mal_id,
             anime_id_map::resolve_cour_anilist_id,
             aniskip::get_skip_windows,

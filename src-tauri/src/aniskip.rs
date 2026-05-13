@@ -827,6 +827,146 @@ struct AnilistIdMalMedia {
     id_mal: Option<u64>,
 }
 
+/// Helper: hit yuna.moe and return the full mapping row for a single
+/// (source, id) pair. Mirrors the lookup in `resolve_mal_id` but
+/// surfaces ALL fields so callers can chain through whichever id is
+/// populated. We keep `resolve_mal_id` as a separate command for
+/// backwards-compatibility with the existing call sites that just
+/// want the MAL id.
+#[derive(Debug, Clone, Deserialize, Default)]
+struct YunaFullResponse {
+    #[serde(default)] anilist: Option<serde_json::Value>,
+    #[serde(default)] mal:     Option<serde_json::Value>,
+}
+
+async fn yuna_lookup_full(source: &str, id: u64) -> Option<YunaFullResponse> {
+    let api_source = match source.to_lowercase().as_str() {
+        "kitsu" | "anidb" | "anilist" | "mal" => source.to_lowercase(),
+        _ => return None,
+    };
+    let url = format!("https://relations.yuna.moe/api/ids?source={api_source}&id={id}");
+    let resp = client().get(&url).send().await.ok()?;
+    if !resp.status().is_success() { return None; }
+    resp.json::<YunaFullResponse>().await.ok()
+}
+
+fn extract_u64(v: &Option<serde_json::Value>) -> Option<u64> {
+    v.as_ref()?.as_u64()
+}
+
+/// Consolidated MAL resolver for the AniSkipMenu — walks the full
+/// chain of fallbacks server-side so the frontend doesn't have to
+/// orchestrate four async invocations.
+///
+/// Resolution order:
+///   1. Direct provider id (kitsu/mal/anidb/anilist parsed from
+///      `target_id`) → yuna.moe `mal` field. If present, done.
+///   2. Same provider id → yuna.moe `anilist` field → AniList
+///      GraphQL `Media.idMal`. Covers recent anime where yuna.moe
+///      has the anilist mapping filled but not mal (Frieren cour 2
+///      is the canonical case).
+///   3. Series-root IMDb + season → Fribb mal_id slot via
+///      `anime_id_map::lookup_mal`. tt-style fallback for shows
+///      AIOMetadata serves under IMDb.
+///   4. Series-root IMDb + season → Fribb anilist_id → AniList
+///      GraphQL idMal. Covers Fribb rows with anilist but no mal.
+///   5. Title-based Jikan search (when season ≤ 1 only). Last
+///      resort; multi-cour anime would return the cour-1 MAL
+///      which is wrong for cour ≥ 2 submissions.
+///
+/// Returns None when every step fails. Each step logs its outcome
+/// so the DevConsole `[aniskip]` filter shows the full chain.
+#[tauri::command]
+pub async fn resolve_mal_for_aniskip(
+    target_id:    String,
+    series_imdb:  Option<String>,
+    season:       Option<u32>,
+    title:        Option<String>,
+) -> Option<u64> {
+    crate::devlog!(
+        info, "aniskip",
+        "resolve_mal_for_aniskip target_id={target_id} series_imdb={series_imdb:?} season={season:?}",
+    );
+    // Parse provider + show id from `kitsu:N:M` / `mal:N:M` / etc.
+    let parts: Vec<&str> = target_id.split(':').collect();
+    let (provider, show_id): (Option<&str>, Option<u64>) = match parts.as_slice() {
+        [p, n, _] => (Some(*p), n.parse::<u64>().ok()),
+        _ => (None, None),
+    };
+    let is_anime_prefix = matches!(
+        provider.map(|s| s.to_lowercase()).as_deref(),
+        Some("kitsu") | Some("mal") | Some("anidb") | Some("anilist"),
+    );
+
+    // Step 1 + 2 — yuna.moe row in one call.
+    if is_anime_prefix {
+        if let (Some(p), Some(id)) = (provider, show_id) {
+            if p.to_lowercase() == "mal" {
+                crate::devlog!(info, "aniskip", "step 1: target id is mal:{id}");
+                return Some(id);
+            }
+            if let Some(row) = yuna_lookup_full(p, id).await {
+                if let Some(mal) = extract_u64(&row.mal) {
+                    crate::devlog!(info, "aniskip", "step 1: yuna.moe {p}={id} → mal={mal}");
+                    return Some(mal);
+                }
+                if let Some(anilist) = extract_u64(&row.anilist) {
+                    crate::devlog!(
+                        info, "aniskip",
+                        "step 2: yuna.moe {p}={id} → anilist={anilist} → AniList idMal",
+                    );
+                    if let Some(mal) = resolve_anilist_to_mal(anilist).await {
+                        return Some(mal);
+                    }
+                }
+            } else {
+                crate::devlog!(info, "aniskip", "step 1: yuna.moe {p}={id} → no row");
+            }
+        }
+    }
+
+    // Step 3 + 4 — Fribb fallback via the cour-aware anime_id_map.
+    if let Some(imdb) = series_imdb.as_deref() {
+        if let Some(mal) = crate::anime_id_map::lookup_mal(imdb, season) {
+            crate::devlog!(info, "aniskip", "step 3: fribb mal {imdb}/{season:?} → {mal}");
+            return Some(mal);
+        }
+        if let Some(anilist) = crate::anime_id_map::lookup(imdb, season) {
+            crate::devlog!(
+                info, "aniskip",
+                "step 4: fribb anilist {imdb}/{season:?} → {anilist} → AniList idMal",
+            );
+            if let Some(mal) = resolve_anilist_to_mal(anilist).await {
+                return Some(mal);
+            }
+        } else {
+            crate::devlog!(info, "aniskip", "step 3/4: fribb has no entry for {imdb}");
+        }
+    }
+
+    // Step 5 — title search (S1 only; multi-cour shows would return
+    // cour 1's MAL which is wrong for cour 2 submissions).
+    let s1_or_unknown = season.map(|s| s <= 1).unwrap_or(true);
+    if s1_or_unknown {
+        if let Some(t) = title.as_deref() {
+            if !t.is_empty() {
+                crate::devlog!(info, "aniskip", "step 5: title search \"{t}\"");
+                if let Ok(Some(mal)) = resolve_mal_id_by_title(t.to_string(), None).await {
+                    return Some(mal as u64);
+                }
+            }
+        }
+    } else {
+        crate::devlog!(
+            info, "aniskip",
+            "step 5: skipped (season={season:?} > 1, would resolve cour 1)",
+        );
+    }
+
+    crate::devlog!(warn, "aniskip", "resolve_mal_for_aniskip: all steps failed");
+    None
+}
+
 #[tauri::command]
 pub async fn resolve_anilist_to_mal(anilist_id: u64) -> Option<u64> {
     let query = "query ($id: Int) { Media(id: $id, type: ANIME) { idMal } }";
