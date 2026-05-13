@@ -144,6 +144,23 @@ pub struct ScrobbleSession {
     /// episodes today.
     #[serde(default)]
     pub series_imdb_id: Option<String>,
+    /// Absolute episode number across the entire show, summed from
+    /// every earlier main-run cour's episode count + the current
+    /// cour-relative episode. Aura computes this on the frontend
+    /// from the meta detail (cour-relative is what AIOMetadata's
+    /// cour-aggregated `videos[].episode` carries).
+    ///
+    /// Used by `trakt_targets` to build a tertiary fallback target
+    /// for shows Trakt indexes by absolute numbering instead of
+    /// per-cour seasons (Frieren is the canonical example —
+    /// `tt22248376` on Trakt has all 38 episodes under S1, so a
+    /// cour-2-ep-9 payload returns `not_found` while
+    /// cour-2-absolute-37 succeeds). None when the frontend doesn't
+    /// have a meta detail to compute against (movies, pre-patch
+    /// shows, scoped scrobble events firing before the videos array
+    /// resolved).
+    #[serde(default)]
+    pub absolute_episode_num: Option<u32>,
 }
 
 static SESSION: OnceLock<Mutex<Option<ScrobbleSession>>> = OnceLock::new();
@@ -236,25 +253,43 @@ fn parse_trakt_target(id: &str, media_type: &str) -> Option<TraktTarget> {
 ///   • Fallback — a different target to retry with on not_found; None
 ///     when the two would be identical (no retry needed) or when the
 ///     session has no usable id (skip path).
-fn trakt_targets(sess: &ScrobbleSession) -> (Option<TraktTarget>, Option<TraktTarget>) {
-    // First try to extract a target from the video id (legacy path,
-    // works when the id is tt-prefixed). If that fails — common for
-    // AIOMetadata's post-patch anime where videos[].id is kitsu/mal/
-    // anidb shape — synthesize an episode target from the series-root
-    // IMDb id + the authoritative VideoEntry numbers. Trakt indexes
-    // anime by IMDb show id + S/E, so as long as we have the series
-    // root and either the id-string numbers or the explicit S/E, the
-    // payload is valid.
+/// Build the ordered list of Trakt /sync/history targets to try for a
+/// single scrobble event. Tried in priority order; the retry loop in
+/// `trakt_sync_history` walks the list until one returns `Added` or
+/// the list is exhausted.
+///
+/// Ordering rationale:
+///   1. VideoEntry-authoritative cour numbering (`series_imdb_id` +
+///      `sess.season` + `sess.episode_num`). What AIOMetadata's
+///      cour-aggregation patch encodes as the canonical view. Trakt
+///      anime entries that follow TVDB's cour-per-season layout
+///      accept this directly.
+///   2. ID-parsed numbering (legacy `tt…:S:E` ids). Only different
+///      from #1 when the id-string S/E disagrees with the VideoEntry
+///      override — the dual-numbering anime case that the original
+///      fallback was designed for.
+///   3. Absolute episode under S1 (`series_imdb_id` + S1 +
+///      `sess.absolute_episode_num`). Covers Trakt entries that
+///      index by show-wide absolute numbering (Frieren is the
+///      canonical example — all 38 eps under S1). Only added when
+///      the absolute number differs from #1's episode (so single-
+///      cour shows don't generate a duplicate retry).
+///
+/// Movies emit one target — the IMDb movie id. The Vec contract
+/// keeps the calling shape uniform.
+///
+/// Returns an empty Vec when no valid target can be synthesized
+/// (movie without a valid IMDb id, series without any S/E source).
+/// Callers treat empty as "skip — id format unsupported".
+fn trakt_targets(sess: &ScrobbleSession) -> Vec<TraktTarget> {
     let from_id = parse_trakt_target(&sess.imdb_id, &sess.media_type);
     let series_root = sess.series_imdb_id.clone().or_else(|| {
-        // Fall back to parsing the show id out of the video id (e.g.
-        // tt22248376:1:5 → tt22248376) when the dedicated field
-        // wasn't supplied. Pre-patch sessions all hit this path.
         sess.imdb_id.split(':').next().filter(|s| s.starts_with("tt")).map(String::from)
     });
-    let from_override = match (&from_id, sess.season, sess.episode_num, &series_root) {
-        // Both VideoEntry S/E and an id-parsed target — use S/E with the
-        // existing show_imdb from the id parse.
+
+    let primary: Option<TraktTarget> = match (&from_id, sess.season, sess.episode_num, &series_root) {
+        // VideoEntry S/E + id-parsed show — use S/E with the show
+        // anchor from the id parse.
         (Some(TraktTarget::Episode { show_imdb, .. }), Some(s), Some(e), _) => {
             Some(TraktTarget::Episode {
                 show_imdb: show_imdb.clone(),
@@ -263,8 +298,7 @@ fn trakt_targets(sess: &ScrobbleSession) -> (Option<TraktTarget>, Option<TraktTa
             })
         }
         // Id parse failed (kitsu-shape video) but we have the series
-        // root + VideoEntry S/E — synthesize the Trakt payload from
-        // those. This is the post-AIOMetadata-fix path.
+        // root + VideoEntry S/E.
         (None, Some(s), Some(e), Some(root)) if sess.media_type != "movie" => {
             Some(TraktTarget::Episode {
                 show_imdb: root.clone(),
@@ -272,20 +306,42 @@ fn trakt_targets(sess: &ScrobbleSession) -> (Option<TraktTarget>, Option<TraktTa
                 number: e,
             })
         }
-        // Movie variant: id-parse failed but we have an IMDb show
-        // root + movie media_type. Rare (movies generally come through
-        // as tt-prefixed ids) but symmetric.
+        // Movie variant.
         (None, _, _, Some(root)) if sess.media_type == "movie" => {
             Some(TraktTarget::Movie { imdb: root.clone() })
         }
         _ => None,
     };
-    match (from_override, from_id) {
-        (Some(o), Some(i)) if o == i => (Some(o), None),
-        (Some(o), Some(i))            => (Some(o), Some(i)),
-        (Some(o), None)               => (Some(o), None),
-        (None,    i)                  => (i, None),
+
+    // Build the ordered candidate list, dedup'ing identical entries
+    // so a single-cour show or a show whose cour/absolute numbering
+    // matches doesn't fan out duplicate POSTs.
+    let mut out: Vec<TraktTarget> = Vec::new();
+    let mut push_unique = |t: TraktTarget| {
+        if !out.iter().any(|existing| existing == &t) {
+            out.push(t);
+        }
+    };
+
+    if let Some(p) = primary {
+        push_unique(p);
     }
+    if let Some(id_target) = from_id {
+        push_unique(id_target);
+    }
+    // Absolute-numbering retry — only for episodes (movies don't
+    // carry episode numbers). Synthesized under S1 with the
+    // absolute episode supplied by the frontend.
+    if sess.media_type != "movie" {
+        if let (Some(root), Some(abs)) = (series_root.as_ref(), sess.absolute_episode_num) {
+            push_unique(TraktTarget::Episode {
+                show_imdb: root.clone(),
+                season: 1,
+                number: abs,
+            });
+        }
+    }
+    out
 }
 
 /// Build the `/sync/history` body for marking a target as watched.
@@ -488,15 +544,15 @@ async fn trakt_sync_history(scope: &str, sess: &ScrobbleSession, time: f64, dura
         );
         return TraktSyncResult::Skipped;
     };
-    let (primary, fallback) = trakt_targets(sess);
-    let Some(primary) = primary else {
+    let candidates = trakt_targets(sess);
+    if candidates.is_empty() {
         crate::devlog!(
             warn, "scrobble",
             "Trakt /sync/history skipped: id format unsupported: {} (type={})",
             sess.imdb_id, sess.media_type,
         );
         return TraktSyncResult::Skipped;
-    };
+    }
 
     let progress_pct = if duration > 0.0 {
         (time / duration * 100.0).clamp(0.0, 100.0)
@@ -504,42 +560,42 @@ async fn trakt_sync_history(scope: &str, sess: &ScrobbleSession, time: f64, dura
         0.0
     };
 
-    let primary_outcome = trakt_sync_history_once(
-        &token.access_token, &primary, sess, progress_pct,
-    ).await;
-
-    match primary_outcome {
-        TraktSyncOutcome::Added => TraktSyncResult::Fired,
-        TraktSyncOutcome::Unauthorized => {
-            scrobble_auth::clear_token_for("trakt", scope);
-            TraktSyncResult::Failed
-        }
-        TraktSyncOutcome::HttpError => TraktSyncResult::Failed,
-        TraktSyncOutcome::NotFound => {
-            // Dual-numbering retry. The fallback target is the
-            // ID-parsed alternate (when the primary came from a
-            // VideoEntry override). If they're identical or there's no
-            // alternate, no retry — surface NotFound as final.
-            let Some(fallback) = fallback else {
-                return TraktSyncResult::NotFound;
-            };
+    // Walk the candidate list in priority order. First Added wins;
+    // NotFound triggers the next attempt; everything else short-
+    // circuits and surfaces the corresponding TraktSyncResult.
+    // Logs name which candidate position is firing so the user can
+    // see in DevConsole which numbering Trakt's catalog accepted.
+    let total = candidates.len();
+    for (idx, target) in candidates.iter().enumerate() {
+        if idx > 0 {
             crate::devlog!(
                 info, "scrobble",
-                "Trakt not_found on primary numbering — retrying with fallback (S/E from id-parse)",
+                "Trakt not_found on attempt {} — retrying with candidate {}/{}",
+                idx, idx + 1, total,
             );
-            match trakt_sync_history_once(
-                &token.access_token, &fallback, sess, progress_pct,
-            ).await {
-                TraktSyncOutcome::Added       => TraktSyncResult::Fired,
-                TraktSyncOutcome::NotFound    => TraktSyncResult::NotFound,
-                TraktSyncOutcome::HttpError   => TraktSyncResult::Failed,
-                TraktSyncOutcome::Unauthorized => {
-                    scrobble_auth::clear_token_for("trakt", scope);
-                    TraktSyncResult::Failed
-                }
+        }
+        let outcome = trakt_sync_history_once(
+            &token.access_token, target, sess, progress_pct,
+        ).await;
+        match outcome {
+            TraktSyncOutcome::Added => return TraktSyncResult::Fired,
+            TraktSyncOutcome::Unauthorized => {
+                scrobble_auth::clear_token_for("trakt", scope);
+                return TraktSyncResult::Failed;
+            }
+            TraktSyncOutcome::HttpError => return TraktSyncResult::Failed,
+            TraktSyncOutcome::NotFound => {
+                // Try the next candidate.
+                continue;
             }
         }
     }
+    crate::devlog!(
+        warn, "scrobble",
+        "Trakt /sync/history exhausted all {} candidate target(s) without Added",
+        total,
+    );
+    TraktSyncResult::NotFound
 }
 
 // ---------------------------------------------------------------------------
@@ -828,12 +884,12 @@ pub fn shutdown_blocking<R: Runtime>(app: &AppHandle<R>) {
     // singleton because reqwest's per-request timeout overrides the
     // builder's, and we want a tighter ceiling than the 8s runtime
     // default for the shutdown path specifically.
-    // Use the same primary-target selection as the live path so the
+    // Use the highest-priority candidate from trakt_targets so the
     // VideoEntry's authoritative season/episode is preferred over the
-    // ID-parsed alternate. Fire-and-forget; no retry on `not_found`
-    // here because the shutdown path can't wait on the response body
-    // parse + a second round-trip.
-    let (primary_target, _fallback) = trakt_targets(&sess);
+    // ID-parsed alternate / absolute fallback. Fire-and-forget; no
+    // retry on `not_found` here because the shutdown path can't wait
+    // on the response body parse + a second round-trip.
+    let primary_target = trakt_targets(&sess).into_iter().next();
     if let (Some(target), Some(token)) = (
         primary_target,
         scrobble_auth::read_token_for("trakt", &scope),

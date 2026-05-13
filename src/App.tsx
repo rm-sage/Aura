@@ -1122,6 +1122,14 @@ export default function App() {
           selectedMeta?.logo ??
           library.find((i) => i.id === target.id)?.logo ??
           null;
+        // absolute_episode_num is patched in by the async effect
+        // below — computing it inline would require awaiting the meta
+        // detail BEFORE we can flip activeTarget, which would block
+        // the play flow on a potentially slow (cold-cache) fetch.
+        // The effect resolves it within milliseconds when the cache
+        // is warm; on cold-cache it lands well before the 120-second
+        // scrobble_start warmup, so the Trakt absolute fallback has
+        // the value it needs.
         setActiveTarget({
           id:            target.id,
           series_id:     target.series_id,
@@ -2495,6 +2503,47 @@ export default function App() {
     setAddons((prev) => prev.filter((a) => a.url !== url));
   }, []);
 
+  // ── Absolute-episode patch effect ──
+  // Computes activeTarget.absolute_episode_num asynchronously after
+  // activeTarget is set. handlePlayStream can't await the meta detail
+  // before flipping activeTarget (would block the play flow on a cold
+  // cache); this effect fetches in the background and patches the
+  // target with the absolute number once detail resolves. Lands well
+  // before the 120 s scrobble_start warmup so the Trakt absolute-
+  // numbering fallback target has the value it needs.
+  //
+  // Only fires for episodes with season > 1 (S1 cour-relative ==
+  // absolute, no conversion needed) AND when absolute_episode_num
+  // isn't already stamped (idempotency — don't refetch on every
+  // re-render).
+  useEffect(() => {
+    if (!activeTarget) return;
+    if (activeTarget.absolute_episode_num != null) return;
+    const s = activeTarget.season;
+    const e = activeTarget.episode_num;
+    if (s == null || s <= 1 || e == null) return;
+    const seriesId = activeTarget.series_id ?? activeTarget.id;
+    let cancelled = false;
+    (async () => {
+      const detail = await getMetaDetailFallback(addons, activeTarget.media_type, seriesId)
+        .catch(() => null);
+      if (cancelled || !detail?.videos || detail.videos.length === 0) return;
+      const priorCourEps = detail.videos.filter(
+        (v) => (v.season ?? 0) > 0 && (v.season ?? 0) < s,
+      ).length;
+      const absoluteEp = priorCourEps + e;
+      // Patch via functional setState — if the user has already swapped
+      // to a different episode by the time the meta resolves, the id
+      // check refuses to overwrite the new target with stale data.
+      setActiveTarget((prev) => {
+        if (!prev || prev.id !== activeTarget.id) return prev;
+        if (prev.absolute_episode_num === absoluteEp) return prev;
+        return { ...prev, absolute_episode_num: absoluteEp };
+      });
+    })();
+    return () => { cancelled = true; };
+  }, [activeTarget, addons]);
+
   // ── Scrobble lifecycle (no-ops while activeTarget is null) ──
   // `scope` keys the per-account Trakt token in the keyring, matching
   // the layout in scrobble_auth.rs (first 12 chars of auth_key, or
@@ -2570,6 +2619,12 @@ export default function App() {
               : (activeTarget.id.startsWith("tt")
                   ? activeTarget.id.split(":")[0]
                   : null),
+          // Absolute episode for Trakt's S1-absolute fallback. Stamped
+          // on activeTarget at handlePlayStream time from
+          // detail.videos prior-cour sums; the test fire reads it
+          // directly so DevConsole test runs cover the same retry
+          // path as live playback.
+          absolute_episode_num: activeTarget.absolute_episode_num ?? null,
         };
         const r = await invoke<RustResult>("scrobble_test_fire", {
           session,

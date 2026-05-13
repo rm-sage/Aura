@@ -97,6 +97,13 @@ export interface ActiveScrobbleTarget {
    *  Movies leave both fields undefined. */
   season?: number;
   episode_num?: number;
+  /** Absolute episode across the entire show, computed by
+   *  handlePlayStream from detail.videos by summing earlier main-run
+   *  cours' episode counts. After AIOMetadata's cour-aggregation
+   *  patch, `episode_num` is cour-relative — Trakt entries indexed by
+   *  absolute numbering need this value as a fallback target.
+   *  Optional; only stamped for season ≥ 2 of cour-aggregated anime. */
+  absolute_episode_num?: number;
   /** Stylized logo URL — used by the buffering overlay. */
   logo?: string | null;
   /** Anime-detection signals — passed to `isAnimeMeta` so the AniList
@@ -324,6 +331,13 @@ export function useScrobble({
           series_imdb_id: active.series_id && active.series_id.startsWith("tt")
             ? active.series_id
             : (active.id.startsWith("tt") ? active.id.split(":")[0] : null),
+          // Absolute episode for Trakt's S1-absolute fallback target.
+          // Computed by handlePlayStream from detail.videos prior-cour
+          // sums; passed through verbatim. scrobble.rs uses it to build
+          // a tertiary candidate target after the cour-numbered primary
+          // returns not_found — covers shows Trakt indexes by absolute
+          // numbering (Frieren et al.).
+          absolute_episode_num: active.absolute_episode_num ?? null,
         },
         duration: playback.duration,
       }).catch(() => {});
