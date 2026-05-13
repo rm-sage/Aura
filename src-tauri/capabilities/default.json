@@ -57,6 +57,7 @@
     "allow-dev-tools",
     "allow-crash-reporting",
     "allow-sync",
+    "allow-log-export",
     "updater:default"
   ]
 }

@@ -241,3 +241,11 @@ commands.allow = [
 identifier = "allow-crash-reporting"
 description = "Allows the frontend to read and write the global Sentry consent state and DSN"
 commands.allow = ["get_crash_reporting", "set_crash_reporting"]
+
+# ── DevConsole log export (Save-As dialog → text file write) ───────────────
+# Used by the F12 DevConsole's Download button to dump the current log
+# buffer to a user-chosen path. See src-tauri/src/log_export.rs.
+[[permission]]
+identifier = "allow-log-export"
+description = "Allows the DevConsole to open a native Save-As dialog and write the log buffer to disk"
+commands.allow = ["save_text_with_dialog"]

@@ -27,6 +27,7 @@ mod backup;
 mod cinema;
 mod crash_reporting;
 mod devlog;
+mod log_export;
 mod anime_id_map;
 mod api_keyring;
 mod media_controls;
@@ -1934,6 +1935,7 @@ pub fn run() {
             sync::fetch_release_signal,
             sync::fetch_release_signals,
             sync::nudge_release_poller,
+            log_export::save_text_with_dialog,
             per_title::get_all_title_state,
             per_title::set_all_title_state,
             scrobble_anilist::get_anilist_id_map,

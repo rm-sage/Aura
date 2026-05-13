@@ -157,6 +157,45 @@ function handleLogCopy(e: React.ClipboardEvent<HTMLDivElement>) {
 }
 
 // ---------------------------------------------------------------------------
+// Bulk-export helpers — used by the Copy / Download toolbar buttons. Mirrors
+// what the Row component renders: HH:MM:SS.mmm  LEVEL  source  message,
+// with the stack (if any) appended on a separate indented line.
+// ---------------------------------------------------------------------------
+
+function formatEntryLine(entry: LogEntry): string {
+  const d = new Date(entry.ts);
+  const time =
+    `${String(d.getHours()).padStart(2, "0")}:` +
+    `${String(d.getMinutes()).padStart(2, "0")}:` +
+    `${String(d.getSeconds()).padStart(2, "0")}.` +
+    `${String(d.getMilliseconds()).padStart(3, "0")}`;
+  const tag = LEVEL_STYLE[entry.level].tag.trim().padEnd(5);
+  let line = `${time}  ${tag}  ${entry.source.padEnd(10)}  ${entry.message}`;
+  if (entry.stack) line += `\n${entry.stack}`;
+  return line;
+}
+
+function buildExportText(entries: LogEntry[]): string {
+  const now = new Date();
+  const header =
+    `# Aura DevConsole export\n` +
+    `# Generated: ${now.toISOString()}\n` +
+    `# Entries: ${entries.length}\n\n`;
+  return header + entries.map(formatEntryLine).join("\n") + "\n";
+}
+
+function defaultExportFilename(): string {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mi = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `aura-devlogs-${yyyy}-${mm}-${dd}_${hh}${mi}${ss}.log`;
+}
+
+// ---------------------------------------------------------------------------
 // Command prompt — types + helpers
 // ---------------------------------------------------------------------------
 
@@ -552,6 +591,9 @@ export default function DevConsole() {
   });
   const [paused, setPaused]   = useState(false);
   const [search, setSearch]   = useState("");
+  /** Brief "copied" / "saved" toast surfaced on the Copy / Download
+   *  buttons after a successful action. Auto-clears after ~1.4 s. */
+  const [exportStatus, setExportStatus] = useState<"copied" | "saved" | "error" | null>(null);
 
   const idRef          = useRef(0);
   const tailRef        = useRef<HTMLDivElement>(null);
@@ -835,6 +877,41 @@ export default function DevConsole() {
   }, [entries, enabled, search]);
   const truncatedCount = entries.length - visible.length;
 
+  // Bulk-export handlers — operate on the FULL entries buffer, not the
+  // filtered/rendered subset, so the user always gets a complete log
+  // regardless of what's currently visible.
+  const flashStatus = useCallback((kind: "copied" | "saved" | "error") => {
+    setExportStatus(kind);
+    window.setTimeout(() => setExportStatus(null), 1400);
+  }, []);
+
+  const handleCopyLogs = useCallback(async () => {
+    if (entries.length === 0) return;
+    const text = buildExportText(entries);
+    try {
+      await navigator.clipboard.writeText(text);
+      flashStatus("copied");
+    } catch (err) {
+      console.error("[devconsole] copy failed:", err);
+      flashStatus("error");
+    }
+  }, [entries, flashStatus]);
+
+  const handleDownloadLogs = useCallback(async () => {
+    if (entries.length === 0) return;
+    const text = buildExportText(entries);
+    try {
+      const path = await invoke<string | null>("save_text_with_dialog", {
+        content: text,
+        defaultName: defaultExportFilename(),
+      });
+      if (path) flashStatus("saved");
+    } catch (err) {
+      console.error("[devconsole] download failed:", err);
+      flashStatus("error");
+    }
+  }, [entries, flashStatus]);
+
   if (!open) return null;
 
   return (
@@ -909,6 +986,36 @@ export default function DevConsole() {
                       }`}
         >
           {paused ? "▶ resume" : "⏸ pause"}
+        </button>
+        <button
+          onClick={handleCopyLogs}
+          disabled={entries.length === 0}
+          title={`Copy all ${entries.length} log entries to the clipboard`}
+          className={`px-2 py-0.5 rounded-sm text-[9.5px] font-semibold tracking-[0.18em] uppercase
+                      border transition-colors disabled:opacity-40 disabled:cursor-not-allowed
+                      ${exportStatus === "copied"
+                        ? "bg-emerald-500/15 text-emerald-300 border-emerald-400/30"
+                        : exportStatus === "error"
+                          ? "bg-red-500/15 text-red-300 border-red-400/30"
+                          : "bg-white/5 text-white/55 border-white/10 hover:bg-white/10"
+                      }`}
+        >
+          {exportStatus === "copied" ? "copied" : "copy"}
+        </button>
+        <button
+          onClick={handleDownloadLogs}
+          disabled={entries.length === 0}
+          title={`Download all ${entries.length} log entries to a file (you'll be prompted for the save location)`}
+          className={`px-2 py-0.5 rounded-sm text-[9.5px] font-semibold tracking-[0.18em] uppercase
+                      border transition-colors disabled:opacity-40 disabled:cursor-not-allowed
+                      ${exportStatus === "saved"
+                        ? "bg-emerald-500/15 text-emerald-300 border-emerald-400/30"
+                        : exportStatus === "error"
+                          ? "bg-red-500/15 text-red-300 border-red-400/30"
+                          : "bg-white/5 text-white/55 border-white/10 hover:bg-white/10"
+                      }`}
+        >
+          {exportStatus === "saved" ? "saved" : "download"}
         </button>
         <button
           onClick={() => setEntries([])}
