@@ -342,15 +342,16 @@ function QueueCard({
             {meta.name}
           </p>
           <div className="flex items-center justify-center gap-1.5 mt-1">
+            {/* Match the Library tile chrome — media-type label only,
+                no trailing year. Stremio's `year` field on library
+                items is inconsistent (off-by-one, missing, or
+                reporting first-aired-of-cour-2 instead of show
+                start), which the user already removed from the
+                Library grid; mirror that here so the two surfaces
+                stay visually consistent. */}
             <span className="text-white/40 text-[10px] uppercase tracking-wider">
               {typeLabel(meta.media_type ?? "other")}
             </span>
-            {meta.release_info && (
-              <>
-                <span className="text-white/20">·</span>
-                <span className="text-white/40 text-[10px]">{meta.release_info}</span>
-              </>
-            )}
           </div>
         </div>
       </button>
