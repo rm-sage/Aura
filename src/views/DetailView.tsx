@@ -2367,6 +2367,27 @@ function EpisodesPanel({
     return main ?? seasons[0] ?? 1;
   });
 
+  // Retarget when targetSeason becomes available AFTER mount. The
+  // useState initializer above only sees what's available at the
+  // moment EpisodesPanel mounts — if the parent's meta-detail fetch
+  // is still in flight when we mount, `videos` is empty and
+  // `targetSeason` evaluates to null. Without this effect we'd land
+  // on S1 by default and stay there even when the just-played
+  // episode belongs to S2 (visible with cour-aggregated anime like
+  // Frieren returning from S2E09).
+  //
+  // The ref gates "consume once" so a later user-driven season pick
+  // doesn't get clobbered by a stale targetSeason value when
+  // scrollToVideoId hasn't been cleared yet.
+  const hasAppliedTargetSeasonRef = useRef(false);
+  useEffect(() => {
+    if (hasAppliedTargetSeasonRef.current) return;
+    if (targetSeason == null) return;
+    hasAppliedTargetSeasonRef.current = true;
+    if (season !== targetSeason) setSeason(targetSeason);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetSeason]);
+
   useEffect(() => {
     if (seasons.length === 0) return;
     if (!seasons.includes(season)) {
