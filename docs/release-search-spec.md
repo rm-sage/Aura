@@ -194,8 +194,12 @@ a single trailing segment.
 - **Logging:** log only `method`, status code, item count, and the
   scope-truncated-to-4-chars (same pattern as existing `logSync`).
   Never log the items array.
-- **Future:** a response `ETag` for short-circuiting unchanged
-  refresh ticks is planned but not yet implemented — see §10.1.
+- **Response ETag (since 2026-05-13).** Every 200 response carries an
+  `ETag` header derived deterministically from the request id list +
+  per-signal etags. Clients may send `If-None-Match: <last-etag>` to
+  short-circuit unchanged refresh ticks; the server replies `304 Not
+  Modified` with the `ETag` header and no body. See §10.1 for the
+  full produce/consume protocol.
 
 ### 4.3 `POST /sync/v1/release/{imdb_id}/refresh` — nudge the poller
 
@@ -615,9 +619,10 @@ Three-place registration per CLAUDE.md: command handler list,
 
 ## 10. Future optimizations
 
-> **Status:** none of this is built yet. Stubs for a future PR.
+> **Status:** §10.1 is implemented (2026-05-13). Remaining items below
+> are stubs for future PRs.
 
-### 10.1 Batch response ETag — short-circuit unchanged refreshes
+### 10.1 Batch response ETag — short-circuit unchanged refreshes — **implemented**
 
 **Motivation.** With the periodic refresh tick from §6.0 (5–10 min
 recommended), the desktop re-downloads the full `/batch` response
@@ -767,3 +772,8 @@ AIOMetadata source):
     mechanics and the desktop-side consumption pattern — pick it up
     when periodic-refresh bandwidth becomes a concern (estimated
     ~99% reduction in steady-state refresh traffic).
+16. **§10.1 implemented (2026-05-13).** `/batch` now returns an
+    `ETag` header and honors `If-None-Match` with `304 Not Modified`.
+    Verified end-to-end: same id list + same per-signal etags →
+    304; id list change or per-signal etag change → 200 with new
+    ETag. Logs include `etag=<4-hex>` on both 200 and 304 paths.

@@ -118,10 +118,14 @@ export function invalidateReleaseSignal(imdbId: string): void {
   singleFetchCache.delete(imdbId);
 }
 
-/** Drop the entire single-fetch cache. Called from sync.ts on session
- *  change so signals from a prior account don't leak. */
+/** Drop the entire single-fetch cache AND the batch-etag cache.
+ *  Called from sync.ts on session change so signals from a prior
+ *  account don't leak. The batch cache also has to drop because the
+ *  prior account's etag is invalid for the new scope (cloud computes
+ *  the etag over signal data scoped to the auth header). */
 export function clearReleaseSignalCache(): void {
   singleFetchCache.clear();
+  batchEtagCache.clear();
 }
 
 /**
@@ -186,6 +190,93 @@ export async function fetchReleaseSignal(imdbId: string): Promise<ReleaseSignal 
 
 const BATCH_MAX_ITEMS = 500;
 
+// ── Batch-response ETag cache ───────────────────────────────────────
+// Per spec §10.1: the cloud computes a response ETag from the sorted
+// id list + per-row etags. The desktop persists the last response
+// ETag keyed by the SAME sorted id list, then sends it as
+// `If-None-Match` on the next call with the same list. On 304 the
+// cloud returns empty body — we reuse the cached `signals` map
+// without re-decoding the (potentially ~100 KB) payload.
+//
+// Cache lives in-memory only (no localStorage persistence). On app
+// restart the first batch round-trips the full payload; subsequent
+// ticks reuse the etag. This matches the spec's "in-memory alongside
+// the signal cache is fine" guidance.
+interface BatchCacheEntry {
+  etag: string;
+  // The actual decoded signal map. On 304 we return this verbatim
+  // (per the spec, the etag matching means nothing changed). If the
+  // local cache was evicted between calls, we drop `If-None-Match`
+  // on the next call and accept a 200 — handled in `runBatchChunk`.
+  signals: Map<string, ReleaseSignal | null>;
+}
+const batchEtagCache = new Map<string, BatchCacheEntry>();
+
+/** Build a stable cache key from a chunk's id list. Order matters
+ *  for the cloud's etag hash (it sorts before hashing), so we sort
+ *  the same way locally — that lets a re-fetch with the items
+ *  shuffled still hit the cache. */
+function batchCacheKey(chunk: ReleaseSignalItem[]): string {
+  return chunk
+    .map((it) => `${it.id}:${it.type}`)
+    .sort()
+    .join(",");
+}
+
+interface BatchChunkOutcome {
+  signals: Map<string, ReleaseSignal | null>;
+  cached304: boolean;
+}
+
+async function runBatchChunk(chunk: ReleaseSignalItem[]): Promise<BatchChunkOutcome> {
+  const cacheKey = batchCacheKey(chunk);
+  const cached = batchEtagCache.get(cacheKey);
+  const ifNoneMatch = cached?.etag ?? null;
+  const result = await invoke<{
+    etag: string | null;
+    signals: Record<string, ReleaseSignal | null> | null;
+  }>("fetch_release_signals", { items: chunk, ifNoneMatch });
+
+  // 304 short-circuit — cloud returned no body, just an etag.
+  // Reuse the prior decode if we still have it. If the in-memory
+  // cache was evicted (which shouldn't happen since we only purge
+  // on session swap), fall back to issuing a fresh request without
+  // the If-None-Match header.
+  if (result.signals === null) {
+    if (cached) {
+      return { signals: cached.signals, cached304: true };
+    }
+    // Cache miss with 304 — pathological. Drop the etag and retry
+    // unconditionally. Defensive; in practice the cache always has
+    // the matching entry because we only evict on session swap.
+    const fresh = await invoke<{
+      etag: string | null;
+      signals: Record<string, ReleaseSignal | null> | null;
+    }>("fetch_release_signals", { items: chunk, ifNoneMatch: null });
+    if (fresh.signals == null) {
+      // Cloud insists on 304 even with no If-None-Match — surface
+      // an empty map rather than throw.
+      return { signals: new Map(), cached304: false };
+    }
+    const map = new Map<string, ReleaseSignal | null>();
+    for (const it of chunk) map.set(it.id, fresh.signals[it.id] ?? null);
+    if (fresh.etag) batchEtagCache.set(cacheKey, { etag: fresh.etag, signals: map });
+    return { signals: map, cached304: false };
+  }
+
+  // 200 — fresh data. Decode into a Map + persist the new etag.
+  const map = new Map<string, ReleaseSignal | null>();
+  for (const it of chunk) map.set(it.id, result.signals[it.id] ?? null);
+  if (result.etag) {
+    batchEtagCache.set(cacheKey, { etag: result.etag, signals: map });
+  } else {
+    // No etag header — older cloud build? Don't cache; force a
+    // full-body refresh on the next tick.
+    batchEtagCache.delete(cacheKey);
+  }
+  return { signals: map, cached304: false };
+}
+
 /** Batch-fetch signals for many ids. Chunks at 500 items per call so
  *  large libraries don't hit the cloud's 64 KiB body cap. Returns a
  *  Map keyed by imdb_id — entries with `null` value mean "queued, no
@@ -193,7 +284,16 @@ const BATCH_MAX_ITEMS = 500;
  *  probe path for those.
  *
  *  Empty input returns an empty map without making a network call
- *  (cheap guard the cloud doesn't have to enforce). */
+ *  (cheap guard the cloud doesn't have to enforce).
+ *
+ *  Conditional-fetch behaviour (spec §10.1): on a repeated call with
+ *  the same chunk id list, the cloud returns 304 + an unchanged
+ *  ETag header. We reuse the cached `signals` map without
+ *  re-decoding the body — the typical refresh tick goes from a
+ *  ~100 KB JSON payload to ~150 bytes of headers. The
+ *  `cached304=true` flag in the chunk outcome bubbles up to the
+ *  per-batch log line so it's easy to verify the cache is working
+ *  in DevConsole. */
 export async function fetchReleaseSignals(
   items: ReleaseSignalItem[],
 ): Promise<Map<string, ReleaseSignal | null>> {
@@ -202,10 +302,12 @@ export async function fetchReleaseSignals(
   const t0 = performance.now();
   let cachedCount = 0;
   let nullCount = 0;
+  let chunk304Count = 0;
+  let chunk200Count = 0;
   // Outbound list — start with everything, then trim ids we already
-  // have a fresh cache for. The cloud bills us per item-bytes so
-  // sending less is friendlier; on the desktop side it also means
-  // the response is smaller to parse.
+  // have a fresh single-fetch cache for. The cloud bills us per
+  // item-bytes so sending less is friendlier; on the desktop side it
+  // also means the response is smaller to parse.
   const outbound: ReleaseSignalItem[] = [];
   for (const it of items) {
     const c = getCachedSingle(it.id);
@@ -221,12 +323,11 @@ export async function fetchReleaseSignals(
   for (let i = 0; i < outbound.length; i += BATCH_MAX_ITEMS) {
     const chunk = outbound.slice(i, i + BATCH_MAX_ITEMS);
     try {
-      const resp = await invoke<Record<string, ReleaseSignal | null>>(
-        "fetch_release_signals",
-        { items: chunk },
-      );
+      const { signals, cached304 } = await runBatchChunk(chunk);
+      if (cached304) chunk304Count += 1;
+      else chunk200Count += 1;
       for (const it of chunk) {
-        const sig = resp[it.id] ?? null;
+        const sig = signals.get(it.id) ?? null;
         out.set(it.id, sig);
         // Seed the single-fetch cache so a follow-up
         // fetchReleaseSignal hits the warm path.
@@ -253,7 +354,7 @@ export async function fetchReleaseSignals(
   console.info(
     `[release-search] batch n=${items.length} cached=${cachedCount} ` +
     `null=${nullCount} resolved=${items.length - cachedCount - nullCount} ` +
-    `latency=${ms}ms`,
+    `chunks=${chunk200Count}+${chunk304Count}(304) latency=${ms}ms`,
   );
   return out;
 }

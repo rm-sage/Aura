@@ -582,31 +582,66 @@ pub async fn fetch_release_signal(
 /// when the library has more — `releaseSearch.ts` does that on the JS
 /// side, so this command sees only chunked payloads.
 ///
-/// Returns the map as-is. Caller handles per-id `null` (queued, no
-/// signal yet) as "fall back to addon probe for this id".
+/// `if_none_match` carries the response ETag from the previous call
+/// with the same id list. The cloud (since 2026-05-13, spec §10.1)
+/// returns `304 Not Modified` when nothing about the response would
+/// change — id list identical AND every signal's individual etag
+/// identical. On 304 we return `BatchResult { etag: same, signals:
+/// None }` so the caller can reuse its cached results without
+/// re-decoding the (potentially ~100 KB) JSON body.
+#[derive(Serialize)]
+pub struct ReleaseBatchResult {
+    /// Response ETag from the cloud. None means the cloud didn't
+    /// include the header (older deploys; not currently possible but
+    /// safe to handle). Use this as the `if_none_match` arg on the
+    /// next call with the same id list.
+    pub etag: Option<String>,
+    /// `Some(map)` on 200 (fresh data — call site should merge into
+    /// store). `None` on 304 (use cached). Always `Some` on the
+    /// no-items short-circuit (empty map).
+    pub signals: Option<std::collections::HashMap<String, Option<serde_json::Value>>>,
+}
+
 #[tauri::command]
 pub async fn fetch_release_signals<R: Runtime>(
     app: AppHandle<R>,
     items: Vec<ReleaseSignalItem>,
-) -> Result<std::collections::HashMap<String, Option<serde_json::Value>>, String> {
+    if_none_match: Option<String>,
+) -> Result<ReleaseBatchResult, String> {
     if items.is_empty() {
-        return Ok(std::collections::HashMap::new());
+        return Ok(ReleaseBatchResult {
+            etag: None,
+            signals: Some(std::collections::HashMap::new()),
+        });
     }
     let Some(scope) = derive_scope_hash(&app) else {
         return Err("not signed in".into());
     };
     let body = ReleaseBatchRequest { items: &items };
-    let resp = client()
+    let mut req = client()
         .post(format!("{SYNC_BASE}/release/batch"))
         .header("Authorization", auth_header(&scope))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            bump_release_failure();
-            format!("network: {e}")
-        })?;
+        .json(&body);
+    if let Some(etag) = if_none_match.as_deref().filter(|s| !s.is_empty()) {
+        req = req.header("If-None-Match", etag);
+    }
+    let resp = req.send().await.map_err(|e| {
+        bump_release_failure();
+        format!("network: {e}")
+    })?;
     let status = resp.status().as_u16();
+    // Pull the ETag header before any body decode — both 200 and 304
+    // paths use it. Cloud spec emits bare hex without surrounding
+    // quotes / W/ prefix; if a future server changes, the header
+    // value is just passed through unchanged.
+    let resp_etag = resp
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    if status == 304 {
+        return Ok(ReleaseBatchResult { etag: resp_etag, signals: None });
+    }
     if !resp.status().is_success() {
         bump_release_failure();
         return Err(format!("fetch_release_signals http {status}"));
@@ -615,7 +650,10 @@ pub async fn fetch_release_signals<R: Runtime>(
         bump_release_failure();
         format!("decode: {e}")
     })?;
-    Ok(parsed.signals)
+    Ok(ReleaseBatchResult {
+        etag: resp_etag,
+        signals: Some(parsed.signals),
+    })
 }
 
 /// POST /sync/v1/release/{imdb_id}/refresh
