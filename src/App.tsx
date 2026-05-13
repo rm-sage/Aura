@@ -46,6 +46,7 @@ import { libraryToggle, libraryRemoveAll, libraryWriteProgress, libraryClearProg
 import { libraryItemSeriesId } from "./libraryNormalize";
 import { sourcesForMeta, openInPopupBrowser } from "./externalSources";
 import { setManualWatchedScope, getManualWatchedState, setManualWatchedState, setManualWatchedMany, getPlannedQueue } from "./manualWatched";
+import { reconcileLibraryReleaseSignals, clearReleaseSignalStore } from "./releaseSignalStore";
 import { syncPullAll, installSyncTriggers, startBackgroundPull, clearSyncEtags, setSyncActiveScope } from "./sync";
 import { setHistoryScope, addHistoryEntry } from "./historyStore";
 import { setAutoBackupScope, startAutoBackup } from "./userDataBackup";
@@ -1817,6 +1818,26 @@ export default function App() {
     window.addEventListener("aura:library-changed", onChange);
     return () => window.removeEventListener("aura:library-changed", onChange);
   }, [session, loadLibrary]);
+
+  // ── Release-signal reconciliation (Phase 9) ──
+  // Fires whenever the library list changes or the session swaps.
+  // Batch-fetches release signals from Aura Cloud and writes them
+  // into releaseSignalStore for downstream consumers (CW banners,
+  // notifications scanner, detail page episode_kinds enrichment).
+  // Bails internally for guests + opted-out users — no need to gate
+  // here. Errors are logged but never thrown; the existing per-user
+  // addon probe paths remain the fallback. See
+  // docs/release-search-spec.md §6.2.
+  useEffect(() => {
+    if (library.length === 0) return;
+    void reconcileLibraryReleaseSignals(library, !session?.auth_key);
+  }, [library, session?.auth_key]);
+
+  // Clear the store on sign-out / account switch so signals from a
+  // prior scope don't leak into the next account's surfaces.
+  useEffect(() => {
+    if (!session?.auth_key) clearReleaseSignalStore();
+  }, [session?.auth_key]);
 
   // Library sync. Stremio's server is eventually-consistent on `_mtime`
   // — pulling within ~30 seconds of a local write rounds-tripped the

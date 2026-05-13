@@ -186,6 +186,13 @@ pub struct SyncStatus {
     pub namespaces: Vec<NamespaceStatus>,
     pub total_size: u64,
     pub quota: u64,
+    /// Cumulative count of failed release-endpoint HTTP attempts since
+    /// app start. Surfaced so the title-bar chip can light up on
+    /// release-search disconnects even when namespace traffic is
+    /// healthy — the two share the same Aura Cloud host but the
+    /// release endpoints can fail independently (poller down,
+    /// upstream addon outage, etc.).
+    pub release_failure_count: u64,
 }
 
 // Server response shapes (private to this module so we can rename
@@ -227,6 +234,7 @@ pub async fn sync_status<R: Runtime>(app: AppHandle<R>) -> Result<SyncStatus, St
             namespaces: vec![],
             total_size: 0,
             quota: MAX_BLOB_BYTES as u64 * NAMESPACES.len() as u64,
+            release_failure_count: release_failure_count(),
         });
     };
 
@@ -244,6 +252,7 @@ pub async fn sync_status<R: Runtime>(app: AppHandle<R>) -> Result<SyncStatus, St
             namespaces: vec![],
             total_size: 0,
             quota: MAX_BLOB_BYTES as u64 * NAMESPACES.len() as u64,
+            release_failure_count: release_failure_count(),
         });
     }
     if !resp.status().is_success() {
@@ -255,6 +264,7 @@ pub async fn sync_status<R: Runtime>(app: AppHandle<R>) -> Result<SyncStatus, St
         namespaces: body.namespaces,
         total_size: body.total_size,
         quota: body.quota,
+        release_failure_count: release_failure_count(),
     })
 }
 
@@ -441,5 +451,208 @@ pub async fn sync_purge<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
         return Err(format!("sync_purge http {}", resp.status().as_u16()));
     }
     crate::devlog!(info, "sync", "purged all cloud blobs for active account");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Release-search service (Phase 9)
+//
+// Three endpoints under `/sync/v1/release/` proxied by the same Aura
+// Cloud service. The cloud-side spec lives at
+// `docs/release-search-spec.md`; desktop responsibilities are §6.
+// Endpoints:
+//
+//   • GET  /sync/v1/release/{imdb_id}        — anonymous, optional
+//     If-None-Match for conditional fetch (304 → use cached).
+//   • POST /sync/v1/release/batch            — Aura-Sync auth required;
+//     body `{ items: [{id, type}, ...] }`, cap 500 items per call.
+//   • POST /sync/v1/release/{imdb_id}/refresh — Aura-Sync auth required;
+//     optional body `{ type }` for first-seen ids.
+//
+// Per the privacy boundary in §2: the cloud must not log the request
+// body. We don't either — the devlog lines below carry counts /
+// outcomes only.
+//
+// Release-endpoint HTTP failures are tracked in a small global counter
+// (`release_failure_count`) that `sync_status` reads, so the title-bar
+// sync chip lights up on release-side disconnect even when the
+// namespace traffic is healthy. Without this, the user's first signal
+// that the release feed is down would be "calendar / library
+// reconciliation is silently stale" — much worse than a visible chip.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct ReleaseSignalItem {
+    pub id: String,
+    // r#type is the raw Rust keyword; serde renames to "type" on the
+    // wire so the JSON shape matches the spec's `{ id, type }`. The
+    // struct is both Deserialize (frontend → command arg) and Serialize
+    // (command → cloud POST body).
+    #[serde(rename = "type")]
+    pub r#type: String,
+}
+
+#[derive(Serialize)]
+struct ReleaseBatchRequest<'a> {
+    items: &'a [ReleaseSignalItem],
+}
+
+#[derive(Deserialize, Serialize)]
+struct ReleaseBatchResponse {
+    /// Map from imdb_id → signal-or-null. `null` differentiates
+    /// "cloud has queued this id but the poller hasn't reached it yet"
+    /// from "cloud has no record at all" (which doesn't happen in
+    /// practice because every batched id is auto-inserted).
+    signals: std::collections::HashMap<String, Option<serde_json::Value>>,
+}
+
+#[derive(Serialize)]
+struct ReleaseNudgeRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    r#type: Option<&'a str>,
+}
+
+// Cumulative count of failed release-endpoint HTTP attempts since app
+// start. `sync_status` returns this as part of the cloud-health view so
+// the title-bar chip can flag release-feed disconnects independently
+// from namespace traffic.
+static RELEASE_FAILURE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn bump_release_failure() {
+    RELEASE_FAILURE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Public — surfaced via `sync_status` payload so the React chip can
+/// pulse on release failures.
+pub fn release_failure_count() -> u64 {
+    RELEASE_FAILURE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// GET /sync/v1/release/{imdb_id}
+///
+/// Anonymous — no auth header. The cloud rate-limits per-IP (120/s
+/// burst, 2/s refill); the desktop should already have a 5-min in-
+/// memory cache so we hit this far less often than that.
+///
+/// `if_none_match` is the etag the desktop received on the prior fetch
+/// for this id. When present, the cloud returns `304 Not Modified`
+/// with no body; we surface that as `Ok(None)` and the caller reuses
+/// its cached signal. The returned JSON Value already carries an
+/// `"etag"` field per §3, so the caller can persist that for the next
+/// conditional fetch.
+#[tauri::command]
+pub async fn fetch_release_signal(
+    imdb_id: String,
+    if_none_match: Option<String>,
+) -> Result<Option<serde_json::Value>, String> {
+    if imdb_id.is_empty() {
+        return Err("empty imdb_id".into());
+    }
+    let mut req = client().get(format!("{SYNC_BASE}/release/{imdb_id}"));
+    if let Some(etag) = if_none_match.as_deref().filter(|s| !s.is_empty()) {
+        req = req.header("If-None-Match", etag);
+    }
+    let resp = req.send().await.map_err(|e| {
+        bump_release_failure();
+        format!("network: {e}")
+    })?;
+    let status = resp.status().as_u16();
+    match status {
+        304 => Ok(None),
+        404 => Ok(None),
+        s if (200..300).contains(&s) => {
+            let body: serde_json::Value = resp.json().await.map_err(|e| {
+                bump_release_failure();
+                format!("decode: {e}")
+            })?;
+            Ok(Some(body))
+        }
+        _ => {
+            bump_release_failure();
+            Err(format!("fetch_release_signal http {status}"))
+        }
+    }
+}
+
+/// POST /sync/v1/release/batch
+///
+/// Auth required. Items cap at 500 per request (the cloud rejects
+/// larger bodies with 400). The desktop is responsible for chunking
+/// when the library has more — `releaseSearch.ts` does that on the JS
+/// side, so this command sees only chunked payloads.
+///
+/// Returns the map as-is. Caller handles per-id `null` (queued, no
+/// signal yet) as "fall back to addon probe for this id".
+#[tauri::command]
+pub async fn fetch_release_signals<R: Runtime>(
+    app: AppHandle<R>,
+    items: Vec<ReleaseSignalItem>,
+) -> Result<std::collections::HashMap<String, Option<serde_json::Value>>, String> {
+    if items.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let Some(scope) = derive_scope_hash(&app) else {
+        return Err("not signed in".into());
+    };
+    let body = ReleaseBatchRequest { items: &items };
+    let resp = client()
+        .post(format!("{SYNC_BASE}/release/batch"))
+        .header("Authorization", auth_header(&scope))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            bump_release_failure();
+            format!("network: {e}")
+        })?;
+    let status = resp.status().as_u16();
+    if !resp.status().is_success() {
+        bump_release_failure();
+        return Err(format!("fetch_release_signals http {status}"));
+    }
+    let parsed: ReleaseBatchResponse = resp.json().await.map_err(|e| {
+        bump_release_failure();
+        format!("decode: {e}")
+    })?;
+    Ok(parsed.signals)
+}
+
+/// POST /sync/v1/release/{imdb_id}/refresh
+///
+/// Auth required. Fire-and-forget from the caller's perspective — the
+/// cloud responds 202 immediately and the poller picks the row up on
+/// its next 5 s tick. We return Ok(()) on 202 / 200 and surface the
+/// failure code on anything else so the calling React code can decide
+/// whether to retry.
+#[tauri::command]
+pub async fn nudge_release_poller<R: Runtime>(
+    app: AppHandle<R>,
+    imdb_id: String,
+    media_type: Option<String>,
+) -> Result<(), String> {
+    if imdb_id.is_empty() {
+        return Err("empty imdb_id".into());
+    }
+    let Some(scope) = derive_scope_hash(&app) else {
+        return Err("not signed in".into());
+    };
+    let mt_str = media_type.as_deref();
+    let body = ReleaseNudgeRequest { r#type: mt_str };
+    let resp = client()
+        .post(format!("{SYNC_BASE}/release/{imdb_id}/refresh"))
+        .header("Authorization", auth_header(&scope))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            bump_release_failure();
+            format!("network: {e}")
+        })?;
+    let status = resp.status().as_u16();
+    if !resp.status().is_success() {
+        bump_release_failure();
+        return Err(format!("nudge_release_poller http {status}"));
+    }
     Ok(())
 }

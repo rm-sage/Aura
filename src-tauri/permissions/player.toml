@@ -228,6 +228,9 @@ commands.allow = [
   "sync_push",
   "sync_delete",
   "sync_purge",
+  "fetch_release_signal",
+  "fetch_release_signals",
+  "nudge_release_poller",
 ]
 
 # ── Crash reporting (Sentry consent + DSN, scope-independent) ──────────────

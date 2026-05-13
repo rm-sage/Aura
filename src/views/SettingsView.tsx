@@ -4368,6 +4368,25 @@ export default function SettingsView({ addons, session }: Props) {
               push / size per namespace plus on-demand Pull / Purge. */}
           <Section id="sec-cloud-sync" title="Cloud Sync">
             <CloudSyncSection authKey={session?.auth_key ?? null} />
+            <div className="h-px bg-white/6 my-3" />
+            {/* Release-search opt-in. Default on for signed-in users
+                per docs/release-search-spec.md §6.4. When off, the
+                desktop falls back to per-user addon probes for
+                library / calendar reconciliation (same code path as
+                pre-Phase 9). Ignored for guests — they always use the
+                addon path because the cloud requires a signed-in
+                scope hash on the batch + nudge endpoints. */}
+            {/* No `disabled` prop on SettingToggle. The setting is
+                editable for everyone, but the runtime gate at call
+                sites (releaseSearch.ts, library reconciler) ignores
+                the flag for guests since the cloud batch + nudge
+                endpoints require a signed-in scope hash. */}
+            <SettingToggle
+              label="Use Aura Cloud's shared release feed"
+              description="When on, Aura asks the cloud service whether new episodes have aired instead of probing addons from your machine. Faster library refresh and lower bandwidth, but Aura Cloud sees the imdb-ids in your library (it never sees streams, watch history, or your Debrid keys). Signed-in only."
+              value={aura.releaseSearchEnabled}
+              onChange={(v) => setLocal({ releaseSearchEnabled: v })}
+            />
           </Section>
 
           {/* API keys — currently just OMDb. Other third-party services

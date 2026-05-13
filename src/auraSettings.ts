@@ -129,6 +129,14 @@ export interface AuraSettings {
    *  Settings since it's a stylistic cousin of "skip the boring
    *  bits". */
   nextUpSkipFillerRecap: "none" | "filler" | "recap" | "both";
+  /** Use Aura Cloud's shared release-search feed for library /
+   *  calendar reconciliation instead of probing addons per-user.
+   *  Phase 9 — cloud-side poller computes the signal once per imdb-id
+   *  globally; clients fan in. Default `true` for signed-in users;
+   *  ignored for guests (always fall back to addon probes). When
+   *  false, the desktop uses only the per-user addon probe path —
+   *  same code as pre-Phase 9. See docs/release-search-spec.md. */
+  releaseSearchEnabled: boolean;
 }
 
 export const DEFAULT_AURA_SETTINGS: AuraSettings = {
@@ -149,6 +157,7 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   blurEpisodeSynopsis: false,
   loudnessNormalization: false,
   nextUpSkipFillerRecap: "none",
+  releaseSearchEnabled: true,
 };
 
 // Module-level memoization snapshot. loadAuraSettings is called many
@@ -227,6 +236,9 @@ function readFromStorage(): AuraSettings {
           || parsed.nextUpSkipFillerRecap === "both"
           ? parsed.nextUpSkipFillerRecap
           : "none",
+      releaseSearchEnabled: typeof parsed.releaseSearchEnabled === "boolean"
+        ? parsed.releaseSearchEnabled
+        : true,
       heroCatalog: parsed.heroCatalog
         && typeof parsed.heroCatalog === "object"
         && typeof (parsed.heroCatalog as Record<string, unknown>).addonUrl === "string"
