@@ -4222,7 +4222,29 @@ function NotificationsBridge({
   popupSuppressed: boolean;
   onOpenMeta: (metaId: string, mediaType?: string) => void;
 }) {
-  const { addNotification, setPopupSuppressed } = useNotifications();
+  const { addNotification, setPopupSuppressed, notifications, dismissNotification } = useNotifications();
+
+  // Stale-update-notification cleanup. A `kind: "update"` entry with
+  // `data.tagName === "v0.6.11"` is dead weight once the user is
+  // already running 0.6.11+ — it would suggest "click to install a
+  // version you already have." Sync replicates these entries across
+  // devices, so a manual install on one device (which never went
+  // through the dismiss-to-bell handler) leaves an orphan on the
+  // others until something prunes. Runs on mount and on the
+  // notifications array change so a freshly-pulled stale entry from
+  // the cloud also gets cleared.
+  useEffect(() => {
+    for (const n of notifications) {
+      if (n.kind !== "update") continue;
+      const tag = (n.data?.tagName as string | undefined) ?? "";
+      if (!tag) continue;
+      // isNewer normalises the leading "v" + strips pre-release
+      // suffixes, so vX.Y.Z and X.Y.Z compare cleanly.
+      if (!isNewer(tag, APP_VERSION)) {
+        dismissNotification(n.id);
+      }
+    }
+  }, [notifications, dismissNotification]);
   // Mirror the prop into the context whenever it flips. Doing this
   // here (inside the provider tree) is the only way App.tsx can
   // reach setPopupSuppressed without lifting the provider above
