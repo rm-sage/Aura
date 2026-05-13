@@ -213,6 +213,37 @@ export default function AniSkipMenu({
       } else {
         console.info(`[aniskip] step 2: skipped (no tt-prefixed series_id)`);
       }
+      // Step 2b: Fribb-cour anilist_id → AniList GraphQL `idMal`.
+      // Fribb's per-cour rows for recent anime sometimes carry the
+      // anilist_id slot but leave the mal_id slot empty (Frieren cour 2
+      // is the canonical case — Fribb has anilist=182255 mapped to
+      // tt22248376 cour 2, no MAL filled in). AniList itself stores
+      // `idMal` on every Media record, so chaining through this
+      // recovers the MAL id without depending on yuna.moe / Fribb
+      // having backfilled the mapping.
+      if (seriesImdb) {
+        try {
+          const anilistId = await invoke<number | null>("resolve_cour_anilist_id", {
+            imdbId: seriesImdb,
+            season: activeTarget.season ?? null,
+          });
+          console.info(
+            `[aniskip] step 2b: resolve_cour_anilist_id(${seriesImdb}, season=${activeTarget.season}) → ${anilistId}`,
+          );
+          if (typeof anilistId === "number") {
+            const m = await invoke<number | null>("resolve_anilist_to_mal", {
+              anilistId,
+            });
+            console.info(`[aniskip] step 2b: resolve_anilist_to_mal(${anilistId}) → ${m}`);
+            if (typeof m === "number") {
+              if (!cancelled) { setMalId(m); setMalResolving(false); }
+              return;
+            }
+          }
+        } catch (e) {
+          console.warn(`[aniskip] step 2b: threw: ${e}`);
+        }
+      }
       // Step 3: title-based Jikan search as last resort. Slower (one
       // HTTP round-trip per call) but covers shows Fribb hasn't
       // indexed AND whose video id provider isn't in yuna.moe. For

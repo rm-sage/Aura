@@ -266,6 +266,24 @@ pub fn resolve_cour_mal_id(imdb_id: String, season: Option<u32>) -> Option<u64> 
     id
 }
 
+/// Tauri command — surface the cour-specific AniList id directly.
+/// Mirrors `resolve_cour_mal_id` but returns the AniList slot of the
+/// Fribb row instead of MAL. Used as a step-2b fallback in the
+/// AniSkipMenu resolver: when Fribb has a row for the imdb+season
+/// pair but its `mal_id` slot is None (recent anime where Fribb
+/// hasn't filled in MAL yet), the AniList slot is often populated,
+/// and the frontend can chain through yuna.moe's `anilist → mal`
+/// mapping to land on the right MAL id anyway.
+#[tauri::command]
+pub fn resolve_cour_anilist_id(imdb_id: String, season: Option<u32>) -> Option<u64> {
+    let id = lookup(&imdb_id, season);
+    crate::devlog!(
+        info, "anime-id-map",
+        "resolve_cour_anilist_id imdb={imdb_id} season={season:?} → {id:?}",
+    );
+    id
+}
+
 /// Number of imdb→anime-ids entries in the in-memory index. Useful for
 /// diagnostics; surfaced in the DevConsole `version` command (TBD) so
 /// users can see whether the map is loaded.

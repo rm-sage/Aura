@@ -805,6 +805,77 @@ pub async fn submit_skip_time<R: Runtime>(
 }
 
 // ---------------------------------------------------------------------------
+// AniList GraphQL → MAL id resolver. yuna.moe's relations API doesn't
+// always have recent anime (Frieren cour 2 fell through that gap),
+// but AniList itself stores the corresponding MAL id on every Media
+// record as `idMal`. Public read; no auth required. One small query
+// per call — only used by the AniSkipMenu's last-resort chain.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct AnilistIdMalResponse {
+    data: Option<AnilistIdMalData>,
+}
+#[derive(Deserialize)]
+struct AnilistIdMalData {
+    #[serde(rename = "Media")]
+    media: Option<AnilistIdMalMedia>,
+}
+#[derive(Deserialize)]
+struct AnilistIdMalMedia {
+    #[serde(rename = "idMal", default)]
+    id_mal: Option<u64>,
+}
+
+#[tauri::command]
+pub async fn resolve_anilist_to_mal(anilist_id: u64) -> Option<u64> {
+    let query = "query ($id: Int) { Media(id: $id, type: ANIME) { idMal } }";
+    let body = serde_json::json!({
+        "query": query,
+        "variables": { "id": anilist_id },
+    });
+    let cli = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .https_only(true)
+        .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " anilist-idmal"))
+        .build()
+        .ok()?;
+    let resp = match cli
+        .post("https://graphql.anilist.co")
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            crate::devlog!(warn, "aniskip", "anilist idMal request failed for {anilist_id}: {e}");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        crate::devlog!(
+            warn, "aniskip",
+            "anilist idMal HTTP {} for {anilist_id}", resp.status().as_u16(),
+        );
+        return None;
+    }
+    let parsed: AnilistIdMalResponse = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            crate::devlog!(warn, "aniskip", "anilist idMal parse error: {e}");
+            return None;
+        }
+    };
+    let id_mal = parsed.data.and_then(|d| d.media).and_then(|m| m.id_mal);
+    crate::devlog!(
+        info, "aniskip",
+        "resolve_anilist_to_mal({anilist_id}) → {id_mal:?}",
+    );
+    id_mal
+}
+
+// ---------------------------------------------------------------------------
 // POST /v2/skip-times/vote/{skip_id} — upvote / downvote a submission.
 // Body: { "voteType": "upvote" | "downvote" }
 // ---------------------------------------------------------------------------
