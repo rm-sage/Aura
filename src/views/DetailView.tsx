@@ -16,6 +16,8 @@ import type {
   VideoEntry,
 } from "../types";
 import { loadAuraSettings } from "../auraSettings";
+import { useReleaseSignal } from "../releaseSignalStore";
+import { fetchReleaseSignal } from "../releaseSearch";
 import { resolveDefaultMetaUrl } from "../addonDefaults";
 import { findAIOMetadataAddon, isAnimeMeta, markAnimeId, typeLabel } from "../aiometadata";
 import { dedupedInvoke } from "../invokeDedupe";
@@ -382,6 +384,26 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
+
+  // Release-search single-fetch on detail open — pulls the cloud
+  // signal for this series so EpisodeRow's filler/recap banner
+  // render (consumed via useReleaseSignal) gets the freshest data
+  // even if the library-level batch reconciler hasn't run for this
+  // session yet. Fire-and-forget; releaseSearch.ts handles the cache
+  // + If-None-Match revalidation internally. Errors are logged in
+  // the module, not surfaced here — the existing per-episode
+  // VideoEntry flags from extract_videos remain the fallback. See
+  // docs/release-search-spec.md §6.2 path 2.
+  useEffect(() => {
+    if (!meta.id) return;
+    if (!meta.id.startsWith("tt")) return;
+    if (!loadAuraSettings().releaseSearchEnabled) return;
+    fetchReleaseSignal(meta.id).catch(() => {
+      // Already logged inside releaseSearch.ts; swallow here so the
+      // detail page doesn't spawn an error toast for a soft-fail
+      // enrichment path.
+    });
+  }, [meta.id]);
 
   // ── Metadata addon resolution ─────────────────────────────────────
   // Pick order:
@@ -2137,6 +2159,11 @@ const EpisodeRow = ({
 }) => {
   const progress = useEpisodeProgress(seriesId, video.id);
   const watchedVariant = useWatchedVariant(video.id);
+  // Release-search signal for this series — used to surface fresher
+  // filler/recap flags than VideoEntry alone carries. Same hook
+  // call shape across every EpisodeRow sibling; useSyncExternalStore
+  // dedupes the subscription bookkeeping.
+  const cloudSignal = useReleaseSignal(seriesId);
 
   // Anti-spoiler thumbnail blur. Subscribe to settings changes so the
   // toggle applies immediately without remounting the detail page.
@@ -2361,25 +2388,52 @@ const EpisodeRow = ({
           className="absolute top-1.5 left-1.5"
         />
 
-        {/* Filler / recap banner — top-RIGHT of the thumbnail. Source
-            field: AIOMetadata's `episodeKind`. Filler = red (you
-            usually want to skip / deprioritise these), recap = yellow
-            (informational; sometimes useful for cold returns). Canon
-            / normal / mixed render nothing — banner space stays empty
-            so non-anime detail pages and untagged episodes don't gain
-            a stripe. */}
-        {(video.episode_kind === "filler" || video.episode_kind === "recap") && (
-          <span
-            className={`absolute top-1.5 right-1.5 px-1.5 py-0.5 rounded text-[9px]
-                        font-semibold tracking-[0.14em] uppercase border
-                        ${video.episode_kind === "filler"
-                          ? "bg-rose-500/85 text-white border-rose-300/30 shadow-[0_2px_6px_rgba(244,63,94,0.4)]"
-                          : "bg-amber-400/85 text-amber-950 border-amber-200/40 shadow-[0_2px_6px_rgba(251,191,36,0.4)]"
-                        }`}
-          >
-            {video.episode_kind}
-          </span>
-        )}
+        {/* Filler / recap banners — top-RIGHT of the thumbnail. Two
+            independent flags (an episode can be BOTH filler AND
+            recap, per release-search-spec §6.3). Render up to two
+            stacked badges. Sources merged in priority order so the
+            freshest data wins:
+              1. Aura Cloud release signal's `episode_kinds` for this
+                 video id (the cloud's poll cadence is faster than the
+                 user's library refresh, so it sees AIOMetadata
+                 updates first).
+              2. VideoEntry's `is_filler` / `is_recap` booleans
+                 (canonical AIOMetadata wire shape).
+              3. Legacy `episode_kind` single-string field (older
+                 AIOMetadata responses pre-spec).
+            Filler = rose (skip-worthy), recap = amber (informational).
+            Canon / normal / mixed render nothing. */}
+        {(() => {
+          const cloudKinds = cloudSignal?.episode_kinds ?? [];
+          const cloudForThis = cloudKinds.filter((k) => k.id === video.id);
+          const cloudFiller = cloudForThis.some((k) => k.kind === "filler");
+          const cloudRecap  = cloudForThis.some((k) => k.kind === "recap");
+          const showFiller = cloudFiller || !!video.is_filler || video.episode_kind === "filler";
+          const showRecap  = cloudRecap  || !!video.is_recap  || video.episode_kind === "recap";
+          if (!showFiller && !showRecap) return null;
+          return (
+            <div className="absolute top-1.5 right-1.5 flex flex-col gap-1 items-end">
+              {showFiller && (
+                <span
+                  className="px-1.5 py-0.5 rounded text-[9px] font-semibold tracking-[0.14em] uppercase
+                             border bg-rose-500/85 text-white border-rose-300/30
+                             shadow-[0_2px_6px_rgba(244,63,94,0.4)]"
+                >
+                  filler
+                </span>
+              )}
+              {showRecap && (
+                <span
+                  className="px-1.5 py-0.5 rounded text-[9px] font-semibold tracking-[0.14em] uppercase
+                             border bg-amber-400/85 text-amber-950 border-amber-200/40
+                             shadow-[0_2px_6px_rgba(251,191,36,0.4)]"
+                >
+                  recap
+                </span>
+              )}
+            </div>
+          );
+        })()}
 
         {/* Progress overlay — bottom of the thumbnail when partially watched. */}
         {progress?.partial && (

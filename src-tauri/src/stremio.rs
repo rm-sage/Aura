@@ -464,7 +464,24 @@ pub struct VideoEntry {
     /// next-up auto-advance can be configured to skip filler/recap.
     /// `None` = upstream didn't emit the field (movies, non-anime
     /// series, older addons without the patch).
+    ///
+    /// Kept as a string for back-compat with downstream surfaces that
+    /// already branch on its single-value shape (CinemaRows banners,
+    /// auto-advance filter). For the dual-flag case (AIOMetadata
+    /// flagging both filler AND recap on one episode), see the two
+    /// boolean fields below — `episode_kind` resolves to whichever
+    /// flag is dominant (filler wins) when both are set.
     pub episode_kind: Option<String>,
+    /// True when AIOMetadata flagged the episode as filler. Independent
+    /// of `is_recap` — both can be true on the same episode per the
+    /// release-search-spec §6.3 contract. Defaults to `false` for
+    /// non-anime content / older addons.
+    #[serde(default)]
+    pub is_filler: bool,
+    /// True when AIOMetadata flagged the episode as recap. See
+    /// `is_filler` for the dual-flag rationale.
+    #[serde(default)]
+    pub is_recap: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -2223,14 +2240,21 @@ fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
                 .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
                 .map(|s| s.to_lowercase())
                 .filter(|s| matches!(s.as_str(), "filler" | "recap" | "normal" | "canon" | "mixed"));
+            // Independent boolean flags — AIOMetadata's canonical wire
+            // shape per release-search-spec §6.3. Both can be true on
+            // the same episode; downstream code renders both banners.
+            let is_filler = v.get("filler").and_then(|x| x.as_bool()).unwrap_or(false)
+                || string_kind.as_deref() == Some("filler");
+            let is_recap = v.get("recap").and_then(|x| x.as_bool()).unwrap_or(false)
+                || string_kind.as_deref() == Some("recap");
+            // Back-compat single-value field — preserves the existing
+            // consumer surfaces (CinemaRows banners, autoAdvance
+            // filter) while the new flags carry the full info. Filler
+            // wins when both are true.
             let episode_kind = string_kind.or_else(|| {
-                if v.get("filler").and_then(|x| x.as_bool()).unwrap_or(false) {
-                    Some("filler".to_string())
-                } else if v.get("recap").and_then(|x| x.as_bool()).unwrap_or(false) {
-                    Some("recap".to_string())
-                } else {
-                    None
-                }
+                if is_filler { Some("filler".to_string()) }
+                else if is_recap { Some("recap".to_string()) }
+                else { None }
             });
 
             Some(VideoEntry {
@@ -2242,6 +2266,8 @@ fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
                 thumbnail: json_url(v, "thumbnail"),
                 overview:  json_str(v, "overview", 600),
                 episode_kind,
+                is_filler,
+                is_recap,
             })
         })
         .collect();

@@ -206,8 +206,16 @@ export interface VideoEntry {
    *  paints a banner on the episode row in DetailView and the
    *  next-up auto-advance can be configured to skip filler/recap.
    *  `null` = upstream didn't emit the field (movies, non-anime
-   *  series, older addons without the patch). */
+   *  series, older addons without the patch). Kept for back-compat
+   *  with downstream surfaces that branch on single-value shape;
+   *  for the dual-flag case see `is_filler` / `is_recap` below. */
   episode_kind: string | null;
+  /** Independent filler flag — true when AIOMetadata flagged the
+   *  episode as filler. Can coexist with `is_recap=true` per the
+   *  release-search-spec §6.3 contract (one episode can be both). */
+  is_filler?: boolean;
+  /** Independent recap flag — see `is_filler`. */
+  is_recap?: boolean;
 }
 
 export interface StreamEntry {
