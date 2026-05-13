@@ -54,9 +54,12 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import auraIconAsset from "../assets/aura-icon.png";
 
-/** Single source of truth for the app version. Mirrors package.json,
- *  Cargo.toml and tauri.conf.json — bump all four together when releasing. */
-const APP_VERSION = "0.6.7";
+/** App version. Sourced from package.json via the `VITE_APP_VERSION`
+ *  define in vite.config.ts so a single version bump in package.json
+ *  flows everywhere. See App.tsx's APP_VERSION comment for the
+ *  incident this prevents (hardcoded constant drifted from the actual
+ *  build version, so the updater self-reported as "up to date"). */
+const APP_VERSION = (import.meta.env.VITE_APP_VERSION as string | undefined) ?? "0.0.0";
 
 // ---------------------------------------------------------------------------
 // Backend-side settings shape — must mirror Rust AppSettings.

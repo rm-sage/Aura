@@ -108,10 +108,15 @@ const SESSION_EXPIRED = "SESSION_EXPIRED";
 
 /** Current app version — kept in sync with package.json by hand. Read by
  *  the auto-updater on every Home visit (debounced to 1×/5min) to compare
- *  against the latest GitHub release tag. Hardcoded rather than imported
- *  from package.json because resolveJsonModule pulls in the whole file
- *  into the bundle and we only ever want this one string at runtime. */
-const APP_VERSION = "0.6.7";
+ *  against the latest GitHub release tag. Sourced from `package.json`'s
+ *  `version` field via the `VITE_APP_VERSION` define wired in
+ *  vite.config.ts, so it stays in sync with every version bump without
+ *  needing two extra Edit calls per release. Previously a hardcoded
+ *  string here — that drifted from package.json once (constant got
+ *  pre-bumped to a release that hadn't shipped yet, so binaries built in
+ *  the interim believed they were already on the new version and the
+ *  in-app "up to date" check silently stopped working). */
+const APP_VERSION = (import.meta.env.VITE_APP_VERSION as string | undefined) ?? "0.0.0";
 
 /** localStorage key for the most recent release tag the user has dismissed
  *  to the notifications bell. The auto-updater popup re-fires only when
