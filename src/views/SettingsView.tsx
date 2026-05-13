@@ -4,8 +4,7 @@
 import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { openUrl } from "@tauri-apps/plugin-opener";
-import { checkForUpdate } from "../updater";
+import { checkForUpdatePlugin, downloadAndInstallUpdatePlugin } from "../updaterPlugin";
 import StorageReport from "../StorageReport";
 import {
   buildExportBlob,
@@ -2295,21 +2294,31 @@ function StatRow({ label, value, tooltip }: { label: string; value: string; tool
 
 const MANUAL_UPDATE_COOLDOWN_MS = 60_000; // 1 minute
 
-type CheckState = "idle" | "checking" | "uptodate" | "available" | "error" | "ratelimited";
+type CheckState = "idle" | "checking" | "uptodate" | "available" | "installing" | "error" | "ratelimited";
 
 function CheckForUpdatesButton() {
   const [state, setState] = useState<CheckState>("idle");
   const [latestTag, setLatestTag] = useState<string | null>(null);
-  const [latestUrl, setLatestUrl] = useState<string | null>(null);
   const lastCheckRef = useRef<number>(0);
 
   const onClick = useCallback(async () => {
-    if (state === "checking") return;
-    // If an update is already known to be available, the button doubles
-    // as "open release notes in browser" — clicking takes the user
-    // directly to the release page they'd otherwise have to find.
-    if (state === "available" && latestUrl) {
-      openUrl(latestUrl).catch(() => {});
+    if (state === "checking" || state === "installing") return;
+    // If an update is already known to be available, clicking the
+    // button triggers the signed in-app install via the updater
+    // plugin (download → verify minisign signature → install →
+    // relaunch). The success branch typically never repaints
+    // because the relaunch tears down the React tree first.
+    if (state === "available") {
+      setState("installing");
+      try {
+        const ok = await downloadAndInstallUpdatePlugin();
+        if (!ok) setState("error");
+        // success: app is about to relaunch, leave state pinned to
+        // "installing" so the button stays in its busy look until
+        // the process exits.
+      } catch {
+        setState("error");
+      }
       return;
     }
     const now = Date.now();
@@ -2319,25 +2328,26 @@ function CheckForUpdatesButton() {
     }
     lastCheckRef.current = now;
     setState("checking");
-    const release = await checkForUpdate(APP_VERSION);
+    const release = await checkForUpdatePlugin();
     if (release) {
-      setLatestTag(release.tagName);
-      setLatestUrl(release.htmlUrl || null);
+      setLatestTag(`v${release.version}`);
       setState("available");
     } else {
-      // checkForUpdate returns null for "no update", network error, or
-      // malformed response. We can't disambiguate from the API surface,
-      // but in practice the most common outcome is "you're up to date"
-      // — call it that to avoid alarming the user on every blip.
+      // checkForUpdatePlugin returns null for "no update", network
+      // error, or signature mismatch. We can't disambiguate from
+      // the API surface, but in practice the most common outcome
+      // is "you're up to date" — call it that to avoid alarming
+      // the user on every blip.
       setState("uptodate");
     }
-  }, [state, latestUrl]);
+  }, [state]);
 
   const label = (() => {
     switch (state) {
       case "checking":     return "Checking…";
       case "uptodate":     return "Up to date";
-      case "available":    return latestTag ? `Update available · ${latestTag}` : "Update available";
+      case "available":    return latestTag ? `Install ${latestTag}` : "Install update";
+      case "installing":   return "Installing…";
       case "ratelimited":  return "Try again soon";
       case "error":        return "Check failed";
       default:             return "Check for Updates";

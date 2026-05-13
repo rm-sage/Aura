@@ -110,8 +110,23 @@ export default function NotificationsPanel({ onClose, closing }: Props) {
                   // Mark read on activation regardless of kind.
                   markRead(n.id);
                   if (n.kind === "update") {
-                    const url = (n.data?.htmlUrl as string | undefined) ?? null;
-                    if (url) openUrl(url).catch(() => {});
+                    // Drive the signed in-app installer (tauri-
+                    // plugin-updater) instead of opening the
+                    // release page. Falls back to the browser when
+                    // the plugin call fails (signature mismatch,
+                    // network outage, etc) so the user can still
+                    // download manually as a recovery path.
+                    void (async () => {
+                      try {
+                        const { downloadAndInstallUpdatePlugin } = await import("./updaterPlugin");
+                        const ok = await downloadAndInstallUpdatePlugin();
+                        if (ok) return;
+                      } catch {
+                        // fall through to browser fallback
+                      }
+                      const url = (n.data?.htmlUrl as string | undefined) ?? null;
+                      if (url) openUrl(url).catch(() => {});
+                    })();
                     return;
                   }
                   // notice → settings deep-link path (e.g. the post-
