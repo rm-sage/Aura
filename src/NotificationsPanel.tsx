@@ -110,17 +110,25 @@ export default function NotificationsPanel({ onClose, closing }: Props) {
                   // Mark read on activation regardless of kind.
                   markRead(n.id);
                   if (n.kind === "update") {
-                    // Drive the signed in-app installer (tauri-
-                    // plugin-updater) instead of opening the
-                    // release page. Falls back to the browser when
-                    // the plugin call fails (signature mismatch,
-                    // network outage, etc) so the user can still
-                    // download manually as a recovery path.
+                    // Drive the signed in-app installer instead of
+                    // opening the release page. The plugin's
+                    // install path needs the Update resource the
+                    // check produces, so we always run a fresh
+                    // check first — the cached resource from
+                    // App.tsx's home-screen check may not survive
+                    // an app restart between when the bell entry
+                    // was added and now. Fall through to the
+                    // browser only when either the check or install
+                    // fails.
                     void (async () => {
                       try {
-                        const { downloadAndInstallUpdatePlugin } = await import("./updaterPlugin");
-                        const ok = await downloadAndInstallUpdatePlugin();
-                        if (ok) return;
+                        const { checkForUpdatePlugin, downloadAndInstallUpdatePlugin } =
+                          await import("./updaterPlugin");
+                        const release = await checkForUpdatePlugin();
+                        if (release) {
+                          const ok = await downloadAndInstallUpdatePlugin();
+                          if (ok) return;
+                        }
                       } catch {
                         // fall through to browser fallback
                       }

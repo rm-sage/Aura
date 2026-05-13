@@ -24,11 +24,14 @@
     "@tauri-apps/plugin-clipboard-manager": "^2.3.2",
     "@tauri-apps/plugin-opener": "^2",
     "@tauri-apps/plugin-shell": "^2.3.5",
+    "@tauri-apps/plugin-updater": "^2.10.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["@sentry/cli"],
+    "onlyBuiltDependencies": [
+      "@sentry/cli"
+    ],
     "ignoredBuiltDependencies": []
   },
   "devDependencies": {
