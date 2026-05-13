@@ -1182,6 +1182,17 @@ const HARDCODED_SENTRY_DSN: &str =
     "https://a58c117ea2f8f76c8f3f666be1ef44d8@o4511346738987008.ingest.de.sentry.io/4511346906038352";
 
 fn init_sentry_if_consented() -> Option<sentry::ClientInitGuard> {
+    // Dev gate: debug builds (cargo build without --release, which is
+    // what `pnpm tauri dev` produces) never ship events to the
+    // production Sentry project. HMR reloads, intentional panics
+    // during local debugging, and noisy work-in-progress code paths
+    // would otherwise flood Issues. To exercise the real Sentry path
+    // locally, build a release binary (`pnpm tauri build`) — that
+    // still respects the user-consent flag below. Mirrors the
+    // `import.meta.env.DEV` gate on the JS side in `main.tsx`.
+    if cfg!(debug_assertions) {
+        return None;
+    }
     let cfg = crash_reporting::load_pre_init();
     if cfg.consent != Some(true) {
         return None;

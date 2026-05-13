@@ -56,6 +56,13 @@ const HARDCODED_SENTRY_DSN =
   "https://a58c117ea2f8f76c8f3f666be1ef44d8@o4511346738987008.ingest.de.sentry.io/4511346906038352";
 
 async function bootstrapSentry() {
+  // Dev gate: `pnpm tauri dev` / `pnpm dev` runs are excluded so HMR
+  // reloads, debug console output, and intentional dev errors never
+  // ship to the production Sentry project. The Rust side has its own
+  // dev gate in `lib.rs::run`. If you NEED to test Sentry against a
+  // live DSN locally, run a release build (`pnpm tauri build`) — that
+  // still respects the user-consent flag.
+  if (import.meta.env.DEV) return;
   try {
     const cfg = await invoke<{
       consent?: boolean | null;
@@ -96,12 +103,15 @@ async function bootstrapSentry() {
           maskAllText:  true,
           blockAllMedia: true,
         }),
-        // Console capture → Logs surface in Sentry. The integration
-        // name in @sentry/react v8 is `captureConsoleIntegration`
-        // (Sentry's Logs feature consumes these). Without it, Logs
-        // view stays empty even when devs use console.error.
+        // Console capture → Sentry Issues / Logs. Capped to `error`
+        // and `warn` deliberately: at `info`/`debug` every routine
+        // breadcrumb (e.g. `[release-search] batch n=120 …`,
+        // `[library-sync] focus → loadLibrary`) becomes its own
+        // Sentry event and floods Issues with non-actionable noise.
+        // Anything genuinely worth tracking should be logged at
+        // `error` or `warn` at the call site instead.
         Sentry.captureConsoleIntegration({
-          levels: ["error", "warn", "info", "debug"],
+          levels: ["error", "warn"],
         }),
       ],
 

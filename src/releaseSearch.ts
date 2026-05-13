@@ -373,7 +373,13 @@ export function nudgeReleasePoller(imdbId: string, type?: ReleaseMediaType): voi
   invalidateReleaseSignal(imdbId);
   void invoke<void>("nudge_release_poller", { imdbId, mediaType: type ?? null })
     .catch((err) => {
-      console.warn(`[release-search] nudgeReleasePoller(${imdbId}) failed: ${String(err)}`);
+      // 429 is the expected response when the cloud's rate-limit
+      // bucket is full — not an actionable failure. Demote to
+      // `info` so it stays in DevConsole but doesn't make it past
+      // the Sentry `["error", "warn"]` capture levels.
+      const msg = String(err);
+      const log = msg.includes("429") ? console.info : console.warn;
+      log(`[release-search] nudgeReleasePoller(${imdbId}) failed: ${msg}`);
     });
 }
 
