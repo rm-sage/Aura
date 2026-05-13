@@ -531,6 +531,59 @@ const COMMANDS: DevCommand[] = [
     },
   },
   {
+    name: "sync-migrate",
+    usage: "sync-migrate",
+    description: "One-shot copy of cloud-sync blobs from the legacy auth-key scope to the new user-id scope. Run on the desktop that has the data.",
+    run: async (_args, ctx) => {
+      const { invoke } = await import("@tauri-apps/api/core");
+      ctx.push({
+        ts: Date.now(), level: "info", source: "console",
+        message: "sync-migrate: invoking migrate_sync_scope…",
+      });
+      try {
+        const report = await invoke<{
+          legacy_scope_prefix: string;
+          new_scope_prefix:    string;
+          copied:              string[];
+          skipped_empty:       string[];
+          failed:              { namespace: string; stage: string; error: string }[];
+        }>("migrate_sync_scope");
+
+        const copiedSummary = report.copied.length > 0
+          ? report.copied.join(", ")
+          : "(none)";
+        const emptySummary  = report.skipped_empty.length > 0
+          ? report.skipped_empty.join(", ")
+          : "(none)";
+        ctx.push({
+          ts: Date.now(), level: "info", source: "console",
+          message:
+            `sync-migrate: legacy=${report.legacy_scope_prefix}… → new=${report.new_scope_prefix}…\n` +
+            `  copied (${report.copied.length}): ${copiedSummary}\n` +
+            `  skipped/empty (${report.skipped_empty.length}): ${emptySummary}\n` +
+            `  failed: ${report.failed.length}`,
+        });
+        for (const f of report.failed) {
+          ctx.push({
+            ts: Date.now(), level: "warn", source: "console",
+            message: `sync-migrate: ${f.namespace} ${f.stage} failed — ${f.error}`,
+          });
+        }
+        if (report.legacy_scope_prefix === report.new_scope_prefix) {
+          ctx.push({
+            ts: Date.now(), level: "info", source: "console",
+            message: "sync-migrate: legacy and new scope hashes are identical — nothing to migrate. (This can happen if a future Stremio API change makes auth_key == user_id, or if you've already migrated.)",
+          });
+        }
+      } catch (e) {
+        ctx.push({
+          ts: Date.now(), level: "error", source: "console",
+          message: `sync-migrate: ${String(e)}`,
+        });
+      }
+    },
+  },
+  {
     name: "eval",
     usage: "eval <expression>",
     description: "Evaluate a JavaScript expression (power user; runs in app context)",

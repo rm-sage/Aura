@@ -2511,6 +2511,20 @@ export default function App() {
     invoke<UserSession | null>("get_session")
       .then(async (sess) => {
         if (sess) {
+          // Pre-0.6.9 sessions in the keyring don't carry `user_id`.
+          // Backfill it from Stremio's `/getUser` BEFORE the scope
+          // hash is derived for the first time — otherwise the very
+          // first sync_pull_all uses the legacy auth_key-derived
+          // scope and re-asserts the cross-device-inconsistent
+          // bucket. Backfill failures are non-fatal; sync.rs falls
+          // back to the legacy scope so the user isn't locked out.
+          if (!sess.user_id) {
+            try {
+              await invoke<string | null>("backfill_user_id");
+            } catch (e) {
+              console.warn(`[auth] backfill_user_id failed: ${String(e)}`);
+            }
+          }
           await applySettingsScope(sess.auth_key);
           setSession(sess);
           setLandingDismissed(true); // bypass landing on cached credentials

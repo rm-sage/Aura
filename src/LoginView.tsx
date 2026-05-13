@@ -7,6 +7,13 @@ import { invoke } from "@tauri-apps/api/core";
 export interface UserSession {
   email: string;
   auth_key: string;
+  /** Stremio user `_id` — stable across logins on every device for
+   *  the same Stremio account. Captured at login from
+   *  `result.user._id`; null when missing on the wire (older
+   *  Stremio API schema) or on legacy keyring blobs before the
+   *  backfill runs. Used to derive the Aura Cloud Sync scope hash
+   *  so all of a user's devices land in the same proxy bucket. */
+  user_id?: string | null;
 }
 
 interface Props {

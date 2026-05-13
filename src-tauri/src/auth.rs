@@ -61,6 +61,17 @@ fn auth_client() -> &'static reqwest::Client {
 pub struct UserSession {
     pub email: String,
     pub auth_key: String,
+    /// Stremio user `_id` (MongoDB ObjectID), captured from the
+    /// `/login` response or backfilled via `/getUser`. Stable across
+    /// devices for the same Stremio account, which is what the Aura
+    /// Cloud Sync scope hash needs to be cross-device-consistent.
+    ///
+    /// `Option` rather than `String` because pre-0.6.9 sessions in
+    /// the keyring don't carry it. Deserialization defaults to
+    /// `None` on legacy blobs; the session-restore path then calls
+    /// `backfill_user_id` to populate it via Stremio's `/getUser`.
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +243,20 @@ pub async fn login<R: Runtime>(
         .unwrap_or_else(|| "") // email field is cosmetic — fall back gracefully
         .to_string();
 
-    let session = UserSession { email, auth_key };
+    // `/login`'s response embeds `result.user._id` — Stremio's stable
+    // MongoDB ObjectID for the account, identical across every login
+    // session on every device. We need this for the Aura Cloud Sync
+    // scope hash so all of a user's devices land in the same proxy
+    // bucket. Falls back to None if the field is missing (older
+    // Stremio API responses, or schema drift); the session-restore
+    // path will then attempt a `/getUser` backfill before deriving
+    // the scope hash.
+    let user_id = json
+        .pointer("/result/user/_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let session = UserSession { email, auth_key, user_id };
     store_session(&app, &session)?;
     Ok(session)
 }
@@ -242,6 +266,74 @@ pub async fn login<R: Runtime>(
 #[tauri::command]
 pub async fn logout<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     delete_session(&app)
+}
+
+/// Backfill `user_id` on a stored session that predates the field
+/// (pre-0.6.9 keyring blobs). Calls Stremio's `/getUser` with the
+/// session's existing auth_key, extracts `result._id`, persists the
+/// updated session back to the keyring, and returns the new
+/// `user_id` so the caller knows the round-trip succeeded.
+///
+/// Idempotent: a session that already carries `user_id` short-
+/// circuits and just returns the cached value, no network call.
+///
+/// `SESSION_EXPIRED` is returned when the API rejects the auth_key
+/// — the frontend should treat that the same as get_synced_addons's
+/// session-expiry path (force a fresh login).
+#[tauri::command]
+pub async fn backfill_user_id<R: Runtime>(app: AppHandle<R>) -> Result<Option<String>, String> {
+    let Some(mut session) = load_session(&app)? else {
+        return Ok(None);
+    };
+    if let Some(existing) = &session.user_id {
+        if !existing.is_empty() {
+            return Ok(Some(existing.clone()));
+        }
+    }
+    if session.auth_key.is_empty() {
+        return Ok(None);
+    }
+
+    let body = serde_json::json!({ "authKey": session.auth_key });
+    let raw = auth_client()
+        .post(format!("{STREMIO_API}/getUser"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("Response read error: {e}"))?;
+
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("JSON parse error: {e}\nRaw response: {raw}"))?;
+
+    if let Some(err) = json.get("error").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        return Err(stremio_error(err.to_string()));
+    }
+
+    // `/getUser` returns `{ result: { _id, email, ... } }` — the user
+    // object is at the result root, not nested under `result.user`
+    // the way `/login` shapes it. Probe both for forward-compat in
+    // case the API consolidates them.
+    let user_id = json
+        .pointer("/result/_id")
+        .or_else(|| json.pointer("/result/user/_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    match user_id {
+        Some(id) if !id.is_empty() => {
+            session.user_id = Some(id.clone());
+            store_session(&app, &session)?;
+            crate::devlog!(info, "auth", "backfilled user_id (len={})", id.len());
+            Ok(Some(id))
+        }
+        _ => {
+            crate::devlog!(warn, "auth", "backfill: /getUser did not return _id; raw={raw}");
+            Ok(None)
+        }
+    }
 }
 
 /// Read the stored session without any network request.

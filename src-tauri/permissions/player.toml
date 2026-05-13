@@ -54,7 +54,7 @@ commands.allow = ["add_addon", "remove_addon", "list_addons"]
 [[permission]]
 identifier = "allow-auth"
 description = "Allows the frontend to login, logout, and retrieve the current Stremio session"
-commands.allow = ["login", "logout", "get_session", "get_synced_addons"]
+commands.allow = ["login", "logout", "get_session", "get_synced_addons", "backfill_user_id"]
 
 # ── Global search & cloud sync (2.3) ──────────────────────────────────────────
 [[permission]]
@@ -231,6 +231,7 @@ commands.allow = [
   "fetch_release_signal",
   "fetch_release_signals",
   "nudge_release_poller",
+  "migrate_sync_scope",
 ]
 
 # ── Crash reporting (Sentry consent + DSN, scope-independent) ──────────────

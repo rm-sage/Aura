@@ -115,18 +115,45 @@ fn client() -> &'static reqwest::Client {
 // Scope derivation
 // ---------------------------------------------------------------------------
 
-/// Derive the proxy-side scope hash from the Stremio auth_key. The hash
-/// goes into the `Authorization` header; the raw auth_key never leaves
-/// the desktop. Returns None when no Stremio session is active (guest
-/// mode); callers then short-circuit before any network I/O.
+/// Derive the proxy-side scope hash. Prefers the Stremio user `_id`
+/// (stable across logins on every device for the same account); falls
+/// back to the auth_key only when the user_id hasn't been backfilled
+/// yet (pre-0.6.9 sessions on first launch after upgrade, or when
+/// the `/getUser` backfill failed).
+///
+/// Returns None when no Stremio session is active (guest mode).
+///
+/// The auth_key fallback is the LEGACY path — every device that
+/// logged in pre-0.6.9 wrote data to `sha256(auth_key)` and that
+/// scope is now cross-device-inconsistent. Callers that want the
+/// legacy scope explicitly (the migration sweep) should use
+/// `legacy_scope_hash_from_auth_key` instead of this function.
 fn derive_scope_hash<R: Runtime>(app: &AppHandle<R>) -> Option<String> {
     let session = auth::load_session(app).ok().flatten()?;
+    if let Some(uid) = session.user_id.as_deref().filter(|s| !s.is_empty()) {
+        return Some(hash_hex(uid.as_bytes()));
+    }
     if session.auth_key.is_empty() {
         return None;
     }
+    crate::devlog!(
+        warn, "sync",
+        "derive_scope_hash: falling back to auth_key (user_id not backfilled — cross-device sync won't work for this session)",
+    );
+    Some(hash_hex(session.auth_key.as_bytes()))
+}
+
+/// Legacy scope-hash derivation: `sha256(auth_key)`. Used exclusively
+/// by the migration sweep so we can read blobs out of the old
+/// per-session scope and copy them into the new per-account scope.
+fn legacy_scope_hash_from_auth_key(auth_key: &str) -> String {
+    hash_hex(auth_key.as_bytes())
+}
+
+fn hash_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(session.auth_key.as_bytes());
-    Some(hex::encode(hasher.finalize()))
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
 }
 
 fn auth_header(hash: &str) -> String {
@@ -452,6 +479,170 @@ pub async fn sync_purge<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     }
     crate::devlog!(info, "sync", "purged all cloud blobs for active account");
     Ok(())
+}
+
+/// Summary of a migration run. One entry per namespace plus
+/// totals so the DevConsole can render a single human-readable line.
+#[derive(Serialize)]
+pub struct MigrationReport {
+    pub legacy_scope_prefix: String,
+    pub new_scope_prefix: String,
+    pub copied: Vec<String>,
+    pub skipped_empty: Vec<String>,
+    pub failed: Vec<MigrationFailure>,
+}
+
+#[derive(Serialize)]
+pub struct MigrationFailure {
+    pub namespace: String,
+    pub stage: String, // "pull" | "push"
+    pub error: String,
+}
+
+/// One-shot copy of all namespace blobs from the legacy scope
+/// (`sha256(auth_key)`) to the new scope (`sha256(user_id)`).
+///
+/// Pre-0.6.9 desktops wrote data to a per-session scope that's
+/// invisible to every other device on the same Stremio account
+/// (different auth_keys → different hashes). This migration runs
+/// MANUALLY from the DevConsole (`sync-migrate`) on the device that
+/// holds the legacy data; the user's other devices then see it on
+/// their next pull.
+///
+/// Force-overwrites on push (no If-Match): the new scope is empty
+/// on a fresh-migration device, so there's no merge concern.
+/// Bails early when the session is missing user_id (can't determine
+/// the new scope) or when the two scopes already match (nothing to
+/// do).
+#[tauri::command]
+pub async fn migrate_sync_scope<R: Runtime>(app: AppHandle<R>) -> Result<MigrationReport, String> {
+    let session = auth::load_session(&app)?
+        .ok_or_else(|| "migrate_sync_scope: no Stremio session".to_string())?;
+
+    let user_id = session
+        .user_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "migrate_sync_scope: user_id is not yet backfilled — run get_session or sign in again first".to_string()
+        })?;
+
+    if session.auth_key.is_empty() {
+        return Err("migrate_sync_scope: no auth_key in session".to_string());
+    }
+
+    let legacy_scope = legacy_scope_hash_from_auth_key(&session.auth_key);
+    let new_scope = hash_hex(user_id.as_bytes());
+
+    if legacy_scope == new_scope {
+        return Ok(MigrationReport {
+            legacy_scope_prefix: legacy_scope[..8].to_string(),
+            new_scope_prefix: new_scope[..8].to_string(),
+            copied: vec![],
+            skipped_empty: NAMESPACES.iter().map(|s| s.to_string()).collect(),
+            failed: vec![],
+        });
+    }
+
+    let mut report = MigrationReport {
+        legacy_scope_prefix: legacy_scope[..8].to_string(),
+        new_scope_prefix: new_scope[..8].to_string(),
+        copied: vec![],
+        skipped_empty: vec![],
+        failed: vec![],
+    };
+
+    for &name in NAMESPACES {
+        // Pull from the legacy scope.
+        let legacy_blob = match client()
+            .get(format!("{SYNC_BASE}/{name}"))
+            .header("Authorization", auth_header(&legacy_scope))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().as_u16() == 404 => {
+                report.skipped_empty.push(name.to_string());
+                continue;
+            }
+            Ok(resp) if !resp.status().is_success() => {
+                report.failed.push(MigrationFailure {
+                    namespace: name.to_string(),
+                    stage: "pull".to_string(),
+                    error: format!("http {}", resp.status().as_u16()),
+                });
+                continue;
+            }
+            Ok(resp) => match resp.json::<ServerBlobResponse>().await {
+                Ok(body) => body.data,
+                Err(e) => {
+                    report.failed.push(MigrationFailure {
+                        namespace: name.to_string(),
+                        stage: "pull".to_string(),
+                        error: format!("decode: {e}"),
+                    });
+                    continue;
+                }
+            },
+            Err(e) => {
+                report.failed.push(MigrationFailure {
+                    namespace: name.to_string(),
+                    stage: "pull".to_string(),
+                    error: format!("network: {e}"),
+                });
+                continue;
+            }
+        };
+
+        // Push to the new scope, force-overwrite (no If-Match).
+        let serialized = match serde_json::to_vec(&legacy_blob) {
+            Ok(v) => v,
+            Err(e) => {
+                report.failed.push(MigrationFailure {
+                    namespace: name.to_string(),
+                    stage: "push".to_string(),
+                    error: format!("serialize: {e}"),
+                });
+                continue;
+            }
+        };
+
+        let push_resp = client()
+            .put(format!("{SYNC_BASE}/{name}"))
+            .header("Authorization", auth_header(&new_scope))
+            .header("Content-Type", "application/json")
+            .body(serialized)
+            .send()
+            .await;
+
+        match push_resp {
+            Ok(resp) if resp.status().is_success() => {
+                report.copied.push(name.to_string());
+            }
+            Ok(resp) => {
+                report.failed.push(MigrationFailure {
+                    namespace: name.to_string(),
+                    stage: "push".to_string(),
+                    error: format!("http {}", resp.status().as_u16()),
+                });
+            }
+            Err(e) => {
+                report.failed.push(MigrationFailure {
+                    namespace: name.to_string(),
+                    stage: "push".to_string(),
+                    error: format!("network: {e}"),
+                });
+            }
+        }
+    }
+
+    crate::devlog!(
+        info, "sync",
+        "migrate_sync_scope: {} → {} | copied={:?} skipped_empty={:?} failed={}",
+        report.legacy_scope_prefix, report.new_scope_prefix,
+        report.copied, report.skipped_empty, report.failed.len(),
+    );
+
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------
