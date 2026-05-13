@@ -472,9 +472,9 @@ const COMMANDS: DevCommand[] = [
       ctx.push({
         ts: Date.now(), level: "info", source: "console",
         message:
-          "If nothing fires: (a) confirm the cloud signal above shows a recent last_aired, " +
-          "(b) confirm the title is actually in your library, " +
-          "(c) check that the addon's meta returns the same recent episode (scanner uses addon probe, not the cloud signal directly).",
+          "If nothing fires: (a) confirm the cloud signal above shows a last_aired the scanner hasn't seen, " +
+          "(b) confirm the title is in your library AND tt-prefixed (cloud is imdb-keyed; kitsu/mal/anidb library entries won't fire), " +
+          "(c) confirm `releaseSearchEnabled` is on in Settings — Cloud Sync section.",
       });
     },
   },

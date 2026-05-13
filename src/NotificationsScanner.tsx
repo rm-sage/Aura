@@ -5,61 +5,51 @@ import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { AddonEntry, LibraryItem } from "./types";
 import { loadAuraSettings } from "./auraSettings";
-import { resolveDefaultMetaUrl } from "./addonDefaults";
-import { getMetaDetail } from "./metaCache";
 import { useNotifications } from "./NotificationsContext";
+import {
+  getReleaseSignal,
+  useReleaseSignalsVersion,
+} from "./releaseSignalStore";
 
 // ---------------------------------------------------------------------------
-// useNotificationsScanner
+// useNotificationsScanner — cloud-signal driven.
 //
-// Polls library items (series / anime only — no reliable "movie released"
-// signal from Stremio meta) for new episodes. Pushes a kind:'episode'
-// notification for any video whose `released` falls in the recent window
-// that we haven't surfaced before.
+// History (in case this needs to be redesigned later):
+//   • v1: ran on activeView==="home" gate only — users who lived in
+//     Library / Calendar / Settings never saw notifications.
+//   • v2: removed view gate, walked addon-probe meta per library item
+//     every 30 min. Worked, but redundant with Aura Cloud's release
+//     poller doing the same probe globally — and the per-user probe
+//     can't see new episodes when AIOMetadata's local cache is cold
+//     (the cloud's poller is warm by virtue of fanning across every
+//     user's library).
+//   • v3 (this file): driven entirely by `releaseSignalStore`. The
+//     cloud is the single source of truth for "what's the most-recent
+//     aired episode for series X" — the desktop just compares the
+//     signal's `last_aired.id` against its local seen-episodes ledger
+//     and fires a notification when there's a new one. No timer, no
+//     addon probe. The store updates whenever the library changes or
+//     the user hits the refresh button, so this hook reacts to those
+//     updates via `useReleaseSignalsVersion`.
 //
-// What changed from the previous implementation:
-//
-//   1. **No view gate.** The old scanner only ran while the user was on
-//      Home, which meant a user who lived in Library / Calendar never
-//      got notifications. We now run on a global timer regardless.
-//
-//   2. **Shared meta cache.** The old code hit `fetch_meta_detail` for
-//      every due item per scan, ignoring the 24-hour persistent cache
-//      in `metaCache.ts`. We now route through `getMetaDetail`, which
-//      is what the Calendar view also uses — meta fetched for one
-//      view (or earlier scan) satisfies the other for free, and
-//      concurrent scans for the same item dedupe via `dedupedInvoke`.
-//
-//   3. **First-scan seeding fixed.** The old logic seeded
-//      `seenVideoIds` with EVERY video on the first pass, so any
-//      episode that was already in the addon's feed when the user
-//      first installed Aura would never notify — even if it aired
-//      yesterday. We now only seed videos that fall OUTSIDE the
-//      recent-release window on first scan; episodes inside the
-//      window are still candidates for notification on first contact.
-//      This is what made the bell silently stop firing for "the
-//      latest Frieren" types of cases the user reported.
-//
-//   4. **Optional stream-availability gate.** When
-//      `auraSettings.notifyOnlyWithStreams` is true, the scanner
-//      additionally calls `fetch_streams` for each candidate and
-//      only fires the notification if at least one non-pseudo
-//      stream is returned. Result is cached locally for 12 hours so
-//      a re-scan over the same episode doesn't spam the network.
-//      Off by default to keep the scan cheap; users with
-//      occasionally-empty addons can toggle it on.
+// Non-cloud items (kitsu/mal/anidb-keyed library entries):
+//   Per release-search-spec §6 the cloud poller is imdb-keyed.
+//   Library items whose id doesn't start with "tt" don't get cloud
+//   signals and therefore don't fire notifications from this scanner.
+//   That's an explicit trade — the addon-probe fallback was removed
+//   per user direction since Aura Cloud is supposed to be the
+//   authoritative release-detection path.
 //
 // Persisted state (localStorage `aura:notifications:scanner-state`):
 //   { [libraryItemId]: { lastChecked: number; seenVideoIds: string[] } }
+//   Shape unchanged from v2 so `notifytest` and the cloud sync layer
+//   keep working. `seenVideoIds` now grows by ~1 entry per
+//   cloud-detected new episode rather than the full episode array.
 // ---------------------------------------------------------------------------
 
 const SCANNER_STATE_KEY = "aura:notifications:scanner-state";
 const STREAM_AVAILABILITY_KEY = "aura:notifications:stream-availability";
-const SCAN_INTERVAL_MS = 30 * 60 * 1000;
-const PER_ITEM_DEBOUNCE_MS = 30 * 60 * 1000;
-const RECENT_RELEASE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 const STREAM_AVAILABILITY_TTL_MS = 12 * 60 * 60 * 1000;
-const FETCH_STAGGER_MS = 1500;
 
 interface ScannerItemState {
   lastChecked: number;
@@ -111,12 +101,6 @@ function loadStreamAvailability(): StreamAvailabilityCache {
     if (!raw) return {};
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return {};
-    // Evict entries past 2x the TTL. Without this the map grows
-    // unboundedly across years of use, slowing every scan tick on
-    // JSON parse + bloating the localStorage budget metaCache also
-    // pulls from. 2x the TTL gives the user a generous "we already
-    // checked, don't re-check immediately" window without keeping
-    // entries forever.
     const now = Date.now();
     const evictBefore = now - STREAM_AVAILABILITY_TTL_MS * 2;
     const out: StreamAvailabilityCache = {};
@@ -142,27 +126,33 @@ function saveStreamAvailability(cache: StreamAvailabilityCache) {
   }
 }
 
-/** Series-only filter — movies are excluded for now (no good "release" signal
- *  from the existing meta endpoint without rebuilding the airDate logic the
- *  Calendar already has). Anime is reported as media_type "anime" or "series"
- *  with one of the known anime-id prefixes — we accept both. */
+/** Items that participate in the scanner. Movies excluded (no
+ *  episode-level "release" signal we'd surface as a notification).
+ *  Channel / TV streams skipped (live programming, not catalog). */
 function isScannable(item: LibraryItem): boolean {
   if (item.removed) return false;
-  if (item.temp) return false; // auto-tracked items aren't user-curated
+  if (item.temp) return false;
+  if (!item.id || !item.id.startsWith("tt")) return false; // cloud is imdb-keyed
   const t = (item.media_type ?? "").toLowerCase();
   if (t === "movie") return false;
   if (t === "channel" || t === "channels" || t === "tv") return false;
   return true;
 }
 
-/** Streams whose `type` is "statistic" or "error" are AIOStreams meta
- *  pseudo-streams (filter / scrape / debrid summary) — they don't
- *  represent actual playable sources. The notifications scanner counts
- *  only real streams when deciding whether to fire under the
- *  notifyOnlyWithStreams gate. */
 function isPlayableStream(s: { type?: string | null }): boolean {
   const t = (s.type ?? "").toLowerCase();
   return t !== "statistic" && t !== "error";
+}
+
+/** Format an SxxEyy / Eyy label from optional season + episode
+ *  numbers. Mirrors the prior scanner's helper to keep notification
+ *  titles visually identical. */
+function formatEpLabel(season: number | null | undefined, episode: number | null | undefined): string | null {
+  if (typeof season === "number" && typeof episode === "number") {
+    return `S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`;
+  }
+  if (typeof episode === "number") return `E${episode}`;
+  return null;
 }
 
 interface Props {
@@ -172,194 +162,162 @@ interface Props {
 
 export default function NotificationsScanner({ addons, library }: Props) {
   const { addNotification } = useNotifications();
-  // Latest props captured in a ref so the scheduler doesn't have to be
-  // re-armed on every library re-fetch.
+  // Re-render on every release-signal store change. The store version
+  // bumps from `reconcileLibraryReleaseSignals` (library load /
+  // refresh / manual nudge) so this hook reacts to the same events
+  // that drive the rest of the cloud-signal pipeline.
+  const version = useReleaseSignalsVersion();
+
+  // Capture props in a ref so the scan effect doesn't redeclare its
+  // closure when only `library` changes (the version bump above is
+  // what we react to; library identity bumps just refresh the ref).
   const propsRef = useRef({ addons, library });
   useEffect(() => { propsRef.current = { addons, library }; }, [addons, library]);
 
-  // Ref guard to keep multiple in-flight scans from overlapping (which would
-  // double-fire notifications when an interval tick lands while a previous
-  // scan is still walking the staggered fetch list).
+  // Re-entrancy guard. If a refresh fires while the previous async
+  // body is still running its stream-availability checks, the second
+  // run skips — the next version bump will pick up wherever we left
+  // off.
   const scanningRef = useRef(false);
-  const runScan = useRef<() => Promise<void>>(async () => {});
 
   useEffect(() => {
-    runScan.current = async () => {
-      if (scanningRef.current) return;
-      const { addons, library } = propsRef.current;
-      if (addons.length === 0 || library.length === 0) return;
+    if (scanningRef.current) return;
+    const { addons, library } = propsRef.current;
+    if (library.length === 0) return;
 
-      // Resolve metadata addon — settings override wins; otherwise we
-      // walk the manifest-id default order (AIOMetadata → Cinemeta) so
-      // a fresh-install user with Cinemeta but no AIOMetadata still
-      // gets a sensible meta source. Final fallback: first installed
-      // addon.
-      const settings = loadAuraSettings();
-      const overrideUrl = settings.defaultMetadataAddonUrl &&
-        addons.find((a) => a.url === settings.defaultMetadataAddonUrl)?.url;
-      const defaultUrl = overrideUrl ?? resolveDefaultMetaUrl(addons);
-      const metaAddon = (defaultUrl && addons.find((a) => a.url === defaultUrl))
-        || addons[0];
-      if (!metaAddon) return;
+    const settings = loadAuraSettings();
+    // Honor the user's opt-out — if they've disabled the cloud
+    // release feed, we can't drive notifications from it. Nothing
+    // fires; v2's addon-probe fallback was removed per direction.
+    if (!settings.releaseSearchEnabled) return;
 
-      const candidates = library.filter(isScannable);
-      if (candidates.length === 0) return;
+    const candidates = library.filter(isScannable);
+    if (candidates.length === 0) return;
 
-      const state = loadScannerState();
-      // Evict scanner state entries for library items the user removed.
-      // Without this, removing a 200-episode show leaves its 200-id
-      // seenVideoIds array in localStorage forever, slowing every
-      // subsequent loadScannerState parse + bloating the persisted
-      // blob the sync layer round-trips. We rebuild a clean state
-      // from the current candidate set, preserving entries for items
-      // still in the library; everything else falls off.
-      const liveIds = new Set(candidates.map((c) => c.id));
-      let stateDirty = false;
-      for (const id of Object.keys(state)) {
-        if (!liveIds.has(id)) {
-          delete state[id];
-          stateDirty = true;
-        }
-      }
-      if (stateDirty) saveScannerState(state);
-      const now = Date.now();
-      const due = candidates.filter((item) => {
-        const s = state[item.id];
-        if (!s) return true;
-        return now - s.lastChecked > PER_ITEM_DEBOUNCE_MS;
-      });
-      if (due.length === 0) return;
+    scanningRef.current = true;
 
-      const streamAvailability = loadStreamAvailability();
-      let streamCacheDirty = false;
-
-      scanningRef.current = true;
+    void (async () => {
       try {
-        for (const item of due) {
-          if (item !== due[0]) {
-            await new Promise((r) => setTimeout(r, FETCH_STAGGER_MS));
+        const state = loadScannerState();
+        // Evict scanner state entries for library items the user
+        // removed (same housekeeping as v2).
+        const liveIds = new Set(candidates.map((c) => c.id));
+        let stateDirty = false;
+        for (const id of Object.keys(state)) {
+          if (!liveIds.has(id)) {
+            delete state[id];
+            stateDirty = true;
           }
-          // Route through the shared 24h persistent meta cache so a
-          // hit landed by Calendar / DetailView / a previous scan
-          // satisfies us for free. The cache also dedupes concurrent
-          // calls for the same key, so two browser tabs (or the
-          // sync layer pulling at the same time) can't fan a request
-          // out twice.
-          const detail = await getMetaDetail(metaAddon, item.media_type, item.id)
-            .catch(() => null);
+        }
+
+        const streamAvailability = loadStreamAvailability();
+        let streamCacheDirty = false;
+
+        for (const item of candidates) {
+          const signal = getReleaseSignal(item.id);
+          // `undefined` means "store hasn't seen this id yet" —
+          // happens during the first reconcile pass or for ids the
+          // cloud poller hasn't reached. We skip rather than
+          // assuming no episode aired.
+          if (signal === undefined) continue;
+          // `null` is "cloud has no record for this id" — also a
+          // skip; nothing to compare against.
+          if (signal === null) continue;
+          const la = signal.last_aired;
+          if (!la?.id) continue;
 
           const prev = state[item.id] ?? { lastChecked: 0, seenVideoIds: [] };
           const seenSet = new Set<string>(prev.seenVideoIds);
           const isFirstScan = prev.lastChecked === 0;
 
-          if (detail && Array.isArray(detail.videos)) {
-            for (const v of detail.videos) {
-              if (!v.id) continue;
-              if (seenSet.has(v.id)) continue;
-              // Skip TMDB/TVDB season-0 specials/extras unconditionally.
-              if (typeof v.season === "number" && v.season <= 0) {
-                seenSet.add(v.id);
+          // First-scan seeding: if we've never seen this series
+          // before, mark the current `last_aired` as seen WITHOUT
+          // notifying. Notifications only fire for genuinely-new
+          // episodes that arrived after the user's first scan.
+          // Without this, signing in on a fresh device would spam a
+          // notification for whatever happened to be the most-recent
+          // episode of every show in the library.
+          if (isFirstScan) {
+            seenSet.add(la.id);
+            state[item.id] = {
+              lastChecked: Date.now(),
+              seenVideoIds: Array.from(seenSet),
+            };
+            stateDirty = true;
+            continue;
+          }
+
+          // Already notified about this episode — no-op.
+          if (seenSet.has(la.id)) {
+            // Bump lastChecked so the housekeeping eviction above
+            // doesn't think we never touched this entry. Cheap.
+            if (state[item.id]) state[item.id].lastChecked = Date.now();
+            continue;
+          }
+
+          // Optional stream-availability gate (preserved from v2). When
+          // on, we only fire the notification if at least one
+          // playable stream is available for the new episode. Result
+          // cached locally for 12 h so re-scans don't refire the
+          // network call. Cloud doesn't know about streams (per
+          // §2 privacy boundary — streams stay per-user), so this
+          // gate stays client-side.
+          if (settings.notifyOnlyWithStreams) {
+            const now = Date.now();
+            const cacheHit = streamAvailability[la.id];
+            let hasStreams: boolean;
+            if (cacheHit && now - cacheHit.ts < STREAM_AVAILABILITY_TTL_MS) {
+              hasStreams = cacheHit.hasStreams;
+            } else {
+              try {
+                const streams = await invoke<Array<{ type?: string | null }>>(
+                  "fetch_streams",
+                  { addons, mediaType: item.media_type, id: la.id },
+                );
+                hasStreams = Array.isArray(streams)
+                  && streams.some(isPlayableStream);
+              } catch {
+                // Network blip — don't mark as seen so the next
+                // signal-bump retries.
                 continue;
               }
-              const releasedTs = v.released ? Date.parse(v.released) : NaN;
-              const inWindow = Number.isFinite(releasedTs)
-                && releasedTs <= now + 24 * 60 * 60 * 1000
-                && now - releasedTs <= RECENT_RELEASE_WINDOW_MS;
-
-              // First-scan seeding fix: only mark videos OUTSIDE the
-              // recent-release window as seen. Episodes inside the
-              // window are still notification candidates on first
-              // contact, which is what makes "I just installed Aura
-              // and last episode aired yesterday" actually work.
-              if (isFirstScan && !inWindow) {
-                seenSet.add(v.id);
-                continue;
-              }
-              if (!inWindow) continue;
-
-              // Optional stream-availability gate. Cached for 12h
-              // per video id so a re-scan over the same recent
-              // episode doesn't refire the network call.
-              if (settings.notifyOnlyWithStreams) {
-                const cacheHit = streamAvailability[v.id];
-                let hasStreams: boolean;
-                if (cacheHit && now - cacheHit.ts < STREAM_AVAILABILITY_TTL_MS) {
-                  hasStreams = cacheHit.hasStreams;
-                } else {
-                  try {
-                    const streams = await invoke<Array<{ type?: string | null }>>(
-                      "fetch_streams",
-                      { addons, mediaType: item.media_type, id: v.id },
-                    );
-                    hasStreams = Array.isArray(streams)
-                      && streams.some(isPlayableStream);
-                  } catch {
-                    // Network blip: don't suppress permanently and
-                    // don't mark as seen — the next scan retries.
-                    continue;
-                  }
-                  streamAvailability[v.id] = { hasStreams, ts: now };
-                  streamCacheDirty = true;
-                }
-                if (!hasStreams) {
-                  // Skip THIS scan but DON'T add to seenSet. The
-                  // previous code added the id to seenSet permanently,
-                  // which trapped users in "no notification ever" for
-                  // any episode whose first stream-check failed —
-                  // making the 12h TTL on the availability cache dead
-                  // code (the seenSet check above short-circuits
-                  // before the TTL is consulted). Leaving v.id
-                  // unmarked lets the next scan re-query streams once
-                  // the cache entry expires, which is what we want:
-                  // delayed-source episodes do eventually notify.
-                  continue;
-                }
-              }
-
-              seenSet.add(v.id);
-              const epLabel = (() => {
-                if (typeof v.season === "number" && typeof v.episode === "number") {
-                  const s = String(v.season).padStart(2, "0");
-                  const e = String(v.episode).padStart(2, "0");
-                  return `S${s}E${e}`;
-                }
-                if (typeof v.episode === "number") return `E${v.episode}`;
-                return null;
-              })();
-              const titleParts = [item.name];
-              if (epLabel) titleParts.push(epLabel);
-              addNotification({
-                id: `episode:${item.id}:${v.id}`,
-                kind: "episode",
-                title: titleParts.join(" — "),
-                subtitle: v.title || undefined,
-                data: { metaId: item.id, videoId: v.id, mediaType: item.media_type },
-              });
+              streamAvailability[la.id] = { hasStreams, ts: now };
+              streamCacheDirty = true;
+            }
+            if (!hasStreams) {
+              // Skip THIS pass; v2's bug of permanently marking
+              // unavailable-stream eps as seen is not repeated.
+              continue;
             }
           }
+
+          // Fire the notification.
+          seenSet.add(la.id);
+          const epLabel = formatEpLabel(la.season, la.episode);
+          const titleParts: string[] = [item.name];
+          if (epLabel) titleParts.push(epLabel);
+          addNotification({
+            id: `episode:${item.id}:${la.id}`,
+            kind: "episode",
+            title: titleParts.join(" — "),
+            subtitle: undefined,
+            data: { metaId: item.id, videoId: la.id, mediaType: item.media_type },
+          });
           state[item.id] = {
             lastChecked: Date.now(),
             seenVideoIds: Array.from(seenSet),
           };
-          saveScannerState(state);
+          stateDirty = true;
         }
+
+        if (stateDirty) saveScannerState(state);
+        if (streamCacheDirty) saveStreamAvailability(streamAvailability);
       } finally {
         scanningRef.current = false;
-        if (streamCacheDirty) saveStreamAvailability(streamAvailability);
       }
-    };
-  }, [addNotification]);
-
-  // Run on mount + every 30 minutes, regardless of which view the user
-  // is on. Previously this gated on activeView === "home" which meant
-  // a user who lived in Library / Calendar / Settings never saw
-  // notifications fire — that's the most likely root cause of the
-  // user-reported "I haven't seen new-episode notifications for a while".
-  useEffect(() => {
-    runScan.current();
-    const id = setInterval(() => { runScan.current(); }, SCAN_INTERVAL_MS);
-    return () => clearInterval(id);
-  }, []);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [version]);
 
   return null;
 }
