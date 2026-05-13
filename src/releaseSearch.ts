@@ -42,6 +42,14 @@ export interface ReleaseSignal {
   media_type: ReleaseMediaType;
   last_aired: ReleaseAired | null;
   next_aired: ReleaseAired | null;
+  /** Every episode whose `aired_at` is in the last 365 days, sorted
+   *  ascending by `aired_at`, capped at 200 most-recent. The
+   *  notification source per §3 — desktop iterates this list and
+   *  fires one notification per episode newer than its local
+   *  "last seen" record, so multiple between-session aired episodes
+   *  surface (instead of being collapsed into one via `last_aired`
+   *  alone). Empty array for movies. */
+  recent_aired: ReleaseAired[];
   /** Per-episode classification within ±14 days of `polled_at`. Empty
    *  for Cinemeta-sourced signals (Cinemeta doesn't carry
    *  filler/recap). An id can appear twice with different `kind`s when

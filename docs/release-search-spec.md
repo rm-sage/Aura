@@ -80,6 +80,11 @@ Stored once per imdb-id (NOT per user). JSON shape:
     "aired_at": "2026-05-05T15:00:00Z",
     "id": "tt22248376:2:8"
   },
+  "recent_aired": [
+    { "season": 2, "episode": 5, "absolute_episode": 33, "aired_at": "2026-04-14T15:00:00Z", "id": "tt22248376:2:5" },
+    { "season": 2, "episode": 6, "absolute_episode": 34, "aired_at": "2026-04-21T15:00:00Z", "id": "tt22248376:2:6" },
+    { "season": 2, "episode": 7, "absolute_episode": 35, "aired_at": "2026-04-28T15:00:00Z", "id": "tt22248376:2:7" }
+  ],
   "episode_kinds": [
     { "id": "tt22248376:2:7", "kind": "filler" },
     { "id": "tt22248376:2:9", "kind": "recap" }
@@ -97,6 +102,17 @@ Field rules:
   For movies, `last_aired` is null and `next_aired.aired_at` carries the
   theatrical / streaming release date.
 - `absolute_episode` is omitted when the addon doesn't supply it.
+- `recent_aired`: every episode whose `aired_at` is in the last 365 days,
+  sorted **ascending** by `aired_at`. Capped at the 200 most-recent
+  entries (oldest are dropped first when the list overflows the cap).
+  Empty array for movies. **This is the notification source**: the
+  desktop iterates this list and fires one notification per episode
+  newer than its local "last seen" record for the title, so multiple
+  episodes that aired between sessions all surface — not just the single
+  most-recent one. `last_aired` remains as a convenience accessor (= the
+  newest entry of `recent_aired` when both are non-empty, modulo the
+  365-day window: `last_aired` may be older than the window for titles
+  with no recent activity, in which case `recent_aired` is empty).
 - `episode_kinds`: per-episode classification, only for episodes whose
   `aired_at` is within ±14 days of `polled_at` (sliding window — drop
   older entries so the blob doesn't grow). Derived from AIOMetadata's
@@ -178,6 +194,8 @@ a single trailing segment.
 - **Logging:** log only `method`, status code, item count, and the
   scope-truncated-to-4-chars (same pattern as existing `logSync`).
   Never log the items array.
+- **Future:** a response `ETag` for short-circuiting unchanged
+  refresh ticks is planned but not yet implemented — see §10.1.
 
 ### 4.3 `POST /sync/v1/release/{imdb_id}/refresh` — nudge the poller
 
@@ -383,6 +401,19 @@ the desktop changes are what unlock the user-visible benefits.
     `episode_kinds` data.
   - On manual library refresh → `nudgeReleasePoller(id, type)` per
     item, then re-batch after 30s.
+  - **Periodic refresh while open**: re-call `fetchReleaseSignals`
+    on a timer (5–10 min recommended) so newly-aired episodes
+    surface without the user manually refreshing. The cloud serves
+    this from cache; it's cheap.
+- [ ] **Stacked notifications via `recent_aired`** (§6.3 also). On
+      each refresh, for every signal, walk `recent_aired` and fire one
+      notification per episode whose `aired_at` is newer than the
+      desktop's local "last seen" record for that title. Don't fire
+      based on `last_aired` alone — that field is just the most-recent
+      entry; using it would collapse three new episodes into one
+      notification. Update the local "last seen" timestamp to the
+      latest `aired_at` you fired for, so the next refresh doesn't
+      duplicate.
 - [ ] **Fallback path preservation.** Keep the existing per-user
       addon probe path. Fall back to it when:
   - the cloud is unreachable / returns 5xx;
@@ -582,6 +613,103 @@ Three-place registration per CLAUDE.md: command handler list,
 
 ---
 
+## 10. Future optimizations
+
+> **Status:** none of this is built yet. Stubs for a future PR.
+
+### 10.1 Batch response ETag — short-circuit unchanged refreshes
+
+**Motivation.** With the periodic refresh tick from §6.0 (5–10 min
+recommended), the desktop re-downloads the full `/batch` response
+(~1 KB × N items ≈ ~120 KB for a typical library) on every tick even
+when the cache is fully warm and the response is byte-identical to
+the previous one. Most ticks return the same data; we should let the
+desktop short-circuit.
+
+**Cloud side.**
+
+1. After collecting signal rows for the request's id list, compute a
+   response ETag deterministically from the id list and per-row
+   etags:
+   ```
+   response_etag = sha256(sorted("<id>:<etag>" for each row, plus
+                                  "<id>:null" for cache-miss ids))[:16]
+   ```
+   Both the id set and the individual signal etags are inputs, so the
+   response ETag changes when (a) any returned signal changes or (b)
+   the request id list changes.
+2. Return `ETag: <hex>` on every 200 response.
+3. If the request carries `If-None-Match: <hex>` and it equals the
+   recomputed response ETag, respond `304 Not Modified` with the
+   `ETag` header and no body. Skip JSON serialization entirely.
+4. Log line stays one line per request; add a `cached=1` field when
+   we 304:
+   ```
+   release method=POST path=/sync/v1/release/batch scope=h7Q4 outcome=304 items=120 cached=1
+   ```
+
+**RFC nuance.** Strict RFC 7232 says servers should return
+`412 Precondition Failed` (not `304`) for `If-None-Match` on POST.
+We return `304` because the desired semantic — "no changes; use last
+cache" — matches `304` and most clients handle it correctly. If you'd
+rather stay strict, two alternative shapes work equally well:
+- Move the freshness check to a body-level signature: request carries
+  `"if_signature": "<hex>"`, response is either
+  `{"unchanged": true, "signature": "<hex>"}` or the full payload
+  with the new signature. Cleanest semantic for POST, slightly more
+  client code.
+- Move batch to GET with the id list compactly encoded in a query
+  param (comma-joined). HTTP semantics then naturally support
+  `If-None-Match` / `304`. Hits URL-length limits past ~200 ids
+  unless you split into multiple GETs.
+
+The HTTP-convention 304-on-POST path is what's documented above; pick
+a different shape if you have strong reasons.
+
+**Desktop side.**
+
+1. Persist the response `ETag` returned on the last successful batch
+   call (in-memory alongside the signal cache is fine — no need to
+   write through to disk).
+2. On the next batch call with the same id list, send
+   `If-None-Match: <last-etag>`.
+3. On `304`, reuse the cached signals and skip the downstream
+   merge / notification-diff work. Notifications should still
+   re-evaluate against the latest local "last seen" state — `304`
+   just means "the cloud's view is the same as last tick", not "the
+   user has seen everything", so a fresh local notification pass on
+   the cached data is still correct.
+4. On `200`, update the stored ETag and run the normal merge flow.
+
+If the desktop's library changes between ticks (id added/removed),
+the next request's id list differs and the cloud's response ETag
+differs — the desktop should expect `200` here and treat it as the
+new baseline.
+
+**Estimated impact.** For a 120-item library at a 5-min refresh tick
+with no upstream changes: ~99% of ticks return `304` (headers only,
+maybe ~150 bytes including TLS framing); the full ~120 KB body only
+flows when something actually advanced. Net inbound bandwidth on the
+desktop drops from ~17 MB/day per user to ~50 KB/day per user.
+
+**Failure modes.**
+
+- ETag mismatch due to a signal being mid-write while we compute the
+  response. SetMaxOpenConns(1) on the SQLite handle serializes reads
+  vs writes, so this race can't actually occur — the batch read sees
+  one consistent snapshot of every row's etag.
+- The desktop persists the wrong ETag and the cloud always 200s. Not
+  a correctness issue, just no bandwidth saving. Self-heals on next
+  successful round trip.
+- Race where the desktop sends `If-None-Match` from a stale local
+  cache it has since dropped. Cloud's 304 says "you already have
+  this"; desktop has nothing to reuse. The desktop should treat 304
+  as authoritative only when its local cache is still populated —
+  if the cache was evicted, drop the `If-None-Match` header on the
+  next call and accept a 200.
+
+---
+
 ## Appendix A — changes from v1 draft
 
 For reviewers comparing this to the original draft you may have
@@ -625,3 +753,17 @@ AIOMetadata source):
 13. **Explicit Aura responsibilities checklist** added at the top of
     §6 so the desktop hand-off has a single-glance summary of what
     needs to land on the client side.
+14. **`recent_aired` array** added to the signal (§3). The earlier
+    draft only carried `last_aired` (single most-recent), which would
+    collapse multiple episodes that aired between user sessions into
+    one notification. `recent_aired` carries every aired episode in
+    the last 365 days (capped at 200 most-recent), so the desktop can
+    stack notifications by iterating the list and firing one per
+    episode newer than the user's local "last seen" state. §6.0
+    checklist updated with the corresponding consumption rule.
+15. **§10 Future optimizations** section added to track planned-but-
+    not-yet-built work. §10.1 specifies the `/batch` response ETag
+    short-circuit for unchanged refresh ticks, both the cloud-side
+    mechanics and the desktop-side consumption pattern — pick it up
+    when periodic-refresh bandwidth becomes a concern (estimated
+    ~99% reduction in steady-state refresh traffic).

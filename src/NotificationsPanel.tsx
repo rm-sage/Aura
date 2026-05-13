@@ -53,7 +53,16 @@ export default function NotificationsPanel({ onClose, closing }: Props) {
         "absolute bottom-12 left-0",
         "w-[380px] max-h-[480px]",
         "rounded-2xl overflow-hidden",
-        "bg-white/[0.07] backdrop-blur-xl",
+        // Higher-contrast surface than the prior `bg-white/[0.07]`.
+        // `bg-black/82` darkens the panel substantially so titles
+        // stay legible against Mica's bright bleedthrough, while the
+        // `backdrop-saturate-150 backdrop-brightness-75 backdrop-blur-2xl`
+        // chain approximates iOS-style vibrancy without the per-frame
+        // GPU cost of the proper macOS Vibrancy API. The bright
+        // background still tinges the panel (the eye reads it as
+        // "translucent") but text contrast is uniform regardless of
+        // what's behind it.
+        "bg-black/82 backdrop-saturate-150 backdrop-brightness-75 backdrop-blur-2xl",
         "border border-white/10",
         "shadow-2xl",
         "flex flex-col",
@@ -275,11 +284,16 @@ function NotificationRow({ notification, onActivate, onDismiss }: RowProps) {
         <KindIcon kind={kind} />
       </div>
       <div className="flex-1 min-w-0">
-        <div className="text-sm text-white/90 leading-tight truncate">
+        {/* Native browser tooltip surfaces the full title on hover when
+            the rendered text gets clipped by `truncate`. Long anime
+            names ("Mushoku Tensei: Jobless Reincarnation …") were
+            otherwise unreadable without opening the detail page.
+            Same cheap solution Aura already uses on catalog cards. */}
+        <div className="text-sm text-white/90 leading-tight truncate" title={title}>
           {title}
         </div>
         {subtitle && (
-          <div className="text-xs text-white/55 leading-snug mt-0.5 line-clamp-2">
+          <div className="text-xs text-white/55 leading-snug mt-0.5 line-clamp-2" title={subtitle}>
             {subtitle}
           </div>
         )}
@@ -313,9 +327,18 @@ function NotificationRow({ notification, onActivate, onDismiss }: RowProps) {
           className={[
             "flex-shrink-0 self-start mt-0.5",
             "h-6 w-6 rounded-md",
-            "text-white/40 hover:text-white hover:bg-white/[0.12]",
+            // Two-stage colour scheme: row-hover makes the X visible
+            // as a rose tint (high-contrast even against Mica's bright
+            // bleedthrough), button-hover then deepens to a solid
+            // rose background so the destructive intent reads
+            // unambiguously before the click. Was previously
+            // white-on-white-translucent which dropped to ~0
+            // contrast on light Mica.
+            "text-white/40 group-hover:text-rose-400",
+            "hover:!text-white hover:!bg-rose-500/55 hover:!border-rose-400/40",
+            "border border-transparent",
             "opacity-0 group-hover:opacity-100",
-            "transition-opacity duration-150",
+            "transition-all duration-150",
             "flex items-center justify-center",
           ].join(" ")}
         >
