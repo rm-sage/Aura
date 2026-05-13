@@ -184,27 +184,49 @@ function useSeasonEpisodes(item: LibraryItem, addons: AddonEntry[] | undefined):
         setEps([]);
         return;
       }
-      // Resume episode tells us which season — IMDb-style episodes
-      // (`tt0903747:1:5`) carry "1" as the second segment. For
-      // prefix-style ids (kitsu/mal/anidb) there's typically no
-      // season concept, so we render every video as a single bar.
+      // Determine which season's episodes the bar should represent.
+      // Resolution order:
+      //   1. VideoEntry-authoritative: find the video in detail.videos
+      //      whose id matches state.video_id. Works uniformly for both
+      //      tt-style ids (`tt22248376:2:9`) and anime-prefix ids
+      //      (`kitsu:49240:9`) — the latter carries the kitsu show id
+      //      in its middle slot, not a season number, so id-parsing
+      //      would mis-read it as season 49240.
+      //   2. (season, episode) tuple match for legacy library entries
+      //      whose state.video_id shape no longer matches videos[].id.
+      //   3. Id-string parse fallback (tt-only) when neither matches —
+      //      covers in-flight meta where videos[] hasn't loaded yet.
+      // Cour-aggregated anime: AIOMetadata now emits one season per
+      // cour, so v.season carries the cour position (1, 2, 3, …) and
+      // the bar correctly represents the user's current cour.
       const videoId = (item.state ?? {}).video_id;
       let season: number | null = null;
-      if (typeof videoId === "string") {
-        const parts = videoId.split(":");
-        if (parts.length >= 3) {
-          const maybeSeason = Number(parts[parts.length - 2]);
-          if (Number.isFinite(maybeSeason)) season = maybeSeason;
+      if (typeof videoId === "string" && videoId.length > 0) {
+        const directMatch = detail.videos.find((v) => v.id === videoId);
+        if (directMatch?.season != null) {
+          season = directMatch.season;
+        } else {
+          // Tuple-match fallback for ids that don't equal any current
+          // video id (legacy shape after addon-side renaming, e.g.
+          // tt22248376:1:5 against new kitsu:46474:5 videos).
+          const parts = videoId.split(":");
+          if (parts.length >= 3 && videoId.startsWith("tt")) {
+            const s = Number(parts[parts.length - 2]);
+            const e = Number(parts[parts.length - 1]);
+            if (Number.isFinite(s) && Number.isFinite(e)) {
+              const tupleMatch = detail.videos.find(
+                (v) => (v.season ?? 0) === s && (v.episode ?? 0) === e,
+              );
+              if (tupleMatch?.season != null) season = tupleMatch.season;
+            }
+          }
         }
       }
-      // Filter to the resume episode's season when we can determine
-      // it. If the filter returns nothing — common for AIOMetadata-
-      // patched shows where the video_id encodes the split-season cour
-      // (`:2:6`) but the meta.videos[] entries still use the merged
-      // shape (`v.season === 1` for the same content), and for the
-      // kitsu/mal/anidb prefix-style ids that don't carry a true
-      // season slot — fall back to the full episode list so the
-      // segmented bar still draws.
+      // Filter to the resolved season. When season is null (initial
+      // load / unrecognised id / single-season show), fall through to
+      // the full list so the bar still draws — the strip-specials
+      // filter below collapses it to a sensible single-bar render for
+      // flat shows.
       let seasonEps = season != null
         ? detail.videos.filter((v) => v.season === season)
         : detail.videos;
