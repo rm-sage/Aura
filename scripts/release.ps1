@@ -149,6 +149,107 @@ if (-not (Test-Path $bundleDir)) {
 }
 
 # ---------------------------------------------------------------------------
+# Generate latest.json (auto-updater manifest)
+#
+# Tauri 2's bundler emits the signed installer + .sig file, but NOT the
+# `latest.json` manifest the updater fetches from the GitHub Releases
+# endpoint baked into tauri.conf.json. We assemble it here so a release
+# is "upload everything in $bundleDir + bundle/{nsis,msi}" with no
+# out-of-band manifest authoring.
+#
+# Notes source priority (best → worst):
+#   1. The annotated body of the `v<version>` git tag — preferred,
+#      because it's intentional release prose. RECOMMENDED WORKFLOW:
+#      tag the release BEFORE invoking this script.
+#   2. The commit subjects between the previous tag and HEAD — accurate
+#      but noisy. Used when no annotated tag exists for this version.
+#   3. A stub pointing at the GitHub release page — used when there's
+#      neither a tag nor a prior tag to compute a delta against.
+#
+# The first paragraph (up to the first blank line) of the tag body is
+# what ends up in `notes`; the full body stays on the GitHub release
+# page. This keeps the in-app updater dialog readable while preserving
+# the structured changelog for users who click through.
+# ---------------------------------------------------------------------------
+
+function Get-ReleaseNotes {
+    param(
+        [Parameter(Mandatory)][string]$Version,
+        [Parameter(Mandatory)][string]$RepoRoot
+    )
+    $tag = "v$Version"
+
+    # 1. Annotated tag body.
+    $tagBody = & git -C $RepoRoot for-each-ref "refs/tags/$tag" --format='%(contents:body)' 2>$null
+    if ($LASTEXITCODE -eq 0 -and $tagBody) {
+        $body = ($tagBody | Out-String).Trim()
+        # First paragraph — split on the first blank line.
+        $firstPara = ($body -split "(?:\r?\n){2,}", 2)[0].Trim()
+        # Strip any leading "Aura vX.Y.Z — " duplicate; the manifest
+        # stamps the version separately so leaving it in is redundant.
+        $firstPara = $firstPara -replace "^Aura\s+v?$([regex]::Escape($Version))\s*[—–\-]\s*", ""
+        # Drop trailing Co-Authored-By trailers — these are git
+        # bookkeeping, not release notes.
+        $firstPara = ($firstPara -split "\r?\nCo-Authored-By:", 2)[0].TrimEnd()
+        # Cap so the in-app updater dialog stays readable.
+        if ($firstPara.Length -gt 600) {
+            $firstPara = $firstPara.Substring(0, 597) + "..."
+        }
+        if ($firstPara.Length -ge 30) {
+            Write-Host "[release] notes: using v$Version annotated tag body (first paragraph, $($firstPara.Length) chars)" -ForegroundColor DarkGray
+            return $firstPara
+        }
+    }
+
+    # 2. Commit-subject aggregation since the previous tag.
+    $prevTag = & git -C $RepoRoot describe --tags --abbrev=0 --exclude=$tag HEAD 2>$null
+    if ($LASTEXITCODE -eq 0 -and $prevTag) {
+        $log = & git -C $RepoRoot log "$prevTag..HEAD" --pretty="- %s" --no-merges 2>$null
+        if ($log) {
+            $joined = (($log | Out-String) -split "\r?\n" | Where-Object { $_.Trim() } | Out-String).Trim()
+            if ($joined.Length -gt 560) {
+                $joined = $joined.Substring(0, 557) + "..."
+            }
+            Write-Host "[release] notes: no v$Version tag — falling back to commit log since $prevTag" -ForegroundColor Yellow
+            return "Changes since ${prevTag}:`n$joined"
+        }
+    }
+
+    # 3. Stub.
+    Write-Host "[release] notes: no tag history — emitting stub link" -ForegroundColor Yellow
+    return "Aura $Version - see https://github.com/rm-sage/Aura/releases/tag/$tag for the full changelog."
+}
+
+$nsisInstaller = "Aura_$($pkg.version)_x64-setup.exe"
+$nsisSigPath   = Join-Path $bundleDir "nsis/$nsisInstaller.sig"
+
+if (-not (Test-Path $nsisSigPath)) {
+    Write-Host "[release] WARNING: NSIS .sig file not found at $nsisSigPath — skipping latest.json generation" -ForegroundColor Yellow
+    Write-Host "[release] (the bundler skipped signing — verify tauri.conf.json `plugins.updater.active` and the signing env wiring)" -ForegroundColor DarkGray
+} else {
+    $notes     = Get-ReleaseNotes -Version $pkg.version -RepoRoot $repoRoot
+    $signature = (Get-Content -Raw -Path $nsisSigPath).Trim()
+    $pubDate   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $manifest  = [ordered]@{
+        version   = $pkg.version
+        notes     = $notes
+        pub_date  = $pubDate
+        platforms = [ordered]@{
+            "windows-x86_64" = [ordered]@{
+                signature = $signature
+                url       = "https://github.com/rm-sage/Aura/releases/download/v$($pkg.version)/$nsisInstaller"
+            }
+        }
+    }
+    $manifestPath = Join-Path $bundleDir "latest.json"
+    # ConvertTo-Json escapes non-ASCII to \uXXXX by default, which keeps
+    # the manifest pure-ASCII for endpoints that proxy it through
+    # ASCII-only transports. The Tauri updater handles both forms fine.
+    $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path $manifestPath -Encoding UTF8
+    Write-Host "[release] latest.json written to $manifestPath" -ForegroundColor Green
+}
+
+# ---------------------------------------------------------------------------
 # Sentry debug-info upload
 #
 # Reads SENTRY_* vars from .env.local (the same file vite.config.ts reads
@@ -210,11 +311,19 @@ Write-Host "[release] BUILD SUCCEEDED" -ForegroundColor Green
 Write-Host "[release] release artifacts under: $bundleDir"
 Write-Host ""
 Write-Host "Next steps:"
-Write-Host "  1. Tag the release (e.g. git tag v$($pkg.version) && git push --tags)"
-Write-Host "  2. Create a GitHub release for that tag"
-Write-Host "  3. Upload BOTH:"
-Write-Host "       • the .msi (or .exe) installer from $bundleDir/msi/ (or /nsis/)"
-Write-Host "       • the latest.json manifest (alongside the installer)"
+Write-Host "  1. If you haven't yet, tag the release with annotated notes BEFORE"
+Write-Host "     re-running this script — the tag body's first paragraph is what"
+Write-Host "     populates `latest.json`'s `notes` field:"
+Write-Host "       git tag -a v$($pkg.version) -m '<release summary>'"
+Write-Host "       git push origin v$($pkg.version)"
+Write-Host "  2. Create a GitHub release for that tag (or `gh release create v$($pkg.version) --notes-from-tag`)."
+Write-Host "  3. Upload installers + sig files + latest.json. Example:"
+Write-Host "       gh release upload v$($pkg.version) ``"
+Write-Host "         $bundleDir/nsis/Aura_$($pkg.version)_x64-setup.exe ``"
+Write-Host "         $bundleDir/nsis/Aura_$($pkg.version)_x64-setup.exe.sig ``"
+Write-Host "         $bundleDir/msi/Aura_$($pkg.version)_x64_en-US.msi ``"
+Write-Host "         $bundleDir/msi/Aura_$($pkg.version)_x64_en-US.msi.sig ``"
+Write-Host "         $bundleDir/latest.json"
 Write-Host "  4. The in-app updater resolves to:"
 Write-Host "       https://github.com/rm-sage/Aura/releases/latest/download/latest.json"
 Write-Host "     and installs subsequent updates automatically."
