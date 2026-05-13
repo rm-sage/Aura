@@ -1900,6 +1900,7 @@ pub fn run() {
             aniskip::set_skip_windows,
             aniskip::submit_skip_time,
             aniskip::vote_skip_time,
+            anime_id_map::resolve_cour_mal_id,
             aniskip::get_skip_windows,
             aniskip::resolve_mal_id,
             aniskip::resolve_mal_id_by_title,

@@ -143,6 +143,10 @@ export default function AniSkipMenu({
     setMalResolving(true);
     setMalId(null);
     (async () => {
+      // Step 1: anime-prefix video id (kitsu:N / mal:N / anidb:N /
+      // anilist:N). AIOMetadata's cour-aggregation patch encodes the
+      // cour-specific provider id directly, so this is the most
+      // accurate path when present.
       const segs = activeTarget.id.split(":");
       if (segs.length === 3) {
         const provider = segs[0].toLowerCase();
@@ -157,16 +161,39 @@ export default function AniSkipMenu({
               const m = await invoke<number | null>("resolve_mal_id", {
                 source: provider, id: showId,
               });
-              if (!cancelled) {
-                setMalId(typeof m === "number" ? m : null);
-                setMalResolving(false);
+              if (typeof m === "number") {
+                if (!cancelled) { setMalId(m); setMalResolving(false); }
+                return;
               }
-              return;
             } catch {
-              if (!cancelled) { setMalId(null); setMalResolving(false); }
-              return;
+              // fall through to the cour-aware tt-style fallback
             }
           }
+        }
+      }
+      // Step 2: tt-style fallback using the series-root IMDb id plus
+      // the cour number. resolve_cour_mal_id walks the Fribb anime-id
+      // map, picks the per-cour row by `season - 1` index, returns
+      // its `mal_id`. Covers cour 2+ episodes whose video id is
+      // tt-prefixed (e.g. `tt22248376:2:1` for Frieren cour 2 ep 1
+      // when AIOMetadata's wire format still carries the IMDb shape
+      // for some entries).
+      const seriesImdb = activeTarget.series_id && activeTarget.series_id.startsWith("tt")
+        ? activeTarget.series_id
+        : (activeTarget.id.startsWith("tt") ? activeTarget.id.split(":")[0] : null);
+      if (seriesImdb) {
+        try {
+          const m = await invoke<number | null>("resolve_cour_mal_id", {
+            imdbId: seriesImdb,
+            season: activeTarget.season ?? null,
+          });
+          if (!cancelled) {
+            setMalId(typeof m === "number" ? m : null);
+            setMalResolving(false);
+          }
+          return;
+        } catch {
+          // fall through
         }
       }
       if (!cancelled) { setMalId(null); setMalResolving(false); }
@@ -277,7 +304,13 @@ export default function AniSkipMenu({
 
   return (
     <div
-      className="absolute bottom-full mb-2 right-0 z-50
+      // Anchored fixed bottom-right of the viewport so the menu sits
+      // OFF TO THE SIDE of the controls bar rather than overlapping
+      // the scrub bar above the three-dots button. `bottom-24` leaves
+      // clearance for the controls bar height; `right-4` keeps the
+      // panel away from the right edge. max-w-[92vw] handles the
+      // narrow-viewport collapse without spilling off-screen.
+      className="fixed bottom-24 right-4 z-50
                  rounded-xl aura-glass-menu shadow-glass-edge
                  w-[460px] max-w-[92vw] text-white/85"
       onClick={(e) => e.stopPropagation()}
@@ -501,8 +534,10 @@ export default function AniSkipMenu({
 }
 
 /** One row of the skip-mode toggles — off / prompt / auto pill group.
- *  Pill-style segment buttons so the active mode is obvious at a glance
- *  without needing a separate label. */
+ *  Matches Settings → Anime OP/ED Skip's `SkipModeRow` styling exactly
+ *  so the player-side mirror feels visually unified: rounded-full
+ *  capsule with per-state tone (white/55 off, amber prompt, emerald
+ *  auto) and a soft accent background on the active pill. */
 function ModeRow({
   label, value, onChange, disabled,
 }: {
@@ -511,28 +546,37 @@ function ModeRow({
   onChange: (v: SkipMode) => void;
   disabled?: boolean;
 }) {
-  const options: SkipMode[] = ["off", "prompt", "auto"];
+  const opts: { id: SkipMode; label: string; tone: string }[] = [
+    { id: "off",    label: "Off",    tone: "text-white/55" },
+    { id: "prompt", label: "Prompt", tone: "text-amber-300" },
+    { id: "auto",   label: "Auto",   tone: "text-emerald-300" },
+  ];
   return (
-    <div className="flex items-center justify-between gap-3">
+    <div className="flex items-center justify-between gap-4">
       <span className="text-[12px] text-white/85 flex-shrink-0">{label}</span>
-      <div className="flex bg-white/[0.05] border border-white/10 rounded-md p-0.5">
-        {options.map((opt) => (
-          <button
-            key={opt}
-            type="button"
-            onClick={() => onChange(opt)}
-            disabled={disabled}
-            className={`px-2.5 py-0.5 rounded text-[10.5px] font-semibold uppercase tracking-wider
-                        transition-colors
-                        ${value === opt
-                          ? "bg-ln-accent/25 text-ln-accent"
-                          : "text-white/55 hover:text-white/85"
-                        }
-                        disabled:opacity-50 disabled:cursor-not-allowed`}
-          >
-            {opt}
-          </button>
-        ))}
+      <div
+        className="flex-shrink-0 inline-flex rounded-full overflow-hidden
+                   bg-white/5 border border-white/10 p-0.5 gap-0.5"
+      >
+        {opts.map((o) => {
+          const active = value === o.id;
+          return (
+            <button
+              key={o.id}
+              type="button"
+              onClick={() => onChange(o.id)}
+              disabled={disabled}
+              className={`px-3 py-1 rounded-full text-[11.5px] font-medium tracking-wide
+                          transition-colors duration-150
+                          ${active
+                            ? `bg-ln-accent/20 ${o.tone}`
+                            : "text-white/55 hover:text-white/85"}
+                          disabled:opacity-50 disabled:cursor-not-allowed`}
+            >
+              {o.label}
+            </button>
+          );
+        })}
       </div>
     </div>
   );

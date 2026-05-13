@@ -47,22 +47,45 @@ const FRIBB_URL: &str = "https://raw.githubusercontent.com/Fribb/anime-lists/mas
 const TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// Subset of Fribb's per-anime row that we care about. The full row
-/// has anidb / kitsu / mal / tvdb / tmdb fields too; we ignore them
-/// since AniList id + IMDB id is what feeds the lookup. Defaulted so
-/// rows missing an `anilist_id` (most non-anime) don't fail parsing.
+/// also has tvdb / tmdb fields; we ignore those. Defaulted so rows
+/// missing an `anilist_id` (most non-anime) don't fail parsing.
 #[derive(Deserialize)]
 struct FribbEntry {
     #[serde(default)]
     anilist_id: Option<u64>,
     #[serde(default)]
+    mal_id: Option<u64>,
+    #[serde(default)]
+    kitsu_id: Option<u64>,
+    #[serde(default)]
+    anidb_id: Option<u64>,
+    #[serde(default)]
     imdb_id: Option<String>,
 }
 
-/// In-memory lookup. Populated by `warm_cache`; accessed by
-/// `scrobble_anilist::save_progress` via `lookup()`.
-static MAP: OnceLock<Mutex<HashMap<String, Vec<u64>>>> = OnceLock::new();
+/// One row's worth of cross-anime ids — what we keep in the in-memory
+/// index per imdb-id. Multi-cour shows produce multiple of these
+/// under the same imdb-id key (Fribb's data shape).
+///
+/// `kitsu_id` and `anidb_id` are populated but no lookup currently
+/// surfaces them — kept for symmetry with `anilist_id` and `mal_id`,
+/// and ready for the day a future caller needs the cour-specific
+/// kitsu / anidb id (e.g. to bypass the yuna.moe round-trip we
+/// currently use). Suppressing dead-code until then.
+#[derive(Clone, Debug, Default)]
+pub struct AnimeIdRow {
+    pub anilist_id: Option<u64>,
+    pub mal_id:     Option<u64>,
+    #[allow(dead_code)] pub kitsu_id: Option<u64>,
+    #[allow(dead_code)] pub anidb_id: Option<u64>,
+}
 
-fn map_slot() -> &'static Mutex<HashMap<String, Vec<u64>>> {
+/// In-memory lookup. Populated by `warm_cache`; accessed by
+/// `scrobble_anilist::save_progress` via `lookup()` for AniList and by
+/// `aniskip` resolution paths via `lookup_mal()`.
+static MAP: OnceLock<Mutex<HashMap<String, Vec<AnimeIdRow>>>> = OnceLock::new();
+
+fn map_slot() -> &'static Mutex<HashMap<String, Vec<AnimeIdRow>>> {
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -78,12 +101,26 @@ fn parse_entries(text: &str) -> Option<Vec<FribbEntry>> {
     serde_json::from_str::<Vec<FribbEntry>>(text).ok()
 }
 
-fn build_index(entries: &[FribbEntry]) -> HashMap<String, Vec<u64>> {
-    let mut m: HashMap<String, Vec<u64>> = HashMap::with_capacity(entries.len());
+fn build_index(entries: &[FribbEntry]) -> HashMap<String, Vec<AnimeIdRow>> {
+    let mut m: HashMap<String, Vec<AnimeIdRow>> = HashMap::with_capacity(entries.len());
     for e in entries {
-        let (Some(imdb), Some(anilist)) = (&e.imdb_id, e.anilist_id) else { continue };
+        // Index any row carrying an imdb_id + AT LEAST ONE anime id.
+        // The earlier filter required anilist_id specifically, which
+        // dropped rows where Fribb has only mal/kitsu but no anilist
+        // (occasionally happens for older entries). Inclusive shape
+        // lets aniskip mal lookups succeed for those too.
+        let Some(imdb) = &e.imdb_id else { continue };
         if imdb.is_empty() { continue; }
-        m.entry(imdb.clone()).or_default().push(anilist);
+        if e.anilist_id.is_none() && e.mal_id.is_none()
+            && e.kitsu_id.is_none() && e.anidb_id.is_none() {
+            continue;
+        }
+        m.entry(imdb.clone()).or_default().push(AnimeIdRow {
+            anilist_id: e.anilist_id,
+            mal_id:     e.mal_id,
+            kitsu_id:   e.kitsu_id,
+            anidb_id:   e.anidb_id,
+        });
     }
     m
 }
@@ -94,7 +131,7 @@ fn install(entries: &[FribbEntry]) {
     if let Ok(mut g) = map_slot().lock() {
         *g = next;
     }
-    crate::devlog!(info, "anime-id-map", "installed {count} imdb→anilist entries");
+    crate::devlog!(info, "anime-id-map", "installed {count} imdb→anime-ids entries");
 }
 
 async fn fetch_fresh() -> Result<String, String> {
@@ -179,30 +216,57 @@ pub async fn warm_cache<R: Runtime>(app: AppHandle<R>) {
 /// Resolve an IMDB show id to an AniList media id.
 ///
 /// `season` is the user's-VideoEntry-authoritative season number when
-/// available. For most anime (single-season) the map has a single
-/// anilist_id per imdb_id and season is ignored. For multi-season
-/// anime (Frieren, Demon Slayer, etc.) Fribb may carry multiple
-/// anilist_ids under the same imdb_id; we use `season - 1` as an index
-/// into the Vec. Falls back to the first entry when the season index
-/// is out of range OR season is None.
+/// available. For most anime (single-season) the map has a single row
+/// per imdb_id and season is ignored. For multi-season anime (Frieren,
+/// Demon Slayer, etc.) Fribb may carry multiple rows under the same
+/// imdb_id; we use `season - 1` as an index into the Vec. Falls back
+/// to the first entry when the season index is out of range OR season
+/// is None.
 ///
 /// Returns None when the imdb_id isn't in the map (uncached, niche, or
 /// the map hasn't been warmed yet). Caller is expected to fall through
 /// to the existing cache + title-search resolution.
 pub fn lookup(imdb_id: &str, season: Option<u32>) -> Option<u64> {
+    lookup_row(imdb_id, season).and_then(|r| r.anilist_id)
+}
+
+/// Same lookup heuristic as `lookup`, but returns the MAL id slot.
+/// Used by the AniSkip submission path so cour-2 episodes of multi-
+/// cour anime get the correct per-cour MAL entry (e.g. Frieren cour 2
+/// → MAL 59978 rather than the show-root cour 1 MAL 52991).
+pub fn lookup_mal(imdb_id: &str, season: Option<u32>) -> Option<u64> {
+    lookup_row(imdb_id, season).and_then(|r| r.mal_id)
+}
+
+fn lookup_row(imdb_id: &str, season: Option<u32>) -> Option<AnimeIdRow> {
     let g = map_slot().lock().ok()?;
     let entries = g.get(imdb_id)?;
     if entries.is_empty() { return None; }
     match season {
         Some(s) if s > 1 => {
             let idx = (s - 1) as usize;
-            entries.get(idx).copied().or_else(|| entries.first().copied())
+            entries.get(idx).cloned().or_else(|| entries.first().cloned())
         }
-        _ => entries.first().copied(),
+        _ => entries.first().cloned(),
     }
 }
 
-/// Number of imdb→anilist entries in the in-memory index. Useful for
+/// Tauri command — surface `lookup_mal` to the frontend so the
+/// AniSkipMenu's submission path can resolve cour-specific MAL ids
+/// for tt-style video ids (where the cour-specific anime id isn't
+/// embedded in `target.id`). Returns None when the map hasn't been
+/// warmed or the imdb id isn't in Fribb's dataset.
+#[tauri::command]
+pub fn resolve_cour_mal_id(imdb_id: String, season: Option<u32>) -> Option<u64> {
+    let id = lookup_mal(&imdb_id, season);
+    crate::devlog!(
+        info, "anime-id-map",
+        "resolve_cour_mal_id imdb={imdb_id} season={season:?} → {id:?}",
+    );
+    id
+}
+
+/// Number of imdb→anime-ids entries in the in-memory index. Useful for
 /// diagnostics; surfaced in the DevConsole `version` command (TBD) so
 /// users can see whether the map is loaded.
 #[allow(dead_code)]

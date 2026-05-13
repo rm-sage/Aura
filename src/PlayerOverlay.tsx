@@ -2227,17 +2227,27 @@ function Scrubber({
 
   // Filter segments to those that are within-duration AND have a
   // sane width — guards against malformed AniSkip rows (start > end,
-  // negative timestamps) that would otherwise render as garbled
-  // bands.
+  // negative timestamps, end past duration) that would otherwise
+  // render as garbled bands extending off the track. Important:
+  // bail entirely when max ≤ 1 — that's the duration=0 fallback in
+  // the parent's `max || 1`, and any segment computed against it
+  // would render at thousands-of-percent left offsets that escape
+  // the scrub track horizontally.
   const drawableSegments = useMemo(() => {
-    if (!segments || max <= 0) return [];
+    if (!segments || max <= 1) return [];
     return segments
       .filter((s) => s.end > s.start && s.end > 0 && s.start < max)
-      .map((s) => ({
-        ...s,
-        leftPct:  Math.max(0,  (s.start / max) * 100),
-        widthPct: Math.min(100, ((s.end - s.start) / max) * 100),
-      }))
+      .map((s) => {
+        // Clamp end to the track's right edge so windows that extend
+        // past `max` (rare but real — AniSkip submitters sometimes
+        // record an `endTime` slightly past the actual runtime) stop
+        // at 100% instead of continuing into the void.
+        const clampedStart = Math.max(0, s.start);
+        const clampedEnd   = Math.min(max, s.end);
+        const leftPct  = Math.max(0, Math.min(100, (clampedStart / max) * 100));
+        const widthPct = Math.max(0, Math.min(100 - leftPct, ((clampedEnd - clampedStart) / max) * 100));
+        return { ...s, leftPct, widthPct };
+      })
       .filter((s) => s.widthPct > 0.05);
   }, [segments, max]);
 
