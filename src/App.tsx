@@ -1541,15 +1541,21 @@ export default function App() {
       const playedEpisodeId = activeTarget.id;
       const isSeriesEpisode = activeTarget.series_id != null && activeTarget.series_id !== activeTarget.id;
       if (meaningfulRatio && meaningfulTime && playedEpisodeId) {
-        let season: number | null = null;
-        let episode: number | null = null;
-        if (isSeriesEpisode) {
+        // Same VideoEntry-first / id-parse-fallback shape as
+        // handleExitPlayback's history append — see that block for
+        // the rationale (post-AIOMetadata-patch non-tt ids would
+        // otherwise mis-parse provider id as season).
+        let season: number | null = activeTarget.season ?? null;
+        let episode: number | null = activeTarget.episode_num ?? null;
+        if (isSeriesEpisode
+            && (season == null || episode == null)
+            && playedEpisodeId.startsWith("tt")) {
           const parts = playedEpisodeId.split(":");
           if (parts.length >= 3) {
             const s = Number(parts[parts.length - 2]);
             const e = Number(parts[parts.length - 1]);
-            if (Number.isFinite(s)) season = s;
-            if (Number.isFinite(e)) episode = e;
+            if (season == null && Number.isFinite(s)) season = s;
+            if (episode == null && Number.isFinite(e)) episode = e;
           }
         }
         const libRecord = library.find((i) => i.id === seriesId) ?? null;
@@ -2943,20 +2949,26 @@ export default function App() {
       const meaningfulTime  = watched >= 5 * 60;
       const seriesId = activeTarget.series_id ?? activeTarget.id;
       if (meaningfulRatio && meaningfulTime) {
-        // Episode info for series — parse from the episode id
-        // (`tt12345:1:5` → S01E05). Movies skip this branch.
-        let season: number | null = null;
-        let episode: number | null = null;
-        if (isSeriesEpisode && playedEpisodeId) {
+        // Episode info for series. Prefer the VideoEntry-authoritative
+        // `activeTarget.season` / `activeTarget.episode_num` — those
+        // are set by App.tsx from the clicked video's metadata and are
+        // correct regardless of id shape. Falls back to id-string
+        // parsing (`tt12345:1:5` → S01E05) only for tt-prefixed ids
+        // where the trailing segments are guaranteed to be S/E. After
+        // AIOMetadata's IMDb-anime patch, non-tt ids (`kitsu:46474:5`)
+        // have a provider id in the middle slot that would otherwise
+        // get mis-parsed as season=46474.
+        let season: number | null = activeTarget.season ?? null;
+        let episode: number | null = activeTarget.episode_num ?? null;
+        if (isSeriesEpisode && playedEpisodeId
+            && (season == null || episode == null)
+            && playedEpisodeId.startsWith("tt")) {
           const parts = playedEpisodeId.split(":");
           if (parts.length >= 3) {
             const s = Number(parts[parts.length - 2]);
             const e = Number(parts[parts.length - 1]);
-            if (Number.isFinite(s)) season = s;
-            if (Number.isFinite(e)) episode = e;
-          } else if (parts.length === 3) {
-            const e = Number(parts[parts.length - 1]);
-            if (Number.isFinite(e)) episode = e;
+            if (season == null && Number.isFinite(s)) season = s;
+            if (episode == null && Number.isFinite(e)) episode = e;
           }
         }
         const libRecord = library.find((i) => i.id === seriesId) ?? null;

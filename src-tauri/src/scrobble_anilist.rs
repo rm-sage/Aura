@@ -421,16 +421,114 @@ async fn save_media_list_entry(
 // Session id parsing
 // ---------------------------------------------------------------------------
 
-/// Pull the show root from `tt0903747:1:5` → `Some("tt0903747")`. Movies
-/// (`tt0111161`) return themselves. Anything not IMDB-shaped returns None.
+/// Anime-provider prefixes that yuna.moe's relations API maps to a
+/// canonical AniList id. Keep this aligned with the
+/// `match source.to_lowercase()` arms in `aniskip::resolve_mal_id`.
+const ANIME_PREFIXES: &[&str] = &["kitsu", "mal", "anilist", "anidb"];
+
+/// Pull the show root from a session id.
+///
+/// Accepted shapes (in priority order):
+///   • `tt0903747`              → `Some("tt0903747")` (IMDb movie)
+///   • `tt0903747:1:5`          → `Some("tt0903747")` (IMDb episode)
+///   • `kitsu:46474`            → `Some("kitsu:46474")` (anime prefix show)
+///   • `kitsu:46474:5`          → `Some("kitsu:46474")` (anime prefix ep)
+///   • same for mal / anilist / anidb prefixes
+///
+/// The anime-prefix branch returns the `<provider>:<id>` slice so the
+/// caller has the provider tag for routing — IMDb roots go through the
+/// Fribb id-map cour-aware path, anime-prefix roots route through
+/// yuna.moe's exact-mapping API (no fuzzy season heuristic needed
+/// because AIOMetadata has already encoded the cour-specific provider
+/// id).
 fn parse_show_id(id: &str) -> Option<&str> {
-    let first = id.split(':').next()?;
-    if first.starts_with("tt") {
-        Some(first)
-    } else {
-        None
+    let parts: Vec<&str> = id.split(':').collect();
+    match parts.as_slice() {
+        [first] if first.starts_with("tt") => Some(*first),
+        [first, _, _] if first.starts_with("tt") => Some(*first),
+        // `kitsu:46474` (2-segment, no episode) — returns whole id.
+        [first, _] if ANIME_PREFIXES.contains(&first.to_lowercase().as_str()) => {
+            Some(id)
+        }
+        // `kitsu:46474:5` — slice off the trailing `:<episode>`.
+        [first, _, _] if ANIME_PREFIXES.contains(&first.to_lowercase().as_str()) => {
+            id.match_indices(':').nth(1).map(|(i, _)| &id[..i])
+        }
+        _ => None,
     }
 }
+
+/// Did `parse_show_id` return an anime-provider root (vs an IMDb root)?
+fn is_anime_prefix_root(show_id: &str) -> bool {
+    let Some((provider, _)) = show_id.split_once(':') else { return false; };
+    ANIME_PREFIXES.contains(&provider.to_lowercase().as_str())
+}
+
+/// Resolve an anime-provider show id to an AniList media id via
+/// yuna.moe's relations API. Returns the bare AniList id directly
+/// when the provider is already `anilist:N`. For other prefixes, hits
+/// `https://relations.yuna.moe/api/ids` and pulls the `anilist`
+/// field out of the response.
+///
+/// Errors / no-match cases (network failure, unrecognised provider,
+/// no AniList counterpart) return Ok(None). Callers fall back to the
+/// title-search path.
+async fn resolve_anilist_id_for_anime_prefix(show_id: &str) -> Result<Option<u64>, String> {
+    let Some((source_raw, id_str)) = show_id.split_once(':') else {
+        return Ok(None);
+    };
+    let source = source_raw.to_lowercase();
+    let id: u32 = id_str.parse().map_err(|e| format!("bad anime prefix id: {e}"))?;
+    if source == "anilist" {
+        return Ok(Some(id as u64));
+    }
+    let api_source = match source.as_str() {
+        "kitsu" | "mal" | "anidb" => source.as_str(),
+        _ => return Ok(None),
+    };
+    #[derive(serde::Deserialize)]
+    struct YunaResponse {
+        #[serde(default)]
+        anilist: Option<serde_json::Value>,
+    }
+    let url = format!("https://relations.yuna.moe/api/ids?source={api_source}&id={id}");
+    let cli = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .https_only(true)
+        .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " anilist-resolve"))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = match cli.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            crate::devlog!(warn, "scrobble", "yuna.moe lookup failed for {source}={id}: {e}");
+            return Ok(None);
+        }
+    };
+    if !resp.status().is_success() {
+        crate::devlog!(
+            warn, "scrobble",
+            "yuna.moe HTTP {} for {source}={id}", resp.status().as_u16(),
+        );
+        return Ok(None);
+    }
+    let parsed: YunaResponse = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            crate::devlog!(warn, "scrobble", "yuna.moe JSON parse error: {e}");
+            return Ok(None);
+        }
+    };
+    let anilist_id = parsed.anilist
+        .and_then(|v| v.as_u64())
+        .or_else(|| parsed_anilist_string());
+    Ok(anilist_id)
+}
+
+/// Stub for the rare `anilist` field-as-string case. Kept separate so
+/// the parsing path stays explicit; yuna.moe currently always returns
+/// the field as a number when present.
+fn parsed_anilist_string() -> Option<u64> { None }
 
 /// Parse the episode number from the session id. Movies always return 1
 /// (AniList treats movies as 1-episode anime). Series ids
@@ -581,22 +679,48 @@ pub async fn save_progress<R: Runtime>(
         id_season, sess.season, lookup_season, sess.episode_num,
     );
 
-    // 0. Fribb/anime-lists ID-map fast path. Single hash lookup; no
-    //    network round-trip. Skipped silently when the map is empty
-    //    (uncached / niche show / map not warmed yet). When the show
-    //    has multiple AniList ids (multi-season anime), the map's
-    //    `season - 1` index heuristic picks the corresponding entry;
-    //    if we still pick the wrong one (heuristic miss), the
-    //    AniList `progress > episodes` guard down-stream rejects the
-    //    save and the caller falls back through search-and-pick.
-    let id_map_anilist_id = crate::anime_id_map::lookup(show_id, lookup_season);
-    if let Some(anilist_id) = id_map_anilist_id {
-        crate::devlog!(
-            info, "scrobble",
-            "AniList id-map hit: show={} → anilist_id={} (skipping title search)",
-            show_id, anilist_id,
-        );
-    }
+    // 0. Resolve the AniList id. Two paths:
+    //    a) Anime-provider prefix (`kitsu:46474`, `mal:N`, `anilist:N`,
+    //       `anidb:N`) — yuna.moe direct mapping. Exact, no fuzzy
+    //       heuristic; AIOMetadata has already encoded the cour-
+    //       specific provider id so we don't need Fribb's season index.
+    //       `anilist:N` is even shorter: N IS the anilist id.
+    //    b) IMDb (`ttN`) — Fribb/anime-lists id-map with the
+    //       `season - 1` heuristic for multi-cour anime. Falls back to
+    //       title search down-stream when the heuristic misses.
+    let id_map_anilist_id = if is_anime_prefix_root(show_id) {
+        match resolve_anilist_id_for_anime_prefix(show_id).await {
+            Ok(Some(id)) => {
+                crate::devlog!(
+                    info, "scrobble",
+                    "AniList anime-prefix resolved: show={} → anilist_id={}",
+                    show_id, id,
+                );
+                Some(id)
+            }
+            Ok(None) => {
+                crate::devlog!(
+                    info, "scrobble",
+                    "AniList anime-prefix lookup yielded no anilist id for {show_id} — falling through to title search",
+                );
+                None
+            }
+            Err(e) => {
+                crate::devlog!(warn, "scrobble", "anime-prefix resolve error: {e}");
+                None
+            }
+        }
+    } else {
+        let id = crate::anime_id_map::lookup(show_id, lookup_season);
+        if let Some(anilist_id) = id {
+            crate::devlog!(
+                info, "scrobble",
+                "AniList id-map hit: show={} → anilist_id={} (skipping title search)",
+                show_id, anilist_id,
+            );
+        }
+        id
+    };
 
     // 1. Cache lookup. Keyed by show + season so multi-cour anime
     // (Frieren, Demon Slayer, Mushoku Tensei …) doesn't ping-pong a

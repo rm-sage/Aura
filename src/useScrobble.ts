@@ -313,6 +313,17 @@ export function useScrobble({
           // where the stream id and the displayed S/E disagree.
           season:      active.season ?? null,
           episode_num: active.episode_num ?? null,
+          // Series-root IMDb id, kept separate from `imdb_id` (which
+          // carries the video id for the episode). After AIOMetadata's
+          // IMDb-anime patch, the video id may be kitsu/mal/anidb-
+          // shaped (e.g. `kitsu:46474:5`) while the series root stays
+          // tt-prefixed. Trakt keys shows by IMDb id; without this
+          // anchor, scrobble.rs's id-parse path fails and no Trakt
+          // payload goes out for those episodes. Falls back to a tt
+          // extracted from `imdb_id` when not supplied.
+          series_imdb_id: active.series_id && active.series_id.startsWith("tt")
+            ? active.series_id
+            : (active.id.startsWith("tt") ? active.id.split(":")[0] : null),
         },
         duration: playback.duration,
       }).catch(() => {});

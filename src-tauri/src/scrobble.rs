@@ -128,6 +128,22 @@ pub struct ScrobbleSession {
     /// disambiguation purpose.
     #[serde(default)]
     pub episode_num: Option<u32>,
+    /// Series-root IMDb id (e.g. `"tt22248376"`), kept separately from
+    /// `imdb_id` (which carries the *video* id for the episode being
+    /// scrobbled). Required after AIOMetadata's IMDb-anime patch makes
+    /// the video id non-tt-prefixed (e.g. `kitsu:46474:5`) while the
+    /// series root stays IMDb. Trakt scrobble keys the show by IMDb id
+    /// + S/E numbers, so without this we lose the show anchor for
+    /// anime once the video ids switch shape.
+    ///
+    /// Optional because movies and pre-patch shows don't need it (the
+    /// id parse path still works) and because frontend may not always
+    /// have a separate series root to thread. When None, scrobble.rs
+    /// falls back to extracting the show id from `imdb_id` via the
+    /// existing parse path — which yields the same value for IMDb-keyed
+    /// episodes today.
+    #[serde(default)]
+    pub series_imdb_id: Option<String>,
 }
 
 static SESSION: OnceLock<Mutex<Option<ScrobbleSession>>> = OnceLock::new();
@@ -221,14 +237,46 @@ fn parse_trakt_target(id: &str, media_type: &str) -> Option<TraktTarget> {
 ///     when the two would be identical (no retry needed) or when the
 ///     session has no usable id (skip path).
 fn trakt_targets(sess: &ScrobbleSession) -> (Option<TraktTarget>, Option<TraktTarget>) {
+    // First try to extract a target from the video id (legacy path,
+    // works when the id is tt-prefixed). If that fails — common for
+    // AIOMetadata's post-patch anime where videos[].id is kitsu/mal/
+    // anidb shape — synthesize an episode target from the series-root
+    // IMDb id + the authoritative VideoEntry numbers. Trakt indexes
+    // anime by IMDb show id + S/E, so as long as we have the series
+    // root and either the id-string numbers or the explicit S/E, the
+    // payload is valid.
     let from_id = parse_trakt_target(&sess.imdb_id, &sess.media_type);
-    let from_override = match (&from_id, sess.season, sess.episode_num) {
-        (Some(TraktTarget::Episode { show_imdb, .. }), Some(s), Some(e)) => {
+    let series_root = sess.series_imdb_id.clone().or_else(|| {
+        // Fall back to parsing the show id out of the video id (e.g.
+        // tt22248376:1:5 → tt22248376) when the dedicated field
+        // wasn't supplied. Pre-patch sessions all hit this path.
+        sess.imdb_id.split(':').next().filter(|s| s.starts_with("tt")).map(String::from)
+    });
+    let from_override = match (&from_id, sess.season, sess.episode_num, &series_root) {
+        // Both VideoEntry S/E and an id-parsed target — use S/E with the
+        // existing show_imdb from the id parse.
+        (Some(TraktTarget::Episode { show_imdb, .. }), Some(s), Some(e), _) => {
             Some(TraktTarget::Episode {
                 show_imdb: show_imdb.clone(),
                 season: s,
                 number: e,
             })
+        }
+        // Id parse failed (kitsu-shape video) but we have the series
+        // root + VideoEntry S/E — synthesize the Trakt payload from
+        // those. This is the post-AIOMetadata-fix path.
+        (None, Some(s), Some(e), Some(root)) if sess.media_type != "movie" => {
+            Some(TraktTarget::Episode {
+                show_imdb: root.clone(),
+                season: s,
+                number: e,
+            })
+        }
+        // Movie variant: id-parse failed but we have an IMDb show
+        // root + movie media_type. Rare (movies generally come through
+        // as tt-prefixed ids) but symmetric.
+        (None, _, _, Some(root)) if sess.media_type == "movie" => {
+            Some(TraktTarget::Movie { imdb: root.clone() })
         }
         _ => None,
     };

@@ -278,6 +278,52 @@ function badgeForVideoId(vid: string | null | undefined): string | null {
  *  unwatched ep can be found OR the episode list isn't loaded yet.
  *  Subscribes to manual-watched changes so the calling card
  *  repaints the moment the user toggles a mark. */
+/** Parse `<provider>:<a>:<b>` ids into (a, b) when both segments are
+ *  numeric. For tt-prefixed IMDb episode ids that's (season, episode);
+ *  for kitsu/mal/anidb-prefixed ids it's (showId, episode) — but for
+ *  the CW segmented bar's tuple-match path we only care about the
+ *  episode component, so the caller decides what to do with the pair. */
+function parseLastTwoNumericSegments(id: string): { mid: number; last: number } | null {
+  const parts = id.split(":");
+  if (parts.length < 3) return null;
+  const mid  = Number(parts[parts.length - 2]);
+  const last = Number(parts[parts.length - 1]);
+  if (!Number.isFinite(mid) || !Number.isFinite(last)) return null;
+  return { mid, last };
+}
+
+/** Resolve a (possibly stale-shape) baseId to the matching episode in
+ *  the current `episodes` list. Prefers direct id equality (the
+ *  common path); falls back to (season, episode) tuple match for
+ *  legacy library entries whose `state.video_id` shape no longer
+ *  matches the current `videos[].id` shape — covers the
+ *  AIOMetadata IMDb-anime transition where state was written under
+ *  `tt22248376:1:5` but the new videos[] entries use
+ *  `kitsu:46474:5`. Tuple match assumes `v.season === parsedSeason`
+ *  and `v.episode === parsedEpisode` for tt-style ids; for non-tt
+ *  ids the tuple may be (showId, episode), in which case the season
+ *  filter falls through and we match purely by episode number
+ *  within the current season list. */
+function resolveCurrentEpisode(
+  baseId: string,
+  episodes: VideoEntry[],
+): VideoEntry | null {
+  if (episodes.length === 0) return null;
+  const direct = episodes.find((v) => v.id === baseId);
+  if (direct) return direct;
+  const pair = parseLastTwoNumericSegments(baseId);
+  if (!pair) return null;
+  if (baseId.startsWith("tt")) {
+    const found = episodes.find((v) => (v.season ?? 0) === pair.mid && (v.episode ?? 0) === pair.last);
+    if (found) return found;
+  }
+  // Episode-only fallback (prefix-style ids whose middle slot is the
+  // provider show id rather than a season). The episodes list is
+  // already filtered to the current season by useSeasonEpisodes so
+  // this is unambiguous in practice.
+  return episodes.find((v) => (v.episode ?? 0) === pair.last) ?? null;
+}
+
 function useEffectiveResumeVideoId(
   item: LibraryItem,
   episodes: VideoEntry[] | null,
@@ -285,18 +331,28 @@ function useEffectiveResumeVideoId(
   void useManualWatchedVersion();
   const baseId = (item.state ?? {}).video_id;
   if (typeof baseId !== "string" || baseId.length === 0) return null;
-  if (getManualWatchedState(baseId) !== "watched") return baseId;
+  if (getManualWatchedState(baseId) !== "watched") {
+    // Even when the user isn't manually-watched here, the baseId may
+    // not directly match the current videos[] shape (post AIOMetadata
+    // IMDb-anime patch transition). Resolve to the current-shape id
+    // via the tuple fallback so the badge + bar paint correctly.
+    if (!episodes || episodes.length === 0) return baseId;
+    const resolved = resolveCurrentEpisode(baseId, episodes);
+    return resolved?.id ?? baseId;
+  }
   // Resume ep is manually-watched. Walk the season to find the next
   // non-watched episode — that's where the user would resume.
   if (!episodes || episodes.length === 0) return baseId;
-  const idx = episodes.findIndex((v) => v.id === baseId);
-  if (idx < 0) return baseId;
+  const startEp = resolveCurrentEpisode(baseId, episodes);
+  if (!startEp) return baseId;
+  const idx = episodes.findIndex((v) => v.id === startEp.id);
+  if (idx < 0) return startEp.id;
   for (let i = idx + 1; i < episodes.length; i += 1) {
     const ep = episodes[i];
     if (getManualWatchedState(ep.id) === "watched") continue;
     return ep.id;
   }
-  return baseId;
+  return startEp.id;
 }
 
 const ContinueWatchingCard = memo(function ContinueWatchingCard(
