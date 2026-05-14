@@ -97,10 +97,46 @@ function ensureHydrated(): void {
 }
 
 /** Switch the active scope. Called from App.tsx on auth state changes
- *  alongside the settings + manualWatched scope swaps. */
-export function setHistoryScope(scope: string | null): void {
+ *  alongside the settings + manualWatched scope swaps.
+ *
+ *  `legacyScope` is the auth_key-derived scope this user had before
+ *  the post-0.6.x switch to user_id-based scoping. Pre-fix Aura keyed
+ *  every per-scope localStorage entry by `auth_key.slice(0, 12)`, but
+ *  Stremio rotates auth_keys on every login — so any login (and every
+ *  cross-device install) effectively created a fresh scope and left
+ *  the prior session's history orphaned. When `legacyScope` is
+ *  supplied AND the new scope's localStorage entry is empty AND the
+ *  legacy scope has data, we copy it over once so the user doesn't
+ *  see "history wiped". The old entry stays in place so a downgrade
+ *  to an older Aura build can still read it. */
+export function setHistoryScope(
+  scope: string | null,
+  opts?: { legacyScope?: string | null },
+): void {
   const next = scope && scope.trim() ? scope : "guest";
   if (next === _activeScope && _hydrated) return;
+
+  // One-shot legacy-scope migration. Only runs when the new scope's
+  // localStorage entry doesn't exist yet (so re-running is a no-op
+  // once the user has any new entries written).
+  const legacy = opts?.legacyScope?.trim();
+  if (legacy && legacy !== next) {
+    const newKey = storageKey(next);
+    if (!localStorage.getItem(newKey)) {
+      const oldKey = storageKey(legacy);
+      const carried = localStorage.getItem(oldKey);
+      if (carried) {
+        try {
+          localStorage.setItem(newKey, carried);
+        } catch {
+          // Quota or disabled storage — non-fatal; history will just
+          // appear empty until the user plays something on the new
+          // scope.
+        }
+      }
+    }
+  }
+
   _activeScope = next;
   _entries = loadFromStorage(next);
   _hydrated = true;

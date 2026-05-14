@@ -2447,10 +2447,27 @@ export default function App() {
   // same scope swap into the manualWatched store (purely JS-side
   // localStorage) so that "I've already watched this" marks also stay
   // scoped to the user.
-  const applySettingsScope = useCallback(async (authKey: string | null) => {
+  const applySettingsScope = useCallback(async (sess: UserSession | null) => {
+    const authKey = sess?.auth_key ?? null;
+    const userId  = sess?.user_id ?? null;
+    // History keys on the stable user_id so a fresh login (Stremio
+    // rotates auth_keys on every login) doesn't orphan the user's
+    // play log. legacyAuthScope is the pre-fix scope the user's
+    // history may still live under — historyStore migrates from it
+    // on the first call where the new scope's storage entry is empty.
+    const newHistoryScope = userId && userId.trim()
+      ? `user-${userId.slice(0, 16)}`
+      : (authKey && authKey.trim() ? `user-${authKey.slice(0, 12)}` : "guest");
+    const legacyAuthScope = authKey && authKey.trim()
+      ? `user-${authKey.slice(0, 12)}`
+      : null;
+    // Manual-watched and auto-backup stay on the auth_key-prefix
+    // scope for now — manual-watched cloud-syncs (so a fresh local
+    // scope is repopulated by the next pull), and auto-backup keeps
+    // its directories addressable from the existing UI.
     const scope = authKey && authKey.trim() ? `user-${authKey.slice(0, 12)}` : "guest";
     setManualWatchedScope(scope);
-    setHistoryScope(scope);
+    setHistoryScope(newHistoryScope, { legacyScope: legacyAuthScope });
     // Backups follow the same scope so a sign-out / sign-in cycle's
     // auto-snapshots land under the right user-<hash> directory and
     // a restore from Settings lists the user's actual snapshots.
@@ -2520,12 +2537,19 @@ export default function App() {
           // back to the legacy scope so the user isn't locked out.
           if (!sess.user_id) {
             try {
-              await invoke<string | null>("backfill_user_id");
+              const backfilled = await invoke<string | null>("backfill_user_id");
+              // Merge the backfilled user_id into the in-memory
+              // session BEFORE applySettingsScope runs — otherwise
+              // the scope derivation on this launch still falls
+              // back to the legacy auth_key prefix and the history-
+              // store migration can't anchor on the new user_id-
+              // based scope.
+              if (backfilled) sess = { ...sess, user_id: backfilled };
             } catch (e) {
               console.warn(`[auth] backfill_user_id failed: ${String(e)}`);
             }
           }
-          await applySettingsScope(sess.auth_key);
+          await applySettingsScope(sess);
           setSession(sess);
           setLandingDismissed(true); // bypass landing on cached credentials
           await Promise.all([loadSyncedAddons(sess), loadLibrary(sess)]);
@@ -2540,7 +2564,7 @@ export default function App() {
 
   // ── Auth handlers ──
   const handleLoginSuccess = useCallback(async (sess: UserSession) => {
-    await applySettingsScope(sess.auth_key);
+    await applySettingsScope(sess);
     setSession(sess);
     setLandingDismissed(true);
     await Promise.all([loadSyncedAddons(sess), loadLibrary(sess)]);
