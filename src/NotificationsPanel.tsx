@@ -81,10 +81,13 @@ export default function NotificationsPanel({ onClose, closing }: Props) {
           onClick={() => { if (hasDismissable) dismissAll(); }}
           disabled={!hasDismissable}
           className={[
-            "text-xs px-2 py-1 rounded-md transition-colors",
+            "text-[11.5px] font-medium px-2.5 py-1 rounded-md border transition-colors",
+            // Solid pill with a visible border + background so the
+            // label reads cleanly against the Mica accent themes that
+            // were swallowing the previous text-only treatment.
             hasDismissable
-              ? "text-white/70 hover:text-white hover:bg-white/10"
-              : "text-white/30 cursor-default",
+              ? "text-white bg-white/12 border-white/25 hover:bg-white/20 hover:border-white/40"
+              : "text-white/35 bg-transparent border-white/10 cursor-default",
           ].join(" ")}
         >
           Dismiss all

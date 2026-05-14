@@ -5,6 +5,7 @@ import { memo, useEffect, useMemo, useState } from "react";
 import { FilterBar, applyFilters, DEFAULT_FILTERS, type FilterState } from "./FilterBar";
 import { invoke } from "@tauri-apps/api/core";
 import type { MetaPreview, LibraryItem, AddonEntry, VideoEntry } from "./types";
+import { isVideoAired } from "./types";
 import ImageLoader from "./ImageLoader";
 import { useLibraryProgress } from "./LibraryContext";
 import WatchedBadge, { useWatchedVariant, WatchedBadgeStatic } from "./WatchedBadge";
@@ -129,7 +130,16 @@ function SegmentedSeasonBar({
   // Beyond the segment-count cap, hand off to the continuous bar.
   // Avoids visual mush from 60+ slivers on long-runners (One Piece,
   // Naruto, Detective Conan).
-  if (episodes.length > SEGMENTED_BAR_EPISODE_CAP) {
+  //
+  // Count AIRED episodes only — a show like Frieren (38 aired,
+  // 14 still on the schedule) would otherwise flip to the gradient
+  // long-runner mode when the total crosses 50, even though the
+  // user can only act on the 38 aired ones. The segmented bar
+  // stays comfortable up to 50 segments; we want the pivot to
+  // happen on a real airing show that's actually past that, not on
+  // a future-content roll-up.
+  const airedCount = episodes.filter(isVideoAired).length;
+  if (airedCount > SEGMENTED_BAR_EPISODE_CAP) {
     return <ContinuousProgressBar episodes={episodes} currentId={currentId} />;
   }
 

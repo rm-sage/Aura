@@ -98,6 +98,7 @@ import type {
   StreamEntry,
   VideoEntry,
 } from "./types";
+import { isVideoAired } from "./types";
 import type { UserSession } from "./LoginView";
 import "./App.css";
 
@@ -2250,7 +2251,18 @@ export default function App() {
             void (async () => {
               try {
                 const detail = await getMetaDetailFallback(addons, meta.media_type, meta.id);
-                const episodeIds = (detail?.videos ?? [])
+                // When MARKING as watched, restrict the fan-out to
+                // episodes that have actually aired. Without this
+                // filter, a 52-video meta like Frieren (S3 not yet
+                // fully aired) ends up with every future episode
+                // green-checked. When UN-marking we don't filter —
+                // the unmark needs to be able to reach any stale
+                // future-episode marks a previous bug may have
+                // written.
+                const candidates = next === "watched"
+                  ? (detail?.videos ?? []).filter(isVideoAired)
+                  : (detail?.videos ?? []);
+                const episodeIds = candidates
                   .map((v) => v.id)
                   .filter((id): id is string => typeof id === "string" && id.length > 0);
                 if (episodeIds.length > 0) {

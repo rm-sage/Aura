@@ -218,6 +218,27 @@ export interface VideoEntry {
   is_recap?: boolean;
 }
 
+/** True when a video has aired (release date in the past) or its
+ *  release date is unknown / unparseable. The "unknown date counts
+ *  as aired" fallback is intentional — some addons don't ship dates
+ *  on episodes that have clearly been out for years, and treating
+ *  those as "not aired" would silently hide them from the bulk
+ *  mark-as-watched fan-out and the CW continuous-bar threshold.
+ *
+ *  Used by:
+ *    • App.tsx catalog-level "Mark as Watched" — avoids marking
+ *      unaired future episodes that the user couldn't have watched.
+ *    • DetailView bulk-mark actions — same reason.
+ *    • CinemaRows segmented-vs-continuous bar pivot — the
+ *      50-episode threshold should consider aired-only count so a
+ *      show with 14 future eps still on the schedule doesn't pivot
+ *      to the long-runner gradient prematurely. */
+export function isVideoAired(v: { released?: string | null }): boolean {
+  if (!v.released) return true;
+  const t = Date.parse(v.released);
+  return !Number.isFinite(t) || t <= Date.now();
+}
+
 export interface StreamEntry {
   title: string;
   addon_name: string;

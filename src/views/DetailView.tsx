@@ -15,6 +15,7 @@ import type {
   StreamMetadata,
   VideoEntry,
 } from "../types";
+import { isVideoAired } from "../types";
 import { loadAuraSettings } from "../auraSettings";
 import { useReleaseSignal } from "../releaseSignalStore";
 import { fetchReleaseSignal } from "../releaseSearch";
@@ -2232,7 +2233,13 @@ const EpisodeRow = ({
           state: "watched" | null,
           rangeLabel: string,
         ) => () => {
-          const ids = set.map((v) => v.id);
+          // When marking watched, exclude episodes that haven't
+          // aired yet — same rule as the catalog-level fan-out in
+          // App.tsx. Un-marking passes the full set through so it
+          // can reach any future-episode marks a previous build
+          // wrote before this guard existed.
+          const targets = state === "watched" ? set.filter(isVideoAired) : set;
+          const ids = targets.map((v) => v.id);
           setManualWatchedMany(ids, state);
           showFlyUpToast(
             state ? `Marked watched · ${rangeLabel}` : `Unmarked · ${rangeLabel}`,
