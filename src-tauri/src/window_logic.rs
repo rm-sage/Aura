@@ -442,6 +442,19 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     // bring the window back via the tray icon. We deliberately
                     // do NOT stop MPV: hiding the window mid-playback should
                     // feel like a quick "hide, resume later" toggle.
+                    //
+                    // Pause MPV unconditionally (regardless of
+                    // pause_on_lost_focus / pause_on_minimize) before
+                    // calling win.hide(). When the OS marks the window
+                    // hidden, libmpv's vo keeps rendering frames into the
+                    // off-screen child surface; on this build that's been
+                    // observed to leave audio / video desynced or the vo
+                    // stuck on a frozen frame after the user restores
+                    // from the tray. Pausing first means MPV is in a
+                    // known-quiet state across the hide/show cycle and
+                    // the user-perceived "stream broke while minimised
+                    // to tray" symptom doesn't manifest.
+                    pause_mpv(&handle);
                     api.prevent_close();
                     let _ = win.hide();
                 } else {

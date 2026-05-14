@@ -68,11 +68,31 @@ fn client() -> &'static reqwest::Client {
 // Persistent ID cache (title → AniList id, keyed by IMDB show id)
 // ---------------------------------------------------------------------------
 
+/// Cache schema version. Bump whenever the resolution algorithm
+/// changes in a way that could make existing cached anilist_ids
+/// wrong. The cache reader treats multi-cour entries (lookup_season
+/// > 1) with `resolver_version < CURRENT_CACHE_VERSION` as misses
+/// so a single re-resolve corrects them via the new path.
+///
+/// History:
+///   * v0 (implicit, pre-release): popularity-search picked the
+///     franchise root for any season. Multi-cour saves landed on
+///     the wrong cour (Frieren S02E10 → S1 entry).
+///   * v1: SEQUEL-walk on save_progress finds the correct cour for
+///     season > 1. Bumped so existing v0 multi-cour rows get
+///     re-resolved on next watch.
+const CURRENT_CACHE_VERSION: u32 = 1;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CachedMedia {
     anilist_id: u64,
     episodes:   Option<u32>,
     fetched_at: u64,
+    /// Cache schema version that wrote this row. `default = 0` so
+    /// rows from older Aura versions deserialize cleanly; the reader
+    /// then invalidates them for multi-cour keys.
+    #[serde(default)]
+    resolver_version: u32,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -336,6 +356,25 @@ query ($mediaId: Int) {
 }
 ";
 
+/// Walks a single SEQUEL edge from a starting Media. Used by the
+/// season-aware resolver to map Aura's `season > 1` requests onto
+/// AniList's per-cour entries when a popularity-sorted title search
+/// returns the franchise root (season 1) instead of the sequel the
+/// user is actually watching. One hop per call; the caller iterates
+/// `lookup_season - 1` times to reach season N.
+const RELATIONS_QUERY: &str = "
+query ($mediaId: Int) {
+  Media(id: $mediaId, type: ANIME) {
+    relations {
+      edges {
+        relationType
+        node { id idMal episodes status }
+      }
+    }
+  }
+}
+";
+
 const SAVE_MUTATION: &str = "
 mutation ($mediaId: Int, $progress: Int, $status: MediaListStatus) {
   SaveMediaListEntry(mediaId: $mediaId, progress: $progress, status: $status) {
@@ -398,6 +437,48 @@ struct SaveResponse {
     _save: serde_json::Value,
 }
 
+/// Minimal Media shape returned by the relations query — only the
+/// fields needed to decide whether a sequel candidate is the right
+/// cour. Re-fetched via fetch_media at the end of the walk to pick
+/// up `mediaListEntry`, which the relations payload doesn't include.
+#[derive(Deserialize, Debug, Clone)]
+struct RelationNode {
+    id: u64,
+    /// Episode count surfaced for log diagnostics; the walk's final
+    /// is_plausible_target check looks at the destination Media's
+    /// episodes rather than the intermediate node's.
+    #[allow(dead_code)]
+    #[serde(default)]
+    episodes: Option<u32>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct RelationEdge {
+    #[serde(rename = "relationType", default)]
+    relation_type: String,
+    node: RelationNode,
+}
+
+#[derive(Deserialize, Debug)]
+struct RelationsPayload {
+    #[serde(default)]
+    edges: Vec<RelationEdge>,
+}
+
+#[derive(Deserialize, Debug)]
+struct RelationsMedia {
+    #[serde(default)]
+    relations: Option<RelationsPayload>,
+}
+
+#[derive(Deserialize, Debug)]
+struct RelationsResponse {
+    #[serde(rename = "Media")]
+    media: Option<RelationsMedia>,
+}
+
 async fn search_anilist(token: &str, title: &str) -> Result<Vec<MediaInfo>, AnilistError> {
     let resp: SearchResponse =
         graphql_post(token, SEARCH_QUERY, serde_json::json!({ "search": title })).await?;
@@ -408,6 +489,81 @@ async fn fetch_media(token: &str, anilist_id: u64) -> Result<MediaInfo, AnilistE
     let resp: MediaResponse =
         graphql_post(token, MEDIA_QUERY, serde_json::json!({ "mediaId": anilist_id as i64 })).await?;
     resp.media.ok_or(AnilistError::NotFound)
+}
+
+/// Fetch the SEQUEL relation edges from a Media. Returns the bare
+/// nodes (not full MediaInfo) — the caller traverses to a target
+/// hop and only fetches full Media for the final pick.
+async fn fetch_sequel_node(token: &str, anilist_id: u64) -> Result<Option<RelationNode>, AnilistError> {
+    let resp: RelationsResponse = graphql_post(
+        token,
+        RELATIONS_QUERY,
+        serde_json::json!({ "mediaId": anilist_id as i64 }),
+    )
+    .await?;
+    let edges = resp
+        .media
+        .and_then(|m| m.relations)
+        .map(|r| r.edges)
+        .unwrap_or_default();
+    Ok(edges.into_iter().find(|e| e.relation_type == "SEQUEL").map(|e| e.node))
+}
+
+/// Walk N SEQUEL hops from `start_id`, returning a fully-populated
+/// MediaInfo for the destination. Returns Ok(None) when the chain
+/// runs out (no SEQUEL edge) before reaching the target hop, or when
+/// the destination Media fails the plausible-target check (e.g. the
+/// chosen sequel is NOT_YET_RELEASED — the user can't be watching
+/// episode N of an unaired entry).
+async fn walk_sequel_chain(
+    token: &str,
+    start_id: u64,
+    hops: u32,
+    episode_num: u32,
+) -> Result<Option<MediaInfo>, AnilistError> {
+    if hops == 0 {
+        return Ok(None);
+    }
+    let mut current_id = start_id;
+    for hop in 0..hops {
+        let next = match fetch_sequel_node(token, current_id).await {
+            Ok(Some(n)) => n,
+            Ok(None) => {
+                crate::devlog!(
+                    info, "scrobble",
+                    "AniList SEQUEL walk: chain ended at id={current_id} after {} hop(s); needed {hops}",
+                    hop,
+                );
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        current_id = next.id;
+        // Reject branches that point at an unaired entry while the
+        // user is requesting concrete progress — same wrong-mapping
+        // signal the id-map / cache resolvers use. Without this an
+        // S2→S3 walk could land on a NOT_YET_RELEASED S3 row and
+        // silently save progress to the wrong cour again.
+        if next.status.as_deref() == Some("NOT_YET_RELEASED") && episode_num > 0 {
+            crate::devlog!(
+                info, "scrobble",
+                "AniList SEQUEL walk: hop {} landed on id={} (NOT_YET_RELEASED); abandoning chain",
+                hop + 1, current_id,
+            );
+            return Ok(None);
+        }
+    }
+    let final_media = fetch_media(token, current_id).await?;
+    if is_plausible_target(&final_media, episode_num) {
+        Ok(Some(final_media))
+    } else {
+        crate::devlog!(
+            info, "scrobble",
+            "AniList SEQUEL walk: final hop id={} rejected (eps={:?} status={:?} ep_num={episode_num})",
+            final_media.id, final_media.episodes, final_media.status,
+        );
+        Ok(None)
+    }
 }
 
 async fn save_media_list_entry(
@@ -602,6 +758,7 @@ async fn resolve_via_cache_or_search(
     title: &str,
     show_id: &str,
     episode_num: u32,
+    season: Option<u32>,
 ) -> Result<MediaInfo, AnilistError> {
     match cached {
         Some(c) if c.episodes.map(|e| e >= episode_num).unwrap_or(true) => {
@@ -638,7 +795,7 @@ async fn resolve_via_cache_or_search(
                         // small (one entry per (show, cour) pair).
                         g.by_show.retain(|_, v| v.anilist_id != c.anilist_id);
                     }
-                    search_and_pick(access, title, episode_num).await
+                    search_and_pick(access, title, episode_num, season).await
                 }
                 Err(AnilistError::NotFound) => {
                     crate::devlog!(
@@ -646,7 +803,7 @@ async fn resolve_via_cache_or_search(
                         "AniList cached id {} returned NotFound — falling back to title search for \"{}\"",
                         c.anilist_id, title,
                     );
-                    search_and_pick(access, title, episode_num).await
+                    search_and_pick(access, title, episode_num, season).await
                 }
                 Err(e) => Err(e),
             }
@@ -657,7 +814,7 @@ async fn resolve_via_cache_or_search(
                 "AniList cache inconsistent: cached episodes={:?} < requested ep={} — re-searching",
                 c.episodes, episode_num,
             );
-            search_and_pick(access, title, episode_num).await
+            search_and_pick(access, title, episode_num, season).await
         }
         None => {
             crate::devlog!(
@@ -665,7 +822,7 @@ async fn resolve_via_cache_or_search(
                 "AniList cache miss for show={} — searching by title \"{}\"",
                 show_id, title,
             );
-            search_and_pick(access, title, episode_num).await
+            search_and_pick(access, title, episode_num, season).await
         }
     }
 }
@@ -782,10 +939,28 @@ pub async fn save_progress<R: Runtime>(
     // saves. Movies and single-cour shows fall back to season=0, which
     // gives them a stable single key just like before.
     let cache_key = format!("{}:{}", show_id, lookup_season.unwrap_or(0));
-    let cached = cache_lock()
+    let cached_raw = cache_lock()
         .lock()
         .ok()
         .and_then(|g| g.by_show.get(&cache_key).cloned());
+    // Multi-cour cache rows written by a pre-v1 Aura mapped many
+    // season > 1 keys to the franchise root's anilist_id (the
+    // popularity-search winner before the SEQUEL walk landed). Treat
+    // those as misses so a single re-resolve corrects the mapping;
+    // season-1 / movie rows aren't affected because v0's behaviour
+    // was correct for them.
+    let cached = cached_raw.clone().filter(|c| {
+        let multi_cour = lookup_season.map(|s| s > 1).unwrap_or(false);
+        let fresh = c.resolver_version >= CURRENT_CACHE_VERSION;
+        !multi_cour || fresh
+    });
+    if cached_raw.is_some() && cached.is_none() {
+        crate::devlog!(
+            info, "scrobble",
+            "AniList cache: invalidating stale pre-v{CURRENT_CACHE_VERSION} multi-cour entry \
+             for {cache_key} so the SEQUEL-walk path can re-resolve the correct cour",
+        );
+    }
 
     // Resolve to an AniList MediaInfo. Four layered strategies, each
     // surfacing a clear log line so the DevConsole shows which path
@@ -814,19 +989,19 @@ pub async fn save_progress<R: Runtime>(
                     "AniList id-map entry {id_anilist} rejected ({reason}) for ep {episode_num} \
                      — falling through to cache/search (multi-season heuristic miss)",
                 );
-                resolve_via_cache_or_search(&access, &cached, &sess.title, show_id, episode_num).await?
+                resolve_via_cache_or_search(&access, &cached, &sess.title, show_id, episode_num, lookup_season).await?
             }
             Err(AnilistError::NotFound) => {
                 crate::devlog!(
                     warn, "scrobble",
                     "AniList id-map entry {id_anilist} returned NotFound — falling through to cache/search",
                 );
-                resolve_via_cache_or_search(&access, &cached, &sess.title, show_id, episode_num).await?
+                resolve_via_cache_or_search(&access, &cached, &sess.title, show_id, episode_num, lookup_season).await?
             }
             Err(e) => return Err(e),
         }
     } else {
-        resolve_via_cache_or_search(&access, &cached, &sess.title, show_id, episode_num).await?
+        resolve_via_cache_or_search(&access, &cached, &sess.title, show_id, episode_num, lookup_season).await?
     };
 
     crate::devlog!(
@@ -845,9 +1020,10 @@ pub async fn save_progress<R: Runtime>(
             g.by_show.insert(
                 cache_key.clone(),
                 CachedMedia {
-                    anilist_id: media.id,
-                    episodes:   media.episodes,
-                    fetched_at: now_secs(),
+                    anilist_id:       media.id,
+                    episodes:         media.episodes,
+                    fetched_at:       now_secs(),
+                    resolver_version: CURRENT_CACHE_VERSION,
                 },
             );
             save_cache(app, &g);
@@ -974,6 +1150,7 @@ async fn search_and_pick(
     token:       &str,
     title:       &str,
     episode_num: u32,
+    season:      Option<u32>,
 ) -> Result<MediaInfo, AnilistError> {
     let variants = title_search_variants(title);
     for (i, variant) in variants.iter().enumerate() {
@@ -995,14 +1172,56 @@ async fn search_and_pick(
                 .collect::<Vec<_>>()
                 .join(", "),
         );
-        let pick = candidates
+        // Pick the first plausible candidate as the franchise root.
+        // For season=1 (or unspecified) this IS the answer; for
+        // season>1 it's the starting point of a SEQUEL walk.
+        // Note we deliberately ignore `episodes >= episode_num` when
+        // `season > 1` — the popular S1 row's episode count
+        // (typically 24-28) coincidentally also satisfies a cour-2
+        // ep number like 10, which used to make us pick S1 and save
+        // Frieren S02E10's progress against S01.
+        let base_pick = candidates
             .iter()
             .find(|m| m.episodes.map(|e| e >= episode_num).unwrap_or(true))
             .or_else(|| candidates.first())
             .cloned();
-        if let Some(pick) = pick {
-            return Ok(pick);
+        let Some(base) = base_pick else { continue; };
+
+        // Season-aware walk. When the user is watching season N>1,
+        // AniList typically links seasons via SEQUEL relations from
+        // the franchise root, so (season-1) hops lands on the cour
+        // the user is actually watching. Falls back to the base
+        // candidate on any walk failure (chain stops short, sequel
+        // is unaired, network error) so we never regress past the
+        // prior behaviour.
+        if let Some(target_season) = season.filter(|&s| s > 1) {
+            let hops = target_season - 1;
+            match walk_sequel_chain(token, base.id, hops, episode_num).await {
+                Ok(Some(seq)) => {
+                    crate::devlog!(
+                        info, "scrobble",
+                        "AniList SEQUEL walk: base id={} → season {} id={} ({} hop(s), eps={:?})",
+                        base.id, target_season, seq.id, hops, seq.episodes,
+                    );
+                    return Ok(seq);
+                }
+                Ok(None) => {
+                    crate::devlog!(
+                        info, "scrobble",
+                        "AniList SEQUEL walk: no plausible season-{target_season} sequel of id={} — falling back to base",
+                        base.id,
+                    );
+                }
+                Err(e) => {
+                    crate::devlog!(
+                        warn, "scrobble",
+                        "AniList SEQUEL walk error: {e}; falling back to base id={}", base.id,
+                    );
+                }
+            }
         }
+
+        return Ok(base);
     }
     crate::devlog!(
         warn, "scrobble",

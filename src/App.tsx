@@ -271,7 +271,7 @@ interface PlaybackPayload {
   eof: boolean;
 }
 
-function usePlayback(_playerActive: boolean) {
+function usePlayback(playerActive: boolean) {
   const [time, setTime]           = useState(0);
   const [duration, setDuration]   = useState(0);
   const [paused, setPaused]       = useState(true);
@@ -413,6 +413,40 @@ function usePlayback(_playerActive: boolean) {
     });
     return () => { p.then((fn) => fn()).catch(() => {}); };
   }, [logLoadEvent]);
+
+  // Pause → unpause transition: reset the heartbeat baseline so the
+  // stale-heartbeat detector measures from "just resumed", not "last
+  // time-pos before pause". Without this, a long pause (tray-close
+  // for several minutes, then restore + resume) makes the detector
+  // fire immediately on resume because `last` is stale by however
+  // long the user was paused — visible as a spurious "Stream
+  // connection lost" prompt on a perfectly healthy resume.
+  const prevPausedRef = useRef(paused);
+  useEffect(() => {
+    if (prevPausedRef.current && !paused) {
+      lastTimeUpdateAtRef.current = Date.now();
+    }
+    prevPausedRef.current = paused;
+  }, [paused]);
+
+  // Tray-restore handler. Rust emits `aura:window-restored-from-tray`
+  // after `win.show()` in the tray-icon click path. We poke MPV's vo
+  // (refresh_video toggles video-zoom to force a redraw) — the
+  // off-screen render period during the hide can leave the vo stuck
+  // on a stale frame. We also stamp the heartbeat to "now" so the
+  // stale-heartbeat detector measures from the restore moment; if
+  // the user resumes playback and the stream is dead (debrid URL
+  // expired during the tray dwell), the detector then fires the
+  // reload prompt after the normal 8 s grace window instead of
+  // waiting indefinitely on an unrecoverable stream.
+  useEffect(() => {
+    if (!playerActive) return;
+    const p = listen("aura:window-restored-from-tray", () => {
+      invoke("refresh_video").catch(() => {});
+      lastTimeUpdateAtRef.current = Date.now();
+    });
+    return () => { p.then((fn) => fn()).catch(() => {}); };
+  }, [playerActive]);
 
   // Stale-heartbeat detector. Wakes once a second; flags the stream
   // broken when time-pos hasn't ticked in BROKEN_STALE_MS while we

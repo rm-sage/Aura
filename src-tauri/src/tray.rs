@@ -14,7 +14,7 @@
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 pub fn install<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let show = MenuItem::with_id(app, "tray-show", "Show Aura", true, None::<&str>)
@@ -62,5 +62,13 @@ fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
+        // Notify the frontend that the window came back from a hidden
+        // (tray) state. App.tsx listens and pokes MPV's render context
+        // via refresh_video to clear any vo staleness from the
+        // off-screen render period, and lets the stale-heartbeat
+        // detector run with a tighter window so a stream that died
+        // while we were hidden surfaces the reload prompt promptly
+        // instead of waiting 8 s of post-resume silence.
+        let _ = app.emit("aura:window-restored-from-tray", ());
     }
 }

@@ -2202,22 +2202,60 @@ fn parse_aggregate_credits(v: &serde_json::Value) -> Option<AggregateCredits> {
     Some(AggregateCredits { cast, crew })
 }
 
+/// Repair video ids whose prefix is a JS-stringified bogus value (typically
+/// `undefined`, but also `null` / `NaN` / `[object Object]`). Returns the
+/// repaired id and whether a repair was performed; falls back to the raw id
+/// when we don't have enough context to rebuild it (no parent id, no
+/// season/episode on the entry).
+fn repair_broken_video_id(raw_id: &str, parent_id: &str, video: &serde_json::Value) -> (String, bool) {
+    const BROKEN_PREFIXES: &[&str] = &[
+        "undefined:",
+        "null:",
+        "NaN:",
+        "[object Object]:",
+    ];
+    let is_broken = BROKEN_PREFIXES.iter().any(|p| raw_id.starts_with(p));
+    if !is_broken || parent_id.is_empty() {
+        return (raw_id.to_string(), false);
+    }
+    let season = video.get("season").and_then(|x| x.as_i64()).unwrap_or(0);
+    let episode = video.get("episode").and_then(|x| x.as_i64()).unwrap_or(0);
+    if season == 0 || episode == 0 {
+        return (raw_id.to_string(), false);
+    }
+    (format!("{}:{}:{}", parent_id, season, episode), true)
+}
+
 /// Parse an addon's `videos` array into typed entries. Episode IDs are
 /// preserved verbatim — `kitsu:12345:1`, `tt0903747:1:5`, etc. — because
 /// addons key streams off these strings exactly.
+///
+/// Exception: an addon-side bug seen in AIOMetadata for newer shows (Witch Hat
+/// Atelier tt32550889 being the first reproduction) serves video entries with
+/// `id: "undefined:1:1"` — the addon's template literal references a field
+/// that's undefined for the show, and JS happily stringifies it. Without
+/// repair the literal "undefined" prefix flows into fetch_streams, every
+/// addon's id-prefix gate rejects it, and the user gets zero streams for an
+/// otherwise-supported title. We rebuild the prefix from the parent meta id
+/// when we detect this pattern; episode addons keyed off the canonical
+/// `<imdb>:<s>:<e>` shape then resolve normally.
 fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
+    let parent_id = meta.get("id").and_then(|x| x.as_str()).unwrap_or("");
     let Some(arr) = meta.get("videos").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
+    let mut repaired_count: usize = 0;
     let videos: Vec<VideoEntry> = arr.iter()
         .take(2000) // generous cap; long-running anime can have 1000+ episodes
         .filter_map(|v| {
             // ID is required — without it we can't fetch streams.
             let raw_id = v.get("id").and_then(|x| x.as_str())?;
+            let (repaired_id, was_repaired) = repair_broken_video_id(raw_id, parent_id, v);
+            if was_repaired { repaired_count += 1; }
             // Cap at 256 — preserves the longest realistic episode IDs without
             // truncating multi-segment forms. We DON'T strip colons, slashes,
             // or other addon-specific path tokens.
-            let id = cap(raw_id.to_string(), 256);
+            let id = cap(repaired_id, 256);
 
             // Name fallback hierarchy: title → name → "Episode N"
             let title = v
@@ -2295,6 +2333,13 @@ fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
             "extract_videos: parsed {} videos ({} filler, {} recap); canonical fields on first entry: {:?}",
             videos.len(), filler_count, recap_count, canonical_keys_present,
         );
+        if repaired_count > 0 {
+            crate::devlog!(
+                warn, "meta",
+                "extract_videos: repaired {repaired_count} video id(s) with bogus prefix (e.g. \"undefined:S:E\") \
+                 — addon emitted a JS-stringified missing field. Reconstructed from parent meta id."
+            );
+        }
     }
     videos
 }
