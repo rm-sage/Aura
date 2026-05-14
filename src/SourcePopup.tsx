@@ -426,30 +426,45 @@ export default function SourcePopupHost() {
             credentials into. */}
         <div className="flex items-center justify-between gap-4 px-6 py-4 shrink-0
                         border-b border-white/8">
-          <div className="flex items-center gap-3 min-w-0 flex-1">
-            <h2 className="text-white/90 text-lg font-semibold tracking-tight truncate">
-              {active.title}
-            </h2>
-            {active.oauth?.userCode ? (
-              <span
-                className="text-[12px] font-mono tracking-[0.18em] px-2.5 py-1
-                           rounded-md bg-amber-500/10 text-amber-200 border border-amber-400/25
-                           shrink-0 select-all"
-                title="Enter this code in the loaded page to authorize Aura."
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-3 min-w-0">
+              <h2 className="text-white/90 text-lg font-semibold tracking-tight truncate">
+                {active.title}
+              </h2>
+              {active.oauth?.userCode ? (
+                <span
+                  className="text-[12px] font-mono tracking-[0.18em] px-2.5 py-1
+                             rounded-md bg-amber-500/10 text-amber-200 border border-amber-400/25
+                             shrink-0 select-all"
+                  title="Enter this code in the loaded page to authorize Aura."
+                >
+                  {active.oauth.userCode}
+                </span>
+              ) : null}
+              {active.oauth && navHost ? (
+                <span
+                  className="text-[11px] font-mono uppercase tracking-wider px-2 py-0.5
+                             rounded-md bg-white/8 text-white/60 border border-white/10
+                             shrink-0"
+                  title="Current page host. Verify this matches the OAuth provider before entering credentials."
+                >
+                  {navHost}
+                </span>
+              ) : null}
+            </div>
+            {/* Destination URL — surfaced under the title so the user can
+                preview where the popup is taking them. Suppressed in
+                OAuth mode because the start URL carries the device-flow
+                state token; the navHost security chip above is the
+                anti-phishing surface for that flow instead. */}
+            {!active.oauth && (
+              <div
+                className="text-white/55 text-[11px] font-mono truncate mt-1 select-text"
+                title={active.url}
               >
-                {active.oauth.userCode}
-              </span>
-            ) : null}
-            {active.oauth && navHost ? (
-              <span
-                className="text-[11px] font-mono uppercase tracking-wider px-2 py-0.5
-                           rounded-md bg-white/8 text-white/60 border border-white/10
-                           shrink-0"
-                title="Current page host. Verify this matches the OAuth provider before entering credentials."
-              >
-                {navHost}
-              </span>
-            ) : null}
+                {active.url}
+              </div>
+            )}
           </div>
           <button
             onClick={minimize}

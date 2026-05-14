@@ -23,7 +23,7 @@
 // rather than inline styles so we share the @layer-components scoping
 // and theme cross-fade behaviour with the rest of the app.
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { UpdateInfo } from "./updaterPlugin";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
@@ -40,16 +40,70 @@ interface Props {
   onDismiss:      () => void;
 }
 
-/** Cap the rendered release notes to the first ~300 chars. Long
- *  multi-paragraph release notes from GitHub crash the modal's vertical
- *  rhythm and bury the action buttons; the user can read the full notes
- *  on the release page after clicking Update. */
-const NOTES_MAX = 300;
+/** CP437 → byte map for the upper-half (0x80–0xEF) range — covers the
+ *  characters that show up when UTF-8 box-drawing / accented Latin text
+ *  is decoded as CP437 by mistake. Used by `recoverFromCp437Mojibake`
+ *  to undo a known-bad encoding chain in pre-v0.6.22 latest.json
+ *  manifests (the release script ran on a non-UTF-8 console and
+ *  decoded `git`'s stdout as CP437 before encoding the result back
+ *  into the manifest as UTF-8). */
+const CP437_TO_BYTE: Record<string, number> = {
+  "Ç":0x80,"ü":0x81,"é":0x82,"â":0x83,"ä":0x84,"à":0x85,"å":0x86,"ç":0x87,
+  "ê":0x88,"ë":0x89,"è":0x8A,"ï":0x8B,"î":0x8C,"ì":0x8D,"Ä":0x8E,"Å":0x8F,
+  "É":0x90,"æ":0x91,"Æ":0x92,"ô":0x93,"ö":0x94,"ò":0x95,"û":0x96,"ù":0x97,
+  "ÿ":0x98,"Ö":0x99,"Ü":0x9A,"¢":0x9B,"£":0x9C,"¥":0x9D,"₧":0x9E,"ƒ":0x9F,
+  "á":0xA0,"í":0xA1,"ó":0xA2,"ú":0xA3,"ñ":0xA4,"Ñ":0xA5,"ª":0xA6,"º":0xA7,
+  "¿":0xA8,"⌐":0xA9,"¬":0xAA,"½":0xAB,"¼":0xAC,"¡":0xAD,"«":0xAE,"»":0xAF,
+  "░":0xB0,"▒":0xB1,"▓":0xB2,"│":0xB3,"┤":0xB4,"╡":0xB5,"╢":0xB6,"╖":0xB7,
+  "╕":0xB8,"╣":0xB9,"║":0xBA,"╗":0xBB,"╝":0xBC,"╜":0xBD,"╛":0xBE,"┐":0xBF,
+  "└":0xC0,"┴":0xC1,"┬":0xC2,"├":0xC3,"─":0xC4,"┼":0xC5,"╞":0xC6,"╟":0xC7,
+  "╚":0xC8,"╔":0xC9,"╩":0xCA,"╦":0xCB,"╠":0xCC,"═":0xCD,"╬":0xCE,"╧":0xCF,
+  "╨":0xD0,"╤":0xD1,"╥":0xD2,"╙":0xD3,"╘":0xD4,"╒":0xD5,"╓":0xD6,"╫":0xD7,
+  "╪":0xD8,"┘":0xD9,"┌":0xDA,"█":0xDB,"▄":0xDC,"▌":0xDD,"▐":0xDE,"▀":0xDF,
+  "α":0xE0,"ß":0xE1,"Γ":0xE2,"π":0xE3,"Σ":0xE4,"σ":0xE5,"µ":0xE6,"τ":0xE7,
+  "Φ":0xE8,"Θ":0xE9,"Ω":0xEA,"δ":0xEB,"∞":0xEC,"φ":0xED,"ε":0xEE,"∩":0xEF,
+};
+
+/** Detect & reverse the CP437-mojibake chain that v0.6.21's release
+ *  script applied to UTF-8 tag bodies. The trigger is the unmistakable
+ *  `Γ<a><b>` triplet pattern — Γ = U+0393 (CP437 byte 0xE2, the leading
+ *  byte of every UTF-8 box-drawing character) followed by two more
+ *  high-CP437 chars. If we find that pattern, walk every char in the
+ *  string, map each to its CP437 byte (ASCII fall-through for chars
+ *  already in the 0x00–0x7F range), and decode the resulting byte
+ *  array as UTF-8. Any mapping miss or decode failure aborts the
+ *  recovery; the original string is returned untouched so we never
+ *  destroy a legitimate non-mojibake release note. */
+function recoverFromCp437Mojibake(text: string): string {
+  if (!/Γ[-∀]{2}/.test(text)) return text;
+  const bytes: number[] = [];
+  for (const ch of text) {
+    const cp = ch.codePointAt(0)!;
+    if (cp < 0x80) {
+      bytes.push(cp);
+      continue;
+    }
+    const mapped = CP437_TO_BYTE[ch];
+    if (mapped === undefined) return text;
+    bytes.push(mapped);
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(bytes));
+  } catch {
+    return text;
+  }
+}
+
+/** Cap the rendered release notes at a generous limit so a runaway
+ *  tag body can't make the popup scroll forever. 2200 chars covers a
+ *  multi-section changelog with FIXED / ADDED / CHANGED blocks and
+ *  still leaves the action row visible without the user having to
+ *  scroll. Anything longer truncates with an ellipsis and a hint to
+ *  view full notes on GitHub. */
+const NOTES_MAX = 2200;
 function truncateNotes(body: string): string {
   const trimmed = (body ?? "").trim();
   if (trimmed.length <= NOTES_MAX) return trimmed;
-  // Try to break at a paragraph / sentence boundary inside the budget so
-  // we don't slice mid-word. Falls back to a hard slice + ellipsis.
   const slice = trimmed.slice(0, NOTES_MAX);
   const lastBreak = Math.max(
     slice.lastIndexOf("\n\n"),
@@ -58,6 +112,119 @@ function truncateNotes(body: string): string {
   );
   const cut = lastBreak > NOTES_MAX * 0.6 ? slice.slice(0, lastBreak + 1) : slice;
   return cut.trimEnd() + "…";
+}
+
+/** Block-level structural parse of the lightweight changelog format
+ *  Aura's release tags use:
+ *
+ *    ════════════════════════════════
+ *    SECTION HEADER
+ *    ════════════════════════════════
+ *
+ *      • bullet point one
+ *      • bullet point two with
+ *        continuation indent
+ *
+ *    paragraph text
+ *
+ *  Outputs structured blocks the renderer can layout — proper
+ *  headings, bullet lists, and paragraph runs — so the popup reads
+ *  like styled content instead of a wall of pre-wrapped monospace.
+ *  Lines that don't fit a known pattern fall back to paragraph runs
+ *  to preserve content. */
+type NoteBlock =
+  | { kind: "rule" }
+  | { kind: "heading"; text: string }
+  | { kind: "bullets"; items: string[] }
+  | { kind: "paragraph"; text: string };
+
+const RULE_RE = /^[─━═\-_=]{6,}$/;
+
+function parseNoteBlocks(notes: string): NoteBlock[] {
+  const lines = notes.split(/\r?\n/);
+  const blocks: NoteBlock[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (!trimmed) {
+      i += 1;
+      continue;
+    }
+    if (RULE_RE.test(trimmed)) {
+      // Rule. If the next non-empty line is short + uppercase, treat
+      // the rule + that line as a heading (and skip the closing rule
+      // if it's there too). Otherwise emit a plain rule.
+      let j = i + 1;
+      while (j < lines.length && !lines[j].trim()) j += 1;
+      const candidate = j < lines.length ? lines[j].trim() : "";
+      const isHeading =
+        candidate.length > 0 &&
+        candidate.length <= 60 &&
+        candidate === candidate.toUpperCase() &&
+        !RULE_RE.test(candidate);
+      if (isHeading) {
+        blocks.push({ kind: "heading", text: candidate });
+        i = j + 1;
+        // Swallow a closing rule if it immediately follows.
+        while (i < lines.length && !lines[i].trim()) i += 1;
+        if (i < lines.length && RULE_RE.test(lines[i].trim())) i += 1;
+        continue;
+      }
+      blocks.push({ kind: "rule" });
+      i += 1;
+      continue;
+    }
+    // Bullet block — runs of lines whose first non-space token is a
+    // bullet glyph. Continuation lines (indented but no bullet) fold
+    // into the previous item.
+    if (/^\s*[•·●▪■▶►*-]\s+/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length) {
+        const cur = lines[i];
+        const curTrim = cur.trim();
+        if (!curTrim) {
+          i += 1;
+          // Blank line between bullets is fine — keep collecting.
+          if (i < lines.length && /^\s*[•·●▪■▶►*-]\s+/.test(lines[i])) {
+            continue;
+          }
+          break;
+        }
+        const bullet = cur.match(/^\s*[•·●▪■▶►*-]\s+(.*)$/);
+        if (bullet) {
+          items.push(bullet[1]);
+          i += 1;
+          continue;
+        }
+        // Continuation line — append to the previous item.
+        if (items.length > 0 && /^\s+/.test(cur)) {
+          items[items.length - 1] = items[items.length - 1] + " " + curTrim;
+          i += 1;
+          continue;
+        }
+        break;
+      }
+      blocks.push({ kind: "bullets", items });
+      continue;
+    }
+    // Paragraph — collect consecutive non-bullet, non-rule lines into
+    // one block; preserves intentional line-breaks via space-join so
+    // hard-wrapped tag prose reads like flowing text.
+    const para: string[] = [trimmed];
+    i += 1;
+    while (i < lines.length) {
+      const cur = lines[i];
+      const curTrim = cur.trim();
+      if (!curTrim) break;
+      if (RULE_RE.test(curTrim)) break;
+      if (/^\s*[•·●▪■▶►*-]\s+/.test(cur)) break;
+      para.push(curTrim);
+      i += 1;
+    }
+    blocks.push({ kind: "paragraph", text: para.join(" ") });
+  }
+  return blocks;
 }
 
 export default function UpdatePopup({
@@ -94,7 +261,16 @@ export default function UpdatePopup({
     return () => window.removeEventListener("keydown", onKey, true);
   }, [onDismiss, installing]);
 
-  const notes = truncateNotes(release.body ?? "");
+  // Run mojibake recovery BEFORE truncation so the heuristic gets the
+  // full string to work on — truncating first could split a 3-char
+  // mojibake triplet across the boundary and leave us unable to undo
+  // it. The recovery is no-op when the body is clean.
+  const noteBlocks = useMemo(() => {
+    const raw = release.body ?? "";
+    const recovered = recoverFromCp437Mojibake(raw);
+    const truncated = truncateNotes(recovered);
+    return parseNoteBlocks(truncated);
+  }, [release.body]);
   // Plugin's UpdateInfo carries a bare version like "0.6.9"; surface
   // it with the conventional "v" prefix to match the GitHub release
   // page and the user's mental model of release tags.
@@ -131,8 +307,8 @@ export default function UpdatePopup({
     >
       <div
         className="aura-update-card glass-panel-elevated rounded-2xl
-                   px-7 py-6 w-full max-w-[420px] mx-4 shadow-glass-edge
-                   flex flex-col gap-4"
+                   px-8 py-7 w-full max-w-[680px] mx-4 shadow-glass-edge
+                   flex flex-col gap-5"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -151,15 +327,61 @@ export default function UpdatePopup({
           </p>
         </div>
 
-        {/* Release notes — truncated, scrollable up to a reasonable max. */}
-        {notes && (
+        {/* Release notes — block-parsed (headings / bullets / rules /
+            paragraphs) so a multi-section changelog reads as styled
+            content instead of monospace pre-wrapped text. Scrolls when
+            the body exceeds the height cap (~half-viewport). */}
+        {noteBlocks.length > 0 && (
           <div
             className="bg-white/[0.03] border border-white/[0.08] rounded-xl
-                       px-4 py-3 max-h-56 overflow-y-auto"
+                       px-5 py-4 max-h-[50vh] overflow-y-auto"
           >
-            <p className="text-white/70 text-xs leading-relaxed whitespace-pre-line">
-              {notes}
-            </p>
+            <div className="text-white/75 text-[13px] leading-relaxed space-y-3">
+              {noteBlocks.map((block, idx) => {
+                switch (block.kind) {
+                  case "rule":
+                    return (
+                      <hr
+                        key={idx}
+                        className="border-0 border-t border-white/10 my-1"
+                      />
+                    );
+                  case "heading":
+                    return (
+                      <h3
+                        key={idx}
+                        className="text-[color:rgb(91,164,255)] text-[11px]
+                                   font-semibold tracking-[0.2em] uppercase
+                                   pt-1"
+                      >
+                        {block.text}
+                      </h3>
+                    );
+                  case "bullets":
+                    return (
+                      <ul key={idx} className="space-y-2 pl-1">
+                        {block.items.map((item, j) => (
+                          <li
+                            key={j}
+                            className="flex gap-2.5 text-white/75"
+                          >
+                            <span className="text-[color:rgb(91,164,255)]/70 mt-[2px] shrink-0">
+                              •
+                            </span>
+                            <span className="flex-1">{item}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    );
+                  case "paragraph":
+                    return (
+                      <p key={idx} className="text-white/75">
+                        {block.text}
+                      </p>
+                    );
+                }
+              })}
+            </div>
           </div>
         )}
 
