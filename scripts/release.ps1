@@ -40,6 +40,24 @@ param(
 $ErrorActionPreference = "Stop"
 
 # ---------------------------------------------------------------------------
+# Force UTF-8 for native subprocess I/O. Without this, PowerShell decodes
+# `git` stdout using `[Console]::OutputEncoding`, which defaults to the OEM
+# code page on Windows (CP437 on US-English, CP850 / CP1252 / etc. on
+# other locales). When the v0.6.21 release shipped, the build machine
+# decoded the annotated tag body's UTF-8 box-drawing characters (═ = E2 95
+# 90, ─ = E2 94 80) as CP437 — each byte mapped to a separate Greek /
+# accented-Latin glyph (E2→Γ, 95→ò, 90→É) and the resulting "ΓòÉ" salad
+# was re-encoded as UTF-8 in latest.json. The in-app updater then rendered
+# the corrupted notes verbatim.
+#
+# Setting OutputEncoding + InputEncoding to UTF-8 here makes git's stdout
+# round-trip correctly regardless of the build host's locale.
+# ---------------------------------------------------------------------------
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::InputEncoding  = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding           = [System.Text.UTF8Encoding]::new($false)
+
+# ---------------------------------------------------------------------------
 # Sanity checks
 # ---------------------------------------------------------------------------
 
@@ -166,10 +184,11 @@ if (-not (Test-Path $bundleDir)) {
 #   3. A stub pointing at the GitHub release page — used when there's
 #      neither a tag nor a prior tag to compute a delta against.
 #
-# The first paragraph (up to the first blank line) of the tag body is
-# what ends up in `notes`; the full body stays on the GitHub release
-# page. This keeps the in-app updater dialog readable while preserving
-# the structured changelog for users who click through.
+# The full annotated tag body (Co-Authored-By trailers stripped, capped
+# at 2000 chars) ships in `notes`. The popup renders it with markdown-
+# ish formatting (bullets, section headers, horizontal rules) instead
+# of the prior "first paragraph only" truncation that buried the
+# changelog body behind the header banner.
 # ---------------------------------------------------------------------------
 
 function Get-ReleaseNotes {
@@ -183,21 +202,21 @@ function Get-ReleaseNotes {
     $tagBody = & git -C $RepoRoot for-each-ref "refs/tags/$tag" --format='%(contents:body)' 2>$null
     if ($LASTEXITCODE -eq 0 -and $tagBody) {
         $body = ($tagBody | Out-String).Trim()
-        # First paragraph — split on the first blank line.
-        $firstPara = ($body -split "(?:\r?\n){2,}", 2)[0].Trim()
         # Strip any leading "Aura vX.Y.Z — " duplicate; the manifest
         # stamps the version separately so leaving it in is redundant.
-        $firstPara = $firstPara -replace "^Aura\s+v?$([regex]::Escape($Version))\s*[—–\-]\s*", ""
+        $body = $body -replace "^Aura\s+v?$([regex]::Escape($Version))\s*[—–\-]\s*", ""
         # Drop trailing Co-Authored-By trailers — these are git
         # bookkeeping, not release notes.
-        $firstPara = ($firstPara -split "\r?\nCo-Authored-By:", 2)[0].TrimEnd()
-        # Cap so the in-app updater dialog stays readable.
-        if ($firstPara.Length -gt 600) {
-            $firstPara = $firstPara.Substring(0, 597) + "..."
+        $body = ($body -split "\r?\nCo-Authored-By:", 2)[0].TrimEnd()
+        # Cap so the in-app updater dialog stays readable. 2000 chars
+        # fits a multi-section changelog comfortably; longer notes are
+        # one click away on the GitHub release page anyway.
+        if ($body.Length -gt 2000) {
+            $body = $body.Substring(0, 1997) + "..."
         }
-        if ($firstPara.Length -ge 30) {
-            Write-Host "[release] notes: using v$Version annotated tag body (first paragraph, $($firstPara.Length) chars)" -ForegroundColor DarkGray
-            return $firstPara
+        if ($body.Length -ge 30) {
+            Write-Host "[release] notes: using v$Version annotated tag body ($($body.Length) chars)" -ForegroundColor DarkGray
+            return $body
         }
     }
 
