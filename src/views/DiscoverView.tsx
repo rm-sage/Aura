@@ -399,6 +399,19 @@ const DiscoverPosterCard = memo(function DiscoverPosterCard({
     <button
       type="button"
       onClick={handleClick}
+      // Same right-click → context-menu plumbing every other catalog
+      // surface uses (Home / Library / Calendar / Search / Catalog
+      // page). The `data-meta-card` attribute is used by the global
+      // capture-phase contextmenu listener installed in main.tsx for
+      // diagnostic logging; the dispatch is what actually opens the
+      // menu via App.tsx's card-context handler.
+      onContextMenu={(e) => {
+        e.preventDefault();
+        window.dispatchEvent(new CustomEvent("aura:card-context", {
+          detail: { meta, x: e.clientX, y: e.clientY },
+        }));
+      }}
+      data-meta-card={`${meta.media_type}:${meta.id}`}
       className="aura-poster-card group relative block w-full text-left rounded-xl
                  transition-transform"
     >
