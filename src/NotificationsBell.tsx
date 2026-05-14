@@ -101,7 +101,7 @@ export default function NotificationsBell() {
   return (
     <div
       ref={containerRef}
-      className="fixed bottom-3 left-3 z-30"
+      className="fixed bottom-3 left-[46px] z-30"
       style={{ pointerEvents: "auto" }}
     >
       {open && <NotificationsPanel onClose={requestClose} closing={closing} />}
@@ -265,26 +265,35 @@ function NotificationThoughtBubble({
       data-notifications-popup
       onClick={onClick}
       className={[
-        "absolute bottom-12 left-0 z-40",
-        "max-w-[280px] min-w-[180px]",
-        "px-3.5 py-2.5 pr-7",
-        "rounded-2xl",
-        "bg-black/90 backdrop-blur-2xl",
-        "border border-white/15",
-        "shadow-[0_18px_48px_-14px_rgba(0,0,0,0.85)]",
-        "cursor-pointer select-none",
-        "text-left",
-        // Tail trio (rendered via ::before / ::after / a sibling).
-        "aura-popup-bubble",
-        phase === "enter" ? "aura-popup-enter" : "",
-        phase === "exit"  ? "aura-popup-exit"  : "",
-        phase === "idle"  ? "aura-popup-breathe" : "",
+        // Anchored above the bell, slid right so the accent edge sits
+        // flush with the bell's right border for a chained look.
+        "absolute bottom-12 left-1 z-40",
+        "min-w-[220px] max-w-[300px]",
+        "pl-3 pr-8 py-2.5",
+        "rounded-xl overflow-hidden",
+        // Aura's standard elevated-glass surface — same panel
+        // recipe used by the player overlay, the OAuth popup, and
+        // the settings panels. Drops the plain-black opaque shell
+        // of the old thought bubble in favour of the theme's
+        // signature blurred-glass + subtle accent edge.
+        "glass-panel-elevated",
+        "shadow-[0_12px_36px_-10px_rgba(0,0,0,0.7),0_0_22px_-8px_rgba(91,164,255,0.35)]",
+        "cursor-pointer select-none text-left",
+        phase === "enter" ? "aura-popup-card-enter" : "",
+        phase === "exit"  ? "aura-popup-card-exit"  : "",
+        phase === "idle"  ? "aura-popup-card-breathe" : "",
       ].filter(Boolean).join(" ")}
       style={{ transformOrigin: "bottom left" }}
     >
-      {/* Tail dots — positioned via CSS pseudo-elements on the
-          aura-popup-bubble class. Keeps the JSX clean while letting
-          the keyframes coordinate the bubble + tail entrance. */}
+      {/* Left accent stripe — picks up the same ln-accent token the
+          rest of Aura's primary UI uses. Doubles as the visual
+          "anchor" to the bell beneath it. */}
+      <span
+        aria-hidden
+        className="absolute inset-y-0 left-0 w-[3px]
+                   bg-gradient-to-b from-ln-accent/85 via-ln-accent/55 to-ln-accent/20
+                   shadow-[0_0_10px_rgba(91,164,255,0.55)]"
+      />
       <button
         type="button"
         aria-label="Dismiss"
@@ -298,17 +307,29 @@ function NotificationThoughtBubble({
           <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
         </svg>
       </button>
-      <p
-        id="aura-popup-title"
-        className="text-white/95 text-[13px] font-semibold leading-snug line-clamp-2"
-      >
-        {notification.title}
-      </p>
-      {subtitleClamped && (
-        <p className="text-white/55 text-[11.5px] leading-snug mt-1 line-clamp-2 break-words">
-          {subtitleClamped}
-        </p>
-      )}
+      <div className="flex items-start gap-2.5">
+        {/* Tiny pulsing accent dot — the "fresh notification"
+            signal the bubble used to communicate via its tail. */}
+        <span
+          aria-hidden
+          className="mt-1 flex-shrink-0 w-1.5 h-1.5 rounded-full
+                     bg-ln-accent shadow-[0_0_6px_rgba(91,164,255,0.85)]
+                     aura-popup-card-pulse"
+        />
+        <div className="min-w-0 flex-1">
+          <p
+            id="aura-popup-title"
+            className="text-white/95 text-[13px] font-semibold leading-snug line-clamp-2"
+          >
+            {notification.title}
+          </p>
+          {subtitleClamped && (
+            <p className="text-white/55 text-[11.5px] leading-snug mt-1 line-clamp-2 break-words">
+              {subtitleClamped}
+            </p>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

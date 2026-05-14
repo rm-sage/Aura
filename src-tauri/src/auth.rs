@@ -237,10 +237,18 @@ pub async fn login<R: Runtime>(
         .ok_or_else(|| format!("authKey missing in response: {raw}"))?
         .to_string();
 
+    // `/login`'s response shape is `{ result: { authKey, user: { _id,
+    // email, ... } } }`. Probe `/result/user/email` first (canonical
+    // path), then `/result/email` as a safety net for older API
+    // versions / schema drift. Pre-0.6.17 sessions had this set to
+    // empty because we only checked `/result/email` — that's why
+    // the ProfilePopover was rendering "Stremio account" on both
+    // lines instead of the user's actual address.
     let email = json
-        .pointer("/result/email")
+        .pointer("/result/user/email")
+        .or_else(|| json.pointer("/result/email"))
         .and_then(|v| v.as_str())
-        .unwrap_or_else(|| "") // email field is cosmetic — fall back gracefully
+        .unwrap_or("")
         .to_string();
 
     // `/login`'s response embeds `result.user._id` — Stremio's stable
@@ -322,15 +330,42 @@ pub async fn backfill_user_id<R: Runtime>(app: AppHandle<R>) -> Result<Option<St
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // Email comes along for the ride — pre-0.6.17 sessions had
+    // empty email fields because the original /login parser looked
+    // at the wrong JSON path. Backfilling here ensures the popover
+    // can render a real address on the next launch even for
+    // sessions stored before the fix.
+    let email = json
+        .pointer("/result/email")
+        .or_else(|| json.pointer("/result/user/email"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let mut updated = false;
+    if let Some(e) = email.as_ref().filter(|s| !s.is_empty()) {
+        if session.email != *e {
+            session.email = e.clone();
+            updated = true;
+        }
+    }
     match user_id {
         Some(id) if !id.is_empty() => {
             session.user_id = Some(id.clone());
             store_session(&app, &session)?;
-            crate::devlog!(info, "auth", "backfilled user_id (len={})", id.len());
+            crate::devlog!(
+                info, "auth",
+                "backfilled user_id (len={}) email_updated={}",
+                id.len(), updated,
+            );
             Ok(Some(id))
         }
         _ => {
-            crate::devlog!(warn, "auth", "backfill: /getUser did not return _id; raw={raw}");
+            if updated {
+                store_session(&app, &session)?;
+                crate::devlog!(info, "auth", "backfilled email only; user_id missing");
+            } else {
+                crate::devlog!(warn, "auth", "backfill: /getUser did not return _id; raw={raw}");
+            }
             Ok(None)
         }
     }

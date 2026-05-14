@@ -119,7 +119,9 @@ export default function LibraryRefreshButton({ library }: Props) {
         "disabled:opacity-50 disabled:cursor-not-allowed",
         "disabled:hover:bg-white/[0.08] disabled:hover:border-white/10",
       ].filter(Boolean).join(" ")}
-      style={{ left: "55px" }}
+      // Centered inside the 180px sidebar column alongside the
+       // bell (offset 46px). Bell width 40 + 8px gap = 94.
+      style={{ left: "94px" }}
     >
       <RefreshIcon spinning={spinning} />
     </button>

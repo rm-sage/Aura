@@ -1434,6 +1434,43 @@ select,
   }
 
   /* ---------------------------------------------------------------- */
+  /* Notification preview card — the redesigned popup that replaced  */
+  /* the older speech-bubble shape. Slides up from the bell with a    */
+  /* small overshoot, idle-breathes via a subtle accent glow, and    */
+  /* exits down + fade. Keyframes live here (not inline) for the     */
+  /* same React-19 hoisting reason SpectralPulse needed.              */
+  /* ---------------------------------------------------------------- */
+  @keyframes aura-popup-card-enter {
+    0%   { opacity: 0; transform: translateY(8px) scale(0.94); }
+    72%  { opacity: 1; transform: translateY(-2px) scale(1.02); }
+    100% { opacity: 1; transform: translateY(0)   scale(1); }
+  }
+  @keyframes aura-popup-card-exit {
+    0%   { opacity: 1; transform: translateY(0)   scale(1); }
+    100% { opacity: 0; transform: translateY(6px) scale(0.96); }
+  }
+  @keyframes aura-popup-card-breathe {
+    0%, 100% { box-shadow: 0 12px 36px -10px rgba(0,0,0,0.7), 0 0 22px -8px rgba(91,164,255,0.35); }
+    50%      { box-shadow: 0 12px 36px -10px rgba(0,0,0,0.7), 0 0 28px -6px rgba(91,164,255,0.55); }
+  }
+  @keyframes aura-popup-card-pulse {
+    0%, 100% { opacity: 0.7; transform: scale(0.92); }
+    50%      { opacity: 1;   transform: scale(1.18); }
+  }
+  .aura-popup-card-enter   { animation: aura-popup-card-enter  280ms cubic-bezier(0.34, 1.56, 0.64, 1) forwards; }
+  .aura-popup-card-exit    { animation: aura-popup-card-exit   200ms ease-in forwards; }
+  .aura-popup-card-breathe { animation: aura-popup-card-breathe 3.2s ease-in-out infinite; }
+  .aura-popup-card-pulse   { animation: aura-popup-card-pulse   1.6s ease-in-out infinite; }
+  /* Reduced-motion respect: skip the breathe + pulse loops; keep
+     the enter/exit transitions but make them instant + crossfade. */
+  html[data-reduced-motion="true"] .aura-popup-card-enter,
+  html[data-reduced-motion="true"] .aura-popup-card-exit,
+  html[data-reduced-motion="true"] .aura-popup-card-breathe,
+  html[data-reduced-motion="true"] .aura-popup-card-pulse {
+    animation: none;
+  }
+
+  /* ---------------------------------------------------------------- */
   /* aura-buffering-pulse — wrapper used when the buffering overlay   */
   /* has a real logo image. Slow opacity / scale breathe so the user  */
   /* knows playback is alive while the network catches up.            */

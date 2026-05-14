@@ -296,7 +296,7 @@ export default function NavSidebar({
       {profileOpen && (
         <ProfilePopover
           loggedIn={loggedIn}
-          email={identityLabel}
+          email={userEmail}
           nickname={userNickname}
           onClose={() => setProfileOpen(false)}
           onSettings={() => { setProfileOpen(false); onNavigate("settings"); }}
@@ -564,12 +564,34 @@ function ProfilePopover({
                 style={{ boxShadow: loggedIn ? "0 0 8px rgba(110,231,183,0.65)" : undefined }} />
         </span>
         <div className="flex-1 min-w-0 selectable">
-          <p className="text-white/95 text-sm font-semibold leading-tight truncate">
-            {loggedIn ? (nickname ?? email ?? "Signed in") : "Guest mode"}
-          </p>
-          <p className="text-white/45 text-[11px] mt-0.5 truncate font-mono">
-            {loggedIn ? (email ?? "") : "No Stremio account linked"}
-          </p>
+          {(() => {
+            // Three display states:
+            //   • Guest          → "Guest mode" + "No Stremio account linked"
+            //   • Logged in, email known      → "Stremio account" + email
+            //   • Logged in, email missing    → "Stremio account" + "—" (no fake duplicate)
+            // The duplicate "Stremio account / Stremio account" rendering
+            // pre-0.6.17 was caused by passing the same placeholder as
+            // both nickname and email; we now pass raw fields and let the
+            // popover decide what to show.
+            if (!loggedIn) {
+              return (
+                <>
+                  <p className="text-white/95 text-sm font-semibold leading-tight truncate">Guest mode</p>
+                  <p className="text-white/45 text-[11px] mt-0.5 truncate font-mono">No Stremio account linked</p>
+                </>
+              );
+            }
+            const hasEmail = !!email && email.length > 0;
+            const topName  = nickname && nickname.length > 0 ? nickname : "Stremio account";
+            return (
+              <>
+                <p className="text-white/95 text-sm font-semibold leading-tight truncate">{topName}</p>
+                <p className="text-white/45 text-[11px] mt-0.5 truncate font-mono">
+                  {hasEmail ? email : "Email pending sync"}
+                </p>
+              </>
+            );
+          })()}
         </div>
       </div>
 
