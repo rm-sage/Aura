@@ -196,6 +196,22 @@ pub enum PushOutcome {
     Conflict { server: SyncBlob },
 }
 
+/// Outcome of a single-namespace pull. Mirrors the three branches of the
+/// proxy's GET handler: 200 → Fresh, 304 → NotModified, 404 → Missing.
+/// Anything else surfaces as `Err(String)` from the parent command.
+///
+/// `NotModified` echoes the etag the desktop sent in If-None-Match so
+/// the caller can confirm match (the proxy never widens the etag set
+/// across requests, but echoing keeps the contract clean) and re-stamp
+/// a last-checked timestamp without touching the cached blob.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PullOutcome {
+    Fresh { blob: SyncBlob },
+    NotModified { namespace: String, etag: String },
+    Missing { namespace: String },
+}
+
 /// Status row used by the Settings → Cloud Sync panel.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NamespaceStatus {
@@ -296,63 +312,129 @@ pub async fn sync_status<R: Runtime>(app: AppHandle<R>) -> Result<SyncStatus, St
     })
 }
 
-/// Fetch a single namespace blob. Returns `None` when:
+/// Fetch a single namespace blob.
 ///
-///   - No Stremio session is active (guest mode), or
-///   - The proxy returns 404 (no blob written for this account yet)
+/// When `if_none_match` carries the etag from a prior successful pull,
+/// the proxy responds with `304 Not Modified` (no body) iff the stored
+/// blob is unchanged — we surface that as `PullOutcome::NotModified` so
+/// the caller reuses its cached state without re-decoding. Bare hex,
+/// quoted (`"hex"`) and weak (`W/"hex"`) forms are all accepted by the
+/// cloud; the desktop sends the bare hex it received originally.
 ///
-/// Any other failure (network, HTTP 5xx, malformed JSON) is surfaced as
-/// an error so the caller can decide whether to retry / show a toast.
+/// Branches:
+///   - 200 OK    → `PullOutcome::Fresh { blob }` (cache should replace)
+///   - 304       → `PullOutcome::NotModified { namespace, etag }`
+///   - 404       → `PullOutcome::Missing { namespace }`
+///   - guest     → `PullOutcome::Missing { namespace }` (no round-trip)
+///   - other     → `Err(String)`
 #[tauri::command]
 pub async fn sync_pull<R: Runtime>(
     app: AppHandle<R>,
     namespace: String,
-) -> Result<Option<SyncBlob>, String> {
+    if_none_match: Option<String>,
+) -> Result<PullOutcome, String> {
     validate_namespace(&namespace)?;
     let Some(scope) = derive_scope_hash(&app) else {
-        return Ok(None);
+        return Ok(PullOutcome::Missing { namespace });
     };
 
-    let resp = client()
+    let mut req = client()
         .get(format!("{SYNC_BASE}/{namespace}"))
-        .header("Authorization", auth_header(&scope))
-        .send()
-        .await
-        .map_err(|e| format!("network: {e}"))?;
+        .header("Authorization", auth_header(&scope));
+    let sent_etag = if_none_match.as_deref().filter(|s| !s.is_empty());
+    if let Some(etag) = sent_etag {
+        req = req.header("If-None-Match", etag);
+    }
 
-    if resp.status().as_u16() == 404 {
-        return Ok(None);
+    let resp = req.send().await.map_err(|e| format!("network: {e}"))?;
+    let status = resp.status().as_u16();
+
+    if status == 304 {
+        // 304 has no body. Prefer the server's ETag header (per spec it
+        // always lands on 304) but echo the request-side value if the
+        // header is missing — semantically the server has confirmed
+        // ours matches. Strip surrounding quotes / W/ prefix so the
+        // value stored locally is the canonical bare hex form.
+        let header_etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(canonical_etag);
+        let etag = header_etag
+            .or_else(|| sent_etag.map(canonical_etag))
+            .unwrap_or_default();
+        return Ok(PullOutcome::NotModified { namespace, etag });
+    }
+    if status == 404 {
+        return Ok(PullOutcome::Missing { namespace });
     }
     if !resp.status().is_success() {
-        return Err(format!("sync_pull {namespace} http {}", resp.status().as_u16()));
+        return Err(format!("sync_pull {namespace} http {status}"));
     }
     let body: ServerBlobResponse = resp.json().await.map_err(|e| format!("decode: {e}"))?;
-    Ok(Some(SyncBlob {
-        namespace,
-        data: body.data,
-        etag: body.etag,
-        updated_at: body.updated_at,
-    }))
+    Ok(PullOutcome::Fresh {
+        blob: SyncBlob {
+            namespace,
+            data: body.data,
+            etag: body.etag,
+            updated_at: body.updated_at,
+        },
+    })
+}
+
+/// Strip `W/` weak prefix and surrounding double quotes from an ETag
+/// value. The cloud emits bare hex but RFC-conformant intermediaries (or
+/// a future server change) may wrap; canonicalise on read so the value
+/// the desktop persists and re-sends in If-None-Match is always the bare
+/// hex form the server compares against.
+fn canonical_etag(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let without_weak = trimmed.strip_prefix("W/").unwrap_or(trimmed);
+    let without_quotes = without_weak
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(without_weak);
+    without_quotes.to_string()
 }
 
 /// Pull every known namespace in a single sweep. Used by the login
 /// flow so a fresh device gets the full per-account picture in one
 /// orchestrated round-trip rather than seven independent fetches.
 ///
+/// `if_none_match` carries the per-namespace etag the desktop holds
+/// from the prior successful pull. Each entry is forwarded as an
+/// `If-None-Match` header on that namespace's GET, allowing the proxy
+/// to short-circuit unchanged blobs with `304 Not Modified` — the
+/// returned `PullOutcome::NotModified` variants then tell the caller
+/// to reuse its cached state without re-decoding.
+///
 /// Failures on individual namespaces are LOGGED but do not abort the
 /// sweep — the caller gets back whatever did succeed. This matches the
 /// "best effort restore" intent: a single dropped blob shouldn't
 /// prevent the rest of settings from landing.
 #[tauri::command]
-pub async fn sync_pull_all<R: Runtime>(app: AppHandle<R>) -> Result<Vec<SyncBlob>, String> {
+pub async fn sync_pull_all<R: Runtime>(
+    app: AppHandle<R>,
+    if_none_match: Option<std::collections::HashMap<String, String>>,
+) -> Result<Vec<PullOutcome>, String> {
     if derive_scope_hash(&app).is_none() {
         return Ok(vec![]);
     }
+    let etag_map = if_none_match.unwrap_or_default();
     let mut out = Vec::with_capacity(NAMESPACES.len());
+    let mut fresh_count = 0usize;
+    let mut not_modified_count = 0usize;
     for &name in NAMESPACES {
-        match sync_pull(app.clone(), name.to_string()).await {
-            Ok(Some(blob)) => out.push(blob),
-            Ok(None) => {}
+        let prior = etag_map.get(name).cloned();
+        match sync_pull(app.clone(), name.to_string(), prior).await {
+            Ok(outcome) => {
+                match &outcome {
+                    PullOutcome::Fresh { .. } => fresh_count += 1,
+                    PullOutcome::NotModified { .. } => not_modified_count += 1,
+                    PullOutcome::Missing { .. } => {}
+                }
+                out.push(outcome);
+            }
             Err(e) => {
                 crate::devlog!(
                     warn, "sync",
@@ -360,6 +442,12 @@ pub async fn sync_pull_all<R: Runtime>(app: AppHandle<R>) -> Result<Vec<SyncBlob
                 );
             }
         }
+    }
+    if not_modified_count > 0 {
+        crate::devlog!(
+            debug, "sync",
+            "pull_all: {fresh_count} fresh, {not_modified_count} not-modified (304 short-circuit)",
+        );
     }
     Ok(out)
 }

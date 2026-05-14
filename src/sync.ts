@@ -60,6 +60,13 @@ export type PushOutcome =
   | { status: "ok"; etag: string; updated_at: number }
   | { status: "conflict"; server: SyncBlob };
 
+/** Mirror of `sync.rs::PullOutcome`. Carries per-namespace pull results
+ *  with 304 short-circuit information distinguished from 200 / 404. */
+export type PullOutcome =
+  | { status: "fresh"; blob: SyncBlob }
+  | { status: "not_modified"; namespace: string; etag: string }
+  | { status: "missing"; namespace: string };
+
 export interface NamespaceStatus {
   name: string;
   etag: string | null;
@@ -101,15 +108,76 @@ const LOCAL_KEYS: Partial<Record<SyncNamespace, string>> = {
 
 // ── ETag tracker ─────────────────────────────────────────────────────────
 //
-// Per-namespace ETag of the last successful pull or push. Used as the
-// `if_match` parameter on the next push so the proxy can reject
-// concurrent writes from another device with 412 Precondition Failed.
-// Cleared on logout (auth-key change) so the next push to a new
-// account doesn't carry an ETag from the previous one.
+// Per-namespace ETag of the last successful pull or push. Two roles:
+//
+//   1. PUSH: passed as If-Match so the proxy rejects concurrent writes
+//      from another device with 412 Precondition Failed.
+//   2. PULL: passed as If-None-Match so the proxy short-circuits with
+//      304 Not Modified when the blob hasn't changed. Cuts read-side
+//      bandwidth to near-zero on the steady-state 5-min background tick
+//      (was ~6 KB/h per scope on history alone).
+//
+// Persisted to localStorage under a per-account key so the short-circuit
+// survives app restarts — without persistence the first pull after every
+// launch refetches every namespace even when nothing changed. Cleared on
+// account switch (clearSyncEtags) so a new account doesn't carry forward
+// the previous one's etags.
 
 const lastEtag: Map<SyncNamespace, string> = new Map();
+const ETAG_STORAGE_PREFIX = "aura:sync:etags:";
+
+function etagStorageKey(): string {
+  return `${ETAG_STORAGE_PREFIX}${activeScope()}`;
+}
+
+/** Pull persisted etags for the active scope into the in-memory Map.
+ *  Idempotent — clears the Map first so a scope switch always starts
+ *  from a clean slate. */
+function loadEtagsForActiveScope(): void {
+  lastEtag.clear();
+  try {
+    const raw = localStorage.getItem(etagStorageKey());
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+    for (const ns of SYNC_NAMESPACES) {
+      const val = (parsed as Record<string, unknown>)[ns];
+      if (typeof val === "string" && val.length > 0) {
+        lastEtag.set(ns, val);
+      }
+    }
+  } catch {
+    // Corrupt JSON / quota error — fall through with an empty Map; the
+    // next pull just fetches everything fresh and re-stamps the entry.
+  }
+}
+
+/** Persist the current Map state for the active scope. Called whenever
+ *  we mutate `lastEtag` from a successful pull or push. Guard for guest
+ *  scope: persisting under "guest" is fine because clearSyncEtags will
+ *  wipe it on sign-in anyway, and a guest can still see 304 benefits
+ *  within a single session. */
+function persistEtags(): void {
+  try {
+    const obj: Record<string, string> = {};
+    for (const [ns, etag] of lastEtag) obj[ns] = etag;
+    if (Object.keys(obj).length === 0) {
+      localStorage.removeItem(etagStorageKey());
+    } else {
+      localStorage.setItem(etagStorageKey(), JSON.stringify(obj));
+    }
+  } catch {
+    // Quota / serialization errors are non-fatal — the in-memory Map
+    // still works for the duration of this session.
+  }
+}
 
 export function clearSyncEtags(): void {
+  // Drop the persisted blob for the OUTGOING scope before we mutate
+  // _activeScope — otherwise the removeItem in persistEtags would land
+  // on the wrong key. Callers typically pair clearSyncEtags with a
+  // following setSyncActiveScope, so the order matters.
+  try { localStorage.removeItem(etagStorageKey()); } catch {}
   lastEtag.clear();
   // Reset the pull min-interval guard too — a fresh account swap
   // should pull immediately, not wait out a 30s floor that was set
@@ -143,7 +211,17 @@ export function clearSyncEtags(): void {
 let _activeScope: string = "guest";
 
 export function setSyncActiveScope(scope: string | null): void {
-  _activeScope = scope && scope.trim() ? scope : "guest";
+  const next = scope && scope.trim() ? scope : "guest";
+  if (next === _activeScope) return;
+  _activeScope = next;
+  // Rehydrate the per-namespace etag Map from this scope's persisted
+  // entry so an app restart can immediately use If-None-Match on the
+  // first pull. clearSyncEtags wipes the previous scope's storage
+  // before this point on a real account switch; on a same-scope
+  // re-call (no-op guarded above) we'd skip the reload to avoid
+  // clobbering in-memory etags freshly written by a just-completed
+  // pull or push.
+  loadEtagsForActiveScope();
 }
 
 function activeScope(): string { return _activeScope; }
@@ -787,20 +865,62 @@ export function syncPullAll(): Promise<void> {
   pullInFlight = true;
   pullAllInflight = (async () => {
     try {
-      const blobs = await invoke<SyncBlob[]>("sync_pull_all");
-      for (const blob of blobs) {
-        const ns = blob.namespace as SyncNamespace;
-        if (!SYNC_NAMESPACES.includes(ns)) continue;
-        try {
-          const local  = await readLocal(ns);
-          const merger = MERGERS[ns];
-          const merged = merger(local, blob.data);
-          await writeLocal(ns, merged);
-          lastEtag.set(ns, blob.etag);
-        } catch (e) {
-          console.warn(`[sync] merge ${ns} failed:`, e);
+      // Snapshot the in-memory etag Map and forward as If-None-Match
+      // per namespace so the proxy can short-circuit unchanged blobs
+      // with 304. The Rust side maps each entry onto its namespace's
+      // GET request and surfaces three outcomes: fresh (200 → merge
+      // and re-stamp), not_modified (304 → keep cached state), missing
+      // (404 → no server-side blob, drop any stale etag we hold).
+      const etagMap: Record<string, string> = {};
+      for (const [ns, etag] of lastEtag) {
+        if (etag) etagMap[ns] = etag;
+      }
+      const outcomes = await invoke<PullOutcome[]>("sync_pull_all", {
+        ifNoneMatch: etagMap,
+      });
+      let etagsMutated = false;
+      for (const outcome of outcomes) {
+        if (outcome.status === "fresh") {
+          const blob = outcome.blob;
+          const ns = blob.namespace as SyncNamespace;
+          if (!SYNC_NAMESPACES.includes(ns)) continue;
+          try {
+            const local  = await readLocal(ns);
+            const merger = MERGERS[ns];
+            const merged = merger(local, blob.data);
+            await writeLocal(ns, merged);
+            if (lastEtag.get(ns) !== blob.etag) {
+              lastEtag.set(ns, blob.etag);
+              etagsMutated = true;
+            }
+          } catch (e) {
+            console.warn(`[sync] merge ${ns} failed:`, e);
+          }
+        } else if (outcome.status === "not_modified") {
+          // Cached blob is current. No merge, no write. Defensive: if
+          // the server's echoed etag differs from what we sent (would
+          // only happen on a header-rewriting intermediary canonical-
+          // ising the form), align the stored value so the next
+          // If-None-Match round-trips cleanly.
+          const ns = outcome.namespace as SyncNamespace;
+          if (SYNC_NAMESPACES.includes(ns) && outcome.etag && lastEtag.get(ns) !== outcome.etag) {
+            lastEtag.set(ns, outcome.etag);
+            etagsMutated = true;
+          }
+        } else if (outcome.status === "missing") {
+          // 404 — server has no blob for this namespace. Drop any
+          // local etag pointing at a vanished blob so the next pull
+          // doesn't send a stale If-None-Match that the server would
+          // ignore anyway, and a subsequent push can force-overwrite
+          // without an If-Match round-trip.
+          const ns = outcome.namespace as SyncNamespace;
+          if (SYNC_NAMESPACES.includes(ns) && lastEtag.has(ns)) {
+            lastEtag.delete(ns);
+            etagsMutated = true;
+          }
         }
       }
+      if (etagsMutated) persistEtags();
     } catch (e) {
       console.warn("[sync] pull_all failed:", e);
     } finally {
@@ -870,6 +990,7 @@ export async function syncPushNow(namespace: SyncNamespace): Promise<void> {
   });
   if (result.status === "ok") {
     lastEtag.set(namespace, result.etag);
+    persistEtags();
     return;
   }
   // 412 conflict: merge server into local, retry push with the
@@ -884,11 +1005,13 @@ export async function syncPushNow(namespace: SyncNamespace): Promise<void> {
   });
   if (retry.status === "ok") {
     lastEtag.set(namespace, retry.etag);
+    persistEtags();
   } else {
     // Two consecutive conflicts is rare (third device writing
     // mid-merge). Drop the etag so the next attempt force-overwrites;
     // the user's local state wins.
     lastEtag.delete(namespace);
+    persistEtags();
     console.warn(`[sync] push ${namespace} conflicted twice; force-overwrite next attempt`);
   }
 }
@@ -897,6 +1020,7 @@ export async function syncPushNow(namespace: SyncNamespace): Promise<void> {
 export async function syncDelete(namespace: SyncNamespace): Promise<void> {
   await invoke("sync_delete", { namespace });
   lastEtag.delete(namespace);
+  persistEtags();
 }
 
 /** Drop every blob for the active account and clear local etags. */
