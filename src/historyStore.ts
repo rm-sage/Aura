@@ -183,6 +183,25 @@ export function removeHistoryEntry(id: string, playedAt: string): void {
   window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
 }
 
+/** Replace the entire history list for the current scope in one
+ *  shot. Used by the cloud-sync merger: the merge layer fetches
+ *  server + local, unions them, and writes the result back through
+ *  this function. Skips the change-event dispatch when `silent` is
+ *  set so the writer can avoid bouncing through the
+ *  `aura:history-changed` → debouncedPush → re-pull loop. */
+export function setAllHistory(entries: HistoryEntry[], opts?: { silent?: boolean }): void {
+  ensureHydrated();
+  const sanitized = Array.isArray(entries)
+    ? entries.filter((e): e is HistoryEntry =>
+        e != null && typeof e === "object" &&
+        typeof e.id === "string" && typeof e.played_at === "string",
+      )
+    : [];
+  _entries = sanitized.slice(0, MAX_ENTRIES);
+  saveToStorage(_activeScope, _entries);
+  if (!opts?.silent) window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
+}
+
 /** Clear every entry in the current scope. Wired to a confirm-button
  *  on the history view. */
 export function clearHistory(): void {

@@ -82,6 +82,7 @@ const NAMESPACES: &[&str] = &[
     "recent-searches",
     "title-state",
     "anilist-id-map",
+    "history",
 ];
 
 fn validate_namespace(namespace: &str) -> Result<(), String> {

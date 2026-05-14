@@ -4,6 +4,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { loadAuraSettings, saveAuraSettings, getSettingsUpdatedAt, setSettingsUpdatedAt, bumpSettingsUpdatedAt, type AuraSettings, DEFAULT_AURA_SETTINGS } from "./auraSettings";
 import { encryptForCloud, decryptFromCloud, isEncryptedBlob, type EncryptedBlob } from "./syncCrypto";
+import { getHistory, setAllHistory, type HistoryEntry } from "./historyStore";
 
 // ---------------------------------------------------------------------------
 // Aura Cloud sync orchestrator (frontend)
@@ -83,6 +84,7 @@ export const SYNC_NAMESPACES = [
   "recent-searches",
   "title-state",
   "anilist-id-map",
+  "history",
 ] as const;
 
 export type SyncNamespace = (typeof SYNC_NAMESPACES)[number];
@@ -361,6 +363,35 @@ const mergeAnilistIdMap: MergeFn<{ by_show?: Record<string, AnilistMapEntry> }> 
   return { by_show: out };
 };
 
+interface HistoryWireEntry {
+  id: string;
+  played_at: string;
+  [k: string]: unknown;
+}
+
+/** History merger — union by (id, played_at) so the same play
+ *  captured on multiple devices dedupes, sorted newest-first, capped
+ *  at 1000. Server entries iterate first so a local re-watch with
+ *  the exact same timestamp (vanishingly rare, but cheap to handle)
+ *  keeps the server copy's enrichment (poster URL etc) over a
+ *  potentially sparser local row. */
+const mergeHistory: MergeFn<HistoryWireEntry[]> = (local, server) => {
+  const list: HistoryWireEntry[] = [];
+  const seen = new Set<string>();
+  const push = (e: HistoryWireEntry | undefined | null) => {
+    if (!e || typeof e !== "object") return;
+    if (typeof e.id !== "string" || typeof e.played_at !== "string") return;
+    const key = `${e.id}::${e.played_at}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    list.push(e);
+  };
+  if (Array.isArray(server)) for (const e of server) push(e);
+  if (Array.isArray(local))  for (const e of local)  push(e);
+  list.sort((a, b) => b.played_at.localeCompare(a.played_at));
+  return list.slice(0, 1000);
+};
+
 // Per-namespace merge wiring. recent-searches and title-state use
 // shape-validating server-wins (the previous unconditional server-wins
 // could clobber local state when the server returned garbage).
@@ -372,6 +403,7 @@ const MERGERS: Record<SyncNamespace, MergeFn<any>> = {
   "recent-searches": mergeServerWinsRecentSearches,
   "title-state":     mergeServerWinsTitleState,
   "anilist-id-map":  mergeAnilistIdMap as MergeFn<any>,
+  history:           mergeHistory as MergeFn<any>,
 };
 
 // ── Settings blob shape ───────────────────────────────────────────────────
@@ -560,6 +592,11 @@ async function readLocal(namespace: SyncNamespace): Promise<unknown> {
   if (namespace === "manual-state") {
     return readManualStateAggregate();
   }
+  if (namespace === "history") {
+    // historyStore reads from its scoped localStorage entry — same
+    // shape that flies on the wire (an array of HistoryEntry).
+    return getHistory();
+  }
 
   const lsKey = LOCAL_KEYS[namespace];
   if (!lsKey) return null;
@@ -592,6 +629,13 @@ async function writeLocal(namespace: SyncNamespace, value: unknown): Promise<voi
   }
   if (namespace === "manual-state") {
     writeManualStateAggregate(value as ManualState);
+    return;
+  }
+  if (namespace === "history") {
+    // silent: true keeps writeLocal off the aura:history-changed →
+    // debouncedPush bus so a pull doesn't immediately schedule a
+    // re-push of the same merged blob.
+    setAllHistory(value as HistoryEntry[], { silent: true });
     return;
   }
 
@@ -906,6 +950,7 @@ export function installSyncTriggers(): void {
 
   window.addEventListener("aura:settings-changed",        () => debouncedPush("settings"));
   window.addEventListener("aura:keybindings-changed",     () => debouncedPush("settings"));
+  window.addEventListener("aura:history-changed",         () => debouncedPush("history"));
   // API-key changes ride along with the settings blob (the
   // encrypted api_keys field is built inside readSettingsBlob).
   // Treat as a settings change for both timestamp + push purposes.
