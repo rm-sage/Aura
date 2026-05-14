@@ -448,7 +448,13 @@ function NavRow({ label, icon, active, onClick }: RowProps) {
     <button
       onClick={onClick}
       aria-label={label}
-      className={`nav-tap relative flex items-center gap-3 px-3 rounded-xl
+      // `w-full` is what makes the hover background fill the same
+      // footprint as the `.aura-glow` active pill (which is
+      // absolute-positioned left:0 right:0 across the group). Without
+      // it the hover bg only spanned the intrinsic icon+label width,
+      // so Calendar / History / Discover hover looked tighter than
+      // Queue (which has w-full in its sub-row variant).
+      className={`nav-tap relative w-full flex items-center gap-3 px-3 rounded-xl
                   transition-all duration-150
                   ${active
                     ? "text-ln-accent"
