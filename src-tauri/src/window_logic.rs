@@ -396,11 +396,28 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
             // Resyncing in Rust costs nothing and guarantees the child
             // tracks the parent's client area.
             WindowEvent::Resized(_) => {
-                if cfg.pause_on_minimize {
-                    if let Ok(true) = win.is_minimized() {
-                        crate::devlog!(info, "win", "minimised → pause MPV");
+                // Minimised path — pause MPV (if configured) and BAIL
+                // before the child-resize backstop below. A Resized
+                // event during a minimise/restore cycle reports a
+                // zero-sized payload; calling
+                // `resize_mpv_child_to_parent` with that rect would
+                // SetWindowPos the MPV child to 0×0, which on this
+                // libmpv build tears down the render surface so that
+                // the subsequent restore lands on a dead vo. Visible
+                // symptom: "I minimised mid-playback and the stream
+                // came back broken on restore." The Focused(true)
+                // handler above already re-syncs the child rect when
+                // the window comes back, so skipping the resize here
+                // is safe.
+                let minimised = matches!(win.is_minimized(), Ok(true));
+                if minimised {
+                    if cfg.pause_on_minimize {
+                        crate::devlog!(info, "win", "minimised → pause MPV (resize skipped)");
                         pause_mpv(&handle);
+                    } else {
+                        crate::devlog!(info, "win", "minimised → resize skipped (pause-on-minimize off)");
                     }
+                    return;
                 }
                 #[cfg(target_os = "windows")]
                 {

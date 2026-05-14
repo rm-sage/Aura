@@ -319,6 +319,7 @@ query ($search: String) {
       id
       idMal
       episodes
+      status
       title { romaji english native }
       mediaListEntry { id status progress }
     }
@@ -329,7 +330,7 @@ query ($search: String) {
 const MEDIA_QUERY: &str = "
 query ($mediaId: Int) {
   Media(id: $mediaId, type: ANIME) {
-    id idMal episodes
+    id idMal episodes status
     mediaListEntry { id status progress }
   }
 }
@@ -351,6 +352,17 @@ pub struct MediaInfo {
     pub id_mal:   Option<u64>,
     #[serde(default)]
     pub episodes: Option<u32>,
+    /// AniList release status — one of `FINISHED`, `RELEASING`,
+    /// `NOT_YET_RELEASED`, `CANCELLED`, `HIATUS`. Aura uses this as
+    /// an additional wrong-mapping signal: when the id-map (Fribb)
+    /// hands us an entry that's `NOT_YET_RELEASED` but the user is
+    /// requesting progress > 0, the mapping is almost certainly off
+    /// (Fribb has Frieren's cour rows in the wrong order, for
+    /// example, mapping S2 → S3's anilist_id). The existing
+    /// `episodes >= episode_num` guard didn't fire for unaired
+    /// entries because `episodes` is None until the schedule is set.
+    #[serde(default)]
+    pub status:   Option<String>,
     #[serde(rename = "mediaListEntry", default)]
     pub media_list_entry: Option<MediaListEntry>,
 }
@@ -570,6 +582,20 @@ fn parse_season_num(id: &str, media_type: &str) -> Option<u32> {
 /// `save_progress` so the new id-map path can fall through cleanly when
 /// its fetch_media returns NotFound or the wrong-season heuristic miss.
 /// Mirrors the legacy three-branch cache/search behaviour exactly.
+/// True when a Media we just fetched is plausibly the user's
+/// target — episode count accommodates the requested episode AND
+/// the show is actually airing (or finished). A
+/// `NOT_YET_RELEASED` entry hit while requesting progress > 0 is
+/// almost always a Fribb id-map mis-mapping (an unaired cour ends
+/// up at an earlier cour's index, e.g. Frieren tt22248376 season=2
+/// pointing at "Sousou no Frieren 3rd Season"). Rejecting it
+/// pushes the resolver to fall through to the title-search path.
+fn is_plausible_target(m: &MediaInfo, episode_num: u32) -> bool {
+    let episode_ok = m.episodes.map(|e| e >= episode_num).unwrap_or(true);
+    let status_ok  = m.status.as_deref() != Some("NOT_YET_RELEASED") || episode_num == 0;
+    episode_ok && status_ok
+}
+
 async fn resolve_via_cache_or_search(
     access: &str,
     cached: &Option<CachedMedia>,
@@ -585,7 +611,35 @@ async fn resolve_via_cache_or_search(
                 show_id, c.anilist_id, c.episodes,
             );
             match fetch_media(access, c.anilist_id).await {
-                Ok(m) => Ok(m),
+                Ok(m) if is_plausible_target(&m, episode_num) => Ok(m),
+                Ok(m) => {
+                    // Cached id resolves to an entry that can't be
+                    // what the user is watching (most often a
+                    // NOT_YET_RELEASED cour the prior version cached
+                    // before the wrong-mapping guard existed). Drop
+                    // it from cache so subsequent runs don't keep
+                    // hitting the same dead end, then search.
+                    let reason = if m.status.as_deref() == Some("NOT_YET_RELEASED") {
+                        "status=NOT_YET_RELEASED"
+                    } else {
+                        "episodes insufficient"
+                    };
+                    crate::devlog!(
+                        warn, "scrobble",
+                        "AniList cached id {} rejected ({reason}) for ep {episode_num} — \
+                         invalidating cache row and re-searching for \"{title}\"",
+                        c.anilist_id,
+                    );
+                    if let Ok(mut g) = cache_lock().lock() {
+                        // Walk every key that points at this anilist_id
+                        // and remove. We don't have the cache_key here
+                        // (intentional — keeps this helper reusable);
+                        // a tiny value-scan is fine since the map is
+                        // small (one entry per (show, cour) pair).
+                        g.by_show.retain(|_, v| v.anilist_id != c.anilist_id);
+                    }
+                    search_and_pick(access, title, episode_num).await
+                }
                 Err(AnilistError::NotFound) => {
                     crate::devlog!(
                         warn, "scrobble",
@@ -748,15 +802,16 @@ pub async fn save_progress<R: Runtime>(
     //   • Uncached → search.
     let media = if let Some(id_anilist) = id_map_anilist_id {
         match fetch_media(&access, id_anilist).await {
-            Ok(m) if m.episodes.map(|e| e >= episode_num).unwrap_or(true) => m,
-            Ok(_) => {
-                // Wrong season picked by the heuristic — episode count
-                // can't accommodate the requested episode. Drop through
-                // to the cache / search path which has its own consistency
-                // guards.
+            Ok(m) if is_plausible_target(&m, episode_num) => m,
+            Ok(m) => {
+                let reason = if m.status.as_deref() == Some("NOT_YET_RELEASED") {
+                    "status=NOT_YET_RELEASED while episode_num>0 (Fribb row mis-mapped to unaired cour)"
+                } else {
+                    "episodes insufficient for the requested episode"
+                };
                 crate::devlog!(
                     info, "scrobble",
-                    "AniList id-map entry {id_anilist} has insufficient episodes for ep {episode_num} \
+                    "AniList id-map entry {id_anilist} rejected ({reason}) for ep {episode_num} \
                      — falling through to cache/search (multi-season heuristic miss)",
                 );
                 resolve_via_cache_or_search(&access, &cached, &sess.title, show_id, episode_num).await?
