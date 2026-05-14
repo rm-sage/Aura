@@ -1,8 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useState } from "react";
-import Tooltip from "./Tooltip";
+import { useState } from "react";
 import AuraLogoA from "./AuraLogoA";
 
 export type NavView = "home" | "library" | "queue" | "addons" | "discover" | "calendar" | "history" | "settings";
@@ -143,38 +142,13 @@ export default function NavSidebar({
   onLoginRequest,
   onLogout,
 }: Props) {
-  // Prefer the explicit `loggedIn` prop (driven by auth_key in App.tsx);
-  // fall back to checking `userEmail` for older callers that don't pass
-  // it. This matters because some users have a valid keyring session
-  // with an empty email field, and we still want the UI to show them
-  // as signed in.
-  const loggedIn = loggedInProp ?? !!userEmail;
-  const identityLabel = userEmail && userEmail.length > 0
-    ? userEmail
-    : (loggedIn ? "Stremio account" : null);
-  const profileTitle = loggedIn
-    ? `Signed in as ${userNickname ?? identityLabel ?? "Stremio account"}`
-    : "Guest. Click to sign in.";
-
-  // Profile popover open state
-  const [profileOpen, setProfileOpen] = useState(false);
-
-  useEffect(() => {
-    if (!profileOpen) return;
-    const onMouseDown = (e: MouseEvent) => {
-      const target = e.target as Node;
-      const isInsidePopover = (target as HTMLElement)?.closest?.("[data-profile-popover]");
-      const isProfileBtn    = (target as HTMLElement)?.closest?.("[data-profile-trigger]");
-      if (!isInsidePopover && !isProfileBtn) setProfileOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setProfileOpen(false); };
-    window.addEventListener("mousedown", onMouseDown);
-    window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("mousedown", onMouseDown);
-      window.removeEventListener("keydown", onKey);
-    };
-  }, [profileOpen]);
+  // Profile popover state and identity derivation moved to
+  // <AccountButton /> in 0.6.18 — see src/AccountButton.tsx.
+  // NavSidebar no longer needs loggedIn / email / nickname /
+  // callbacks; those props remain on the Props interface only for
+  // backward-compat with call sites that still pass them. They're
+  // ignored here.
+  void loggedInProp; void userEmail; void userNickname; void onLoginRequest; void onLogout;
 
   // Queue is a Library sub-tab — when it's the active view, the Library
   // pill should stay lit (Queue is conceptually nested under Library).
@@ -222,36 +196,11 @@ export default function NavSidebar({
       className="relative z-20 self-center flex-shrink-0 flex flex-col w-[180px] px-2 py-3"
       aria-label="Navigation"
     >
-      {/* ── Compact profile / brand button (anchored near top) ───────── */}
-      <Tooltip text={profileTitle} pos="right">
-        <button
-          data-profile-trigger
-          onClick={() => setProfileOpen((o) => !o)}
-          aria-label={profileTitle}
-          aria-expanded={profileOpen}
-          className={`nav-tap mb-3 w-full flex items-center justify-start gap-3 px-3
-                      rounded-xl transition-colors duration-150
-                      bg-white/5 hover:bg-white/10 border border-white/10
-                      ${profileOpen ? "ring-1 ring-ln-accent/50" : ""}`}
-          style={{ height: ROW_H_PX }}
-        >
-          <span className="relative flex items-center justify-center w-9 h-9">
-            <AuraLogoA size={32} />
-            {/* Tiny status dot — green when signed in, neutral when guest. */}
-            <span
-              aria-hidden
-              className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-[1.5px]
-                          ${loggedIn
-                            ? "bg-emerald-400 border-black/85"
-                            : "bg-white/30 border-black/85"}`}
-              style={{ boxShadow: loggedIn ? "0 0 6px rgba(110,231,183,0.65)" : undefined }}
-            />
-          </span>
-          <span className="text-white/85 text-[13px] font-semibold tracking-[0.04em]">
-            Aura
-          </span>
-        </button>
-      </Tooltip>
+      {/* Profile button + popover moved out of the sidebar in
+          0.6.18 — the Aura logo / account affordance now lives at
+          the top-left of the app body via <AccountButton />,
+          rendered alongside the bell + refresh from App.tsx. The
+          sidebar starts at the nav cluster. */}
 
       {/* ── Nav cluster ────────────────────────────────────────────── */}
       {/* TOP group with the Queue sub-row permanently in-flow directly
@@ -293,17 +242,7 @@ export default function NavSidebar({
         onNavigate={onNavigate}
       />
 
-      {profileOpen && (
-        <ProfilePopover
-          loggedIn={loggedIn}
-          email={userEmail}
-          nickname={userNickname}
-          onClose={() => setProfileOpen(false)}
-          onSettings={() => { setProfileOpen(false); onNavigate("settings"); }}
-          onLogin={() => { setProfileOpen(false); onLoginRequest?.(); }}
-          onLogout={() => { setProfileOpen(false); onLogout?.(); }}
-        />
-      )}
+      {/* ProfilePopover invocation moved to <AccountButton />. */}
     </aside>
   );
 }
@@ -524,10 +463,13 @@ function NavRow({ label, icon, active, onClick }: RowProps) {
 }
 
 // ---------------------------------------------------------------------------
-// ProfilePopover — anchored to the right of the sidebar.
+// ProfilePopover — anchored to its parent's right edge (absolute
+// positioning, `top-2 left-full ml-3`). Exported so the floating
+// AccountButton (top-left of the app, below the title bar) can reuse
+// the same panel without forking the JSX.
 // ---------------------------------------------------------------------------
 
-function ProfilePopover({
+export function ProfilePopover({
   loggedIn, email, nickname, onClose, onSettings, onLogin, onLogout,
 }: {
   loggedIn: boolean;

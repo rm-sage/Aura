@@ -86,6 +86,7 @@ import { LibraryProvider } from "./LibraryContext";
 import { NotificationsProvider, useNotifications } from "./NotificationsContext";
 import NotificationsBell from "./NotificationsBell";
 import LibraryRefreshButton from "./LibraryRefreshButton";
+import AccountButton from "./AccountButton";
 import NotificationsScanner from "./NotificationsScanner";
 import { getTitleState } from "./titleState";
 import { isAnimeMeta, markAnimeId } from "./aiometadata";
@@ -3943,12 +3944,24 @@ export default function App() {
         )}
       </div>
 
-      {/* Notifications bell — fixed bottom-3 left-3, rendered INSIDE the
-          app body so it inherits the `hidden` class during playback and
-          unmounts visually when the player owns the screen. Living here
-          (rather than inside HomeView) lets the bell appear on every
-          main tab (Home, Library, Calendar, Addons, Settings); the
-          NotificationsProvider above keeps state continuous. */}
+      {/* Account button — top-left, below the title bar's
+          SyncStatusChip. Same body-level placement as the bell /
+          refresh below so all three floating account/notification
+          affordances inherit the `hidden` class during playback. */}
+      <AccountButton
+        loggedIn={!!session?.auth_key}
+        email={session?.email ?? null}
+        onOpenSettings={() => setActiveView("settings")}
+        onLoginRequest={() => setShowLogin(true)}
+        onLogout={handleLogout}
+      />
+      {/* Notifications bell — fixed bottom-3 left-[46px], rendered
+          INSIDE the app body so it inherits the `hidden` class during
+          playback and unmounts visually when the player owns the
+          screen. Living here (rather than inside HomeView) lets the
+          bell appear on every main tab (Home, Library, Calendar,
+          Addons, Settings); the NotificationsProvider above keeps
+          state continuous. */}
       <NotificationsBell />
       {/* Manual library refresh — sits next to the bell. Same fixed
           bottom-left anchoring inherits the player-hidden behaviour
