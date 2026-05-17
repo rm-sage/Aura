@@ -1061,8 +1061,14 @@ export default function App() {
           // Read fresh — the toggle (Settings or player's three-dots
           // menu) writes through saveAuraSettings which busts the
           // module-level snapshot, so this returns the current value.
-          const { loudnessNormalization } = loadAuraSettings();
+          const { loudnessNormalization, motionInterpolation } = loadAuraSettings();
           invoke("set_audio_loudnorm", { enabled: !!loudnessNormalization }).catch(() => {});
+          // SVP Tier 1 — re-apply the persisted motion-interpolation
+          // setting on every load (the @auraInterp vf is per-file).
+          // Issued inside the same +1500 ms post-load gate as loudnorm
+          // so it never touches libmpv during the loadfile critical
+          // section (landmine #3).
+          invoke("set_motion_interpolation", { enabled: !!motionInterpolation }).catch(() => {});
         }, 1500);
 
         // ── Anime OP/ED skip windows ──

@@ -519,6 +519,65 @@ async fn set_audio_loudnorm(app: tauri::AppHandle, enabled: bool) -> Result<(), 
     .map_err(|e| e.to_string())?
 }
 
+/// SVP-style motion interpolation — TIER 1 (no external deps).
+///
+/// Toggles a labelled `@auraInterp` video filter that runs ffmpeg's
+/// `minterpolate` (true motion-compensated frame interpolation, AOBMC +
+/// variable-size blocks, bidirectional ME) to a 60 fps output. This is
+/// the no-dependency approximation of Stremio Kai's SVP — genuine
+/// motion interpolation, but software/CPU-bound, so it can fall behind
+/// real-time on weak hardware at high resolutions. The performant
+/// svpflow/RIFE-via-VapourSynth path is deliberately deferred
+/// (Tier 2 — ROADMAP §8.10).
+///
+/// Mirrors `set_audio_loudnorm` exactly, by design:
+///   • `vf` (the video-filter `change-list`-style command), NOT
+///     `set_property("vf", …)` — incremental graph mutation keeps the
+///     render chain hot and sidesteps the in-place-replace re-init
+///     class of bug the loudnorm note documents.
+///   • `@auraInterp` label = the remove handle. Remove-first makes
+///     repeat calls idempotent (App.tsx re-fires this on every
+///     `load_video` to honour the persisted setting).
+///   • Issued via `command` (not `set_property`) and only after
+///     `duration > 0` on the caller side (the App.tsx +1500 ms block),
+///     so it never touches libmpv inside the loadfile critical section
+///     (landmine #3) and `vf`/`estimated-vf-fps` are never added to
+///     `observed_properties` (landmine #4).
+#[tauri::command]
+async fn set_motion_interpolation(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    crate::devlog!(info, "player", "set_motion_interpolation(enabled={enabled})");
+    tauri::async_runtime::spawn_blocking(move || {
+        let mpv = app.mpv();
+        // Always remove first so repeat calls don't stack duplicate
+        // labelled filters. `remove` is a no-op when the label isn't
+        // present; ignore its error.
+        let _ = mpv.command(
+            "vf",
+            &vec![serde_json::json!("remove"), serde_json::json!("@auraInterp")],
+            "main",
+        );
+        if !enabled {
+            return Ok(());
+        }
+        mpv.command(
+            "vf",
+            &vec![
+                serde_json::json!("add"),
+                serde_json::json!(
+                    "@auraInterp:lavfi=[minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1]"
+                ),
+            ],
+            "main",
+        )
+        .map_err(|e| {
+            crate::devlog!(warn, "player", "set_motion_interpolation failed: {e}");
+            e.to_string()
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn set_volume(app: tauri::AppHandle, volume: f64) -> Result<(), String> {
     crate::devlog!(info, "player", "set_volume({volume})");
@@ -1842,6 +1901,7 @@ pub fn run() {
             seek_relative,
             frame_step,
             set_audio_loudnorm,
+            set_motion_interpolation,
             set_volume,
             set_speed,
             seek_absolute,

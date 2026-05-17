@@ -2798,6 +2798,14 @@ function MoreMenu({
     window.addEventListener("aura:settings-changed", sync);
     return () => window.removeEventListener("aura:settings-changed", sync);
   }, []);
+  // SVP Tier 1 motion interpolation — same auraSettings-event-bus
+  // mirror pattern as loudness above.
+  const [interp, setInterp] = useState(() => !!loadAuraSettings().motionInterpolation);
+  useEffect(() => {
+    const sync = () => setInterp(!!loadAuraSettings().motionInterpolation);
+    window.addEventListener("aura:settings-changed", sync);
+    return () => window.removeEventListener("aura:settings-changed", sync);
+  }, []);
   const ref = useRef<HTMLDivElement>(null);
   useMenuOpenSync(open);
 
@@ -2817,6 +2825,17 @@ function MoreMenu({
     saveAuraSettings({ ...current, loudnessNormalization: next });
     invoke("set_audio_loudnorm", { enabled: next }).catch(() => {});
     showFlash(next ? "Loudness normalization on" : "Loudness normalization off");
+  };
+
+  const toggleInterp = () => {
+    const next = !interp;
+    setInterp(next);
+    const current = loadAuraSettings();
+    saveAuraSettings({ ...current, motionInterpolation: next });
+    // Applies to the CURRENT video immediately; App.tsx re-applies on
+    // each subsequent load. CPU-heavy on weak hardware (Tier 1).
+    invoke("set_motion_interpolation", { enabled: next }).catch(() => {});
+    showFlash(next ? "Motion interpolation on" : "Motion interpolation off");
   };
 
   const showFlash = (msg: string) => {
@@ -2923,6 +2942,36 @@ function MoreMenu({
                 className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-md
                            transition-transform duration-150"
                 style={{ transform: loudness ? "translateX(16px)" : "translateX(0)" }}
+              />
+            </span>
+          </button>
+          {/* SVP Tier 1 motion interpolation — in-player mirror of the
+              Settings → Video & Audio toggle. Same auraSettings event
+              bus keeps the two surfaces in lock-step. */}
+          <button
+            type="button"
+            onClick={toggleInterp}
+            className="w-full flex items-center gap-3 px-4 py-2 text-left text-[13px]
+                       text-white/85 hover:text-white hover:bg-white/[0.16]
+                       transition-colors"
+            role="switch"
+            aria-checked={interp}
+          >
+            <span className="text-white/55 flex-shrink-0">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                <path d="M4 4h16a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zm1 3v2h2V7H5zm0 4v2h2v-2H5zm0 4v2h2v-2H5zm12-8v2h2V7h-2zm0 4v2h2v-2h-2zm0 4v2h2v-2h-2zM9 8.5v7l5-3.5-5-3.5z" />
+              </svg>
+            </span>
+            <span className="flex-1">Motion interpolation</span>
+            <span
+              aria-hidden
+              className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0
+                          ${interp ? "bg-ln-accent/80" : "bg-white/15"}`}
+            >
+              <span
+                className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-md
+                           transition-transform duration-150"
+                style={{ transform: interp ? "translateX(16px)" : "translateX(0)" }}
               />
             </span>
           </button>

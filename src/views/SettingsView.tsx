@@ -4065,6 +4065,16 @@ export default function SettingsView({ addons, session }: Props) {
                   invoke("set_audio_loudnorm", { enabled: v }).catch(() => {});
                 }}
               />
+              <div className="h-px bg-white/6" />
+              <SettingToggle
+                label="Motion interpolation (SVP — Tier 1)"
+                description="Genuine motion-compensated frame interpolation to 60 fps for smoother motion on low-frame-rate content (anime, 24 fps film). Uses ffmpeg minterpolate — no extra downloads — but it is CPU-intensive and can fall behind real-time on weaker hardware at high resolutions; turn it off if playback stutters. Re-applies on every stream load. A faster GPU/SVP path is planned."
+                value={!!aura.motionInterpolation}
+                onChange={(v) => {
+                  setLocal({ motionInterpolation: v });
+                  invoke("set_motion_interpolation", { enabled: v }).catch(() => {});
+                }}
+              />
             </Section>
           )}
 

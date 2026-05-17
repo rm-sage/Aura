@@ -3,6 +3,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { loadAuraSettings } from "./auraSettings";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -150,6 +151,25 @@ function OsdOverlay({ stats, topPx }: { stats: OsdStats; topPx: number }) {
           ? `${fpsValue} → ${containerFps}`
           : fpsValue}
       />
+      {/* SVP Tier 1 status. Read fresh from auraSettings each OSD
+          re-render (≤2 s poll), so toggling from the player menu
+          reflects here without extra wiring. When on, the
+          estimated-vf-fps readout (already polled, safe `double`
+          format) shows the effective interpolated output rate. */}
+      {(() => {
+        const interpOn = !!loadAuraSettings().motionInterpolation;
+        return (
+          <StatRow
+            label="Interpolation"
+            value={interpOn
+              ? (stats.estimated_vf_fps > 0
+                  ? `On · ~${stats.estimated_vf_fps.toFixed(0)} fps`
+                  : "On")
+              : "Off"}
+            valueClass={interpOn ? "text-ln-accent" : "text-white/45"}
+          />
+        );
+      })()}
       <StatRow label="Bitrate" value={fmtBitrate(stats.video_bitrate)} />
 
       <StatSection label="Audio" />

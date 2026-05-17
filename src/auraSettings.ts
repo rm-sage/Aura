@@ -152,6 +152,17 @@ export interface AuraSettings {
    *  toggle change; both the Settings panel and the in-player
    *  three-dots menu surface the same setting. */
   loudnessNormalization: boolean;
+  /** SVP-style motion interpolation (Tier 1 — ffmpeg `minterpolate`,
+   *  no external deps). Genuine motion-compensated frame interpolation
+   *  to 60 fps; software/CPU-bound, so it can fall behind real-time on
+   *  weak hardware at high resolutions — opt-in, default false.
+   *  Re-applies on every stream load AND on toggle; surfaced in both
+   *  Settings and the in-player three-dots menu (mirrors
+   *  loudnessNormalization). The performant svpflow/RIFE path is
+   *  deferred (Tier 2 — ROADMAP §8.10). Optional in the type only so
+   *  incremental edits type-check; defaults + parse always populate
+   *  it, so `loadAuraSettings()` always returns a boolean. */
+  motionInterpolation?: boolean;
   /** Next-Up CTA: skip filler / recap episodes when computing the
    *  next-up target. Source field: AIOMetadata's per-episode
    *  `episodeKind`. Default `"none"` so users on non-anime content
@@ -193,6 +204,7 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   autoAdvanceDelaySeconds: 10,
   blurEpisodeSynopsis: false,
   loudnessNormalization: false,
+  motionInterpolation: false,
   nextUpSkipFillerRecap: "none",
   releaseSearchEnabled: true,
 };
@@ -266,6 +278,9 @@ function readFromStorage(): AuraSettings {
         : false,
       loudnessNormalization: typeof parsed.loudnessNormalization === "boolean"
         ? parsed.loudnessNormalization
+        : false,
+      motionInterpolation: typeof parsed.motionInterpolation === "boolean"
+        ? parsed.motionInterpolation
         : false,
       nextUpSkipFillerRecap:
         parsed.nextUpSkipFillerRecap === "filler"
