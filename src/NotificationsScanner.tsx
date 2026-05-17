@@ -360,8 +360,17 @@ export default function NotificationsScanner({ addons, library }: Props) {
           if (isFirstScan) {
             let newestSeed = 0;
             for (const ep of candidates_aired) {
-              seenSet.add(ep.id);
               const ms = airedAtMs(ep);
+              // Defense-in-depth (caveat #1): don't seed a not-yet-
+              // aired episode as "seen". If the cloud surfaced it
+              // early (degraded upstream render / future estimate),
+              // seeding it here would permanently suppress its
+              // notification when it actually airs. Leaving it
+              // un-seeded lets the normal diff fire it once aired.
+              // (Unparseable timestamps are NEGATIVE_INFINITY → not
+              // > now → seeded as before.)
+              if (ms > now) continue;
+              seenSet.add(ep.id);
               if (ms > newestSeed) newestSeed = ms;
             }
             state[item.id] = {
@@ -384,10 +393,33 @@ export default function NotificationsScanner({ addons, library }: Props) {
             if (!ep?.id) continue;
             if (seenSet.has(ep.id)) continue;
             const epMs = airedAtMs(ep);
-            if (epMs <= lastNotifiedMs) {
-              // Older than the watermark — mark as seen without
-              // notifying. Prevents future polls from re-evaluating
-              // it every tick.
+            // Defense-in-depth (caveat #1): never notify before the
+            // episode's stated air time. The cloud is the primary
+            // guard — it pins aired_at and shouldn't surface an
+            // episode early — but a degraded upstream render or a
+            // future first-published estimate could still slip a
+            // not-yet-aired entry into recent_aired. Skip it WITHOUT
+            // marking it seen or advancing the watermark so it gets
+            // re-evaluated and fires correctly once actually aired.
+            // (A local clock running behind real time at worst delays
+            // a just-aired episode by one ~5-min tick — self-healing;
+            // firing early is the worse failure. Unparseable
+            // timestamps are NEGATIVE_INFINITY → not > now → fall
+            // through to the existing handling below.)
+            if (epMs > now) continue;
+            if (epMs < lastNotifiedMs) {
+              // Strictly older than the watermark — mark as seen
+              // without notifying. Prevents future polls from
+              // re-evaluating it every tick.
+              //
+              // NOTE (caveat #2): this is `<`, not `<=`, on purpose.
+              // An episode whose aired_at exactly EQUALS the watermark
+              // is a same-timestamp sibling of an already-fired
+              // episode (batch / double drop) — it must NOT be
+              // silently swallowed here; it falls through to the
+              // id-dedup + notify path below. The `seenSet.has(ep.id)`
+              // check above still prevents re-firing the episode that
+              // set the watermark.
               seenSet.add(ep.id);
               continue;
             }
