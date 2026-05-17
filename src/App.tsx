@@ -155,13 +155,25 @@ interface MpvChapter {
 function classifyChapterTitle(title: string): "op" | "ed" | "recap" | null {
   const t = title.toLowerCase().trim();
   if (!t) return null;
-  // Recap before OP — "Previously on…" / "recap" / "summary" intros
-  // sometimes precede an opening, so the recap match wins for clarity.
-  if (/\b(recap|previously|summary|previously on)\b/.test(t)) return "recap";
-  // Opening: "Opening", "OP", "OP1", "OP 1", "Op (Theme)"
-  if (/^op( |$|\d|\b)/.test(t) || /\bopening\b/.test(t)) return "op";
-  // Ending: "Ending", "ED", "ED1", "Outro", "Closing"
-  if (/^ed( |$|\d|\b)/.test(t) || /\b(ending|outro|closing)\b/.test(t)) return "ed";
+  // Recap first — "Previously on…" / "recap" / "summary" intros
+  // sometimes precede an opening, so the recap match wins.
+  if (/\b(recap|previously|previously on|last time|story so far|summary)\b/.test(t)) return "recap";
+  // Opening / intro / theme — generic enough to also catch live-action
+  // title sequences (not anime-only). "Cold open" / "teaser" are
+  // DELIBERATELY excluded: those are usually real story content, and
+  // skipping them would eat the episode.
+  if (
+    /^op(\b|\d| |$)/.test(t) ||
+    /\b(opening|intro|introduction|theme song|main theme|title sequence)\b/.test(t)
+  ) return "op";
+  // Ending / outro / credits / next-episode preview. "Preview" /
+  // "next episode" are end-of-episode content; the positional guard in
+  // mergeChapterSkipWindows stops a stray EARLY "Preview" chapter from
+  // being treated as an outro.
+  if (
+    /^ed(\b|\d| |$)/.test(t) ||
+    /\b(ending|outro|closing|end credits|credits|epilogue|end theme|closing theme|preview|next episode|next time|coming up)\b/.test(t)
+  ) return "ed";
   return null;
 }
 
@@ -171,6 +183,31 @@ interface PreparedWindow {
   end:    number;
   source: string;
   auto:   boolean;
+}
+
+// Kai-derived chapter heuristics (live-action + anime where AniSkip
+// has no data). Industry-standard OP length is ~90 s; an UNTITLED
+// chapter inside the leading INTRO_FRACTION whose length is closest to
+// that (within OP_MIN..OP_MAX) is treated as the opening — prompt-only
+// (never auto: it's a guess). AniSkip windows and titled chapters
+// always take precedence over the positional heuristic.
+const INTRO_FRACTION       = 0.20;
+const OUTRO_FRACTION       = 0.20;
+const TARGET_OP_SECONDS    = 90;
+const OP_MIN_SECONDS       = 30;
+const OP_MAX_SECONDS       = 130;
+// Sanity caps so a mis-titled giant chapter ("Part 1") can't nuke real
+// content. ED can legitimately run long (a full credits roll).
+const TITLED_OP_MAX_SECONDS = 300;
+const ED_MAX_SECONDS        = 900;
+const MIN_WINDOW_SECONDS    = 2;
+
+/** Fraction of [aStart,aEnd) that overlaps [bStart,bEnd). */
+function windowOverlapFraction(
+  aStart: number, aEnd: number, bStart: number, bEnd: number,
+): number {
+  const inter = Math.max(0, Math.min(aEnd, bEnd) - Math.max(aStart, bStart));
+  return inter / Math.max(0.001, aEnd - aStart);
 }
 
 async function mergeChapterSkipWindows(
@@ -213,31 +250,113 @@ async function mergeChapterSkipWindows(
     .filter((c) => typeof c.time === "number")
     .sort((a, b) => (a.time ?? 0) - (b.time ?? 0));
 
+  // Derive [start,end) for every chapter once (MPV stores start only;
+  // end = next chapter's start, or duration for the last). Drop sub-
+  // MIN_WINDOW_SECONDS slivers (chapter-marker noise).
+  const spans = sorted
+    .map((c, i) => {
+      const start = c.time ?? 0;
+      const end   = ((sorted[i + 1]?.time) ?? (duration || start)) - 0.001;
+      return { title: (c.title ?? "").toString(), start, end };
+    })
+    .filter((s) => s.end > s.start + MIN_WINDOW_SECONDS);
+
   const derived: PreparedWindow[] = [];
-  for (let i = 0; i < sorted.length; i += 1) {
-    const c = sorted[i];
-    const title = (c.title ?? "").toString();
-    const kind = classifyChapterTitle(title);
+  // Any-overlap guard (vs AniSkip `existing` AND already-derived) —
+  // used for the heuristic windows so a guess can never double-stamp
+  // a region a precise source already owns.
+  const free = (start: number, end: number): boolean =>
+    !existing.some((e) => windowOverlapFraction(start, end, e.start, e.end) > 0.0001) &&
+    !derived.some((d) => windowOverlapFraction(start, end, d.start, d.end) > 0.0001);
+
+  // 1. TITLED chapters — honour the user's per-kind mode (may be auto).
+  //    Length-capped so a mis-titled monster chapter can't nuke real
+  //    content. A "Preview"/"Next episode" chapter only counts as an
+  //    ending when it actually sits in the outro region.
+  for (const s of spans) {
+    const kind = classifyChapterTitle(s.title);
     if (!kind) continue;
     if (modeFor(kind) === "off") continue;
-    const start = c.time ?? 0;
-    const next  = sorted[i + 1];
-    const end   = (next?.time ?? duration ?? start) - 0.001;
-    if (end <= start) continue;
-    // Merge-skip if AniSkip already covers this region (overlap > 80 %).
-    const dup = existing.some((e) =>
-      Math.max(0, Math.min(e.end, end) - Math.max(e.start, start))
-        / Math.max(0.001, end - start) > 0.8
+    const len = s.end - s.start;
+    if (len > (kind === "ed" ? ED_MAX_SECONDS : TITLED_OP_MAX_SECONDS)) continue;
+    const lower = s.title.toLowerCase();
+    const isPreviewish =
+      /\b(preview|next episode|next time|coming up)\b/.test(lower) &&
+      !/\b(ending|outro|closing|credits|epilogue)\b/.test(lower);
+    if (
+      kind === "ed" && isPreviewish && duration > 0 &&
+      s.start < duration * (1 - OUTRO_FRACTION) - 1
+    ) continue; // a stray EARLY "Preview" is not an outro
+    // Skip when AniSkip already covers this region (>80 % overlap).
+    const dup = existing.some(
+      (e) => windowOverlapFraction(s.start, s.end, e.start, e.end) > 0.8,
     );
     if (dup) continue;
     derived.push({
       type:   kind,
-      start,
-      end,
+      start:  s.start,
+      end:    s.end,
       source: "chapter",
       auto:   modeFor(kind) === "auto",
     });
   }
+
+  // 2. PROLOGUE FIX — when nothing (AniSkip or titled chapter) gave us
+  //    an OP, pick the untitled chapter in the leading INTRO_FRACTION
+  //    whose length is closest to the ~90 s industry-standard OP
+  //    (tie → the LATER chapter, so a short cold-open prologue loses
+  //    to the real OP). Prompt-only — never auto-skip a guess.
+  if (duration > 0 && modeFor("op") !== "off") {
+    const hasOp =
+      existing.some((e) => e.type === "op" || e.type === "mixed-op") ||
+      derived.some((d) => d.type === "op");
+    if (!hasOp) {
+      const introLimit = duration * INTRO_FRACTION;
+      const cands = spans
+        .filter((s) => classifyChapterTitle(s.title) === null && s.start < introLimit)
+        .map((s) => ({ s, len: s.end - s.start }))
+        .filter(({ len }) => len >= OP_MIN_SECONDS && len <= OP_MAX_SECONDS)
+        .sort((a, b) => {
+          const da = Math.abs(a.len - TARGET_OP_SECONDS);
+          const db = Math.abs(b.len - TARGET_OP_SECONDS);
+          return Math.abs(da - db) <= 5 ? b.s.start - a.s.start : da - db;
+        });
+      const pick = cands[0]?.s;
+      if (pick && free(pick.start, pick.end)) {
+        derived.push({
+          type: "op", start: pick.start, end: pick.end,
+          source: "chapter-heuristic", auto: false,
+        });
+      }
+    }
+  }
+
+  // 3. Untitled OUTRO — exactly one untitled chapter wholly inside the
+  //    trailing OUTRO_FRACTION, ≥20 s, when nothing else gave an ED.
+  //    Prompt-only. The "exactly one" gate keeps multi-part credits /
+  //    post-credit scenes from being mis-skipped.
+  if (duration > 0 && modeFor("ed") !== "off") {
+    const hasEd =
+      existing.some((e) => e.type === "ed") || derived.some((d) => d.type === "ed");
+    if (!hasEd) {
+      const outroStart = duration * (1 - OUTRO_FRACTION);
+      const outroCands = spans.filter(
+        (s) =>
+          classifyChapterTitle(s.title) === null &&
+          s.start >= outroStart &&
+          s.end - s.start >= 20 &&
+          s.end - s.start <= ED_MAX_SECONDS,
+      );
+      if (outroCands.length === 1 && free(outroCands[0].start, outroCands[0].end)) {
+        const o = outroCands[0];
+        derived.push({
+          type: "ed", start: o.start, end: o.end,
+          source: "chapter-heuristic", auto: false,
+        });
+      }
+    }
+  }
+
   if (derived.length === 0) return existing;
 
   const merged = [...existing, ...derived];
@@ -970,6 +1089,69 @@ export default function App() {
             // Reset first so non-anime / no-data cases don't leave
             // stale windows from the previous load.
             try { await invoke("set_skip_windows", { payload: { windows: [] } }); } catch {}
+
+            // Skip windows are a SERIES concept (anime via AniSkip +
+            // chapters; live-action via chapters / the positional
+            // heuristic). Movies and live-TV have no OP/ED structure.
+            const mtLower = (target.media_type ?? "").toLowerCase();
+            if (mtLower === "movie" || mtLower === "channel" || mtLower === "channels" || mtLower === "tv") {
+              return;
+            }
+
+            // Settings → per-kind mode. HOISTED above the MAL cascade
+            // (was below it) so (a) the chapter path is reachable for
+            // live-action, which never resolves a MAL id, and (b) an
+            // all-off config short-circuits before any network round
+            // trip (the old order paid the MAL/Jikan cascade first).
+            let settings: BackendSettingsLite | null = null;
+            try { settings = await invoke<BackendSettingsLite>("get_settings"); } catch {}
+            const normalizeMode = (raw: string | undefined, fallback: "off" | "prompt" | "auto"): "off" | "prompt" | "auto" =>
+              raw === "off" || raw === "prompt" || raw === "auto" ? raw : fallback;
+            const opMode    = normalizeMode(settings?.skip_op_mode,    "auto");
+            const edMode    = normalizeMode(settings?.skip_ed_mode,    "prompt");
+            const recapMode = normalizeMode(settings?.skip_recap_mode, "prompt");
+            const treatMixed = settings?.skip_treat_mixed_op_as_op ?? true;
+            if (opMode === "off" && edMode === "off" && recapMode === "off") {
+              console.info(`[aniskip] skip — all modes off`);
+              return;
+            }
+            const modeFor = (kind: string): "off" | "prompt" | "auto" =>
+              kind === "op" || kind === "mixed-op" ? opMode
+              : kind === "ed"    ? edMode
+              : kind === "recap" ? recapMode
+              : "off";
+
+            // Tail used by EVERY exit below: stamp any AniSkip windows
+            // (empty for live-action / AniSkip-miss), then ALWAYS run
+            // the chapter augment so titled chapters + the positional
+            // heuristic still produce skip windows, then surface the
+            // ED start for the Next-Up CTA. This is what extends skip
+            // from anime-only to any series.
+            const finishWithChapters = async (prepared: PreparedWindow[]): Promise<void> => {
+              try {
+                if (prepared.length > 0) {
+                  await invoke("set_skip_windows", { payload: { windows: prepared } });
+                  console.info(`[aniskip] stamped ${prepared.length} window(s)`);
+                }
+                const merged = await mergeChapterSkipWindows(prepared, modeFor);
+                // Latest ED window START → precisely-timed Next-Up CTA
+                // (last ED wins for double-ED / sponsor-bumper cases).
+                const lastEdStart = merged
+                  .filter((w) => w.type === "ed")
+                  .reduce<number | null>(
+                    (acc, w) => (acc == null || w.start > acc ? w.start : acc),
+                    null,
+                  );
+                if (lastEdStart != null) {
+                  window.dispatchEvent(new CustomEvent<number>("aura:ed-start-time", {
+                    detail: lastEdStart,
+                  }));
+                }
+              } catch (err) {
+                console.warn(`[aniskip] finish/chapter merge failed: ${String(err)}`);
+              }
+            };
+
             // Resolve mal_id via the meta-detail cache. The detail
             // fetch is shared with the buffering-overlay path so it's
             // already warm by the time we get here.
@@ -1055,7 +1237,13 @@ export default function App() {
               } catch { /* leave null, falls through to skip log */ }
             }
             if (!malId) {
-              console.info(`[aniskip] skip — no mal_id resolvable for ${seriesId}`);
+              // Live-action, or anime we couldn't resolve to a MAL id
+              // (IMDb-keyed with no anime ids + no Jikan title hit).
+              // No AniSkip data — fall straight through to the chapter
+              // path so chaptered live-action series still get skip
+              // windows. THIS is the anime-only → any-series extension.
+              console.info(`[aniskip] no mal_id for ${seriesId} — chapter-only skip path`);
+              await finishWithChapters([]);
               return;
             }
             // Mal-id was resolved → this is an anime; mark for future
@@ -1084,7 +1272,10 @@ export default function App() {
               ? (target.episode_num as number)
               : idEpisode;
             if (!Number.isFinite(episodeNum)) {
-              console.info(`[aniskip] skip — couldn't parse episode from ${target.id}`);
+              // Can't index AniSkip without an episode number, but a
+              // chaptered file can still yield skip windows.
+              console.info(`[aniskip] couldn't parse episode from ${target.id} — chapter-only`);
+              await finishWithChapters([]);
               return;
             }
             console.info(
@@ -1092,20 +1283,11 @@ export default function App() {
               `cour-relative=${target.episode_num}, using=${episodeNum} ` +
               `(against mal=${malId})`,
             );
-            // Settings drive the per-window auto/prompt/off decision.
-            let settings: BackendSettingsLite | null = null;
-            try { settings = await invoke<BackendSettingsLite>("get_settings"); } catch {}
-            const normalizeMode = (raw: string | undefined, fallback: "off" | "prompt" | "auto"): "off" | "prompt" | "auto" =>
-              raw === "off" || raw === "prompt" || raw === "auto" ? raw : fallback;
-            const opMode    = normalizeMode(settings?.skip_op_mode,    "auto");
-            const edMode    = normalizeMode(settings?.skip_ed_mode,    "prompt");
-            const recapMode = normalizeMode(settings?.skip_recap_mode, "prompt");
-            const treatMixed = settings?.skip_treat_mixed_op_as_op ?? true;
-            // No point hitting the network if every type is off.
-            if (opMode === "off" && edMode === "off" && recapMode === "off") {
-              console.info(`[aniskip] skip — all modes off`);
-              return;
-            }
+            // AniSkip fetch (settings / modeFor / all-off were handled
+            // up top). On found → build prepared windows; on
+            // not-found / network failure → prepared stays empty and
+            // we still fall through to the chapter augment.
+            let prepared: PreparedWindow[] = [];
             try {
               const cacheKey = `${malId}:${episodeNum}:${treatMixed ? 1 : 0}`;
               let result = aniskipCache.get(cacheKey);
@@ -1127,56 +1309,27 @@ export default function App() {
               } else {
                 console.info(`[aniskip] cache hit mal=${malId} ep=${episodeNum}`);
               }
-              if (!result.found || result.windows.length === 0) return;
-              const modeFor = (kind: string): "off" | "prompt" | "auto" =>
-                kind === "op" || kind === "mixed-op" ? opMode
-                : kind === "ed"    ? edMode
-                : kind === "recap" ? recapMode
-                : "off";
-              const prepared = result.windows
-                .filter((w) => modeFor(w.kind) !== "off")
-                .map((w) => ({
-                  type:    w.kind,
-                  start:   w.start,
-                  end:     w.end,
-                  source:  w.source,
-                  auto:    modeFor(w.kind) === "auto",
-                  skip_id: w.skip_id ?? null,
-                }));
-              if (prepared.length > 0) {
-                await invoke("set_skip_windows", { payload: { windows: prepared } });
-                console.info(`[aniskip] stamped ${prepared.length} window(s) for mal=${malId} ep=${episodeNum}`);
-              }
-              // Chapter-detection augment: scan MPV's chapter-list for
-              // titles matching OP/ED/recap patterns, merge any new
-              // windows in, and re-stamp. Chapter parse can land 1-3 s
-              // after loadfile, so we poll up to 10x at 600 ms intervals.
-              const merged = await mergeChapterSkipWindows(prepared, modeFor);
-              // Surface the latest ED start-time for the Next-Up CTA
-              // so anime gets a precisely-timed prompt at credits
-              // START — same instant the "Skip ending? Press X"
-              // notice surfaces. Earlier code stamped ED END, which
-              // delayed the CTA by ~90 s past the user-visible signal.
-              // Pick the LATEST `ed` window's START (handles double-ED
-              // edge cases and sponsor-bumpered endings — last ED
-              // wins since the next-up is always for the END of the
-              // episode). Dispatched as a window event so the App-
-              // level Next-Up effect picks it up without prop
-              // threading through this nested callback.
-              const lastEdStart = merged
-                .filter((w) => w.type === "ed")
-                .reduce<number | null>(
-                  (acc, w) => (acc == null || w.start > acc ? w.start : acc),
-                  null,
-                );
-              if (lastEdStart != null) {
-                window.dispatchEvent(new CustomEvent<number>("aura:ed-start-time", {
-                  detail: lastEdStart,
-                }));
+              if (result.found && result.windows.length > 0) {
+                prepared = result.windows
+                  .filter((w) => modeFor(w.kind) !== "off")
+                  .map((w) => ({
+                    type:    w.kind,
+                    start:   w.start,
+                    end:     w.end,
+                    source:  w.source,
+                    auto:    modeFor(w.kind) === "auto",
+                    skip_id: w.skip_id ?? null,
+                  }));
               }
             } catch (err) {
+              // AniSkip network/parse failure is non-fatal — chapter +
+              // heuristic windows still run via finishWithChapters.
               console.warn(`[aniskip] lookup failed: ${String(err)}`);
             }
+            // ALWAYS augment with chapters (even on an empty AniSkip
+            // result): anime with no AniSkip data gets the same
+            // chapter / heuristic treatment as live-action.
+            await finishWithChapters(prepared);
           })();
         }
         // Stash the DIRECT raw URL (not the bridge-proxied form) so Copy /
