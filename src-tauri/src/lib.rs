@@ -519,75 +519,53 @@ async fn set_audio_loudnorm(app: tauri::AppHandle, enabled: bool) -> Result<(), 
     .map_err(|e| e.to_string())?
 }
 
-/// SVP-style motion interpolation — TIER 1 (no external deps).
+/// Motion interpolation — mpv's BUILT-IN GPU frame interpolation.
 ///
-/// Toggles a labelled `@auraInterp` video filter that runs ffmpeg's
-/// `minterpolate` (true motion-compensated frame interpolation, AOBMC +
-/// variable-size blocks, bidirectional ME) to a 60 fps output. This is
-/// the no-dependency approximation of Stremio Kai's SVP — genuine
-/// motion interpolation, but software/CPU-bound, so it can fall behind
-/// real-time on weak hardware at high resolutions. The performant
-/// svpflow/RIFE-via-VapourSynth path is deliberately deferred
-/// (Tier 2 — ROADMAP §8.10).
+/// `video-sync=display-resample` retimes frames to the display refresh
+/// and `interpolation=yes` blends across them via `tscale`. `oversample`
+/// is the community "smooth motion" default: sharp, minimal blur,
+/// frame-rate-conversion-like — the best judder-free-panning result on
+/// a high-refresh display, and it runs on the GPU (Aura already uses
+/// `vo=gpu-next`) so it's effectively free.
 ///
-/// Mirrors `set_audio_loudnorm` exactly, by design:
-///   • `vf` (the video-filter `change-list`-style command), NOT
-///     `set_property("vf", …)` — incremental graph mutation keeps the
-///     render chain hot and sidesteps the in-place-replace re-init
-///     class of bug the loudnorm note documents.
-///   • `@auraInterp` label = the remove handle. Remove-first makes
-///     repeat calls idempotent (App.tsx re-fires this on every
-///     `load_video` to honour the persisted setting).
-///   • Issued via `command` (not `set_property`) and only after
-///     `duration > 0` on the caller side (the App.tsx +1500 ms block),
-///     so it never touches libmpv inside the loadfile critical section
-///     (landmine #3) and `vf`/`estimated-vf-fps` are never added to
-///     `observed_properties` (landmine #4).
+/// History: the ffmpeg `minterpolate` vf was tried first, but `mi_mode=
+/// mci` is far too CPU-heavy to sustain real-time (estimated-vf-fps
+/// never left source rate — every interpolated frame was dropped). The
+/// svpflow / RIFE-via-VapourSynth path was dropped at the user's
+/// request. This GPU path is the one to dial in.
+///
+/// Direct `set_property` FFI — NOT `command("set_property", …)` (that's
+/// the silent-no-op landmine #1). These are persistent per-instance mpv
+/// options, so App.tsx re-firing this on every `load_video` is
+/// idempotent. Tunable knobs for "dialing in": `tscale` (oversample /
+/// mitchell / catmull_rom / box …), `video-sync`
+/// (display-resample / display-resample-vdrop …).
 #[tauri::command]
 async fn set_motion_interpolation(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     crate::devlog!(info, "player", "set_motion_interpolation(enabled={enabled})");
     tauri::async_runtime::spawn_blocking(move || {
         let mpv = app.mpv();
-        // Always remove first so repeat calls don't stack duplicate
-        // labelled filters. `remove` is a no-op when the label isn't
-        // present; ignore its error.
-        let _ = mpv.command(
-            "vf",
-            &vec![serde_json::json!("remove"), serde_json::json!("@auraInterp")],
-            "main",
-        );
-        if !enabled {
-            return Ok(());
+        let set = |name: &str, val: serde_json::Value| -> Result<(), String> {
+            mpv.set_property(name, &val, "main").map_err(|e| {
+                crate::devlog!(warn, "player", "set_motion_interpolation: {name} failed: {e}");
+                e.to_string()
+            })
+        };
+        if enabled {
+            // video-sync must flip to a display mode BEFORE interpolation.
+            set("video-sync", serde_json::json!("display-resample"))?;
+            set("tscale", serde_json::json!("oversample"))?;
+            set("interpolation", serde_json::json!(true))?;
+            crate::devlog!(
+                info, "player",
+                "motion interpolation ON (video-sync=display-resample, tscale=oversample)"
+            );
+        } else {
+            set("interpolation", serde_json::json!(false))?;
+            set("video-sync", serde_json::json!("audio"))?;
+            crate::devlog!(info, "player", "motion interpolation OFF");
         }
-        // `minterpolate` is NOT a native mpv video filter — it lives in
-        // libavfilter. mpv's `vf`/`af` bridge passes an unknown filter
-        // name straight to libavfilter, which is exactly how the proven
-        // `@loudnorm:loudnorm=I=-23:LRA=7:TP=-2` works in this build via
-        // the `af` command. So the correct form is the BARE filter name
-        // with `:`-separated options — NOT the `lavfi=[…]` graph wrapper
-        // (that wrapper form silently failed to enter the chain via the
-        // `vf add` command, so estimated-vf-fps never moved).
-        const INTERP_VF: &str =
-            "@auraInterp:minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1";
-        let r = mpv.command(
-            "vf",
-            &vec![serde_json::json!("add"), serde_json::json!(INTERP_VF)],
-            "main",
-        );
-        match r {
-            Ok(()) => {
-                // Diagnostic so the user can confirm in DevConsole /
-                // aura-mpv.log that the filter actually entered the
-                // chain (vs. silently CPU-dropping every interpolated
-                // frame, which looks identical from the FPS readout).
-                crate::devlog!(info, "player", "motion interpolation vf added: {INTERP_VF}");
-                Ok(())
-            }
-            Err(e) => {
-                crate::devlog!(warn, "player", "set_motion_interpolation failed: {e}");
-                Err(e.to_string())
-            }
-        }
+        Ok::<(), String>(())
     })
     .await
     .map_err(|e| e.to_string())?

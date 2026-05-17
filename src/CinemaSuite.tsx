@@ -151,20 +151,21 @@ function OsdOverlay({ stats, topPx }: { stats: OsdStats; topPx: number }) {
           ? `${fpsValue} → ${containerFps}`
           : fpsValue}
       />
-      {/* SVP Tier 1 status. Read fresh from auraSettings each OSD
-          re-render (≤2 s poll), so toggling from the player menu
-          reflects here without extra wiring. When on, the
-          estimated-vf-fps readout (already polled, safe `double`
-          format) shows the effective interpolated output rate. */}
+      {/* Interpolation status. Read fresh from auraSettings each OSD
+          re-render (≤2 s poll) so a player-menu toggle reflects here
+          without extra wiring. This is mpv's VO-level display-resample
+          (NOT a vf), so estimated-vf-fps stays at source — the
+          meaningful figure is the display refresh frames are being
+          retimed to (the "FPS (display)" row above). */}
       {(() => {
         const interpOn = !!loadAuraSettings().motionInterpolation;
         return (
           <StatRow
             label="Interpolation"
             value={interpOn
-              ? (stats.estimated_vf_fps > 0
-                  ? `On · ~${stats.estimated_vf_fps.toFixed(0)} fps`
-                  : "On")
+              ? (stats.display_fps > 0
+                  ? `On → ${stats.display_fps.toFixed(0)} Hz`
+                  : "On (display-resample)")
               : "Off"}
             valueClass={interpOn ? "text-ln-accent" : "text-white/45"}
           />

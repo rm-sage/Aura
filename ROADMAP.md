@@ -848,33 +848,14 @@ the local axum bridge). `<SubtitlePicker />` includes the hash +
 the top with a "Hash match" badge. Falls back to query-based search on
 any Range / TLS failure.
 
-### 8.10 SVP Tier 2 — true motion-compensated interpolation 🔴 ⏸ DEFERRED
+### 8.10 SVP Tier 2 — DROPPED
 
-**Status: deliberately deferred** (Tier 1 — mpv built-in interpolation
-— ships first as a separate phase). Bring Stremio-Kai-grade anime
-interpolation: a VapourSynth `.vpy` running real `svpflow` (SVP) with
-an MVTools fallback, or RIFE-ncnn (cleaner redistribution licence than
-svpflow), applied as an mpv `vf`. Blocked on, and must resolve, all of:
-
-1. **Verify VapourSynth support** is actually compiled into the
-   `nini22P/libmpv-wrapper` + `zhongfly/mpv-winbuild` libmpv Aura ships
-   (`src-tauri/lib/`). Unconfirmed; this is the gating unknown.
-2. **Bundling** the VapourSynth runtime + a Python env + `svpflow1/2` +
-   MVTools (or RIFE-ncnn-vulkan + models) — ~100s MB; svpflow's free-tier
-   redistribution licence is murky, so RIFE is the preferred path.
-3. **Port Kai's safety Lua to native Rust/React.** Kai relies on
-   `reactive_vf_bypass.lua` (disable the vf on every seek) and
-   `svp_cleanup.lua` (synchronous filter-graph teardown on file unload).
-   Aura's Lua `load-script` is unreliable on this libmpv build, so this
-   orchestration must be reimplemented natively, hooked into Aura's
-   existing seek + `load_video` lifecycle.
-4. **Validate against the MPV crash landmines** (CLAUDE.md / HANDOFF.md
-   #3 — seek/loadfile critical sections; do not extend
-   `observed_properties`). A heavy VapourSynth vf interacts with exactly
-   the code paths those landmines cover.
-
-Tracked as a visual deferred task in the session task list. Revisit
-after Tier 1 ships.
+True svpflow/RIFE-via-VapourSynth interpolation was scoped here but
+**dropped at the user's request** — Tier 1 is mpv's built-in GPU
+interpolation (`video-sync=display-resample` + `interpolation` +
+`tscale`), which the user dials in directly; the heavy bundled-runtime
+SVP path is not wanted. Left as a tombstone so the numbering stays
+stable and the decision is on record.
 
 ### 8.11 Skip: Kai-style Hybrid Mode (blackdetect + silencedetect) 🔴 ⏸ DEFERRED
 

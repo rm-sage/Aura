@@ -2413,19 +2413,42 @@ function Scrubber({
         }}
       />
 
-      {/* Hover-seek preview — frame box (only when the toggle is on,
-          an engine is wired, AND we have a frame or are fetching one)
-          above an ALWAYS-visible timestamp. Suppressed while hovering a
-          skip band so it doesn't fight that band's tooltip. The stale
-          frame is cleared the instant the target second changes (debounce
-          effect above), so the loading animation shows — never the
-          previous frame. */}
-      {hoverSec != null && !hoveredSegment && (
+      {/* Unified hover popover — one cursor-anchored column that grows
+          UPWARD (bottom-full + flex-col, so the first child sits
+          highest). Order: skip-segment details (when hovering a band)
+          ABOVE the frame preview ABOVE the always-visible timestamp —
+          so the segment info never covers the thumbnail, it stacks on
+          top of it (the requested behaviour). The stale frame is
+          cleared the instant the target second changes (debounce effect
+          above) so the loading animation shows, never the prior frame. */}
+      {hoverSec != null && (
         <div
           className="absolute bottom-full mb-3 pointer-events-none z-10
-                     flex flex-col items-center gap-1"
+                     flex flex-col items-center gap-1.5"
           style={{ left: `${hoverPct}%`, transform: "translateX(-50%)" }}
         >
+          {hoveredSegment && (
+            <div className="aura-glass-menu rounded-md px-3 py-2 text-[11.5px] min-w-[160px]">
+              <div className="text-white font-semibold tracking-wide">
+                {skipKindLabel(hoveredSegment.seg.type)}
+                {hoveredSegment.seg.type === "mixed-op" && (
+                  <span className="text-white/45 font-normal ml-1.5">(mixed)</span>
+                )}
+              </div>
+              <div className="text-white/75 font-mono tabular-nums mt-0.5">
+                {fmtTime(hoveredSegment.seg.start)} – {fmtTime(hoveredSegment.seg.end)}
+              </div>
+              <div className="text-white/45 text-[10px] mt-0.5">
+                {(hoveredSegment.seg.end - hoveredSegment.seg.start).toFixed(1)}s
+                {hoveredSegment.seg.source && hoveredSegment.seg.source !== "aniskip" && (
+                  <span className="ml-2">· source: {hoveredSegment.seg.source}</span>
+                )}
+                {hoveredSegment.seg.auto && (
+                  <span className="ml-2 text-amber-300/80">· auto-skip</span>
+                )}
+              </div>
+            </div>
+          )}
           {thumbsEnabled && thumbnailAt && (thumbUrl || thumbBusy) && (
             <div className="relative w-40 aspect-video rounded-md overflow-hidden
                             aura-glass-menu shadow-[0_8px_24px_-8px_rgba(0,0,0,0.7)]">
@@ -2453,42 +2476,6 @@ function Scrubber({
           <div className="aura-glass-menu rounded px-2 py-0.5 text-[11px]
                           font-mono tabular-nums text-white/90">
             {fmtTime(hoverSec)}
-          </div>
-        </div>
-      )}
-
-      {/* Segment hover tooltip — anchored above the band's centre
-          so it reads as part of that specific window. Glass-style
-          panel with the kind + start/end + duration. The aniskip
-          source line is included so the user can tell community-
-          submitted from local-chapter-detected windows at a glance. */}
-      {hoveredSegment && (
-        <div
-          className="absolute bottom-full mb-3 pointer-events-none
-                     aura-glass-menu rounded-md px-3 py-2 text-[11.5px]
-                     min-w-[160px] z-10"
-          style={{
-            left: `${hoveredSegment.leftPct}%`,
-            transform: "translateX(-50%)",
-          }}
-        >
-          <div className="text-white font-semibold tracking-wide">
-            {skipKindLabel(hoveredSegment.seg.type)}
-            {hoveredSegment.seg.type === "mixed-op" && (
-              <span className="text-white/45 font-normal ml-1.5">(mixed)</span>
-            )}
-          </div>
-          <div className="text-white/75 font-mono tabular-nums mt-0.5">
-            {fmtTime(hoveredSegment.seg.start)} – {fmtTime(hoveredSegment.seg.end)}
-          </div>
-          <div className="text-white/45 text-[10px] mt-0.5">
-            {(hoveredSegment.seg.end - hoveredSegment.seg.start).toFixed(1)}s
-            {hoveredSegment.seg.source && hoveredSegment.seg.source !== "aniskip" && (
-              <span className="ml-2">· source: {hoveredSegment.seg.source}</span>
-            )}
-            {hoveredSegment.seg.auto && (
-              <span className="ml-2 text-amber-300/80">· auto-skip</span>
-            )}
           </div>
         </div>
       )}
