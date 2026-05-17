@@ -1137,7 +1137,10 @@ export default function App() {
             // heuristic still produce skip windows, then surface the
             // ED start for the Next-Up CTA. This is what extends skip
             // from anime-only to any series.
-            const finishWithChapters = async (prepared: PreparedWindow[]): Promise<void> => {
+            const finishWithChapters = async (
+              prepared: PreparedWindow[],
+              opts?: { silenceUrl?: string | null },
+            ): Promise<void> => {
               try {
                 if (prepared.length > 0) {
                   await invoke("set_skip_windows", { payload: { windows: prepared } });
@@ -1156,6 +1159,58 @@ export default function App() {
                   window.dispatchEvent(new CustomEvent<number>("aura:ed-start-time", {
                     detail: lastEdStart,
                   }));
+                }
+                // Auto silencedetect fallback. Only the AniSkip path
+                // passes `silenceUrl` (so live-action / no-mal opens
+                // don't trigger a heavy ffmpeg scan). Fires only when
+                // NOTHING upstream produced an OP — AniSkip had no
+                // community data (404) AND no titled/heuristic chapter
+                // OP — i.e. exactly the "anime we know, AniSkip
+                // doesn't" case (Daemons of the Shadow Realm S?E06).
+                // Same one-shot command + heuristic as the manual
+                // "Detect Skip" button; just automatic. Prompt-mode
+                // (auto:false) — never auto-seek a guessed boundary.
+                const url = opts?.silenceUrl ?? null;
+                const hasOp = merged.some((w) => w.type === "op" || w.type === "mixed-op");
+                if (url && !hasOp && modeFor("op") !== "off") {
+                  try {
+                    const sd = await invoke<{
+                      available: boolean;
+                      intervals: { start: number; end: number; duration: number }[];
+                      note: string;
+                    }>("detect_silence_intervals", { url, maxSecs: 180 });
+                    if (sd.available) {
+                      // Largest silence ≥1.5 s starting 30–180 s ≈ the
+                      // OP→dialogue boundary (identical heuristic to
+                      // SkipWindowButton's manual path).
+                      const cand = sd.intervals
+                        .filter((iv) => iv.duration >= 1.5 && iv.start >= 30 && iv.start <= 180)
+                        .sort((a, b) => b.duration - a.duration)[0];
+                      if (cand) {
+                        const opWin: PreparedWindow = {
+                          type: "op",
+                          start: 0,
+                          end: cand.end,
+                          source: "silencedetect",
+                          auto: false,
+                        };
+                        // MERGE (not replace) so chapter ED windows
+                        // already stamped above survive.
+                        await invoke("set_skip_windows", {
+                          payload: { windows: [...merged, opWin] },
+                        });
+                        console.info(
+                          `[aniskip] silencedetect fallback → OP 0-${Math.round(cand.end)}s`,
+                        );
+                      } else {
+                        console.info(`[aniskip] silencedetect: no obvious OP boundary`);
+                      }
+                    } else {
+                      console.info(`[aniskip] silencedetect unavailable (ffmpeg not on PATH)`);
+                    }
+                  } catch (e) {
+                    console.warn(`[aniskip] silencedetect fallback failed: ${String(e)}`);
+                  }
                 }
               } catch (err) {
                 console.warn(`[aniskip] finish/chapter merge failed: ${String(err)}`);
@@ -1338,8 +1393,12 @@ export default function App() {
             }
             // ALWAYS augment with chapters (even on an empty AniSkip
             // result): anime with no AniSkip data gets the same
-            // chapter / heuristic treatment as live-action.
-            await finishWithChapters(prepared);
+            // chapter / heuristic treatment as live-action. Passing
+            // `silenceUrl` arms the auto silencedetect OP fallback for
+            // this (MAL-resolved) path only — the no-mal / no-episode
+            // exits above intentionally don't, to avoid a heavy ffmpeg
+            // scan on every live-action open.
+            await finishWithChapters(prepared, { silenceUrl: stream.url ?? null });
           })();
         }
         // Stash the DIRECT raw URL (not the bridge-proxied form) so Copy /

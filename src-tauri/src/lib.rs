@@ -559,20 +559,35 @@ async fn set_motion_interpolation(app: tauri::AppHandle, enabled: bool) -> Resul
         if !enabled {
             return Ok(());
         }
-        mpv.command(
+        // `minterpolate` is NOT a native mpv video filter — it lives in
+        // libavfilter. mpv's `vf`/`af` bridge passes an unknown filter
+        // name straight to libavfilter, which is exactly how the proven
+        // `@loudnorm:loudnorm=I=-23:LRA=7:TP=-2` works in this build via
+        // the `af` command. So the correct form is the BARE filter name
+        // with `:`-separated options — NOT the `lavfi=[…]` graph wrapper
+        // (that wrapper form silently failed to enter the chain via the
+        // `vf add` command, so estimated-vf-fps never moved).
+        const INTERP_VF: &str =
+            "@auraInterp:minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1";
+        let r = mpv.command(
             "vf",
-            &vec![
-                serde_json::json!("add"),
-                serde_json::json!(
-                    "@auraInterp:lavfi=[minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1]"
-                ),
-            ],
+            &vec![serde_json::json!("add"), serde_json::json!(INTERP_VF)],
             "main",
-        )
-        .map_err(|e| {
-            crate::devlog!(warn, "player", "set_motion_interpolation failed: {e}");
-            e.to_string()
-        })
+        );
+        match r {
+            Ok(()) => {
+                // Diagnostic so the user can confirm in DevConsole /
+                // aura-mpv.log that the filter actually entered the
+                // chain (vs. silently CPU-dropping every interpolated
+                // frame, which looks identical from the FPS readout).
+                crate::devlog!(info, "player", "motion interpolation vf added: {INTERP_VF}");
+                Ok(())
+            }
+            Err(e) => {
+                crate::devlog!(warn, "player", "set_motion_interpolation failed: {e}");
+                Err(e.to_string())
+            }
+        }
     })
     .await
     .map_err(|e| e.to_string())?
