@@ -3,7 +3,7 @@
 
 import { useState, useMemo, memo } from "react";
 import type { MetaPreview } from "./CatalogGrid";
-import { FilterBar, applyFilters, DEFAULT_FILTERS, type FilterState } from "./FilterBar";
+import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "./FilterBar";
 import ImageLoader from "./ImageLoader";
 
 const PosterCard = memo(function PosterCard({
@@ -85,34 +85,35 @@ export default function SearchResultsGrid({ query, results, loading, onSelectMet
         <div className="h-px flex-shrink-0 bg-gradient-to-r from-transparent via-ln-accent to-transparent animate-pulse" />
       )}
 
-      <div className="flex-shrink-0 px-5 pt-4 pb-2">
+      <div className="flex-shrink-0 px-5 pt-4 pb-2 flex items-center justify-between gap-4">
         <p className="text-white/40 text-xs">{headerLabel}</p>
+        {results.length > 0 && (
+          <FilterMenu items={results} state={filters} onChange={setFilters} />
+        )}
       </div>
 
-      <div className="flex-1 min-h-0 flex gap-6 px-5 pb-5">
-        {/* Results grid */}
-        <div className="flex-1 min-w-0 overflow-y-auto"
-             style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.1) transparent" }}>
-          {filtered.length > 0 ? (
-            <div
-              className="grid gap-5"
-              style={{ gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))" }}
-            >
-              {filtered.map((meta) => (
-                <PosterCard key={meta.id} meta={meta} onSelect={onSelectMeta} />
-              ))}
-            </div>
-          ) : !loading ? (
-            <div className="h-full flex items-center justify-center text-white/25 text-sm">
-              {results.length === 0 ? "No results found." : "No results match the current filter."}
-            </div>
-          ) : null}
-        </div>
-
-        {/* Filter bar — only when we have results to filter */}
-        {results.length > 0 && (
-          <FilterBar items={results} state={filters} onChange={setFilters} />
-        )}
+      {/* flex-1 + min-h-0 + overflow-y-auto = robust column scroll.
+          Do NOT use h-full here: a % height vs a flex item sized only
+          by its parent is unreliable in WebView2 — same bug class that
+          broke the search View-all popup. */}
+      <div
+        className="flex-1 min-h-0 overflow-y-auto px-5 pb-5"
+        style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.1) transparent" }}
+      >
+        {filtered.length > 0 ? (
+          <div
+            className="grid gap-5"
+            style={{ gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))" }}
+          >
+            {filtered.map((meta) => (
+              <PosterCard key={meta.id} meta={meta} onSelect={onSelectMeta} />
+            ))}
+          </div>
+        ) : !loading ? (
+          <div className="h-full flex items-center justify-center text-white/25 text-sm">
+            {results.length === 0 ? "No results found." : "No results match the current filter."}
+          </div>
+        ) : null}
       </div>
     </div>
   );

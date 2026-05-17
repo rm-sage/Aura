@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { memo, useEffect, useMemo, useState } from "react";
-import { FilterBar, applyFilters, DEFAULT_FILTERS, type FilterState } from "./FilterBar";
+import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "./FilterBar";
 import { invoke } from "@tauri-apps/api/core";
 import type { MetaPreview, LibraryItem, AddonEntry, VideoEntry } from "./types";
 import { isVideoAired } from "./types";
@@ -1081,59 +1081,62 @@ function CatalogOverlay({
                   : `${filteredItems.length} of ${items.length} items`}
             </p>
           </div>
-          <button
-            onClick={onClose}
-            aria-label="Close"
-            className="w-8 h-8 rounded-full glass-panel flex items-center justify-center
-                       text-white/50 hover:text-white transition-colors shrink-0 mt-0.5"
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-              <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
-            </svg>
-          </button>
+          <div className="flex items-center gap-3 shrink-0">
+            {items.length > 0 && (
+              <FilterMenu items={items} state={filters} onChange={setFilters} />
+            )}
+            <button
+              onClick={onClose}
+              aria-label="Close"
+              className="w-8 h-8 rounded-full glass-panel flex items-center justify-center
+                         text-white/50 hover:text-white transition-colors"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
+              </svg>
+            </button>
+          </div>
         </div>
 
-        {/* Body — grid + filter sidebar. The grid column count comes
-            from --catalog-popup-cols (6 ultrawide, 4 at 1080p). The
-            FilterBar sits in a flex sibling so the grid reflows around
-            it on narrower windows; on smaller windows we fall back to
-            grid-only via the same xl:block pattern other views use. */}
+        {/* Body — poster grid. Column count comes from
+            --catalog-popup-cols (6 ultrawide, 4 at 1080p). Filter &
+            sort now lives as a hover/pin dropdown in the header (see
+            <FilterMenu/>) and floats ABOVE this grid, so the grid uses
+            the popup's full width instead of reserving a sidebar. */}
+        {/* flex-1 + min-h-0 + overflow-y-auto = robust column scroll.
+            Do NOT use h-full here: a % height resolved against a flex
+            item whose size comes only from the popup's max-height (no
+            explicit height) is unreliable in WebView2 — it collapses to
+            auto and the popup just clips. That broke the search
+            View-all (mounts tall in one synchronous render, unlike
+            paginated catalogs that re-render tall after a fetch). */}
         <div
-          className="flex-1 min-h-0 flex overflow-hidden"
+          className="flex-1 min-h-0 overflow-y-auto p-6"
+          style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
         >
           <div
-            className="flex-1 overflow-y-auto p-6"
-            style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
+            className="grid gap-4"
+            style={{ gridTemplateColumns: "repeat(var(--catalog-popup-cols), minmax(0, 1fr))" }}
           >
-            <div
-              className="grid gap-4"
-              style={{ gridTemplateColumns: "repeat(var(--catalog-popup-cols), minmax(0, 1fr))" }}
-            >
-              {loading && items.length === 0
-                ? Array.from({ length: 12 }).map((_, i) => (
-                    <div
-                      key={`skeleton-${i}`}
-                      className="rounded-xl bg-white/5 image-loader-skeleton"
-                      style={{ aspectRatio: "2 / 3" }}
-                    />
-                  ))
-                : filteredItems.map((meta) => (
-                    <CatalogCard
-                      key={`${meta.media_type}:${meta.id}`}
-                      meta={meta}
-                      onSelect={onSelectMeta ? (m) => { onClose(); onSelectMeta(m); } : undefined}
-                    />
-                  ))}
-            </div>
-            {!loading && filteredItems.length === 0 && items.length > 0 && (
-              <div className="text-center py-10 text-white/55 text-sm">
-                No items match the current filter.
-              </div>
-            )}
+            {loading && items.length === 0
+              ? Array.from({ length: 12 }).map((_, i) => (
+                  <div
+                    key={`skeleton-${i}`}
+                    className="rounded-xl bg-white/5 image-loader-skeleton"
+                    style={{ aspectRatio: "2 / 3" }}
+                  />
+                ))
+              : filteredItems.map((meta) => (
+                  <CatalogCard
+                    key={`${meta.media_type}:${meta.id}`}
+                    meta={meta}
+                    onSelect={onSelectMeta ? (m) => { onClose(); onSelectMeta(m); } : undefined}
+                  />
+                ))}
           </div>
-          {items.length > 0 && (
-            <div className="hidden xl:flex flex-col p-4 pt-0 pl-0 shrink-0">
-              <FilterBar items={items} state={filters} onChange={setFilters} />
+          {!loading && filteredItems.length === 0 && items.length > 0 && (
+            <div className="text-center py-10 text-white/55 text-sm">
+              No items match the current filter.
             </div>
           )}
         </div>

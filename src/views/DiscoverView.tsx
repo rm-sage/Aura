@@ -8,7 +8,7 @@ import type { CatalogInfo } from "../CatalogPicker";
 import ImageLoader from "../ImageLoader";
 import ErrorBoundary from "../ErrorBoundary";
 import WatchedBadge from "../WatchedBadge";
-import { FilterBar, applyFilters, DEFAULT_FILTERS, type FilterState } from "../FilterBar";
+import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "../FilterBar";
 
 // ---------------------------------------------------------------------------
 // DiscoverView — browse any addon's catalogs, including ones the addon has
@@ -161,14 +161,19 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
       >
         <div className="max-w-[1800px] mx-auto px-6 py-6 space-y-5">
           {/* Header */}
-          <div>
-            <h1 className="aura-row-title text-3xl font-semibold tracking-tight">
-              Discover
-            </h1>
-            <p className="text-white/35 text-sm mt-1">
-              Browse every catalog your addons expose, including the ones
-              hidden from your home page.
-            </p>
+          <div className="flex items-end justify-between gap-4 flex-wrap">
+            <div>
+              <h1 className="aura-row-title text-3xl font-semibold tracking-tight">
+                Discover
+              </h1>
+              <p className="text-white/35 text-sm mt-1">
+                Browse every catalog your addons expose, including the ones
+                hidden from your home page.
+              </p>
+            </div>
+            {items && items.length > 0 && (
+              <FilterMenu items={items} state={filters} onChange={setFilters} />
+            )}
           </div>
 
           {/* Pill dropdowns — addon then catalog. Catalog list updates as
@@ -255,12 +260,6 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
         </div>
       </div>
 
-      {/* Filter sidebar — only when items loaded and there's something to filter */}
-      {items && items.length > 0 && (
-        <div className="absolute right-6 top-24 z-20 hidden xl:block">
-          <FilterBar items={items} state={filters} onChange={setFilters} />
-        </div>
-      )}
     </div>
   );
 }

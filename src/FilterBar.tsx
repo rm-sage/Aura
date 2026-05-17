@@ -5,7 +5,8 @@ import { useMemo, useState, memo } from "react";
 import type { MetaPreview } from "./types";
 
 // ---------------------------------------------------------------------------
-// FilterBar — client-side filter & sort over an in-memory MetaPreview list.
+// FilterBar / FilterMenu — client-side filter & sort over an in-memory
+// MetaPreview list.
 //
 // All filtering happens in pure JS over an already-fetched array. Rendering
 // 50+ items through these predicates is sub-millisecond; we never re-fetch
@@ -13,15 +14,24 @@ import type { MetaPreview } from "./types";
 //
 // State shape is owned by the parent so the filtered output can be passed
 // down to whatever renderer consumes it (Discovery rows, search grid, …).
+//
+// FilterMenu is the single shell (FilterControls / useFilterModel do the
+// work): a header dropdown used by every browseable surface — Library,
+// Queue, Discover, Search, the view-all catalog page, and the
+// CatalogOverlay popup. It expands on hover, pins on click, and renders
+// ABOVE the grid (absolute / z-50) rather than beside it.
+//
+// The rating filter + "Rating" sort were intentionally removed: with RPDB
+// the posters carry several rating sources and the meta panel shows several
+// more, so a single "minimum rating" was ambiguous about which number it
+// referred to.
 // ---------------------------------------------------------------------------
 
-export type SortMode = "default" | "rating" | "year" | "name";
+export type SortMode = "default" | "year" | "name";
 
 export interface FilterState {
   yearMin: number;
   yearMax: number;
-  /** Inclusive lower bound on imdb_rating, parsed as a float (0..10). */
-  ratingMin: number;
   /** Selected genre names — match is OR (any selected must intersect item.genres). */
   genres: string[];
   sort: SortMode;
@@ -31,11 +41,10 @@ const YEAR_MIN_DEFAULT = 1900;
 const YEAR_MAX_DEFAULT = new Date().getFullYear() + 1; // allow next year
 
 export const DEFAULT_FILTERS: FilterState = {
-  yearMin:   YEAR_MIN_DEFAULT,
-  yearMax:   YEAR_MAX_DEFAULT,
-  ratingMin: 0,
-  genres:    [],
-  sort:      "default",
+  yearMin: YEAR_MIN_DEFAULT,
+  yearMax: YEAR_MAX_DEFAULT,
+  genres:  [],
+  sort:    "default",
 };
 
 // ---------------------------------------------------------------------------
@@ -58,15 +67,6 @@ export function applyFilters(items: MetaPreview[], f: FilterState): MetaPreview[
     const y = parseYear(it.release_info);
     if (y !== null && (y < f.yearMin || y > f.yearMax)) return false;
 
-    // Rating
-    if (f.ratingMin > 0) {
-      const r = it.imdb_rating ? parseFloat(it.imdb_rating) : NaN;
-      if (Number.isFinite(r) && r < f.ratingMin) return false;
-      // Items without a rating pass when ratingMin > 0 only if user opted to
-      // include them — for now we exclude them to keep the filter strict.
-      if (!Number.isFinite(r)) return false;
-    }
-
     // Genres (OR match)
     if (f.genres.length > 0) {
       const hits = it.genres ?? [];
@@ -77,10 +77,6 @@ export function applyFilters(items: MetaPreview[], f: FilterState): MetaPreview[
   });
 
   switch (f.sort) {
-    case "rating":
-      return [...filtered].sort((a, b) =>
-        (parseFloat(b.imdb_rating ?? "0") || 0) - (parseFloat(a.imdb_rating ?? "0") || 0)
-      );
     case "year":
       return [...filtered].sort((a, b) =>
         (parseYear(b.release_info) ?? 0) - (parseYear(a.release_info) ?? 0)
@@ -105,12 +101,27 @@ export function collectGenres(items: MetaPreview[]): string[] {
 // Bar UI
 // ---------------------------------------------------------------------------
 
+/** A surface-specific Sort By choice. When a caller passes `sortOptions`
+ *  these REPLACE the generic Default / Year / Name buttons and are driven
+ *  by `sortValue` / `onSortChange`, independent of FilterState.sort — the
+ *  caller applies the ordering itself (Library sorts by ctime / mtime,
+ *  which a MetaPreview can't express). */
+export interface SortOption {
+  value: string;
+  label: string;
+}
+
 interface Props {
   /** Full unfiltered list — used to derive available genres + bound the
       year range slider so we never offer "1900–2026" when items are recent. */
   items: MetaPreview[];
   state: FilterState;
   onChange: (next: FilterState) => void;
+  /** Optional custom Sort By list. Omit for the generic Default / Year /
+   *  Name sort bound to FilterState.sort (every surface except Library). */
+  sortOptions?: SortOption[];
+  sortValue?: string;
+  onSortChange?: (value: string) => void;
 }
 
 const FilterIcon = () => (
@@ -132,12 +143,9 @@ const ChevronIcon = ({ open }: { open: boolean }) => (
   </svg>
 );
 
-function FilterBarInner({ items, state, onChange }: Props) {
-  // Default to collapsed so the panel doesn't overlap nearby controls
-  // (Library's Sort dropdown, Queue's drag affordance) until the user
-  // explicitly opens it. The chevron + "Filter & Sort" label still
-  // signals it's there.
-  const [open, setOpen] = useState(false);
+/** Derives genres + year bounds from the list and bundles the mutation
+ *  helpers so both shells (sidebar bar, header menu) stay in lockstep. */
+function useFilterModel({ items, state, onChange, sortOptions, sortValue, onSortChange }: Props) {
   const genres = useMemo(() => collectGenres(items), [items]);
 
   // Bounds for the year slider — clamp to actual data when present
@@ -161,186 +169,237 @@ function FilterBarInner({ items, state, onChange }: Props) {
     set({ genres: exists ? state.genres.filter((x) => x !== g) : [...state.genres, g] });
   };
 
-  const reset = () =>
+  // Sort: a caller-supplied list (Library) overrides the generic axis
+  // bound to FilterState.sort. Either way the model exposes one uniform
+  // { choices, active, set } so FilterControls stays presentational.
+  const GENERIC_SORT: SortOption[] = [
+    { value: "default", label: "Default" },
+    { value: "year",    label: "Year" },
+    { value: "name",    label: "A → Z" },
+  ];
+  const sortChoices = sortOptions ?? GENERIC_SORT;
+  const sortDefault = sortChoices[0]?.value ?? "default";
+  const activeSort  = sortOptions ? (sortValue ?? sortDefault) : state.sort;
+  const setSort = (value: string) => {
+    if (sortOptions) onSortChange?.(value);
+    else set({ sort: value as SortMode });
+  };
+
+  const reset = () => {
     onChange({ ...DEFAULT_FILTERS, yearMin: yearBounds.min, yearMax: yearBounds.max });
+    if (sortOptions) onSortChange?.(sortDefault);
+  };
 
   const isDirty =
     state.yearMin !== yearBounds.min ||
     state.yearMax !== yearBounds.max ||
-    state.ratingMin > 0 ||
     state.genres.length > 0 ||
-    state.sort !== "default";
+    activeSort !== sortDefault;
+
+  return {
+    genres, yearBounds, set, toggleGenre, reset, isDirty,
+    sortChoices, activeSort, setSort,
+  };
+}
+
+type FilterModel = ReturnType<typeof useFilterModel>;
+
+// The controls (Sort / Year / Genres / Reset). Presentational — all
+// derivation lives in useFilterModel so the sidebar and the popup menu
+// can never drift apart. Both reach here, so removing rating + the
+// single dual-thumb year track applies to every Filter & Sort surface.
+function FilterControls({ state, model }: { state: FilterState; model: FilterModel }) {
+  const {
+    genres, yearBounds, set, toggleGenre, reset, isDirty,
+    sortChoices, activeSort, setSort,
+  } = model;
+
+  // Highlighted span between the two thumbs, as track percentages. The
+  // committed state can sit outside the data-derived bounds (defaults
+  // are 1900…next year) so clamp before painting the fill.
+  const span = yearBounds.max - yearBounds.min;
+  const clampPct = (n: number) => Math.max(0, Math.min(100, n));
+  const pctMin = span <= 0 ? 0   : clampPct(((state.yearMin - yearBounds.min) / span) * 100);
+  const pctMax = span <= 0 ? 100 : clampPct(((state.yearMax - yearBounds.min) / span) * 100);
 
   return (
-    <aside
-      className="flex-shrink-0 w-72 aura-glass-menu rounded-2xl p-4 self-start"
-      style={{ position: "sticky", top: 0 }}
+    <div className="space-y-5">
+      {/* Sort */}
+      <div className="space-y-1.5">
+        <label className="text-white/40 text-[10px] font-semibold tracking-wider uppercase">
+          Sort By
+        </label>
+        <div className={`grid gap-1 ${sortChoices.length === 4 ? "grid-cols-2" : "grid-cols-3"}`}>
+          {sortChoices.map(({ value, label }) => {
+            const active = activeSort === value;
+            return (
+              <button
+                key={value}
+                onClick={() => setSort(value)}
+                className={`px-2 py-1.5 rounded-lg text-xs transition-colors
+                            ${active
+                              ? "bg-ln-accent/25 text-ln-accent border border-ln-accent/35"
+                              : "bg-white/5 text-white/55 border border-white/8 hover:bg-white/10"
+                            }`}
+              >
+                {label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Release year — one track, two thumbs (min / max) */}
+      <div className="space-y-1.5">
+        <div className="flex items-center justify-between">
+          <label className="text-white/40 text-[10px] font-semibold tracking-wider uppercase">
+            Release Year
+          </label>
+          <span className="text-white/55 text-xs font-mono tabular-nums">
+            {state.yearMin}–{state.yearMax}
+          </span>
+        </div>
+        <div
+          className="aura-range-dual mt-2"
+          style={{
+            ["--range-min" as string]: `${pctMin}%`,
+            ["--range-max" as string]: `${pctMax}%`,
+          }}
+        >
+          <div className="aura-range-dual-track" />
+          <div className="aura-range-dual-fill" />
+          <input
+            type="range"
+            min={yearBounds.min}
+            max={yearBounds.max}
+            value={state.yearMin}
+            onChange={(e) => {
+              const v = parseInt(e.target.value, 10);
+              set({ yearMin: Math.min(v, state.yearMax) });
+            }}
+            aria-label="Earliest year"
+          />
+          <input
+            type="range"
+            min={yearBounds.min}
+            max={yearBounds.max}
+            value={state.yearMax}
+            onChange={(e) => {
+              const v = parseInt(e.target.value, 10);
+              set({ yearMax: Math.max(v, state.yearMin) });
+            }}
+            aria-label="Latest year"
+          />
+        </div>
+      </div>
+
+      {/* Genres */}
+      {genres.length > 0 && (
+        <div className="space-y-1.5">
+          <label className="text-white/40 text-[10px] font-semibold tracking-wider uppercase">
+            Genres
+          </label>
+          <div className="flex flex-wrap gap-1.5">
+            {genres.map((g) => {
+              const active = state.genres.includes(g);
+              return (
+                <button
+                  key={g}
+                  onClick={() => toggleGenre(g)}
+                  className={`px-2.5 py-1 rounded-full text-[11px] transition-colors
+                              ${active
+                                ? "bg-ln-accent/25 text-ln-accent border border-ln-accent/40"
+                                : "bg-white/5 text-white/55 border border-white/10 hover:bg-white/10"
+                              }`}
+                >
+                  {g}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Reset */}
+      <button
+        onClick={reset}
+        disabled={!isDirty}
+        className="w-full py-1.5 rounded-lg text-xs transition-all
+                   bg-white/5 hover:bg-white/10 border border-white/10
+                   text-white/55 hover:text-white/85
+                   disabled:opacity-30 disabled:cursor-not-allowed"
+      >
+        Reset filters
+      </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Header dropdown shell — used by every browseable surface.
+//
+// • Lives in the header/title row, not beside the grid.
+// • Expands on hover; the open panel is absolute + z-50 so it renders
+//   OVER the poster grid and never pushes the header down or clips.
+// • Clicking the trigger row pins it open (stays open when the mouse
+//   leaves); clicking again unpins (reverts to hover).
+// • Unmounting (e.g. closing the popup) resets pin/hover for free.
+//
+// pointerenter / pointerleave treat an element + its descendants as one
+// region. The open panel is an absolutely-positioned DESCENDANT of the
+// wrapper, and the visual gap above the card is transparent padding
+// inside that same descendant — so travelling trigger → card never
+// leaves the wrapper subtree and no grace timer is needed.
+// ---------------------------------------------------------------------------
+
+function FilterMenuInner(props: Props) {
+  const model = useFilterModel(props);
+  const [pinned, setPinned] = useState(false);
+  const [hovered, setHovered] = useState(false);
+  const open = pinned || hovered;
+
+  return (
+    <div
+      className="relative"
+      onPointerEnter={() => setHovered(true)}
+      onPointerLeave={() => setHovered(false)}
     >
       <button
-        onClick={() => setOpen((o) => !o)}
-        className="w-full flex items-center justify-between gap-2 mb-3"
+        type="button"
+        onClick={() => setPinned((p) => !p)}
+        aria-expanded={open}
+        className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-semibold tracking-[0.1em] uppercase transition-colors
+                    ${pinned
+                      ? "bg-ln-accent/25 border-ln-accent/35 text-ln-accent"
+                      : "bg-white/5 border-white/8 text-white/75 hover:bg-white/10"
+                    }`}
       >
-        <span className="flex items-center gap-2 text-white/75 text-xs font-semibold tracking-[0.1em] uppercase">
-          <FilterIcon />
-          Filter & Sort
-          {isDirty && (
-            <span className="ml-1 w-1.5 h-1.5 rounded-full bg-ln-accent" aria-label="active" />
-          )}
-        </span>
-        <span className="text-white/40">
+        <FilterIcon />
+        Filter &amp; Sort
+        {model.isDirty && (
+          <span className="w-1.5 h-1.5 rounded-full bg-ln-accent" aria-label="active" />
+        )}
+        <span className="text-white/40 ml-0.5">
           <ChevronIcon open={open} />
         </span>
       </button>
 
       {open && (
-        <div className="space-y-5">
-          {/* Sort */}
-          <div className="space-y-1.5">
-            <label className="text-white/40 text-[10px] font-semibold tracking-wider uppercase">
-              Sort By
-            </label>
-            <div className="grid grid-cols-2 gap-1">
-              {([
-                ["default", "Default"],
-                ["rating",  "Rating"],
-                ["year",    "Year"],
-                ["name",    "A → Z"],
-              ] as const).map(([id, label]) => {
-                const active = state.sort === id;
-                return (
-                  <button
-                    key={id}
-                    onClick={() => set({ sort: id })}
-                    className={`px-2 py-1.5 rounded-lg text-xs transition-colors
-                                ${active
-                                  ? "bg-ln-accent/25 text-ln-accent border border-ln-accent/35"
-                                  : "bg-white/5 text-white/55 border border-white/8 hover:bg-white/10"
-                                }`}
-                  >
-                    {label}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* Year range */}
-          <div className="space-y-1.5">
-            <div className="flex items-center justify-between">
-              <label className="text-white/40 text-[10px] font-semibold tracking-wider uppercase">
-                Release Year
-              </label>
-              <span className="text-white/55 text-xs font-mono tabular-nums">
-                {state.yearMin}–{state.yearMax}
-              </span>
-            </div>
-            <div className="space-y-1.5 pt-1">
-              <input
-                type="range"
-                min={yearBounds.min}
-                max={yearBounds.max}
-                value={state.yearMin}
-                onChange={(e) => {
-                  const v = parseInt(e.target.value, 10);
-                  set({ yearMin: Math.min(v, state.yearMax) });
-                }}
-                className="aura-filter-slider w-full"
-                style={{
-                  ["--filter-progress" as string]: `${
-                    yearBounds.max === yearBounds.min ? 0
-                    : ((state.yearMin - yearBounds.min) / (yearBounds.max - yearBounds.min)) * 100
-                  }%`,
-                }}
-                aria-label="Earliest year"
-              />
-              <input
-                type="range"
-                min={yearBounds.min}
-                max={yearBounds.max}
-                value={state.yearMax}
-                onChange={(e) => {
-                  const v = parseInt(e.target.value, 10);
-                  set({ yearMax: Math.max(v, state.yearMin) });
-                }}
-                className="aura-filter-slider w-full"
-                style={{
-                  ["--filter-progress" as string]: `${
-                    yearBounds.max === yearBounds.min ? 0
-                    : ((state.yearMax - yearBounds.min) / (yearBounds.max - yearBounds.min)) * 100
-                  }%`,
-                }}
-                aria-label="Latest year"
-              />
-            </div>
-          </div>
-
-          {/* Rating */}
-          <div className="space-y-1.5">
-            <div className="flex items-center justify-between">
-              <label className="text-white/40 text-[10px] font-semibold tracking-wider uppercase">
-                Min Rating
-              </label>
-              <span className="text-white/55 text-xs font-mono tabular-nums">
-                {state.ratingMin > 0 ? `${state.ratingMin.toFixed(1)} / 10` : "Any"}
-              </span>
-            </div>
-            <input
-              type="range"
-              min={0}
-              max={9.5}
-              step={0.5}
-              value={state.ratingMin}
-              onChange={(e) => set({ ratingMin: parseFloat(e.target.value) })}
-              className="aura-filter-slider w-full"
-              style={{
-                ["--filter-progress" as string]: `${(state.ratingMin / 9.5) * 100}%`,
-              }}
-              aria-label="Minimum rating"
-            />
-          </div>
-
-          {/* Genres */}
-          {genres.length > 0 && (
-            <div className="space-y-1.5">
-              <label className="text-white/40 text-[10px] font-semibold tracking-wider uppercase">
-                Genres
-              </label>
-              <div className="flex flex-wrap gap-1.5">
-                {genres.map((g) => {
-                  const active = state.genres.includes(g);
-                  return (
-                    <button
-                      key={g}
-                      onClick={() => toggleGenre(g)}
-                      className={`px-2.5 py-1 rounded-full text-[11px] transition-colors
-                                  ${active
-                                    ? "bg-ln-accent/25 text-ln-accent border border-ln-accent/40"
-                                    : "bg-white/5 text-white/55 border border-white/10 hover:bg-white/10"
-                                  }`}
-                    >
-                      {g}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          {/* Reset */}
-          <button
-            onClick={reset}
-            disabled={!isDirty}
-            className="w-full py-1.5 rounded-lg text-xs transition-all
-                       bg-white/5 hover:bg-white/10 border border-white/10
-                       text-white/55 hover:text-white/85
-                       disabled:opacity-30 disabled:cursor-not-allowed"
+        // Outer wrapper is flush under the trigger (top-full, no offset);
+        // the visible gap is transparent pt-2 so the hover region stays
+        // continuous. right-0 anchors it under the pill so the card can't
+        // overflow the popup's right edge. z-50 floats it over the grid.
+        <div className="absolute right-0 top-full z-50 pt-2">
+          <div
+            className="w-72 aura-glass-menu rounded-2xl p-4 max-h-[70vh] overflow-y-auto shadow-2xl"
+            style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
           >
-            Reset filters
-          </button>
+            <FilterControls state={props.state} model={model} />
+          </div>
         </div>
       )}
-    </aside>
+    </div>
   );
 }
 
-export const FilterBar = memo(FilterBarInner);
+export const FilterMenu = memo(FilterMenuInner);

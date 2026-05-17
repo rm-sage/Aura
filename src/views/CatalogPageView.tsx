@@ -8,7 +8,7 @@ import ImageLoader from "../ImageLoader";
 import ErrorBoundary from "../ErrorBoundary";
 import { withTypeSuffix } from "../aiometadata";
 import {
-  FilterBar, applyFilters, DEFAULT_FILTERS, type FilterState,
+  FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState,
 } from "../FilterBar";
 
 // ---------------------------------------------------------------------------
@@ -109,6 +109,9 @@ function CatalogPageBody({ target, onBack, onSelectMeta }: Props) {
                 </p>
               </div>
             </div>
+            {items && items.length > 0 && (
+              <FilterMenu items={items} state={filters} onChange={setFilters} />
+            )}
           </div>
 
           {error && (
@@ -139,12 +142,6 @@ function CatalogPageBody({ target, onBack, onSelectMeta }: Props) {
         </div>
       </div>
 
-      {/* Filter sidebar — only when items loaded and there's something to filter */}
-      {items && items.length > 0 && (
-        <div className="absolute right-6 top-24 z-20 hidden xl:block">
-          <FilterBar items={items} state={filters} onChange={setFilters} />
-        </div>
-      )}
     </div>
   );
 }

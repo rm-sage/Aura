@@ -33,7 +33,7 @@ import ErrorBoundary from "../ErrorBoundary";
 import WatchedBadge from "../WatchedBadge";
 import { showAppToast } from "../AppToast";
 import { typeLabel } from "../aiometadata";
-import { FilterBar, applyFilters, DEFAULT_FILTERS, type FilterState } from "../FilterBar";
+import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "../FilterBar";
 
 // ---------------------------------------------------------------------------
 // QueueView — ordered list of items the user has marked as "planned".
@@ -116,10 +116,10 @@ function QueueViewBody({ library, onSelectMeta }: Props) {
     }
     return out;
   }, [orderedIds, libIndex]);
-  // applyFilters returns the items in the FilterBar's chosen sort
-  // order — so we use THAT order when the sort axis is non-default,
-  // and fall back to the user's manual drag order otherwise. The two
-  // modes coexist: drag = "default", FilterBar Sort By = override.
+  // applyFilters returns the items in the panel's chosen sort order —
+  // so we use THAT order when the sort axis is non-default, and fall
+  // back to the user's manual drag order otherwise. The two modes
+  // coexist: drag = "default", Filter & Sort "Sort By" = override.
   const filterApplied = useMemo(
     () => applyFilters(queuedAsMeta, filters),
     [queuedAsMeta, filters],
@@ -194,6 +194,9 @@ function QueueViewBody({ library, onSelectMeta }: Props) {
                   : `${orderedIds.length} planned · drag tiles to reorder.`}
               </p>
             </div>
+            {queuedAsMeta.length > 0 && (
+              <FilterMenu items={queuedAsMeta} state={filters} onChange={setFilters} />
+            )}
           </div>
 
           {orderedIds.length === 0 ? (
@@ -232,14 +235,6 @@ function QueueViewBody({ library, onSelectMeta }: Props) {
         </div>
       </div>
 
-      {/* Filter & sort sidebar — same FilterBar component used across
-          Library / Discover / view-all catalog. Renders only when at
-          least one queued item exists. */}
-      {queuedAsMeta.length > 0 && (
-        <div className="absolute right-6 top-24 z-20 hidden xl:block">
-          <FilterBar items={queuedAsMeta} state={filters} onChange={setFilters} />
-        </div>
-      )}
     </div>
   );
 }

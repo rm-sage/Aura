@@ -8,7 +8,10 @@ import ImageLoader from "../ImageLoader";
 import ErrorBoundary from "../ErrorBoundary";
 import { isAnimeMeta, typeLabel } from "../aiometadata";
 import WatchedBadge from "../WatchedBadge";
-import { FilterBar, applyFilters, DEFAULT_FILTERS, type FilterState } from "../FilterBar";
+import {
+  FilterMenu, applyFilters, DEFAULT_FILTERS,
+  type FilterState, type SortOption,
+} from "../FilterBar";
 
 // ---------------------------------------------------------------------------
 // LibraryView — full grid of saved Stremio library items.
@@ -27,6 +30,16 @@ import { FilterBar, applyFilters, DEFAULT_FILTERS, type FilterState } from "../F
 
 type SortMode = "alpha" | "alpha-desc" | "added" | "played";
 type Filter   = "all" | "movie" | "series" | "anime";
+
+// Library's Sort By choices, now surfaced inside the header Filter &
+// Sort panel (the standalone <select> was removed). `value` maps to
+// SortMode; the ordering itself is applied in `sorted` below.
+const LIBRARY_SORT_OPTIONS: SortOption[] = [
+  { value: "added",      label: "Recently Added" },
+  { value: "played",     label: "Recently Watched" },
+  { value: "alpha",      label: "A → Z" },
+  { value: "alpha-desc", label: "Z → A" },
+];
 
 interface Props {
   /** Undefined while the initial library_get is in flight. */
@@ -77,10 +90,10 @@ export default function LibraryView(props: Props) {
 function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props) {
   const [sort, setSort]     = useState<SortMode>("added");
   const [filter, setFilter] = useState<Filter>("all");
-  // Year / genre / rating refinement layered on top of the type-pill
-  // and sort dropdown above. Mirrors the FilterBar pattern used by
-  // CatalogPageView and DiscoverView so the affordance reads the same
-  // across every browseable surface.
+  // Year / genre refinement plus the Sort By choice, both surfaced in
+  // the header Filter & Sort panel (FilterMenu) — the same affordance
+  // every other browseable surface uses. `sort` drives the ordering;
+  // this FilterState only carries the year / genre filter.
   const [extraFilters, setExtraFilters] = useState<FilterState>(DEFAULT_FILTERS);
 
   // Scroll-debounced "is the user actively scrolling" flag. The
@@ -163,10 +176,10 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
 
   const filtered = buckets[filter];
 
-  // Project library items into MetaPreview shape so the FilterBar's
-  // genre / year / rating gates can run uniformly across every
-  // browseable surface. The conversion is cheap; library typically
-  // tops out around a few hundred entries even for heavy users.
+  // Project library items into MetaPreview shape so the panel's genre /
+  // year filter can run uniformly across every browseable surface. The
+  // conversion is cheap; library typically tops out around a few
+  // hundred entries even for heavy users.
   const filteredAsMeta: MetaPreview[] = useMemo(
     () => filtered.map(libraryItemToMeta),
     [filtered],
@@ -175,11 +188,12 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
     () => buckets.all.map(libraryItemToMeta),
     [buckets.all],
   );
-  // Run the FilterBar's filter + sort over the projected metas. The
-  // returned ORDER drives the displayed list when extraFilters.sort
-  // is non-default (Rating / Year / A→Z); otherwise the LibraryView's
-  // own Sort dropdown wins. This way both controls stay functional and
-  // the FilterBar's sort buttons aren't dead clicks.
+  // The header Filter & Sort panel now owns BOTH axes for Library:
+  // year / genre filtering via applyFilters, and the Sort By choice via
+  // the panel's sortOptions (wired to `sort` / `setSort`). So we run
+  // applyFilters purely for its FILTER pass (extraFilters.sort stays
+  // "default") and apply Library's own ctime / mtime / alpha ordering
+  // on top — no more dual-control override to reconcile.
   const filterApplied = useMemo(
     () => applyFilters(filteredAsMeta, extraFilters),
     [filteredAsMeta, extraFilters],
@@ -188,27 +202,9 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
     () => new Set(filterApplied.map((m) => m.id)),
     [filterApplied],
   );
-  const filterBarOrderIndex = useMemo(() => {
-    const m = new Map<string, number>();
-    filterApplied.forEach((meta, i) => m.set(meta.id, i));
-    return m;
-  }, [filterApplied]);
 
   const sorted = useMemo(() => {
     const arr = filtered.filter((it) => filteredMetaIds.has(it.id));
-    // FilterBar override: when the user picks a non-default Sort By
-    // button on the sidebar, that order wins over the LibraryView
-    // header's Sort dropdown. The two controls do different things
-    // (header sort: ctime/mtime, alpha; FilterBar sort: rating/year/
-    // alpha) and the FilterBar feels broken if its sort buttons
-    // visibly do nothing — so when the user touches the FilterBar
-    // they get their pick.
-    if (extraFilters.sort !== "default") {
-      arr.sort((a, b) =>
-        (filterBarOrderIndex.get(a.id) ?? 0) - (filterBarOrderIndex.get(b.id) ?? 0),
-      );
-      return arr;
-    }
     switch (sort) {
       case "alpha":
         arr.sort((a, b) => (a.name ?? "").localeCompare(b.name ?? ""));
@@ -224,7 +220,7 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
         break;
     }
     return arr;
-  }, [filtered, sort, extraFilters.sort, filteredMetaIds, filterBarOrderIndex]);
+  }, [filtered, sort, filteredMetaIds]);
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
@@ -247,28 +243,16 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
               </p>
             </div>
 
-            <div className="flex items-center gap-2">
-              <span className="text-white/35 text-xs">Sort</span>
-              <select
-                value={sort}
-                onChange={(e) => setSort(e.target.value as SortMode)}
-                disabled={isLoading || counts.all === 0}
-                className="bg-white/5 border border-white/10 rounded-full px-3.5 py-1.5 text-xs
-                           outline-none cursor-pointer focus:border-white/25 transition-colors
-                           appearance-none pr-7 disabled:opacity-40 disabled:cursor-not-allowed"
-                style={{
-                  color: "var(--text-primary)",
-                  backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='rgba(255,255,255,0.4)'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E")`,
-                  backgroundRepeat: "no-repeat",
-                  backgroundPosition: "right 10px center",
-                }}
-              >
-                <option value="added">Recently Added</option>
-                <option value="played">Recently Watched</option>
-                <option value="alpha">Alphabetical (A → Z)</option>
-                <option value="alpha-desc">Alphabetical (Z → A)</option>
-              </select>
-            </div>
+            {aggregateMeta.length > 0 && (
+              <FilterMenu
+                items={aggregateMeta}
+                state={extraFilters}
+                onChange={setExtraFilters}
+                sortOptions={LIBRARY_SORT_OPTIONS}
+                sortValue={sort}
+                onSortChange={(v) => setSort(v as SortMode)}
+              />
+            )}
           </div>
 
           {/* ── Shell: filter pills (always render; counts may be 0) ── */}
@@ -327,19 +311,6 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
         </div>
       </div>
 
-      {/* Filter & sort sidebar — same component the catalog and Discover
-          views use, so the affordance reads identically across browseable
-          surfaces. Only renders once at least one library item exists so
-          we don't show an empty filter panel on a fresh install. */}
-      {aggregateMeta.length > 0 && (
-        // top-44 (176 px) clears the Library header's title + Sort
-        // dropdown + media-type filter pills. top-24 (the default
-        // used by simpler views) was overlapping the Sort dropdown
-        // since both wanted the right edge of the header band.
-        <div className="absolute right-6 top-44 z-20 hidden xl:block">
-          <FilterBar items={aggregateMeta} state={extraFilters} onChange={setExtraFilters} />
-        </div>
-      )}
     </div>
   );
 }
