@@ -2161,8 +2161,22 @@ export default function PlayerOverlay({
 // Scrubber — animated gradient progress + draggable thumb.
 // ---------------------------------------------------------------------------
 
+/** A scrub-bar preview frame. Either a standalone image (`src` only)
+ *  or a crop from a BIF / WebVTT sprite sheet (`src` + sprite rect, in
+ *  device px). This is the stable contract the thumbnail-source layer
+ *  (ROADMAP / task #11) resolves into; the Scrubber renders it with a
+ *  loading animation until the underlying image actually loads. */
+interface ThumbFrame {
+  src: string;
+  spriteX?: number;
+  spriteY?: number;
+  spriteW?: number;
+  spriteH?: number;
+}
+
 function Scrubber({
   value, max, progressPct, onScrubStart, onScrub, onScrubEnd, segments,
+  thumbnailAt,
 }: {
   value: number;
   max: number;
@@ -2174,6 +2188,11 @@ function Scrubber({
    *  amber bands overlaid on the scrub fill so the user can see where
    *  skip boundaries land. Hovering shows the kind + timestamps. */
   segments?: AuraSkipWindow[];
+  /** Resolve a preview frame for a hovered second, or null when no
+   *  source is available (no addon BIF/VTT track). Optional — when
+   *  absent the scrubber still shows the timestamp tooltip on hover,
+   *  just no image. Supplied by task #11. */
+  thumbnailAt?: (seconds: number) => ThumbFrame | null;
 }) {
   const trackRef = useRef<HTMLDivElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -2186,6 +2205,35 @@ function Scrubber({
     seg: AuraSkipWindow;
     leftPct: number;
   } | null>(null);
+
+  // Hover-thumbnail state. `thumbsEnabled` mirrors the auraSettings
+  // toggle via the same event bus as the loudness/interp toggles so
+  // flipping it in Settings / the player menu takes effect live.
+  // DEFAULT ON → `!== false`.
+  const [thumbsEnabled, setThumbsEnabled] = useState(
+    () => loadAuraSettings().hoverThumbnails !== false,
+  );
+  useEffect(() => {
+    const sync = () => setThumbsEnabled(loadAuraSettings().hoverThumbnails !== false);
+    window.addEventListener("aura:settings-changed", sync);
+    return () => window.removeEventListener("aura:settings-changed", sync);
+  }, []);
+  // Seconds at the cursor (null when not hovering). Drives the always-
+  // on timestamp tooltip and the optional frame lookup.
+  const hoverSec = hoverPct != null ? (hoverPct / 100) * max : null;
+  // Resolve the preview frame for the hovered second. Null when the
+  // setting is off OR no source resolver was supplied (task #11) OR
+  // the source has no frame for that time.
+  const thumbFrame: ThumbFrame | null =
+    thumbsEnabled && hoverSec != null && thumbnailAt
+      ? thumbnailAt(hoverSec)
+      : null;
+  const thumbSrc = thumbFrame?.src ?? null;
+  const [thumbLoaded, setThumbLoaded] = useState(false);
+  // Reset the loaded flag whenever the underlying image changes so a
+  // new hover position shows the loading animation, NEVER the prior
+  // frame (the user's explicit requirement).
+  useEffect(() => { setThumbLoaded(false); }, [thumbSrc]);
 
   const pctFromEvent = useCallback((clientX: number): number => {
     const el = trackRef.current;
@@ -2319,6 +2367,78 @@ function Scrubber({
           opacity: dragging || progressPct > 0 ? 1 : 0,
         }}
       />
+
+      {/* Hover-seek preview — a frame box (only when the setting is
+          on AND a source resolved a frame) above an ALWAYS-visible
+          timestamp. Suppressed while hovering a skip band so it
+          doesn't fight that band's tooltip. The frame box shows a
+          loading animation until its own image loads — moving the
+          cursor resets it (thumbSrc-keyed effect above), so the user
+          never sees a stale prior frame. */}
+      {hoverSec != null && !hoveredSegment && (
+        <div
+          className="absolute bottom-full mb-3 pointer-events-none z-10
+                     flex flex-col items-center gap-1"
+          style={{ left: `${hoverPct}%`, transform: "translateX(-50%)" }}
+        >
+          {thumbFrame && (
+            <div className="relative w-40 aspect-video rounded-md overflow-hidden
+                            aura-glass-menu shadow-[0_8px_24px_-8px_rgba(0,0,0,0.7)]">
+              {!thumbLoaded && (
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <div className="absolute inset-0 bg-white/5 animate-pulse" />
+                  <svg
+                    className="relative w-5 h-5 animate-spin text-white/70"
+                    viewBox="0 0 24 24" fill="none" aria-hidden
+                  >
+                    <circle cx="12" cy="12" r="9" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
+                    <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                  </svg>
+                </div>
+              )}
+              {thumbFrame.spriteW && thumbFrame.spriteH ? (
+                <>
+                  {/* Sprite-sheet crop (BIF/VTT). background-image has
+                      no onLoad, so a hidden probe <img> drives the
+                      loaded state for the sheet. */}
+                  <div
+                    className="absolute inset-0 transition-opacity duration-150"
+                    style={{
+                      backgroundImage: `url("${thumbFrame.src}")`,
+                      backgroundPosition: `-${thumbFrame.spriteX ?? 0}px -${thumbFrame.spriteY ?? 0}px`,
+                      backgroundRepeat: "no-repeat",
+                      opacity: thumbLoaded ? 1 : 0,
+                    }}
+                  />
+                  <img
+                    key={`probe:${thumbFrame.src}`}
+                    src={thumbFrame.src}
+                    alt="" aria-hidden
+                    onLoad={() => setThumbLoaded(true)}
+                    onError={() => setThumbLoaded(false)}
+                    style={{ display: "none" }}
+                  />
+                </>
+              ) : (
+                <img
+                  key={thumbFrame.src}
+                  src={thumbFrame.src}
+                  alt=""
+                  draggable={false}
+                  onLoad={() => setThumbLoaded(true)}
+                  onError={() => setThumbLoaded(false)}
+                  className="absolute inset-0 w-full h-full object-cover transition-opacity duration-150"
+                  style={{ opacity: thumbLoaded ? 1 : 0 }}
+                />
+              )}
+            </div>
+          )}
+          <div className="aura-glass-menu rounded px-2 py-0.5 text-[11px]
+                          font-mono tabular-nums text-white/90">
+            {fmtTime(hoverSec)}
+          </div>
+        </div>
+      )}
 
       {/* Segment hover tooltip — anchored above the band's centre
           so it reads as part of that specific window. Glass-style
@@ -2806,6 +2926,16 @@ function MoreMenu({
     window.addEventListener("aura:settings-changed", sync);
     return () => window.removeEventListener("aura:settings-changed", sync);
   }, []);
+  // Hover-seek thumbnails — DEFAULT ON (`!== false`). Same event-bus
+  // mirror as the toggles above.
+  const [hoverThumbs, setHoverThumbs] = useState(
+    () => loadAuraSettings().hoverThumbnails !== false,
+  );
+  useEffect(() => {
+    const sync = () => setHoverThumbs(loadAuraSettings().hoverThumbnails !== false);
+    window.addEventListener("aura:settings-changed", sync);
+    return () => window.removeEventListener("aura:settings-changed", sync);
+  }, []);
   const ref = useRef<HTMLDivElement>(null);
   useMenuOpenSync(open);
 
@@ -2836,6 +2966,14 @@ function MoreMenu({
     // each subsequent load. CPU-heavy on weak hardware (Tier 1).
     invoke("set_motion_interpolation", { enabled: next }).catch(() => {});
     showFlash(next ? "Motion interpolation on" : "Motion interpolation off");
+  };
+
+  const toggleHoverThumbs = () => {
+    const next = !hoverThumbs;
+    setHoverThumbs(next);
+    const current = loadAuraSettings();
+    saveAuraSettings({ ...current, hoverThumbnails: next });
+    showFlash(next ? "Hover thumbnails on" : "Hover thumbnails off");
   };
 
   const showFlash = (msg: string) => {
@@ -2972,6 +3110,35 @@ function MoreMenu({
                 className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-md
                            transition-transform duration-150"
                 style={{ transform: interp ? "translateX(16px)" : "translateX(0)" }}
+              />
+            </span>
+          </button>
+          {/* Hover-seek thumbnails — in-player mirror of the
+              Settings → Video & Audio toggle. */}
+          <button
+            type="button"
+            onClick={toggleHoverThumbs}
+            className="w-full flex items-center gap-3 px-4 py-2 text-left text-[13px]
+                       text-white/85 hover:text-white hover:bg-white/[0.16]
+                       transition-colors"
+            role="switch"
+            aria-checked={hoverThumbs}
+          >
+            <span className="text-white/55 flex-shrink-0">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                <path d="M4 5h16a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1zm1 3v9h14v-9H5zm2.5 7 2.5-3 1.8 2.2L14.5 11l3 4h-10z" />
+              </svg>
+            </span>
+            <span className="flex-1">Hover thumbnails</span>
+            <span
+              aria-hidden
+              className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0
+                          ${hoverThumbs ? "bg-ln-accent/80" : "bg-white/15"}`}
+            >
+              <span
+                className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-md
+                           transition-transform duration-150"
+                style={{ transform: hoverThumbs ? "translateX(16px)" : "translateX(0)" }}
               />
             </span>
           </button>

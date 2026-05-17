@@ -163,6 +163,16 @@ export interface AuraSettings {
    *  incremental edits type-check; defaults + parse always populate
    *  it, so `loadAuraSettings()` always returns a boolean. */
   motionInterpolation?: boolean;
+  /** Hover-seek thumbnails on the scrub bar. When on (default), the
+   *  scrubber shows a frame preview + timestamp at the cursor; while a
+   *  frame is still fetching it shows a loading animation rather than a
+   *  stale prior frame. The HH:MM:SS time tooltip always shows on
+   *  hover regardless of this toggle (cheap, strictly useful). Optional
+   *  in the type only so incremental edits type-check; defaults +
+   *  parse always populate it (DEFAULT TRUE — note the `!== false`
+   *  reads at call sites). Mirrored in Settings + the in-player
+   *  three-dots menu. */
+  hoverThumbnails?: boolean;
   /** Next-Up CTA: skip filler / recap episodes when computing the
    *  next-up target. Source field: AIOMetadata's per-episode
    *  `episodeKind`. Default `"none"` so users on non-anime content
@@ -205,6 +215,7 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   blurEpisodeSynopsis: false,
   loudnessNormalization: false,
   motionInterpolation: false,
+  hoverThumbnails: true,
   nextUpSkipFillerRecap: "none",
   releaseSearchEnabled: true,
 };
@@ -282,6 +293,9 @@ function readFromStorage(): AuraSettings {
       motionInterpolation: typeof parsed.motionInterpolation === "boolean"
         ? parsed.motionInterpolation
         : false,
+      hoverThumbnails: typeof parsed.hoverThumbnails === "boolean"
+        ? parsed.hoverThumbnails
+        : true,
       nextUpSkipFillerRecap:
         parsed.nextUpSkipFillerRecap === "filler"
           || parsed.nextUpSkipFillerRecap === "recap"
