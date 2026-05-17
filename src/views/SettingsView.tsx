@@ -4067,12 +4067,39 @@ export default function SettingsView({ addons, session }: Props) {
               />
               <div className="h-px bg-white/6" />
               <SettingToggle
-                label="Motion interpolation (SVP — Tier 1)"
-                description="Genuine motion-compensated frame interpolation to 60 fps for smoother motion on low-frame-rate content (anime, 24 fps film). Uses ffmpeg minterpolate — no extra downloads — but it is CPU-intensive and can fall behind real-time on weaker hardware at high resolutions; turn it off if playback stutters. Re-applies on every stream load. A faster GPU/SVP path is planned."
+                label="Motion interpolation"
+                description="mpv's built-in GPU frame interpolation (video-sync=display-resample). Smooths low-frame-rate content (24 fps film, anime) on a high-refresh display. GPU-cheap. Tune the look with the kernel dropdown below."
                 value={!!aura.motionInterpolation}
                 onChange={(v) => {
                   setLocal({ motionInterpolation: v });
-                  invoke("set_motion_interpolation", { enabled: v }).catch(() => {});
+                  invoke("set_motion_interpolation", {
+                    enabled: v,
+                    tscale: aura.interpolationTscale ?? "mitchell",
+                  }).catch(() => {});
+                }}
+              />
+              <SettingDropdown
+                label="Interpolation kernel (smoothness)"
+                description="The tscale kernel — the smoothness dial. 'oversample' only fixes cadence judder and synthesises no in-between motion, so it looks barely interpolated (especially when your refresh rate is an exact multiple of the video fps). The blending kernels add visibly smoother motion with progressively more softening. Applies live when interpolation is on."
+                value={aura.interpolationTscale ?? "mitchell"}
+                options={[
+                  { value: "oversample",  label: "Oversample — sharpest · judder-fix only (least obvious)" },
+                  { value: "catmull_rom", label: "Catmull-Rom — sharp · light smoothing" },
+                  { value: "mitchell",    label: "Mitchell — balanced smoothing (recommended)" },
+                  { value: "gaussian",    label: "Gaussian — smooth · soft" },
+                  { value: "bicubic",     label: "Bicubic — smoothest · softest" },
+                ]}
+                required
+                onChange={(v) => {
+                  const k = v || "mitchell";
+                  setLocal({ interpolationTscale: k });
+                  // Apply live only when interpolation is currently on.
+                  if (aura.motionInterpolation) {
+                    invoke("set_motion_interpolation", {
+                      enabled: true,
+                      tscale: k,
+                    }).catch(() => {});
+                  }
                 }}
               />
               <div className="h-px bg-white/6" />

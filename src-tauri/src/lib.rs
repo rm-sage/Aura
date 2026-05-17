@@ -541,8 +541,12 @@ async fn set_audio_loudnorm(app: tauri::AppHandle, enabled: bool) -> Result<(), 
 /// mitchell / catmull_rom / box …), `video-sync`
 /// (display-resample / display-resample-vdrop …).
 #[tauri::command]
-async fn set_motion_interpolation(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
-    crate::devlog!(info, "player", "set_motion_interpolation(enabled={enabled})");
+async fn set_motion_interpolation(
+    app: tauri::AppHandle,
+    enabled: bool,
+    tscale: Option<String>,
+) -> Result<(), String> {
+    crate::devlog!(info, "player", "set_motion_interpolation(enabled={enabled}, tscale={tscale:?})");
     tauri::async_runtime::spawn_blocking(move || {
         let mpv = app.mpv();
         let set = |name: &str, val: serde_json::Value| -> Result<(), String> {
@@ -552,13 +556,25 @@ async fn set_motion_interpolation(app: tauri::AppHandle, enabled: bool) -> Resul
             })
         };
         if enabled {
+            // Whitelist the kernel — never forward an arbitrary string
+            // to mpv. mpv's separable convolution tscales, listed
+            // sharp → smooth. `oversample` only fixes cadence judder
+            // (no synthesised motion = looks un-interpolated); the
+            // blending kernels produce the visibly-smooth result.
+            // Unknown / absent → `mitchell` (the sensible "smooth
+            // video" default).
+            let kernel: &str = match tscale.as_deref() {
+                Some(k @ ("oversample" | "linear" | "catmull_rom"
+                          | "mitchell" | "gaussian" | "bicubic")) => k,
+                _ => "mitchell",
+            };
             // video-sync must flip to a display mode BEFORE interpolation.
             set("video-sync", serde_json::json!("display-resample"))?;
-            set("tscale", serde_json::json!("oversample"))?;
+            set("tscale", serde_json::json!(kernel))?;
             set("interpolation", serde_json::json!(true))?;
             crate::devlog!(
                 info, "player",
-                "motion interpolation ON (video-sync=display-resample, tscale=oversample)"
+                "motion interpolation ON (video-sync=display-resample, tscale={kernel})"
             );
         } else {
             set("interpolation", serde_json::json!(false))?;

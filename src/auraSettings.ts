@@ -152,17 +152,25 @@ export interface AuraSettings {
    *  toggle change; both the Settings panel and the in-player
    *  three-dots menu surface the same setting. */
   loudnessNormalization: boolean;
-  /** SVP-style motion interpolation (Tier 1 — ffmpeg `minterpolate`,
-   *  no external deps). Genuine motion-compensated frame interpolation
-   *  to 60 fps; software/CPU-bound, so it can fall behind real-time on
-   *  weak hardware at high resolutions — opt-in, default false.
-   *  Re-applies on every stream load AND on toggle; surfaced in both
-   *  Settings and the in-player three-dots menu (mirrors
-   *  loudnessNormalization). The performant svpflow/RIFE path is
-   *  deferred (Tier 2 — ROADMAP §8.10). Optional in the type only so
-   *  incremental edits type-check; defaults + parse always populate
-   *  it, so `loadAuraSettings()` always returns a boolean. */
+  /** Motion interpolation — mpv's built-in GPU frame interpolation
+   *  (`video-sync=display-resample` + `interpolation` + `tscale`).
+   *  GPU-cheap (Aura already uses `vo=gpu-next`), opt-in, default
+   *  false. Re-applies on every stream load AND on toggle; surfaced
+   *  in both Settings and the in-player three-dots menu. Optional in
+   *  the type only so incremental edits type-check; defaults + parse
+   *  always populate it. */
   motionInterpolation?: boolean;
+  /** The `tscale` (temporal scaler) kernel mpv interpolation uses —
+   *  THE quality dial. mpv lists kernels in increasing smoothness:
+   *  `oversample` (sharpest — judder-fix only, synthesises NO
+   *  intermediate motion, so it looks un-interpolated) → `catmull_rom`
+   *  → `mitchell` → `gaussian` → `bicubic` (softest). Default
+   *  `mitchell`: visibly smoother motion with moderate softening (the
+   *  standard "smooth video" pick). `oversample` is intentionally the
+   *  least obvious — pick a blending kernel for the SVP-like look.
+   *  Whitelisted Rust-side. Optional in the type only; defaults +
+   *  parse always populate it. */
+  interpolationTscale?: string;
   /** Hover-seek thumbnails on the scrub bar. When on (default), the
    *  scrubber shows a frame preview + timestamp at the cursor; while a
    *  frame is still fetching it shows a loading animation rather than a
@@ -215,6 +223,7 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   blurEpisodeSynopsis: false,
   loudnessNormalization: false,
   motionInterpolation: false,
+  interpolationTscale: "mitchell",
   hoverThumbnails: true,
   nextUpSkipFillerRecap: "none",
   releaseSearchEnabled: true,
@@ -293,6 +302,9 @@ function readFromStorage(): AuraSettings {
       motionInterpolation: typeof parsed.motionInterpolation === "boolean"
         ? parsed.motionInterpolation
         : false,
+      interpolationTscale: typeof parsed.interpolationTscale === "string"
+        ? parsed.interpolationTscale
+        : "mitchell",
       hoverThumbnails: typeof parsed.hoverThumbnails === "boolean"
         ? parsed.hoverThumbnails
         : true,

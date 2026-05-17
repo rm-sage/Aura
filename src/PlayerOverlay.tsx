@@ -2967,8 +2967,12 @@ function MoreMenu({
     const current = loadAuraSettings();
     saveAuraSettings({ ...current, motionInterpolation: next });
     // Applies to the CURRENT video immediately; App.tsx re-applies on
-    // each subsequent load. CPU-heavy on weak hardware (Tier 1).
-    invoke("set_motion_interpolation", { enabled: next }).catch(() => {});
+    // each subsequent load. mpv GPU interpolation — the tscale kernel
+    // (the smoothness dial) lives in Settings.
+    invoke("set_motion_interpolation", {
+      enabled: next,
+      tscale: loadAuraSettings().interpolationTscale ?? "mitchell",
+    }).catch(() => {});
     showFlash(next ? "Motion interpolation on" : "Motion interpolation off");
   };
 
