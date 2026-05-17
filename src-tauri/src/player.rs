@@ -496,3 +496,134 @@ pub fn init_mpv<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Hover-seek thumbnails — native 2nd-libmpv frame engine.
+//
+// A single lazily-initialised, paused, audio-less, headless `"thumb"`
+// libmpv instance. Per request: (re)loadfile when the URL changes,
+// seek absolute+exact, brief bounded settle, `screenshot-to-file`
+// (video, no OSD/subs) to a temp JPEG, base64 → data URL.
+//
+// RISK (user-accepted): multi-instance + headless screenshot are
+// unverified on this libmpv-wrapper build. EVERYTHING here fails
+// gracefully to `Ok(None)` (or `Err` the JS side swallows) so the
+// scrubber simply falls back to the timestamp-only tooltip — it can
+// never break the main player. `screenshot-raw` is intentionally NOT
+// used: the plugin's `command` returns no value, so the only way to
+// get pixels out is via a file. Output is pre-scaled to 320 px wide
+// so each data URL is a few KB.
+// ---------------------------------------------------------------------------
+
+struct ThumbState {
+    inited: bool,
+    loaded_url: Option<String>,
+}
+static THUMB: std::sync::OnceLock<std::sync::Mutex<ThumbState>> = std::sync::OnceLock::new();
+
+/// Standard base64 (with padding). Tiny inline impl — avoids pulling a
+/// new crate for a few-KB transient thumbnail.
+fn b64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+#[tauri::command]
+pub async fn extract_thumbnail(
+    app: AppHandle,
+    url: String,
+    at_seconds: f64,
+) -> Result<Option<String>, String> {
+    if url.is_empty() || !at_seconds.is_finite() || at_seconds < 0.0 {
+        return Ok(None);
+    }
+    tauri::async_runtime::spawn_blocking(move || -> Result<Option<String>, String> {
+        let lock = THUMB.get_or_init(|| {
+            std::sync::Mutex::new(ThumbState { inited: false, loaded_url: None })
+        });
+        // Serialise all thumb ops (the JS side single-flights + debounces
+        // anyway, so contention is minimal).
+        let mut st = lock.lock().map_err(|_| "thumb state poisoned".to_string())?;
+        let mpv = app.mpv();
+
+        if !st.inited {
+            let mut opts: IndexMap<String, serde_json::Value> = IndexMap::new();
+            opts.insert("vo".into(), serde_json::json!("null"));
+            opts.insert("audio".into(), serde_json::json!(false));
+            opts.insert("pause".into(), serde_json::json!(true));
+            opts.insert("idle".into(), serde_json::json!("yes"));
+            // Software decode — predictable headless screenshots; no
+            // shared GPU surface with the main instance.
+            opts.insert("hwdec".into(), serde_json::json!("no"));
+            opts.insert("really-quiet".into(), serde_json::json!(true));
+            opts.insert("hr-seek".into(), serde_json::json!("yes"));
+            opts.insert("vf".into(), serde_json::json!("scale=320:-2"));
+            opts.insert("screenshot-format".into(), serde_json::json!("jpg"));
+            opts.insert("screenshot-jpeg-quality".into(), serde_json::json!(80));
+            opts.insert("demuxer-max-bytes".into(), serde_json::json!("32MiB"));
+            opts.insert("cache".into(), serde_json::json!("yes"));
+            let cfg = MpvConfig {
+                initial_options: opts,
+                observed_properties: IndexMap::new(),
+            };
+            mpv.init(cfg, "thumb").map_err(|e| {
+                crate::devlog!(warn, "player", "thumb instance init failed: {e}");
+                format!("thumb init: {e}")
+            })?;
+            st.inited = true;
+            crate::devlog!(info, "player", "thumb libmpv instance initialised");
+        }
+
+        if st.loaded_url.as_deref() != Some(url.as_str()) {
+            mpv.command("loadfile", &vec![serde_json::json!(url.clone())], "thumb")
+                .map_err(|e| format!("thumb loadfile: {e}"))?;
+            st.loaded_url = Some(url.clone());
+            // Let demux/decode spin up before the first seek.
+            std::thread::sleep(std::time::Duration::from_millis(450));
+        }
+
+        mpv.command(
+            "seek",
+            &vec![serde_json::json!(at_seconds), serde_json::json!("absolute+exact")],
+            "thumb",
+        )
+        .map_err(|e| format!("thumb seek: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(260));
+
+        let mut path = std::env::temp_dir();
+        path.push("aura-thumb.jpg");
+        let _ = std::fs::remove_file(&path);
+        let path_fwd = path.to_string_lossy().replace('\\', "/");
+        mpv.command(
+            "screenshot-to-file",
+            &vec![serde_json::json!(path_fwd), serde_json::json!("video")],
+            "thumb",
+        )
+        .map_err(|e| format!("thumb screenshot: {e}"))?;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let bytes = match std::fs::read(&path) {
+            Ok(b) if !b.is_empty() => b,
+            // Empty / missing screenshot (headless render produced
+            // nothing on this build) — graceful: scrubber stays on the
+            // timestamp tooltip.
+            _ => return Ok(None),
+        };
+        let _ = std::fs::remove_file(&path);
+        Ok(Some(format!("data:image/jpeg;base64,{}", b64_encode(&bytes))))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}

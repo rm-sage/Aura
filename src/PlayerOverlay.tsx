@@ -1876,6 +1876,15 @@ export default function PlayerOverlay({
               }}
               progressPct={progress}
               segments={skipWindowsForScrub}
+              thumbnailAt={
+                streamUrl
+                  ? (sec) =>
+                      invoke<string | null>("extract_thumbnail", {
+                        url: streamUrl,
+                        atSeconds: sec,
+                      }).catch(() => null)
+                  : undefined
+              }
             />
           </div>
 
@@ -2166,14 +2175,6 @@ export default function PlayerOverlay({
  *  device px). This is the stable contract the thumbnail-source layer
  *  (ROADMAP / task #11) resolves into; the Scrubber renders it with a
  *  loading animation until the underlying image actually loads. */
-interface ThumbFrame {
-  src: string;
-  spriteX?: number;
-  spriteY?: number;
-  spriteW?: number;
-  spriteH?: number;
-}
-
 function Scrubber({
   value, max, progressPct, onScrubStart, onScrub, onScrubEnd, segments,
   thumbnailAt,
@@ -2188,11 +2189,12 @@ function Scrubber({
    *  amber bands overlaid on the scrub fill so the user can see where
    *  skip boundaries land. Hovering shows the kind + timestamps. */
   segments?: AuraSkipWindow[];
-  /** Resolve a preview frame for a hovered second, or null when no
-   *  source is available (no addon BIF/VTT track). Optional — when
-   *  absent the scrubber still shows the timestamp tooltip on hover,
-   *  just no image. Supplied by task #11. */
-  thumbnailAt?: (seconds: number) => ThumbFrame | null;
+  /** Async resolver: returns a frame data URL for a hovered second,
+   *  or null when none is available (extraction failed / no engine).
+   *  Optional — when absent the scrubber still shows the timestamp
+   *  tooltip on hover, just no image. Wired by PlayerOverlay to the
+   *  native `extract_thumbnail` libmpv engine. */
+  thumbnailAt?: (seconds: number) => Promise<string | null>;
 }) {
   const trackRef = useRef<HTMLDivElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -2219,21 +2221,64 @@ function Scrubber({
     return () => window.removeEventListener("aura:settings-changed", sync);
   }, []);
   // Seconds at the cursor (null when not hovering). Drives the always-
-  // on timestamp tooltip and the optional frame lookup.
+  // on timestamp tooltip and the debounced frame lookup.
   const hoverSec = hoverPct != null ? (hoverPct / 100) * max : null;
-  // Resolve the preview frame for the hovered second. Null when the
-  // setting is off OR no source resolver was supplied (task #11) OR
-  // the source has no frame for that time.
-  const thumbFrame: ThumbFrame | null =
-    thumbsEnabled && hoverSec != null && thumbnailAt
-      ? thumbnailAt(hoverSec)
-      : null;
-  const thumbSrc = thumbFrame?.src ?? null;
-  const [thumbLoaded, setThumbLoaded] = useState(false);
-  // Reset the loaded flag whenever the underlying image changes so a
-  // new hover position shows the loading animation, NEVER the prior
-  // frame (the user's explicit requirement).
-  useEffect(() => { setThumbLoaded(false); }, [thumbSrc]);
+
+  // Async hover-thumbnail resolution. The engine (native libmpv
+  // screenshot) is slow + serialised, so we DEBOUNCE on hover-settle,
+  // single-flight via a request id, and cache per integer-second. The
+  // stale frame is cleared the instant the target second changes, so
+  // the loading animation shows — never the previous frame.
+  const thumbnailAtRef = useRef(thumbnailAt);
+  useEffect(() => { thumbnailAtRef.current = thumbnailAt; }, [thumbnailAt]);
+  const [thumbUrl, setThumbUrl] = useState<string | null>(null);
+  const [thumbBusy, setThumbBusy] = useState(false);
+  const thumbCacheRef = useRef<Map<number, string>>(new Map());
+  const thumbReqRef = useRef(0);
+
+  useEffect(() => {
+    if (!thumbsEnabled || !thumbnailAtRef.current || hoverSec == null) return;
+    const sec = Math.max(0, Math.floor(hoverSec));
+    const cached = thumbCacheRef.current.get(sec);
+    if (cached) { setThumbUrl(cached); setThumbBusy(false); return; }
+    // New, uncached position → drop the (now stale) frame immediately
+    // so the loader shows rather than the previous second's image.
+    setThumbUrl(null);
+    setThumbBusy(true);
+    const reqId = ++thumbReqRef.current;
+    const timer = setTimeout(() => {
+      const fn = thumbnailAtRef.current;
+      if (!fn) { setThumbBusy(false); return; }
+      fn(sec)
+        .then((url) => {
+          if (reqId !== thumbReqRef.current) return; // superseded
+          if (url) {
+            const c = thumbCacheRef.current;
+            if (c.size > 240) c.clear(); // crude bound; ~a few MB of data URLs
+            c.set(sec, url);
+            setThumbUrl(url);
+          } else {
+            setThumbUrl(null);
+          }
+          setThumbBusy(false);
+        })
+        .catch(() => {
+          if (reqId !== thumbReqRef.current) return;
+          setThumbUrl(null);
+          setThumbBusy(false);
+        });
+    }, 220);
+    return () => clearTimeout(timer);
+  }, [hoverSec, thumbsEnabled]);
+
+  // Leaving the track: invalidate any in-flight request and clear.
+  useEffect(() => {
+    if (hoverSec == null) {
+      thumbReqRef.current += 1;
+      setThumbUrl(null);
+      setThumbBusy(false);
+    }
+  }, [hoverSec]);
 
   const pctFromEvent = useCallback((clientX: number): number => {
     const el = trackRef.current;
@@ -2368,23 +2413,30 @@ function Scrubber({
         }}
       />
 
-      {/* Hover-seek preview — a frame box (only when the setting is
-          on AND a source resolved a frame) above an ALWAYS-visible
-          timestamp. Suppressed while hovering a skip band so it
-          doesn't fight that band's tooltip. The frame box shows a
-          loading animation until its own image loads — moving the
-          cursor resets it (thumbSrc-keyed effect above), so the user
-          never sees a stale prior frame. */}
+      {/* Hover-seek preview — frame box (only when the toggle is on,
+          an engine is wired, AND we have a frame or are fetching one)
+          above an ALWAYS-visible timestamp. Suppressed while hovering a
+          skip band so it doesn't fight that band's tooltip. The stale
+          frame is cleared the instant the target second changes (debounce
+          effect above), so the loading animation shows — never the
+          previous frame. */}
       {hoverSec != null && !hoveredSegment && (
         <div
           className="absolute bottom-full mb-3 pointer-events-none z-10
                      flex flex-col items-center gap-1"
           style={{ left: `${hoverPct}%`, transform: "translateX(-50%)" }}
         >
-          {thumbFrame && (
+          {thumbsEnabled && thumbnailAt && (thumbUrl || thumbBusy) && (
             <div className="relative w-40 aspect-video rounded-md overflow-hidden
                             aura-glass-menu shadow-[0_8px_24px_-8px_rgba(0,0,0,0.7)]">
-              {!thumbLoaded && (
+              {thumbUrl ? (
+                <img
+                  src={thumbUrl}
+                  alt=""
+                  draggable={false}
+                  className="absolute inset-0 w-full h-full object-cover"
+                />
+              ) : (
                 <div className="absolute inset-0 flex items-center justify-center">
                   <div className="absolute inset-0 bg-white/5 animate-pulse" />
                   <svg
@@ -2395,41 +2447,6 @@ function Scrubber({
                     <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
                   </svg>
                 </div>
-              )}
-              {thumbFrame.spriteW && thumbFrame.spriteH ? (
-                <>
-                  {/* Sprite-sheet crop (BIF/VTT). background-image has
-                      no onLoad, so a hidden probe <img> drives the
-                      loaded state for the sheet. */}
-                  <div
-                    className="absolute inset-0 transition-opacity duration-150"
-                    style={{
-                      backgroundImage: `url("${thumbFrame.src}")`,
-                      backgroundPosition: `-${thumbFrame.spriteX ?? 0}px -${thumbFrame.spriteY ?? 0}px`,
-                      backgroundRepeat: "no-repeat",
-                      opacity: thumbLoaded ? 1 : 0,
-                    }}
-                  />
-                  <img
-                    key={`probe:${thumbFrame.src}`}
-                    src={thumbFrame.src}
-                    alt="" aria-hidden
-                    onLoad={() => setThumbLoaded(true)}
-                    onError={() => setThumbLoaded(false)}
-                    style={{ display: "none" }}
-                  />
-                </>
-              ) : (
-                <img
-                  key={thumbFrame.src}
-                  src={thumbFrame.src}
-                  alt=""
-                  draggable={false}
-                  onLoad={() => setThumbLoaded(true)}
-                  onError={() => setThumbLoaded(false)}
-                  className="absolute inset-0 w-full h-full object-cover transition-opacity duration-150"
-                  style={{ opacity: thumbLoaded ? 1 : 0 }}
-                />
               )}
             </div>
           )}

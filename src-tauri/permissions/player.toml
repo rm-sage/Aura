@@ -15,6 +15,7 @@ commands.allow = [
   "frame_step",
   "set_audio_loudnorm",
   "set_motion_interpolation",
+  "extract_thumbnail",
   "seek_absolute",
   "set_volume",
   "set_speed",

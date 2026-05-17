@@ -1917,6 +1917,7 @@ pub fn run() {
             frame_step,
             set_audio_loudnorm,
             set_motion_interpolation,
+            player::extract_thumbnail,
             set_volume,
             set_speed,
             seek_absolute,
