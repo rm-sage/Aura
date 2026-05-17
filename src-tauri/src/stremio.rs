@@ -1494,6 +1494,50 @@ pub async fn search_addon_grouped(
     Ok(out)
 }
 
+/// Expanded search — re-fetch a SINGLE search catalog with a `skip`
+/// param present so a skip-aware addon (e.g. AI Search) returns its
+/// full result set instead of the fast 10-item preview. Per the addon
+/// contract the skip VALUE is irrelevant (it's clamped to offset 0 for
+/// search); only its PRESENCE flips the addon into expanded mode. Same
+/// catalog URL the initial search used, plus `&skip=0`. Used by the
+/// "View all" affordance on a search-result row. Single-catalog, so
+/// errors return `Err` (the client falls back to the preview items)
+/// rather than the silent multi-catalog `continue` of
+/// `search_addon_grouped`.
+#[tauri::command]
+pub async fn fetch_search_catalog_expanded(
+    addon_url: String,
+    media_type: String,
+    catalog_id: String,
+    query: String,
+) -> Result<Vec<MetaPreview>, String> {
+    let query = query.trim().to_string();
+    if query.is_empty() {
+        return Ok(vec![]);
+    }
+    let base = normalise_addon_base(&addon_url);
+    let encoded = encode_query(&query);
+    let url = format!(
+        "{base}/catalog/{media_type}/{catalog_id}/search={encoded}&skip=0.json",
+    );
+    crate::devlog!(info, "search", "[expand] GET {url}");
+    let resp = client()
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("{}: {e}", describe_reqwest_err(&e)))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status().as_u16()));
+    }
+    let cr = resp
+        .json::<CatalogResponse>()
+        .await
+        .map_err(|e| format!("JSON parse failed: {e}"))?;
+    let items: Vec<MetaPreview> = cr.metas.into_iter().map(sanitize_meta).collect();
+    crate::devlog!(info, "search", "[expand] {url} → {} item(s)", items.len());
+    Ok(items)
+}
+
 /// Like `global_search`, but returns results grouped by addon + catalog so
 /// the search view can render Stremio-style discrete sections. Iterates
 /// addons in install order; per addon, iterates catalogs in manifest order.

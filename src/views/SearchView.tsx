@@ -196,6 +196,12 @@ function SearchViewBody({ addons, query, onSelectMeta }: Props) {
                   items={g.items}
                   loading={false}
                   onSelectMeta={onSelectMeta}
+                  searchExpand={{
+                    addonUrl:  g.addon_url,
+                    mediaType: g.media_type,
+                    catalogId: g.catalog_id,
+                    query:     query.trim(),
+                  }}
                 />
               ))}
               {/* Trailing shimmer when at least one addon is still

@@ -786,10 +786,21 @@ interface DiscoveryRowProps {
   addonUrl?:    string;
   catalogType?: string;
   catalogId?:   string;
+  /** Search-result rows: enables a "View all" that re-fetches the
+   *  SAME search catalog with a `skip` param present, which flips a
+   *  skip-aware addon (AI Search) out of its fast 10-item preview into
+   *  the full result set. Distinct from the catalog (addonUrl/…)
+   *  pagination path — search uses a search-specific extra. */
+  searchExpand?: {
+    addonUrl:  string;
+    mediaType: string;
+    catalogId: string;
+    query:     string;
+  };
 }
 
 export const DiscoveryRow = memo(function DiscoveryRow(
-  { title, items, loading, onSelectMeta, addonUrl, catalogType, catalogId }: DiscoveryRowProps
+  { title, items, loading, onSelectMeta, addonUrl, catalogType, catalogId, searchExpand }: DiscoveryRowProps
 ) {
   const [overflowOpen, setOverflowOpen]   = useState(false);
   const [overflowItems, setOverflowItems] = useState<MetaPreview[] | null>(null);
@@ -838,47 +849,84 @@ export const DiscoveryRow = memo(function DiscoveryRow(
   // A catalog row can still expand beyond what's loaded if it's wired
   // to fetch_catalog_paginated. If it isn't (search rows), only show
   // View all when the loaded items already exceed the visible cells.
+  // Catalog rows expand via fetch_catalog_paginated. Search rows
+  // expand via the skip-param re-fetch (searchExpand). Either way the
+  // preview is only ~10 and the expanded set is larger, so offer
+  // "View all" whenever there are items; a plain search row with no
+  // expand path only offers it once the loaded items overflow the
+  // visible cells.
   const hasOverflow = canPaginate
     ? dedupedItems.length > 0
-    : dedupedItems.length > 8;
+    : searchExpand
+      ? dedupedItems.length >= HOME_VISIBLE
+      : dedupedItems.length > 8;
 
   const cacheKey = canPaginate
     ? `${addonUrl}|${catalogType}|${catalogId}`
-    : null;
+    : searchExpand
+      ? `search:${searchExpand.addonUrl}|${searchExpand.mediaType}|${searchExpand.catalogId}|${searchExpand.query}`
+      : null;
 
   const handleViewAll = async () => {
     setOverflowOpen(true);
-    if (!canPaginate || !cacheKey) {
-      // Search-style row — show the items already in hand.
+
+    // Cached (either path) → render immediately.
+    if (cacheKey) {
+      const cached = catalogPaginationCache.get(cacheKey);
+      if (cached) {
+        setOverflowItems(cached);
+        return;
+      }
+    }
+
+    // Plain search row with no expand path — show what's in hand.
+    if (!canPaginate && !searchExpand) {
       setOverflowItems(dedupedItems);
       return;
     }
-    // Cached? Render immediately.
-    const cached = catalogPaginationCache.get(cacheKey);
-    if (cached) {
-      setOverflowItems(cached);
-      return;
-    }
-    setOverflowLoading(true);
-    try {
-      const more = await invoke<MetaPreview[]>("fetch_catalog_paginated", {
-        addonUrl,
-        catalogType,
-        catalogId,
-        target: VIEW_ALL_TARGET,
-      });
-      // Dedupe by id — fetch_catalog_paginated already does this in
-      // Rust but a cross-page collision could still slip through if
-      // items shifted upstream during pagination, so we re-check.
+
+    const dedupe = (more: MetaPreview[]): MetaPreview[] => {
       const popupSeen = new Set<string>();
-      const merged: MetaPreview[] = [];
+      const out: MetaPreview[] = [];
       for (const m of more) {
         const k = `${m.media_type}:${m.id}`;
         if (popupSeen.has(k)) continue;
         popupSeen.add(k);
-        merged.push(m);
+        out.push(m);
       }
-      catalogPaginationCache.set(cacheKey, merged);
+      return out;
+    };
+
+    setOverflowLoading(true);
+    try {
+      let merged: MetaPreview[];
+      if (canPaginate) {
+        const more = await invoke<MetaPreview[]>("fetch_catalog_paginated", {
+          addonUrl,
+          catalogType,
+          catalogId,
+          target: VIEW_ALL_TARGET,
+        });
+        // Rust already de-dupes, but a cross-page collision can slip
+        // through if items shifted upstream during pagination.
+        merged = dedupe(more);
+      } else {
+        // Search "View all" — re-fetch the SAME catalog WITH a skip
+        // param present (Rust appends &skip=0). Per the addon
+        // contract the skip value is irrelevant; its presence flips a
+        // skip-aware addon out of the fast 10-item preview into the
+        // full result set. Falls back to the preview if the addon
+        // returns nothing.
+        const more = await invoke<MetaPreview[]>("fetch_search_catalog_expanded", {
+          addonUrl:  searchExpand!.addonUrl,
+          mediaType: searchExpand!.mediaType,
+          catalogId: searchExpand!.catalogId,
+          query:     searchExpand!.query,
+        });
+        const deduped = dedupe(more);
+        merged = deduped.length > 0 ? deduped : dedupedItems;
+      }
+      if (cacheKey) catalogPaginationCache.set(cacheKey, merged);
       setOverflowItems(merged);
     } catch {
       // Fall back to the items we already have so the popup isn't

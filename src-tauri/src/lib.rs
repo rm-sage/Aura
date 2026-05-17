@@ -1955,6 +1955,7 @@ pub fn run() {
             stremio::global_search,
             stremio::global_search_grouped,
             stremio::search_addon_grouped,
+            stremio::fetch_search_catalog_expanded,
             stremio::cloud_add_addon,
             stremio::cloud_remove_addon,
             // ── Auth ────────────────────────────────────────────────────────

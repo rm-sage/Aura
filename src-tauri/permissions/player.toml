@@ -62,7 +62,7 @@ commands.allow = ["login", "logout", "get_session", "get_synced_addons", "backfi
 [[permission]]
 identifier = "allow-global-search"
 description = "Allows the frontend to run a concurrent global search across all search-enabled addons"
-commands.allow = ["global_search", "global_search_grouped", "search_addon_grouped"]
+commands.allow = ["global_search", "global_search_grouped", "search_addon_grouped", "fetch_search_catalog_expanded"]
 
 [[permission]]
 identifier = "allow-cloud-sync"
