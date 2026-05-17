@@ -71,6 +71,12 @@ function streamCacheGet(key: string): StreamFetchResult | null {
   }
   return hit.result;
 }
+// Drop a single entry — the "Refresh streams" button forces this for
+// the active query so the next read misses the cache and pays a fresh
+// multi-addon fan-out instead of replaying the stale snapshot.
+function streamCacheDelete(key: string): void {
+  streamCache.delete(key);
+}
 import { useEpisodeProgress, useResumeVideoId } from "../LibraryContext";
 import SpectralPulse from "../SpectralPulse";
 import WatchedBadge, { useWatchedVariant } from "../WatchedBadge";
@@ -259,6 +265,25 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
   });
   const [streamsLoading, setStreamsLoading] = useState(false);
   const [opening, setOpening]               = useState(true);
+  // Flips true once the entrance transform has finished settling.
+  // StreamMetaBadges must NOT measure its anchor while the root is
+  // still mid-transform — getBoundingClientRect() returns the animating
+  // (scaled-toward-center) rect. On a cached re-entry the streams render
+  // synchronously, so the badges mount DURING the 380 ms open
+  // transition; without this gate the cluster froze near screen centre
+  // because no resize/scroll/ResizeObserver event re-fires once the
+  // transform lands (an ancestor transform doesn't resize the aside).
+  // The root's onTransitionEnd flips this the instant the transform
+  // settles; this timeout is the belt-and-braces fallback for the
+  // cases where that event never fires — prefers-reduced-motion
+  // stripping the transition, or openTransform equalling the resting
+  // transform so no transition runs at all.
+  const [entered, setEntered]               = useState(false);
+  useEffect(() => {
+    if (entered) return;
+    const t = setTimeout(() => setEntered(true), 480);
+    return () => clearTimeout(t);
+  }, [entered]);
   const [activeVideo, setActiveVideo]       = useState<VideoEntry | null>(null);
   // Per-episode "user has clicked through the spoiler blur" set. Keyed
   // by VideoEntry.id; non-persisted (resets when DetailView unmounts).
@@ -635,7 +660,11 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
   // (preserving the user's chosen order). Non-stream addons (subtitles,
   // catalog-only, etc.) are gated by the manifest check on the Rust side
   // anyway, so leaving them in the list when null is harmless.
-  useEffect(() => {
+  // Extracted so the "Refresh streams" button can re-invoke it with
+  // `force` to bypass the in-memory cache. The wrapper effect below
+  // drives the automatic fetch on target / addon change exactly as
+  // before; `force` only matters for the manual refresh path.
+  const runStreamFetch = useCallback((force = false): (() => void) | void => {
     let cancelled = false;
     const episodicId = activeVideo?.id ?? resumeVideoId;
     if (isEpisodic && !episodicId) {
@@ -660,18 +689,25 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
 
     // 3-minute in-memory cache — closing and reopening the same
     // episode shouldn't refetch from every addon. Skips both the
-    // network fanout and the spinner.
-    const cached = streamCacheGet(queryKey);
-    if (cached) {
-      if (Array.isArray(cached)) {
-        setStreams(cached as unknown as StreamEntry[]);
-        setStreamMeta({ errors: [], warnings: [], info: [], stats: [] });
-      } else {
-        setStreams(cached.streams ?? []);
-        setStreamMeta(cached.metadata ?? { errors: [], warnings: [], info: [], stats: [] });
+    // network fanout and the spinner. A manual refresh (`force`)
+    // drops the cached snapshot so the next read misses and we pay a
+    // fresh fan-out; the button is disabled while loading so there's
+    // never a concurrent in-flight call to dedupe into.
+    if (force) {
+      streamCacheDelete(queryKey);
+    } else {
+      const cached = streamCacheGet(queryKey);
+      if (cached) {
+        if (Array.isArray(cached)) {
+          setStreams(cached as unknown as StreamEntry[]);
+          setStreamMeta({ errors: [], warnings: [], info: [], stats: [] });
+        } else {
+          setStreams(cached.streams ?? []);
+          setStreamMeta(cached.metadata ?? { errors: [], warnings: [], info: [], stats: [] });
+        }
+        setStreamsLoading(false);
+        return () => { cancelled = true; };
       }
-      setStreamsLoading(false);
-      return () => { cancelled = true; };
     }
 
     dedupedInvoke(queryKey, () => invoke<StreamFetchResult>("fetch_streams", {
@@ -698,6 +734,20 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
       .finally(() => { if (!cancelled) setStreamsLoading(false); });
     return () => { cancelled = true; };
   }, [addons, meta.id, meta.media_type, activeVideo, resumeVideoId, isEpisodic]);
+
+  useEffect(() => runStreamFetch(), [runStreamFetch]);
+
+  // Manual "Refresh streams" — StreamsPanel's header button dispatches
+  // this window event (decoupled the same way as
+  // aura:detail-season-changed rather than threading a callback through
+  // UnifiedPanel's prop list). Re-bound whenever runStreamFetch's
+  // identity changes so it always refetches the CURRENT target, and
+  // `force` skips the in-memory cache.
+  useEffect(() => {
+    const onRefresh = () => runStreamFetch(true);
+    window.addEventListener("aura:streams-refresh", onRefresh);
+    return () => window.removeEventListener("aura:streams-refresh", onRefresh);
+  }, [runStreamFetch]);
 
   // When `detail.videos` arrives AND the user has a resume target AND no
   // active episode yet, snap the active episode to the resume one. This
@@ -786,6 +836,16 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
   return (
     <div
       className="fixed left-0 right-0 bottom-0 z-[60] overflow-hidden"
+      onTransitionEnd={(e) => {
+        // Only the transform settle matters for badge anchoring (the
+        // opacity transition finishes earlier, at a different time).
+        // `e.target === e.currentTarget` rejects bubbled transitionend
+        // events from descendants (e.g. a badge's hover-scale, which
+        // also has propertyName "transform").
+        if (e.propertyName === "transform" && e.target === e.currentTarget) {
+          setEntered(true);
+        }
+      }}
       style={{
         // top: 36 px — leave the custom Tauri title bar uncovered so the user
         // can still drag / minimise / close the window while a detail page
@@ -1159,6 +1219,32 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
             streamMeta={streamMeta}
             streamsLoading={streamsLoading}
             groupedStreams={groupedStreams}
+            // Cour-specific catalog entries carry the season in their
+            // title ("Dorohedoro Season 2", "… 2nd Season", "… Part 2",
+            // "… Cour 2", "… Season II"). Parse an EXPLICIT ordinal only
+            // — bare trailing numbers are skipped so "Mob Psycho 100" /
+            // "86" / "Steins;Gate 0" never misfire. EpisodesPanel
+            // ignores this unless that season exists in the aggregated
+            // videos, and a resume / just-played target still wins.
+            seasonHint={isEpisodic
+              ? (() => {
+                  const t = (meta.name ?? "").trim();
+                  if (!t) return null;
+                  const ROMAN: Record<string, number> = {
+                    i: 1, ii: 2, iii: 3, iv: 4, v: 5, vi: 6, vii: 7, viii: 8,
+                  };
+                  let m =
+                    t.match(/\b(?:season|cour|part)\s+(\d{1,2})\b/i) ??
+                    t.match(/\b(\d{1,2})(?:st|nd|rd|th)\s+(?:season|cour)\b/i);
+                  if (m) {
+                    const s = parseInt(m[1], 10);
+                    return s >= 1 && s <= 50 ? s : null;
+                  }
+                  m = t.match(/\b(?:season|cour|part)\s+([ivx]{1,5})\b/i);
+                  if (m) return ROMAN[m[1].toLowerCase()] ?? null;
+                  return null;
+                })()
+              : null}
             // detail===null is the only signal Aura has for "meta
             // fetch still in flight". As soon as ANY addon returns,
             // detail flips to a value and the shimmer collapses;
@@ -1193,7 +1279,7 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
               that whole overflow chain — the cluster lives in viewport
               coordinates, immune to any ancestor's overflow rules. */}
           {panelMode === "streams" && streams.length > 0 && (
-            <StreamMetaBadges metadata={streamMeta} anchorRef={asideRef} />
+            <StreamMetaBadges metadata={streamMeta} anchorRef={asideRef} entered={entered} />
           )}
         </aside>
       </div>
@@ -2065,12 +2151,15 @@ interface PanelProps {
    *  Lets the parent clear `scrollToVideoId` so a later season change
    *  (or videos arriving asynchronously) doesn't keep re-scrolling. */
   onScrollHandled?: () => void;
+  /** Season parsed from the catalog entry's title — forwarded to
+   *  EpisodesPanel so e.g. "Dorohedoro Season 2" opens on season 2. */
+  seasonHint?: number | null;
 }
 
 function UnifiedPanel({
   mode, isEpisodic, seriesId, seriesMediaType, videos, activeVideo, streams, streamMeta, streamsLoading,
   groupedStreams, metaLoading, onPickEpisode, onBackToEpisodes, onPlay, onCopy, onPlayExternal,
-  scrollToVideoId, onScrollHandled,
+  scrollToVideoId, onScrollHandled, seasonHint,
 }: PanelProps) {
   // The streams panel needs `position: relative` so the floating AIOStreams
   // status icons (rendered with `absolute -top-3 -left-3`) anchor to its
@@ -2109,6 +2198,7 @@ function UnifiedPanel({
             scrollToVideoId={scrollToVideoId}
             onScrollHandled={onScrollHandled}
             metaLoading={metaLoading}
+            seasonHint={seasonHint}
           />
         </div>
       ) : (
@@ -2481,7 +2571,7 @@ const EpisodeRow = ({
 
 function EpisodesPanel({
   seriesId, seriesMediaType, videos, activeVideo, onPick, scrollToVideoId, onScrollHandled,
-  metaLoading,
+  metaLoading, seasonHint,
 }: {
   seriesId: string;
   seriesMediaType: string;
@@ -2491,6 +2581,11 @@ function EpisodesPanel({
   onPick: (v: VideoEntry) => void;
   scrollToVideoId?: string | null;
   onScrollHandled?: () => void;
+  /** Season parsed from the catalog entry's title (e.g. "Dorohedoro
+   *  Season 2" → 2). Selected on open when that season actually exists
+   *  in the cour-aggregated videos, UNLESS a resume / just-played
+   *  target (scrollToVideoId) already pins a season — that wins. */
+  seasonHint?: number | null;
 }) {
   const seasons = useMemo(() => {
     const set = new Set<number>();
@@ -2515,8 +2610,12 @@ function EpisodesPanel({
   const targetSeason = resolvedScrollTarget?.season ?? null;
   const resolvedScrollId = resolvedScrollTarget?.id ?? null;
 
+  // Priority: resume / just-played season (targetSeason) > catalog
+  // title season (seasonHint, only if that cour actually exists in the
+  // aggregated videos) > first non-special season.
   const [season, setSeason] = useState<number>(() => {
     if (targetSeason != null) return targetSeason;
+    if (seasonHint != null && seasons.includes(seasonHint)) return seasonHint;
     const main = seasons.find((s) => s > 0);
     return main ?? seasons[0] ?? 1;
   });
@@ -2541,6 +2640,25 @@ function EpisodesPanel({
     if (season !== targetSeason) setSeason(targetSeason);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [targetSeason]);
+
+  // Same late-arrival retarget for the catalog-title season. Cold-cache
+  // anime resolve `videos` 10-30 s after mount, so the initializer
+  // above saw an empty `seasons` and couldn't honour the hint yet.
+  // Yields to a resume / just-played target (those flow through
+  // targetSeason) so "open Dorohedoro Season 2" still defers to "you
+  // were watching S1E5" when both are present. Consume-once via the
+  // ref so a later user season pick isn't clobbered.
+  const hasAppliedSeasonHintRef = useRef(false);
+  useEffect(() => {
+    if (hasAppliedSeasonHintRef.current) return;
+    if (hasAppliedTargetSeasonRef.current) return;
+    if (targetSeason != null) return;
+    if (seasonHint == null) return;
+    if (!seasons.includes(seasonHint)) return;
+    hasAppliedSeasonHintRef.current = true;
+    setSeason((cur) => (cur === seasonHint ? cur : seasonHint));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seasonHint, seasons, targetSeason]);
 
   useEffect(() => {
     if (seasons.length === 0) return;
@@ -2828,9 +2946,17 @@ const KIND_ORDER: MessageKind[] = ["error", "warning", "info", "stats"];
 function StreamMetaBadges({
   metadata,
   anchorRef,
+  entered,
 }: {
   metadata: StreamMetadata;
   anchorRef: React.RefObject<HTMLElement | null>;
+  /** True once DetailView's entrance transform has settled. Measuring
+   *  the anchor before that captures the mid-animation (scaled toward
+   *  centre) rect; on a cached re-entry the badges mount DURING that
+   *  transition, so without this gate the cluster freezes near screen
+   *  centre and never recovers (a parent transform doesn't resize the
+   *  aside, so the ResizeObserver below never re-fires). */
+  entered: boolean;
 }) {
   // Subscribe to the visibility toggle so flipping it in Settings takes
   // effect without remounting the detail page.
@@ -2855,30 +2981,39 @@ function StreamMetaBadges({
     left: 0, bottom: 0, ready: false,
   });
 
+  const reposition = useCallback(() => {
+    const el = anchorRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    setPos({
+      left:   r.left - 48,
+      bottom: window.innerHeight - r.bottom + 16,
+      ready:  true,
+    });
+  }, [anchorRef]);
+
   useLayoutEffect(() => {
-    const reposition = () => {
-      const el = anchorRef.current;
-      if (!el) return;
-      const r = el.getBoundingClientRect();
-      setPos({
-        left:   r.left - 48,
-        bottom: window.innerHeight - r.bottom + 16,
-        ready:  true,
-      });
-    };
+    // Don't anchor while the entrance transform is still running — the
+    // measured rect would be the animating (centre-scaled) one, and
+    // nothing re-fires once it settles (a parent transform doesn't
+    // change the aside's border-box, so the ResizeObserver below stays
+    // silent). `entered` flips after the root transform's transitionend
+    // (or the fallback timeout in DetailViewBody).
+    if (!entered) return;
     reposition();
     window.addEventListener("resize", reposition);
     window.addEventListener("scroll", reposition, true);
     // ResizeObserver — covers panel resizes that don't fire window resize
     // (e.g. layout shifts as detail content loads).
-    const ro = anchorRef.current ? new ResizeObserver(reposition) : null;
-    if (ro && anchorRef.current) ro.observe(anchorRef.current);
+    const el = anchorRef.current;
+    const ro = el ? new ResizeObserver(reposition) : null;
+    if (ro && el) ro.observe(el);
     return () => {
       window.removeEventListener("resize", reposition);
       window.removeEventListener("scroll", reposition, true);
       ro?.disconnect();
     };
-  }, [anchorRef]);
+  }, [entered, reposition, anchorRef]);
 
   const filterBucket = (rows: StreamMessage[]): StreamMessage[] =>
     showAll ? rows : rows.filter((r) => r.forced === true);
@@ -3179,6 +3314,26 @@ function StreamsPanel({
         right={loading ? "Searching…" : `${streams.length} found`}
         backLabel={onBack ? "Episodes" : undefined}
         onBack={onBack}
+        action={(
+          <button
+            type="button"
+            onClick={() => window.dispatchEvent(new CustomEvent("aura:streams-refresh"))}
+            disabled={loading}
+            aria-label="Refresh streams"
+            title="Refresh streams"
+            className="flex items-center justify-center w-7 h-7 -my-1 rounded-md
+                       text-white/55 hover:text-white hover:bg-white/8
+                       disabled:opacity-40 disabled:hover:bg-transparent
+                       disabled:cursor-default transition-colors"
+          >
+            <svg
+              width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden
+              className={loading ? "animate-spin" : undefined}
+            >
+              <path d="M17.65 6.35A7.958 7.958 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A5.99 5.99 0 0 1 12 18a6 6 0 1 1 0-12c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" />
+            </svg>
+          </button>
+        )}
       />
       {subtitle && (
         <div className="px-4 py-3 border-b border-white/8">
@@ -3261,12 +3416,15 @@ function StreamsPanel({
 // ---------------------------------------------------------------------------
 
 function PanelHeader({
-  title, right, backLabel, onBack,
+  title, right, backLabel, onBack, action,
 }: {
   title: string;
   right?: string | null;
   backLabel?: string;
   onBack?: () => void;
+  /** Optional trailing control (e.g. the Streams "Refresh" button),
+   *  rendered after the right-aligned status text. */
+  action?: React.ReactNode;
 }) {
   return (
     <div className="flex items-center gap-2 px-4 py-3 border-b border-white/10">
@@ -3291,6 +3449,7 @@ function PanelHeader({
           {right}
         </span>
       )}
+      {action}
     </div>
   );
 }
