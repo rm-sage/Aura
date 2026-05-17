@@ -876,6 +876,53 @@ svpflow), applied as an mpv `vf`. Blocked on, and must resolve, all of:
 Tracked as a visual deferred task in the session task list. Revisit
 after Tier 1 ships.
 
+### 8.11 Skip: Kai-style Hybrid Mode (blackdetect + silencedetect) 🔴 ⏸ DEFERRED
+
+Chapter-less / no-AniSkip fallback: extend `silencedetect.rs` into a
+Hybrid detector — add ffmpeg `blackdetect` alongside `silencedetect`
+with Kai's "single source of truth" chapter cross-check (a filter hit
+only counts when it aligns with an intro/outro window). **Deferred:**
+heaviest remaining skip item; ffmpeg stays best-effort/PATH; Kai drives
+this by running the player at 90× with frame-drop while observing
+`vf-metadata`/`af-metadata`, which interacts directly with Aura's
+seek/property-race + `observed_properties` landmines and must be
+orchestrated natively (Aura's Lua `load-script` is unreliable). Needs
+careful runtime validation — unsafe to land blind. NOTE: the common
+live-action case (embedded chapters) is **already shipped** via the
+§8-era chapter-heuristic path (`feat(skip)` — positional windows + the
+90 s Prologue Fix + generic patterns); this phase only adds the
+chapter-less case.
+
+### 8.12 Hover-seek thumbnails — real frame source/engine 🔴 ⏸ DEFERRED
+
+The hover-thumbnail **UI** (preview box + loading animation + always-on
+timestamp + Settings/player toggles + the `ThumbFrame` resolver prop)
+is **shipped** (`feat(player): hover-seek thumbnail UI…`). What's
+deferred is the frame *source*:
+
+- Addon **BIF/WebVTT** was the original low-risk plan, but the Stremio
+  `Stream` object spec has no scrub-thumbnail field — addons
+  effectively never ship one, so that resolver would be ~always null.
+- The functional engines are the risky ones: (a) a Rust-managed second
+  headless libmpv instance doing `screenshot-raw` — untested
+  multi-instance stability on Aura's `libmpv-wrapper` build, and a
+  crash shares the process; (b) per-hover ffmpeg seek-extract via the
+  bridge — ffmpeg not bundled, debrid/HTTPS-bypass latency + auth.
+
+Revisit with a chosen engine, prototyped behind a flag with runtime
+stress-testing against the MPV landmines. The UI already degrades
+cleanly (timestamp-only) until an engine lands.
+
+### 8.13 Skip reliability — timing + MAL prefetch 🔴 ⏸ DEFERRED
+
+Shipped: AniSkip cache TTL curated 30 d → 3 d so community corrections
+surface within days. Deferred (need runtime verification; touch the
+MPV-timing / play-dispatch paths governed by the seek/loadfile
+landmines — unsafe to change blind): (1) sub-second auto-skip seek
+timing precision (currently bounded by `time-pos` event granularity);
+(2) MAL-resolution prefetch at detail-open so windows are ready before
+the OP instead of racing it from playback start.
+
 ---
 
 ## Technical Constraints
