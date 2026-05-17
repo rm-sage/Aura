@@ -61,13 +61,17 @@ interface AniSkipResult {
   windows: { kind: string; start: number; end: number; source: string; skip_id?: string | null }[];
 }
 
-// 30-day cache for AniSkip windows. Once an episode has aired, its
-// crowd-sourced op/ed/recap windows are effectively immutable — there's
-// no honest reason to re-fetch beyond catching the rare community
-// correction. Saves a network round-trip on every re-watch.
+// 3-day cache for AniSkip windows. Still skips the network round-trip
+// on a binge / same-week re-watch (the common case), but the previous
+// 30-day TTL meant a community CORRECTION to an episode's timestamps
+// stayed invisible for up to a month for anyone who'd watched it once.
+// 3 days is the balance: corrections surface within days, re-watches
+// inside the window stay free. Negative results are still never cached
+// (see the fetch site), so a freshly-contributed not-found → found
+// flip is picked up on the very next watch regardless of this TTL.
 const aniskipCache = new PersistentCache<AniSkipResult>({
   storageKey: "aura:aniskip-cache:v1",
-  ttlMs:      30 * 24 * 60 * 60 * 1000,
+  ttlMs:      3 * 24 * 60 * 60 * 1000,
   maxEntries: 600,
 });
 
