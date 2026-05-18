@@ -2631,6 +2631,7 @@ const TOC_GROUPS: TocGroup[] = [
       { id: "sec-streams",     label: "Stream Providers" },
       { id: "sec-search",      label: "Search Providers" },
       { id: "sec-detail-page", label: "Detail Page" },
+      { id: "sec-hover-panel", label: "Hover Meta Panel" },
       { id: "sec-notifications", label: "Notifications" },
     ],
   },
@@ -2932,6 +2933,79 @@ function KeybindRow({ label, description, code, onChange }: KeybindRowProps) {
                     }`}
       >
         {capturing ? "Press a key…" : code ? prettyBinding(code) : "Unbound"}
+      </kbd>
+    </button>
+  );
+}
+
+const MOUSE_BTN_LABELS: Record<number, string> = {
+  1: "Middle click",
+  3: "Back button",
+  4: "Forward button",
+};
+
+/** Captures one of the three non-conflicting mouse buttons (middle /
+ *  back / forward) on the next press. Left (0) and right (2) are
+ *  rejected — left selects/navigates, right is the card context menu.
+ *  Esc cancels capture. Mirrors KeybindRow's capture UX. */
+function MouseBindRow({
+  label, description, button, onChange,
+}: {
+  label: string;
+  description: string;
+  button: number;
+  onChange: (next: number) => void;
+}) {
+  const [capturing, setCapturing] = useState(false);
+
+  useEffect(() => {
+    if (!capturing) return;
+    const onDown = (e: MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.button === 1 || e.button === 3 || e.button === 4) {
+        onChange(e.button);
+        setCapturing(false);
+      }
+      // Left (0) / right (2): ignore — keep waiting for a valid button.
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { e.preventDefault(); setCapturing(false); }
+    };
+    const onCtx = (e: Event) => { e.preventDefault(); };
+    window.addEventListener("mousedown", onDown, { capture: true });
+    window.addEventListener("keydown", onKey, { capture: true });
+    window.addEventListener("contextmenu", onCtx, { capture: true });
+    return () => {
+      window.removeEventListener("mousedown", onDown, { capture: true } as any);
+      window.removeEventListener("keydown", onKey, { capture: true } as any);
+      window.removeEventListener("contextmenu", onCtx, { capture: true } as any);
+    };
+  }, [capturing, onChange]);
+
+  return (
+    <button
+      onClick={() => setCapturing(true)}
+      className={`w-full flex items-center justify-between gap-4 px-3 py-2.5 rounded-lg
+                  text-left transition-colors
+                  ${capturing
+                    ? "bg-ln-accent/15 border border-ln-accent/40"
+                    : "hover:bg-white/5 border border-white/8"
+                  }`}
+    >
+      <div className="flex-1 min-w-0">
+        <p className="text-white/75 text-sm font-medium">{label}</p>
+        <p className="text-white/35 text-xs mt-0.5">{description}</p>
+      </div>
+      <kbd
+        className={`flex-shrink-0 min-w-[96px] px-2.5 py-1 rounded-md text-xs font-mono
+                    text-center transition-colors
+                    ${capturing
+                      ? "bg-ln-accent/25 text-ln-accent border border-ln-accent/50"
+                      : "bg-white/8 text-white/75 border border-white/12"
+                    }`}
+      >
+        {capturing ? "Press a button…" : (MOUSE_BTN_LABELS[button] ?? "Middle click")}
       </kbd>
     </button>
   );
@@ -3958,6 +4032,33 @@ export default function SettingsView({ addons, session }: Props) {
               value={aura.blurEpisodeSynopsis}
               onChange={(v) => setLocal({ blurEpisodeSynopsis: v })}
             />
+          </Section>
+
+          {/* ── Hover Meta Panel ──────────────────────────────────────────
+              The mini-meta panel that pops beside a catalog card
+              (poster, ratings, plot, cast). Default: opens on hover.
+              The toggle switches every surface (Home / Search / Library
+              / Discover / Queue / Calendar day view) to open it on a
+              mouse-button press instead — useful if hover-open feels
+              twitchy or for click-only navigation. */}
+          <Section id="sec-hover-panel" title="Hover Meta Panel">
+            <SettingToggle
+              label="Open with a mouse button instead of hover"
+              description="When on, the meta panel no longer opens on hover. Press the bound mouse button on any poster to open it; press again to dismiss. Esc or a click elsewhere also closes it."
+              value={aura.metaPanelBindEnabled}
+              onChange={(v) => setLocal({ metaPanelBindEnabled: v })}
+            />
+            {aura.metaPanelBindEnabled && (
+              <>
+                <div className="h-px bg-white/6" />
+                <MouseBindRow
+                  label="Meta panel button"
+                  description="Mouse button that opens / dismisses the panel. Middle, Back, or Forward only — left stays select/navigate and right stays the context menu. Click the chip, then press the button. Esc cancels."
+                  button={aura.metaPanelBindButton}
+                  onChange={(b) => setLocal({ metaPanelBindButton: b })}
+                />
+              </>
+            )}
           </Section>
 
           {/* ── Notifications ─────────────────────────────────────────────
