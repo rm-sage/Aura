@@ -194,7 +194,9 @@ async fn jikan_for_mal_id(mal_id: u32) -> Vec<AggregateRating> {
             source: "MyAnimeList".into(),
             value: format!("{score:.2}/10"),
             kind: "aggregate".into(),
-            weight: 95,
+            // > IMDb's 100 so anime always surfaces MAL/AniList first
+            // within the chip cap (the user's "prioritise" ask).
+            weight: 110,
         });
     }
     if let Some(rank) = data.rank.filter(|v| *v > 0) {
@@ -217,14 +219,58 @@ async fn jikan_for_mal_id(mal_id: u32) -> Vec<AggregateRating> {
     out
 }
 
-/// Resolve an arbitrary anime id (kitsu, anilist, anidb) → MAL id and
-/// fetch the Jikan rating block. Routes through the existing aniskip
-/// resolver since it already knows the relations.yuna.moe mapping.
-async fn jikan_via_resolved_mal(source: &str, id: u32) -> Vec<AggregateRating> {
-    match crate::aniskip::resolve_mal_id(source.to_string(), id).await {
-        Ok(Some(mal)) => jikan_for_mal_id(mal).await,
-        Ok(None) | Err(_) => Vec::new(),
-    }
+// ---------------------------------------------------------------------------
+// AniList branch — public GraphQL, no key, generous rate limit. AniList
+// indexes by MAL id directly (`idMal`), so we reuse whatever MAL id the
+// Jikan branch resolved. `averageScore` is AniList's weighted 0-100
+// mean — the score users actually recognise on anilist.co.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct AlMedia {
+    #[serde(rename = "averageScore")]
+    average_score: Option<i64>,
+}
+#[derive(Deserialize)]
+struct AlData {
+    #[serde(rename = "Media")]
+    media: Option<AlMedia>,
+}
+#[derive(Deserialize)]
+struct AlResp {
+    data: Option<AlData>,
+}
+
+async fn anilist_for_mal(mal_id: u32) -> Vec<AggregateRating> {
+    let body = serde_json::json!({
+        "query": "query($m:Int){Media(idMal:$m,type:ANIME){averageScore}}",
+        "variables": { "m": mal_id },
+    });
+    let resp = match client().post("https://graphql.anilist.co").json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            crate::devlog!(warn, "ratings", "anilist request failed: {e}");
+            return Vec::new();
+        }
+    };
+    let parsed: AlResp = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let Some(score) = parsed
+        .data
+        .and_then(|d| d.media)
+        .and_then(|m| m.average_score)
+        .filter(|s| *s > 0)
+    else {
+        return Vec::new();
+    };
+    vec![AggregateRating {
+        source: "AniList".into(),
+        value:  format!("{score}%"),
+        kind:   "audience".into(),
+        weight: 108, // just below MAL, above IMDb (anime priority)
+    }]
 }
 
 // ---------------------------------------------------------------------------
@@ -270,29 +316,33 @@ pub async fn fetch_aggregate_ratings(
         out.extend(mdblist_to_aggregate(imdb).await);
     }
 
-    // ── Jikan / MAL branch (anime only) ─────────────────────────────────
+    // ── Anime branch (MAL + AniList, anime only) ────────────────────────
+    // Resolve a MAL id ONCE (it keys both Jikan and AniList), then fetch
+    // both ratings in parallel. Title resolution is the last resort —
+    // its sequel/dub/movie-of-series heuristics occasionally mispick on
+    // very generic names; worst case is a slightly-off score the user
+    // can ignore.
     if input.is_anime {
-        // Direct hit if the caller already has the MAL id.
-        if let Some(mal) = input.mal_id {
-            out.extend(jikan_for_mal_id(mal).await);
+        let mal: Option<u32> = if let Some(m) = input.mal_id {
+            Some(m)
         } else if let Some(id) = input.kitsu_id {
-            out.extend(jikan_via_resolved_mal("kitsu", id).await);
+            crate::aniskip::resolve_mal_id("kitsu".into(), id).await.ok().flatten()
         } else if let Some(id) = input.anilist_id {
-            out.extend(jikan_via_resolved_mal("anilist", id).await);
+            crate::aniskip::resolve_mal_id("anilist".into(), id).await.ok().flatten()
         } else if let Some(id) = input.anidb_id {
-            out.extend(jikan_via_resolved_mal("anidb", id).await);
+            crate::aniskip::resolve_mal_id("anidb".into(), id).await.ok().flatten()
         } else if let Some(title) = input.title.as_deref().filter(|s| !s.trim().is_empty()) {
-            // Title-based MAL resolution as a last resort. Less
-            // reliable than id-based — the resolver has heuristics for
-            // disambiguating sequels / dubs / movies-of-series, but it
-            // will occasionally pick the wrong title for very generic
-            // names. We accept that — the worst case is a slightly off
-            // MAL score on the meta page, which the user can ignore.
-            if let Ok(Some(mal)) = crate::aniskip::resolve_mal_id_by_title(
-                title.to_string(), input.year,
-            ).await {
-                out.extend(jikan_for_mal_id(mal).await);
-            }
+            crate::aniskip::resolve_mal_id_by_title(title.to_string(), input.year)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        if let Some(mal) = mal {
+            let (j, a) = tokio::join!(jikan_for_mal_id(mal), anilist_for_mal(mal));
+            out.extend(j);
+            out.extend(a);
         }
     }
 

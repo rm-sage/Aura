@@ -148,7 +148,20 @@ export async function getMetaDetailFallback(
   mediaType: string,
   id: string,
 ): Promise<MetaDetail | null> {
-  for (const a of addons) {
+  // Only query addons that actually expose the `meta` resource.
+  // Search/catalog-only addons (e.g. "AI Search") otherwise get a
+  // `/meta/...` round-trip on EVERY hover / CW / Calendar / detail
+  // lookup and just return an empty "?" stub — pure wasted latency
+  // since the loop then falls through to the real meta addon anyway.
+  // Back-compat: if NO addon advertises `meta` (old addons.json that
+  // predates the `resources` capture), fall back to the full list so
+  // we never regress to "no metadata at all".
+  const metaCapable = addons.filter((a) =>
+    Array.isArray(a.resources) &&
+    a.resources.some((r) => r.toLowerCase() === "meta"),
+  );
+  const candidates = metaCapable.length > 0 ? metaCapable : addons;
+  for (const a of candidates) {
     const d = await getMetaDetail(a, mediaType, id);
     if (!d) continue;
     // For series, prefer a response with videos populated — otherwise
