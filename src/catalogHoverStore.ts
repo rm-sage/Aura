@@ -17,6 +17,7 @@
 
 import { useSyncExternalStore } from "react";
 import type { MetaPreview } from "./types";
+import { loadAuraSettings } from "./auraSettings";
 
 export interface HoverTarget {
   meta: MetaPreview;
@@ -71,8 +72,16 @@ export function cancelHoverOpen(): void {
   clearOpen();
 }
 
-/** Card OR popup pointer-leave: arm a delayed close (the leeway). */
+/** Card OR popup pointer-leave: arm a delayed close (the leeway).
+ *
+ *  No-op in bind mode: there the panel is opened/dismissed explicitly
+ *  (bound-button toggle, click-outside, Esc, scroll-out), and the card
+ *  has no onMouseEnter to cancel this timer — so honouring a panel/card
+ *  pointer-leave here would self-close the panel the moment the user
+ *  moves onto it to read and back. `loadAuraSettings()` is memoized and
+ *  cache-busted on change, so this check is cheap. */
 export function scheduleHoverClose(): void {
+  if (loadAuraSettings().metaPanelBindEnabled) return;
   clearOpen();
   clearClose();
   closeTimer = setTimeout(() => {
