@@ -82,6 +82,7 @@ export default function AccountPanel({
       <div
         role="dialog"
         aria-label="Stremio account"
+        aria-modal="true"
         onClick={(e) => e.stopPropagation()}
         className="w-[380px] max-w-[92vw] rounded-2xl border border-white/15
                    bg-[rgba(12,12,16,0.97)] backdrop-blur-2xl shadow-glass-edge px-5 py-5"
