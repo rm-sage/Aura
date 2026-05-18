@@ -19,9 +19,12 @@
 // source is a single async fn that pushes Rating rows.
 //
 // Sources supported here:
-//   • OMDb (omdbapi.com)             — IMDb, Rotten Tomatoes critic,
-//                                       Metacritic critic. User-supplied
-//                                       free key.
+//   • MDBList (mdblist.com/api)      — IMDb + Rotten Tomatoes & Metacritic
+//                                       AUDIENCE + TMDB + Trakt + Letterboxd,
+//                                       one call by IMDb id. Key baked at
+//                                       build time (build.rs, git-ignored
+//                                       file → cargo:rustc-env). Replaced
+//                                       OMDb (critic-only, redundant now).
 //   • Jikan (api.jikan.moe v4)       — MyAnimeList score (anime only),
 //                                       no key needed, 3 req/sec ceiling.
 //
@@ -69,31 +72,72 @@ pub struct AggregateRating {
 }
 
 // ---------------------------------------------------------------------------
-// OMDb branch — wraps the existing fetch_omdb_ratings in this module's
-// shape so callers can hit one entry point.
+// MDBList branch — one call by IMDb id returns every mainstream score
+// (replaces OMDb, which only had IMDb + RT/Metacritic CRITIC). Key is
+// baked at build time by build.rs (cargo:rustc-env) from a git-ignored
+// file — never in the repo; empty key → branch no-ops cleanly.
+//
+// We surface the AUDIENCE score per brand (one chip each): RT audience
+// (not the Tomatometer), Metacritic user (not the Metascore), TMDB /
+// Trakt user scores, IMDb, Letterboxd. Pure-critic rows
+// (tomatoes/metacritic critic, rogerebert) and myanimelist are skipped
+// — MAL is owned by the richer Jikan branch below (score + rank +
+// popularity, and it works for kitsu/mal-id anime MDBList can't key).
 // ---------------------------------------------------------------------------
 
-async fn omdb_to_aggregate(imdb_id: &str) -> Vec<AggregateRating> {
-    let raw = match crate::omdb::fetch_omdb_ratings(imdb_id.to_string()).await {
-        Ok(v) => v,
+const MDBLIST_KEY: &str = env!("AURA_MDBLIST_KEY");
+
+#[derive(Deserialize)]
+struct MdbRating {
+    source: String,
+    value:  Option<f64>,
+    score:  Option<f64>,
+}
+#[derive(Deserialize)]
+struct MdbResponse {
+    #[serde(default)]
+    ratings: Vec<MdbRating>,
+}
+
+async fn mdblist_to_aggregate(imdb_id: &str) -> Vec<AggregateRating> {
+    if MDBLIST_KEY.is_empty() {
+        return Vec::new();
+    }
+    let url = format!("https://mdblist.com/api/?apikey={MDBLIST_KEY}&i={imdb_id}");
+    let resp = match client().get(&url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Vec::new(),
+    };
+    let data: MdbResponse = match resp.json().await {
+        Ok(d) => d,
         Err(_) => return Vec::new(),
     };
-    raw.into_iter()
-        .map(|r| {
-            let weight = match r.source.as_str() {
-                "IMDb"            => 100,
-                "Rotten Tomatoes" => 90,
-                "Metacritic"      => 80,
-                _                  => 50,
-            };
-            AggregateRating {
-                source: r.source,
-                value: r.value,
-                kind: "critic".into(),
+
+    let pct = |s: Option<f64>| s.map(|v| format!("{}%", v.round() as i64));
+    let ten = |v: Option<f64>| v.map(|x| format!("{x:.1}"));
+
+    let mut out = Vec::new();
+    for r in &data.ratings {
+        // (label, formatted value, weight, kind)
+        let mapped: Option<(&str, Option<String>, i32, &str)> = match r.source.as_str() {
+            "imdb"             => Some(("IMDb",            ten(r.value), 100, "audience")),
+            "tomatoesaudience" => Some(("Rotten Tomatoes", pct(r.score),  92, "audience")),
+            "metacriticuser"   => Some(("Metacritic",      pct(r.score),  80, "audience")),
+            "tmdb"             => Some(("TMDB",            pct(r.score),  70, "audience")),
+            "trakt"            => Some(("Trakt",           pct(r.score),  65, "audience")),
+            "letterboxd"       => Some(("Letterboxd",      ten(r.value),  60, "audience")),
+            _ => None,
+        };
+        if let Some((source, Some(value), weight, kind)) = mapped {
+            out.push(AggregateRating {
+                source: source.into(),
+                value,
+                kind: kind.into(),
                 weight,
-            }
-        })
-        .collect()
+            });
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -220,9 +264,10 @@ pub async fn fetch_aggregate_ratings(
 ) -> Result<Vec<AggregateRating>, String> {
     let mut out: Vec<AggregateRating> = Vec::new();
 
-    // ── OMDb branch (IMDb / RT critic / Metacritic critic) ──────────────
+    // ── MDBList branch (IMDb / RT+Metacritic AUDIENCE / TMDB / Trakt /
+    //    Letterboxd) — by IMDb id ─────────────────────────────────────────
     if let Some(imdb) = input.imdb_id.as_deref().filter(|s| s.starts_with("tt")) {
-        out.extend(omdb_to_aggregate(imdb).await);
+        out.extend(mdblist_to_aggregate(imdb).await);
     }
 
     // ── Jikan / MAL branch (anime only) ─────────────────────────────────

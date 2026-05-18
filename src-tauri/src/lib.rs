@@ -31,7 +31,6 @@ mod log_export;
 mod anime_id_map;
 mod api_keyring;
 mod media_controls;
-mod omdb;
 mod player;
 mod ratings;
 mod scrobble;
@@ -2039,9 +2038,7 @@ pub fn run() {
             media_controls::smtc_clear,
             // ── Phase 5: stream aggregation ──────────────────────────────────
             stremio::fetch_streams,
-            // ── Phase 6.0.5: OMDb ratings enrichment ─────────────────────────
-            omdb::fetch_omdb_ratings,
-            // ── Multi-source ratings (MAL via Jikan, etc.) ───────────────────
+            // ── Multi-source ratings (MDBList + MAL via Jikan) ───────────────
             ratings::fetch_aggregate_ratings,
             // ── Phase 5.5: external subtitles fan-out ────────────────────────
             stremio::fetch_external_subtitles,

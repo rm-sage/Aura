@@ -87,3 +87,7 @@ src-tauri/shaders/*.hook
 # Aura already reads those from .env.local but the CLI sometimes writes
 # its own. Defensive ignore.
 .sentryclirc
+
+# MDBList API key — secret, baked into the build by src-tauri/build.rs
+# (cargo:rustc-env). Never commit; the binary embeds it, the repo must not.
+src-tauri/mdblist.key
