@@ -465,6 +465,7 @@ pub async fn get_synced_addons(auth_key: String) -> Result<Vec<AddonEntry>, Stri
             let id_prefixes = crate::stremio::extract_manifest_id_prefixes(manifest);
             let (stream_types, stream_id_prefixes) =
                 crate::stremio::extract_stream_resource_info(manifest);
+            let configurable = crate::stremio::extract_manifest_configurable(manifest);
             let manifest_id = manifest
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -496,6 +497,7 @@ pub async fn get_synced_addons(auth_key: String) -> Result<Vec<AddonEntry>, Stri
                     stream_types,
                     id_prefixes,
                     stream_id_prefixes,
+                    configurable,
                 })
             }
         })
