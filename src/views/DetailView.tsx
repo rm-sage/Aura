@@ -93,6 +93,7 @@ import ImageLoader from "../ImageLoader";
 import ErrorBoundary from "../ErrorBoundary";
 import { parseStream, chipStyleFor, type ChipKind } from "../streamMeta";
 import Tooltip from "../Tooltip";
+import { BrandLogo, ratingDomain } from "../logodev";
 
 // ---------------------------------------------------------------------------
 // DetailView — full-bleed cinematic detail page with a "Command Center" feel.
@@ -1401,12 +1402,20 @@ function RatingTile({
   const palette = RATING_PALETTE[key] ?? NEUTRAL_RATING_PALETTE;
   return (
     <span
-      className={`inline-flex items-baseline gap-2 px-2.5 py-1 rounded-md border
+      className={`inline-flex items-center gap-2 px-2.5 py-1.5 rounded-md border
                   ${palette.bg} ${palette.border}`}
     >
-      <span className={`text-[10.5px] font-semibold tracking-[0.16em] ${palette.label}`}>
-        {ratingLabelFor(source, kind)}
-      </span>
+      <BrandLogo
+        domain={ratingDomain(source)}
+        alt={ratingLabelFor(source, kind)}
+        size={64}
+        className="h-4 w-auto max-w-[72px] object-contain"
+        fallback={
+          <span className={`text-[10.5px] font-semibold tracking-[0.16em] ${palette.label}`}>
+            {ratingLabelFor(source, kind)}
+          </span>
+        }
+      />
       <span className={`text-[13px] font-semibold tabular-nums ${palette.value}`}>
         {value}
       </span>

@@ -18,6 +18,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { AddonEntry, MetaPreview, MetaDetail } from "./types";
 import { getMetaDetailFallback } from "./metaCache";
+import { BrandLogo, ratingDomain } from "./logodev";
 import {
   useHoverTarget,
   cancelHoverClose,
@@ -66,8 +67,18 @@ function RatingChip({ source, value }: { source: string; value: string }) {
   const { key, label } = chipKeyLabel(source);
   const st = RATING_STYLES[key] ?? NEUTRAL_CHIP;
   return (
-    <span className={`inline-flex items-baseline gap-1.5 px-2 py-0.5 rounded-md border ${st.bg} ${st.border}`}>
-      <span className={`text-[10px] font-bold tracking-wide opacity-80 ${st.fg}`}>{label}</span>
+    <span className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md border ${st.bg} ${st.border}`}>
+      <BrandLogo
+        domain={ratingDomain(source)}
+        alt={label}
+        size={48}
+        className="h-3.5 w-auto max-w-[54px] object-contain"
+        fallback={
+          <span className={`text-[10px] font-bold tracking-wide opacity-80 ${st.fg}`}>
+            {label}
+          </span>
+        }
+      />
       <span className={`text-[12px] font-semibold tabular-nums ${st.fg}`}>{value}</span>
     </span>
   );

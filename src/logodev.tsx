@@ -1,0 +1,91 @@
+// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// ---------------------------------------------------------------------------
+// logodev — Logo.dev brand-logo image API (https://img.logo.dev/{domain}).
+//
+// Used for compact rating-source icons (and any other brand glyph that
+// saves space vs. a text label). The token is a PUBLISHABLE key —
+// Logo.dev's design has it living in the client; safe to ship in the
+// bundle. `format=png` is deliberate (transparent background, vs. jpg's
+// white box which would look broken on Aura's dark surfaces). `retina`
+// keeps it crisp when rendered small. `fallback=404` makes the API
+// return a real 404 when a brand has no logo, so <BrandLogo> can swap
+// in a styled text fallback that matches the surrounding chip instead
+// of Logo.dev's generic monogram.
+// ---------------------------------------------------------------------------
+
+import { useEffect, useState } from "react";
+
+export const LOGODEV_PUBLISHABLE_KEY = "pk_fkGWFYlzQMebhze1-a9JYw";
+
+export interface LogoOpts {
+  /** 1-800, default 64 (rendered small + retina). */
+  size?: number;
+  format?: "png" | "jpg" | "webp";
+  theme?: "auto" | "light" | "dark";
+  greyscale?: boolean;
+  retina?: boolean;
+  fallback?: "monogram" | "404";
+}
+
+export function logoUrl(domain: string, opts: LogoOpts = {}): string {
+  const p = new URLSearchParams({ token: LOGODEV_PUBLISHABLE_KEY });
+  p.set("size", String(opts.size ?? 64));
+  p.set("format", opts.format ?? "png");
+  if (opts.theme) p.set("theme", opts.theme);
+  if (opts.greyscale) p.set("greyscale", "true");
+  if (opts.retina ?? true) p.set("retina", "true");
+  p.set("fallback", opts.fallback ?? "404");
+  return `https://img.logo.dev/${encodeURIComponent(domain)}?${p.toString()}`;
+}
+
+/** Map a rating-source label (as returned by the meta aggregators) to a
+ *  brand domain Logo.dev can resolve. Null = not a known logo'd brand
+ *  (caller shows a text label instead). */
+export function ratingDomain(source: string): string | null {
+  const s = source.toLowerCase();
+  if (s.includes("imdb")) return "imdb.com";
+  if (s.includes("rotten") || s === "rt") return "rottentomatoes.com";
+  if (s.includes("metacritic") || s.includes("metascore")) return "metacritic.com";
+  if (s.includes("myanimelist") || s.includes("mal")) return "myanimelist.net";
+  if (s.includes("tmdb") || s.includes("the movie")) return "themoviedb.org";
+  if (s.includes("anilist")) return "anilist.co";
+  if (s.includes("kitsu")) return "kitsu.io";
+  if (s.includes("trakt")) return "trakt.tv";
+  if (s.includes("letterboxd")) return "letterboxd.com";
+  return null;
+}
+
+/** Brand glyph with a graceful, styled fallback. Renders the Logo.dev
+ *  image; on a 404 / network error (offline, unknown brand) it renders
+ *  `fallback` instead — so callers keep full control of the missing
+ *  state (a palette-matched text label, usually). `domain` may be null
+ *  (→ straight to fallback) so callers can pass `ratingDomain(src)`
+ *  directly. */
+export function BrandLogo({
+  domain, alt, size = 64, className, fallback,
+}: {
+  domain: string | null;
+  alt: string;
+  size?: number;
+  className?: string;
+  fallback: React.ReactNode;
+}) {
+  const [failed, setFailed] = useState(false);
+  // Reset when the domain changes so a recycled component instance
+  // re-attempts for the new brand instead of staying on the fallback.
+  useEffect(() => { setFailed(false); }, [domain]);
+
+  if (!domain || failed) return <>{fallback}</>;
+  return (
+    <img
+      src={logoUrl(domain, { size, format: "png", retina: true, fallback: "404" })}
+      alt={alt}
+      draggable={false}
+      loading="lazy"
+      onError={() => setFailed(true)}
+      className={className}
+    />
+  );
+}
