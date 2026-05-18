@@ -191,6 +191,16 @@ export interface AuraSettings {
    *  false, the desktop uses only the per-user addon probe path —
    *  same code as pre-Phase 9. See docs/release-search-spec.md. */
   releaseSearchEnabled: boolean;
+  /** When true, the mini-meta hover panel no longer opens on hover;
+   *  instead it opens when the configured mouse button is pressed on a
+   *  card (and the same press toggles it closed). Default false =
+   *  classic hover behaviour on every surface. */
+  metaPanelBindEnabled: boolean;
+  /** Mouse button that opens the meta panel when `metaPanelBindEnabled`.
+   *  DOM `MouseEvent.button`: 1 = middle (default), 3 = back, 4 =
+   *  forward. 0 (left) and 2 (right) are intentionally not selectable —
+   *  left is select/navigate, right is the card context menu. */
+  metaPanelBindButton: number;
 }
 
 export const DEFAULT_AURA_SETTINGS: AuraSettings = {
@@ -214,6 +224,8 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   interpolationTscale: "oversample",
   nextUpSkipFillerRecap: "none",
   releaseSearchEnabled: true,
+  metaPanelBindEnabled: false,
+  metaPanelBindButton: 1,
 };
 
 // Module-level memoization snapshot. loadAuraSettings is called many
@@ -303,6 +315,15 @@ function readFromStorage(): AuraSettings {
       releaseSearchEnabled: typeof parsed.releaseSearchEnabled === "boolean"
         ? parsed.releaseSearchEnabled
         : true,
+      metaPanelBindEnabled: typeof parsed.metaPanelBindEnabled === "boolean"
+        ? parsed.metaPanelBindEnabled
+        : false,
+      // Only the three non-conflicting buttons are valid; anything else
+      // (legacy / garbage / left / right) falls back to middle.
+      metaPanelBindButton:
+        parsed.metaPanelBindButton === 3 || parsed.metaPanelBindButton === 4
+          ? parsed.metaPanelBindButton
+          : 1,
       heroCatalog: parsed.heroCatalog
         && typeof parsed.heroCatalog === "object"
         && typeof (parsed.heroCatalog as Record<string, unknown>).addonUrl === "string"
