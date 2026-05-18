@@ -8,6 +8,8 @@ import { resolveDefaultMetaUrl } from "../addonDefaults";
 import { getMetaDetail } from "../metaCache";
 import ImageLoader from "../ImageLoader";
 import { formatEpLabel } from "../episodeLabel";
+import { useHoverCardActivation } from "../useHoverCardActivation";
+import { closeHoverNow } from "../catalogHoverStore";
 
 // ---------------------------------------------------------------------------
 // CalendarView — full-viewport month grid + day-click overlay
@@ -679,6 +681,7 @@ function DayOverlay({ date, entries, onClose, onSelectMeta }: DayOverlayProps) {
             {entries.map(({ item, detail, video, releaseDate }, idx) => (
               <CalendarCard
                 key={`${item.id}:${video?.id ?? idx}`}
+                meta={libraryItemToMeta(item, detail)}
                 name={detail?.name ?? item.name}
                 poster={detail?.poster ?? item.poster}
                 mediaType={detail?.media_type ?? item.media_type}
@@ -687,7 +690,7 @@ function DayOverlay({ date, entries, onClose, onSelectMeta }: DayOverlayProps) {
                   : null}
                 episodeTitle={video?.title ?? null}
                 released={releaseDate}
-                onClick={onSelectMeta ? () => { onClose(); onSelectMeta(libraryItemToMeta(item, detail)); } : undefined}
+                onClick={onSelectMeta ? () => { closeHoverNow(); onClose(); onSelectMeta(libraryItemToMeta(item, detail)); } : undefined}
                 onContextMenu={(e) => {
                   // Right-click → fire the same `aura:card-context`
                   // event the rest of the app's cards use. The App-
@@ -721,8 +724,10 @@ function DayOverlay({ date, entries, onClose, onSelectMeta }: DayOverlayProps) {
 // ---------------------------------------------------------------------------
 
 function CalendarCard({
-  name, poster, mediaType, episodeTag, episodeTitle, released, onClick, onContextMenu,
+  meta, name, poster, mediaType, episodeTag, episodeTitle, released, onClick, onContextMenu,
 }: {
+  /** Catalog meta for the shared mini-meta hover/bind panel. */
+  meta: MetaPreview;
   name: string;
   poster: string | null;
   mediaType: string;
@@ -738,6 +743,7 @@ function CalendarCard({
   onClick?: () => void;
 }) {
   const Tag = onClick ? "button" : "div";
+  const hover = useHoverCardActivation(meta);
   const dateLabel = released.toLocaleDateString(undefined, {
     month: "short", day: "numeric",
   });
@@ -745,6 +751,8 @@ function CalendarCard({
     <Tag
       onClick={onClick}
       onContextMenu={onContextMenu}
+      {...hover}
+      data-meta-card={`${mediaType}:${meta.id}`}
       className={`glass-panel rounded-xl p-2.5 flex flex-col gap-2 text-left w-full
                   ${onClick ? "hover:bg-white/8 transition-colors cursor-pointer" : ""}`}
     >
