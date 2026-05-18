@@ -1,6 +1,6 @@
 [package]
 name = "aura"
-version = "0.6.23"
+version = "0.7.0"
 description = "Aura — Cinematic Media Player"
 authors = ["rm-sage"]
 edition = "2021"
