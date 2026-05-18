@@ -14,6 +14,8 @@ export function formatEpLabel(
   if (typeof season === "number" && typeof episode === "number") {
     return `S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`;
   }
+  // Episode-only (season unknown): no zero-pad — matches the Stremio
+  // `E<n>` label convention and the prior NotificationsScanner behavior.
   if (typeof episode === "number") return `E${episode}`;
   return null;
 }
