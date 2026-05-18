@@ -497,7 +497,7 @@ interface SettingsSyncBlob {
   backend: BackendSettingsLite;
   frontend: AuraSettings;
   updated_at: number;
-  /** Encrypted third-party API keys (OMDb, OpenSubtitles).
+  /** Encrypted third-party API keys (OpenSubtitles).
    *
    *  Carried INSIDE the settings blob rather than as its own
    *  namespace specifically to avoid a coordinated proxy deploy —
@@ -507,7 +507,7 @@ interface SettingsSyncBlob {
    *  only.
    *
    *  Plaintext shape under the AES-GCM ciphertext:
-   *    { omdb?: string, opensubtitles?: string }
+   *    { opensubtitles?: string }
    *
    *  Devices that haven't yet backfilled user_id (offline first
    *  launch, /getUser failure) can't decrypt and gracefully drop
@@ -520,11 +520,10 @@ interface SettingsSyncBlob {
  *  `src-tauri/src/api_keyring.rs`. If you add a key on the Rust side,
  *  list it here too — the encryption layer just sees the JSON shape
  *  but the read/write paths use this list explicitly. */
-const SYNCED_API_KEYS = ["omdb", "opensubtitles"] as const;
+const SYNCED_API_KEYS = ["opensubtitles"] as const;
 type SyncedApiKeyName = typeof SYNCED_API_KEYS[number];
 
 interface ApiKeysPlaintext {
-  omdb?: string;
   opensubtitles?: string;
 }
 
@@ -600,7 +599,7 @@ async function readSettingsBlob(): Promise<SettingsSyncBlob> {
   // derivation input) AND at least one API key set locally. Guests
   // and pre-backfill sessions ride along with api_keys omitted —
   // the local keyring stays the source of truth on this device.
-  if (userId && (apiKeys.omdb || apiKeys.opensubtitles)) {
+  if (userId && apiKeys.opensubtitles) {
     try {
       api_keys = await encryptForCloud(JSON.stringify(apiKeys), userId);
     } catch (e) {

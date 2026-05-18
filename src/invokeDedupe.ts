@@ -7,7 +7,7 @@
 // React StrictMode (and any transient remount) double-invokes effects in
 // dev mode. Without dedupe, the second invocation fires a duplicate
 // network round-trip that the consumer immediately discards via its
-// `cancelled` cleanup flag — but the addon / OMDb / etc. still pays
+// `cancelled` cleanup flag — but the addon / ratings API / etc. still pays
 // the cost. Logs show pairs of identical requests within ~1 ms,
 // matching the StrictMode pattern.
 //
@@ -19,7 +19,7 @@
 // Used by:
 //   • SearchView — global_search_grouped (already had its own copy;
 //     this module exists to share the pattern instead of duplicating)
-//   • DetailView — fetch_meta_detail, fetch_streams, OMDb fan-out
+//   • DetailView — fetch_meta_detail, fetch_streams, ratings fan-out
 //   • anywhere else that double-fire shows up
 // ---------------------------------------------------------------------------
 

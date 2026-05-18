@@ -150,19 +150,6 @@ pub struct AppSettings {
     #[serde(default)]
     pub opensubtitles_api_key: String,
 
-    // ── OMDb (Rotten Tomatoes / Metacritic critic scores) ──────────────────
-    /// Free-tier key for omdbapi.com. 1,000 req/day per key. Defaults to
-    /// EMPTY — release builds no longer ship a shared key (it was an
-    /// AGPL-licence muddle and would be revoked the moment users
-    /// noticed the rate-limit). Empty string = OMDb lookups disabled
-    /// silently (DetailView falls back to addon-supplied ratings + the
-    /// new aggregator path). The user can paste their own free key
-    /// (omdbapi.com signup is < 30s) into Settings → API Keys; that
-    /// key round-trips via settings export so it follows them across
-    /// installs.
-    #[serde(default)]
-    pub omdb_api_key: String,
-
 
     // ── Video quality ──────────────────────────────────────────────────────
     /// LEGACY HDR toggle. Pre-`hdr_mode`, this drove the HDR pipeline as a
@@ -349,7 +336,6 @@ impl Default for AppSettings {
             scrobble_addon_url:          String::new(),
             scrobble_enabled:            false,
             opensubtitles_api_key:       String::new(),
-            omdb_api_key:                String::new(),
             hdr_enabled:                 true,
             hdr_mode:                    default_hdr_mode(),
             next_up_lead_seconds:        default_next_up_lead_seconds(),

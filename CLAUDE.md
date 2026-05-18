@@ -101,13 +101,13 @@ These are mistakes that have specific, hard-to-diagnose symptoms. The HANDOFF.md
 - "App crashes on play" (STATUS_ACCESS_VIOLATION) → MPV property race; check polling and observed-property formats.
 - "Native browser context menu appears" → `main.tsx` capture-phase `contextmenu` listener; must install BEFORE React mounts.
 - "Streams from addon X don't appear" → DevConsole filter for `[X]`; `fetch_streams` logs manifest gate decisions.
-- "OMDb ratings missing" → only fires for `tt`-prefixed IDs (anime / Kitsu / TMDB skipped — OMDb only knows IMDb).
+- "Ratings missing/sparse" → `ratings.rs` aggregator: MDBList branch needs a `tt`-prefixed IMDb id (key baked at build via `build.rs` from git-ignored `src-tauri/mdblist.key`; empty key → branch no-ops); MAL+AniList branch needs a resolvable anime id. Non-tt non-anime ⇒ only addon-supplied `detail.ratings`.
 - "Library page blank" → `<ErrorBoundary scope="Library">` will surface the render error.
 
 ## Conventions
 
 - F12 opens the in-app DevConsole (ring buffer, level filters, search). Rust logs come through via `crate::devlog!` macro which mirrors to stderr AND emits a `dev-log` Tauri event.
-- Rust log labels: `[bridge]`, `[player]`, `[streams]`, `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[omdb]`, `[rpc]`, `[win32]`, `[smtc]`, `[scrobble]` — grep these in DevConsole or `aura-mpv.log`.
+- Rust log labels: `[bridge]`, `[player]`, `[streams]`, `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[ratings]`, `[rpc]`, `[win32]`, `[smtc]`, `[scrobble]` — grep these in DevConsole or `aura-mpv.log`.
 - libmpv writes its own verbose log to `%USERPROFILE%\aura-mpv.log` (truncated each MPV init). The last few lines usually pinpoint a STATUS_ACCESS_VIOLATION.
 - Discord RPC uses application ID `1499651271357890610` (in `window_logic.rs`). Browse states are gated on `discord_rpc_browse_states` setting; playback states honor `discord_rpc_show_titles` + the per-title blocklist.
 - Libmpv DLLs in `src-tauri/lib/` (`libmpv-2.dll` + `libmpv-wrapper.dll`) are git-ignored (>100 MB). Keep them present locally; downloads are at `github.com/zhongfly/mpv-winbuild` and `github.com/nini22P/libmpv-wrapper`.

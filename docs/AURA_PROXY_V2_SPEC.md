@@ -234,7 +234,7 @@ sync provider=v1 method=PUT namespace=settings scope=h7Q4… outcome=200 size=41
 
 `scope` is the FIRST 4 chars of the scope hash, never the full hash. The full hash isn't a secret per se (it's not the auth_key) but truncating prevents log scrapers from reconstructing per-account activity timelines.
 
-The body contents (the actual blob JSON) MUST NEVER be logged. Settings blobs include the user's OMDb API key.
+The body contents (the actual blob JSON) MUST NEVER be logged. Settings blobs include the user's encrypted OpenSubtitles API key.
 
 ## 9. CORS
 

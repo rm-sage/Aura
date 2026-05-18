@@ -24,12 +24,12 @@ import { findAIOMetadataAddon, isAnimeMeta, markAnimeId, typeLabel } from "../ai
 import { dedupedInvoke } from "../invokeDedupe";
 import { PersistentCache } from "../persistentCache";
 
-// 7-day cache for OMDb critic scores. RT/Metacritic values shift on
+// 7-day cache for the aggregate ratings. RT/Metacritic values shift on
 // the order of weeks for theatrical releases and never for older
 // titles, so a week between refreshes is safe and saves ~1 invoke per
 // detail open across re-uses of the same library.
-const omdbCache = new PersistentCache<{ source: string; value: string }[]>({
-  storageKey: "aura:omdb-cache:v1",
+const ratingsCache = new PersistentCache<{ source: string; value: string }[]>({
+  storageKey: "aura:ratings-cache:v1",
   ttlMs:      7 * 24 * 60 * 60 * 1000,
   maxEntries: 800,
 });
@@ -553,11 +553,11 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
   }, [metaAddon, addons, meta.id, meta.media_type]);
 
   // ── Multi-source ratings enrichment ──
-  // Unified replacement for the previous OMDb-only path. Hits a Rust
-  // aggregator (fetch_aggregate_ratings) that fans out to every
-  // available source — currently OMDb (IMDb / RT critic / Metacritic
-  // critic) and Jikan (MyAnimeList score / rank / popularity for anime).
-  // Empty array on failure / no key / no record — never throws.
+  // Hits a Rust aggregator (fetch_aggregate_ratings) that fans out to
+  // every available source — MDBList (IMDb / RT / Metacritic / TMDB /
+  // Trakt / Letterboxd by IMDb id) plus Jikan (MyAnimeList score / rank
+  // / popularity) and AniList (averageScore) for anime.
+  // Empty array on failure / no record — never throws.
   //
   // Anime detection: the meta detail's anime IDs (mal_id / kitsu_id /
   // anilist_id / anidb_id) are passed through to let Jikan resolve
@@ -574,7 +574,7 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
   useEffect(() => {
     setAggregateRatings([]);
     if (!meta.id) return;
-    const cached = omdbCache.get(meta.id);
+    const cached = ratingsCache.get(meta.id);
     if (cached && cached.length > 0) {
       // Re-shape legacy cache entries (pre-aggregator) into the new
       // format so existing cached values still render. Once the cache
@@ -614,7 +614,7 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
         setAggregateRatings(list);
         // Persist as the legacy { source, value }[] shape so existing
         // cache infrastructure keeps working without a schema bump.
-        omdbCache.set(
+        ratingsCache.set(
           meta.id,
           list.map((row) => ({ source: row.source, value: row.value })),
         );
@@ -1033,8 +1033,8 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
                 / runtime. Each tile is brand-coloured (IMDb yellow,
                 Rotten Tomatoes red, Metacritic teal, MyAnimeList
                 indigo, etc.); see ratingPalette below. The Rust
-                aggregator (`fetch_aggregate_ratings`) returns up to
-                three OMDb-sourced rows and three MAL rows for anime,
+                aggregator (`fetch_aggregate_ratings`) returns the
+                MDBList-sourced rows plus MAL/AniList rows for anime,
                 merged with whatever the addon shipped. We render at
                 most six. */}
             {mergedRatings.length > 0 && (

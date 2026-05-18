@@ -4,7 +4,7 @@
 //! Third-party API keys stored in the OS keyring (DPAPI on Windows,
 //! Keychain on macOS, Secret Service on Linux — via `keyring 3`'s
 //! native backends). Replaces the previous plaintext storage in
-//! `settings.json::omdb_api_key` / `opensubtitles_api_key`.
+//! `settings.json::opensubtitles_api_key`.
 //!
 //! Threat model: even in a "single-user desktop, OS-level filesystem
 //! trust" context, the keyring is the right place for credentials.
@@ -28,7 +28,7 @@ const KEYRING_SERVICE: &str = "aura-api-keys";
 /// Canonical name of every API key Aura stores. Centralised here so
 /// the migration, reads, and settings-export paths all reference the
 /// same set.
-pub const SUPPORTED_KEYS: &[&str] = &["omdb", "opensubtitles"];
+pub const SUPPORTED_KEYS: &[&str] = &["opensubtitles"];
 
 fn entry(name: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEYRING_SERVICE, name).map_err(|e| e.to_string())
@@ -102,7 +102,7 @@ pub async fn clear_api_key(name: String) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// Resolver — used by feature code (omdb.rs, subtitles.rs) to fetch the
+// Resolver — used by feature code (subtitles.rs) to fetch the
 // active key. Keyring-first, with a fallback to settings.json so the
 // brief migration window doesn't break in-flight feature work.
 // ---------------------------------------------------------------------------
@@ -116,7 +116,6 @@ pub fn resolve(name: &str) -> Option<Zeroizing<String>> {
     }
     let s = crate::settings::snapshot();
     let raw = match name {
-        "omdb"          => s.omdb_api_key.trim().to_string(),
         "opensubtitles" => s.opensubtitles_api_key.trim().to_string(),
         _ => return None,
     };
@@ -145,8 +144,7 @@ pub fn migrate_from_settings<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let mut settings = crate::settings::load(app);
     let mut changed = false;
 
-    let pairs: [(&str, String); 2] = [
-        ("omdb",          settings.omdb_api_key.trim().to_string()),
+    let pairs: [(&str, String); 1] = [
         ("opensubtitles", settings.opensubtitles_api_key.trim().to_string()),
     ];
 
@@ -180,7 +178,6 @@ pub fn migrate_from_settings<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         // null out the settings.json field. Keyring is now the source
         // of truth for this key.
         match *name {
-            "omdb"          => { settings.omdb_api_key.clear(); }
             "opensubtitles" => { settings.opensubtitles_api_key.clear(); }
             _ => {}
         }

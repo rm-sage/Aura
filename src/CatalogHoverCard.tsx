@@ -37,10 +37,10 @@ const PAD = 10;
  *  the same ordering DetailView uses; absent → 50. */
 interface RatingRow { source: string; value: string; kind?: string; weight?: number }
 
-// Session cache for the multi-source aggregate (OMDb IMDb/RT/Metacritic
-// + MAL for anime). Hovering re-fires the panel constantly, and OMDb
-// has a request budget — cache by meta id so a card is fetched at most
-// once per session.
+// Session cache for the multi-source aggregate (MDBList IMDb/RT/Metacritic
+// + MAL/AniList for anime). Hovering re-fires the panel constantly, and
+// the upstreams have request budgets — cache by meta id so a card is
+// fetched at most once per session.
 const aggRatingsCache = new Map<string, RatingRow[]>();
 
 interface RatingChipStyle { bg: string; border: string; fg: string; }
@@ -170,10 +170,11 @@ function HoverPanel({
   }, [meta.id, meta.media_type, addons]);
 
   // Multi-source rating enrichment — the SAME free aggregator the
-  // detail page uses (OMDb: IMDb / RT critic / Metacritic critic; + MAL
-  // for anime). The addon's own `detail.ratings` is usually just IMDb,
-  // which is why the hover card looked bare. Session-cached per id so
-  // repeat hovers don't burn the OMDb request budget; dedupe shares one
+  // detail page uses (MDBList: IMDb / RT / Metacritic / TMDB / Trakt /
+  // Letterboxd; + MAL/AniList for anime). The addon's own
+  // `detail.ratings` is usually just IMDb, which is why the hover card
+  // looked bare. Session-cached per id so repeat hovers don't burn the
+  // upstream request budgets; dedupe shares one
   // in-flight call across rapid re-hovers.
   const [aggRatings, setAggRatings] = useState<RatingRow[]>(
     () => aggRatingsCache.get(meta.id) ?? [],

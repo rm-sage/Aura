@@ -4,11 +4,13 @@
 // ---------------------------------------------------------------------------
 // Multi-source ratings aggregator.
 //
-// Folds OMDb (IMDb / Rotten Tomatoes critic / Metacritic critic) and
-// Jikan (MyAnimeList score, weighted score, popularity rank) into a
-// single normalized list the DetailView renders. OMDb stays optional —
-// no API key = no IMDb / RT / Metacritic, but Jikan still lights up for
-// anime, and addon-supplied ratings still render alongside.
+// Folds MDBList (IMDb / RT & Metacritic audience / TMDB / Trakt /
+// Letterboxd) and the anime pair Jikan (MyAnimeList score, weighted
+// score, popularity rank) + AniList (averageScore) into a single
+// normalized list the DetailView renders. The MDBList key is baked at
+// build time, so the IMDb / RT / Metacritic tier always lights up;
+// Jikan + AniList add the anime scores, and addon-supplied ratings
+// still render alongside.
 //
 // Why no Rotten Tomatoes audience score? RT's "audience" score sits
 // behind Fandango's paid Audience Insights API and isn't exposed by any
@@ -27,6 +29,8 @@
 //                                       OMDb (critic-only, redundant now).
 //   • Jikan (api.jikan.moe v4)       — MyAnimeList score (anime only),
 //                                       no key needed, 3 req/sec ceiling.
+//   • AniList (graphql.anilist.co)   — averageScore by idMal (anime
+//                                       only), no key needed.
 //
 // Output shape: `AggregateRating { source, value, weight, kind, badge_color }`
 // — the frontend doesn't need to know how each value was sourced; it
@@ -82,7 +86,8 @@ pub struct AggregateRating {
 // Trakt user scores, IMDb, Letterboxd. Pure-critic rows
 // (tomatoes/metacritic critic, rogerebert) and myanimelist are skipped
 // — MAL is owned by the richer Jikan branch below (score + rank +
-// popularity, and it works for kitsu/mal-id anime MDBList can't key).
+// popularity, and it works for kitsu/mal-id anime MDBList can't key);
+// AniList rides alongside Jikan from the same resolved MAL id.
 // ---------------------------------------------------------------------------
 
 const MDBLIST_KEY: &str = env!("AURA_MDBLIST_KEY");
@@ -279,10 +284,10 @@ async fn anilist_for_mal(mal_id: u32) -> Vec<AggregateRating> {
 
 #[derive(Deserialize)]
 pub struct AggregateInput {
-    /// IMDb id when known (`tt0903747`). Populates OMDb branch.
+    /// IMDb id when known (`tt0903747`). Populates the MDBList branch.
     pub imdb_id: Option<String>,
     /// Numeric MAL id, when the caller already knows it (e.g. from
-    /// AIOMetadata). Populates Jikan branch directly.
+    /// AIOMetadata). Populates the Jikan + AniList branches directly.
     pub mal_id: Option<u32>,
     /// Numeric Kitsu id; resolved → MAL → Jikan.
     pub kitsu_id: Option<u32>,

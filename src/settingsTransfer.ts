@@ -9,7 +9,7 @@
 // SCOPE
 //   Three buckets:
 //     1. backend  — addon-independent BackendSettings (theme, RPC, audio,
-//                   subtitles, keybindings, omdb_api_key, …)
+//                   subtitles, keybindings, opensubtitles_api_key, …)
 //     2. aura     — addon-independent localStorage prefs (detail-page
 //                   toggles like hideCastSpoilers / blurUnwatchedThumbnails)
 //     3. providers — addon-DEPENDENT prefs encoded by manifest_id INSTEAD
@@ -76,7 +76,6 @@ const PORTABLE_BACKEND_FIELDS = [
   "close_on_exit",
   "minimize_to_tray_on_close",
   "opensubtitles_api_key",
-  "omdb_api_key",
   "hdr_enabled",
   "hdr_mode",
   "next_up_lead_seconds",

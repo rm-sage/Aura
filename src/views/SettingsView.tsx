@@ -87,7 +87,6 @@ interface BackendSettings {
   scrobble_addon_url: string;
   scrobble_enabled: boolean;
   opensubtitles_api_key: string;
-  omdb_api_key: string;
   /** Legacy HDR toggle. Kept on the wire so older settings survive the
    *  migration, but the new UI talks to `hdr_mode` directly. */
   hdr_enabled: boolean;
@@ -957,7 +956,7 @@ function BackupRestoreSection({
   // sites await the blob.
   const hydrateBackendWithKeyringKeys = useCallback(async (): Promise<Record<string, unknown>> => {
     const merged: Record<string, unknown> = { ...(backend as unknown as Record<string, unknown>) };
-    for (const name of ["omdb", "opensubtitles"] as const) {
+    for (const name of ["opensubtitles"] as const) {
       try {
         const v = await invoke<string>("get_api_key", { name });
         if (v && v.trim()) {
@@ -1013,11 +1012,8 @@ function BackupRestoreSection({
       // into the OS keyring. We mutate a copy of blob.backend so the
       // backend patch sent to onApply has the key fields stripped.
       const backendPatch = { ...(blob.backend as Record<string, unknown>) };
-      const omdbKey = typeof backendPatch.omdb_api_key === "string"
-        ? backendPatch.omdb_api_key as string : "";
       const opensubKey = typeof backendPatch.opensubtitles_api_key === "string"
         ? backendPatch.opensubtitles_api_key as string : "";
-      delete backendPatch.omdb_api_key;
       delete backendPatch.opensubtitles_api_key;
 
       await onApply(backendPatch as Partial<BackendSettings>);
@@ -1028,10 +1024,6 @@ function BackupRestoreSection({
       // key manually). Skip empty values so we don't overwrite an
       // existing keyring entry with nothing.
       let apiKeysTouched = false;
-      if (omdbKey.trim()) {
-        await invoke("set_api_key", { name: "omdb", value: omdbKey.trim() }).catch(() => {});
-        apiKeysTouched = true;
-      }
       if (opensubKey.trim()) {
         await invoke("set_api_key", { name: "opensubtitles", value: opensubKey.trim() }).catch(() => {});
         apiKeysTouched = true;
@@ -1768,7 +1760,7 @@ function AutoAdvanceDelayRow({
 function KeyringApiKeyInput({
   name, label, description, placeholder,
 }: {
-  name: "omdb" | "opensubtitles";
+  name: "opensubtitles";
   label: string;
   description: string;
   placeholder?: string;
@@ -4467,25 +4459,13 @@ export default function SettingsView({ addons, session }: Props) {
             />
           </Section>
 
-          {/* API keys — currently just OMDb. Other third-party services
-              that need a key (OpenSubtitles, etc.) can plug into this
-              section as they get re-introduced. Aura no longer ships
-              a default OMDb key — users register a free one at
-              omdbapi.com (signup ~30 s, 1,000 req/day) and paste it
-              here. Without a key OMDb is silently disabled and the
-              detail page falls back to addon-supplied ratings plus the
-              MAL aggregator. The user's key is round-tripped via the
-              Backup & Restore export blob so it follows them across
-              installs. */}
+          {/* API keys. Ratings now come from MDBList (key baked at
+              build time, not user-supplied) + the free MAL/AniList
+              APIs, so the only user-facing key left is OpenSubtitles.
+              It's round-tripped via the Backup & Restore export blob so
+              it follows the user across installs. */}
           {backend && (
             <Section id="sec-api-keys" title="API Keys">
-              <KeyringApiKeyInput
-                name="omdb"
-                label="OMDb API key"
-                description="Enriches Detail-page ratings with Rotten Tomatoes and Metacritic critic scores. Aura does not ship a default key; register a free one at omdbapi.com (1,000 requests/day, ~30 s signup) and paste it here. Leave empty to disable OMDb; addon-supplied ratings and the MAL aggregator still render without it. Stored securely in the OS keyring."
-                placeholder="e.g. 1a2b3c4d"
-              />
-              <div className="h-px bg-white/6" />
               <KeyringApiKeyInput
                 name="opensubtitles"
                 label="OpenSubtitles API key"

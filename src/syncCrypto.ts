@@ -4,7 +4,7 @@
 // syncCrypto.ts ─────────────────────────────────────────────────────────────
 //
 // Client-side AES-GCM helpers for the sync blobs that carry third-party
-// API keys (OMDb, OpenSubtitles). Those credentials are categorically
+// API keys (OpenSubtitles). Those credentials are categorically
 // more sensitive than the rest of synced state — a proxy compromise
 // would leak per-user quota tokens for external services. The other
 // namespaces are deliberately stored in clear (the proxy already gates

@@ -136,7 +136,7 @@ fn client() -> &'static reqwest::Client {
             // Defence-in-depth: api.aniskip.com is HTTPS-only in
             // practice, but `https_only` rejects any silent HTTP
             // downgrade (e.g. a captured DNS rebinding to a malicious
-            // plain-HTTP host). Matches the policy on auth / OMDb /
+            // plain-HTTP host). Matches the policy on the auth /
             // ratings clients elsewhere in the crate.
             .https_only(true)
             .timeout(Duration::from_secs(8))

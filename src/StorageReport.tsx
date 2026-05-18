@@ -110,9 +110,9 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
     destructive: false,
   },
   {
-    prefix:      "aura:omdb-cache:v1",
-    label:       "OMDb ratings cache",
-    description: "Rotten Tomatoes and Metacritic critic scores fetched via OMDb. 7-day TTL; scores rarely change. Re-fetches on next detail open after expiry. Safe to clear.",
+    prefix:      "aura:ratings-cache:v1",
+    label:       "Ratings cache",
+    description: "Aggregated ratings (MDBList: IMDb / Rotten Tomatoes / Metacritic / TMDB / Trakt / Letterboxd, plus MAL + AniList for anime). 7-day TTL; scores rarely change. Re-fetches on next detail open after expiry. Safe to clear.",
     destructive: false,
   },
   {

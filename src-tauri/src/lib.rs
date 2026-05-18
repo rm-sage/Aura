@@ -1542,8 +1542,8 @@ pub fn run() {
             crate::devlog!(info, "lib", "Aura setup begin");
 
             // ── API key migration: settings.json → OS keyring ──
-            // One-shot per launch. Moves plaintext OMDb / OpenSubtitles
-            // keys from settings.json into the keyring (DPAPI / Keychain
+            // One-shot per launch. Moves the plaintext OpenSubtitles
+            // key from settings.json into the keyring (DPAPI / Keychain
             // / Secret Service) and clears the settings.json fields.
             // Idempotent — no-op when there's nothing to migrate AND
             // the keyring is already populated. See `api_keyring.rs`

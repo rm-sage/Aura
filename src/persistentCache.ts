@@ -6,7 +6,7 @@
 // from / writes to localStorage with a TTL and soft size cap.
 //
 // Used wherever a backend round-trip is expensive enough to be worth
-// persisting across app restarts (OMDb ratings, AniSkip windows, hero
+// persisting across app restarts (aggregate ratings, AniSkip windows, hero
 // logos, etc.). The metaCache module has a hand-rolled equivalent
 // because it predates this helper and uses a slightly different
 // shape — leave that one alone.
