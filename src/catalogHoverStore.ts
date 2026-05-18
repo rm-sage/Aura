@@ -97,6 +97,27 @@ export function closeHoverNow(): void {
   }
 }
 
+/** Open the panel IMMEDIATELY (no hover-intent delay). Used by the
+ *  optional mouse-button bind, where the open is an explicit user
+ *  action rather than a hover so the 450 ms intent delay is wrong. */
+export function openHoverNow(meta: MetaPreview, el: HTMLElement): void {
+  clearOpen();
+  clearClose();
+  active = { meta, el, rect: el.getBoundingClientRect() };
+  emit();
+}
+
+/** Bind pressed on a card: open it, or close if THAT card's panel is
+ *  already open (press-again-to-dismiss). Identity is by element, so
+ *  two cards sharing a meta id still toggle independently. */
+export function toggleHoverNow(meta: MetaPreview, el: HTMLElement): void {
+  if (active && active.el === el) {
+    closeHoverNow();
+  } else {
+    openHoverNow(meta, el);
+  }
+}
+
 // While the cursor is over the popup itself, the user is reading it:
 // scroll/resize must NOT re-anchor (that would slide the panel out
 // from under the cursor) and must NOT close it. The panel toggles this
