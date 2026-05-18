@@ -11,6 +11,12 @@ import { useLibraryProgress } from "./LibraryContext";
 import WatchedBadge, { useWatchedVariant, WatchedBadgeStatic } from "./WatchedBadge";
 import { getManualWatchedState, useManualWatchedVersion } from "./manualWatched";
 import { getMetaDetailFallback } from "./metaCache";
+import {
+  scheduleHoverOpen,
+  cancelHoverOpen,
+  scheduleHoverClose,
+  closeHoverNow,
+} from "./catalogHoverStore";
 
 /** Per-catalog cache for the View-all popup. Keyed by
  *  `${addonUrl}|${type}|${id}`. Persists across DiscoveryRow remounts
@@ -685,13 +691,22 @@ export const CatalogCard = memo(function CatalogCard({ meta, onSelect }: Catalog
   return (
     <button
       type="button"
-      onClick={() => onSelect?.(meta)}
+      onClick={() => { closeHoverNow(); onSelect?.(meta); }}
       onContextMenu={(e) => {
         e.preventDefault();
+        closeHoverNow();
         window.dispatchEvent(new CustomEvent("aura:card-context", {
           detail: { meta, x: e.clientX, y: e.clientY },
         }));
       }}
+      // Kai-style mini-meta panel — hover-intent open (delayed in the
+      // store) keyed off this card's viewport rect; close is delayed
+      // (leeway) so travelling the cursor onto the panel doesn't dismiss
+      // it. The central CatalogHoverHost owns the actual popup.
+      onMouseEnter={(e) =>
+        scheduleHoverOpen(meta, e.currentTarget.getBoundingClientRect())
+      }
+      onMouseLeave={() => { cancelHoverOpen(); scheduleHoverClose(); }}
       className="card-grow group flex flex-col gap-2 cursor-pointer card-contain text-left
                  focus:outline-none focus-visible:ring-2 focus-visible:ring-ln-accent/60 rounded-xl"
       data-meta-card={`${meta.media_type}:${meta.id}`}

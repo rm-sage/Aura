@@ -26,6 +26,7 @@ import { isOnboardingComplete } from "./onboarding";
 import PlayerOverlay from "./PlayerOverlay";
 import AmbientAura from "./AmbientAura";
 import ContextMenuHost, { openContextMenu } from "./ContextMenu";
+import { CatalogHoverHost } from "./CatalogHoverCard";
 import AppToastHost, { showAppToast } from "./AppToast";
 import FlyUpToastHost, { showFlyUpToast } from "./FlyUpToast";
 import SourcePopupHost from "./SourcePopup";
@@ -4468,6 +4469,11 @@ export default function App() {
 
       {/* Singleton context menu host — listens for openContextMenu() events. */}
       <ContextMenuHost />
+
+      {/* Singleton Kai-style mini-meta hover panel — driven by
+          catalogHoverStore, fed by every CatalogCard's hover intent. */}
+      <CatalogHoverHost addons={addons} onSelectMeta={openDetail} />
+
 
       {/* Global toast surface — visible on every tab, fed by showAppToast(). */}
       <AppToastHost />
