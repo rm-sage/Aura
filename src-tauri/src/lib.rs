@@ -1991,6 +1991,7 @@ pub fn run() {
             aniskip::resolve_mal_id,
             aniskip::resolve_mal_id_by_title,
             silencedetect::detect_silence_intervals,
+            silencedetect::detect_outro_boundary,
             // ── Phase 3C: scrobbling ──────────────────────────────────────────
             scrobble::scrobble_start,
             scrobble::scrobble_heartbeat,

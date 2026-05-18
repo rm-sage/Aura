@@ -1164,16 +1164,15 @@ export default function App() {
                     detail: lastEdStart,
                   }));
                 }
-                // Auto silencedetect fallback. Only the AniSkip path
-                // passes `silenceUrl` (so live-action / no-mal opens
-                // don't trigger a heavy ffmpeg scan). Fires only when
-                // NOTHING upstream produced an OP — AniSkip had no
-                // community data (404) AND no titled/heuristic chapter
-                // OP — i.e. exactly the "anime we know, AniSkip
-                // doesn't" case (Daemons of the Shadow Realm S?E06).
-                // Same one-shot command + heuristic as the manual
-                // "Detect Skip" button; just automatic. Prompt-mode
-                // (auto:false) — never auto-seek a guessed boundary.
+                // Hybrid-mode auto OP fallback. Every series path now
+                // passes `silenceUrl` (anime AND live-action) — that's
+                // the Hybrid opt-in: when NOTHING upstream produced an
+                // OP (no AniSkip data AND no titled/heuristic chapter
+                // OP), one bounded ffmpeg silencedetect pass infers the
+                // OP→dialogue boundary. Same one-shot command + heuristic
+                // as the manual "Detect Skip" button; just automatic.
+                // Prompt-mode (auto:false) — never auto-seek a guess.
+                // ffmpeg-on-PATH best-effort: a clean no-op without it.
                 const url = opts?.silenceUrl ?? null;
                 const hasOp = merged.some((w) => w.type === "op" || w.type === "mixed-op");
                 if (url && !hasOp && modeFor("op") !== "off") {
@@ -1214,6 +1213,36 @@ export default function App() {
                     }
                   } catch (e) {
                     console.warn(`[aniskip] silencedetect fallback failed: ${String(e)}`);
+                  }
+                }
+                // Hybrid-mode ED fallback. When NOTHING upstream gave an
+                // ED (no AniSkip ED, no titled/heuristic chapter ED →
+                // `lastEdStart == null`), tail-scan the stream's last
+                // few minutes for the credits boundary (one bounded
+                // ffmpeg pass, blackdetect + silencedetect, NO 90×
+                // scan). We do NOT stamp a skip window (no reliable end
+                // without the container duration) — we only hand the
+                // Next-Up CTA an ED-start so it fires on time for
+                // live-action / any series AniSkip + chapters miss.
+                if (url && lastEdStart == null && modeFor("ed") !== "off") {
+                  try {
+                    const ob = await invoke<{
+                      available: boolean;
+                      ed_start: number | null;
+                      note: string;
+                    }>("detect_outro_boundary", { url, tailSecs: 330 });
+                    if (ob.available && ob.ed_start != null && ob.ed_start > 0) {
+                      window.dispatchEvent(new CustomEvent<number>("aura:ed-start-time", {
+                        detail: ob.ed_start,
+                      }));
+                      console.info(
+                        `[aniskip] outro tail-scan → ED≈${Math.round(ob.ed_start)}s (next-up timing)`,
+                      );
+                    } else {
+                      console.info(`[aniskip] outro tail-scan: ${ob.note}`);
+                    }
+                  } catch (e) {
+                    console.warn(`[aniskip] outro tail-scan failed: ${String(e)}`);
                   }
                 }
               } catch (err) {
@@ -1312,7 +1341,7 @@ export default function App() {
               // path so chaptered live-action series still get skip
               // windows. THIS is the anime-only → any-series extension.
               console.info(`[aniskip] no mal_id for ${seriesId} — chapter-only skip path`);
-              await finishWithChapters([]);
+              await finishWithChapters([], { silenceUrl: stream.url ?? null });
               return;
             }
             // Mal-id was resolved → this is an anime; mark for future
@@ -1344,7 +1373,7 @@ export default function App() {
               // Can't index AniSkip without an episode number, but a
               // chaptered file can still yield skip windows.
               console.info(`[aniskip] couldn't parse episode from ${target.id} — chapter-only`);
-              await finishWithChapters([]);
+              await finishWithChapters([], { silenceUrl: stream.url ?? null });
               return;
             }
             console.info(

@@ -173,6 +173,179 @@ pub async fn detect_silence_intervals(
     })
 }
 
+/// Result of the outro/ED boundary tail-scan.
+#[derive(Debug, Serialize)]
+pub struct OutroBoundaryResult {
+    pub available: bool,
+    /// Absolute timestamp (seconds, stream PTS) where the ED / credits
+    /// most likely begin, or null when no confident boundary was found.
+    pub ed_start:  Option<f64>,
+    pub note:      String,
+}
+
+/// Hybrid-mode ED detection (the bounded, low-risk slice — NO 90× scan).
+///
+/// Scans only the LAST `tail_secs` of the stream with a SINGLE ffmpeg
+/// pass running `blackdetect` (downscaled, cheap) + `silencedetect`
+/// together. Credits/ED almost always begin with a hard scene→black
+/// cut and/or a music/dialogue→silence transition; the EARLIEST such
+/// significant boundary inside the tail (excluding the seek-in artifact
+/// and the final fade-to-black at EOF) is the ED start.
+///
+/// This does NOT stamp a skip window (no reliable end without the
+/// container duration) — its job is to hand the desktop an ED-start so
+/// the Next-Up CTA fires at the right moment for live-action / any
+/// series AniSkip + chapters don't cover. ffmpeg-on-PATH best-effort,
+/// same graceful `available=false` contract as `detect_silence_intervals`.
+#[tauri::command]
+pub async fn detect_outro_boundary(
+    url: String,
+    tail_secs: u32,
+) -> Result<OutroBoundaryResult, String> {
+    let tail = if tail_secs == 0 { 300 } else { tail_secs.min(900) };
+    crate::devlog!(
+        info, "silence",
+        "detect_outro_boundary tail={tail}s url={}",
+        url.chars().take(80).collect::<String>(),
+    );
+
+    if !ffmpeg_is_available().await {
+        return Ok(OutroBoundaryResult {
+            available: false,
+            ed_start:  None,
+            note:      "ffmpeg not found on PATH".to_string(),
+        });
+    }
+
+    // `-sseof -tail` seeks to (duration - tail); reported PTS stay
+    // absolute. Downscale before blackdetect so the video decode of the
+    // tail is cheap. A hard `-t` bounds the worst case.
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-hide_banner")
+        .arg("-nostdin")
+        .arg("-sseof").arg(format!("-{tail}"))
+        .arg("-i").arg(&url)
+        .arg("-vf").arg("scale=160:-2,blackdetect=d=0.30:pic_th=0.98")
+        .arg("-af").arg("silencedetect=n=-30dB:d=0.5")
+        .arg("-t").arg((tail + 30).to_string())
+        .arg("-f").arg("null")
+        .arg("-")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            crate::devlog!(warn, "silence", "outro spawn failed: {e}");
+            return Ok(OutroBoundaryResult {
+                available: false,
+                ed_start:  None,
+                note:      format!("ffmpeg spawn failed: {e}"),
+            });
+        }
+    };
+
+    let stderr = match child.stderr.take() {
+        Some(s) => s,
+        None    => return Err("could not capture ffmpeg stderr".to_string()),
+    };
+    let mut reader = BufReader::new(stderr).lines();
+
+    // (start, kind) — kind: true=black, false=long-silence. We also
+    // track the scanned PTS range to drop the seek-in artifact and the
+    // final EOF fade without needing the container duration.
+    let mut blacks: Vec<f64> = Vec::new();   // black_start where black_duration ≥ 0.30
+    let mut sils:   Vec<f64> = Vec::new();   // silence_start where silence ≥ 1.5 s
+    let mut sil_start: Option<f64> = None;
+    let mut black_start: Option<f64> = None;
+    let mut ts_min = f64::INFINITY;
+    let mut ts_max = f64::NEG_INFINITY;
+
+    let parse = async {
+        while let Ok(Some(line)) = reader.next_line().await {
+            if let Some(rest) = line.split("black_start:").nth(1) {
+                if let Some(tok) = rest.trim().split_whitespace().next() {
+                    if let Ok(s) = tok.parse::<f64>() {
+                        black_start = Some(s);
+                        ts_min = ts_min.min(s);
+                        ts_max = ts_max.max(s);
+                    }
+                }
+            } else if let Some(rest) = line.split("black_end:").nth(1) {
+                if let Some(tok) = rest.trim().split_whitespace().next() {
+                    if let Ok(e) = tok.parse::<f64>() {
+                        ts_max = ts_max.max(e);
+                        if let Some(bs) = black_start.take() {
+                            if e - bs >= 0.30 { blacks.push(bs); }
+                        }
+                    }
+                }
+            } else if let Some(rest) = line.split("silence_start:").nth(1) {
+                if let Some(tok) = rest.trim().split_whitespace().next() {
+                    if let Ok(s) = tok.parse::<f64>() {
+                        sil_start = Some(s);
+                        ts_min = ts_min.min(s);
+                        ts_max = ts_max.max(s);
+                    }
+                }
+            } else if let Some(rest) = line.split("silence_end:").nth(1) {
+                if let Some(tok) = rest.trim().split_whitespace().next() {
+                    if let Ok(e) = tok.parse::<f64>() {
+                        ts_max = ts_max.max(e);
+                        if let Some(ss) = sil_start.take() {
+                            if e - ss >= 1.5 { sils.push(ss); }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    let timed = tokio::time::timeout(Duration::from_secs(300), parse).await;
+    if timed.is_err() {
+        crate::devlog!(warn, "silence", "outro ffmpeg readline timed out — killing");
+        let _ = child.kill().await;
+    }
+    let _ = child.wait().await;
+
+    // Exclude the seek-in artifact (first ~2 s of the scan) and the
+    // final fade-to-black at the very end (~last 8 s). The ED begins at
+    // the EARLIEST qualifying boundary in between; a hard black cut is
+    // a stronger credits signal than silence, so prefer it.
+    let lo = if ts_min.is_finite() { ts_min + 2.0 } else { 0.0 };
+    let hi = if ts_max.is_finite() { ts_max - 8.0 } else { f64::INFINITY };
+    let in_window = |t: f64| t >= lo && t <= hi;
+
+    let earliest_black = blacks.iter().copied().filter(|&t| in_window(t))
+        .fold(f64::INFINITY, f64::min);
+    let earliest_sil = sils.iter().copied().filter(|&t| in_window(t))
+        .fold(f64::INFINITY, f64::min);
+
+    let ed_start = if earliest_black.is_finite() {
+        Some(earliest_black)
+    } else if earliest_sil.is_finite() {
+        Some(earliest_sil)
+    } else {
+        None
+    };
+
+    let note = match ed_start {
+        Some(t) => format!(
+            "tail {tail}s: {} black + {} silence boundary(s) → ED≈{:.1}s",
+            blacks.len(), sils.len(), t,
+        ),
+        None => format!(
+            "tail {tail}s: {} black + {} silence boundary(s), none qualified",
+            blacks.len(), sils.len(),
+        ),
+    };
+    crate::devlog!(info, "silence", "{note}");
+
+    Ok(OutroBoundaryResult { available: true, ed_start, note })
+}
+
 async fn ffmpeg_is_available() -> bool {
     // `ffmpeg -version` exits 0 when the binary is on PATH and
     // executable. We don't care about the version string itself.

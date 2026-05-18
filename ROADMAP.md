@@ -857,22 +857,30 @@ interpolation (`video-sync=display-resample` + `interpolation` +
 SVP path is not wanted. Left as a tombstone so the numbering stays
 stable and the decision is on record.
 
-### 8.11 Skip: Kai-style Hybrid Mode (blackdetect + silencedetect) 🔴 ⏸ DEFERRED
+### 8.11 Skip: Kai-style Hybrid Mode (blackdetect + silencedetect) 🟢 SHIPPED (bounded slice)
 
-Chapter-less / no-AniSkip fallback: extend `silencedetect.rs` into a
-Hybrid detector — add ffmpeg `blackdetect` alongside `silencedetect`
-with Kai's "single source of truth" chapter cross-check (a filter hit
-only counts when it aligns with an intro/outro window). **Deferred:**
-heaviest remaining skip item; ffmpeg stays best-effort/PATH; Kai drives
-this by running the player at 90× with frame-drop while observing
-`vf-metadata`/`af-metadata`, which interacts directly with Aura's
-seek/property-race + `observed_properties` landmines and must be
-orchestrated natively (Aura's Lua `load-script` is unreliable). Needs
-careful runtime validation — unsafe to land blind. NOTE: the common
-live-action case (embedded chapters) is **already shipped** via the
-§8-era chapter-heuristic path (`feat(skip)` — positional windows + the
-90 s Prologue Fix + generic patterns); this phase only adds the
-chapter-less case.
+The pragmatic, low-risk slice is **done**:
+
+- `silencedetect.rs::detect_outro_boundary` — ONE bounded ffmpeg pass
+  over the stream's last few minutes (`-sseof`), downscaled
+  `blackdetect` + `silencedetect`, heuristically picks the credits/ED
+  start (earliest hard-black-cut, else long-silence, excluding the
+  seek-in artefact and the EOF fade). It does NOT stamp a skip window
+  (no reliable end without container duration) — it hands the Next-Up
+  CTA an ED-start so the card fires on time for live-action / anything
+  AniSkip + chapters miss.
+- The auto OP silencedetect fallback (already shipped) is now armed for
+  **every series path, anime AND live-action** (Hybrid opt-in), not
+  just the MAL-resolved one. Both passes are ffmpeg-on-PATH best-effort
+  (clean no-op without it), bounded + kill-on-drop, prompt-mode.
+
+**Deliberately NOT done** (and recommended against): Kai's 90×-speed
+full-scan with live `vf-metadata`/`af-metadata` observation. It
+collides head-on with Aura's seek/property-race + `observed_properties`
+landmines, needs native orchestration (Lua `load-script` unreliable),
+and the bounded tail-scan above already covers the real-world need.
+Reopen only if a concrete gap appears that the tail-scan can't reach.
+The chaptered case remains covered by the §8 chapter-heuristic path.
 
 ### 8.12 Hover-seek thumbnails — real frame source/engine 🔴 ⏸ DEFERRED
 
