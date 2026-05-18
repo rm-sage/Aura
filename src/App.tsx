@@ -4252,7 +4252,6 @@ export default function App() {
       <AccountButton
         loggedIn={!!session?.auth_key}
         email={session?.email ?? null}
-        onOpenSettings={() => setActiveView("settings")}
         onLoginRequest={() => setShowLogin(true)}
         onLogout={handleLogout}
       />

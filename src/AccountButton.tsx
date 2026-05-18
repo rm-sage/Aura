@@ -4,6 +4,7 @@
 import { useEffect, useState } from "react";
 import { ProfilePopover } from "./NavSidebar";
 import AuraLogoA from "./AuraLogoA";
+import AccountPanel from "./AccountPanel";
 
 // ---------------------------------------------------------------------------
 // AccountButton — compact circular Aura logo button + popover, anchored
@@ -31,15 +32,15 @@ interface Props {
   /** Display nickname if available. Currently null in the source — wired
    *  through for forward-compat when Stremio surfaces one. */
   nickname?: string | null;
-  onOpenSettings: () => void;
   onLoginRequest?: () => void;
   onLogout?: () => void;
 }
 
 export default function AccountButton({
-  loggedIn, email, nickname, onOpenSettings, onLoginRequest, onLogout,
+  loggedIn, email, nickname, onLoginRequest, onLogout,
 }: Props) {
   const [open, setOpen] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
 
   // Outside-click + Esc to close — match the sidebar variant's behavior
   // exactly, including the same data-attribute guards so nested clicks
@@ -107,9 +108,16 @@ export default function AccountButton({
           email={email}
           nickname={nickname}
           onClose={() => setOpen(false)}
-          onSettings={() => { setOpen(false); onOpenSettings(); }}
+          onSettings={() => { setOpen(false); setAccountOpen(true); }}
           onLogin={() => { setOpen(false); onLoginRequest?.(); }}
           onLogout={() => { setOpen(false); onLogout?.(); }}
+        />
+      )}
+      {accountOpen && (
+        <AccountPanel
+          loggedIn={loggedIn}
+          sessionEmail={email ?? null}
+          onClose={() => setAccountOpen(false)}
         />
       )}
     </div>
