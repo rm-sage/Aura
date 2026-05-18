@@ -1402,6 +1402,7 @@ function RatingTile({
   const palette = RATING_PALETTE[key] ?? NEUTRAL_RATING_PALETTE;
   return (
     <span
+      title={ratingLabelFor(source, kind)}
       className={`inline-flex items-center gap-2 px-2.5 py-1.5 rounded-md border
                   ${palette.bg} ${palette.border}`}
     >

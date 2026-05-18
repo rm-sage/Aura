@@ -16,8 +16,10 @@
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { invoke } from "@tauri-apps/api/core";
 import type { AddonEntry, MetaPreview, MetaDetail } from "./types";
 import { getMetaDetailFallback } from "./metaCache";
+import { dedupedInvoke } from "./invokeDedupe";
 import { BrandLogo, ratingDomain } from "./logodev";
 import {
   useHoverTarget,
@@ -30,6 +32,16 @@ import {
 const PANEL_W = 360;
 const GAP = 12;
 const PAD = 10;
+
+/** A merged rating row (addon-supplied OR aggregator). `weight` drives
+ *  the same ordering DetailView uses; absent → 50. */
+interface RatingRow { source: string; value: string; kind?: string; weight?: number }
+
+// Session cache for the multi-source aggregate (OMDb IMDb/RT/Metacritic
+// + MAL for anime). Hovering re-fires the panel constantly, and OMDb
+// has a request budget — cache by meta id so a card is fetched at most
+// once per session.
+const aggRatingsCache = new Map<string, RatingRow[]>();
 
 interface RatingChipStyle { bg: string; border: string; fg: string; }
 
@@ -67,7 +79,10 @@ function RatingChip({ source, value }: { source: string; value: string }) {
   const { key, label } = chipKeyLabel(source);
   const st = RATING_STYLES[key] ?? NEUTRAL_CHIP;
   return (
-    <span className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md border ${st.bg} ${st.border}`}>
+    <span
+      title={source}
+      className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md border ${st.bg} ${st.border}`}
+    >
       <BrandLogo
         domain={ratingDomain(source)}
         alt={label}
@@ -154,6 +169,50 @@ function HoverPanel({
     return () => { cancelled = true; };
   }, [meta.id, meta.media_type, addons]);
 
+  // Multi-source rating enrichment — the SAME free aggregator the
+  // detail page uses (OMDb: IMDb / RT critic / Metacritic critic; + MAL
+  // for anime). The addon's own `detail.ratings` is usually just IMDb,
+  // which is why the hover card looked bare. Session-cached per id so
+  // repeat hovers don't burn the OMDb request budget; dedupe shares one
+  // in-flight call across rapid re-hovers.
+  const [aggRatings, setAggRatings] = useState<RatingRow[]>(
+    () => aggRatingsCache.get(meta.id) ?? [],
+  );
+  useEffect(() => {
+    const cached = aggRatingsCache.get(meta.id);
+    if (cached) { setAggRatings(cached); return; }
+    let cancelled = false;
+    const isAnime =
+      meta.media_type === "anime" ||
+      /^(kitsu|mal|anidb|anilist):/.test(meta.id) ||
+      !!(detail?.mal_id || detail?.kitsu_id || detail?.anidb_id);
+    const input = {
+      imdb_id:    meta.id.startsWith("tt") ? meta.id : null,
+      mal_id:     detail?.mal_id   ?? null,
+      kitsu_id:   detail?.kitsu_id ?? null,
+      anilist_id: null,
+      anidb_id:   detail?.anidb_id ?? null,
+      title:      meta.name,
+      year:       meta.release_info ? Number(meta.release_info.slice(0, 4)) || null : null,
+      is_anime:   isAnime,
+    };
+    // Nothing resolvable → skip the round-trip entirely.
+    if (!input.imdb_id && !isAnime) return;
+    dedupedInvoke(
+      `ratings:${meta.id}:${isAnime ? "anime" : "std"}`,
+      () => invoke<RatingRow[]>("fetch_aggregate_ratings", { input }),
+    )
+      .then((r) => {
+        if (cancelled) return;
+        const list = Array.isArray(r) ? r : [];
+        aggRatingsCache.set(meta.id, list);
+        setAggRatings(list);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [meta.id, meta.media_type, meta.name, meta.release_info,
+      detail?.mal_id, detail?.kitsu_id, detail?.anidb_id]);
+
   // Position beside the card: prefer the right edge, flip left when
   // there is no room, clamp vertically into the viewport.
   useLayoutEffect(() => {
@@ -182,7 +241,22 @@ function HoverPanel({
   if (isEpisodic && epCount > 0) metaBits.push(`${epCount} Episode${epCount === 1 ? "" : "s"}`);
   if (detail?.runtime) metaBits.push(detail.runtime);
 
-  const ratings = (detail?.ratings ?? []).filter((r) => r.value).slice(0, 6);
+  // Merge addon-supplied + aggregator ratings (aggregator wins on
+  // source collision — it goes through ratings.rs label normalisation),
+  // weight-sorted exactly like DetailView so the strongest sources
+  // surface first within the 6-chip cap.
+  const ratings = (() => {
+    const map = new Map<string, RatingRow>();
+    for (const r of detail?.ratings ?? []) {
+      if (r.value) map.set(r.source.toLowerCase(), { source: r.source, value: r.value });
+    }
+    for (const r of aggRatings) {
+      if (r.value) map.set(r.source.toLowerCase(), r);
+    }
+    return [...map.values()]
+      .sort((a, b) => (b.weight ?? 50) - (a.weight ?? 50))
+      .slice(0, 6);
+  })();
   const tags = (detail?.genres ?? []).slice(0, 8);
   const directors = (detail?.director ?? []).filter(Boolean).slice(0, 2);
   const cast = (detail?.cast_detailed ?? []).slice(0, 6);
