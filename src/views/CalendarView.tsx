@@ -500,7 +500,7 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
                               className="absolute top-1 left-1 text-[9px] leading-none
                                          font-mono font-semibold text-white/95
                                          px-1 py-0.5 rounded bg-black/85
-                                         border border-white/15 max-w-[90%] truncate"
+                                         border border-white/15"
                             >
                               {epLabel}
                             </span>
