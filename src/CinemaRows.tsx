@@ -704,7 +704,7 @@ export const CatalogCard = memo(function CatalogCard({ meta, onSelect }: Catalog
       // (leeway) so travelling the cursor onto the panel doesn't dismiss
       // it. The central CatalogHoverHost owns the actual popup.
       onMouseEnter={(e) =>
-        scheduleHoverOpen(meta, e.currentTarget.getBoundingClientRect())
+        scheduleHoverOpen(meta, e.currentTarget as HTMLElement)
       }
       onMouseLeave={() => { cancelHoverOpen(); scheduleHoverClose(); }}
       className="card-grow group flex flex-col gap-2 cursor-pointer card-contain text-left

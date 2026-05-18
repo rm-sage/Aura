@@ -2287,7 +2287,19 @@ function Scrubber({
   };
 
   const onPointerMove = (e: React.PointerEvent) => {
-    setHoverPct(pctFromEvent(e.clientX) * 100);
+    const pct = pctFromEvent(e.clientX) * 100;
+    setHoverPct(pct);
+    // OP/ED segment hover is driven from the cursor's X across the
+    // FULL track height — the same vertical leeway the thumbnail
+    // already gets — rather than the 4px band's own pointer events
+    // (which demanded pixel-perfect aim on the bar). `drawableSegments`
+    // is initialised by render time; this only runs on pointer events.
+    const hit = drawableSegments.find(
+      (s) => pct >= s.leftPct && pct <= s.leftPct + s.widthPct,
+    );
+    setHoveredSegment(
+      hit ? { seg: hit, leftPct: hit.leftPct + hit.widthPct / 2 } : null,
+    );
     if (!dragging) return;
     onScrub(pctFromEvent(e.clientX) * max);
   };
@@ -2373,21 +2385,18 @@ function Scrubber({
         style={{ left: 0, width: `${progressPct}%` }}
       />
 
-      {/* AniSkip segment bands — rendered above the fill so the
-          amber stands out against the green gradient. Each band is
-          a pointer-events-auto sliver that captures hover so the
-          tooltip can anchor; the underlying scrub click still works
-          because the band sits on a SEPARATE pointer handler that
-          stops propagation only for hover state updates. Pointer
-          down still bubbles to the scrubber's onPointerDown so
-          clicking a band seeks into it. */}
+      {/* AniSkip segment bands — rendered above the fill so the amber
+          stands out against the green gradient. Purely visual now
+          (aria-hidden, pointer-events handled by the track): hover
+          detection is driven by the track's onPointerMove against the
+          cursor X, so the OP/ED tooltip triggers anywhere in the full
+          24px track height — same leeway as the frame thumbnail —
+          instead of demanding pixel-perfect aim on this 4px sliver. */}
       {drawableSegments.map((s, i) => (
         <div
           key={`${s.type}:${s.start}:${i}`}
           aria-hidden
-          onPointerEnter={() => setHoveredSegment({ seg: s, leftPct: s.leftPct + s.widthPct / 2 })}
-          onPointerLeave={() => setHoveredSegment((h) => h && h.seg === s ? null : h)}
-          className={`absolute h-1 rounded-full group-hover:h-1.5 transition-all duration-150 ${bandClassFor(s.auto)}`}
+          className={`absolute h-1 rounded-full group-hover:h-1.5 transition-all duration-150 pointer-events-none ${bandClassFor(s.auto)}`}
           style={{ left: `${s.leftPct}%`, width: `${s.widthPct}%` }}
         />
       ))}

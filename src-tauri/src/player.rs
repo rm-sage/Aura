@@ -594,35 +594,56 @@ pub async fn extract_thumbnail(
             std::thread::sleep(std::time::Duration::from_millis(450));
         }
 
-        mpv.command(
-            "seek",
-            &vec![serde_json::json!(at_seconds), serde_json::json!("absolute+exact")],
-            "thumb",
-        )
-        .map_err(|e| format!("thumb seek: {e}"))?;
-        std::thread::sleep(std::time::Duration::from_millis(260));
-
         let mut path = std::env::temp_dir();
         path.push("aura-thumb.jpg");
-        let _ = std::fs::remove_file(&path);
         let path_fwd = path.to_string_lossy().replace('\\', "/");
-        mpv.command(
-            "screenshot-to-file",
-            &vec![serde_json::json!(path_fwd), serde_json::json!("video")],
-            "thumb",
-        )
-        .map_err(|e| format!("thumb screenshot: {e}"))?;
-        std::thread::sleep(std::time::Duration::from_millis(50));
 
-        let bytes = match std::fs::read(&path) {
-            Ok(b) if !b.is_empty() => b,
-            // Empty / missing screenshot (headless render produced
-            // nothing on this build) — graceful: scrubber stays on the
-            // timestamp tooltip.
-            _ => return Ok(None),
-        };
+        // Bounded retry — this is the "warm-up" fix. On the FIRST hover
+        // of a freshly-loaded URL the headless decode pipeline usually
+        // hasn't produced a frame yet, so the first screenshot(s) come
+        // back empty. The old code returned Ok(None) immediately, so the
+        // scrubber flashed the loading spinner then nothing and the user
+        // had to hover 2-3 times to "warm" the engine. Retrying the
+        // seek+screenshot here self-warms WITHIN the first hover. Warm /
+        // subsequent hovers still succeed on attempt 0, so there's no
+        // added latency once primed.
+        for attempt in 0..6u32 {
+            mpv.command(
+                "seek",
+                &vec![serde_json::json!(at_seconds), serde_json::json!("absolute+exact")],
+                "thumb",
+            )
+            .map_err(|e| format!("thumb seek: {e}"))?;
+            // Generous settle on the first couple of attempts (pipeline
+            // still spinning up), short once it's emitting frames.
+            std::thread::sleep(std::time::Duration::from_millis(
+                if attempt == 0 { 260 } else { 190 },
+            ));
+
+            let _ = std::fs::remove_file(&path);
+            mpv.command(
+                "screenshot-to-file",
+                &vec![serde_json::json!(path_fwd.clone()), serde_json::json!("video")],
+                "thumb",
+            )
+            .map_err(|e| format!("thumb screenshot: {e}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
+            if let Ok(bytes) = std::fs::read(&path) {
+                if !bytes.is_empty() {
+                    let _ = std::fs::remove_file(&path);
+                    return Ok(Some(format!(
+                        "data:image/jpeg;base64,{}",
+                        b64_encode(&bytes),
+                    )));
+                }
+            }
+        }
+        // Still nothing after the retries (headless render produced
+        // nothing on this build) — graceful: scrubber stays on the
+        // timestamp-only tooltip.
         let _ = std::fs::remove_file(&path);
-        Ok(Some(format!("data:image/jpeg;base64,{}", b64_encode(&bytes))))
+        Ok(None)
     })
     .await
     .map_err(|e| e.to_string())?

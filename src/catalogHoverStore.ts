@@ -20,9 +20,12 @@ import type { MetaPreview } from "./types";
 
 export interface HoverTarget {
   meta: MetaPreview;
-  /** Viewport rect of the hovered card at open time — the panel anchors
-   *  beside it and re-clamps to the viewport. Stale on scroll, so the
-   *  host closes on any scroll/resize. */
+  /** The hovered card element. Retained so scroll/resize can RE-ANCHOR
+   *  the panel to the card's current box instead of closing the popup
+   *  (the popup only closes when the cursor leaves the card / panel). */
+  el: HTMLElement;
+  /** Viewport rect of the card. Recomputed from `el` on scroll/resize
+   *  so the panel tracks the card while the cursor still hovers it. */
   rect: DOMRect;
 }
 
@@ -49,13 +52,16 @@ function clearClose(): void {
   if (closeTimer) { clearTimeout(closeTimer); closeTimer = null; }
 }
 
-/** Card pointer-enter: arm a delayed open (replaces any pending close). */
-export function scheduleHoverOpen(meta: MetaPreview, rect: DOMRect): void {
+/** Card pointer-enter: arm a delayed open (replaces any pending close).
+ *  Takes the card element (not a snapshot rect) so the rect is captured
+ *  fresh when the open actually fires, and so scroll/resize can later
+ *  re-anchor to its live box. */
+export function scheduleHoverOpen(meta: MetaPreview, el: HTMLElement): void {
   clearClose();
   clearOpen();
   openTimer = setTimeout(() => {
     openTimer = null;
-    active = { meta, rect };
+    active = { meta, el, rect: el.getBoundingClientRect() };
     emit();
   }, OPEN_DELAY_MS);
 }
@@ -81,7 +87,7 @@ export function cancelHoverClose(): void {
   clearClose();
 }
 
-/** Hard close — card click, scroll, route change. */
+/** Hard close — card click, route change. */
 export function closeHoverNow(): void {
   clearOpen();
   clearClose();
@@ -89,6 +95,43 @@ export function closeHoverNow(): void {
     active = null;
     emit();
   }
+}
+
+// While the cursor is over the popup itself, the user is reading it:
+// scroll/resize must NOT re-anchor (that would slide the panel out
+// from under the cursor) and must NOT close it. The panel toggles this
+// on its own pointer enter/leave.
+let pointerInPanel = false;
+export function notePanelPointer(inside: boolean): void {
+  pointerInPanel = inside;
+}
+
+// Scroll / resize handler. Instead of closing (the old behaviour the
+// user disliked), re-anchor the panel to the card's CURRENT box so it
+// stays glued while the cursor still hovers the card. The only things
+// that close it now are leaving the card/panel (existing
+// scheduleHoverClose) or the card scrolling out of the viewport /
+// unmounting. rAF-coalesced — scroll fires hot.
+let rafPending = false;
+export function refreshHoverAnchor(): void {
+  if (!active || pointerInPanel || rafPending) return;
+  rafPending = true;
+  requestAnimationFrame(() => {
+    rafPending = false;
+    const cur = active;
+    if (!cur || pointerInPanel) return;
+    const el = cur.el;
+    if (!el || !el.isConnected) { closeHoverNow(); return; }
+    const r = el.getBoundingClientRect();
+    // Card scrolled fully out of view → nothing to anchor to.
+    if (r.bottom <= 0 || r.top >= window.innerHeight ||
+        r.right <= 0 || r.left >= window.innerWidth) {
+      closeHoverNow();
+      return;
+    }
+    active = { ...cur, rect: r };
+    emit();
+  });
 }
 
 function subscribe(cb: () => void): () => void {

@@ -57,6 +57,22 @@ export function ratingDomain(source: string): string | null {
   return null;
 }
 
+/** Tooltip suffix disambiguating critic vs audience — ONLY for the
+ *  sources that actually publish both axes (Rotten Tomatoes'
+ *  Tomatometer vs Audience Score, Metacritic's Metascore vs User
+ *  Score). Single-figure aggregate sites (IMDb, TMDB, Trakt,
+ *  Letterboxd, MyAnimeList, AniList) don't differentiate, so the
+ *  suffix would be noise → "". Mirrors DetailView's ratingLabelFor so
+ *  the detail page and the hover card read identically. */
+export function ratingKindNote(source: string, kind?: string): string {
+  const suffix =
+    kind === "critic"   ? " · CRITIC"
+  : kind === "audience" ? " · AUDIENCE"
+  : "";
+  if (!suffix) return "";
+  return /rotten tomatoes|metacritic/i.test(source) ? suffix : "";
+}
+
 /** Brand glyph with a graceful, styled fallback. Renders the Logo.dev
  *  image; on a 404 / network error (offline, unknown brand) it renders
  *  `fallback` instead — so callers keep full control of the missing

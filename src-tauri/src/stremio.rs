@@ -2020,11 +2020,26 @@ pub async fn fetch_meta_detail(
         let keys: Vec<&str> = meta.as_object()
             .map(|o| o.keys().map(|s| s.as_str()).collect::<Vec<_>>())
             .unwrap_or_default();
-        crate::devlog!(
-            warn, "meta",
-            "[{}] originalLanguage missing; meta keys present: {:?}",
-            label, keys,
-        );
+        if keys.is_empty() {
+            // The addon returned no meta object at all. Expected and
+            // common for search/catalog-only addons that get probed
+            // during hover (e.g. AI Search) — NOT a warning condition;
+            // keep it at debug so it doesn't flood the DevConsole on
+            // every hover.
+            crate::devlog!(
+                debug, "meta",
+                "[{}] no meta object returned — nothing to enrich", label,
+            );
+        } else {
+            // A populated meta that simply lacks originalLanguage —
+            // mildly notable for AIOMetadata field-coverage diagnostics,
+            // but still not an error: info, not warn.
+            crate::devlog!(
+                info, "meta",
+                "[{}] originalLanguage missing; meta keys present: {:?}",
+                label, keys,
+            );
+        }
     }
 
     // ── seasonCredits + aggregateCredits ────────────────────────────────

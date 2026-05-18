@@ -20,18 +20,24 @@ import { invoke } from "@tauri-apps/api/core";
 import type { AddonEntry, MetaPreview, MetaDetail } from "./types";
 import { getMetaDetailFallback } from "./metaCache";
 import { dedupedInvoke } from "./invokeDedupe";
-import { BrandLogo, ratingDomain } from "./logodev";
+import { BrandLogo, ratingDomain, ratingKindNote } from "./logodev";
 import {
   useHoverTarget,
   cancelHoverClose,
   scheduleHoverClose,
   closeHoverNow,
+  refreshHoverAnchor,
+  notePanelPointer,
   type HoverTarget,
 } from "./catalogHoverStore";
 
 const PANEL_W = 360;
 const GAP = 12;
 const PAD = 10;
+// Nudge the panel UP off the card's vertical centre so it doesn't sit
+// dead-level with the card it overlays — leaves the card's lower half
+// clear, making it easier to sweep the cursor back onto the card.
+const ANCHOR_Y_NUDGE = -30;
 
 /** A merged rating row (addon-supplied OR aggregator). `weight` drives
  *  the same ordering DetailView uses; absent → 50. */
@@ -75,12 +81,12 @@ function chipKeyLabel(source: string): { key: string; label: string } {
   return { key: "_", label: source.toUpperCase().slice(0, 6) };
 }
 
-function RatingChip({ source, value }: { source: string; value: string }) {
+function RatingChip({ source, value, kind }: { source: string; value: string; kind?: string }) {
   const { key, label } = chipKeyLabel(source);
   const st = RATING_STYLES[key] ?? NEUTRAL_CHIP;
   return (
     <span
-      title={source}
+      title={source + ratingKindNote(source, kind)}
       className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md border ${st.bg} ${st.border}`}
     >
       <BrandLogo
@@ -224,7 +230,7 @@ function HoverPanel({
     let left = rect.right + GAP;
     if (left + PANEL_W + PAD > vw) left = rect.left - GAP - PANEL_W;
     if (left < PAD) left = Math.max(PAD, (vw - PANEL_W) / 2);
-    let top = rect.top + rect.height / 2 - h / 2;
+    let top = rect.top + rect.height / 2 - h / 2 + ANCHOR_Y_NUDGE;
     if (top + h + PAD > vh) top = vh - h - PAD;
     if (top < PAD) top = PAD;
     setPos({ left, top, ready: true });
@@ -267,8 +273,8 @@ function HoverPanel({
       ref={ref}
       role="dialog"
       aria-label={`${meta.name} details`}
-      onMouseEnter={cancelHoverClose}
-      onMouseLeave={scheduleHoverClose}
+      onMouseEnter={() => { notePanelPointer(true); cancelHoverClose(); }}
+      onMouseLeave={() => { notePanelPointer(false); scheduleHoverClose(); }}
       className="fixed z-[280] w-[360px] max-h-[80vh] overflow-y-auto
                  rounded-xl border border-white/12 bg-black/85 backdrop-blur-2xl
                  shadow-[0_28px_64px_-20px_rgba(0,0,0,0.92)]
@@ -319,7 +325,7 @@ function HoverPanel({
       {ratings.length > 0 && (
         <div className="flex flex-wrap gap-1.5 mt-2.5">
           {ratings.map((r) => (
-            <RatingChip key={r.source} source={r.source} value={r.value} />
+            <RatingChip key={r.source} source={r.source} value={r.value} kind={r.kind} />
           ))}
         </div>
       )}
@@ -402,17 +408,19 @@ export function CatalogHoverHost({
 }) {
   const target = useHoverTarget();
 
-  // The captured rect goes stale the moment the page scrolls / resizes
-  // — just close (user can re-hover). Capture phase so an inner scroll
-  // container counts too.
+  // Scroll / resize used to hard-close the popup (the rect went stale).
+  // Now we RE-ANCHOR to the card's live box instead, so the panel stays
+  // open while the cursor is still on the card (it only closes when the
+  // pointer leaves the card/panel, or the card scrolls off-screen).
+  // Capture phase so an inner scroll container counts too.
   useEffect(() => {
     if (!target) return;
-    const close = () => closeHoverNow();
-    window.addEventListener("scroll", close, true);
-    window.addEventListener("resize", close);
+    const reanchor = () => refreshHoverAnchor();
+    window.addEventListener("scroll", reanchor, true);
+    window.addEventListener("resize", reanchor);
     return () => {
-      window.removeEventListener("scroll", close, true);
-      window.removeEventListener("resize", close);
+      window.removeEventListener("scroll", reanchor, true);
+      window.removeEventListener("resize", reanchor);
     };
   }, [target]);
 
