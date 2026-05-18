@@ -12,6 +12,7 @@ import {
 } from "./releaseSignalStore";
 import { reconcileLibraryReleaseSignals } from "./releaseSignalStore";
 import type { ReleaseAired } from "./releaseSearch";
+import { formatEpLabel } from "./episodeLabel";
 
 // ---------------------------------------------------------------------------
 // useNotificationsScanner — cloud-signal driven (v3).
@@ -225,14 +226,6 @@ function isPlayableStream(s: { type?: string | null }): boolean {
   return t !== "statistic" && t !== "error";
 }
 
-/** Format an SxxEyy / Eyy label. */
-function formatEpLabel(season: number | null | undefined, episode: number | null | undefined): string | null {
-  if (typeof season === "number" && typeof episode === "number") {
-    return `S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`;
-  }
-  if (typeof episode === "number") return `E${episode}`;
-  return null;
-}
 
 /** Parse aired_at to ms epoch. Treats unparseable strings as
  *  `Number.NEGATIVE_INFINITY` so they sort to the bottom and never
