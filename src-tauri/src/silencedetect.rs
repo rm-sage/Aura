@@ -14,9 +14,17 @@
 // intervals as floats. Does NOT do heuristic OP-window classification
 // — that's left to the caller. The intent is "raw silences, you decide".
 //
-// Graceful degradation: if ffmpeg isn't on PATH, we return an empty
-// list with a clear `available=false` flag rather than erroring out.
-// Aura doesn't bundle ffmpeg, so this feature is best-effort by design.
+// Graceful degradation: if no ffmpeg is resolvable (neither the bundled
+// `lib/ffmpeg.exe` nor one on PATH), we return an empty list with a
+// clear `available=false` flag rather than erroring out — best-effort
+// by design.
+//
+// Security: these detectors run UNATTENDED (auto-fallback from the skip
+// pipeline, not only on an explicit user action), so the input is
+// constrained to remote http(s) streams — the same URLs mpv already
+// plays — via a scheme guard plus an ffmpeg `-protocol_whitelist`. That
+// closes local-path / `concat:` / `subfile:` and similar pseudo-protocol
+// reads that ffmpeg would otherwise honour on `-i`.
 // ---------------------------------------------------------------------------
 
 use std::path::PathBuf;
@@ -85,9 +93,9 @@ pub struct SilenceInterval {
 
 #[derive(Debug, Serialize)]
 pub struct SilenceDetectResult {
-    /// True when ffmpeg was found on PATH and produced parseable output.
-    /// False = ffmpeg missing or invocation error; `intervals` will be
-    /// empty in that case.
+    /// True when ffmpeg (bundled or PATH) was found and produced
+    /// parseable output. False = ffmpeg missing, the url was rejected,
+    /// or an invocation error; `intervals` will be empty in that case.
     pub available: bool,
     pub intervals: Vec<SilenceInterval>,
     /// Free-form note explaining a failure mode (when available=false)
@@ -104,9 +112,9 @@ pub struct SilenceDetectResult {
 /// Threshold: -30 dB, minimum silence duration: 0.5 s. Typical anime
 /// OPs end in a clear musical-to-dialogue silence break of ~1-2 s.
 ///
-/// Returns `available=false` immediately when ffmpeg is not on PATH;
-/// callers should surface a "ffmpeg not installed" hint to the user
-/// in that case.
+/// Returns `available=false` immediately when no ffmpeg is resolvable
+/// (neither bundled nor on PATH) or when `url` is not http(s); callers
+/// should surface a "ffmpeg not installed" hint to the user in that case.
 #[tauri::command]
 pub async fn detect_silence_intervals(
     app: tauri::AppHandle,
@@ -119,13 +127,24 @@ pub async fn detect_silence_intervals(
         url.chars().take(80).collect::<String>(),
     );
 
+    // Security guard: only remote http(s) streams (what mpv already
+    // plays) — reject local paths / ffmpeg pseudo-protocols at source.
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        crate::devlog!(warn, "silence", "rejected non-http(s) url");
+        return Ok(SilenceDetectResult {
+            available: false,
+            intervals: vec![],
+            note: "non-http(s) url rejected".to_string(),
+        });
+    }
+
     // Probe ffmpeg presence first so the caller sees a clean "not
     // available" instead of a generic spawn error.
     if !ffmpeg_is_available(&app).await {
         return Ok(SilenceDetectResult {
             available: false,
             intervals: vec![],
-            note: "ffmpeg not found on PATH".to_string(),
+            note: "ffmpeg unavailable (no bundled lib/ffmpeg.exe, none on PATH)".to_string(),
         });
     }
 
@@ -135,6 +154,7 @@ pub async fn detect_silence_intervals(
     let mut cmd = Command::new(ffmpeg_bin(&app));
     cmd.arg("-hide_banner")
         .arg("-nostdin")
+        .arg("-protocol_whitelist").arg("http,https,tcp,tls,crypto")
         .arg("-i").arg(&url)
         .arg("-vn")
         .arg("-af").arg("silencedetect=n=-30dB:d=0.5")
@@ -257,11 +277,22 @@ pub async fn detect_outro_boundary(
         url.chars().take(80).collect::<String>(),
     );
 
+    // Security guard: only remote http(s) streams (what mpv already
+    // plays) — reject local paths / ffmpeg pseudo-protocols at source.
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        crate::devlog!(warn, "silence", "outro: rejected non-http(s) url");
+        return Ok(OutroBoundaryResult {
+            available: false,
+            ed_start:  None,
+            note:      "non-http(s) url rejected".to_string(),
+        });
+    }
+
     if !ffmpeg_is_available(&app).await {
         return Ok(OutroBoundaryResult {
             available: false,
             ed_start:  None,
-            note:      "ffmpeg not found on PATH".to_string(),
+            note:      "ffmpeg unavailable (no bundled lib/ffmpeg.exe, none on PATH)".to_string(),
         });
     }
 
@@ -271,6 +302,7 @@ pub async fn detect_outro_boundary(
     let mut cmd = Command::new(ffmpeg_bin(&app));
     cmd.arg("-hide_banner")
         .arg("-nostdin")
+        .arg("-protocol_whitelist").arg("http,https,tcp,tls,crypto")
         .arg("-sseof").arg(format!("-{tail}"))
         .arg("-i").arg(&url)
         .arg("-vf").arg("scale=160:-2,blackdetect=d=0.30:pic_th=0.98")

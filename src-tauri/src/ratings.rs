@@ -108,8 +108,15 @@ async fn mdblist_to_aggregate(imdb_id: &str) -> Vec<AggregateRating> {
     if MDBLIST_KEY.is_empty() {
         return Vec::new();
     }
-    let url = format!("https://mdblist.com/api/?apikey={MDBLIST_KEY}&i={imdb_id}");
-    let resp = match client().get(&url).send().await {
+    // Build the query via reqwest so the key + id are percent-encoded
+    // and never string-interpolated into a URL we might log. `imdb_id`
+    // is already `tt`-shape-filtered upstream; this is defence-in-depth.
+    let resp = match client()
+        .get("https://mdblist.com/api/")
+        .query(&[("apikey", MDBLIST_KEY), ("i", imdb_id)])
+        .send()
+        .await
+    {
         Ok(r) if r.status().is_success() => r,
         _ => return Vec::new(),
     };

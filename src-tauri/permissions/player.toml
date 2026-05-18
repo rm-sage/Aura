@@ -110,22 +110,16 @@ identifier = "allow-subtitles"
 description = "Allows the frontend to search OpenSubtitles, download .srt files, and inject them into MPV"
 commands.allow = ["search_subtitles", "download_subtitle", "add_subtitle_to_mpv", "compute_opensubtitles_hash"]
 
-# ── Phase 6.0.5: OMDb ratings ────────────────────────────────────────────────
-[[permission]]
-identifier = "allow-omdb-ratings"
-description = "Allows the frontend to query the user's OMDb key for Rotten Tomatoes / Metacritic critic scores"
-commands.allow = ["fetch_omdb_ratings"]
-
 # ── API keys (OS keyring) ────────────────────────────────────────────────────
 [[permission]]
 identifier = "allow-api-keys"
-description = "Allows the Settings UI to read / write / clear third-party API keys (OMDb, OpenSubtitles) stored in the OS keyring"
+description = "Allows the Settings UI to read / write / clear third-party API keys (OpenSubtitles) stored in the OS keyring"
 commands.allow = ["get_api_key", "set_api_key", "clear_api_key"]
 
 # ── Multi-source ratings aggregator ─────────────────────────────────────────
 [[permission]]
 identifier = "allow-aggregate-ratings"
-description = "Allows the frontend to query OMDb + Jikan (MAL) and any other ratings backend Aura adds, returning a unified list"
+description = "Allows the frontend to query MDBList + Jikan (MAL) + AniList and any other ratings backend Aura adds, returning a unified list"
 commands.allow = ["fetch_aggregate_ratings"]
 
 # ── User-data backups (Queue / History / manual marks / settings snapshot) ──

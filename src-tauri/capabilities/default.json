@@ -43,7 +43,6 @@
     "allow-scrobble-auth",
     "allow-discord-rpc",
     "allow-subtitles",
-    "allow-omdb-ratings",
     "allow-api-keys",
     "allow-aggregate-ratings",
     "allow-user-backups",
