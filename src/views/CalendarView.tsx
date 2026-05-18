@@ -7,6 +7,7 @@ import { loadAuraSettings } from "../auraSettings";
 import { resolveDefaultMetaUrl } from "../addonDefaults";
 import { getMetaDetail } from "../metaCache";
 import ImageLoader from "../ImageLoader";
+import { formatEpLabel } from "../episodeLabel";
 
 // ---------------------------------------------------------------------------
 // CalendarView — full-viewport month grid + day-click overlay
@@ -461,8 +462,12 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
                   // is driven by the 1fr row, not a fixed minHeight. The
                   // 2:3 aspect ratio derives width from height automatically.
                   <div className="mt-2 flex-1 min-h-0 flex items-end justify-center gap-1.5">
-                    {visiblePosters.map(({ item, detail }) => {
+                    {visiblePosters.map(({ item, detail, video }) => {
                       const src = detail?.poster ?? item.poster;
+                      const epLabel =
+                        video && video.season != null && video.episode != null
+                          ? formatEpLabel(video.season, video.episode)
+                          : null;
                       return (
                         <div
                           key={item.id}
@@ -486,6 +491,19 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
                                             text-white/20 text-[10px]">
                               ?
                             </div>
+                          )}
+                          {epLabel && (
+                            // Top-LEFT to match the DayOverlay badge and to
+                            // stay clear of addon-baked HDR/DV/language badges
+                            // that sit in the poster's top-right art.
+                            <span
+                              className="absolute top-1 left-1 text-[9px] leading-none
+                                         font-mono font-semibold text-white/95
+                                         px-1 py-0.5 rounded bg-black/85
+                                         border border-white/15 max-w-[90%] truncate"
+                            >
+                              {epLabel}
+                            </span>
                           )}
                         </div>
                       );
@@ -665,7 +683,7 @@ function DayOverlay({ date, entries, onClose, onSelectMeta }: DayOverlayProps) {
                 poster={detail?.poster ?? item.poster}
                 mediaType={detail?.media_type ?? item.media_type}
                 episodeTag={video && video.season != null && video.episode != null
-                  ? `S${String(video.season).padStart(2,"0")}E${String(video.episode).padStart(2,"0")}`
+                  ? formatEpLabel(video.season, video.episode)
                   : null}
                 episodeTitle={video?.title ?? null}
                 released={releaseDate}
