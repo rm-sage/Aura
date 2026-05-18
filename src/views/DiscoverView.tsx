@@ -9,6 +9,7 @@ import ImageLoader from "../ImageLoader";
 import ErrorBoundary from "../ErrorBoundary";
 import WatchedBadge from "../WatchedBadge";
 import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "../FilterBar";
+import { useHoverCardActivation } from "../useHoverCardActivation";
 
 // ---------------------------------------------------------------------------
 // DiscoverView — browse any addon's catalogs, including ones the addon has
@@ -393,6 +394,7 @@ const DiscoverPosterCard = memo(function DiscoverPosterCard({
   onSelect?: (meta: MetaPreview) => void;
 }) {
   const handleClick = useCallback(() => onSelect?.(meta), [meta, onSelect]);
+  const hover = useHoverCardActivation(meta);
 
   return (
     <button
@@ -410,6 +412,7 @@ const DiscoverPosterCard = memo(function DiscoverPosterCard({
           detail: { meta, x: e.clientX, y: e.clientY },
         }));
       }}
+      {...hover}
       data-meta-card={`${meta.media_type}:${meta.id}`}
       className="aura-poster-card group relative block w-full text-left rounded-xl
                  transition-transform"

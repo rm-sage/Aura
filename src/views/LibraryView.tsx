@@ -8,6 +8,7 @@ import ImageLoader from "../ImageLoader";
 import ErrorBoundary from "../ErrorBoundary";
 import { isAnimeMeta, typeLabel } from "../aiometadata";
 import WatchedBadge from "../WatchedBadge";
+import { useHoverCardActivation } from "../useHoverCardActivation";
 import {
   FilterMenu, applyFilters, DEFAULT_FILTERS,
   type FilterState, type SortOption,
@@ -359,6 +360,7 @@ const LibraryCard = memo(function LibraryCard({
   onRemove?: (origin: { x: number; y: number }) => void;
 }) {
   const meta = libraryItemToMeta(item);
+  const hover = useHoverCardActivation(meta);
 
   return (
     <div
@@ -374,6 +376,7 @@ const LibraryCard = memo(function LibraryCard({
             detail: { meta, x: e.clientX, y: e.clientY },
           }));
         }}
+        {...hover}
         className="flex flex-col gap-2 text-left
                    focus:outline-none focus-visible:ring-2 focus-visible:ring-ln-accent/60 rounded-xl"
       >
