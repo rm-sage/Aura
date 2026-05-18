@@ -10,6 +10,7 @@ import ErrorBoundary from "../ErrorBoundary";
 import WatchedBadge from "../WatchedBadge";
 import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "../FilterBar";
 import { useHoverCardActivation } from "../useHoverCardActivation";
+import { closeHoverNow } from "../catalogHoverStore";
 
 // ---------------------------------------------------------------------------
 // DiscoverView — browse any addon's catalogs, including ones the addon has
@@ -393,7 +394,7 @@ const DiscoverPosterCard = memo(function DiscoverPosterCard({
   meta: MetaPreview;
   onSelect?: (meta: MetaPreview) => void;
 }) {
-  const handleClick = useCallback(() => onSelect?.(meta), [meta, onSelect]);
+  const handleClick = useCallback(() => { closeHoverNow(); onSelect?.(meta); }, [meta, onSelect]);
   const hover = useHoverCardActivation(meta);
 
   return (

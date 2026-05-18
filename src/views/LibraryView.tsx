@@ -9,6 +9,7 @@ import ErrorBoundary from "../ErrorBoundary";
 import { isAnimeMeta, typeLabel } from "../aiometadata";
 import WatchedBadge from "../WatchedBadge";
 import { useHoverCardActivation } from "../useHoverCardActivation";
+import { closeHoverNow } from "../catalogHoverStore";
 import {
   FilterMenu, applyFilters, DEFAULT_FILTERS,
   type FilterState, type SortOption,
@@ -369,7 +370,7 @@ const LibraryCard = memo(function LibraryCard({
     >
       <button
         type="button"
-        onClick={() => onSelect?.(meta)}
+        onClick={() => { closeHoverNow(); onSelect?.(meta); }}
         onContextMenu={(e) => {
           e.preventDefault();
           window.dispatchEvent(new CustomEvent("aura:card-context", {
