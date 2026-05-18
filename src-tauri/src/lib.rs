@@ -2019,6 +2019,7 @@ pub fn run() {
             sync::nudge_release_poller,
             sync::migrate_sync_scope,
             auth::backfill_user_id,
+            auth::fetch_stremio_account,
             log_export::save_text_with_dialog,
             per_title::get_all_title_state,
             per_title::set_all_title_state,

@@ -266,6 +266,7 @@ pub async fn login<R: Runtime>(
 
     let session = UserSession { email, auth_key, user_id };
     store_session(&app, &session)?;
+    clear_account_cache();
     Ok(session)
 }
 
@@ -273,6 +274,7 @@ pub async fn login<R: Runtime>(
 /// file in debug builds).
 #[tauri::command]
 pub async fn logout<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    clear_account_cache();
     delete_session(&app)
 }
 
@@ -391,6 +393,121 @@ pub async fn get_session<R: Runtime>(
         Err(e) => crate::devlog!(warn, "auth", "get_session → error: {}", e),
     }
     result
+}
+
+/// Read-only snapshot of the signed-in Stremio account, surfaced by the
+/// Account panel. Serialised to the frontend with these exact field
+/// names (snake_case == the TS `StremioAccount` interface), so NO serde
+/// rename is needed — Tauri sends Rust field names outward.
+#[derive(Debug, Clone, Serialize)]
+pub struct StremioAccount {
+    pub email: String,
+    pub user_id: String,
+    /// ISO date string from `/getUser` `dateRegistered`; `None` when the
+    /// API omits it (frontend then hides the "Member since" row).
+    pub date_registered: Option<String>,
+    /// Optional premium-expiry ISO string. Only `Some` when the API
+    /// actually returns a non-empty value — the panel never fabricates
+    /// a "not active" line.
+    pub premium_until: Option<String>,
+}
+
+// 24h in-memory cache. One signed-in account at a time, so a single
+// slot suffices. Cleared on login/logout (below) so a re-auth always
+// re-fetches. Fully-qualified std paths keep auth.rs's import list
+// untouched.
+static ACCOUNT_CACHE: std::sync::Mutex<Option<(std::time::Instant, StremioAccount)>> =
+    std::sync::Mutex::new(None);
+
+fn clear_account_cache() {
+    if let Ok(mut g) = ACCOUNT_CACHE.lock() {
+        *g = None;
+    }
+}
+
+/// Fetch the signed-in user's Stremio account via `/getUser`, cached
+/// in-memory for 24h. Self-heals the stored session's `email`: the
+/// `/login` path can persist an empty email when the API omits it at
+/// the probed pointers, and `backfill_user_id` short-circuits once
+/// `user_id` is set — so without this a session stays stuck on an
+/// empty email. Read-only: only surfaces fields the API returns;
+/// never fabricates. Returns `NOT_LOGGED_IN` when there is no session.
+#[tauri::command]
+pub async fn fetch_stremio_account<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<StremioAccount, String> {
+    if let Ok(g) = ACCOUNT_CACHE.lock() {
+        if let Some((at, acct)) = g.as_ref() {
+            if at.elapsed() < std::time::Duration::from_secs(24 * 3600) {
+                return Ok(acct.clone());
+            }
+        }
+    }
+
+    let Some(mut session) = load_session(&app)? else {
+        return Err("NOT_LOGGED_IN".into());
+    };
+    if session.auth_key.is_empty() {
+        return Err("NOT_LOGGED_IN".into());
+    }
+
+    let body = serde_json::json!({ "authKey": session.auth_key });
+    let raw = auth_client()
+        .post(format!("{STREMIO_API}/getUser"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("Response read error: {e}"))?;
+
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("JSON parse error: {e}\nRaw response: {raw}"))?;
+
+    if let Some(err) = json.get("error").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        return Err(stremio_error(err.to_string()));
+    }
+
+    let email = json
+        .pointer("/result/email")
+        .or_else(|| json.pointer("/result/user/email"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let user_id = json
+        .pointer("/result/_id")
+        .or_else(|| json.pointer("/result/user/_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let date_registered = json
+        .pointer("/result/dateRegistered")
+        .or_else(|| json.pointer("/result/user/dateRegistered"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    // Defensive premium-expiry probe — surfaced only if a non-empty
+    // date string is actually present.
+    let premium_until = json
+        .pointer("/result/premium_expire")
+        .or_else(|| json.pointer("/result/user/premium_expire"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    // Self-heal: persist a recovered email so the ProfilePopover line
+    // stops showing "Email pending sync" on the next session read.
+    if !email.is_empty() && session.email != email {
+        session.email = email.clone();
+        store_session(&app, &session)?;
+    }
+
+    let acct = StremioAccount { email, user_id, date_registered, premium_until };
+    if let Ok(mut g) = ACCOUNT_CACHE.lock() {
+        *g = Some((std::time::Instant::now(), acct.clone()));
+    }
+    Ok(acct)
 }
 
 /// Fetch the user's installed addon list from the Stremio account API.
