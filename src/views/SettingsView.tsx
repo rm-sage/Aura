@@ -4102,13 +4102,6 @@ export default function SettingsView({ addons, session }: Props) {
                   }
                 }}
               />
-              <div className="h-px bg-white/6" />
-              <SettingToggle
-                label="Hover-seek thumbnails"
-                description="Show a frame preview and timestamp when hovering the scrub bar. While a frame is still loading you get a loading animation rather than a stale previous frame. The timestamp tooltip always shows on hover regardless of this setting. Frame previews require the stream's addon to provide a thumbnail track."
-                value={aura.hoverThumbnails !== false}
-                onChange={(v) => setLocal({ hoverThumbnails: v })}
-              />
             </Section>
           )}
 

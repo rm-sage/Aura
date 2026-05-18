@@ -163,24 +163,12 @@ export interface AuraSettings {
   /** The `tscale` (temporal scaler) kernel mpv interpolation uses —
    *  THE quality dial. mpv lists kernels in increasing smoothness:
    *  `oversample` (sharpest — judder-fix only, synthesises NO
-   *  intermediate motion, so it looks un-interpolated) → `catmull_rom`
-   *  → `mitchell` → `gaussian` → `bicubic` (softest). Default
-   *  `mitchell`: visibly smoother motion with moderate softening (the
-   *  standard "smooth video" pick). `oversample` is intentionally the
-   *  least obvious — pick a blending kernel for the SVP-like look.
-   *  Whitelisted Rust-side. Optional in the type only; defaults +
-   *  parse always populate it. */
+   *  intermediate motion) → `catmull_rom` → `mitchell` → `gaussian`
+   *  → `bicubic` (softest). Default `oversample` (low overhead, the
+   *  user's pick for the always-on default); switch to a blending
+   *  kernel for the SVP-like look. Whitelisted Rust-side. Optional in
+   *  the type only; defaults + parse always populate it. */
   interpolationTscale?: string;
-  /** Hover-seek thumbnails on the scrub bar. When on (default), the
-   *  scrubber shows a frame preview + timestamp at the cursor; while a
-   *  frame is still fetching it shows a loading animation rather than a
-   *  stale prior frame. The HH:MM:SS time tooltip always shows on
-   *  hover regardless of this toggle (cheap, strictly useful). Optional
-   *  in the type only so incremental edits type-check; defaults +
-   *  parse always populate it (DEFAULT TRUE — note the `!== false`
-   *  reads at call sites). Mirrored in Settings + the in-player
-   *  three-dots menu. */
-  hoverThumbnails?: boolean;
   /** Next-Up CTA: skip filler / recap episodes when computing the
    *  next-up target. Source field: AIOMetadata's per-episode
    *  `episodeKind`. Default `"none"` so users on non-anime content
@@ -222,9 +210,8 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   autoAdvanceDelaySeconds: 10,
   blurEpisodeSynopsis: false,
   loudnessNormalization: false,
-  motionInterpolation: false,
-  interpolationTscale: "mitchell",
-  hoverThumbnails: true,
+  motionInterpolation: true,
+  interpolationTscale: "oversample",
   nextUpSkipFillerRecap: "none",
   releaseSearchEnabled: true,
 };
@@ -299,15 +286,14 @@ function readFromStorage(): AuraSettings {
       loudnessNormalization: typeof parsed.loudnessNormalization === "boolean"
         ? parsed.loudnessNormalization
         : false,
+      // Default ON now — only an explicitly-stored `false` (user
+      // turned it off) keeps it off; absent key → new default true.
       motionInterpolation: typeof parsed.motionInterpolation === "boolean"
         ? parsed.motionInterpolation
-        : false,
+        : true,
       interpolationTscale: typeof parsed.interpolationTscale === "string"
         ? parsed.interpolationTscale
-        : "mitchell",
-      hoverThumbnails: typeof parsed.hoverThumbnails === "boolean"
-        ? parsed.hoverThumbnails
-        : true,
+        : "oversample",
       nextUpSkipFillerRecap:
         parsed.nextUpSkipFillerRecap === "filler"
           || parsed.nextUpSkipFillerRecap === "recap"

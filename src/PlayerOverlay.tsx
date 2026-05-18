@@ -2208,18 +2208,9 @@ function Scrubber({
     leftPct: number;
   } | null>(null);
 
-  // Hover-thumbnail state. `thumbsEnabled` mirrors the auraSettings
-  // toggle via the same event bus as the loudness/interp toggles so
-  // flipping it in Settings / the player menu takes effect live.
-  // DEFAULT ON → `!== false`.
-  const [thumbsEnabled, setThumbsEnabled] = useState(
-    () => loadAuraSettings().hoverThumbnails !== false,
-  );
-  useEffect(() => {
-    const sync = () => setThumbsEnabled(loadAuraSettings().hoverThumbnails !== false);
-    window.addEventListener("aura:settings-changed", sync);
-    return () => window.removeEventListener("aura:settings-changed", sync);
-  }, []);
+  // Hover thumbnails are always on (the toggle was removed — low
+  // resource cost, good UX). The frame box still only renders when an
+  // engine is wired AND a frame resolves/loads.
   // Seconds at the cursor (null when not hovering). Drives the always-
   // on timestamp tooltip and the debounced frame lookup.
   const hoverSec = hoverPct != null ? (hoverPct / 100) * max : null;
@@ -2237,7 +2228,7 @@ function Scrubber({
   const thumbReqRef = useRef(0);
 
   useEffect(() => {
-    if (!thumbsEnabled || !thumbnailAtRef.current || hoverSec == null) return;
+    if (!thumbnailAtRef.current || hoverSec == null) return;
     const sec = Math.max(0, Math.floor(hoverSec));
     const cached = thumbCacheRef.current.get(sec);
     if (cached) { setThumbUrl(cached); setThumbBusy(false); return; }
@@ -2269,7 +2260,7 @@ function Scrubber({
         });
     }, 220);
     return () => clearTimeout(timer);
-  }, [hoverSec, thumbsEnabled]);
+  }, [hoverSec]);
 
   // Leaving the track: invalidate any in-flight request and clear.
   useEffect(() => {
@@ -2449,7 +2440,7 @@ function Scrubber({
               </div>
             </div>
           )}
-          {thumbsEnabled && thumbnailAt && (thumbUrl || thumbBusy) && (
+          {thumbnailAt && (thumbUrl || thumbBusy) && (
             <div className="relative w-40 aspect-video rounded-md overflow-hidden
                             aura-glass-menu shadow-[0_8px_24px_-8px_rgba(0,0,0,0.7)]">
               {thumbUrl ? (
@@ -2930,16 +2921,6 @@ function MoreMenu({
     window.addEventListener("aura:settings-changed", sync);
     return () => window.removeEventListener("aura:settings-changed", sync);
   }, []);
-  // Hover-seek thumbnails — DEFAULT ON (`!== false`). Same event-bus
-  // mirror as the toggles above.
-  const [hoverThumbs, setHoverThumbs] = useState(
-    () => loadAuraSettings().hoverThumbnails !== false,
-  );
-  useEffect(() => {
-    const sync = () => setHoverThumbs(loadAuraSettings().hoverThumbnails !== false);
-    window.addEventListener("aura:settings-changed", sync);
-    return () => window.removeEventListener("aura:settings-changed", sync);
-  }, []);
   const ref = useRef<HTMLDivElement>(null);
   useMenuOpenSync(open);
 
@@ -2974,14 +2955,6 @@ function MoreMenu({
       tscale: loadAuraSettings().interpolationTscale ?? "mitchell",
     }).catch(() => {});
     showFlash(next ? "Motion interpolation on" : "Motion interpolation off");
-  };
-
-  const toggleHoverThumbs = () => {
-    const next = !hoverThumbs;
-    setHoverThumbs(next);
-    const current = loadAuraSettings();
-    saveAuraSettings({ ...current, hoverThumbnails: next });
-    showFlash(next ? "Hover thumbnails on" : "Hover thumbnails off");
   };
 
   const showFlash = (msg: string) => {
@@ -3118,35 +3091,6 @@ function MoreMenu({
                 className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-md
                            transition-transform duration-150"
                 style={{ transform: interp ? "translateX(16px)" : "translateX(0)" }}
-              />
-            </span>
-          </button>
-          {/* Hover-seek thumbnails — in-player mirror of the
-              Settings → Video & Audio toggle. */}
-          <button
-            type="button"
-            onClick={toggleHoverThumbs}
-            className="w-full flex items-center gap-3 px-4 py-2 text-left text-[13px]
-                       text-white/85 hover:text-white hover:bg-white/[0.16]
-                       transition-colors"
-            role="switch"
-            aria-checked={hoverThumbs}
-          >
-            <span className="text-white/55 flex-shrink-0">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                <path d="M4 5h16a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1zm1 3v9h14v-9H5zm2.5 7 2.5-3 1.8 2.2L14.5 11l3 4h-10z" />
-              </svg>
-            </span>
-            <span className="flex-1">Hover thumbnails</span>
-            <span
-              aria-hidden
-              className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0
-                          ${hoverThumbs ? "bg-ln-accent/80" : "bg-white/15"}`}
-            >
-              <span
-                className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-md
-                           transition-transform duration-150"
-                style={{ transform: hoverThumbs ? "translateX(16px)" : "translateX(0)" }}
               />
             </span>
           </button>
