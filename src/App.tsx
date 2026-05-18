@@ -2854,6 +2854,20 @@ export default function App() {
           await applySettingsScope(sess);
           setSession(sess);
           setLandingDismissed(true); // bypass landing on cached credentials
+          // Self-heal a stuck/empty email: /login can persist an empty
+          // address and backfill_user_id short-circuits once user_id is
+          // set, so the popover would show "Email pending sync"
+          // forever. fetch_stremio_account re-derives it from /getUser
+          // (cached 24h) and rewrites the keyring; merge the result
+          // into the in-memory session so the line updates without a
+          // relogin. Best-effort — failure leaves the prior behaviour.
+          invoke<import("./LoginView").StremioAccount>("fetch_stremio_account")
+            .then((acct) => {
+              if (acct?.email) {
+                setSession((s) => (s && s.email !== acct.email ? { ...s, email: acct.email } : s));
+              }
+            })
+            .catch(() => {});
           await Promise.all([loadSyncedAddons(sess), loadLibrary(sess)]);
         } else {
           await applySettingsScope(null);
