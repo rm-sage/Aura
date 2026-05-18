@@ -19,12 +19,58 @@
 // Aura doesn't bundle ffmpeg, so this feature is best-effort by design.
 // ---------------------------------------------------------------------------
 
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Serialize;
+use tauri::Manager;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+
+/// Resolve the ffmpeg binary. Prefers a BUNDLED `lib/ffmpeg.exe`
+/// (shipped via the existing `resources: ["lib/**/*"]` glob — drop the
+/// binary into `src-tauri/lib/` exactly like the git-ignored libmpv
+/// DLLs and the installer picks it up), so the user doesn't need ffmpeg
+/// on PATH. Candidate order, first existing wins:
+///   1. `AURA_FFMPEG` env override (power users / CI).
+///   2. `<resource_dir>/lib/ffmpeg.exe`         — bundled / installed.
+///   3. `<exe_dir>/lib/ffmpeg.exe`              — portable layout.
+///   4. `<CARGO_MANIFEST_DIR>/lib/ffmpeg.exe`   — `tauri dev` (points
+///      at `src-tauri/`; the dev binary lives in target/ so a relative
+///      path wouldn't resolve).
+/// Falls back to the bare name `ffmpeg` (PATH) so a system install
+/// still works and nothing regresses for users who never add the
+/// bundled binary.
+fn ffmpeg_bin(app: &tauri::AppHandle) -> std::ffi::OsString {
+    const NAME: &str = "ffmpeg.exe";
+
+    if let Ok(p) = std::env::var("AURA_FFMPEG") {
+        let pb = PathBuf::from(&p);
+        if pb.is_file() {
+            return pb.into_os_string();
+        }
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(dir) = app.path().resource_dir() {
+        candidates.push(dir.join("lib").join(NAME));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("lib").join(NAME));
+        }
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lib").join(NAME));
+
+    for c in candidates {
+        if c.is_file() {
+            crate::devlog!(info, "silence", "using bundled ffmpeg: {}", c.display());
+            return c.into_os_string();
+        }
+    }
+    // PATH fallback — unchanged behaviour for system-ffmpeg users.
+    std::ffi::OsString::from("ffmpeg")
+}
 
 /// One silence interval reported by ffmpeg, in seconds.
 #[derive(Debug, Clone, Serialize)]
@@ -63,6 +109,7 @@ pub struct SilenceDetectResult {
 /// in that case.
 #[tauri::command]
 pub async fn detect_silence_intervals(
+    app: tauri::AppHandle,
     url: String,
     max_secs: u32,
 ) -> Result<SilenceDetectResult, String> {
@@ -74,7 +121,7 @@ pub async fn detect_silence_intervals(
 
     // Probe ffmpeg presence first so the caller sees a clean "not
     // available" instead of a generic spawn error.
-    if !ffmpeg_is_available().await {
+    if !ffmpeg_is_available(&app).await {
         return Ok(SilenceDetectResult {
             available: false,
             intervals: vec![],
@@ -85,7 +132,7 @@ pub async fn detect_silence_intervals(
     // Build args. We discard video (`-vn`), apply silencedetect to
     // audio, write nothing (`-f null -`). Bound the runtime via -t
     // when caller asked for it.
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(ffmpeg_bin(&app));
     cmd.arg("-hide_banner")
         .arg("-nostdin")
         .arg("-i").arg(&url)
@@ -199,6 +246,7 @@ pub struct OutroBoundaryResult {
 /// same graceful `available=false` contract as `detect_silence_intervals`.
 #[tauri::command]
 pub async fn detect_outro_boundary(
+    app: tauri::AppHandle,
     url: String,
     tail_secs: u32,
 ) -> Result<OutroBoundaryResult, String> {
@@ -209,7 +257,7 @@ pub async fn detect_outro_boundary(
         url.chars().take(80).collect::<String>(),
     );
 
-    if !ffmpeg_is_available().await {
+    if !ffmpeg_is_available(&app).await {
         return Ok(OutroBoundaryResult {
             available: false,
             ed_start:  None,
@@ -220,7 +268,7 @@ pub async fn detect_outro_boundary(
     // `-sseof -tail` seeks to (duration - tail); reported PTS stay
     // absolute. Downscale before blackdetect so the video decode of the
     // tail is cheap. A hard `-t` bounds the worst case.
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(ffmpeg_bin(&app));
     cmd.arg("-hide_banner")
         .arg("-nostdin")
         .arg("-sseof").arg(format!("-{tail}"))
@@ -346,10 +394,10 @@ pub async fn detect_outro_boundary(
     Ok(OutroBoundaryResult { available: true, ed_start, note })
 }
 
-async fn ffmpeg_is_available() -> bool {
-    // `ffmpeg -version` exits 0 when the binary is on PATH and
-    // executable. We don't care about the version string itself.
-    let res = Command::new("ffmpeg")
+async fn ffmpeg_is_available(app: &tauri::AppHandle) -> bool {
+    // `ffmpeg -version` exits 0 when the resolved binary (bundled or
+    // PATH) is present + executable. We don't care about the version.
+    let res = Command::new(ffmpeg_bin(app))
         .arg("-version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())

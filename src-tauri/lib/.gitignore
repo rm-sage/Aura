@@ -5,3 +5,11 @@ libmpv-2.dll
 mpv.dll
 mpv-2.dll
 mpv-1.dll
+
+# Bundled ffmpeg (~80 MB) — removes the system-PATH requirement for
+# the silence/black skip detectors. Drop a static ffmpeg.exe here
+# (e.g. from https://www.gyan.dev/ffmpeg/builds/ — ffmpeg-release-
+# essentials) before building; tauri.conf.json's resources glob
+# ("lib/**/*") bundles it and silencedetect.rs::ffmpeg_bin prefers
+# it over PATH. Absent → falls back to PATH ffmpeg (no regression).
+ffmpeg.exe
