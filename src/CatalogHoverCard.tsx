@@ -21,6 +21,7 @@ import type { AddonEntry, MetaPreview, MetaDetail } from "./types";
 import { getMetaDetailFallback } from "./metaCache";
 import { dedupedInvoke } from "./invokeDedupe";
 import { BrandLogo, ratingDomain, ratingKindNote } from "./logodev";
+import { hasUsableRating } from "./ratingValue";
 import {
   useHoverTarget,
   cancelHoverClose,
@@ -256,10 +257,10 @@ function HoverPanel({
   const ratings = (() => {
     const map = new Map<string, RatingRow>();
     for (const r of detail?.ratings ?? []) {
-      if (r.value) map.set(r.source.toLowerCase(), { source: r.source, value: r.value });
+      if (hasUsableRating(r.value)) map.set(r.source.toLowerCase(), { source: r.source, value: r.value });
     }
     for (const r of aggRatings) {
-      if (r.value) map.set(r.source.toLowerCase(), r);
+      if (hasUsableRating(r.value)) map.set(r.source.toLowerCase(), r);
     }
     return [...map.values()]
       .sort((a, b) => (b.weight ?? 50) - (a.weight ?? 50))

@@ -94,6 +94,7 @@ import ErrorBoundary from "../ErrorBoundary";
 import { parseStream, chipStyleFor, type ChipKind } from "../streamMeta";
 import Tooltip from "../Tooltip";
 import { BrandLogo, ratingDomain } from "../logodev";
+import { hasUsableRating } from "../ratingValue";
 
 // ---------------------------------------------------------------------------
 // DetailView — full-bleed cinematic detail page with a "Command Center" feel.
@@ -570,6 +571,14 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
     kind: string;
     weight: number;
   };
+  // Anime if the meta says so or the resolved detail carries an
+  // anime-native id (mal/kitsu/anidb). detail ids land async after the
+  // meta-detail fetch, so this re-derives each render as they resolve.
+  const isAnime =
+    (meta.media_type ?? "").toLowerCase() === "anime" ||
+    detail?.mal_id != null ||
+    detail?.kitsu_id != null ||
+    detail?.anidb_id != null;
   const [aggregateRatings, setAggregateRatings] = useState<AggregateRating[]>([]);
   useEffect(() => {
     setAggregateRatings([]);
@@ -589,11 +598,6 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
       );
     }
     let cancelled = false;
-    const isAnime =
-      (meta.media_type ?? "").toLowerCase() === "anime" ||
-      detail?.mal_id != null ||
-      detail?.kitsu_id != null ||
-      detail?.anidb_id != null;
     const input = {
       imdb_id:    meta.id.startsWith("tt") ? meta.id : null,
       mal_id:     detail?.mal_id     ?? null,
@@ -632,24 +636,38 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
    *  source-label normalization in ratings.rs. */
   const mergedRatings = useMemo(() => {
     type RatingRow = { source: string; value: string; kind?: string; weight?: number };
+    // Drop sources with no usable value (empty / "0.0" — the MDBList
+    // Letterboxd row for series/anime is the canonical junk), and drop
+    // Letterboxd entirely for anime since it's movie-only on MDBList.
+    const accept = (r: { source: string; value: string }) =>
+      hasUsableRating(r.value) &&
+      !(isAnime && r.source.toLowerCase() === "letterboxd");
     const map = new Map<string, RatingRow>();
     for (const r of detail?.ratings ?? []) {
-      map.set(r.source.toLowerCase(), { source: r.source, value: r.value });
+      if (accept(r)) map.set(r.source.toLowerCase(), { source: r.source, value: r.value });
     }
     for (const r of aggregateRatings) {
-      map.set(r.source.toLowerCase(), r);
+      if (accept(r)) map.set(r.source.toLowerCase(), r);
     }
-    // Sort by aggregator weight DESC (IMDb 100, MAL 95, RT 90,
-    // Metacritic 80, MAL Rank 60, MAL Popularity 55, others 50).
-    // Addon-supplied ratings without an aggregator counterpart get
-    // weight 50 so they slot after the well-known sources but before
-    // the niche ones.
+    // For anime, surface the anime-native sources first — MAL score,
+    // AniList, then MAL rank & popularity — so the detail page shows the
+    // same MAL trio the hover card does instead of letting IMDb/RT/MC
+    // crowd them past the six-tile cap. Otherwise sort by aggregator
+    // weight DESC (IMDb 100, MAL 95, RT 90, …; addon-only sources 50).
+    const ANIME_FIRST = ["myanimelist", "anilist", "mal rank", "mal popularity"];
     return [...map.values()].sort((a, b) => {
-      const aw = a.weight ?? 50;
-      const bw = b.weight ?? 50;
-      return bw - aw;
+      if (isAnime) {
+        const ai = ANIME_FIRST.indexOf(a.source.toLowerCase());
+        const bi = ANIME_FIRST.indexOf(b.source.toLowerCase());
+        if (ai !== bi) {
+          if (ai === -1) return 1;
+          if (bi === -1) return -1;
+          return ai - bi;
+        }
+      }
+      return (b.weight ?? 50) - (a.weight ?? 50);
     });
-  }, [detail?.ratings, aggregateRatings]);
+  }, [detail?.ratings, aggregateRatings, isAnime]);
 
   // Fetch streams: movies use parent id; series/anime use the picked video
   // id, falling back to the resume video id from the library if the user
