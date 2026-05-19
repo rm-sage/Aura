@@ -53,7 +53,7 @@ import { setHistoryScope, addHistoryEntry } from "./historyStore";
 import { setAutoBackupScope, startAutoBackup } from "./userDataBackup";
 import NextUpCta from "./NextUpCta";
 import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPreviousEpisode } from "./nextUp";
-import { getMetaDetailFallback } from "./metaCache";
+import { getMetaDetailFallback, peekCachedDetailById } from "./metaCache";
 import { PersistentCache } from "./persistentCache";
 import { loadAuraSettings } from "./auraSettings";
 
@@ -2472,7 +2472,28 @@ export default function App() {
         `[ctx] App received card-context: ${meta.media_type}:${meta.id} "${meta.name}" @ (${x},${y}) source=${source ?? "default"}`,
       );
       const inLib = library.some((i) => i.id === meta.id && !i.removed);
-      const isAnime = isAnimeMeta(meta);
+      // Anime detection at right-click time: a stripped library / CW
+      // preview often lacks the genres isAnimeMeta needs, but the hover
+      // panel / CW / Calendar usually warmed metaCache for this id
+      // already. Consult that cached detail (genres / language / mal·
+      // kitsu·anidb ids) synchronously, and persist a positive via
+      // markAnimeId so a later cold-cache right-click still resolves —
+      // that also makes sourcesForMeta's own isAnimeMeta hit the cache.
+      const cachedDetail = peekCachedDetailById(meta.id);
+      const isAnime =
+        isAnimeMeta(meta) ||
+        (cachedDetail != null &&
+          (cachedDetail.mal_id != null ||
+            cachedDetail.kitsu_id != null ||
+            cachedDetail.anidb_id != null ||
+            isAnimeMeta({
+              media_type: cachedDetail.media_type,
+              id: cachedDetail.id,
+              genres: cachedDetail.genres,
+              original_language: cachedDetail.original_language,
+              production_countries: cachedDetail.production_countries,
+            })));
+      if (isAnime) markAnimeId(meta.id);
       console.info(
         `[anime] check id=${meta.id} type=${meta.media_type} ` +
           `genres=${JSON.stringify(meta.genres ?? [])} → ${isAnime ? "ANIME" : "non-anime"}`,
