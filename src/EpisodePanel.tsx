@@ -45,10 +45,16 @@ interface Props {
   currentEpisodeId: string | null;
   /** The resolved next episode id (highlighted as "Next"), if any. */
   nextEpisodeId: string | null;
+  /** True in OS fullscreen — the Win32 title bar is hidden, so the
+   *  drawer can start at top:0; in windowed mode offset 36px below the
+   *  always-visible 36px Win32 title bar (CLAUDE.md landmine #6). */
+  isFullscreen: boolean;
   /** id→LibraryItem index for the pure spoiler gate. */
   libraryById: Map<string, LibraryItem>;
-  /** Series art fallback for episodes with no still + an unwatched
-   *  blur (Decision 6 parity — never a big blurred image). */
+  /** Series art fallback. NO LONGER used for panel rows (those now
+   *  always show the blurred episode still, mirroring DetailView's
+   *  EpisodeRow); retained only so EosSpotlight's large preview can
+   *  pass it through unchanged. */
   seriesArt: string | null;
   /** App injects the play path (resolves a stream, swaps the active
    *  target through handlePlayStream — carries History/scrobble). */
@@ -57,7 +63,8 @@ interface Props {
 
 export default function EpisodePanel({
   open, onClose, seriesId, mediaType, addons,
-  currentEpisodeId, nextEpisodeId, libraryById, seriesArt, onPlayEpisode,
+  currentEpisodeId, nextEpisodeId, isFullscreen, libraryById,
+  seriesArt: _seriesArt, onPlayEpisode,
 }: Props) {
   // Seed synchronously from the meta cache so a warm open paints
   // immediately (no skeleton flash); fall back to the async fetch.
@@ -148,16 +155,17 @@ export default function EpisodePanel({
           click is swallowed here so it never reaches the video region's
           play/pause toggle underneath. */}
       <div
-        className="fixed inset-0 z-[10000] bg-black/45 animate-[fade-in_140ms_ease-out]"
+        className="fixed inset-0 z-[10400] pointer-events-auto bg-black/45 animate-[fade-in_140ms_ease-out]"
         onClick={(e) => { e.stopPropagation(); onClose(); }}
         onPointerDown={(e) => e.stopPropagation()}
         onMouseDown={(e) => e.stopPropagation()}
       />
       <div
-        className="fixed top-0 right-0 bottom-0 z-[10000] w-[420px] max-w-[88vw]
+        className="fixed right-0 bottom-0 z-[10400] pointer-events-auto w-[420px] max-w-[88vw]
                    aura-glass-menu border-l border-white/10
                    flex flex-col text-white
                    animate-[ep-panel-slide_220ms_cubic-bezier(0.16,1,0.3,1)]"
+        style={{ top: isFullscreen ? 0 : 36 }}
         role="dialog"
         aria-label="Episodes"
         onClick={(e) => e.stopPropagation()}
@@ -214,8 +222,6 @@ export default function EpisodePanel({
               const isNext = v.id === nextEpisodeId;
               const watched = isEpisodeWatched(libraryById, v.id);
               const blurThumb = shouldBlurThumbnail(libraryById, v.id, blurThumbs);
-              const showSeriesArt = blurThumb || !v.thumbnail;
-              const thumb = showSeriesArt ? seriesArt : v.thumbnail;
               return (
                 <button
                   key={v.id}
@@ -232,12 +238,13 @@ export default function EpisodePanel({
                                bg-white/5 border border-white/10"
                     style={{ aspectRatio: "16 / 9" }}
                   >
-                    {thumb ? (
+                    {v.thumbnail ? (
                       <ImageLoader
-                        src={thumb}
+                        src={v.thumbnail}
                         alt=""
                         className="absolute inset-0 w-full h-full"
-                        imgClassName="w-full h-full object-cover"
+                        imgClassName={`w-full h-full object-cover transition-[filter] duration-300
+                                       ${blurThumb ? "blur-md scale-110" : ""}`}
                       />
                     ) : (
                       <div className="absolute inset-0 flex items-center justify-center text-white/25">
@@ -246,8 +253,14 @@ export default function EpisodePanel({
                         </svg>
                       </div>
                     )}
-                    {blurThumb && v.thumbnail && !showSeriesArt && (
-                      <div className="absolute inset-0 backdrop-blur-md bg-black/20 flex items-center justify-center">
+                    {/* Anti-spoiler veil — slight darken under the blur so
+                        the row text reads cleanly; mirrors DetailView's
+                        EpisodeRow exactly. */}
+                    {blurThumb && v.thumbnail && (
+                      <div
+                        aria-hidden
+                        className="absolute inset-0 bg-black/30 transition-opacity duration-300 flex items-center justify-center"
+                      >
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" className="text-white/55" aria-hidden>
                           <path d="M12 17a2 2 0 0 0 2-2 2 2 0 0 0-2-2 2 2 0 0 0-2 2 2 2 0 0 0 2 2m6-9a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2h1V6a5 5 0 0 1 5-5 5 5 0 0 1 5 5v2h1M12 3a3 3 0 0 0-3 3v2h6V6a3 3 0 0 0-3-3z" />
                         </svg>

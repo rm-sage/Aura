@@ -1073,6 +1073,7 @@ interface Props {
     addons: AddonEntry[];
     currentEpisodeId: string;
     nextEpisodeId: string | null;
+    isFullscreen: boolean;
     libraryById: Map<string, LibraryItem>;
     seriesArt: string | null;
     onPlayEpisode: (video: VideoEntry) => void;
@@ -1093,7 +1094,7 @@ interface Props {
 
 function EpisodeEdgeTrigger({
   seriesId, mediaType, addons, currentEpisodeId, nextEpisodeId,
-  libraryById, seriesArt, onPlayEpisode,
+  isFullscreen, libraryById, seriesArt, onPlayEpisode,
 }: NonNullable<Props["episodePanel"]>) {
   const [open, setOpen] = useState(false);
   useMenuOpenSync(open);
@@ -1179,6 +1180,7 @@ function EpisodeEdgeTrigger({
           in from the right; clicking the scrim / Escape / a row closes
           it via onClose. */}
       <div
+        className="pointer-events-auto"
         onPointerEnter={cancelClose}
         onPointerLeave={armClose}
       >
@@ -1190,6 +1192,7 @@ function EpisodeEdgeTrigger({
           addons={addons}
           currentEpisodeId={currentEpisodeId}
           nextEpisodeId={nextEpisodeId}
+          isFullscreen={isFullscreen}
           libraryById={libraryById}
           seriesArt={seriesArt}
           onPlayEpisode={(v) => { closeNow(); onPlayEpisode(v); }}

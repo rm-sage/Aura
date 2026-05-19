@@ -594,8 +594,20 @@ function usePlayback(playerActive: boolean) {
   useEffect(() => {
     lastPosRef.current = { time, duration };
   }, [time, duration]);
+  // One-shot guard so the fast near-end EOS short-circuit dispatches
+  // `aura:eos-detected` exactly once per stream. Reset per load inside
+  // notifyNewLoad (alongside the other fresh-load state resets).
+  const nearEndEosFiredRef = useRef(false);
   useEffect(() => {
     const BROKEN_STALE_MS = 8000;
+    // Fast path: when playback was already within the last few seconds
+    // of the metadata duration, a stale heartbeat is end-of-stream, not
+    // a network break — on this libmpv-wrapper build `time-pos` simply
+    // stops at true EOF and `end-file` is unreliable, so the 8 s broken
+    // detector would otherwise make the EOS Spotlight appear ~8 s late.
+    // Surface it after ~1.5 s instead. Genuine mid-stream halts (>5 s
+    // from the end) still wait the full 8 s and flip `streamBroken`.
+    const EOS_NEAR_END_STALE_MS = 1500;
     const EOS_TAIL_SECONDS = 5;
     const id = window.setInterval(() => {
       const last = lastTimeUpdateAtRef.current;
@@ -604,9 +616,22 @@ function usePlayback(playerActive: boolean) {
       // for-cache buffering is its own state with its own UI.
       if (paused) return;
       if (!firstFrameSeen) return;
-      if (Date.now() - last >= BROKEN_STALE_MS) {
-        const { time: t, duration: d } = lastPosRef.current;
-        if (t > 0 && d > 0 && d - t <= EOS_TAIL_SECONDS) {
+      const staleFor = Date.now() - last;
+      const { time: t, duration: d } = lastPosRef.current;
+      const nearEnd = t > 0 && d > 0 && d - t <= EOS_TAIL_SECONDS;
+      // Near-end short-circuit (~1.5 s): clean EOF, fire the Spotlight
+      // early. Guarded so it dispatches once per stream.
+      if (
+        nearEnd &&
+        !nearEndEosFiredRef.current &&
+        staleFor >= EOS_NEAR_END_STALE_MS
+      ) {
+        nearEndEosFiredRef.current = true;
+        window.dispatchEvent(new CustomEvent("aura:eos-detected"));
+        return;
+      }
+      if (staleFor >= BROKEN_STALE_MS) {
+        if (nearEnd) {
           // Near-end stall → end-of-stream, not a break. App owns the
           // Spotlight; one dispatch is enough (the listener latches).
           window.dispatchEvent(new CustomEvent("aura:eos-detected"));
@@ -685,6 +710,7 @@ function usePlayback(playerActive: boolean) {
     loadEventsSeenRef.current = new Set();
     lastTimeUpdateAtRef.current = 0;
     lastCacheBufferLogRef.current = null;
+    nearEndEosFiredRef.current = false;
     console.info("[load] +0ms notifyNewLoad — fresh load sequence begins");
     setBuffering(true);
     setFirstFrameSeen(false);
@@ -1110,6 +1136,23 @@ export default function App() {
             enabled: !!motionInterpolation,
             tscale: interpolationTscale ?? "mitchell",
           }).catch(() => {});
+          // Hover-thumbnail pre-warm. `extract_thumbnail` lazily spins
+          // up a SEPARATE "thumb" libmpv instance (audio=false, vo=null,
+          // no observed properties) and loadfiles the URL on the FIRST
+          // scrubber hover, so the first ~4 user hovers were spent just
+          // warming it. Prime it once here, off the user's path, with
+          // the SAME URL the Scrubber later passes as `streamUrl`
+          // (== activeStreamUrl == stream.url). Fire-and-forget; runs
+          // inside this same +1500 ms post-load gate so it is well
+          // clear of the loadfile critical section (landmine #3) and
+          // touches a different instance entirely (never the "main"
+          // mpv). No-op for magnet streams (no stream.url).
+          if (stream.url) {
+            void invoke("extract_thumbnail", {
+              url: stream.url,
+              atSeconds: 1,
+            }).catch(() => {});
+          }
         }, 1500);
 
         // ── Anime OP/ED skip windows ──
@@ -3794,6 +3837,14 @@ export default function App() {
     handleExitPlayback();
   }, [handleExitPlayback]);
 
+  // Spotlight × / Escape — hide the end screen WITHOUT tearing playback
+  // down (distinct from onEosExit's handleExitPlayback teardown). mpv is
+  // idle/ended at EOF; the reverted DXGI flip model retains the last
+  // decoded frame, so the user is left on the paused final frame. No
+  // mpv pause/set_property here — flip-model retention handles the
+  // visual (CLAUDE.md landmine #1: never mpv.command set_property).
+  const onEosDismiss = useCallback(() => setEosActive(false), []);
+
   // EpisodePanel play path (Spotlight "Episodes" button + Phase 4 hover
   // edge). Same target shape as onNextUpPlay; routes through
   // handlePlayStream so the History/scrobble pass + reload-survival
@@ -4736,6 +4787,7 @@ export default function App() {
               addons,
               currentEpisodeId: activeTarget.id,
               nextEpisodeId: nextUpInfo?.episode?.id ?? null,
+              isFullscreen,
               libraryById,
               seriesArt:
                 selectedMeta?.background ?? selectedMeta?.poster ??
@@ -4800,6 +4852,7 @@ export default function App() {
             onPlayNext={onEosPlayNext}
             onReplay={onEosReplay}
             onExit={onEosExit}
+            onDismiss={onEosDismiss}
             onOpenEpisodes={() => setEosEpisodesOpen(true)}
           />
         );
@@ -4826,6 +4879,7 @@ export default function App() {
             addons={addons}
             currentEpisodeId={activeTarget.id}
             nextEpisodeId={nextUpInfo?.episode?.id ?? null}
+            isFullscreen={isFullscreen}
             libraryById={libraryById}
             seriesArt={seriesArt}
             onPlayEpisode={onEosPlayEpisode}

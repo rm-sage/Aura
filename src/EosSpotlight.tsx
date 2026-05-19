@@ -63,11 +63,18 @@ interface Props {
   onReplay: () => void;
   onExit: () => void;
   onOpenEpisodes: () => void;
+  /** Hide the Spotlight WITHOUT tearing playback down (distinct from
+   *  onExit, which is the full handleExitPlayback teardown). mpv is
+   *  idle/ended at EOF and the DXGI flip model retains the last frame,
+   *  so the user is left looking at the paused final frame. Wired to
+   *  the × button and Escape. */
+  onDismiss: () => void;
 }
 
 export default function EosSpotlight({
   title, episode, stream, loading, isSeries, caughtUpUnaired,
   seriesArt, libraryById, onPlayNext, onReplay, onExit, onOpenEpisodes,
+  onDismiss,
 }: Props) {
   const isNextUp = episode != null;
 
@@ -114,6 +121,22 @@ export default function EosSpotlight({
       window.removeEventListener("wheel", cancel);
     };
   }, [remaining]);
+
+  // Escape dismisses the Spotlight (stay paused on the last frame).
+  // Independent of the countdown-cancel listener above: that one only
+  // exists while a countdown is armed and merely cancels auto-advance;
+  // this one always exists and actually hides the screen. stopPropagation
+  // so the keypress doesn't also reach PlayerOverlay's own Esc handler.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        onDismiss();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onDismiss]);
 
   const countdownActive = remaining !== null && remaining > 0;
   const ringPct = countdownActive
@@ -170,8 +193,24 @@ export default function EosSpotlight({
       onMouseDown={(e) => e.stopPropagation()}
       onDoubleClick={(e) => e.stopPropagation()}
     >
-      <div className="aura-glass-menu rounded-3xl w-[92%] max-w-[760px] p-7 text-white
+      <div className="relative aura-glass-menu rounded-3xl w-[92%] max-w-[760px] p-7 text-white
                       shadow-[0_40px_90px_-20px_rgba(0,0,0,0.85)]">
+        {/* Dismiss — hides the Spotlight without tearing playback down.
+            The reverted DXGI flip model retains the last decoded frame,
+            so the user is left on the paused final frame. Distinct from
+            Exit (full teardown). Also bound to Escape above. */}
+        <button
+          type="button"
+          onClick={onDismiss}
+          aria-label="Close (stay paused)"
+          className="absolute top-3 right-3 w-8 h-8 rounded-full
+                     text-white/55 hover:text-white hover:bg-white/10
+                     transition-colors flex items-center justify-center z-10"
+        >
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+            <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
+          </svg>
+        </button>
         {isNextUp ? (
           <>
             <p className="text-white/45 text-[11px] font-mono uppercase tracking-[0.22em] mb-4">
