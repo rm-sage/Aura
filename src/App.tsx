@@ -104,7 +104,7 @@ import type {
   VideoEntry,
 } from "./types";
 import { isVideoAired } from "./types";
-import type { UserSession } from "./LoginView";
+import type { UserSession, StremioAccount } from "./LoginView";
 import "./App.css";
 
 // ---------------------------------------------------------------------------
@@ -2878,7 +2878,7 @@ export default function App() {
           // (cached 24h) and rewrites the keyring; merge the result
           // into the in-memory session so the line updates without a
           // relogin. Best-effort — failure leaves the prior behaviour.
-          invoke<import("./LoginView").StremioAccount>("fetch_stremio_account")
+          invoke<StremioAccount>("fetch_stremio_account")
             .then((acct) => {
               if (acct?.email) {
                 setSession((s) => (s && s.email !== acct.email ? { ...s, email: acct.email } : s));
