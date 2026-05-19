@@ -92,7 +92,7 @@ import { NotificationsProvider, useNotifications } from "./NotificationsContext"
 import NotificationsBell from "./NotificationsBell";
 import LibraryRefreshButton from "./LibraryRefreshButton";
 import AccountButton from "./AccountButton";
-import NotificationsScanner from "./NotificationsScanner";
+import NotificationsScanner, { clearScannerState } from "./NotificationsScanner";
 import { getTitleState } from "./titleState";
 import { isAnimeMeta, markAnimeId } from "./aiometadata";
 import type {
@@ -2749,6 +2749,10 @@ export default function App() {
   // same scope swap into the manualWatched store (purely JS-side
   // localStorage) so that "I've already watched this" marks also stay
   // scoped to the user.
+  // Tracks the last scope `applySettingsScope` actually applied, so a
+  // cross-account switch can be distinguished from a same-account
+  // restore (drives the release-signal/scanner clear below).
+  const appliedScopeRef = useRef<string | null>(null);
   const applySettingsScope = useCallback(async (sess: UserSession | null) => {
     const authKey = sess?.auth_key ?? null;
     const userId  = sess?.user_id ?? null;
@@ -2768,6 +2772,19 @@ export default function App() {
     // scope is repopulated by the next pull), and auto-backup keeps
     // its directories addressable from the existing UI.
     const scope = authKey && authKey.trim() ? `user-${authKey.slice(0, 12)}` : "guest";
+    // Cross-account isolation for the in-memory release-signal store +
+    // the persisted episode-scanner seen-ledger (both per-account).
+    // The sign-out-only effect elsewhere misses a DIRECT account A→B
+    // switch — it routes through here but not setSession(null). Gate
+    // on an ACTUAL scope change: first apply (ref===null) and a
+    // same-account cached-session restore (ref===scope) must NOT wipe
+    // the scanner ledger, else every launch re-seeds and a genuinely
+    // new episode is swallowed by first-scan seeding.
+    if (appliedScopeRef.current !== null && appliedScopeRef.current !== scope) {
+      clearReleaseSignalStore();
+      clearScannerState();
+    }
+    appliedScopeRef.current = scope;
     setManualWatchedScope(scope);
     setHistoryScope(newHistoryScope, { legacyScope: legacyAuthScope });
     // Backups follow the same scope so a sign-out / sign-in cycle's

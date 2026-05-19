@@ -156,6 +156,22 @@ function saveScannerState(state: ScannerState) {
   }
 }
 
+/** Wipe the persisted episode-scanner seen-ledger. Called by the
+ *  settings-scope follower on an ACTUAL account change (A→B / sign-
+ *  out) so one account's "already seen / notified" memory can't bleed
+ *  into another. The next scan then takes the documented one-shot
+ *  first-scan seeding grace (seeds current state, fires nothing), then
+ *  resumes normal new-episode detection. Never call on a same-account
+ *  restore — that would re-seed every launch and swallow a genuinely
+ *  new episode. */
+export function clearScannerState(): void {
+  try {
+    localStorage.removeItem(SCANNER_STATE_KEY);
+  } catch {
+    // private mode / quota — non-fatal
+  }
+}
+
 /** Migration gate — v2 left stale `seenVideoIds` blobs that don't
  *  align with cloud-signal id shapes. On v3 first boot, wipe the
  *  scanner state so the new scan path seeds from cloud + library
