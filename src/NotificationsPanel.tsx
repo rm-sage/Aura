@@ -64,16 +64,20 @@ export default function NotificationsPanel({
         "w-[380px] max-h-[480px]",
         "rounded-2xl overflow-hidden",
         // Higher-contrast surface than the prior `bg-white/[0.07]`.
-        // `bg-black/82` darkens the panel substantially so titles
-        // stay legible against Mica's bright bleedthrough, while the
-        // `backdrop-saturate-150 backdrop-brightness-75 backdrop-blur-2xl`
-        // chain approximates iOS-style vibrancy without the per-frame
-        // GPU cost of the proper macOS Vibrancy API. The bright
-        // background still tinges the panel (the eye reads it as
-        // "translucent") but text contrast is uniform regardless of
-        // what's behind it.
-        "bg-black/82 backdrop-saturate-150 backdrop-brightness-75 backdrop-blur-2xl",
-        "border border-white/10",
+        // NOTE: a prior revision used `bg-black/82`, but `/82` is NOT on
+        // Tailwind's opacity scale (…/80/85/90) and isn't in the extended
+        // set in tailwind.config.ts (92/93/96/97/98) — the JIT silently
+        // emitted NO background rule, so the panel had zero fill and
+        // Mica's bright bleedthrough (plus any catalog title behind it)
+        // showed straight through, making the text unreadable. Use a
+        // VALID step on a real token: `bg-ln-base/85` (ln.base #080808)
+        // is an ~85% near-black scrim that keeps text legible over bright
+        // backgrounds, while the remaining ~15% translucency +
+        // `backdrop-saturate-150 backdrop-blur-2xl` preserves the glassy
+        // look. `backdrop-brightness-75` only existed to compensate for
+        // the (absent) fill — now redundant, dropped.
+        "bg-ln-base/85 backdrop-saturate-150 backdrop-blur-2xl",
+        "border border-white/15",
         "shadow-2xl",
         "flex flex-col",
         closing ? "aura-bell-panel-out" : "aura-bell-panel-in",
@@ -134,7 +138,7 @@ export default function NotificationsPanel({
         style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.10) transparent" }}
       >
         {sorted.length === 0 ? (
-          <div className="px-4 py-8 text-center text-xs text-white/40">
+          <div className="px-4 py-8 text-center text-xs text-white/55">
             No notifications
           </div>
         ) : (

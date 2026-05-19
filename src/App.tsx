@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -52,6 +52,8 @@ import { syncPullAll, installSyncTriggers, startBackgroundPull, clearSyncEtags, 
 import { setHistoryScope, addHistoryEntry } from "./historyStore";
 import { setAutoBackupScope, startAutoBackup } from "./userDataBackup";
 import NextUpCta from "./NextUpCta";
+import EosSpotlight from "./EosSpotlight";
+import EpisodePanel from "./EpisodePanel";
 import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPreviousEpisode } from "./nextUp";
 import { getMetaDetailFallback, peekCachedDetailById } from "./metaCache";
 import { PersistentCache } from "./persistentCache";
@@ -577,8 +579,24 @@ function usePlayback(playerActive: boolean) {
   // overlay shown by PlayerOverlay reads this and offers a Reload
   // button that re-invokes handlePlayStream with the current target
   // and the last-known time as the resume offset.
+  //
+  // EOS DISAMBIGUATION (EOS Spotlight, 2026-05-19): on this libmpv
+  // build mpv stops emitting `time-pos` at true end-of-stream, so the
+  // 8 s stale detector would otherwise fire a FALSE "Stream connection
+  // lost" modal on every clean episode/movie finish. Before flagging
+  // the stream broken we check the last-known position: if playback
+  // halted within ~5 s of the metadata duration (≈ the last 1 %), this
+  // is end-of-stream, not a network break — dispatch `aura:eos-detected`
+  // and let App's EOS Spotlight own the screen instead. Genuine breaks
+  // (>5 s from the end) still flip `streamBroken` and surface the
+  // unchanged recovery / Reload modal.
+  const lastPosRef = useRef({ time: 0, duration: 0 });
+  useEffect(() => {
+    lastPosRef.current = { time, duration };
+  }, [time, duration]);
   useEffect(() => {
     const BROKEN_STALE_MS = 8000;
+    const EOS_TAIL_SECONDS = 5;
     const id = window.setInterval(() => {
       const last = lastTimeUpdateAtRef.current;
       if (last === 0) return;
@@ -587,6 +605,13 @@ function usePlayback(playerActive: boolean) {
       if (paused) return;
       if (!firstFrameSeen) return;
       if (Date.now() - last >= BROKEN_STALE_MS) {
+        const { time: t, duration: d } = lastPosRef.current;
+        if (t > 0 && d > 0 && d - t <= EOS_TAIL_SECONDS) {
+          // Near-end stall → end-of-stream, not a break. App owns the
+          // Spotlight; one dispatch is enough (the listener latches).
+          window.dispatchEvent(new CustomEvent("aura:eos-detected"));
+          return;
+        }
         setStreamBroken(true);
       }
     }, 1000);
@@ -610,13 +635,22 @@ function usePlayback(playerActive: boolean) {
   useEffect(() => {
     const p = listen<{ reason?: string; error?: number }>("playback-end", ({ payload }) => {
       const reason = payload?.reason ?? "";
-      // "error" is the only failure mode worth surfacing — "eof",
-      // "stop", and "quit" are all expected user-initiated paths.
-      // "redirect" is internal to MPV's playlist handling and never
-      // reaches the user.
+      // "error" is the only failure mode worth surfacing as a BREAK —
+      // "stop" and "quit" are user-initiated; "redirect" is internal to
+      // MPV's playlist handling and never reaches the user.
       if (reason === "error") {
         console.warn("[playback] end-file reason=error", payload);
         setStreamBroken(true);
+        return;
+      }
+      // "eof" = the file played to completion. This is the clean
+      // end-of-stream signal (EOS Spotlight, 2026-05-19). App owns the
+      // Spotlight UI; we just notify via a window event so usePlayback
+      // stays free of the eosActive state (App clears it on new load /
+      // exit). The near-end stale-heartbeat path above is the fallback
+      // for containers whose `eof` event never arrives.
+      if (reason === "eof") {
+        window.dispatchEvent(new CustomEvent("aura:eos-detected"));
       }
     });
     return () => { p.then((fn) => fn()).catch(() => {}); };
@@ -803,7 +837,7 @@ export default function App() {
   // ── Playback hook — gated on activeTarget so the polling fallback only
   //     runs while a stream is loaded.
   const {
-    time, duration, paused, volume, speed, buffering, bufferPct, eof, firstFrameSeen,
+    time, duration, paused, volume, speed, buffering, bufferPct, firstFrameSeen,
     streamBroken, setStreamBroken,
     togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
     notifyNewLoad, logLoadEvent,
@@ -1185,9 +1219,28 @@ export default function App() {
                       // Largest silence ≥1.5 s starting 30–180 s ≈ the
                       // OP→dialogue boundary (identical heuristic to
                       // SkipWindowButton's manual path).
-                      const cand = sd.intervals
+                      const qualifying = sd.intervals
                         .filter((iv) => iv.duration >= 1.5 && iv.start >= 30 && iv.start <= 180)
-                        .sort((a, b) => b.duration - a.duration)[0];
+                        .sort((a, b) => b.duration - a.duration);
+                      // Only treat the dominant silence as an OP boundary
+                      // if it's actually OP-shaped: it must END in the
+                      // 60–110 s band (a real OP→content cut after a
+                      // standard ~90 s opening) AND be clearly the single
+                      // dominant pause (no comparable-length silence else-
+                      // where in the first 3 min). Without these guards
+                      // ANY show with an ordinary ≥1.5 s dialogue gap in
+                      // 30–180 s got a bogus "OP 0-Ns" stamped — e.g.
+                      // Witch Hat Atelier (no OP at all) reported OP
+                      // 0-119s and then auto-skipped real content.
+                      const top = qualifying[0];
+                      const cand =
+                        top &&
+                        top.end >= 60 &&
+                        top.end <= 110 &&
+                        (qualifying.length < 2 ||
+                          qualifying[1].duration < top.duration * 0.6)
+                          ? top
+                          : undefined;
                       if (cand) {
                         const opWin: PreparedWindow = {
                           type: "op",
@@ -1744,6 +1797,22 @@ export default function App() {
    *  per-tick render. */
   const [nextUpVisible, setNextUpVisible] = useState(false);
 
+  // ── EOS Spotlight (2026-05-19) ──────────────────────────────────────
+  // `eosActive` is the App-owned carrier for the end-of-stream screen.
+  // It is set ONLY via the `aura:eos-detected` window event dispatched
+  // from usePlayback's detectors (playback-end reason="eof" OR a near-
+  // end stale-heartbeat ≤5 s from duration). usePlayback deliberately
+  // does NOT own this state — App clears it on every new load / target
+  // change (the reset effect below) and on handleExitPlayback so a
+  // re-watch or episode swap starts clean. Mounting the Spotlight
+  // suppresses the small NextUpCta (mutual exclusion in the JSX gate).
+  const [eosActive, setEosActive] = useState(false);
+  useEffect(() => {
+    const onEos = () => setEosActive(true);
+    window.addEventListener("aura:eos-detected", onEos);
+    return () => window.removeEventListener("aura:eos-detected", onEos);
+  }, []);
+
   // Listen for ED-start updates from the AniSkip pipeline. The event
   // is dispatched from inside handlePlayStream's lookup IIFE.
   useEffect(() => {
@@ -1758,9 +1827,15 @@ export default function App() {
   }, []);
 
   // Reset CTA state whenever the active target changes (new playback).
+  // This is also the canonical "new load" boundary for the EOS
+  // Spotlight: every load_video site (DetailView pick, NextUp/Spotlight
+  // Play-Next, Reload) routes through a setActiveTarget, so clearing
+  // eosActive here covers all of them without touching usePlayback's
+  // notifyNewLoad. handleExitPlayback also clears it explicitly.
   useEffect(() => {
     setNextUpInfo(null);
     setNextUpVisible(false);
+    setEosActive(false);
     nextUpResolvedFor.current = null;
     nextUpEdStartRef.current = null;
     // Don't reset nextUpDismissedFor here — App.tsx unmounts the
@@ -1840,7 +1915,13 @@ export default function App() {
     if (nextUpVisible) return;
     const remaining = duration - time;
     const edStart = nextUpEdStartRef.current;
-    const edTriggered = edStart != null && time >= edStart;
+    // Sanity-gate the ED start: a real end-credits boundary is in the
+    // back half of the runtime. Ignoring an implausibly-early edStart
+    // keeps a bad value (e.g. a future regression in the tail-scan
+    // timestamp math) from firing Next-Up mid-episode the instant the
+    // 50 %-gated pre-resolve completes.
+    const edTriggered =
+      edStart != null && duration > 0 && edStart >= duration * 0.5 && time >= edStart;
     const leadTriggered =
       nextUpLeadSeconds > 0 && duration > 0 && remaining <= nextUpLeadSeconds && remaining > 0;
     if (edTriggered || leadTriggered) {
@@ -1848,33 +1929,13 @@ export default function App() {
     }
   }, [activeTarget, time, duration, nextUpInfo, nextUpLeadSeconds, nextUpVisible]);
 
-  // Hard EOF safety net — if the file ends sooner than its metadata
-  // duration suggests AND we never armed the CTA, force the resolution
-  // through. This catches episodes whose container reports a duration
-  // longer than the actual content (cropped Netflix rips, etc.).
-  useEffect(() => {
-    if (!eof || !activeTarget) return;
-    const mt = (activeTarget.media_type ?? "").toLowerCase();
-    if (mt !== "series" && mt !== "anime") return;
-    if (nextUpInfo) {
-      if (!nextUpVisible) setNextUpVisible(true);
-      return;
-    }
-    if (nextUpResolvedFor.current === activeTarget.id) return;
-    nextUpResolvedFor.current = activeTarget.id;
-    const seriesId = activeTarget.series_id ?? activeTarget.id;
-    const mediaType = activeTarget.media_type;
-    const currentId = activeTarget.id;
-    void (async () => {
-      const next = await resolveNextEpisode(addons, mediaType, seriesId, currentId, loadAuraSettings().nextUpSkipFillerRecap);
-      if (!next) return;
-      const stream = await pickFirstStreamForEpisode(addons, mediaType, next.next.id);
-      if (nextUpResolvedFor.current === currentId) {
-        setNextUpInfo({ episode: next.next, stream });
-        setNextUpVisible(true);
-      }
-    })();
-  }, [eof, activeTarget, addons, nextUpInfo, nextUpVisible]);
+  // "Hard EOF" NextUp forcer REMOVED (EOS Spotlight, 2026-05-19): it
+  // was gated on the dead `eof` carrier (Rust never sets
+  // PlaybackState.eof) so it never ran. End-of-stream now surfaces the
+  // EOS Spotlight (App-level, gated on `eosActive`), which resolves the
+  // next episode itself and supersedes the small NextUpCta — so the
+  // "container reports a longer duration than the actual content" case
+  // is covered by the Spotlight's own resolveNextEpisode call.
 
   /** Click-handler for the Next-Up CTA — flushes the current episode's
    *  resume offset, then routes the resolved stream + target through
@@ -1961,6 +2022,91 @@ export default function App() {
     }
     setNextUpInfo(null);
   }, [activeTarget]);
+
+  // ── EOS Spotlight wiring (2026-05-19) ───────────────────────────────
+  // Pure id→LibraryItem index for the spoiler gate (mirrors what
+  // LibraryProvider builds; passed to EosSpotlight + EpisodePanel so the
+  // blur rule is byte-identical to DetailView without re-implementing).
+  const libraryById = useMemo(() => {
+    const m = new Map<string, LibraryItem>();
+    for (const it of library) { if (!it.removed) m.set(it.id, it); }
+    return m;
+  }, [library]);
+
+  // Resolution state for the Spotlight: idle (not at EOS) → resolving →
+  // ready (a next episode exists; reuse `nextUpInfo`) | none (END-CARD:
+  // movie / finale / caught-up-unaired). `eosCaughtUpUnaired` only flips
+  // true when a LATER episode exists but hasn't aired yet (so the
+  // END-CARD wording differs from a true finale).
+  const [eosResolve, setEosResolve] = useState<"idle" | "resolving" | "ready" | "none">("idle");
+  const [eosCaughtUpUnaired, setEosCaughtUpUnaired] = useState(false);
+  const [eosEpisodesOpen, setEosEpisodesOpen] = useState(false);
+  /** Episode id whose EOS resolution has already been kicked off, so
+   *  the resolution effect's own `setEosResolve("resolving")` re-run
+   *  doesn't fire a duplicate addon round-trip. Reset when the EOS
+   *  screen tears down (eosActive false / target change). */
+  const eosResolveStartedFor = useRef<string | null>(null);
+
+  // Drive the resolution when the EOS screen activates. The pre-resolve
+  // effect usually populated `nextUpInfo` already (fires at 50 %), so
+  // the common path is an instant "ready". When it didn't (short
+  // episode, resume-near-end, container shorter than metadata), resolve
+  // here. Movies skip straight to END-CARD.
+  useEffect(() => {
+    if (!eosActive || !activeTarget) {
+      setEosResolve("idle");
+      setEosCaughtUpUnaired(false);
+      setEosEpisodesOpen(false);
+      eosResolveStartedFor.current = null;
+      return;
+    }
+    const mt = (activeTarget.media_type ?? "").toLowerCase();
+    const isSeriesLike = mt === "series" || mt === "anime";
+    if (!isSeriesLike) { setEosResolve("none"); return; }
+    if (nextUpInfo) { setEosResolve("ready"); return; }
+    if (eosResolve === "ready" || eosResolve === "none") return;
+    // Once per current episode: the setEosResolve("resolving") below
+    // re-runs this effect, but the started-for ref keeps us from
+    // firing a second addon fan-out.
+    if (eosResolveStartedFor.current === activeTarget.id) return;
+    eosResolveStartedFor.current = activeTarget.id;
+    setEosResolve("resolving");
+    const seriesId = activeTarget.series_id ?? activeTarget.id;
+    const mediaType = activeTarget.media_type;
+    const currentId = activeTarget.id;
+    let cancelled = false;
+    void (async () => {
+      const res = await resolveNextEpisode(
+        addons, mediaType, seriesId, currentId,
+        loadAuraSettings().nextUpSkipFillerRecap,
+      );
+      if (cancelled) return;
+      if (res) {
+        const stream = await pickFirstStreamForEpisode(addons, mediaType, res.next.id);
+        if (cancelled) return;
+        setNextUpInfo({ episode: res.next, stream });
+        setEosResolve("ready");
+        return;
+      }
+      // No AIRED next episode. Distinguish "true finale" from "caught
+      // up — next season not yet aired": re-run the walk ignoring the
+      // aired filter (a far-future `now`); a hit there means a later
+      // episode exists but simply hasn't aired.
+      const detail =
+        peekCachedDetailById(seriesId) ??
+        (await getMetaDetailFallback(addons, mediaType, seriesId));
+      if (cancelled) return;
+      const laterIgnoringAir = detail
+        ? findNextEpisode(detail, currentId, Number.MAX_SAFE_INTEGER,
+            loadAuraSettings().nextUpSkipFillerRecap)
+        : null;
+      setEosCaughtUpUnaired(!!laterIgnoringAir);
+      setEosResolve("none");
+    })();
+    return () => { cancelled = true; };
+  }, [eosActive, activeTarget, addons, nextUpInfo, eosResolve]);
+  // (EOS action handlers are defined just below handleExitPlayback —
+  // they depend on it, which is declared later in this component.)
 
   // ── Global last-used volume ──
   // Volume is a property of the user's environment (headphones loud, TV
@@ -2327,11 +2473,57 @@ export default function App() {
       const detail = (e as CustomEvent<{ seriesId?: string; episodeId?: string; mediaType?: string }>).detail;
       if (!detail || typeof detail.seriesId !== "string" || typeof detail.episodeId !== "string") return;
       const mt = detail.mediaType ?? "";
+      // History parity. The 80 % auto-complete is the definitive
+      // "watched" signal that already drives Trakt/AniList — but the
+      // History tab is written ONLY by handleExitPlayback / onNextUpPlay,
+      // and a binge / auto-advance / resume-at-end teardown can skip BOTH
+      // for the just-finished episode (observed: WHA EP01 scrobbled to
+      // Trakt+AniList yet never appeared in History). Write it here too,
+      // for the episode that's actually active. `autoHistoryWrittenId`
+      // is the per-play slot handleExitPlayback consults so it skips its
+      // own duplicate append (addHistoryEntry only dedups exact
+      // id+played_at, and the two paths fire at different timestamps).
+      const at = activeTarget;
+      if (
+        at &&
+        at.id === detail.episodeId &&
+        detail.seriesId !== detail.episodeId &&
+        autoHistoryWrittenId.current !== detail.episodeId
+      ) {
+        const { time: watched, duration: dur } = playbackRef.current;
+        let season: number | null = at.season ?? null;
+        let episode: number | null = at.episode_num ?? null;
+        if ((season == null || episode == null) && detail.episodeId.startsWith("tt")) {
+          const parts = detail.episodeId.split(":");
+          if (parts.length >= 3) {
+            const s = Number(parts[parts.length - 2]);
+            const ep = Number(parts[parts.length - 1]);
+            if (season == null && Number.isFinite(s)) season = s;
+            if (episode == null && Number.isFinite(ep)) episode = ep;
+          }
+        }
+        const libRecord = library.find((i) => i.id === detail.seriesId) ?? null;
+        addHistoryEntry({
+          id:            detail.episodeId,
+          parent_id:     detail.seriesId,
+          name:          at.name,
+          media_type:    at.media_type,
+          poster:        libRecord?.poster ?? selectedMeta?.poster ?? null,
+          background:    libRecord?.background ?? selectedMeta?.background ?? null,
+          season,
+          episode,
+          episode_title: at.episode_title ?? null,
+          played_at:     new Date().toISOString(),
+          duration:      dur || undefined,
+          watched_seconds: watched || undefined,
+        });
+        autoHistoryWrittenId.current = detail.episodeId;
+      }
       void advanceWatchedAfter(detail.seriesId, detail.episodeId, mt, addons);
     };
     window.addEventListener("aura:auto-advance-watched", onAdvance);
     return () => window.removeEventListener("aura:auto-advance-watched", onAdvance);
-  }, [addons]);
+  }, [addons, activeTarget, library, selectedMeta]);
 
   // ── Library toggle handler — exposed to right-click menus + DetailView.
   //
@@ -3392,6 +3584,13 @@ export default function App() {
   const writebackTimer  = useRef<ReturnType<typeof setTimeout> | null>(null);
   const playbackRef     = useRef({ time: 0, duration: 0 });
   useEffect(() => { playbackRef.current = { time, duration }; }, [time, duration]);
+  /** Episode id whose History row was already written by the 80 %
+   *  auto-complete path (onAdvance) for the CURRENT play. Lets
+   *  handleExitPlayback skip its duplicate append (addHistoryEntry
+   *  dedups only on exact id+played_at, and the two paths fire at
+   *  different timestamps). Reset per load in notifyNewLoad so a
+   *  re-watch in the same session still logs a fresh row. */
+  const autoHistoryWrittenId = useRef<string | null>(null);
 
   /** Stable, sync writer used in cleanup/pause paths so we don't capture stale
    *  state from old renders. Calls library_put best-effort.
@@ -3488,7 +3687,11 @@ export default function App() {
       const meaningfulRatio = dur > 0 && watched / dur >= 0.80;
       const meaningfulTime  = watched >= 5 * 60;
       const seriesId = activeTarget.series_id ?? activeTarget.id;
-      if (meaningfulRatio && meaningfulTime) {
+      // Skip if the 80 %-autocomplete path (onAdvance) already wrote a
+      // History row for THIS play — addHistoryEntry only dedups exact
+      // id+played_at and the two fire at different timestamps, so without
+      // this guard every normally-watched episode would double-log.
+      if (meaningfulRatio && meaningfulTime && autoHistoryWrittenId.current !== playedEpisodeId) {
         // Episode info for series. Prefer the VideoEntry-authoritative
         // `activeTarget.season` / `activeTarget.episode_num` — those
         // are set by App.tsx from the clicked video's metadata and are
@@ -3527,6 +3730,10 @@ export default function App() {
           watched_seconds: watched,
         });
       }
+      // Reset the per-play guard now the History decision for this play
+      // is done, so a later re-watch of the same episode in this session
+      // logs a fresh row (addHistoryEntry keys on id+played_at).
+      autoHistoryWrittenId.current = null;
     }
     // Always exit fullscreen on exit-playback — fullscreen is a
     // player-scoped concept; once the player is gone the rest of the
@@ -3545,6 +3752,10 @@ export default function App() {
     setActiveStreamUrl(null);
     setActiveExternalSubs([]);
     setActiveScoringMeta(null);
+    // EOS Spotlight: ensure the end screen is torn down the instant the
+    // player exits, independent of the activeTarget-reset effect's
+    // ordering (the Spotlight's own Exit button routes here).
+    setEosActive(false);
     if (isSeriesEpisode && playedEpisodeId) {
       // DetailView reads this once on mount, opens the episode panel,
       // selects the right season, and scrolls the matching row to the
@@ -3555,6 +3766,70 @@ export default function App() {
     }
   }, [session, flushProgress, activeTarget, time, duration, library, selectedMeta]);
 
+  // ── EOS Spotlight action handlers ───────────────────────────────────
+  // Defined here (not next to the resolution effect above) because they
+  // depend on `handleExitPlayback`, which is block-scoped just above.
+
+  // Spotlight / END-CARD "Replay" — reload the CURRENT stream from 0
+  // (mirrors the recovery modal's Reload, minus the resume offset).
+  // Clearing eosActive tears the screen down; notifyNewLoad re-arms the
+  // load-state UI so the buffering overlay shows through the re-buffer.
+  const onEosReplay = useCallback(async () => {
+    if (!activeStreamUrl) { setEosActive(false); handleExitPlayback(); return; }
+    setEosActive(false);
+    notifyNewLoad();
+    try {
+      await invoke("load_video", { path: activeStreamUrl, startSeconds: null });
+    } catch (e) {
+      console.error("[eos] replay failed", e);
+    }
+  }, [activeStreamUrl, handleExitPlayback, notifyNewLoad]);
+
+  // "Play Next" reuses onNextUpPlay (carries this pass's History/
+  // scrobble append + target build + handlePlayStream swap unchanged).
+  const onEosPlayNext = useCallback(() => { void onNextUpPlay(); }, [onNextUpPlay]);
+
+  const onEosExit = useCallback(() => {
+    setEosActive(false);
+    handleExitPlayback();
+  }, [handleExitPlayback]);
+
+  // EpisodePanel play path (Spotlight "Episodes" button + Phase 4 hover
+  // edge). Same target shape as onNextUpPlay; routes through
+  // handlePlayStream so the History/scrobble pass + reload-survival
+  // invariant hold. Picking a DIFFERENT episode mid-stream is a user-
+  // initiated jump (like DetailView's in-session switching), so we don't
+  // duplicate the natural-finish History append here.
+  const onEosPlayEpisode = useCallback(async (video: VideoEntry) => {
+    if (!activeTarget) return;
+    const seriesId = activeTarget.series_id ?? activeTarget.id;
+    const mediaType = activeTarget.media_type;
+    const stream = await pickFirstStreamForEpisode(addons, mediaType, video.id);
+    if (!stream) {
+      window.dispatchEvent(new CustomEvent("aura:player-toast", {
+        detail: { message: "No streams found for that episode" },
+      }));
+      return;
+    }
+    const tag =
+      video.season != null && video.episode != null
+        ? `S${String(video.season).padStart(2, "0")}E${String(video.episode).padStart(2, "0")}`
+        : video.episode != null ? `Episode ${video.episode}` : undefined;
+    setEosEpisodesOpen(false);
+    setEosActive(false);
+    setNextUpInfo(null);
+    await handlePlayStream(stream, {
+      id:            video.id,
+      series_id:     seriesId,
+      media_type:    mediaType,
+      name:          activeTarget.name,
+      episode:       tag,
+      episode_title: video.title ?? undefined,
+      season:        video.season ?? undefined,
+      episode_num:   video.episode ?? undefined,
+    });
+  }, [activeTarget, addons, handlePlayStream]);
+
   /** Set by handleExitPlayback when the user just finished an episode of
    *  a series/anime; consumed by DetailView's mount effect to anchor the
    *  episode list on the just-played row. Cleared after consumption so
@@ -3562,10 +3837,12 @@ export default function App() {
   const [lastPlayedEpisodeId, setLastPlayedEpisodeId] = useState<string | null>(null);
   const consumeLastPlayedEpisode = useCallback(() => setLastPlayedEpisodeId(null), []);
 
-  // Auto-exit on EOF — when MPV reports the file finished, drop the player.
-  useEffect(() => {
-    if (eof && activeTarget) handleExitPlayback();
-  }, [eof, activeTarget, handleExitPlayback]);
+  // EOF auto-exit REMOVED (EOS Spotlight, 2026-05-19): the dead `eof`
+  // carrier never fired (Rust never sets PlaybackState.eof). End-of-
+  // stream is now detected via the `playback-end` reason="eof" branch /
+  // near-end stale-heartbeat path, both of which dispatch
+  // `aura:eos-detected`; the EOS Spotlight owns the end screen and
+  // routes Exit through handleExitPlayback explicitly.
 
   // ── MPV transparent passthrough ───────────────────────────────────────
   // When a video is loaded, NO React content can paint opaque pixels in the
@@ -4443,6 +4720,29 @@ export default function App() {
           avoidDubs={avoidDubs}
           userRegion={userRegion}
           silentWakeCodes={[keybindings["volume-up"], keybindings["volume-down"]]}
+          episodePanel={(() => {
+            // In-playback episode drawer data (EOS Spotlight Phase 4).
+            // Series/anime only — null for movies so PlayerOverlay
+            // doesn't render the edge handle. seriesArt mirrors the
+            // Spotlight's fallback chain.
+            if (!activeTarget) return null;
+            const mt = (activeTarget.media_type ?? "").toLowerCase();
+            if (mt !== "series" && mt !== "anime") return null;
+            const sId = activeTarget.series_id ?? activeTarget.id;
+            const libRow = library.find((i) => i.id === sId);
+            return {
+              seriesId: sId,
+              mediaType: activeTarget.media_type,
+              addons,
+              currentEpisodeId: activeTarget.id,
+              nextEpisodeId: nextUpInfo?.episode?.id ?? null,
+              libraryById,
+              seriesArt:
+                selectedMeta?.background ?? selectedMeta?.poster ??
+                libRow?.background ?? libRow?.poster ?? null,
+              onPlayEpisode: onEosPlayEpisode,
+            };
+          })()}
         />
       )}
 
@@ -4451,10 +4751,13 @@ export default function App() {
           `z-[9999]`) so its click handlers win over the overlay's
           invisible "tap to play/pause" layer. Mounts only after the
           pre-resolve flow has populated `nextUpInfo` AND the display
-          gate has tripped (ED-end for anime / lead-time fallback /
-          EOF). The user can dismiss it for the rest of the playback
-          or click through to advance. */}
-      {isPlayerActive && nextUpInfo && nextUpVisible && (
+          gate has tripped (ED-end for anime / lead-time fallback).
+          MUTUAL EXCLUSION (EOS Spotlight): suppressed entirely while
+          the EOS Spotlight is up — the Spotlight is the full-screen
+          end-of-stream surface and owns the next-episode decision; a
+          small corner CTA underneath it would be redundant + fight for
+          the click. */}
+      {!eosActive && isPlayerActive && nextUpInfo && nextUpVisible && (
         <NextUpCta
           episode={nextUpInfo.episode}
           loading={false}
@@ -4463,6 +4766,72 @@ export default function App() {
           onDismiss={onNextUpDismiss}
         />
       )}
+
+      {/* ── EOS Spotlight — full-screen end-of-stream surface (spec
+          2026-05-19). App-level sibling like NextUpCta / the recovery
+          modal. z-[10300] (in EosSpotlight) sits above PlayerOverlay
+          (9999) + NextUpCta (10001) and below the stream-broken
+          recovery modal (10500) so a genuine break still wins if both
+          ever race. Gated purely on `eosActive` (set by the
+          `aura:eos-detected` event from clean EOF / near-end stale);
+          shows a loading primary while the next episode resolves, then
+          NEXT-UP or END-CARD per `eosResolve`. */}
+      {eosActive && isPlayerActive && (() => {
+        const mt = (activeTarget?.media_type ?? "").toLowerCase();
+        const isSeriesLike = mt === "series" || mt === "anime";
+        const libRow = activeTarget
+          ? library.find((i) => i.id === (activeTarget.series_id ?? activeTarget.id))
+          : null;
+        const seriesArt =
+          selectedMeta?.background ?? selectedMeta?.poster ??
+          libRow?.background ?? libRow?.poster ?? null;
+        const resolving = eosResolve === "idle" || eosResolve === "resolving";
+        const nextEp = eosResolve === "ready" ? (nextUpInfo?.episode ?? null) : null;
+        return (
+          <EosSpotlight
+            title={activeTarget?.name ?? "this title"}
+            episode={nextEp}
+            stream={nextEp ? (nextUpInfo?.stream ?? null) : null}
+            loading={resolving && isSeriesLike}
+            isSeries={isSeriesLike}
+            caughtUpUnaired={eosCaughtUpUnaired}
+            seriesArt={seriesArt}
+            libraryById={libraryById}
+            onPlayNext={onEosPlayNext}
+            onReplay={onEosReplay}
+            onExit={onEosExit}
+            onOpenEpisodes={() => setEosEpisodesOpen(true)}
+          />
+        );
+      })()}
+
+      {/* Shared EpisodePanel opened by the Spotlight's "Episodes"
+          button (the in-player hover-edge trigger is wired in Phase 4
+          inside PlayerOverlay). z-[10000] in-component; the Spotlight
+          (10300) stays painted behind it so closing the drawer returns
+          to the end screen. */}
+      {isPlayerActive && activeTarget && eosEpisodesOpen && (() => {
+        const libRow = library.find(
+          (i) => i.id === (activeTarget.series_id ?? activeTarget.id),
+        );
+        const seriesArt =
+          selectedMeta?.background ?? selectedMeta?.poster ??
+          libRow?.background ?? libRow?.poster ?? null;
+        return (
+          <EpisodePanel
+            open={eosEpisodesOpen}
+            onClose={() => setEosEpisodesOpen(false)}
+            seriesId={activeTarget.series_id ?? activeTarget.id}
+            mediaType={activeTarget.media_type}
+            addons={addons}
+            currentEpisodeId={activeTarget.id}
+            nextEpisodeId={nextUpInfo?.episode?.id ?? null}
+            libraryById={libraryById}
+            seriesArt={seriesArt}
+            onPlayEpisode={onEosPlayEpisode}
+          />
+        );
+      })()}
 
       {/* Standalone login modal — used when a guest clicks the profile avatar */}
       {showLogin && !showLanding && (

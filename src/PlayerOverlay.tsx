@@ -18,7 +18,8 @@ import SubtitlePicker from "./SubtitlePicker";
 import CinemaSuite from "./CinemaSuite";
 import ImageLoader from "./ImageLoader";
 import type { ActiveScrobbleTarget } from "./useScrobble";
-import type { ExternalSubtitle, TrackEntry } from "./types";
+import type { AddonEntry, ExternalSubtitle, LibraryItem, TrackEntry, VideoEntry } from "./types";
+import EpisodePanel from "./EpisodePanel";
 import { setTitleState } from "./titleState";
 import { pickDefaultAudio, type ScoringMeta } from "./audioScoring";
 import { prettyBinding } from "./useKeybindings";
@@ -1059,6 +1060,143 @@ interface Props {
    *  App passes the user's volume-up / volume-down bindings here so
    *  arrow-key volume bumps stay silent (toast-only) like mousewheel. */
   silentWakeCodes?: readonly string[];
+
+  /** In-playback episode drawer (EOS Spotlight spec 2026-05-19, Phase
+   *  4). When supplied (series/anime only), PlayerOverlay renders an
+   *  always-present thin right-edge handle that hover/click-expands the
+   *  shared EpisodePanel. Omitted for movies. seriesId / mediaType /
+   *  currentEpisodeId derive from activeTarget on the App side; the
+   *  panel resolves its own (cached) MetaDetail. */
+  episodePanel?: {
+    seriesId: string;
+    mediaType: string;
+    addons: AddonEntry[];
+    currentEpisodeId: string;
+    nextEpisodeId: string | null;
+    libraryById: Map<string, LibraryItem>;
+    seriesArt: string | null;
+    onPlayEpisode: (video: VideoEntry) => void;
+  } | null;
+}
+
+// ---------------------------------------------------------------------------
+// EpisodeEdgeTrigger — the in-playback episode drawer affordance (EOS
+// Spotlight spec 2026-05-19, Phase 4). A thin always-present handle on
+// the right edge; hovering it (with a ~150 ms open-intent delay so a
+// cursor merely crossing the edge doesn't fire) or clicking it expands
+// the shared EpisodePanel. Leaving the handle + panel for ~300 ms closes
+// it (grace so a brief overshoot toward the season dropdown doesn't
+// dismiss). `useMenuOpenSync(open)` freezes the control-bar auto-hide
+// while it's open AND makes the overlay swallow the dismiss click — the
+// exact same coordination AniSkipMenu / SubtitlePicker use.
+// ---------------------------------------------------------------------------
+
+function EpisodeEdgeTrigger({
+  seriesId, mediaType, addons, currentEpisodeId, nextEpisodeId,
+  libraryById, seriesArt, onPlayEpisode,
+}: NonNullable<Props["episodePanel"]>) {
+  const [open, setOpen] = useState(false);
+  useMenuOpenSync(open);
+
+  // Two timers: open-intent (hover dwell before expanding) and leave-
+  // grace (delay before collapsing). Refs so re-renders don't drop a
+  // pending timer.
+  const openTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearTimers = useCallback(() => {
+    if (openTimer.current) { clearTimeout(openTimer.current); openTimer.current = null; }
+    if (closeTimer.current) { clearTimeout(closeTimer.current); closeTimer.current = null; }
+  }, []);
+  useEffect(() => clearTimers, [clearTimers]);
+
+  const armOpen = useCallback(() => {
+    if (open) return;
+    if (closeTimer.current) { clearTimeout(closeTimer.current); closeTimer.current = null; }
+    if (openTimer.current) return;
+    openTimer.current = setTimeout(() => {
+      openTimer.current = null;
+      setOpen(true);
+    }, 150);
+  }, [open]);
+
+  const cancelOpen = useCallback(() => {
+    if (openTimer.current) { clearTimeout(openTimer.current); openTimer.current = null; }
+  }, []);
+
+  const armClose = useCallback(() => {
+    if (closeTimer.current) return;
+    closeTimer.current = setTimeout(() => {
+      closeTimer.current = null;
+      setOpen(false);
+    }, 300);
+  }, []);
+
+  const cancelClose = useCallback(() => {
+    if (closeTimer.current) { clearTimeout(closeTimer.current); closeTimer.current = null; }
+  }, []);
+
+  const closeNow = useCallback(() => {
+    clearTimers();
+    setOpen(false);
+  }, [clearTimers]);
+
+  return (
+    <>
+      {/* Always-present thin edge handle. z-[9998] keeps it just under
+          PlayerOverlay's click-capture (9999) but it has its own
+          pointer-events so hover/click still register. Stays put
+          regardless of the control-bar auto-hide — the user can summon
+          the episode list at any time. Hidden once the panel is open
+          (the panel covers this strip). */}
+      {!open && (
+        <button
+          type="button"
+          aria-label="Show episodes"
+          onClick={() => { cancelOpen(); setOpen(true); }}
+          onPointerEnter={armOpen}
+          onPointerLeave={cancelOpen}
+          className="fixed top-1/2 -translate-y-1/2 right-0 z-[9998]
+                     h-28 w-[10px] hover:w-[16px] rounded-l-lg
+                     bg-white/10 hover:bg-white/20 backdrop-blur-sm
+                     border-y border-l border-white/10
+                     flex items-center justify-center
+                     transition-[width,background-color] duration-150
+                     pointer-events-auto group"
+        >
+          <svg
+            width="12" height="12" viewBox="0 0 24 24" fill="currentColor"
+            className="text-white/55 group-hover:text-white/85 -ml-0.5"
+            aria-hidden
+          >
+            <path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z" />
+          </svg>
+        </button>
+      )}
+
+      {/* Shared drawer. Wrapped so a pointer dwelling on the panel
+          cancels the leave-grace, and leaving it (toward the video)
+          re-arms the close. EpisodePanel paints its own scrim + slides
+          in from the right; clicking the scrim / Escape / a row closes
+          it via onClose. */}
+      <div
+        onPointerEnter={cancelClose}
+        onPointerLeave={armClose}
+      >
+        <EpisodePanel
+          open={open}
+          onClose={closeNow}
+          seriesId={seriesId}
+          mediaType={mediaType}
+          addons={addons}
+          currentEpisodeId={currentEpisodeId}
+          nextEpisodeId={nextEpisodeId}
+          libraryById={libraryById}
+          seriesArt={seriesArt}
+          onPlayEpisode={(v) => { closeNow(); onPlayEpisode(v); }}
+        />
+      </div>
+    </>
+  );
 }
 
 const SPEED_OPTIONS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5];
@@ -1074,6 +1212,7 @@ export default function PlayerOverlay({
   selectableSubLangs,
   scoringMeta, audioPriority, avoidDubs, userRegion,
   silentWakeCodes,
+  episodePanel,
 }: Props) {
   // ── Open-menu tracker ──────────────────────────────────────────────
   // Each child menu (TrackMenu, SpeedMenu, ShaderPicker, MoreMenu,
@@ -2129,6 +2268,14 @@ export default function PlayerOverlay({
           </div>
         </div>
       </div>
+
+      {/* In-playback episode drawer — hover-right-edge trigger + the
+          shared EpisodePanel (EOS Spotlight spec, Phase 4). Only mounts
+          for series/anime (App passes `episodePanel` null for movies).
+          Lives inside MenuTrackerCtx so its open state freezes the
+          control-bar auto-hide and the overlay swallows the dismiss
+          click — same as the other submenus. */}
+      {episodePanel && <EpisodeEdgeTrigger {...episodePanel} />}
 
       {/* SubtitlePicker (OpenSubtitles search overlay) */}
       <SubtitlePicker

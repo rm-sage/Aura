@@ -992,6 +992,24 @@ select,
     0%   { transform: translateY(16px); opacity: 0; }
     100% { transform: translateY(0);    opacity: 1; }
   }
+
+  /* Generic opacity fade — referenced by `animate-[fade-in_...]` on the
+     stream-broken recovery modal and the EOS Spotlight / EpisodePanel
+     scrims. The keyframe was previously undefined (the class was a
+     silent no-op → instant appear); defining it here makes those
+     scrims fade in as intended without changing any logic. */
+  @keyframes fade-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+  }
+
+  /* EpisodePanel — right-side drawer slide-in (EOS Spotlight spec
+     2026-05-19, Phase 3). Springy ease so the panel feels physical
+     when it enters from the right edge; pairs with the fade-in scrim. */
+  @keyframes ep-panel-slide {
+    0%   { transform: translateX(100%); opacity: 0.4; }
+    100% { transform: translateX(0);    opacity: 1;   }
+  }
   /* ----------------------------------------------------------------
    * .aura-slider — restyled <input type="range"> matching the player
    * scrubber's visual language.

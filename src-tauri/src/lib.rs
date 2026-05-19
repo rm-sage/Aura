@@ -1648,6 +1648,18 @@ pub fn run() {
             settings::load(app.handle());
 
             // ── MPV engine ─────────────────────────────────────────────────
+            // Make the process immune to Windows background timer/priority
+            // throttling BEFORE MPV starts, so off-focus playback (alt-tab
+            // or a click on another monitor) keeps frame pacing. The
+            // throttle is catastrophic for interpolation's display-resample
+            // path (20-60 dropped fps) and noticeable even without it. See
+            // win32::pin_process_scheduling — touches no MPV property or
+            // window (clear of every MPV stability landmine).
+            #[cfg(target_os = "windows")]
+            {
+                win32::pin_process_scheduling();
+            }
+
             player::init_mpv(app.handle()).map_err(|e| {
                 crate::devlog!(error, "player", "MPV init failed: {e}");
                 std::io::Error::new(std::io::ErrorKind::Other, e)

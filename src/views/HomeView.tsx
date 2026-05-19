@@ -595,7 +595,16 @@ export default function HomeView({
         />
       ) : (
         <div
-          className="flex-1 min-h-0 overflow-y-auto"
+          // `px-3` is NOT cosmetic padding: this scroll container is the
+          // horizontal clip box (overflow-y-auto forces overflow-x to
+          // compute to clip). Without inner padding, the leftmost catalog
+          // card's hover `drop-shadow` (~24px reach) is sliced into a hard
+          // vertical line at the column edge adjacent to the sidebar. The
+          // 12px inset lets the shadow fade naturally inside the clip box;
+          // rows already self-pad (px-6) so net layout shift is minor and
+          // uniform, and the symmetrical right inset softens the (latent)
+          // identical clip on the rightmost card.
+          className="flex-1 min-h-0 overflow-y-auto px-3"
           style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
         >
           {/* Empty state when no addons */}

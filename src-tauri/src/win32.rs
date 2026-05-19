@@ -819,3 +819,107 @@ pub fn exit_native_fullscreen(parent_hwnd: isize) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Background-throttle immunity for the embedded MPV render loop
+// ---------------------------------------------------------------------------
+//
+// libmpv runs INSIDE this process and renders into the embedded child
+// window. When Aura is not the foreground window — the user alt-tabbed,
+// or clicked a window on another monitor (Aura still fully visible, just
+// unfocused, so this is NOT DWM occlusion throttling) — Windows applies
+// two process-level throttles that wreck MPV's frame pacing:
+//
+//   1. The high-resolution multimedia timer is clamped back to the
+//      default ~15.6 ms tick for non-foreground processes. MPV's
+//      `video-sync=display-resample` path (interpolation ON) needs
+//      sub-millisecond wakeups to hit every display refresh; 15.6 ms
+//      scheduling granularity makes it miss refresh deadlines wholesale
+//      → the reported 20-60 dropped fps. With interpolation OFF
+//      (`video-sync=audio`) only whole frames jitter → the milder
+//      6-8/sec the user also saw. This asymmetry is the fingerprint.
+//   2. The foreground priority boost is gone, so the render/decode
+//      threads get preempted harder and longer.
+//
+// Fix: pin a 1 ms timer resolution for the ENTIRE process lifetime
+// (deliberately never paired with timeEndPeriod — the same lifetime
+// hold mpv.exe / VLC / browsers use for video) and nudge the process
+// priority class up one notch. Both are process-global and independent
+// of focus, so playback stays smooth off-focus. Touches NO MPV property
+// and NO window — clear of every MPV stability landmine in CLAUDE.md.
+//
+// Loaded via libloading to stay consistent with this module's stated
+// "no windows-sys dep" approach (see the module header). winmm is
+// intentionally leaked so the timeBeginPeriod request is never
+// implicitly dropped by the Library handle closing.
+
+type TimeBeginPeriodFn = unsafe extern "system" fn(u32) -> u32;
+type GetCurrentProcessFn = unsafe extern "system" fn() -> *mut c_void;
+type SetPriorityClassFn = unsafe extern "system" fn(*mut c_void, u32) -> i32;
+
+/// `ABOVE_NORMAL_PRIORITY_CLASS`. Deliberately NOT `HIGH_PRIORITY_CLASS`
+/// (0x80) — HIGH can starve the audio service / DWM compositor and cause
+/// its own stutter. ABOVE_NORMAL restores the scheduling headroom lost
+/// when the foreground boost disappears, without that risk.
+const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x0000_8000;
+
+/// Make the process immune to Windows background timer/priority
+/// throttling so the embedded MPV render loop keeps pace when Aura is
+/// not the foreground window. Call once, early, at startup. A second
+/// call is harmless (timeBeginPeriod ref-counts; we never balance it —
+/// intended) but unnecessary.
+pub fn pin_process_scheduling() {
+    unsafe {
+        // 1 ms timer resolution, held for the whole process lifetime.
+        match libloading::Library::new("winmm.dll") {
+            Ok(winmm) => {
+                match winmm.get::<TimeBeginPeriodFn>(b"timeBeginPeriod\0") {
+                    Ok(time_begin_period) => {
+                        let r = time_begin_period(1);
+                        crate::devlog!(info, "win32",
+                            "timeBeginPeriod(1) → {} (0 = TIMERR_NOERROR); \
+                             held for process lifetime", r);
+                    }
+                    Err(e) => crate::devlog!(warn, "win32",
+                        "winmm!timeBeginPeriod unavailable: {} — off-focus \
+                         frame pacing NOT hardened", e),
+                }
+                // Never unload winmm: dropping the Library closes our
+                // module handle. forget() keeps it resident so the timer
+                // request is unambiguously lifetime-scoped.
+                std::mem::forget(winmm);
+            }
+            Err(e) => crate::devlog!(warn, "win32",
+                "winmm.dll load failed: {} — off-focus frame pacing NOT \
+                 hardened", e),
+        }
+
+        // Nudge the process priority class up one notch.
+        match libloading::Library::new("kernel32.dll") {
+            Ok(kernel32) => {
+                let get_cur =
+                    kernel32.get::<GetCurrentProcessFn>(b"GetCurrentProcess\0");
+                let set_pc =
+                    kernel32.get::<SetPriorityClassFn>(b"SetPriorityClass\0");
+                if let (Ok(get_current_process), Ok(set_priority_class)) =
+                    (get_cur, set_pc)
+                {
+                    let ok = set_priority_class(
+                        get_current_process(),
+                        ABOVE_NORMAL_PRIORITY_CLASS,
+                    );
+                    crate::devlog!(info, "win32",
+                        "SetPriorityClass(ABOVE_NORMAL) → {} (nonzero = ok)",
+                        ok);
+                } else {
+                    crate::devlog!(warn, "win32",
+                        "kernel32 priority symbols unavailable; priority \
+                         class left at OS default");
+                }
+            }
+            Err(e) => crate::devlog!(warn, "win32",
+                "kernel32.dll load failed: {} — priority class left at OS \
+                 default", e),
+        }
+    }
+}
+

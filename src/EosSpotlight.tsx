@@ -1,0 +1,376 @@
+// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// ---------------------------------------------------------------------------
+// EosSpotlight — the End-Of-Stream "Next-Up Spotlight" (design spec
+// 2026-05-19, Decisions 1-2 & 6). A full-screen dark-scrim overlay shown
+// the instant playback reaches a clean end (mpv `playback-end`
+// reason="eof" OR a near-end stale-heartbeat ≤5 s from duration — see
+// App.tsx). It REPLACES the false "Stream connection lost" modal at true
+// end-of-stream and gives the user one focused decision.
+//
+// Two states:
+//   • NEXT-UP   — a next aired episode exists. Big thumbnail (series-art
+//                 fallback per Decision 6), SxxEyy tag, title, spoiler-
+//                 gated synopsis, primary "Play Next" (with the
+//                 NextUpCta-style countdown ring iff autoAdvance is on),
+//                 Replay, Exit, "Episodes" (opens the shared drawer).
+//   • END-CARD  — no next episode (movie finished / series finale / last
+//                 aired with a later season unaired). "You've finished
+//                 {title}", optional season note, Replay / Episodes
+//                 (series only) / Exit. No countdown.
+//
+// Z-INDEX: z-[10300] — above PlayerOverlay (9999) and the small NextUpCta
+// (10001), below the stream-broken recovery modal (10500) so a genuine
+// break still wins if both ever race. MPV is a separate child window, so
+// the dark scrim alone hides the last frame; we do NOT CSS-blur video.
+//
+// This component is presentational + self-contained timing. All playback
+// side-effects (resolve next, play, reload, exit) are injected by App so
+// the History/scrobble fixes on those paths are reused unchanged.
+// ---------------------------------------------------------------------------
+
+import { useEffect, useRef, useState } from "react";
+import ImageLoader from "./ImageLoader";
+import type { LibraryItem, StreamEntry, VideoEntry } from "./types";
+import { formatEpisodeTag } from "./nextUp";
+import { loadAuraSettings } from "./auraSettings";
+import { isEpisodeWatched, shouldBlurSynopsis } from "./episodeSpoilers";
+
+interface Props {
+  /** Series / movie display name for the END-CARD heading. */
+  title: string;
+  /** Next aired episode, or null → END-CARD state. */
+  episode: VideoEntry | null;
+  /** Pre-resolved first stream for `episode`. null + !loading ⇒ the
+   *  "no source" hint (Replay / Exit / Episodes still work). */
+  stream: StreamEntry | null;
+  /** True while App is still resolving the next episode / its stream.
+   *  Renders the card skeleton-ish with a disabled, spinner primary. */
+  loading: boolean;
+  /** True for series/anime (drives "Episodes" button + finale copy). */
+  isSeries: boolean;
+  /** True when there IS no next AIRED episode but a later season is
+   *  known/likely unaired ("Caught up" wording vs plain "finale"). */
+  caughtUpUnaired: boolean;
+  /** Series landscape/portrait art — the Decision-6 fallback shown
+   *  instead of a big blurred still for an unwatched next episode. */
+  seriesArt: string | null;
+  /** id→LibraryItem index (App builds from `library`) for the pure
+   *  spoiler gate — identical rule to DetailView. */
+  libraryById: Map<string, LibraryItem>;
+  onPlayNext: () => void;
+  onReplay: () => void;
+  onExit: () => void;
+  onOpenEpisodes: () => void;
+}
+
+export default function EosSpotlight({
+  title, episode, stream, loading, isSeries, caughtUpUnaired,
+  seriesArt, libraryById, onPlayNext, onReplay, onExit, onOpenEpisodes,
+}: Props) {
+  const isNextUp = episode != null;
+
+  // ── Countdown (NEXT-UP only) — mirrors NextUpCta's pattern exactly:
+  // read autoAdvance settings once at mount, clamp delay to [5,30], arm
+  // only when a playable stream is resolved (loading false + stream
+  // present), latch-cancel on ANY pointer/key/wheel so a user reaching
+  // for the remote never gets surprise-advanced.
+  const settings = loadAuraSettings();
+  const initialSeconds = Math.max(5, Math.min(30, Math.round(settings.autoAdvanceDelaySeconds)));
+  const autoArmed =
+    isNextUp && settings.autoAdvanceNextEpisode && !loading && stream != null;
+
+  const [remaining, setRemaining] = useState<number | null>(autoArmed ? initialSeconds : null);
+  const cancelledRef = useRef(false);
+
+  useEffect(() => {
+    if (!autoArmed) return;
+    if (cancelledRef.current) return;
+    if (remaining === null) {
+      setRemaining(initialSeconds);
+      return;
+    }
+    if (remaining <= 0) {
+      onPlayNext();
+      return;
+    }
+    const id = window.setTimeout(() => setRemaining((s) => (s === null ? null : s - 1)), 1000);
+    return () => window.clearTimeout(id);
+  }, [autoArmed, remaining, initialSeconds, onPlayNext]);
+
+  useEffect(() => {
+    if (remaining === null) return;
+    const cancel = () => {
+      cancelledRef.current = true;
+      setRemaining(null);
+    };
+    window.addEventListener("pointermove", cancel, { passive: true });
+    window.addEventListener("keydown", cancel);
+    window.addEventListener("wheel", cancel, { passive: true });
+    return () => {
+      window.removeEventListener("pointermove", cancel);
+      window.removeEventListener("keydown", cancel);
+      window.removeEventListener("wheel", cancel);
+    };
+  }, [remaining]);
+
+  const countdownActive = remaining !== null && remaining > 0;
+  const ringPct = countdownActive
+    ? Math.max(0, Math.min(100, ((initialSeconds - remaining) / initialSeconds) * 100))
+    : 0;
+
+  // ── Decision 6 — never show a big blurred still ──
+  // When blurUnwatchedThumbnails is ON and the next episode is unwatched,
+  // render the SERIES art instead of the episode still. Watched episodes
+  // (or the setting off) show the real still. Synopsis still respects
+  // blurEpisodeSynopsis (blur + click-to-reveal), same as DetailView.
+  const epId = episode?.id ?? "";
+  const epWatched = isNextUp ? isEpisodeWatched(libraryById, epId) : false;
+  const blurThumbSetting = settings.blurUnwatchedThumbnails;
+  const useSeriesArt =
+    isNextUp && blurThumbSetting && !epWatched;
+  const thumbSrc = isNextUp
+    ? (useSeriesArt ? seriesArt : (episode!.thumbnail || seriesArt))
+    : seriesArt;
+
+  const [revealed, setRevealed] = useState(false);
+  // Re-lock the reveal whenever the episode identity changes (a fresh
+  // EOS for a different episode shouldn't inherit the prior reveal).
+  useEffect(() => { setRevealed(false); }, [epId]);
+  const synopsis = (episode?.overview ?? "").trim();
+  const synopsisBlurred =
+    isNextUp &&
+    !!synopsis &&
+    shouldBlurSynopsis(libraryById, epId, settings.blurEpisodeSynopsis, revealed);
+
+  const tag = isNextUp ? formatEpisodeTag(episode!) : "";
+  const epTitle = (episode?.title ?? "").trim() || "Untitled episode";
+
+  // Shared button class fragments.
+  const btnBase =
+    "px-5 py-2.5 rounded-xl text-[13px] font-semibold tracking-wide transition-colors flex items-center justify-center gap-2";
+  const btnGhost =
+    "text-white/85 bg-white/[0.06] border border-white/10 hover:bg-white/[0.10] hover:text-white";
+
+  return (
+    <div
+      // z-[10300]: above PlayerOverlay (9999) + NextUpCta (10001), below
+      // the recovery modal (10500). pointer-events-auto + click/pointer
+      // stop so the dark scrim swallows stray taps (no pause toggle on
+      // the dead controls beneath).
+      className="fixed inset-0 z-[10300] flex items-center justify-center
+                 bg-black/80 backdrop-blur-md
+                 animate-[fade-in_160ms_ease-out]"
+      role="dialog"
+      aria-modal="true"
+      aria-label={isNextUp ? "Next episode" : "Playback finished"}
+      onClick={(e) => e.stopPropagation()}
+      onPointerDown={(e) => e.stopPropagation()}
+      onMouseDown={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => e.stopPropagation()}
+    >
+      <div className="aura-glass-menu rounded-3xl w-[92%] max-w-[760px] p-7 text-white
+                      shadow-[0_40px_90px_-20px_rgba(0,0,0,0.85)]">
+        {isNextUp ? (
+          <>
+            <p className="text-white/45 text-[11px] font-mono uppercase tracking-[0.22em] mb-4">
+              Up next
+            </p>
+            <div className="flex gap-6 items-stretch">
+              {/* ── Thumbnail / series-art (Decision 6) ── */}
+              <div
+                className="relative flex-shrink-0 w-[300px] max-w-[40vw] rounded-2xl
+                           overflow-hidden bg-white/5 border border-white/10"
+                style={{ aspectRatio: "16 / 9" }}
+              >
+                {thumbSrc ? (
+                  <ImageLoader
+                    src={thumbSrc}
+                    alt=""
+                    className="absolute inset-0 w-full h-full"
+                    imgClassName="w-full h-full object-cover"
+                  />
+                ) : (
+                  <div className="absolute inset-0 flex items-center justify-center text-white/25">
+                    <svg width="40" height="40" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                      <path d="M8 5v14l11-7z" />
+                    </svg>
+                  </div>
+                )}
+              </div>
+
+              {/* ── Body ── */}
+              <div className="flex-1 min-w-0 flex flex-col">
+                <span className="text-white/45 text-[11px] font-mono uppercase tracking-[0.18em]">
+                  {title} · {tag}
+                </span>
+                <h2 className="text-white text-[22px] font-semibold leading-tight mt-1 line-clamp-2">
+                  {epTitle}
+                </h2>
+
+                {synopsis && (
+                  <div className="relative mt-3 max-w-prose">
+                    <p
+                      className={[
+                        "text-white/70 text-[13.5px] leading-relaxed line-clamp-4 transition-[filter] duration-200",
+                        synopsisBlurred ? "select-none" : "selectable",
+                      ].join(" ")}
+                      style={{
+                        filter: synopsisBlurred ? "blur(8px) saturate(120%)" : "none",
+                        userSelect: synopsisBlurred ? "none" : "text",
+                      }}
+                    >
+                      {synopsis}
+                    </p>
+                    {synopsisBlurred && (
+                      <button
+                        type="button"
+                        onClick={() => setRevealed(true)}
+                        aria-label="Reveal episode synopsis"
+                        className="absolute inset-0 cursor-pointer group"
+                      >
+                        <span
+                          aria-hidden
+                          className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2
+                                     opacity-0 group-hover:opacity-100 pointer-events-none whitespace-nowrap
+                                     px-2.5 py-1 rounded-md bg-black/80 backdrop-blur-sm
+                                     text-white/85 text-[11px] tracking-wide border border-white/10"
+                        >
+                          Click to reveal spoilers
+                        </span>
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                <div className="flex-1" />
+
+                {/* ── Actions ── */}
+                <div className="flex flex-wrap items-center gap-2.5 mt-5">
+                  {stream == null && !loading ? (
+                    <p className="text-amber-300/90 text-[12.5px] leading-snug flex-1 min-w-[200px]">
+                      No streams found for this episode. Open the episode
+                      list to pick a source.
+                    </p>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={loading}
+                      onClick={onPlayNext}
+                      className={`relative overflow-hidden ${btnBase}
+                                  border border-ln-accent/45 bg-ln-accent/20 text-ln-accent
+                                  hover:bg-ln-accent/30 disabled:opacity-55 disabled:cursor-progress
+                                  min-w-[170px]`}
+                    >
+                      {countdownActive && (
+                        <span
+                          aria-hidden
+                          className="absolute inset-y-0 left-0 bg-ln-accent/25 transition-[width] duration-1000 ease-linear"
+                          style={{ width: `${ringPct}%` }}
+                        />
+                      )}
+                      {loading ? (
+                        <span className="relative flex items-center gap-2">
+                          <svg className="animate-spin" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
+                            <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeDasharray="32 16" />
+                          </svg>
+                          Resolving stream…
+                        </span>
+                      ) : countdownActive ? (
+                        <span className="relative flex items-center gap-2">
+                          <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                            <path d="M8 5v14l11-7z" />
+                          </svg>
+                          Play next in {remaining}s — move to cancel
+                        </span>
+                      ) : (
+                        <span className="relative flex items-center gap-2">
+                          <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                            <path d="M8 5v14l11-7z" />
+                          </svg>
+                          Play Next
+                        </span>
+                      )}
+                    </button>
+                  )}
+                  <button type="button" onClick={onReplay} className={`${btnBase} ${btnGhost}`}>
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                      <path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z" />
+                    </svg>
+                    Replay
+                  </button>
+                  {isSeries && (
+                    <button type="button" onClick={onOpenEpisodes} className={`${btnBase} ${btnGhost}`}>
+                      Episodes
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                        <path d="M7 10l5 5 5-5z" />
+                      </svg>
+                    </button>
+                  )}
+                  <button type="button" onClick={onExit} className={`${btnBase} ${btnGhost}`}>
+                    Exit
+                  </button>
+                </div>
+              </div>
+            </div>
+          </>
+        ) : (
+          // ── END-CARD ──
+          <div className="flex flex-col items-center text-center py-4">
+            {thumbSrc && (
+              <div
+                className="relative w-[200px] rounded-2xl overflow-hidden mb-5
+                           bg-white/5 border border-white/10"
+                style={{ aspectRatio: "2 / 3" }}
+              >
+                <ImageLoader
+                  src={thumbSrc}
+                  alt=""
+                  className="absolute inset-0 w-full h-full"
+                  imgClassName="w-full h-full object-cover"
+                />
+              </div>
+            )}
+            <p className="text-white/45 text-[11px] font-mono uppercase tracking-[0.22em] mb-2">
+              {caughtUpUnaired ? "Caught up" : isSeries ? "Series finale" : "Finished"}
+            </p>
+            <h2 className="text-white text-[24px] font-semibold leading-tight mb-2 max-w-[34ch]">
+              You’ve finished {title}
+            </h2>
+            <p className="text-white/60 text-[13.5px] leading-relaxed mb-6 max-w-[42ch]">
+              {caughtUpUnaired
+                ? "You’re all caught up — the next season hasn’t aired yet."
+                : isSeries
+                  ? "That’s the last available episode. Nicely done."
+                  : "Thanks for watching."}
+            </p>
+            <div className="flex flex-wrap items-center justify-center gap-2.5">
+              <button
+                type="button"
+                onClick={onReplay}
+                className={`${btnBase} border border-ln-accent/45 bg-ln-accent/20 text-ln-accent hover:bg-ln-accent/30`}
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                  <path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z" />
+                </svg>
+                Replay
+              </button>
+              {isSeries && (
+                <button type="button" onClick={onOpenEpisodes} className={`${btnBase} ${btnGhost}`}>
+                  Episodes
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                    <path d="M7 10l5 5 5-5z" />
+                  </svg>
+                </button>
+              )}
+              <button type="button" onClick={onExit} className={`${btnBase} ${btnGhost}`}>
+                Back
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

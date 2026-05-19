@@ -190,6 +190,20 @@ pub fn init_mpv<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     // to keep — confirmed as stable in this app prior to recent changes.
     // `hwdec=auto` enables the full set of MPV's hardware decoders.
     initial_options.insert("vo".into(), serde_json::json!("gpu-next"));
+    // `d3d11-flip=no` — force the legacy BitBlt swapchain instead of the
+    // DXGI flip-presentation model. With gpu-next's d3d11 context the
+    // default is flip-model (confirmed in aura-mpv.log: "Using flip-model
+    // presentation"), whose Present() is gated by the DWM compositor for
+    // any window that is NOT the foreground window — even when fully
+    // visible on another monitor. That stall is what drops 20-60 fps off
+    // -focus with interpolation (video-sync=display-resample must present
+    // every refresh) and ~6-8 fps without. BitBlt is not foreground-gated,
+    // so playback stays smooth unfocused. Aura's --wid child-window +
+    // Win32-parent-resize fullscreen never uses flip/independent-flip
+    // optimizations anyway, so the only cost (a present-time copy) is
+    // negligible. vsync is still honored via the default d3d11-sync
+    // -interval=1. Init-time option only — clear of every MPV landmine.
+    initial_options.insert("d3d11-flip".into(), serde_json::json!("no"));
     initial_options.insert("hwdec".into(), serde_json::json!("auto"));
     initial_options.insert("keepaspect".into(), serde_json::json!("yes"));
     // Transparent letterbox so the area outside the active video is
