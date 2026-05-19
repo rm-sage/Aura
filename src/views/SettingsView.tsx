@@ -2632,6 +2632,7 @@ const TOC_GROUPS: TocGroup[] = [
       { id: "sec-search",      label: "Search Providers" },
       { id: "sec-detail-page", label: "Detail Page" },
       { id: "sec-hover-panel", label: "Hover Meta Panel" },
+      { id: "sec-open-links", label: "Open Links" },
       { id: "sec-notifications", label: "Notifications" },
     ],
   },
@@ -4059,6 +4060,20 @@ export default function SettingsView({ addons, session }: Props) {
                 />
               </>
             )}
+          </Section>
+
+          {/* ── Open Links ────────────────────────────────────────────────
+              The right-click "Open in…" external-source links (IMDb /
+              MyAnimeList / Trakt / …). Default opens them in Aura's
+              in-app popup webview; this switches to the user's default
+              system browser. */}
+          <Section id="sec-open-links" title="Open Links">
+            <SettingToggle
+              label="Open external links in my browser"
+              description="When on, the right-click “Open in…” links (IMDb, MyAnimeList, Trakt, etc.) open in your default system browser instead of Aura's in-app popup. Off by default — links stay in-app."
+              value={aura.openLinksExternally}
+              onChange={(v) => setLocal({ openLinksExternally: v })}
+            />
           </Section>
 
           {/* ── Notifications ─────────────────────────────────────────────

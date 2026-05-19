@@ -201,6 +201,10 @@ export interface AuraSettings {
    *  forward. 0 (left) and 2 (right) are intentionally not selectable —
    *  left is select/navigate, right is the card context menu. */
   metaPanelBindButton: 1 | 3 | 4;
+  /** "Open in…" external-source links open in the user's default system
+   *  browser instead of Aura's in-app popup webview. Default false =
+   *  the in-app popup (unchanged behaviour). */
+  openLinksExternally: boolean;
 }
 
 export const DEFAULT_AURA_SETTINGS: AuraSettings = {
@@ -226,6 +230,7 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   releaseSearchEnabled: true,
   metaPanelBindEnabled: false,
   metaPanelBindButton: 1,
+  openLinksExternally: false,
 };
 
 // Module-level memoization snapshot. loadAuraSettings is called many
@@ -324,6 +329,9 @@ function readFromStorage(): AuraSettings {
         parsed.metaPanelBindButton === 3 || parsed.metaPanelBindButton === 4
           ? parsed.metaPanelBindButton
           : 1,
+      openLinksExternally: typeof parsed.openLinksExternally === "boolean"
+        ? parsed.openLinksExternally
+        : false,
       heroCatalog: parsed.heroCatalog
         && typeof parsed.heroCatalog === "object"
         && typeof (parsed.heroCatalog as Record<string, unknown>).addonUrl === "string"
