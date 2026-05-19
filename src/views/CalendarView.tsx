@@ -678,10 +678,12 @@ function DayOverlay({ date, entries, onClose, onSelectMeta }: DayOverlayProps) {
           style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
         >
           <div className="grid gap-4 grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
-            {entries.map(({ item, detail, video, releaseDate }, idx) => (
+            {entries.map(({ item, detail, video, releaseDate }, idx) => {
+              const meta = libraryItemToMeta(item, detail);
+              return (
               <CalendarCard
                 key={`${item.id}:${video?.id ?? idx}`}
-                meta={libraryItemToMeta(item, detail)}
+                meta={meta}
                 name={detail?.name ?? item.name}
                 poster={detail?.poster ?? item.poster}
                 mediaType={detail?.media_type ?? item.media_type}
@@ -690,7 +692,7 @@ function DayOverlay({ date, entries, onClose, onSelectMeta }: DayOverlayProps) {
                   : null}
                 episodeTitle={video?.title ?? null}
                 released={releaseDate}
-                onClick={onSelectMeta ? () => { closeHoverNow(); onClose(); onSelectMeta(libraryItemToMeta(item, detail)); } : undefined}
+                onClick={onSelectMeta ? () => { closeHoverNow(); onClose(); onSelectMeta(meta); } : undefined}
                 onContextMenu={(e) => {
                   // Right-click → fire the same `aura:card-context`
                   // event the rest of the app's cards use. The App-
@@ -702,7 +704,7 @@ function DayOverlay({ date, entries, onClose, onSelectMeta }: DayOverlayProps) {
                   e.preventDefault();
                   window.dispatchEvent(new CustomEvent("aura:card-context", {
                     detail: {
-                      meta: libraryItemToMeta(item, detail),
+                      meta,
                       x: e.clientX,
                       y: e.clientY,
                       source: "calendar",
@@ -711,7 +713,8 @@ function DayOverlay({ date, entries, onClose, onSelectMeta }: DayOverlayProps) {
                   }));
                 }}
               />
-            ))}
+              );
+            })}
           </div>
         </div>
       </div>

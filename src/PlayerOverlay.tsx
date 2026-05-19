@@ -24,6 +24,7 @@ import { pickDefaultAudio, type ScoringMeta } from "./audioScoring";
 import { prettyBinding } from "./useKeybindings";
 import { loadAuraSettings, saveAuraSettings } from "./auraSettings";
 import AniSkipMenu from "./AniSkipMenu";
+import { copyTextToClipboard } from "./clipboard";
 
 // ---------------------------------------------------------------------------
 // Menu-open tracker — child menus (TrackMenu, SpeedMenu, ShaderPicker,
@@ -50,25 +51,8 @@ function useMenuOpenSync(open: boolean) {
   }, [open, tracker]);
 }
 
-/** writeText / openUrl wrappers — both wrapped in try/catch so a missing
- *  permission can never crash the app. */
-async function copyToClipboard(text: string): Promise<boolean> {
-  try {
-    const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
-    await writeText(text);
-    return true;
-  } catch (e) {
-    // Browser fallback — some hosts (older WebView2 builds without permission
-    // strings) reject the plugin call. The HTML5 clipboard API still works.
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch (e2) {
-      console.error("clipboard write failed", e, e2);
-      return false;
-    }
-  }
-}
+/** openUrl wrapper — wrapped in try/catch so a missing permission can
+ *  never crash the app. (Clipboard copy: ./clipboard#copyTextToClipboard.) */
 
 async function openExternalUrl(url: string): Promise<boolean> {
   try {
@@ -2973,7 +2957,7 @@ function MoreMenu({
 
   const copy = useCallback(async () => {
     if (!streamUrl) { showFlash("No stream URL"); return; }
-    const ok = await copyToClipboard(streamUrl);
+    const ok = await copyTextToClipboard(streamUrl);
     showFlash(ok ? "Copied!" : "Copy failed");
   }, [streamUrl]);
 

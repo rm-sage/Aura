@@ -11,25 +11,32 @@ import { openContextMenu } from "../ContextMenu";
 import { showAppToast } from "../AppToast";
 import Tooltip from "../Tooltip";
 import { requestReopenAddons } from "../onboarding";
+import { copyTextToClipboard } from "../clipboard";
 
-/** Copy text to the clipboard. Prefers the Tauri clipboard plugin
- *  (reliable on every WebView2 build), falling back to the browser
- *  Clipboard API. Mirrors the helper in PlayerOverlay.tsx (proven to
- *  compile — the plugin is a declared dependency). */
-async function copyText(text: string): Promise<boolean> {
-  try {
-    const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
-    await writeText(text);
-    return true;
-  } catch {
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-}
+/** Glass icon-button styling shared by the addon-row action cluster.
+ *  ACCENT = Copy/Configure/Refresh (blue accent hover); DESTRUCTIVE =
+ *  Remove (rose hover). Extracted so the cluster reads as one set and
+ *  the four buttons can't drift apart. */
+const ACCENT_ICON_BTN =
+  "w-10 h-10 flex items-center justify-center rounded-xl " +
+  "bg-white/[0.04] border border-white/10 " +
+  "text-white/65 hover:text-ln-accent " +
+  "hover:bg-ln-accent/12 hover:border-ln-accent/40 " +
+  "hover:shadow-[0_0_0_3px_rgba(91,164,255,0.08),0_4px_14px_-6px_rgba(91,164,255,0.45)] " +
+  "transition-all duration-150 " +
+  "disabled:opacity-40 disabled:hover:bg-white/[0.04] " +
+  "disabled:hover:border-white/10 disabled:hover:shadow-none " +
+  "active:scale-95 active:bg-ln-accent/18";
+const DESTRUCTIVE_ICON_BTN =
+  "w-10 h-10 flex items-center justify-center rounded-xl " +
+  "bg-white/[0.04] border border-white/10 " +
+  "text-white/65 hover:text-rose-300 " +
+  "hover:bg-rose-500/12 hover:border-rose-400/40 " +
+  "hover:shadow-[0_0_0_3px_rgba(244,63,94,0.08),0_4px_14px_-6px_rgba(244,63,94,0.45)] " +
+  "transition-all duration-150 " +
+  "disabled:opacity-40 disabled:hover:bg-white/[0.04] " +
+  "disabled:hover:border-white/10 disabled:hover:shadow-none " +
+  "active:scale-95 active:bg-rose-500/20";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -303,7 +310,7 @@ function AddonRow({
   };
 
   const handleCopyManifest = async () => {
-    const ok = await copyText(manifestUrl);
+    const ok = await copyTextToClipboard(manifestUrl);
     if (ok) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
@@ -330,7 +337,7 @@ function AddonRow({
           },
           {
             label: "Copy manifest URL",
-            onClick: () => { void copyText(manifestUrl); },
+            onClick: () => { void copyTextToClipboard(manifestUrl); },
           },
           {
             label: "Remove addon",
@@ -370,15 +377,7 @@ function AddonRow({
             type="button"
             onClick={handleCopyManifest}
             aria-label={`Copy ${addon.name} manifest URL`}
-            className="w-10 h-10 flex items-center justify-center rounded-xl
-                       bg-white/[0.04] border border-white/10
-                       text-white/65 hover:text-ln-accent
-                       hover:bg-ln-accent/12 hover:border-ln-accent/40
-                       hover:shadow-[0_0_0_3px_rgba(91,164,255,0.08),0_4px_14px_-6px_rgba(91,164,255,0.45)]
-                       transition-all duration-150
-                       disabled:opacity-40 disabled:hover:bg-white/[0.04]
-                       disabled:hover:border-white/10 disabled:hover:shadow-none
-                       active:scale-95 active:bg-ln-accent/18"
+            className={ACCENT_ICON_BTN}
           >
             <CopyIcon copied={copied} />
           </button>
@@ -389,15 +388,7 @@ function AddonRow({
               type="button"
               onClick={() => openUrl(configureUrl).catch(() => {})}
               aria-label={`Configure ${addon.name}`}
-              className="w-10 h-10 flex items-center justify-center rounded-xl
-                         bg-white/[0.04] border border-white/10
-                         text-white/65 hover:text-ln-accent
-                         hover:bg-ln-accent/12 hover:border-ln-accent/40
-                         hover:shadow-[0_0_0_3px_rgba(91,164,255,0.08),0_4px_14px_-6px_rgba(91,164,255,0.45)]
-                         transition-all duration-150
-                         disabled:opacity-40 disabled:hover:bg-white/[0.04]
-                         disabled:hover:border-white/10 disabled:hover:shadow-none
-                         active:scale-95 active:bg-ln-accent/18"
+              className={ACCENT_ICON_BTN}
             >
               <ConfigureIcon />
             </button>
@@ -409,15 +400,7 @@ function AddonRow({
             onClick={handleRefresh}
             disabled={refreshing || removing}
             aria-label={`Refresh ${addon.name}`}
-            className="w-10 h-10 flex items-center justify-center rounded-xl
-                       bg-white/[0.04] border border-white/10
-                       text-white/65 hover:text-ln-accent
-                       hover:bg-ln-accent/12 hover:border-ln-accent/40
-                       hover:shadow-[0_0_0_3px_rgba(91,164,255,0.08),0_4px_14px_-6px_rgba(91,164,255,0.45)]
-                       transition-all duration-150
-                       disabled:opacity-40 disabled:hover:bg-white/[0.04]
-                       disabled:hover:border-white/10 disabled:hover:shadow-none
-                       active:scale-95 active:bg-ln-accent/18"
+            className={ACCENT_ICON_BTN}
           >
             <RefreshIcon spinning={refreshing} />
           </button>
@@ -428,15 +411,7 @@ function AddonRow({
             onClick={handleRemove}
             disabled={removing || refreshing}
             aria-label={`Remove ${addon.name}`}
-            className="w-10 h-10 flex items-center justify-center rounded-xl
-                       bg-white/[0.04] border border-white/10
-                       text-white/65 hover:text-rose-300
-                       hover:bg-rose-500/12 hover:border-rose-400/40
-                       hover:shadow-[0_0_0_3px_rgba(244,63,94,0.08),0_4px_14px_-6px_rgba(244,63,94,0.45)]
-                       transition-all duration-150
-                       disabled:opacity-40 disabled:hover:bg-white/[0.04]
-                       disabled:hover:border-white/10 disabled:hover:shadow-none
-                       active:scale-95 active:bg-rose-500/20"
+            className={DESTRUCTIVE_ICON_BTN}
           >
             {removing ? <SpinnerDot /> : <CloseIcon />}
           </button>
