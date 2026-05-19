@@ -49,7 +49,14 @@ export function useHoverCardActivation(meta: MetaPreview): HoverCardActivation {
   const [bind, setBind] = useState(readBindSettings);
 
   useEffect(() => {
-    const sync = () => setBind(readBindSettings());
+    // Only re-read when a bind-relevant key actually changed —
+    // otherwise every poster on screen re-renders on any unrelated
+    // settings flip. Absent detail.keys (legacy emitters) → re-read.
+    const sync = (e: Event) => {
+      const keys = (e as CustomEvent<{ keys?: string[] }>).detail?.keys;
+      if (keys && !keys.includes("metaPanelBindEnabled") && !keys.includes("metaPanelBindButton")) return;
+      setBind(readBindSettings());
+    };
     window.addEventListener("aura:settings-changed", sync);
     return () => window.removeEventListener("aura:settings-changed", sync);
   }, []);
@@ -62,7 +69,7 @@ export function useHoverCardActivation(meta: MetaPreview): HoverCardActivation {
   }
 
   return {
-    onPointerDown: (e) => { if (e.button === bind.button) e.preventDefault(); },
+    onPointerDown: (e) => { if (e.button !== bind.button) return; e.preventDefault(); },
     onAuxClick: (e) => {
       if (e.button !== bind.button) return;
       e.preventDefault();

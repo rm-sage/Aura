@@ -200,7 +200,7 @@ export interface AuraSettings {
    *  DOM `MouseEvent.button`: 1 = middle (default), 3 = back, 4 =
    *  forward. 0 (left) and 2 (right) are intentionally not selectable —
    *  left is select/navigate, right is the card context menu. */
-  metaPanelBindButton: number;
+  metaPanelBindButton: 1 | 3 | 4;
 }
 
 export const DEFAULT_AURA_SETTINGS: AuraSettings = {

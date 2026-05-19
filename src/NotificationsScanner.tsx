@@ -343,16 +343,6 @@ export default function NotificationsScanner({ addons, library }: Props) {
 
         for (const item of candidates) {
           const signal = getReleaseSignal(item.id);
-          // 5.0 diagnostic (Item 5): surface every scannable series'
-          // EXACT stored id + name + cloud-signal state so a
-          // missed-notification id (e.g. a wrong baked `tt…` id that
-          // the cloud has no data for) is visible in the F12
-          // DevConsole. Read-only — no mutation, no extra network.
-          console.info(
-            `[release-signals] scannable id=${item.id} ` +
-            `name=${JSON.stringify(item.name)} type=${item.media_type} ` +
-            `signal=${signal === undefined ? "unseen" : signal === null ? "none" : "present"}`,
-          );
           if (signal === undefined) continue; // store hasn't seen this id yet
           if (signal === null) continue;       // cloud has no record
           const recent = Array.isArray(signal.recent_aired) ? signal.recent_aired : [];

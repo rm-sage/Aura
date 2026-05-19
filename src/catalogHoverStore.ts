@@ -110,8 +110,8 @@ export function closeHoverNow(): void {
  *  optional mouse-button bind, where the open is an explicit user
  *  action rather than a hover so the 450 ms intent delay is wrong. */
 export function openHoverNow(meta: MetaPreview, el: HTMLElement): void {
+  clearClose();   // order mirrors scheduleHoverOpen's idiom (immaterial — independent timers)
   clearOpen();
-  clearClose();
   active = { meta, el, rect: el.getBoundingClientRect() };
   emit();
 }

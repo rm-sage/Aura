@@ -414,7 +414,11 @@ export function CatalogHoverHost({
   );
 
   useEffect(() => {
-    const sync = () => setBindEnabled(loadAuraSettings().metaPanelBindEnabled);
+    const sync = (e: Event) => {
+      const keys = (e as CustomEvent<{ keys?: string[] }>).detail?.keys;
+      if (keys && !keys.includes("metaPanelBindEnabled")) return;
+      setBindEnabled(loadAuraSettings().metaPanelBindEnabled);
+    };
     window.addEventListener("aura:settings-changed", sync);
     return () => window.removeEventListener("aura:settings-changed", sync);
   }, []);

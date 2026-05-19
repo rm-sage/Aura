@@ -2954,7 +2954,7 @@ function MouseBindRow({
   label: string;
   description: string;
   button: number;
-  onChange: (next: number) => void;
+  onChange: (next: 1 | 3 | 4) => void;
 }) {
   const [capturing, setCapturing] = useState(false);
 
@@ -2964,15 +2964,15 @@ function MouseBindRow({
       e.preventDefault();
       e.stopPropagation();
       if (e.button === 1 || e.button === 3 || e.button === 4) {
-        onChange(e.button);
+        onChange(e.button as 1 | 3 | 4);
         setCapturing(false);
       }
       // Left (0) / right (2): ignore — keep waiting for a valid button.
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { e.preventDefault(); setCapturing(false); }
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); setCapturing(false); }
     };
-    const onCtx = (e: Event) => { e.preventDefault(); };
+    const onCtx = (e: Event) => { e.preventDefault(); e.stopPropagation(); };
     window.addEventListener("mousedown", onDown, { capture: true });
     window.addEventListener("keydown", onKey, { capture: true });
     window.addEventListener("contextmenu", onCtx, { capture: true });
