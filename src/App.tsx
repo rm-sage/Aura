@@ -90,7 +90,6 @@ import { normalizeLibrary } from "./libraryNormalize";
 import { LibraryProvider } from "./LibraryContext";
 import { NotificationsProvider, useNotifications } from "./NotificationsContext";
 import NotificationsBell from "./NotificationsBell";
-import LibraryRefreshButton from "./LibraryRefreshButton";
 import AccountButton from "./AccountButton";
 import NotificationsScanner, { clearScannerState } from "./NotificationsScanner";
 import { getTitleState } from "./titleState";
@@ -4307,19 +4306,15 @@ export default function App() {
         onLoginRequest={() => setShowLogin(true)}
         onLogout={handleLogout}
       />
-      {/* Notifications bell — fixed bottom-3 left-[46px], rendered
-          INSIDE the app body so it inherits the `hidden` class during
+      {/* Notifications bell — fixed bottom-3 left-3, rendered INSIDE
+          the app body so it inherits the `hidden` class during
           playback and unmounts visually when the player owns the
           screen. Living here (rather than inside HomeView) lets the
           bell appear on every main tab (Home, Library, Calendar,
           Addons, Settings); the NotificationsProvider above keeps
-          state continuous. */}
-      <NotificationsBell />
-      {/* Manual library refresh — sits next to the bell. Same fixed
-          bottom-left anchoring inherits the player-hidden behaviour
-          for free, and the button mounts on every main tab because
-          it's a body-level child same as the bell. */}
-      <LibraryRefreshButton library={library} />
+          state continuous. The manual library-refresh control now
+          lives inside this bell's popup header. */}
+      <NotificationsBell library={library} />
 
       </div>
       )}

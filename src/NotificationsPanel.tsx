@@ -9,6 +9,7 @@ import {
   type Notification,
   type NotificationKind,
 } from "./NotificationsContext";
+import Tooltip from "./Tooltip";
 
 // ---------------------------------------------------------------------------
 // NotificationsPanel — anchored ABOVE the bell (bottom-12 left-3 in absolute
@@ -24,9 +25,18 @@ interface Props {
    *  class (.aura-bell-panel-out) so it visibly retracts toward the
    *  bell instead of vanishing on unmount. */
   closing?: boolean;
+  /** When present, renders a refresh-library button in the panel
+   *  header — the old standalone LibraryRefreshButton, folded in. */
+  onRefresh?: () => void;
+  /** Spinner state for the refresh button. */
+  refreshing?: boolean;
+  /** Cooldown lockout for the refresh button (rate-limit guard). */
+  refreshDisabled?: boolean;
 }
 
-export default function NotificationsPanel({ onClose, closing }: Props) {
+export default function NotificationsPanel({
+  onClose, closing, onRefresh, refreshing, refreshDisabled,
+}: Props) {
   const {
     notifications,
     markRead,
@@ -76,22 +86,46 @@ export default function NotificationsPanel({ onClose, closing }: Props) {
         <div className="text-sm font-semibold text-white/90 tracking-wide">
           Notifications
         </div>
-        <button
-          type="button"
-          onClick={() => { if (hasDismissable) dismissAll(); }}
-          disabled={!hasDismissable}
-          className={[
-            "text-[11.5px] font-medium px-2.5 py-1 rounded-md border transition-colors",
-            // Solid pill with a visible border + background so the
-            // label reads cleanly against the Mica accent themes that
-            // were swallowing the previous text-only treatment.
-            hasDismissable
-              ? "text-white bg-white/12 border-white/25 hover:bg-white/20 hover:border-white/40"
-              : "text-white/35 bg-transparent border-white/10 cursor-default",
-          ].join(" ")}
-        >
-          Dismiss all
-        </button>
+        <div className="flex items-center gap-2">
+          {onRefresh && (
+            <Tooltip
+              text="Refresh library — pulls fresh data from Stremio, then asks Aura Cloud whether any library titles have new episodes."
+              pos="top"
+              delay={60}
+            >
+              <button
+                type="button"
+                onClick={onRefresh}
+                disabled={refreshDisabled}
+                aria-label="Refresh library"
+                className={[
+                  "h-7 w-7 rounded-md flex items-center justify-center border transition-colors",
+                  refreshDisabled
+                    ? "text-white/35 bg-transparent border-white/10 cursor-default"
+                    : "text-white bg-white/12 border-white/25 hover:bg-white/20 hover:border-white/40",
+                ].join(" ")}
+              >
+                <RefreshIcon spinning={!!refreshing} />
+              </button>
+            </Tooltip>
+          )}
+          <button
+            type="button"
+            onClick={() => { if (hasDismissable) dismissAll(); }}
+            disabled={!hasDismissable}
+            className={[
+              "text-[11.5px] font-medium px-2.5 py-1 rounded-md border transition-colors",
+              // Solid pill with a visible border + background so the
+              // label reads cleanly against the Mica accent themes that
+              // were swallowing the previous text-only treatment.
+              hasDismissable
+                ? "text-white bg-white/12 border-white/25 hover:bg-white/20 hover:border-white/40"
+                : "text-white/35 bg-transparent border-white/10 cursor-default",
+            ].join(" ")}
+          >
+            Dismiss all
+          </button>
+        </div>
       </div>
 
       {/* Body */}
@@ -473,4 +507,29 @@ function relativeTime(ts: number): string {
   } catch {
     return `${day}d ago`;
   }
+}
+
+// ---------------------------------------------------------------------------
+// RefreshIcon — Material-style circular-refresh glyph. Spins while a
+// refresh is in flight. Moved here from the retired standalone
+// LibraryRefreshButton; the `aura-refresh-spin` keyframe lives in
+// App.css (global) so deleting that component left it intact.
+// ---------------------------------------------------------------------------
+
+function RefreshIcon({ spinning }: { spinning: boolean }) {
+  return (
+    <svg
+      width="15"
+      height="15"
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      aria-hidden
+      style={{
+        transition: "transform 0.2s ease",
+        animation: spinning ? "aura-refresh-spin 1.2s linear infinite" : "none",
+      }}
+    >
+      <path d="M17.65 6.35A7.958 7.958 0 0 0 12 4c-4.42 0-8 3.58-8 8s3.58 8 8 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0 1 12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" />
+    </svg>
+  );
 }

@@ -4,6 +4,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNotifications, type Notification } from "./NotificationsContext";
 import NotificationsPanel from "./NotificationsPanel";
+import { nudgeReleasePoller } from "./releaseSearch";
+import { loadAuraSettings } from "./auraSettings";
+import type { LibraryItem } from "./types";
 
 // ---------------------------------------------------------------------------
 // NotificationsBell — fixed bottom-3 left-3, z-30 (above app body, below
@@ -20,8 +23,12 @@ import NotificationsPanel from "./NotificationsPanel";
  *  triggers close so the exit animation has a chance to play before
  *  React removes the DOM node. */
 const PANEL_CLOSE_MS = 200;
+/** Refresh-button cooldown — respects the cloud's per-IP nudge rate
+ *  limit (the same 2 s the standalone button used before it was
+ *  folded into the bell popup). */
+const REFRESH_COOLDOWN_MS = 2000;
 
-export default function NotificationsBell() {
+export default function NotificationsBell({ library }: { library: LibraryItem[] }) {
   const { notifications, unreadCount, hasNew, popup, dismissPopup, markRead, markAllRead } = useNotifications();
   const [open, setOpen] = useState(false);
 
@@ -95,16 +102,62 @@ export default function NotificationsBell() {
     };
   }, [open, requestClose]);
 
+  // Manual library refresh, folded into the bell popup header. Same
+  // semantics as the old standalone button (release-search-spec §6.2
+  // path 3): fire aura:library-changed, nudge the cloud poller per
+  // tt item, re-batch after 30 s. Short cooldown guards the cloud
+  // per-IP nudge rate limit.
+  const [refreshCooldown, setRefreshCooldown] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  useEffect(() => {
+    if (!refreshCooldown) return;
+    const t = setTimeout(() => setRefreshCooldown(false), REFRESH_COOLDOWN_MS);
+    return () => clearTimeout(t);
+  }, [refreshCooldown]);
+  const handleRefresh = useCallback(() => {
+    if (refreshCooldown) return;
+    setRefreshCooldown(true);
+    setRefreshing(true);
+    setTimeout(() => setRefreshing(false), REFRESH_COOLDOWN_MS);
+    window.dispatchEvent(new CustomEvent("aura:library-changed"));
+    if (loadAuraSettings().releaseSearchEnabled) {
+      for (const it of library) {
+        if (!it.id || !it.id.startsWith("tt")) continue;
+        const t = (it.media_type ?? "").toLowerCase();
+        const mt: "series" | "movie" | undefined =
+          t === "movie" ? "movie"
+            : (t === "series" || t === "anime") ? "series"
+            : undefined;
+        if (!mt) continue;
+        nudgeReleasePoller(it.id, mt);
+      }
+      // Re-batch after 30 s so the cloud's freshly-polled signals
+      // propagate into the local store without waiting for the next
+      // library mutation.
+      setTimeout(() => {
+        window.dispatchEvent(new CustomEvent("aura:library-changed"));
+      }, 30_000);
+    }
+  }, [refreshCooldown, library]);
+
   // Format the count badge — "9+" cap handles 10..999 uniformly.
   const badgeText = unreadCount > 9 ? "9+" : String(unreadCount);
 
   return (
     <div
       ref={containerRef}
-      className="fixed bottom-3 left-[46px] z-30"
+      className="fixed bottom-3 left-3 z-30"
       style={{ pointerEvents: "auto" }}
     >
-      {open && <NotificationsPanel onClose={requestClose} closing={closing} />}
+      {open && (
+        <NotificationsPanel
+          onClose={requestClose}
+          closing={closing}
+          onRefresh={handleRefresh}
+          refreshing={refreshing}
+          refreshDisabled={refreshCooldown}
+        />
+      )}
       {popupActive && (
         <NotificationThoughtBubble
           notification={popupActive}
