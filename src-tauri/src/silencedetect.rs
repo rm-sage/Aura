@@ -296,14 +296,23 @@ pub async fn detect_outro_boundary(
         });
     }
 
-    // `-sseof -tail` seeks to (duration - tail); reported PTS stay
-    // absolute. Downscale before blackdetect so the video decode of the
-    // tail is cheap. A hard `-t` bounds the worst case.
+    // `-sseof -tail` seeks to (duration - tail). `-copyts` MUST follow
+    // it: without it ffmpeg rebases the output timeline to ~0, so the
+    // silencedetect/blackdetect PTS would be tail-RELATIVE (0..tail).
+    // The parser below assumes ABSOLUTE container PTS (the ts_min/ts_max
+    // artifact-trim and the dispatched `ed_start`), so tail-relative
+    // values produced a bogus early ED — a 1420 s episode reported
+    // "ED≈46 s" (~1090 s too early), which made the Next-Up card fire at
+    // the episode midpoint. `-copyts` keeps input timestamps intact so
+    // `ed_start` is a true absolute container timestamp. Downscale before
+    // blackdetect so the tail video decode is cheap; `-t` bounds the
+    // worst case.
     let mut cmd = Command::new(ffmpeg_bin(&app));
     cmd.arg("-hide_banner")
         .arg("-nostdin")
         .arg("-protocol_whitelist").arg("http,https,tcp,tls,crypto")
         .arg("-sseof").arg(format!("-{tail}"))
+        .arg("-copyts")
         .arg("-i").arg(&url)
         .arg("-vf").arg("scale=160:-2,blackdetect=d=0.30:pic_th=0.98")
         .arg("-af").arg("silencedetect=n=-30dB:d=0.5")

@@ -21,6 +21,7 @@ import type { AddonEntry, MetaPreview, MetaDetail } from "./types";
 import { getMetaDetailFallback } from "./metaCache";
 import { dedupedInvoke } from "./invokeDedupe";
 import { BrandLogo, ratingDomain, ratingKindNote } from "./logodev";
+import { hasUsableRating } from "./ratingValue";
 import {
   useHoverTarget,
   cancelHoverClose,
@@ -30,6 +31,7 @@ import {
   notePanelPointer,
   type HoverTarget,
 } from "./catalogHoverStore";
+import { loadAuraSettings } from "./auraSettings";
 
 const PANEL_W = 360;
 const GAP = 12;
@@ -255,10 +257,10 @@ function HoverPanel({
   const ratings = (() => {
     const map = new Map<string, RatingRow>();
     for (const r of detail?.ratings ?? []) {
-      if (r.value) map.set(r.source.toLowerCase(), { source: r.source, value: r.value });
+      if (hasUsableRating(r.value)) map.set(r.source.toLowerCase(), { source: r.source, value: r.value });
     }
     for (const r of aggRatings) {
-      if (r.value) map.set(r.source.toLowerCase(), r);
+      if (hasUsableRating(r.value)) map.set(r.source.toLowerCase(), r);
     }
     return [...map.values()]
       .sort((a, b) => (b.weight ?? 50) - (a.weight ?? 50))
@@ -273,6 +275,7 @@ function HoverPanel({
       ref={ref}
       role="dialog"
       aria-label={`${meta.name} details`}
+      data-hover-panel="true"
       onMouseEnter={() => { notePanelPointer(true); cancelHoverClose(); }}
       onMouseLeave={() => { notePanelPointer(false); scheduleHoverClose(); }}
       className="fixed z-[280] w-[360px] max-h-[80vh] overflow-y-auto
@@ -407,6 +410,19 @@ export function CatalogHoverHost({
   onSelectMeta?: (m: MetaPreview) => void;
 }) {
   const target = useHoverTarget();
+  const [bindEnabled, setBindEnabled] = useState(
+    () => loadAuraSettings().metaPanelBindEnabled,
+  );
+
+  useEffect(() => {
+    const sync = (e: Event) => {
+      const keys = (e as CustomEvent<{ keys?: string[] }>).detail?.keys;
+      if (keys && !keys.includes("metaPanelBindEnabled")) return;
+      setBindEnabled(loadAuraSettings().metaPanelBindEnabled);
+    };
+    window.addEventListener("aura:settings-changed", sync);
+    return () => window.removeEventListener("aura:settings-changed", sync);
+  }, []);
 
   // Scroll / resize used to hard-close the popup (the rect went stale).
   // Now we RE-ANCHOR to the card's live box instead, so the panel stays
@@ -423,6 +439,30 @@ export function CatalogHoverHost({
       window.removeEventListener("resize", reanchor);
     };
   }, [target]);
+
+  // Bind mode only: there is no mouse-leave close, so Esc and a click
+  // outside the panel + its anchoring card dismiss it. Hover mode is
+  // intentionally NOT given these (its leave/scroll behaviour is
+  // unchanged and shipped). target.el is the active card element.
+  useEffect(() => {
+    if (!target || !bindEnabled) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") closeHoverNow();
+    };
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Element | null;
+      if (!t) return;
+      if (t.closest("[data-hover-panel]")) return;       // click inside panel
+      if (target.el.contains(t)) return;                 // click on the card
+      closeHoverNow();
+    };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("mousedown", onDown, true);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("mousedown", onDown, true);
+    };
+  }, [target, bindEnabled]);
 
   if (!target) return null;
   return <HoverPanel target={target} addons={addons} onSelectMeta={onSelectMeta} />;

@@ -12,6 +12,7 @@ import {
 } from "./releaseSignalStore";
 import { reconcileLibraryReleaseSignals } from "./releaseSignalStore";
 import type { ReleaseAired } from "./releaseSearch";
+import { formatEpLabel } from "./episodeLabel";
 
 // ---------------------------------------------------------------------------
 // useNotificationsScanner — cloud-signal driven (v3).
@@ -155,6 +156,22 @@ function saveScannerState(state: ScannerState) {
   }
 }
 
+/** Wipe the persisted episode-scanner seen-ledger. Called by the
+ *  settings-scope follower on an ACTUAL account change (A→B / sign-
+ *  out) so one account's "already seen / notified" memory can't bleed
+ *  into another. The next scan then takes the documented one-shot
+ *  first-scan seeding grace (seeds current state, fires nothing), then
+ *  resumes normal new-episode detection. Never call on a same-account
+ *  restore — that would re-seed every launch and swallow a genuinely
+ *  new episode. */
+export function clearScannerState(): void {
+  try {
+    localStorage.removeItem(SCANNER_STATE_KEY);
+  } catch {
+    // private mode / quota — non-fatal
+  }
+}
+
 /** Migration gate — v2 left stale `seenVideoIds` blobs that don't
  *  align with cloud-signal id shapes. On v3 first boot, wipe the
  *  scanner state so the new scan path seeds from cloud + library
@@ -223,15 +240,6 @@ function isScannable(item: LibraryItem): boolean {
 function isPlayableStream(s: { type?: string | null }): boolean {
   const t = (s.type ?? "").toLowerCase();
   return t !== "statistic" && t !== "error";
-}
-
-/** Format an SxxEyy / Eyy label. */
-function formatEpLabel(season: number | null | undefined, episode: number | null | undefined): string | null {
-  if (typeof season === "number" && typeof episode === "number") {
-    return `S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`;
-  }
-  if (typeof episode === "number") return `E${episode}`;
-  return null;
 }
 
 /** Parse aired_at to ms epoch. Treats unparseable strings as

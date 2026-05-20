@@ -173,6 +173,25 @@ export async function getMetaDetailFallback(
   return null;
 }
 
+/** Synchronous best-effort peek — the freshest non-stale cached detail
+ *  for an id across any addon / media type. No network and no fetch:
+ *  for call sites that must stay synchronous and can only use what's
+ *  already in memory (the card context menu's anime check — the hover
+ *  panel / CW / Calendar usually warmed this entry first). Returns
+ *  null on miss. */
+export function peekCachedDetailById(id: string): MetaDetail | null {
+  if (!id) return null;
+  const suffix = `::${id}`;
+  let best: CacheEntry | null = null;
+  for (const [k, v] of cache) {
+    if (!v.detail || !k.endsWith(suffix)) continue;
+    const mt = k.split("::")[1] ?? "";
+    if (Date.now() - v.ts >= ttlFor(mt)) continue;
+    if (!best || v.ts > best.ts) best = v;
+  }
+  return best ? best.detail : null;
+}
+
 /** Drop everything — useful as a last-resort cache buster. Wired to
  *  the Storage section in Settings via the `aura:meta-cache:v1`
  *  localStorage key, but also exposed here for "refresh metadata"

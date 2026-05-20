@@ -183,6 +183,18 @@ struct WireManifest {
     /// returns results for its own AI-generated catalog ids.
     #[serde(default, rename = "idPrefixes")]
     id_prefixes: Vec<String>,
+    /// Stremio `behaviorHints` — we only need `configurable` (does the
+    /// addon host a `/configure` page?). `#[serde(default)]` tolerates a
+    /// missing object; nested `#[serde(default)]` tolerates a missing
+    /// `configurable` key.
+    #[serde(default, rename = "behaviorHints")]
+    behavior_hints: WireBehaviorHints,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct WireBehaviorHints {
+    #[serde(default)]
+    configurable: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1022,6 +1034,7 @@ pub async fn add_addon<R: tauri::Runtime>(
     let resources   = collect_wire_resources(&wire);
     let id_prefixes = collect_wire_id_prefixes(&wire);
     let (stream_types, stream_id_prefixes) = collect_wire_stream_resource_info(&wire);
+    let configurable = wire.behavior_hints.configurable;
 
     let entry = AddonEntry {
         url: base,
@@ -1033,6 +1046,7 @@ pub async fn add_addon<R: tauri::Runtime>(
         stream_types,
         id_prefixes,
         stream_id_prefixes,
+        configurable,
     };
     list.push(entry.clone());
     addons::save(&app, &list)?;
@@ -1740,6 +1754,7 @@ pub async fn cloud_add_addon(auth_key: String, url: String) -> Result<AddonEntry
     let resources   = extract_manifest_resources(&manifest_json);
     let id_prefixes = extract_manifest_id_prefixes(&manifest_json);
     let (stream_types, stream_id_prefixes) = extract_stream_resource_info(&manifest_json);
+    let configurable = extract_manifest_configurable(&manifest_json);
 
     Ok(AddonEntry {
         url: base,
@@ -1751,6 +1766,7 @@ pub async fn cloud_add_addon(auth_key: String, url: String) -> Result<AddonEntry
         stream_types,
         id_prefixes,
         stream_id_prefixes,
+        configurable,
     })
 }
 
@@ -3294,6 +3310,18 @@ pub fn extract_manifest_id_prefixes(manifest: &serde_json::Value) -> Vec<String>
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| cap(s.into(), 32))).collect())
         .unwrap_or_default()
+}
+
+/// Public helper — whether the manifest declares
+/// `behaviorHints.configurable == true` (the addon hosts a `/configure`
+/// page). Consumed by `cloud_add_addon` and `auth.rs` cloud-sync, which
+/// build `AddonEntry` from a raw manifest JSON rather than `WireManifest`.
+pub fn extract_manifest_configurable(manifest: &serde_json::Value) -> bool {
+    manifest
+        .get("behaviorHints")
+        .and_then(|v| v.get("configurable"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// Per-resource overrides for the `stream` resource — its declared types

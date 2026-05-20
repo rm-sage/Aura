@@ -1,8 +1,10 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type { MetaPreview } from "./types";
 import { isAnimeMeta } from "./aiometadata";
+import { loadAuraSettings } from "./auraSettings";
 
 // ---------------------------------------------------------------------------
 // externalSources — opens a meta in an external review/database site via an
@@ -153,8 +155,19 @@ function searchQuery(meta: MetaPreview): string {
 
 const OPEN_EVENT = "aura:open-source-popup";
 
+/** Open an external source. Default: the in-app popup webview (event
+ *  → SourcePopupHost). When the user has opted into
+ *  `openLinksExternally`, hand off to the system browser instead; if
+ *  that throws (e.g. missing opener permission on an old WebView2
+ *  build) fall back to the popup so the action never silently no-ops. */
 export function openInPopupBrowser(url: string, title: string): void {
-  window.dispatchEvent(
-    new CustomEvent(OPEN_EVENT, { detail: { url, title } }),
-  );
+  const popup = () =>
+    window.dispatchEvent(
+      new CustomEvent(OPEN_EVENT, { detail: { url, title } }),
+    );
+  if (loadAuraSettings().openLinksExternally) {
+    openUrl(url).catch(popup);
+    return;
+  }
+  popup();
 }

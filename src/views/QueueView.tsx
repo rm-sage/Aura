@@ -34,6 +34,8 @@ import WatchedBadge from "../WatchedBadge";
 import { showAppToast } from "../AppToast";
 import { typeLabel } from "../aiometadata";
 import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "../FilterBar";
+import { closeHoverNow } from "../catalogHoverStore";
+import { useHoverCardActivation } from "../useHoverCardActivation";
 
 // ---------------------------------------------------------------------------
 // QueueView — ordered list of items the user has marked as "planned".
@@ -210,6 +212,7 @@ function QueueViewBody({ library, onSelectMeta }: Props) {
             <DndContext
               sensors={sensors}
               collisionDetection={collisionDetectionStrategy}
+              onDragStart={() => closeHoverNow()}
               onDragEnd={handleDragEnd}
             >
               <SortableContext items={filteredOrderedIds} strategy={rectSortingStrategy}>
@@ -287,10 +290,13 @@ function QueueCard({
         imdb_rating: null, genres: [],
       };
 
+  const hover = useHoverCardActivation(meta);
+
   return (
     <div
       ref={setNodeRef}
       style={style}
+      {...hover}
       className="group relative flex flex-col gap-2 card-contain"
       data-meta-card={`${meta.media_type}:${meta.id}`}
     >
@@ -298,7 +304,7 @@ function QueueCard({
         type="button"
         {...attributes}
         {...listeners}
-        onClick={() => onSelect?.(meta)}
+        onClick={() => { closeHoverNow(); onSelect?.(meta); }}
         onContextMenu={(e) => {
           e.preventDefault();
           window.dispatchEvent(new CustomEvent("aura:card-context", {

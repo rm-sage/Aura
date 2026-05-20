@@ -11,12 +11,8 @@ import { useLibraryProgress } from "./LibraryContext";
 import WatchedBadge, { useWatchedVariant, WatchedBadgeStatic } from "./WatchedBadge";
 import { getManualWatchedState, useManualWatchedVersion } from "./manualWatched";
 import { getMetaDetailFallback } from "./metaCache";
-import {
-  scheduleHoverOpen,
-  cancelHoverOpen,
-  scheduleHoverClose,
-  closeHoverNow,
-} from "./catalogHoverStore";
+import { closeHoverNow } from "./catalogHoverStore";
+import { useHoverCardActivation } from "./useHoverCardActivation";
 
 /** Per-catalog cache for the View-all popup. Keyed by
  *  `${addonUrl}|${type}|${id}`. Persists across DiscoveryRow remounts
@@ -688,6 +684,11 @@ export const CatalogCard = memo(function CatalogCard({ meta, onSelect }: Catalog
   // unobtrusive overlays so they don't compete with the poster art.
   const progress = useLibraryProgress(meta.id);
 
+  // Hover-vs-bind activation for the central mini-meta panel. Hover
+  // mode is byte-equivalent to the previous inline handlers; bind mode
+  // is opt-in via Settings. The card keeps its own click/context menu.
+  const hover = useHoverCardActivation(meta);
+
   return (
     <button
       type="button"
@@ -699,14 +700,7 @@ export const CatalogCard = memo(function CatalogCard({ meta, onSelect }: Catalog
           detail: { meta, x: e.clientX, y: e.clientY },
         }));
       }}
-      // Kai-style mini-meta panel — hover-intent open (delayed in the
-      // store) keyed off this card's viewport rect; close is delayed
-      // (leeway) so travelling the cursor onto the panel doesn't dismiss
-      // it. The central CatalogHoverHost owns the actual popup.
-      onMouseEnter={(e) =>
-        scheduleHoverOpen(meta, e.currentTarget as HTMLElement)
-      }
-      onMouseLeave={() => { cancelHoverOpen(); scheduleHoverClose(); }}
+      {...hover}
       className="card-grow group flex flex-col gap-2 cursor-pointer card-contain text-left
                  focus:outline-none focus-visible:ring-2 focus-visible:ring-ln-accent/60 rounded-xl"
       data-meta-card={`${meta.media_type}:${meta.id}`}

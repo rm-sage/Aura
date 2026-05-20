@@ -23,6 +23,7 @@ import { resolveDefaultMetaUrl } from "../addonDefaults";
 import { findAIOMetadataAddon, isAnimeMeta, markAnimeId, typeLabel } from "../aiometadata";
 import { dedupedInvoke } from "../invokeDedupe";
 import { PersistentCache } from "../persistentCache";
+import SeasonSelect from "../SeasonSelect";
 
 // 7-day cache for the aggregate ratings. RT/Metacritic values shift on
 // the order of weeks for theatrical releases and never for older
@@ -94,6 +95,7 @@ import ErrorBoundary from "../ErrorBoundary";
 import { parseStream, chipStyleFor, type ChipKind } from "../streamMeta";
 import Tooltip from "../Tooltip";
 import { BrandLogo, ratingDomain } from "../logodev";
+import { hasUsableRating } from "../ratingValue";
 
 // ---------------------------------------------------------------------------
 // DetailView — full-bleed cinematic detail page with a "Command Center" feel.
@@ -163,6 +165,20 @@ interface Props {
    *  starting at the first episode regardless of any state.video_id
    *  resume hint stamped from previous CW interactions. */
   ignoreResumeHint?: boolean;
+  /** When true, force the initial panelMode to "streams" for the
+   *  episode pointed to by `openOnEpisodeId`, skipping the episodes-
+   *  list intermediate step. Highest precedence over the
+   *  openOnEpisodeId / resumeVideoId branches. Used by the EOS
+   *  Spotlight's EpisodePanel single-click flow (2026-05-20) so a user
+   *  who picks an episode from the in-player panel lands directly on
+   *  the streams picker for that episode. Consumed once via
+   *  `onConsumeOpenInStreamsMode` so the hint can't bleed into a
+   *  later unrelated open. */
+  openInStreamsMode?: boolean;
+  /** Called once after `openInStreamsMode` has been consumed (after
+   *  the initial mount effect runs). Lets the parent clear the hint
+   *  so a later open from an unrelated card doesn't inherit it. */
+  onConsumeOpenInStreamsMode?: () => void;
 }
 
 const CloseIcon = () => (
@@ -258,7 +274,7 @@ export default function DetailView(props: Props) {
   );
 }
 
-function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, openOnEpisodeId, onConsumeOpenHint, ignoreResumeHint }: Props) {
+function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, openOnEpisodeId, onConsumeOpenHint, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
   const [detail, setDetail]                 = useState<MetaDetail | null>(null);
   const [streams, setStreams]               = useState<StreamEntry[]>([]);
   const [streamMeta, setStreamMeta]         = useState<StreamMetadata>({
@@ -375,9 +391,24 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
   // EXCEPTION: when `openOnEpisodeId` is set (i.e. we're remounting right
   // after the user exited playback), force episodes mode so they land on
   // the list with the just-played episode anchored at the top.
+  //
+  // HIGHEST-PRECEDENCE EXCEPTION: when `openInStreamsMode` is set (the EOS
+  // Spotlight's EpisodePanel single-click path, 2026-05-20), force STREAMS
+  // mode for the chosen `openOnEpisodeId` — skips the episodes-list
+  // intermediate step so the user lands one click from playable.
   const [panelMode, setPanelMode] = useState<PanelMode>(
-    isEpisodic && (openOnEpisodeId || !resumeVideoId) ? "episodes" : "streams"
+    openInStreamsMode
+      ? "streams"
+      : isEpisodic && (openOnEpisodeId || !resumeVideoId) ? "episodes" : "streams"
   );
+
+  // One-shot consume of the streams-mode hint. Runs once on mount (deps
+  // intentionally minimal); the parent clears its state on the next
+  // render so a later open from an unrelated surface starts clean.
+  useEffect(() => {
+    if (openInStreamsMode) onConsumeOpenInStreamsMode?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Snapshot the open hint into a local state at mount so we can clear
   // the parent's prop immediately (next renders pass null) without
@@ -570,6 +601,14 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
     kind: string;
     weight: number;
   };
+  // Anime if the meta says so or the resolved detail carries an
+  // anime-native id (mal/kitsu/anidb). detail ids land async after the
+  // meta-detail fetch, so this re-derives each render as they resolve.
+  const isAnime =
+    (meta.media_type ?? "").toLowerCase() === "anime" ||
+    detail?.mal_id != null ||
+    detail?.kitsu_id != null ||
+    detail?.anidb_id != null;
   const [aggregateRatings, setAggregateRatings] = useState<AggregateRating[]>([]);
   useEffect(() => {
     setAggregateRatings([]);
@@ -589,11 +628,6 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
       );
     }
     let cancelled = false;
-    const isAnime =
-      (meta.media_type ?? "").toLowerCase() === "anime" ||
-      detail?.mal_id != null ||
-      detail?.kitsu_id != null ||
-      detail?.anidb_id != null;
     const input = {
       imdb_id:    meta.id.startsWith("tt") ? meta.id : null,
       mal_id:     detail?.mal_id     ?? null,
@@ -632,24 +666,38 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
    *  source-label normalization in ratings.rs. */
   const mergedRatings = useMemo(() => {
     type RatingRow = { source: string; value: string; kind?: string; weight?: number };
+    // Drop sources with no usable value (empty / "0.0" — the MDBList
+    // Letterboxd row for series/anime is the canonical junk), and drop
+    // Letterboxd entirely for anime since it's movie-only on MDBList.
+    const accept = (r: { source: string; value: string }) =>
+      hasUsableRating(r.value) &&
+      !(isAnime && r.source.toLowerCase() === "letterboxd");
     const map = new Map<string, RatingRow>();
     for (const r of detail?.ratings ?? []) {
-      map.set(r.source.toLowerCase(), { source: r.source, value: r.value });
+      if (accept(r)) map.set(r.source.toLowerCase(), { source: r.source, value: r.value });
     }
     for (const r of aggregateRatings) {
-      map.set(r.source.toLowerCase(), r);
+      if (accept(r)) map.set(r.source.toLowerCase(), r);
     }
-    // Sort by aggregator weight DESC (IMDb 100, MAL 95, RT 90,
-    // Metacritic 80, MAL Rank 60, MAL Popularity 55, others 50).
-    // Addon-supplied ratings without an aggregator counterpart get
-    // weight 50 so they slot after the well-known sources but before
-    // the niche ones.
+    // For anime, surface the anime-native sources first — MAL score,
+    // AniList, then MAL rank & popularity — so the detail page shows the
+    // same MAL trio the hover card does instead of letting IMDb/RT/MC
+    // crowd them past the six-tile cap. Otherwise sort by aggregator
+    // weight DESC (IMDb 100, MAL 95, RT 90, …; addon-only sources 50).
+    const ANIME_FIRST = ["myanimelist", "anilist", "mal rank", "mal popularity"];
     return [...map.values()].sort((a, b) => {
-      const aw = a.weight ?? 50;
-      const bw = b.weight ?? 50;
-      return bw - aw;
+      if (isAnime) {
+        const ai = ANIME_FIRST.indexOf(a.source.toLowerCase());
+        const bi = ANIME_FIRST.indexOf(b.source.toLowerCase());
+        if (ai !== bi) {
+          if (ai === -1) return 1;
+          if (bi === -1) return -1;
+          return ai - bi;
+        }
+      }
+      return (b.weight ?? 50) - (a.weight ?? 50);
     });
-  }, [detail?.ratings, aggregateRatings]);
+  }, [detail?.ratings, aggregateRatings, isAnime]);
 
   // Fetch streams: movies use parent id; series/anime use the picked video
   // id, falling back to the resume video id from the library if the user
@@ -768,6 +816,26 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
     const v = resolveResumeEpisode(resumeVideoId, detail?.videos);
     if (v) setActiveVideo(v);
   }, [detail?.videos, resumeVideoId, isEpisodic, activeVideo]);
+
+  // EOS Spotlight EpisodePanel single-click path (2026-05-20): when
+  // `openInStreamsMode` AND `openOnEpisodeId` are both set, snap
+  // `activeVideo` to the CLICKED episode (not the last-played one
+  // from state.video_id). Without this the streams panel would render
+  // streams for whatever Stremio's state.video_id last stamped (the
+  // just-finished episode), not the episode the user explicitly
+  // picked in the in-player panel. Runs once when videos arrive; the
+  // existing resume effect above is skipped because activeVideo is
+  // already set after this fires. resolveResumeEpisode handles
+  // legacy id-shape mismatches (cour-aggregation, etc.) — same
+  // resilience the resume path gets.
+  useEffect(() => {
+    if (activeVideo) return;
+    if (!isEpisodic) return;
+    if (!openInStreamsMode) return;
+    if (!openOnEpisodeId) return;
+    const v = resolveResumeEpisode(openOnEpisodeId, detail?.videos);
+    if (v) setActiveVideo(v);
+  }, [detail?.videos, openInStreamsMode, openOnEpisodeId, isEpisodic, activeVideo]);
 
   const groupedStreams = useMemo(() => {
     const map = new Map<string, StreamEntry[]>();
@@ -1934,196 +2002,11 @@ function SeasonAwareCastBlock({
 }
 
 // ---------------------------------------------------------------------------
-// SeasonSelect — custom popover dropdown for the episode panel's season
-// picker. Replaces a native <select> for two reasons:
-//
-//   1. Direction control. Windows native combo-boxes open upward when
-//      the trigger is near the bottom of the screen, which on a multi-
-//      monitor setup with the app at the bottom of the primary display
-//      stretches the popup onto a different monitor (or off-screen).
-//      We always prefer downward and only flip up when there's no room
-//      below (rare; the popover is short).
-//   2. Visible-count cap. Native <select> shows ~30 items by default
-//      on Windows; the user wants up to 10 visible with scroll for
-//      anime / long-running shows. A custom list trivially caps via
-//      max-height + overflow-y: auto.
-//
-// Behaviour:
-//   • Click trigger → open popover positioned just below the trigger
-//     button. Width matches the trigger.
-//   • Click outside / press Escape / pick a season → close.
-//   • Up/Down keys move highlight; Enter selects.
-//   • Highlights the current season; clicking the same one is a no-op
-//     close.
+// SeasonSelect — EXTRACTED to ../SeasonSelect (EOS Spotlight spec
+// 2026-05-19, Phase 3). The implementation moved VERBATIM so the EOS
+// in-player EpisodePanel and this DetailView share one byte-identical
+// dropdown; behaviour is unchanged. Imported at the top of this file.
 // ---------------------------------------------------------------------------
-
-const SEASON_VISIBLE_CAP = 10;
-
-function SeasonSelect({
-  seasons, value, onChange,
-}: {
-  seasons: number[];
-  value: number;
-  onChange: (s: number) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const [highlight, setHighlight] = useState<number>(value);
-  const triggerRef = useRef<HTMLButtonElement>(null);
-  const popoverRef = useRef<HTMLDivElement>(null);
-  const itemsRef = useRef<Map<number, HTMLButtonElement>>(new Map());
-
-  const label = (s: number) => (s === 0 ? "Specials" : `Season ${s}`);
-
-  // Close on outside click / Escape.
-  useEffect(() => {
-    if (!open) return;
-    const onDoc = (e: MouseEvent) => {
-      if (popoverRef.current?.contains(e.target as Node)) return;
-      if (triggerRef.current?.contains(e.target as Node)) return;
-      setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        setOpen(false);
-        triggerRef.current?.focus();
-        return;
-      }
-      if (e.key === "ArrowDown") {
-        e.preventDefault();
-        setHighlight((h) => {
-          const idx = seasons.indexOf(h);
-          const next = seasons[(idx + 1) % seasons.length];
-          itemsRef.current.get(next)?.scrollIntoView({ block: "nearest" });
-          return next;
-        });
-      }
-      if (e.key === "ArrowUp") {
-        e.preventDefault();
-        setHighlight((h) => {
-          const idx = seasons.indexOf(h);
-          const prev = seasons[(idx - 1 + seasons.length) % seasons.length];
-          itemsRef.current.get(prev)?.scrollIntoView({ block: "nearest" });
-          return prev;
-        });
-      }
-      if (e.key === "Enter") {
-        e.preventDefault();
-        onChange(highlight);
-        setOpen(false);
-        triggerRef.current?.focus();
-      }
-    };
-    window.addEventListener("mousedown", onDoc);
-    window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("mousedown", onDoc);
-      window.removeEventListener("keydown", onKey);
-    };
-  }, [open, seasons, highlight, onChange]);
-
-  // Reset highlight when opening so the cursor lands on the current season.
-  useEffect(() => {
-    if (!open) return;
-    setHighlight(value);
-    // Defer the scroll until the popover has actually mounted with the
-    // current item visible — without this, scrollIntoView runs against
-    // the just-mounted container before its height is final.
-    requestAnimationFrame(() => {
-      itemsRef.current.get(value)?.scrollIntoView({ block: "nearest" });
-    });
-  }, [open, value]);
-
-  // Decide direction: prefer downward. Flip upward only when there's
-  // genuinely no room below (rare given the popover caps at ~10 rows).
-  // Recomputed every time the popover opens so a different season
-  // count or window resize doesn't keep a stale orientation.
-  const [direction, setDirection] = useState<"down" | "up">("down");
-  useEffect(() => {
-    if (!open || !triggerRef.current) return;
-    const rect = triggerRef.current.getBoundingClientRect();
-    const itemH = 36;
-    const padding = 12;
-    const wantH = Math.min(seasons.length, SEASON_VISIBLE_CAP) * itemH + padding;
-    const spaceBelow = window.innerHeight - rect.bottom;
-    const spaceAbove = rect.top;
-    if (spaceBelow >= wantH || spaceBelow >= spaceAbove) {
-      setDirection("down");
-    } else {
-      setDirection("up");
-    }
-  }, [open, seasons.length]);
-
-  const popoverStyle: React.CSSProperties = {
-    maxHeight: `${SEASON_VISIBLE_CAP * 36 + 8}px`,
-    minWidth: triggerRef.current?.offsetWidth ?? 160,
-    ...(direction === "down" ? { top: "100%", marginTop: 4 } : { bottom: "100%", marginBottom: 4 }),
-  };
-
-  return (
-    <div className="relative inline-block">
-      <button
-        ref={triggerRef}
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        className="bg-black/45 border border-white/16 rounded-lg px-5 py-2.5
-                   text-[16px] font-mono tracking-wide outline-none
-                   focus:border-ln-accent/45 transition-colors cursor-pointer
-                   appearance-none pr-10 inline-flex items-center"
-        style={{
-          color: "var(--text-primary)",
-          backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='rgba(255,255,255,0.55)'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E")`,
-          backgroundRepeat: "no-repeat",
-          backgroundPosition: "right 10px center",
-        }}
-      >
-        {label(value)}
-      </button>
-      {open && (
-        <div
-          ref={popoverRef}
-          role="listbox"
-          className="absolute left-0 z-40 overflow-y-auto
-                     bg-black/85 backdrop-blur-2xl
-                     border border-white/15 rounded-lg
-                     shadow-[0_18px_48px_-12px_rgba(0,0,0,0.85)]
-                     py-1"
-          style={{ ...popoverStyle, scrollbarWidth: "thin",
-                   scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
-        >
-          {seasons.map((s) => {
-            const isActive    = s === value;
-            const isHighlight = s === highlight;
-            return (
-              <button
-                key={s}
-                ref={(el) => {
-                  if (el) itemsRef.current.set(s, el);
-                  else    itemsRef.current.delete(s);
-                }}
-                role="option"
-                aria-selected={isActive}
-                onClick={() => {
-                  onChange(s);
-                  setOpen(false);
-                  triggerRef.current?.focus();
-                }}
-                onMouseEnter={() => setHighlight(s)}
-                className={`block w-full text-left px-4 py-2 text-[14px] font-mono tracking-wide
-                            transition-colors
-                            ${isActive ? "text-ln-accent" : "text-white/85"}
-                            ${isHighlight ? "bg-white/10" : "hover:bg-white/8"}`}
-              >
-                {label(s)}
-              </button>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
 
 // ---------------------------------------------------------------------------
 // UnifiedPanel — the compact RIGHT column. Swaps between Episodes and Streams.

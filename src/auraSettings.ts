@@ -154,11 +154,14 @@ export interface AuraSettings {
   loudnessNormalization: boolean;
   /** Motion interpolation — mpv's built-in GPU frame interpolation
    *  (`video-sync=display-resample` + `interpolation` + `tscale`).
-   *  GPU-cheap (Aura already uses `vo=gpu-next`), opt-in, default
-   *  false. Re-applies on every stream load AND on toggle; surfaced
-   *  in both Settings and the in-player three-dots menu. Optional in
-   *  the type only so incremental edits type-check; defaults + parse
-   *  always populate it. */
+   *  GPU-cheap (Aura already uses `vo=gpu-next`), opt-in, **default
+   *  false until the deferred `mpv_render_context` render-API rewrite
+   *  is sorted** (with the current `--wid` child-HWND embedding,
+   *  `display-resample` makes off-focus frame drops catastrophic —
+   *  ~20-60 fps vs ~6-8/s with audio-sync; see HANDOFF.md). Re-applies
+   *  on every stream load AND on toggle; surfaced in both Settings and
+   *  the in-player three-dots menu. Optional in the type only so
+   *  incremental edits type-check; defaults + parse always populate it. */
   motionInterpolation?: boolean;
   /** The `tscale` (temporal scaler) kernel mpv interpolation uses —
    *  THE quality dial. mpv lists kernels in increasing smoothness:
@@ -191,6 +194,20 @@ export interface AuraSettings {
    *  false, the desktop uses only the per-user addon probe path —
    *  same code as pre-Phase 9. See docs/release-search-spec.md. */
   releaseSearchEnabled: boolean;
+  /** When true, the mini-meta hover panel no longer opens on hover;
+   *  instead it opens when the configured mouse button is pressed on a
+   *  card (and the same press toggles it closed). Default false =
+   *  classic hover behaviour on every surface. */
+  metaPanelBindEnabled: boolean;
+  /** Mouse button that opens the meta panel when `metaPanelBindEnabled`.
+   *  DOM `MouseEvent.button`: 1 = middle (default), 3 = back, 4 =
+   *  forward. 0 (left) and 2 (right) are intentionally not selectable —
+   *  left is select/navigate, right is the card context menu. */
+  metaPanelBindButton: 1 | 3 | 4;
+  /** "Open in…" external-source links open in the user's default system
+   *  browser instead of Aura's in-app popup webview. Default false =
+   *  the in-app popup (unchanged behaviour). */
+  openLinksExternally: boolean;
 }
 
 export const DEFAULT_AURA_SETTINGS: AuraSettings = {
@@ -210,10 +227,13 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   autoAdvanceDelaySeconds: 10,
   blurEpisodeSynopsis: false,
   loudnessNormalization: false,
-  motionInterpolation: true,
+  motionInterpolation: false,
   interpolationTscale: "oversample",
   nextUpSkipFillerRecap: "none",
   releaseSearchEnabled: true,
+  metaPanelBindEnabled: false,
+  metaPanelBindButton: 1,
+  openLinksExternally: false,
 };
 
 // Module-level memoization snapshot. loadAuraSettings is called many
@@ -286,11 +306,13 @@ function readFromStorage(): AuraSettings {
       loudnessNormalization: typeof parsed.loudnessNormalization === "boolean"
         ? parsed.loudnessNormalization
         : false,
-      // Default ON now — only an explicitly-stored `false` (user
-      // turned it off) keeps it off; absent key → new default true.
+      // Default OFF until the deferred mpv_render_context rewrite is
+      // sorted — under the current --wid child-HWND embedding,
+      // display-resample makes off-focus frame drops catastrophic.
+      // An explicitly-stored `true` (user opted in) keeps it on.
       motionInterpolation: typeof parsed.motionInterpolation === "boolean"
         ? parsed.motionInterpolation
-        : true,
+        : false,
       interpolationTscale: typeof parsed.interpolationTscale === "string"
         ? parsed.interpolationTscale
         : "oversample",
@@ -303,6 +325,18 @@ function readFromStorage(): AuraSettings {
       releaseSearchEnabled: typeof parsed.releaseSearchEnabled === "boolean"
         ? parsed.releaseSearchEnabled
         : true,
+      metaPanelBindEnabled: typeof parsed.metaPanelBindEnabled === "boolean"
+        ? parsed.metaPanelBindEnabled
+        : false,
+      // Only the three non-conflicting buttons are valid; anything else
+      // (legacy / garbage / left / right) falls back to middle.
+      metaPanelBindButton:
+        parsed.metaPanelBindButton === 3 || parsed.metaPanelBindButton === 4
+          ? parsed.metaPanelBindButton
+          : 1,
+      openLinksExternally: typeof parsed.openLinksExternally === "boolean"
+        ? parsed.openLinksExternally
+        : false,
       heroCatalog: parsed.heroCatalog
         && typeof parsed.heroCatalog === "object"
         && typeof (parsed.heroCatalog as Record<string, unknown>).addonUrl === "string"

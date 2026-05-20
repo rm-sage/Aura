@@ -91,3 +91,6 @@ src-tauri/shaders/*.hook
 # MDBList API key — secret, baked into the build by src-tauri/build.rs
 # (cargo:rustc-env). Never commit; the binary embeds it, the repo must not.
 src-tauri/mdblist.key
+
+# superpowers brainstorm visual companion (local only, not committed)
+.superpowers/

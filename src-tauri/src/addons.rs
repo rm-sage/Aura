@@ -50,6 +50,16 @@ pub struct AddonEntry {
     /// stricter of the two wins inside fetch_streams).
     #[serde(default)]
     pub stream_id_prefixes: Vec<String>,
+    /// Whether the addon manifest declares `behaviorHints.configurable =
+    /// true` — i.e. it hosts a `/configure` page. Drives the conditional
+    /// "Configure" button in the Addons UI; Cinemeta and other
+    /// non-configurable addons have this `false` so no button shows.
+    /// `#[serde(default)]` (=> `false`) keeps older `addons.json` files —
+    /// and addons whose manifest predates this capture — loading
+    /// forward-compatibly; the value is (re)populated whenever the entry
+    /// is rebuilt (local add, cloud add, or the launch-time cloud sync).
+    #[serde(default)]
+    pub configurable: bool,
 }
 
 // ---------------------------------------------------------------------------

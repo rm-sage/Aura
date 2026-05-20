@@ -312,7 +312,28 @@ export function useScrobble({
           media_type: active.media_type,
           episode: active.episode ?? null,
           title: active.name,
-          is_anime: isAnimeMeta(active),
+          // `isAnimeMeta(active)` reads genre/lang/country off `active`,
+          // but only the first-play path (DetailView → targetForPlay)
+          // carries those via `scoring`. Autoplay-next / SMTC-step /
+          // queue-advance build the target WITHOUT scoring, so those
+          // signals are null and this returns false — observed live as
+          // ep6 anime=true (played from DetailView) then ep7 anime=false
+          // on auto-advance, which silently skipped the AniList scrobble
+          // for ep7. The localStorage anime cache (isAnimeMeta branch 5)
+          // is the intended fallback, but every markAnimeId() writer
+          // stamps the SERIES-ROOT id while `active.id` here is the
+          // per-EPISODE id, so `cache.has(active.id)` never matched for
+          // series. Re-check with the series root so the cache fallback
+          // actually fires and AniList scrobbling survives auto-advance.
+          is_anime:
+            isAnimeMeta(active) ||
+            isAnimeMeta({
+              media_type: active.media_type,
+              id: active.series_id ?? active.id,
+              genres: active.genres,
+              original_language: active.original_language,
+              production_countries: active.production_countries,
+            }),
           scope,
           // Authoritative numbers from the VideoEntry the user clicked.
           // scrobble.rs prefers these over the ID-string parse when

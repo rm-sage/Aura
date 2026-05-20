@@ -134,6 +134,22 @@ export async function reconcileLibraryReleaseSignals(
     let mutated = false;
     for (const [id, sig] of result.entries()) {
       const prev = store.get(id);
+      // Sticky last-good signal. The cloud signal flaps present↔null
+      // (eventual-consistency / 304 races): a transient `null` must
+      // NOT clobber a signal we've already seen as present, or the
+      // notifications scanner skips that id for the duration of the
+      // flap — and if the first usable `present` then lands after a
+      // new episode's air time, the scanner's first-scan anti-backlog
+      // seeding swallows that episode permanently (the missed-Wistoria
+      // symptom). `prev != null` is true only for a real ReleaseSignal
+      // (not `null`, not `undefined`), so: a genuinely-untracked id
+      // (only ever null) still writes null and the scanner's
+      // null-skip still works; a real present→present change still
+      // writes through; only an incoming transient null over an
+      // existing real signal is ignored. seenVideoIds + the
+      // lastNotifiedAt watermark already prevent any double-notify
+      // from briefly retaining a slightly-stale recent_aired.
+      if (sig === null && prev != null) continue;
       if (prev !== sig) {
         store.set(id, sig);
         mutated = true;

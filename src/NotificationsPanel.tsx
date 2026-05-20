@@ -9,6 +9,7 @@ import {
   type Notification,
   type NotificationKind,
 } from "./NotificationsContext";
+import Tooltip from "./Tooltip";
 
 // ---------------------------------------------------------------------------
 // NotificationsPanel — anchored ABOVE the bell (bottom-12 left-3 in absolute
@@ -24,9 +25,18 @@ interface Props {
    *  class (.aura-bell-panel-out) so it visibly retracts toward the
    *  bell instead of vanishing on unmount. */
   closing?: boolean;
+  /** When present, renders a refresh-library button in the panel
+   *  header — the old standalone LibraryRefreshButton, folded in. */
+  onRefresh?: () => void;
+  /** Spinner state for the refresh button. */
+  refreshing?: boolean;
+  /** Cooldown lockout for the refresh button (rate-limit guard). */
+  refreshDisabled?: boolean;
 }
 
-export default function NotificationsPanel({ onClose, closing }: Props) {
+export default function NotificationsPanel({
+  onClose, closing, onRefresh, refreshing, refreshDisabled,
+}: Props) {
   const {
     notifications,
     markRead,
@@ -54,16 +64,20 @@ export default function NotificationsPanel({ onClose, closing }: Props) {
         "w-[380px] max-h-[480px]",
         "rounded-2xl overflow-hidden",
         // Higher-contrast surface than the prior `bg-white/[0.07]`.
-        // `bg-black/82` darkens the panel substantially so titles
-        // stay legible against Mica's bright bleedthrough, while the
-        // `backdrop-saturate-150 backdrop-brightness-75 backdrop-blur-2xl`
-        // chain approximates iOS-style vibrancy without the per-frame
-        // GPU cost of the proper macOS Vibrancy API. The bright
-        // background still tinges the panel (the eye reads it as
-        // "translucent") but text contrast is uniform regardless of
-        // what's behind it.
-        "bg-black/82 backdrop-saturate-150 backdrop-brightness-75 backdrop-blur-2xl",
-        "border border-white/10",
+        // NOTE: a prior revision used `bg-black/82`, but `/82` is NOT on
+        // Tailwind's opacity scale (…/80/85/90) and isn't in the extended
+        // set in tailwind.config.ts (92/93/96/97/98) — the JIT silently
+        // emitted NO background rule, so the panel had zero fill and
+        // Mica's bright bleedthrough (plus any catalog title behind it)
+        // showed straight through, making the text unreadable. Use a
+        // VALID step on a real token: `bg-ln-base/85` (ln.base #080808)
+        // is an ~85% near-black scrim that keeps text legible over bright
+        // backgrounds, while the remaining ~15% translucency +
+        // `backdrop-saturate-150 backdrop-blur-2xl` preserves the glassy
+        // look. `backdrop-brightness-75` only existed to compensate for
+        // the (absent) fill — now redundant, dropped.
+        "bg-ln-base/85 backdrop-saturate-150 backdrop-blur-2xl",
+        "border border-white/15",
         "shadow-2xl",
         "flex flex-col",
         closing ? "aura-bell-panel-out" : "aura-bell-panel-in",
@@ -76,22 +90,46 @@ export default function NotificationsPanel({ onClose, closing }: Props) {
         <div className="text-sm font-semibold text-white/90 tracking-wide">
           Notifications
         </div>
-        <button
-          type="button"
-          onClick={() => { if (hasDismissable) dismissAll(); }}
-          disabled={!hasDismissable}
-          className={[
-            "text-[11.5px] font-medium px-2.5 py-1 rounded-md border transition-colors",
-            // Solid pill with a visible border + background so the
-            // label reads cleanly against the Mica accent themes that
-            // were swallowing the previous text-only treatment.
-            hasDismissable
-              ? "text-white bg-white/12 border-white/25 hover:bg-white/20 hover:border-white/40"
-              : "text-white/35 bg-transparent border-white/10 cursor-default",
-          ].join(" ")}
-        >
-          Dismiss all
-        </button>
+        <div className="flex items-center gap-2">
+          {onRefresh && (
+            <Tooltip
+              text="Refresh library — pulls fresh data from Stremio, then asks Aura Cloud whether any library titles have new episodes."
+              pos="top"
+              delay={60}
+            >
+              <button
+                type="button"
+                onClick={onRefresh}
+                disabled={refreshDisabled}
+                aria-label="Refresh library"
+                className={[
+                  "h-7 w-7 rounded-md flex items-center justify-center border transition-colors",
+                  refreshDisabled
+                    ? "text-white/35 bg-transparent border-white/10 cursor-default"
+                    : "text-white bg-white/12 border-white/25 hover:bg-white/20 hover:border-white/40",
+                ].join(" ")}
+              >
+                <RefreshIcon spinning={!!refreshing} />
+              </button>
+            </Tooltip>
+          )}
+          <button
+            type="button"
+            onClick={() => { if (hasDismissable) dismissAll(); }}
+            disabled={!hasDismissable}
+            className={[
+              "text-[11.5px] font-medium px-2.5 py-1 rounded-md border transition-colors",
+              // Solid pill with a visible border + background so the
+              // label reads cleanly against the Mica accent themes that
+              // were swallowing the previous text-only treatment.
+              hasDismissable
+                ? "text-white bg-white/12 border-white/25 hover:bg-white/20 hover:border-white/40"
+                : "text-white/35 bg-transparent border-white/10 cursor-default",
+            ].join(" ")}
+          >
+            Dismiss all
+          </button>
+        </div>
       </div>
 
       {/* Body */}
@@ -100,7 +138,7 @@ export default function NotificationsPanel({ onClose, closing }: Props) {
         style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.10) transparent" }}
       >
         {sorted.length === 0 ? (
-          <div className="px-4 py-8 text-center text-xs text-white/40">
+          <div className="px-4 py-8 text-center text-xs text-white/55">
             No notifications
           </div>
         ) : (
@@ -473,4 +511,29 @@ function relativeTime(ts: number): string {
   } catch {
     return `${day}d ago`;
   }
+}
+
+// ---------------------------------------------------------------------------
+// RefreshIcon — Material-style circular-refresh glyph. Spins while a
+// refresh is in flight. Moved here from the retired standalone
+// LibraryRefreshButton; the `aura-refresh-spin` keyframe lives in
+// App.css (global) so deleting that component left it intact.
+// ---------------------------------------------------------------------------
+
+function RefreshIcon({ spinning }: { spinning: boolean }) {
+  return (
+    <svg
+      width="15"
+      height="15"
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      aria-hidden
+      style={{
+        transition: "transform 0.2s ease",
+        animation: spinning ? "aura-refresh-spin 1.2s linear infinite" : "none",
+      }}
+    >
+      <path d="M17.65 6.35A7.958 7.958 0 0 0 12 4c-4.42 0-8 3.58-8 8s3.58 8 8 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0 1 12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" />
+    </svg>
+  );
 }

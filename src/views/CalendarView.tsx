@@ -7,6 +7,9 @@ import { loadAuraSettings } from "../auraSettings";
 import { resolveDefaultMetaUrl } from "../addonDefaults";
 import { getMetaDetail } from "../metaCache";
 import ImageLoader from "../ImageLoader";
+import { formatEpLabel } from "../episodeLabel";
+import { useHoverCardActivation } from "../useHoverCardActivation";
+import { closeHoverNow } from "../catalogHoverStore";
 
 // ---------------------------------------------------------------------------
 // CalendarView — full-viewport month grid + day-click overlay
@@ -461,8 +464,12 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
                   // is driven by the 1fr row, not a fixed minHeight. The
                   // 2:3 aspect ratio derives width from height automatically.
                   <div className="mt-2 flex-1 min-h-0 flex items-end justify-center gap-1.5">
-                    {visiblePosters.map(({ item, detail }) => {
+                    {visiblePosters.map(({ item, detail, video }) => {
                       const src = detail?.poster ?? item.poster;
+                      const epLabel =
+                        video && video.season != null && video.episode != null
+                          ? formatEpLabel(video.season, video.episode)
+                          : null;
                       return (
                         <div
                           key={item.id}
@@ -486,6 +493,19 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
                                             text-white/20 text-[10px]">
                               ?
                             </div>
+                          )}
+                          {epLabel && (
+                            // Top-LEFT to match the DayOverlay badge and to
+                            // stay clear of addon-baked HDR/DV/language badges
+                            // that sit in the poster's top-right art.
+                            <span
+                              className="absolute top-1 left-1 text-[9px] leading-none
+                                         font-mono font-semibold text-white/95
+                                         px-1 py-0.5 rounded bg-black/85
+                                         border border-white/15"
+                            >
+                              {epLabel}
+                            </span>
                           )}
                         </div>
                       );
@@ -658,18 +678,21 @@ function DayOverlay({ date, entries, onClose, onSelectMeta }: DayOverlayProps) {
           style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
         >
           <div className="grid gap-4 grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
-            {entries.map(({ item, detail, video, releaseDate }, idx) => (
+            {entries.map(({ item, detail, video, releaseDate }, idx) => {
+              const meta = libraryItemToMeta(item, detail);
+              return (
               <CalendarCard
                 key={`${item.id}:${video?.id ?? idx}`}
+                meta={meta}
                 name={detail?.name ?? item.name}
                 poster={detail?.poster ?? item.poster}
                 mediaType={detail?.media_type ?? item.media_type}
                 episodeTag={video && video.season != null && video.episode != null
-                  ? `S${String(video.season).padStart(2,"0")}E${String(video.episode).padStart(2,"0")}`
+                  ? formatEpLabel(video.season, video.episode)
                   : null}
                 episodeTitle={video?.title ?? null}
                 released={releaseDate}
-                onClick={onSelectMeta ? () => { onClose(); onSelectMeta(libraryItemToMeta(item, detail)); } : undefined}
+                onClick={onSelectMeta ? () => { closeHoverNow(); onClose(); onSelectMeta(meta); } : undefined}
                 onContextMenu={(e) => {
                   // Right-click → fire the same `aura:card-context`
                   // event the rest of the app's cards use. The App-
@@ -681,7 +704,7 @@ function DayOverlay({ date, entries, onClose, onSelectMeta }: DayOverlayProps) {
                   e.preventDefault();
                   window.dispatchEvent(new CustomEvent("aura:card-context", {
                     detail: {
-                      meta: libraryItemToMeta(item, detail),
+                      meta,
                       x: e.clientX,
                       y: e.clientY,
                       source: "calendar",
@@ -690,7 +713,8 @@ function DayOverlay({ date, entries, onClose, onSelectMeta }: DayOverlayProps) {
                   }));
                 }}
               />
-            ))}
+              );
+            })}
           </div>
         </div>
       </div>
@@ -703,8 +727,10 @@ function DayOverlay({ date, entries, onClose, onSelectMeta }: DayOverlayProps) {
 // ---------------------------------------------------------------------------
 
 function CalendarCard({
-  name, poster, mediaType, episodeTag, episodeTitle, released, onClick, onContextMenu,
+  meta, name, poster, mediaType, episodeTag, episodeTitle, released, onClick, onContextMenu,
 }: {
+  /** Catalog meta for the shared mini-meta hover/bind panel. */
+  meta: MetaPreview;
   name: string;
   poster: string | null;
   mediaType: string;
@@ -720,6 +746,7 @@ function CalendarCard({
   onClick?: () => void;
 }) {
   const Tag = onClick ? "button" : "div";
+  const hover = useHoverCardActivation(meta);
   const dateLabel = released.toLocaleDateString(undefined, {
     month: "short", day: "numeric",
   });
@@ -727,6 +754,8 @@ function CalendarCard({
     <Tag
       onClick={onClick}
       onContextMenu={onContextMenu}
+      {...hover}
+      data-meta-card={`${mediaType}:${meta.id}`}
       className={`glass-panel rounded-xl p-2.5 flex flex-col gap-2 text-left w-full
                   ${onClick ? "hover:bg-white/8 transition-colors cursor-pointer" : ""}`}
     >

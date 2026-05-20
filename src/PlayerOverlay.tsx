@@ -18,12 +18,14 @@ import SubtitlePicker from "./SubtitlePicker";
 import CinemaSuite from "./CinemaSuite";
 import ImageLoader from "./ImageLoader";
 import type { ActiveScrobbleTarget } from "./useScrobble";
-import type { ExternalSubtitle, TrackEntry } from "./types";
+import type { AddonEntry, ExternalSubtitle, LibraryItem, TrackEntry, VideoEntry } from "./types";
+import EpisodePanel from "./EpisodePanel";
 import { setTitleState } from "./titleState";
 import { pickDefaultAudio, type ScoringMeta } from "./audioScoring";
 import { prettyBinding } from "./useKeybindings";
 import { loadAuraSettings, saveAuraSettings } from "./auraSettings";
 import AniSkipMenu from "./AniSkipMenu";
+import { copyTextToClipboard } from "./clipboard";
 
 // ---------------------------------------------------------------------------
 // Menu-open tracker — child menus (TrackMenu, SpeedMenu, ShaderPicker,
@@ -50,25 +52,8 @@ function useMenuOpenSync(open: boolean) {
   }, [open, tracker]);
 }
 
-/** writeText / openUrl wrappers — both wrapped in try/catch so a missing
- *  permission can never crash the app. */
-async function copyToClipboard(text: string): Promise<boolean> {
-  try {
-    const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
-    await writeText(text);
-    return true;
-  } catch (e) {
-    // Browser fallback — some hosts (older WebView2 builds without permission
-    // strings) reject the plugin call. The HTML5 clipboard API still works.
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch (e2) {
-      console.error("clipboard write failed", e, e2);
-      return false;
-    }
-  }
-}
+/** openUrl wrapper — wrapped in try/catch so a missing permission can
+ *  never crash the app. (Clipboard copy: ./clipboard#copyTextToClipboard.) */
 
 async function openExternalUrl(url: string): Promise<boolean> {
   try {
@@ -1075,6 +1060,146 @@ interface Props {
    *  App passes the user's volume-up / volume-down bindings here so
    *  arrow-key volume bumps stay silent (toast-only) like mousewheel. */
   silentWakeCodes?: readonly string[];
+
+  /** In-playback episode drawer (EOS Spotlight spec 2026-05-19, Phase
+   *  4). When supplied (series/anime only), PlayerOverlay renders an
+   *  always-present thin right-edge handle that hover/click-expands the
+   *  shared EpisodePanel. Omitted for movies. seriesId / mediaType /
+   *  currentEpisodeId derive from activeTarget on the App side; the
+   *  panel resolves its own (cached) MetaDetail. */
+  episodePanel?: {
+    seriesId: string;
+    mediaType: string;
+    addons: AddonEntry[];
+    currentEpisodeId: string;
+    nextEpisodeId: string | null;
+    isFullscreen: boolean;
+    libraryById: Map<string, LibraryItem>;
+    seriesArt: string | null;
+    onPlayEpisode: (video: VideoEntry) => void;
+  } | null;
+}
+
+// ---------------------------------------------------------------------------
+// EpisodeEdgeTrigger — the in-playback episode drawer affordance (EOS
+// Spotlight spec 2026-05-19, Phase 4). A thin always-present handle on
+// the right edge; hovering it (with a ~150 ms open-intent delay so a
+// cursor merely crossing the edge doesn't fire) or clicking it expands
+// the shared EpisodePanel. Leaving the handle + panel for ~300 ms closes
+// it (grace so a brief overshoot toward the season dropdown doesn't
+// dismiss). `useMenuOpenSync(open)` freezes the control-bar auto-hide
+// while it's open AND makes the overlay swallow the dismiss click — the
+// exact same coordination AniSkipMenu / SubtitlePicker use.
+// ---------------------------------------------------------------------------
+
+function EpisodeEdgeTrigger({
+  seriesId, mediaType, addons, currentEpisodeId, nextEpisodeId,
+  isFullscreen, libraryById, seriesArt, onPlayEpisode,
+}: NonNullable<Props["episodePanel"]>) {
+  const [open, setOpen] = useState(false);
+  useMenuOpenSync(open);
+
+  // Two timers: open-intent (hover dwell before expanding) and leave-
+  // grace (delay before collapsing). Refs so re-renders don't drop a
+  // pending timer.
+  const openTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearTimers = useCallback(() => {
+    if (openTimer.current) { clearTimeout(openTimer.current); openTimer.current = null; }
+    if (closeTimer.current) { clearTimeout(closeTimer.current); closeTimer.current = null; }
+  }, []);
+  useEffect(() => clearTimers, [clearTimers]);
+
+  const armOpen = useCallback(() => {
+    if (open) return;
+    if (closeTimer.current) { clearTimeout(closeTimer.current); closeTimer.current = null; }
+    if (openTimer.current) return;
+    openTimer.current = setTimeout(() => {
+      openTimer.current = null;
+      setOpen(true);
+    }, 150);
+  }, [open]);
+
+  const cancelOpen = useCallback(() => {
+    if (openTimer.current) { clearTimeout(openTimer.current); openTimer.current = null; }
+  }, []);
+
+  const armClose = useCallback(() => {
+    if (closeTimer.current) return;
+    closeTimer.current = setTimeout(() => {
+      closeTimer.current = null;
+      setOpen(false);
+    }, 300);
+  }, []);
+
+  const cancelClose = useCallback(() => {
+    if (closeTimer.current) { clearTimeout(closeTimer.current); closeTimer.current = null; }
+  }, []);
+
+  const closeNow = useCallback(() => {
+    clearTimers();
+    setOpen(false);
+  }, [clearTimers]);
+
+  return (
+    <>
+      {/* Always-present thin edge handle. z-[9998] keeps it just under
+          PlayerOverlay's click-capture (9999) but it has its own
+          pointer-events so hover/click still register. Stays put
+          regardless of the control-bar auto-hide — the user can summon
+          the episode list at any time. Hidden once the panel is open
+          (the panel covers this strip). */}
+      {!open && (
+        <button
+          type="button"
+          aria-label="Show episodes"
+          onClick={() => { cancelOpen(); setOpen(true); }}
+          onPointerEnter={armOpen}
+          onPointerLeave={cancelOpen}
+          className="fixed top-1/2 -translate-y-1/2 right-0 z-[9998]
+                     h-28 w-[10px] hover:w-[16px] rounded-l-lg
+                     bg-white/10 hover:bg-white/20 backdrop-blur-sm
+                     border-y border-l border-white/10
+                     flex items-center justify-center
+                     transition-[width,background-color] duration-150
+                     pointer-events-auto group"
+        >
+          <svg
+            width="12" height="12" viewBox="0 0 24 24" fill="currentColor"
+            className="text-white/55 group-hover:text-white/85 -ml-0.5"
+            aria-hidden
+          >
+            <path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z" />
+          </svg>
+        </button>
+      )}
+
+      {/* Shared drawer. Wrapped so a pointer dwelling on the panel
+          cancels the leave-grace, and leaving it (toward the video)
+          re-arms the close. EpisodePanel paints its own scrim + slides
+          in from the right; clicking the scrim / Escape / a row closes
+          it via onClose. */}
+      <div
+        className="pointer-events-auto"
+        onPointerEnter={cancelClose}
+        onPointerLeave={armClose}
+      >
+        <EpisodePanel
+          open={open}
+          onClose={closeNow}
+          seriesId={seriesId}
+          mediaType={mediaType}
+          addons={addons}
+          currentEpisodeId={currentEpisodeId}
+          nextEpisodeId={nextEpisodeId}
+          isFullscreen={isFullscreen}
+          libraryById={libraryById}
+          seriesArt={seriesArt}
+          onPlayEpisode={(v) => { closeNow(); onPlayEpisode(v); }}
+        />
+      </div>
+    </>
+  );
 }
 
 const SPEED_OPTIONS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5];
@@ -1090,6 +1215,7 @@ export default function PlayerOverlay({
   selectableSubLangs,
   scoringMeta, audioPriority, avoidDubs, userRegion,
   silentWakeCodes,
+  episodePanel,
 }: Props) {
   // ── Open-menu tracker ──────────────────────────────────────────────
   // Each child menu (TrackMenu, SpeedMenu, ShaderPicker, MoreMenu,
@@ -1879,7 +2005,7 @@ export default function PlayerOverlay({
               thumbnailAt={
                 streamUrl
                   ? (sec) =>
-                      invoke<string | null>("extract_thumbnail", {
+                      invoke<{ data_url: string; at: number } | null>("extract_thumbnail", {
                         url: streamUrl,
                         atSeconds: sec,
                       }).catch(() => null)
@@ -2146,6 +2272,14 @@ export default function PlayerOverlay({
         </div>
       </div>
 
+      {/* In-playback episode drawer — hover-right-edge trigger + the
+          shared EpisodePanel (EOS Spotlight spec, Phase 4). Only mounts
+          for series/anime (App passes `episodePanel` null for movies).
+          Lives inside MenuTrackerCtx so its open state freezes the
+          control-bar auto-hide and the overlay swallows the dismiss
+          click — same as the other submenus. */}
+      {episodePanel && <EpisodeEdgeTrigger {...episodePanel} />}
+
       {/* SubtitlePicker (OpenSubtitles search overlay) */}
       <SubtitlePicker
         open={subsOpen}
@@ -2189,12 +2323,15 @@ function Scrubber({
    *  amber bands overlaid on the scrub fill so the user can see where
    *  skip boundaries land. Hovering shows the kind + timestamps. */
   segments?: AuraSkipWindow[];
-  /** Async resolver: returns a frame data URL for a hovered second,
-   *  or null when none is available (extraction failed / no engine).
-   *  Optional — when absent the scrubber still shows the timestamp
-   *  tooltip on hover, just no image. Wired by PlayerOverlay to the
-   *  native `extract_thumbnail` libmpv engine. */
-  thumbnailAt?: (seconds: number) => Promise<string | null>;
+  /** Async resolver: returns the data URL + the ACTUAL `playback-time`
+   *  at which mpv produced the frame, or null when none is available
+   *  (extraction failed / no engine). Optional — when absent the
+   *  scrubber still shows the timestamp tooltip on hover, just no
+   *  image. Wired by PlayerOverlay to the native `extract_thumbnail`
+   *  libmpv engine. Reporting `at` lets us cache at the frame's real
+   *  second so an immediate re-hover at the same second hits the cache
+   *  instead of re-paying the seek+screenshot cost. */
+  thumbnailAt?: (seconds: number) => Promise<{ data_url: string; at: number } | null>;
 }) {
   const trackRef = useRef<HTMLDivElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -2214,6 +2351,22 @@ function Scrubber({
   // Seconds at the cursor (null when not hovering). Drives the always-
   // on timestamp tooltip and the debounced frame lookup.
   const hoverSec = hoverPct != null ? (hoverPct / 100) * max : null;
+  // Integer-second bucket. The fetch debounce keys on THIS, not the
+  // float `hoverSec`, so sub-second mouse moves WITHIN the same integer
+  // second don't reset the 220 ms timer. Earlier code keyed the effect
+  // dep on `hoverSec` directly, which meant every pointermove (every
+  // ~8-16 ms) re-ran the effect, the cleanup cancelled the pending
+  // 220 ms timer, and a fresh timer was scheduled — so as long as the
+  // user kept moving (even slowly) the timer NEVER fired and no fetch
+  // was issued. The visible symptom was "the displayed thumb only
+  // updates when the mouse leaves and re-enters the bar": leaving
+  // cleared `hoverSec` (separate effect below), re-entering populated
+  // a fresh `hoverSec` once → effect ran → timer fired → fetch
+  // succeeded → new thumb displayed. Bucketing the dep on `Math.floor`
+  // is the minimal correct fix: continuous hovering WITHIN an integer
+  // second leaves the timer alone (it fires after 220 ms), and only
+  // CROSSING an integer-second boundary cancels and re-schedules.
+  const hoverIntSec = hoverSec != null ? Math.max(0, Math.floor(hoverSec)) : null;
 
   // Async hover-thumbnail resolution. The engine (native libmpv
   // screenshot) is slow + serialised, so we DEBOUNCE on hover-settle,
@@ -2223,50 +2376,87 @@ function Scrubber({
   const thumbnailAtRef = useRef(thumbnailAt);
   useEffect(() => { thumbnailAtRef.current = thumbnailAt; }, [thumbnailAt]);
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
+  // The integer-second the current `thumbUrl` corresponds to (the sec
+  // for which the cached/fetched thumb was set). The render gates the
+  // <img> on `thumbUrlSec === hoverIntSec` so a stale URL — left over
+  // while the new fetch is in flight, OR carried briefly because React
+  // hasn't committed the setThumbUrl(null) yet, OR re-set by a late-
+  // arriving superseded .then — can never paint on top of a different
+  // hover position. Symptom this fixes: "after a thumb generates, the
+  // OLD thumb is shown for 1-2 s when moving to a new second before
+  // the new one resolves" (the user-reported regression after 837f850
+  // switched the effect dep to hoverIntSec). With this gate the user
+  // sees the loader during fetch latency, never a stale frame.
+  const [thumbUrlSec, setThumbUrlSec] = useState<number | null>(null);
   const [thumbBusy, setThumbBusy] = useState(false);
   const thumbCacheRef = useRef<Map<number, string>>(new Map());
   const thumbReqRef = useRef(0);
 
   useEffect(() => {
-    if (!thumbnailAtRef.current || hoverSec == null) return;
-    const sec = Math.max(0, Math.floor(hoverSec));
+    // Bump reqId FIRST — synchronously, before the cache check — so
+    // that ANY in-flight `.then` from a prior effect run is guaranteed
+    // to see a mismatch and discard, even on the cache-hit early
+    // return. Otherwise a stale fetch resolving during a cache-hit
+    // could overwrite the just-set thumbUrl with the prior sec's
+    // image (the supersession check at the .then catches this only if
+    // the bump happens before the .then runs — which is now always).
+    const reqId = ++thumbReqRef.current;
+    if (!thumbnailAtRef.current || hoverIntSec == null) return;
+    const sec = hoverIntSec;
     const cached = thumbCacheRef.current.get(sec);
-    if (cached) { setThumbUrl(cached); setThumbBusy(false); return; }
+    if (cached) {
+      setThumbUrl(cached);
+      setThumbUrlSec(sec);
+      setThumbBusy(false);
+      return;
+    }
     // New, uncached position → drop the (now stale) frame immediately
     // so the loader shows rather than the previous second's image.
+    // Pair with thumbUrlSec=null so the render gate falls back to the
+    // loader even if React is mid-commit on the prior URL.
     setThumbUrl(null);
+    setThumbUrlSec(null);
     setThumbBusy(true);
-    const reqId = ++thumbReqRef.current;
     const timer = setTimeout(() => {
       const fn = thumbnailAtRef.current;
       if (!fn) { setThumbBusy(false); return; }
       fn(sec)
-        .then((url) => {
+        .then((res) => {
           if (reqId !== thumbReqRef.current) return; // superseded
-          if (url) {
+          if (res) {
             const c = thumbCacheRef.current;
             if (c.size > 240) c.clear(); // crude bound; ~a few MB of data URLs
-            c.set(sec, url);
-            setThumbUrl(url);
+            // Cache at the ACTUAL playback-time the frame represents
+            // (Rust seek-confirmation poll guarantees pt ≈ requested ±0.5 s).
+            // Alias the requested second too when within 1 s tolerance so
+            // an immediate re-hover at the same integer-second is a hit.
+            const key = Math.max(0, Math.floor(res.at));
+            c.set(key, res.data_url);
+            if (Math.abs(res.at - sec) <= 1) c.set(sec, res.data_url);
+            setThumbUrl(res.data_url);
+            setThumbUrlSec(sec);
           } else {
             setThumbUrl(null);
+            setThumbUrlSec(null);
           }
           setThumbBusy(false);
         })
         .catch(() => {
           if (reqId !== thumbReqRef.current) return;
           setThumbUrl(null);
+          setThumbUrlSec(null);
           setThumbBusy(false);
         });
     }, 220);
     return () => clearTimeout(timer);
-  }, [hoverSec]);
+  }, [hoverIntSec]);
 
   // Leaving the track: invalidate any in-flight request and clear.
   useEffect(() => {
     if (hoverSec == null) {
       thumbReqRef.current += 1;
       setThumbUrl(null);
+      setThumbUrlSec(null);
       setThumbBusy(false);
     }
   }, [hoverSec]);
@@ -2452,7 +2642,14 @@ function Scrubber({
           {thumbnailAt && (thumbUrl || thumbBusy) && (
             <div className="relative w-40 aspect-video rounded-md overflow-hidden
                             aura-glass-menu shadow-[0_8px_24px_-8px_rgba(0,0,0,0.7)]">
-              {thumbUrl ? (
+              {/* Gate the <img> on thumbUrlSec === hoverIntSec so a stale
+                  URL (from a prior sec's fetch resolving after the user
+                  moved, or React batching the state update across a
+                  hoverIntSec change) NEVER paints over a new hover. The
+                  loader shows in that gap. Without this gate, the user-
+                  reported "old thumb shown for 1-2 s after a fresh hover
+                  before the new one resolves" symptom recurs. */}
+              {thumbUrl && thumbUrlSec === hoverIntSec ? (
                 <img
                   src={thumbUrl}
                   alt=""
@@ -2973,7 +3170,7 @@ function MoreMenu({
 
   const copy = useCallback(async () => {
     if (!streamUrl) { showFlash("No stream URL"); return; }
-    const ok = await copyToClipboard(streamUrl);
+    const ok = await copyTextToClipboard(streamUrl);
     showFlash(ok ? "Copied!" : "Copy failed");
   }, [streamUrl]);
 

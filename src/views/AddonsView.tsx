@@ -11,6 +11,32 @@ import { openContextMenu } from "../ContextMenu";
 import { showAppToast } from "../AppToast";
 import Tooltip from "../Tooltip";
 import { requestReopenAddons } from "../onboarding";
+import { copyTextToClipboard } from "../clipboard";
+
+/** Glass icon-button styling shared by the addon-row action cluster.
+ *  ACCENT = Copy/Configure/Refresh (blue accent hover); DESTRUCTIVE =
+ *  Remove (rose hover). Extracted so the cluster reads as one set and
+ *  the four buttons can't drift apart. */
+const ACCENT_ICON_BTN =
+  "w-10 h-10 flex items-center justify-center rounded-xl " +
+  "bg-white/[0.04] border border-white/10 " +
+  "text-white/65 hover:text-ln-accent " +
+  "hover:bg-ln-accent/12 hover:border-ln-accent/40 " +
+  "hover:shadow-[0_0_0_3px_rgba(91,164,255,0.08),0_4px_14px_-6px_rgba(91,164,255,0.45)] " +
+  "transition-all duration-150 " +
+  "disabled:opacity-40 disabled:hover:bg-white/[0.04] " +
+  "disabled:hover:border-white/10 disabled:hover:shadow-none " +
+  "active:scale-95 active:bg-ln-accent/18";
+const DESTRUCTIVE_ICON_BTN =
+  "w-10 h-10 flex items-center justify-center rounded-xl " +
+  "bg-white/[0.04] border border-white/10 " +
+  "text-white/65 hover:text-rose-300 " +
+  "hover:bg-rose-500/12 hover:border-rose-400/40 " +
+  "hover:shadow-[0_0_0_3px_rgba(244,63,94,0.08),0_4px_14px_-6px_rgba(244,63,94,0.45)] " +
+  "transition-all duration-150 " +
+  "disabled:opacity-40 disabled:hover:bg-white/[0.04] " +
+  "disabled:hover:border-white/10 disabled:hover:shadow-none " +
+  "active:scale-95 active:bg-rose-500/20";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -233,6 +259,18 @@ function AddonRow({
 }) {
   const [removing, setRemoving] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  // The manifest URL is the install URL with /manifest.json appended;
+  // Stremio "Configure" pages live at <base>/configure. Computed once
+  // here so the icon buttons AND the right-click context menu share a
+  // single source of truth.
+  const manifestUrl = addon.url.endsWith("/manifest.json")
+    ? addon.url
+    : `${addon.url.replace(/\/$/, "")}/manifest.json`;
+  const configureUrl = addon.url.endsWith("/manifest.json")
+    ? addon.url.replace(/\/manifest\.json$/, "/configure")
+    : `${addon.url.replace(/\/$/, "")}/configure`;
 
   const handleRemove = async () => {
     setRemoving(true);
@@ -271,6 +309,16 @@ function AddonRow({
     }
   };
 
+  const handleCopyManifest = async () => {
+    const ok = await copyTextToClipboard(manifestUrl);
+    if (ok) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } else {
+      showAppToast("Couldn't copy manifest URL", { duration: 3000 });
+    }
+  };
+
   return (
     <div
       className="group flex items-center gap-3 px-4 py-3 rounded-xl
@@ -278,14 +326,6 @@ function AddonRow({
                  transition-colors"
       onContextMenu={(e) => {
         e.preventDefault();
-        // The manifest URL is the install URL with /manifest.json appended.
-        const manifestUrl = addon.url.endsWith("/manifest.json")
-          ? addon.url
-          : `${addon.url.replace(/\/$/, "")}/manifest.json`;
-        // Stremio addon "Configure" pages live at <base>/configure
-        const configureUrl = addon.url.endsWith("/manifest.json")
-          ? addon.url.replace(/\/manifest\.json$/, "/configure")
-          : `${addon.url.replace(/\/$/, "")}/configure`;
         openContextMenu(e.clientX, e.clientY, [
           {
             label: "Configure addon",
@@ -297,7 +337,7 @@ function AddonRow({
           },
           {
             label: "Copy manifest URL",
-            onClick: () => navigator.clipboard.writeText(manifestUrl).catch(() => {}),
+            onClick: () => { void copyTextToClipboard(manifestUrl); },
           },
           {
             label: "Remove addon",
@@ -326,27 +366,41 @@ function AddonRow({
           </div>
         ) : null}
       </div>
-      {/* Paired icon buttons — Refresh + Remove. Larger glass-styled
-          targets, vertically centred against the row, persistent (no
-          hover-to-reveal) so the affordances are always discoverable.
-          Refresh uses the accent palette to match Aura's primary
-          actions; Remove uses rose hover for the destructive intent. */}
+      {/* Paired icon buttons — Copy, optional Configure, Refresh,
+          Remove. Larger glass-styled targets, vertically centred,
+          persistent (no hover-to-reveal). Copy/Configure reuse the
+          Refresh button's exact accent styling so the cluster reads as
+          one set; Remove uses rose hover for destructive intent. */}
       <div className="flex-shrink-0 flex items-center gap-2 self-center">
+        <Tooltip text={copied ? "Copied ✓" : "Copy manifest URL"} pos="bottom">
+          <button
+            type="button"
+            onClick={handleCopyManifest}
+            aria-label={`Copy ${addon.name} manifest URL`}
+            className={ACCENT_ICON_BTN}
+          >
+            <CopyIcon copied={copied} />
+          </button>
+        </Tooltip>
+        {addon.configurable && (
+          <Tooltip text="Configure addon" pos="bottom">
+            <button
+              type="button"
+              onClick={() => openUrl(configureUrl).catch(() => {})}
+              aria-label={`Configure ${addon.name}`}
+              className={ACCENT_ICON_BTN}
+            >
+              <ConfigureIcon />
+            </button>
+          </Tooltip>
+        )}
         <Tooltip text={refreshing ? "Refreshing…" : "Refresh manifest"} pos="bottom">
           <button
             type="button"
             onClick={handleRefresh}
             disabled={refreshing || removing}
             aria-label={`Refresh ${addon.name}`}
-            className="w-10 h-10 flex items-center justify-center rounded-xl
-                       bg-white/[0.04] border border-white/10
-                       text-white/65 hover:text-ln-accent
-                       hover:bg-ln-accent/12 hover:border-ln-accent/40
-                       hover:shadow-[0_0_0_3px_rgba(91,164,255,0.08),0_4px_14px_-6px_rgba(91,164,255,0.45)]
-                       transition-all duration-150
-                       disabled:opacity-40 disabled:hover:bg-white/[0.04]
-                       disabled:hover:border-white/10 disabled:hover:shadow-none
-                       active:scale-95 active:bg-ln-accent/18"
+            className={ACCENT_ICON_BTN}
           >
             <RefreshIcon spinning={refreshing} />
           </button>
@@ -357,15 +411,7 @@ function AddonRow({
             onClick={handleRemove}
             disabled={removing || refreshing}
             aria-label={`Remove ${addon.name}`}
-            className="w-10 h-10 flex items-center justify-center rounded-xl
-                       bg-white/[0.04] border border-white/10
-                       text-white/65 hover:text-rose-300
-                       hover:bg-rose-500/12 hover:border-rose-400/40
-                       hover:shadow-[0_0_0_3px_rgba(244,63,94,0.08),0_4px_14px_-6px_rgba(244,63,94,0.45)]
-                       transition-all duration-150
-                       disabled:opacity-40 disabled:hover:bg-white/[0.04]
-                       disabled:hover:border-white/10 disabled:hover:shadow-none
-                       active:scale-95 active:bg-rose-500/20"
+            className={DESTRUCTIVE_ICON_BTN}
           >
             {removing ? <SpinnerDot /> : <CloseIcon />}
           </button>
@@ -433,6 +479,55 @@ function SpinnerDot() {
       style={{ animation: "addon-spinner-pulse 0.9s ease-in-out infinite" }}
       aria-hidden
     />
+  );
+}
+
+/** Copy glyph — swaps to a checkmark for ~1.5 s after a successful
+ *  copy. Stroke-based so it inherits the button's hover text colour,
+ *  matching RefreshIcon / CloseIcon. */
+function CopyIcon({ copied }: { copied: boolean }) {
+  if (copied) {
+    return (
+      <svg
+        width="17" height="17" viewBox="0 0 24 24" fill="none"
+        stroke="currentColor" strokeWidth="2" strokeLinecap="round"
+        strokeLinejoin="round" aria-hidden
+      >
+        <polyline points="20 6 9 17 4 12" />
+      </svg>
+    );
+  }
+  return (
+    <svg
+      width="16" height="16" viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" strokeWidth="2" strokeLinecap="round"
+      strokeLinejoin="round" aria-hidden
+    >
+      <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+    </svg>
+  );
+}
+
+/** Configure glyph (sliders) — shown only for addons whose manifest
+ *  declares `behaviorHints.configurable`. */
+function ConfigureIcon() {
+  return (
+    <svg
+      width="17" height="17" viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" strokeWidth="2" strokeLinecap="round"
+      strokeLinejoin="round" aria-hidden
+    >
+      <line x1="4" y1="21" x2="4" y2="14" />
+      <line x1="4" y1="10" x2="4" y2="3" />
+      <line x1="12" y1="21" x2="12" y2="12" />
+      <line x1="12" y1="8" x2="12" y2="3" />
+      <line x1="20" y1="21" x2="20" y2="16" />
+      <line x1="20" y1="12" x2="20" y2="3" />
+      <line x1="1" y1="14" x2="7" y2="14" />
+      <line x1="9" y1="8" x2="15" y2="8" />
+      <line x1="17" y1="16" x2="23" y2="16" />
+    </svg>
   );
 }
 

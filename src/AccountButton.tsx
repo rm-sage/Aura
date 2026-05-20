@@ -31,13 +31,12 @@ interface Props {
   /** Display nickname if available. Currently null in the source — wired
    *  through for forward-compat when Stremio surfaces one. */
   nickname?: string | null;
-  onOpenSettings: () => void;
   onLoginRequest?: () => void;
   onLogout?: () => void;
 }
 
 export default function AccountButton({
-  loggedIn, email, nickname, onOpenSettings, onLoginRequest, onLogout,
+  loggedIn, email, nickname, onLoginRequest, onLogout,
 }: Props) {
   const [open, setOpen] = useState(false);
 
@@ -107,7 +106,6 @@ export default function AccountButton({
           email={email}
           nickname={nickname}
           onClose={() => setOpen(false)}
-          onSettings={() => { setOpen(false); onOpenSettings(); }}
           onLogin={() => { setOpen(false); onLoginRequest?.(); }}
           onLogout={() => { setOpen(false); onLogout?.(); }}
         />

@@ -34,14 +34,15 @@ import type { LibraryItem } from "./types";
  *   kitsu:12345:5     → kitsu:12345        (anime episode, with prefix)
  *   mal:42:7          → mal:42             (anime episode, with prefix)
  *
- * Heuristic: 2+ colons means episode-level; the FIRST segment tells us
- * whether the id is prefix-style (`kitsu:`, `mal:`, …) by checking for a
- * non-digit character.
+ * Heuristic: 3+ segments (2+ colons) means episode-level. The FIRST
+ * segment discriminates a pure-alpha namespace prefix (`kitsu`, `mal`,
+ * `tmdb`, …) from an alphanumeric IMDb id (`tt0903747`): a prefixed id
+ * keeps its `<prefix>:<id>` root, a bare IMDb id is the root by itself.
  */
 export function libraryItemSeriesId(id: string): string {
   const parts = id.split(":");
   if (parts.length <= 2) return id;
-  const hasPrefix = /[a-zA-Z]/.test(parts[0]);
+  const hasPrefix = /^[a-zA-Z]+$/.test(parts[0]);
   return hasPrefix ? `${parts[0]}:${parts[1]}` : parts[0];
 }
 

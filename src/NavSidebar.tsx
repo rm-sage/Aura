@@ -1,7 +1,10 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import type { StremioAccount } from "./LoginView";
 import AuraLogoA from "./AuraLogoA";
 
 export type NavView = "home" | "library" | "queue" | "addons" | "discover" | "calendar" | "history" | "settings";
@@ -96,11 +99,9 @@ const SignInIcon = () => (
     <path d="M11 7L9.6 8.4l2.6 2.6H2v2h10.2l-2.6 2.6L11 17l5-5-5-5zm9 12h-8v2h8c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2h-8v2h8v14z" />
   </svg>
 );
-const CogIconSm = () => (
-  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-    <path d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.07-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61 l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41 h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.74,8.87 C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.07,0.94l-2.03,1.58 c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-0.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54 c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.44-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96 c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.47-0.12-0.61L19.14,12.94z M12,15.6c-1.98,0-3.6-1.62-3.6-3.6 s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z" />
-  </svg>
-);
+// (CogIconSm removed — the popover's "Account settings" button it
+//  iconed was replaced by inline account details + a "Manage on
+//  Stremio" link in ProfilePopover.)
 
 // ---------------------------------------------------------------------------
 // Item groups
@@ -476,16 +477,44 @@ function NavRow({ label, icon, active, onClick }: RowProps) {
 // ---------------------------------------------------------------------------
 
 export function ProfilePopover({
-  loggedIn, email, nickname, onClose, onSettings, onLogin, onLogout,
+  loggedIn, email, nickname, onClose, onLogin, onLogout,
 }: {
   loggedIn: boolean;
   email?: string | null;
   nickname?: string | null;
   onClose: () => void;
-  onSettings: () => void;
   onLogin: () => void;
   onLogout: () => void;
 }) {
+  // Read-only Stremio account snapshot, baked directly into this
+  // popover (the former separate "Account settings" panel was folded
+  // in here). The Rust command is cached 24h, so each popover open is
+  // a cache hit. Best-effort — failure just leaves the prop email.
+  const [acct, setAcct] = useState<StremioAccount | null>(null);
+  useEffect(() => {
+    if (!loggedIn) { setAcct(null); return; }
+    let cancelled = false;
+    invoke<StremioAccount>("fetch_stremio_account")
+      .then((a) => { if (!cancelled) setAcct(a); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [loggedIn]);
+
+  const monthYear = (iso: string | null | undefined): string | null => {
+    if (!iso) return null;
+    const t = Date.parse(iso);
+    if (Number.isNaN(t)) return null;
+    return new Date(t).toLocaleDateString(undefined, { month: "short", year: "numeric" });
+  };
+
+  const fetchedEmail = acct?.email && acct.email.length > 0 ? acct.email : null;
+  const propEmail = email && email.length > 0 ? email : null;
+  const shownEmail = fetchedEmail ?? propEmail;
+  const since = monthYear(acct?.date_registered);
+  const premium = monthYear(acct?.premium_until);
+  const id = acct?.user_id ?? "";
+  const acctId = id.length > 12 ? `${id.slice(0, 6)}…${id.slice(-4)}` : (id || null);
+
   return (
     <div
       data-profile-popover
@@ -512,36 +541,47 @@ export function ProfilePopover({
                 style={{ boxShadow: loggedIn ? "0 0 8px rgba(110,231,183,0.65)" : undefined }} />
         </span>
         <div className="flex-1 min-w-0 selectable">
-          {(() => {
-            // Three display states:
-            //   • Guest          → "Guest mode" + "No Stremio account linked"
-            //   • Logged in, email known      → "Stremio account" + email
-            //   • Logged in, email missing    → "Stremio account" + "—" (no fake duplicate)
-            // The duplicate "Stremio account / Stremio account" rendering
-            // pre-0.6.17 was caused by passing the same placeholder as
-            // both nickname and email; we now pass raw fields and let the
-            // popover decide what to show.
-            if (!loggedIn) {
-              return (
-                <>
-                  <p className="text-white/95 text-sm font-semibold leading-tight truncate">Guest mode</p>
-                  <p className="text-white/45 text-[11px] mt-0.5 truncate font-mono">No Stremio account linked</p>
-                </>
-              );
-            }
-            const hasEmail = !!email && email.length > 0;
-            const topName  = nickname && nickname.length > 0 ? nickname : "Stremio account";
-            return (
-              <>
-                <p className="text-white/95 text-sm font-semibold leading-tight truncate">{topName}</p>
-                <p className="text-white/45 text-[11px] mt-0.5 truncate font-mono">
-                  {hasEmail ? email : "Email pending sync"}
-                </p>
-              </>
-            );
-          })()}
+          {!loggedIn ? (
+            <>
+              <p className="text-white/95 text-sm font-semibold leading-tight truncate">Guest mode</p>
+              <p className="text-white/45 text-[11px] mt-0.5 truncate font-mono">No Stremio account linked</p>
+            </>
+          ) : (
+            <>
+              <p className="text-white/95 text-sm font-semibold leading-tight truncate">
+                {nickname && nickname.length > 0 ? nickname : "Stremio account"}
+              </p>
+              <p className="text-white/45 text-[11px] mt-0.5 truncate font-mono">
+                {shownEmail ?? "Email pending sync"}
+              </p>
+            </>
+          )}
         </div>
       </div>
+
+      {/* Account details — baked in (replaces the old separate panel). */}
+      {loggedIn && (since || acctId || premium) && (
+        <div className="px-4 py-3 border-b border-white/8 space-y-1.5 selectable">
+          {since && (
+            <div className="flex items-center justify-between gap-3 text-[12px]">
+              <span className="text-white/40">Member since</span>
+              <span className="text-white/85">{since}</span>
+            </div>
+          )}
+          {acctId && (
+            <div className="flex items-center justify-between gap-3 text-[12px]">
+              <span className="text-white/40">Account</span>
+              <span className="text-white/85 font-mono">{acctId}</span>
+            </div>
+          )}
+          {premium && (
+            <div className="flex items-center justify-between gap-3 text-[12px]">
+              <span className="text-white/40">Stremio Premium</span>
+              <span className="text-white/85">until {premium}</span>
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="px-4 py-3 border-b border-white/8">
         <p className="text-white/40 text-[9.5px] font-mono font-semibold tracking-[0.18em] uppercase mb-1.5">
@@ -557,7 +597,17 @@ export function ProfilePopover({
       </div>
 
       <div className="py-1">
-        <PopoverButton icon={<CogIconSm />} label="Account settings" onClick={onSettings} />
+        {loggedIn && (
+          <PopoverButton
+            icon={
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                <path d="M14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7zM19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7z" />
+              </svg>
+            }
+            label="Manage on Stremio"
+            onClick={() => { openUrl("https://www.stremio.com/acc-settings").catch(() => {}); }}
+          />
+        )}
         {loggedIn ? (
           <PopoverButton icon={<LogOutIcon />} label="Log out" danger onClick={onLogout} />
         ) : (

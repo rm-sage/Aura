@@ -21,6 +21,11 @@ export interface AddonEntry {
   id_prefixes?: string[];
   /** Per-resource override of `idPrefixes` for the stream resource. */
   stream_id_prefixes?: string[];
+  /** Manifest `behaviorHints.configurable` — true when the addon hosts a
+   *  `/configure` page. Drives the conditional Configure button in the
+   *  Addons UI. Optional for back-compat with any cached pre-field shape;
+   *  the Rust side now always emits it (default `false`). */
+  configurable?: boolean;
 }
 
 /** One cast / producer entry with optional character pairing + photo.

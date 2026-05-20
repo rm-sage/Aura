@@ -368,18 +368,39 @@ export async function fetchReleaseSignals(
  *  Also invalidates the single-fetch cache entry so the next
  *  `fetchReleaseSignal` call doesn't return the stale pre-nudge
  *  value. */
+// A manual library refresh fires one fire-and-forget nudge per tt id
+// (hundreds, in a sub-second burst). 429 is the EXPECTED rate-limit
+// response and is harmless — the cloud polls on its own 5 s tick and
+// a re-batch is scheduled after 30 s. Coalesce the 429s into ONE
+// debounced summary instead of one DevConsole line per id so a
+// large-library refresh doesn't flood the console.
+let nudge429Count = 0;
+let nudge429Timer: ReturnType<typeof setTimeout> | null = null;
+function noteNudge429(): void {
+  nudge429Count += 1;
+  if (nudge429Timer) return;
+  nudge429Timer = setTimeout(() => {
+    console.info(
+      `[release-search] nudgeReleasePoller: ${nudge429Count} rate-limited (429) ` +
+      `— expected/harmless (cloud polls on its own tick + 30s re-batch)`,
+    );
+    nudge429Count = 0;
+    nudge429Timer = null;
+  }, 2000);
+}
+
 export function nudgeReleasePoller(imdbId: string, type?: ReleaseMediaType): void {
   if (!imdbId) return;
   invalidateReleaseSignal(imdbId);
   void invoke<void>("nudge_release_poller", { imdbId, mediaType: type ?? null })
     .catch((err) => {
-      // 429 is the expected response when the cloud's rate-limit
-      // bucket is full — not an actionable failure. Demote to
-      // `info` so it stays in DevConsole but doesn't make it past
-      // the Sentry `["error", "warn"]` capture levels.
       const msg = String(err);
-      const log = msg.includes("429") ? console.info : console.warn;
-      log(`[release-search] nudgeReleasePoller(${imdbId}) failed: ${msg}`);
+      // 429 = cloud rate-limit bucket full: expected, not actionable;
+      // coalesced into one summary (kept at `info` so it never reaches
+      // the Sentry ["error","warn"] capture levels). Anything else is
+      // rare + actionable → individual warn.
+      if (msg.includes("429")) { noteNudge429(); return; }
+      console.warn(`[release-search] nudgeReleasePoller(${imdbId}) failed: ${msg}`);
     });
 }
 

@@ -16,6 +16,19 @@ export interface UserSession {
   user_id?: string | null;
 }
 
+/** Read-only Stremio account snapshot from the `fetch_stremio_account`
+ *  Tauri command. snake_case mirrors the Rust struct's wire field names
+ *  exactly (no serde rename in play). Optional fields are `null` when
+ *  `/getUser` omits them OR returns an empty string (the Rust side
+ *  filters non-empty) — the popover hides those rows rather than
+ *  showing placeholders. */
+export interface StremioAccount {
+  email: string;
+  user_id: string;
+  date_registered?: string | null;
+  premium_until?: string | null;
+}
+
 interface Props {
   onSuccess: (session: UserSession) => void;
   onGuest: () => void;
