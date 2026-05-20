@@ -502,6 +502,22 @@ function usePlayback(playerActive: boolean) {
   const lastTimeUpdateAtRef = useRef<number>(0);
 
   useEffect(() => {
+    // Previous tick's `payload.paused` for the keep-open EOS branch
+    // below. With `keep-open=yes` + `keep-open-pause=yes` (player.rs
+    // init_mpv), mpv at true EOF does NOT emit END_FILE — it auto-
+    // pauses internally and holds the last frame. That breaks the
+    // existing EOS-trigger paths:
+    //   • The immediate-fire branch below has a `!_isPaused` guard
+    //     that fails the moment mpv auto-pauses.
+    //   • The 1 Hz stale-heartbeat detector early-returns on `paused`.
+    //   • `playback-end {reason:"eof"}` never fires under keep-open.
+    // The unambiguous EOS signal under keep-open is the false→true
+    // transition of `paused` while time is near duration. (A manual
+    // user-pause can happen at any time, not specifically near the
+    // end — so the near-duration gate keeps it unambiguous.) Live in
+    // the listener effect so it's per-mount (re-created on dep change
+    // matches the natural fresh-listener lifetime).
+    let prevPayloadPaused = false;
     const p = listen<PlaybackPayload>("playback-update", ({ payload }) => {
       if (typeof payload.time === "number") {
         lastTimeUpdateAtRef.current = Date.now();
@@ -560,6 +576,41 @@ function usePlayback(playerActive: boolean) {
       ) {
         nearEndEosFiredRef.current = true;
         window.dispatchEvent(new CustomEvent("aura:eos-detected"));
+      }
+
+      // EOS Spotlight — keep-open paused-transition branch (2026-05-20).
+      // With `keep-open=yes` + `keep-open-pause=yes` (player.rs), mpv
+      // at true EOF auto-pauses on the last frame instead of emitting
+      // MPV_EVENT_END_FILE. The immediate-fire branch above can't catch
+      // it because `!_isPaused` is false in that exact tick, and the
+      // playback-end {eof} / stale-heartbeat fallbacks ALSO fail (the
+      // event never fires; the stale detector early-returns on paused).
+      // Solution: the unambiguous EOS signal under keep-open is the
+      // false→true transition of `paused` WHILE time is near duration.
+      // 0.75 s window is slightly more generous than the 0.5 s
+      // immediate-fire window because mpv's last reported time before
+      // the pause-transition can be a frame or two earlier than the
+      // true duration — we want this to catch reliably. A user manual
+      // pause CANNOT satisfy both "transition to paused this tick" AND
+      // "within 0.75 s of duration" except at true EOF. Shares the
+      // one-shot nearEndEosFiredRef so all paths latch through one
+      // fuse; the existing aura:eos-detected listener stays unchanged.
+      if (
+        !nearEndEosFiredRef.current &&
+        _isPaused && !prevPayloadPaused &&
+        _t != null && _d != null && _t > 0 && _d > 0 &&
+        _d - _t <= 0.75
+      ) {
+        nearEndEosFiredRef.current = true;
+        window.dispatchEvent(new CustomEvent("aura:eos-detected"));
+      }
+
+      // Update prev-paused tracker AT THE END so the next tick
+      // compares against THIS tick's paused state. Only update when
+      // payload actually carried a paused field — otherwise we'd
+      // collapse to false on every payload that lacks it.
+      if (typeof payload.paused === "boolean") {
+        prevPayloadPaused = payload.paused;
       }
     });
     return () => { p.then((fn) => fn()).catch(() => {}); };

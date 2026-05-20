@@ -2376,20 +2376,47 @@ function Scrubber({
   const thumbnailAtRef = useRef(thumbnailAt);
   useEffect(() => { thumbnailAtRef.current = thumbnailAt; }, [thumbnailAt]);
   const [thumbUrl, setThumbUrl] = useState<string | null>(null);
+  // The integer-second the current `thumbUrl` corresponds to (the sec
+  // for which the cached/fetched thumb was set). The render gates the
+  // <img> on `thumbUrlSec === hoverIntSec` so a stale URL — left over
+  // while the new fetch is in flight, OR carried briefly because React
+  // hasn't committed the setThumbUrl(null) yet, OR re-set by a late-
+  // arriving superseded .then — can never paint on top of a different
+  // hover position. Symptom this fixes: "after a thumb generates, the
+  // OLD thumb is shown for 1-2 s when moving to a new second before
+  // the new one resolves" (the user-reported regression after 837f850
+  // switched the effect dep to hoverIntSec). With this gate the user
+  // sees the loader during fetch latency, never a stale frame.
+  const [thumbUrlSec, setThumbUrlSec] = useState<number | null>(null);
   const [thumbBusy, setThumbBusy] = useState(false);
   const thumbCacheRef = useRef<Map<number, string>>(new Map());
   const thumbReqRef = useRef(0);
 
   useEffect(() => {
+    // Bump reqId FIRST — synchronously, before the cache check — so
+    // that ANY in-flight `.then` from a prior effect run is guaranteed
+    // to see a mismatch and discard, even on the cache-hit early
+    // return. Otherwise a stale fetch resolving during a cache-hit
+    // could overwrite the just-set thumbUrl with the prior sec's
+    // image (the supersession check at the .then catches this only if
+    // the bump happens before the .then runs — which is now always).
+    const reqId = ++thumbReqRef.current;
     if (!thumbnailAtRef.current || hoverIntSec == null) return;
     const sec = hoverIntSec;
     const cached = thumbCacheRef.current.get(sec);
-    if (cached) { setThumbUrl(cached); setThumbBusy(false); return; }
+    if (cached) {
+      setThumbUrl(cached);
+      setThumbUrlSec(sec);
+      setThumbBusy(false);
+      return;
+    }
     // New, uncached position → drop the (now stale) frame immediately
     // so the loader shows rather than the previous second's image.
+    // Pair with thumbUrlSec=null so the render gate falls back to the
+    // loader even if React is mid-commit on the prior URL.
     setThumbUrl(null);
+    setThumbUrlSec(null);
     setThumbBusy(true);
-    const reqId = ++thumbReqRef.current;
     const timer = setTimeout(() => {
       const fn = thumbnailAtRef.current;
       if (!fn) { setThumbBusy(false); return; }
@@ -2407,14 +2434,17 @@ function Scrubber({
             c.set(key, res.data_url);
             if (Math.abs(res.at - sec) <= 1) c.set(sec, res.data_url);
             setThumbUrl(res.data_url);
+            setThumbUrlSec(sec);
           } else {
             setThumbUrl(null);
+            setThumbUrlSec(null);
           }
           setThumbBusy(false);
         })
         .catch(() => {
           if (reqId !== thumbReqRef.current) return;
           setThumbUrl(null);
+          setThumbUrlSec(null);
           setThumbBusy(false);
         });
     }, 220);
@@ -2426,6 +2456,7 @@ function Scrubber({
     if (hoverSec == null) {
       thumbReqRef.current += 1;
       setThumbUrl(null);
+      setThumbUrlSec(null);
       setThumbBusy(false);
     }
   }, [hoverSec]);
@@ -2611,7 +2642,14 @@ function Scrubber({
           {thumbnailAt && (thumbUrl || thumbBusy) && (
             <div className="relative w-40 aspect-video rounded-md overflow-hidden
                             aura-glass-menu shadow-[0_8px_24px_-8px_rgba(0,0,0,0.7)]">
-              {thumbUrl ? (
+              {/* Gate the <img> on thumbUrlSec === hoverIntSec so a stale
+                  URL (from a prior sec's fetch resolving after the user
+                  moved, or React batching the state update across a
+                  hoverIntSec change) NEVER paints over a new hover. The
+                  loader shows in that gap. Without this gate, the user-
+                  reported "old thumb shown for 1-2 s after a fresh hover
+                  before the new one resolves" symptom recurs. */}
+              {thumbUrl && thumbUrlSec === hoverIntSec ? (
                 <img
                   src={thumbUrl}
                   alt=""
