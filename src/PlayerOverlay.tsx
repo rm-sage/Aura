@@ -2351,6 +2351,22 @@ function Scrubber({
   // Seconds at the cursor (null when not hovering). Drives the always-
   // on timestamp tooltip and the debounced frame lookup.
   const hoverSec = hoverPct != null ? (hoverPct / 100) * max : null;
+  // Integer-second bucket. The fetch debounce keys on THIS, not the
+  // float `hoverSec`, so sub-second mouse moves WITHIN the same integer
+  // second don't reset the 220 ms timer. Earlier code keyed the effect
+  // dep on `hoverSec` directly, which meant every pointermove (every
+  // ~8-16 ms) re-ran the effect, the cleanup cancelled the pending
+  // 220 ms timer, and a fresh timer was scheduled — so as long as the
+  // user kept moving (even slowly) the timer NEVER fired and no fetch
+  // was issued. The visible symptom was "the displayed thumb only
+  // updates when the mouse leaves and re-enters the bar": leaving
+  // cleared `hoverSec` (separate effect below), re-entering populated
+  // a fresh `hoverSec` once → effect ran → timer fired → fetch
+  // succeeded → new thumb displayed. Bucketing the dep on `Math.floor`
+  // is the minimal correct fix: continuous hovering WITHIN an integer
+  // second leaves the timer alone (it fires after 220 ms), and only
+  // CROSSING an integer-second boundary cancels and re-schedules.
+  const hoverIntSec = hoverSec != null ? Math.max(0, Math.floor(hoverSec)) : null;
 
   // Async hover-thumbnail resolution. The engine (native libmpv
   // screenshot) is slow + serialised, so we DEBOUNCE on hover-settle,
@@ -2365,8 +2381,8 @@ function Scrubber({
   const thumbReqRef = useRef(0);
 
   useEffect(() => {
-    if (!thumbnailAtRef.current || hoverSec == null) return;
-    const sec = Math.max(0, Math.floor(hoverSec));
+    if (!thumbnailAtRef.current || hoverIntSec == null) return;
+    const sec = hoverIntSec;
     const cached = thumbCacheRef.current.get(sec);
     if (cached) { setThumbUrl(cached); setThumbBusy(false); return; }
     // New, uncached position → drop the (now stale) frame immediately
@@ -2403,7 +2419,7 @@ function Scrubber({
         });
     }, 220);
     return () => clearTimeout(timer);
-  }, [hoverSec]);
+  }, [hoverIntSec]);
 
   // Leaving the track: invalidate any in-flight request and clear.
   useEffect(() => {

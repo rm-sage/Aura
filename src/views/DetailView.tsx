@@ -165,6 +165,20 @@ interface Props {
    *  starting at the first episode regardless of any state.video_id
    *  resume hint stamped from previous CW interactions. */
   ignoreResumeHint?: boolean;
+  /** When true, force the initial panelMode to "streams" for the
+   *  episode pointed to by `openOnEpisodeId`, skipping the episodes-
+   *  list intermediate step. Highest precedence over the
+   *  openOnEpisodeId / resumeVideoId branches. Used by the EOS
+   *  Spotlight's EpisodePanel single-click flow (2026-05-20) so a user
+   *  who picks an episode from the in-player panel lands directly on
+   *  the streams picker for that episode. Consumed once via
+   *  `onConsumeOpenInStreamsMode` so the hint can't bleed into a
+   *  later unrelated open. */
+  openInStreamsMode?: boolean;
+  /** Called once after `openInStreamsMode` has been consumed (after
+   *  the initial mount effect runs). Lets the parent clear the hint
+   *  so a later open from an unrelated card doesn't inherit it. */
+  onConsumeOpenInStreamsMode?: () => void;
 }
 
 const CloseIcon = () => (
@@ -260,7 +274,7 @@ export default function DetailView(props: Props) {
   );
 }
 
-function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, openOnEpisodeId, onConsumeOpenHint, ignoreResumeHint }: Props) {
+function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, openOnEpisodeId, onConsumeOpenHint, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
   const [detail, setDetail]                 = useState<MetaDetail | null>(null);
   const [streams, setStreams]               = useState<StreamEntry[]>([]);
   const [streamMeta, setStreamMeta]         = useState<StreamMetadata>({
@@ -377,9 +391,24 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
   // EXCEPTION: when `openOnEpisodeId` is set (i.e. we're remounting right
   // after the user exited playback), force episodes mode so they land on
   // the list with the just-played episode anchored at the top.
+  //
+  // HIGHEST-PRECEDENCE EXCEPTION: when `openInStreamsMode` is set (the EOS
+  // Spotlight's EpisodePanel single-click path, 2026-05-20), force STREAMS
+  // mode for the chosen `openOnEpisodeId` — skips the episodes-list
+  // intermediate step so the user lands one click from playable.
   const [panelMode, setPanelMode] = useState<PanelMode>(
-    isEpisodic && (openOnEpisodeId || !resumeVideoId) ? "episodes" : "streams"
+    openInStreamsMode
+      ? "streams"
+      : isEpisodic && (openOnEpisodeId || !resumeVideoId) ? "episodes" : "streams"
   );
+
+  // One-shot consume of the streams-mode hint. Runs once on mount (deps
+  // intentionally minimal); the parent clears its state on the next
+  // render so a later open from an unrelated surface starts clean.
+  useEffect(() => {
+    if (openInStreamsMode) onConsumeOpenInStreamsMode?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Snapshot the open hint into a local state at mount so we can clear
   // the parent's prop immediately (next renders pass null) without
@@ -787,6 +816,26 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
     const v = resolveResumeEpisode(resumeVideoId, detail?.videos);
     if (v) setActiveVideo(v);
   }, [detail?.videos, resumeVideoId, isEpisodic, activeVideo]);
+
+  // EOS Spotlight EpisodePanel single-click path (2026-05-20): when
+  // `openInStreamsMode` AND `openOnEpisodeId` are both set, snap
+  // `activeVideo` to the CLICKED episode (not the last-played one
+  // from state.video_id). Without this the streams panel would render
+  // streams for whatever Stremio's state.video_id last stamped (the
+  // just-finished episode), not the episode the user explicitly
+  // picked in the in-player panel. Runs once when videos arrive; the
+  // existing resume effect above is skipped because activeVideo is
+  // already set after this fires. resolveResumeEpisode handles
+  // legacy id-shape mismatches (cour-aggregation, etc.) — same
+  // resilience the resume path gets.
+  useEffect(() => {
+    if (activeVideo) return;
+    if (!isEpisodic) return;
+    if (!openInStreamsMode) return;
+    if (!openOnEpisodeId) return;
+    const v = resolveResumeEpisode(openOnEpisodeId, detail?.videos);
+    if (v) setActiveVideo(v);
+  }, [detail?.videos, openInStreamsMode, openOnEpisodeId, isEpisodic, activeVideo]);
 
   const groupedStreams = useMemo(() => {
     const map = new Map<string, StreamEntry[]>();

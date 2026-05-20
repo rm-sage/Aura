@@ -537,10 +537,17 @@ function usePlayback(playerActive: boolean) {
       if (typeof payload.eof === "boolean")     setEof(payload.eof);
 
       // EOS Spotlight — immediate-fire on the live tick. mpv's time-pos halts
-      // within ~0.25 s of duration at true EOF on this libmpv build; without
+      // within ~0.5 s of duration at true EOF on this libmpv build; without
       // this, the stale-heartbeat path adds a 1.5 s floor. Shares the one-shot
       // nearEndEosFiredRef so the 1.5 s / 8 s / playback-end {eof} fallbacks
-      // all latch through one fuse.
+      // all latch through one fuse. Window widened from 0.25 → 0.5 s
+      // (2026-05-20): the 0.25 s threshold was tighter than the actual last
+      // tick before mpv entered keep-open state (now `keep-open=yes`), so
+      // many true-EOF flushes fell through to the 1.5 s stale-heartbeat path
+      // — visible as a ~1.5 s delay before the Spotlight appeared. 0.5 s
+      // catches the genuine last tick while still being narrow enough that
+      // mid-playback ticks don't trip it (a forward seek would have to land
+      // within half a second of duration, which only happens at true EOF).
       const _t = typeof payload.time     === "number" ? payload.time     : null;
       const _d = typeof payload.duration === "number" ? payload.duration : null;
       const _isPaused = typeof payload.paused === "boolean" ? payload.paused : false;
@@ -548,7 +555,7 @@ function usePlayback(playerActive: boolean) {
         !nearEndEosFiredRef.current &&
         _t != null && _d != null &&
         _t > 0 && _d > 0 &&
-        _d - _t <= 0.25 &&
+        _d - _t <= 0.5 &&
         !_isPaused
       ) {
         nearEndEosFiredRef.current = true;
@@ -922,6 +929,20 @@ export default function App() {
    *  request — search / catalog / library / hero / history / calendar
    *  all preferred the episodes-list-first behaviour. */
   const [ignoreResumeOnNextOpen, setIgnoreResumeOnNextOpen] = useState(true);
+
+  /** When true, DetailView's next mount opens directly in STREAMS mode
+   *  for the supplied `openOnEpisodeId`, skipping the episodes-list
+   *  intermediate step. Used by the EOS Spotlight's EpisodePanel
+   *  single-click flow (2026-05-20): the user picks an episode from
+   *  the in-player panel, App bounces them out to DetailView, and
+   *  rather than landing on the episodes list (one extra click) they
+   *  land directly on the streams panel for the chosen episode. Highest
+   *  precedence over openOnEpisodeId/resumeVideoId default branches in
+   *  DetailView's panelMode init. One-shot — consumed via
+   *  `onConsumeOpenInStreamsMode` on the next render so a stale flag
+   *  doesn't bleed into a later unrelated open. */
+  const [openInStreamsMode, setOpenInStreamsMode] = useState(false);
+  const consumeOpenInStreamsMode = useCallback(() => setOpenInStreamsMode(false), []);
 
   /** Default open: ignores the resume hint. Used by every surface that
    *  isn't a CW tile (search / catalog / library / hero / history /
@@ -3925,10 +3946,14 @@ export default function App() {
     // handleExitPlayback + the 80% autocomplete from the prior pass).
     handleExitPlayback();
     // Anchor DetailView on this episode + force streams-mode initial panel
-    // (DetailView's panelMode initial state already routes to "streams"
-    // when openOnEpisodeId is set + resume is being ignored).
+    // so the user lands directly in the streams picker for the chosen
+    // episode (one click from Spotlight's EpisodePanel → playable). The
+    // openInStreamsMode hint takes precedence in DetailView's panelMode
+    // init; without it the user would land on the episodes-list view
+    // and have to click the episode again to reach the streams panel.
     setLastPlayedEpisodeId(video.id);
     setIgnoreResumeOnNextOpen(false);
+    setOpenInStreamsMode(true);
     setSelectedRect(null);
     setSelectedMeta(meta);
   }, [
@@ -4912,6 +4937,7 @@ export default function App() {
             onExit={onEosExit}
             onDismiss={onEosDismiss}
             onOpenEpisodes={() => setEosEpisodesOpen(true)}
+            episodesOpen={eosEpisodesOpen}
           />
         );
       })()}
@@ -4976,6 +5002,8 @@ export default function App() {
           openOnEpisodeId={lastPlayedEpisodeId}
           ignoreResumeHint={ignoreResumeOnNextOpen}
           onConsumeOpenHint={consumeLastPlayedEpisode}
+          openInStreamsMode={openInStreamsMode}
+          onConsumeOpenInStreamsMode={consumeOpenInStreamsMode}
         />
       )}
 

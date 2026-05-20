@@ -197,6 +197,19 @@ pub fn init_mpv<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     // keeps the OS-level vibrancy / desktop visible behind the player.
     initial_options.insert("background".into(), serde_json::json!("none"));
 
+    // keep-open=yes — at EOF, do NOT unload the file. mpv holds the last
+    // frame, pauses (keep-open-pause=yes is default for keep-open=yes),
+    // and remains fully seekable. This is what makes the EOS Spotlight's
+    // dismiss-and-rewind / Replay flow work: after the user finishes an
+    // episode they can scrub backward without reloading. MPV_EVENT_END_FILE
+    // reason=eof still fires before mpv enters keep-open state, so our
+    // playback-end{eof} → aura:eos-detected path is intact (and now also
+    // arrives more reliably). loadfile "replace" cleanly discards the
+    // held frame on the next play. NO observed-properties impact
+    // (landmine #4 — keep-open is an initial_option only).
+    initial_options.insert("keep-open".into(),       serde_json::json!("yes"));
+    initial_options.insert("keep-open-pause".into(), serde_json::json!("yes"));
+
     // ── HDR ────────────────────────────────────────────────────────────────
     // Tri-state mode (was a boolean — see settings.rs). The previous "on"
     // path (target-colorspace-hint=yes + tone-mapping=auto + compute-peak)

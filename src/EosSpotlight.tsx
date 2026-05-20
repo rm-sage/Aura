@@ -69,12 +69,23 @@ interface Props {
    *  so the user is left looking at the paused final frame. Wired to
    *  the × button and Escape. */
   onDismiss: () => void;
+  /** True when the EpisodePanel drawer (opened via Spotlight's
+   *  "Episodes" button) is on top of the Spotlight. Esc cascade
+   *  contract: panel closes FIRST (its own listener), then Spotlight
+   *  dismisses, then App's playback-exit. Without this gate, BOTH the
+   *  panel's Esc and Spotlight's Esc fire on the same keystroke and
+   *  the user loses the Spotlight after dismissing the panel — Esc
+   *  becomes "close both at once" instead of "close one layer at a
+   *  time". When the panel is open we return EARLY without calling
+   *  onDismiss, letting the panel's own keydown listener handle it
+   *  (panel sits at z-10400, Spotlight at z-10300). */
+  episodesOpen: boolean;
 }
 
 export default function EosSpotlight({
   title, episode, stream, loading, isSeries, caughtUpUnaired,
   seriesArt, libraryById, onPlayNext, onReplay, onExit, onOpenEpisodes,
-  onDismiss,
+  onDismiss, episodesOpen,
 }: Props) {
   const isNextUp = episode != null;
 
@@ -127,16 +138,26 @@ export default function EosSpotlight({
   // exists while a countdown is armed and merely cancels auto-advance;
   // this one always exists and actually hides the screen. stopPropagation
   // so the keypress doesn't also reach PlayerOverlay's own Esc handler.
+  //
+  // Esc cascade (2026-05-20): when EpisodePanel is OPEN on top of the
+  // Spotlight, RETURN EARLY so the panel's own keydown listener owns
+  // this keystroke. Without this gate both listeners fire in parallel
+  // (window-level keydown is delivered to every registered listener),
+  // so a single Esc closed BOTH the panel and the Spotlight at once.
+  // With the gate the cascade is: Esc → panel closes → episodesOpen
+  // flips false → next Esc dismisses Spotlight → next Esc exits
+  // playback (App's window-level Esc handler, which already gates on
+  // both eosEpisodesOpen and eosActive being false).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        onDismiss();
-      }
+      if (e.key !== "Escape") return;
+      if (episodesOpen) return;
+      e.stopPropagation();
+      onDismiss();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onDismiss]);
+  }, [onDismiss, episodesOpen]);
 
   const countdownActive = remaining !== null && remaining > 0;
   const ringPct = countdownActive
