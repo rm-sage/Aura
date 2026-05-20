@@ -540,16 +540,27 @@ fn b64_encode(data: &[u8]) -> String {
     out
 }
 
+/// Result shape for `extract_thumbnail`. The Rust side reports the
+/// ACTUAL `playback-time` at which mpv produced the frame, not just the
+/// requested seek target — the frontend caches at the actual time so an
+/// immediate re-hover one second later hits the cache instead of
+/// re-paying the seek+screenshot cost.
+#[derive(serde::Serialize)]
+pub struct ThumbResult {
+    pub data_url: String,
+    pub at:       f64,
+}
+
 #[tauri::command]
 pub async fn extract_thumbnail(
     app: AppHandle,
     url: String,
     at_seconds: f64,
-) -> Result<Option<String>, String> {
+) -> Result<Option<ThumbResult>, String> {
     if url.is_empty() || !at_seconds.is_finite() || at_seconds < 0.0 {
         return Ok(None);
     }
-    tauri::async_runtime::spawn_blocking(move || -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<Option<ThumbResult>, String> {
         let lock = THUMB.get_or_init(|| {
             std::sync::Mutex::new(ThumbState { inited: false, loaded_url: None })
         });
@@ -607,6 +618,18 @@ pub async fn extract_thumbnail(
         // seek+screenshot here self-warms WITHIN the first hover. Warm /
         // subsequent hovers still succeed on attempt 0, so there's no
         // added latency once primed.
+        //
+        // Seek-confirmation poll (2026-05-19): the old fixed sleep was
+        // often shorter than a real exact-seek on a remote stream, so
+        // the screenshot returned the PREVIOUSLY decoded frame and the
+        // tooltip lied about which moment it showed. We now poll
+        // `playback-time` against the requested target until it matches
+        // ±0.5 s, bounded. The thumb instance is serialised under THUMB's
+        // Mutex (paused, vo=null, idle) — no concurrent ops, so
+        // landmine #3's race-during-seek does not apply (that documents
+        // the *main* instance race with Lua-issued seeks). Format MUST
+        // be "double" (NEVER "node" — that's the dispatch-table fault
+        // path on this libmpv build).
         for attempt in 0..6u32 {
             mpv.command(
                 "seek",
@@ -614,11 +637,24 @@ pub async fn extract_thumbnail(
                 "thumb",
             )
             .map_err(|e| format!("thumb seek: {e}"))?;
-            // Generous settle on the first couple of attempts (pipeline
-            // still spinning up), short once it's emitting frames.
-            std::thread::sleep(std::time::Duration::from_millis(
-                if attempt == 0 { 260 } else { 190 },
-            ));
+
+            // Confirm the seek landed before screenshotting.
+            let deadline_ms: u32 = if attempt == 0 { 900 } else { 500 };
+            let mut waited_ms: u32 = 0;
+            let mut confirmed = false;
+            while waited_ms < deadline_ms {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                waited_ms += 25;
+                if let Ok(v) = mpv.get_property("playback-time".into(), "double".into(), "thumb") {
+                    if let Some(pt) = v.as_f64() {
+                        if (pt - at_seconds).abs() <= 0.5 {
+                            confirmed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !confirmed { continue; } // try seek again
 
             let _ = std::fs::remove_file(&path);
             mpv.command(
@@ -632,10 +668,19 @@ pub async fn extract_thumbnail(
             if let Ok(bytes) = std::fs::read(&path) {
                 if !bytes.is_empty() {
                     let _ = std::fs::remove_file(&path);
-                    return Ok(Some(format!(
-                        "data:image/jpeg;base64,{}",
-                        b64_encode(&bytes),
-                    )));
+                    // Read the actual playback-time once more for the
+                    // return shape (Fix 3b). Same safety as the poll
+                    // above. Falls back to the requested target if the
+                    // get_property happens to fail at the same moment.
+                    let actual_at = mpv
+                        .get_property("playback-time".into(), "double".into(), "thumb")
+                        .ok()
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(at_seconds);
+                    return Ok(Some(ThumbResult {
+                        data_url: format!("data:image/jpeg;base64,{}", b64_encode(&bytes)),
+                        at:       actual_at,
+                    }));
                 }
             }
         }

@@ -57,8 +57,10 @@ interface Props {
    *  pass it through unchanged. */
   seriesArt: string | null;
   /** App injects the play path (resolves a stream, swaps the active
-   *  target through handlePlayStream — carries History/scrobble). */
-  onPlayEpisode: (video: VideoEntry) => void;
+   *  target through handlePlayStream — carries History/scrobble). May
+   *  be sync (Option-A EOS-bounce handler) or async (legacy direct-play
+   *  path); the single-flight wrapper below treats both uniformly. */
+  onPlayEpisode: (video: VideoEntry) => void | Promise<void>;
 }
 
 export default function EpisodePanel({
@@ -146,6 +148,37 @@ export default function EpisodePanel({
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
 
+  // Single-flight guard for episode-row clicks. Without this, a rapid
+  // double-click (or impatient repeated clicks while the EOS-bounce
+  // tears playback down) can queue parallel play paths through the
+  // App-level handler — each one mutating activeTarget / DetailView
+  // state out from under the previous. The ref short-circuits the
+  // second click before any state work; the state flag drives a small
+  // spinner overlay + `disabled` on every row so the user sees the
+  // click landed. Reset on panel close (open === false).
+  const [pendingPlayId, setPendingPlayId] = useState<string | null>(null);
+  const pendingPlayRef = useRef<string | null>(null);
+
+  const handleRowClick = (v: VideoEntry) => {
+    if (v.id === currentEpisodeId) return; // currently playing — no-op
+    if (pendingPlayRef.current) return;    // already a play in flight
+    pendingPlayRef.current = v.id;
+    setPendingPlayId(v.id);
+    // Fire-and-release. onPlayEpisode may be sync (Option-A handler is
+    // sync void) or async; treat uniformly.
+    Promise.resolve(onPlayEpisode(v)).finally(() => {
+      pendingPlayRef.current = null;
+      setPendingPlayId(null);
+    });
+  };
+
+  useEffect(() => {
+    if (!open) {
+      pendingPlayRef.current = null;
+      setPendingPlayId(null);
+    }
+  }, [open]);
+
   if (!open) return null;
 
   return (
@@ -222,13 +255,17 @@ export default function EpisodePanel({
               const isNext = v.id === nextEpisodeId;
               const watched = isEpisodeWatched(libraryById, v.id);
               const blurThumb = shouldBlurThumbnail(libraryById, v.id, blurThumbs);
+              const isPending = pendingPlayId === v.id;
               return (
                 <button
                   key={v.id}
                   data-ep-id={v.id}
                   type="button"
-                  onClick={() => onPlayEpisode(v)}
-                  className={`w-full flex gap-3 p-2 rounded-xl text-left transition-colors
+                  onClick={() => handleRowClick(v)}
+                  disabled={pendingPlayId !== null}
+                  aria-busy={isPending || undefined}
+                  className={`relative overflow-hidden w-full flex gap-3 p-2 rounded-xl text-left transition-colors
+                              disabled:cursor-default
                               ${isCurrent
                                 ? "bg-ln-accent/15 border border-ln-accent/35"
                                 : "border border-transparent hover:bg-white/[0.07]"}`}
@@ -296,6 +333,26 @@ export default function EpisodePanel({
                       {(v.title ?? "").trim() || "Untitled episode"}
                     </p>
                   </div>
+                  {isPending && (
+                    <span
+                      aria-hidden
+                      className="absolute inset-0 flex items-center justify-center
+                                 bg-black/45 backdrop-blur-sm pointer-events-none"
+                    >
+                      <svg
+                        width="22"
+                        height="22"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2.4"
+                        strokeLinecap="round"
+                        className="animate-spin text-white/85"
+                      >
+                        <path d="M21 12a9 9 0 1 1-9-9" />
+                      </svg>
+                    </span>
+                  )}
                 </button>
               );
             })

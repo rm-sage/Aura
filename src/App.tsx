@@ -535,6 +535,25 @@ function usePlayback(playerActive: boolean) {
       if (typeof payload.speed === "number" && payload.speed > 0) setSpeed(payload.speed);
       if (typeof payload.buffering === "boolean") setBuffering(payload.buffering);
       if (typeof payload.eof === "boolean")     setEof(payload.eof);
+
+      // EOS Spotlight — immediate-fire on the live tick. mpv's time-pos halts
+      // within ~0.25 s of duration at true EOF on this libmpv build; without
+      // this, the stale-heartbeat path adds a 1.5 s floor. Shares the one-shot
+      // nearEndEosFiredRef so the 1.5 s / 8 s / playback-end {eof} fallbacks
+      // all latch through one fuse.
+      const _t = typeof payload.time     === "number" ? payload.time     : null;
+      const _d = typeof payload.duration === "number" ? payload.duration : null;
+      const _isPaused = typeof payload.paused === "boolean" ? payload.paused : false;
+      if (
+        !nearEndEosFiredRef.current &&
+        _t != null && _d != null &&
+        _t > 0 && _d > 0 &&
+        _d - _t <= 0.25 &&
+        !_isPaused
+      ) {
+        nearEndEosFiredRef.current = true;
+        window.dispatchEvent(new CustomEvent("aura:eos-detected"));
+      }
     });
     return () => { p.then((fn) => fn()).catch(() => {}); };
   }, [logLoadEvent]);
@@ -634,7 +653,10 @@ function usePlayback(playerActive: boolean) {
         if (nearEnd) {
           // Near-end stall → end-of-stream, not a break. App owns the
           // Spotlight; one dispatch is enough (the listener latches).
-          window.dispatchEvent(new CustomEvent("aura:eos-detected"));
+          if (!nearEndEosFiredRef.current) {
+            nearEndEosFiredRef.current = true;
+            window.dispatchEvent(new CustomEvent("aura:eos-detected"));
+          }
           return;
         }
         setStreamBroken(true);
@@ -675,7 +697,10 @@ function usePlayback(playerActive: boolean) {
       // exit). The near-end stale-heartbeat path above is the fallback
       // for containers whose `eof` event never arrives.
       if (reason === "eof") {
-        window.dispatchEvent(new CustomEvent("aura:eos-detected"));
+        if (!nearEndEosFiredRef.current) {
+          nearEndEosFiredRef.current = true;
+          window.dispatchEvent(new CustomEvent("aura:eos-detected"));
+        }
       }
     });
     return () => { p.then((fn) => fn()).catch(() => {}); };
@@ -1850,11 +1875,26 @@ export default function App() {
   // re-watch or episode swap starts clean. Mounting the Spotlight
   // suppresses the small NextUpCta (mutual exclusion in the JSX gate).
   const [eosActive, setEosActive] = useState(false);
+  // Mirror `paused` into a ref so the eos-detected listener can read it
+  // without stale closures (the listener is registered once and lives
+  // across renders).
+  const pausedRef = useRef(paused);
+  useEffect(() => { pausedRef.current = paused; }, [paused]);
+
   useEffect(() => {
-    const onEos = () => setEosActive(true);
+    const onEos = () => {
+      setEosActive(true);
+      // Pause mpv at the last frame. This silences the 1 Hz stale-
+      // heartbeat detector's `if (paused) return` short-circuit, so no
+      // further eos-detected can re-dispatch after the user dismisses.
+      // togglePause is a CYCLE on mpv (landmine #1 — not set_property);
+      // gate on pausedRef so we don't accidentally unpause an already-
+      // paused stream.
+      if (!pausedRef.current) togglePause();
+    };
     window.addEventListener("aura:eos-detected", onEos);
     return () => window.removeEventListener("aura:eos-detected", onEos);
-  }, []);
+  }, [togglePause]);
 
   // Listen for ED-start updates from the AniSkip pipeline. The event
   // is dispatched from inside handlePlayStream's lookup IIFE.
@@ -3851,35 +3891,49 @@ export default function App() {
   // invariant hold. Picking a DIFFERENT episode mid-stream is a user-
   // initiated jump (like DetailView's in-session switching), so we don't
   // duplicate the natural-finish History append here.
-  const onEosPlayEpisode = useCallback(async (video: VideoEntry) => {
+  const onEosPlayEpisode = useCallback((video: VideoEntry) => {
     if (!activeTarget) return;
-    const seriesId = activeTarget.series_id ?? activeTarget.id;
-    const mediaType = activeTarget.media_type;
-    const stream = await pickFirstStreamForEpisode(addons, mediaType, video.id);
-    if (!stream) {
-      window.dispatchEvent(new CustomEvent("aura:player-toast", {
-        detail: { message: "No streams found for that episode" },
-      }));
+    // No-op on the currently-playing episode.
+    if (video.id === activeTarget.id) {
+      setEosEpisodesOpen(false);
       return;
     }
-    const tag =
-      video.season != null && video.episode != null
-        ? `S${String(video.season).padStart(2, "0")}E${String(video.episode).padStart(2, "0")}`
-        : video.episode != null ? `Episode ${video.episode}` : undefined;
+    const seriesId = activeTarget.series_id ?? activeTarget.id;
+    // Build (or reuse) the MetaPreview the DetailView will open against.
+    const libRow = library.find((i) => i.id === seriesId) ?? null;
+    const meta: MetaPreview = (selectedMeta && selectedMeta.id === seriesId)
+      ? selectedMeta
+      : {
+          id:           seriesId,
+          media_type:   activeTarget.media_type,
+          name:         activeTarget.name,
+          poster:       libRow?.poster ?? selectedMeta?.poster ?? null,
+          background:   libRow?.background ?? selectedMeta?.background ?? null,
+          fanart:       null,
+          backdrop:     null,
+          logo:         libRow?.logo ?? selectedMeta?.logo ?? null,
+          release_info: libRow?.year ?? selectedMeta?.release_info ?? null,
+          description:  null,
+          imdb_rating:  null,
+          genres:       [],
+        };
+    // Drop EOS surfaces synchronously so the panel disappears instantly.
     setEosEpisodesOpen(false);
     setEosActive(false);
     setNextUpInfo(null);
-    await handlePlayStream(stream, {
-      id:            video.id,
-      series_id:     seriesId,
-      media_type:    mediaType,
-      name:          activeTarget.name,
-      episode:       tag,
-      episode_title: video.title ?? undefined,
-      season:        video.season ?? undefined,
-      episode_num:   video.episode ?? undefined,
-    });
-  }, [activeTarget, addons, handlePlayStream]);
+    // Tear down playback (history/scrobble append already handled by
+    // handleExitPlayback + the 80% autocomplete from the prior pass).
+    handleExitPlayback();
+    // Anchor DetailView on this episode + force streams-mode initial panel
+    // (DetailView's panelMode initial state already routes to "streams"
+    // when openOnEpisodeId is set + resume is being ignored).
+    setLastPlayedEpisodeId(video.id);
+    setIgnoreResumeOnNextOpen(false);
+    setSelectedRect(null);
+    setSelectedMeta(meta);
+  }, [
+    activeTarget, library, selectedMeta, handleExitPlayback,
+  ]);
 
   /** Set by handleExitPlayback when the user just finished an episode of
    *  a series/anime; consumed by DetailView's mount effect to anchor the
@@ -3949,6 +4003,10 @@ export default function App() {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       if (isFullscreen) return; // PlayerOverlay's own ESC handler owns this
+      // EOS layers own Escape when visible — their own listeners dismiss themselves.
+      // Top-layer-wins: EpisodePanel (z-10400) > Spotlight (z-10300) > playback exit.
+      if (eosEpisodesOpen) return;
+      if (eosActive) return;
       if (isPlayerActive) {
         e.stopPropagation();
         handleExitPlayback();
@@ -3974,7 +4032,7 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [
     isFullscreen, isPlayerActive, selectedMeta, activeCatalog, showLogin,
-    handleExitPlayback, closeDetail,
+    handleExitPlayback, closeDetail, eosActive, eosEpisodesOpen,
   ]);
 
   const toggleFullscreen = useCallback(async () => {

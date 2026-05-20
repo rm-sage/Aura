@@ -2005,7 +2005,7 @@ export default function PlayerOverlay({
               thumbnailAt={
                 streamUrl
                   ? (sec) =>
-                      invoke<string | null>("extract_thumbnail", {
+                      invoke<{ data_url: string; at: number } | null>("extract_thumbnail", {
                         url: streamUrl,
                         atSeconds: sec,
                       }).catch(() => null)
@@ -2323,12 +2323,15 @@ function Scrubber({
    *  amber bands overlaid on the scrub fill so the user can see where
    *  skip boundaries land. Hovering shows the kind + timestamps. */
   segments?: AuraSkipWindow[];
-  /** Async resolver: returns a frame data URL for a hovered second,
-   *  or null when none is available (extraction failed / no engine).
-   *  Optional — when absent the scrubber still shows the timestamp
-   *  tooltip on hover, just no image. Wired by PlayerOverlay to the
-   *  native `extract_thumbnail` libmpv engine. */
-  thumbnailAt?: (seconds: number) => Promise<string | null>;
+  /** Async resolver: returns the data URL + the ACTUAL `playback-time`
+   *  at which mpv produced the frame, or null when none is available
+   *  (extraction failed / no engine). Optional — when absent the
+   *  scrubber still shows the timestamp tooltip on hover, just no
+   *  image. Wired by PlayerOverlay to the native `extract_thumbnail`
+   *  libmpv engine. Reporting `at` lets us cache at the frame's real
+   *  second so an immediate re-hover at the same second hits the cache
+   *  instead of re-paying the seek+screenshot cost. */
+  thumbnailAt?: (seconds: number) => Promise<{ data_url: string; at: number } | null>;
 }) {
   const trackRef = useRef<HTMLDivElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -2375,13 +2378,19 @@ function Scrubber({
       const fn = thumbnailAtRef.current;
       if (!fn) { setThumbBusy(false); return; }
       fn(sec)
-        .then((url) => {
+        .then((res) => {
           if (reqId !== thumbReqRef.current) return; // superseded
-          if (url) {
+          if (res) {
             const c = thumbCacheRef.current;
             if (c.size > 240) c.clear(); // crude bound; ~a few MB of data URLs
-            c.set(sec, url);
-            setThumbUrl(url);
+            // Cache at the ACTUAL playback-time the frame represents
+            // (Rust seek-confirmation poll guarantees pt ≈ requested ±0.5 s).
+            // Alias the requested second too when within 1 s tolerance so
+            // an immediate re-hover at the same integer-second is a hit.
+            const key = Math.max(0, Math.floor(res.at));
+            c.set(key, res.data_url);
+            if (Math.abs(res.at - sec) <= 1) c.set(sec, res.data_url);
+            setThumbUrl(res.data_url);
           } else {
             setThumbUrl(null);
           }
