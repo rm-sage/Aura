@@ -396,6 +396,14 @@ interface PlaybackPayload {
   eof: boolean;
 }
 
+// Tail window (seconds before metadata duration) considered "near end"
+// for EOS detection. Shared between the in-listener paused-transition
+// fast-path and the 1 Hz stale-heartbeat near-end short-circuit below.
+// 5 s is generous enough that a last reported `time-pos` a frame or two
+// behind duration still trips, but tight enough that an intentional
+// user pause earlier in the file cannot satisfy it.
+const EOS_TAIL_SECONDS = 5;
+
 function usePlayback(playerActive: boolean) {
   const [time, setTime]           = useState(0);
   const [duration, setDuration]   = useState(0);
@@ -587,19 +595,30 @@ function usePlayback(playerActive: boolean) {
       // event never fires; the stale detector early-returns on paused).
       // Solution: the unambiguous EOS signal under keep-open is the
       // false→true transition of `paused` WHILE time is near duration.
-      // 0.75 s window is slightly more generous than the 0.5 s
-      // immediate-fire window because mpv's last reported time before
-      // the pause-transition can be a frame or two earlier than the
-      // true duration — we want this to catch reliably. A user manual
-      // pause CANNOT satisfy both "transition to paused this tick" AND
-      // "within 0.75 s of duration" except at true EOF. Shares the
-      // one-shot nearEndEosFiredRef so all paths latch through one
-      // fuse; the existing aura:eos-detected listener stays unchanged.
+      //
+      // CRITICAL (2026-05-20 v2): the Rust bridge in lib.rs emits one
+      // `playback-update` PER observed-property change carrying ONLY
+      // the field that changed (lib.rs:1786 "PARTIAL update carrying
+      // ONLY the field that changed"). So the very payload that flips
+      // `paused=true` typically has NO `time` / `duration` field, and
+      // an `_t != null && _d != null` gate on the SAME payload is
+      // unsatisfiable. We must read the LAST-KNOWN time/duration from
+      // `lastPosRef.current` (set on every time/duration update
+      // below) instead. Widened tail to EOS_TAIL_SECONDS (5 s) — under
+      // keep-open the false→true pause transition is itself the
+      // unambiguous EOS signal; the tail just bounds the "user
+      // manually paused at the very end" misfire window, which a
+      // generous 5 s value still keeps tight (any intentional pause
+      // ≥5 s from end is filtered out).
+      const lastKnownT =
+        _t != null ? _t : lastPosRef.current.time;
+      const lastKnownD =
+        _d != null ? _d : lastPosRef.current.duration;
       if (
         !nearEndEosFiredRef.current &&
         _isPaused && !prevPayloadPaused &&
-        _t != null && _d != null && _t > 0 && _d > 0 &&
-        _d - _t <= 0.75
+        lastKnownT > 0 && lastKnownD > 0 &&
+        lastKnownD - lastKnownT <= EOS_TAIL_SECONDS
       ) {
         nearEndEosFiredRef.current = true;
         window.dispatchEvent(new CustomEvent("aura:eos-detected"));
@@ -685,19 +704,27 @@ function usePlayback(playerActive: boolean) {
     // Surface it after ~1.5 s instead. Genuine mid-stream halts (>5 s
     // from the end) still wait the full 8 s and flip `streamBroken`.
     const EOS_NEAR_END_STALE_MS = 1500;
-    const EOS_TAIL_SECONDS = 5;
     const id = window.setInterval(() => {
       const last = lastTimeUpdateAtRef.current;
       if (last === 0) return;
-      // Only meaningful while playback was actually rolling. paused-
-      // for-cache buffering is its own state with its own UI.
-      if (paused) return;
       if (!firstFrameSeen) return;
       const staleFor = Date.now() - last;
       const { time: t, duration: d } = lastPosRef.current;
       const nearEnd = t > 0 && d > 0 && d - t <= EOS_TAIL_SECONDS;
-      // Near-end short-circuit (~1.5 s): clean EOF, fire the Spotlight
-      // early. Guarded so it dispatches once per stream.
+      // Near-end EOS short-circuit (~1.5 s): runs REGARDLESS of the
+      // paused flag. Under `keep-open=yes` + `keep-open-pause=yes`
+      // (player.rs init_mpv), mpv at true EOF auto-pauses on the last
+      // frame and stops emitting `time-pos`. The original
+      // `if (paused) return;` guard up here would have gated this out
+      // — the in-listener paused-transition detector can't compensate
+      // because the Rust bridge emits partial `playback-update`
+      // payloads (lib.rs:1786 "PARTIAL update carrying ONLY the field
+      // that changed"), so the very payload that flips `paused=true`
+      // typically has NO `time`/`duration` field. The single reliable
+      // signal under keep-open is "time-pos was static at near-end for
+      // ≥EOS_NEAR_END_STALE_MS"; that is exactly what this branch
+      // checks. Defense-in-depth with the in-listener path: whichever
+      // trips first wins via `nearEndEosFiredRef`.
       if (
         nearEnd &&
         !nearEndEosFiredRef.current &&
@@ -707,6 +734,13 @@ function usePlayback(playerActive: boolean) {
         window.dispatchEvent(new CustomEvent("aura:eos-detected"));
         return;
       }
+      // Genuine-break path below: only meaningful while playback was
+      // actually rolling. A deliberate user pause must not trigger the
+      // recovery modal. (paused-for-cache buffering is its own state
+      // with its own UI.) IMPORTANT: this early-return MUST come AFTER
+      // the near-end EOS check above — moving it back up would re-
+      // introduce the keep-open EOS regression.
+      if (paused) return;
       if (staleFor >= BROKEN_STALE_MS) {
         if (nearEnd) {
           // Near-end stall → end-of-stream, not a break. App owns the
