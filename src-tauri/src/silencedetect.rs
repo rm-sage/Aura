@@ -80,6 +80,26 @@ fn ffmpeg_bin(app: &tauri::AppHandle) -> std::ffi::OsString {
     std::ffi::OsString::from("ffmpeg")
 }
 
+/// Build an ffmpeg [`Command`] with its console window suppressed.
+///
+/// Aura is a GUI app with no console of its own. Without `CREATE_NO_WINDOW`,
+/// every ffmpeg spawn pops a visible console window for the lifetime of the
+/// process — a few seconds on each stream start, which looks alarming (and
+/// outright suspicious) to users. Every ffmpeg invocation in this module
+/// goes through here so the flag can't be forgotten at a call site. This
+/// mirrors the bridge subprocess spawn in `lib.rs`.
+fn ffmpeg_command(app: &tauri::AppHandle) -> Command {
+    let mut cmd = Command::new(ffmpeg_bin(app));
+    #[cfg(target_os = "windows")]
+    {
+        // CREATE_NO_WINDOW = 0x08000000. tokio's Command exposes
+        // `creation_flags` directly on Windows (forwards to the inner
+        // std Command), so no `CommandExt` import is needed.
+        cmd.creation_flags(0x08000000);
+    }
+    cmd
+}
+
 /// One silence interval reported by ffmpeg, in seconds.
 #[derive(Debug, Clone, Serialize)]
 pub struct SilenceInterval {
@@ -151,7 +171,7 @@ pub async fn detect_silence_intervals(
     // Build args. We discard video (`-vn`), apply silencedetect to
     // audio, write nothing (`-f null -`). Bound the runtime via -t
     // when caller asked for it.
-    let mut cmd = Command::new(ffmpeg_bin(&app));
+    let mut cmd = ffmpeg_command(&app);
     cmd.arg("-hide_banner")
         .arg("-nostdin")
         .arg("-protocol_whitelist").arg("http,https,tcp,tls,crypto")
@@ -307,7 +327,7 @@ pub async fn detect_outro_boundary(
     // `ed_start` is a true absolute container timestamp. Downscale before
     // blackdetect so the tail video decode is cheap; `-t` bounds the
     // worst case.
-    let mut cmd = Command::new(ffmpeg_bin(&app));
+    let mut cmd = ffmpeg_command(&app);
     cmd.arg("-hide_banner")
         .arg("-nostdin")
         .arg("-protocol_whitelist").arg("http,https,tcp,tls,crypto")
@@ -438,7 +458,7 @@ pub async fn detect_outro_boundary(
 async fn ffmpeg_is_available(app: &tauri::AppHandle) -> bool {
     // `ffmpeg -version` exits 0 when the resolved binary (bundled or
     // PATH) is present + executable. We don't care about the version.
-    let res = Command::new(ffmpeg_bin(app))
+    let res = ffmpeg_command(app)
         .arg("-version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
