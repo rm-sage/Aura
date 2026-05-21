@@ -73,7 +73,7 @@ export function useScrobbleAuthAlerts(authKey: string | null) {
           subtitle: provider === "anilist"
             ? "AniList does not support refresh. Open Settings and reconnect to keep scrobbling."
             : "Open Settings and reconnect to keep scrobbling.",
-          data:     { provider, scope, kind: "scrobble-auth-expired" },
+          data:     { provider, scope, kind: "scrobble-auth-expired", settingsSection: "sec-scrobble" },
         });
       } else if (!isExpired && wasExpired) {
         dismissNotification(alertId(provider, scope));

@@ -404,6 +404,12 @@ interface PlaybackPayload {
 // user pause earlier in the file cannot satisfy it.
 const EOS_TAIL_SECONDS = 5;
 
+// Per-tick forward-progress cap (s) for the History watched accumulator.
+// A `time` delta larger than this is a seek, not playback — discarded so
+// skipping to the end never inflates summed watched time. Matches
+// useScrobble's TICK_DELTA_CAP_S.
+const HISTORY_TICK_DELTA_CAP_S = 5;
+
 function usePlayback(playerActive: boolean) {
   const [time, setTime]           = useState(0);
   const [duration, setDuration]   = useState(0);
@@ -529,6 +535,14 @@ function usePlayback(playerActive: boolean) {
     const p = listen<PlaybackPayload>("playback-update", ({ payload }) => {
       if (typeof payload.time === "number") {
         lastTimeUpdateAtRef.current = Date.now();
+        // Accumulate real forward-progress for the History gate. Only
+        // positive sub-cap deltas count, so a seek-to-end never inflates
+        // watchedElapsedRef (see HISTORY_TICK_DELTA_CAP_S).
+        const _dt = payload.time - watchedElapsedLastTimeRef.current;
+        if (_dt > 0 && _dt < HISTORY_TICK_DELTA_CAP_S) {
+          watchedElapsedRef.current += _dt;
+        }
+        watchedElapsedLastTimeRef.current = payload.time;
         setTime(payload.time);
         // First-frame latch: any time > 0 reading means MPV has
         // started producing frames for the current file. Once
@@ -690,6 +704,13 @@ function usePlayback(playerActive: boolean) {
   useEffect(() => {
     lastPosRef.current = { time, duration };
   }, [time, duration]);
+  /** Summed forward playback progress (s) for the CURRENT load. Mirrors
+   *  useScrobble's elapsedThisSession: per-tick time deltas accumulate
+   *  only when positive and below the seek cap, so seeking never inflates
+   *  it. Gates History writes so skip-to-end doesn't log a watched entry.
+   *  Reset per load in notifyNewLoad. */
+  const watchedElapsedRef = useRef<number>(0);
+  const watchedElapsedLastTimeRef = useRef<number>(0);
   // One-shot guard so the fast near-end EOS short-circuit dispatches
   // `aura:eos-detected` exactly once per stream. Reset per load inside
   // notifyNewLoad (alongside the other fresh-load state resets).
@@ -828,6 +849,8 @@ function usePlayback(playerActive: boolean) {
     lastTimeUpdateAtRef.current = 0;
     lastCacheBufferLogRef.current = null;
     nearEndEosFiredRef.current = false;
+    watchedElapsedRef.current = 0;
+    watchedElapsedLastTimeRef.current = 0;
     console.info("[load] +0ms notifyNewLoad — fresh load sequence begins");
     setBuffering(true);
     setFirstFrameSeen(false);
@@ -877,6 +900,7 @@ function usePlayback(playerActive: boolean) {
     streamBroken, setStreamBroken,
     togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
     notifyNewLoad, logLoadEvent,
+    watchedElapsedRef,
   };
 }
 
@@ -984,6 +1008,7 @@ export default function App() {
     streamBroken, setStreamBroken,
     togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
     notifyNewLoad, logLoadEvent,
+    watchedElapsedRef,
   } = usePlayback(isPlayerActive);
 
   // ── Detail-view state (selected meta + click-rect for shared-element open) ──
@@ -2145,7 +2170,10 @@ export default function App() {
     {
       const { time: watched, duration: dur } = playbackRef.current;
       const meaningfulRatio = dur > 0 && watched / dur >= 0.80;
-      const meaningfulTime  = watched >= 5 * 60;
+      // Real summed forward-progress, NOT the raw playhead — seeking to
+      // the end leaves watchedElapsedRef at ~0 so a skip-to-end episode
+      // is correctly excluded from History.
+      const meaningfulTime  = watchedElapsedRef.current >= 5 * 60;
       const playedEpisodeId = activeTarget.id;
       const isSeriesEpisode = activeTarget.series_id != null && activeTarget.series_id !== activeTarget.id;
       if (meaningfulRatio && meaningfulTime && playedEpisodeId) {
@@ -3874,7 +3902,10 @@ export default function App() {
       // AND requires both engagement AND substantive progress, which
       // matches the user's expectation of "I actually watched this."
       const meaningfulRatio = dur > 0 && watched / dur >= 0.80;
-      const meaningfulTime  = watched >= 5 * 60;
+      // Real summed forward-progress, NOT the raw playhead — seeking to
+      // the end leaves watchedElapsedRef at ~0 so a skip-to-end episode
+      // is correctly excluded from History.
+      const meaningfulTime  = watchedElapsedRef.current >= 5 * 60;
       const seriesId = activeTarget.series_id ?? activeTarget.id;
       // Skip if the 80 %-autocomplete path (onAdvance) already wrote a
       // History row for THIS play — addHistoryEntry only dedups exact
