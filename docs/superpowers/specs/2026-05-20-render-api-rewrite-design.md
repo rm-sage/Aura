@@ -95,19 +95,23 @@ mpv's render context accepts either an OpenGL or Vulkan/D3D11 context. On Window
 
 **Phase 7 — delete `libmpv-wrapper.dll` + tauri-plugin-libmpv dep**. Update DLL-probe + README + HANDOFF.md.
 
-## Open questions (review before Phase 1)
+## Decisions (LOCKED — user-approved 2026-05-20)
 
-1. **Direct-FFI (Option A — recommended) vs fork-the-wrapper (Option B)?** I strongly recommend A. Owning the FFI is cleaner long-term and matches the existing libloading pattern in win32.rs.
-2. **WGL vs ANGLE-EGL?** I recommend WGL as the primary path; reserve ANGLE for a fallback only if WGL fails for a user.
-3. **Is the off-focus drop the only goal, or also a render-architecture cleanup?** Option A enables future things — a cleaner shader pipeline, easier HDR display-tonemap integration, etc. Worth noting but doesn't change Phase 1's scope.
-4. **`libmpv-rs` vs hand-rolled FFI?** I recommend hand-rolled FFI (matches existing pattern, no version-skew, ~30-50 functions). `libmpv-rs` is an alternative if you'd rather lean on an upstream wrapper despite its render.rs being empty in the cached version.
+1. **Direct FFI to `libmpv-2.dll` (Option A).** Bypass the wrapper entirely. Confirmed.
+2. **WGL** + an Aura-owned Win32 child HWND (replacing the `--wid` child) as the GL context. ANGLE-EGL stays a fallback only if WGL fails for a specific user/GPU.
+3. **Off-focus frame drops are the primary goal — AND broader improvements the rewrite enables are explicitly in-scope and to be prioritized.** Per the user: any architecture wins that fall out of owning the render path (cleaner shader pipeline, direct HDR display-tonemap control, removing the focus/resize `SetWindowPos` storm, simpler fullscreen) should be taken, not deferred. Don't treat this as a minimal port — treat it as the chance to do the render layer right.
+4. **Hand-rolled `libloading` FFI** (no upstream wrapper crate, no new deps). Done — see Phase 1 below.
 
-## What was done tonight (autonomously)
+## Progress
 
-- v0.8.0 released, signed, published to GitHub (https://github.com/rm-sage/Aura/releases/tag/v0.8.0), latest.json uploaded.
-- Branch `feat/render-api-rewrite` rebased onto post-v0.8.0 main and force-pushed.
-- Wrapper feasibility spike: confirmed `tauri-plugin-libmpv 0.3.2` exposes NO render-context symbols. Direct FFI to libmpv-2.dll is required.
-- This spec doc written + committed; awaiting user review of approach before any deps are added or code is written.
+- **v0.8.0 released** (2026-05-20), signed, published to GitHub (https://github.com/rm-sage/Aura/releases/tag/v0.8.0), latest.json uploaded.
+- Branch `feat/render-api-rewrite` rebased onto post-v0.8.0 main.
+- Wrapper feasibility spike: confirmed `tauri-plugin-libmpv 0.3.2` exposes NO render-context symbols.
+- **Phase 1 (FFI bindings foundation) DONE.** New `src-tauri/src/mpv2/` module: `ffi.rs` (raw FFI — opaque `mpv_handle`/`mpv_render_context`, the 6 enums as `#[repr(transparent)]` newtypes, all `#[repr(C)]` event/render/node structs, 28 `unsafe extern "C"` fn typedefs for client.h + render.h, and a `Libmpv` loader mirroring win32.rs's libloading pattern + player.rs's DLL-search) and `mod.rs`. Transcribed verbatim from mpv `master` headers (`client.h` API v2.5, `render.h`, `render_gl.h`) so the `#[repr(C)]` layouts are ABI-exact. `#![allow(dead_code)]` — additive, compiles via `mod mpv2;` in lib.rs, runtime behavior of the app unchanged. `cargo check` exit 0.
+
+## Next — Phase 1 runtime half (needs the user's hardware to verify)
+
+The remaining Phase-1 work: create the Win32 child window, a WGL pixel-format + context, call `mpv_create / mpv_initialize / mpv_render_context_create` with the GL `get_proc_address`, and render a single static-color clear frame. This is the first thing that CANNOT be compile-only verified — it needs a run on the user's machine to confirm the window + context + render path actually produces a frame before scaling to Phase 2 (real playback). Start here next session.
 
 ## CLAUDE.md landmine implications (carry-forward)
 

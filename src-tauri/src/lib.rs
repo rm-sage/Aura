@@ -31,6 +31,11 @@ mod log_export;
 mod anime_id_map;
 mod api_keyring;
 mod media_controls;
+// Direct-FFI bindings for libmpv-2.dll — foundation of the render-API
+// rewrite (docs/superpowers/specs/2026-05-20-render-api-rewrite-design.md).
+// ADDITIVE: declared so `cargo check` compiles it; not yet wired into any
+// runtime path (player.rs still uses tauri-plugin-libmpv).
+mod mpv2;
 mod player;
 mod ratings;
 mod scrobble;
