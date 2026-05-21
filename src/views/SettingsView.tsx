@@ -3718,6 +3718,26 @@ export default function SettingsView({ addons, session }: Props) {
   const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
   useEffect(() => { setScrollEl(scrollRef.current); }, []);
 
+  // Consume the section anchor set by App's aura:open-settings handler
+  // (window.location.hash). Without this, deep-linking to a Settings
+  // section (Trakt re-auth notification, scrobble onboarding, the
+  // SyncStatusChip) switched the view but never scrolled.
+  useEffect(() => {
+    if (!scrollEl) return;
+    const jump = () => {
+      const id = window.location.hash.replace(/^#/, "");
+      if (!id) return;
+      // rAF so backend-gated / conditionally-rendered sections have mounted.
+      requestAnimationFrame(() => {
+        const el = scrollEl.querySelector<HTMLElement>(`#${window.CSS.escape(id)}`);
+        el?.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+    };
+    jump();                                    // already-on-Settings case
+    window.addEventListener("hashchange", jump);
+    return () => window.removeEventListener("hashchange", jump);
+  }, [scrollEl]);
+
   // ── Settings search ───────────────────────────────────────────────────
   //
   // Forgiving fuzzy filter over visible Sections. Each whitespace-separated
