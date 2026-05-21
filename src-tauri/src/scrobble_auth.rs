@@ -236,6 +236,19 @@ pub async fn clear_scrobble_auth_token(
     if !["trakt", "anilist"].contains(&service.as_str()) {
         return Err(format!("unknown scrobble service: {service}"));
     }
+
+    // Best-effort server-side revoke BEFORE dropping the local entry so
+    // Trakt invalidates the token on their side too — otherwise a
+    // "disconnected" token stays live on Trakt until its 90-day TTL.
+    // Trakt-only: AniList exposes no revoke endpoint. Every failure is
+    // swallowed inside `revoke_trakt_token`; the local clear below runs
+    // regardless of whether the proxy/Trakt was reachable.
+    if service == "trakt" {
+        if let Some(tok) = read_token("trakt", &scope) {
+            revoke_trakt_token(&tok.access_token).await;
+        }
+    }
+
     let e = entry(&service, &scope)?;
     match e.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => {
@@ -532,6 +545,290 @@ pub async fn scrobble_oauth_device_poll(
         }
     };
     Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Trakt refresh-token flow
+//
+// Trakt's OAuth access tokens are 90-day-lived but the device-flow
+// stores a `refresh_token` alongside. Earlier Aura builds never used it
+// — on any 401 the keyring entry was just deleted and the user was
+// re-prompted (roughly weekly in practice). The proxy now exposes
+// `POST /oauth/trakt/refresh`, so scrobble.rs refreshes proactively
+// (near expiry) and reactively (on a 401) instead of dropping the
+// token.
+//
+// CONCURRENCY: Trakt rotates the refresh_token on every refresh and
+// invalidates the previous one. Two concurrent 401s both calling the
+// proxy with the SAME stored refresh_token would have the first
+// rotation invalidate the token the second call carries — the second
+// refresh then 401s and triggers a spurious full re-auth. The
+// per-scope async mutex below serialises refreshes; after acquiring it
+// the function re-reads the keyring, and if another task already
+// rotated the token (the stored access_token now differs from the one
+// the caller saw fail) it returns that fresh token without spending a
+// second refresh.
+//
+// AniList has NO refresh endpoint and is deliberately untouched here.
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+
+/// Per-Trakt-scope refresh lock registry. Each scope gets its own
+/// `tokio::sync::Mutex`; the outer `std::sync::Mutex` only guards the
+/// short map lookup/insert and is never held across an await.
+fn refresh_locks() -> &'static std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>
+        = OnceLock::new();
+    LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn refresh_lock_for(scope: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = refresh_locks().lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(scope.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Why a Trakt refresh attempt failed. The caller (scrobble.rs) routes
+/// on the discriminant:
+///   • `NoRefreshToken` — nothing to refresh with; fall back to the old
+///     clear-token-and-re-auth behaviour.
+///   • `Rejected` — the proxy returned 401; the refresh_token is dead.
+///     `refresh_trakt_token` has ALREADY cleared the keyring entry.
+///   • `Transient` — 429 / 502 / 400 / network / decode error. The
+///     stored token is untouched and still usable; the caller should
+///     fail this attempt without clearing.
+#[derive(Debug)]
+pub(crate) enum RefreshError {
+    /// No `refresh_token` stored for this scope.
+    NoRefreshToken,
+    /// Proxy 401 — refresh token expired/revoked. Keyring already cleared.
+    Rejected,
+    /// Transient failure (429/502/400/network/decode). Token left intact.
+    Transient(String),
+}
+
+/// Successful Trakt refresh. Carries the new access_token so the caller
+/// can immediately retry the request that triggered the refresh without
+/// a second keyring round-trip.
+#[derive(Debug)]
+pub(crate) struct RefreshOutcome {
+    pub access_token: String,
+}
+
+/// Attempt to refresh the stored Trakt access token for `scope` using
+/// its rotating `refresh_token` against the proxy.
+///
+/// `failing_access_token` is the access_token the caller saw fail (or
+/// the one it read just before a proactive refresh). It is used purely
+/// for the concurrency short-circuit: if, after acquiring the per-scope
+/// lock, the stored access_token no longer matches it, another task
+/// already refreshed — we return that fresh token instead of spending
+/// the (now-rotated) refresh_token a second time. Pass `None` to skip
+/// the short-circuit and always attempt a refresh.
+///
+/// Not a `#[tauri::command]` — called from Rust (scrobble.rs), so no
+/// command registration is needed.
+pub(crate) async fn refresh_trakt_token(
+    scope: &str,
+    failing_access_token: Option<&str>,
+) -> Result<RefreshOutcome, RefreshError> {
+    // Cheap pre-check before taking the lock: if there's no token or no
+    // refresh_token at all, there's nothing the lock can change.
+    let pre = read_token("trakt", scope);
+    match &pre {
+        Some(t) if t.refresh_token.is_some() => {}
+        _ => return Err(RefreshError::NoRefreshToken),
+    }
+
+    let lock = refresh_lock_for(scope);
+    let _guard = lock.lock().await;
+
+    // Re-read under the lock — another task may have refreshed while we
+    // were queued. If the stored access_token already differs from the
+    // one the caller saw failing, that other task rotated the token;
+    // hand back the fresh one rather than burning the refresh_token.
+    let stored = read_token("trakt", scope);
+    let refresh_token = match &stored {
+        Some(t) => {
+            if let (Some(failing), fresh) = (failing_access_token, t.access_token.as_str()) {
+                if failing != fresh {
+                    crate::devlog!(
+                        info, "scrobble",
+                        "Trakt refresh skipped for scope={scope}: another task already rotated the token",
+                    );
+                    return Ok(RefreshOutcome { access_token: fresh.to_string() });
+                }
+            }
+            match &t.refresh_token {
+                Some(rt) => rt.clone(),
+                // The token (or its refresh_token) was cleared between
+                // the pre-check and acquiring the lock — most likely a
+                // concurrent Rejected. Nothing to refresh with.
+                None => return Err(RefreshError::NoRefreshToken),
+            }
+        }
+        None => return Err(RefreshError::NoRefreshToken),
+    };
+    // `stored` is guaranteed Some here.
+    let prev_username = stored.and_then(|t| t.username);
+
+    let url = format!("{REDIRECT_BASE}/trakt/refresh");
+    let client = match device_flow_client() {
+        Ok(c) => c,
+        Err(e) => return Err(RefreshError::Transient(e)),
+    };
+    let resp = match client
+        .post(&url)
+        .json(&serde_json::json!({ "refresh_token": refresh_token }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // Network-level failure — transient, leave the token alone.
+            let reason = format!("network error: {e}");
+            crate::devlog!(warn, "scrobble", "Trakt refresh for scope={scope} failed: {reason}");
+            return Err(RefreshError::Transient(reason));
+        }
+    };
+
+    let status = resp.status();
+
+    if status.as_u16() == 401 {
+        // refresh_token is dead — the user must fully re-authenticate.
+        // Clear the keyring so the existing "Trakt token expired"
+        // notification fires on the next status read.
+        clear_token_for("trakt", scope);
+        crate::devlog!(
+            warn, "scrobble",
+            "Trakt refresh rejected (401) for scope={scope} — refresh token dead, token cleared",
+        );
+        return Err(RefreshError::Rejected);
+    }
+
+    if !status.is_success() {
+        // 429 (rate_limited) / 502 (upstream_failure) / 400 (bad_request)
+        // / any other non-2xx — all transient. Do NOT clear the token.
+        let body_text = resp.text().await.unwrap_or_default();
+        let reason = format!(
+            "proxy returned {} ({})",
+            status.as_u16(),
+            body_text.chars().take(120).collect::<String>(),
+        );
+        crate::devlog!(warn, "scrobble", "Trakt refresh for scope={scope} failed: {reason}");
+        return Err(RefreshError::Transient(reason));
+    }
+
+    // HTTP 200 — decode with the SAME success-body struct the
+    // device-flow poll uses (the proxy's refresh 200 body is identical).
+    let body_text = match resp.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            let reason = format!("read 200 body: {e}");
+            crate::devlog!(warn, "scrobble", "Trakt refresh for scope={scope} failed: {reason}");
+            return Err(RefreshError::Transient(reason));
+        }
+    };
+    #[derive(Deserialize)]
+    struct SuccessBody {
+        access_token:  String,
+        #[serde(default)]
+        refresh_token: Option<String>,
+        #[serde(default)]
+        expires_at:    Option<u64>,
+        #[serde(default)]
+        username:      Option<String>,
+    }
+    let body: SuccessBody = match serde_json::from_str(&body_text) {
+        Ok(b) => b,
+        Err(e) => {
+            // Decode failure — the token on disk is still the valid one;
+            // treat as transient so the reactive 401 path can retry.
+            let reason = format!("decode refresh response: {e}");
+            crate::devlog!(warn, "scrobble", "Trakt refresh for scope={scope} failed: {reason}");
+            return Err(RefreshError::Transient(reason));
+        }
+    };
+
+    // Persist the rotated token. Trakt always issues a new
+    // refresh_token; if the proxy ever omits it, keep the old one so we
+    // don't end up with no refresh path. `username` may be empty when
+    // the proxy's identity fetch failed — keep the previously-stored
+    // display name in that case.
+    let rotated_refresh = body.refresh_token.or(Some(refresh_token));
+    let username = match body.username {
+        Some(u) if !u.is_empty() => Some(u),
+        _ => prev_username,
+    };
+    let new_token = ScrobbleAuthToken {
+        access_token: body.access_token.clone(),
+        refresh_token: rotated_refresh,
+        expires_at:   body.expires_at,
+        username,
+    };
+    let json = match serde_json::to_string(&new_token) {
+        Ok(j) => j,
+        // Serialisation can't realistically fail for this shape, but if
+        // it does the old token is still valid — transient.
+        Err(e) => return Err(RefreshError::Transient(
+            format!("serialise refreshed token: {e}"),
+        )),
+    };
+    let persist = entry("trakt", scope)
+        .and_then(|e| e.set_password(&json).map_err(|e| e.to_string()));
+    if let Err(e) = persist {
+        return Err(RefreshError::Transient(e));
+    }
+
+    crate::devlog!(
+        info, "scrobble",
+        "Trakt token refreshed for scope={scope} (expires_at={:?})",
+        new_token.expires_at,
+    );
+    Ok(RefreshOutcome { access_token: body.access_token })
+}
+
+/// Best-effort server-side revoke of a Trakt access token. Called from
+/// the "Disconnect Trakt" path BEFORE the local keyring entry is
+/// dropped so Trakt invalidates the token on their side too. Every
+/// failure is swallowed — the disconnect must succeed regardless of
+/// whether the proxy/Trakt is reachable. Trakt-only; AniList has no
+/// revoke endpoint.
+pub(crate) async fn revoke_trakt_token(access_token: &str) {
+    let client = match device_flow_client() {
+        Ok(c) => c,
+        Err(e) => {
+            crate::devlog!(warn, "scrobble", "Trakt revoke skipped: client init failed: {e}");
+            return;
+        }
+    };
+    let url = format!("{REDIRECT_BASE}/trakt/revoke");
+    match client
+        .post(&url)
+        .json(&serde_json::json!({ "token": access_token }))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => {
+            crate::devlog!(info, "scrobble", "Trakt token revoked server-side");
+        }
+        Ok(r) => {
+            crate::devlog!(
+                warn, "scrobble",
+                "Trakt revoke returned {} (ignored — disconnecting anyway)",
+                r.status().as_u16(),
+            );
+        }
+        Err(e) => {
+            crate::devlog!(
+                warn, "scrobble",
+                "Trakt revoke request failed: {e} (ignored — disconnecting anyway)",
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
