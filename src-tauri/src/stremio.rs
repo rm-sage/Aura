@@ -1107,7 +1107,7 @@ pub async fn fetch_catalog(
     let label = log_label("", &base);
 
     // Soft-fail cache: if THIS specific catalog timed out recently,
-    // skip the network call to avoid paying another 10 s timeout. The
+    // skip the network call to avoid paying another 20 s timeout. The
     // cooldown is per-(addon, catalog) so a slow catalog only mutes
     // ITSELF — sibling catalogs from the same addon keep loading
     // normally. If we have a stale-but-cached payload for this
@@ -1139,7 +1139,14 @@ pub async fn fetch_catalog(
     // Live fetch. Network-class failures fall through to the stale
     // cache (when available) so a flaky upstream doesn't blank out
     // the home row that previously had data.
-    let resp = match client().get(&url).send().await {
+    //
+    // Catalog requests get a longer per-request timeout (20 s) than the
+    // shared client default (`TIMEOUT`, 10 s). Aggregating catalog
+    // builders (flixpatrol, the streaming.* rows) routinely need more
+    // than 10 s on a cold request, and a timed-out catalog row is more
+    // disruptive than a slow one. This is a per-request override, so
+    // manifest / stream / meta fetches keep the snappier 10 s.
+    let resp = match client().get(&url).timeout(Duration::from_secs(20)).send().await {
         Ok(r) => r,
         Err(e) => {
             let cat = describe_reqwest_err(&e);
