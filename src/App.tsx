@@ -3853,6 +3853,18 @@ export default function App() {
   useEffect(() => {
     return () => {
       flushProgress(session, writebackTarget.current);
+      // Reset the dedup guard for the NEXT target. `flushProgress` skips a
+      // write when `time` is within 1 s of `lastWrittenTime` (to coalesce a
+      // pause-write and an unmount-write on the same second). Left un-reset
+      // across an episode boundary, that guard instead compares the new
+      // episode's playhead against the *previous* episode's last write —
+      // and when two back-to-back episodes end at a similar playhead
+      // (routine in anime binges) it wrongly suppresses the new episode's
+      // flush, freezing `state.video_id` on an earlier episode. That stale
+      // video_id is what surfaces in Continue Watching as a prior episode
+      // stuck "in progress". The -1 sentinel makes the next target's first
+      // flush always pass.
+      lastWrittenTime.current = -1;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTarget]);
