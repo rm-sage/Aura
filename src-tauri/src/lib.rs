@@ -1671,6 +1671,16 @@ pub fn run() {
             })?;
             crate::devlog!(info, "player", "MPV engine ready");
 
+            // ── mpv2 render-API Phase-1 hello-world (opt-in) ───────────────
+            // No-op unless AURA_MPV2_HELLO is set. When it is, spawns the
+            // render-context rewrite's Win32 + WGL + mpv_render_context
+            // verification path on its own thread — see mpv2::hello. The
+            // shipped --wid playback engine above is untouched either way.
+            #[cfg(target_os = "windows")]
+            {
+                mpv2::hello::run_if_requested();
+            }
+
             // ── Window lifecycle (pause-on-blur, pause-on-min, close-on-exit) ─
             window_logic::install(app.handle());
 

@@ -13,7 +13,7 @@
 //! swapchain. `libmpv-wrapper.dll` exports zero `mpv_render_context_*`
 //! symbols, so we must bind `libmpv-2.dll` directly.
 //!
-//! ## Phase 1 (this commit) — bindings layer only
+//! ## Phase 1 — bindings layer + render-context hello-world
 //!
 //! [`ffi`] holds the raw `#[repr(C)]` FFI surface (opaque handles, enums,
 //! structs, function-pointer typedefs) transcribed verbatim from mpv's
@@ -21,20 +21,23 @@
 //! symbol out of `libmpv-2.dll` via `libloading` — mirroring the pattern
 //! `win32.rs` already uses for user32/winmm/kernel32.
 //!
-//! **This module is ADDITIVE and currently dead.** Nothing here is wired
-//! into any runtime path; `player.rs` / `lib.rs` still use
-//! `tauri-plugin-libmpv` unchanged. `cargo check` compiles this module so
-//! the FFI declarations are kept honest, but it is not exercised until
-//! Phase 2 ports `init_mpv` + `load_video` onto it.
+//! [`hello`] (Windows-only) is the Phase-1 runtime half: a Win32 window +
+//! WGL context + `mpv_render_context_create` + a short render loop, used
+//! to verify the render-API path works on real hardware. It uses a
+//! standalone top-level window so the result is visible above Aura's
+//! opaque home screen; Phase 2's real render surface is a child window.
+//!
+//! **This module does not affect normal launches.** `hello` only runs
+//! when the `AURA_MPV2_HELLO` environment variable is set; otherwise
+//! nothing here is exercised and `player.rs` / `lib.rs` use
+//! `tauri-plugin-libmpv` unchanged. `cargo check` compiles the whole
+//! module so the FFI declarations stay honest.
 //!
 //! ## Deferred to later phases (NOT in this module yet)
 //!
-//! - Phase 1 runtime half: the Win32 child window, the WGL context, and
-//!   the `mpv_render_context_create` + render-loop wiring (needs hardware
-//!   verification).
 //! - Phase 2+: the safe high-level `Mpv` wrapper (typed `command()` /
-//!   `set_property()` / `get_property()` / event pump), and every Tauri
-//!   command reroute.
+//!   `set_property()` / `get_property()` / event pump), the persistent
+//!   dual-mode present loop, and every Tauri command reroute.
 //!
 //! ## Correctness note
 //!
@@ -52,3 +55,9 @@
 #![allow(dead_code, non_camel_case_types)]
 
 pub mod ffi;
+
+// Phase-1 runtime hello-world (Win32 child window + WGL + render context).
+// Windows-only — the WGL path has no cross-platform meaning, and Aura ships
+// Windows-only anyway.
+#[cfg(target_os = "windows")]
+pub mod hello;

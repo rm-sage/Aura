@@ -109,11 +109,21 @@ sentry-rust-minidump = "0.14"
 # already in our transitive dep graph (Tauri pulls it in at this exact
 # version), so adding it as a direct dep with explicit features doesn't
 # introduce a new compile-time cost.
+#
+# The Graphics_OpenGL / Graphics_Gdi / UI_WindowsAndMessaging /
+# System_LibraryLoader features back the render-API rewrite's WGL path
+# (mpv2::hello and later phases): the Win32 child window, the WGL pixel
+# format + context, and the opengl32.dll proc-address fallback. They only
+# add code-generation for symbols we reference — no extra runtime cost.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Com",
+    "Win32_System_LibraryLoader",
     "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_OpenGL",
 ] }
 
 # Dev-profile slimming. The default debug profile produced ~43 GB of
