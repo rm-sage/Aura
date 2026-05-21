@@ -537,13 +537,74 @@ async fn trakt_sync_history_once(
 }
 
 async fn trakt_sync_history(scope: &str, sess: &ScrobbleSession, time: f64, duration: f64) -> TraktSyncResult {
-    let Some(token) = scrobble_auth::read_token_for("trakt", scope) else {
+    let Some(mut token) = scrobble_auth::read_token_for("trakt", scope) else {
         crate::devlog!(
             info, "scrobble",
             "Trakt /sync/history skipped: no token for scope={scope}",
         );
         return TraktSyncResult::Skipped;
     };
+
+    // ── Proactive refresh ──────────────────────────────────────────
+    // Trakt access tokens are 90-day-lived. If this one is within ~7
+    // days of expiry, refresh BEFORE dispatching so the request goes
+    // out with a fresh token rather than relying on the reactive 401
+    // backstop. `expires_at == None` means the proxy didn't stamp an
+    // expiry (older token) — skip the proactive check and let the
+    // reactive path handle it.
+    if let Some(exp) = token.expires_at {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        const PROACTIVE_WINDOW: u64 = 7 * 24 * 3600;
+        if exp.saturating_sub(now) < PROACTIVE_WINDOW {
+            match scrobble_auth::refresh_trakt_token(scope, Some(&token.access_token)).await {
+                Ok(_) => {
+                    // Re-read so the dispatch below uses the rotated token.
+                    match scrobble_auth::read_token_for("trakt", scope) {
+                        Some(fresh) => token = fresh,
+                        None => {
+                            // Cleared out from under us between refresh
+                            // and re-read — treat as expired.
+                            crate::devlog!(
+                                warn, "scrobble",
+                                "Trakt token vanished after proactive refresh for scope={scope}",
+                            );
+                            return TraktSyncResult::Skipped;
+                        }
+                    }
+                }
+                Err(scrobble_auth::RefreshError::Rejected) => {
+                    // Refresh token dead — keyring already cleared by
+                    // refresh_trakt_token; the expired-token notification
+                    // will fire. Abort the sync cleanly.
+                    crate::devlog!(
+                        warn, "scrobble",
+                        "Trakt proactive refresh rejected for scope={scope} — aborting sync, user must reconnect",
+                    );
+                    return TraktSyncResult::Skipped;
+                }
+                Err(scrobble_auth::RefreshError::Transient(reason)) => {
+                    // Proxy/network blip — proceed with the still-valid
+                    // current token; the reactive 401 path is the backstop.
+                    crate::devlog!(
+                        info, "scrobble",
+                        "Trakt proactive refresh transient failure for scope={scope}: {reason} — proceeding with current token",
+                    );
+                }
+                Err(scrobble_auth::RefreshError::NoRefreshToken) => {
+                    // No refresh_token stored — nothing to do proactively;
+                    // the reactive 401 path will fall back to re-auth.
+                    crate::devlog!(
+                        info, "scrobble",
+                        "Trakt token near expiry for scope={scope} but no refresh_token stored",
+                    );
+                }
+            }
+        }
+    }
+
     let candidates = trakt_targets(sess);
     if candidates.is_empty() {
         crate::devlog!(
@@ -574,12 +635,74 @@ async fn trakt_sync_history(scope: &str, sess: &ScrobbleSession, time: f64, dura
                 idx, idx + 1, total,
             );
         }
-        let outcome = trakt_sync_history_once(
+        let mut outcome = trakt_sync_history_once(
             &token.access_token, target, sess, progress_pct,
         ).await;
+
+        // ── Reactive refresh on 401 ────────────────────────────────
+        // The token 401'd mid-flight (expired since the proactive
+        // check, or there was no proactive check). Try to refresh and
+        // retry this exact request ONCE. The per-scope async mutex in
+        // refresh_trakt_token collapses concurrent 401s onto a single
+        // refresh so the rotating refresh_token isn't double-spent.
+        if let TraktSyncOutcome::Unauthorized = outcome {
+            match scrobble_auth::refresh_trakt_token(scope, Some(&token.access_token)).await {
+                Ok(refreshed) => {
+                    crate::devlog!(
+                        info, "scrobble",
+                        "Trakt 401 — token refreshed, retrying /sync/history once",
+                    );
+                    // Re-read the persisted token so any later candidate
+                    // iteration also uses the fresh access_token.
+                    if let Some(fresh) = scrobble_auth::read_token_for("trakt", scope) {
+                        token = fresh;
+                    } else {
+                        token.access_token = refreshed.access_token.clone();
+                    }
+                    outcome = trakt_sync_history_once(
+                        &token.access_token, target, sess, progress_pct,
+                    ).await;
+                    if let TraktSyncOutcome::Unauthorized = outcome {
+                        // Refreshed token still 401s — give up, clear,
+                        // surface the reconnect prompt. Do NOT loop.
+                        crate::devlog!(
+                            warn, "scrobble",
+                            "Trakt /sync/history 401 even after refresh — clearing token",
+                        );
+                        scrobble_auth::clear_token_for("trakt", scope);
+                        return TraktSyncResult::Failed;
+                    }
+                }
+                Err(scrobble_auth::RefreshError::Rejected) => {
+                    // refresh_token dead — refresh_trakt_token already
+                    // cleared the keyring. Same outcome as the old
+                    // clear-on-401 path; the notification fires.
+                    return TraktSyncResult::Failed;
+                }
+                Err(scrobble_auth::RefreshError::Transient(reason)) => {
+                    // Transient refresh failure — do NOT clear; the
+                    // token is left intact for a later retry.
+                    crate::devlog!(
+                        warn, "scrobble",
+                        "Trakt 401 + transient refresh failure: {reason} — leaving token intact, failing this sync",
+                    );
+                    return TraktSyncResult::Failed;
+                }
+                Err(scrobble_auth::RefreshError::NoRefreshToken) => {
+                    // Nothing to refresh with — fall back to the legacy
+                    // clear-token-and-re-auth behaviour.
+                    scrobble_auth::clear_token_for("trakt", scope);
+                    return TraktSyncResult::Failed;
+                }
+            }
+        }
+
         match outcome {
             TraktSyncOutcome::Added => return TraktSyncResult::Fired,
             TraktSyncOutcome::Unauthorized => {
+                // Reached only when the reactive block above didn't run
+                // (it always resolves Unauthorized to a return or a
+                // non-401 outcome) — defensive, mirrors legacy behaviour.
                 scrobble_auth::clear_token_for("trakt", scope);
                 return TraktSyncResult::Failed;
             }
