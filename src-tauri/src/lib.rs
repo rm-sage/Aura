@@ -2004,6 +2004,9 @@ pub fn run() {
             aniskip::resolve_mal_id_by_title,
             silencedetect::detect_silence_intervals,
             silencedetect::detect_outro_boundary,
+            // ── publicmetadb (OP/ED skip source: live-action + anime) ──
+            publicmetadb::fetch_publicmetadb_skips,
+            publicmetadb::resolve_anime_tmdb_id,
             // ── Phase 3C: scrobbling ──────────────────────────────────────────
             scrobble::scrobble_start,
             scrobble::scrobble_heartbeat,
