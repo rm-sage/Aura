@@ -173,6 +173,10 @@ export interface MetaDetail {
   kitsu_id: number | null;
   /** AniDB numeric id (future anidb→mal AniSkip fallback). */
   anidb_id: number | null;
+  /** The Movie Database (TMDB) numeric id when the addon stamps one.
+   *  Reliable for live-action series (AIOMetadata `_tmdbId`); usually
+   *  null for anime. Drives the publicmetadb OP/ED skip lookup. */
+  tmdb_id: number | null;
   country: string | null;
   /** ISO 639-1 (e.g. "ko", "ja", "en") — drives the "original" token in
    *  the audio_priority preference list. Null when the addon doesn't
