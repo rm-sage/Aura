@@ -444,6 +444,11 @@ pub struct MetaDetail {
     /// AniDB numeric id when present. Future use: anidb→mal mapping
     /// fallback for AniSkip.
     pub anidb_id: Option<u32>,
+    /// The Movie Database (TMDB) numeric id when the addon stamps one.
+    /// Sourced from AIOMetadata's `_tmdbId` — correct on live-action
+    /// series, unreliable for anime (null, or the broken literal
+    /// "[object Object]"). Drives the publicmetadb OP/ED skip lookup.
+    pub tmdb_id: Option<i64>,
     /// Per-season cast/crew rosters. Keys are season numbers (TMDB /
     /// TVDB convention — season 0 is specials, 1+ are the main run).
     /// Empty on movies + MAL-meta anime + older cached entries that
@@ -1996,9 +2001,15 @@ pub async fn fetch_meta_detail(
     let mal_id   = read_numeric_id(meta, &["_malId",   "malId",   "mal_id"]);
     let kitsu_id = read_numeric_id(meta, &["_kitsuId", "kitsuId", "kitsu_id"]);
     let anidb_id = read_numeric_id(meta, &["_anidbId", "anidbId", "anidb_id"]);
+    // TMDB id — AIOMetadata's `_tmdbId` (a JSON string like "61859" on
+    // live-action series; null or the broken literal "[object Object]"
+    // on anime — both yield None, since read_numeric_id's str branch
+    // does a numeric parse). Widened to i64 for the publicmetadb lookup.
+    let tmdb_id = read_numeric_id(meta, &["_tmdbId", "tmdbId", "tmdb_id"])
+        .map(i64::from);
     crate::devlog!(
         info, "meta",
-        "[{}] anime ids: mal={mal_id:?} kitsu={kitsu_id:?} anidb={anidb_id:?}",
+        "[{}] anime ids: mal={mal_id:?} kitsu={kitsu_id:?} anidb={anidb_id:?} tmdb={tmdb_id:?}",
         label,
     );
 
@@ -2134,6 +2145,7 @@ pub async fn fetch_meta_detail(
         mal_id,
         kitsu_id,
         anidb_id,
+        tmdb_id,
         season_credits,
         aggregate_credits,
     })
