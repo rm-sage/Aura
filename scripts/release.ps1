@@ -13,7 +13,8 @@
 
 .PARAMETER Password
     Password for the aura-updater.key minisign key. Required unless the
-    AURA_UPDATER_KEY_PASSWORD environment variable is set.
+    AURA_UPDATER_KEY_PASSWORD environment variable is set or an
+    AURA_UPDATER_KEY_PASSWORD= line is present in .env.local.
 
 .PARAMETER KeyPath
     Path to the minisign private key. Defaults to ./aura-updater.key in
@@ -28,6 +29,10 @@
 
 .EXAMPLE
     $env:AURA_UPDATER_KEY_PASSWORD = "<key-password>"
+    pwsh ./scripts/release.ps1
+
+.EXAMPLE
+    # Add AURA_UPDATER_KEY_PASSWORD=<key-password> to .env.local, then:
     pwsh ./scripts/release.ps1
 #>
 
@@ -64,6 +69,23 @@ $OutputEncoding           = [System.Text.UTF8Encoding]::new($false)
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $repoRoot
 
+# Parse .env.local (KEY=VALUE; `#` comments and blank lines skipped)
+# once, up front — it now backs both the updater-key password and the
+# Sentry upload vars.
+function Read-DotEnv {
+    param([string]$Path)
+    $map = @{}
+    if (Test-Path $Path) {
+        foreach ($line in Get-Content $Path) {
+            if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$') {
+                $map[$matches[1]] = $matches[2].Trim().Trim('"').Trim("'").Trim()
+            }
+        }
+    }
+    return $map
+}
+$dotenv = Read-DotEnv (Join-Path $repoRoot ".env.local")
+
 if (-not $KeyPath) {
     $KeyPath = Join-Path $repoRoot "aura-updater.key"
 }
@@ -84,12 +106,16 @@ if (-not (Test-Path -Path $KeyPath -PathType Leaf)) {
 if (-not $Password) {
     if ($env:AURA_UPDATER_KEY_PASSWORD) {
         $Password = $env:AURA_UPDATER_KEY_PASSWORD
+    } elseif ($dotenv["AURA_UPDATER_KEY_PASSWORD"]) {
+        $Password = $dotenv["AURA_UPDATER_KEY_PASSWORD"]
+        Write-Host "[release] updater-key password loaded from .env.local"
     } else {
         Write-Host ""
-        Write-Host "ERROR: -Password not provided and AURA_UPDATER_KEY_PASSWORD not set." -ForegroundColor Red
+        Write-Host "ERROR: -Password not provided, AURA_UPDATER_KEY_PASSWORD not set," -ForegroundColor Red
+        Write-Host "       and no AURA_UPDATER_KEY_PASSWORD line in .env.local." -ForegroundColor Red
         Write-Host ""
-        Write-Host "Either pass -Password '<key-password>' or export"
-        Write-Host "AURA_UPDATER_KEY_PASSWORD before re-running."
+        Write-Host "Pass -Password '<key-password>', export AURA_UPDATER_KEY_PASSWORD,"
+        Write-Host "or add an AURA_UPDATER_KEY_PASSWORD= line to .env.local."
         Write-Host ""
         exit 1
     }
@@ -282,20 +308,10 @@ if (-not (Test-Path $nsisSigPath)) {
 # the vite build step, so we don't re-upload them here.
 # ---------------------------------------------------------------------------
 
-$envLocal = Join-Path $repoRoot ".env.local"
-$sentryEnv = @{}
-if (Test-Path $envLocal) {
-    foreach ($line in Get-Content $envLocal) {
-        if ($line -match '^\s*([A-Z_]+)\s*=\s*(.*)$') {
-            $sentryEnv[$matches[1]] = $matches[2].Trim('"').Trim()
-        }
-    }
-}
-
-$sentryAuth    = $sentryEnv["SENTRY_AUTH_TOKEN"]
-$sentryOrg     = $sentryEnv["SENTRY_ORG"]
-$sentryProject = $sentryEnv["SENTRY_PROJECT"]
-$sentryUrl     = if ($sentryEnv["SENTRY_URL"]) { $sentryEnv["SENTRY_URL"] } else { "https://sentry.io/" }
+$sentryAuth    = $dotenv["SENTRY_AUTH_TOKEN"]
+$sentryOrg     = $dotenv["SENTRY_ORG"]
+$sentryProject = $dotenv["SENTRY_PROJECT"]
+$sentryUrl     = if ($dotenv["SENTRY_URL"]) { $dotenv["SENTRY_URL"] } else { "https://sentry.io/" }
 
 $pdbPath = Join-Path $repoRoot "src-tauri/target/release/aura.pdb"
 
