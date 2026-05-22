@@ -32,6 +32,7 @@ mod anime_id_map;
 mod api_keyring;
 mod media_controls;
 mod player;
+mod publicmetadb;
 mod ratings;
 mod scrobble;
 mod scrobble_anilist;
