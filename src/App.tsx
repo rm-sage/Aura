@@ -1748,6 +1748,51 @@ export default function App() {
               // heuristic windows still run via finishWithChapters.
               console.warn(`[aniskip] lookup failed: ${String(err)}`);
             }
+            // publicmetadb anime fallback — best-effort SECONDARY source.
+            // Fires only when AniSkip left an OP or ED gap. The TMDB id
+            // is resolved from yuna.moe's `themoviedb` (anime `_tmdbId`
+            // from AIOMetadata is unreliable) using whichever anime id
+            // we have. Fills ONLY the kinds AniSkip didn't supply. NOTE:
+            // for multi-cour anime the MAL-local episode may not align
+            // with TMDB numbering — that mis-key is the accepted
+            // "best-effort" cost (AniSkip remains anime's primary source).
+            try {
+              const haveOp = prepared.some((w) => w.type === "op" || w.type === "mixed-op");
+              const haveEd = prepared.some((w) => w.type === "ed");
+              if ((!haveOp || !haveEd) && Number.isFinite(episodeNum)) {
+                let animeTmdb: number | null = detail?.tmdb_id ?? null;
+                const tmdbSources: ["kitsu" | "anidb" | "anilist", number | null | undefined][] = [
+                  ["kitsu",   detail?.kitsu_id],
+                  ["anidb",   detail?.anidb_id],
+                  ["anilist", (detail as { anilist_id?: number | null } | null)?.anilist_id],
+                ];
+                for (const [src, sid] of tmdbSources) {
+                  if (animeTmdb != null) break;
+                  if (sid == null) continue;
+                  try {
+                    animeTmdb = await invoke<number | null>(
+                      "resolve_anime_tmdb_id", { source: src, id: sid },
+                    );
+                  } catch { /* best-effort — leave null */ }
+                }
+                if (animeTmdb != null) {
+                  const pmdb = await fetchPublicmetadbWindows(
+                    animeTmdb, "tv", target.season ?? 1, episodeNum, modeFor,
+                  );
+                  for (const w of pmdb) {
+                    if (w.type === "op" && !haveOp) prepared.push(w);
+                    if (w.type === "ed" && !haveEd) prepared.push(w);
+                  }
+                  if (pmdb.length > 0) {
+                    console.info(
+                      `[publicmetadb] anime fallback: tmdb=${animeTmdb} → ${pmdb.length} window(s)`,
+                    );
+                  }
+                }
+              }
+            } catch (e) {
+              console.warn(`[publicmetadb] anime fallback failed: ${String(e)}`);
+            }
             // ALWAYS augment with chapters (even on an empty AniSkip
             // result): anime with no AniSkip data gets the same
             // chapter / heuristic treatment as live-action. Passing
