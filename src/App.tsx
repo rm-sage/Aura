@@ -378,6 +378,47 @@ async function mergeChapterSkipWindows(
 }
 
 // ---------------------------------------------------------------------------
+// publicmetadb skip windows — crowd-sourced OP/ED timestamps from the
+// publicmetadb skip database (TMDB-keyed). Aura's PRIMARY skip source
+// for live-action series; a best-effort fallback for anime. Maps the
+// Rust `PublicmetadbSkips` payload into `PreparedWindow`s, dropping any
+// kind the user has switched off. Network / parse failure → empty list
+// (the caller falls through to chapters / silencedetect).
+// ---------------------------------------------------------------------------
+async function fetchPublicmetadbWindows(
+  tmdbId:    number,
+  mediaType: "tv" | "movie",
+  season:    number,
+  episode:   number,
+  modeFor:   (kind: string) => "off" | "prompt" | "auto",
+): Promise<PreparedWindow[]> {
+  try {
+    const res = await invoke<{
+      found:   boolean;
+      windows: { kind: string; start: number; end: number; source: string }[];
+    }>("fetch_publicmetadb_skips", {
+      tmdbId,
+      mediaType,
+      season,
+      episode,
+    });
+    if (!res.found || res.windows.length === 0) return [];
+    return res.windows
+      .filter((w) => modeFor(w.kind) !== "off")
+      .map((w) => ({
+        type:   w.kind,
+        start:  w.start,
+        end:    w.end,
+        source: w.source, // "publicmetadb"
+        auto:   modeFor(w.kind) === "auto",
+      }));
+  } catch (e) {
+    console.warn(`[publicmetadb] lookup failed: ${String(e)}`);
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
 // usePlayback
 // ---------------------------------------------------------------------------
 
@@ -1586,13 +1627,45 @@ export default function App() {
               } catch { /* leave null, falls through to skip log */ }
             }
             if (!malId) {
-              // Live-action, or anime we couldn't resolve to a MAL id
-              // (IMDb-keyed with no anime ids + no Jikan title hit).
-              // No AniSkip data — fall straight through to the chapter
-              // path so chaptered live-action series still get skip
-              // windows. THIS is the anime-only → any-series extension.
-              console.info(`[aniskip] no mal_id for ${seriesId} — chapter-only skip path`);
-              await finishWithChapters([], { silenceUrl: stream.url ?? null });
+              // Live-action, or anime we couldn't resolve to a MAL id.
+              // publicmetadb is the PRIMARY skip source here — keyed by
+              // the show's TMDB id + season/episode. It feeds
+              // finishWithChapters as `prepared`, so chapters and the
+              // silencedetect heuristic only fill kinds it did not
+              // supply. No publicmetadb data → empty list, and the
+              // chapter path still runs so chaptered live-action keeps
+              // producing windows.
+              let pmdbWindows: PreparedWindow[] = [];
+              const laTmdb = detail?.tmdb_id ?? null;
+              const laSegs = target.id.split(":");
+              // The segment fallback is for IMDb-style episode ids
+              // (tt…:S:E). An anime-prefix id (kitsu:N:M, mal:N:M, …)
+              // also splits into 3 segments, but segment 1 is a show
+              // id, not a season — trust the fallback only when segment
+              // 0 is a tt-prefixed IMDb id; otherwise yield NaN so the
+              // Number.isFinite guard below cleanly skips publicmetadb.
+              const laImdbId = laSegs.length === 3 && /^tt\d/i.test(laSegs[0]);
+              const laSeason = Number.isFinite(target.season as number)
+                ? (target.season as number)
+                : laImdbId ? Number(laSegs[1]) : NaN;
+              const laEpisode = Number.isFinite(target.episode_num as number)
+                ? (target.episode_num as number)
+                : laImdbId ? Number(laSegs[2]) : NaN;
+              if (laTmdb != null && Number.isFinite(laSeason) && Number.isFinite(laEpisode)) {
+                pmdbWindows = await fetchPublicmetadbWindows(
+                  laTmdb, "tv", laSeason, laEpisode, modeFor,
+                );
+                console.info(
+                  `[publicmetadb] no mal_id for ${seriesId} — ` +
+                  `tmdb=${laTmdb} s${laSeason}e${laEpisode} → ${pmdbWindows.length} window(s)`,
+                );
+              } else {
+                console.info(
+                  `[publicmetadb] no mal_id for ${seriesId} — skipped ` +
+                  `(tmdb=${laTmdb} season=${laSeason} episode=${laEpisode}); chapter-only`,
+                );
+              }
+              await finishWithChapters(pmdbWindows, { silenceUrl: stream.url ?? null });
               return;
             }
             // Mal-id was resolved → this is an anime; mark for future
