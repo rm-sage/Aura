@@ -516,6 +516,12 @@ pub struct StreamEntry {
     pub file_idx: Option<i64>,
     /// Behavior hints from the addon (HDR, 4K, etc).
     pub description: Option<String>,
+    /// `behaviorHints.filename` from the addon — raw release filename
+    /// (e.g. "Frieren.S01E07.1080p.WEB-DL.x265-RAWR.mkv"). AIOStreams
+    /// and some other addons populate this; the UI surfaces it as a
+    /// hover tooltip on the stream row's headline so users can verify
+    /// the exact release without copying the link first.
+    pub filename: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3224,6 +3230,15 @@ fn sanitize_stream(s: &serde_json::Value, addon_name: &str) -> Option<StreamEntr
         }
     });
 
+    // behaviorHints.filename — populated by AIOStreams (and some other
+    // addons) with the raw release filename. Cap matches `title` to
+    // protect against pathological addon payloads.
+    let filename = s
+        .get("behaviorHints")
+        .and_then(|v| v.get("filename"))
+        .and_then(|v| v.as_str())
+        .map(|s| cap(s.to_string(), 512));
+
     Some(StreamEntry {
         title,
         addon_name: cap(addon_name.to_string(), 64),
@@ -3234,6 +3249,7 @@ fn sanitize_stream(s: &serde_json::Value, addon_name: &str) -> Option<StreamEntr
             .get("description")
             .and_then(|v| v.as_str())
             .map(|s| cap(s.to_string(), 1024)),
+        filename,
     })
 }
 

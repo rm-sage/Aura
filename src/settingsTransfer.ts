@@ -91,12 +91,10 @@ const PORTABLE_BACKEND_FIELDS = [
 export type PortableBackendField = typeof PORTABLE_BACKEND_FIELDS[number];
 
 /** Aura-side fields safe to round-trip across installs (all addon-URL-
- *  independent). hideCastSpoilers + showAioStreamsNotices are per-user
- *  preferences, not tied to any addon, so they're appropriate for the
- *  portable blob. */
+ *  independent). hideCastSpoilers is a per-user preference, not tied to
+ *  any addon, so it's appropriate for the portable blob. */
 const PORTABLE_AURA_FIELDS = [
   "hideCastSpoilers",
-  "showAioStreamsNotices",
   "blurUnwatchedThumbnails",
 ] as const;
 export type PortableAuraField = typeof PORTABLE_AURA_FIELDS[number];

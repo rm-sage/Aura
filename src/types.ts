@@ -251,6 +251,11 @@ export interface StreamEntry {
   info_hash: string | null;
   file_idx: number | null;
   description: string | null;
+  /** `behaviorHints.filename` from the addon — raw release filename when
+   *  available. AIOStreams and some other addons populate it; the
+   *  StreamRow surfaces it as a hover tooltip on the headline so users
+   *  can verify the exact release without copying the link. */
+  filename: string | null;
 }
 
 /** AIOStreams emits structured payloads alongside the canonical `streams`

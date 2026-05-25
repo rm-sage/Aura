@@ -1042,9 +1042,6 @@ function BackupRestoreSection({
         if (typeof blob.aura.hideCastSpoilers === "boolean") {
           next.hideCastSpoilers = blob.aura.hideCastSpoilers;
         }
-        if (typeof blob.aura.showAioStreamsNotices === "boolean") {
-          next.showAioStreamsNotices = blob.aura.showAioStreamsNotices;
-        }
         if (typeof blob.aura.blurUnwatchedThumbnails === "boolean") {
           next.blurUnwatchedThumbnails = blob.aura.blurUnwatchedThumbnails;
         }
@@ -4031,13 +4028,6 @@ export default function SettingsView({ addons, session }: Props) {
               description="Some shows treat regular vs. guest billing as a plot beat (deaths, returns, surprise cameos). When on, the cast hover card shows just the name; per-actor episode counts and tier are hidden."
               value={aura.hideCastSpoilers}
               onChange={(v) => setLocal({ hideCastSpoilers: v })}
-            />
-            <div className="h-px bg-white/6" />
-            <SettingToggle
-              label="Show AIOStreams notices"
-              description="Show filter, timing, and scrape-summary notices plus addon errors as small icon badges over the streams panel. Notices the addon flags as un-suppressible (e.g. the Digital Release Filter warning) always show, regardless of this toggle."
-              value={aura.showAioStreamsNotices}
-              onChange={(v) => setLocal({ showAioStreamsNotices: v })}
             />
             <div className="h-px bg-white/6" />
             <SettingToggle
