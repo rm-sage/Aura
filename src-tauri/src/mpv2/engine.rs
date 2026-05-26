@@ -33,7 +33,7 @@ use std::ffi::{c_char, c_int, c_void, CStr};
 use std::mem::size_of;
 use std::ptr;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicIsize, Ordering},
     mpsc::{self, Receiver, Sender, TryRecvError},
     Arc, Mutex, OnceLock,
 };
@@ -45,7 +45,10 @@ use windows::Win32::Foundation::{
     GetLastError, ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT,
     RECT, WPARAM,
 };
-use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC, HDC};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, CreateSolidBrush, EndPaint, GetDC, ReleaseDC, HDC, PAINTSTRUCT,
+};
+use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Graphics::OpenGL::{
     glClear, glClearColor, glGetString, glViewport, wglCreateContext, wglDeleteContext,
     wglGetProcAddress, wglMakeCurrent, ChoosePixelFormat, SetPixelFormat, SwapBuffers,
@@ -57,8 +60,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     IsWindow, MsgWaitForMultipleObjects, PeekMessageW, RegisterClassW, SetWindowPos,
     TranslateMessage, CS_OWNDC, HWND_BOTTOM, MSG, PM_REMOVE, QS_ALLINPUT,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WINDOW_EX_STYLE, WNDCLASSW, WS_CHILD,
-    WS_VISIBLE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WINDOW_EX_STYLE, WM_PAINT, WM_SIZE,
+    WNDCLASSW, WS_CHILD, WS_VISIBLE,
 };
 
 use super::ffi::{
@@ -275,15 +278,60 @@ const TITLE_BAR_H: i32 = 36;
 const FALLBACK_W: i32 = 720;
 const FALLBACK_H: i32 = 460;
 
-/// Trivial wndproc — the engine window does no input handling and paints
-/// only via OpenGL, so every message goes to the default handler.
+/// HDC of the engine window, cached after [`wglMakeCurrent`] succeeds so
+/// the wndproc's resize-time fast-path can [`SwapBuffers`] without
+/// re-querying state out of [`run_engine`]'s locals. Zero when the engine
+/// isn't running. Safe because there's only one engine instance per
+/// process and the wndproc runs on the same thread that writes this
+/// value (the render thread).
+static ENGINE_HDC: AtomicIsize = AtomicIsize::new(0);
+
+/// Engine wndproc. Two messages get explicit handling, everything else
+/// (including `WM_ERASEBKGND`) goes to the default handler so the class's
+/// teal background brush actually gets used to fill newly-exposed area
+/// during drag-resize.
+///
+/// * `WM_PAINT` → BeginPaint / EndPaint with no GDI work, return 0. The
+///   actual painting is the render thread's continuous SwapBuffers; this
+///   only validates the paint rect so Windows doesn't immediately re-fire
+///   WM_PAINT.
+/// * `WM_SIZE` → synchronously glClear + SwapBuffers at the new size. The
+///   GL context is current on this thread (wndproc runs on the window's
+///   owning thread = render thread), and the next regular render tick
+///   would arrive up to ~16 ms later — fast enough to feel laggy under a
+///   drag-resize. Doing the clear inline closes the gap.
 unsafe extern "system" fn engine_wndproc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    DefWindowProcW(hwnd, msg, wparam, lparam)
+    match msg {
+        WM_PAINT => {
+            let mut ps: PAINTSTRUCT = std::mem::zeroed();
+            let _ = BeginPaint(hwnd, &mut ps);
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_SIZE => {
+            let raw_hdc = ENGINE_HDC.load(Ordering::Acquire);
+            if raw_hdc != 0 {
+                // WM_SIZE's lparam packs the new client size: low 16 bits
+                // = width, next 16 bits = height. Both unsigned 16-bit, so
+                // they fit in i32 without sign concerns.
+                let cw = (lparam.0 & 0xFFFF) as i32;
+                let ch = ((lparam.0 >> 16) & 0xFFFF) as i32;
+                if cw > 0 && ch > 0 {
+                    glViewport(0, 0, cw, ch);
+                    glClearColor(0.04, 0.45, 0.50, 1.0);
+                    glClear(GL_COLOR_BUFFER_BIT);
+                    let _ = SwapBuffers(HDC(raw_hdc as *mut c_void));
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
 }
 
 /// Two-tier `get_proc_address` for `mpv_opengl_init_params`: try
@@ -427,11 +475,40 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize) {
         };
         let hinstance = HINSTANCE(hmodule.0);
 
+        // Background brush filled with the engine's "alive" teal — the
+        // SAME colour the render thread `glClear`s to every frame. With
+        // this set on the class, DefWindowProc handles WM_ERASEBKGND by
+        // GDI-filling the dirty area, AND if a non-GL paint cycle ever
+        // sneaks in the area shows teal instead of the parent's
+        // transparent backdrop. The brush is leaked for process lifetime
+        // (one allocation per process; matches the once-per-process
+        // RegisterClassW semantics below).
+        //
+        // KNOWN LIMITATION (deferred to Phase 5+): this does NOT fix
+        // drag-resize flicker. Tested 2026-05-26 — the teal-↔-black
+        // flicker during drag-resize persists even with the class brush,
+        // because the gap is DWM compositor latency between the OS
+        // committing the child's new screen rect and the next vblank
+        // pulling our SwapBuffers result. Cannot be closed from the
+        // wndproc; the canonical fix involves either (a) owning the
+        // `SetWindowPos` path so it can be deferred with
+        // SWP_DEFERERASE | SWP_NOREDRAW until our render is queued, or
+        // (b) moving to a D3D11 swap-chain whose Present is DWM-atomic.
+        // Both are out-of-scope for Phase 2 — they belong in Phase 5
+        // (`win32::resize_mpv_child_to_parent` ownership port) and the
+        // Phase 6 regression gate against the v0.8.0 baseline. Single-
+        // shot resizes (maximize / restore) are NOT affected because the
+        // single SetWindowPos completes inside one DWM frame.
+        //
+        // COLORREF is 0x00BBGGRR. Our glClear colour (0.04, 0.45, 0.50)
+        // ≈ (10, 115, 128) RGB, which is 0x00807310 in BGR.
+        let teal_brush = CreateSolidBrush(COLORREF(0x0080_730A));
         let wc = WNDCLASSW {
             style: CS_OWNDC,
             lpfnWndProc: Some(engine_wndproc),
             hInstance: hinstance,
             lpszClassName: CLASS_NAME,
+            hbrBackground: teal_brush,
             ..Default::default()
         };
         if RegisterClassW(&wc) == 0 {
@@ -528,6 +605,9 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize) {
             let _ = DestroyWindow(hwnd);
             return;
         }
+        // Publish the HDC so the wndproc's resize-time fast-path can swap.
+        // Cleared by `teardown_wgl` before the HDC is released.
+        ENGINE_HDC.store(hdc.0 as isize, Ordering::Release);
         crate::devlog!(
             info, "mpv2",
             "WGL context current — GL_VERSION='{}', GL_RENDERER='{}'",
@@ -772,6 +852,10 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize) {
 /// "context-not-current" branch, so the early-exit call sites can use it
 /// without first un-currenting anything.
 unsafe fn teardown_wgl(hwnd: HWND, hdc: HDC, hglrc: HGLRC) {
+    // Clear the cached HDC first so the wndproc's WM_SIZE fast-path
+    // (which may still fire during DestroyWindow's parent-notify cascade)
+    // can't reach a freed DC. A zero load makes the fast-path a no-op.
+    ENGINE_HDC.store(0, Ordering::Release);
     let _ = wglMakeCurrent(HDC::default(), HGLRC::default());
     let _ = wglDeleteContext(hglrc);
     ReleaseDC(Some(hwnd), hdc);
