@@ -65,14 +65,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::ffi::{
-    mpv_event_id, mpv_event_log_message, mpv_format, mpv_handle, mpv_opengl_fbo,
-    mpv_opengl_init_params, mpv_render_context, mpv_render_param, mpv_render_param_type,
-    Libmpv, MPV_RENDER_API_TYPE_OPENGL,
+    mpv_event_end_file, mpv_event_id, mpv_event_log_message, mpv_event_property,
+    mpv_format, mpv_handle, mpv_opengl_fbo, mpv_opengl_init_params, mpv_render_context,
+    mpv_render_param, mpv_render_param_type, Libmpv, MPV_RENDER_API_TYPE_OPENGL,
 };
 
 // ===========================================================================
 // Public API
 // ===========================================================================
+
+/// Type-erased emit callback the engine uses to push events to the
+/// frontend. lib.rs's setup provides a closure that calls
+/// `app.emit("mpv-event-main", payload)` on the active `AppHandle`. The
+/// engine module stays Tauri-agnostic by going through this boxed `Fn`.
+pub type EngineEmit = Box<dyn Fn(&str, serde_json::Value) + Send + Sync + 'static>;
 
 /// A request submitted to the engine's render thread.
 ///
@@ -141,8 +147,10 @@ pub fn is_running() -> bool {
 /// can cross the thread boundary (`HWND` itself is not `Send`). The render
 /// thread re-wraps it. Passing 0 disables the engine even when the env var
 /// is set — used as a defensive fall-through when the main window's HWND
-/// can't be resolved at setup time.
-pub fn start_if_requested(parent_hwnd: isize) {
+/// can't be resolved at setup time. `emit` is the channel the render
+/// thread uses to push mpv events (property changes, end-of-file, …) back
+/// to the frontend through Tauri.
+pub fn start_if_requested(parent_hwnd: isize, emit: EngineEmit) {
     if !enabled() {
         return;
     }
@@ -171,7 +179,7 @@ pub fn start_if_requested(parent_hwnd: isize) {
     let (tx, rx) = mpsc::channel::<EngineCommand>();
     let join = match thread::Builder::new()
         .name("aura-mpv2-engine".into())
-        .spawn(move || run_engine(rx, parent_hwnd))
+        .spawn(move || run_engine(rx, parent_hwnd, emit))
     {
         Ok(j) => j,
         Err(e) => {
@@ -542,11 +550,71 @@ unsafe fn set_volume(
     }
 }
 
-/// Drain queued mpv events without blocking. Forwards LOG_MESSAGE to the
-/// DevConsole and returns once the queue is empty or a SHUTDOWN is seen.
-/// The full event channel goes to Phase 3 — this minimal drain keeps mpv's
-/// own diagnostics reaching the user.
-unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle) {
+/// Render an observed `mpv_event_property` payload as a serde JSON value
+/// suitable for the `mpv-event-main` Tauri event the bridge in lib.rs
+/// consumes. Returns `Null` when the property couldn't be retrieved (mpv
+/// signals this with `format == NONE` or `data == NULL`); the bridge
+/// already has a guard that drops null updates so the property's
+/// last-known value isn't clobbered.
+unsafe fn property_value_to_json(prop: &mpv_event_property) -> serde_json::Value {
+    if prop.data.is_null() {
+        return serde_json::Value::Null;
+    }
+    let fmt = prop.format.0;
+    if fmt == mpv_format::FLAG.0 {
+        let v = *(prop.data as *const c_int);
+        serde_json::Value::Bool(v != 0)
+    } else if fmt == mpv_format::INT64.0 {
+        let v = *(prop.data as *const i64);
+        serde_json::Value::Number(serde_json::Number::from(v))
+    } else if fmt == mpv_format::DOUBLE.0 {
+        let v = *(prop.data as *const f64);
+        serde_json::Number::from_f64(v)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null)
+    } else if fmt == mpv_format::STRING.0 {
+        // For STRING format `data` points to a `*const c_char` — read the
+        // outer pointer first, then the C string itself.
+        let ptr = *(prop.data as *const *const c_char);
+        if ptr.is_null() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(cstr(ptr))
+        }
+    } else {
+        serde_json::Value::Null
+    }
+}
+
+/// Map an `mpv_end_file_reason` enum value to the string the legacy
+/// `tauri-plugin-libmpv` plugin emitted. The lib.rs observer bridge
+/// already accepts either a string OR the raw int, but matching the
+/// legacy string form keeps the bridge's fast path active and the
+/// devlog messages identical between engines.
+fn end_file_reason_to_str(reason: c_int) -> &'static str {
+    match reason {
+        0 => "eof",
+        2 => "stop",
+        3 => "quit",
+        4 => "error",
+        5 => "redirect",
+        _ => "unknown",
+    }
+}
+
+/// Drain queued mpv events without blocking. Three handlings:
+///
+/// * `LOG_MESSAGE` → DevConsole.
+/// * `PROPERTY_CHANGE` → emit `{name, data}` so the lib.rs observer
+///   bridge translates it into `playback-update`.
+/// * `END_FILE` → emit `{name: "end-file", data: {reason, error}}` so the
+///   bridge fires `playback-end`.
+/// * `SHUTDOWN` → logged, drain stops.
+///
+/// Other events (start-file / file-loaded / seek / playback-restart, …)
+/// aren't consumed by the bridge today, so they're discarded silently —
+/// Phase 4 can extend this when a setter or observer needs them.
+unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineEmit) {
     loop {
         let ev = (lib.wait_event)(handle, 0.0);
         if ev.is_null() {
@@ -565,6 +633,43 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle) {
                     cstr((*m).prefix).trim(),
                     cstr((*m).text).trim_end(),
                 );
+            }
+        } else if id == mpv_event_id::PROPERTY_CHANGE {
+            let p = (*ev).data as *const mpv_event_property;
+            if !p.is_null() && !(*p).name.is_null() {
+                let name = cstr((*p).name);
+                let data = property_value_to_json(&*p);
+                // Devlog `frame-drop-count` separately — the lib.rs
+                // observer bridge doesn't consume it (no UI surface yet)
+                // and silent-discards it from the `mpv-event-main`
+                // channel. Surfacing it here lets us read drop deltas
+                // around focus transitions to validate the off-focus
+                // rewrite empirically — the verification deferred from
+                // Phase 2.4. Only logs on change (mpv only fires
+                // PROPERTY_CHANGE on transitions), so no spam.
+                if name == "frame-drop-count" {
+                    crate::devlog!(
+                        info, "mpv2",
+                        "frame-drop-count → {data}",
+                    );
+                }
+                emit(&name, data);
+            }
+        } else if id == mpv_event_id::END_FILE {
+            let e = (*ev).data as *const mpv_event_end_file;
+            if !e.is_null() {
+                let mut payload = serde_json::Map::new();
+                payload.insert(
+                    "reason".into(),
+                    serde_json::Value::String(
+                        end_file_reason_to_str((*e).reason.0).to_string(),
+                    ),
+                );
+                payload.insert(
+                    "error".into(),
+                    serde_json::Value::Number(serde_json::Number::from((*e).error as i64)),
+                );
+                emit("end-file", serde_json::Value::Object(payload));
             }
         } else if id == mpv_event_id::SHUTDOWN {
             crate::devlog!(warn, "mpv2", "mpv emitted SHUTDOWN");
@@ -628,7 +733,7 @@ unsafe fn parent_client_inset(parent: HWND) -> (i32, i32, i32, i32) {
 
 /// Render-thread body. Sets everything up, runs until `Shutdown` is
 /// received (or the window is closed externally), then tears down.
-fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize) {
+fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit) {
     crate::devlog!(info, "mpv2", "engine thread started");
 
     unsafe {
@@ -838,6 +943,37 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize) {
         }
         (lib.request_log_messages)(handle, b"info\0".as_ptr() as *const c_char);
 
+        // -- Observe properties (Phase 3) --
+        // Trimmed working set per CLAUDE.md landmine #4: pause / time-pos
+        // / duration / volume / speed were the only properties safe to
+        // observe through the legacy wrapper's event channel. Direct FFI
+        // MAY relax this — the wrapper was the fragile part, not libmpv
+        // itself — but we start with that exact set so the existing
+        // observer bridge in lib.rs (which folds these five into
+        // `playback-update`) keeps working unchanged. `frame-drop-count`
+        // is added on top as INT64 telemetry for the off-focus-drop
+        // verification deferred from Phase 2.4 — it isn't consumed by the
+        // bridge today, but emitting it lets us log/inspect drop deltas
+        // around focus transitions.
+        for (name, fmt) in [
+            (b"pause\0".as_slice(), mpv_format::FLAG),
+            (b"time-pos\0".as_slice(), mpv_format::DOUBLE),
+            (b"duration\0".as_slice(), mpv_format::DOUBLE),
+            (b"volume\0".as_slice(), mpv_format::DOUBLE),
+            (b"speed\0".as_slice(), mpv_format::DOUBLE),
+            (b"frame-drop-count\0".as_slice(), mpv_format::INT64),
+        ] {
+            let r = (lib.observe_property)(handle, 0, name.as_ptr() as *const c_char, fmt);
+            if r < 0 {
+                crate::devlog!(
+                    warn, "mpv2",
+                    "observe_property('{}') failed: {}",
+                    String::from_utf8_lossy(&name[..name.len() - 1]),
+                    err_str(&lib, r),
+                );
+            }
+        }
+
         let mut gl_init = mpv_opengl_init_params {
             get_proc_address: Some(aura_get_proc_address),
             get_proc_address_ctx: opengl32.0,
@@ -1044,7 +1180,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize) {
 
             glViewport(0, 0, cw, ch);
 
-            drain_mpv_events(&lib, handle);
+            drain_mpv_events(&lib, handle, &emit);
 
             // Consume the update-callback flag and the render-context's
             // own update bitset for completeness, but DO NOT use them to

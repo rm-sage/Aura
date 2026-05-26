@@ -1729,7 +1729,28 @@ pub fn run() {
                     .and_then(|w| w.hwnd().ok())
                     .map(|h| h.0 as isize)
                     .unwrap_or(0);
-                mpv2::engine::start_if_requested(parent_hwnd);
+                // Engine event channel — the render thread calls this on
+                // every mpv property change / end-of-file, which the
+                // observer bridge below already consumes as `mpv-event-main`
+                // and folds into `playback-update` / `playback-end`. Going
+                // through the bridge means zero frontend changes and a
+                // single observer surface across both engines.
+                let emit_handle = app.handle().clone();
+                mpv2::engine::start_if_requested(
+                    parent_hwnd,
+                    Box::new(move |name, payload| {
+                        let mut wrapped = serde_json::Map::new();
+                        wrapped.insert(
+                            "name".into(),
+                            serde_json::Value::String(name.to_string()),
+                        );
+                        wrapped.insert("data".into(), payload);
+                        let _ = emit_handle.emit(
+                            "mpv-event-main",
+                            serde_json::Value::Object(wrapped),
+                        );
+                    }),
+                );
             }
 
             // ── Window lifecycle (pause-on-blur, pause-on-min, close-on-exit) ─
