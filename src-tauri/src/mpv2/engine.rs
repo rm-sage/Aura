@@ -58,11 +58,12 @@ use windows::Win32::Graphics::OpenGL::{
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    GetForegroundWindow, IsWindow, MsgWaitForMultipleObjects, PeekMessageW,
+    IsIconic, IsWindow, IsWindowVisible, MsgWaitForMultipleObjects, PeekMessageW,
     RegisterClassW, SetWindowPos, TranslateMessage, CS_OWNDC, HWND_BOTTOM, MSG,
     PM_REMOVE, QS_ALLINPUT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WINDOW_EX_STYLE,
     WM_PAINT, WM_SIZE, WNDCLASSW, WS_CHILD, WS_VISIBLE,
 };
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 
 use super::ffi::{
     mpv_event_end_file, mpv_event_id, mpv_event_log_message, mpv_event_property,
@@ -972,13 +973,54 @@ unsafe fn apply_framedrop_policy(
     }
 }
 
-/// True when our parent window IS the OS-level foreground window. That's
-/// the same predicate DWM uses to decide whether to throttle the
-/// composition of this window's swap chain — non-foreground composition
-/// is what produces the off-focus frame drops the rewrite targets.
-unsafe fn is_foreground_parent(parent: HWND) -> bool {
-    let fg = GetForegroundWindow();
-    !fg.is_invalid() && fg == parent
+/// True when our parent window is **actually visible** on screen — not
+/// minimised, not DWM-cloaked (a different virtual desktop, or a UWP-
+/// style ghost), AND the `WS_VISIBLE` style bit is set.
+///
+/// This is intentionally NOT the same predicate as
+/// `GetForegroundWindow() == parent`. The earlier dual-mode loop used
+/// foreground detection and treated *every* not-foreground case as
+/// "DWM is throttling us; switch to timer-paced render mode" — but
+/// DWM doesn't throttle visible-on-another-monitor windows. A user
+/// who has Aura playing a stream on monitor 2 while working on
+/// monitor 1 expects full-quality playback; the legacy detection
+/// dropped them into timer-paced + framedrop+report_swap mode that
+/// was actively dropping ~16% of frames OR (with framedrop=no)
+/// accumulating decoded-but-undisplayed frames until refocus, which
+/// caused the catch-up burst the user reported.
+///
+/// Real DWM throttling only applies to:
+///   * Minimised windows (`IsIconic`).
+///   * DWM-cloaked windows (different virtual desktop, hidden by
+///     window-management policy, etc.).
+///   * Hidden windows (`!IsWindowVisible`).
+///
+/// For all of those, swap-chain present is throttled to ~1 Hz or
+/// suspended entirely. For the visible-but-not-foreground case, DWM
+/// composites normally — vsync-blocked SwapBuffers behaves exactly
+/// as it does for the foreground window.
+unsafe fn is_parent_actually_visible(parent: HWND) -> bool {
+    if !IsWindowVisible(parent).as_bool() {
+        return false;
+    }
+    if IsIconic(parent).as_bool() {
+        return false;
+    }
+    // DWMWA_CLOAKED returns a BOOL/DWORD (0 = not cloaked, nonzero =
+    // cloaked for a documented reason: virtual desktop, UWP shell-
+    // ghost, etc.). Treat any cloaking as "not visible" so we fall
+    // back to the lightweight render path in those cases.
+    let mut cloaked: u32 = 0;
+    let r = DwmGetWindowAttribute(
+        parent,
+        DWMWA_CLOAKED,
+        &mut cloaked as *mut _ as *mut c_void,
+        std::mem::size_of::<u32>() as u32,
+    );
+    if r.is_ok() && cloaked != 0 {
+        return false;
+    }
+    true
 }
 
 /// Compute the engine child's target geometry from its parent's client
@@ -1315,7 +1357,13 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 "wglSwapIntervalEXT not available — both modes will be timer-paced",
             );
         }
-        let mut focused = is_foreground_parent(parent);
+        // `visible` here means "DWM is compositing us at normal cadence"
+        // — see `is_parent_actually_visible` for what that includes /
+        // excludes. The variable name `focused` is kept for code-locality
+        // with the existing focused/unfocused devlog messages even though
+        // the predicate has changed; user-visible behaviour is now
+        // "actually visible window stays in full-quality vsync mode".
+        let mut focused = is_parent_actually_visible(parent);
         if let Some(set_swap) = wgl_swap_interval {
             let interval = if focused { 1 } else { 0 };
             let r = set_swap(interval);
@@ -1469,8 +1517,12 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 break;
             }
 
-            // Detect focus transition and re-toggle vsync if it changed.
-            let now_focused = is_foreground_parent(parent);
+            // Detect visibility transition and re-toggle vsync / framedrop
+            // policy. Visibility ≠ foreground: a window minimised to the
+            // tray, cloaked to another virtual desktop, or hidden flips
+            // to the background path. A window on a second monitor while
+            // the user works on the primary stays in full-quality mode.
+            let now_focused = is_parent_actually_visible(parent);
             if now_focused != focused {
                 focused = now_focused;
                 if let Some(set_swap) = wgl_swap_interval {

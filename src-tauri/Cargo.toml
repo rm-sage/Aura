@@ -124,6 +124,14 @@ windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_OpenGL",
+    # DwmGetWindowAttribute + DWMWA_CLOAKED — used by mpv2::engine to
+    # detect whether the window is "actually visible" (not minimised,
+    # not cloaked to a different virtual desktop) vs. only "not the
+    # foreground window". A visible window on a second monitor while
+    # the user works on the primary should keep full-quality vsync
+    # rendering; only minimised / cloaked / hidden windows should drop
+    # to the timer-paced background path.
+    "Win32_Graphics_Dwm",
 ] }
 
 # Dev-profile slimming. The default debug profile produced ~43 GB of
