@@ -454,6 +454,21 @@ pub async fn add_subtitle_to_mpv(
 ) -> Result<(), String> {
     let normalised = path.replace('\\', "/");
     let mode = flag.unwrap_or_else(|| "select".into());
+    #[cfg(target_os = "windows")]
+    if crate::mpv2::engine::enabled() && crate::mpv2::engine::is_running() {
+        let mut args: Vec<String> = vec![
+            "sub-add".into(),
+            normalised.clone(),
+            mode.clone(),
+        ];
+        if title.is_some() || lang.is_some() {
+            args.push(title.clone().unwrap_or_default());
+            if let Some(lang_str) = lang.clone() {
+                args.push(lang_str);
+            }
+        }
+        return crate::mpv2::engine::submit_command(args);
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let mut args: Vec<serde_json::Value> = vec![
             serde_json::json!(normalised),

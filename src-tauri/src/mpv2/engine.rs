@@ -80,6 +80,32 @@ use super::ffi::{
 /// engine module stays Tauri-agnostic by going through this boxed `Fn`.
 pub type EngineEmit = Box<dyn Fn(&str, serde_json::Value) + Send + Sync + 'static>;
 
+/// Typed property value the engine accepts when forwarding
+/// `mpv_set_property`. Tauri command handlers pick the variant that
+/// matches mpv's documented format for the property — FLAG for booleans
+/// like `pause` / `sub-visibility`, DOUBLE for `volume` / `speed` /
+/// `audio-delay`, STRING for `aid` / `sid` (mpv accepts "auto" / "no" /
+/// numeric strings here), INT64 for the few integer properties Aura
+/// touches. Picking the wrong variant returns an mpv error code rather
+/// than corrupting state.
+pub enum PropValue {
+    Flag(bool),
+    Int64(i64),
+    Double(f64),
+    String(String),
+}
+
+/// Format hint for [`EngineCommand::GetProperty`], mirroring mpv's
+/// `mpv_format` enum. The engine reads via `mpv_get_property` with the
+/// matching format and serialises the result to JSON for the reply
+/// channel so the Tauri command handler can hand it straight back to JS.
+pub enum GetFormat {
+    Flag,
+    Int64,
+    Double,
+    String,
+}
+
 /// A request submitted to the engine's render thread.
 ///
 /// The render thread owns `*mut mpv_handle` and `*mut mpv_render_context`
@@ -88,10 +114,15 @@ pub type EngineEmit = Box<dyn Fn(&str, serde_json::Value) + Send + Sync + 'stati
 /// `EngineCommand` instead and the render thread drains the queue between
 /// frames, executing each on the libmpv client API.
 ///
-/// Phase 2.4 carries the minimum surface to play one stream end-to-end:
-/// load a URL, toggle pause, set volume. Phase 4 will extend this with
-/// the full property / command set used by Aura (subtitle / audio track,
-/// seek, glsl-shaders, HDR options, ...).
+/// Phase 4 surface:
+/// * Typed variants for the hot, special-cased operations (`LoadFile`
+///   needs pre/post pause clears, `TogglePause` / `SetVolume` are
+///   submitted often enough to justify dedicated dispatch).
+/// * Generic `Command` / `SetProperty` / `GetProperty` variants for the
+///   long tail — every other `app.mpv().command(...)` / `set_property(...)`
+///   / `get_property(...)` site in lib.rs routes through these.
+/// * `GetProperty` carries a synchronous reply `Sender` so the calling
+///   Tauri command can await the result.
 enum EngineCommand {
     Shutdown,
     LoadFile {
@@ -100,6 +131,19 @@ enum EngineCommand {
     },
     TogglePause,
     SetVolume(f64),
+    Command(Vec<String>),
+    SetProperty {
+        name: String,
+        value: PropValue,
+    },
+    GetProperty {
+        name: String,
+        format: GetFormat,
+        /// One-shot reply channel: `Ok(Value)` on success, `Err(msg)` on
+        /// mpv error or a name/format mismatch. The Tauri handler blocks
+        /// on `reply.recv()` and forwards either to JS.
+        reply: Sender<Result<serde_json::Value, String>>,
+    },
 }
 
 /// Live engine bookkeeping. Held inside [`ENGINE`] for the engine's lifetime.
@@ -206,6 +250,42 @@ pub fn submit_toggle_pause() -> Result<(), String> {
 /// units (0.0 = mute, 100.0 = unity gain).
 pub fn submit_set_volume(volume: f64) -> Result<(), String> {
     submit(EngineCommand::SetVolume(volume))
+}
+
+/// Submit an arbitrary mpv `command` — the `args` slice is the same as
+/// the C `const char **args` form: positional command name first, then
+/// arguments, no trailing NULL (the engine appends it). Use this for the
+/// long tail of Aura's command call sites (seek, stop, frame-step,
+/// sub-add, af add/remove, change-list, ...).
+pub fn submit_command(args: Vec<String>) -> Result<(), String> {
+    submit(EngineCommand::Command(args))
+}
+
+/// Submit an arbitrary `mpv_set_property` write. Pick the [`PropValue`]
+/// variant that matches mpv's documented format for `name` — getting
+/// this wrong returns an mpv error rather than corrupting state.
+pub fn submit_set_property(name: String, value: PropValue) -> Result<(), String> {
+    submit(EngineCommand::SetProperty { name, value })
+}
+
+/// Submit a synchronous `mpv_get_property` read. Returns the property's
+/// value as JSON or an mpv error message. Blocks the calling thread on
+/// the engine's reply channel — keep the call off the Tauri main runtime
+/// (use `spawn_blocking` in the Tauri handler).
+pub fn submit_get_property(
+    name: String,
+    format: GetFormat,
+) -> Result<serde_json::Value, String> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    submit(EngineCommand::GetProperty {
+        name,
+        format,
+        reply: reply_tx,
+    })?;
+    match reply_rx.recv() {
+        Ok(r) => r,
+        Err(e) => Err(format!("engine reply channel closed: {e}")),
+    }
 }
 
 /// Shared submit path — locks the slot briefly, sends through the
@@ -547,6 +627,138 @@ unsafe fn set_volume(
         Err(err_str(lib, r))
     } else {
         Ok(())
+    }
+}
+
+/// Generic `mpv_set_property` for the long-tail of property writes
+/// outside the hot path. Picks the FFI format based on the [`PropValue`]
+/// variant. STRING uses `set_property_string` which takes the value as a
+/// NUL-terminated `*const c_char` directly rather than via the
+/// `*mut c_void` route (the value isn't mutated either way; the
+/// dedicated string entry-point sidesteps the double-pointer convention
+/// the FFI version uses for STRING format).
+unsafe fn set_property_generic(
+    lib: &Libmpv,
+    handle: *mut mpv_handle,
+    name: &str,
+    value: &PropValue,
+) -> Result<(), String> {
+    let name_c = CString::new(name)
+        .map_err(|e| format!("property name contains NUL: {e}"))?;
+    let r = match value {
+        PropValue::Flag(b) => {
+            let mut v: c_int = if *b { 1 } else { 0 };
+            (lib.set_property)(
+                handle,
+                name_c.as_ptr(),
+                mpv_format::FLAG,
+                &mut v as *mut _ as *mut c_void,
+            )
+        }
+        PropValue::Int64(i) => {
+            let mut v: i64 = *i;
+            (lib.set_property)(
+                handle,
+                name_c.as_ptr(),
+                mpv_format::INT64,
+                &mut v as *mut _ as *mut c_void,
+            )
+        }
+        PropValue::Double(d) => {
+            let mut v: f64 = *d;
+            (lib.set_property)(
+                handle,
+                name_c.as_ptr(),
+                mpv_format::DOUBLE,
+                &mut v as *mut _ as *mut c_void,
+            )
+        }
+        PropValue::String(s) => {
+            let v_c = CString::new(s.as_str())
+                .map_err(|e| format!("property value contains NUL: {e}"))?;
+            (lib.set_property_string)(handle, name_c.as_ptr(), v_c.as_ptr())
+        }
+    };
+    if r < 0 {
+        Err(err_str(lib, r))
+    } else {
+        Ok(())
+    }
+}
+
+/// Generic `mpv_get_property` for the long-tail of property reads. The
+/// return shape mirrors the format choice — `Bool` for FLAG, `Number`
+/// for INT64/DOUBLE, `String` for STRING. mpv allocates STRING results
+/// on its heap via `mpv_alloc`; the FFI takes ownership and frees via
+/// `mpv_free` once the value is copied into a Rust `String`.
+unsafe fn get_property_generic(
+    lib: &Libmpv,
+    handle: *mut mpv_handle,
+    name: &str,
+    format: GetFormat,
+) -> Result<serde_json::Value, String> {
+    let name_c = CString::new(name)
+        .map_err(|e| format!("property name contains NUL: {e}"))?;
+    match format {
+        GetFormat::Flag => {
+            let mut v: c_int = 0;
+            let r = (lib.get_property)(
+                handle,
+                name_c.as_ptr(),
+                mpv_format::FLAG,
+                &mut v as *mut _ as *mut c_void,
+            );
+            if r < 0 {
+                Err(err_str(lib, r))
+            } else {
+                Ok(serde_json::Value::Bool(v != 0))
+            }
+        }
+        GetFormat::Int64 => {
+            let mut v: i64 = 0;
+            let r = (lib.get_property)(
+                handle,
+                name_c.as_ptr(),
+                mpv_format::INT64,
+                &mut v as *mut _ as *mut c_void,
+            );
+            if r < 0 {
+                Err(err_str(lib, r))
+            } else {
+                Ok(serde_json::Value::Number(serde_json::Number::from(v)))
+            }
+        }
+        GetFormat::Double => {
+            let mut v: f64 = 0.0;
+            let r = (lib.get_property)(
+                handle,
+                name_c.as_ptr(),
+                mpv_format::DOUBLE,
+                &mut v as *mut _ as *mut c_void,
+            );
+            if r < 0 {
+                Err(err_str(lib, r))
+            } else {
+                Ok(serde_json::Number::from_f64(v)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null))
+            }
+        }
+        GetFormat::String => {
+            // `mpv_get_property_string` returns a `char*` mpv heap-owns;
+            // the caller must `mpv_free` once the string has been
+            // copied into Rust storage. Going through the typed FFI
+            // here lets us reuse the existing `get_property_string` /
+            // `free` pair without juggling the *mut*mut c_char dance.
+            let p = (lib.get_property_string)(handle, name_c.as_ptr());
+            if p.is_null() {
+                Err(format!("get_property_string('{}') returned NULL", name))
+            } else {
+                let owned = cstr(p);
+                (lib.free)(p as *mut c_void);
+                Ok(serde_json::Value::String(owned))
+            }
+        }
     }
 }
 
@@ -1133,6 +1345,34 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         if let Err(e) = set_volume(&lib, handle, v) {
                             crate::devlog!(warn, "mpv2", "set volume failed: {e}");
                         }
+                    }
+                    Ok(EngineCommand::Command(args)) => {
+                        let borrowed: Vec<&str> =
+                            args.iter().map(String::as_str).collect();
+                        if let Err(e) = run_mpv_command(&lib, handle, &borrowed) {
+                            crate::devlog!(
+                                warn, "mpv2",
+                                "command {:?} failed: {e}", borrowed,
+                            );
+                        }
+                    }
+                    Ok(EngineCommand::SetProperty { name, value }) => {
+                        if let Err(e) =
+                            set_property_generic(&lib, handle, &name, &value)
+                        {
+                            crate::devlog!(
+                                warn, "mpv2",
+                                "set_property('{name}') failed: {e}",
+                            );
+                        }
+                    }
+                    Ok(EngineCommand::GetProperty { name, format, reply }) => {
+                        let result =
+                            get_property_generic(&lib, handle, &name, format);
+                        // Drop the reply Result if the caller has gone
+                        // away — the channel close is the natural signal
+                        // and we don't want to leak a warning for it.
+                        let _ = reply.send(result);
                     }
                     Err(TryRecvError::Empty) => break,
                 }

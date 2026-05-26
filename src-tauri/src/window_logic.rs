@@ -293,6 +293,17 @@ pub fn now_unix() -> i64 {
 // ---------------------------------------------------------------------------
 
 fn pause_mpv<R: Runtime>(app: &AppHandle<R>) {
+    #[cfg(target_os = "windows")]
+    if crate::mpv2::engine::enabled() && crate::mpv2::engine::is_running() {
+        // mpv2 path: queue a typed pause-true write. The engine is the
+        // only owner of the live mpv handle when AURA_MPV2 is set, so
+        // hitting `app.mpv()` would touch an un-init'd legacy instance.
+        let _ = crate::mpv2::engine::submit_set_property(
+            "pause".into(),
+            crate::mpv2::engine::PropValue::Flag(true),
+        );
+        return;
+    }
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         // CLAUDE.md landmine #1: this libmpv build silently no-ops the

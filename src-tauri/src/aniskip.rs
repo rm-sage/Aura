@@ -651,6 +651,13 @@ pub async fn set_skip_windows<R: Runtime>(
         *cache = payload.clone();
     }
     let _ = app.emit("aura:skip-windows", &payload);
+    #[cfg(target_os = "windows")]
+    if crate::mpv2::engine::enabled() && crate::mpv2::engine::is_running() {
+        return crate::mpv2::engine::submit_set_property(
+            "user-data/aura/skip-windows".into(),
+            crate::mpv2::engine::PropValue::String(json),
+        );
+    }
     tauri::async_runtime::spawn_blocking(move || {
         app.mpv()
             .set_property(
