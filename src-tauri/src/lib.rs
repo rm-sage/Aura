@@ -1680,6 +1680,10 @@ pub fn run() {
             #[cfg(target_os = "windows")]
             {
                 mpv2::hello::run_if_requested();
+                // Phase 2.1 long-lived engine. Independent opt-in via
+                // AURA_MPV2_ENGINE; the legacy --wid engine above is still
+                // the one driving playback until Phase 2.4 ports loadfile.
+                mpv2::engine::start_if_requested();
             }
 
             // ── Window lifecycle (pause-on-blur, pause-on-min, close-on-exit) ─

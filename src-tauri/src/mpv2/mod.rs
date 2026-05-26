@@ -61,3 +61,9 @@ pub mod ffi;
 // Windows-only anyway.
 #[cfg(target_os = "windows")]
 pub mod hello;
+
+// Phase-2.1 long-lived render engine — promotes the verified Phase-1 setup
+// into a persistent owner with a real command channel. Still top-level and
+// still without playback wiring; those land in Phase 2.2 / 2.4.
+#[cfg(target_os = "windows")]
+pub mod engine;

@@ -477,6 +477,12 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     // exits via app.exit). Capped at 2 s internally.
                     crate::scrobble::shutdown_blocking(&handle);
                     shutdown_mpv_sync(&handle);
+                    // Phase 2.1 mpv2 engine — no-op when AURA_MPV2_ENGINE
+                    // wasn't set. When it was, this joins the dedicated
+                    // render thread so its mpv handle is fully torn down
+                    // before app.exit() pulls the process out from under it.
+                    #[cfg(target_os = "windows")]
+                    crate::mpv2::engine::shutdown_if_running();
                     clear_presence_inner();
                     // Reap the streaming-bridge subprocess so it doesn't
                     // outlive the parent. Without this the bridge keeps
