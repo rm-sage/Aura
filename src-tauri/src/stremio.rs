@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -20,22 +21,210 @@ const STREMIO_ACCOUNT_API: &str = "https://api.strem.io/api";
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 static ACCOUNT_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
-// Session-scoped manifest cache — avoids redundant /manifest.json fetches that
-// would otherwise fire on every home load, search, stream fetch, and subtitle
+// Manifest cache — avoids redundant /manifest.json fetches that would
+// otherwise fire on every home load, search, stream fetch, and subtitle
 // fetch. AIOStreams and other self-hosted addons build their manifest
-// dynamically (internal health checks per request) so repeated fetches show up
-// as high-frequency status hits in their logs.
+// dynamically (internal health checks per request) so repeated fetches
+// show up as high-frequency status hits in their logs.
+//
+// `MANIFEST_TTL` (24 h) is the single cache window — entries inside it
+// serve verbatim. Addon manifests describe long-lived capabilities
+// (catalogs / resources / id prefixes); they change at the cadence of
+// an addon redeploy, not per-request. Tolerating up to a day of
+// staleness dramatically improves cold-launch responsiveness for users
+// with several addons installed. The user-facing `Refresh` button
+// (`refresh_addon_manifest`) explicitly drops the entry to force a
+// fresh fetch when the user actually wants one.
+//
+// Disk persistence: the in-memory map is mirrored to
+// `app_data_dir/manifest-cache.json` on every successful insert
+// (synchronous JSON write through a temp-file + rename, ~10–50 ms).
+// At app boot, [`init_manifest_cache_path`] is called from lib.rs
+// setup with the data-dir path; that function also reads the file once
+// and populates memory with any entry still inside `MANIFEST_TTL`.
 static MANIFEST_CACHE: OnceLock<Mutex<HashMap<String, ManifestCacheEntry>>> = OnceLock::new();
-const MANIFEST_TTL: Duration = Duration::from_secs(300); // 5-minute TTL
+const MANIFEST_TTL: Duration = Duration::from_secs(86_400); // 24h
 
+/// On-disk cache file path. Set once at boot by [`init_manifest_cache_path`].
+/// When absent (test runs / pre-setup callers), disk persistence is a
+/// no-op and the cache behaves exactly as the prior in-memory-only version.
+static MANIFEST_CACHE_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Wire format version for the on-disk manifest cache. Bump on any
+/// breaking change to `WireManifest` / `WireCatalogEntry` so a stale
+/// file from an older Aura build is dropped instead of misparsed.
+const MANIFEST_CACHE_FILE_VERSION: u32 = 1;
+
+#[derive(Clone)]
 struct ManifestCacheEntry {
     wire:       WireManifest,
     has_search: bool,
-    cached_at:  Instant,
+    /// SystemTime so the entry can serialise to / deserialise from the
+    /// disk cache via Unix-epoch seconds. Compared via
+    /// `SystemTime::now().duration_since(cached_at)` — a clock that
+    /// goes backwards (`Err`) treats the entry as infinitely old, so
+    /// the next fetch revalidates.
+    cached_at:  SystemTime,
 }
 
 fn manifest_cache() -> &'static Mutex<HashMap<String, ManifestCacheEntry>> {
     MANIFEST_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// On-disk cache record. Owned `WireManifest` so the file is
+/// self-contained and decoupled from any one Aura process.
+#[derive(Deserialize, Serialize)]
+struct ManifestCacheDiskEntry {
+    wire: WireManifest,
+    has_search: bool,
+    /// Unix-epoch seconds at the moment of caching.
+    cached_at_unix: i64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ManifestCacheDiskFile {
+    version: u32,
+    entries: HashMap<String, ManifestCacheDiskEntry>,
+}
+
+/// Set the on-disk manifest cache file path and warm the in-memory map
+/// from it. Called from lib.rs setup once the Tauri app data directory
+/// is known. Safe to call more than once (subsequent calls are no-ops).
+///
+/// Disk-side errors are logged at `warn` and never propagated — a
+/// missing / corrupt / unreadable file simply means we start with an
+/// empty cache, identical to the pre-persistence behaviour.
+pub fn init_manifest_cache_path(path: PathBuf) {
+    if MANIFEST_CACHE_PATH.set(path.clone()).is_err() {
+        return; // already initialised; second call is a no-op
+    }
+    if !path.exists() {
+        crate::devlog!(
+            info, "catalog",
+            "manifest cache: no disk file yet (cold start)",
+        );
+        return;
+    }
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::devlog!(
+                warn, "catalog",
+                "manifest cache: read failed ({e}); starting with empty cache",
+            );
+            return;
+        }
+    };
+    let parsed: ManifestCacheDiskFile = match serde_json::from_str(&raw) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::devlog!(
+                warn, "catalog",
+                "manifest cache: parse failed ({e}); starting with empty cache",
+            );
+            return;
+        }
+    };
+    if parsed.version != MANIFEST_CACHE_FILE_VERSION {
+        crate::devlog!(
+            info, "catalog",
+            "manifest cache: file version {} doesn't match expected {} — discarding",
+            parsed.version, MANIFEST_CACHE_FILE_VERSION,
+        );
+        return;
+    }
+    let now = SystemTime::now();
+    let mut loaded = 0usize;
+    let mut dropped_stale = 0usize;
+    let mut cache = manifest_cache().lock().unwrap();
+    for (url, disk) in parsed.entries {
+        let cached_at = match u64::try_from(disk.cached_at_unix) {
+            Ok(secs) => UNIX_EPOCH + Duration::from_secs(secs),
+            Err(_) => continue, // negative timestamp = corrupt
+        };
+        match now.duration_since(cached_at) {
+            Ok(age) if age <= MANIFEST_TTL => {
+                cache.insert(url, ManifestCacheEntry {
+                    wire: disk.wire,
+                    has_search: disk.has_search,
+                    cached_at,
+                });
+                loaded += 1;
+            }
+            _ => dropped_stale += 1,
+        }
+    }
+    drop(cache);
+    crate::devlog!(
+        info, "catalog",
+        "manifest cache: warmed from disk ({loaded} entry/entries, {dropped_stale} dropped as stale)",
+    );
+}
+
+/// Persist the current in-memory manifest cache to the configured disk
+/// path. No-op when [`init_manifest_cache_path`] hasn't been called.
+/// Errors are logged but never propagated — disk persistence is an
+/// optimisation, not a correctness requirement.
+fn save_manifest_cache_to_disk() {
+    let Some(path) = MANIFEST_CACHE_PATH.get() else { return; };
+    // Snapshot under the lock; do the file write outside it so a slow
+    // I/O can't stall other fetches.
+    let snapshot = {
+        let cache = match manifest_cache().lock() {
+            Ok(c) => c,
+            Err(e) => {
+                crate::devlog!(
+                    warn, "catalog",
+                    "manifest cache: poisoned on save: {e}",
+                );
+                return;
+            }
+        };
+        let mut out: HashMap<String, ManifestCacheDiskEntry> =
+            HashMap::with_capacity(cache.len());
+        for (url, entry) in cache.iter() {
+            let cached_at_unix = match entry.cached_at.duration_since(UNIX_EPOCH) {
+                Ok(d) => d.as_secs() as i64,
+                Err(_) => continue, // cached_at < UNIX_EPOCH — shouldn't happen
+            };
+            out.insert(url.clone(), ManifestCacheDiskEntry {
+                wire: entry.wire.clone(),
+                has_search: entry.has_search,
+                cached_at_unix,
+            });
+        }
+        out
+    };
+    let file = ManifestCacheDiskFile {
+        version: MANIFEST_CACHE_FILE_VERSION,
+        entries: snapshot,
+    };
+    let json = match serde_json::to_vec(&file) {
+        Ok(b) => b,
+        Err(e) => {
+            crate::devlog!(
+                warn, "catalog",
+                "manifest cache: serialise failed: {e}",
+            );
+            return;
+        }
+    };
+    // Ensure parent dir exists (Tauri's data dir is created on first
+    // access — but if we somehow beat it, mkdir is a no-op when present).
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Atomic write: temp file + rename. Prevents a half-written cache
+    // file from breaking the next launch's parse.
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &json) {
+        crate::devlog!(warn, "catalog", "manifest cache: tmp write failed: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        crate::devlog!(warn, "catalog", "manifest cache: rename failed: {e}");
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 // Per-CATALOG soft-fail cache.
@@ -161,7 +350,7 @@ fn account_client() -> &'static reqwest::Client {
 // Stremio wire types
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct WireManifest {
     /// Manifest-level `id` (stable across deployments of the same addon —
     /// e.g. "com.linvo.cinemeta"). Optional in deserialization for
@@ -191,13 +380,13 @@ struct WireManifest {
     behavior_hints: WireBehaviorHints,
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 struct WireBehaviorHints {
     #[serde(default)]
     configurable: bool,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct WireCatalogEntry {
     #[serde(rename = "type")]
     media_type: String,
@@ -778,12 +967,22 @@ fn encode_query(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 async fn fetch_manifest(base: &str) -> Result<(WireManifest, bool), String> {
-    // Cache hit — avoids redundant network calls on home load, search, stream
-    // and subtitle fan-outs. Lock is dropped before any await point.
+    // Cache hit — avoids redundant network calls on home load, search,
+    // stream and subtitle fan-outs. Lock is dropped before any await
+    // point. Manifests rarely change for installed addons (capabilities
+    // are tied to the addon's deploy, not per-request), and the
+    // user-facing `Refresh` button (`refresh_addon_manifest`) drops the
+    // entry to force a fresh fetch when needed. MANIFEST_TTL is the
+    // same window the disk-cache warm-start uses, so a cold launch can
+    // serve an addon's manifest from local storage instead of a
+    // network round-trip.
     {
         let cache = manifest_cache().lock().unwrap();
         if let Some(entry) = cache.get(base) {
-            if entry.cached_at.elapsed() < MANIFEST_TTL {
+            let age = SystemTime::now()
+                .duration_since(entry.cached_at)
+                .unwrap_or(Duration::MAX);
+            if age < MANIFEST_TTL {
                 return Ok((entry.wire.clone(), entry.has_search));
             }
         }
@@ -816,9 +1015,13 @@ async fn fetch_manifest(base: &str) -> Result<(WireManifest, bool), String> {
         cache.insert(base.to_string(), ManifestCacheEntry {
             wire:       wire.clone(),
             has_search,
-            cached_at:  Instant::now(),
+            cached_at:  SystemTime::now(),
         });
     }
+    // Persist to disk so the next cold launch's home-screen mount can
+    // serve the addon's capability list from local storage instead of
+    // refetching N manifests in parallel.
+    save_manifest_cache_to_disk();
 
     Ok((wire, has_search))
 }
@@ -1004,6 +1207,9 @@ pub async fn refresh_addon_manifest(addon_url: String) -> Result<AddonManifest, 
     // catalog-level success caches keyed against this base so the
     // refresh actually surfaces the new state on next home load.
     manifest_cache().lock().unwrap().remove(&base);
+    // Mirror the eviction to disk so the next launch doesn't warm an
+    // entry the user just asked to discard.
+    save_manifest_cache_to_disk();
     let prefix = format!("{base}|");
     if let Ok(mut ok)   = catalog_ok_cache().lock()   { ok.retain(|k, _| !k.starts_with(&prefix)); }
     if let Ok(mut fail) = addon_fail_cache().lock()   { fail.retain(|k, _| !k.starts_with(&prefix)); }

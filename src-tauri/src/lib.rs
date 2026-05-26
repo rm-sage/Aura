@@ -2038,6 +2038,22 @@ pub fn run() {
             let mpv2_active = mpv2::engine::enabled();
             #[cfg(not(target_os = "windows"))]
             let mpv2_active = false;
+
+            // Persist the addon-manifest cache across launches. Reads
+            // the existing JSON file (if any), warms the in-memory map
+            // with anything <24 h old, and stores the path so subsequent
+            // cache writes mirror to disk. Best-effort: a missing /
+            // unreadable / wrong-version file just leaves us with an
+            // empty cache, identical to pre-persistence behaviour.
+            // Skipping the manifest cache when app_data_dir resolution
+            // fails is fine too — Tauri's path resolver almost never
+            // fails on Windows, but the in-memory cache still works.
+            if let Ok(data_dir) = app.path().app_data_dir() {
+                let _ = std::fs::create_dir_all(&data_dir);
+                let cache_path = data_dir.join("manifest-cache.json");
+                crate::stremio::init_manifest_cache_path(cache_path);
+            }
+
             if !mpv2_active {
                 player::init_mpv(app.handle()).map_err(|e| {
                     crate::devlog!(error, "player", "MPV init failed: {e}");
