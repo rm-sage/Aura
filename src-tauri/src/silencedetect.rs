@@ -219,11 +219,11 @@ pub async fn detect_silence_intervals(
             //   [silencedetect @ 0xbeef] silence_start: 12.345
             //   [silencedetect @ 0xbeef] silence_end: 18.901 | silence_duration: 6.556
             if let Some(rest) = line.split("silence_start:").nth(1) {
-                if let Some(token) = rest.trim().split_whitespace().next() {
+                if let Some(token) = rest.split_whitespace().next() {
                     if let Ok(s) = token.parse::<f64>() { current_start = Some(s); }
                 }
             } else if let Some(rest) = line.split("silence_end:").nth(1) {
-                if let Some(token) = rest.trim().split_whitespace().next() {
+                if let Some(token) = rest.split_whitespace().next() {
                     if let Ok(end) = token.parse::<f64>() {
                         if let Some(start) = current_start.take() {
                             intervals.push(SilenceInterval {
@@ -375,7 +375,7 @@ pub async fn detect_outro_boundary(
     let parse = async {
         while let Ok(Some(line)) = reader.next_line().await {
             if let Some(rest) = line.split("black_start:").nth(1) {
-                if let Some(tok) = rest.trim().split_whitespace().next() {
+                if let Some(tok) = rest.split_whitespace().next() {
                     if let Ok(s) = tok.parse::<f64>() {
                         black_start = Some(s);
                         ts_min = ts_min.min(s);
@@ -383,7 +383,7 @@ pub async fn detect_outro_boundary(
                     }
                 }
             } else if let Some(rest) = line.split("black_end:").nth(1) {
-                if let Some(tok) = rest.trim().split_whitespace().next() {
+                if let Some(tok) = rest.split_whitespace().next() {
                     if let Ok(e) = tok.parse::<f64>() {
                         ts_max = ts_max.max(e);
                         if let Some(bs) = black_start.take() {
@@ -392,7 +392,7 @@ pub async fn detect_outro_boundary(
                     }
                 }
             } else if let Some(rest) = line.split("silence_start:").nth(1) {
-                if let Some(tok) = rest.trim().split_whitespace().next() {
+                if let Some(tok) = rest.split_whitespace().next() {
                     if let Ok(s) = tok.parse::<f64>() {
                         sil_start = Some(s);
                         ts_min = ts_min.min(s);
@@ -400,7 +400,7 @@ pub async fn detect_outro_boundary(
                     }
                 }
             } else if let Some(rest) = line.split("silence_end:").nth(1) {
-                if let Some(tok) = rest.trim().split_whitespace().next() {
+                if let Some(tok) = rest.split_whitespace().next() {
                     if let Ok(e) = tok.parse::<f64>() {
                         ts_max = ts_max.max(e);
                         if let Some(ss) = sil_start.take() {

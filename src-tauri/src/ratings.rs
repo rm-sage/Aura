@@ -360,6 +360,6 @@ pub async fn fetch_aggregate_ratings(
 
     // Stable sort by weight DESCENDING — highest-weighted source first
     // so DetailView's slice(0, N) renders the most valuable ratings.
-    out.sort_by(|a, b| b.weight.cmp(&a.weight));
+    out.sort_by_key(|r| std::cmp::Reverse(r.weight));
     Ok(out)
 }

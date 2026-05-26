@@ -560,7 +560,7 @@ pub async fn resolve_mal_id_by_title(
         // Cap the contribution so it can't outweigh title match.
         score += (50_000_u32.saturating_sub(a.mal_id.min(50_000)) / 5_000) as i32;
 
-        if score >= 100 && best.map_or(true, |(s, _)| score > s) {
+        if score >= 100 && best.is_none_or(|(s, _)| score > s) {
             best = Some((score, a.mal_id));
         }
     }

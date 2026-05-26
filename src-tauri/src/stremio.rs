@@ -2477,7 +2477,7 @@ fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
             .map(|first| ["filler", "recap"]
                 .iter()
                 .filter(|k| first.get(*k).is_some())
-                .map(|k| *k)
+                .copied()
                 .collect::<Vec<_>>())
             .unwrap_or_default();
         crate::devlog!(
@@ -2593,8 +2593,7 @@ fn cast_members_from_objects(
                     let photo = o.get("photo")
                         .and_then(|p| p.as_str())
                         .filter(|s| !s.is_empty())
-                        .map(|s| sanitize_url(Some(s.to_string())))
-                        .flatten();
+                        .and_then(|s| sanitize_url(Some(s.to_string())));
                     Some(CastMember {
                         name: cap(name.to_string(), per_entry),
                         character,
@@ -3250,11 +3249,10 @@ fn infer_aio_stat_category(title: &str) -> AioCategory {
 /// and the immediately-following whitespace. Lightweight: walks the
 /// string and discards prefix codepoints that look like emoji.
 fn strip_leading_emoji(s: &str) -> &str {
-    let mut iter = s.char_indices();
     let mut end = 0;
-    while let Some((i, c)) = iter.next() {
+    for (i, c) in s.char_indices() {
         let is_emoji_prefix = (c as u32) >= 0x1F300       // misc symbols / pictographs +
-            || (c as u32) >= 0x2600 && (c as u32) <= 0x27BF // misc + dingbats
+            || ((c as u32) >= 0x2600 && (c as u32) <= 0x27BF) // misc + dingbats
             || c == '\u{FE0F}'                             // variation selector-16
             || c == '\u{200D}';                            // ZWJ
         if !is_emoji_prefix && !c.is_whitespace() {

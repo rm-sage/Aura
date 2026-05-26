@@ -890,10 +890,8 @@ fn json_to_propvalue(value: &serde_json::Value) -> Option<mpv2::engine::PropValu
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Some(PropValue::Int64(i))
-            } else if let Some(f) = n.as_f64() {
-                Some(PropValue::Double(f))
             } else {
-                None
+                n.as_f64().map(PropValue::Double)
             }
         }
         serde_json::Value::String(s) => Some(PropValue::String(s.clone())),
@@ -2020,7 +2018,7 @@ pub fn run() {
             if !mpv2_active {
                 player::init_mpv(app.handle()).map_err(|e| {
                     crate::devlog!(error, "player", "MPV init failed: {e}");
-                    std::io::Error::new(std::io::ErrorKind::Other, e)
+                    std::io::Error::other(e)
                 })?;
                 crate::devlog!(info, "player", "MPV engine ready");
             } else {

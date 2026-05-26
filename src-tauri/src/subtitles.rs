@@ -338,7 +338,7 @@ fn parse_search_response(raw: &str) -> Result<Vec<SubtitleEntry>, String> {
     // surface them first so the user picks them by default. Stable
     // sort preserves OpenSubtitles' original ordering within each
     // group (typically by download_count desc).
-    out.sort_by(|a, b| b.moviehash_match.cmp(&a.moviehash_match));
+    out.sort_by_key(|e| std::cmp::Reverse(e.moviehash_match));
     Ok(out)
 }
 
@@ -387,7 +387,7 @@ pub async fn download_subtitle<R: Runtime>(
     let file_name = json
         .get("file_name")
         .and_then(|v| v.as_str())
-        .map(|s| sanitize_filename(s))
+        .map(sanitize_filename)
         .unwrap_or_else(|| format!("{file_id}.srt"));
 
     // Step 2: GET the link directly
