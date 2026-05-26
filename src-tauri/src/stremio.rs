@@ -915,8 +915,78 @@ fn log_label(name: &str, url: &str) -> String {
     } else if !name.is_empty() {
         name.to_string()
     } else {
-        url.to_string()
+        redact_sensitive_url(url)
     }
+}
+
+/// Strip API-key / token shaped fragments from a URL before it's
+/// devlog'd. Stream addons routinely return URLs with debrid bearer
+/// keys embedded as `?api_key=…`, `?token=…`, or `/api_key/<key>/…`
+/// path segments — devlog'ing the raw URL persists them to
+/// `aura-mpv.log` AND the DevConsole ring buffer (which gets exported
+/// from the Help menu). The redacted form preserves the host and the
+/// non-secret path so debugging still works.
+///
+/// Conservative scope: redact ONLY parameters whose name matches the
+/// well-known secret-bearing keys. Aura's own addon URLs (configured by
+/// the user, e.g. AIOMetadata `?lang=en&…`) stay readable.
+pub(crate) fn redact_sensitive_url(input: &str) -> String {
+    // Path-segment form: `…/api_key/<value>/…` → `…/api_key/<redacted>/…`
+    const PATH_KEYS: &[&str] = &["api_key", "apikey", "token", "auth"];
+    // Query-param form: `?api_key=<value>` / `&token=<value>` → `<redacted>`
+    const QUERY_KEYS: &[&str] = &[
+        "api_key", "apikey", "apiKey", "token", "password", "pin", "auth", "key",
+    ];
+
+    let mut s = input.to_string();
+
+    // Pass 1: path-segment redaction. Walk each key marker and replace
+    // the segment following it (up to the next `/` or `?` or end).
+    for k in PATH_KEYS {
+        let marker = format!("/{}/", k);
+        let mut search_start = 0;
+        while let Some(idx) = s[search_start..].find(&marker) {
+            let abs = search_start + idx + marker.len();
+            // Find end of value: next '/' or '?' or end-of-string.
+            let tail = &s[abs..];
+            let end = tail
+                .find(|c: char| c == '/' || c == '?')
+                .unwrap_or(tail.len());
+            if end > 0 {
+                s.replace_range(abs..abs + end, "<redacted>");
+            }
+            // Advance past the redaction so we don't re-scan it.
+            search_start = abs + "<redacted>".len();
+            if search_start >= s.len() {
+                break;
+            }
+        }
+    }
+
+    // Pass 2: query-param redaction. Each `?key=` or `&key=` followed by
+    // value up to the next `&` or `#` or end.
+    for k in QUERY_KEYS {
+        let prefixes = [format!("?{k}="), format!("&{k}=")];
+        for prefix in &prefixes {
+            let mut search_start = 0;
+            while let Some(idx) = s[search_start..].find(prefix) {
+                let abs = search_start + idx + prefix.len();
+                let tail = &s[abs..];
+                let end = tail
+                    .find(|c: char| c == '&' || c == '#')
+                    .unwrap_or(tail.len());
+                if end > 0 {
+                    s.replace_range(abs..abs + end, "<redacted>");
+                }
+                search_start = abs + "<redacted>".len();
+                if search_start >= s.len() {
+                    break;
+                }
+            }
+        }
+    }
+
+    s
 }
 
 /// Force a fresh manifest fetch, bypassing the 5-minute MANIFEST_CACHE
@@ -1481,7 +1551,7 @@ pub async fn search_addon_grouped(
             ty = c.media_type,
             id = c.id,
         );
-        crate::devlog!(info, "search", "[{}] GET {url}", addon_name_str);
+        crate::devlog!(info, "search", "[{}] GET {}", addon_name_str, redact_sensitive_url(&url));
         let items: Vec<MetaPreview> = match client().get(&url).send().await {
             Ok(resp) => {
                 if !resp.status().is_success() {
@@ -1563,7 +1633,7 @@ pub async fn fetch_search_catalog_expanded(
     let url = format!(
         "{base}/catalog/{media_type}/{catalog_id}/search={encoded}&skip=0.json",
     );
-    crate::devlog!(info, "search", "[expand] GET {url}");
+    crate::devlog!(info, "search", "[expand] GET {}", redact_sensitive_url(&url));
     let resp = client()
         .get(&url)
         .send()
@@ -1577,7 +1647,7 @@ pub async fn fetch_search_catalog_expanded(
         .await
         .map_err(|e| format!("JSON parse failed: {e}"))?;
     let items: Vec<MetaPreview> = cr.metas.into_iter().map(sanitize_meta).collect();
-    crate::devlog!(info, "search", "[expand] {url} → {} item(s)", items.len());
+    crate::devlog!(info, "search", "[expand] {} → {} item(s)", redact_sensitive_url(&url), items.len());
     Ok(items)
 }
 
@@ -1635,7 +1705,7 @@ pub async fn global_search_grouped(
                     ty = c.media_type,
                     id = c.id,
                 );
-                crate::devlog!(info, "search", "[{}] GET {url}", addon_name_str);
+                crate::devlog!(info, "search", "[{}] GET {}", addon_name_str, redact_sensitive_url(&url));
                 let items: Vec<MetaPreview> = match client().get(&url).send().await {
                     Ok(resp) => {
                         if !resp.status().is_success() {
@@ -1878,7 +1948,7 @@ pub async fn fetch_meta_detail(
     let url = format!("{base}/meta/{media_type}/{id}.json");
     let label = log_label("", &base);
 
-    crate::devlog!(info, "meta", "[{}] GET {}", label, url);
+    crate::devlog!(info, "meta", "[{}] GET {}", label, redact_sensitive_url(&url));
 
     let json: serde_json::Value = client()
         .get(&url)
@@ -2900,7 +2970,7 @@ pub async fn fetch_streams(
             let addon_name = addon.name.clone();
 
             let url = format!("{base}/stream/{media_type}/{id}.json");
-            crate::devlog!(info, "streams", "[{}] GET {}", label, url);
+            crate::devlog!(info, "streams", "[{}] GET {}", label, redact_sensitive_url(&url));
 
             // Per-request 35 s timeout overrides the global 10 s default.
             // AIOStreams orchestrators (TorBox Search, MediaFusion, etc.)
@@ -3524,7 +3594,7 @@ pub async fn fetch_external_subtitles(
             let addon_name = wire.name.clone();
 
             let url = format!("{base}/subtitles/{media_type}/{id}.json");
-            crate::devlog!(info, "subtitles", "[{}] GET {}", label, url);
+            crate::devlog!(info, "subtitles", "[{}] GET {}", label, redact_sensitive_url(&url));
             let Ok(resp) = client().get(&url).send().await else {
                 crate::devlog!(warn, "subtitles", "[{}] request failed", label);
                 return vec![];

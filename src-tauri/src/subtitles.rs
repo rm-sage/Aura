@@ -452,6 +452,35 @@ pub async fn add_subtitle_to_mpv(
     title: Option<String>,
     lang: Option<String>,
 ) -> Result<(), String> {
+    // Path containment: external subtitles must be either remote
+    // (http(s)) OR a file inside `app_data_dir()/subtitles` (the only
+    // directory `download_subtitle` ever writes to). Without this guard
+    // a renderer-side bug or a malicious addon could call sub-add with
+    // an arbitrary local path (`C:\Users\…\id_rsa`) and have mpv read
+    // it as a "subtitle stream", leaking file existence and size via
+    // mpv property events. Other schemes (`file://`, `\\server\share`,
+    // bare drive letters) are rejected.
+    let is_remote =
+        path.starts_with("http://") || path.starts_with("https://");
+    if !is_remote {
+        let subs_root = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| e.to_string())?
+            .join("subtitles");
+        // canonicalize requires the path exist; if it doesn't, that's
+        // already a reject. Same for the root.
+        let canon_root = std::fs::canonicalize(&subs_root)
+            .map_err(|e| format!("subtitle root not initialised: {e}"))?;
+        let canon_path = std::fs::canonicalize(&path)
+            .map_err(|e| format!("subtitle path not found: {e}"))?;
+        if !canon_path.starts_with(&canon_root) {
+            return Err(
+                "subtitle path is outside the allowed downloads directory"
+                    .to_string(),
+            );
+        }
+    }
     let normalised = path.replace('\\', "/");
     let mode = flag.unwrap_or_else(|| "select".into());
     #[cfg(target_os = "windows")]

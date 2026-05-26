@@ -327,9 +327,32 @@ async fn load_video(
     start_seconds: Option<f64>,
 ) -> Result<(), String> {
     let normalised = path.replace('\\', "/");
+    // Defence in depth: only http(s) URLs, the localhost streaming
+    // bridge, or magnet links may reach mpv from this command. The
+    // intended renderer-trusted threat model still holds, but a
+    // malicious or compromised addon manifest could theoretically
+    // surface `file:///C:/…` in a stream record and reach here via JS
+    // state. Reject anything that doesn't start with a known scheme so
+    // such a value can't quietly cause mpv to open arbitrary local files.
+    let allowed_prefix = ["http://", "https://", "127.0.0.1", "magnet:"]
+        .iter()
+        .any(|p| normalised.starts_with(p));
+    if !allowed_prefix {
+        return Err(format!(
+            "load_video: rejected path with unsupported scheme: {}",
+            crate::stremio::redact_sensitive_url(&normalised),
+        ));
+    }
+    // Stream URLs frequently embed debrid API keys (TorBox `?api_key=…`,
+    // Real-Debrid path tokens, etc.). The raw URL would otherwise land
+    // verbatim in `aura-mpv.log` and the DevConsole ring buffer (which
+    // is part of the Help → Export Logs surface). The helper masks the
+    // well-known secret-bearing query params and path segments — see
+    // `stremio::redact_sensitive_url`.
     crate::devlog!(
         info, "player",
-        "load_video: {normalised} (start={:?})",
+        "load_video: {} (start={:?})",
+        crate::stremio::redact_sensitive_url(&normalised),
         start_seconds,
     );
     // Phase 2.4: when the mpv2 master gate is set AND the engine is alive,
