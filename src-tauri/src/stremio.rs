@@ -1077,6 +1077,17 @@ pub async fn list_addons<R: tauri::Runtime>(
     addons::load(&app)
 }
 
+/// Reorder the local addons.json to match `urls`. Guest-mode counterpart of
+/// `cloud_reorder_addons`. Returns the new ordering so the caller can
+/// reconcile its in-memory state without a separate `list_addons` round-trip.
+#[tauri::command]
+pub async fn reorder_addons<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    urls: Vec<String>,
+) -> Result<Vec<AddonEntry>, String> {
+    addons::reorder(&app, &urls)
+}
+
 // ---------------------------------------------------------------------------
 // Commands — catalog browsing
 // ---------------------------------------------------------------------------
@@ -1802,6 +1813,47 @@ pub async fn cloud_remove_addon(auth_key: String, url: String) -> Result<(), Str
     }
 
     push_collection(&auth_key, collection).await
+}
+
+/// Reorder the user's Stremio cloud addon collection to match `urls`.
+/// `urls` is the desired full order; matching is by normalized transportUrl
+/// (the `/manifest.json` suffix and trailing slashes are ignored). Any cloud
+/// entry not present in `urls` is preserved at the tail — defensive against
+/// the cross-device race where device B added an addon between our most
+/// recent get_synced_addons and this reorder call.
+#[tauri::command]
+pub async fn cloud_reorder_addons(auth_key: String, urls: Vec<String>) -> Result<(), String> {
+    if urls.is_empty() {
+        return Ok(());
+    }
+    let collection = fetch_raw_collection(&auth_key).await?;
+
+    let target: Vec<String> = urls
+        .iter()
+        .map(|u| normalize_addon_url(u.trim_end_matches('/')).to_ascii_lowercase())
+        .collect();
+
+    let mut by_url: std::collections::HashMap<String, serde_json::Value> = collection
+        .into_iter()
+        .map(|entry| {
+            let key = entry
+                .get("transportUrl")
+                .and_then(|v| v.as_str())
+                .map(|t| normalize_addon_url(t).to_ascii_lowercase())
+                .unwrap_or_default();
+            (key, entry)
+        })
+        .collect();
+
+    let mut next: Vec<serde_json::Value> = Vec::with_capacity(by_url.len());
+    for tn in &target {
+        if let Some(entry) = by_url.remove(tn) {
+            next.push(entry);
+        }
+    }
+    next.extend(by_url.into_values());
+
+    push_collection(&auth_key, next).await
 }
 
 // ---------------------------------------------------------------------------

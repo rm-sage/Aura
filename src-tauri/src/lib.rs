@@ -1962,6 +1962,7 @@ pub fn run() {
             stremio::add_addon,
             stremio::remove_addon,
             stremio::list_addons,
+            stremio::reorder_addons,
             // ── Global search & cloud sync (2.3) ────────────────────────────
             stremio::global_search,
             stremio::global_search_grouped,
@@ -1969,6 +1970,7 @@ pub fn run() {
             stremio::fetch_search_catalog_expanded,
             stremio::cloud_add_addon,
             stremio::cloud_remove_addon,
+            stremio::cloud_reorder_addons,
             // ── Auth ────────────────────────────────────────────────────────
             auth::login,
             auth::logout,

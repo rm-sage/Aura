@@ -49,8 +49,8 @@ commands.allow = ["get_addon_manifest", "refresh_addon_manifest"]
 # ── Addon management ──────────────────────────────────────────────────────────
 [[permission]]
 identifier = "allow-addon-management"
-description = "Allows the frontend to add, remove, and list persisted addons (guest mode)"
-commands.allow = ["add_addon", "remove_addon", "list_addons"]
+description = "Allows the frontend to add, remove, list, and reorder persisted addons (guest mode)"
+commands.allow = ["add_addon", "remove_addon", "list_addons", "reorder_addons"]
 
 # ── Authentication ────────────────────────────────────────────────────────────
 [[permission]]
@@ -66,8 +66,8 @@ commands.allow = ["global_search", "global_search_grouped", "search_addon_groupe
 
 [[permission]]
 identifier = "allow-cloud-sync"
-description = "Allows the frontend to add/remove addons in the user's Stremio cloud account"
-commands.allow = ["cloud_add_addon", "cloud_remove_addon"]
+description = "Allows the frontend to add, remove, and reorder addons in the user's Stremio cloud account"
+commands.allow = ["cloud_add_addon", "cloud_remove_addon", "cloud_reorder_addons"]
 
 # ── Streaming bridge (2.4) ────────────────────────────────────────────────────
 [[permission]]

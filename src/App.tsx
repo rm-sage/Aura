@@ -3355,6 +3355,51 @@ export default function App() {
     setAddons((prev) => prev.filter((a) => a.url !== url));
   }, []);
 
+  /** Persist the new addon order to disk (guest) or to the Stremio cloud
+   *  (logged-in). Optimistically updates local state immediately so the
+   *  drag-drop feels instant; reverts on failure and surfaces a toast.
+   *  Mirrors the new ordering into the warm-start cloud cache so the
+   *  next launch paints the reordered list on the first frame. */
+  const handleAddonsReorder = useCallback(async (urls: string[]) => {
+    const previous = addons;
+    const norm = (s: string) =>
+      s.trim().replace(/\/manifest\.json$/, "").replace(/\/+$/, "").toLowerCase();
+    const byUrl = new Map(previous.map((a) => [norm(a.url), a] as const));
+    const reordered: AddonEntry[] = [];
+    for (const u of urls) {
+      const hit = byUrl.get(norm(u));
+      if (hit) { reordered.push(hit); byUrl.delete(norm(hit.url)); }
+    }
+    for (const leftover of byUrl.values()) reordered.push(leftover);
+    if (reordered.length === 0) return;
+
+    setAddons(reordered);
+
+    try {
+      if (session?.auth_key) {
+        await invoke("cloud_reorder_addons", {
+          authKey: session.auth_key,
+          urls: reordered.map((a) => a.url),
+        });
+        try {
+          localStorage.setItem(
+            cloudAddonCacheKey(session.auth_key),
+            JSON.stringify(reordered),
+          );
+        } catch { /* quota */ }
+      } else {
+        await invoke("reorder_addons", { urls: reordered.map((a) => a.url) });
+      }
+    } catch (err) {
+      if (String(err) === SESSION_EXPIRED) {
+        await handleSessionExpired();
+        return;
+      }
+      setAddons(previous);
+      showAppToast(`Couldn't save addon order: ${String(err)}`, { duration: 4000 });
+    }
+  }, [addons, session, cloudAddonCacheKey, handleSessionExpired]);
+
   // ── Absolute-episode patch effect ──
   // Computes activeTarget.absolute_episode_num asynchronously after
   // activeTarget is set. handlePlayStream can't await the meta detail
@@ -4813,6 +4858,7 @@ export default function App() {
             session={session}
             onAdd={handleAddonAdded}
             onRemove={handleAddonRemoved}
+            onReorder={handleAddonsReorder}
             onLoginSuccess={handleLoginSuccess}
             onLogout={handleLogout}
             onSessionExpired={handleSessionExpired}
