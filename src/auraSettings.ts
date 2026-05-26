@@ -84,12 +84,6 @@ export interface AuraSettings {
    *  billing as a plot beat (deaths, returns, cameos), so the count
    *  alone can spoil. Default false (overlay visible). */
   hideCastSpoilers: boolean;
-  /** Show AIOStreams notices (filter / timing / scrape-summary stats
-   *  + addon errors) as badges over the streams panel. When off, only
-   *  notices flagged `forced=true` by the addon (Digital Release
-   *  Filter, disabled-stream-types removal reasons) still surface —
-   *  user toggles never silently swallow those. Default true. */
-  showAioStreamsNotices: boolean;
   /** Blur the per-episode thumbnail until that episode is marked
    *  watched (manually OR auto-derived from playback progress).
    *  Anti-spoiler aid for thrillers / mystery / anime where the
@@ -218,7 +212,6 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   searchAddonUrls: null,
   searchSuggestionAddonUrls: null,
   hideCastSpoilers: false,
-  showAioStreamsNotices: true,
   blurUnwatchedThumbnails: false,
   heroCatalog: null,
   notifyOnlyWithStreams: false,
@@ -280,9 +273,6 @@ function readFromStorage(): AuraSettings {
       hideCastSpoilers: typeof parsed.hideCastSpoilers === "boolean"
         ? parsed.hideCastSpoilers
         : false,
-      showAioStreamsNotices: typeof parsed.showAioStreamsNotices === "boolean"
-        ? parsed.showAioStreamsNotices
-        : true,
       blurUnwatchedThumbnails: typeof parsed.blurUnwatchedThumbnails === "boolean"
         ? parsed.blurUnwatchedThumbnails
         : false,

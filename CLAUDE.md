@@ -107,7 +107,7 @@ These are mistakes that have specific, hard-to-diagnose symptoms. The HANDOFF.md
 ## Conventions
 
 - F12 opens the in-app DevConsole (ring buffer, level filters, search). Rust logs come through via `crate::devlog!` macro which mirrors to stderr AND emits a `dev-log` Tauri event.
-- Rust log labels: `[bridge]`, `[player]`, `[streams]`, `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[ratings]`, `[rpc]`, `[win32]`, `[smtc]`, `[scrobble]`, `[mpv2]` — grep these in DevConsole or `aura-mpv.log`. (`[mpv2]` is the render-API rewrite — `src-tauri/src/mpv2/`.)
+- Rust log labels: `[bridge]`, `[player]`, `[streams]`, `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[ratings]`, `[rpc]`, `[win32]`, `[smtc]`, `[scrobble]`, `[publicmetadb]`, `[mpv2]` — grep these in DevConsole or `aura-mpv.log`. (`[mpv2]` is the render-API rewrite — `src-tauri/src/mpv2/`.)
 - libmpv writes its own verbose log to `%USERPROFILE%\aura-mpv.log` (truncated each MPV init). The last few lines usually pinpoint a STATUS_ACCESS_VIOLATION.
 - Discord RPC uses application ID `1499651271357890610` (in `window_logic.rs`). Browse states are gated on `discord_rpc_browse_states` setting; playback states honor `discord_rpc_show_titles` + the per-title blocklist.
 - Libmpv DLLs in `src-tauri/lib/` (`libmpv-2.dll` + `libmpv-wrapper.dll`) are git-ignored (>100 MB). Keep them present locally; downloads are at `github.com/zhongfly/mpv-winbuild` and `github.com/nini22P/libmpv-wrapper`.

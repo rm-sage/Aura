@@ -38,6 +38,19 @@ export interface ImageLoaderProps {
   fallback?: React.ReactNode;
 }
 
+/** Map an `api.ratingposterdb.com/.../imdb/poster-default/<tt…>.jpg` URL to
+ *  the equivalent metahub poster URL. Returns null for any non-RPDB or
+ *  non-IMDb path. RPDB serves posters via per-user `t3-<token>` API keys
+ *  baked into the URL by whichever addon supplied the poster; once that
+ *  token is revoked or rate-limited, RPDB returns `403 "API Key is
+ *  Invalid"` for every poster sharing the token. Metahub (Cinemeta's
+ *  CDN) is freely accessible and carries the same poster set keyed by
+ *  IMDb id, so it's a clean drop-in fallback for tt-prefixed entries. */
+function rpdbToMetahubFallback(url: string): string | null {
+  const m = url.match(/api\.ratingposterdb\.com\/[^/]+\/imdb\/poster-default\/(tt\d+)\.jpg/);
+  return m ? `https://images.metahub.space/poster/medium/${m[1]}/img` : null;
+}
+
 export default function ImageLoader({
   src,
   alt = "",
@@ -53,6 +66,14 @@ export default function ImageLoader({
 }: ImageLoaderProps) {
   const [loaded, setLoaded] = useState(false);
   const [errored, setErrored] = useState(false);
+  // Substitute URL we've swapped in after the original failed. Used for
+  // the RPDB → metahub recovery path below. Distinct from `errored` so a
+  // successful retry can paint normally without flickering through the
+  // skeleton/placeholder.
+  const [fallbackSrc, setFallbackSrc] = useState<string | null>(null);
+  // Ref-not-state so the onError closure always sees the latest value
+  // without re-binding the listener through a render cycle.
+  const triedFallbackRef = useRef(false);
   // `inView` controls whether we even set the <img>'s src. Native
   // `loading="lazy"` mis-fires on tiles inside horizontally-scrolling
   // rows: the initial IntersectionObserver check misses some entries,
@@ -70,6 +91,8 @@ export default function ImageLoader({
   useEffect(() => {
     setLoaded(false);
     setErrored(false);
+    setFallbackSrc(null);
+    triedFallbackRef.current = false;
     // If the browser already had this URL cached, `onLoad` may not fire.
     // Detect that and short-circuit so we don't show an indefinite skeleton.
     const img = ref.current;
@@ -134,7 +157,7 @@ export default function ImageLoader({
       {src && !errored && inView && (
         <img
           ref={ref}
-          src={src}
+          src={fallbackSrc ?? src}
           alt={alt}
           draggable={draggable}
           decoding={decoding}
@@ -164,7 +187,23 @@ export default function ImageLoader({
               finishLoad();
             }
           }}
-          onError={() => setErrored(true)}
+          onError={() => {
+            // First-failure recovery: if the broken URL is an RPDB
+            // poster (per-user API key in the path; common revocation
+            // / rate-limit failure mode), retry once from metahub
+            // using the same IMDb id. Tracked via a ref so a second
+            // failure on the metahub URL falls through to the
+            // placeholder instead of looping.
+            if (!triedFallbackRef.current) {
+              const swap = rpdbToMetahubFallback(fallbackSrc ?? src ?? "");
+              if (swap) {
+                triedFallbackRef.current = true;
+                setFallbackSrc(swap);
+                return;
+              }
+            }
+            setErrored(true);
+          }}
           className={`block ${imgClassName ?? ""}`}
           style={{
             opacity: loaded ? 1 : 0,

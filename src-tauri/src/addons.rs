@@ -106,3 +106,34 @@ pub fn save<R: tauri::Runtime>(
     let json = serde_json::to_string_pretty(addons).map_err(|e| format!("Serialise addons: {e}"))?;
     std::fs::write(&path, json).map_err(|e| format!("Write addons: {e}"))
 }
+
+/// Permute the on-disk addon list to match `urls` (matched by normalized URL —
+/// trailing slash and `/manifest.json` are ignored). Any locally-persisted
+/// addon not mentioned in `urls` is appended at the tail so a partial caller
+/// list can't accidentally drop entries. Returns the new ordering.
+pub fn reorder<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    urls: &[String],
+) -> Result<Vec<AddonEntry>, String> {
+    let current = load(app)?;
+    let norm = |s: &str| {
+        s.trim()
+            .trim_end_matches('/')
+            .trim_end_matches("/manifest.json")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    };
+    let mut by_url: std::collections::HashMap<String, AddonEntry> = current
+        .into_iter()
+        .map(|a| (norm(&a.url), a))
+        .collect();
+    let mut next: Vec<AddonEntry> = Vec::with_capacity(by_url.len());
+    for u in urls {
+        if let Some(entry) = by_url.remove(&norm(u)) {
+            next.push(entry);
+        }
+    }
+    next.extend(by_url.into_values());
+    save(app, &next)?;
+    Ok(next)
+}

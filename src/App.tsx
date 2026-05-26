@@ -55,7 +55,7 @@ import NextUpCta from "./NextUpCta";
 import EosSpotlight from "./EosSpotlight";
 import EpisodePanel from "./EpisodePanel";
 import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPreviousEpisode } from "./nextUp";
-import { getMetaDetailFallback, peekCachedDetailById } from "./metaCache";
+import { getMetaDetailFallback, peekCachedDetailById, peekFreshestPostersByIds } from "./metaCache";
 import { PersistentCache } from "./persistentCache";
 import { loadAuraSettings } from "./auraSettings";
 
@@ -375,6 +375,47 @@ async function mergeChapterSkipWindows(
     console.warn(`[aniskip] chapter merge stamp failed: ${String(err)}`);
   }
   return merged;
+}
+
+// ---------------------------------------------------------------------------
+// publicmetadb skip windows — crowd-sourced OP/ED timestamps from the
+// publicmetadb skip database (TMDB-keyed). Aura's PRIMARY skip source
+// for live-action series; a best-effort fallback for anime. Maps the
+// Rust `PublicmetadbSkips` payload into `PreparedWindow`s, dropping any
+// kind the user has switched off. Network / parse failure → empty list
+// (the caller falls through to chapters / silencedetect).
+// ---------------------------------------------------------------------------
+async function fetchPublicmetadbWindows(
+  tmdbId:    number,
+  mediaType: "tv" | "movie",
+  season:    number,
+  episode:   number,
+  modeFor:   (kind: string) => "off" | "prompt" | "auto",
+): Promise<PreparedWindow[]> {
+  try {
+    const res = await invoke<{
+      found:   boolean;
+      windows: { kind: string; start: number; end: number; source: string }[];
+    }>("fetch_publicmetadb_skips", {
+      tmdbId,
+      mediaType,
+      season,
+      episode,
+    });
+    if (!res.found || res.windows.length === 0) return [];
+    return res.windows
+      .filter((w) => modeFor(w.kind) !== "off")
+      .map((w) => ({
+        type:   w.kind,
+        start:  w.start,
+        end:    w.end,
+        source: w.source, // "publicmetadb"
+        auto:   modeFor(w.kind) === "auto",
+      }));
+  } catch (e) {
+    console.warn(`[publicmetadb] lookup failed: ${String(e)}`);
+    return [];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1586,13 +1627,45 @@ export default function App() {
               } catch { /* leave null, falls through to skip log */ }
             }
             if (!malId) {
-              // Live-action, or anime we couldn't resolve to a MAL id
-              // (IMDb-keyed with no anime ids + no Jikan title hit).
-              // No AniSkip data — fall straight through to the chapter
-              // path so chaptered live-action series still get skip
-              // windows. THIS is the anime-only → any-series extension.
-              console.info(`[aniskip] no mal_id for ${seriesId} — chapter-only skip path`);
-              await finishWithChapters([], { silenceUrl: stream.url ?? null });
+              // Live-action, or anime we couldn't resolve to a MAL id.
+              // publicmetadb is the PRIMARY skip source here — keyed by
+              // the show's TMDB id + season/episode. It feeds
+              // finishWithChapters as `prepared`, so chapters and the
+              // silencedetect heuristic only fill kinds it did not
+              // supply. No publicmetadb data → empty list, and the
+              // chapter path still runs so chaptered live-action keeps
+              // producing windows.
+              let pmdbWindows: PreparedWindow[] = [];
+              const laTmdb = detail?.tmdb_id ?? null;
+              const laSegs = target.id.split(":");
+              // The segment fallback is for IMDb-style episode ids
+              // (tt…:S:E). An anime-prefix id (kitsu:N:M, mal:N:M, …)
+              // also splits into 3 segments, but segment 1 is a show
+              // id, not a season — trust the fallback only when segment
+              // 0 is a tt-prefixed IMDb id; otherwise yield NaN so the
+              // Number.isFinite guard below cleanly skips publicmetadb.
+              const laImdbId = laSegs.length === 3 && /^tt\d/i.test(laSegs[0]);
+              const laSeason = Number.isFinite(target.season as number)
+                ? (target.season as number)
+                : laImdbId ? Number(laSegs[1]) : NaN;
+              const laEpisode = Number.isFinite(target.episode_num as number)
+                ? (target.episode_num as number)
+                : laImdbId ? Number(laSegs[2]) : NaN;
+              if (laTmdb != null && Number.isFinite(laSeason) && Number.isFinite(laEpisode)) {
+                pmdbWindows = await fetchPublicmetadbWindows(
+                  laTmdb, "tv", laSeason, laEpisode, modeFor,
+                );
+                console.info(
+                  `[publicmetadb] no mal_id for ${seriesId} — ` +
+                  `tmdb=${laTmdb} s${laSeason}e${laEpisode} → ${pmdbWindows.length} window(s)`,
+                );
+              } else {
+                console.info(
+                  `[publicmetadb] no mal_id for ${seriesId} — skipped ` +
+                  `(tmdb=${laTmdb} season=${laSeason} episode=${laEpisode}); chapter-only`,
+                );
+              }
+              await finishWithChapters(pmdbWindows, { silenceUrl: stream.url ?? null });
               return;
             }
             // Mal-id was resolved → this is an anime; mark for future
@@ -1674,6 +1747,51 @@ export default function App() {
               // AniSkip network/parse failure is non-fatal — chapter +
               // heuristic windows still run via finishWithChapters.
               console.warn(`[aniskip] lookup failed: ${String(err)}`);
+            }
+            // publicmetadb anime fallback — best-effort SECONDARY source.
+            // Fires only when AniSkip left an OP or ED gap. The TMDB id
+            // is resolved from yuna.moe's `themoviedb` (anime `_tmdbId`
+            // from AIOMetadata is unreliable) using whichever anime id
+            // we have. Fills ONLY the kinds AniSkip didn't supply. NOTE:
+            // for multi-cour anime the MAL-local episode may not align
+            // with TMDB numbering — that mis-key is the accepted
+            // "best-effort" cost (AniSkip remains anime's primary source).
+            try {
+              const haveOp = prepared.some((w) => w.type === "op" || w.type === "mixed-op");
+              const haveEd = prepared.some((w) => w.type === "ed");
+              if ((!haveOp || !haveEd) && Number.isFinite(episodeNum)) {
+                let animeTmdb: number | null = detail?.tmdb_id ?? null;
+                const tmdbSources: ["kitsu" | "anidb" | "anilist", number | null | undefined][] = [
+                  ["kitsu",   detail?.kitsu_id],
+                  ["anidb",   detail?.anidb_id],
+                  ["anilist", (detail as { anilist_id?: number | null } | null)?.anilist_id],
+                ];
+                for (const [src, sid] of tmdbSources) {
+                  if (animeTmdb != null) break;
+                  if (sid == null) continue;
+                  try {
+                    animeTmdb = await invoke<number | null>(
+                      "resolve_anime_tmdb_id", { source: src, id: sid },
+                    );
+                  } catch { /* best-effort — leave null */ }
+                }
+                if (animeTmdb != null) {
+                  const pmdb = await fetchPublicmetadbWindows(
+                    animeTmdb, "tv", target.season ?? 1, episodeNum, modeFor,
+                  );
+                  for (const w of pmdb) {
+                    if (w.type === "op" && !haveOp) prepared.push(w);
+                    if (w.type === "ed" && !haveEd) prepared.push(w);
+                  }
+                  if (pmdb.length > 0) {
+                    console.info(
+                      `[publicmetadb] anime fallback: tmdb=${animeTmdb} → ${pmdb.length} window(s)`,
+                    );
+                  }
+                }
+              }
+            } catch (e) {
+              console.warn(`[publicmetadb] anime fallback failed: ${String(e)}`);
             }
             // ALWAYS augment with chapters (even on an empty AniSkip
             // result): anime with no AniSkip data gets the same
@@ -2399,7 +2517,19 @@ export default function App() {
       if (raw) {
         const cached = JSON.parse(raw) as LibraryItem[];
         if (Array.isArray(cached) && cached.length > 0) {
-          setLibrary(overlayRecentClears(cached));
+          // metaCache hydrates synchronously at module import, so any
+          // fresh poster URLs we warmed in the previous session are
+          // already in memory. Apply them to the warm-start cache so
+          // tile artwork is correct on the first paint instead of
+          // flickering through the stale-URL set.
+          const posterMap = peekFreshestPostersByIds(cached.map((it) => it.id));
+          const warmed = posterMap.size > 0
+            ? cached.map((it) => {
+                const fresh = posterMap.get(it.id);
+                return fresh && fresh !== it.poster ? { ...it, poster: fresh } : it;
+              })
+            : cached;
+          setLibrary(overlayRecentClears(warmed));
           setLibraryLoaded(true);
         }
       }
@@ -2413,7 +2543,22 @@ export default function App() {
       // boundary means none of them have to repeat the dedup logic.
       const items = normalizeLibrary(raw);
       setRawLibrary(raw);
-      setLibrary(overlayRecentClears(items));
+      // Synchronously swap in any fresh poster URLs we already have
+      // cached for these ids — Stremio library records freeze the
+      // poster URL at insert time, so library tiles can display
+      // stale (e.g. revoked RPDB-key) URLs while Home / Discover
+      // catalogs show the latest because they re-fetch from the
+      // addon. The metaCache typically holds fresher entries from
+      // Calendar / Notifications scanner / Detail visits; the
+      // background-warm effect below handles ids we don't yet have.
+      const posterMap = peekFreshestPostersByIds(items.map((it) => it.id));
+      const itemsWithFreshPosters = posterMap.size > 0
+        ? items.map((it) => {
+            const fresh = posterMap.get(it.id);
+            return fresh && fresh !== it.poster ? { ...it, poster: fresh } : it;
+          })
+        : items;
+      setLibrary(overlayRecentClears(itemsWithFreshPosters));
       // Pull half of the watched-status sync — mirror cloud `aura_watched`
       // flags into the local manualWatched store. Idempotent; only
       // promotes null → "watched" so it never clobbers an explicit
@@ -2448,7 +2593,11 @@ export default function App() {
           (collapsed > 0 ? ` (collapsed ${collapsed} duplicate/episode rows)` : ""),
       );
       try {
-        localStorage.setItem(cacheKey, JSON.stringify(items));
+        // Persist the patched list so a relaunch immediately shows the
+        // fresh poster URLs without paying another full-library
+        // background warm. The Stremio cloud record itself is left
+        // untouched — this is purely a local UI cache.
+        localStorage.setItem(cacheKey, JSON.stringify(itemsWithFreshPosters));
       } catch { /* quota exceeded — non-fatal */ }
     } catch (err) {
       if (String(err) === SESSION_EXPIRED) {
@@ -2462,6 +2611,61 @@ export default function App() {
       setLibraryLoaded(true);
     }
   }, [overlayRecentClears]);
+
+  // ── Background library-poster warm ──
+  // Stremio library records freeze the poster URL at insertion time
+  // (revoked RPDB API keys leave 403'd tiles in Library / Queue
+  // forever even after the addon serves new URLs in catalogs). For
+  // every library id we don't yet have in the metaCache, fire a
+  // best-effort `getMetaDetailFallback` and apply the fresh poster
+  // back to the in-memory library — the rendered UI updates without
+  // touching the Stremio cloud record. A ref-tracked set of "already
+  // attempted" ids stops focus refetches / library-changed bumps
+  // from re-firing the same network requests every cycle. Concurrency
+  // is capped at 6 to keep AIOMetadata from getting hammered when the
+  // user has a large library.
+  const warmedPosterIdsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (library.length === 0 || addons.length === 0) return;
+    const candidates = library.filter((it) =>
+      !warmedPosterIdsRef.current.has(it.id) &&
+      !peekCachedDetailById(it.id),
+    );
+    if (candidates.length === 0) return;
+    for (const it of candidates) warmedPosterIdsRef.current.add(it.id);
+
+    let cancelled = false;
+    void (async () => {
+      const updates = new Map<string, string>();
+      const queue = [...candidates];
+      const concurrency = 6;
+      const worker = async () => {
+        while (queue.length > 0 && !cancelled) {
+          const it = queue.shift();
+          if (!it) break;
+          const detail = await getMetaDetailFallback(addons, it.media_type, it.id)
+            .catch(() => null);
+          if (detail?.poster && detail.poster !== it.poster) {
+            updates.set(it.id, detail.poster);
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+      if (cancelled || updates.size === 0) return;
+      setLibrary((prev) => {
+        let dirty = false;
+        const next = prev.map((it) => {
+          const fresh = updates.get(it.id);
+          if (!fresh || fresh === it.poster) return it;
+          dirty = true;
+          return { ...it, poster: fresh };
+        });
+        return dirty ? next : prev;
+      });
+    })();
+
+    return () => { cancelled = true; };
+  }, [library, addons]);
 
   // ── Session expired ──
   const handleSessionExpired = useCallback(async () => {
@@ -3355,6 +3559,51 @@ export default function App() {
     setAddons((prev) => prev.filter((a) => a.url !== url));
   }, []);
 
+  /** Persist the new addon order to disk (guest) or to the Stremio cloud
+   *  (logged-in). Optimistically updates local state immediately so the
+   *  drag-drop feels instant; reverts on failure and surfaces a toast.
+   *  Mirrors the new ordering into the warm-start cloud cache so the
+   *  next launch paints the reordered list on the first frame. */
+  const handleAddonsReorder = useCallback(async (urls: string[]) => {
+    const previous = addons;
+    const norm = (s: string) =>
+      s.trim().replace(/\/manifest\.json$/, "").replace(/\/+$/, "").toLowerCase();
+    const byUrl = new Map(previous.map((a) => [norm(a.url), a] as const));
+    const reordered: AddonEntry[] = [];
+    for (const u of urls) {
+      const hit = byUrl.get(norm(u));
+      if (hit) { reordered.push(hit); byUrl.delete(norm(hit.url)); }
+    }
+    for (const leftover of byUrl.values()) reordered.push(leftover);
+    if (reordered.length === 0) return;
+
+    setAddons(reordered);
+
+    try {
+      if (session?.auth_key) {
+        await invoke("cloud_reorder_addons", {
+          authKey: session.auth_key,
+          urls: reordered.map((a) => a.url),
+        });
+        try {
+          localStorage.setItem(
+            cloudAddonCacheKey(session.auth_key),
+            JSON.stringify(reordered),
+          );
+        } catch { /* quota */ }
+      } else {
+        await invoke("reorder_addons", { urls: reordered.map((a) => a.url) });
+      }
+    } catch (err) {
+      if (String(err) === SESSION_EXPIRED) {
+        await handleSessionExpired();
+        return;
+      }
+      setAddons(previous);
+      showAppToast(`Couldn't save addon order: ${String(err)}`, { duration: 4000 });
+    }
+  }, [addons, session, cloudAddonCacheKey, handleSessionExpired]);
+
   // ── Absolute-episode patch effect ──
   // Computes activeTarget.absolute_episode_num asynchronously after
   // activeTarget is set. handlePlayStream can't await the meta detail
@@ -3853,6 +4102,18 @@ export default function App() {
   useEffect(() => {
     return () => {
       flushProgress(session, writebackTarget.current);
+      // Reset the dedup guard for the NEXT target. `flushProgress` skips a
+      // write when `time` is within 1 s of `lastWrittenTime` (to coalesce a
+      // pause-write and an unmount-write on the same second). Left un-reset
+      // across an episode boundary, that guard instead compares the new
+      // episode's playhead against the *previous* episode's last write —
+      // and when two back-to-back episodes end at a similar playhead
+      // (routine in anime binges) it wrongly suppresses the new episode's
+      // flush, freezing `state.video_id` on an earlier episode. That stale
+      // video_id is what surfaces in Continue Watching as a prior episode
+      // stuck "in progress". The -1 sentinel makes the next target's first
+      // flush always pass.
+      lastWrittenTime.current = -1;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTarget]);
@@ -4801,6 +5062,7 @@ export default function App() {
             session={session}
             onAdd={handleAddonAdded}
             onRemove={handleAddonRemoved}
+            onReorder={handleAddonsReorder}
             onLoginSuccess={handleLoginSuccess}
             onLogout={handleLogout}
             onSessionExpired={handleSessionExpired}

@@ -49,8 +49,8 @@ commands.allow = ["get_addon_manifest", "refresh_addon_manifest"]
 # ── Addon management ──────────────────────────────────────────────────────────
 [[permission]]
 identifier = "allow-addon-management"
-description = "Allows the frontend to add, remove, and list persisted addons (guest mode)"
-commands.allow = ["add_addon", "remove_addon", "list_addons"]
+description = "Allows the frontend to add, remove, list, and reorder persisted addons (guest mode)"
+commands.allow = ["add_addon", "remove_addon", "list_addons", "reorder_addons"]
 
 # ── Authentication ────────────────────────────────────────────────────────────
 [[permission]]
@@ -66,8 +66,8 @@ commands.allow = ["global_search", "global_search_grouped", "search_addon_groupe
 
 [[permission]]
 identifier = "allow-cloud-sync"
-description = "Allows the frontend to add/remove addons in the user's Stremio cloud account"
-commands.allow = ["cloud_add_addon", "cloud_remove_addon"]
+description = "Allows the frontend to add, remove, and reorder addons in the user's Stremio cloud account"
+commands.allow = ["cloud_add_addon", "cloud_remove_addon", "cloud_reorder_addons"]
 
 # ── Streaming bridge (2.4) ────────────────────────────────────────────────────
 [[permission]]
@@ -103,6 +103,12 @@ commands.allow = ["get_settings", "set_theme", "update_settings", "reset_setting
 identifier = "allow-aniskip"
 description = "Allows the frontend to fetch op/ed/recap skip-time windows from the AniSkip API for anime titles"
 commands.allow = ["fetch_skip_windows", "set_skip_windows", "get_skip_windows", "resolve_mal_id", "resolve_mal_id_by_title", "detect_silence_intervals", "detect_outro_boundary", "submit_skip_time", "vote_skip_time", "resolve_cour_mal_id", "resolve_cour_anilist_id", "resolve_anilist_to_mal", "resolve_mal_for_aniskip"]
+
+# ── publicmetadb (crowd-sourced OP/ED skip source) ──────────────────────────
+[[permission]]
+identifier = "allow-publicmetadb"
+description = "Allows the frontend to fetch crowd-sourced OP/ED skip windows from publicmetadb and to resolve an anime TMDB id for that lookup"
+commands.allow = ["fetch_publicmetadb_skips", "resolve_anime_tmdb_id"]
 
 # ── Phase 4: OpenSubtitles ────────────────────────────────────────────────────
 [[permission]]

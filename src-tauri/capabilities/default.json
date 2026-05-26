@@ -53,6 +53,7 @@
     "allow-stats",
     "allow-storage-management",
     "allow-aniskip",
+    "allow-publicmetadb",
     "allow-dev-tools",
     "allow-crash-reporting",
     "allow-sync",

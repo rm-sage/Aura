@@ -444,6 +444,11 @@ pub struct MetaDetail {
     /// AniDB numeric id when present. Future use: anidb→mal mapping
     /// fallback for AniSkip.
     pub anidb_id: Option<u32>,
+    /// The Movie Database (TMDB) numeric id when the addon stamps one.
+    /// Sourced from AIOMetadata's `_tmdbId` — correct on live-action
+    /// series, unreliable for anime (null, or the broken literal
+    /// "[object Object]"). Drives the publicmetadb OP/ED skip lookup.
+    pub tmdb_id: Option<i64>,
     /// Per-season cast/crew rosters. Keys are season numbers (TMDB /
     /// TVDB convention — season 0 is specials, 1+ are the main run).
     /// Empty on movies + MAL-meta anime + older cached entries that
@@ -516,6 +521,12 @@ pub struct StreamEntry {
     pub file_idx: Option<i64>,
     /// Behavior hints from the addon (HDR, 4K, etc).
     pub description: Option<String>,
+    /// `behaviorHints.filename` from the addon — raw release filename
+    /// (e.g. "Frieren.S01E07.1080p.WEB-DL.x265-RAWR.mkv"). AIOStreams
+    /// and some other addons populate this; the UI surfaces it as a
+    /// hover tooltip on the stream row's headline so users can verify
+    /// the exact release without copying the link first.
+    pub filename: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,6 +1082,17 @@ pub async fn list_addons<R: tauri::Runtime>(
     addons::load(&app)
 }
 
+/// Reorder the local addons.json to match `urls`. Guest-mode counterpart of
+/// `cloud_reorder_addons`. Returns the new ordering so the caller can
+/// reconcile its in-memory state without a separate `list_addons` round-trip.
+#[tauri::command]
+pub async fn reorder_addons<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    urls: Vec<String>,
+) -> Result<Vec<AddonEntry>, String> {
+    addons::reorder(&app, &urls)
+}
+
 // ---------------------------------------------------------------------------
 // Commands — catalog browsing
 // ---------------------------------------------------------------------------
@@ -1107,7 +1129,7 @@ pub async fn fetch_catalog(
     let label = log_label("", &base);
 
     // Soft-fail cache: if THIS specific catalog timed out recently,
-    // skip the network call to avoid paying another 10 s timeout. The
+    // skip the network call to avoid paying another 20 s timeout. The
     // cooldown is per-(addon, catalog) so a slow catalog only mutes
     // ITSELF — sibling catalogs from the same addon keep loading
     // normally. If we have a stale-but-cached payload for this
@@ -1139,7 +1161,14 @@ pub async fn fetch_catalog(
     // Live fetch. Network-class failures fall through to the stale
     // cache (when available) so a flaky upstream doesn't blank out
     // the home row that previously had data.
-    let resp = match client().get(&url).send().await {
+    //
+    // Catalog requests get a longer per-request timeout (20 s) than the
+    // shared client default (`TIMEOUT`, 10 s). Aggregating catalog
+    // builders (flixpatrol, the streaming.* rows) routinely need more
+    // than 10 s on a cold request, and a timed-out catalog row is more
+    // disruptive than a slow one. This is a per-request override, so
+    // manifest / stream / meta fetches keep the snappier 10 s.
+    let resp = match client().get(&url).timeout(Duration::from_secs(20)).send().await {
         Ok(r) => r,
         Err(e) => {
             let cat = describe_reqwest_err(&e);
@@ -1791,6 +1820,47 @@ pub async fn cloud_remove_addon(auth_key: String, url: String) -> Result<(), Str
     push_collection(&auth_key, collection).await
 }
 
+/// Reorder the user's Stremio cloud addon collection to match `urls`.
+/// `urls` is the desired full order; matching is by normalized transportUrl
+/// (the `/manifest.json` suffix and trailing slashes are ignored). Any cloud
+/// entry not present in `urls` is preserved at the tail — defensive against
+/// the cross-device race where device B added an addon between our most
+/// recent get_synced_addons and this reorder call.
+#[tauri::command]
+pub async fn cloud_reorder_addons(auth_key: String, urls: Vec<String>) -> Result<(), String> {
+    if urls.is_empty() {
+        return Ok(());
+    }
+    let collection = fetch_raw_collection(&auth_key).await?;
+
+    let target: Vec<String> = urls
+        .iter()
+        .map(|u| normalize_addon_url(u.trim_end_matches('/')).to_ascii_lowercase())
+        .collect();
+
+    let mut by_url: std::collections::HashMap<String, serde_json::Value> = collection
+        .into_iter()
+        .map(|entry| {
+            let key = entry
+                .get("transportUrl")
+                .and_then(|v| v.as_str())
+                .map(|t| normalize_addon_url(t).to_ascii_lowercase())
+                .unwrap_or_default();
+            (key, entry)
+        })
+        .collect();
+
+    let mut next: Vec<serde_json::Value> = Vec::with_capacity(by_url.len());
+    for tn in &target {
+        if let Some(entry) = by_url.remove(tn) {
+            next.push(entry);
+        }
+    }
+    next.extend(by_url.into_values());
+
+    push_collection(&auth_key, next).await
+}
+
 // ---------------------------------------------------------------------------
 // Commands — meta detail (Phase 3 Task B)
 // ---------------------------------------------------------------------------
@@ -1989,9 +2059,15 @@ pub async fn fetch_meta_detail(
     let mal_id   = read_numeric_id(meta, &["_malId",   "malId",   "mal_id"]);
     let kitsu_id = read_numeric_id(meta, &["_kitsuId", "kitsuId", "kitsu_id"]);
     let anidb_id = read_numeric_id(meta, &["_anidbId", "anidbId", "anidb_id"]);
+    // TMDB id — AIOMetadata's `_tmdbId` (a JSON string like "61859" on
+    // live-action series; null or the broken literal "[object Object]"
+    // on anime — both yield None, since read_numeric_id's str branch
+    // does a numeric parse). Widened to i64 for the publicmetadb lookup.
+    let tmdb_id = read_numeric_id(meta, &["_tmdbId", "tmdbId", "tmdb_id"])
+        .map(i64::from);
     crate::devlog!(
         info, "meta",
-        "[{}] anime ids: mal={mal_id:?} kitsu={kitsu_id:?} anidb={anidb_id:?}",
+        "[{}] anime ids: mal={mal_id:?} kitsu={kitsu_id:?} anidb={anidb_id:?} tmdb={tmdb_id:?}",
         label,
     );
 
@@ -2127,6 +2203,7 @@ pub async fn fetch_meta_detail(
         mal_id,
         kitsu_id,
         anidb_id,
+        tmdb_id,
         season_credits,
         aggregate_credits,
     })
@@ -3217,6 +3294,15 @@ fn sanitize_stream(s: &serde_json::Value, addon_name: &str) -> Option<StreamEntr
         }
     });
 
+    // behaviorHints.filename — populated by AIOStreams (and some other
+    // addons) with the raw release filename. Cap matches `title` to
+    // protect against pathological addon payloads.
+    let filename = s
+        .get("behaviorHints")
+        .and_then(|v| v.get("filename"))
+        .and_then(|v| v.as_str())
+        .map(|s| cap(s.to_string(), 512));
+
     Some(StreamEntry {
         title,
         addon_name: cap(addon_name.to_string(), 64),
@@ -3227,6 +3313,7 @@ fn sanitize_stream(s: &serde_json::Value, addon_name: &str) -> Option<StreamEntr
             .get("description")
             .and_then(|v| v.as_str())
             .map(|s| cap(s.to_string(), 1024)),
+        filename,
     })
 }
 

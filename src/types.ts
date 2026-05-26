@@ -173,6 +173,10 @@ export interface MetaDetail {
   kitsu_id: number | null;
   /** AniDB numeric id (future anidb→mal AniSkip fallback). */
   anidb_id: number | null;
+  /** The Movie Database (TMDB) numeric id when the addon stamps one.
+   *  Reliable for live-action series (AIOMetadata `_tmdbId`); usually
+   *  null for anime. Drives the publicmetadb OP/ED skip lookup. */
+  tmdb_id: number | null;
   country: string | null;
   /** ISO 639-1 (e.g. "ko", "ja", "en") — drives the "original" token in
    *  the audio_priority preference list. Null when the addon doesn't
@@ -251,6 +255,11 @@ export interface StreamEntry {
   info_hash: string | null;
   file_idx: number | null;
   description: string | null;
+  /** `behaviorHints.filename` from the addon — raw release filename when
+   *  available. AIOStreams and some other addons populate it; the
+   *  StreamRow surfaces it as a hover tooltip on the headline so users
+   *  can verify the exact release without copying the link. */
+  filename: string | null;
 }
 
 /** AIOStreams emits structured payloads alongside the canonical `streams`

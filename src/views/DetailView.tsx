@@ -2831,11 +2831,7 @@ const KIND_ORDER: MessageKind[] = ["error", "warning", "info", "stats"];
 
 /** Floating cluster of 1–4 status icons anchored OUTSIDE the panel's top-left
  *  corner. Each icon corresponds to a non-empty message kind and reveals the
- *  relevant rows in a hover tooltip. Honors the `showAioStreamsNotices`
- *  setting — when off, only entries flagged `forced=true` by the addon
- *  surface, so user toggles can never silently suppress the
- *  un-suppressible warnings (Digital Release Filter, disabled-stream-types
- *  removal reasons, etc.). */
+ *  relevant rows in a hover tooltip. */
 function StreamMetaBadges({
   metadata,
   anchorRef,
@@ -2851,19 +2847,6 @@ function StreamMetaBadges({
    *  aside, so the ResizeObserver below never re-fires). */
   entered: boolean;
 }) {
-  // Subscribe to the visibility toggle so flipping it in Settings takes
-  // effect without remounting the detail page.
-  const [showAll, setShowAll] = useState(() => loadAuraSettings().showAioStreamsNotices);
-  useEffect(() => {
-    const sync = () => setShowAll(loadAuraSettings().showAioStreamsNotices);
-    window.addEventListener("aura:settings-changed", sync);
-    window.addEventListener("storage", sync);
-    return () => {
-      window.removeEventListener("aura:settings-changed", sync);
-      window.removeEventListener("storage", sync);
-    };
-  }, []);
-
   // Position relative to the streams-panel aside. Recomputed on resize
   // and on scroll bubbling (capture phase, so any ancestor scroll counts).
   // Bottom-left anchored: 48 px outside the panel's left edge (extra gap
@@ -2908,14 +2891,11 @@ function StreamMetaBadges({
     };
   }, [entered, reposition, anchorRef]);
 
-  const filterBucket = (rows: StreamMessage[]): StreamMessage[] =>
-    showAll ? rows : rows.filter((r) => r.forced === true);
-
   const allBuckets: { kind: MessageKind; rows: StreamMessage[] }[] = [
-    { kind: "error",   rows: filterBucket(metadata.errors)   },
-    { kind: "warning", rows: filterBucket(metadata.warnings) },
-    { kind: "info",    rows: filterBucket(metadata.info)     },
-    { kind: "stats",   rows: filterBucket(metadata.stats)    },
+    { kind: "error",   rows: metadata.errors   },
+    { kind: "warning", rows: metadata.warnings },
+    { kind: "info",    rows: metadata.info     },
+    { kind: "stats",   rows: metadata.stats    },
   ];
   const buckets = allBuckets.filter((b) => b.rows.length > 0);
 
@@ -3506,7 +3486,10 @@ function StreamRow({
                 <span className="text-cyan-300/85 text-[12px] leading-none" aria-label="from library">☁</span>
               )}
               {headline && (
-                <p className="text-white/95 text-[15px] leading-snug font-semibold break-words selectable line-clamp-2">
+                <p
+                  className="text-white/95 text-[15px] leading-snug font-semibold break-words selectable line-clamp-2"
+                  title={stream.filename ?? undefined}
+                >
                   {headline}
                 </p>
               )}
