@@ -29,7 +29,7 @@
 //!
 //! Windows-only — gated at the `mod` declaration in [`super`].
 
-use std::ffi::{c_char, c_int, c_void, CStr};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::mem::size_of;
 use std::ptr;
 use std::sync::{
@@ -65,20 +65,35 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::ffi::{
-    mpv_event_id, mpv_event_log_message, mpv_handle, mpv_opengl_fbo,
+    mpv_event_id, mpv_event_log_message, mpv_format, mpv_handle, mpv_opengl_fbo,
     mpv_opengl_init_params, mpv_render_context, mpv_render_param, mpv_render_param_type,
-    mpv_render_update_flag, Libmpv, MPV_RENDER_API_TYPE_OPENGL,
+    Libmpv, MPV_RENDER_API_TYPE_OPENGL,
 };
 
 // ===========================================================================
 // Public API
 // ===========================================================================
 
-/// A request submitted to the engine's render thread. Phase 2.1 only carries
-/// `Shutdown`; Phase 2.4 will extend this with `LoadFile`, property setters
-/// etc. as the wrapper's call sites get migrated.
+/// A request submitted to the engine's render thread.
+///
+/// The render thread owns `*mut mpv_handle` and `*mut mpv_render_context`
+/// uniquely — those pointers stay off other threads to avoid a `Sync`
+/// fight with raw FFI types. Tauri command handlers submit a typed
+/// `EngineCommand` instead and the render thread drains the queue between
+/// frames, executing each on the libmpv client API.
+///
+/// Phase 2.4 carries the minimum surface to play one stream end-to-end:
+/// load a URL, toggle pause, set volume. Phase 4 will extend this with
+/// the full property / command set used by Aura (subtitle / audio track,
+/// seek, glsl-shaders, HDR options, ...).
 enum EngineCommand {
     Shutdown,
+    LoadFile {
+        url: String,
+        start_seconds: Option<f64>,
+    },
+    TogglePause,
+    SetVolume(f64),
 }
 
 /// Live engine bookkeeping. Held inside [`ENGINE`] for the engine's lifetime.
@@ -96,9 +111,31 @@ fn engine_slot() -> &'static Mutex<Option<EngineHandle>> {
     ENGINE.get_or_init(|| Mutex::new(None))
 }
 
-/// Spawn the engine — but only if the `AURA_MPV2_ENGINE` environment
-/// variable is set. A no-op otherwise. Idempotent: a second call while the
-/// engine is already running returns without doing anything.
+/// Master env-var gate for the mpv2 path: when set, [`start_if_requested`]
+/// spawns the engine AND the Tauri command handlers route playback through
+/// it ([`crate::mpv2::engine::submit_load_file`] / `_toggle_pause` /
+/// `_set_volume`). Unset → behaviour is identical to the legacy `--wid`
+/// engine. Single switch by design so partial runs (engine without command
+/// routing or vice versa) can't accidentally happen.
+pub const ENV_VAR: &str = "AURA_MPV2";
+
+/// Whether the master env-var gate is set this process.
+pub fn enabled() -> bool {
+    std::env::var_os(ENV_VAR).is_some()
+}
+
+/// Whether the engine thread is currently running. Tauri command handlers
+/// gate on this to decide between the mpv2 path and the legacy path.
+pub fn is_running() -> bool {
+    engine_slot()
+        .lock()
+        .map(|s| s.is_some())
+        .unwrap_or(false)
+}
+
+/// Spawn the engine — but only if [`ENV_VAR`] is set. A no-op otherwise.
+/// Idempotent: a second call while the engine is already running returns
+/// without doing anything.
 ///
 /// `parent_hwnd` is the Tauri main window's HWND, passed as `isize` so it
 /// can cross the thread boundary (`HWND` itself is not `Send`). The render
@@ -106,13 +143,13 @@ fn engine_slot() -> &'static Mutex<Option<EngineHandle>> {
 /// is set — used as a defensive fall-through when the main window's HWND
 /// can't be resolved at setup time.
 pub fn start_if_requested(parent_hwnd: isize) {
-    if std::env::var_os("AURA_MPV2_ENGINE").is_none() {
+    if !enabled() {
         return;
     }
     if parent_hwnd == 0 {
         crate::devlog!(
             warn, "mpv2",
-            "AURA_MPV2_ENGINE set but parent HWND is 0 — engine not spawned",
+            "{ENV_VAR} set but parent HWND is 0 — engine not spawned",
         );
         return;
     }
@@ -128,7 +165,7 @@ pub fn start_if_requested(parent_hwnd: isize) {
     }
     crate::devlog!(
         info, "mpv2",
-        "AURA_MPV2_ENGINE set — spawning long-lived render engine (parent HWND {parent_hwnd:#x})",
+        "{ENV_VAR} set — spawning long-lived render engine (parent HWND {parent_hwnd:#x})",
     );
 
     let (tx, rx) = mpsc::channel::<EngineCommand>();
@@ -144,6 +181,36 @@ pub fn start_if_requested(parent_hwnd: isize) {
     };
 
     *slot = Some(EngineHandle { tx, join: Some(join) });
+}
+
+/// Submit a `LoadFile` command. Returns an error if the engine isn't
+/// running (master gate off or pre-startup) or the channel is closed.
+pub fn submit_load_file(url: String, start_seconds: Option<f64>) -> Result<(), String> {
+    submit(EngineCommand::LoadFile { url, start_seconds })
+}
+
+/// Submit a `TogglePause` command.
+pub fn submit_toggle_pause() -> Result<(), String> {
+    submit(EngineCommand::TogglePause)
+}
+
+/// Submit a `SetVolume` command. Volume is in mpv's `volume` property
+/// units (0.0 = mute, 100.0 = unity gain).
+pub fn submit_set_volume(volume: f64) -> Result<(), String> {
+    submit(EngineCommand::SetVolume(volume))
+}
+
+/// Shared submit path — locks the slot briefly, sends through the
+/// channel, releases. Multiple Tauri command handlers can call this
+/// concurrently; the render thread drains them in order between frames.
+fn submit(cmd: EngineCommand) -> Result<(), String> {
+    let slot = engine_slot()
+        .lock()
+        .map_err(|e| format!("engine slot poisoned: {e}"))?;
+    let Some(h) = slot.as_ref() else {
+        return Err("engine not running".to_string());
+    };
+    h.tx.send(cmd).map_err(|e| format!("engine channel closed: {e}"))
 }
 
 /// Tear down the engine if one is running. Safe to call when none was
@@ -404,6 +471,75 @@ unsafe fn cstr(p: *const c_char) -> String {
 
 unsafe fn err_str(lib: &Libmpv, code: c_int) -> String {
     format!("{code} ({})", cstr((lib.error_string)(code)))
+}
+
+/// Run an mpv `command`-style call: `mpv_command(handle, args)`. Args are
+/// borrowed `&str`s, internally promoted to NUL-terminated `CString`s and
+/// then a `*const c_char` array terminated by a NULL sentinel (libmpv reads
+/// past the array bounds otherwise). Returns the mpv error code as a
+/// human-readable string on failure.
+unsafe fn run_mpv_command(
+    lib: &Libmpv,
+    handle: *mut mpv_handle,
+    args: &[&str],
+) -> Result<(), String> {
+    let cstrings: Vec<CString> = args
+        .iter()
+        .map(|s| CString::new(*s))
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("argument contained NUL: {e}"))?;
+    let mut ptrs: Vec<*const c_char> = cstrings.iter().map(|c| c.as_ptr()).collect();
+    ptrs.push(ptr::null());
+    let r = (lib.command)(handle, ptrs.as_mut_ptr());
+    if r < 0 {
+        Err(err_str(lib, r))
+    } else {
+        Ok(())
+    }
+}
+
+/// `mpv_set_property("pause", MPV_FORMAT_FLAG, &flag)`. Separate helper
+/// because the FLAG-format `data` argument is an `int *` not the C-string
+/// form `set_property_string` accepts.
+unsafe fn set_pause(
+    lib: &Libmpv,
+    handle: *mut mpv_handle,
+    paused: bool,
+) -> Result<(), String> {
+    let mut v: c_int = if paused { 1 } else { 0 };
+    let r = (lib.set_property)(
+        handle,
+        b"pause\0".as_ptr() as *const c_char,
+        mpv_format::FLAG,
+        &mut v as *mut _ as *mut c_void,
+    );
+    if r < 0 {
+        Err(err_str(lib, r))
+    } else {
+        Ok(())
+    }
+}
+
+/// `mpv_set_property("volume", MPV_FORMAT_DOUBLE, &v)`. mpv's `volume`
+/// property is a `double` in the [0, 100] (or higher) range — 100 is
+/// unity gain. Callers should clamp upstream if a hard ceiling is wanted.
+unsafe fn set_volume(
+    lib: &Libmpv,
+    handle: *mut mpv_handle,
+    volume: f64,
+) -> Result<(), String> {
+    let mut v: f64 = volume;
+    let r = (lib.set_property)(
+        handle,
+        b"volume\0".as_ptr() as *const c_char,
+        mpv_format::DOUBLE,
+        &mut v as *mut _ as *mut c_void,
+    );
+    if r < 0 {
+        Err(err_str(lib, r))
+    } else {
+        Ok(())
+    }
 }
 
 /// Drain queued mpv events without blocking. Forwards LOG_MESSAGE to the
@@ -803,11 +939,67 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize) {
                 );
                 break;
             }
-            match rx.try_recv() {
-                Ok(EngineCommand::Shutdown) | Err(TryRecvError::Disconnected) => {
-                    shutting_down = true;
+            // Drain every queued command this tick so a burst (e.g. a
+            // volume slider drag) doesn't accumulate one-per-frame latency.
+            // Shutdown wins immediately — anything after it would race the
+            // teardown sequence.
+            loop {
+                match rx.try_recv() {
+                    Ok(EngineCommand::Shutdown) | Err(TryRecvError::Disconnected) => {
+                        shutting_down = true;
+                        break;
+                    }
+                    Ok(EngineCommand::LoadFile { url, start_seconds }) => {
+                        // Pre-loadfile pause clear: an inherited pause flag
+                        // from a previous file would carry over otherwise
+                        // and require a manual click to start playback.
+                        if let Err(e) = set_pause(&lib, handle, false) {
+                            crate::devlog!(
+                                warn, "mpv2",
+                                "set_pause(false) pre-loadfile failed: {e}",
+                            );
+                        }
+                        let start_opt = start_seconds
+                            .filter(|v| v.is_finite() && *v > 0.0)
+                            .map(|t| format!("start={:.3}", t.min(86_400.0 * 7.0)));
+                        let mut args_v: Vec<&str> = vec!["loadfile", &url, "replace"];
+                        if let Some(s) = start_opt.as_deref() {
+                            // Positional 3 ("0") is the file-index — required
+                            // when supplying a 4th-positional options string.
+                            args_v.push("0");
+                            args_v.push(s);
+                        }
+                        match run_mpv_command(&lib, handle, &args_v) {
+                            Ok(()) => crate::devlog!(
+                                info, "mpv2",
+                                "loadfile accepted: {url}{}",
+                                start_opt.as_deref().map(|s| format!(" {s}")).unwrap_or_default(),
+                            ),
+                            Err(e) => crate::devlog!(
+                                warn, "mpv2", "loadfile failed: {e}",
+                            ),
+                        }
+                        // Belt-and-suspenders: some libmpv builds reset the
+                        // pause flag during demuxer init, so clear again.
+                        if let Err(e) = set_pause(&lib, handle, false) {
+                            crate::devlog!(
+                                warn, "mpv2",
+                                "set_pause(false) post-loadfile failed: {e}",
+                            );
+                        }
+                    }
+                    Ok(EngineCommand::TogglePause) => {
+                        if let Err(e) = run_mpv_command(&lib, handle, &["cycle", "pause"]) {
+                            crate::devlog!(warn, "mpv2", "cycle pause failed: {e}");
+                        }
+                    }
+                    Ok(EngineCommand::SetVolume(v)) => {
+                        if let Err(e) = set_volume(&lib, handle, v) {
+                            crate::devlog!(warn, "mpv2", "set volume failed: {e}");
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
                 }
-                Err(TryRecvError::Empty) => {}
             }
             if shutting_down {
                 break;
@@ -850,70 +1042,68 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize) {
                 (last_geom.2, last_geom.3)
             };
 
-            // Visible "engine alive" baseline — a steady teal clear regardless
-            // of whether mpv produced a frame this tick.
             glViewport(0, 0, cw, ch);
-            glClearColor(0.04, 0.45, 0.50, 1.0);
-            glClear(GL_COLOR_BUFFER_BIT);
 
             drain_mpv_events(&lib, handle);
 
-            let asked = needs_render.swap(false, Ordering::AcqRel);
-            let flags = (lib.render_context_update)(rctx);
-            let frame_ready = asked || (flags & mpv_render_update_flag::FRAME) != 0;
+            // Consume the update-callback flag and the render-context's
+            // own update bitset for completeness, but DO NOT use them to
+            // gate mpv_render_context_render. mpv must be invoked every
+            // present so the FBO content tracks the current playback
+            // state — when the video frame rate is lower than the swap
+            // rate (e.g. 23.976 fps video on a 144 Hz monitor in
+            // focused/vsync-blocked mode), mpv internally re-paints the
+            // most-recent frame; an `if frame_ready` gate would leave
+            // the FBO unrendered on those ticks and SwapBuffers would
+            // present whatever was left in the back buffer (an old
+            // clear). The user-visible symptom was cyan flashes when the
+            // player had focus — fixed by rendering unconditionally.
+            let _ = needs_render.swap(false, Ordering::AcqRel);
+            let _ = (lib.render_context_update)(rctx);
 
-            let mut rendered_mpv = false;
-            if frame_ready {
-                let mut fbo = mpv_opengl_fbo {
-                    fbo: 0,
-                    w: cw,
-                    h: ch,
-                    internal_format: 0,
-                };
-                let mut flip_y: c_int = 1;
-                let mut rparams = [
-                    mpv_render_param {
-                        r#type: mpv_render_param_type::OPENGL_FBO,
-                        data: &mut fbo as *mut _ as *mut c_void,
-                    },
-                    mpv_render_param {
-                        r#type: mpv_render_param_type::FLIP_Y,
-                        data: &mut flip_y as *mut _ as *mut c_void,
-                    },
-                    mpv_render_param {
-                        r#type: mpv_render_param_type::INVALID,
-                        data: ptr::null_mut(),
-                    },
-                ];
-                let r = (lib.render_context_render)(rctx, rparams.as_mut_ptr());
-                if r < 0 {
+            let mut fbo = mpv_opengl_fbo {
+                fbo: 0,
+                w: cw,
+                h: ch,
+                internal_format: 0,
+            };
+            let mut flip_y: c_int = 1;
+            let mut rparams = [
+                mpv_render_param {
+                    r#type: mpv_render_param_type::OPENGL_FBO,
+                    data: &mut fbo as *mut _ as *mut c_void,
+                },
+                mpv_render_param {
+                    r#type: mpv_render_param_type::FLIP_Y,
+                    data: &mut flip_y as *mut _ as *mut c_void,
+                },
+                mpv_render_param {
+                    r#type: mpv_render_param_type::INVALID,
+                    data: ptr::null_mut(),
+                },
+            ];
+            let r = (lib.render_context_render)(rctx, rparams.as_mut_ptr());
+            if r < 0 {
+                crate::devlog!(
+                    warn, "mpv2",
+                    "render_context_render: {}", err_str(&lib, r),
+                );
+            } else {
+                frame_count = frame_count.saturating_add(1);
+                if frame_count == 1 {
                     crate::devlog!(
-                        warn, "mpv2",
-                        "render_context_render: {}", err_str(&lib, r),
+                        info, "mpv2",
+                        "first mpv frame rendered by engine",
                     );
-                } else {
-                    rendered_mpv = true;
-                    frame_count = frame_count.saturating_add(1);
-                    if frame_count == 1 {
-                        crate::devlog!(
-                            info, "mpv2",
-                            "first mpv frame rendered by engine",
-                        );
-                    }
                 }
             }
 
             let _ = SwapBuffers(hdc);
             // Report every present so mpv's display-resample tracks the
-            // ACTUAL swap cadence — not just frames mpv produced. mpv
-            // documents this hook as "a frame was flipped", referring to
-            // the buffer swap rather than whether mpv contributed pixels;
-            // calling it after every SwapBuffers keeps the vsync model
-            // honest across idle-but-paced ticks.
+            // ACTUAL swap cadence. mpv documents this hook as "a frame
+            // was flipped", referring to the buffer swap rather than
+            // whether mpv contributed new pixels.
             (lib.render_context_report_swap)(rctx);
-            // Silence the unused-warning for `rendered_mpv` until the
-            // playback-port phases consume it for metrics.
-            let _ = rendered_mpv;
 
             // Pacing branch: focused mode is paced by SwapBuffers' vblank
             // wait (swap-interval=1), so we move straight on. Unfocused

@@ -332,6 +332,14 @@ async fn load_video(
         "load_video: {normalised} (start={:?})",
         start_seconds,
     );
+    // Phase 2.4: when the mpv2 master gate is set AND the engine is alive,
+    // route this loadfile through the new render-context path. The legacy
+    // `--wid` engine stays untouched (`init_mpv` here is a no-op when the
+    // instance already exists), so a flag flip can fall back instantly.
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        return mpv2::engine::submit_load_file(normalised, start_seconds);
+    }
     let t_start = std::time::Instant::now();
     tauri::async_runtime::spawn_blocking(move || {
         // Defensive re-init: if the MPV instance has been destroyed for any
@@ -419,6 +427,10 @@ async fn stop_video(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 async fn toggle_pause(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        return mpv2::engine::submit_toggle_pause();
+    }
     tauri::async_runtime::spawn_blocking(move || {
         app.mpv()
             .command("cycle", &vec![serde_json::json!("pause")], "main")
@@ -595,6 +607,10 @@ async fn set_motion_interpolation(
 #[tauri::command]
 async fn set_volume(app: tauri::AppHandle, volume: f64) -> Result<(), String> {
     crate::devlog!(info, "player", "set_volume({volume})");
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        return mpv2::engine::submit_set_volume(volume);
+    }
     tauri::async_runtime::spawn_blocking(move || {
         // Use the dedicated set_property FFI path — going through the
         // generic `command("set_property", [name, value])` route silently
@@ -1666,11 +1682,32 @@ pub fn run() {
                 win32::pin_process_scheduling();
             }
 
-            player::init_mpv(app.handle()).map_err(|e| {
-                crate::devlog!(error, "player", "MPV init failed: {e}");
-                std::io::Error::new(std::io::ErrorKind::Other, e)
-            })?;
-            crate::devlog!(info, "player", "MPV engine ready");
+            // Skip the legacy `--wid` engine entirely when the mpv2 master
+            // gate is set. Otherwise the legacy child window is created
+            // before the engine's child and sits ABOVE it in z-order
+            // (HWND_BOTTOM puts the engine all the way down), which would
+            // hide every frame the engine renders during Phase 2.4
+            // playback. Skipping init_mpv leaves `app.mpv()` calls to
+            // no-op-or-error harmlessly — every Tauri command that
+            // actually drives playback gates on `mpv2::engine::enabled()`
+            // anyway. Flag flip falls back instantly: unset the env var
+            // and the legacy path is restored on next launch.
+            #[cfg(target_os = "windows")]
+            let mpv2_active = mpv2::engine::enabled();
+            #[cfg(not(target_os = "windows"))]
+            let mpv2_active = false;
+            if !mpv2_active {
+                player::init_mpv(app.handle()).map_err(|e| {
+                    crate::devlog!(error, "player", "MPV init failed: {e}");
+                    std::io::Error::new(std::io::ErrorKind::Other, e)
+                })?;
+                crate::devlog!(info, "player", "MPV engine ready");
+            } else {
+                crate::devlog!(
+                    info, "player",
+                    "AURA_MPV2 set — skipping legacy --wid MPV init; mpv2 engine will drive playback",
+                );
+            }
 
             // ── mpv2 render-API Phase-1 hello-world (opt-in) ───────────────
             // No-op unless AURA_MPV2_HELLO is set. When it is, spawns the
