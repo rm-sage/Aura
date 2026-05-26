@@ -57,7 +57,7 @@ import EpisodePanel from "./EpisodePanel";
 import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPreviousEpisode } from "./nextUp";
 import { getMetaDetailFallback, peekCachedDetailById, peekFreshestPostersByIds } from "./metaCache";
 import { PersistentCache } from "./persistentCache";
-import { loadAuraSettings } from "./auraSettings";
+import { applyReducedMotionAttribute, loadAuraSettings } from "./auraSettings";
 
 interface AniSkipResult {
   found: boolean;
@@ -2027,16 +2027,14 @@ export default function App() {
   //     toggle without restarting Aura)
   //   • Aura-level `reduceMotion` setting changes (user toggles via
   //     Settings → Appearance — dispatches `aura:settings-changed`)
-  // Lazy import (`require` style via dynamic) would defeat the
-  // tree-shake, so we import statically from auraSettings; the
-  // function is a one-line DOM write so the bundle cost is trivial.
+  // applyReducedMotionAttribute is statically imported (line 60) so
+  // this effect can run synchronously on first render — the previous
+  // dynamic `import("./auraSettings")` re-resolved a chunk that was
+  // already in the main bundle and introduced an unnecessary
+  // microtask delay before the first attribute write.
   useEffect(() => {
-    let importedApply: (() => void) | null = null;
-    import("./auraSettings").then((mod) => {
-      importedApply = mod.applyReducedMotionAttribute;
-      importedApply();
-    });
-    const apply = () => importedApply?.();
+    applyReducedMotionAttribute();
+    const apply = () => applyReducedMotionAttribute();
     const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
     mq.addEventListener("change", apply);
     window.addEventListener("aura:settings-changed", apply);
@@ -3480,26 +3478,19 @@ export default function App() {
     invoke<UserSession | null>("get_session")
       .then(async (sess) => {
         if (sess) {
-          // Pre-0.6.9 sessions in the keyring don't carry `user_id`.
-          // Backfill it from Stremio's `/getUser` BEFORE the scope
-          // hash is derived for the first time — otherwise the very
-          // first sync_pull_all uses the legacy auth_key-derived
-          // scope and re-asserts the cross-device-inconsistent
-          // bucket. Backfill failures are non-fatal; sync.rs falls
-          // back to the legacy scope so the user isn't locked out.
+          // Don't await `backfill_user_id` on boot any more. The
+          // history-store migration falls back to `legacyAuthScope`
+          // (a hash of `auth_key.slice(0, 12)`) whenever `user_id`
+          // is absent — that's been the legacy-session compat path
+          // since 0.6.x and works fine. Awaiting the round-trip
+          // here added 200–800 ms to every cold start on
+          // legacy-shaped sessions for no user-visible payoff;
+          // backfill still runs in the background so the NEXT
+          // launch's `get_session` picks up the persisted user_id.
           if (!sess.user_id) {
-            try {
-              const backfilled = await invoke<string | null>("backfill_user_id");
-              // Merge the backfilled user_id into the in-memory
-              // session BEFORE applySettingsScope runs — otherwise
-              // the scope derivation on this launch still falls
-              // back to the legacy auth_key prefix and the history-
-              // store migration can't anchor on the new user_id-
-              // based scope.
-              if (backfilled) sess = { ...sess, user_id: backfilled };
-            } catch (e) {
+            void invoke<string | null>("backfill_user_id").catch((e) => {
               console.warn(`[auth] backfill_user_id failed: ${String(e)}`);
-            }
+            });
           }
           await applySettingsScope(sess);
           setSession(sess);
@@ -3518,7 +3509,15 @@ export default function App() {
               }
             })
             .catch(() => {});
-          await Promise.all([loadSyncedAddons(sess), loadLibrary(sess)]);
+          // Library + synced-addons load is fire-and-forget. Each
+          // path already paints from its localStorage warm cache
+          // immediately on the synchronous setX(cached) inside its
+          // own function; awaiting the cloud refetch here just
+          // delayed the splash for a redundant network round-trip.
+          // The setters fire mid-flight via React state updates;
+          // nothing downstream of `authChecked` reads from them
+          // synchronously.
+          void Promise.all([loadSyncedAddons(sess), loadLibrary(sess)]);
         } else {
           await applySettingsScope(null);
           loadLocalAddons();
