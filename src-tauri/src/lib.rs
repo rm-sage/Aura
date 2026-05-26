@@ -1680,10 +1680,19 @@ pub fn run() {
             #[cfg(target_os = "windows")]
             {
                 mpv2::hello::run_if_requested();
-                // Phase 2.1 long-lived engine. Independent opt-in via
+                // Phase 2.2 long-lived engine. Independent opt-in via
                 // AURA_MPV2_ENGINE; the legacy --wid engine above is still
                 // the one driving playback until Phase 2.4 ports loadfile.
-                mpv2::engine::start_if_requested();
+                // The engine's GL surface is parented under main's HWND
+                // exactly where the legacy mpv child sits — passing 0 here
+                // (HWND lookup failed) makes start_if_requested a no-op so
+                // we never attempt to parent under an invalid window.
+                let parent_hwnd: isize = app
+                    .get_webview_window("main")
+                    .and_then(|w| w.hwnd().ok())
+                    .map(|h| h.0 as isize)
+                    .unwrap_or(0);
+                mpv2::engine::start_if_requested(parent_hwnd);
             }
 
             // ── Window lifecycle (pause-on-blur, pause-on-min, close-on-exit) ─

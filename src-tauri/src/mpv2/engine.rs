@@ -55,8 +55,10 @@ use windows::Win32::Graphics::OpenGL::{
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    IsWindow, PeekMessageW, RegisterClassW, TranslateMessage, CS_OWNDC, MSG, PM_REMOVE,
-    WNDCLASSW, WS_CAPTION, WS_EX_TOPMOST, WS_SYSMENU, WS_VISIBLE,
+    IsWindow, MsgWaitForMultipleObjects, PeekMessageW, RegisterClassW, SetWindowPos,
+    TranslateMessage, CS_OWNDC, HWND_BOTTOM, MSG, PM_REMOVE, QS_ALLINPUT,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WINDOW_EX_STYLE, WNDCLASSW, WS_CHILD,
+    WS_VISIBLE,
 };
 
 use super::ffi::{
@@ -94,8 +96,21 @@ fn engine_slot() -> &'static Mutex<Option<EngineHandle>> {
 /// Spawn the engine — but only if the `AURA_MPV2_ENGINE` environment
 /// variable is set. A no-op otherwise. Idempotent: a second call while the
 /// engine is already running returns without doing anything.
-pub fn start_if_requested() {
+///
+/// `parent_hwnd` is the Tauri main window's HWND, passed as `isize` so it
+/// can cross the thread boundary (`HWND` itself is not `Send`). The render
+/// thread re-wraps it. Passing 0 disables the engine even when the env var
+/// is set — used as a defensive fall-through when the main window's HWND
+/// can't be resolved at setup time.
+pub fn start_if_requested(parent_hwnd: isize) {
     if std::env::var_os("AURA_MPV2_ENGINE").is_none() {
+        return;
+    }
+    if parent_hwnd == 0 {
+        crate::devlog!(
+            warn, "mpv2",
+            "AURA_MPV2_ENGINE set but parent HWND is 0 — engine not spawned",
+        );
         return;
     }
     let mut slot = match engine_slot().lock() {
@@ -110,13 +125,13 @@ pub fn start_if_requested() {
     }
     crate::devlog!(
         info, "mpv2",
-        "AURA_MPV2_ENGINE set — spawning long-lived render engine",
+        "AURA_MPV2_ENGINE set — spawning long-lived render engine (parent HWND {parent_hwnd:#x})",
     );
 
     let (tx, rx) = mpsc::channel::<EngineCommand>();
     let join = match thread::Builder::new()
         .name("aura-mpv2-engine".into())
-        .spawn(move || run_engine(rx))
+        .spawn(move || run_engine(rx, parent_hwnd))
     {
         Ok(j) => j,
         Err(e) => {
@@ -148,12 +163,96 @@ pub fn shutdown_if_running() {
 
     let _ = tx.send(EngineCommand::Shutdown);
     if let Some(j) = join {
-        if let Err(e) = j.join() {
-            crate::devlog!(error, "mpv2", "engine thread join panicked: {e:?}");
-            return;
-        }
+        join_with_message_pump(j);
     }
     crate::devlog!(info, "mpv2", "engine shut down");
+}
+
+/// Wait for the engine thread to finish while continuing to pump Win32
+/// messages on the calling (main) thread.
+///
+/// A plain `JoinHandle::join` would block the message loop, which deadlocks
+/// the engine's teardown: `DestroyWindow` on a child sends `WM_PARENTNOTIFY`
+/// synchronously to the parent window's owning thread (the main thread),
+/// and any `SetWindowPos` on a child may route notifications through the
+/// parent's thread too. If the main thread is asleep in `join`, those
+/// sends never complete and neither side moves. `MsgWaitForMultipleObjects`
+/// wakes us up either when the thread finishes OR when a message arrives;
+/// in the message-arrived case we drain the queue and loop. Capped at 5 s
+/// so a genuinely hung worker can't stall app shutdown indefinitely.
+fn join_with_message_pump(j: JoinHandle<()>) {
+    use std::os::windows::io::AsRawHandle;
+    use std::time::{Duration, Instant};
+    use windows::Win32::Foundation::HANDLE;
+
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 0x102;
+    const WAIT_FAILED: u32 = 0xFFFF_FFFF;
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    let raw = j.as_raw_handle();
+    let handle = HANDLE(raw);
+    let handles = [handle];
+    let deadline = Instant::now() + TIMEOUT;
+
+    loop {
+        let remaining_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(u32::MAX as u128) as u32;
+        if remaining_ms == 0 {
+            crate::devlog!(
+                warn, "mpv2",
+                "engine join timed out after 5 s — detaching thread",
+            );
+            std::mem::forget(j);
+            return;
+        }
+        // MsgWaitForMultipleObjects returns WAIT_EVENT(u32) in this windows
+        // crate version; compare the inner u32 against the documented
+        // sentinels rather than rebinding their names as match patterns.
+        let res = unsafe {
+            MsgWaitForMultipleObjects(
+                Some(&handles),
+                false,
+                remaining_ms,
+                QS_ALLINPUT,
+            )
+        }
+        .0;
+        if res == WAIT_OBJECT_0 {
+            break;
+        }
+        if res == WAIT_TIMEOUT {
+            crate::devlog!(
+                warn, "mpv2",
+                "engine join timed out — detaching thread",
+            );
+            std::mem::forget(j);
+            return;
+        }
+        if res == WAIT_FAILED {
+            crate::devlog!(
+                error, "mpv2",
+                "MsgWaitForMultipleObjects failed — detaching thread",
+            );
+            std::mem::forget(j);
+            return;
+        }
+        // Any other wake (typically WAIT_OBJECT_0 + 1 = "messages
+        // available") means: pump the queue so the engine thread's
+        // cross-thread Win32 sends can complete, then retry the wait.
+        unsafe {
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+    if let Err(e) = j.join() {
+        crate::devlog!(error, "mpv2", "engine thread join panicked: {e:?}");
+    }
 }
 
 // ===========================================================================
@@ -163,10 +262,18 @@ pub fn shutdown_if_running() {
 const CLASS_NAME: PCWSTR = w!("AuraMpv2EngineWindow");
 const WINDOW_NAME: PCWSTR = w!("Aura render-API engine");
 
-const WIN_X: i32 = 160;
-const WIN_Y: i32 = 120;
-const WIN_W: i32 = 720;
-const WIN_H: i32 = 460;
+/// Title-bar inset for the engine window in windowed mode — matches the
+/// custom React-rendered TitleBar height that the existing `--wid` MPV
+/// child is also offset under (see `win32::resize_mpv_child_to_parent` call
+/// sites in `window_logic.rs`). In native fullscreen the inset is 0 — the
+/// title bar is unmounted and the engine occupies the full client area.
+const TITLE_BAR_H: i32 = 36;
+
+/// Fallback engine size used only when [`GetClientRect`] on the parent
+/// fails at startup (so creation can still succeed and the per-frame resync
+/// in [`run_engine`] can recover on the next iteration).
+const FALLBACK_W: i32 = 720;
+const FALLBACK_H: i32 = 460;
 
 /// Trivial wndproc — the engine window does no input handling and paints
 /// only via OpenGL, so every message goes to the default handler.
@@ -266,15 +373,51 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle) {
     }
 }
 
+/// Compute the engine child's target geometry from its parent's client
+/// rect: full client width, full client height minus the title-bar inset
+/// (which is 0 in fullscreen, [`TITLE_BAR_H`] windowed). On failure or a
+/// degenerate rect, falls back to a small visible default so the engine
+/// can still come up and the per-frame resync can correct on the next
+/// iteration once the parent settles.
+unsafe fn parent_client_inset(parent: HWND) -> (i32, i32, i32, i32) {
+    let y_off = if crate::win32::is_in_native_fullscreen() {
+        0
+    } else {
+        TITLE_BAR_H
+    };
+    let mut rc = RECT::default();
+    if GetClientRect(parent, &mut rc).is_ok()
+        && rc.right > rc.left
+        && rc.bottom > rc.top
+    {
+        let w = rc.right - rc.left;
+        let h = (rc.bottom - rc.top - y_off).max(1);
+        return (0, y_off, w, h);
+    }
+    (0, y_off, FALLBACK_W, FALLBACK_H)
+}
+
 /// Render-thread body. Sets everything up, runs until `Shutdown` is
 /// received (or the window is closed externally), then tears down.
-fn run_engine(rx: Receiver<EngineCommand>) {
+fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize) {
     crate::devlog!(info, "mpv2", "engine thread started");
 
     unsafe {
-        // -- Win32 top-level window --
-        // Phase 2.1: still top-level. Phase 2.2 swaps in a WS_CHILD parented
-        // under the Tauri main HWND.
+        // -- Win32 child window under the Tauri main HWND --
+        // Phase 2.2: the engine's GL surface lives as a WS_CHILD of the
+        // Tauri main window, exactly where the legacy `--wid` mpv child
+        // sits today. Z-order is pushed to HWND_BOTTOM right after
+        // creation so the transparent WebView2 stays on top and continues
+        // to receive all input.
+        let parent = HWND(parent_hwnd as *mut c_void);
+        if !IsWindow(Some(parent)).as_bool() {
+            crate::devlog!(
+                error, "mpv2",
+                "parent HWND {parent_hwnd:#x} is not a valid window",
+            );
+            return;
+        }
+
         let hmodule = match GetModuleHandleW(PCWSTR::null()) {
             Ok(h) => h,
             Err(e) => {
@@ -299,16 +442,17 @@ fn run_engine(rx: Receiver<EngineCommand>) {
             }
         }
 
+        let (init_x, init_y, init_w, init_h) = parent_client_inset(parent);
         let hwnd = match CreateWindowExW(
-            WS_EX_TOPMOST,
+            WINDOW_EX_STYLE(0),
             CLASS_NAME,
             WINDOW_NAME,
-            WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-            WIN_X,
-            WIN_Y,
-            WIN_W,
-            WIN_H,
-            None,
+            WS_CHILD | WS_VISIBLE,
+            init_x,
+            init_y,
+            init_w,
+            init_h,
+            Some(parent),
             None,
             Some(hinstance),
             None,
@@ -319,7 +463,22 @@ fn run_engine(rx: Receiver<EngineCommand>) {
                 return;
             }
         };
-        crate::devlog!(info, "mpv2", "engine window created ({WIN_W}x{WIN_H})");
+        // Push to the bottom of the child z-order immediately so the
+        // (transparent) WebView2 sits above the engine and continues to
+        // receive keyboard / mouse messages. SWP_NOMOVE | SWP_NOSIZE keep
+        // the geometry we just set.
+        if let Err(e) = SetWindowPos(
+            hwnd,
+            Some(HWND_BOTTOM),
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        ) {
+            crate::devlog!(warn, "mpv2", "SetWindowPos(HWND_BOTTOM) failed: {e}");
+        }
+        crate::devlog!(
+            info, "mpv2",
+            "engine child window created at ({init_x},{init_y}) {init_w}x{init_h}",
+        );
 
         // -- WGL pixel format + context --
         let hdc = GetDC(Some(hwnd));
@@ -472,6 +631,7 @@ fn run_engine(rx: Receiver<EngineCommand>) {
         // paints teal until shutdown.
         let mut frame_count: u64 = 0;
         let mut shutting_down = false;
+        let last_geom = (init_x, init_y, init_w, init_h);
         loop {
             // Pump win32 messages.
             let mut msg = MSG::default();
@@ -481,6 +641,13 @@ fn run_engine(rx: Receiver<EngineCommand>) {
             }
             if !IsWindow(Some(hwnd)).as_bool() {
                 crate::devlog!(warn, "mpv2", "engine window closed externally — ending");
+                break;
+            }
+            if !IsWindow(Some(parent)).as_bool() {
+                crate::devlog!(
+                    warn, "mpv2",
+                    "parent window destroyed — engine ending",
+                );
                 break;
             }
             match rx.try_recv() {
@@ -493,6 +660,19 @@ fn run_engine(rx: Receiver<EngineCommand>) {
                 break;
             }
 
+            // Resize sync is intentionally NOT done from this thread.
+            // `win32::resize_mpv_child_to_parent` (driven by Tauri's
+            // Focused / Resized window events on the main thread) already
+            // enumerates non-WebView2 children and resizes them; the
+            // engine's class name passes that filter so our window tracks
+            // the parent client area automatically. Doing SetWindowPos
+            // here from a worker thread carries a cross-thread Win32
+            // hazard: SetWindowPos on a child can route notifications
+            // through the parent's owning thread, and if the parent
+            // thread is ever blocked (e.g. waiting on this engine to
+            // join during shutdown) the call deadlocks. Reading the
+            // size for the GL viewport is fine — that's pure local
+            // state read on our own HWND.
             let mut rc = RECT::default();
             let (cw, ch) = if GetClientRect(hwnd, &mut rc).is_ok()
                 && rc.right > rc.left
@@ -500,7 +680,7 @@ fn run_engine(rx: Receiver<EngineCommand>) {
             {
                 (rc.right - rc.left, rc.bottom - rc.top)
             } else {
-                (WIN_W, WIN_H)
+                (last_geom.2, last_geom.3)
             };
 
             // Visible "engine alive" baseline — a steady teal clear regardless
