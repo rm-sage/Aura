@@ -1903,6 +1903,7 @@ export default function PlayerOverlay({
         seekAbsolute={seekAbsolute}
         isFullscreen={isFullscreen}
         streamUrl={streamUrl}
+        controlsVisible={controlsVisible}
       />
 
       {/* ── Top scrim — gradient fade from black to transparent so the
@@ -3493,9 +3494,11 @@ function skipKindLabel(kind: string): string {
 function SkipPromptToast({
   window: w,
   isFullscreen,
+  visible,
 }: {
   window: AuraSkipWindow;
   isFullscreen: boolean;
+  visible: boolean;
 }) {
   const kindLabel = skipKindLabel(w.type);
   // Top offset has to clear the "Exit playback ↗  <Title>" header above.
@@ -3510,6 +3513,8 @@ function SkipPromptToast({
                  text-white shadow-glass-edge"
       style={{
         top,
+        opacity: visible ? 1 : 0,
+        transition: "opacity 400ms ease",
         animation: "aura-toast-pop 220ms cubic-bezier(0.34, 1.56, 0.64, 1)",
         textShadow: "0 1px 4px rgba(0,0,0,0.85)",
       }}
@@ -3536,12 +3541,13 @@ function SkipPromptToast({
  *  top of PlayerOverlay so its `keydown` listeners stay alive even
  *  when the bottom control bar is hidden by the auto-fade timer. */
 function SkipController({
-  time, seekAbsolute, isFullscreen, streamUrl,
+  time, seekAbsolute, isFullscreen, streamUrl, controlsVisible,
 }: {
   time: number;
   seekAbsolute: (t: number) => void;
   isFullscreen: boolean;
   streamUrl: string | null;
+  controlsVisible: boolean;
 }) {
   const windows = useSkipWindows();
   const active   = windows.find((w) => time >= w.start && time < w.end) ?? null;
@@ -3638,11 +3644,25 @@ function SkipController({
     return () => window.removeEventListener("keydown", onKey, true);
   }, []);
 
+  // After 10 s in the same prompt window, fade the toast out — but
+  // unhide it again whenever the player chrome reappears. The 'x'
+  // keybind above is bound to `active`, not the toast's visibility,
+  // so the skip still works while the prompt is hidden.
+  const promptKey = active && !active.auto ? `${active.start}-${active.end}` : null;
+  const [autoHidden, setAutoHidden] = useState(false);
+  useEffect(() => {
+    setAutoHidden(false);
+    if (!promptKey) return;
+    const t = setTimeout(() => setAutoHidden(true), 10_000);
+    return () => clearTimeout(t);
+  }, [promptKey]);
+
   if (!active || active.auto) return null;
   // Suppress the toast briefly after firing — `firedRef.has(key)` is
   // the cleanest way to know "user already accepted, hide the prompt".
   if (firedRef.current.has(`${active.start}-${active.end}`)) return null;
-  return <SkipPromptToast window={active} isFullscreen={isFullscreen} />;
+  const visible = !autoHidden || controlsVisible;
+  return <SkipPromptToast window={active} isFullscreen={isFullscreen} visible={visible} />;
 }
 
 function SkipWindowButton({
