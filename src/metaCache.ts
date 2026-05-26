@@ -192,6 +192,37 @@ export function peekCachedDetailById(id: string): MetaDetail | null {
   return best ? best.detail : null;
 }
 
+/** Batch-peek the freshest non-stale poster for each id in `ids`. One
+ *  pass over the cache regardless of how many ids are queried, so it's
+ *  safe to call against a full library (~hundreds of items) per render
+ *  without quadratic blowup. Returns a Map keyed by id; ids with no
+ *  cached poster are simply absent. Used by App.tsx to swap in fresh
+ *  RPDB-rewritten poster URLs for library items whose stored Stremio
+ *  record carries a stale (revoked-key) URL — Stremio library records
+ *  freeze the poster URL at insertion time; the cache layer has the
+ *  current addon view. */
+export function peekFreshestPostersByIds(ids: Iterable<string>): Map<string, string> {
+  const wanted = ids instanceof Set ? ids : new Set(ids);
+  if (wanted.size === 0) return new Map();
+  const best = new Map<string, { ts: number; poster: string }>();
+  const now = Date.now();
+  for (const [key, entry] of cache) {
+    if (!entry.detail?.poster) continue;
+    const parts = key.split("::");
+    const mt = parts[1] ?? "";
+    const id = parts[2] ?? "";
+    if (!wanted.has(id)) continue;
+    if (now - entry.ts >= ttlFor(mt)) continue;
+    const prior = best.get(id);
+    if (!prior || entry.ts > prior.ts) {
+      best.set(id, { ts: entry.ts, poster: entry.detail.poster });
+    }
+  }
+  const out = new Map<string, string>();
+  for (const [id, v] of best) out.set(id, v.poster);
+  return out;
+}
+
 /** Drop everything — useful as a last-resort cache buster. Wired to
  *  the Storage section in Settings via the `aura:meta-cache:v1`
  *  localStorage key, but also exposed here for "refresh metadata"

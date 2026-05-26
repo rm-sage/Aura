@@ -2,6 +2,23 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useState } from "react";
+import {
+  DndContext,
+  PointerSensor,
+  KeyboardSensor,
+  useSensor,
+  useSensors,
+  closestCenter,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  arrayMove,
+  verticalListSortingStrategy,
+  sortableKeyboardCoordinates,
+  useSortable,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { AddonEntry } from "../types";
@@ -47,10 +64,15 @@ interface Props {
   session: UserSession | null;
   onAdd: (entry: AddonEntry) => void;
   onRemove: (url: string) => void;
+  /** Persist a new addon ordering. The parent handles optimistic UI
+   *  state — this callback fires the cloud / local invoke and is
+   *  expected to swallow + toast on failure. */
+  onReorder: (urls: string[]) => void;
   onLoginSuccess: (sess: UserSession) => void;
   onLogout: () => void;
   onSessionExpired: () => void;
 }
+
 
 // ---------------------------------------------------------------------------
 // Tag pill — distinct color per tag KIND so the eye can quickly tell at a
@@ -251,15 +273,38 @@ function AddonRow({
   session,
   onRemove,
   onSessionExpired,
+  reorderEnabled,
 }: {
   addon: AddonEntry;
   session: UserSession | null;
   onRemove: (url: string) => void;
   onSessionExpired: () => void;
+  /** False collapses the drag handle to a non-interactive spacer so
+   *  single-addon lists keep a stable leading-edge width. */
+  reorderEnabled: boolean;
 }) {
   const [removing, setRemoving] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [copied, setCopied] = useState(false);
+
+  // dnd-kit sortable binding — keyed by addon URL (unique + stable).
+  // `listeners` go on the drag handle, NOT the row, so the action
+  // buttons (Copy/Configure/Refresh/Remove) stay clickable without
+  // accidentally lifting the row. `attributes` carry ARIA roles for
+  // keyboard accessibility (KeyboardSensor handles Space-to-lift,
+  // arrows-to-move, Space-to-drop).
+  const {
+    attributes, listeners, setNodeRef, transform, transition, isDragging,
+  } = useSortable({ id: addon.url, disabled: !reorderEnabled });
+
+  const rowStyle: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.4 : 1,
+    // Lift the row above its siblings while dragging so the dnd-kit
+    // transform doesn't appear to slide UNDER neighbouring rows.
+    zIndex: isDragging ? 10 : "auto",
+  };
 
   // The manifest URL is the install URL with /manifest.json appended;
   // Stremio "Configure" pages live at <base>/configure. Computed once
@@ -321,7 +366,9 @@ function AddonRow({
 
   return (
     <div
-      className="group flex items-center gap-3 px-4 py-3 rounded-xl
+      ref={setNodeRef}
+      style={rowStyle}
+      className="group relative flex items-center gap-3 px-4 py-3 rounded-xl
                  bg-white/3 border border-white/6 hover:bg-white/5
                  transition-colors"
       onContextMenu={(e) => {
@@ -347,6 +394,12 @@ function AddonRow({
         ]);
       }}
     >
+      <DragHandle
+        enabled={reorderEnabled}
+        ariaLabel={`Drag ${addon.name} to reorder`}
+        listeners={listeners}
+        attributes={attributes}
+      />
       <div className="flex-1 min-w-0 space-y-1">
         <div className="flex items-center gap-2 flex-wrap">
           <p className="text-white/85 text-sm font-medium leading-tight">{addon.name}</p>
@@ -509,6 +562,65 @@ function CopyIcon({ copied }: { copied: boolean }) {
   );
 }
 
+/** Six-dot grip glyph rendered inside the drag handle. Stroke-based
+ *  so it inherits text colour from the parent — fades from /35 → /85
+ *  on row hover via the `group-hover:` rule. */
+function GripIcon() {
+  return (
+    <svg
+      width="14" height="16" viewBox="0 0 12 16" fill="currentColor"
+      aria-hidden
+    >
+      <circle cx="3" cy="3" r="1.3" />
+      <circle cx="3" cy="8" r="1.3" />
+      <circle cx="3" cy="13" r="1.3" />
+      <circle cx="9" cy="3" r="1.3" />
+      <circle cx="9" cy="8" r="1.3" />
+      <circle cx="9" cy="13" r="1.3" />
+    </svg>
+  );
+}
+
+/** Drag handle — sole drag initiator. Sits at the leading edge of the
+ *  row. The dnd-kit `listeners` (pointerdown / keydown) attach here
+ *  ONLY, so the trailing action buttons stay clickable without
+ *  accidentally lifting the row. `attributes` carry the ARIA roles for
+ *  keyboard reorder (Space lifts, arrows move, Space drops). Native
+ *  HTML5 drag isn't used because Tauri 2's window `dragDropEnabled`
+ *  default intercepts the events for OS file-drop handling, which
+ *  fights `preventDefault()` inside the webview and produces a 🚫
+ *  cursor on every drop target. dnd-kit is pointer-event-based and
+ *  sidesteps that entire conflict — the same library backs the Queue
+ *  reorder, which already works for the same reason. */
+function DragHandle({
+  enabled,
+  ariaLabel,
+  listeners,
+  attributes,
+}: {
+  enabled: boolean;
+  ariaLabel: string;
+  listeners: ReturnType<typeof useSortable>["listeners"];
+  attributes: ReturnType<typeof useSortable>["attributes"];
+}) {
+  if (!enabled) {
+    return <span className="w-5 flex-shrink-0" aria-hidden />;
+  }
+  return (
+    <span
+      aria-label={ariaLabel}
+      {...attributes}
+      {...listeners}
+      className="flex-shrink-0 w-5 h-8 flex items-center justify-center
+                 text-white/35 group-hover:text-white/70 active:text-white/85
+                 cursor-grab active:cursor-grabbing select-none touch-none
+                 transition-colors outline-none focus-visible:text-ln-accent"
+    >
+      <GripIcon />
+    </span>
+  );
+}
+
 /** Configure glyph (sliders) — shown only for addons whose manifest
  *  declares `behaviorHints.configurable`. */
 function ConfigureIcon() {
@@ -540,11 +652,32 @@ export default function AddonsView({
   session,
   onAdd,
   onRemove,
+  onReorder,
   onLoginSuccess,
   onLogout,
   onSessionExpired,
 }: Props) {
   const [showLogin, setShowLogin] = useState(false);
+
+  // dnd-kit sensors. 6 px pointer activation threshold matches QueueView
+  // so a user clicking the handle for any other reason (focus, context
+  // menu) doesn't accidentally start a drag. KeyboardSensor enables
+  // Space-to-lift / arrow-keys-to-move / Space-to-drop on the focused
+  // handle for accessibility.
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+
+  const handleDragEnd = (e: DragEndEvent) => {
+    const { active, over } = e;
+    if (!over || active.id === over.id) return;
+    const oldIdx = addons.findIndex((a) => a.url === String(active.id));
+    const newIdx = addons.findIndex((a) => a.url === String(over.id));
+    if (oldIdx < 0 || newIdx < 0) return;
+    const next = arrayMove(addons, oldIdx, newIdx);
+    onReorder(next.map((a) => a.url));
+  };
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
@@ -616,17 +749,29 @@ export default function AddonsView({
           {addons.length === 0 ? (
             <p className="text-white/25 text-sm">No addons installed yet.</p>
           ) : (
-            <div className="space-y-2">
-              {addons.map((addon) => (
-                <AddonRow
-                  key={addon.url}
-                  addon={addon}
-                  session={session}
-                  onRemove={onRemove}
-                  onSessionExpired={onSessionExpired}
-                />
-              ))}
-            </div>
+            <DndContext
+              sensors={sensors}
+              collisionDetection={closestCenter}
+              onDragEnd={handleDragEnd}
+            >
+              <SortableContext
+                items={addons.map((a) => a.url)}
+                strategy={verticalListSortingStrategy}
+              >
+                <div className="space-y-2">
+                  {addons.map((addon) => (
+                    <AddonRow
+                      key={addon.url}
+                      addon={addon}
+                      session={session}
+                      onRemove={onRemove}
+                      onSessionExpired={onSessionExpired}
+                      reorderEnabled={addons.length > 1}
+                    />
+                  ))}
+                </div>
+              </SortableContext>
+            </DndContext>
           )}
         </section>
         </div>

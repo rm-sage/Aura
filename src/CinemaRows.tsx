@@ -149,6 +149,26 @@ function SegmentedSeasonBar({
     ? episodes.findIndex((v) => v.id === currentId)
     : -1;
 
+  // Rightmost explicitly-watched episode. Any "in-progress" mark BEFORE
+  // this index is treated as stale and rendered as implied-watched — the
+  // user has clearly progressed past it. Without this heuristic, mid-
+  // season episodes whose auto-bump-to-watched was skipped (app crash
+  // mid-flush, out-of-order viewing where the missed episode kept the
+  // "in-progress" set on it by the prior episode's advance, legacy
+  // auto-advance behaviour) render as amber dots inside a green run,
+  // which surprised users who consider the show fully watched up to the
+  // resume point. The fix is rendering-only: localStorage state is
+  // untouched, so a user who genuinely skipped an episode and wants the
+  // marker back can re-mark it explicitly.
+  let lastWatchedIdx = -1;
+  for (let i = episodes.length - 1; i >= 0; i -= 1) {
+    if (getManualWatchedState(episodes[i].id) === "watched") {
+      lastWatchedIdx = i;
+      break;
+    }
+  }
+  const impliedThroughIdx = Math.max(currentIdx, lastWatchedIdx);
+
   // Inset the bar from each side by the card's corner radius (rounded-xl
   // = 12 px). Without this, the leftmost and rightmost segments get
   // visually swallowed by the parent's curved corner — for a season
@@ -163,9 +183,11 @@ function SegmentedSeasonBar({
         let cls: string;
         if (manual === "watched") {
           cls = "bg-emerald-400";
-        } else if (manual === "in-progress" || i === currentIdx) {
+        } else if ((manual === "in-progress" || i === currentIdx) && i >= lastWatchedIdx) {
+          // Genuine current position — no later episode has been watched
+          // past this one, so the amber "you are here" marker is meaningful.
           cls = "bg-amber-400";
-        } else if (currentIdx >= 0 && i < currentIdx) {
+        } else if (i < impliedThroughIdx) {
           cls = "bg-emerald-400/85"; // implied-watched (earlier in season)
         } else {
           cls = "bg-white/15";
@@ -202,6 +224,16 @@ function ContinuousProgressBar({
     ? episodes.findIndex((v) => v.id === currentId)
     : -1;
 
+  // Rightmost explicitly-watched episode. Drives the "stuck in-progress"
+  // suppression below — see SegmentedSeasonBar for the full rationale.
+  let lastWatchedIdx = -1;
+  for (let i = total - 1; i >= 0; i -= 1) {
+    if (getManualWatchedState(episodes[i].id) === "watched") {
+      lastWatchedIdx = i;
+      break;
+    }
+  }
+
   // Walk forward — for each episode, count it as "engaged" when it's
   // manually watched, manually in-progress, OR earlier than the
   // current-resume index (implied watched, mirrors the segmented
@@ -235,8 +267,13 @@ function ContinuousProgressBar({
   // episode is manually watched, no resume position), use a flat
   // green so the bar reads "fully consumed" rather than "still
   // watching".
+  // Only consider an in-progress mark "active" when it sits at or past
+  // the rightmost watched episode — a mid-show in-progress with later
+  // watched episodes is stale (the user moved past it) and shouldn't
+  // paint the gradient's amber tip on an otherwise-completed run.
   const hasInProgress = currentIdx >= 0
-    || episodes.some((ep) => getManualWatchedState(ep.id) === "in-progress");
+    || episodes.some((ep, i) =>
+      getManualWatchedState(ep.id) === "in-progress" && i >= lastWatchedIdx);
   const fillStyle: React.CSSProperties = hasInProgress
     ? {
         width: `${fillPct}%`,

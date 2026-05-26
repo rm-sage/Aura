@@ -521,6 +521,12 @@ pub struct StreamEntry {
     pub file_idx: Option<i64>,
     /// Behavior hints from the addon (HDR, 4K, etc).
     pub description: Option<String>,
+    /// `behaviorHints.filename` from the addon — raw release filename
+    /// (e.g. "Frieren.S01E07.1080p.WEB-DL.x265-RAWR.mkv"). AIOStreams
+    /// and some other addons populate this; the UI surfaces it as a
+    /// hover tooltip on the stream row's headline so users can verify
+    /// the exact release without copying the link first.
+    pub filename: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1074,6 +1080,17 @@ pub async fn list_addons<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
 ) -> Result<Vec<AddonEntry>, String> {
     addons::load(&app)
+}
+
+/// Reorder the local addons.json to match `urls`. Guest-mode counterpart of
+/// `cloud_reorder_addons`. Returns the new ordering so the caller can
+/// reconcile its in-memory state without a separate `list_addons` round-trip.
+#[tauri::command]
+pub async fn reorder_addons<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    urls: Vec<String>,
+) -> Result<Vec<AddonEntry>, String> {
+    addons::reorder(&app, &urls)
 }
 
 // ---------------------------------------------------------------------------
@@ -1801,6 +1818,47 @@ pub async fn cloud_remove_addon(auth_key: String, url: String) -> Result<(), Str
     }
 
     push_collection(&auth_key, collection).await
+}
+
+/// Reorder the user's Stremio cloud addon collection to match `urls`.
+/// `urls` is the desired full order; matching is by normalized transportUrl
+/// (the `/manifest.json` suffix and trailing slashes are ignored). Any cloud
+/// entry not present in `urls` is preserved at the tail — defensive against
+/// the cross-device race where device B added an addon between our most
+/// recent get_synced_addons and this reorder call.
+#[tauri::command]
+pub async fn cloud_reorder_addons(auth_key: String, urls: Vec<String>) -> Result<(), String> {
+    if urls.is_empty() {
+        return Ok(());
+    }
+    let collection = fetch_raw_collection(&auth_key).await?;
+
+    let target: Vec<String> = urls
+        .iter()
+        .map(|u| normalize_addon_url(u.trim_end_matches('/')).to_ascii_lowercase())
+        .collect();
+
+    let mut by_url: std::collections::HashMap<String, serde_json::Value> = collection
+        .into_iter()
+        .map(|entry| {
+            let key = entry
+                .get("transportUrl")
+                .and_then(|v| v.as_str())
+                .map(|t| normalize_addon_url(t).to_ascii_lowercase())
+                .unwrap_or_default();
+            (key, entry)
+        })
+        .collect();
+
+    let mut next: Vec<serde_json::Value> = Vec::with_capacity(by_url.len());
+    for tn in &target {
+        if let Some(entry) = by_url.remove(tn) {
+            next.push(entry);
+        }
+    }
+    next.extend(by_url.into_values());
+
+    push_collection(&auth_key, next).await
 }
 
 // ---------------------------------------------------------------------------
@@ -3236,6 +3294,15 @@ fn sanitize_stream(s: &serde_json::Value, addon_name: &str) -> Option<StreamEntr
         }
     });
 
+    // behaviorHints.filename — populated by AIOStreams (and some other
+    // addons) with the raw release filename. Cap matches `title` to
+    // protect against pathological addon payloads.
+    let filename = s
+        .get("behaviorHints")
+        .and_then(|v| v.get("filename"))
+        .and_then(|v| v.as_str())
+        .map(|s| cap(s.to_string(), 512));
+
     Some(StreamEntry {
         title,
         addon_name: cap(addon_name.to_string(), 64),
@@ -3246,6 +3313,7 @@ fn sanitize_stream(s: &serde_json::Value, addon_name: &str) -> Option<StreamEntr
             .get("description")
             .and_then(|v| v.as_str())
             .map(|s| cap(s.to_string(), 1024)),
+        filename,
     })
 }
 
