@@ -923,6 +923,55 @@ unsafe fn resolve_swap_interval() -> Option<WglSwapIntervalExtFn> {
     Some(std::mem::transmute::<_, WglSwapIntervalExtFn>(f))
 }
 
+/// Apply mpv's `framedrop` property based on focus state. Focused →
+/// `vo` (mpv's default: drop late frames at the renderer to keep a/v
+/// sync tight). Unfocused → `no` (don't drop; present every frame even
+/// if "late"). The unfocused choice exists because:
+///
+/// 1. We call `mpv_render_context_report_swap` after each SwapBuffers
+///    to give mpv vsync timing info. In focused mode SwapBuffers
+///    blocks on vblank so the timestamp is accurate. In unfocused
+///    mode SwapBuffers returns immediately (swap-interval=0) while
+///    DWM throttles the real screen flip — the reported time bears
+///    no relationship to when the user actually sees the frame.
+/// 2. mpv's display-sync builds a vsync-prediction model from those
+///    report_swap calls. Fed misinformation in unfocused mode, it
+///    predicts the next vsync wrongly and drops frames it thinks
+///    will arrive late — the source of the ~16% drop rate observed
+///    empirically with framedrop=vo + unfocused timer pacing.
+/// 3. The user can't see the dropped frames either way (window's
+///    backgrounded). Showing them on return is preferred to having
+///    mpv catch up via a visible skip.
+///
+/// Errors are devlog'd at `warn` and otherwise ignored — `framedrop`
+/// is a runtime hint, not a correctness requirement.
+unsafe fn apply_framedrop_policy(
+    lib: &Libmpv,
+    handle: *mut mpv_handle,
+    focused: bool,
+) {
+    let value = if focused { b"vo\0" } else { b"no\0" };
+    let r = (lib.set_property_string)(
+        handle,
+        b"framedrop\0".as_ptr() as *const c_char,
+        value.as_ptr() as *const c_char,
+    );
+    if r < 0 {
+        crate::devlog!(
+            warn, "mpv2",
+            "set framedrop={} failed: {}",
+            if focused { "vo" } else { "no" },
+            err_str(lib, r),
+        );
+    } else {
+        crate::devlog!(
+            debug, "mpv2",
+            "framedrop = {} (focused={focused})",
+            if focused { "vo" } else { "no" },
+        );
+    }
+}
+
 /// True when our parent window IS the OS-level foreground window. That's
 /// the same predicate DWM uses to decide whether to throttle the
 /// composition of this window's swap chain — non-foreground composition
@@ -1275,6 +1324,18 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 "wglSwapIntervalEXT({interval}) → {r} (nonzero = ok)",
             );
         }
+        // Initial framedrop policy mirrors the focus state. Helper
+        // re-applies it on every focus transition. The vo→no swap
+        // when unfocused is the actual off-focus-drop fix: mpv's
+        // default `framedrop=vo` drops video frames whose predicted
+        // present time would miss the next vsync, but our timer-paced
+        // unfocused mode reports "swaps happened at 60 Hz" while DWM
+        // throttles the real screen flip — the prediction model is
+        // built on misinformation and triggers spurious drops. With
+        // framedrop=no, late frames are still presented; the user
+        // sees the most-recent frame on return rather than artefacts
+        // of mpv's catch-up.
+        apply_framedrop_policy(&lib, handle, focused);
         crate::devlog!(
             info, "mpv2",
             "engine starting in {} present mode",
@@ -1420,6 +1481,10 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         "wglSwapIntervalEXT({interval}) → {r}",
                     );
                 }
+                // Re-apply framedrop policy alongside vsync — `vo`
+                // (drop late frames) when focused, `no` (present all
+                // frames) when unfocused. See `apply_framedrop_policy`.
+                apply_framedrop_policy(&lib, handle, focused);
                 crate::devlog!(
                     info, "mpv2",
                     "engine present mode → {}",
@@ -1507,11 +1572,27 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             }
 
             let _ = SwapBuffers(hdc);
-            // Report every present so mpv's display-resample tracks the
-            // ACTUAL swap cadence. mpv documents this hook as "a frame
-            // was flipped", referring to the buffer swap rather than
-            // whether mpv contributed new pixels.
-            (lib.render_context_report_swap)(rctx);
+            // Only report_swap when focused. In focused mode
+            // SwapBuffers blocks on vblank, so the call sequence
+            // models a real flip: mpv learns accurate vsync timing
+            // and its display-sync prediction model works correctly.
+            //
+            // In unfocused mode SwapBuffers returns immediately
+            // (swap-interval=0) while DWM throttles the actual
+            // composite. Calling report_swap here would tell mpv
+            // "vsync at 60 Hz" while the real flip happens whenever
+            // DWM decides — that misinformation builds an incorrect
+            // prediction model and was the source of the ~16% drop
+            // rate observed pre-fix. Suppressing the call lets mpv
+            // fall back to its audio-clock-only timing model, which
+            // doesn't depend on vsync prediction. Paired with
+            // `framedrop=no` (set by apply_framedrop_policy on focus
+            // change) the engine plays every decoded frame in
+            // unfocused mode rather than dropping ones it incorrectly
+            // judges as "late".
+            if focused {
+                (lib.render_context_report_swap)(rctx);
+            }
 
             // Pacing branch: focused mode is paced by SwapBuffers' vblank
             // wait (swap-interval=1), so we move straight on. Unfocused
