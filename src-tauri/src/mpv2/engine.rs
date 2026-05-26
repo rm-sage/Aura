@@ -38,7 +38,7 @@ use std::sync::{
     Arc, Mutex, OnceLock,
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::core::{w, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{
@@ -58,10 +58,10 @@ use windows::Win32::Graphics::OpenGL::{
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    IsWindow, MsgWaitForMultipleObjects, PeekMessageW, RegisterClassW, SetWindowPos,
-    TranslateMessage, CS_OWNDC, HWND_BOTTOM, MSG, PM_REMOVE, QS_ALLINPUT,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WINDOW_EX_STYLE, WM_PAINT, WM_SIZE,
-    WNDCLASSW, WS_CHILD, WS_VISIBLE,
+    GetForegroundWindow, IsWindow, MsgWaitForMultipleObjects, PeekMessageW,
+    RegisterClassW, SetWindowPos, TranslateMessage, CS_OWNDC, HWND_BOTTOM, MSG,
+    PM_REMOVE, QS_ALLINPUT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WINDOW_EX_STYLE,
+    WM_PAINT, WM_SIZE, WNDCLASSW, WS_CHILD, WS_VISIBLE,
 };
 
 use super::ffi::{
@@ -278,6 +278,22 @@ const TITLE_BAR_H: i32 = 36;
 const FALLBACK_W: i32 = 720;
 const FALLBACK_H: i32 = 460;
 
+/// Unfocused-mode present cadence — 60 fps nominal (16.667 ms). The exact
+/// rate isn't load-bearing — what matters is that the spacing is regular
+/// and that `mpv_render_context_report_swap` is called at this cadence so
+/// mpv's display-resample doesn't think the swap chain stalled while DWM
+/// is throttling our non-foreground composition. `pin_process_scheduling`
+/// holds `timeBeginPeriod(1)` for the process lifetime, so `thread::sleep`
+/// granularity here is ~1 ms — close enough.
+const UNFOCUSED_FRAME: Duration = Duration::from_micros(16_667);
+
+/// `BOOL wglSwapIntervalEXT(int interval)` — WGL_EXT_swap_control. 0 turns
+/// vsync off (`SwapBuffers` returns immediately); 1 waits for the next
+/// vblank before returning. Resolved at runtime via `wglGetProcAddress`;
+/// the call is the standard handle for toggling between vsync-blocked and
+/// timer-paced present modes.
+type WglSwapIntervalExtFn = unsafe extern "system" fn(interval: c_int) -> i32;
+
 /// HDC of the engine window, cached after [`wglMakeCurrent`] succeeds so
 /// the wndproc's resize-time fast-path can [`SwapBuffers`] without
 /// re-querying state out of [`run_engine`]'s locals. Zero when the engine
@@ -419,6 +435,35 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle) {
             break;
         }
     }
+}
+
+/// Resolve `wglSwapIntervalEXT` via `wglGetProcAddress`. Returns `None` if
+/// the driver doesn't advertise the extension (rare on Windows; every
+/// major GPU vendor exports it) — in that case the dual-mode loop falls
+/// back to pure timer pacing in both branches. Must be called with a GL
+/// context current on the calling thread, since `wglGetProcAddress` reads
+/// from the current context's ICD.
+unsafe fn resolve_swap_interval() -> Option<WglSwapIntervalExtFn> {
+    let name = PCSTR(b"wglSwapIntervalEXT\0".as_ptr());
+    let f = wglGetProcAddress(name)?;
+    let addr = f as usize as isize;
+    if matches!(addr, 0 | 1 | 2 | 3 | -1) {
+        return None;
+    }
+    // Both source and target are `unsafe extern "system" fn` pointers,
+    // identical size and ABI on Windows — transmuting between function
+    // signatures of the same calling convention is the standard pattern
+    // for typed extension loaders.
+    Some(std::mem::transmute::<_, WglSwapIntervalExtFn>(f))
+}
+
+/// True when our parent window IS the OS-level foreground window. That's
+/// the same predicate DWM uses to decide whether to throttle the
+/// composition of this window's swap chain — non-foreground composition
+/// is what produces the off-focus frame drops the rewrite targets.
+unsafe fn is_foreground_parent(parent: HWND) -> bool {
+    let fg = GetForegroundWindow();
+    !fg.is_invalid() && fg == parent
 }
 
 /// Compute the engine child's target geometry from its parent's client
@@ -704,15 +749,43 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize) {
             rctx, Some(on_mpv_update), cb_ctx,
         );
 
+        // -- Dual-mode present pacing setup --
+        // Resolve wglSwapIntervalEXT once. If absent, both branches fall
+        // back to pure timer pacing (no vsync wait) — playback still
+        // works, just without the extra-smooth focused-mode vblank lock.
+        let wgl_swap_interval = resolve_swap_interval();
+        if wgl_swap_interval.is_none() {
+            crate::devlog!(
+                warn, "mpv2",
+                "wglSwapIntervalEXT not available — both modes will be timer-paced",
+            );
+        }
+        let mut focused = is_foreground_parent(parent);
+        if let Some(set_swap) = wgl_swap_interval {
+            set_swap(if focused { 1 } else { 0 });
+        }
+        crate::devlog!(
+            info, "mpv2",
+            "engine starting in {} present mode",
+            if focused { "vsync-blocked (focused)" } else { "timer-paced (unfocused)" },
+        );
+
         // -- Render loop --
-        // ~60 Hz steady cadence; Phase 2.3 introduces the focused/unfocused
-        // dual-mode loop. No file is loaded yet (Phase 2.4 wires `loadfile`),
-        // so in practice the update callback never fires and the loop just
-        // paints teal until shutdown.
+        // Dual-mode pacing per the render-API spec:
+        //   * Focused: swap-interval=1, SwapBuffers itself is the clock.
+        //   * Unfocused: swap-interval=0 + a fixed timer cadence — DWM
+        //     throttles a non-foreground window's compositor, so vsync
+        //     would stall us; we drive render+report_swap at a steady
+        //     ~60 Hz instead so mpv's display-resample model stays fed.
+        // Mode switches are detected by polling GetForegroundWindow each
+        // tick (cheap; the win32 transition is what off-focus-drop is
+        // really about, so we react inside one frame of the change).
         let mut frame_count: u64 = 0;
         let mut shutting_down = false;
         let last_geom = (init_x, init_y, init_w, init_h);
         loop {
+            let frame_start = Instant::now();
+
             // Pump win32 messages.
             let mut msg = MSG::default();
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -738,6 +811,20 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize) {
             }
             if shutting_down {
                 break;
+            }
+
+            // Detect focus transition and re-toggle vsync if it changed.
+            let now_focused = is_foreground_parent(parent);
+            if now_focused != focused {
+                focused = now_focused;
+                if let Some(set_swap) = wgl_swap_interval {
+                    set_swap(if focused { 1 } else { 0 });
+                }
+                crate::devlog!(
+                    info, "mpv2",
+                    "engine present mode → {}",
+                    if focused { "vsync-blocked (focused)" } else { "timer-paced (unfocused)" },
+                );
             }
 
             // Resize sync is intentionally NOT done from this thread.
@@ -817,15 +904,26 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize) {
             }
 
             let _ = SwapBuffers(hdc);
-            if rendered_mpv {
-                // report_swap is the channel mpv uses to learn vsync cadence —
-                // only call it when we actually drove an mpv frame, otherwise
-                // we'd be reporting "a frame was displayed" for a frame mpv
-                // didn't produce.
-                (lib.render_context_report_swap)(rctx);
-            }
+            // Report every present so mpv's display-resample tracks the
+            // ACTUAL swap cadence — not just frames mpv produced. mpv
+            // documents this hook as "a frame was flipped", referring to
+            // the buffer swap rather than whether mpv contributed pixels;
+            // calling it after every SwapBuffers keeps the vsync model
+            // honest across idle-but-paced ticks.
+            (lib.render_context_report_swap)(rctx);
+            // Silence the unused-warning for `rendered_mpv` until the
+            // playback-port phases consume it for metrics.
+            let _ = rendered_mpv;
 
-            thread::sleep(Duration::from_millis(16));
+            // Pacing branch: focused mode is paced by SwapBuffers' vblank
+            // wait (swap-interval=1), so we move straight on. Unfocused
+            // mode sleeps until the next steady 60 Hz tick.
+            if !focused {
+                let elapsed = frame_start.elapsed();
+                if elapsed < UNFOCUSED_FRAME {
+                    thread::sleep(UNFOCUSED_FRAME - elapsed);
+                }
+            }
         }
 
         // -- Teardown --
