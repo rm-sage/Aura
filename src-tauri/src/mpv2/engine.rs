@@ -851,18 +851,31 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
             if !p.is_null() && !(*p).name.is_null() {
                 let name = cstr((*p).name);
                 let data = property_value_to_json(&*p);
-                // Devlog `frame-drop-count` separately — the lib.rs
-                // observer bridge doesn't consume it (no UI surface yet)
-                // and silent-discards it from the `mpv-event-main`
-                // channel. Surfacing it here lets us read drop deltas
-                // around focus transitions to validate the off-focus
-                // rewrite empirically — the verification deferred from
-                // Phase 2.4. Only logs on change (mpv only fires
-                // PROPERTY_CHANGE on transitions), so no spam.
+                // Devlog the two drop counters separately — the lib.rs
+                // observer bridge doesn't consume them and silent-
+                // discards them from the `mpv-event-main` channel.
+                // Distinguishing VO drops (frame-drop-count) from
+                // decoder drops (decoder-frame-drop-count) tells us
+                // WHERE in the pipeline the loss happens:
+                //   * VO drops without decoder drops → presentation
+                //     timing issue (DWM throttling, swap-interval
+                //     mismatch, render-loop pacing drift).
+                //   * Decoder drops → CPU starvation / process power
+                //     throttling. Win11 EcoQoS is the canonical cause
+                //     post-2021; pin_process_scheduling now opts out.
+                //   * Both → both. mpv usually drops at the decoder
+                //     first when CPU-bound.
+                // Only logs on change (mpv fires PROPERTY_CHANGE on
+                // transitions), so no spam.
                 if name == "frame-drop-count" {
                     crate::devlog!(
                         info, "mpv2",
-                        "frame-drop-count → {data}",
+                        "frame-drop-count → {data} (VO)",
+                    );
+                } else if name == "decoder-frame-drop-count" {
+                    crate::devlog!(
+                        info, "mpv2",
+                        "decoder-frame-drop-count → {data} (decoder)",
                     );
                 }
                 emit(&name, data);
@@ -1173,7 +1186,16 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             (b"duration\0".as_slice(), mpv_format::DOUBLE),
             (b"volume\0".as_slice(), mpv_format::DOUBLE),
             (b"speed\0".as_slice(), mpv_format::DOUBLE),
+            // `frame-drop-count` — VO-level drops (the renderer
+            // decided a decoded frame couldn't be shown in time).
             (b"frame-drop-count\0".as_slice(), mpv_format::INT64),
+            // `decoder-frame-drop-count` — drops at the decoder layer
+            // (decoder fell behind audio clock and skipped a frame
+            // before it ever reached the renderer). Distinguishing the
+            // two is critical for diagnosing off-focus drops: VO drops
+            // mean a presentation timing issue; decoder drops mean the
+            // CPU is being throttled / starved.
+            (b"decoder-frame-drop-count\0".as_slice(), mpv_format::INT64),
         ] {
             let r = (lib.observe_property)(handle, 0, name.as_ptr() as *const c_char, fmt);
             if r < 0 {
@@ -1246,7 +1268,12 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         }
         let mut focused = is_foreground_parent(parent);
         if let Some(set_swap) = wgl_swap_interval {
-            set_swap(if focused { 1 } else { 0 });
+            let interval = if focused { 1 } else { 0 };
+            let r = set_swap(interval);
+            crate::devlog!(
+                info, "mpv2",
+                "wglSwapIntervalEXT({interval}) → {r} (nonzero = ok)",
+            );
         }
         crate::devlog!(
             info, "mpv2",
@@ -1386,7 +1413,12 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             if now_focused != focused {
                 focused = now_focused;
                 if let Some(set_swap) = wgl_swap_interval {
-                    set_swap(if focused { 1 } else { 0 });
+                    let interval = if focused { 1 } else { 0 };
+                    let r = set_swap(interval);
+                    crate::devlog!(
+                        debug, "mpv2",
+                        "wglSwapIntervalEXT({interval}) → {r}",
+                    );
                 }
                 crate::devlog!(
                     info, "mpv2",

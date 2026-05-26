@@ -855,12 +855,40 @@ pub fn exit_native_fullscreen(parent_hwnd: isize) -> Result<(), String> {
 type TimeBeginPeriodFn = unsafe extern "system" fn(u32) -> u32;
 type GetCurrentProcessFn = unsafe extern "system" fn() -> *mut c_void;
 type SetPriorityClassFn = unsafe extern "system" fn(*mut c_void, u32) -> i32;
+type SetProcessInformationFn = unsafe extern "system" fn(
+    handle: *mut c_void,
+    info_class: i32,
+    info: *mut c_void,
+    size: u32,
+) -> i32;
 
 /// `ABOVE_NORMAL_PRIORITY_CLASS`. Deliberately NOT `HIGH_PRIORITY_CLASS`
 /// (0x80) — HIGH can starve the audio service / DWM compositor and cause
 /// its own stutter. ABOVE_NORMAL restores the scheduling headroom lost
 /// when the foreground boost disappears, without that risk.
 const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x0000_8000;
+
+/// `PROCESS_INFORMATION_CLASS::ProcessPowerThrottling` discriminant.
+/// Used with `SetProcessInformation` to opt out of Windows 11 EcoQoS
+/// background CPU throttling — without this, the OS may drop our
+/// process to the "efficiency core" power state when minimised /
+/// occluded / generally background, even with `ABOVE_NORMAL_PRIORITY_CLASS`
+/// set. Discord / Slack / OBS / video editors all do this.
+const PROCESS_POWER_THROTTLING: i32 = 4;
+/// Wire format version for `PROCESS_POWER_THROTTLING_STATE`.
+const PROCESS_POWER_THROTTLING_CURRENT_VERSION: u32 = 1;
+/// Bit in `ControlMask` / `StateMask` corresponding to the execution-
+/// speed throttling axis (EcoQoS). Setting it in `ControlMask` says
+/// "we are managing this knob"; clearing it in `StateMask` says
+/// "don't throttle me".
+const PROCESS_POWER_THROTTLING_EXECUTION_SPEED: u32 = 0x1;
+
+#[repr(C)]
+struct ProcessPowerThrottlingState {
+    version: u32,
+    control_mask: u32,
+    state_mask: u32,
+}
 
 /// Make the process immune to Windows background timer/priority
 /// throttling so the embedded MPV render loop keeps pace when Aura is
@@ -893,7 +921,17 @@ pub fn pin_process_scheduling() {
                  hardened", e),
         }
 
-        // Nudge the process priority class up one notch.
+        // Nudge the process priority class up one notch AND opt out of
+        // Windows-11 EcoQoS background-execution throttling. The latter
+        // is the documented cause of post-2021 "background apps drop
+        // frames even with ABOVE_NORMAL priority" behaviour: when the
+        // OS decides our process is background-ish (minimised, behind
+        // another foreground window, etc.) it can drop the process to
+        // efficiency-core power state independent of priority class.
+        // SetProcessInformation(ProcessPowerThrottling) with
+        // ControlMask = EXECUTION_SPEED and StateMask = 0 means
+        // "I'm managing this; do NOT throttle me". Discord, Slack, OBS,
+        // and pretty much every real-time Windows app does this.
         match libloading::Library::new("kernel32.dll") {
             Ok(kernel32) => {
                 let get_cur =
@@ -901,7 +939,7 @@ pub fn pin_process_scheduling() {
                 let set_pc =
                     kernel32.get::<SetPriorityClassFn>(b"SetPriorityClass\0");
                 if let (Ok(get_current_process), Ok(set_priority_class)) =
-                    (get_cur, set_pc)
+                    (&get_cur, &set_pc)
                 {
                     let ok = set_priority_class(
                         get_current_process(),
@@ -914,6 +952,39 @@ pub fn pin_process_scheduling() {
                     crate::devlog!(warn, "win32",
                         "kernel32 priority symbols unavailable; priority \
                          class left at OS default");
+                }
+
+                // EcoQoS opt-out. `SetProcessInformation` was added in
+                // Windows 8 (the function), but the
+                // `ProcessPowerThrottling` info class is Windows 11+ —
+                // pre-Win11 calls return ERROR_INVALID_PARAMETER, which
+                // is benign (the throttling behaviour we're opting out
+                // of didn't exist on those builds either).
+                let set_pi = kernel32
+                    .get::<SetProcessInformationFn>(b"SetProcessInformation\0");
+                if let (Ok(get_current_process), Ok(set_process_information)) =
+                    (&get_cur, &set_pi)
+                {
+                    let mut state = ProcessPowerThrottlingState {
+                        version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                        control_mask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+                        state_mask: 0, // 0 = "don't throttle"
+                    };
+                    let ok = set_process_information(
+                        get_current_process(),
+                        PROCESS_POWER_THROTTLING,
+                        &mut state as *mut _ as *mut c_void,
+                        std::mem::size_of::<ProcessPowerThrottlingState>() as u32,
+                    );
+                    crate::devlog!(info, "win32",
+                        "SetProcessInformation(EcoQoS disable) → {} \
+                         (nonzero = ok; 0 on Win10 / WinServer 2019 is benign)",
+                        ok);
+                } else {
+                    crate::devlog!(warn, "win32",
+                        "kernel32!SetProcessInformation unavailable — \
+                         Win11 EcoQoS background throttling NOT disabled, \
+                         off-focus playback may drop frames");
                 }
             }
             Err(e) => crate::devlog!(warn, "win32",
