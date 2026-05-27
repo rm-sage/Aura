@@ -4230,8 +4230,16 @@ export default function SettingsView({ addons, session }: Props) {
           {/* TOC — sticky so it stays in view while the user scrolls.
               The search input now lives at the BOTTOM of this sidebar
               (instead of in a sticky page header) so the content
-              column doesn't lose vertical real estate to a fixed bar. */}
-          <aside className="sticky top-6 self-start">
+              column doesn't lose vertical real estate to a fixed bar.
+              `max-h: 100vh - 3rem` (24 px top sticky-offset + 24 px
+              bottom buffer) + `overflow-y-auto` bounds the aside to
+              the viewport so laptop / short-screen aspect ratios show
+              the full TOC with internal scrolling instead of forcing
+              the user to scroll the page itself to see lower entries. */}
+          <aside
+            className="sticky top-6 self-start overflow-y-auto"
+            style={{ maxHeight: "calc(100vh - 3rem)" }}
+          >
             <SettingsToc
               scrollRoot={scrollEl}
               search={{
