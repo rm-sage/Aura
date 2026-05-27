@@ -2533,10 +2533,13 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
 
       <div className="h-px bg-white/6" />
 
-      {/* Drop counters (live) */}
+      {/* Drop counters (live) — cumulative since playback started.
+          The drop-test result below shows the DELTA across the test
+          window, which is the more meaningful figure for "did this
+          mode change cause drops?". */}
       <div>
         <p className="text-white/40 text-[10.5px] font-mono uppercase tracking-[0.18em] mb-2">
-          Drop counters (live)
+          Drop counters (live — cumulative since playback start)
         </p>
         <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12.5px]">
           <DebugRow
