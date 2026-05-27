@@ -2219,6 +2219,379 @@ function formatAgo(diffMs: number): string {
   return `${yr}y ago`;
 }
 
+// ---------------------------------------------------------------------------
+// Debug Stuff — engine + mpv diagnostics + off-focus drop-rate test.
+//
+// Intentionally NOT registered in TOC_GROUPS — the section is here for
+// power-user diagnostics, not part of the navigable settings hierarchy.
+// Sits at the very bottom of the page so it doesn't interrupt the
+// scrollspy walk over the actual settings groups.
+// ---------------------------------------------------------------------------
+
+interface DebugEngineSnapshot {
+  engine: {
+    mpv2_active: boolean;
+    mpv2_running: boolean;
+    present_mode: string | null;
+  };
+  window: {
+    available: boolean;
+    hwnd_hex?: string;
+    is_foreground?: boolean;
+    is_visible?: boolean;
+    is_iconic?: boolean;
+    is_cloaked?: boolean;
+    cloak_reason?: number;
+    reason?: string;
+  };
+  mpv: {
+    video_codec?: string | null;
+    video_format?: string | null;
+    video_w?: number | null;
+    video_h?: number | null;
+    fps?: number | null;
+    estimated_vf_fps?: number | null;
+    display_fps?: number | null;
+    hwdec_current?: string | null;
+    audio_codec?: string | null;
+    pixelformat?: string | null;
+    primaries?: string | null;
+    gamma?: string | null;
+    hdr_detected?: boolean;
+    hdr_kind?: string | null;
+    dv_profile?: number | null;
+    dv_detected?: boolean;
+    frame_drop_count?: number | null;
+    decoder_frame_drop_count?: number | null;
+    vo_delayed_frame_count?: number | null;
+    paused?: boolean;
+    time_pos?: number | null;
+    duration?: number | null;
+    volume?: number | null;
+    speed?: number | null;
+  } | null;
+}
+
+interface DropTestResult {
+  duration_secs: number;
+  initial_mode: string | null;
+  final_mode: string | null;
+  start_drop_count_vo: number;
+  end_drop_count_vo: number;
+  delta_vo: number;
+  rate_vo: number;
+  start_drop_count_dec: number;
+  end_drop_count_dec: number;
+  delta_dec: number;
+  rate_dec: number;
+  verdict: "clean" | "minor" | "drops";
+}
+
+function DebugStuffSection() {
+  const [snap, setSnap] = useState<DebugEngineSnapshot | null>(null);
+  const [snapError, setSnapError] = useState<string | null>(null);
+  const [running, setRunning] = useState(false);
+  const [duration, setDuration] = useState<number>(15);
+  const [result, setResult] = useState<DropTestResult | null>(null);
+  const [testError, setTestError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  // Live 1 Hz polling of the engine snapshot. The Tauri command is
+  // synchronous and read-only (only touches an atomic + a handful of
+  // get_property reads), so per-second polling is essentially free.
+  useEffect(() => {
+    let cancelled = false;
+    const tick = () => {
+      invoke<DebugEngineSnapshot>("debug_engine_state")
+        .then((s) => {
+          if (cancelled) return;
+          setSnap(s);
+          setSnapError(null);
+        })
+        .catch((e) => {
+          if (cancelled) return;
+          setSnapError(String(e));
+        });
+    };
+    tick();
+    const h = setInterval(tick, 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(h);
+    };
+  }, []);
+
+  const runTest = useCallback(async () => {
+    setRunning(true);
+    setResult(null);
+    setTestError(null);
+    try {
+      const r = await invoke<DropTestResult>("debug_drop_test", {
+        durationSecs: duration,
+      });
+      setResult(r);
+    } catch (e) {
+      setTestError(String(e));
+    } finally {
+      setRunning(false);
+    }
+  }, [duration]);
+
+  const copyDump = useCallback(async () => {
+    const blob = JSON.stringify(
+      {
+        timestamp: new Date().toISOString(),
+        aura_version: APP_VERSION,
+        engine_snapshot: snap,
+        last_drop_test: result,
+      },
+      null,
+      2,
+    );
+    try {
+      await navigator.clipboard.writeText(blob);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard unavailable — fall back to a download? Skip for now;
+      // user can still screenshot the panel.
+    }
+  }, [snap, result]);
+
+  return (
+    <Section title="Debug Stuff">
+      <p className="text-white/55 text-xs leading-relaxed">
+        Diagnostic surface for the mpv2 render-API engine. Not part of the
+        Settings table of contents. Live state refreshes once per second; the
+        drop-rate test reads mpv's own counters at the start and end of a
+        timed window so you can correlate drops with the engine's
+        foreground / visible-background / hidden mode.
+      </p>
+
+      <div className="h-px bg-white/6" />
+
+      {/* Engine + window */}
+      <div>
+        <p className="text-white/40 text-[10.5px] font-mono uppercase tracking-[0.18em] mb-2">
+          Engine + window
+        </p>
+        <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12.5px]">
+          <DebugRow label="AURA_MPV2 set" value={fmtBool(snap?.engine.mpv2_active)} />
+          <DebugRow label="Engine running" value={fmtBool(snap?.engine.mpv2_running)} />
+          <DebugRow label="Present mode" value={snap?.engine.present_mode ?? "—"} />
+          <DebugRow label="HWND" value={snap?.window.hwnd_hex ?? "—"} />
+          <DebugRow label="Foreground" value={fmtBool(snap?.window.is_foreground)} />
+          <DebugRow label="Visible (WS_VISIBLE)" value={fmtBool(snap?.window.is_visible)} />
+          <DebugRow label="Minimised (IsIconic)" value={fmtBool(snap?.window.is_iconic)} />
+          <DebugRow label="Cloaked (DWMWA_CLOAKED)" value={fmtBool(snap?.window.is_cloaked)} />
+        </div>
+      </div>
+
+      <div className="h-px bg-white/6" />
+
+      {/* Video decode */}
+      <div>
+        <p className="text-white/40 text-[10.5px] font-mono uppercase tracking-[0.18em] mb-2">
+          Video decode (mpv)
+        </p>
+        {snap?.engine.mpv2_running ? (
+          <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12.5px]">
+            <DebugRow label="Codec" value={snap?.mpv?.video_codec ?? "—"} />
+            <DebugRow
+              label="Resolution"
+              value={
+                snap?.mpv?.video_w && snap?.mpv?.video_h
+                  ? `${snap.mpv.video_w}×${snap.mpv.video_h}`
+                  : "—"
+              }
+            />
+            <DebugRow label="Source FPS" value={fmtFps(snap?.mpv?.fps)} />
+            <DebugRow label="Display FPS" value={fmtFps(snap?.mpv?.display_fps)} />
+            <DebugRow label="Hardware decode" value={snap?.mpv?.hwdec_current ?? "—"} />
+            <DebugRow label="Pixel format" value={snap?.mpv?.pixelformat ?? "—"} />
+            <DebugRow label="Primaries" value={snap?.mpv?.primaries ?? "—"} />
+            <DebugRow label="Gamma / transfer" value={snap?.mpv?.gamma ?? "—"} />
+            <DebugRow
+              label="HDR"
+              value={
+                snap?.mpv?.hdr_kind ??
+                (snap?.mpv?.hdr_detected ? "detected" : "—")
+              }
+            />
+            <DebugRow
+              label="Dolby Vision"
+              value={
+                snap?.mpv?.dv_detected
+                  ? `profile ${snap.mpv.dv_profile ?? "?"}`
+                  : "not detected"
+              }
+            />
+            <DebugRow label="Audio codec" value={snap?.mpv?.audio_codec ?? "—"} />
+            <DebugRow
+              label="Paused"
+              value={
+                snap?.mpv?.paused === undefined
+                  ? "—"
+                  : snap.mpv?.paused
+                    ? "yes"
+                    : "no"
+              }
+            />
+          </div>
+        ) : (
+          <p className="text-white/45 text-[12.5px] italic">
+            mpv2 engine not running (AURA_MPV2 unset or not yet initialised).
+          </p>
+        )}
+      </div>
+
+      <div className="h-px bg-white/6" />
+
+      {/* Drop counters (live) */}
+      <div>
+        <p className="text-white/40 text-[10.5px] font-mono uppercase tracking-[0.18em] mb-2">
+          Drop counters (live)
+        </p>
+        <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12.5px]">
+          <DebugRow
+            label="VO drops"
+            value={fmtCount(snap?.mpv?.frame_drop_count ?? null)}
+          />
+          <DebugRow
+            label="Decoder drops"
+            value={fmtCount(snap?.mpv?.decoder_frame_drop_count ?? null)}
+          />
+          <DebugRow
+            label="VO delayed frames"
+            value={fmtCount(snap?.mpv?.vo_delayed_frame_count ?? null)}
+          />
+        </div>
+      </div>
+
+      <div className="h-px bg-white/6" />
+
+      {/* Drop test */}
+      <div>
+        <p className="text-white/40 text-[10.5px] font-mono uppercase tracking-[0.18em] mb-2">
+          Off-focus drop test
+        </p>
+        <p className="text-white/55 text-[12px] leading-relaxed">
+          Start a stream playing. Click <span className="text-white/80">Run test</span>,
+          then move Aura to the state you want to measure (alt-tab away, drag
+          to another monitor, minimise, etc.) and leave it there until the
+          timer expires. The result captures total drops and rate over the
+          window, plus the present-mode at start and end.
+        </p>
+        <div className="mt-3 flex items-center gap-3">
+          <label className="text-white/55 text-[12px]">Duration</label>
+          <select
+            className="bg-white/5 border border-white/12 rounded-md px-2 py-1 text-[12.5px] text-white/90"
+            value={duration}
+            onChange={(e) => setDuration(Number(e.target.value))}
+            disabled={running}
+          >
+            <option value={5}>5 s</option>
+            <option value={10}>10 s</option>
+            <option value={15}>15 s</option>
+            <option value={30}>30 s</option>
+            <option value={60}>60 s</option>
+          </select>
+          <button
+            type="button"
+            onClick={runTest}
+            disabled={running || !snap?.engine.mpv2_running}
+            className="px-3 py-1 rounded-md bg-ln-accent/20 text-ln-accent
+                       hover:bg-ln-accent/30 active:bg-ln-accent/40
+                       border border-ln-accent/40
+                       text-[12.5px] font-semibold tracking-wide
+                       disabled:opacity-50 disabled:cursor-default
+                       transition-colors"
+          >
+            {running ? `Running… (${duration}s)` : "Run test"}
+          </button>
+        </div>
+
+        {testError && (
+          <p className="mt-2 text-rose-300/85 text-[12px]">{testError}</p>
+        )}
+        {result && (
+          <div className="mt-3 grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12.5px] bg-black/20 border border-white/8 rounded-lg px-3 py-3">
+            <DebugRow
+              label="Duration"
+              value={`${result.duration_secs.toFixed(2)} s`}
+            />
+            <DebugRow
+              label="Verdict"
+              value={
+                result.verdict === "clean"
+                  ? "✓ Clean"
+                  : result.verdict === "minor"
+                    ? "~ Minor"
+                    : "✗ Drops"
+              }
+            />
+            <DebugRow label="Mode at start" value={result.initial_mode ?? "—"} />
+            <DebugRow label="Mode at end" value={result.final_mode ?? "—"} />
+            <DebugRow
+              label="VO drops"
+              value={`${result.delta_vo} (${result.rate_vo.toFixed(2)} /s)`}
+            />
+            <DebugRow
+              label="Decoder drops"
+              value={`${result.delta_dec} (${result.rate_dec.toFixed(2)} /s)`}
+            />
+          </div>
+        )}
+      </div>
+
+      <div className="h-px bg-white/6" />
+
+      <div className="flex items-center justify-between">
+        <p className="text-white/45 text-[11.5px]">
+          {snapError ? (
+            <span className="text-rose-300/75">Snapshot error: {snapError}</span>
+          ) : (
+            "Snapshot polls every second."
+          )}
+        </p>
+        <button
+          type="button"
+          onClick={copyDump}
+          className="px-3 py-1 rounded-md bg-white/8 hover:bg-white/12 active:bg-white/16
+                     border border-white/15 text-white/80 text-[12px]
+                     transition-colors"
+        >
+          {copied ? "Copied" : "Copy diagnostic dump"}
+        </button>
+      </div>
+    </Section>
+  );
+}
+
+function DebugRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-baseline justify-between gap-2">
+      <span className="text-white/55 truncate">{label}</span>
+      <span className="text-white/85 font-mono tabular-nums truncate text-right">
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function fmtBool(b: boolean | undefined): string {
+  if (b === undefined) return "—";
+  return b ? "yes" : "no";
+}
+function fmtCount(n: number | null | undefined): string {
+  if (n === null || n === undefined) return "—";
+  return n.toLocaleString();
+}
+function fmtFps(n: number | null | undefined): string {
+  if (n === null || n === undefined) return "—";
+  return `${n.toFixed(3)} fps`;
+}
+
 function AboutSection({ addonCount }: { addonCount: number }) {
   const [stats, setStats] = useState<AuraStats | null>(null);
   useEffect(() => {
@@ -4683,6 +5056,12 @@ export default function SettingsView({ addons, session }: Props) {
 
           {/* About */}
           <AboutSection addonCount={addons.length} />
+
+          {/* Debug Stuff — engine + mpv diagnostics + drop-rate test.
+              Deliberately NOT registered in TOC_GROUPS so it doesn't
+              appear in the sidebar navigation; only reachable by
+              scrolling to the bottom of the page. */}
+          <DebugStuffSection />
           </div>{/* /content column */}
 
           {/* Mirror of the TOC width — empty third column. Keeps the

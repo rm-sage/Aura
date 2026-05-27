@@ -35,6 +35,7 @@ mod media_controls;
 // rewrite (docs/superpowers/specs/2026-05-20-render-api-rewrite-design.md).
 // ADDITIVE: declared so `cargo check` compiles it; not yet wired into any
 // runtime path (player.rs still uses tauri-plugin-libmpv).
+mod debug_panel;
 mod mpv2;
 mod player;
 mod publicmetadb;
@@ -2378,6 +2379,8 @@ pub fn run() {
             set_subtitle_visibility,
             set_panscan,
             dev_force_panic,
+            debug_panel::debug_engine_state,
+            debug_panel::debug_drop_test,
             get_tracks,
             get_property,
             refresh_video,

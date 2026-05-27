@@ -55,6 +55,7 @@
     "allow-aniskip",
     "allow-publicmetadb",
     "allow-dev-tools",
+    "allow-debug-panel",
     "allow-crash-reporting",
     "allow-sync",
     "allow-log-export",

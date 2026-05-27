@@ -33,7 +33,7 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::mem::size_of;
 use std::ptr;
 use std::sync::{
-    atomic::{AtomicBool, AtomicIsize, Ordering},
+    atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering},
     mpsc::{self, Receiver, Sender, TryRecvError},
     Arc, Mutex, OnceLock,
 };
@@ -58,10 +58,11 @@ use windows::Win32::Graphics::OpenGL::{
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    IsIconic, IsWindow, IsWindowVisible, MsgWaitForMultipleObjects, PeekMessageW,
-    RegisterClassW, SetWindowPos, TranslateMessage, CS_OWNDC, HWND_BOTTOM, MSG,
-    PM_REMOVE, QS_ALLINPUT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WINDOW_EX_STYLE,
-    WM_PAINT, WM_SIZE, WNDCLASSW, WS_CHILD, WS_VISIBLE,
+    GetForegroundWindow, IsIconic, IsWindow, IsWindowVisible,
+    MsgWaitForMultipleObjects, PeekMessageW, RegisterClassW, SetWindowPos,
+    TranslateMessage, CS_OWNDC, HWND_BOTTOM, MSG, PM_REMOVE, QS_ALLINPUT,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WINDOW_EX_STYLE, WM_PAINT, WM_SIZE,
+    WNDCLASSW, WS_CHILD, WS_VISIBLE,
 };
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 
@@ -457,6 +458,18 @@ type WglSwapIntervalExtFn = unsafe extern "system" fn(interval: c_int) -> i32;
 /// process and the wndproc runs on the same thread that writes this
 /// value (the render thread).
 static ENGINE_HDC: AtomicIsize = AtomicIsize::new(0);
+
+/// Current [`PresentMode`] discriminant, published from the render thread
+/// on every mode transition. 255 = engine not running. Read by the debug
+/// Tauri commands so the Settings → Debug Stuff panel can show the live
+/// state without touching the render thread.
+static CURRENT_MODE: AtomicU8 = AtomicU8::new(255);
+
+/// Read the engine's current [`PresentMode`]. Returns `None` when the
+/// engine isn't running.
+pub fn current_present_mode() -> Option<PresentMode> {
+    PresentMode::from_u8(CURRENT_MODE.load(Ordering::Acquire))
+}
 
 /// Engine wndproc. Two messages get explicit handling, everything else
 /// (including `WM_ERASEBKGND`) goes to the default handler so the class's
@@ -949,28 +962,156 @@ unsafe fn resolve_swap_interval() -> Option<WglSwapIntervalExtFn> {
 unsafe fn apply_framedrop_policy(
     lib: &Libmpv,
     handle: *mut mpv_handle,
-    focused: bool,
+    mode: PresentMode,
 ) {
-    let value = if focused { b"vo\0" } else { b"no\0" };
+    let value = mode.framedrop();
     let r = (lib.set_property_string)(
         handle,
         b"framedrop\0".as_ptr() as *const c_char,
         value.as_ptr() as *const c_char,
     );
+    let value_label = std::str::from_utf8(&value[..value.len().saturating_sub(1)])
+        .unwrap_or("?");
     if r < 0 {
         crate::devlog!(
             warn, "mpv2",
-            "set framedrop={} failed: {}",
-            if focused { "vo" } else { "no" },
+            "set framedrop={value_label} failed: {}",
             err_str(lib, r),
         );
     } else {
         crate::devlog!(
             debug, "mpv2",
-            "framedrop = {} (focused={focused})",
-            if focused { "vo" } else { "no" },
+            "framedrop = {value_label} (mode={})",
+            mode.label(),
         );
     }
+}
+
+/// Three-state present mode the render thread switches between based on
+/// the parent window's foreground / visibility state. Each state picks a
+/// distinct (swap-interval, report_swap, framedrop) policy so playback
+/// quality matches the user's actual viewing scenario.
+///
+/// * [`Foreground`] — the parent IS `GetForegroundWindow()` AND visible.
+///   Full-quality mode: `wglSwapIntervalEXT(1)` (vsync-blocked), every
+///   present reports the swap to mpv, and `framedrop=vo` drops frames
+///   that would arrive late (mpv's default behaviour for tight a/v sync).
+///
+/// * [`VisibleBackground`] — visible but NOT foreground. The user has
+///   Aura on monitor 2 (or alongside a foreground app on the same
+///   monitor) while working in something else. WGL/DWM on Windows
+///   throttles non-foreground swap chains' present cadence regardless of
+///   `swap-interval=1`, so mpv's default `framedrop=vo` sees the slow
+///   swaps and drops ~16% of frames to "stay synced to audio". For a
+///   passively-watched second-monitor stream the drops are visible
+///   stutters while slight a/v drift is invisible — so this mode keeps
+///   vsync + report_swap on (mpv still gets accurate timing for the
+///   cases it can handle) but flips `framedrop=no` to let every decoded
+///   frame play through, accepting drift instead of drops.
+///
+/// * [`Hidden`] — minimised, DWM-cloaked (different virtual desktop /
+///   UWP shell-ghost), or otherwise not visible. The user can't see
+///   playback. Drop to the background path: `swap-interval=0` (no vsync
+///   stall), no `report_swap` (don't lie to mpv about timing it can't
+///   meaningfully use), `framedrop=no` (don't try to maintain anything).
+///   The audio still plays in real time; video runs at whatever cadence
+///   mpv naturally arrives at.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum PresentMode {
+    Foreground,
+    VisibleBackground,
+    Hidden,
+}
+
+impl PresentMode {
+    /// Numeric discriminant for the [`CURRENT_MODE`] atomic. 255 stands
+    /// for "engine not running" so debug callers can distinguish a
+    /// genuinely-foreground engine from an idle / shut-down one.
+    fn as_u8(self) -> u8 {
+        match self {
+            PresentMode::Foreground => 0,
+            PresentMode::VisibleBackground => 1,
+            PresentMode::Hidden => 2,
+        }
+    }
+
+    /// Reverse of [`as_u8`] — used by [`current_present_mode`] to
+    /// translate the atomic back into a Mode.
+    fn from_u8(value: u8) -> Option<PresentMode> {
+        match value {
+            0 => Some(PresentMode::Foreground),
+            1 => Some(PresentMode::VisibleBackground),
+            2 => Some(PresentMode::Hidden),
+            _ => None,
+        }
+    }
+
+    /// Short string identifier (no parenthetical) for the debug API
+    /// JSON. Stable name — frontend can switch on this.
+    pub fn name(self) -> &'static str {
+        match self {
+            PresentMode::Foreground => "foreground",
+            PresentMode::VisibleBackground => "visible-background",
+            PresentMode::Hidden => "hidden",
+        }
+    }
+
+    /// Human-readable label for devlog messages.
+    fn label(self) -> &'static str {
+        match self {
+            PresentMode::Foreground => "foreground (full quality)",
+            PresentMode::VisibleBackground => "visible-background (no-drop)",
+            PresentMode::Hidden => "hidden (background)",
+        }
+    }
+    /// `wglSwapIntervalEXT` value for this mode. `1` vsync-locks the
+    /// next SwapBuffers to vblank; `0` returns immediately.
+    fn swap_interval(self) -> c_int {
+        match self {
+            PresentMode::Foreground | PresentMode::VisibleBackground => 1,
+            PresentMode::Hidden => 0,
+        }
+    }
+    /// Whether `mpv_render_context_report_swap` should fire after each
+    /// SwapBuffers. We lie to mpv about timing in Hidden mode because
+    /// the swap there isn't vsync-anchored to anything mpv can use.
+    fn report_swap(self) -> bool {
+        match self {
+            PresentMode::Foreground | PresentMode::VisibleBackground => true,
+            PresentMode::Hidden => false,
+        }
+    }
+    /// mpv `framedrop` property value. `vo` is mpv's default (drop late
+    /// frames at the renderer); `no` plays every decoded frame regardless
+    /// of timing — accepting drift to avoid drops.
+    fn framedrop(self) -> &'static [u8] {
+        match self {
+            PresentMode::Foreground => b"vo\0",
+            PresentMode::VisibleBackground | PresentMode::Hidden => b"no\0",
+        }
+    }
+}
+
+/// Determine the [`PresentMode`] from the parent window's current
+/// foreground / visibility state. Order matters: a foreground window IS
+/// always visible, so we check that first; only fall through to the
+/// non-foreground checks when foreground fails.
+unsafe fn detect_present_mode(parent: HWND) -> PresentMode {
+    if !is_parent_actually_visible(parent) {
+        return PresentMode::Hidden;
+    }
+    if is_parent_foreground(parent) {
+        return PresentMode::Foreground;
+    }
+    PresentMode::VisibleBackground
+}
+
+/// True when the parent IS the OS-level foreground window. Used in
+/// combination with [`is_parent_actually_visible`] to derive the
+/// three-state [`PresentMode`].
+unsafe fn is_parent_foreground(parent: HWND) -> bool {
+    let fg = GetForegroundWindow();
+    !fg.is_invalid() && fg == parent
 }
 
 /// True when our parent window is **actually visible** on screen — not
@@ -1247,6 +1388,76 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             b"libmpv\0".as_ptr() as *const c_char,
         );
 
+        // -- Initial playback options --
+        // Mirrors the legacy `player::init_mpv` set for the options that
+        // are decode/cache-stage (the render path differs: legacy uses
+        // `vo=gpu-next`, mpv2 must use `vo=libmpv` for the render-API
+        // contract — that's the only intentional divergence). Without
+        // `hwdec=auto` mpv defaults to software decode, which means
+        // 4K HEVC 10-bit playback bottlenecks the CPU and produces a
+        // steady VO drop pattern even in focused/visible mode. With
+        // hwdec=auto, NVDEC / D3D11VA / DXVA take over and the GPU
+        // handles the decode. The cache tuning matches the legacy
+        // path's "no 1-second stall on stream start" behaviour
+        // (cache-pause-initial=no, big demuxer-max-bytes, etc.) and
+        // the libavformat reconnect flags keep playback alive through
+        // transient HTTP errors from debrid hosts.
+        //
+        // Each value is a literal C string set BEFORE mpv_initialize
+        // so the option goes through mpv's "option" path rather than
+        // the runtime property path — same approach the legacy
+        // `MpvConfig.initial_options` plumbing uses internally.
+        // Failures are devlog'd at `warn` but never fatal: mpv may
+        // reject an unknown option on a future libmpv version without
+        // breaking the rest of init.
+        const INIT_OPTS: &[(&[u8], &[u8])] = &[
+            // GPU decode — the actual fix for the focused 4K HEVC drops.
+            (b"hwdec\0", b"auto\0"),
+            // Render-side defaults that match legacy gpu-next behaviour.
+            (b"keepaspect\0", b"yes\0"),
+            (b"background\0", b"none\0"),
+            // Keep the last frame around at EOF so EOS Spotlight /
+            // Replay can scrub backwards without reloading.
+            (b"keep-open\0", b"yes\0"),
+            (b"keep-open-pause\0", b"yes\0"),
+            // Streaming cache — 1.5 GiB forward / 256 MiB back; start
+            // playback immediately rather than waiting for the cache
+            // to pre-fill; re-buffer when the queue falls below 4 s.
+            (b"cache\0", b"yes\0"),
+            (b"cache-pause-initial\0", b"no\0"),
+            (b"cache-secs\0", b"180\0"),
+            (b"demuxer-readahead-secs\0", b"120\0"),
+            (b"demuxer-max-bytes\0", b"1610612736\0"),
+            (b"demuxer-max-back-bytes\0", b"268435456\0"),
+            (b"cache-pause-wait\0", b"4.0\0"),
+            (b"cache-pause\0", b"yes\0"),
+            (b"network-timeout\0", b"60\0"),
+            // libavformat HTTP resilience — reconnect on EOF / network
+            // errors with capped backoff. Without these, debrid hosts
+            // that close idle keep-alives mid-episode surface as a
+            // hard "End of file" stop.
+            (
+                b"demuxer-lavf-o\0",
+                b"reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=4\0",
+            ),
+        ];
+        for (name, value) in INIT_OPTS {
+            let r = (lib.set_property_string)(
+                handle,
+                name.as_ptr() as *const c_char,
+                value.as_ptr() as *const c_char,
+            );
+            if r < 0 {
+                crate::devlog!(
+                    warn, "mpv2",
+                    "init option {} = {} failed: {}",
+                    String::from_utf8_lossy(&name[..name.len().saturating_sub(1)]),
+                    String::from_utf8_lossy(&value[..value.len().saturating_sub(1)]),
+                    err_str(&lib, r),
+                );
+            }
+        }
+
         let ir = (lib.initialize)(handle);
         if ir < 0 {
             crate::devlog!(
@@ -1357,37 +1568,29 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 "wglSwapIntervalEXT not available — both modes will be timer-paced",
             );
         }
-        // `visible` here means "DWM is compositing us at normal cadence"
-        // — see `is_parent_actually_visible` for what that includes /
-        // excludes. The variable name `focused` is kept for code-locality
-        // with the existing focused/unfocused devlog messages even though
-        // the predicate has changed; user-visible behaviour is now
-        // "actually visible window stays in full-quality vsync mode".
-        let mut focused = is_parent_actually_visible(parent);
+        // Three-state present mode: see `PresentMode` doc for the full
+        // rationale. Foreground gets full-quality (vsync + report_swap +
+        // framedrop=vo); visible-but-not-foreground gets no-drop
+        // (vsync + report_swap + framedrop=no — DWM throttles
+        // non-foreground presents and mpv's default framedrop would
+        // see the slow swaps as "late frames" and drop them); hidden
+        // gets the background path (no vsync, no report_swap, no
+        // framedrop).
+        let mut mode = detect_present_mode(parent);
         if let Some(set_swap) = wgl_swap_interval {
-            let interval = if focused { 1 } else { 0 };
+            let interval = mode.swap_interval();
             let r = set_swap(interval);
             crate::devlog!(
                 info, "mpv2",
                 "wglSwapIntervalEXT({interval}) → {r} (nonzero = ok)",
             );
         }
-        // Initial framedrop policy mirrors the focus state. Helper
-        // re-applies it on every focus transition. The vo→no swap
-        // when unfocused is the actual off-focus-drop fix: mpv's
-        // default `framedrop=vo` drops video frames whose predicted
-        // present time would miss the next vsync, but our timer-paced
-        // unfocused mode reports "swaps happened at 60 Hz" while DWM
-        // throttles the real screen flip — the prediction model is
-        // built on misinformation and triggers spurious drops. With
-        // framedrop=no, late frames are still presented; the user
-        // sees the most-recent frame on return rather than artefacts
-        // of mpv's catch-up.
-        apply_framedrop_policy(&lib, handle, focused);
+        apply_framedrop_policy(&lib, handle, mode);
+        CURRENT_MODE.store(mode.as_u8(), Ordering::Release);
         crate::devlog!(
             info, "mpv2",
             "engine starting in {} present mode",
-            if focused { "vsync-blocked (focused)" } else { "timer-paced (unfocused)" },
+            mode.label(),
         );
 
         // -- Render loop --
@@ -1517,30 +1720,29 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 break;
             }
 
-            // Detect visibility transition and re-toggle vsync / framedrop
-            // policy. Visibility ≠ foreground: a window minimised to the
-            // tray, cloaked to another virtual desktop, or hidden flips
-            // to the background path. A window on a second monitor while
-            // the user works on the primary stays in full-quality mode.
-            let now_focused = is_parent_actually_visible(parent);
-            if now_focused != focused {
-                focused = now_focused;
+            // Detect mode transitions across all three states.
+            // Foreground → VisibleBackground happens on alt-tab to
+            // another monitor; VisibleBackground → Hidden happens on
+            // minimise / virtual-desktop switch; etc. Each switch
+            // re-applies the appropriate swap-interval + framedrop
+            // policy so playback is right for the new context.
+            let now_mode = detect_present_mode(parent);
+            if now_mode != mode {
+                mode = now_mode;
                 if let Some(set_swap) = wgl_swap_interval {
-                    let interval = if focused { 1 } else { 0 };
+                    let interval = mode.swap_interval();
                     let r = set_swap(interval);
                     crate::devlog!(
                         debug, "mpv2",
                         "wglSwapIntervalEXT({interval}) → {r}",
                     );
                 }
-                // Re-apply framedrop policy alongside vsync — `vo`
-                // (drop late frames) when focused, `no` (present all
-                // frames) when unfocused. See `apply_framedrop_policy`.
-                apply_framedrop_policy(&lib, handle, focused);
+                apply_framedrop_policy(&lib, handle, mode);
+                CURRENT_MODE.store(mode.as_u8(), Ordering::Release);
                 crate::devlog!(
                     info, "mpv2",
                     "engine present mode → {}",
-                    if focused { "vsync-blocked (focused)" } else { "timer-paced (unfocused)" },
+                    mode.label(),
                 );
             }
 
@@ -1642,14 +1844,18 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             // change) the engine plays every decoded frame in
             // unfocused mode rather than dropping ones it incorrectly
             // judges as "late".
-            if focused {
+            if mode.report_swap() {
                 (lib.render_context_report_swap)(rctx);
             }
 
-            // Pacing branch: focused mode is paced by SwapBuffers' vblank
-            // wait (swap-interval=1), so we move straight on. Unfocused
-            // mode sleeps until the next steady 60 Hz tick.
-            if !focused {
+            // Pacing branch:
+            //   * Foreground / VisibleBackground: SwapBuffers is the
+            //     clock (swap-interval=1 blocks on vblank — DWM-throttled
+            //     in the background case, vsync-locked in the foreground
+            //     case, either way we don't need to add our own sleep).
+            //   * Hidden: SwapBuffers returns immediately; sleep until
+            //     the next steady 60 Hz tick so the loop doesn't spin.
+            if matches!(mode, PresentMode::Hidden) {
                 let elapsed = frame_start.elapsed();
                 if elapsed < UNFOCUSED_FRAME {
                     thread::sleep(UNFOCUSED_FRAME - elapsed);
@@ -1669,6 +1875,9 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         (lib.terminate_destroy)(handle);
         teardown_wgl(hwnd, hdc, hglrc);
 
+        // Reset the published mode so debug callers see "not running"
+        // after teardown.
+        CURRENT_MODE.store(255, Ordering::Release);
         crate::devlog!(
             info, "mpv2",
             "engine torn down cleanly ({frame_count} mpv frame(s) rendered)",

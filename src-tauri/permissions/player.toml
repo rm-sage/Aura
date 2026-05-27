@@ -214,6 +214,17 @@ identifier = "allow-dev-tools"
 description = "Allows the frontend to invoke DevConsole-only debug commands (e.g. force-panic for Sentry verification)"
 commands.allow = ["dev_force_panic"]
 
+# ── Settings → Debug Stuff (engine + mpv diagnostics + drop-rate test) ─────
+# Surface live mpv2 engine state, the parent window's foreground / visibility
+# / cloak status, current mpv property snapshot (codec, hwdec, HDR/DV detection,
+# drop counters), and a timed drop-rate test the user runs to validate
+# off-focus-drop behaviour. Read-only / observation-only on the engine side;
+# the drop test only reads counters.
+[[permission]]
+identifier = "allow-debug-panel"
+description = "Allows the frontend Settings → Debug Stuff panel to read engine + mpv diagnostics and run drop-rate tests"
+commands.allow = ["debug_engine_state", "debug_drop_test"]
+
 # ── Aura Proxy v2: per-account cloud sync ──────────────────────────────────
 # Round-trips per-account state (settings, manual marks, queue, recent
 # searches, per-title preferences, AniList ID cache) through the
