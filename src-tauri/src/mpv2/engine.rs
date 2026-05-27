@@ -33,7 +33,7 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::mem::size_of;
 use std::ptr;
 use std::sync::{
-    atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
     mpsc::{self, Receiver, Sender, TryRecvError},
     Arc, Mutex, OnceLock,
 };
@@ -50,10 +50,10 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Graphics::OpenGL::{
-    glClear, glClearColor, glGetString, glViewport, wglCreateContext, wglDeleteContext,
-    wglGetProcAddress, wglMakeCurrent, ChoosePixelFormat, SetPixelFormat, SwapBuffers,
-    GL_COLOR_BUFFER_BIT, GL_RENDERER, GL_VERSION, HGLRC, PFD_DOUBLEBUFFER,
-    PFD_DRAW_TO_WINDOW, PFD_SUPPORT_OPENGL, PFD_TYPE_RGBA, PIXELFORMATDESCRIPTOR,
+    glGetString, glViewport, wglCreateContext, wglDeleteContext, wglGetProcAddress,
+    wglMakeCurrent, ChoosePixelFormat, SetPixelFormat, SwapBuffers, GL_RENDERER,
+    GL_VERSION, HGLRC, PFD_DOUBLEBUFFER, PFD_DRAW_TO_WINDOW, PFD_SUPPORT_OPENGL,
+    PFD_TYPE_RGBA, PIXELFORMATDESCRIPTOR,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -61,8 +61,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, IsIconic, IsWindow, IsWindowVisible,
     MsgWaitForMultipleObjects, PeekMessageW, RegisterClassW, SetWindowPos,
     TranslateMessage, CS_OWNDC, HWND_BOTTOM, MSG, PM_REMOVE, QS_ALLINPUT,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WINDOW_EX_STYLE, WM_PAINT, WM_SIZE,
-    WNDCLASSW, WS_CHILD, WS_VISIBLE,
+    SWP_DEFERERASE, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, WINDOW_EX_STYLE, WM_PAINT, WNDCLASSW, WS_CHILD, WS_VISIBLE,
 };
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 
@@ -464,14 +464,6 @@ const UNFOCUSED_FRAME: Duration = Duration::from_micros(16_667);
 /// timer-paced present modes.
 type WglSwapIntervalExtFn = unsafe extern "system" fn(interval: c_int) -> i32;
 
-/// HDC of the engine window, cached after [`wglMakeCurrent`] succeeds so
-/// the wndproc's resize-time fast-path can [`SwapBuffers`] without
-/// re-querying state out of [`run_engine`]'s locals. Zero when the engine
-/// isn't running. Safe because there's only one engine instance per
-/// process and the wndproc runs on the same thread that writes this
-/// value (the render thread).
-static ENGINE_HDC: AtomicIsize = AtomicIsize::new(0);
-
 /// Current [`PresentMode`] discriminant, published from the render thread
 /// on every mode transition. 255 = engine not running. Read by the debug
 /// Tauri commands so the Settings → Debug Stuff panel can show the live
@@ -484,52 +476,38 @@ pub fn current_present_mode() -> Option<PresentMode> {
     PresentMode::from_u8(CURRENT_MODE.load(Ordering::Acquire))
 }
 
-/// Engine wndproc. Two messages get explicit handling, everything else
-/// (including `WM_ERASEBKGND`) goes to the default handler so the class's
-/// teal background brush actually gets used to fill newly-exposed area
-/// during drag-resize.
+/// Engine wndproc. Only `WM_PAINT` is special-cased; everything else
+/// (including `WM_SIZE`, `WM_ERASEBKGND`, `WM_WINDOWPOSCHANGED`) goes to
+/// the default handler. The render thread polls the parent's client rect
+/// every tick and `SetWindowPos`-es itself when the parent has moved,
+/// driving its own resize — the wndproc doesn't need a fast-path because
+/// the render thread is already the source of geometry change.
 ///
 /// * `WM_PAINT` → BeginPaint / EndPaint with no GDI work, return 0. The
 ///   actual painting is the render thread's continuous SwapBuffers; this
 ///   only validates the paint rect so Windows doesn't immediately re-fire
 ///   WM_PAINT.
-/// * `WM_SIZE` → synchronously glClear + SwapBuffers at the new size. The
-///   GL context is current on this thread (wndproc runs on the window's
-///   owning thread = render thread), and the next regular render tick
-///   would arrive up to ~16 ms later — fast enough to feel laggy under a
-///   drag-resize. Doing the clear inline closes the gap.
+///
+/// Phase 2.2 ran an inline `glClear` + `SwapBuffers` from `WM_SIZE` to
+/// close the latency window during drag-resize, but the glClear's teal
+/// fill WAS the visible cyan flicker — every cross-thread `SetWindowPos`
+/// caused a one-frame teal flash before the next render tick painted the
+/// real frame. Removed in Phase 5 in favour of engine-driven resize +
+/// black class brush; stale content for ≤16 ms is preferable to a teal
+/// blink.
 unsafe extern "system" fn engine_wndproc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    match msg {
-        WM_PAINT => {
-            let mut ps: PAINTSTRUCT = std::mem::zeroed();
-            let _ = BeginPaint(hwnd, &mut ps);
-            let _ = EndPaint(hwnd, &ps);
-            LRESULT(0)
-        }
-        WM_SIZE => {
-            let raw_hdc = ENGINE_HDC.load(Ordering::Acquire);
-            if raw_hdc != 0 {
-                // WM_SIZE's lparam packs the new client size: low 16 bits
-                // = width, next 16 bits = height. Both unsigned 16-bit, so
-                // they fit in i32 without sign concerns.
-                let cw = (lparam.0 & 0xFFFF) as i32;
-                let ch = ((lparam.0 >> 16) & 0xFFFF) as i32;
-                if cw > 0 && ch > 0 {
-                    glViewport(0, 0, cw, ch);
-                    glClearColor(0.04, 0.45, 0.50, 1.0);
-                    glClear(GL_COLOR_BUFFER_BIT);
-                    let _ = SwapBuffers(HDC(raw_hdc as *mut c_void));
-                }
-            }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    if msg == WM_PAINT {
+        let mut ps: PAINTSTRUCT = std::mem::zeroed();
+        let _ = BeginPaint(hwnd, &mut ps);
+        let _ = EndPaint(hwnd, &ps);
+        return LRESULT(0);
     }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
 /// Two-tier `get_proc_address` for `mpv_opengl_init_params`: try
@@ -1231,40 +1209,27 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         };
         let hinstance = HINSTANCE(hmodule.0);
 
-        // Background brush filled with the engine's "alive" teal — the
-        // SAME colour the render thread `glClear`s to every frame. With
-        // this set on the class, DefWindowProc handles WM_ERASEBKGND by
-        // GDI-filling the dirty area, AND if a non-GL paint cycle ever
-        // sneaks in the area shows teal instead of the parent's
-        // transparent backdrop. The brush is leaked for process lifetime
-        // (one allocation per process; matches the once-per-process
-        // RegisterClassW semantics below).
+        // Background brush filled with black. DefWindowProc uses this for
+        // WM_ERASEBKGND, so any GDI fill that happens between a resize and
+        // the next render-tick SwapBuffers shows black — matching mpv's
+        // letterbox / idle colour, perceptually invisible against video
+        // content. Phase 2.2 used a teal brush as a "render thread is
+        // alive" signal; that bled through as cyan flicker during
+        // drag-resize on every cross-thread SetWindowPos because the
+        // brush would paint AND the WM_SIZE handler would do an explicit
+        // teal glClear. Black brush + WM_SIZE pass-through (see
+        // [`engine_wndproc`]) + engine-driven per-frame resize (below) is
+        // Phase 5's resolution.
         //
-        // KNOWN LIMITATION (deferred to Phase 5+): this does NOT fix
-        // drag-resize flicker. Tested 2026-05-26 — the teal-↔-black
-        // flicker during drag-resize persists even with the class brush,
-        // because the gap is DWM compositor latency between the OS
-        // committing the child's new screen rect and the next vblank
-        // pulling our SwapBuffers result. Cannot be closed from the
-        // wndproc; the canonical fix involves either (a) owning the
-        // `SetWindowPos` path so it can be deferred with
-        // SWP_DEFERERASE | SWP_NOREDRAW until our render is queued, or
-        // (b) moving to a D3D11 swap-chain whose Present is DWM-atomic.
-        // Both are out-of-scope for Phase 2 — they belong in Phase 5
-        // (`win32::resize_mpv_child_to_parent` ownership port) and the
-        // Phase 6 regression gate against the v0.8.0 baseline. Single-
-        // shot resizes (maximize / restore) are NOT affected because the
-        // single SetWindowPos completes inside one DWM frame.
-        //
-        // COLORREF is 0x00BBGGRR. Our glClear colour (0.04, 0.45, 0.50)
-        // ≈ (10, 115, 128) RGB, which is 0x00807310 in BGR.
-        let teal_brush = CreateSolidBrush(COLORREF(0x0080_730A));
+        // The brush is leaked for process lifetime — one allocation per
+        // process, matches the once-per-process RegisterClassW semantics.
+        let black_brush = CreateSolidBrush(COLORREF(0));
         let wc = WNDCLASSW {
             style: CS_OWNDC,
             lpfnWndProc: Some(engine_wndproc),
             hInstance: hinstance,
             lpszClassName: CLASS_NAME,
-            hbrBackground: teal_brush,
+            hbrBackground: black_brush,
             ..Default::default()
         };
         if RegisterClassW(&wc) == 0 {
@@ -1361,9 +1326,6 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             let _ = DestroyWindow(hwnd);
             return;
         }
-        // Publish the HDC so the wndproc's resize-time fast-path can swap.
-        // Cleared by `teardown_wgl` before the HDC is released.
-        ENGINE_HDC.store(hdc.0 as isize, Ordering::Release);
         crate::devlog!(
             info, "mpv2",
             "WGL context current — GL_VERSION='{}', GL_RENDERER='{}'",
@@ -1618,7 +1580,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         // really about, so we react inside one frame of the change).
         let mut frame_count: u64 = 0;
         let mut shutting_down = false;
-        let last_geom = (init_x, init_y, init_w, init_h);
+        let mut last_geom = (init_x, init_y, init_w, init_h);
         loop {
             let frame_start = Instant::now();
 
@@ -1759,28 +1721,59 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 );
             }
 
-            // Resize sync is intentionally NOT done from this thread.
-            // `win32::resize_mpv_child_to_parent` (driven by Tauri's
-            // Focused / Resized window events on the main thread) already
-            // enumerates non-WebView2 children and resizes them; the
-            // engine's class name passes that filter so our window tracks
-            // the parent client area automatically. Doing SetWindowPos
-            // here from a worker thread carries a cross-thread Win32
-            // hazard: SetWindowPos on a child can route notifications
-            // through the parent's owning thread, and if the parent
-            // thread is ever blocked (e.g. waiting on this engine to
-            // join during shutdown) the call deadlocks. Reading the
-            // size for the GL viewport is fine — that's pure local
-            // state read on our own HWND.
-            let mut rc = RECT::default();
-            let (cw, ch) = if GetClientRect(hwnd, &mut rc).is_ok()
-                && rc.right > rc.left
-                && rc.bottom > rc.top
+            // Phase 5 — engine owns its resize. Poll the PARENT's client
+            // rect every tick; if our cached geometry differs, SetWindowPos
+            // ourselves to match. Same-thread `SetWindowPos` on our own
+            // HWND invokes our wndproc inline (no cross-thread message),
+            // so this is cheap and deadlock-free.
+            //
+            // Driving resize from the render thread (vs. the old path of
+            // Tauri's onResized → `refresh_video` → `EnumChildWindows` +
+            // `SetWindowPos` on the main thread) closes two latencies:
+            // the JS round-trip and the cross-thread SendMessage to our
+            // wndproc. During a drag-resize the engine reacts within one
+            // render tick (~16 ms) instead of however long the JS hop
+            // takes, which kills the visible stale-frame gap.
+            //
+            // `SWP_NOCOPYBITS | SWP_DEFERERASE` suppresses GDI's bitblt
+            // copy + WM_ERASEBKGND fill — both produce visible frame
+            // artifacts when the next render tick is about to overwrite
+            // the surface anyway.
+            let y_off = if crate::win32::is_in_native_fullscreen() {
+                0
+            } else {
+                TITLE_BAR_H
+            };
+            let mut parent_rc = RECT::default();
+            let (target_w, target_h) = if GetClientRect(parent, &mut parent_rc).is_ok()
+                && parent_rc.right > parent_rc.left
+                && parent_rc.bottom > parent_rc.top
             {
-                (rc.right - rc.left, rc.bottom - rc.top)
+                let pw = parent_rc.right - parent_rc.left;
+                let ph = (parent_rc.bottom - parent_rc.top - y_off).max(1);
+                (pw, ph)
             } else {
                 (last_geom.2, last_geom.3)
             };
+            let target_geom = (0, y_off, target_w, target_h);
+            if target_geom != last_geom {
+                if let Err(e) = SetWindowPos(
+                    hwnd,
+                    None,
+                    target_geom.0,
+                    target_geom.1,
+                    target_geom.2,
+                    target_geom.3,
+                    SWP_NOZORDER
+                        | SWP_NOACTIVATE
+                        | SWP_NOCOPYBITS
+                        | SWP_DEFERERASE,
+                ) {
+                    crate::devlog!(warn, "mpv2", "self SetWindowPos failed: {e}");
+                }
+                last_geom = target_geom;
+            }
+            let (cw, ch) = (target_w, target_h);
 
             glViewport(0, 0, cw, ch);
 
@@ -1903,10 +1896,6 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
 /// "context-not-current" branch, so the early-exit call sites can use it
 /// without first un-currenting anything.
 unsafe fn teardown_wgl(hwnd: HWND, hdc: HDC, hglrc: HGLRC) {
-    // Clear the cached HDC first so the wndproc's WM_SIZE fast-path
-    // (which may still fire during DestroyWindow's parent-notify cascade)
-    // can't reach a freed DC. A zero load makes the fast-path a no-op.
-    ENGINE_HDC.store(0, Ordering::Release);
     let _ = wglMakeCurrent(HDC::default(), HGLRC::default());
     let _ = wglDeleteContext(hglrc);
     ReleaseDC(Some(hwnd), hdc);

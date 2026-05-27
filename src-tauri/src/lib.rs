@@ -812,9 +812,12 @@ async fn refresh_video(
     #[cfg(target_os = "windows")]
     if mpv2::engine::enabled() && mpv2::engine::is_running() {
         use mpv2::engine::PropValue;
-        if parent_hwnd != 0 {
-            win32::resize_mpv_child_to_parent(parent_hwnd, title_bar_h);
-        }
+        // Phase 5: the engine owns its own resize via per-frame parent-
+        // rect tracking, so we don't need to drive SetWindowPos from
+        // here. `title_bar_h` is still computed for the legacy path
+        // below; the engine reads `win32::is_in_native_fullscreen()`
+        // itself on every tick.
+        let _ = (parent_hwnd, title_bar_h);
         // The video-zoom toggle is mpv's documented "force a re-render"
         // trick — the same two-step the legacy path uses.
         let _ = mpv2::engine::submit_set_property(
@@ -1370,17 +1373,24 @@ async fn set_native_fullscreen(
         .map_err(|e| e.to_string())?;
 
         let p = parent_hwnd;
+        let engine_active = mpv2::engine::enabled() && mpv2::engine::is_running();
         tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
             if enabled {
                 win32::enter_native_fullscreen(p)?;
                 // After the parent restyle, snap the MPV child to the
                 // freshly-resized client area so the video covers the
-                // whole monitor (not just the previous windowed bounds).
-                win32::resize_mpv_child_to_parent(p, 0);
+                // whole monitor. The mpv2 engine handles this itself via
+                // per-frame parent-rect tracking (Phase 5); only the
+                // legacy `--wid` path needs the explicit call.
+                if !engine_active {
+                    win32::resize_mpv_child_to_parent(p, 0);
+                }
             } else {
                 win32::exit_native_fullscreen(p)?;
                 // Title bar comes back on exit; keep the 36 px offset.
-                win32::resize_mpv_child_to_parent(p, 36);
+                if !engine_active {
+                    win32::resize_mpv_child_to_parent(p, 36);
+                }
             }
             Ok(())
         })

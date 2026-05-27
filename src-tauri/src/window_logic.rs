@@ -381,15 +381,23 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
             WindowEvent::Focused(true) => {
                 #[cfg(target_os = "windows")]
                 {
-                    let parent_hwnd: isize =
-                        win.hwnd().ok().map(|h| h.0 as isize).unwrap_or(0);
-                    if parent_hwnd != 0 {
-                        let y_offset = if crate::win32::is_in_native_fullscreen() {
-                            0
-                        } else {
-                            36
-                        };
-                        crate::win32::resize_mpv_child_to_parent(parent_hwnd, y_offset);
+                    // Skip when the mpv2 engine is running — it tracks
+                    // the parent's client rect every render tick and
+                    // SetWindowPos-es itself, so no Tauri-driven
+                    // backstop is needed (Phase 5).
+                    let engine_active = crate::mpv2::engine::enabled()
+                        && crate::mpv2::engine::is_running();
+                    if !engine_active {
+                        let parent_hwnd: isize =
+                            win.hwnd().ok().map(|h| h.0 as isize).unwrap_or(0);
+                        if parent_hwnd != 0 {
+                            let y_offset = if crate::win32::is_in_native_fullscreen() {
+                                0
+                            } else {
+                                36
+                            };
+                            crate::win32::resize_mpv_child_to_parent(parent_hwnd, y_offset);
+                        }
                     }
                 }
             }
@@ -432,13 +440,17 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                 }
                 #[cfg(target_os = "windows")]
                 {
-                    let parent_hwnd: isize = win.hwnd().ok().map(|h| h.0 as isize).unwrap_or(0);
-                    if parent_hwnd != 0 {
-                        // y_offset = 0 in fullscreen (we sit at monitor top
-                        // and the title bar is unmounted), 36 windowed
-                        // (TitleBar component height).
-                        let y_offset = if crate::win32::is_in_native_fullscreen() { 0 } else { 36 };
-                        crate::win32::resize_mpv_child_to_parent(parent_hwnd, y_offset);
+                    let engine_active = crate::mpv2::engine::enabled()
+                        && crate::mpv2::engine::is_running();
+                    if !engine_active {
+                        let parent_hwnd: isize = win.hwnd().ok().map(|h| h.0 as isize).unwrap_or(0);
+                        if parent_hwnd != 0 {
+                            // y_offset = 0 in fullscreen (we sit at monitor top
+                            // and the title bar is unmounted), 36 windowed
+                            // (TitleBar component height).
+                            let y_offset = if crate::win32::is_in_native_fullscreen() { 0 } else { 36 };
+                            crate::win32::resize_mpv_child_to_parent(parent_hwnd, y_offset);
+                        }
                     }
                 }
             }
