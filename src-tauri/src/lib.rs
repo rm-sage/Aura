@@ -2381,6 +2381,7 @@ pub fn run() {
             dev_force_panic,
             debug_panel::debug_engine_state,
             debug_panel::debug_drop_test,
+            debug_panel::debug_load_test_pattern,
             get_tracks,
             get_property,
             refresh_video,

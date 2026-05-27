@@ -2220,12 +2220,13 @@ function formatAgo(diffMs: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Debug Stuff — engine + mpv diagnostics + off-focus drop-rate test.
+// Debug Panel — engine + mpv diagnostics + off-focus drop-rate test.
 //
-// Intentionally NOT registered in TOC_GROUPS — the section is here for
-// power-user diagnostics, not part of the navigable settings hierarchy.
-// Sits at the very bottom of the page so it doesn't interrupt the
-// scrollspy walk over the actual settings groups.
+// Surfaced as a modal overlay opened from a button in the About section
+// rather than a Settings section. It's a diagnostic tool, not a setting,
+// and the modal pattern means the test runner can load a synthetic test
+// pattern + manage its own playback lifecycle without the user needing
+// to set up a stream and navigate back to Settings to run the test.
 // ---------------------------------------------------------------------------
 
 interface DebugEngineSnapshot {
@@ -2287,7 +2288,7 @@ interface DropTestResult {
   verdict: "clean" | "minor" | "drops";
 }
 
-function DebugStuffSection() {
+function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [snap, setSnap] = useState<DebugEngineSnapshot | null>(null);
   const [snapError, setSnapError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
@@ -2295,11 +2296,12 @@ function DebugStuffSection() {
   const [result, setResult] = useState<DropTestResult | null>(null);
   const [testError, setTestError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [loadingPattern, setLoadingPattern] = useState(false);
 
-  // Live 1 Hz polling of the engine snapshot. The Tauri command is
-  // synchronous and read-only (only touches an atomic + a handful of
-  // get_property reads), so per-second polling is essentially free.
+  // Live 1 Hz polling of the engine snapshot. Only polls while the
+  // overlay is open — closing the overlay tears down the interval.
   useEffect(() => {
+    if (!open) return;
     let cancelled = false;
     const tick = () => {
       invoke<DebugEngineSnapshot>("debug_engine_state")
@@ -2319,6 +2321,33 @@ function DebugStuffSection() {
       cancelled = true;
       clearInterval(h);
     };
+  }, [open]);
+
+  // Esc closes the overlay; backdrop click closes too (the click
+  // handler on the wrapper div). Both routes share the same path so
+  // playback can keep running if it was loaded by the test.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !running) {
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, running, onClose]);
+
+  const loadPattern = useCallback(async () => {
+    setLoadingPattern(true);
+    setTestError(null);
+    try {
+      await invoke("debug_load_test_pattern");
+    } catch (e) {
+      setTestError(`Load test pattern failed: ${String(e)}`);
+    } finally {
+      setLoadingPattern(false);
+    }
   }, []);
 
   const runTest = useCallback(async () => {
@@ -2326,6 +2355,18 @@ function DebugStuffSection() {
     setResult(null);
     setTestError(null);
     try {
+      // If nothing is currently playing, auto-load the synthetic test
+      // pattern so the user doesn't have to set up a stream first.
+      // Detection: paused === undefined means no file loaded;
+      // paused === true/false means a file is loaded (even if paused).
+      const needsPattern = snap?.mpv?.paused === undefined ||
+        snap?.mpv?.paused === null;
+      if (needsPattern) {
+        await invoke("debug_load_test_pattern");
+        // Give mpv a moment to start decoding the pattern before
+        // sampling drop counters.
+        await new Promise((r) => setTimeout(r, 800));
+      }
       const r = await invoke<DropTestResult>("debug_drop_test", {
         durationSecs: duration,
       });
@@ -2335,7 +2376,7 @@ function DebugStuffSection() {
     } finally {
       setRunning(false);
     }
-  }, [duration]);
+  }, [duration, snap]);
 
   const copyDump = useCallback(async () => {
     const blob = JSON.stringify(
@@ -2358,17 +2399,47 @@ function DebugStuffSection() {
     }
   }, [snap, result]);
 
-  return (
-    <Section title="Debug Stuff">
-      <p className="text-white/55 text-xs leading-relaxed">
-        Diagnostic surface for the mpv2 render-API engine. Not part of the
-        Settings table of contents. Live state refreshes once per second; the
-        drop-rate test reads mpv's own counters at the start and end of a
-        timed window so you can correlate drops with the engine's
-        foreground / visible-background / hidden mode.
-      </p>
+  if (!open) return null;
 
-      <div className="h-px bg-white/6" />
+  return (
+    <div
+      className="fixed inset-0 z-[9000] flex items-center justify-center
+                 bg-black/65 backdrop-blur-md
+                 animate-[settings-fade-in_140ms_ease-out]"
+      onClick={() => { if (!running) onClose(); }}
+    >
+      <div
+        className="w-[min(720px,calc(100vw-48px))]
+                   max-h-[calc(100vh-48px)] overflow-y-auto
+                   bg-[#0d1117]/96 border border-white/15 rounded-2xl
+                   shadow-glass-edge px-6 py-5 space-y-5"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between">
+          <h2 className="text-white/95 text-[15px] font-semibold tracking-wide">
+            Debug Panel
+          </h2>
+          <button
+            type="button"
+            onClick={() => { if (!running) onClose(); }}
+            disabled={running}
+            className="text-white/45 hover:text-white/85 text-[13px]
+                       disabled:opacity-30 disabled:cursor-default
+                       transition-colors"
+            aria-label="Close"
+          >
+            ✕
+          </button>
+        </div>
+
+        <p className="text-white/55 text-xs leading-relaxed">
+          Diagnostic surface for the mpv2 render-API engine. Live state
+          refreshes once per second; the drop-rate test reads mpv's own
+          counters at the start and end of a timed window. If nothing is
+          playing when you click Run, the test auto-loads a synthetic
+          SMPTE-bars pattern via mpv's lavfi source so you don't have
+          to set up a stream first.
+        </p>
 
       {/* Engine + window */}
       <div>
@@ -2476,13 +2547,15 @@ function DebugStuffSection() {
           Off-focus drop test
         </p>
         <p className="text-white/55 text-[12px] leading-relaxed">
-          Start a stream playing. Click <span className="text-white/80">Run test</span>,
-          then move Aura to the state you want to measure (alt-tab away, drag
-          to another monitor, minimise, etc.) and leave it there until the
-          timer expires. The result captures total drops and rate over the
-          window, plus the present-mode at start and end.
+          Click <span className="text-white/80">Run test</span> — if nothing
+          is playing, a synthetic SMPTE-bars pattern auto-loads via mpv's
+          lavfi source (no file, no network). Then move Aura to the state
+          you want to measure (alt-tab away, drag to another monitor,
+          minimise, etc.) and leave it there until the timer expires. The
+          result captures total drops and rate over the window, plus the
+          present-mode at start and end.
         </p>
-        <div className="mt-3 flex items-center gap-3">
+        <div className="mt-3 flex items-center gap-3 flex-wrap">
           <label className="text-white/55 text-[12px]">Duration</label>
           <select
             className="bg-white/5 border border-white/12 rounded-md px-2 py-1 text-[12.5px] text-white/90"
@@ -2508,6 +2581,19 @@ function DebugStuffSection() {
                        transition-colors"
           >
             {running ? `Running… (${duration}s)` : "Run test"}
+          </button>
+          <button
+            type="button"
+            onClick={loadPattern}
+            disabled={running || loadingPattern || !snap?.engine.mpv2_running}
+            className="px-3 py-1 rounded-md bg-white/6 hover:bg-white/10 active:bg-white/14
+                       border border-white/15 text-white/80
+                       text-[12px]
+                       disabled:opacity-50 disabled:cursor-default
+                       transition-colors"
+            title="Load the SMPTE-bars test pattern without running the drop test"
+          >
+            {loadingPattern ? "Loading…" : "Load test pattern"}
           </button>
         </div>
 
@@ -2564,7 +2650,8 @@ function DebugStuffSection() {
           {copied ? "Copied" : "Copy diagnostic dump"}
         </button>
       </div>
-    </Section>
+      </div>{/* /panel */}
+    </div>
   );
 }
 
@@ -2594,6 +2681,7 @@ function fmtFps(n: number | null | undefined): string {
 
 function AboutSection({ addonCount }: { addonCount: number }) {
   const [stats, setStats] = useState<AuraStats | null>(null);
+  const [debugOpen, setDebugOpen] = useState(false);
   useEffect(() => {
     invoke<AuraStats>("get_stats").then(setStats).catch(() => {});
   }, []);
@@ -2638,6 +2726,30 @@ function AboutSection({ addonCount }: { addonCount: number }) {
           />
         </div>
       </div>
+
+      <div className="h-px bg-white/6" />
+
+      {/* Debug panel — a one-button entry point to the diagnostic
+          overlay. Lives under About (not in the TOC) because it's a
+          tool, not a setting. The overlay manages its own playback
+          test lifecycle so the user doesn't need to set up a stream
+          to run the drop-rate test. */}
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-white/55 text-[12px] leading-relaxed">
+          Engine + mpv diagnostics and an off-focus drop-rate test
+          with a built-in test pattern.
+        </p>
+        <button
+          type="button"
+          onClick={() => setDebugOpen(true)}
+          className="shrink-0 px-3 py-1 rounded-md bg-white/8 hover:bg-white/12 active:bg-white/16
+                     border border-white/15 text-white/85 text-[12.5px]
+                     transition-colors"
+        >
+          Open Debug Panel
+        </button>
+      </div>
+      <DebugOverlay open={debugOpen} onClose={() => setDebugOpen(false)} />
     </Section>
   );
 }
@@ -5062,14 +5174,12 @@ export default function SettingsView({ addons, session }: Props) {
             />
           )}
 
-          {/* About */}
+          {/* About — also hosts the Debug Panel button (overlay
+              modal). Debug surfaced via About-button instead of its
+              own page section because it's a diagnostic tool, not a
+              setting; the modal also manages its own playback test
+              lifecycle so the user doesn't need a stream loaded. */}
           <AboutSection addonCount={addons.length} />
-
-          {/* Debug Stuff — engine + mpv diagnostics + drop-rate test.
-              Deliberately NOT registered in TOC_GROUPS so it doesn't
-              appear in the sidebar navigation; only reachable by
-              scrolling to the bottom of the page. */}
-          <DebugStuffSection />
           </div>{/* /content column */}
 
           {/* Mirror of the TOC width — empty third column. Keeps the

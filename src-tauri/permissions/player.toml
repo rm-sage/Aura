@@ -223,7 +223,7 @@ commands.allow = ["dev_force_panic"]
 [[permission]]
 identifier = "allow-debug-panel"
 description = "Allows the frontend Settings → Debug Stuff panel to read engine + mpv diagnostics and run drop-rate tests"
-commands.allow = ["debug_engine_state", "debug_drop_test"]
+commands.allow = ["debug_engine_state", "debug_drop_test", "debug_load_test_pattern"]
 
 # ── Aura Proxy v2: per-account cloud sync ──────────────────────────────────
 # Round-trips per-account state (settings, manual marks, queue, recent
