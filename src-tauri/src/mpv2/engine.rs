@@ -172,8 +172,21 @@ fn engine_slot() -> &'static Mutex<Option<EngineHandle>> {
 pub const ENV_VAR: &str = "AURA_MPV2";
 
 /// Whether the master env-var gate is set this process.
+///
+/// Truthiness mirrors the unix convention: any value that parses to
+/// "yes" wins. Treats the variable as DISABLED when it's unset OR when
+/// it's set to one of `""`, `0`, `false`, `off`, `no` (case-insensitive,
+/// trimmed). This matches what users intuitively expect when they
+/// `$env:AURA_MPV2=0` to turn the engine off — earlier the gate was a
+/// raw `var_os(...).is_some()` which marked `0` as "set" → "enabled",
+/// silently skipping the legacy `--wid` init while the user thought
+/// they were turning the engine off.
 pub fn enabled() -> bool {
-    std::env::var_os(ENV_VAR).is_some()
+    let Ok(raw) = std::env::var(ENV_VAR) else {
+        return false;
+    };
+    let v = raw.trim().to_ascii_lowercase();
+    !v.is_empty() && !matches!(v.as_str(), "0" | "false" | "off" | "no")
 }
 
 /// Whether the engine thread is currently running. Tauri command handlers

@@ -2342,11 +2342,26 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
     setLoadingPattern(true);
     setTestError(null);
     try {
+      // Stop whatever's currently playing first. mpv's loadfile-replace
+      // already swaps files, but the user reported repeated loads
+      // appearing to "stack and brighten" — likely a render-context
+      // state quirk on rapid re-load. An explicit stop in between is
+      // free insurance and makes each Load click idempotent.
+      try { await invoke("debug_stop_playback"); } catch {}
       await invoke("debug_load_test_pattern");
     } catch (e) {
       setTestError(`Load test pattern failed: ${String(e)}`);
     } finally {
       setLoadingPattern(false);
+    }
+  }, []);
+
+  const stopPlayback = useCallback(async () => {
+    setTestError(null);
+    try {
+      await invoke("debug_stop_playback");
+    } catch (e) {
+      setTestError(`Stop playback failed: ${String(e)}`);
     }
   }, []);
 
@@ -2594,6 +2609,19 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
             title="Load the SMPTE-bars test pattern without running the drop test"
           >
             {loadingPattern ? "Loading…" : "Load test pattern"}
+          </button>
+          <button
+            type="button"
+            onClick={stopPlayback}
+            disabled={running || !snap?.engine.mpv2_running}
+            className="px-3 py-1 rounded-md bg-white/6 hover:bg-white/10 active:bg-white/14
+                       border border-white/15 text-white/80
+                       text-[12px]
+                       disabled:opacity-50 disabled:cursor-default
+                       transition-colors"
+            title="Unload whatever is currently playing in the engine"
+          >
+            Stop playback
           </button>
         </div>
 

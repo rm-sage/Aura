@@ -2075,7 +2075,20 @@ pub fn run() {
             // shipped --wid playback engine above is untouched either way.
             #[cfg(target_os = "windows")]
             {
-                mpv2::hello::run_if_requested();
+                // CRITICAL: hello-world and the long-lived engine MUST NOT
+                // both spawn in the same process. Each opens its own
+                // libmpv handle + GL context against the SAME WGL ICD,
+                // and the two unsynchronised render contexts collide in
+                // libmpv's internal state — observed as a
+                // STATUS_ACCESS_VIOLATION a few seconds after launch
+                // when the user had `AURA_MPV2_HELLO` left set from an
+                // earlier verification session AND newly set
+                // `AURA_MPV2=1`. The hello-world artifact is opt-in
+                // verification scaffolding (Phase 1) — when the engine
+                // is enabled it's strictly redundant. Skip it.
+                if !mpv2::engine::enabled() {
+                    mpv2::hello::run_if_requested();
+                }
                 // Phase 2.2 long-lived engine. Independent opt-in via
                 // AURA_MPV2_ENGINE; the legacy --wid engine above is still
                 // the one driving playback until Phase 2.4 ports loadfile.
@@ -2382,6 +2395,7 @@ pub fn run() {
             debug_panel::debug_engine_state,
             debug_panel::debug_drop_test,
             debug_panel::debug_load_test_pattern,
+            debug_panel::debug_stop_playback,
             get_tracks,
             get_property,
             refresh_video,

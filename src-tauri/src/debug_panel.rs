@@ -225,6 +225,29 @@ pub async fn debug_load_test_pattern() -> Result<(), String> {
     }
 }
 
+/// Unload whatever is currently playing in the mpv2 engine. Mirrors
+/// the `stop_video` Tauri command but bypasses its scope for the
+/// debug panel — the panel needs to remove the test pattern without
+/// disturbing the rest of the player UI state. Uses `mpv_command
+/// ["stop"]` which discards the loaded file and returns the engine
+/// to idle (with the last frame held thanks to `keep-open=yes`, until
+/// the next `loadfile` replaces it).
+#[tauri::command]
+pub fn debug_stop_playback() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use crate::mpv2::engine::{enabled as engine_enabled, is_running, submit_command};
+        if !engine_enabled() || !is_running() {
+            return Err("debug_stop_playback: mpv2 engine not running.".into());
+        }
+        submit_command(vec!["stop".into()])
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("debug_stop_playback: not implemented on non-Windows builds".into())
+    }
+}
+
 /// Run a timed drop-rate test. Reads `frame-drop-count` and
 /// `decoder-frame-drop-count` at start, awaits `duration_secs`
 /// (clamped 3..=60), reads them again, returns deltas + rates.
