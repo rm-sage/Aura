@@ -405,15 +405,31 @@ struct WireCatalogEntry {
 
 #[derive(Deserialize)]
 struct CatalogResponse {
+    /// Raw per-meta values; deserialised one-by-one in `fetch_catalog`
+    /// so a single malformed item doesn't poison the whole payload.
+    /// AniList / MAL catalogs occasionally surface entries that fail the
+    /// strict `id`/`type`/`name` requirement on `WireMeta` (numeric id
+    /// types, missing fields, etc.) — pre-this-refactor that wiped the
+    /// entire catalog with a top-level "error decoding response body".
     #[serde(default)]
-    metas: Vec<WireMeta>,
+    metas: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
 struct WireMeta {
+    /// Required. The Stremio addon spec mandates an id on every meta;
+    /// we drop the row if it's missing or empty.
     id: String,
-    #[serde(rename = "type")]
+    /// Required by the spec, but some community addons (AniList /
+    /// MAL-backed catalogs in particular) occasionally emit metas
+    /// without a `type` field — we default to empty and let downstream
+    /// resolve via id-prefix.
+    #[serde(rename = "type", default)]
     media_type: String,
+    /// Required by spec; default to empty so the catalog still renders
+    /// the entry and downstream code can detect "no title" gracefully
+    /// rather than wiping the whole payload.
+    #[serde(default)]
     name: String,
     poster: Option<String>,
     background: Option<String>,
@@ -825,6 +841,30 @@ fn sanitize_url(url: Option<String>) -> Option<String> {
 
 fn cap(s: String, max: usize) -> String {
     if s.chars().count() <= max { s } else { s.chars().take(max).collect() }
+}
+
+/// Per-item-tolerant deserialiser. Returns the items that parse cleanly
+/// AND have a non-empty id; counts the ones that failed for the caller's
+/// log line. Used by every catalog / search call site so a single
+/// malformed meta entry can't blank out an entire payload. Spec-violating
+/// entries (numeric ids, missing `type`/`name`) are logged at the call
+/// site but never crash the response.
+fn parse_meta_array(raw: Vec<serde_json::Value>) -> (Vec<WireMeta>, usize, Vec<String>) {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut dropped = 0usize;
+    let mut errors = Vec::new();
+    for value in raw {
+        match serde_json::from_value::<WireMeta>(value.clone()) {
+            Ok(m) if !m.id.is_empty() => out.push(m),
+            Ok(_) => { dropped += 1; errors.push("empty id".to_string()); }
+            Err(e) => {
+                dropped += 1;
+                let preview: String = value.to_string().chars().take(160).collect();
+                errors.push(format!("{e} (raw: {preview})"));
+            }
+        }
+    }
+    (out, dropped, errors)
 }
 
 /// Clamp all text fields to safe lengths and strip dangerous poster URLs.
@@ -1487,18 +1527,27 @@ pub async fn fetch_catalog(
         }
     };
 
-    let total = response.metas.len();
-    let metas: Vec<_> = match limit {
+    let total_raw = response.metas.len();
+    let raw_metas: Vec<_> = match limit {
         Some(n) => response.metas.into_iter().take(n as usize).collect(),
         None    => response.metas,
     };
+    let (metas, dropped, errors) = parse_meta_array(raw_metas);
+    for err in errors.iter().take(3) {
+        crate::devlog!(
+            warn, "catalog",
+            "[{}] {}/{} skipped malformed meta: {}",
+            label, catalog_type, catalog_id, err,
+        );
+    }
     let kept = metas.len();
     crate::devlog!(
         info, "catalog",
-        "[{}] {}/{} skip={} → {} item(s){}",
+        "[{}] {}/{} skip={} → {} item(s){}{}",
         label, catalog_type, catalog_id,
         skip.unwrap_or(0), kept,
-        if kept != total { format!(" (sliced from {total})") } else { String::new() },
+        if kept + dropped != total_raw { format!(" (sliced from {total_raw})") } else { String::new() },
+        if dropped > 0 { format!(" ({dropped} dropped)") } else { String::new() },
     );
     let sanitized: Vec<MetaPreview> = metas.into_iter().map(sanitize_meta).collect();
     // Stash successful first-page responses into the stale-fallback
@@ -1680,7 +1729,8 @@ pub async fn global_search(
                 if let Ok(resp) = client().get(&url).send().await {
                     if let Ok(resp) = resp.error_for_status() {
                         if let Ok(cr) = resp.json::<CatalogResponse>().await {
-                            results.extend(cr.metas.into_iter().map(sanitize_meta));
+                            let (metas, _, _) = parse_meta_array(cr.metas);
+                            results.extend(metas.into_iter().map(sanitize_meta));
                         }
                     }
                 }
@@ -1769,7 +1819,10 @@ pub async fn search_addon_grouped(
                     continue;
                 }
                 match resp.json::<CatalogResponse>().await {
-                    Ok(cr) => cr.metas.into_iter().map(sanitize_meta).collect(),
+                    Ok(cr) => {
+                        let (metas, _, _) = parse_meta_array(cr.metas);
+                        metas.into_iter().map(sanitize_meta).collect()
+                    }
                     Err(e) => {
                         crate::devlog!(
                             warn, "search",
@@ -1852,7 +1905,8 @@ pub async fn fetch_search_catalog_expanded(
         .json::<CatalogResponse>()
         .await
         .map_err(|e| format!("JSON parse failed: {e}"))?;
-    let items: Vec<MetaPreview> = cr.metas.into_iter().map(sanitize_meta).collect();
+    let (metas, _, _) = parse_meta_array(cr.metas);
+    let items: Vec<MetaPreview> = metas.into_iter().map(sanitize_meta).collect();
     crate::devlog!(info, "search", "[expand] {} → {} item(s)", redact_sensitive_url(&url), items.len());
     Ok(items)
 }
@@ -1923,7 +1977,10 @@ pub async fn global_search_grouped(
                             continue;
                         }
                         match resp.json::<CatalogResponse>().await {
-                            Ok(cr) => cr.metas.into_iter().map(sanitize_meta).collect(),
+                            Ok(cr) => {
+                                let (metas, _, _) = parse_meta_array(cr.metas);
+                                metas.into_iter().map(sanitize_meta).collect()
+                            }
                             Err(e) => {
                                 crate::devlog!(
                                     warn, "search",
@@ -3785,17 +3842,18 @@ pub async fn fetch_external_subtitles(
     let safe_type = cap(media_type, 32);
     let safe_id   = cap(id, 128);
 
-    let mut set: tokio::task::JoinSet<Vec<ExternalSubtitle>> = tokio::task::JoinSet::new();
-    for addon in addons {
+    let slot_len = addons.len();
+    let mut set: tokio::task::JoinSet<(usize, Vec<ExternalSubtitle>)> = tokio::task::JoinSet::new();
+    for (idx, addon) in addons.into_iter().enumerate() {
         let media_type = safe_type.clone();
         let id         = safe_id.clone();
         set.spawn(async move {
             let base = normalise_addon_base(&addon.url);
 
-            let Ok((wire, _)) = fetch_manifest(&base).await else { return vec![]; };
+            let Ok((wire, _)) = fetch_manifest(&base).await else { return (idx, vec![]); };
             let label = log_label(&wire.name, &base);
             if !manifest_has_subtitle_resource(&wire) {
-                return vec![];
+                return (idx, vec![]);
             }
             let addon_name = wire.name.clone();
 
@@ -3803,20 +3861,20 @@ pub async fn fetch_external_subtitles(
             crate::devlog!(info, "subtitles", "[{}] GET {}", label, redact_sensitive_url(&url));
             let Ok(resp) = client().get(&url).send().await else {
                 crate::devlog!(warn, "subtitles", "[{}] request failed", label);
-                return vec![];
+                return (idx, vec![]);
             };
             let Ok(resp) = resp.error_for_status() else {
                 crate::devlog!(warn, "subtitles", "[{}] HTTP error", label);
-                return vec![];
+                return (idx, vec![]);
             };
             let Ok(json) = resp.json::<serde_json::Value>().await else {
                 crate::devlog!(warn, "subtitles", "[{}] JSON parse failed", label);
-                return vec![];
+                return (idx, vec![]);
             };
 
             let Some(arr) = json.get("subtitles").and_then(|v| v.as_array()) else {
                 crate::devlog!(info, "subtitles", "[{}] no `subtitles` array", label);
-                return vec![];
+                return (idx, vec![]);
             };
 
             let kept: Vec<ExternalSubtitle> = arr.iter()
@@ -3824,18 +3882,30 @@ pub async fn fetch_external_subtitles(
                 .filter_map(|s| sanitize_external_subtitle(s, &addon_name))
                 .collect();
             crate::devlog!(info, "subtitles", "[{}] → {} subtitle(s)", label, kept.len());
-            kept
+            (idx, kept)
         });
+    }
+
+    // Collect into per-addon slots so the merged list follows installed-addon
+    // order regardless of which network task finished first. JoinSet yields in
+    // completion order — relying on that scrambled the subtitle list (the
+    // ordering bug). Dedupe-by-URL is applied in addon order.
+    let mut slots: Vec<Vec<ExternalSubtitle>> =
+        std::iter::repeat_with(Vec::new).take(slot_len).collect();
+    while let Some(task_result) = set.join_next().await {
+        if let Ok((idx, items)) = task_result {
+            if idx < slots.len() {
+                slots[idx] = items;
+            }
+        }
     }
 
     let mut all: Vec<ExternalSubtitle> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    while let Some(task_result) = set.join_next().await {
-        if let Ok(items) = task_result {
-            for s in items {
-                if seen.insert(s.url.clone()) {
-                    all.push(s);
-                }
+    for slot in slots {
+        for s in slot {
+            if seen.insert(s.url.clone()) {
+                all.push(s);
             }
         }
     }

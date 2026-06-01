@@ -1677,7 +1677,26 @@ export default function PlayerOverlay({
     }
     const usedTitles = new Set<string>();
 
-    const externals: TrackEntry[] = externalSubs.map((s, idx) => {
+    // Externals ordering: OpenSubtitles bucket → preferred-language →
+    // addon-installed order. Array.sort is stable in V8, so equal-key pairs
+    // keep the addon order the Rust fan-out now guarantees. OpenSubtitles is
+    // self-gating: the bucket only has members when an OpenSubtitles addon is
+    // installed (the API key is unrelated — it's only for MovieHash matching).
+    const isOpenSubs = (s: ExternalSubtitle) => /opensubtitles/i.test(s.addon_name);
+    const prefLang = preferredSubLang ? preferredSubLang.toLowerCase() : null;
+    const sortedSource = [...externalSubs].sort((a, b) => {
+      const aOs = isOpenSubs(a) ? 0 : 1;
+      const bOs = isOpenSubs(b) ? 0 : 1;
+      if (aOs !== bOs) return aOs - bOs;
+      if (prefLang) {
+        const aPref = (a.lang ?? "").toLowerCase().startsWith(prefLang) ? 0 : 1;
+        const bPref = (b.lang ?? "").toLowerCase().startsWith(prefLang) ? 0 : 1;
+        if (aPref !== bPref) return aPref - bPref;
+      }
+      return 0; // preserve addon order (stable sort)
+    });
+
+    const externals: TrackEntry[] = sortedSource.map((s, idx) => {
       const title = externalTitleFor(s);
       const live = subAddedByTitle.get(title);
       // Only the FIRST external row matching a live (sub-added) title
@@ -1704,15 +1723,6 @@ export default function PlayerOverlay({
     const orphans: TrackEntry[] = [];
     for (const [title, t] of subAddedByTitle) {
       if (!usedTitles.has(title)) orphans.push(t);
-    }
-
-    if (preferredSubLang) {
-      const pref = preferredSubLang.toLowerCase();
-      externals.sort((a, b) => {
-        const aPref = (a.lang ?? "").toLowerCase().startsWith(pref) ? 0 : 1;
-        const bPref = (b.lang ?? "").toLowerCase().startsWith(pref) ? 0 : 1;
-        return aPref - bPref;
-      });
     }
 
     let merged = [...fileEmbedded, ...externals, ...orphans];
