@@ -3146,7 +3146,6 @@ const TOC_GROUPS: TocGroup[] = [
       { id: "sec-detail-page", label: "Detail Page" },
       { id: "sec-hover-panel", label: "Hover Meta Panel" },
       { id: "sec-open-links", label: "Open Links" },
-      { id: "sec-notifications", label: "Notifications" },
     ],
   },
   {
@@ -4610,23 +4609,6 @@ export default function SettingsView({ addons, session }: Props) {
             />
           </Section>
 
-          {/* ── Notifications ─────────────────────────────────────────────
-              The bell's "new episode aired" notifications are scheduled
-              by NotificationsScanner against your library's series/anime
-              entries. By default the scanner notifies the moment an
-              addon publishes a recently-released episode; this toggle
-              additionally gates on stream availability for users whose
-              addon mix occasionally publishes episodes hours or days
-              before any source becomes scrapable. */}
-          <Section id="sec-notifications" title="Notifications">
-            <SettingToggle
-              label="Only notify when a stream is available"
-              description="When on, the bell waits to fire a new-episode notification until at least one playable stream is found across your installed addons. Adds a small per-episode network check at scan time (cached for 12 hours so re-scans are free). Off by default: the bell fires the moment an episode is marked released, even if scrapers haven't caught up yet."
-              value={aura.notifyOnlyWithStreams}
-              onChange={(v) => setLocal({ notifyOnlyWithStreams: v })}
-            />
-          </Section>
-
           <GroupHeader label="Playback" />
 
           {/* Video & Audio quality */}
@@ -4710,7 +4692,7 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Motion interpolation"
-                description="mpv's built-in GPU frame interpolation (video-sync=display-resample). Smooths low-frame-rate content (24 fps film, anime) on a high-refresh display. GPU-cheap. Tune the look with the kernel dropdown below."
+                description="mpv's built-in GPU frame interpolation (video-sync=display-resample). Smooths low-frame-rate content (24 fps film, anime) on a high-refresh display. GPU-cheap. Tune the look with the kernel dropdown below. Applies to anime only — it is skipped on live-action, where it adds judder."
                 value={!!aura.motionInterpolation}
                 onChange={(v) => {
                   setLocal({ motionInterpolation: v });
