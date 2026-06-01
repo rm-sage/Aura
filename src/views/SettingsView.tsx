@@ -4695,11 +4695,14 @@ export default function SettingsView({ addons, session }: Props) {
                 description="mpv's built-in GPU frame interpolation (video-sync=display-resample). Smooths low-frame-rate content (24 fps film, anime) on a high-refresh display. GPU-cheap. Tune the look with the kernel dropdown below. Applies to anime only — it is skipped on live-action, where it adds judder."
                 value={!!aura.motionInterpolation}
                 onChange={(v) => {
+                  // Persist ONLY — do not apply live from Settings. Interp is
+                  // anime-gated and this view has no active-target context, so
+                  // a live invoke here would enable interpolation on whatever
+                  // is currently playing (incl. live-action), bypassing the
+                  // gate. The per-load path (enabled && animeFlag) applies it
+                  // correctly on the next play; the in-player MoreMenu toggle
+                  // handles live changes for the anime that's actually on screen.
                   setLocal({ motionInterpolation: v });
-                  invoke("set_motion_interpolation", {
-                    enabled: v,
-                    tscale: aura.interpolationTscale ?? "mitchell",
-                  }).catch(() => {});
                 }}
               />
               <SettingDropdown
@@ -4716,14 +4719,11 @@ export default function SettingsView({ addons, session }: Props) {
                 required
                 onChange={(v) => {
                   const k = v || "mitchell";
+                  // Persist ONLY — see the Motion-interpolation toggle above.
+                  // Applying live here would push interpolation onto whatever
+                  // is playing without the anime gate; the kernel takes effect
+                  // on the next play via the gated load path.
                   setLocal({ interpolationTscale: k });
-                  // Apply live only when interpolation is currently on.
-                  if (aura.motionInterpolation) {
-                    invoke("set_motion_interpolation", {
-                      enabled: true,
-                      tscale: k,
-                    }).catch(() => {});
-                  }
                 }}
               />
             </Section>

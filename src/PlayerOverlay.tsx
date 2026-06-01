@@ -1712,7 +1712,7 @@ export default function PlayerOverlay({
       return 0; // preserve addon order (stable sort)
     });
 
-    const externals: TrackEntry[] = sortedSource.map((s, idx) => {
+    const externals: TrackEntry[] = sortedSource.map((s) => {
       const title = externalTitleFor(s);
       const live = subAddedByTitle.get(title);
       // Only the FIRST external row matching a live (sub-added) title
@@ -1722,8 +1722,13 @@ export default function PlayerOverlay({
         usedTitles.add(title);
         return live;
       }
+      // Synthetic id keyed on the ORIGINAL externalSubs position, NOT the
+      // sorted index — a re-sort (e.g. preferredSubLang change) would
+      // otherwise remap ids and make the optimistic selectedSubId highlight
+      // point at the wrong row until the next reconcile.
+      const originalIdx = externalSubs.indexOf(s);
       return {
-        id: -1 - idx,
+        id: -1 - originalIdx,
         type: "sub",
         title,
         lang: s.lang || null,

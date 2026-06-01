@@ -960,6 +960,29 @@ function pickArt(...candidates: (string | null | undefined)[]): string | null {
   return null;
 }
 
+/** Robust anime check for the active playback target. Series episodes key
+ *  their anime signals (id-prefix, genres, localStorage cache) at the SERIES
+ *  ROOT — `target.id` is the EPISODE id (tt…:S:E) and never matches — so we
+ *  resolve `series_id` and feed the library item's genres. Mirrors the
+ *  stats-ticker detection; the single source of truth for "is the thing on
+ *  screen anime", shared by the motion-interpolation gate and in-player UI. */
+function activeTargetIsAnime(
+  target: ActiveScrobbleTarget,
+  library: LibraryItem[],
+): boolean {
+  const recordId = target.series_id ?? target.id;
+  const libItem = library.find((i) => i.id === recordId);
+  const stateGenres = (libItem?.state ?? {}).genres;
+  const genres = Array.isArray(stateGenres)
+    ? stateGenres.filter((g): g is string => typeof g === "string")
+    : undefined;
+  return isAnimeMeta({
+    media_type: target.media_type,
+    id:         recordId,
+    genres,
+  });
+}
+
 export default function App() {
   // ── Nav state ──
   const [activeView, setActiveView] = useState<NavView>("home");
@@ -1319,16 +1342,13 @@ export default function App() {
         // Apply preferred language tracks after MPV has had time to detect
         // the available audio/subtitle streams.
         //
-        // `media_type === "anime"` alone misses most titles — anime
-        // catalogs from AIOMetadata typically tag content as `series` or
-        // `movie` and rely on the `kitsu:` / `anilist:` / `mal:` /
-        // `anidb:` ID prefix to mark it as anime. `isAnimeMeta` checks
-        // both. Without this, every anime got the global English audio
-        // pref instead of the Japanese-first anime defaults.
-        const animeFlag = isAnimeMeta({
-          media_type: target.media_type,
-          id: target.id,
-        });
+        // Robust anime detection: series episodes key their signals at the
+        // SERIES ROOT (id-prefix / genres / cache), and `target.id` is the
+        // EPISODE id, so we resolve series_id + feed the library item's
+        // genres. Drives both the Japanese-first audio/sub defaults AND the
+        // motion-interpolation gate (interp is anime-only), so they stay
+        // consistent with the in-player toggle's `isAnime`.
+        const animeFlag = activeTargetIsAnime(target, libraryRef.current);
         setTimeout(() => {
           invoke("apply_lang_defaults", { isAnime: animeFlag }).catch(() => {});
           // Re-push the user's subtitle styling so a freshly-loaded
@@ -5359,11 +5379,7 @@ export default function App() {
       {isPlayerActive && (
         <PlayerOverlay
           activeTarget={activeTarget}
-          isAnime={
-            activeTarget
-              ? isAnimeMeta({ media_type: activeTarget.media_type, id: activeTarget.id })
-              : false
-          }
+          isAnime={activeTarget ? activeTargetIsAnime(activeTarget, library) : false}
           time={time}
           duration={duration}
           paused={paused}
