@@ -1370,7 +1370,13 @@ export default function PlayerOverlay({
     const startTimer = setTimeout(() => {
       if (!cancelled) refresh();
     }, 1500);
-    const onRefresh = () => { if (!cancelled) refresh(); };
+    const onRefresh = () => {
+      if (cancelled) return;
+      refresh();
+      // Reconcile after mpv commits the new sid — the immediate read can
+      // still report the OLD selected track. selectedSubId covers the gap.
+      setTimeout(() => { if (!cancelled) refresh(); }, 150);
+    };
     window.addEventListener("aura:tracks-refresh", onRefresh);
     return () => {
       cancelled = true;
@@ -1425,6 +1431,16 @@ export default function PlayerOverlay({
   }, [controlsVisible, tracksReady, subBaseline]);
 
   const audioTracks = useMemo(() => tracks.filter((t) => t.type === "audio"), [tracks]);
+  // Optimistic subtitle selection. mpv's track-list `selected` flag lags a
+  // switch by a beat, so the menu highlight drifted from reality right after
+  // a pick. We record the user's intent here for instant feedback; the
+  // delayed get_tracks reconcile (below) is authoritative. Reset per file so
+  // a stale id can't match a different track after an episode change.
+  const [selectedSubId, setSelectedSubId] = useState<number | null>(null);
+  useEffect(() => {
+    setSelectedSubId(null);
+  }, [activeTarget?.id, streamUrl]);
+
   // Embedded MPV subtitle tracks (in-file + any sub-add'd via the
   // OpenSubtitles picker). The external addon list is merged in below.
   const embeddedSubTracks = useMemo(
@@ -1741,8 +1757,17 @@ export default function PlayerOverlay({
       });
     }
 
+    // Optimistic override: when the user just picked a track, force its row
+    // selected immediately. Guarded on the id still matching a visible row —
+    // once an external is sub-added and swapped to its live (positive) id, the
+    // negative selectedSubId no longer matches and we fall back to the
+    // authoritative track-list `selected` flag. subsMuted = nothing selected.
+    if (selectedSubId != null && !subsMuted && merged.some((t) => t.id === selectedSubId)) {
+      merged = merged.map((t) => ({ ...t, selected: t.id === selectedSubId }));
+    }
+
     return merged;
-  }, [embeddedSubTracks, externalSubs, preferredSubLang, subsMuted, selectableSubLangs]);
+  }, [embeddedSubTracks, externalSubs, preferredSubLang, subsMuted, selectableSubLangs, selectedSubId]);
 
   // Volume scroll wheel — wired locally since the rest of the app is hidden.
   // Skipped when the wheel is over a scroll-capable child (track-menu lists,
@@ -2158,6 +2183,7 @@ export default function PlayerOverlay({
                 try {
                   await invoke("set_subtitle_visibility", { visible: false });
                   setSubsMuted(true);
+                  setSelectedSubId(null);
                   fireToast("Subtitles off");
                   if (activeTarget) {
                     setTitleState(activeTarget.media_type, activeTarget.id, {
@@ -2174,6 +2200,7 @@ export default function PlayerOverlay({
                 } catch {}
 
                 if (id == null) {
+                  setSelectedSubId(null);
                   invoke("set_subtitle_track", { track: "no" })
                     .then(() => window.dispatchEvent(new Event("aura:tracks-refresh")))
                     .catch(() => {});
@@ -2198,6 +2225,7 @@ export default function PlayerOverlay({
                   if (matching) {
                     try {
                       await invoke("set_subtitle_track", { track: matching.id });
+                      setSelectedSubId(matching.id);
                       window.dispatchEvent(new Event("aura:tracks-refresh"));
                       fireToast(
                         `Subtitles · ${matching.title ?? matching.lang?.toUpperCase() ?? `#${matching.id}`}`,
@@ -2222,6 +2250,7 @@ export default function PlayerOverlay({
                       title: ext?.title,
                       lang: ext?.lang ?? null,
                     });
+                    setSelectedSubId(id); // negative menu id until the refresh swaps in the live track
                     window.dispatchEvent(new Event("aura:tracks-refresh"));
                     fireToast(`Subtitles · ${ext?.lang?.toUpperCase() ?? "external"}`);
                     if (activeTarget && ext?.lang) {
@@ -2236,6 +2265,7 @@ export default function PlayerOverlay({
                 }
                 try {
                   await invoke("set_subtitle_track", { track: id });
+                  setSelectedSubId(id);
                   window.dispatchEvent(new Event("aura:tracks-refresh"));
                   const t = subDropdownItems.find((x) => x.id === id);
                   fireToast(`Subtitles · ${t?.title ?? t?.lang?.toUpperCase() ?? `#${id}`}`);
