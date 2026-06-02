@@ -14,7 +14,7 @@ import { getMetaDetailFallback, canonicalReleaseYear, useMetaCacheVersion } from
 import { closeHoverNow } from "./catalogHoverStore";
 import { useHoverCardActivation } from "./useHoverCardActivation";
 import { getReleaseSignal, useReleaseSignalsVersion } from "./releaseSignalStore";
-import { formatCountdown, useCountdownNow } from "./releaseCountdown";
+import { formatCountdown, airingInfo, useCountdownNow } from "./releaseCountdown";
 
 /** Per-catalog cache for the View-all popup. Keyed by
  *  `${addonUrl}|${type}|${id}`. Persists across DiscoveryRow remounts
@@ -178,8 +178,17 @@ function SegmentedSeasonBar({
   // segment ends up rendering as a sliver or disappearing entirely.
   // The 8 px inset is enough to clear the curvature on a 5 px-tall
   // bar without leaving an obvious gap.
+  //
+  // Airing marker: a glowing accent dot floats above the latest-aired
+  // segment, and aired-but-unwatched segments are tinted brighter than
+  // not-yet-aired ones so "available to watch now" reads at a glance.
+  // overflow-visible lets the dot (and the Task-5 tooltip) sit above the bar.
+  const air = airingInfo(episodes);
+  const latestAiredIdx = air.isAiring && air.latestAiredId
+    ? episodes.findIndex((v) => v.id === air.latestAiredId)
+    : -1;
   return (
-    <div className="absolute left-2 right-2 bottom-1 h-[5px] flex gap-[1.5px] rounded-full overflow-hidden">
+    <div className="absolute left-2 right-2 bottom-1 h-[5px] flex gap-[1.5px] rounded-full overflow-visible">
       {episodes.map((ep, i) => {
         const manual = getManualWatchedState(ep.id);
         let cls: string;
@@ -191,10 +200,25 @@ function SegmentedSeasonBar({
           cls = "bg-amber-400";
         } else if (i < impliedThroughIdx) {
           cls = "bg-emerald-400/85"; // implied-watched (earlier in season)
+        } else if (isVideoAired(ep)) {
+          cls = "bg-white/35"; // aired but unwatched — available to watch now
         } else {
-          cls = "bg-white/15";
+          cls = "bg-white/15"; // not yet aired
         }
-        return <div key={ep.id} className={`flex-1 h-full ${cls}`} />;
+        return (
+          <div key={ep.id} className={`relative flex-1 h-full ${cls}`}>
+            {i === latestAiredIdx && (
+              <span
+                aria-hidden
+                className="absolute -top-[7px] left-1/2 -translate-x-1/2 w-1.5 h-1.5 rounded-full z-20"
+                style={{
+                  background: "#5BA4FF",
+                  boxShadow: "0 0 6px 2px rgba(91,164,255,0.5), 0 0 0 1px rgba(0,0,0,0.55)",
+                }}
+              />
+            )}
+          </div>
+        );
       })}
     </div>
   );
@@ -287,9 +311,25 @@ function ContinuousProgressBar({
         background: "rgb(52,211,153)",
       };
 
+  // Airing frontier line at the latest-aired position (Option A for the
+  // long-runner bar — the segmented bar uses the dot instead).
+  const air = airingInfo(episodes);
+  const latestAiredIdx = air.isAiring && air.latestAiredId
+    ? episodes.findIndex((v) => v.id === air.latestAiredId)
+    : -1;
+  const frontierPct = latestAiredIdx >= 0 ? ((latestAiredIdx + 1) / total) * 100 : null;
   return (
-    <div className="absolute left-2 right-2 bottom-1 h-[5px] rounded-full overflow-hidden bg-white/15">
-      <div aria-hidden className="h-full" style={fillStyle} />
+    <div className="absolute left-2 right-2 bottom-1 h-[5px] rounded-full overflow-visible">
+      <div className="absolute inset-0 rounded-full overflow-hidden bg-white/15">
+        <div aria-hidden className="h-full" style={fillStyle} />
+      </div>
+      {frontierPct != null && (
+        <div
+          aria-hidden
+          className="absolute -top-[3px] -bottom-[3px] w-[2px] rounded-[2px] z-20"
+          style={{ left: `${frontierPct}%`, background: "#5BA4FF", boxShadow: "0 0 6px 1px rgba(91,164,255,0.5)" }}
+        />
+      )}
     </div>
   );
 }
@@ -543,7 +583,7 @@ function CWReleaseCountdown({ seriesId }: { seriesId: string }) {
   const targetMs = Date.parse(nextIso);
   if (!Number.isFinite(targetMs) || targetMs <= now) return null;
   return (
-    <div className="absolute inset-x-0 bottom-2.5 flex justify-center pointer-events-none z-10">
+    <div className="absolute inset-x-0 bottom-[28px] flex justify-center pointer-events-none z-10">
       <span
         className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full
                    bg-black/72 backdrop-blur-sm border border-white/15
