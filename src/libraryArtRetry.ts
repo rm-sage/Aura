@@ -58,10 +58,20 @@ export function useLibraryArtRetry(
       if (metaAddons.length === 0) return;
 
       const now = Date.now();
-      const attempts = loadAttempts();
+      const currentIds = new Set(items.map((i) => i.id));
+      // Prune throttle entries for ids no longer in the library (removed /
+      // unsynced) so the persisted map can't grow unbounded over time.
+      const attempts: Record<string, number> = {};
+      let prunedAny = false;
+      for (const [id, ts] of Object.entries(loadAttempts())) {
+        if (currentIds.has(id)) attempts[id] = ts; else prunedAny = true;
+      }
       const due = items.filter((it) =>
         !it.poster && !it.removed && (now - (attempts[it.id] ?? 0) >= HOUR_MS));
-      if (due.length === 0) return;
+      if (due.length === 0) {
+        if (prunedAny) saveAttempts(attempts);
+        return;
+      }
 
       running.current = true;
       try {

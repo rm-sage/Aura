@@ -3062,7 +3062,7 @@ const KIND_ORDER: MessageKind[] = ["error", "warning", "info", "stats"];
 function suppressNoisyNotices(metadata: StreamMetadata): StreamMetadata {
   const isDrf = (m: StreamMessage) =>
     /digital release filter/i.test(m.title ?? "") ||
-    /digital release filter/i.test(m.description ?? "");
+    /digital release filter/i.test(m.description);
   const all = [...metadata.errors, ...metadata.warnings, ...metadata.info, ...metadata.stats];
   if (!all.some(isDrf)) return metadata;
   const keep = (rows: StreamMessage[]) => rows.filter(isDrf);
