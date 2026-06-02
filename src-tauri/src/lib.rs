@@ -37,6 +37,7 @@ mod media_controls;
 // runtime path (player.rs still uses tauri-plugin-libmpv).
 mod debug_panel;
 mod mpv2;
+mod popup_nav;
 mod player;
 mod publicmetadb;
 mod ratings;
@@ -466,6 +467,21 @@ async fn toggle_pause(app: tauri::AppHandle) -> Result<(), String> {
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Keep the display + system awake while the player is active and unpaused.
+/// The frontend invokes this on every `isPlayerActive && !paused` change.
+/// Under the mpv2 render engine, mpv (`vo=libmpv`) owns no window and so
+/// can't run its own `stop-screensaver`; the engine's render thread reads
+/// this flag and asserts/releases `SetThreadExecutionState`. No-op on the
+/// legacy `--wid` path (mpv inhibits the screensaver itself there) and on
+/// non-Windows.
+#[tauri::command]
+fn set_keep_display_awake(enabled: bool) {
+    #[cfg(target_os = "windows")]
+    mpv2::engine::set_display_awake_desired(enabled);
+    #[cfg(not(target_os = "windows"))]
+    { let _ = enabled; }
 }
 
 #[tauri::command]
@@ -1363,18 +1379,26 @@ async fn set_native_fullscreen(
         //      y_offset=0 (no title bar in fullscreen).
         //   3. MPV's `fullscreen` property flipped — drives MPV's
         //      taskbar-auto-hide signalling and render-path optimisations.
-        let mpv_handle = app.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            let _ = mpv_handle.mpv().set_property(
-                "fullscreen", &serde_json::json!(enabled), "main",
-            );
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-
+        //
+        // mpv2 SHORT-CIRCUIT: under the render-API engine, `app.mpv()`
+        // points at a legacy `tauri-plugin-libmpv` handle that was never
+        // initialised (`init_mpv` is skipped under AURA_MPV2). Calling
+        // `set_property("fullscreen", …)` on it was the dominant source
+        // of the multi-second fullscreen-toggle latency — the wrapper's
+        // IPC sits waiting for a response that never comes. The mpv2
+        // engine handles fullscreen itself via win32::enter_native_fullscreen
+        // + per-frame parent-rect tracking, so the legacy poke is dead
+        // weight. We also collapse the two sequential `spawn_blocking`
+        // awaits into one to halve the cross-thread hop cost.
         let p = parent_hwnd;
         let engine_active = mpv2::engine::enabled() && mpv2::engine::is_running();
+        let mpv_handle = (!engine_active).then(|| app.clone());
         tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+            if let Some(handle) = mpv_handle {
+                let _ = handle.mpv().set_property(
+                    "fullscreen", &serde_json::json!(enabled), "main",
+                );
+            }
             if enabled {
                 win32::enter_native_fullscreen(p)?;
                 // After the parent restyle, snap the MPV child to the
@@ -2035,18 +2059,34 @@ pub fn run() {
                 win32::pin_process_scheduling();
             }
 
-            // Skip the legacy `--wid` engine entirely when the mpv2 master
-            // gate is set. Otherwise the legacy child window is created
-            // before the engine's child and sits ABOVE it in z-order
-            // (HWND_BOTTOM puts the engine all the way down), which would
-            // hide every frame the engine renders during Phase 2.4
-            // playback. Skipping init_mpv leaves `app.mpv()` calls to
-            // no-op-or-error harmlessly — every Tauri command that
-            // actually drives playback gates on `mpv2::engine::enabled()`
-            // anyway. Flag flip falls back instantly: unset the env var
-            // and the legacy path is restored on next launch.
+            // The mpv2 render-context engine is the DEFAULT playback path
+            // now. Skipping the legacy `--wid` init when it's active is
+            // load-bearing: the legacy child window would otherwise be
+            // created before the engine's child and sit ABOVE it in
+            // z-order (HWND_BOTTOM pushes the engine to the bottom),
+            // hiding every frame the engine renders. Every playback Tauri
+            // command gates on `mpv2::engine::enabled() && is_running()`,
+            // falling back to `app.mpv()` only when the engine isn't
+            // running. Escape hatch: `AURA_MPV2=0` (off/false/no) restores
+            // the legacy path on next launch.
+            //
+            // We additionally require the main window's HWND to resolve
+            // before skipping init_mpv: default-on means a skipped legacy
+            // init would leave NO playback engine at all if the engine
+            // can't parent its surface, so on the (near-impossible) HWND
+            // failure we keep the legacy init as a safety net. NOTE: this
+            // only covers the SYNCHRONOUS boot failure — if the engine's
+            // WGL/GL bring-up fails later on its own render thread there
+            // is no auto-fallback; revert with AURA_MPV2=0. (Automatic
+            // WGL-failure fallback is a Phase 7 hardening item.)
             #[cfg(target_os = "windows")]
-            let mpv2_active = mpv2::engine::enabled();
+            let mpv2_main_hwnd: isize = app
+                .get_webview_window("main")
+                .and_then(|w| w.hwnd().ok())
+                .map(|h| h.0 as isize)
+                .unwrap_or(0);
+            #[cfg(target_os = "windows")]
+            let mpv2_active = mpv2::engine::enabled() && mpv2_main_hwnd != 0;
             #[cfg(not(target_os = "windows"))]
             let mpv2_active = false;
 
@@ -2074,7 +2114,7 @@ pub fn run() {
             } else {
                 crate::devlog!(
                     info, "player",
-                    "AURA_MPV2 set — skipping legacy --wid MPV init; mpv2 engine will drive playback",
+                    "mpv2 render engine is the default — skipping legacy --wid MPV init (set AURA_MPV2=0 to revert)",
                 );
             }
 
@@ -2099,18 +2139,13 @@ pub fn run() {
                 if !mpv2::engine::enabled() {
                     mpv2::hello::run_if_requested();
                 }
-                // Phase 2.2 long-lived engine. Independent opt-in via
-                // AURA_MPV2_ENGINE; the legacy --wid engine above is still
-                // the one driving playback until Phase 2.4 ports loadfile.
-                // The engine's GL surface is parented under main's HWND
-                // exactly where the legacy mpv child sits — passing 0 here
-                // (HWND lookup failed) makes start_if_requested a no-op so
-                // we never attempt to parent under an invalid window.
-                let parent_hwnd: isize = app
-                    .get_webview_window("main")
-                    .and_then(|w| w.hwnd().ok())
-                    .map(|h| h.0 as isize)
-                    .unwrap_or(0);
+                // Phase 2.2 long-lived engine — the default playback path
+                // now. Its GL surface parents under main's HWND exactly
+                // where the legacy mpv child sat. We resolved the HWND
+                // above (`mpv2_main_hwnd`); when it's 0 the init decision
+                // already kept the legacy `--wid` path, and
+                // start_if_requested no-ops on a 0 parent.
+                let parent_hwnd: isize = mpv2_main_hwnd;
                 // Engine event channel — the render thread calls this on
                 // every mpv property change / end-of-file, which the
                 // observer bridge below already consumes as `mpv-event-main`
@@ -2387,6 +2422,7 @@ pub fn run() {
             load_video,
             stop_video,
             toggle_pause,
+            set_keep_display_awake,
             seek_relative,
             frame_step,
             set_audio_loudnorm,
@@ -2406,6 +2442,10 @@ pub fn run() {
             debug_panel::debug_drop_test,
             debug_panel::debug_load_test_pattern,
             debug_panel::debug_stop_playback,
+            popup_nav::popup_webview_back,
+            popup_nav::popup_webview_forward,
+            popup_nav::popup_webview_reload,
+            popup_nav::popup_webview_navigate,
             get_tracks,
             get_property,
             refresh_video,

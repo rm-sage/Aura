@@ -121,6 +121,11 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
 
   // Fetch the catalog whenever a new (addon, catalog) pair settles.
   useEffect(() => {
+    // Switching catalog/addon unmounts every card in the current grid.
+    // Closing the hover panel here guarantees a stale anchor (left over
+    // from a brief hover that armed the open just before the click)
+    // can't survive into the new grid as a stuck panel in the corner.
+    closeHoverNow();
     if (!selectedAddon || !selectedCatalog) {
       setItems(null);
       setItemsErr(null);

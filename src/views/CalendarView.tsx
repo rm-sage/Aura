@@ -438,13 +438,12 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
                 {/* Date number + optional overflow badge */}
                 <div className="flex items-start justify-between">
                   <span
-                    className={`text-sm font-medium leading-none
-                                ${isToday
-                                  ? "text-ln-accent"
-                                  : dim
-                                    ? "text-white/35"
-                                    : "text-white/75"
-                                }`}
+                    className={`leading-none ${isToday
+                      ? "inline-flex items-center justify-center min-w-[22px] h-[22px] px-1.5 -ml-0.5 -mt-0.5 rounded-full bg-ln-accent text-black text-sm font-bold shadow-[0_0_10px_rgba(91,164,255,0.7)]"
+                      : dim
+                        ? "text-white/35 text-sm font-medium"
+                        : "text-white/75 text-sm font-medium"
+                    }`}
                   >
                     {date.getDate()}
                   </span>

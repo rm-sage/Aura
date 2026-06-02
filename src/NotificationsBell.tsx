@@ -32,17 +32,26 @@ export default function NotificationsBell({ library }: { library: LibraryItem[] 
   const { notifications, unreadCount, hasNew, popup, dismissPopup, markRead, markAllRead } = useNotifications();
   const [open, setOpen] = useState(false);
 
+  const openPanel = useCallback(() => {
+    setOpen((wasOpen) => !wasOpen);
+  }, []);
+
   // Treat panel-open as a global mark-read. The user has actively
   // surfaced the panel; whatever they see there counts as seen for
   // the purpose of the badge. Individual dismiss still works for
   // hiding entries from the list, but the badge clears immediately
   // so the bell stops drawing the eye while the user is reading.
-  const openPanel = useCallback(() => {
-    setOpen((wasOpen) => {
-      if (!wasOpen) markAllRead();
-      return !wasOpen;
-    });
-  }, [markAllRead]);
+  //
+  // Done in an effect on the open transition — NOT inside the setOpen
+  // updater. Updater functions run during React's render phase, so
+  // calling markAllRead() (a NotificationsProvider setstate) there fired
+  // React's "Cannot update NotificationsProvider while rendering
+  // NotificationsBell" warning. The effect runs after commit, clearing the
+  // badge the moment the panel opens, with no cross-component render-phase
+  // update.
+  useEffect(() => {
+    if (open) markAllRead();
+  }, [open, markAllRead]);
   /** When true, the panel is in the middle of its out-animation —
    *  still mounted, but pointer-events disabled and visually
    *  collapsing. setOpen(false) and clearing this flag both run on

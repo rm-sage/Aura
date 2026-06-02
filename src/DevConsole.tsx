@@ -443,7 +443,6 @@ const COMMANDS: DevCommand[] = [
       //   • lastChecked = 1   → > 0, so isFirstScan = false
       //   • seenVideoIds = [] → every recent_aired ep counts as "new"
       //   • lastNotifiedAt = 0 → every ep passes the watermark check
-      //   • pendingStreamCheck = undefined → start fresh
       // The scanner will then evaluate the cloud's recent_aired list
       // and fire on any episode the user hasn't already played past
       // in their library (the librarySaysSeen gate still applies; see
@@ -511,13 +510,19 @@ const COMMANDS: DevCommand[] = [
 
       // Step 3 — kick the library refresh. App.tsx listens for
       // aura:library-changed → loadLibrary → reconcileLibraryReleaseSignals.
-      // The scanner separately polls on a 30-min timer; we also fire
-      // its own change listener so it re-evaluates right now rather
-      // than waiting for the next tick.
+      // The reconcile only calls `bump()` when a signal mutates, so
+      // for byte-identical data the scanner's [version] effect would
+      // never re-fire — making notifytest silently inert. We fire the
+      // dedicated force-scan event after a short delay so the scanner
+      // runs after the library reload has settled.
       window.dispatchEvent(new CustomEvent("aura:library-changed"));
+      const { FORCE_SCAN_EVENT } = await import("./NotificationsScanner");
+      setTimeout(() => {
+        window.dispatchEvent(new CustomEvent(FORCE_SCAN_EVENT));
+      }, 1500);
       ctx.push({
         ts: Date.now(), level: "info", source: "console",
-        message: "notifytest: fired aura:library-changed — watch for a notification in the bell within ~10s.",
+        message: "notifytest: fired aura:library-changed + force-scan — watch for a notification in the bell within ~10s.",
       });
       ctx.push({
         ts: Date.now(), level: "info", source: "console",
@@ -526,7 +531,64 @@ const COMMANDS: DevCommand[] = [
           "(b) confirm `releaseSearchEnabled` is on in Settings → Cloud Sync, " +
           "(c) librarySaysSeen suppresses the fire when your library `state.video_id` is at/past the cloud's last_aired episode — " +
           "for an end-to-end test, pick an id whose latest cloud episode is AHEAD of where you've watched, " +
-          "or temporarily mark the show as unwatched.",
+          "or temporarily mark the show as unwatched. Watch DevConsole for `[notif-scan]` lines — they'll show which gate the signal hits. " +
+          "If the cloud signal is empty for the id, run `notifyforce <imdb_id>` instead to bypass the scanner entirely and validate the bell/popup pipeline.",
+      });
+    },
+  },
+  {
+    name: "notifyforce",
+    usage: "notifyforce <imdb_id>",
+    description: "Bypass the scanner + cloud entirely and synthesize a notification directly through addNotification. Validates the bell + popup + persistence pipeline end-to-end when the cloud signal is empty for a real id, or when you just want to see the UI fire on demand. The id must be a library item so we can resolve its name and media_type for the notification title.",
+    run: async (args, ctx) => {
+      const imdbId = args.trim();
+      if (!imdbId) {
+        ctx.push({
+          ts: Date.now(), level: "warn", source: "console",
+          message: "Usage: notifyforce <imdb_id>  (e.g. notifytest tt22248376)",
+        });
+        return;
+      }
+      const { invoke } = await import("@tauri-apps/api/core");
+      // Pull the library so the synthesized notification can carry the
+      // real series/movie name + media_type. Falling back to the bare
+      // id would still surface SOMETHING, but the bell entry would read
+      // "tt12345678 — now available" instead of the actual title.
+      let item: { id: string; name: string; media_type: string } | null = null;
+      try {
+        const library = await invoke<Array<{ id: string; name: string; media_type: string; removed?: boolean }>>("library_get");
+        item = library.find((it) => it.id === imdbId && !it.removed) ?? null;
+      } catch {
+        // Network/IPC failure — fall through to bare-id mode below.
+      }
+      if (!item) {
+        ctx.push({
+          ts: Date.now(), level: "warn", source: "console",
+          message:
+            `notifyforce: ${imdbId} isn't in your library. Synthesizing a generic notification anyway ` +
+            `— add the title to library first if you want a click-through to DetailView.`,
+        });
+      }
+      const mediaType = (item?.media_type ?? "series").toLowerCase();
+      const isMovie = mediaType === "movie";
+      const title = item
+        ? (isMovie ? `${item.name} — now available` : `${item.name} — TEST EPISODE`)
+        : `${imdbId} — notifyforce test`;
+      const eventDetail = {
+        id: `notifyforce:${imdbId}:${Date.now()}`,
+        kind: (isMovie ? "release" : "episode") as "release" | "episode",
+        title,
+        subtitle: "Synthesized by notifyforce — bell/popup pipeline test",
+        data: {
+          metaId:    imdbId,
+          mediaType: item?.media_type ?? "series",
+          synthetic: true,
+        },
+      };
+      window.dispatchEvent(new CustomEvent("aura:notify-force", { detail: eventDetail }));
+      ctx.push({
+        ts: Date.now(), level: "info", source: "console",
+        message: `notifyforce: dispatched aura:notify-force for ${imdbId} (kind=${eventDetail.kind}, title="${title}"). Bell should glow + popup should surface within a second.`,
       });
     },
   },

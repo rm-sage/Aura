@@ -11,6 +11,7 @@ identifier = "allow-player-controls"
 description = "Allows the frontend to toggle pause, seek, set volume / speed, switch audio + subtitle tracks, query state, and apply language defaults"
 commands.allow = [
   "toggle_pause",
+  "set_keep_display_awake",
   "seek_relative",
   "frame_step",
   "set_audio_loudnorm",
@@ -224,6 +225,24 @@ commands.allow = ["dev_force_panic"]
 identifier = "allow-debug-panel"
 description = "Allows the frontend Settings → Debug Stuff panel to read engine + mpv diagnostics and run drop-rate tests"
 commands.allow = ["debug_engine_state", "debug_drop_test", "debug_load_test_pattern", "debug_stop_playback"]
+
+# ── Popup webview navigation ───────────────────────────────────────────────
+# Drives the Back / Forward / Refresh / address-bar controls in the in-app
+# SourcePopup chrome strip. Rust-side commands look up the popup webview
+# by label (gated to the `aura-source-popup-` prefix) and call eval with
+# the corresponding `history.back()` / `history.forward()` /
+# `location.reload()` / `location.assign(url)`. URL navigation re-
+# validates the scheme on the Rust side (http/https only) so a malicious
+# js:// or file:// can't be smuggled past the frontend guard.
+[[permission]]
+identifier = "allow-popup-nav"
+description = "Allows the SourcePopup chrome strip to drive back/forward/refresh/navigate against its own child webview"
+commands.allow = [
+  "popup_webview_back",
+  "popup_webview_forward",
+  "popup_webview_reload",
+  "popup_webview_navigate",
+]
 
 # ── Aura Proxy v2: per-account cloud sync ──────────────────────────────────
 # Round-trips per-account state (settings, manual marks, queue, recent

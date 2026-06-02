@@ -1,8 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useEffect, useRef, useState } from "react";
 import type { AddonEntry, LibraryItem } from "./types";
 import { loadAuraSettings } from "./auraSettings";
 import { useNotifications } from "./NotificationsContext";
@@ -48,13 +47,6 @@ import { formatEpLabel } from "./episodeLabel";
 // cheaply; the §10.1 batch-ETag short-circuit will land later to
 // reduce the bandwidth further.
 //
-// Stream-availability gate: when `notifyOnlyWithStreams` is on, the
-// scanner records new episodes as "pending stream check" instead of
-// notifying immediately, and a 15-min timer re-checks fetch_streams
-// for each pending entry. First time streams come back, the
-// notification fires. Pending state is persisted so it survives
-// app restarts.
-//
 // Persisted state (localStorage `aura:notifications:scanner-state`):
 //   {
 //     "tt22248376": {
@@ -64,15 +56,7 @@ import { formatEpLabel } from "./episodeLabel";
 //       // for. Used as the diff baseline against recent_aired so we
 //       // don't re-fire on a new poller tick that returns the same
 //       // already-notified episodes.
-//       lastNotifiedAt: <ms epoch>,
-//       // Episodes seen via cloud signal but withheld because
-//       // notifyOnlyWithStreams was on and no streams were available
-//       // yet. The 15-min timer retries fetch_streams for these and
-//       // promotes to seenVideoIds + fires the notification once
-//       // streams appear.
-//       pendingStreamCheck?: [
-//         { videoId, aired_at, season, episode, recordedAt }
-//       ]
+//       lastNotifiedAt: <ms epoch>
 //     }
 //   }
 // ---------------------------------------------------------------------------
@@ -80,35 +64,15 @@ import { formatEpLabel } from "./episodeLabel";
 const SCANNER_STATE_KEY = "aura:notifications:scanner-state";
 const SCANNER_VERSION_KEY = "aura:notifications:scanner-version";
 const CURRENT_SCANNER_VERSION = "3";
-const STREAM_AVAILABILITY_KEY = "aura:notifications:stream-availability";
-const STREAM_AVAILABILITY_TTL_MS = 12 * 60 * 60 * 1000;
 const PERIODIC_REFRESH_MS = 5 * 60 * 1000;
-const STREAM_RECHECK_MS = 15 * 60 * 1000;
-const PENDING_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
-
-interface PendingStreamCheck {
-  videoId: string;
-  airedAtMs: number;
-  season: number | null;
-  episode: number | null;
-  recordedAtMs: number;
-}
 
 interface ScannerItemState {
   lastChecked: number;
   seenVideoIds: string[];
   lastNotifiedAt?: number;
-  pendingStreamCheck?: PendingStreamCheck[];
 }
 
 type ScannerState = Record<string, ScannerItemState>;
-
-interface StreamAvailabilityEntry {
-  hasStreams: boolean;
-  ts: number;
-}
-
-type StreamAvailabilityCache = Record<string, StreamAvailabilityEntry>;
 
 function loadScannerState(): ScannerState {
   try {
@@ -125,22 +89,7 @@ function loadScannerState(): ScannerState {
         ? (s.seenVideoIds as unknown[]).filter((x): x is string => typeof x === "string")
         : [];
       const lastNotifiedAt = typeof s.lastNotifiedAt === "number" ? s.lastNotifiedAt : undefined;
-      const pending = Array.isArray(s.pendingStreamCheck)
-        ? (s.pendingStreamCheck as unknown[])
-            .map((p) => {
-              if (!p || typeof p !== "object") return null;
-              const o = p as Record<string, unknown>;
-              const videoId = typeof o.videoId === "string" ? o.videoId : null;
-              const airedAtMs = typeof o.airedAtMs === "number" ? o.airedAtMs : null;
-              const season = typeof o.season === "number" ? o.season : null;
-              const episode = typeof o.episode === "number" ? o.episode : null;
-              const recordedAtMs = typeof o.recordedAtMs === "number" ? o.recordedAtMs : Date.now();
-              if (!videoId || airedAtMs == null) return null;
-              return { videoId, airedAtMs, season, episode, recordedAtMs } satisfies PendingStreamCheck;
-            })
-            .filter((p): p is PendingStreamCheck => p !== null)
-        : undefined;
-      out[k] = { lastChecked, seenVideoIds: seen, lastNotifiedAt, pendingStreamCheck: pending };
+      out[k] = { lastChecked, seenVideoIds: seen, lastNotifiedAt };
     }
     return out;
   } catch {
@@ -193,53 +142,23 @@ function maybeMigrateScannerState(): void {
   }
 }
 
-function loadStreamAvailability(): StreamAvailabilityCache {
-  try {
-    const raw = localStorage.getItem(STREAM_AVAILABILITY_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") return {};
-    const now = Date.now();
-    const evictBefore = now - STREAM_AVAILABILITY_TTL_MS * 2;
-    const out: StreamAvailabilityCache = {};
-    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-      if (!v || typeof v !== "object") continue;
-      const e = v as Record<string, unknown>;
-      const ts = typeof e.ts === "number" ? e.ts : 0;
-      if (ts < evictBefore) continue;
-      const hasStreams = e.hasStreams === true;
-      out[k] = { hasStreams, ts };
-    }
-    return out;
-  } catch {
-    return {};
-  }
-}
-
-function saveStreamAvailability(cache: StreamAvailabilityCache) {
-  try {
-    localStorage.setItem(STREAM_AVAILABILITY_KEY, JSON.stringify(cache));
-  } catch {
-    // non-fatal
-  }
-}
-
-/** Items that participate in the scanner. Movies excluded (no
- *  episode-level "release" signal we'd surface as a notification).
- *  Channel / TV streams skipped (live programming, not catalog). */
+/** Items that participate in the scanner. Channel / TV streams
+ *  skipped (live programming, not catalog). Movies ARE included now:
+ *  the cloud's `last_aired` carries the digital-release timestamp,
+ *  so a movie added to the library pre-release fires a notification
+ *  the first scan after it goes available. Anime / series fire per
+ *  episode via `recent_aired` as before. */
 function isScannable(item: LibraryItem): boolean {
   if (item.removed) return false;
   if (item.temp) return false;
   if (!item.id || !item.id.startsWith("tt")) return false; // cloud is imdb-keyed
   const t = (item.media_type ?? "").toLowerCase();
-  if (t === "movie") return false;
   if (t === "channel" || t === "channels" || t === "tv") return false;
   return true;
 }
 
-function isPlayableStream(s: { type?: string | null }): boolean {
-  const t = (s.type ?? "").toLowerCase();
-  return t !== "statistic" && t !== "error";
+function isMovieType(item: LibraryItem): boolean {
+  return (item.media_type ?? "").toLowerCase() === "movie";
 }
 
 /** Parse aired_at to ms epoch. Treats unparseable strings as
@@ -261,10 +180,17 @@ function airedAtMs(a: ReleaseAired | null | undefined): number {
  *  via (season, episode) tuple. tt-style ids carry these directly;
  *  for prefix-style ids (kitsu/mal/anidb) we have no clean
  *  comparison shortcut so the check returns false and the cloud
- *  signal wins. */
+ *  signal wins.
+ *
+ *  Movies: returns true when the user has any playback offset for
+ *  the movie. A pre-release movie sitting in library with no
+ *  timeOffset still notifies on release. */
 function librarySaysSeen(item: LibraryItem, target: ReleaseAired): boolean {
   const state = item.state;
   if (!state) return false;
+  if (isMovieType(item)) {
+    return typeof state.timeOffset === "number" && state.timeOffset > 0;
+  }
   const lastVideoId = typeof state.video_id === "string" ? state.video_id : null;
   if (!lastVideoId) return false;
   // Same id → trivially seen.
@@ -291,9 +217,33 @@ interface Props {
   library: LibraryItem[];
 }
 
+/** Window event the scanner listens for to force an immediate scan
+ *  pass regardless of whether the release-signal store version has
+ *  changed. Wired up by the DevConsole `notifytest` command so the
+ *  user can validate the gate path end-to-end even when the cloud
+ *  signal is byte-identical to its cached copy (the normal store
+ *  bump path short-circuits in that case — by design — leaving the
+ *  command otherwise inert). Also useful when debugging release
+ *  notifications: dispatch from the DevConsole and watch the
+ *  `[notif-scan]` trail. */
+export const FORCE_SCAN_EVENT = "aura:notifications-force-scan";
+
 export default function NotificationsScanner({ addons, library }: Props) {
   const { addNotification } = useNotifications();
   const version = useReleaseSignalsVersion();
+  // Bumps any time a `aura:notifications-force-scan` event fires.
+  // The main scan effect re-runs on this counter (in addition to the
+  // store's `version`) so notifytest etc. always exercise the gate
+  // path, even when the underlying signal data didn't move.
+  const [forceTick, setForceTick] = useState(0);
+  useEffect(() => {
+    const onForce = () => {
+      console.info("[notif-scan] force-scan event received");
+      setForceTick((t) => t + 1);
+    };
+    window.addEventListener(FORCE_SCAN_EVENT, onForce);
+    return () => window.removeEventListener(FORCE_SCAN_EVENT, onForce);
+  }, []);
 
   // Run migration once per app lifetime — the storage write itself
   // is idempotent so the useEffect's empty dep array is fine.
@@ -309,16 +259,35 @@ export default function NotificationsScanner({ addons, library }: Props) {
   // Main signal-diff effect. Reruns on every version bump from the
   // release-signal store (library load, refresh button, periodic
   // refresh below).
+  //
+  // Heavy console.info instrumentation: every gate logs a short label.
+  // Run `notifytest <imdb_id>` in DevConsole and the trail tells you
+  // exactly which gate swallowed the signal. The lines are intentionally
+  // prefixed `[notif-scan]` so DevConsole's source filter picks them up
+  // as a coherent set.
   useEffect(() => {
-    if (scanningRef.current) return;
+    if (scanningRef.current) {
+      console.info(`[notif-scan] skip: scan already in flight (version=${version})`);
+      return;
+    }
     const { library } = propsRef.current;
-    if (library.length === 0) return;
+    if (library.length === 0) {
+      console.info(`[notif-scan] skip: empty library (version=${version})`);
+      return;
+    }
 
     const settings = loadAuraSettings();
-    if (!settings.releaseSearchEnabled) return;
+    if (!settings.releaseSearchEnabled) {
+      console.info(`[notif-scan] skip: releaseSearchEnabled is OFF`);
+      return;
+    }
 
     const candidates = library.filter(isScannable);
-    if (candidates.length === 0) return;
+    if (candidates.length === 0) {
+      console.info(`[notif-scan] skip: no scannable items in library of ${library.length}`);
+      return;
+    }
+    console.info(`[notif-scan] start: ${candidates.length}/${library.length} scannable, version=${version}`);
 
     scanningRef.current = true;
 
@@ -336,28 +305,44 @@ export default function NotificationsScanner({ addons, library }: Props) {
           }
         }
 
-        const streamAvailability = loadStreamAvailability();
-        let streamCacheDirty = false;
         const now = Date.now();
 
+        let firedCount = 0;
         for (const item of candidates) {
           const signal = getReleaseSignal(item.id);
-          if (signal === undefined) continue; // store hasn't seen this id yet
-          if (signal === null) continue;       // cloud has no record
+          if (signal === undefined) {
+            console.info(`[notif-scan] ${item.id} (${item.name}): store has no entry — skip`);
+            continue;
+          }
+          if (signal === null) {
+            console.info(`[notif-scan] ${item.id} (${item.name}): cloud has no record — skip`);
+            continue;
+          }
+          const isMovie = isMovieType(item);
+          // Movies surface their digital-release date via `last_aired`
+          // (cloud guarantees `recent_aired: []` for movies). Series /
+          // anime walk every recent episode, falling back to last_aired
+          // if the cloud hasn't filled recent_aired yet.
           const recent = Array.isArray(signal.recent_aired) ? signal.recent_aired : [];
-          // Fallback to last_aired when the cloud's recent_aired is
-          // empty — covers the transition window where the cloud
-          // hasn't been redeployed with the new field, OR shows that
-          // only have a single tracked episode.
-          const candidates_aired: ReleaseAired[] = recent.length > 0
-            ? recent
-            : (signal.last_aired ? [signal.last_aired] : []);
-          if (candidates_aired.length === 0) continue;
+          const candidates_aired: ReleaseAired[] = isMovie
+            ? (signal.last_aired ? [signal.last_aired] : [])
+            : recent.length > 0
+              ? recent
+              : (signal.last_aired ? [signal.last_aired] : []);
+          if (candidates_aired.length === 0) {
+            console.info(`[notif-scan] ${item.id} (${item.name}): signal carries no aired entries (recent_aired=${recent.length}, last_aired=${signal.last_aired ? "set" : "null"}) — skip`);
+            continue;
+          }
 
           const prev = state[item.id] ?? { lastChecked: 0, seenVideoIds: [] };
           const seenSet = new Set<string>(prev.seenVideoIds);
           const isFirstScan = prev.lastChecked === 0;
           const lastNotifiedMs = prev.lastNotifiedAt ?? 0;
+
+          console.info(
+            `[notif-scan] ${item.id} (${item.name}): walking ${candidates_aired.length} aired entries, ` +
+            `isFirstScan=${isFirstScan}, seenIds=${seenSet.size}, lastNotifiedAt=${lastNotifiedMs}, isMovie=${isMovie}`,
+          );
 
           // First-scan seeding. Mark everything currently aired as
           // seen WITHOUT notifying. Uses the library `state.video_id`
@@ -366,6 +351,7 @@ export default function NotificationsScanner({ addons, library }: Props) {
           // to recent episodes. This is the v2→v3 migration safety
           // net + the cold-install onboarding behaviour.
           if (isFirstScan) {
+            console.info(`[notif-scan] ${item.id}: FIRST-SCAN seed (no notifications will fire this pass)`);
             let newestSeed = 0;
             for (const ep of candidates_aired) {
               const ms = airedAtMs(ep);
@@ -385,7 +371,6 @@ export default function NotificationsScanner({ addons, library }: Props) {
               lastChecked: now,
               seenVideoIds: Array.from(seenSet),
               lastNotifiedAt: newestSeed > 0 ? newestSeed : undefined,
-              pendingStreamCheck: prev.pendingStreamCheck,
             };
             stateDirty = true;
             continue;
@@ -395,11 +380,16 @@ export default function NotificationsScanner({ addons, library }: Props) {
           // every entry that's (a) not yet seen AND (b) newer than
           // our `lastNotifiedAt` watermark AND (c) not behind the
           // user's library state.video_id.
-          const newPending: PendingStreamCheck[] = [...(prev.pendingStreamCheck ?? [])];
           let highestFiredMs = lastNotifiedMs;
           for (const ep of candidates_aired) {
-            if (!ep?.id) continue;
-            if (seenSet.has(ep.id)) continue;
+            if (!ep?.id) {
+              console.info(`[notif-scan] ${item.id}: skipping entry with no id`);
+              continue;
+            }
+            if (seenSet.has(ep.id)) {
+              console.info(`[notif-scan] ${item.id}/${ep.id}: already in seenSet — skip`);
+              continue;
+            }
             const epMs = airedAtMs(ep);
             // Defense-in-depth (caveat #1): never notify before the
             // episode's stated air time. The cloud is the primary
@@ -414,7 +404,10 @@ export default function NotificationsScanner({ addons, library }: Props) {
             // firing early is the worse failure. Unparseable
             // timestamps are NEGATIVE_INFINITY → not > now → fall
             // through to the existing handling below.)
-            if (epMs > now) continue;
+            if (epMs > now) {
+              console.info(`[notif-scan] ${item.id}/${ep.id}: aired_at is in the future (${ep.aired_at}) — skip without seeding`);
+              continue;
+            }
             if (epMs < lastNotifiedMs) {
               // Strictly older than the watermark — mark as seen
               // without notifying. Prevents future polls from
@@ -428,76 +421,62 @@ export default function NotificationsScanner({ addons, library }: Props) {
               // id-dedup + notify path below. The `seenSet.has(ep.id)`
               // check above still prevents re-firing the episode that
               // set the watermark.
+              console.info(`[notif-scan] ${item.id}/${ep.id}: aired_at ${ep.aired_at} predates watermark ${lastNotifiedMs} — mark seen without firing`);
               seenSet.add(ep.id);
               continue;
             }
             if (librarySaysSeen(item, ep)) {
               // User has already played at or past this episode in
               // their library — don't notify.
+              console.info(`[notif-scan] ${item.id}/${ep.id}: librarySaysSeen=true (state.video_id=${item.state?.video_id ?? "(none)"}, timeOffset=${item.state?.timeOffset ?? 0}) — mark seen without firing`);
               seenSet.add(ep.id);
               if (epMs > highestFiredMs) highestFiredMs = epMs;
-              continue;
-            }
-
-            if (settings.notifyOnlyWithStreams) {
-              // Defer to the periodic stream-recheck timer. Record
-              // the pending entry; the timer fires fetch_streams +
-              // promotes to a notification once streams appear.
-              // Avoid duplicate pending entries on rapid version
-              // bumps.
-              if (!newPending.some((p) => p.videoId === ep.id)) {
-                newPending.push({
-                  videoId: ep.id,
-                  airedAtMs: epMs,
-                  season: ep.season ?? null,
-                  episode: ep.episode ?? null,
-                  recordedAtMs: now,
-                });
-              }
-              // Don't mark as seen yet — only promote when streams
-              // arrive (in the recheck timer below).
               continue;
             }
 
             // Fire the notification.
             seenSet.add(ep.id);
             if (epMs > highestFiredMs) highestFiredMs = epMs;
-            const epLabel = formatEpLabel(ep.season, ep.episode);
-            const titleParts: string[] = [item.name];
-            if (epLabel) titleParts.push(epLabel);
-            addNotification({
-              id: `episode:${item.id}:${ep.id}`,
-              kind: "episode",
-              title: titleParts.join(" — "),
-              subtitle: undefined,
-              data: { metaId: item.id, videoId: ep.id, mediaType: item.media_type },
-            });
+            firedCount++;
+            console.info(`[notif-scan] ${item.id}/${ep.id}: FIRING notification (${isMovie ? "movie release" : "episode"})`);
+            if (isMovie) {
+              addNotification({
+                id: `release:${item.id}`,
+                kind: "release",
+                title: `${item.name} — now available`,
+                subtitle: undefined,
+                data: { metaId: item.id, mediaType: item.media_type },
+              });
+            } else {
+              const epLabel = formatEpLabel(ep.season, ep.episode);
+              const titleParts: string[] = [item.name];
+              if (epLabel) titleParts.push(epLabel);
+              addNotification({
+                id: `episode:${item.id}:${ep.id}`,
+                kind: "episode",
+                title: titleParts.join(" — "),
+                subtitle: undefined,
+                data: { metaId: item.id, videoId: ep.id, mediaType: item.media_type },
+              });
+            }
           }
 
           state[item.id] = {
             lastChecked: now,
             seenVideoIds: Array.from(seenSet),
             lastNotifiedAt: highestFiredMs > 0 ? highestFiredMs : prev.lastNotifiedAt,
-            pendingStreamCheck: newPending.length > 0 ? newPending : undefined,
           };
           stateDirty = true;
         }
 
+        console.info(`[notif-scan] done: fired=${firedCount}, stateDirty=${stateDirty}`);
         if (stateDirty) saveScannerState(state);
-        if (streamCacheDirty) saveStreamAvailability(streamAvailability);
-
-        // After the diff finishes, kick the stream-recheck path so
-        // anything pending from THIS tick gets a chance to promote
-        // immediately when streams happen to already exist (e.g. on
-        // a delayed cold-start where the episode aired hours ago
-        // and scrapers have caught up).
-        void recheckPendingStreams(propsRef.current.library, propsRef.current.addons, addNotification);
       } finally {
         scanningRef.current = false;
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [version]);
+  }, [version, forceTick]);
 
   // Periodic refresh — kicks reconcileLibraryReleaseSignals so the
   // cloud signal store stays fresh while the app is open. Per §6.0
@@ -514,114 +493,5 @@ export default function NotificationsScanner({ addons, library }: Props) {
     return () => clearInterval(id);
   }, []);
 
-  // Stream-recheck timer — handles the notifyOnlyWithStreams flow.
-  // When the setting is on, the main diff above doesn't fire
-  // notifications immediately; it records `pendingStreamCheck`
-  // entries. This timer iterates those entries every 15 min, calls
-  // fetch_streams for each, and promotes to a notification the
-  // first time streams come back.
-  useEffect(() => {
-    const tick = () => {
-      void recheckPendingStreams(propsRef.current.library, propsRef.current.addons, addNotification);
-    };
-    const id = setInterval(tick, STREAM_RECHECK_MS);
-    return () => clearInterval(id);
-  }, [addNotification]);
-
   return null;
-}
-
-/** Walk every library item's `pendingStreamCheck` list, query
- *  `fetch_streams` for each pending video, and promote to a fired
- *  notification when streams appear. Pending entries older than
- *  PENDING_MAX_AGE_MS (14 days) are dropped — by then the user has
- *  either seen the episode through other means or the addon isn't
- *  going to find streams. Idempotent + safe to call from multiple
- *  triggers (signal bump + 15-min interval).
- *
- *  Exported-shape isn't useful outside this module; kept as a
- *  module-private async function. */
-async function recheckPendingStreams(
-  library: LibraryItem[],
-  addons: AddonEntry[],
-  addNotification: ReturnType<typeof useNotifications>["addNotification"],
-): Promise<void> {
-  if (library.length === 0) return;
-  const settings = loadAuraSettings();
-  if (!settings.notifyOnlyWithStreams) return; // setting off → nothing to do
-  if (!settings.releaseSearchEnabled) return;
-
-  const state = loadScannerState();
-  const streamAvailability = loadStreamAvailability();
-  const now = Date.now();
-  let stateDirty = false;
-  let streamCacheDirty = false;
-
-  for (const item of library) {
-    if (!isScannable(item)) continue;
-    const entry = state[item.id];
-    if (!entry?.pendingStreamCheck || entry.pendingStreamCheck.length === 0) continue;
-
-    const remaining: PendingStreamCheck[] = [];
-    const seenSet = new Set<string>(entry.seenVideoIds);
-    let lastNotifiedAt = entry.lastNotifiedAt ?? 0;
-
-    for (const pending of entry.pendingStreamCheck) {
-      // Drop entries older than the 14-day cap.
-      if (now - pending.recordedAtMs > PENDING_MAX_AGE_MS) continue;
-
-      // Use the 12-h availability cache first.
-      const cached = streamAvailability[pending.videoId];
-      let hasStreams: boolean | null = null;
-      if (cached && now - cached.ts < STREAM_AVAILABILITY_TTL_MS) {
-        hasStreams = cached.hasStreams;
-      } else {
-        try {
-          const streams = await invoke<Array<{ type?: string | null }>>(
-            "fetch_streams",
-            { addons, mediaType: item.media_type, id: pending.videoId },
-          );
-          hasStreams = Array.isArray(streams) && streams.some(isPlayableStream);
-          streamAvailability[pending.videoId] = { hasStreams, ts: now };
-          streamCacheDirty = true;
-        } catch {
-          hasStreams = null;
-        }
-      }
-
-      if (hasStreams === true) {
-        // Promote. Fire notification and remove from pending.
-        seenSet.add(pending.videoId);
-        if (pending.airedAtMs > lastNotifiedAt) lastNotifiedAt = pending.airedAtMs;
-        const epLabel = formatEpLabel(pending.season, pending.episode);
-        const titleParts: string[] = [item.name];
-        if (epLabel) titleParts.push(epLabel);
-        addNotification({
-          id: `episode:${item.id}:${pending.videoId}`,
-          kind: "episode",
-          title: titleParts.join(" — "),
-          subtitle: undefined,
-          data: { metaId: item.id, videoId: pending.videoId, mediaType: item.media_type },
-        });
-        stateDirty = true;
-      } else {
-        // No streams yet (or fetch failed) — keep in pending for
-        // the next tick.
-        remaining.push(pending);
-      }
-    }
-
-    if (remaining.length !== entry.pendingStreamCheck.length || seenSet.size !== entry.seenVideoIds.length) {
-      state[item.id] = {
-        ...entry,
-        seenVideoIds: Array.from(seenSet),
-        lastNotifiedAt: lastNotifiedAt > 0 ? lastNotifiedAt : entry.lastNotifiedAt,
-        pendingStreamCheck: remaining.length > 0 ? remaining : undefined,
-      };
-      stateDirty = true;
-    }
-  }
-
-  if (stateDirty) saveScannerState(state);
-  if (streamCacheDirty) saveStreamAvailability(streamAvailability);
 }

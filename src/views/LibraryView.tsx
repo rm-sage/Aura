@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { LibraryItem, MetaPreview } from "../types";
 import type { UserSession } from "../LoginView";
 import ImageLoader from "../ImageLoader";
@@ -81,6 +81,133 @@ function libraryItemToMeta(item: LibraryItem): MetaPreview {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Row windowing for the responsive Library grid.
+//
+// The grid is `repeat(auto-fill, minmax(180px, 1fr))` + a 20px gap, so the
+// column count + card width vary with viewport width. Rendering all N cards
+// (100s for heavy users) keeps every poster + its observers/subscriptions in
+// the DOM; the transparent WebView2 then composites the lot slowly on scroll.
+// This hook mounts only the rows in (or near) the viewport.
+//
+//   • COLUMNS — the standard CSS auto-fill count from the wrapper's measured
+//     width: floor((W + gap) / (minCardW + gap)).
+//   • ROW STRIDE — MEASURED from a real rendered card's height + the gap
+//     (cards are uniform height — see the fixed title block in LibraryCard),
+//     so we track the actual layout instead of guessing. Re-measured on
+//     column change (card width → height changes). Estimate until first paint.
+//   • RANGE — scrollTop (offset by the grid's position within the scroll
+//     content) ± a row buffer to avoid blank flashes during fast scrolls.
+//
+// The grid is absolutely positioned at `offsetY` inside a full-height spacer
+// so the scrollbar reflects the whole list while only ~viewport rows mount.
+// ---------------------------------------------------------------------------
+const LIB_GRID_GAP = 20;     // gap-5 (1.25rem)
+const LIB_MIN_CARD_W = 200;  // minmax(200px, 1fr) — bigger posters (was 180)
+// Cap the grid width so the column count stops scaling with the window.
+// `max-w-6xl` on the content wrapper is a NO-OP here — tailwind.config
+// strips the maxWidth scale ("fluid ultrawide layouts"), so the grid ran
+// full-width: ~15 columns maximized on a 3440px panel → ~15 ×
+// (visible + overscan rows) ≈ 150 mounted cards, each carrying its own
+// IntersectionObserver / hover listener / progress subscription. That
+// per-scroll mount-and-subscribe churn (NOT GPU compositing) was the
+// ultrawide lag. Capping to ~8 big posters roughly halves both the
+// mounted-card count and the painted poster area. Tunable — raise for
+// more columns.
+const LIB_MAX_GRID_W = 2000; // px — width cap for the centered grid (~8 cols)
+const LIB_BUFFER_ROWS = 2;   // overscan rows above + below (trimmed from 3)
+const LIB_EST_ROW_STRIDE = 380; // pre-measure fallback: ~200px poster + h-14 title + gap
+
+interface RowWindow {
+  start: number;
+  end: number;
+  totalHeight: number;
+  offsetY: number;
+  cols: number;
+}
+
+function useLibraryRowWindow(
+  scrollRef: React.RefObject<HTMLDivElement | null>,
+  wrapperRef: React.RefObject<HTMLDivElement | null>,
+  gridRef: React.RefObject<HTMLDivElement | null>,
+  itemCount: number,
+): RowWindow {
+  const [cols, setCols] = useState(1);
+  const [rowStride, setRowStride] = useState(LIB_EST_ROW_STRIDE);
+  // Seed a first-chunk window so the initial paint shows cards immediately
+  // (effects refine start/end after mount). Avoids a one-frame empty grid.
+  const [range, setRange] = useState({ start: 0, end: 40 });
+  // The grid's top within the scroll content (≈ header height). Cached here
+  // and refreshed on resize so the scroll handler never pays a
+  // getBoundingClientRect (forced reflow) per scroll event.
+  const gridTopRef = useRef(0);
+
+  // Measure layout BEFORE paint (useLayoutEffect, not useEffect) so the
+  // first frame already has the right column count + row stride — otherwise
+  // the grid flashes (giant 1-column scrollbar → correct) on mount. Also
+  // re-measures on container/grid resize via ResizeObserver.
+  //
+  // NOTE: the CSS grid is `auto-fill`, so cards are ALWAYS laid out at the
+  // true column count from the container width regardless of `cols` state —
+  // which means the measured card height is correct immediately. `cols` only
+  // needs to match that count for the windowing MATH (slice + offset).
+  useLayoutEffect(() => {
+    const scroll = scrollRef.current;
+    const wrapper = wrapperRef.current;
+    if (!scroll || !wrapper) return;
+    const measure = () => {
+      const w = wrapper.clientWidth;
+      if (w > 0) {
+        const c = Math.max(1, Math.floor((w + LIB_GRID_GAP) / (LIB_MIN_CARD_W + LIB_GRID_GAP)));
+        setCols((prev) => (prev === c ? prev : c));
+      }
+      const card = gridRef.current?.firstElementChild as HTMLElement | null;
+      const h = card?.offsetHeight ?? 0;
+      if (h > 0) {
+        const s = h + LIB_GRID_GAP;
+        setRowStride((prev) => (Math.abs(prev - s) < 0.5 ? prev : s));
+      }
+      const wrapRect = wrapper.getBoundingClientRect();
+      const scrollRect = scroll.getBoundingClientRect();
+      gridTopRef.current = wrapRect.top - scrollRect.top + scroll.scrollTop;
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(wrapper);
+    ro.observe(scroll);
+    return () => ro.disconnect();
+  }, [scrollRef, wrapperRef, gridRef, itemCount]);
+
+  // Recompute the visible range on scroll. Cheap: reads scrollTop +
+  // clientHeight + the cached gridTop — no getBoundingClientRect per event.
+  useEffect(() => {
+    const scroll = scrollRef.current;
+    if (!scroll) return;
+    const compute = () => {
+      if (rowStride <= 0) return;
+      const within = scroll.scrollTop - gridTopRef.current;
+      const viewportH = scroll.clientHeight;
+      const totalRows = Math.ceil(itemCount / cols);
+      const firstRow = Math.max(0, Math.floor(within / rowStride) - LIB_BUFFER_ROWS);
+      const rowsInView = Math.ceil(viewportH / rowStride) + LIB_BUFFER_ROWS * 2;
+      const lastRow = Math.min(totalRows, firstRow + rowsInView);
+      const nextStart = firstRow * cols;
+      const nextEnd = Math.min(itemCount, lastRow * cols);
+      setRange((prev) =>
+        prev.start === nextStart && prev.end === nextEnd ? prev : { start: nextStart, end: nextEnd },
+      );
+    };
+    compute();
+    scroll.addEventListener("scroll", compute, { passive: true });
+    return () => scroll.removeEventListener("scroll", compute);
+  }, [scrollRef, cols, rowStride, itemCount]);
+
+  const totalRows = Math.ceil(itemCount / cols);
+  const totalHeight = totalRows > 0 ? totalRows * rowStride - LIB_GRID_GAP : 0;
+  const offsetY = Math.floor(range.start / cols) * rowStride;
+  return { start: range.start, end: range.end, totalHeight, offsetY, cols };
+}
+
 export default function LibraryView(props: Props) {
   return (
     <ErrorBoundary scope="Library">
@@ -98,30 +225,50 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
   // this FilterState only carries the year / genre filter.
   const [extraFilters, setExtraFilters] = useState<FilterState>(DEFAULT_FILTERS);
 
-  // Scroll-debounced "is the user actively scrolling" flag. The
-  // wrapper's class flips on while scroll events are firing and 150 ms
-  // after the last one, the class drops back off. CSS uses this to
-  // freeze per-card transitions during a scroll burst — without that,
-  // every card's `transition-transform` / `transition-opacity` set up
-  // GPU layers on every frame, and on a 45+ visible-card ultrawide
-  // layout the layer count alone tanks scroll perf.
+  // Scroll-burst class toggle. While scroll events fire (and for 150 ms
+  // after the last one) the grid carries `aura-scrolling`, which CSS uses
+  // to freeze per-card transitions — without that, every card's
+  // `transition-transform` / `transition-opacity` sets up a GPU layer on
+  // every frame and the layer count alone tanks scroll perf.
+  //
+  // CRITICAL: this is toggled via direct DOM (`classList`), NOT React
+  // state. An earlier version held `scrolling` in useState and called
+  // `setScrolling(true)` on scroll-start — that re-rendered LibraryViewBody
+  // mid-scroll, which (because the card callbacks weren't referentially
+  // stable) re-ran ALL ~N card component functions synchronously on the
+  // main thread. On a 120+ item library that was a ~1s block: the
+  // scrollbar (compositor thread) kept moving while the content (main
+  // thread) stayed frozen until the re-render finished. content-visibility
+  // skips off-screen PAINT but does nothing for React's JS reconciliation,
+  // so the cost was paid regardless. Flipping a class imperatively keeps
+  // the transition-freeze benefit with zero render cost.
   const scrollContainerRef = useRef<HTMLDivElement>(null);
-  const [scrolling, setScrolling] = useState(false);
+  const gridRef = useRef<HTMLDivElement>(null);
+  // Full-height spacer that owns the scrollbar extent; the grid is absolutely
+  // positioned inside it at the windowed offset. See useLibraryRowWindow.
+  const gridWrapperRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const node = scrollContainerRef.current;
     if (!node) return;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let active = false;
     const onScroll = () => {
-      if (!scrolling) setScrolling(true);
+      if (!active) {
+        active = true;
+        gridRef.current?.classList.add("aura-scrolling");
+      }
       if (timer) clearTimeout(timer);
-      timer = setTimeout(() => setScrolling(false), 150);
+      timer = setTimeout(() => {
+        active = false;
+        gridRef.current?.classList.remove("aura-scrolling");
+      }, 150);
     };
     node.addEventListener("scroll", onScroll, { passive: true });
     return () => {
       node.removeEventListener("scroll", onScroll);
       if (timer) clearTimeout(timer);
     };
-  }, [scrolling]);
+  }, []);
 
   // Defensive: library prop may be undefined while the initial fetch is in
   // flight. Treat that distinctly from "explicitly empty".
@@ -224,6 +371,18 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
     return arr;
   }, [filtered, sort, filteredMetaIds]);
 
+  // Windowing — only the cards in/near the viewport are mounted.
+  const win = useLibraryRowWindow(scrollContainerRef, gridWrapperRef, gridRef, sorted.length);
+  const visible = sorted.slice(win.start, win.end);
+
+  // Reset scroll to the top when the visible set changes wholesale (filter
+  // pill / sort / year-genre filter). Without this a deep scroll position
+  // would survive into a now-shorter list and the window would compute an
+  // out-of-range slice (blank grid until the user scrolls back up).
+  useEffect(() => {
+    scrollContainerRef.current?.scrollTo({ top: 0 });
+  }, [filter, sort, extraFilters]);
+
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
       <div
@@ -231,7 +390,12 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
         className="flex-1 overflow-y-auto"
         style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
       >
-        <div className="max-w-6xl mx-auto px-6 py-6 space-y-5">
+        {/* Width-capped, centered column. NOTE: `max-w-6xl` (or any
+            `max-w-*`) emits no CSS in this project — tailwind.config
+            removes the maxWidth scale — so the cap is an inline style
+            keyed off LIB_MAX_GRID_W (which the row-windowing column math
+            also reads, keeping CSS + JS in lockstep). */}
+        <div className="mx-auto px-6 py-6 space-y-5" style={{ maxWidth: LIB_MAX_GRID_W }}>
           {/* ── Shell: header (always renders) ── */}
           <div className="flex items-end justify-between gap-4 flex-wrap">
             <div>
@@ -296,18 +460,27 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
           ) : sorted.length === 0 ? (
             <EmptyCard message="No items match this filter." />
           ) : (
-            <div
-              className={`grid gap-5 pb-6 aura-lib-grid${scrolling ? " aura-scrolling" : ""}`}
-              style={{ gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))" }}
-            >
-              {sorted.map((item) => (
-                <LibraryCard
-                  key={item.id ?? Math.random()}
-                  item={item}
-                  onSelect={onSelectMeta}
-                  onRemove={onRemoveItem ? (origin) => onRemoveItem(item, origin) : undefined}
-                />
-              ))}
+            <div ref={gridWrapperRef} style={{ position: "relative", height: win.totalHeight }}>
+              <div
+                ref={gridRef}
+                className="grid gap-5 aura-lib-grid"
+                style={{
+                  position: "absolute",
+                  top: win.offsetY,
+                  left: 0,
+                  right: 0,
+                  gridTemplateColumns: `repeat(auto-fill, minmax(${LIB_MIN_CARD_W}px, 1fr))`,
+                }}
+              >
+                {visible.map((item) => (
+                  <LibraryCard
+                    key={item.id}
+                    item={item}
+                    onSelect={onSelectMeta}
+                    onRemove={onRemoveItem}
+                  />
+                ))}
+              </div>
             </div>
           )}
         </div>
@@ -325,7 +498,7 @@ function SkeletonGrid() {
   return (
     <div
       className="grid gap-5 pb-6"
-      style={{ gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))" }}
+      style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${LIB_MIN_CARD_W}px, 1fr))` }}
     >
       {Array.from({ length: 12 }).map((_, i) => (
         <div key={i} className="space-y-2">
@@ -358,7 +531,10 @@ const LibraryCard = memo(function LibraryCard({
 }: {
   item: LibraryItem;
   onSelect?: (meta: MetaPreview) => void;
-  onRemove?: (origin: { x: number; y: number }) => void;
+  // Takes `item` so the parent can pass ONE stable callback for every card
+  // (a per-card `(origin) => onRemove(item, origin)` closure would change
+  // identity each render and defeat this component's `memo`).
+  onRemove?: (item: LibraryItem, origin: { x: number; y: number }) => void;
 }) {
   const meta = libraryItemToMeta(item);
   const hover = useHoverCardActivation(meta);
@@ -389,6 +565,13 @@ const LibraryCard = memo(function LibraryCard({
             <ImageLoader
               src={item.poster}
               alt={item.name ?? ""}
+              // Eager: the row-windowing already mounts only near-viewport
+              // rows (+overscan), so ImageLoader's per-card
+              // IntersectionObserver is redundant here — it just adds one
+              // observer per mounted card (~80+) that churns on every
+              // scroll. Eager loading drops the observer entirely and the
+              // poster is fetched the moment its row enters the window.
+              loading="eager"
               className="absolute inset-0 w-full h-full"
               imgClassName="w-full h-full object-cover"
               fallback={<PosterFallback />}
@@ -408,7 +591,11 @@ const LibraryCard = memo(function LibraryCard({
             className="absolute top-1.5 left-1.5"
           />
         </div>
-        <div className="px-0.5">
+        {/* Fixed-height label block (h-14) so every card is the SAME total
+            height regardless of whether the title wraps to 1 or 2 lines.
+            Uniform card height is what lets the windowing hook derive an
+            accurate per-row stride from a single measured card. */}
+        <div className="px-0.5 h-14 overflow-hidden">
           <p className="text-white/85 text-sm font-medium leading-tight line-clamp-2 text-center">
             {item.name ?? "Unknown title"}
           </p>
@@ -438,7 +625,7 @@ const LibraryCard = memo(function LibraryCard({
           onClick={(e) => {
             e.stopPropagation();
             e.preventDefault();
-            onRemove({ x: e.clientX, y: e.clientY });
+            onRemove(item, { x: e.clientX, y: e.clientY });
           }}
           className="absolute top-2 right-2 w-7 h-7 rounded-full
                      bg-black/70 backdrop-blur-md border border-white/20

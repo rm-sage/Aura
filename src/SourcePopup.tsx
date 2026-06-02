@@ -116,6 +116,17 @@ export default function SourcePopupHost() {
   // events on every top-level navigation). The non-OAuth flow leaves
   // this null and the header just shows the static title.
   const [navHost, setNavHost] = useState<string | null>(null);
+  // Address-bar state for the chrome strip. `urlInput` is what the user
+  // is typing; `currentUrl` is the last-known committed URL of the
+  // child webview (initial URL, or what the user just navigated to).
+  // We don't poll `location.href` from the child — Tauri's child-webview
+  // API doesn't expose a navigation event for the non-OAuth spawn path,
+  // and there's no safe way to read it back without a content script
+  // we'd have to inject (which we don't, since this is a sandboxed
+  // browsing context). In-page link clicks therefore leave the address
+  // bar showing the LAST committed URL until the user types a new one.
+  const [urlInput, setUrlInput] = useState("");
+  const [currentUrl, setCurrentUrl] = useState("");
   // Minimized — collapses the backdrop+card to a floating pill at
   // bottom-right while keeping the child webview alive offscreen so
   // OAuth flow state (cookies, in-progress page, etc) doesn't reset
@@ -128,6 +139,20 @@ export default function SourcePopupHost() {
   // `minimized: true` could persist across an open/close cycle and
   // hide the next popup behind nothing.
   useEffect(() => { if (!active) setMinimized(false); }, [active]);
+
+  // Mirror active.url into the address-bar input + committed-URL state
+  // on every (re)open or external URL change. Keeps the chrome strip
+  // honest when openSourcePopup is called again with a different URL
+  // while the popup is already mounted.
+  useEffect(() => {
+    if (!active) {
+      setUrlInput("");
+      setCurrentUrl("");
+      return;
+    }
+    setUrlInput(active.url);
+    setCurrentUrl(active.url);
+  }, [active?.url]); // eslint-disable-line react-hooks/exhaustive-deps
   const placeholderRef = useRef<HTMLDivElement>(null);
   const webviewRef = useRef<Webview | null>(null);
   const activeLabelRef = useRef<string | null>(null);
@@ -381,6 +406,46 @@ export default function SourcePopupHost() {
    *  back to the placeholder's geometry. */
   const restore  = useCallback(() => setMinimized(false), []);
 
+  // ── Navigation helpers (non-OAuth chrome strip) ──
+  // The JS Webview class doesn't expose eval — Rust commands
+  // (popup_webview_back/forward/reload/navigate) bridge the gap. Each
+  // looks up the popup by label on the Rust side and dispatches a
+  // single fixed eval. Failure is silent: most "failures" here are
+  // "no history to go back to" / "page hasn't loaded yet" which the
+  // user resolves by retrying.
+  const invokePopupCmd = useCallback((command: string, extra?: Record<string, unknown>) => {
+    const label = activeLabelRef.current;
+    if (!label) return;
+    invoke(command, { label, ...(extra ?? {}) }).catch(() => {});
+  }, []);
+  const goBack    = useCallback(() => invokePopupCmd("popup_webview_back"),    [invokePopupCmd]);
+  const goForward = useCallback(() => invokePopupCmd("popup_webview_forward"), [invokePopupCmd]);
+  const refresh   = useCallback(() => invokePopupCmd("popup_webview_reload"),  [invokePopupCmd]);
+
+  /** Sanitise + commit a user-typed URL. Refuses anything that isn't
+   *  plain http(s) — `javascript:`, `data:`, `file:`, `tauri:`, and
+   *  scheme-less inputs are silently corrected (prefixing https:// for
+   *  a bare host) or rejected outright. The Rust command re-validates
+   *  the scheme so a stray non-http(s) URL can't smuggle past this
+   *  guard either. */
+  const submitUrl = useCallback(() => {
+    const raw = urlInput.trim();
+    if (!raw) return;
+    let candidate = raw;
+    if (!/^https?:\/\//i.test(candidate)) {
+      if (/^[a-z][a-z0-9+.-]*:/i.test(candidate)) return; // any other scheme
+      candidate = `https://${candidate}`;
+    }
+    let parsed: URL;
+    try { parsed = new URL(candidate); }
+    catch { return; }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
+    const target = parsed.toString();
+    setCurrentUrl(target);
+    setUrlInput(target);
+    invokePopupCmd("popup_webview_navigate", { url: target });
+  }, [urlInput, invokePopupCmd]);
+
   if (!active) return null;
 
   return (
@@ -452,19 +517,11 @@ export default function SourcePopupHost() {
                 </span>
               ) : null}
             </div>
-            {/* Destination URL — surfaced under the title so the user can
-                preview where the popup is taking them. Suppressed in
-                OAuth mode because the start URL carries the device-flow
-                state token; the navHost security chip above is the
-                anti-phishing surface for that flow instead. */}
-            {!active.oauth && (
-              <div
-                className="text-white/55 text-[11px] font-mono truncate mt-1 select-text"
-                title={active.url}
-              >
-                {active.url}
-              </div>
-            )}
+            {/* OAuth mode keeps the static start-URL preview suppressed
+                (the URL carries a device-flow state token; the navHost
+                chip is the anti-phishing surface for that flow). The
+                non-OAuth chrome strip below provides the URL surface
+                for regular popups. */}
           </div>
           <button
             onClick={minimize}
@@ -488,6 +545,90 @@ export default function SourcePopupHost() {
             </svg>
           </button>
         </div>
+
+        {/* Chrome strip — Back / Forward / Refresh + editable address bar.
+            Non-OAuth popups only. OAuth flows deliberately omit the
+            address bar because the navHost chip in the header is the
+            anti-phishing surface, and offering an editable URL there
+            would let the user paste a phishing URL into a half-loaded
+            OAuth window where credentials are about to be entered. */}
+        {!active.oauth && (
+          <div className="flex items-center gap-2 px-4 py-2.5 border-b border-white/8 shrink-0
+                          bg-white/[0.02]">
+            <button
+              type="button"
+              onClick={goBack}
+              aria-label="Back"
+              title="Back"
+              className="w-8 h-8 shrink-0 rounded-md flex items-center justify-center
+                         text-white/55 hover:text-white hover:bg-white/8 transition-colors"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                <path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              onClick={goForward}
+              aria-label="Forward"
+              title="Forward"
+              className="w-8 h-8 shrink-0 rounded-md flex items-center justify-center
+                         text-white/55 hover:text-white hover:bg-white/8 transition-colors"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                <path d="M8.59 16.59L10 18l6-6-6-6-1.41 1.41L13.17 12z" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              onClick={refresh}
+              aria-label="Refresh"
+              title="Refresh"
+              className="w-8 h-8 shrink-0 rounded-md flex items-center justify-center
+                         text-white/55 hover:text-white hover:bg-white/8 transition-colors"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                <path d="M3 12a9 9 0 0 1 15.4-6.36L21 8" />
+                <polyline points="21 3 21 8 16 8" />
+                <path d="M21 12a9 9 0 0 1-15.4 6.36L3 16" />
+                <polyline points="3 21 3 16 8 16" />
+              </svg>
+            </button>
+            <input
+              type="text"
+              value={urlInput}
+              onChange={(e) => setUrlInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") { e.preventDefault(); submitUrl(); }
+              }}
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
+              placeholder="Enter URL (http or https only)"
+              title={currentUrl || urlInput}
+              className="flex-1 min-w-0 h-8 px-3 rounded-md
+                         bg-white/[0.04] border border-white/10
+                         text-white/85 text-[12px] font-mono
+                         placeholder-white/30
+                         focus:outline-none focus:border-ln-accent/50
+                         focus:bg-white/[0.06]"
+            />
+            <button
+              type="button"
+              onClick={submitUrl}
+              aria-label="Go"
+              title="Go"
+              className="h-8 px-3 shrink-0 rounded-md
+                         bg-white/[0.05] border border-white/10
+                         text-white/75 hover:text-white hover:bg-white/[0.10]
+                         text-[12px] font-medium tracking-wide
+                         transition-colors"
+            >
+              Go
+            </button>
+          </div>
+        )}
 
         {/* Webview placeholder — the child Tauri Webview overlays this
             div via setPosition/setSize. The bg-black underneath is what

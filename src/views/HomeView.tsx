@@ -273,11 +273,18 @@ export default function HomeView({
       }
       setSettingsTick((t) => t + 1);
     };
+    // Same path as a settings change, but triggered when an addon's
+    // manifest is refreshed (post-configure auto-refresh, or the user
+    // clicking the Refresh icon) so home rows reflect newly-enabled
+    // catalogs without waiting for an unrelated setting flip.
+    const onManifestRefresh = () => setSettingsTick((t) => t + 1);
     window.addEventListener("aura:settings-changed", onChange);
     window.addEventListener("storage", onChange);
+    window.addEventListener("aura:addon-manifest-refreshed", onManifestRefresh);
     return () => {
       window.removeEventListener("aura:settings-changed", onChange);
       window.removeEventListener("storage", onChange);
+      window.removeEventListener("aura:addon-manifest-refreshed", onManifestRefresh);
     };
   }, []);
 

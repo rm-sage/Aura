@@ -205,8 +205,8 @@ pub async fn debug_load_test_pattern() -> Result<(), String> {
         use crate::mpv2::engine::{enabled as engine_enabled, is_running, submit_load_file};
         if !engine_enabled() || !is_running() {
             return Err(
-                "debug_load_test_pattern: mpv2 engine not running. Launch \
-                 Aura with AURA_MPV2=1 first."
+                "debug_load_test_pattern: mpv2 engine not running (it is the \
+                 default path — did you launch with AURA_MPV2=0?)."
                     .into(),
             );
         }
@@ -277,8 +277,8 @@ pub async fn debug_drop_test(duration_secs: u32) -> Result<Value, String> {
         };
         if !engine_enabled() || !is_running() {
             return Err(
-                "debug_drop_test: mpv2 engine not running. Launch Aura with \
-                 AURA_MPV2=1 and load a stream first."
+                "debug_drop_test: mpv2 engine not running (it is the default \
+                 path — did you launch with AURA_MPV2=0?). Load a stream first."
                     .into(),
             );
         }

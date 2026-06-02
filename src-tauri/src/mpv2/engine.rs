@@ -24,8 +24,10 @@
 //! paints a steady teal clear forever — the "is the engine alive?" indicator
 //! — and exits via [`shutdown_if_running`] when the user closes Aura.
 //!
-//! Opt-in via the `AURA_MPV2_ENGINE` environment variable, independent from
-//! `AURA_MPV2_HELLO`. A normal launch (neither set) is unaffected.
+//! Drives playback by DEFAULT now. Set `AURA_MPV2=0` (or `false`/`off`/`no`)
+//! to fall back to the legacy `--wid` `tauri-plugin-libmpv` path — the
+//! escape hatch kept until Phase 7 removes that dependency. Independent
+//! from `AURA_MPV2_HELLO` (the Phase-1 verification scaffolding).
 //!
 //! Windows-only — gated at the `mod` declaration in [`super`].
 
@@ -163,30 +165,31 @@ fn engine_slot() -> &'static Mutex<Option<EngineHandle>> {
     ENGINE.get_or_init(|| Mutex::new(None))
 }
 
-/// Master env-var gate for the mpv2 path: when set, [`start_if_requested`]
-/// spawns the engine AND the Tauri command handlers route playback through
-/// it ([`crate::mpv2::engine::submit_load_file`] / `_toggle_pause` /
-/// `_set_volume`). Unset → behaviour is identical to the legacy `--wid`
-/// engine. Single switch by design so partial runs (engine without command
-/// routing or vice versa) can't accidentally happen.
+/// Master env-var gate for the mpv2 path. The engine is the DEFAULT
+/// playback path now: [`start_if_requested`] spawns it AND the Tauri
+/// command handlers route playback through it
+/// ([`submit_load_file`] / [`submit_toggle_pause`] / [`submit_set_volume`])
+/// unless this variable is explicitly set to an off value, which restores
+/// the legacy `--wid` engine. Single switch by design so partial runs
+/// (engine without command routing or vice versa) can't accidentally
+/// happen.
 pub const ENV_VAR: &str = "AURA_MPV2";
 
-/// Whether the master env-var gate is set this process.
+/// Whether the mpv2 engine should drive playback this process.
 ///
-/// Truthiness mirrors the unix convention: any value that parses to
-/// "yes" wins. Treats the variable as DISABLED when it's unset OR when
-/// it's set to one of `""`, `0`, `false`, `off`, `no` (case-insensitive,
-/// trimmed). This matches what users intuitively expect when they
-/// `$env:AURA_MPV2=0` to turn the engine off — earlier the gate was a
-/// raw `var_os(...).is_some()` which marked `0` as "set" → "enabled",
-/// silently skipping the legacy `--wid` init while the user thought
-/// they were turning the engine off.
+/// DEFAULT ON. The engine is disabled only when [`ENV_VAR`] is explicitly
+/// set to an off value — `0`, `false`, `off`, or `no` (case-insensitive,
+/// trimmed). Unset, empty, or any other value → ON. `$env:AURA_MPV2=0`
+/// (or `=off`) is the documented escape hatch back to the legacy `--wid`
+/// path, kept until Phase 7 deletes the legacy plugin.
 pub fn enabled() -> bool {
-    let Ok(raw) = std::env::var(ENV_VAR) else {
-        return false;
-    };
-    let v = raw.trim().to_ascii_lowercase();
-    !v.is_empty() && !matches!(v.as_str(), "0" | "false" | "off" | "no")
+    match std::env::var(ENV_VAR) {
+        Ok(raw) => !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no",
+        ),
+        Err(_) => true,
+    }
 }
 
 /// Whether the engine thread is currently running. Tauri command handlers
@@ -198,9 +201,9 @@ pub fn is_running() -> bool {
         .unwrap_or(false)
 }
 
-/// Spawn the engine — but only if [`ENV_VAR`] is set. A no-op otherwise.
-/// Idempotent: a second call while the engine is already running returns
-/// without doing anything.
+/// Spawn the engine (the default path) — a no-op only when [`ENV_VAR`] is
+/// set to an off value. Idempotent: a second call while the engine is
+/// already running returns without doing anything.
 ///
 /// `parent_hwnd` is the Tauri main window's HWND, passed as `isize` so it
 /// can cross the thread boundary (`HWND` itself is not `Send`). The render
@@ -216,7 +219,7 @@ pub fn start_if_requested(parent_hwnd: isize, emit: EngineEmit) {
     if parent_hwnd == 0 {
         crate::devlog!(
             warn, "mpv2",
-            "{ENV_VAR} set but parent HWND is 0 — engine not spawned",
+            "engine enabled but parent HWND is 0 — engine not spawned (legacy --wid init kept as fallback)",
         );
         return;
     }
@@ -232,7 +235,7 @@ pub fn start_if_requested(parent_hwnd: isize, emit: EngineEmit) {
     }
     crate::devlog!(
         info, "mpv2",
-        "{ENV_VAR} set — spawning long-lived render engine (parent HWND {parent_hwnd:#x})",
+        "spawning long-lived render engine — default path (parent HWND {parent_hwnd:#x})",
     );
 
     let (tx, rx) = mpsc::channel::<EngineCommand>();
@@ -469,6 +472,21 @@ type WglSwapIntervalExtFn = unsafe extern "system" fn(interval: c_int) -> i32;
 /// Tauri commands so the Settings → Debug Stuff panel can show the live
 /// state without touching the render thread.
 static CURRENT_MODE: AtomicU8 = AtomicU8::new(255);
+
+/// Whether the display should be kept awake (set by the frontend via the
+/// `set_keep_display_awake` Tauri command when the player is active and
+/// unpaused). The render thread reads this each iteration and asserts /
+/// releases `SetThreadExecutionState` on transition — see the call in
+/// [`run_engine`] and [`crate::win32::set_display_sleep_inhibited`] for why
+/// it must be driven from the single render thread.
+static DISPLAY_AWAKE_DESIRED: AtomicBool = AtomicBool::new(false);
+
+/// Set by `lib.rs::set_keep_display_awake`. Frontend calls this on every
+/// `isPlayerActive && !paused` change. No-op beyond the store; the render
+/// loop does the actual SetThreadExecutionState on its own thread.
+pub fn set_display_awake_desired(awake: bool) {
+    DISPLAY_AWAKE_DESIRED.store(awake, Ordering::Release);
+}
 
 /// Read the engine's current [`PresentMode`]. Returns `None` when the
 /// engine isn't running.
@@ -928,25 +946,17 @@ unsafe fn resolve_swap_interval() -> Option<WglSwapIntervalExtFn> {
     Some(std::mem::transmute::<_, WglSwapIntervalExtFn>(f))
 }
 
-/// Apply mpv's `framedrop` property based on focus state. Focused →
-/// `vo` (mpv's default: drop late frames at the renderer to keep a/v
-/// sync tight). Unfocused → `no` (don't drop; present every frame even
-/// if "late"). The unfocused choice exists because:
+/// Apply mpv's `framedrop` property. It's now uniformly `vo` (mpv's own
+/// default — drop late frames at the renderer) regardless of mode; see
+/// [`PresentMode::framedrop`]. This still runs on each mode transition so
+/// the property is re-asserted, but it no longer varies by focus.
 ///
-/// 1. We call `mpv_render_context_report_swap` after each SwapBuffers
-///    to give mpv vsync timing info. In focused mode SwapBuffers
-///    blocks on vblank so the timestamp is accurate. In unfocused
-///    mode SwapBuffers returns immediately (swap-interval=0) while
-///    DWM throttles the real screen flip — the reported time bears
-///    no relationship to when the user actually sees the frame.
-/// 2. mpv's display-sync builds a vsync-prediction model from those
-///    report_swap calls. Fed misinformation in unfocused mode, it
-///    predicts the next vsync wrongly and drops frames it thinks
-///    will arrive late — the source of the ~16% drop rate observed
-///    empirically with framedrop=vo + unfocused timer pacing.
-/// 3. The user can't see the dropped frames either way (window's
-///    backgrounded). Showing them on return is preferred to having
-///    mpv catch up via a visible skip.
+/// History: an earlier design used `framedrop=no` while backgrounded to
+/// "present every frame", but that made mpv hoard late frames during
+/// DWM's background-present throttle and then dump the backlog as a
+/// catch-up drop burst the instant focus returned — the off-focus
+/// regression. `vo` (steady dropping, matching what legacy `--wid` did)
+/// is the fix.
 ///
 /// Errors are devlog'd at `warn` and otherwise ignored — `framedrop`
 /// is a runtime hint, not a correctness requirement.
@@ -988,25 +998,26 @@ unsafe fn apply_framedrop_policy(
 ///   present reports the swap to mpv, and `framedrop=vo` drops frames
 ///   that would arrive late (mpv's default behaviour for tight a/v sync).
 ///
-/// * [`VisibleBackground`] — visible but NOT foreground. The user has
-///   Aura on monitor 2 (or alongside a foreground app on the same
-///   monitor) while working in something else. WGL/DWM on Windows
-///   throttles non-foreground swap chains' present cadence regardless of
-///   `swap-interval=1`, so mpv's default `framedrop=vo` sees the slow
-///   swaps and drops ~16% of frames to "stay synced to audio". For a
-///   passively-watched second-monitor stream the drops are visible
-///   stutters while slight a/v drift is invisible — so this mode keeps
-///   vsync + report_swap on (mpv still gets accurate timing for the
-///   cases it can handle) but flips `framedrop=no` to let every decoded
-///   frame play through, accepting drift instead of drops.
+/// * [`VisibleBackground`] — visible but NOT foreground (Aura on monitor
+///   2, or alongside a foreground app). Now treated IDENTICALLY to
+///   [`Foreground`]: vsync (`swap-interval=1`) + `report_swap` +
+///   `framedrop=vo`. DWM throttles a background window's present, but
+///   that's fine — vsync-blocked SwapBuffers keeps `report_swap` honest
+///   (mpv learns the real, throttled cadence) and `framedrop=vo` drops
+///   late frames steadily to track it, the same as the legacy `--wid`
+///   path. (The earlier `framedrop=no` here hoarded late frames and
+///   dumped a catch-up burst on refocus — the off-focus regression.)
+///   Kept as a distinct variant from Foreground only for diagnostic
+///   logging.
 ///
 /// * [`Hidden`] — minimised, DWM-cloaked (different virtual desktop /
 ///   UWP shell-ghost), or otherwise not visible. The user can't see
-///   playback. Drop to the background path: `swap-interval=0` (no vsync
-///   stall), no `report_swap` (don't lie to mpv about timing it can't
-///   meaningfully use), `framedrop=no` (don't try to maintain anything).
-///   The audio still plays in real time; video runs at whatever cadence
-///   mpv naturally arrives at.
+///   playback. Non-blocking present path so the engine stays responsive
+///   to commands / shutdown while the window is suspended:
+///   `swap-interval=0` (SwapBuffers can't block on a suspended present) +
+///   a 60 Hz render timer + no `report_swap` (no real flip to anchor to).
+///   `framedrop=vo` like every other mode, so it drops steadily rather
+///   than hoarding a backlog that would burst on un-minimise.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum PresentMode {
     Foreground,
@@ -1072,14 +1083,17 @@ impl PresentMode {
             PresentMode::Hidden => false,
         }
     }
-    /// mpv `framedrop` property value. `vo` is mpv's default (drop late
-    /// frames at the renderer); `no` plays every decoded frame regardless
-    /// of timing — accepting drift to avoid drops.
+    /// mpv `framedrop` property value — now uniformly `vo` (mpv's own
+    /// default: drop late frames at the renderer). The old per-mode `no`
+    /// for background states WAS the off-focus-burst regression: while DWM
+    /// throttles a background window's present, `framedrop=no` made mpv
+    /// HOARD the late frames instead of dropping them, then dump the whole
+    /// backlog as a catch-up drop burst the instant focus returned. `vo`
+    /// drops steadily instead (no backlog → no burst) — exactly what the
+    /// legacy `--wid` path did. Kept as a method (call sites + logging
+    /// stay put); the value just no longer varies by mode.
     fn framedrop(self) -> &'static [u8] {
-        match self {
-            PresentMode::Foreground => b"vo\0",
-            PresentMode::VisibleBackground | PresentMode::Hidden => b"no\0",
-        }
+        b"vo\0"
     }
 }
 
@@ -1155,25 +1169,63 @@ unsafe fn is_parent_actually_visible(parent: HWND) -> bool {
     true
 }
 
+/// FSO ("Fullscreen Optimization") geometry-break inset, in device
+/// pixels. Subtracted from the engine child's height when the parent is
+/// in native fullscreen so the GL surface does NOT exactly cover the
+/// monitor.
+///
+/// Win11's DWM auto-promotes any swapchain-backed window that covers a
+/// full output to Independent Flip / Multi-Plane Overlay mode (the same
+/// promotion exclusive-fullscreen games get). When that fires the
+/// engine's WGL surface drops out of DWM composition, which produces
+/// FOUR simultaneous symptoms:
+///   1. WebView2 (transparent overlay above the GL child in z-order)
+///      stops compositing over the surface → the React UI vanishes.
+///   2. The display pipeline bypasses DWM's ICM colour management →
+///      colours look "vivid" / over-saturated (raw gamma, no profile).
+///   3. DWM re-sorts every other output's compositor as part of the
+///      transition → secondary monitors flash black for a beat.
+///   4. The acquire path is a real mode transition → ~2-3 seconds of
+///      latency between toggling fullscreen and a stable picture.
+///
+/// VERIFIED FIX (hardware test): shrinking the engine surface 1px shorter
+/// than the monitor stops the promotion outright — DWM can't hand a
+/// non-output-sized window a full-screen overlay plane, so it must
+/// composite. Confirmed the OTHER way round does NOT work: putting opaque
+/// content ABOVE a full-size engine (a 1px WebView2 marker) failed,
+/// because the RTX 4090 supports multi-plane overlays and simply put the
+/// engine on its own plane regardless. The disqualifier MUST be the
+/// engine surface's own geometry, not occlusion from above. The 1px gap
+/// is covered by a black strip in the React layer (App.tsx) so it reads
+/// as a thin letterbox line rather than desktop bleed-through.
+///
+/// Pre-mpv2 (legacy `--wid` mpv child) didn't have this problem because
+/// libmpv's own DirectX swapchain explicitly opts out via DXGI flags
+/// (`SetFullscreenState(FALSE)`). WGL has no equivalent API — we go
+/// through the NVIDIA ICD's hidden DXGI swap chain with no opt-out. The
+/// canonical workaround (RPCS3, PCSX2, many borderless-fullscreen game
+/// launchers) is exactly this 1px geometric break.
+const FSO_HEIGHT_INSET: i32 = 1;
+
 /// Compute the engine child's target geometry from its parent's client
 /// rect: full client width, full client height minus the title-bar inset
-/// (which is 0 in fullscreen, [`TITLE_BAR_H`] windowed). On failure or a
-/// degenerate rect, falls back to a small visible default so the engine
-/// can still come up and the per-frame resync can correct on the next
-/// iteration once the parent settles.
+/// (which is 0 in fullscreen, [`TITLE_BAR_H`] windowed) minus the FSO
+/// break inset ([`FSO_HEIGHT_INSET`] in fullscreen, 0 windowed — see the
+/// constant's comment for the full rationale). On failure or a degenerate
+/// rect, falls back to a small visible default so the engine can still
+/// come up and the per-frame resync can correct on the next iteration
+/// once the parent settles.
 unsafe fn parent_client_inset(parent: HWND) -> (i32, i32, i32, i32) {
-    let y_off = if crate::win32::is_in_native_fullscreen() {
-        0
-    } else {
-        TITLE_BAR_H
-    };
+    let in_fs = crate::win32::is_in_native_fullscreen();
+    let y_off = if in_fs { 0 } else { TITLE_BAR_H };
+    let bottom_inset = if in_fs { FSO_HEIGHT_INSET } else { 0 };
     let mut rc = RECT::default();
     if GetClientRect(parent, &mut rc).is_ok()
         && rc.right > rc.left
         && rc.bottom > rc.top
     {
         let w = rc.right - rc.left;
-        let h = (rc.bottom - rc.top - y_off).max(1);
+        let h = (rc.bottom - rc.top - y_off - bottom_inset).max(1);
         return (0, y_off, w, h);
     }
     (0, y_off, FALLBACK_W, FALLBACK_H)
@@ -1581,8 +1633,26 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         let mut frame_count: u64 = 0;
         let mut shutting_down = false;
         let mut last_geom = (init_x, init_y, init_w, init_h);
+        // Tracks the last display-sleep-inhibit state we asserted, so we
+        // only call SetThreadExecutionState on an actual transition (not
+        // every frame). Starts false = not inhibited.
+        let mut display_awake_applied = false;
         loop {
             let frame_start = Instant::now();
+
+            // Keep the monitor awake while the frontend says playback is
+            // active + unpaused. Applied here (the render thread) because
+            // SetThreadExecutionState's ES_CONTINUOUS state is per-thread —
+            // see crate::win32::set_display_sleep_inhibited. Transition-only.
+            let want_awake = DISPLAY_AWAKE_DESIRED.load(Ordering::Acquire);
+            if want_awake != display_awake_applied {
+                crate::win32::set_display_sleep_inhibited(want_awake);
+                display_awake_applied = want_awake;
+                crate::devlog!(
+                    debug, "mpv2",
+                    "display sleep inhibit → {want_awake}",
+                );
+            }
 
             // Pump win32 messages.
             let mut msg = MSG::default();
@@ -1739,18 +1809,22 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             // copy + WM_ERASEBKGND fill — both produce visible frame
             // artifacts when the next render tick is about to overwrite
             // the surface anyway.
-            let y_off = if crate::win32::is_in_native_fullscreen() {
-                0
-            } else {
-                TITLE_BAR_H
-            };
+            let in_fs = crate::win32::is_in_native_fullscreen();
+            let y_off = if in_fs { 0 } else { TITLE_BAR_H };
+            // Match parent_client_inset: shave FSO_HEIGHT_INSET pixels off
+            // the bottom in fullscreen so the GL surface is NOT exactly
+            // monitor-sized. See the constant's comment — this is the
+            // verified disqualifier for Win11's Independent Flip / MPO
+            // promotion (occlusion from above does NOT work on multi-plane
+            // GPUs). The gap is covered by a black strip in App.tsx.
+            let bottom_inset = if in_fs { FSO_HEIGHT_INSET } else { 0 };
             let mut parent_rc = RECT::default();
             let (target_w, target_h) = if GetClientRect(parent, &mut parent_rc).is_ok()
                 && parent_rc.right > parent_rc.left
                 && parent_rc.bottom > parent_rc.top
             {
                 let pw = parent_rc.right - parent_rc.left;
-                let ph = (parent_rc.bottom - parent_rc.top - y_off).max(1);
+                let ph = (parent_rc.bottom - parent_rc.top - y_off - bottom_inset).max(1);
                 (pw, ph)
             } else {
                 (last_geom.2, last_geom.3)
