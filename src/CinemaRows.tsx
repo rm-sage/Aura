@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { memo, useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "./FilterBar";
 import { invoke } from "@tauri-apps/api/core";
 import type { MetaPreview, LibraryItem, AddonEntry, VideoEntry } from "./types";
@@ -130,7 +131,7 @@ function SegmentedSeasonBar({
   void useManualWatchedVersion();
   // Single mousemove-driven tooltip (4b) — one element per bar, not one per
   // segment, so a row of 50 CW cards doesn't mount thousands of wrappers.
-  const [tip, setTip] = useState<{ x: number; text: string } | null>(null);
+  const [tip, setTip] = useState<{ x: number; y: number; text: string } | null>(null);
 
   if (episodes.length === 0) return null;
 
@@ -214,7 +215,7 @@ function SegmentedSeasonBar({
         const r = e.currentTarget.getBoundingClientRect();
         const frac = Math.max(0, Math.min(0.9999, (e.clientX - r.left) / r.width));
         const idx = Math.min(episodes.length - 1, Math.floor(frac * episodes.length));
-        setTip({ x: e.clientX - r.left, text: segLabel(episodes[idx], idx) });
+        setTip({ x: e.clientX, y: r.top, text: segLabel(episodes[idx], idx) });
       }}
       onMouseLeave={() => setTip(null)}
     >
@@ -230,7 +231,7 @@ function SegmentedSeasonBar({
         } else if (i < impliedThroughIdx) {
           cls = "bg-emerald-400/85"; // implied-watched (earlier in season)
         } else if (isVideoAired(ep)) {
-          cls = "bg-white/35"; // aired but unwatched — available to watch now
+          cls = "bg-white/70"; // aired but unwatched — available to watch now
         } else {
           cls = "bg-white/15"; // not yet aired
         }
@@ -249,15 +250,20 @@ function SegmentedSeasonBar({
           </div>
         );
       })}
-      {tip && (
+      {tip && createPortal(
         <div
-          className="pointer-events-none absolute -top-7 z-30 px-2 py-0.5 rounded-md
+          className="pointer-events-none fixed z-[300] px-2 py-0.5 rounded-md
                      bg-black/85 backdrop-blur-sm border border-white/15
-                     text-white text-[11px] font-medium whitespace-nowrap -translate-x-1/2"
-          style={{ left: tip.x }}
+                     text-white text-[11px] font-medium whitespace-nowrap
+                     -translate-x-1/2 -translate-y-full"
+          style={{
+            left: Math.max(60, Math.min(window.innerWidth - 60, tip.x)),
+            top: tip.y - 6,
+          }}
         >
           {tip.text}
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );
@@ -625,12 +631,12 @@ function CWReleaseCountdown({ seriesId }: { seriesId: string }) {
     <div className="absolute inset-x-0 bottom-[28px] flex justify-center pointer-events-none z-10">
       <span
         title={`Next episode airs ${formatTargetDate(targetMs)}`}
-        className="pointer-events-auto inline-flex items-center gap-1 px-2 py-0.5 rounded-full
+        className="pointer-events-auto inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full
                    bg-black/72 backdrop-blur-sm border border-white/15
-                   text-white text-[11px] font-semibold tabular-nums"
+                   text-white text-[12.5px] font-semibold tabular-nums"
         style={{ textShadow: "0 1px 2px rgba(0,0,0,0.9)" }}
       >
-        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
              strokeWidth="2.2" className="text-ln-accent" aria-hidden>
           <circle cx="12" cy="12" r="9" />
           <path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
