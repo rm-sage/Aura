@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import { isVideoAired, type LibraryItem, type VideoEntry } from "./types";
+import type { LibraryItem, VideoEntry } from "./types";
 import { getManualWatchedState, onManualWatchedChange, useManualWatchedVersion } from "./manualWatched";
 import { airingInfo } from "./releaseCountdown";
 
@@ -271,11 +271,13 @@ export function useEpisodeProgress(
 }
 
 /** "Episodes behind the latest aired" for an AIRING series (else null).
- *  N = airedCount − fully-watched aired episodes. A fully-watched aired
- *  episode is one manually marked watched OR inferred-before-resume; the
- *  in-progress resume episode is NOT counted (matches AniMouto: 2 behind /
- *  7 watched). Returns null when not airing or when behind <= 0. Red-text
- *  "N episodes behind" surfaces on DetailView meta + the hover panel. */
+ *  N = airedCount − fully-watched aired episodes, where "aired" means a
+ *  parseable air date in the past (undated / future episodes are excluded
+ *  from BOTH counts). A fully-watched aired episode is one manually marked
+ *  watched OR inferred-before-resume; the in-progress resume episode is NOT
+ *  counted (matches AniMouto: 2 behind / 7 watched). Returns null when not
+ *  airing or when behind <= 0. Red "N episodes behind" surfaces on the
+ *  DetailView meta strip + the hover panel. */
 export function useEpisodesBehind(
   videos: VideoEntry[] | undefined,
   seriesId: string | null | undefined,
@@ -283,11 +285,17 @@ export function useEpisodesBehind(
   void useManualWatchedVersion();
   const resumeId = useResumeVideoId(seriesId);
   if (!videos || videos.length === 0) return null;
-  const info = airingInfo(videos);
+  const now = Date.now();
+  const info = airingInfo(videos, now);
   if (!info.isAiring) return null;
   let watchedAired = 0;
   for (const v of videos) {
-    if (!isVideoAired(v)) continue;
+    // Count ONLY episodes airingInfo counts as aired (a parseable air date in
+    // the past), so watchedAired and airedCount cover the SAME set. Using
+    // isVideoAired here would over-count: it treats undated episodes as aired,
+    // but airingInfo's airedCount skips them — breaking watchedAired <= aired.
+    const t = v.released ? Date.parse(v.released) : NaN;
+    if (!Number.isFinite(t) || t > now) continue;
     const manual = getManualWatchedState(v.id);
     if (manual === "watched") { watchedAired += 1; continue; }
     if (resumeId && v.id !== resumeId && episodeIsBeforeResume(v.id, resumeId)) watchedAired += 1;
