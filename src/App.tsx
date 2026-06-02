@@ -89,6 +89,7 @@ interface BackendSettingsLite {
 }
 import type { ContextMenuItem } from "./ContextMenu";
 import { normalizeLibrary } from "./libraryNormalize";
+import { useLibraryArtRetry } from "./libraryArtRetry";
 import { LibraryProvider } from "./LibraryContext";
 import { NotificationsProvider, useNotifications } from "./NotificationsContext";
 import NotificationsBell from "./NotificationsBell";
@@ -1026,6 +1027,11 @@ export default function App() {
 
   // ── Library (Continue Watching + Calendar source) ──
   const [library, setLibrary] = useState<LibraryItem[]>([]);
+  // Backfill posters for art-less Library items (often unreleased), retrying
+  // ~hourly per id. In-memory only — never touches the Stremio cloud record.
+  useLibraryArtRetry(library, addons, (id, poster) => {
+    setLibrary((prev) => prev.map((it) => (it.id === id && !it.poster ? { ...it, poster } : it)));
+  });
   // Resume-from-progress prompt: when handlePlayStream sees a saved
   // timeOffset for the target, it sets `pendingResume` to a deferred
   // pair of resolvers (onResume / onStartOver). The prompt component
