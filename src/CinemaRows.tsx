@@ -14,7 +14,7 @@ import { getMetaDetailFallback, canonicalReleaseYear, useMetaCacheVersion } from
 import { closeHoverNow } from "./catalogHoverStore";
 import { useHoverCardActivation } from "./useHoverCardActivation";
 import { getReleaseSignal, useReleaseSignalsVersion } from "./releaseSignalStore";
-import { formatCountdown, airingInfo, useCountdownNow } from "./releaseCountdown";
+import { formatCountdown, formatTargetDate, airingInfo, useCountdownNow } from "./releaseCountdown";
 
 /** Per-catalog cache for the View-all popup. Keyed by
  *  `${addonUrl}|${type}|${id}`. Persists across DiscoveryRow remounts
@@ -128,6 +128,9 @@ function SegmentedSeasonBar({
   // bookkeeping vs. the previous useState+useEffect+tick combo,
   // which mattered when 50 CW cards each carried their own bar.
   void useManualWatchedVersion();
+  // Single mousemove-driven tooltip (4b) — one element per bar, not one per
+  // segment, so a row of 50 CW cards doesn't mount thousands of wrappers.
+  const [tip, setTip] = useState<{ x: number; text: string } | null>(null);
 
   if (episodes.length === 0) return null;
 
@@ -187,8 +190,34 @@ function SegmentedSeasonBar({
   const latestAiredIdx = air.isAiring && air.latestAiredId
     ? episodes.findIndex((v) => v.id === air.latestAiredId)
     : -1;
+
+  // Tooltip label for the segment under the cursor (4b). State-driven so the
+  // user learns what each colour means + the latest-aired marker. Mirrors the
+  // segment colour branches below so the words match the colour.
+  const segLabel = (ep: VideoEntry, i: number): string => {
+    const sxe = ep.season != null && ep.episode != null
+      ? `S${String(ep.season).padStart(2, "0")}E${String(ep.episode).padStart(2, "0")}`
+      : (ep.episode != null ? `E${ep.episode}` : "Episode");
+    const manual = getManualWatchedState(ep.id);
+    let state: string;
+    if (manual === "watched" || i < impliedThroughIdx) state = "Watched";
+    else if ((manual === "in-progress" || i === currentIdx) && i >= lastWatchedIdx) state = "In progress";
+    else if (isVideoAired(ep)) state = "Available now";
+    else state = "Not yet aired";
+    return i === latestAiredIdx ? `${sxe} · ${state} · Latest aired` : `${sxe} · ${state}`;
+  };
+
   return (
-    <div className="absolute left-2 right-2 bottom-1 h-[5px] flex gap-[1.5px] rounded-full overflow-visible">
+    <div
+      className="absolute left-2 right-2 bottom-1 h-[5px] flex gap-[1.5px] rounded-full overflow-visible"
+      onMouseMove={(e) => {
+        const r = e.currentTarget.getBoundingClientRect();
+        const frac = Math.max(0, Math.min(0.9999, (e.clientX - r.left) / r.width));
+        const idx = Math.min(episodes.length - 1, Math.floor(frac * episodes.length));
+        setTip({ x: e.clientX - r.left, text: segLabel(episodes[idx], idx) });
+      }}
+      onMouseLeave={() => setTip(null)}
+    >
       {episodes.map((ep, i) => {
         const manual = getManualWatchedState(ep.id);
         let cls: string;
@@ -220,6 +249,16 @@ function SegmentedSeasonBar({
           </div>
         );
       })}
+      {tip && (
+        <div
+          className="pointer-events-none absolute -top-7 z-30 px-2 py-0.5 rounded-md
+                     bg-black/85 backdrop-blur-sm border border-white/15
+                     text-white text-[11px] font-medium whitespace-nowrap -translate-x-1/2"
+          style={{ left: tip.x }}
+        >
+          {tip.text}
+        </div>
+      )}
     </div>
   );
 }
@@ -585,7 +624,8 @@ function CWReleaseCountdown({ seriesId }: { seriesId: string }) {
   return (
     <div className="absolute inset-x-0 bottom-[28px] flex justify-center pointer-events-none z-10">
       <span
-        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full
+        title={`Next episode airs ${formatTargetDate(targetMs)}`}
+        className="pointer-events-auto inline-flex items-center gap-1 px-2 py-0.5 rounded-full
                    bg-black/72 backdrop-blur-sm border border-white/15
                    text-white text-[11px] font-semibold tabular-nums"
         style={{ textShadow: "0 1px 2px rgba(0,0,0,0.9)" }}
