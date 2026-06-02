@@ -21,7 +21,7 @@ import type { AddonEntry, MetaPreview, MetaDetail } from "./types";
 import { getMetaDetail } from "./metaCache";
 import { useEpisodesBehind } from "./LibraryContext";
 import { dedupedInvoke } from "./invokeDedupe";
-import { BrandLogo, ratingDomain, ratingKindNote } from "./logodev";
+import { BrandLogo, ratingDomain, ratingKindNote, groupRatingsByBrand } from "./logodev";
 import { hasUsableRating } from "./ratingValue";
 import {
   useHoverTarget,
@@ -319,9 +319,9 @@ function HoverPanel({
     for (const r of aggRatings) {
       if (hasUsableRating(r.value)) map.set(r.source.toLowerCase(), r);
     }
-    return [...map.values()]
-      .sort((a, b) => (b.weight ?? 50) - (a.weight ?? 50))
-      .slice(0, 6);
+    return groupRatingsByBrand(
+      [...map.values()].sort((a, b) => (b.weight ?? 50) - (a.weight ?? 50)),
+    ).slice(0, 6);
   })();
   const tags = (detail?.genres ?? []).slice(0, 8);
   const directors = (detail?.director ?? []).filter(Boolean).slice(0, 2);

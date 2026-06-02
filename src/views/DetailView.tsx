@@ -96,7 +96,7 @@ import ImageLoader from "../ImageLoader";
 import ErrorBoundary from "../ErrorBoundary";
 import { parseStream, chipStyleFor, type ChipKind } from "../streamMeta";
 import Tooltip from "../Tooltip";
-import { BrandLogo, ratingDomain } from "../logodev";
+import { BrandLogo, ratingDomain, groupRatingsByBrand } from "../logodev";
 import { hasUsableRating } from "../ratingValue";
 
 // ---------------------------------------------------------------------------
@@ -704,7 +704,7 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
     // crowd them past the six-tile cap. Otherwise sort by aggregator
     // weight DESC (IMDb 100, MAL 95, RT 90, …; addon-only sources 50).
     const ANIME_FIRST = ["myanimelist", "anilist", "mal rank", "mal popularity"];
-    return [...map.values()].sort((a, b) => {
+    const sorted = [...map.values()].sort((a, b) => {
       if (isAnime) {
         const ai = ANIME_FIRST.indexOf(a.source.toLowerCase());
         const bi = ANIME_FIRST.indexOf(b.source.toLowerCase());
@@ -716,6 +716,7 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
       }
       return (b.weight ?? 50) - (a.weight ?? 50);
     });
+    return groupRatingsByBrand(sorted);
   }, [detail?.ratings, aggregateRatings, isAnime]);
 
   // Fetch streams: movies use parent id; series/anime use the picked video
