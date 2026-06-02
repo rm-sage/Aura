@@ -62,6 +62,23 @@ const PERSIST_DEBOUNCE_MS = 500;
 
 const cache = new Map<string, CacheEntry>();
 
+// O(1) id → canonical year index so catalog cards don't scan the whole cache
+// on every meta write (catalog-scale: many cards × many writes would be the
+// per-card cost CLAUDE.md warns about). Stores the freshest-ts year per id,
+// mirroring what the hover/detail surfaces show (prefer release_info, else the
+// year of `released`).
+const idYearIndex = new Map<string, { year: string; ts: number }>();
+function yearFromDetail(d: MetaDetail | null | undefined): string | null {
+  if (!d) return null;
+  return d.release_info || (d.released ? d.released.slice(0, 4) : null);
+}
+function noteYear(id: string, detail: MetaDetail | null, ts: number) {
+  const year = yearFromDetail(detail);
+  if (!year) return;
+  const prev = idYearIndex.get(id);
+  if (!prev || ts >= prev.ts) idYearIndex.set(id, { year, ts });
+}
+
 // Hydrate at import. Failure is silent — a corrupt or missing entry
 // just leaves us with an empty cache, which is identical to a fresh
 // install. Stale entries (past TTL) are dropped during hydration so
@@ -79,6 +96,8 @@ const cache = new Map<string, CacheEntry>();
       if (typeof k !== "string" || !v || typeof v.ts !== "number") continue;
       if (now - v.ts >= TTL_MAX_MS) continue;
       cache.set(k, v);
+      const idPart = k.split("::")[2];
+      if (idPart) noteYear(idPart, v.detail, v.ts);
     }
   } catch { /* corrupt blob — start fresh */ }
 })();
@@ -135,7 +154,9 @@ export async function getMetaDetail(
   // re-firing the same dead fetch every render. The TTL aging will
   // re-attempt eventually.
   const detail = fetched && fetched.name ? fetched : null;
-  cache.set(key, { detail, ts: Date.now() });
+  const ts = Date.now();
+  cache.set(key, { detail, ts });
+  noteYear(id, detail, ts);
   bumpMetaCacheVersion();
   schedulePersist();
   return detail;
@@ -216,13 +237,20 @@ export function useMetaCacheVersion(): number {
   return useSyncExternalStore(subscribeMetaCache, getMetaCacheVersion, getMetaCacheVersion);
 }
 
-/** Canonical release year for a meta id from the cached MetaDetail, mirroring
- *  exactly what the hover panel / DetailView show (prefer release_info, else
- *  the year of `released`). Returns null when no detail is cached yet. */
+/** Canonical release year for a meta id — O(1) index lookup, mirroring what
+ *  the hover panel / DetailView show (prefer release_info, else the year of
+ *  `released`). Returns null when no detail has been cached for the id yet. */
 export function canonicalReleaseYear(id: string): string | null {
-  const d = peekCachedDetailById(id);
-  if (!d) return null;
-  return d.release_info || (d.released ? d.released.slice(0, 4) : null);
+  return idYearIndex.get(id)?.year ?? null;
+}
+
+/** Reactive canonical year for a catalog card. Subscribes to meta-cache writes
+ *  but its snapshot is the per-id year string, so the card only re-renders when
+ *  ITS year actually changes — not on every cache write. Returns `fallback`
+ *  (the catalog addon's releaseInfo) until a meta detail lands. */
+export function useCanonicalReleaseYear(id: string, fallback: string | null): string | null {
+  const snap = () => canonicalReleaseYear(id) ?? fallback;
+  return useSyncExternalStore(subscribeMetaCache, snap, snap);
 }
 
 /** Like getMetaDetailFallback, but returns the detail with the MOST

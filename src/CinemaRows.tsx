@@ -10,7 +10,7 @@ import ImageLoader from "./ImageLoader";
 import { useLibraryProgress } from "./LibraryContext";
 import WatchedBadge, { useWatchedVariant, WatchedBadgeStatic } from "./WatchedBadge";
 import { getManualWatchedState, useManualWatchedVersion } from "./manualWatched";
-import { getMetaDetailFallback, canonicalReleaseYear, useMetaCacheVersion } from "./metaCache";
+import { getMetaDetailFallback, useCanonicalReleaseYear } from "./metaCache";
 import { closeHoverNow } from "./catalogHoverStore";
 import { useHoverCardActivation } from "./useHoverCardActivation";
 import { getReleaseSignal, useReleaseSignalsVersion } from "./releaseSignalStore";
@@ -843,11 +843,11 @@ export const CatalogCard = memo(function CatalogCard({ meta, onSelect }: Catalog
 
   // Prefer the canonical cached meta-detail year over the catalog addon's
   // releaseInfo (which is wrong for some titles, e.g. Cinderella II shows
-  // "2020" from the catalog vs "2002" in the meta). Subscribing to the
-  // meta-cache version makes the card correct itself once a hover/visit
-  // warms the detail — no eager per-card fetch.
-  useMetaCacheVersion();
-  const displayYear = canonicalReleaseYear(meta.id) ?? meta.release_info;
+  // "2020" from the catalog vs "2002" in the meta). O(1) id→year index +
+  // per-id snapshot: the card corrects itself once a hover/visit warms the
+  // detail, and only re-renders when ITS year changes — no eager per-card
+  // fetch, no cache-wide scan per write.
+  const displayYear = useCanonicalReleaseYear(meta.id, meta.release_info ?? null);
 
   return (
     <button
