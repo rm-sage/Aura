@@ -137,6 +137,39 @@ export function nextAiringEpisode(
   return best;
 }
 
+/** Airing snapshot for a series' episode list. Single source of truth for the
+ *  CW latest-aired marker (4a) and the "episodes behind" count (4c).
+ *  - isAiring: at least one aired episode AND at least one not-yet-aired
+ *    episode (has content out, not finished).
+ *  - latestAiredId / latestAiredEpisode: the highest-released episode with
+ *    released <= now.
+ *  - airedCount: episodes whose air date is in the past. */
+export function airingInfo(
+  videos: VideoEntry[] | undefined,
+  nowMs: number = Date.now(),
+): { isAiring: boolean; latestAiredId: string | null; latestAiredEpisode: number | null; airedCount: number } {
+  let airedCount = 0;
+  let anyFuture = false;
+  let latestAiredId: string | null = null;
+  let latestAiredEpisode: number | null = null;
+  let latestAiredMs = -Infinity;
+  for (const v of videos ?? []) {
+    const t = parseMs(v.released);
+    if (t == null) continue;
+    if (t <= nowMs) {
+      airedCount += 1;
+      if (t > latestAiredMs) {
+        latestAiredMs = t;
+        latestAiredId = v.id;
+        latestAiredEpisode = v.episode ?? null;
+      }
+    } else {
+      anyFuture = true;
+    }
+  }
+  return { isAiring: airedCount > 0 && anyFuture, latestAiredId, latestAiredEpisode, airedCount };
+}
+
 /**
  * Full-precision countdown string, always down to the second:
  * "30d 16h 05m 30s", "16h 05m 30s", "5m 30s", or "30s". Lower units are
