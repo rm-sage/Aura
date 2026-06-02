@@ -857,6 +857,19 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
     if (v) setActiveVideo(v);
   }, [detail?.videos, openInStreamsMode, openOnEpisodeId, isEpisodic, activeVideo]);
 
+  // Notification deep-link: populate the episode synopsis by selecting the
+  // ringed episode — WITHOUT switching to streams mode (stay on the list so the
+  // user sees the ring + scroll + synopsis together). Guarded on panelMode so it
+  // never fights a real episode click (which routes to streams).
+  useEffect(() => {
+    if (!ringEpisodeId) return;
+    if (activeVideo) return;
+    if (panelMode === "streams") return;
+    if (!isEpisodic) return;
+    const v = resolveResumeEpisode(ringEpisodeId, detail?.videos);
+    if (v) setActiveVideo(v);
+  }, [ringEpisodeId, detail?.videos, panelMode, isEpisodic, activeVideo]);
+
   const groupedStreams = useMemo(() => {
     const map = new Map<string, StreamEntry[]>();
     for (const s of streams) {
