@@ -10,9 +10,11 @@ import ImageLoader from "./ImageLoader";
 import { useLibraryProgress } from "./LibraryContext";
 import WatchedBadge, { useWatchedVariant, WatchedBadgeStatic } from "./WatchedBadge";
 import { getManualWatchedState, useManualWatchedVersion } from "./manualWatched";
-import { getMetaDetailFallback } from "./metaCache";
+import { getMetaDetailFallback, canonicalReleaseYear, useMetaCacheVersion } from "./metaCache";
 import { closeHoverNow } from "./catalogHoverStore";
 import { useHoverCardActivation } from "./useHoverCardActivation";
+import { getReleaseSignal, useReleaseSignalsVersion } from "./releaseSignalStore";
+import { formatCountdown, useCountdownNow } from "./releaseCountdown";
 
 /** Per-catalog cache for the View-all popup. Keyed by
  *  `${addonUrl}|${type}|${id}`. Persists across DiscoveryRow remounts
@@ -527,6 +529,38 @@ function useEffectiveResumeVideoId(
   return startEp.id;
 }
 
+// Centered "next episode" countdown pill, overlaid on the CW tile art just
+// above the progress bar. Source is the cloud release signal's `next_aired`
+// (series only — movies/finished series have none → renders nothing). Owns
+// its own 1 s tick + subscribes to the signal-store version so it appears
+// the moment the signal lands and advances live. The opaque dark pill +
+// blur + text-shadow keep it legible on light AND dark cover art.
+function CWReleaseCountdown({ seriesId }: { seriesId: string }) {
+  const now = useCountdownNow();
+  useReleaseSignalsVersion(); // re-read getReleaseSignal when signals update
+  const nextIso = getReleaseSignal(seriesId)?.next_aired?.aired_at;
+  if (!nextIso) return null;
+  const targetMs = Date.parse(nextIso);
+  if (!Number.isFinite(targetMs) || targetMs <= now) return null;
+  return (
+    <div className="absolute inset-x-0 bottom-2.5 flex justify-center pointer-events-none z-10">
+      <span
+        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full
+                   bg-black/72 backdrop-blur-sm border border-white/15
+                   text-white text-[11px] font-semibold tabular-nums"
+        style={{ textShadow: "0 1px 2px rgba(0,0,0,0.9)" }}
+      >
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             strokeWidth="2.2" className="text-ln-accent" aria-hidden>
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+        {formatCountdown(targetMs, now)}
+      </span>
+    </div>
+  );
+}
+
 const ContinueWatchingCard = memo(function ContinueWatchingCard(
   { item, onSelect, addons }: ContinueWatchingCardProps
 ) {
@@ -623,6 +657,7 @@ const ContinueWatchingCard = memo(function ContinueWatchingCard(
               <div className="h-full bg-ln-accent" style={{ width: `${progress * 100}%` }} />
             </div>
           )}
+          <CWReleaseCountdown seriesId={item.id} />
         </div>
         <p
           className="text-white/90 text-[17px] font-medium mt-2 leading-tight line-clamp-1 text-center"
@@ -726,6 +761,14 @@ export const CatalogCard = memo(function CatalogCard({ meta, onSelect }: Catalog
   // is opt-in via Settings. The card keeps its own click/context menu.
   const hover = useHoverCardActivation(meta);
 
+  // Prefer the canonical cached meta-detail year over the catalog addon's
+  // releaseInfo (which is wrong for some titles, e.g. Cinderella II shows
+  // "2020" from the catalog vs "2002" in the meta). Subscribing to the
+  // meta-cache version makes the card correct itself once a hover/visit
+  // warms the detail — no eager per-card fetch.
+  useMetaCacheVersion();
+  const displayYear = canonicalReleaseYear(meta.id) ?? meta.release_info;
+
   return (
     <button
       type="button"
@@ -813,8 +856,8 @@ export const CatalogCard = memo(function CatalogCard({ meta, onSelect }: Catalog
       >
         {meta.name}
       </p>
-      {meta.release_info && (
-        <p className="text-white/55 text-[15.5px] mt-0.5 text-center font-mono">{meta.release_info}</p>
+      {displayYear && (
+        <p className="text-white/55 text-[15.5px] mt-0.5 text-center font-mono">{displayYear}</p>
       )}
     </button>
   );

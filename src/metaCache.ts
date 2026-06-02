@@ -1,6 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { AddonEntry, MetaDetail } from "./types";
 import { dedupedInvoke } from "./invokeDedupe";
@@ -135,6 +136,7 @@ export async function getMetaDetail(
   // re-attempt eventually.
   const detail = fetched && fetched.name ? fetched : null;
   cache.set(key, { detail, ts: Date.now() });
+  bumpMetaCacheVersion();
   schedulePersist();
   return detail;
 }
@@ -190,6 +192,88 @@ export function peekCachedDetailById(id: string): MetaDetail | null {
     if (!best || v.ts > best.ts) best = v;
   }
   return best ? best.detail : null;
+}
+
+// ── Reactive version store ────────────────────────────────────────────
+// peekCachedDetailById is synchronous; a card that prefers the cached
+// canonical year needs to re-render when a later meta fetch lands. We
+// expose a useSyncExternalStore version that bumps on every cache write.
+let metaCacheVersion = 0;
+const metaCacheSubs = new Set<() => void>();
+function bumpMetaCacheVersion() {
+  metaCacheVersion += 1;
+  for (const cb of metaCacheSubs) cb();
+}
+export function subscribeMetaCache(cb: () => void): () => void {
+  metaCacheSubs.add(cb);
+  return () => { metaCacheSubs.delete(cb); };
+}
+export function getMetaCacheVersion(): number { return metaCacheVersion; }
+
+/** Subscribe a component to meta-cache writes so synchronous peeks
+ *  (canonicalReleaseYear, peekCachedDetailById) re-read when meta lands. */
+export function useMetaCacheVersion(): number {
+  return useSyncExternalStore(subscribeMetaCache, getMetaCacheVersion, getMetaCacheVersion);
+}
+
+/** Canonical release year for a meta id from the cached MetaDetail, mirroring
+ *  exactly what the hover panel / DetailView show (prefer release_info, else
+ *  the year of `released`). Returns null when no detail is cached yet. */
+export function canonicalReleaseYear(id: string): string | null {
+  const d = peekCachedDetailById(id);
+  if (!d) return null;
+  return d.release_info || (d.released ? d.released.slice(0, 4) : null);
+}
+
+/** Like getMetaDetailFallback, but returns the detail with the MOST
+ *  videos rather than the FIRST videos-populated one. Series-completion +
+ *  next-air detection (the EOS caught-up card, and watched-completion → CW
+ *  removal) need the richest episode list: an addon that lists only AIRED
+ *  episodes would otherwise make a still-airing show look finished (no
+ *  later episode found → wrong "Series finale", and the series wrongly
+ *  marked complete + dropped from Continue Watching). DetailView reaches
+ *  the rich addon because it probes every addon and prefers videos; this
+ *  mirrors that for the detection paths. Low-frequency only (once per
+ *  episode finish) — per-addon cache hits keep repeat calls cheap. */
+export async function getRichestMetaDetail(
+  addons: AddonEntry[],
+  mediaType: string,
+  id: string,
+): Promise<MetaDetail | null> {
+  const metaCapable = addons.filter((a) =>
+    Array.isArray(a.resources) &&
+    a.resources.some((r) => r.toLowerCase() === "meta"),
+  );
+  const candidates = metaCapable.length > 0 ? metaCapable : addons;
+  let best: MetaDetail | null = null;
+  let bestCount = -1;
+  for (const a of candidates) {
+    const d = await getMetaDetail(a, mediaType, id);
+    if (!d) continue;
+    const count = Array.isArray(d.videos) ? d.videos.length : 0;
+    if (count > bestCount) { best = d; bestCount = count; }
+  }
+  return best;
+}
+
+/** Synchronous peek for the richest cached detail (most videos) for an id
+ *  across any addon — no network. The detection paths prefer this so they
+ *  reuse the full episode list DetailView already loaded (which includes
+ *  future-dated episodes) instead of a leaner cache entry. Returns null on
+ *  miss. */
+export function peekRichestCachedDetailById(id: string): MetaDetail | null {
+  if (!id) return null;
+  const suffix = `::${id}`;
+  let best: MetaDetail | null = null;
+  let bestCount = -1;
+  for (const [k, v] of cache) {
+    if (!v.detail || !k.endsWith(suffix)) continue;
+    const mt = k.split("::")[1] ?? "";
+    if (Date.now() - v.ts >= ttlFor(mt)) continue;
+    const count = Array.isArray(v.detail.videos) ? v.detail.videos.length : 0;
+    if (count > bestCount) { best = v.detail; bestCount = count; }
+  }
+  return best;
 }
 
 /** Batch-peek the freshest non-stale poster for each id in `ids`. One
