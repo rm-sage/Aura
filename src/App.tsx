@@ -4497,6 +4497,11 @@ export default function App() {
    *  re-opening detail views from elsewhere doesn't re-anchor. */
   const [lastPlayedEpisodeId, setLastPlayedEpisodeId] = useState<string | null>(null);
   const consumeLastPlayedEpisode = useCallback(() => setLastPlayedEpisodeId(null), []);
+  // Notification deep-link ring: set ONLY by the notifications → open-meta path,
+  // so a normal post-playback return (which also uses lastPlayedEpisodeId for
+  // season select + scroll) does NOT get the selection ring.
+  const [deepLinkEpisodeId, setDeepLinkEpisodeId] = useState<string | null>(null);
+  const consumeDeepLinkEpisode = useCallback(() => setDeepLinkEpisodeId(null), []);
 
   // EOF auto-exit REMOVED (EOS Spotlight, 2026-05-19): the dead `eof`
   // carrier never fired (Rust never sets PlaybackState.eof). End-of-
@@ -5069,7 +5074,7 @@ export default function App() {
       // The most-recently-suppressed candidate is shown the next
       // time the user navigates back to a bell-visible surface.
       popupSuppressed={isPlayerActive || selectedMeta != null}
-      onOpenMeta={(metaId, mediaType) => {
+      onOpenMeta={(metaId, mediaType, videoId) => {
         // Reconstruct a MetaPreview from the LibraryItem when available
         // (covers the scanner's episode notifications since they always
         // refer to a series the user has in their library). Falls back to
@@ -5110,6 +5115,10 @@ export default function App() {
         // bell's host so the user expects to land there on a click.
         setActiveCatalog(null);
         setActiveView("home");
+        if (videoId) {
+          setLastPlayedEpisodeId(videoId); // season select + scroll-to-row
+          setDeepLinkEpisodeId(videoId);   // selection ring (notification only)
+        }
         openDetail(stub);
       }}
     />
@@ -5569,6 +5578,8 @@ export default function App() {
           openOnEpisodeId={lastPlayedEpisodeId}
           ignoreResumeHint={ignoreResumeOnNextOpen}
           onConsumeOpenHint={consumeLastPlayedEpisode}
+          highlightEpisodeId={deepLinkEpisodeId}
+          onConsumeHighlight={consumeDeepLinkEpisode}
           openInStreamsMode={openInStreamsMode}
           onConsumeOpenInStreamsMode={consumeOpenInStreamsMode}
         />
@@ -5685,7 +5696,7 @@ function NotificationsBridge({
    *  to NotificationsContext so the popup bubble is held until the
    *  user navigates back to a bell-visible surface. */
   popupSuppressed: boolean;
-  onOpenMeta: (metaId: string, mediaType?: string) => void;
+  onOpenMeta: (metaId: string, mediaType?: string, videoId?: string) => void;
 }) {
   const { addNotification, setPopupSuppressed, notifications, dismissNotification } = useNotifications();
 
@@ -5809,18 +5820,19 @@ function NotificationsBridge({
   }, [addNotification]);
 
   // aura:open-meta — fired by NotificationsPanel row clicks. The detail
-  // payload is `{ metaId, videoId?, mediaType? }`. We delegate to the
-  // App-level openDetail via the prop callback — videoId would be the
-  // resume hint for series, but DetailView already resolves resume from
-  // libraryState.video_id so we don't need to thread it explicitly.
+  // payload is `{ metaId, videoId?, mediaType? }`. We thread `videoId` through
+  // so an episode-release notification lands on the right season and scrolls
+  // to + rings that episode (onOpenMeta sets the season/scroll hint AND the
+  // notification-only selection ring).
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail as {
         metaId?: string;
         mediaType?: string;
+        videoId?: string;
       } | undefined;
       if (!detail?.metaId) return;
-      onOpenMeta(detail.metaId, detail.mediaType);
+      onOpenMeta(detail.metaId, detail.mediaType, detail.videoId);
     };
     window.addEventListener("aura:open-meta", handler);
     return () => window.removeEventListener("aura:open-meta", handler);

@@ -161,6 +161,11 @@ interface Props {
    *  initial mount effect runs). Lets the parent clear the hint so a
    *  later open from an unrelated card doesn't inherit it. */
   onConsumeOpenHint?: () => void;
+  /** When set, the episode row matching this id gets a persistent selection
+   *  ring (notification deep-link). Distinct from openOnEpisodeId, which only
+   *  selects the season + scrolls. */
+  highlightEpisodeId?: string | null;
+  onConsumeHighlight?: () => void;
   /** When true, suppress the "resume from CW" auto-route to streams
    *  mode. Used by the Library tab's series-click path: clicking a
    *  series in the Library should drop the user on the episode list
@@ -276,7 +281,7 @@ export default function DetailView(props: Props) {
   );
 }
 
-function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, openOnEpisodeId, onConsumeOpenHint, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
+function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
   const [detail, setDetail]                 = useState<MetaDetail | null>(null);
   const [streams, setStreams]               = useState<StreamEntry[]>([]);
   const [streamMeta, setStreamMeta]         = useState<StreamMetadata>({
@@ -425,6 +430,15 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
   const [scrollOnceTo, setScrollOnceTo] = useState<string | null>(openOnEpisodeId ?? null);
   useEffect(() => {
     if (openOnEpisodeId) onConsumeOpenHint?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // Notification deep-link selection ring — snapshot at mount + consume the
+  // parent hint (mirrors scrollOnceTo) so a later unrelated open doesn't
+  // inherit it. Persists for this mount; only the matching row in its season
+  // lights up.
+  const [ringEpisodeId] = useState<string | null>(highlightEpisodeId ?? null);
+  useEffect(() => {
+    if (highlightEpisodeId) onConsumeHighlight?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   // Clear the local hint AFTER the EpisodesPanel has had a chance to
@@ -1414,6 +1428,7 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
             onCopy={(text) => navigator.clipboard.writeText(text).catch(() => {})}
             onPlayExternal={(url) => openUrl(url).catch(() => {})}
             scrollToVideoId={scrollOnceTo}
+            highlightVideoId={ringEpisodeId}
             onScrollHandled={handleScrollHandled}
             // Per-season display names (e.g. anime cour titles like "Stone
             // Wars") keyed by season number, for the label under the season
@@ -2167,12 +2182,14 @@ interface PanelProps {
   /** Per-season display names keyed by season number (string), for the
    *  label under the season dropdown. Undefined when no named seasons. */
   seasonNames?: Record<string, string>;
+  /** Notification deep-link: row matching this id gets a selection ring. */
+  highlightVideoId?: string | null;
 }
 
 function UnifiedPanel({
   mode, isEpisodic, seriesId, seriesMediaType, videos, activeVideo, streams, streamMeta, streamsLoading,
   groupedStreams, metaLoading, onPickEpisode, onBackToEpisodes, onPlay, onCopy, onPlayExternal,
-  scrollToVideoId, onScrollHandled, seasonHint, seasonNames,
+  scrollToVideoId, onScrollHandled, seasonHint, seasonNames, highlightVideoId,
 }: PanelProps) {
   // The streams panel needs `position: relative` so the floating AIOStreams
   // status icons (rendered with `absolute -top-3 -left-3`) anchor to its
@@ -2213,6 +2230,7 @@ function UnifiedPanel({
             metaLoading={metaLoading}
             seasonHint={seasonHint}
             seasonNames={seasonNames}
+            highlightVideoId={highlightVideoId}
           />
         </div>
       ) : (
@@ -2249,7 +2267,7 @@ function UnifiedPanel({
 // ---------------------------------------------------------------------------
 
 const EpisodeRow = ({
-  video, seriesId, seriesMediaType, isActive, onPick, seasonVideos, isNextAiring,
+  video, seriesId, seriesMediaType, isActive, onPick, seasonVideos, isNextAiring, isDeepLinked,
 }: {
   video: VideoEntry;
   seriesId: string;
@@ -2264,6 +2282,8 @@ const EpisodeRow = ({
   /** True for the single earliest-future-dated episode across the series
    *  (computed once by the panel). Drives the live "Airs in …" chip. */
   isNextAiring?: boolean;
+  /** True for the notification deep-linked episode — adds a selection ring. */
+  isDeepLinked?: boolean;
 }) => {
   const progress = useEpisodeProgress(seriesId, video.id);
   const watchedVariant = useWatchedVariant(video.id);
@@ -2475,7 +2495,7 @@ const EpisodeRow = ({
                   border
                   ${isActive
                     ? "bg-ln-accent/15 border-ln-accent/40"
-                    : "border-transparent hover:bg-white/6 border-white/0"}`}
+                    : "border-transparent hover:bg-white/6 border-white/0"}${isDeepLinked ? " ring-2 ring-ln-accent/80" : ""}`}
     >
       <div
         className="relative flex-shrink-0 w-40 rounded overflow-hidden bg-white/5 border border-white/10"
@@ -2612,7 +2632,7 @@ const EpisodeRow = ({
 
 function EpisodesPanel({
   seriesId, seriesMediaType, videos, activeVideo, onPick, scrollToVideoId, onScrollHandled,
-  metaLoading, seasonHint, seasonNames,
+  metaLoading, seasonHint, seasonNames, highlightVideoId,
 }: {
   seriesId: string;
   seriesMediaType: string;
@@ -2630,6 +2650,8 @@ function EpisodesPanel({
   /** Per-season display names keyed by season number — shown under the
    *  dropdown (e.g. anime cour titles). Empty/undefined → nothing renders. */
   seasonNames?: Record<string, string>;
+  /** Notification deep-link: the row matching this id gets a selection ring. */
+  highlightVideoId?: string | null;
 }) {
   const seasons = useMemo(() => {
     const set = new Set<number>();
@@ -2653,6 +2675,12 @@ function EpisodesPanel({
   );
   const targetSeason = resolvedScrollTarget?.season ?? null;
   const resolvedScrollId = resolvedScrollTarget?.id ?? null;
+  // Resolve the deep-link ring target to the current videos shape (same path
+  // as the scroll target) so the right row lights up across legacy/cour ids.
+  const highlightId = useMemo(
+    () => resolveResumeEpisode(highlightVideoId, videos)?.id ?? highlightVideoId ?? null,
+    [videos, highlightVideoId],
+  );
 
   // Priority: resume / just-played season (targetSeason) > catalog
   // title season (seasonHint, only if that cour actually exists in the
@@ -2881,6 +2909,7 @@ function EpisodesPanel({
                     onPick={onPick}
                     seasonVideos={inSeason}
                     isNextAiring={v.id === nextAiringId}
+                    isDeepLinked={v.id === highlightId}
                   />
                 </div>
               ))}
