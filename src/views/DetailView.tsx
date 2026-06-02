@@ -16,6 +16,8 @@ import type {
   VideoEntry,
 } from "../types";
 import { isVideoAired } from "../types";
+import { computeReleaseCountdowns, formatCountdown, formatTargetDate, nextAiringEpisode, useCountdownNow } from "../releaseCountdown";
+import EpisodeAirChip from "../EpisodeAirChip";
 import { loadAuraSettings } from "../auraSettings";
 import { useReleaseSignal } from "../releaseSignalStore";
 import { fetchReleaseSignal } from "../releaseSearch";
@@ -78,7 +80,7 @@ function streamCacheGet(key: string): StreamFetchResult | null {
 function streamCacheDelete(key: string): void {
   streamCache.delete(key);
 }
-import { useEpisodeProgress, useResumeVideoId } from "../LibraryContext";
+import { useEpisodeProgress, useResumeVideoId, useEpisodesBehind } from "../LibraryContext";
 import SpectralPulse from "../SpectralPulse";
 import WatchedBadge, { useWatchedVariant } from "../WatchedBadge";
 import { openContextMenu } from "../ContextMenu";
@@ -355,6 +357,9 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
   //      doesn't ship a videos array — that's what was causing the
   //      "Continue Watching opens a blank page" complaint.
   const rawResumeVideoId = useResumeVideoId(meta.id);
+  // "N episodes behind" for an airing series (red, meta strip below). null
+  // when not airing or fully caught up.
+  const episodesBehind = useEpisodesBehind(detail?.videos, meta.id);
   // Library-tab clicks pass `ignoreResumeHint`, which suppresses the
   // CW resume behaviour: from Library, opening a series should drop
   // the user on the episode list at S01E01 regardless of where they
@@ -1010,8 +1015,37 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
               </h1>
             )}
 
-            {/* Dense meta strip */}
-            <div className="flex items-center gap-3 flex-wrap text-[14px] font-mono uppercase tracking-[0.14em]">
+            {/* Dense meta strip.
+                Readability over bright hero art (e.g. a light anime
+                character face) is handled two ways:
+                  1. A localized scrim "plate" — a left-anchored dark
+                     gradient that fades to transparent on the right. It
+                     bleeds horizontally (negative L/R margin) and adds a
+                     little vertical padding, but deliberately sets NO
+                     top/bottom margin so the parent `space-y-7` rhythm is
+                     untouched. Unlike the hero's bottom gradient, this
+                     travels WITH the strip, so it backs the text wherever
+                     the content column places it (the strip sits mid-art,
+                     not at the bottom edge).
+                  2. text-shadow, which inherits to every chip / Stat /
+                     countdown glyph for a dark halo on top of the plate.
+                Together they keep the mid-tone mono text and the accent
+                countdown legible on any backdrop. */}
+            <div
+              className="flex items-center gap-3 flex-wrap text-[14px] font-mono uppercase tracking-[0.14em]"
+              style={{
+                textShadow: "0 1px 4px rgba(0,0,0,0.92), 0 0 10px rgba(0,0,0,0.6)",
+                background:
+                  "linear-gradient(100deg, rgba(0,0,0,0.62) 0%, rgba(0,0,0,0.44) 50%, rgba(0,0,0,0) 100%)",
+                paddingTop: "7px",
+                paddingBottom: "7px",
+                paddingLeft: "14px",
+                paddingRight: "28px",
+                marginLeft: "-14px",
+                marginRight: "-28px",
+                borderRadius: "10px",
+              }}
+            >
               {/* Anime chip leads the strip when applicable so the
                   classification reads first; the type chip (Movies /
                   Series) follows. Detection now folds in the meta-
@@ -1025,11 +1059,11 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
                 original_language:    detail?.original_language ?? null,
                 production_countries: detail?.production_countries ?? null,
               }) && (
-                <span className="px-2.5 py-1 rounded-sm bg-pink-500/15 border border-pink-400/30
-                                 text-pink-300 text-[12px] font-semibold">Anime</span>
+                <span className="px-2.5 py-1 rounded-sm bg-pink-500/25 border border-pink-400/40
+                                 text-pink-100 text-[12px] font-semibold backdrop-blur-sm">Anime</span>
               )}
-              <span className="px-2.5 py-1 rounded-sm bg-white/12 border border-white/18
-                               text-white/85 text-[12px] font-semibold">
+              <span className="px-2.5 py-1 rounded-sm bg-black/35 border border-white/25
+                               text-white/90 text-[12px] font-semibold backdrop-blur-sm">
                 {typeLabel(detail?.media_type ?? meta.media_type)}
               </span>
               {(detail?.release_info ?? meta.release_info) && (
@@ -1093,6 +1127,27 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
                 );
               })()}
               {detail?.runtime && <Stat label="Runtime" value={detail.runtime} />}
+              {episodesBehind != null && (
+                <span className="text-red-400 text-[13px] font-semibold">
+                  {episodesBehind} episode{episodesBehind === 1 ? "" : "s"} behind
+                </span>
+              )}
+              {/* Live release countdown(s) — MOVIES ONLY here. Series/anime
+                  next-episode/premiere countdowns now live on the episode
+                  list (the next-airing row's chip), so the meta strip carries
+                  only a film's cinematic / digital (~45d est.) dates.
+                  computeReleaseCountdowns returns only upcoming dates, so
+                  nothing renders for fully-released content. */}
+              {detail && computeReleaseCountdowns(detail)
+                .filter((c) => c.kind === "cinematic" || c.kind === "digital")
+                .map((c) => (
+                <CountdownStat
+                  key={c.kind}
+                  label={c.label}
+                  targetMs={c.targetMs}
+                  title={`${c.label}: ${formatTargetDate(c.targetMs)}`}
+                />
+              ))}
             </div>
 
             {/* Ratings row — surfaced as its own tile band below the
@@ -1106,7 +1161,10 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
                 merged with whatever the addon shipped. We render at
                 most six. */}
             {mergedRatings.length > 0 && (
-              <div className="flex items-center gap-2.5 flex-wrap -mt-1">
+              <div
+                className="flex items-center gap-2.5 flex-wrap -mt-1"
+                style={{ textShadow: "0 1px 3px rgba(0,0,0,0.85)" }}
+              >
                 {mergedRatings.slice(0, 6).map((r) => (
                   <RatingTile
                     key={r.source}
@@ -1160,16 +1218,34 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
 
             <div className="h-px w-20 bg-ln-accent/65" aria-hidden />
 
-            {/* Synopsis — larger size + weight for "Command Center" presence */}
-            {(detail?.description ?? meta.description) && (
-              <p
-                className="text-white/95 text-[18px] leading-[1.55] font-normal tracking-[0.005em]
-                           max-w-prose selectable"
-                style={{ textShadow: "0 1px 6px rgba(0,0,0,0.85)" }}
-              >
-                {detail?.description ?? meta.description}
-              </p>
-            )}
+            {/* Synopsis — larger size + weight for "Command Center" presence.
+                Season-aware: when a season is selected and that season has
+                its own overview (season_credits[s].overview), show it
+                instead of the show-level description, falling back to the
+                show description when absent. Populated for TMDB/TVDB
+                live-action seasons; empty for MAL/Kitsu anime (it then
+                falls through to the show description until AIOMetadata
+                surfaces per-season overviews). */}
+            {(() => {
+              const seasonOverview =
+                selectedSeason != null && detail?.season_credits
+                  ? detail.season_credits[String(selectedSeason)]?.overview
+                  : null;
+              const shown =
+                typeof seasonOverview === "string" && seasonOverview.trim()
+                  ? seasonOverview
+                  : (detail?.description ?? meta.description);
+              if (!shown) return null;
+              return (
+                <p
+                  className="text-white/95 text-[18px] leading-[1.55] font-normal tracking-[0.005em]
+                             max-w-prose selectable"
+                  style={{ textShadow: "0 1px 6px rgba(0,0,0,0.85)" }}
+                >
+                  {shown}
+                </p>
+              );
+            })()}
 
             {/* Per-episode synopsis — surfaces below the show synopsis
                 whenever the user has selected an episode in EpisodePane
@@ -1339,6 +1415,21 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
             onPlayExternal={(url) => openUrl(url).catch(() => {})}
             scrollToVideoId={scrollOnceTo}
             onScrollHandled={handleScrollHandled}
+            // Per-season display names (e.g. anime cour titles like "Stone
+            // Wars") keyed by season number, for the label under the season
+            // dropdown. Populated for TMDB/TVDB live-action seasons; EMPTY
+            // for MAL/Kitsu anime today (so nothing renders until
+            // AIOMetadata surfaces season_credits[n].name for anime). Only
+            // non-empty names are forwarded.
+            seasonNames={(() => {
+              const sc = detail?.season_credits;
+              if (!sc) return undefined;
+              const out: Record<string, string> = {};
+              for (const [k, v] of Object.entries(sc)) {
+                if (typeof v?.name === "string" && v.name.trim()) out[k] = v.name;
+              }
+              return Object.keys(out).length ? out : undefined;
+            })()}
           />
           {/* AIOStreams notice badges — portal-rendered into the document
               body and anchored to the aside's left edge via getBoundingClientRect.
@@ -1365,6 +1456,32 @@ function Stat({ label, value }: { label: string; value: string }) {
     <span className="inline-flex items-baseline gap-1.5">
       <span className="text-white/45 text-[11px] tracking-[0.2em]">{label}</span>
       <span className="text-white/95 text-[14px] font-medium">{value}</span>
+    </span>
+  );
+}
+
+// Accent-coloured sibling of Stat for the live release countdown — same
+// baseline layout as the surrounding meta tiles so it sits cleanly in the
+// strip, but tinted with the theme accent + a clock glyph to read as a
+// "time until" element rather than a static fact. `title` carries the full
+// target date for hover.
+//
+// Owns its OWN 1 s tick via useCountdownNow so only this leaf re-renders
+// every second — DetailViewBody (cast grid, episode list, ratings) must NOT
+// tick. The parent computes the countdown SET once and passes targetMs.
+function CountdownStat({ label, targetMs, title }: { label: string; targetMs: number; title?: string }) {
+  const now = useCountdownNow();
+  return (
+    <span className="inline-flex items-center gap-1.5" title={title}>
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           strokeWidth="2" className="text-ln-accent/80" aria-hidden>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+      <span className="text-ln-accent/70 text-[11px] tracking-[0.2em]">{label}</span>
+      <span className="text-ln-accent text-[14px] font-semibold tabular-nums">
+        {formatCountdown(targetMs, now)}
+      </span>
     </span>
   );
 }
@@ -2047,12 +2164,15 @@ interface PanelProps {
   /** Season parsed from the catalog entry's title — forwarded to
    *  EpisodesPanel so e.g. "Dorohedoro Season 2" opens on season 2. */
   seasonHint?: number | null;
+  /** Per-season display names keyed by season number (string), for the
+   *  label under the season dropdown. Undefined when no named seasons. */
+  seasonNames?: Record<string, string>;
 }
 
 function UnifiedPanel({
   mode, isEpisodic, seriesId, seriesMediaType, videos, activeVideo, streams, streamMeta, streamsLoading,
   groupedStreams, metaLoading, onPickEpisode, onBackToEpisodes, onPlay, onCopy, onPlayExternal,
-  scrollToVideoId, onScrollHandled, seasonHint,
+  scrollToVideoId, onScrollHandled, seasonHint, seasonNames,
 }: PanelProps) {
   // The streams panel needs `position: relative` so the floating AIOStreams
   // status icons (rendered with `absolute -top-3 -left-3`) anchor to its
@@ -2092,6 +2212,7 @@ function UnifiedPanel({
             onScrollHandled={onScrollHandled}
             metaLoading={metaLoading}
             seasonHint={seasonHint}
+            seasonNames={seasonNames}
           />
         </div>
       ) : (
@@ -2128,7 +2249,7 @@ function UnifiedPanel({
 // ---------------------------------------------------------------------------
 
 const EpisodeRow = ({
-  video, seriesId, seriesMediaType, isActive, onPick, seasonVideos,
+  video, seriesId, seriesMediaType, isActive, onPick, seasonVideos, isNextAiring,
 }: {
   video: VideoEntry;
   seriesId: string;
@@ -2140,6 +2261,9 @@ const EpisodeRow = ({
   /** All episodes in the currently-displayed season, in episode order.
    *  Drives the "this & above / below / all" right-click bulk options. */
   seasonVideos: VideoEntry[];
+  /** True for the single earliest-future-dated episode across the series
+   *  (computed once by the panel). Drives the live "Airs in …" chip. */
+  isNextAiring?: boolean;
 }) => {
   const progress = useEpisodeProgress(seriesId, video.id);
   const watchedVariant = useWatchedVariant(video.id);
@@ -2166,6 +2290,13 @@ const EpisodeRow = ({
   // via useWatchedVariant). The transition makes the un-blur feel
   // intentional when the user marks an episode watched.
   const shouldBlur = blurEnabled && !isWatched;
+
+  // Unaired = a parseable FUTURE air date. isVideoAired treats missing /
+  // unparseable dates as aired, so undated specials stay untouched. The
+  // next-airing row (flagged by the panel) shows the live countdown chip;
+  // later unaired rows show a static "Airs <date>" + the same dim veil.
+  const unaired = !isVideoAired(video);
+  const airMs = unaired && video.released ? Date.parse(video.released) : null;
 
   return (
     <button
@@ -2369,6 +2500,13 @@ const EpisodeRow = ({
           />
         )}
 
+        {/* Unaired veil — dims upcoming episodes so they read as "not yet
+            available" at a glance. Above the image, below the badges /
+            progress bar so those stay legible. */}
+        {unaired && (
+          <div aria-hidden className="absolute inset-0 bg-black/45" />
+        )}
+
         {/* Watched / in-progress badge — top-LEFT, matches catalog
             card placement. Combines manual marks for THIS episode id
             with library-derived progress (state.timeOffset for the
@@ -2434,6 +2572,12 @@ const EpisodeRow = ({
             />
           </div>
         )}
+
+        {/* Next-to-air countdown — CW-tile-style pill overlaid on the art.
+            Only the single next-airing episode renders it (one live tick). */}
+        {isNextAiring && airMs != null && (
+          <EpisodeAirChip targetMs={airMs} />
+        )}
       </div>
       <div className="flex-1 min-w-0 flex flex-col py-1 justify-center gap-1.5">
         <p className="flex items-baseline gap-3 font-mono text-[14px] tracking-[0.16em] uppercase">
@@ -2442,11 +2586,15 @@ const EpisodeRow = ({
               ? `E${String(video.episode).padStart(2, "0")}`
               : "EP"}
           </span>
-          {video.released && (
-            <span className="text-white/45">
+          {unaired && airMs != null ? (
+            <span className="text-white/45 tracking-wide whitespace-nowrap">
+              Airs {new Date(airMs).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}
+            </span>
+          ) : video.released ? (
+            <span className="text-white/45 tracking-wide whitespace-nowrap">
               {new Date(video.released).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}
             </span>
-          )}
+          ) : null}
         </p>
         <p className={`text-[19px] leading-snug font-medium line-clamp-2
                        ${isActive ? "text-white" : "text-white/95"}`}>
@@ -2464,7 +2612,7 @@ const EpisodeRow = ({
 
 function EpisodesPanel({
   seriesId, seriesMediaType, videos, activeVideo, onPick, scrollToVideoId, onScrollHandled,
-  metaLoading, seasonHint,
+  metaLoading, seasonHint, seasonNames,
 }: {
   seriesId: string;
   seriesMediaType: string;
@@ -2479,6 +2627,9 @@ function EpisodesPanel({
    *  in the cour-aggregated videos, UNLESS a resume / just-played
    *  target (scrollToVideoId) already pins a season — that wins. */
   seasonHint?: number | null;
+  /** Per-season display names keyed by season number — shown under the
+   *  dropdown (e.g. anime cour titles). Empty/undefined → nothing renders. */
+  seasonNames?: Record<string, string>;
 }) {
   const seasons = useMemo(() => {
     const set = new Set<number>();
@@ -2581,6 +2732,15 @@ function EpisodesPanel({
     list.sort((a, b) => (a.episode ?? 0) - (b.episode ?? 0));
     return list;
   }, [videos, season, seasons.length]);
+
+  // The single next-to-air episode across ALL seasons (not just the one
+  // displayed) — its row gets the live countdown chip. Recomputed only
+  // when the video list changes; no per-second tick here (the chip owns
+  // its own tick) so the list never re-renders on the clock.
+  const nextAiringId = useMemo(
+    () => nextAiringEpisode(videos)?.id ?? null,
+    [videos],
+  );
 
   // Scroll the requested video to the top of the list once it's
   // present in the DOM. We retry on a short tick because `videos` may
@@ -2693,6 +2853,7 @@ function EpisodesPanel({
                   seasons={seasons}
                   value={season}
                   onChange={setSeason}
+                  names={seasonNames}
                 />
                 <span className="absolute right-1 text-white/45 text-[13px] font-mono tracking-wider">
                   {inSeason.length} {inSeason.length === 1 ? "ep" : "eps"}
@@ -2719,6 +2880,7 @@ function EpisodesPanel({
                     isActive={activeVideo?.id === v.id}
                     onPick={onPick}
                     seasonVideos={inSeason}
+                    isNextAiring={v.id === nextAiringId}
                   />
                 </div>
               ))}

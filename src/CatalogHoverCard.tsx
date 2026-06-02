@@ -18,7 +18,8 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import type { AddonEntry, MetaPreview, MetaDetail } from "./types";
-import { getMetaDetailFallback } from "./metaCache";
+import { getMetaDetail } from "./metaCache";
+import { useEpisodesBehind } from "./LibraryContext";
 import { dedupedInvoke } from "./invokeDedupe";
 import { BrandLogo, ratingDomain, ratingKindNote } from "./logodev";
 import { hasUsableRating } from "./ratingValue";
@@ -32,6 +33,8 @@ import {
   type HoverTarget,
 } from "./catalogHoverStore";
 import { loadAuraSettings } from "./auraSettings";
+import { resolveDefaultMetaUrl } from "./addonDefaults";
+import { computeReleaseCountdowns, formatCountdown, formatTargetDate, useCountdownNow } from "./releaseCountdown";
 
 const PANEL_W = 360;
 const GAP = 12;
@@ -141,6 +144,25 @@ function Heading({ children }: { children: React.ReactNode }) {
   );
 }
 
+/** Live, self-ticking release-countdown chip. Owns its own 1 s tick so only
+ *  this node re-renders each second, not the whole hover panel (cast grid,
+ *  ratings, etc.). */
+function HoverCountdownChip({ label, targetMs }: { label: string; targetMs: number }) {
+  const now = useCountdownNow();
+  return (
+    <span
+      title={formatTargetDate(targetMs)}
+      className="inline-flex items-center gap-1 text-[11.5px] font-semibold text-ln-accent"
+    >
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+      {label} in {formatCountdown(targetMs, now)}
+    </span>
+  );
+}
+
 function HoverPanel({
   target, addons, onSelectMeta,
 }: {
@@ -156,19 +178,44 @@ function HoverPanel({
     left: 0, top: 0, ready: false,
   });
 
-  // Fetch the meta detail (cached). Alt-type fallback mirrors the CW
-  // card: anime catalogs often tag content as series/movie with an
-  // anime-prefixed id, so the first lookup can miss.
+  // Fetch the meta detail (cached). Goes ONLY to the user's default
+  // metadata provider — fan-out across every installed addon would
+  // pull search-only addons (e.g. AISearch) into the meta path, where
+  // they return empty "?" stubs and waste a network round-trip on
+  // every hover. Resolution order matches CalendarView / DetailView:
+  // explicit setting > manifest-id default (AIOMetadata → Cinemeta) >
+  // first installed addon advertising `meta`.
+  //
+  // Alt-type fallback mirrors the CW card: anime catalogs often tag
+  // content as series/movie with an anime-prefixed id, so the first
+  // lookup against the default provider can miss.
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setDetail(null);
     (async () => {
-      let d = await getMetaDetailFallback(addons, meta.media_type, meta.id);
+      const { defaultMetadataAddonUrl } = loadAuraSettings();
+      const override = defaultMetadataAddonUrl
+        ? addons.find((a) => a.url === defaultMetadataAddonUrl)
+        : null;
+      const metaCapable = (a: AddonEntry) =>
+        Array.isArray(a.resources) &&
+        a.resources.some((r) => r.toLowerCase() === "meta");
+      const provider =
+        override
+        ?? addons.find((a) => a.url === resolveDefaultMetaUrl(addons))
+        ?? addons.find(metaCapable)
+        ?? addons[0]
+        ?? null;
+      if (!provider) {
+        setLoading(false);
+        return;
+      }
+      let d = await getMetaDetail(provider, meta.media_type, meta.id);
       if (!d) {
         const alt = meta.media_type === "series" ? "anime"
           : meta.media_type === "anime" ? "series" : null;
-        if (alt) d = await getMetaDetailFallback(addons, alt, meta.id);
+        if (alt) d = await getMetaDetail(provider, alt, meta.id);
       }
       if (cancelled) return;
       setDetail(d);
@@ -250,6 +297,16 @@ function HoverPanel({
   if (isEpisodic && epCount > 0) metaBits.push(`${epCount} Episode${epCount === 1 ? "" : "s"}`);
   if (detail?.runtime) metaBits.push(detail.runtime);
 
+  // "N episodes behind" for an airing series (red line below). null when not
+  // airing or fully caught up.
+  const episodesBehind = useEpisodesBehind(detail?.videos, meta.id);
+
+  // Release countdown(s) — next-episode / premiere for series, cinematic +
+  // digital for movies. Computed once per render; the hover panel is too
+  // short-lived to need a live tick (see releaseCountdown.ts). No-op when
+  // detail is still loading or nothing is upcoming.
+  const countdowns = detail ? computeReleaseCountdowns(detail) : [];
+
   // Merge addon-supplied + aggregator ratings (aggregator wins on
   // source collision — it goes through ratings.rs label normalisation),
   // weight-sorted exactly like DetailView so the strongest sources
@@ -316,6 +373,20 @@ function HoverPanel({
         </p>
       )}
 
+      {episodesBehind != null && (
+        <p className="text-red-400 text-[12px] font-semibold mt-1">
+          {episodesBehind} episode{episodesBehind === 1 ? "" : "s"} behind
+        </p>
+      )}
+
+      {countdowns.length > 0 && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1.5">
+          {countdowns.map((c) => (
+            <HoverCountdownChip key={c.kind} label={c.label} targetMs={c.targetMs} />
+          ))}
+        </div>
+      )}
+
       {loading && !detail && (
         <div className="py-6 flex items-center justify-center">
           <svg className="w-5 h-5 animate-spin text-white/40" viewBox="0 0 24 24" fill="none" aria-hidden>
@@ -349,14 +420,30 @@ function HoverPanel({
         </>
       )}
 
-      {detail?.description && (
-        <>
-          <Heading>Plot</Heading>
-          <p className="text-white/70 text-[12.5px] leading-relaxed line-clamp-5">
-            {detail.description}
-          </p>
-        </>
-      )}
+      {(() => {
+        // Season/cour-aware plot. When the hovered catalog item is itself a
+        // single season/cour, its season_credits carries exactly one season
+        // — prefer that season's overview so the panel describes the cour,
+        // not the umbrella series. Multi-season series fall through to the
+        // show-level description (which, for a per-cour catalog id, the
+        // addon already returns cour-specific). Empty season_credits (anime
+        // today) also falls through. Always fall back to the default.
+        const sc = detail?.season_credits;
+        const keys = sc ? Object.keys(sc) : [];
+        const lone = keys.length === 1 ? sc![keys[0]]?.overview : null;
+        const plot = (typeof lone === "string" && lone.trim() ? lone : null)
+          ?? detail?.description
+          ?? null;
+        if (!plot) return null;
+        return (
+          <>
+            <Heading>Plot</Heading>
+            <p className="text-white/70 text-[12.5px] leading-relaxed line-clamp-5">
+              {plot}
+            </p>
+          </>
+        );
+      })()}
 
       {directors.length > 0 && (
         <>
@@ -438,6 +525,21 @@ export function CatalogHoverHost({
       window.removeEventListener("scroll", reanchor, true);
       window.removeEventListener("resize", reanchor);
     };
+  }, [target]);
+
+  // Anchor-survival watchdog. The hover store closes on scroll/resize
+  // when the anchor card scrolls out of view or is disconnected, but a
+  // grid change (e.g. Discover switching catalogs while the cursor was
+  // momentarily over a card) unmounts the anchor WITHOUT firing scroll
+  // — and the panel sticks. Re-check every 250 ms while a target is
+  // live; if the anchor is no longer in the document, close. Interval
+  // chosen so a rapid hover→unmount→hover sequence still feels snappy.
+  useEffect(() => {
+    if (!target) return;
+    const id = window.setInterval(() => {
+      if (!target.el.isConnected) closeHoverNow();
+    }, 250);
+    return () => window.clearInterval(id);
   }, [target]);
 
   // Bind mode only: there is no mouse-leave close, so Esc and a click
