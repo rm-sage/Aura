@@ -885,6 +885,9 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
     detail?.background ?? meta.background ??
     meta.fanart ?? meta.backdrop ?? meta.poster ?? null;
   const logoArt = detail?.logo ?? meta.logo ?? null;
+  // Series poster used as the thumbnail for UNAIRED episodes (instead of a
+  // blurred frame) — portrait poster cropped to the 16:9 thumb.
+  const episodeFallbackArt = detail?.poster ?? detail?.background ?? meta.poster ?? null;
 
   const openTransform = fromRect
     ? (() => {
@@ -1443,6 +1446,7 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
             onPlayExternal={(url) => openUrl(url).catch(() => {})}
             scrollToVideoId={scrollOnceTo}
             highlightVideoId={ringEpisodeId}
+            seriesArt={episodeFallbackArt}
             onScrollHandled={handleScrollHandled}
             // Per-season display names (e.g. anime cour titles like "Stone
             // Wars") keyed by season number, for the label under the season
@@ -2198,12 +2202,14 @@ interface PanelProps {
   seasonNames?: Record<string, string>;
   /** Notification deep-link: row matching this id gets a selection ring. */
   highlightVideoId?: string | null;
+  /** Series poster shown as the thumbnail for unaired episodes. */
+  seriesArt?: string | null;
 }
 
 function UnifiedPanel({
   mode, isEpisodic, seriesId, seriesMediaType, videos, activeVideo, streams, streamMeta, streamsLoading,
   groupedStreams, metaLoading, onPickEpisode, onBackToEpisodes, onPlay, onCopy, onPlayExternal,
-  scrollToVideoId, onScrollHandled, seasonHint, seasonNames, highlightVideoId,
+  scrollToVideoId, onScrollHandled, seasonHint, seasonNames, highlightVideoId, seriesArt,
 }: PanelProps) {
   // The streams panel needs `position: relative` so the floating AIOStreams
   // status icons (rendered with `absolute -top-3 -left-3`) anchor to its
@@ -2245,6 +2251,7 @@ function UnifiedPanel({
             seasonHint={seasonHint}
             seasonNames={seasonNames}
             highlightVideoId={highlightVideoId}
+            seriesArt={seriesArt}
           />
         </div>
       ) : (
@@ -2281,7 +2288,7 @@ function UnifiedPanel({
 // ---------------------------------------------------------------------------
 
 const EpisodeRow = ({
-  video, seriesId, seriesMediaType, isActive, onPick, seasonVideos, isNextAiring, isDeepLinked,
+  video, seriesId, seriesMediaType, isActive, onPick, seasonVideos, isNextAiring, isDeepLinked, seriesArt,
 }: {
   video: VideoEntry;
   seriesId: string;
@@ -2298,6 +2305,8 @@ const EpisodeRow = ({
   isNextAiring?: boolean;
   /** True for the notification deep-linked episode — adds a selection ring. */
   isDeepLinked?: boolean;
+  /** Series poster — thumbnail fallback for unaired episodes. */
+  seriesArt?: string | null;
 }) => {
   const progress = useEpisodeProgress(seriesId, video.id);
   const watchedVariant = useWatchedVariant(video.id);
@@ -2515,7 +2524,14 @@ const EpisodeRow = ({
         className="relative flex-shrink-0 w-40 rounded overflow-hidden bg-white/5 border border-white/10"
         style={{ aspectRatio: "16 / 9" }}
       >
-        {video.thumbnail ? (
+        {unaired && seriesArt ? (
+          <ImageLoader
+            src={seriesArt}
+            alt=""
+            className="absolute inset-0 w-full h-full"
+            imgClassName="w-full h-full object-cover"
+          />
+        ) : video.thumbnail ? (
           <ImageLoader
             src={video.thumbnail}
             alt=""
@@ -2646,7 +2662,7 @@ const EpisodeRow = ({
 
 function EpisodesPanel({
   seriesId, seriesMediaType, videos, activeVideo, onPick, scrollToVideoId, onScrollHandled,
-  metaLoading, seasonHint, seasonNames, highlightVideoId,
+  metaLoading, seasonHint, seasonNames, highlightVideoId, seriesArt,
 }: {
   seriesId: string;
   seriesMediaType: string;
@@ -2666,6 +2682,8 @@ function EpisodesPanel({
   seasonNames?: Record<string, string>;
   /** Notification deep-link: the row matching this id gets a selection ring. */
   highlightVideoId?: string | null;
+  /** Series poster shown as the thumbnail for unaired episodes. */
+  seriesArt?: string | null;
 }) {
   const seasons = useMemo(() => {
     const set = new Set<number>();
@@ -2924,6 +2942,7 @@ function EpisodesPanel({
                     seasonVideos={inSeason}
                     isNextAiring={v.id === nextAiringId}
                     isDeepLinked={v.id === highlightId}
+                    seriesArt={seriesArt}
                   />
                 </div>
               ))}
