@@ -15,7 +15,7 @@ import { getMetaDetailFallback, useCanonicalReleaseYear } from "./metaCache";
 import { closeHoverNow } from "./catalogHoverStore";
 import { useHoverCardActivation } from "./useHoverCardActivation";
 import { getReleaseSignal, useReleaseSignalsVersion } from "./releaseSignalStore";
-import { formatCountdown, formatTargetDate, airingInfo, useCountdownNow } from "./releaseCountdown";
+import { formatCountdown, formatTargetDate, airingInfo, nextAiringEpisode, useCountdownNow } from "./releaseCountdown";
 
 /** Per-catalog cache for the View-all popup. Keyed by
  *  `${addonUrl}|${type}|${id}`. Persists across DiscoveryRow remounts
@@ -615,17 +615,26 @@ function useEffectiveResumeVideoId(
 }
 
 // Centered "next episode" countdown pill, overlaid on the CW tile art just
-// above the progress bar. Source is the cloud release signal's `next_aired`
-// (series only — movies/finished series have none → renders nothing). Owns
-// its own 1 s tick + subscribes to the signal-store version so it appears
-// the moment the signal lands and advances live. The opaque dark pill +
-// blur + text-shadow keep it legible on light AND dark cover art.
-function CWReleaseCountdown({ seriesId }: { seriesId: string }) {
+// above the progress bar. Series only (movies/finished series → nothing). Owns
+// its own 1 s tick + subscribes to the signal-store version so it appears the
+// moment data lands and advances live. The opaque dark pill + blur + text-shadow
+// keep it legible on light AND dark cover art.
+//
+// SOURCE PRIORITY: the authoritative meta videos (detail.videos[].released — the
+// SAME source the calendar + DetailView use) come FIRST; the cloud release
+// signal's `next_aired` is only a fallback. The cloud field can be stale/wrong —
+// it once showed 12d for a show whose next episode aired in 6d, because it
+// pointed at a LATER episode than the meta list. Falling back to it only when
+// the meta episode list isn't loaded yet, or has no future ep (e.g. resuming a
+// season older than the one currently airing), keeps the CW countdown in lock-
+// step with the calendar for every show.
+function CWReleaseCountdown({ seriesId, episodes }: { seriesId: string; episodes: VideoEntry[] | null }) {
   const now = useCountdownNow();
   useReleaseSignalsVersion(); // re-read getReleaseSignal when signals update
-  const nextIso = getReleaseSignal(seriesId)?.next_aired?.aired_at;
-  if (!nextIso) return null;
-  const targetMs = Date.parse(nextIso);
+  const metaNextMs = episodes ? (nextAiringEpisode(episodes, now)?.targetMs ?? null) : null;
+  const cloudIso = getReleaseSignal(seriesId)?.next_aired?.aired_at;
+  const cloudMs = cloudIso ? Date.parse(cloudIso) : NaN;
+  const targetMs = metaNextMs ?? cloudMs;
   if (!Number.isFinite(targetMs) || targetMs <= now) return null;
   return (
     <div className="absolute inset-x-0 bottom-[28px] flex justify-center pointer-events-none z-10">
@@ -743,7 +752,7 @@ const ContinueWatchingCard = memo(function ContinueWatchingCard(
               <div className="h-full bg-ln-accent" style={{ width: `${progress * 100}%` }} />
             </div>
           )}
-          <CWReleaseCountdown seriesId={item.id} />
+          <CWReleaseCountdown seriesId={item.id} episodes={seasonEpisodes} />
         </div>
         <p
           className="text-white/90 text-[17px] font-medium mt-2 leading-tight line-clamp-1 text-center"
