@@ -3056,6 +3056,25 @@ const KIND_ORDER: MessageKind[] = ["error", "warning", "info", "stats"];
 /** Floating cluster of 1–4 status icons anchored OUTSIDE the panel's top-left
  *  corner. Each icon corresponds to a non-empty message kind and reveals the
  *  relevant rows in a hover tooltip. */
+/** When AIOStreams returns a "Digital Release Filter" notice (no digital
+ *  release available yet), the other notices (errors / stats / etc.) are just
+ *  noise — keep ONLY the Digital-Release-Filter message(s). */
+function suppressNoisyNotices(metadata: StreamMetadata): StreamMetadata {
+  const isDrf = (m: StreamMessage) =>
+    /digital release filter/i.test(m.title ?? "") ||
+    /digital release filter/i.test(m.description ?? "");
+  const all = [...metadata.errors, ...metadata.warnings, ...metadata.info, ...metadata.stats];
+  if (!all.some(isDrf)) return metadata;
+  const keep = (rows: StreamMessage[]) => rows.filter(isDrf);
+  return {
+    ...metadata,
+    errors:   keep(metadata.errors),
+    warnings: keep(metadata.warnings),
+    info:     keep(metadata.info),
+    stats:    keep(metadata.stats),
+  };
+}
+
 function StreamMetaBadges({
   metadata,
   anchorRef,
@@ -3101,6 +3120,14 @@ function StreamMetaBadges({
     // (or the fallback timeout in DetailViewBody).
     if (!entered) return;
     reposition();
+    // The entrance transform can still be settling when `entered` flips via the
+    // 480 ms fallback timeout (no transitionend fired) — the aside's rect is then
+    // the centre-scaled one, and nothing re-measures afterward (a ResizeObserver
+    // doesn't fire on an ancestor transform). Re-measure on a short cascade so the
+    // FINAL position lands post-settle and the cluster can't freeze mid-screen.
+    const raf = requestAnimationFrame(reposition);
+    const t1 = setTimeout(reposition, 220);
+    const t2 = setTimeout(reposition, 520);
     window.addEventListener("resize", reposition);
     window.addEventListener("scroll", reposition, true);
     // ResizeObserver — covers panel resizes that don't fire window resize
@@ -3109,17 +3136,21 @@ function StreamMetaBadges({
     const ro = el ? new ResizeObserver(reposition) : null;
     if (ro && el) ro.observe(el);
     return () => {
+      cancelAnimationFrame(raf);
+      clearTimeout(t1);
+      clearTimeout(t2);
       window.removeEventListener("resize", reposition);
       window.removeEventListener("scroll", reposition, true);
       ro?.disconnect();
     };
   }, [entered, reposition, anchorRef]);
 
+  const md = suppressNoisyNotices(metadata);
   const allBuckets: { kind: MessageKind; rows: StreamMessage[] }[] = [
-    { kind: "error",   rows: metadata.errors   },
-    { kind: "warning", rows: metadata.warnings },
-    { kind: "info",    rows: metadata.info     },
-    { kind: "stats",   rows: metadata.stats    },
+    { kind: "error",   rows: md.errors   },
+    { kind: "warning", rows: md.warnings },
+    { kind: "info",    rows: md.info     },
+    { kind: "stats",   rows: md.stats    },
   ];
   const buckets = allBuckets.filter((b) => b.rows.length > 0);
 
@@ -3339,11 +3370,12 @@ function StreamMessageRow({ message, kind }: { message: StreamMessage; kind: Mes
  *  AIOStreams returned status messages — replaces the "No streams found"
  *  fallback. */
 function StreamMessagesEmptyState({ metadata }: { metadata: StreamMetadata }) {
+  const md = suppressNoisyNotices(metadata);
   const allGroups: { kind: MessageKind; rows: StreamMessage[] }[] = [
-    { kind: "error",   rows: metadata.errors   },
-    { kind: "warning", rows: metadata.warnings },
-    { kind: "info",    rows: metadata.info     },
-    { kind: "stats",   rows: metadata.stats    },
+    { kind: "error",   rows: md.errors   },
+    { kind: "warning", rows: md.warnings },
+    { kind: "info",    rows: md.info     },
+    { kind: "stats",   rows: md.stats    },
   ];
   const groups = allGroups.filter((g) => g.rows.length > 0);
 
