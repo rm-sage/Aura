@@ -177,9 +177,8 @@ pub fn migrate_from_settings<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         // Whether we just wrote OR the keyring was already populated:
         // null out the settings.json field. Keyring is now the source
         // of truth for this key.
-        match *name {
-            "opensubtitles" => { settings.opensubtitles_api_key.clear(); }
-            _ => {}
+        if *name == "opensubtitles" {
+            settings.opensubtitles_api_key.clear();
         }
         changed = true;
     }

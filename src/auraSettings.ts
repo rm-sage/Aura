@@ -96,17 +96,6 @@ export interface AuraSettings {
    *  list (AIOMetadata's "AI Recommendations", a custom mdblist, etc.)
    *  in the hero band without cluttering the home grid below. */
   heroCatalog: { addonUrl: string; mediaType: string; catalogId: string } | null;
-  /** Episode-notification gate: when true, the bell only fires for a
-   *  new episode if NotificationsScanner can confirm at least one
-   *  stream exists for it (via fetch_streams against the user's
-   *  installed addons). Off by default because it adds a per-episode
-   *  HTTP fanout to every scan; on for users whose addon mix
-   *  occasionally publishes "released" episodes that have no
-   *  scrapable source for hours/days, who'd rather hear about it
-   *  later than have the bell light up with a dead-end notification.
-   *  Result of the stream check is cached locally (12h TTL) so a
-   *  re-scan over the same episode doesn't refire the network call. */
-  notifyOnlyWithStreams: boolean;
   /** Reduced-motion policy. `"auto"` (default) honours the OS-level
    *  `prefers-reduced-motion` media query — most users get exactly the
    *  experience they configured at the OS level. `"always"` forces
@@ -202,6 +191,14 @@ export interface AuraSettings {
    *  browser instead of Aura's in-app popup webview. Default false =
    *  the in-app popup (unchanged behaviour). */
   openLinksExternally: boolean;
+  /** Auto-remove a SERIES from the Queue once it goes in-progress (any
+   *  episode played). Movies are ALWAYS removed from the Queue once
+   *  watched (≥90%), regardless of this toggle — a movie is a single
+   *  unit, so "watched" means done. For series it's preference: the
+   *  Queue semantic is "haven't started yet", so default true graduates
+   *  a show out the moment you begin it. Flip false to keep in-progress
+   *  shows pinned in the Queue. Surfaced as a toggle in the Queue page. */
+  queueRemoveSeriesInProgress: boolean;
 }
 
 export const DEFAULT_AURA_SETTINGS: AuraSettings = {
@@ -214,7 +211,6 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   hideCastSpoilers: false,
   blurUnwatchedThumbnails: false,
   heroCatalog: null,
-  notifyOnlyWithStreams: false,
   reduceMotion: "auto",
   autoAdvanceNextEpisode: false,
   autoAdvanceDelaySeconds: 10,
@@ -227,6 +223,7 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   metaPanelBindEnabled: false,
   metaPanelBindButton: 1,
   openLinksExternally: false,
+  queueRemoveSeriesInProgress: true,
 };
 
 // Module-level memoization snapshot. loadAuraSettings is called many
@@ -276,9 +273,6 @@ function readFromStorage(): AuraSettings {
       blurUnwatchedThumbnails: typeof parsed.blurUnwatchedThumbnails === "boolean"
         ? parsed.blurUnwatchedThumbnails
         : false,
-      notifyOnlyWithStreams: typeof parsed.notifyOnlyWithStreams === "boolean"
-        ? parsed.notifyOnlyWithStreams
-        : false,
       reduceMotion:
         parsed.reduceMotion === "always" || parsed.reduceMotion === "never"
           ? parsed.reduceMotion
@@ -327,6 +321,9 @@ function readFromStorage(): AuraSettings {
       openLinksExternally: typeof parsed.openLinksExternally === "boolean"
         ? parsed.openLinksExternally
         : false,
+      queueRemoveSeriesInProgress: typeof parsed.queueRemoveSeriesInProgress === "boolean"
+        ? parsed.queueRemoveSeriesInProgress
+        : true,
       heroCatalog: parsed.heroCatalog
         && typeof parsed.heroCatalog === "object"
         && typeof (parsed.heroCatalog as Record<string, unknown>).addonUrl === "string"

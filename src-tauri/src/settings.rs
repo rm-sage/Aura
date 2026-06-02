@@ -568,8 +568,10 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> AppSettings {
             let defaults = default_keybindings();
             let mut merged_any = false;
             for (action, default_spec) in defaults {
-                if !parsed.keybindings.contains_key(&action) {
-                    parsed.keybindings.insert(action, default_spec);
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    parsed.keybindings.entry(action)
+                {
+                    e.insert(default_spec);
                     merged_any = true;
                 }
             }

@@ -332,12 +332,15 @@ function AddonRow({
     }
   };
 
-  // Force a fresh manifest fetch (bypassing the 5-min MANIFEST_CACHE
+  // Force a fresh manifest fetch (bypassing the 24-hour MANIFEST_CACHE
   // TTL). Surfaces newly-added catalogs on self-hosted AIOMetadata
   // without forcing a remove + re-add cycle. Toast on success with the
   // catalog count so the user gets concrete feedback; toast + shake on
   // error so a network blip is obvious without burying the chip.
-  const handleRefresh = async () => {
+  // Dispatches `aura:addon-manifest-refreshed` so HomeView re-bootstraps
+  // its catalog rows against the new manifest without waiting for an
+  // unrelated settings change to bump its settingsTick.
+  const handleRefresh = async (silent = false) => {
     if (refreshing) return;
     setRefreshing(true);
     try {
@@ -346,12 +349,48 @@ function AddonRow({
         { addonUrl: addon.url },
       );
       const count = Array.isArray(manifest.catalogs) ? manifest.catalogs.length : 0;
-      showAppToast(`Refreshed ${addon.name} — ${count} catalog${count === 1 ? "" : "s"}`, { duration: 2500 });
+      window.dispatchEvent(new CustomEvent("aura:addon-manifest-refreshed", {
+        detail: { url: addon.url, catalogCount: count },
+      }));
+      if (!silent) {
+        showAppToast(`Refreshed ${addon.name} — ${count} catalog${count === 1 ? "" : "s"}`, { duration: 2500 });
+      }
     } catch (e) {
-      showAppToast(`Couldn't refresh ${addon.name}: ${String(e)}`, { duration: 4000 });
+      if (!silent) {
+        showAppToast(`Couldn't refresh ${addon.name}: ${String(e)}`, { duration: 4000 });
+      }
     } finally {
       setRefreshing(false);
     }
+  };
+
+  // Configure handler — opens the addon's /configure page in the user's
+  // default browser, then schedules a silent manifest refresh on the
+  // next window-focus event (capped at 30 min). This is the "user
+  // toggles catalogs on AIOMetadata's UI, comes back to Aura, expects
+  // to see them" workflow: without auto-refresh, Aura would hold the
+  // pre-configure manifest until the 24h TTL elapses or the user
+  // manually clicks Refresh. The focus-listener is one-shot per
+  // configure click so it can't accumulate across rapid re-clicks.
+  const handleConfigure = () => {
+    openUrl(configureUrl).catch(() => {});
+    let fired = false;
+    const cleanup = () => {
+      window.removeEventListener("focus", onFocus);
+      clearTimeout(expiry);
+    };
+    const onFocus = () => {
+      if (fired) return;
+      fired = true;
+      cleanup();
+      // Brief delay so the manifest fetch doesn't race with whatever
+      // tail-end network requests the addon's configure submit kicked
+      // off (AIOMetadata persists config server-side before the page
+      // re-renders).
+      setTimeout(() => { void handleRefresh(true); }, 750);
+    };
+    const expiry = setTimeout(cleanup, 30 * 60 * 1000);
+    window.addEventListener("focus", onFocus);
   };
 
   const handleCopyManifest = async () => {
@@ -376,7 +415,7 @@ function AddonRow({
         openContextMenu(e.clientX, e.clientY, [
           {
             label: "Configure addon",
-            onClick: () => openUrl(configureUrl).catch(() => {}),
+            onClick: handleConfigure,
           },
           {
             label: "Open manifest URL",
@@ -439,7 +478,7 @@ function AddonRow({
           <Tooltip text="Configure addon" pos="bottom">
             <button
               type="button"
-              onClick={() => openUrl(configureUrl).catch(() => {})}
+              onClick={handleConfigure}
               aria-label={`Configure ${addon.name}`}
               className={ACCENT_ICON_BTN}
             >
@@ -450,7 +489,7 @@ function AddonRow({
         <Tooltip text={refreshing ? "Refreshing…" : "Refresh manifest"} pos="bottom">
           <button
             type="button"
-            onClick={handleRefresh}
+            onClick={() => { void handleRefresh(); }}
             disabled={refreshing || removing}
             aria-label={`Refresh ${addon.name}`}
             className={ACCENT_ICON_BTN}

@@ -60,10 +60,10 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
     // in a Send-marker struct because *mut c_void isn't Send by default; we
     // know the pointer is stable for the window's lifetime.
     #[cfg(target_os = "windows")]
-    let hwnd_send = match app.get_webview_window("main").and_then(|w| w.hwnd().ok()) {
-        Some(hwnd) => Some(SendHwnd(hwnd.0 as *mut std::ffi::c_void)),
-        None => None,
-    };
+    let hwnd_send = app
+        .get_webview_window("main")
+        .and_then(|w| w.hwnd().ok())
+        .map(|hwnd| SendHwnd(hwnd.0));
 
     std::thread::spawn(move || {
         let config = PlatformConfig {
@@ -102,7 +102,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                 Cmd::SetMetadata { title, artist, cover_url, duration } => {
                     let dur = duration
                         .filter(|d| d.is_finite() && *d > 0.0)
-                        .map(|d| Duration::from_secs_f64(d));
+                        .map(Duration::from_secs_f64);
                     let _ = controls.set_metadata(MediaMetadata {
                         title:     Some(&title),
                         artist:    artist.as_deref(),

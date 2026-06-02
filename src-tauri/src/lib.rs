@@ -31,6 +31,13 @@ mod log_export;
 mod anime_id_map;
 mod api_keyring;
 mod media_controls;
+// Direct-FFI bindings for libmpv-2.dll — foundation of the render-API
+// rewrite (docs/superpowers/specs/2026-05-20-render-api-rewrite-design.md).
+// ADDITIVE: declared so `cargo check` compiles it; not yet wired into any
+// runtime path (player.rs still uses tauri-plugin-libmpv).
+mod debug_panel;
+mod mpv2;
+mod popup_nav;
 mod player;
 mod publicmetadb;
 mod ratings;
@@ -322,11 +329,42 @@ async fn load_video(
     start_seconds: Option<f64>,
 ) -> Result<(), String> {
     let normalised = path.replace('\\', "/");
+    // Defence in depth: only http(s) URLs, the localhost streaming
+    // bridge, or magnet links may reach mpv from this command. The
+    // intended renderer-trusted threat model still holds, but a
+    // malicious or compromised addon manifest could theoretically
+    // surface `file:///C:/…` in a stream record and reach here via JS
+    // state. Reject anything that doesn't start with a known scheme so
+    // such a value can't quietly cause mpv to open arbitrary local files.
+    let allowed_prefix = ["http://", "https://", "127.0.0.1", "magnet:"]
+        .iter()
+        .any(|p| normalised.starts_with(p));
+    if !allowed_prefix {
+        return Err(format!(
+            "load_video: rejected path with unsupported scheme: {}",
+            crate::stremio::redact_sensitive_url(&normalised),
+        ));
+    }
+    // Stream URLs frequently embed debrid API keys (TorBox `?api_key=…`,
+    // Real-Debrid path tokens, etc.). The raw URL would otherwise land
+    // verbatim in `aura-mpv.log` and the DevConsole ring buffer (which
+    // is part of the Help → Export Logs surface). The helper masks the
+    // well-known secret-bearing query params and path segments — see
+    // `stremio::redact_sensitive_url`.
     crate::devlog!(
         info, "player",
-        "load_video: {normalised} (start={:?})",
+        "load_video: {} (start={:?})",
+        crate::stremio::redact_sensitive_url(&normalised),
         start_seconds,
     );
+    // Phase 2.4: when the mpv2 master gate is set AND the engine is alive,
+    // route this loadfile through the new render-context path. The legacy
+    // `--wid` engine stays untouched (`init_mpv` here is a no-op when the
+    // instance already exists), so a flag flip can fall back instantly.
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        return mpv2::engine::submit_load_file(normalised, start_seconds);
+    }
     let t_start = std::time::Instant::now();
     tauri::async_runtime::spawn_blocking(move || {
         // Defensive re-init: if the MPV instance has been destroyed for any
@@ -403,6 +441,10 @@ async fn load_video(
 #[tauri::command]
 async fn stop_video(app: tauri::AppHandle) -> Result<(), String> {
     crate::devlog!(info, "player", "stop_video");
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        return mpv2::engine::submit_command(vec!["stop".into()]);
+    }
     tauri::async_runtime::spawn_blocking(move || {
         app.mpv()
             .command("stop", &Vec::<serde_json::Value>::new(), "main")
@@ -414,6 +456,10 @@ async fn stop_video(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 async fn toggle_pause(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        return mpv2::engine::submit_toggle_pause();
+    }
     tauri::async_runtime::spawn_blocking(move || {
         app.mpv()
             .command("cycle", &vec![serde_json::json!("pause")], "main")
@@ -423,8 +469,31 @@ async fn toggle_pause(app: tauri::AppHandle) -> Result<(), String> {
     .map_err(|e| e.to_string())?
 }
 
+/// Keep the display + system awake while the player is active and unpaused.
+/// The frontend invokes this on every `isPlayerActive && !paused` change.
+/// Under the mpv2 render engine, mpv (`vo=libmpv`) owns no window and so
+/// can't run its own `stop-screensaver`; the engine's render thread reads
+/// this flag and asserts/releases `SetThreadExecutionState`. No-op on the
+/// legacy `--wid` path (mpv inhibits the screensaver itself there) and on
+/// non-Windows.
+#[tauri::command]
+fn set_keep_display_awake(enabled: bool) {
+    #[cfg(target_os = "windows")]
+    mpv2::engine::set_display_awake_desired(enabled);
+    #[cfg(not(target_os = "windows"))]
+    { let _ = enabled; }
+}
+
 #[tauri::command]
 async fn seek_relative(app: tauri::AppHandle, seconds: f64) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        return mpv2::engine::submit_command(vec![
+            "seek".into(),
+            format!("{seconds}"),
+            "relative".into(),
+        ]);
+    }
     tauri::async_runtime::spawn_blocking(move || {
         app.mpv()
             .command(
@@ -448,8 +517,12 @@ async fn seek_relative(app: tauri::AppHandle, seconds: f64) -> Result<(), String
 /// transition landmines (CLAUDE.md #3) don't apply here.
 #[tauri::command]
 async fn frame_step(app: tauri::AppHandle, forward: bool) -> Result<(), String> {
+    let cmd = if forward { "frame-step" } else { "frame-back-step" };
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        return mpv2::engine::submit_command(vec![cmd.into()]);
+    }
     tauri::async_runtime::spawn_blocking(move || {
-        let cmd = if forward { "frame-step" } else { "frame-back-step" };
         app.mpv()
             .command(cmd, &vec![], "main")
             .map_err(|e| e.to_string())
@@ -486,6 +559,23 @@ async fn frame_step(app: tauri::AppHandle, forward: bool) -> Result<(), String> 
 #[tauri::command]
 async fn set_audio_loudnorm(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     crate::devlog!(info, "player", "set_audio_loudnorm(enabled={enabled})");
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        // Same remove-first / optional-add sequence as the legacy path,
+        // each as a separate engine command (channel drains them in order
+        // before the next render tick).
+        let _ = mpv2::engine::submit_command(vec![
+            "af".into(), "remove".into(), "@loudnorm".into(),
+        ]);
+        if enabled {
+            return mpv2::engine::submit_command(vec![
+                "af".into(),
+                "add".into(),
+                "@loudnorm:loudnorm=I=-23:LRA=7:TP=-2".into(),
+            ]);
+        }
+        return Ok(());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let mpv = app.mpv();
         // Always remove first so repeat calls don't stack duplicate
@@ -547,6 +637,52 @@ async fn set_motion_interpolation(
     tscale: Option<String>,
 ) -> Result<(), String> {
     crate::devlog!(info, "player", "set_motion_interpolation(enabled={enabled}, tscale={tscale:?})");
+    // Kernel whitelist mirrors the legacy path — same allow-list, same
+    // default. Owned `String` so it lives through both the env-gate
+    // branch and the legacy spawn_blocking move below; otherwise the
+    // borrow against `tscale` would be killed by the closure capture.
+    let kernel: String = if enabled {
+        match tscale.as_deref() {
+            Some(k @ ("oversample" | "linear" | "catmull_rom"
+                      | "mitchell" | "gaussian" | "bicubic")) => k.to_string(),
+            _ => "mitchell".to_string(),
+        }
+    } else {
+        String::new()
+    };
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        use mpv2::engine::PropValue;
+        if enabled {
+            mpv2::engine::submit_set_property(
+                "video-sync".into(),
+                PropValue::String("display-resample".into()),
+            )?;
+            mpv2::engine::submit_set_property(
+                "tscale".into(),
+                PropValue::String(kernel.clone()),
+            )?;
+            mpv2::engine::submit_set_property(
+                "interpolation".into(),
+                PropValue::Flag(true),
+            )?;
+            crate::devlog!(
+                info, "player",
+                "motion interpolation ON (video-sync=display-resample, tscale={kernel})"
+            );
+        } else {
+            mpv2::engine::submit_set_property(
+                "interpolation".into(),
+                PropValue::Flag(false),
+            )?;
+            mpv2::engine::submit_set_property(
+                "video-sync".into(),
+                PropValue::String("audio".into()),
+            )?;
+            crate::devlog!(info, "player", "motion interpolation OFF");
+        }
+        return Ok(());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let mpv = app.mpv();
         let set = |name: &str, val: serde_json::Value| -> Result<(), String> {
@@ -556,18 +692,6 @@ async fn set_motion_interpolation(
             })
         };
         if enabled {
-            // Whitelist the kernel — never forward an arbitrary string
-            // to mpv. mpv's separable convolution tscales, listed
-            // sharp → smooth. `oversample` only fixes cadence judder
-            // (no synthesised motion = looks un-interpolated); the
-            // blending kernels produce the visibly-smooth result.
-            // Unknown / absent → `mitchell` (the sensible "smooth
-            // video" default).
-            let kernel: &str = match tscale.as_deref() {
-                Some(k @ ("oversample" | "linear" | "catmull_rom"
-                          | "mitchell" | "gaussian" | "bicubic")) => k,
-                _ => "mitchell",
-            };
             // video-sync must flip to a display mode BEFORE interpolation.
             set("video-sync", serde_json::json!("display-resample"))?;
             set("tscale", serde_json::json!(kernel))?;
@@ -590,6 +714,10 @@ async fn set_motion_interpolation(
 #[tauri::command]
 async fn set_volume(app: tauri::AppHandle, volume: f64) -> Result<(), String> {
     crate::devlog!(info, "player", "set_volume({volume})");
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        return mpv2::engine::submit_set_volume(volume);
+    }
     tauri::async_runtime::spawn_blocking(move || {
         // Use the dedicated set_property FFI path — going through the
         // generic `command("set_property", [name, value])` route silently
@@ -631,6 +759,26 @@ async fn get_property(
     }
     if name == "track-list" {
         return Err("get_property: track-list reads must go through get_tracks (landmine #3)".into());
+    }
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        use mpv2::engine::GetFormat;
+        let fmt = match format.to_lowercase().as_str() {
+            "flag" => GetFormat::Flag,
+            "int64" => GetFormat::Int64,
+            "double" => GetFormat::Double,
+            "string" => GetFormat::String,
+            other => return Err(format!(
+                "get_property: unsupported format '{other}' for mpv2 engine"
+            )),
+        };
+        // The engine's reply channel blocks; keep off the Tauri runtime.
+        let name_owned = name.clone();
+        return tauri::async_runtime::spawn_blocking(move || {
+            mpv2::engine::submit_get_property(name_owned, fmt)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
     }
     tauri::async_runtime::spawn_blocking(move || {
         app.mpv()
@@ -677,6 +825,25 @@ async fn refresh_video(
         .map(|h| h.0 as isize)
         .unwrap_or(0);
 
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        use mpv2::engine::PropValue;
+        // Phase 5: the engine owns its own resize via per-frame parent-
+        // rect tracking, so we don't need to drive SetWindowPos from
+        // here. `title_bar_h` is still computed for the legacy path
+        // below; the engine reads `win32::is_in_native_fullscreen()`
+        // itself on every tick.
+        let _ = (parent_hwnd, title_bar_h);
+        // The video-zoom toggle is mpv's documented "force a re-render"
+        // trick — the same two-step the legacy path uses.
+        let _ = mpv2::engine::submit_set_property(
+            "video-zoom".into(), PropValue::Double(0.0001),
+        );
+        let _ = mpv2::engine::submit_set_property(
+            "video-zoom".into(), PropValue::Double(0.0),
+        );
+        return Ok(());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         #[cfg(target_os = "windows")]
         if parent_hwnd != 0 {
@@ -694,6 +861,13 @@ async fn refresh_video(
 #[tauri::command]
 async fn set_speed(app: tauri::AppHandle, speed: f64) -> Result<(), String> {
     crate::devlog!(info, "player", "set_speed({speed})");
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        return mpv2::engine::submit_set_property(
+            "speed".into(),
+            mpv2::engine::PropValue::Double(speed),
+        );
+    }
     tauri::async_runtime::spawn_blocking(move || {
         app.mpv()
             .set_property("speed", &serde_json::json!(speed), "main")
@@ -708,6 +882,14 @@ async fn set_speed(app: tauri::AppHandle, speed: f64) -> Result<(), String> {
 
 #[tauri::command]
 async fn seek_absolute(app: tauri::AppHandle, time: f64) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        return mpv2::engine::submit_command(vec![
+            "seek".into(),
+            format!("{time}"),
+            "absolute".into(),
+        ]);
+    }
     tauri::async_runtime::spawn_blocking(move || {
         app.mpv()
             .command(
@@ -735,12 +917,44 @@ fn track_value_as_string(track: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Translate a `serde_json::Value` into the mpv2 engine's typed
+/// [`mpv2::engine::PropValue`]. Used by the handlers that build their
+/// property writes as JSON values (HDR options, subtitle styling, …)
+/// before deciding to route through the engine. `null` and structured
+/// (`Array` / `Object`) values can't be sent — mpv has no NODE-format
+/// setter in our typed enum, and Aura's HDR/sub option maps only ever
+/// emit scalars. Returns `None` for those so the caller can log and
+/// skip rather than send a wrong-format value mpv would reject anyway.
+#[cfg(target_os = "windows")]
+fn json_to_propvalue(value: &serde_json::Value) -> Option<mpv2::engine::PropValue> {
+    use mpv2::engine::PropValue;
+    match value {
+        serde_json::Value::Bool(b) => Some(PropValue::Flag(*b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(PropValue::Int64(i))
+            } else {
+                n.as_f64().map(PropValue::Double)
+            }
+        }
+        serde_json::Value::String(s) => Some(PropValue::String(s.clone())),
+        _ => None,
+    }
+}
+
 #[tauri::command]
 async fn set_audio_track(app: tauri::AppHandle, track: serde_json::Value) -> Result<(), String> {
     crate::devlog!(info, "player", "set_audio_track({track})");
     let Some(track_str) = track_value_as_string(&track) else {
         return Err(format!("invalid track value: {track}"));
     };
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        return mpv2::engine::submit_set_property(
+            "aid".into(),
+            mpv2::engine::PropValue::String(track_str),
+        );
+    }
     tauri::async_runtime::spawn_blocking(move || {
         app.mpv()
             .set_property("aid", &serde_json::json!(track_str), "main")
@@ -763,6 +977,13 @@ async fn set_audio_track(app: tauri::AppHandle, track: serde_json::Value) -> Res
 async fn set_audio_delay(app: tauri::AppHandle, seconds: f64) -> Result<(), String> {
     let clamped = seconds.clamp(-10.0, 10.0);
     crate::devlog!(info, "player", "set_audio_delay({clamped:.3})");
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        return mpv2::engine::submit_set_property(
+            "audio-delay".into(),
+            mpv2::engine::PropValue::Double(clamped),
+        );
+    }
     tauri::async_runtime::spawn_blocking(move || {
         app.mpv()
             .set_property("audio-delay", &serde_json::json!(clamped), "main")
@@ -782,6 +1003,13 @@ async fn set_audio_delay(app: tauri::AppHandle, seconds: f64) -> Result<(), Stri
 async fn set_subtitle_delay(app: tauri::AppHandle, seconds: f64) -> Result<(), String> {
     let clamped = seconds.clamp(-10.0, 10.0);
     crate::devlog!(info, "player", "set_subtitle_delay({clamped:.3})");
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        return mpv2::engine::submit_set_property(
+            "sub-delay".into(),
+            mpv2::engine::PropValue::Double(clamped),
+        );
+    }
     tauri::async_runtime::spawn_blocking(move || {
         app.mpv()
             .set_property("sub-delay", &serde_json::json!(clamped), "main")
@@ -800,6 +1028,13 @@ async fn set_subtitle_track(app: tauri::AppHandle, track: serde_json::Value) -> 
     let Some(track_str) = track_value_as_string(&track) else {
         return Err(format!("invalid track value: {track}"));
     };
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        return mpv2::engine::submit_set_property(
+            "sid".into(),
+            mpv2::engine::PropValue::String(track_str),
+        );
+    }
     tauri::async_runtime::spawn_blocking(move || {
         app.mpv()
             .set_property("sid", &serde_json::json!(track_str), "main")
@@ -818,6 +1053,13 @@ async fn set_subtitle_track(app: tauri::AppHandle, track: serde_json::Value) -> 
 #[tauri::command]
 async fn set_subtitle_visibility(app: tauri::AppHandle, visible: bool) -> Result<(), String> {
     crate::devlog!(info, "player", "set_subtitle_visibility({visible})");
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        return mpv2::engine::submit_set_property(
+            "sub-visibility".into(),
+            mpv2::engine::PropValue::Flag(visible),
+        );
+    }
     tauri::async_runtime::spawn_blocking(move || {
         app.mpv()
             .set_property("sub-visibility", &serde_json::json!(visible), "main")
@@ -870,6 +1112,13 @@ async fn dev_force_panic(message: Option<String>) -> Result<(), String> {
 #[tauri::command]
 async fn set_panscan(app: tauri::AppHandle, value: f64) -> Result<(), String> {
     crate::devlog!(info, "player", "set_panscan({value})");
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        return mpv2::engine::submit_set_property(
+            "panscan".into(),
+            mpv2::engine::PropValue::Double(value),
+        );
+    }
     tauri::async_runtime::spawn_blocking(move || {
         app.mpv()
             .set_property("panscan", &serde_json::json!(value), "main")
@@ -912,6 +1161,54 @@ struct TrackEntry {
 /// through a different code path in the wrapper that doesn't crash.
 #[tauri::command]
 async fn get_tracks(app: tauri::AppHandle) -> Result<Vec<TrackEntry>, String> {
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        use mpv2::engine::GetFormat;
+        return tauri::async_runtime::spawn_blocking(move || {
+            // Read count first; bail early on a 0-track stream rather
+            // than spinning N empty rows.
+            let count = mpv2::engine::submit_get_property(
+                "track-list/count".into(), GetFormat::Int64,
+            )
+            .ok()
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .min(64);
+            if count <= 0 {
+                return Ok::<Vec<TrackEntry>, String>(Vec::new());
+            }
+            let mut out = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let id = mpv2::engine::submit_get_property(
+                    format!("track-list/{}/id", i), GetFormat::Int64,
+                ).ok().and_then(|v| v.as_i64()).unwrap_or(0);
+                let track_type = mpv2::engine::submit_get_property(
+                    format!("track-list/{}/type", i), GetFormat::String,
+                ).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
+                let title = mpv2::engine::submit_get_property(
+                    format!("track-list/{}/title", i), GetFormat::String,
+                ).ok().and_then(|v| v.as_str().map(String::from));
+                let lang = mpv2::engine::submit_get_property(
+                    format!("track-list/{}/lang", i), GetFormat::String,
+                ).ok().and_then(|v| v.as_str().map(String::from));
+                let selected = mpv2::engine::submit_get_property(
+                    format!("track-list/{}/selected", i), GetFormat::Flag,
+                ).ok().and_then(|v| v.as_bool()).unwrap_or(false);
+                let external = mpv2::engine::submit_get_property(
+                    format!("track-list/{}/external", i), GetFormat::Flag,
+                ).ok().and_then(|v| v.as_bool()).unwrap_or(false);
+                let codec = mpv2::engine::submit_get_property(
+                    format!("track-list/{}/codec", i), GetFormat::String,
+                ).ok().and_then(|v| v.as_str().map(String::from));
+                out.push(TrackEntry {
+                    id, track_type, title, lang, selected, external, codec,
+                });
+            }
+            Ok::<Vec<TrackEntry>, String>(out)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let mpv = app.mpv();
 
@@ -1005,6 +1302,24 @@ async fn apply_hdr_settings(app: tauri::AppHandle, mode: String) -> Result<(), S
     settings::save(&app, &s)?;
 
     let mode_for_blocking = mode_norm.clone();
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        let mut opts: indexmap::IndexMap<String, serde_json::Value> = indexmap::IndexMap::new();
+        crate::player::apply_hdr_options(&mut opts, &mode_for_blocking);
+        for (key, value) in opts.iter() {
+            if let Some(pv) = json_to_propvalue(value) {
+                if let Err(e) = mpv2::engine::submit_set_property(key.clone(), pv) {
+                    crate::devlog!(warn, "player", "apply_hdr {key}={value:?} → {e}");
+                }
+            } else {
+                crate::devlog!(
+                    warn, "player",
+                    "apply_hdr {key}={value:?} → unsupported JSON shape for mpv2 PropValue",
+                );
+            }
+        }
+        return Ok(());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let mpv = app.mpv();
         // Build a fresh option map with this mode's properties and push
@@ -1064,27 +1379,42 @@ async fn set_native_fullscreen(
         //      y_offset=0 (no title bar in fullscreen).
         //   3. MPV's `fullscreen` property flipped — drives MPV's
         //      taskbar-auto-hide signalling and render-path optimisations.
-        let mpv_handle = app.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            let _ = mpv_handle.mpv().set_property(
-                "fullscreen", &serde_json::json!(enabled), "main",
-            );
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-
+        //
+        // mpv2 SHORT-CIRCUIT: under the render-API engine, `app.mpv()`
+        // points at a legacy `tauri-plugin-libmpv` handle that was never
+        // initialised (`init_mpv` is skipped under AURA_MPV2). Calling
+        // `set_property("fullscreen", …)` on it was the dominant source
+        // of the multi-second fullscreen-toggle latency — the wrapper's
+        // IPC sits waiting for a response that never comes. The mpv2
+        // engine handles fullscreen itself via win32::enter_native_fullscreen
+        // + per-frame parent-rect tracking, so the legacy poke is dead
+        // weight. We also collapse the two sequential `spawn_blocking`
+        // awaits into one to halve the cross-thread hop cost.
         let p = parent_hwnd;
+        let engine_active = mpv2::engine::enabled() && mpv2::engine::is_running();
+        let mpv_handle = (!engine_active).then(|| app.clone());
         tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+            if let Some(handle) = mpv_handle {
+                let _ = handle.mpv().set_property(
+                    "fullscreen", &serde_json::json!(enabled), "main",
+                );
+            }
             if enabled {
                 win32::enter_native_fullscreen(p)?;
                 // After the parent restyle, snap the MPV child to the
                 // freshly-resized client area so the video covers the
-                // whole monitor (not just the previous windowed bounds).
-                win32::resize_mpv_child_to_parent(p, 0);
+                // whole monitor. The mpv2 engine handles this itself via
+                // per-frame parent-rect tracking (Phase 5); only the
+                // legacy `--wid` path needs the explicit call.
+                if !engine_active {
+                    win32::resize_mpv_child_to_parent(p, 0);
+                }
             } else {
                 win32::exit_native_fullscreen(p)?;
                 // Title bar comes back on exit; keep the 36 px offset.
-                win32::resize_mpv_child_to_parent(p, 36);
+                if !engine_active {
+                    win32::resize_mpv_child_to_parent(p, 36);
+                }
             }
             Ok(())
         })
@@ -1117,6 +1447,13 @@ async fn apply_lang_defaults(
     let s = settings::snapshot();
     let subs = s.subtitle_language.clone();
 
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        return mpv2::engine::submit_set_property(
+            "slang".into(),
+            mpv2::engine::PropValue::String(subs),
+        );
+    }
     tauri::async_runtime::spawn_blocking(move || {
         app.mpv()
             .set_property("slang", &serde_json::json!(subs), "main")
@@ -1142,6 +1479,53 @@ async fn apply_lang_defaults(
 #[tauri::command]
 async fn apply_subtitle_style(app: tauri::AppHandle) -> Result<(), String> {
     let s = settings::snapshot();
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        use mpv2::engine::PropValue;
+        // Best-effort per property — same intent as the legacy block.
+        // The engine reports errors via devlog (`warn` lines), so an
+        // unsupported property doesn't abort the rest of the block.
+        let _ = mpv2::engine::submit_set_property(
+            "sub-font-size".into(), PropValue::Int64(s.subtitle_font_size as i64),
+        );
+        let _ = mpv2::engine::submit_set_property(
+            "sub-margin-y".into(), PropValue::Int64(0),
+        );
+        let _ = mpv2::engine::submit_set_property(
+            "sub-ass-force-margins".into(), PropValue::String("yes".into()),
+        );
+        let _ = mpv2::engine::submit_set_property(
+            "ass-style-override".into(), PropValue::String("force".into()),
+        );
+        let _ = mpv2::engine::submit_set_property(
+            "sub-ass-override".into(), PropValue::String("force".into()),
+        );
+        // sub-pos as Int64 first; if mpv rejects an integer cast on this
+        // build, the engine will log a warning and the next call (sub-pos
+        // as String) is the fallback.
+        let _ = mpv2::engine::submit_set_property(
+            "sub-pos".into(), PropValue::Int64(s.subtitle_position as i64),
+        );
+        let _ = mpv2::engine::submit_set_property(
+            "sub-pos".into(), PropValue::String(s.subtitle_position.to_string()),
+        );
+        let _ = mpv2::engine::submit_set_property(
+            "sub-border-size".into(), PropValue::Int64(s.subtitle_border_size as i64),
+        );
+        let _ = mpv2::engine::submit_set_property(
+            "sub-color".into(), PropValue::String(s.subtitle_color.clone()),
+        );
+        let _ = mpv2::engine::submit_set_property(
+            "sub-back-color".into(), PropValue::String(s.subtitle_back_color.clone()),
+        );
+        if !s.subtitle_font.trim().is_empty() {
+            let _ = mpv2::engine::submit_set_property(
+                "sub-font".into(),
+                PropValue::String(s.subtitle_font.trim().to_string()),
+            );
+        }
+        return Ok(());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let mpv = app.mpv();
 
@@ -1206,6 +1590,20 @@ async fn apply_subtitle_style(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 async fn set_subtitle_position_runtime(app: tauri::AppHandle, percent: u32) -> Result<(), String> {
     let pct = percent.clamp(0, 150);
+    #[cfg(target_os = "windows")]
+    if mpv2::engine::enabled() && mpv2::engine::is_running() {
+        use mpv2::engine::PropValue;
+        // Try Int64 then String, matching the legacy fallback intent —
+        // mpv builds vary on which format `sub-pos` accepts post-loadfile.
+        if mpv2::engine::submit_set_property(
+            "sub-pos".into(), PropValue::Int64(pct as i64),
+        ).is_err() {
+            let _ = mpv2::engine::submit_set_property(
+                "sub-pos".into(), PropValue::String(pct.to_string()),
+            );
+        }
+        return Ok(());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let mpv = app.mpv();
         let pos_num: serde_json::Value = serde_json::json!(pct);
@@ -1661,11 +2059,116 @@ pub fn run() {
                 win32::pin_process_scheduling();
             }
 
-            player::init_mpv(app.handle()).map_err(|e| {
-                crate::devlog!(error, "player", "MPV init failed: {e}");
-                std::io::Error::new(std::io::ErrorKind::Other, e)
-            })?;
-            crate::devlog!(info, "player", "MPV engine ready");
+            // The mpv2 render-context engine is the DEFAULT playback path
+            // now. Skipping the legacy `--wid` init when it's active is
+            // load-bearing: the legacy child window would otherwise be
+            // created before the engine's child and sit ABOVE it in
+            // z-order (HWND_BOTTOM pushes the engine to the bottom),
+            // hiding every frame the engine renders. Every playback Tauri
+            // command gates on `mpv2::engine::enabled() && is_running()`,
+            // falling back to `app.mpv()` only when the engine isn't
+            // running. Escape hatch: `AURA_MPV2=0` (off/false/no) restores
+            // the legacy path on next launch.
+            //
+            // We additionally require the main window's HWND to resolve
+            // before skipping init_mpv: default-on means a skipped legacy
+            // init would leave NO playback engine at all if the engine
+            // can't parent its surface, so on the (near-impossible) HWND
+            // failure we keep the legacy init as a safety net. NOTE: this
+            // only covers the SYNCHRONOUS boot failure — if the engine's
+            // WGL/GL bring-up fails later on its own render thread there
+            // is no auto-fallback; revert with AURA_MPV2=0. (Automatic
+            // WGL-failure fallback is a Phase 7 hardening item.)
+            #[cfg(target_os = "windows")]
+            let mpv2_main_hwnd: isize = app
+                .get_webview_window("main")
+                .and_then(|w| w.hwnd().ok())
+                .map(|h| h.0 as isize)
+                .unwrap_or(0);
+            #[cfg(target_os = "windows")]
+            let mpv2_active = mpv2::engine::enabled() && mpv2_main_hwnd != 0;
+            #[cfg(not(target_os = "windows"))]
+            let mpv2_active = false;
+
+            // Persist the addon-manifest cache across launches. Reads
+            // the existing JSON file (if any), warms the in-memory map
+            // with anything <24 h old, and stores the path so subsequent
+            // cache writes mirror to disk. Best-effort: a missing /
+            // unreadable / wrong-version file just leaves us with an
+            // empty cache, identical to pre-persistence behaviour.
+            // Skipping the manifest cache when app_data_dir resolution
+            // fails is fine too — Tauri's path resolver almost never
+            // fails on Windows, but the in-memory cache still works.
+            if let Ok(data_dir) = app.path().app_data_dir() {
+                let _ = std::fs::create_dir_all(&data_dir);
+                let cache_path = data_dir.join("manifest-cache.json");
+                crate::stremio::init_manifest_cache_path(cache_path);
+            }
+
+            if !mpv2_active {
+                player::init_mpv(app.handle()).map_err(|e| {
+                    crate::devlog!(error, "player", "MPV init failed: {e}");
+                    std::io::Error::other(e)
+                })?;
+                crate::devlog!(info, "player", "MPV engine ready");
+            } else {
+                crate::devlog!(
+                    info, "player",
+                    "mpv2 render engine is the default — skipping legacy --wid MPV init (set AURA_MPV2=0 to revert)",
+                );
+            }
+
+            // ── mpv2 render-API Phase-1 hello-world (opt-in) ───────────────
+            // No-op unless AURA_MPV2_HELLO is set. When it is, spawns the
+            // render-context rewrite's Win32 + WGL + mpv_render_context
+            // verification path on its own thread — see mpv2::hello. The
+            // shipped --wid playback engine above is untouched either way.
+            #[cfg(target_os = "windows")]
+            {
+                // CRITICAL: hello-world and the long-lived engine MUST NOT
+                // both spawn in the same process. Each opens its own
+                // libmpv handle + GL context against the SAME WGL ICD,
+                // and the two unsynchronised render contexts collide in
+                // libmpv's internal state — observed as a
+                // STATUS_ACCESS_VIOLATION a few seconds after launch
+                // when the user had `AURA_MPV2_HELLO` left set from an
+                // earlier verification session AND newly set
+                // `AURA_MPV2=1`. The hello-world artifact is opt-in
+                // verification scaffolding (Phase 1) — when the engine
+                // is enabled it's strictly redundant. Skip it.
+                if !mpv2::engine::enabled() {
+                    mpv2::hello::run_if_requested();
+                }
+                // Phase 2.2 long-lived engine — the default playback path
+                // now. Its GL surface parents under main's HWND exactly
+                // where the legacy mpv child sat. We resolved the HWND
+                // above (`mpv2_main_hwnd`); when it's 0 the init decision
+                // already kept the legacy `--wid` path, and
+                // start_if_requested no-ops on a 0 parent.
+                let parent_hwnd: isize = mpv2_main_hwnd;
+                // Engine event channel — the render thread calls this on
+                // every mpv property change / end-of-file, which the
+                // observer bridge below already consumes as `mpv-event-main`
+                // and folds into `playback-update` / `playback-end`. Going
+                // through the bridge means zero frontend changes and a
+                // single observer surface across both engines.
+                let emit_handle = app.handle().clone();
+                mpv2::engine::start_if_requested(
+                    parent_hwnd,
+                    Box::new(move |name, payload| {
+                        let mut wrapped = serde_json::Map::new();
+                        wrapped.insert(
+                            "name".into(),
+                            serde_json::Value::String(name.to_string()),
+                        );
+                        wrapped.insert("data".into(), payload);
+                        let _ = emit_handle.emit(
+                            "mpv-event-main",
+                            serde_json::Value::Object(wrapped),
+                        );
+                    }),
+                );
+            }
 
             // ── Window lifecycle (pause-on-blur, pause-on-min, close-on-exit) ─
             window_logic::install(app.handle());
@@ -1919,6 +2422,7 @@ pub fn run() {
             load_video,
             stop_video,
             toggle_pause,
+            set_keep_display_awake,
             seek_relative,
             frame_step,
             set_audio_loudnorm,
@@ -1934,6 +2438,14 @@ pub fn run() {
             set_subtitle_visibility,
             set_panscan,
             dev_force_panic,
+            debug_panel::debug_engine_state,
+            debug_panel::debug_drop_test,
+            debug_panel::debug_load_test_pattern,
+            debug_panel::debug_stop_playback,
+            popup_nav::popup_webview_back,
+            popup_nav::popup_webview_forward,
+            popup_nav::popup_webview_reload,
+            popup_nav::popup_webview_navigate,
             get_tracks,
             get_property,
             refresh_video,

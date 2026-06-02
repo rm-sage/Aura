@@ -338,7 +338,7 @@ fn parse_search_response(raw: &str) -> Result<Vec<SubtitleEntry>, String> {
     // surface them first so the user picks them by default. Stable
     // sort preserves OpenSubtitles' original ordering within each
     // group (typically by download_count desc).
-    out.sort_by(|a, b| b.moviehash_match.cmp(&a.moviehash_match));
+    out.sort_by_key(|e| std::cmp::Reverse(e.moviehash_match));
     Ok(out)
 }
 
@@ -387,7 +387,7 @@ pub async fn download_subtitle<R: Runtime>(
     let file_name = json
         .get("file_name")
         .and_then(|v| v.as_str())
-        .map(|s| sanitize_filename(s))
+        .map(sanitize_filename)
         .unwrap_or_else(|| format!("{file_id}.srt"));
 
     // Step 2: GET the link directly
@@ -452,8 +452,52 @@ pub async fn add_subtitle_to_mpv(
     title: Option<String>,
     lang: Option<String>,
 ) -> Result<(), String> {
+    // Path containment: external subtitles must be either remote
+    // (http(s)) OR a file inside `app_data_dir()/subtitles` (the only
+    // directory `download_subtitle` ever writes to). Without this guard
+    // a renderer-side bug or a malicious addon could call sub-add with
+    // an arbitrary local path (`C:\Users\…\id_rsa`) and have mpv read
+    // it as a "subtitle stream", leaking file existence and size via
+    // mpv property events. Other schemes (`file://`, `\\server\share`,
+    // bare drive letters) are rejected.
+    let is_remote =
+        path.starts_with("http://") || path.starts_with("https://");
+    if !is_remote {
+        let subs_root = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| e.to_string())?
+            .join("subtitles");
+        // canonicalize requires the path exist; if it doesn't, that's
+        // already a reject. Same for the root.
+        let canon_root = std::fs::canonicalize(&subs_root)
+            .map_err(|e| format!("subtitle root not initialised: {e}"))?;
+        let canon_path = std::fs::canonicalize(&path)
+            .map_err(|e| format!("subtitle path not found: {e}"))?;
+        if !canon_path.starts_with(&canon_root) {
+            return Err(
+                "subtitle path is outside the allowed downloads directory"
+                    .to_string(),
+            );
+        }
+    }
     let normalised = path.replace('\\', "/");
     let mode = flag.unwrap_or_else(|| "select".into());
+    #[cfg(target_os = "windows")]
+    if crate::mpv2::engine::enabled() && crate::mpv2::engine::is_running() {
+        let mut args: Vec<String> = vec![
+            "sub-add".into(),
+            normalised.clone(),
+            mode.clone(),
+        ];
+        if title.is_some() || lang.is_some() {
+            args.push(title.clone().unwrap_or_default());
+            if let Some(lang_str) = lang.clone() {
+                args.push(lang_str);
+            }
+        }
+        return crate::mpv2::engine::submit_command(args);
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let mut args: Vec<serde_json::Value> = vec![
             serde_json::json!(normalised),

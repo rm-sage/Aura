@@ -293,6 +293,17 @@ pub fn now_unix() -> i64 {
 // ---------------------------------------------------------------------------
 
 fn pause_mpv<R: Runtime>(app: &AppHandle<R>) {
+    #[cfg(target_os = "windows")]
+    if crate::mpv2::engine::enabled() && crate::mpv2::engine::is_running() {
+        // mpv2 path: queue a typed pause-true write. The engine is the
+        // only owner of the live mpv handle when AURA_MPV2 is set, so
+        // hitting `app.mpv()` would touch an un-init'd legacy instance.
+        let _ = crate::mpv2::engine::submit_set_property(
+            "pause".into(),
+            crate::mpv2::engine::PropValue::Flag(true),
+        );
+        return;
+    }
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         // CLAUDE.md landmine #1: this libmpv build silently no-ops the
@@ -370,15 +381,23 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
             WindowEvent::Focused(true) => {
                 #[cfg(target_os = "windows")]
                 {
-                    let parent_hwnd: isize =
-                        win.hwnd().ok().map(|h| h.0 as isize).unwrap_or(0);
-                    if parent_hwnd != 0 {
-                        let y_offset = if crate::win32::is_in_native_fullscreen() {
-                            0
-                        } else {
-                            36
-                        };
-                        crate::win32::resize_mpv_child_to_parent(parent_hwnd, y_offset);
+                    // Skip when the mpv2 engine is running — it tracks
+                    // the parent's client rect every render tick and
+                    // SetWindowPos-es itself, so no Tauri-driven
+                    // backstop is needed (Phase 5).
+                    let engine_active = crate::mpv2::engine::enabled()
+                        && crate::mpv2::engine::is_running();
+                    if !engine_active {
+                        let parent_hwnd: isize =
+                            win.hwnd().ok().map(|h| h.0 as isize).unwrap_or(0);
+                        if parent_hwnd != 0 {
+                            let y_offset = if crate::win32::is_in_native_fullscreen() {
+                                0
+                            } else {
+                                36
+                            };
+                            crate::win32::resize_mpv_child_to_parent(parent_hwnd, y_offset);
+                        }
                     }
                 }
             }
@@ -421,13 +440,17 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                 }
                 #[cfg(target_os = "windows")]
                 {
-                    let parent_hwnd: isize = win.hwnd().ok().map(|h| h.0 as isize).unwrap_or(0);
-                    if parent_hwnd != 0 {
-                        // y_offset = 0 in fullscreen (we sit at monitor top
-                        // and the title bar is unmounted), 36 windowed
-                        // (TitleBar component height).
-                        let y_offset = if crate::win32::is_in_native_fullscreen() { 0 } else { 36 };
-                        crate::win32::resize_mpv_child_to_parent(parent_hwnd, y_offset);
+                    let engine_active = crate::mpv2::engine::enabled()
+                        && crate::mpv2::engine::is_running();
+                    if !engine_active {
+                        let parent_hwnd: isize = win.hwnd().ok().map(|h| h.0 as isize).unwrap_or(0);
+                        if parent_hwnd != 0 {
+                            // y_offset = 0 in fullscreen (we sit at monitor top
+                            // and the title bar is unmounted), 36 windowed
+                            // (TitleBar component height).
+                            let y_offset = if crate::win32::is_in_native_fullscreen() { 0 } else { 36 };
+                            crate::win32::resize_mpv_child_to_parent(parent_hwnd, y_offset);
+                        }
                     }
                 }
             }
@@ -477,6 +500,12 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     // exits via app.exit). Capped at 2 s internally.
                     crate::scrobble::shutdown_blocking(&handle);
                     shutdown_mpv_sync(&handle);
+                    // Phase 2.1 mpv2 engine — no-op when AURA_MPV2_ENGINE
+                    // wasn't set. When it was, this joins the dedicated
+                    // render thread so its mpv handle is fully torn down
+                    // before app.exit() pulls the process out from under it.
+                    #[cfg(target_os = "windows")]
+                    crate::mpv2::engine::shutdown_if_running();
                     clear_presence_inner();
                     // Reap the streaming-bridge subprocess so it doesn't
                     // outlive the parent. Without this the bridge keeps

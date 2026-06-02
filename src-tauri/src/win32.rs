@@ -41,13 +41,40 @@ use windows::Win32::UI::Shell::{ITaskbarList2, TaskbarList};
 const SWP_NOZORDER: u32   = 0x0004;
 const SWP_NOACTIVATE: u32 = 0x0010;
 const SWP_FRAMECHANGED: u32 = 0x0020;
+/// Suppress the WM_WINDOWPOSCHANGING broadcast that other windows /
+/// shell extensions react to. Reduces the multi-monitor DWM
+/// compositor re-sort cost during the fullscreen flip, which is the
+/// dominant source of the brief "other monitors flash black" symptom.
+const SWP_NOSENDCHANGING: u32 = 0x0400;
 const MONITOR_DEFAULTTONEAREST: u32 = 0x0000_0002;
 
 /// HWND_TOPMOST sentinel — pass as `hwndInsertAfter` to make a window
 /// topmost. Windows uses this signal (combined with a window that
 /// covers the full monitor + has no chrome) to flip the auto-hide
 /// taskbar into hidden state.
+///
+/// CAUTION: combining HWND_TOPMOST with WS_POPUP + monitor-rect coverage
+/// + foreground status triggers Windows' "fullscreen optimization" —
+/// DWM drops the window from composition and treats it like an
+/// exclusive-fullscreen game. That breaks WebView2 transparency (the
+/// React UI vanishes), bypasses DWM color management (raw gamma —
+/// looks "more vivid"), and forces a multi-monitor composition re-sort
+/// (other monitors briefly black out during the transition). For
+/// Aura's borderless-fullscreen-with-overlay use case we use HWND_TOP
+/// instead — foreground but NOT topmost, which keeps DWM composition
+/// engaged for our window and avoids all three symptoms.
 const HWND_TOPMOST: *mut c_void = -1isize as *mut c_void;
+/// HWND_TOP — bring to top of the regular (non-topmost) z-order
+/// without joining the topmost pool. This is what we use for native
+/// fullscreen: keeps DWM composition engaged so transparency + colour
+/// management + multi-monitor composition all behave correctly.
+const HWND_TOP: *mut c_void = 0 as *mut c_void;
+
+// HWND_TOPMOST itself is intentionally unused (see big comment above);
+// the symbol + its comment is kept as load-bearing documentation so
+// future code touching the fullscreen path doesn't reintroduce it.
+#[allow(dead_code)]
+const _HWND_TOPMOST_DOC_ANCHOR: *mut c_void = HWND_TOPMOST;
 /// HWND_NOTOPMOST — drop the topmost flag without bringing the window
 /// to front of the regular z-order.
 const HWND_NOTOPMOST: *mut c_void = -2isize as *mut c_void;
@@ -273,6 +300,12 @@ type SetForegroundWindowFn =
     unsafe extern "system" fn(*mut c_void) -> i32;
 type BringWindowToTopFn =
     unsafe extern "system" fn(*mut c_void) -> i32;
+/// GetForegroundWindow returns the HWND that currently owns input focus
+/// (or NULL when no foreground window exists, e.g. during a screen
+/// lock). Used by enter_native_fullscreen to skip redundant activation
+/// calls when our window is already foreground.
+type GetForegroundWindowFn =
+    unsafe extern "system" fn() -> *mut c_void;
 /// IsZoomed returns non-zero if the window is currently maximized. We use
 /// it to remember the maximize state across the fullscreen toggle so the
 /// user lands back in the same window state when they exit.
@@ -369,6 +402,46 @@ pub fn ensure_taskbar_visible() {
 /// y_offset (0 in fullscreen, 36 in windowed).
 pub fn is_in_native_fullscreen() -> bool {
     SAVED_BOUNDS.lock().map(|g| g.is_some()).unwrap_or(false)
+}
+
+/// Keep the display + system awake during playback (or release that hold).
+///
+/// WHY THIS EXISTS: under the mpv2 render-API engine, mpv renders into a
+/// surface WE own (`vo=libmpv`) and no longer manages a video-output
+/// window — so mpv's built-in `stop-screensaver` can't fire, and after the
+/// OS idle timeout the monitors sleep mid-playback. (The legacy `--wid`
+/// path didn't have this problem: mpv owned the window and inhibited the
+/// screensaver itself.) `SetThreadExecutionState` is the canonical Win32
+/// way to assert "keep the display on."
+///
+/// `ES_CONTINUOUS` makes the state persist until the next call (rather
+/// than a one-shot idle-timer poke), so we set it once on the playing↔
+/// paused transition instead of heartbeating. CRITICAL: the continuous
+/// state is PER-THREAD — `inhibit(true)` and the matching `inhibit(false)`
+/// MUST run on the same thread. The mpv2 engine calls this only from its
+/// single long-lived render thread, satisfying that. The state also clears
+/// automatically when that thread terminates (app shutdown), so the
+/// display can sleep again on exit.
+pub fn set_display_sleep_inhibited(inhibit: bool) {
+    const ES_CONTINUOUS: u32 = 0x8000_0000;
+    const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
+    const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
+    type SetThreadExecutionStateFn = unsafe extern "system" fn(u32) -> u32;
+
+    let flags = if inhibit {
+        ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED
+    } else {
+        ES_CONTINUOUS
+    };
+    unsafe {
+        let Ok(kernel32) = libloading::Library::new("kernel32.dll") else { return; };
+        let Ok(set_state) =
+            kernel32.get::<SetThreadExecutionStateFn>(b"SetThreadExecutionState\0")
+        else { return; };
+        // Return value is the PREVIOUS state (or 0 on failure); we don't
+        // need it. The call itself is the effect.
+        let _ = set_state(flags);
+    }
 }
 
 /// One-shot startup recovery. Runs once during app setup AFTER
@@ -664,32 +737,60 @@ pub fn enter_native_fullscreen(parent_hwnd: isize) -> Result<(), String> {
             m.left, m.top, w, h, current_style as u32, fullscreen_style as u32,
         );
 
-        // 4. Move the window to fill the entire monitor + topmost.
+        // 4. Move the window to fill the entire monitor.
         //    SWP_FRAMECHANGED is REQUIRED after a SetWindowLongPtr style
         //    change for Windows to re-evaluate the non-client area.
         //    Crucially we DO want activation here — Windows' "auto-hide
         //    taskbar in fullscreen" heuristic only kicks in for the
         //    foreground window, so dropping SWP_NOACTIVATE is necessary.
+        //
+        //    Z-order is HWND_TOP (foreground non-topmost), NOT
+        //    HWND_TOPMOST. See the HWND_TOPMOST comment above for the
+        //    full rationale — HWND_TOPMOST + WS_POPUP + monitor-rect
+        //    triggers Windows' DWM exclusive-fullscreen optimisation,
+        //    which breaks WebView2 transparency (UI vanishes),
+        //    bypasses colour management (raw gamma), and forces a
+        //    multi-monitor composition re-sort (black flashes).
+        //    HWND_TOP keeps DWM composition engaged on our window so
+        //    the transparent React overlay continues to render over
+        //    the MPV child.
+        //
+        //    SWP_NOSENDCHANGING suppresses the WM_WINDOWPOSCHANGING
+        //    broadcast that other top-level windows and shell extensions
+        //    react to — reduces side-channel work during the flip.
         let r = set_window_pos(
             parent,
-            HWND_TOPMOST,
+            HWND_TOP,
             m.left, m.top, w, h,
-            SWP_FRAMECHANGED,
+            SWP_FRAMECHANGED | SWP_NOSENDCHANGING,
         );
         if r == 0 {
             return Err("SetWindowPos failed".into());
         }
 
-        // 4b. Belt-and-suspenders activation. Some Windows builds require
-        //     an explicit BringWindowToTop + SetForegroundWindow combo
-        //     before the fullscreen-detection heuristic accepts the
-        //     window — SetWindowPos alone isn't always enough on
-        //     borderless+transparent Tauri windows.
-        if let Ok(bring_to_top) = user32.get::<BringWindowToTopFn>(b"BringWindowToTop\0") {
-            let _ = bring_to_top(parent);
-        }
-        if let Ok(set_fg) = user32.get::<SetForegroundWindowFn>(b"SetForegroundWindow\0") {
-            let _ = set_fg(parent);
+        // 4b. Belt-and-suspenders activation. Skipped when the parent
+        //     window is already foreground — the typical case when the
+        //     user clicks the fullscreen button in the player overlay
+        //     (Aura already has focus). Redundant activation calls in
+        //     that path were the dominant source of the multi-second
+        //     fullscreen latency: each one synchronously waits for DWM
+        //     to process the activation change. When Aura is NOT
+        //     foreground (e.g. fullscreen toggled via a hotkey while
+        //     another window was active), the activation IS necessary
+        //     for Windows' fullscreen detection to fire.
+        let get_foreground: Option<libloading::Symbol<GetForegroundWindowFn>> =
+            user32.get(b"GetForegroundWindow\0").ok();
+        let is_already_foreground = get_foreground
+            .as_ref()
+            .map(|f| f() == parent)
+            .unwrap_or(false);
+        if !is_already_foreground {
+            if let Ok(bring_to_top) = user32.get::<BringWindowToTopFn>(b"BringWindowToTop\0") {
+                let _ = bring_to_top(parent);
+            }
+            if let Ok(set_fg) = user32.get::<SetForegroundWindowFn>(b"SetForegroundWindow\0") {
+                let _ = set_fg(parent);
+            }
         }
 
         // 5. Force-hide the taskbar window. Required because Windows'
@@ -770,12 +871,14 @@ pub fn exit_native_fullscreen(parent_hwnd: isize) -> Result<(), String> {
 
         // Drop HWND_TOPMOST so the window goes back into the normal
         // z-order — otherwise the windowed player would sit on top of
-        // every other app forever.
+        // every other app forever. SWP_NOSENDCHANGING mirrors the enter
+        // path: suppresses the broadcast WM_WINDOWPOSCHANGING storm
+        // that triggers DWM multi-monitor compositor re-sort on exit.
         let r = set_window_pos(
             parent,
             HWND_NOTOPMOST,
             x, y, w, h,
-            SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOSENDCHANGING,
         );
         if r == 0 {
             return Err("SetWindowPos restore failed".into());
@@ -855,12 +958,40 @@ pub fn exit_native_fullscreen(parent_hwnd: isize) -> Result<(), String> {
 type TimeBeginPeriodFn = unsafe extern "system" fn(u32) -> u32;
 type GetCurrentProcessFn = unsafe extern "system" fn() -> *mut c_void;
 type SetPriorityClassFn = unsafe extern "system" fn(*mut c_void, u32) -> i32;
+type SetProcessInformationFn = unsafe extern "system" fn(
+    handle: *mut c_void,
+    info_class: i32,
+    info: *mut c_void,
+    size: u32,
+) -> i32;
 
 /// `ABOVE_NORMAL_PRIORITY_CLASS`. Deliberately NOT `HIGH_PRIORITY_CLASS`
 /// (0x80) — HIGH can starve the audio service / DWM compositor and cause
 /// its own stutter. ABOVE_NORMAL restores the scheduling headroom lost
 /// when the foreground boost disappears, without that risk.
 const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x0000_8000;
+
+/// `PROCESS_INFORMATION_CLASS::ProcessPowerThrottling` discriminant.
+/// Used with `SetProcessInformation` to opt out of Windows 11 EcoQoS
+/// background CPU throttling — without this, the OS may drop our
+/// process to the "efficiency core" power state when minimised /
+/// occluded / generally background, even with `ABOVE_NORMAL_PRIORITY_CLASS`
+/// set. Discord / Slack / OBS / video editors all do this.
+const PROCESS_POWER_THROTTLING: i32 = 4;
+/// Wire format version for `PROCESS_POWER_THROTTLING_STATE`.
+const PROCESS_POWER_THROTTLING_CURRENT_VERSION: u32 = 1;
+/// Bit in `ControlMask` / `StateMask` corresponding to the execution-
+/// speed throttling axis (EcoQoS). Setting it in `ControlMask` says
+/// "we are managing this knob"; clearing it in `StateMask` says
+/// "don't throttle me".
+const PROCESS_POWER_THROTTLING_EXECUTION_SPEED: u32 = 0x1;
+
+#[repr(C)]
+struct ProcessPowerThrottlingState {
+    version: u32,
+    control_mask: u32,
+    state_mask: u32,
+}
 
 /// Make the process immune to Windows background timer/priority
 /// throttling so the embedded MPV render loop keeps pace when Aura is
@@ -893,7 +1024,17 @@ pub fn pin_process_scheduling() {
                  hardened", e),
         }
 
-        // Nudge the process priority class up one notch.
+        // Nudge the process priority class up one notch AND opt out of
+        // Windows-11 EcoQoS background-execution throttling. The latter
+        // is the documented cause of post-2021 "background apps drop
+        // frames even with ABOVE_NORMAL priority" behaviour: when the
+        // OS decides our process is background-ish (minimised, behind
+        // another foreground window, etc.) it can drop the process to
+        // efficiency-core power state independent of priority class.
+        // SetProcessInformation(ProcessPowerThrottling) with
+        // ControlMask = EXECUTION_SPEED and StateMask = 0 means
+        // "I'm managing this; do NOT throttle me". Discord, Slack, OBS,
+        // and pretty much every real-time Windows app does this.
         match libloading::Library::new("kernel32.dll") {
             Ok(kernel32) => {
                 let get_cur =
@@ -901,7 +1042,7 @@ pub fn pin_process_scheduling() {
                 let set_pc =
                     kernel32.get::<SetPriorityClassFn>(b"SetPriorityClass\0");
                 if let (Ok(get_current_process), Ok(set_priority_class)) =
-                    (get_cur, set_pc)
+                    (&get_cur, &set_pc)
                 {
                     let ok = set_priority_class(
                         get_current_process(),
@@ -914,6 +1055,39 @@ pub fn pin_process_scheduling() {
                     crate::devlog!(warn, "win32",
                         "kernel32 priority symbols unavailable; priority \
                          class left at OS default");
+                }
+
+                // EcoQoS opt-out. `SetProcessInformation` was added in
+                // Windows 8 (the function), but the
+                // `ProcessPowerThrottling` info class is Windows 11+ —
+                // pre-Win11 calls return ERROR_INVALID_PARAMETER, which
+                // is benign (the throttling behaviour we're opting out
+                // of didn't exist on those builds either).
+                let set_pi = kernel32
+                    .get::<SetProcessInformationFn>(b"SetProcessInformation\0");
+                if let (Ok(get_current_process), Ok(set_process_information)) =
+                    (&get_cur, &set_pi)
+                {
+                    let mut state = ProcessPowerThrottlingState {
+                        version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                        control_mask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+                        state_mask: 0, // 0 = "don't throttle"
+                    };
+                    let ok = set_process_information(
+                        get_current_process(),
+                        PROCESS_POWER_THROTTLING,
+                        &mut state as *mut _ as *mut c_void,
+                        std::mem::size_of::<ProcessPowerThrottlingState>() as u32,
+                    );
+                    crate::devlog!(info, "win32",
+                        "SetProcessInformation(EcoQoS disable) → {} \
+                         (nonzero = ok; 0 on Win10 / WinServer 2019 is benign)",
+                        ok);
+                } else {
+                    crate::devlog!(warn, "win32",
+                        "kernel32!SetProcessInformation unavailable — \
+                         Win11 EcoQoS background throttling NOT disabled, \
+                         off-focus playback may drop frames");
                 }
             }
             Err(e) => crate::devlog!(warn, "win32",

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { memo, useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "./FilterBar";
 import { invoke } from "@tauri-apps/api/core";
 import type { MetaPreview, LibraryItem, AddonEntry, VideoEntry } from "./types";
@@ -10,9 +11,11 @@ import ImageLoader from "./ImageLoader";
 import { useLibraryProgress } from "./LibraryContext";
 import WatchedBadge, { useWatchedVariant, WatchedBadgeStatic } from "./WatchedBadge";
 import { getManualWatchedState, useManualWatchedVersion } from "./manualWatched";
-import { getMetaDetailFallback } from "./metaCache";
+import { getMetaDetailFallback, useCanonicalReleaseYear } from "./metaCache";
 import { closeHoverNow } from "./catalogHoverStore";
 import { useHoverCardActivation } from "./useHoverCardActivation";
+import { getReleaseSignal, useReleaseSignalsVersion } from "./releaseSignalStore";
+import { formatCountdown, formatTargetDate, airingInfo, useCountdownNow } from "./releaseCountdown";
 
 /** Per-catalog cache for the View-all popup. Keyed by
  *  `${addonUrl}|${type}|${id}`. Persists across DiscoveryRow remounts
@@ -126,6 +129,9 @@ function SegmentedSeasonBar({
   // bookkeeping vs. the previous useState+useEffect+tick combo,
   // which mattered when 50 CW cards each carried their own bar.
   void useManualWatchedVersion();
+  // Single mousemove-driven tooltip (4b) — one element per bar, not one per
+  // segment, so a row of 50 CW cards doesn't mount thousands of wrappers.
+  const [tip, setTip] = useState<{ x: number; y: number; text: string } | null>(null);
 
   if (episodes.length === 0) return null;
 
@@ -176,8 +182,43 @@ function SegmentedSeasonBar({
   // segment ends up rendering as a sliver or disappearing entirely.
   // The 8 px inset is enough to clear the curvature on a 5 px-tall
   // bar without leaving an obvious gap.
+  //
+  // Airing marker: a glowing accent dot floats above the latest-aired
+  // segment, and aired-but-unwatched segments are tinted brighter than
+  // not-yet-aired ones so "available to watch now" reads at a glance.
+  // overflow-visible lets the dot (and the Task-5 tooltip) sit above the bar.
+  const air = airingInfo(episodes);
+  const latestAiredIdx = air.isAiring && air.latestAiredId
+    ? episodes.findIndex((v) => v.id === air.latestAiredId)
+    : -1;
+
+  // Tooltip label for the segment under the cursor (4b). State-driven so the
+  // user learns what each colour means + the latest-aired marker. Mirrors the
+  // segment colour branches below so the words match the colour.
+  const segLabel = (ep: VideoEntry, i: number): string => {
+    const sxe = ep.season != null && ep.episode != null
+      ? `S${String(ep.season).padStart(2, "0")}E${String(ep.episode).padStart(2, "0")}`
+      : (ep.episode != null ? `E${ep.episode}` : "Episode");
+    const manual = getManualWatchedState(ep.id);
+    let state: string;
+    if (manual === "watched" || i < impliedThroughIdx) state = "Watched";
+    else if ((manual === "in-progress" || i === currentIdx) && i >= lastWatchedIdx) state = "In progress";
+    else if (isVideoAired(ep)) state = "Available now";
+    else state = "Not yet aired";
+    return i === latestAiredIdx ? `${sxe} · ${state} · Latest aired` : `${sxe} · ${state}`;
+  };
+
   return (
-    <div className="absolute left-2 right-2 bottom-1 h-[5px] flex gap-[1.5px] rounded-full overflow-hidden">
+    <div
+      className="absolute left-2 right-2 bottom-1 h-[5px] flex gap-[1.5px] rounded-full overflow-visible"
+      onMouseMove={(e) => {
+        const r = e.currentTarget.getBoundingClientRect();
+        const frac = Math.max(0, Math.min(0.9999, (e.clientX - r.left) / r.width));
+        const idx = Math.min(episodes.length - 1, Math.floor(frac * episodes.length));
+        setTip({ x: e.clientX, y: r.top, text: segLabel(episodes[idx], idx) });
+      }}
+      onMouseLeave={() => setTip(null)}
+    >
       {episodes.map((ep, i) => {
         const manual = getManualWatchedState(ep.id);
         let cls: string;
@@ -189,11 +230,41 @@ function SegmentedSeasonBar({
           cls = "bg-amber-400";
         } else if (i < impliedThroughIdx) {
           cls = "bg-emerald-400/85"; // implied-watched (earlier in season)
+        } else if (isVideoAired(ep)) {
+          cls = "bg-white/70"; // aired but unwatched — available to watch now
         } else {
-          cls = "bg-white/15";
+          cls = "bg-white/15"; // not yet aired
         }
-        return <div key={ep.id} className={`flex-1 h-full ${cls}`} />;
+        return (
+          <div key={ep.id} className={`relative flex-1 h-full ${cls}`}>
+            {i === latestAiredIdx && (
+              <span
+                aria-hidden
+                className="absolute -top-[7px] left-1/2 -translate-x-1/2 w-1.5 h-1.5 rounded-full z-20"
+                style={{
+                  background: "#5BA4FF",
+                  boxShadow: "0 0 6px 2px rgba(91,164,255,0.5), 0 0 0 1px rgba(0,0,0,0.55)",
+                }}
+              />
+            )}
+          </div>
+        );
       })}
+      {tip && createPortal(
+        <div
+          className="pointer-events-none fixed z-[300] px-2 py-0.5 rounded-md
+                     bg-black/85 backdrop-blur-sm border border-white/15
+                     text-white text-[11px] font-medium whitespace-nowrap
+                     -translate-x-1/2 -translate-y-full"
+          style={{
+            left: Math.max(60, Math.min(window.innerWidth - 60, tip.x)),
+            top: tip.y - 6,
+          }}
+        >
+          {tip.text}
+        </div>,
+        document.body,
+      )}
     </div>
   );
 }
@@ -285,9 +356,25 @@ function ContinuousProgressBar({
         background: "rgb(52,211,153)",
       };
 
+  // Airing frontier line at the latest-aired position (Option A for the
+  // long-runner bar — the segmented bar uses the dot instead).
+  const air = airingInfo(episodes);
+  const latestAiredIdx = air.isAiring && air.latestAiredId
+    ? episodes.findIndex((v) => v.id === air.latestAiredId)
+    : -1;
+  const frontierPct = latestAiredIdx >= 0 ? ((latestAiredIdx + 1) / total) * 100 : null;
   return (
-    <div className="absolute left-2 right-2 bottom-1 h-[5px] rounded-full overflow-hidden bg-white/15">
-      <div aria-hidden className="h-full" style={fillStyle} />
+    <div className="absolute left-2 right-2 bottom-1 h-[5px] rounded-full overflow-visible">
+      <div className="absolute inset-0 rounded-full overflow-hidden bg-white/15">
+        <div aria-hidden className="h-full" style={fillStyle} />
+      </div>
+      {frontierPct != null && (
+        <div
+          aria-hidden
+          className="absolute -top-[3px] -bottom-[3px] w-[2px] rounded-[2px] z-20"
+          style={{ left: `${frontierPct}%`, background: "#5BA4FF", boxShadow: "0 0 6px 1px rgba(91,164,255,0.5)" }}
+        />
+      )}
     </div>
   );
 }
@@ -527,6 +614,39 @@ function useEffectiveResumeVideoId(
   return startEp.id;
 }
 
+// Centered "next episode" countdown pill, overlaid on the CW tile art just
+// above the progress bar. Source is the cloud release signal's `next_aired`
+// (series only — movies/finished series have none → renders nothing). Owns
+// its own 1 s tick + subscribes to the signal-store version so it appears
+// the moment the signal lands and advances live. The opaque dark pill +
+// blur + text-shadow keep it legible on light AND dark cover art.
+function CWReleaseCountdown({ seriesId }: { seriesId: string }) {
+  const now = useCountdownNow();
+  useReleaseSignalsVersion(); // re-read getReleaseSignal when signals update
+  const nextIso = getReleaseSignal(seriesId)?.next_aired?.aired_at;
+  if (!nextIso) return null;
+  const targetMs = Date.parse(nextIso);
+  if (!Number.isFinite(targetMs) || targetMs <= now) return null;
+  return (
+    <div className="absolute inset-x-0 bottom-[28px] flex justify-center pointer-events-none z-10">
+      <span
+        title={`Next episode airs ${formatTargetDate(targetMs)}`}
+        className="pointer-events-auto inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full
+                   bg-black/72 backdrop-blur-sm border border-white/15
+                   text-white text-[12.5px] font-semibold tabular-nums"
+        style={{ textShadow: "0 1px 2px rgba(0,0,0,0.9)" }}
+      >
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             strokeWidth="2.2" className="text-ln-accent" aria-hidden>
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+        {formatCountdown(targetMs, now)}
+      </span>
+    </div>
+  );
+}
+
 const ContinueWatchingCard = memo(function ContinueWatchingCard(
   { item, onSelect, addons }: ContinueWatchingCardProps
 ) {
@@ -623,6 +743,7 @@ const ContinueWatchingCard = memo(function ContinueWatchingCard(
               <div className="h-full bg-ln-accent" style={{ width: `${progress * 100}%` }} />
             </div>
           )}
+          <CWReleaseCountdown seriesId={item.id} />
         </div>
         <p
           className="text-white/90 text-[17px] font-medium mt-2 leading-tight line-clamp-1 text-center"
@@ -726,6 +847,14 @@ export const CatalogCard = memo(function CatalogCard({ meta, onSelect }: Catalog
   // is opt-in via Settings. The card keeps its own click/context menu.
   const hover = useHoverCardActivation(meta);
 
+  // Prefer the canonical cached meta-detail year over the catalog addon's
+  // releaseInfo (which is wrong for some titles, e.g. Cinderella II shows
+  // "2020" from the catalog vs "2002" in the meta). O(1) id→year index +
+  // per-id snapshot: the card corrects itself once a hover/visit warms the
+  // detail, and only re-renders when ITS year changes — no eager per-card
+  // fetch, no cache-wide scan per write.
+  const displayYear = useCanonicalReleaseYear(meta.id, meta.release_info ?? null);
+
   return (
     <button
       type="button"
@@ -813,8 +942,8 @@ export const CatalogCard = memo(function CatalogCard({ meta, onSelect }: Catalog
       >
         {meta.name}
       </p>
-      {meta.release_info && (
-        <p className="text-white/55 text-[15.5px] mt-0.5 text-center font-mono">{meta.release_info}</p>
+      {displayYear && (
+        <p className="text-white/55 text-[15.5px] mt-0.5 text-center font-mono">{displayYear}</p>
       )}
     </button>
   );

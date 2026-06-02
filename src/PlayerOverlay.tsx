@@ -995,6 +995,10 @@ function IconButton({
 interface Props {
   activeTarget: ActiveScrobbleTarget | null;
 
+  /** True when the active target is anime (isAnimeMeta). Gates the
+   *  motion-interpolation toggle — interpolation is anime-only. */
+  isAnime: boolean;
+
   // Playback state
   time: number;
   duration: number;
@@ -1094,8 +1098,8 @@ interface Props {
 
 function EpisodeEdgeTrigger({
   seriesId, mediaType, addons, currentEpisodeId, nextEpisodeId,
-  isFullscreen, libraryById, seriesArt, onPlayEpisode,
-}: NonNullable<Props["episodePanel"]>) {
+  isFullscreen, libraryById, seriesArt, onPlayEpisode, controlsVisible,
+}: NonNullable<Props["episodePanel"]> & { controlsVisible: boolean }) {
   const [open, setOpen] = useState(false);
   useMenuOpenSync(open);
 
@@ -1143,12 +1147,13 @@ function EpisodeEdgeTrigger({
 
   return (
     <>
-      {/* Always-present thin edge handle. z-[9998] keeps it just under
-          PlayerOverlay's click-capture (9999) but it has its own
-          pointer-events so hover/click still register. Stays put
-          regardless of the control-bar auto-hide — the user can summon
-          the episode list at any time. Hidden once the panel is open
-          (the panel covers this strip). */}
+      {/* Thin edge handle. z-[9998] keeps it just under PlayerOverlay's
+          click-capture (9999) but it has its own pointer-events so
+          hover/click register. Fades in lockstep with the control-bar
+          auto-hide (opacity/pointer-events below) — when the chrome
+          hides, the handle goes with it; any pointer move wakes both, so
+          the drawer is still one gesture away. Hidden entirely once the
+          panel is open (the panel covers this strip). */}
       {!open && (
         <button
           type="button"
@@ -1156,13 +1161,17 @@ function EpisodeEdgeTrigger({
           onClick={() => { cancelOpen(); setOpen(true); }}
           onPointerEnter={armOpen}
           onPointerLeave={cancelOpen}
+          style={{
+            opacity: controlsVisible ? 1 : 0,
+            pointerEvents: controlsVisible ? "auto" : "none",
+          }}
           className="fixed top-1/2 -translate-y-1/2 right-0 z-[9998]
                      h-28 w-[10px] hover:w-[16px] rounded-l-lg
                      bg-white/10 hover:bg-white/20 backdrop-blur-sm
                      border-y border-l border-white/10
                      flex items-center justify-center
-                     transition-[width,background-color] duration-150
-                     pointer-events-auto group"
+                     transition-[width,background-color,opacity] duration-150
+                     group"
         >
           <svg
             width="12" height="12" viewBox="0 0 24 24" fill="currentColor"
@@ -1202,10 +1211,14 @@ function EpisodeEdgeTrigger({
   );
 }
 
-const SPEED_OPTIONS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5];
+// 5× was removed: at 5× a 4K HEVC stream can't keep up — the VO drops
+// hundreds of frames/sec and audio/video desyncs. 4× is the smooth
+// ceiling on current hardware, so it's the top stop.
+const SPEED_OPTIONS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4];
 
 export default function PlayerOverlay({
   activeTarget,
+  isAnime,
   time, duration, paused, volume, speed, buffering, bufferPct, firstFrameSeen,
   togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
   onExitPlayback,
@@ -1357,7 +1370,13 @@ export default function PlayerOverlay({
     const startTimer = setTimeout(() => {
       if (!cancelled) refresh();
     }, 1500);
-    const onRefresh = () => { if (!cancelled) refresh(); };
+    const onRefresh = () => {
+      if (cancelled) return;
+      refresh();
+      // Reconcile after mpv commits the new sid — the immediate read can
+      // still report the OLD selected track. selectedSubId covers the gap.
+      setTimeout(() => { if (!cancelled) refresh(); }, 150);
+    };
     window.addEventListener("aura:tracks-refresh", onRefresh);
     return () => {
       cancelled = true;
@@ -1412,6 +1431,16 @@ export default function PlayerOverlay({
   }, [controlsVisible, tracksReady, subBaseline]);
 
   const audioTracks = useMemo(() => tracks.filter((t) => t.type === "audio"), [tracks]);
+  // Optimistic subtitle selection. mpv's track-list `selected` flag lags a
+  // switch by a beat, so the menu highlight drifted from reality right after
+  // a pick. We record the user's intent here for instant feedback; the
+  // delayed get_tracks reconcile (below) is authoritative. Reset per file so
+  // a stale id can't match a different track after an episode change.
+  const [selectedSubId, setSelectedSubId] = useState<number | null>(null);
+  useEffect(() => {
+    setSelectedSubId(null);
+  }, [activeTarget?.id, streamUrl]);
+
   // Embedded MPV subtitle tracks (in-file + any sub-add'd via the
   // OpenSubtitles picker). The external addon list is merged in below.
   const embeddedSubTracks = useMemo(
@@ -1664,7 +1693,26 @@ export default function PlayerOverlay({
     }
     const usedTitles = new Set<string>();
 
-    const externals: TrackEntry[] = externalSubs.map((s, idx) => {
+    // Externals ordering: OpenSubtitles bucket → preferred-language →
+    // addon-installed order. Array.sort is stable in V8, so equal-key pairs
+    // keep the addon order the Rust fan-out now guarantees. OpenSubtitles is
+    // self-gating: the bucket only has members when an OpenSubtitles addon is
+    // installed (the API key is unrelated — it's only for MovieHash matching).
+    const isOpenSubs = (s: ExternalSubtitle) => /opensubtitles/i.test(s.addon_name);
+    const prefLang = preferredSubLang ? preferredSubLang.toLowerCase() : null;
+    const sortedSource = [...externalSubs].sort((a, b) => {
+      const aOs = isOpenSubs(a) ? 0 : 1;
+      const bOs = isOpenSubs(b) ? 0 : 1;
+      if (aOs !== bOs) return aOs - bOs;
+      if (prefLang) {
+        const aPref = (a.lang ?? "").toLowerCase().startsWith(prefLang) ? 0 : 1;
+        const bPref = (b.lang ?? "").toLowerCase().startsWith(prefLang) ? 0 : 1;
+        if (aPref !== bPref) return aPref - bPref;
+      }
+      return 0; // preserve addon order (stable sort)
+    });
+
+    const externals: TrackEntry[] = sortedSource.map((s) => {
       const title = externalTitleFor(s);
       const live = subAddedByTitle.get(title);
       // Only the FIRST external row matching a live (sub-added) title
@@ -1674,8 +1722,13 @@ export default function PlayerOverlay({
         usedTitles.add(title);
         return live;
       }
+      // Synthetic id keyed on the ORIGINAL externalSubs position, NOT the
+      // sorted index — a re-sort (e.g. preferredSubLang change) would
+      // otherwise remap ids and make the optimistic selectedSubId highlight
+      // point at the wrong row until the next reconcile.
+      const originalIdx = externalSubs.indexOf(s);
       return {
-        id: -1 - idx,
+        id: -1 - originalIdx,
         type: "sub",
         title,
         lang: s.lang || null,
@@ -1691,15 +1744,6 @@ export default function PlayerOverlay({
     const orphans: TrackEntry[] = [];
     for (const [title, t] of subAddedByTitle) {
       if (!usedTitles.has(title)) orphans.push(t);
-    }
-
-    if (preferredSubLang) {
-      const pref = preferredSubLang.toLowerCase();
-      externals.sort((a, b) => {
-        const aPref = (a.lang ?? "").toLowerCase().startsWith(pref) ? 0 : 1;
-        const bPref = (b.lang ?? "").toLowerCase().startsWith(pref) ? 0 : 1;
-        return aPref - bPref;
-      });
     }
 
     let merged = [...fileEmbedded, ...externals, ...orphans];
@@ -1718,8 +1762,17 @@ export default function PlayerOverlay({
       });
     }
 
+    // Optimistic override: when the user just picked a track, force its row
+    // selected immediately. Guarded on the id still matching a visible row —
+    // once an external is sub-added and swapped to its live (positive) id, the
+    // negative selectedSubId no longer matches and we fall back to the
+    // authoritative track-list `selected` flag. subsMuted = nothing selected.
+    if (selectedSubId != null && !subsMuted && merged.some((t) => t.id === selectedSubId)) {
+      merged = merged.map((t) => ({ ...t, selected: t.id === selectedSubId }));
+    }
+
     return merged;
-  }, [embeddedSubTracks, externalSubs, preferredSubLang, subsMuted, selectableSubLangs]);
+  }, [embeddedSubTracks, externalSubs, preferredSubLang, subsMuted, selectableSubLangs, selectedSubId]);
 
   // Volume scroll wheel — wired locally since the rest of the app is hidden.
   // Skipped when the wheel is over a scroll-capable child (track-menu lists,
@@ -2066,6 +2119,7 @@ export default function PlayerOverlay({
               time={time}
               seekAbsolute={seekAbsolute}
               streamUrl={streamUrl}
+              mediaType={activeTarget?.media_type}
             />
 
             {/* Spacer */}
@@ -2134,6 +2188,7 @@ export default function PlayerOverlay({
                 try {
                   await invoke("set_subtitle_visibility", { visible: false });
                   setSubsMuted(true);
+                  setSelectedSubId(null);
                   fireToast("Subtitles off");
                   if (activeTarget) {
                     setTitleState(activeTarget.media_type, activeTarget.id, {
@@ -2150,6 +2205,7 @@ export default function PlayerOverlay({
                 } catch {}
 
                 if (id == null) {
+                  setSelectedSubId(null);
                   invoke("set_subtitle_track", { track: "no" })
                     .then(() => window.dispatchEvent(new Event("aura:tracks-refresh")))
                     .catch(() => {});
@@ -2174,6 +2230,7 @@ export default function PlayerOverlay({
                   if (matching) {
                     try {
                       await invoke("set_subtitle_track", { track: matching.id });
+                      setSelectedSubId(matching.id);
                       window.dispatchEvent(new Event("aura:tracks-refresh"));
                       fireToast(
                         `Subtitles · ${matching.title ?? matching.lang?.toUpperCase() ?? `#${matching.id}`}`,
@@ -2198,6 +2255,7 @@ export default function PlayerOverlay({
                       title: ext?.title,
                       lang: ext?.lang ?? null,
                     });
+                    setSelectedSubId(id); // negative menu id until the refresh swaps in the live track
                     window.dispatchEvent(new Event("aura:tracks-refresh"));
                     fireToast(`Subtitles · ${ext?.lang?.toUpperCase() ?? "external"}`);
                     if (activeTarget && ext?.lang) {
@@ -2212,6 +2270,7 @@ export default function PlayerOverlay({
                 }
                 try {
                   await invoke("set_subtitle_track", { track: id });
+                  setSelectedSubId(id);
                   window.dispatchEvent(new Event("aura:tracks-refresh"));
                   const t = subDropdownItems.find((x) => x.id === id);
                   fireToast(`Subtitles · ${t?.title ?? t?.lang?.toUpperCase() ?? `#${id}`}`);
@@ -2265,6 +2324,7 @@ export default function PlayerOverlay({
               streamUrl={streamUrl}
               onRestart={() => seekAbsolute(0)}
               activeTarget={activeTarget}
+              isAnime={isAnime}
               time={time}
               duration={duration}
               skipWindows={skipWindowsForScrub}
@@ -2279,7 +2339,7 @@ export default function PlayerOverlay({
           Lives inside MenuTrackerCtx so its open state freezes the
           control-bar auto-hide and the overlay swallows the dismiss
           click — same as the other submenus. */}
-      {episodePanel && <EpisodeEdgeTrigger {...episodePanel} />}
+      {episodePanel && <EpisodeEdgeTrigger {...episodePanel} controlsVisible={controlsVisible} />}
 
       {/* SubtitlePicker (OpenSubtitles search overlay) */}
       <SubtitlePicker
@@ -3097,11 +3157,12 @@ function TrackMenu({
 // ---------------------------------------------------------------------------
 
 function MoreMenu({
-  streamUrl, onRestart, activeTarget, time, duration, skipWindows,
+  streamUrl, onRestart, activeTarget, isAnime, time, duration, skipWindows,
 }: {
   streamUrl: string | null;
   onRestart: () => void;
   activeTarget: ActiveScrobbleTarget | null;
+  isAnime: boolean;
   time: number;
   duration: number;
   skipWindows: AuraSkipWindow[];
@@ -3150,6 +3211,7 @@ function MoreMenu({
   };
 
   const toggleInterp = () => {
+    if (!isAnime) return; // anime-only — interpolation hurts live-action
     const next = !interp;
     setInterp(next);
     const current = loadAuraSettings();
@@ -3277,11 +3339,20 @@ function MoreMenu({
           <button
             type="button"
             onClick={toggleInterp}
-            className="w-full flex items-center gap-3 px-4 py-2 text-left text-[13px]
-                       text-white/85 hover:text-white hover:bg-white/[0.16]
-                       transition-colors"
+            disabled={!isAnime}
+            title={
+              isAnime
+                ? undefined
+                : "Anime only — interpolation adds judder/drops on live-action"
+            }
+            className={`w-full flex items-center gap-3 px-4 py-2 text-left text-[13px]
+                       transition-colors
+                       ${isAnime
+                         ? "text-white/85 hover:text-white hover:bg-white/[0.16]"
+                         : "text-white/35 cursor-not-allowed"}`}
             role="switch"
-            aria-checked={interp}
+            aria-checked={interp && isAnime}
+            aria-disabled={!isAnime}
           >
             <span className="text-white/55 flex-shrink-0">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
@@ -3666,11 +3737,12 @@ function SkipController({
 }
 
 function SkipWindowButton({
-  time, seekAbsolute, streamUrl,
+  time, seekAbsolute, streamUrl, mediaType,
 }: {
   time: number;
   seekAbsolute: (t: number) => void;
   streamUrl: string | null;
+  mediaType?: string | null;
 }) {
   const windows = useSkipWindows();
   const [detecting, setDetecting] = useState(false);
@@ -3715,7 +3787,11 @@ function SkipWindowButton({
   //   • once per stream (the "attempted" latch suppresses re-offers
   //     after a failed run, since silencedetect is slow and rarely
   //     yields different results on retry)
-  if (windows.length === 0 && time < 240 && !detectAttempted && streamUrl) {
+  // The Detect affordance is OP/ED-oriented (silencedetect looks for the
+  // intro→dialogue boundary), so it's only offered for series / anime —
+  // a movie has no intro window to skip.
+  const allowDetect = mediaType === "series" || mediaType === "anime";
+  if (windows.length === 0 && time < 240 && !detectAttempted && streamUrl && allowDetect) {
     return (
       <button
         type="button"

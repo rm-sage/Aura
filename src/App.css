@@ -742,10 +742,16 @@ select,
   /* Calendar "Today" cell — glow with the Aura spectrum               */
   /* ---------------------------------------------------------------- */
   .cal-today {
+    /* Accent-tinted fill + a bright, thick inset ring so the current day
+       reads at a glance instead of blending into the grid. The 2px inset
+       ring is the primary signal; the outer glow adds the Aura spectral
+       bloom. Paired with the filled accent day-number chip in CalendarView
+       for an unmistakable "today" marker. */
+    background: rgba(91, 164, 255, 0.14);
     box-shadow:
-      0 0 0 1px  rgba(91, 164, 255, 0.55),
-      0 0 14px 2px rgba(180, 130, 255, 0.28),
-      0 0 28px 6px rgba(120, 220, 200, 0.16);
+      inset 0 0 0 2px rgba(91, 164, 255, 0.95),
+      0 0 16px 2px rgba(91, 164, 255, 0.45),
+      0 0 30px 8px rgba(180, 130, 255, 0.22);
   }
 
   /* ---------------------------------------------------------------- */
@@ -1249,23 +1255,17 @@ select,
   }
 
   /* ---------------------------------------------------------------- */
-  /* aura-lib-card — Library grid card. Uses content-visibility:auto */
-  /* so off-screen cards are skipped during paint/layout, recovering */
-  /* a lot of scroll perf on large libraries (100+ cards). The       */
-  /* contain-intrinsic-size hint reserves a placeholder box so the   */
-  /* scrollbar height stays accurate while cards are virtualised.    */
+  /* aura-lib-card — Library grid card.                               */
   /*                                                                  */
-  /* Order is `width height` — earlier this was reversed to          */
-  /* `320px 180px` which fed the browser the wrong placeholder       */
-  /* dimensions; off-screen cards reserved a wide-flat box and       */
-  /* scrolled into the visible area at a different size, forcing a   */
-  /* relayout every time. Numbers now match the actual 2:3 poster +  */
-  /* ~50 px label rows: 180 px × 320 px.                             */
+  /* content-visibility:auto + contain-intrinsic-size were REMOVED:   */
+  /* the Library now uses true JS row-windowing (useLibraryRowWindow) */
+  /* that only mounts ~viewport rows, so there are no off-screen      */
+  /* cards for cv-auto to skip — and WebView2 mishandles cv-auto      */
+  /* (mis-classifies visible rows as off-screen), which added scroll  */
+  /* work rather than saving it. The class name is kept because the   */
+  /* scroll-burst transition-freeze rule below targets it; paint      */
+  /* isolation now comes solely from `card-contain` on the same node. */
   /* ---------------------------------------------------------------- */
-  .aura-lib-card {
-    content-visibility: auto;
-    contain-intrinsic-size: 180px 320px;
-  }
   /* When the user is scrolling we briefly disable the card's hover
      transform-transition + filter-transition. The Library scroll
      handler toggles this class on the wrapper so frames during an

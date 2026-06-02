@@ -96,10 +96,8 @@ fn install_skip_script<R: Runtime>(app: &AppHandle<R>) -> Option<String> {
         Ok(existing) => existing != SKIP_WINDOWS_LUA,
         Err(_)       => true,
     };
-    if needs_write {
-        if std::fs::write(&path, SKIP_WINDOWS_LUA).is_err() {
-            return None;
-        }
+    if needs_write && std::fs::write(&path, SKIP_WINDOWS_LUA).is_err() {
+        return None;
     }
     let raw = path.to_str()?;
     let stripped = raw.strip_prefix(r"\\?\").unwrap_or(raw);
@@ -539,7 +537,7 @@ static THUMB: std::sync::OnceLock<std::sync::Mutex<ThumbState>> = std::sync::Onc
 fn b64_encode(data: &[u8]) -> String {
     const T: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;
@@ -669,6 +667,32 @@ pub async fn extract_thumbnail(
             }
             if !confirmed { continue; } // try seek again
 
+            // Force a decoded frame AT the sought position before grabbing it.
+            // `playback-time` tracks the DEMUXER position, which can reach the
+            // target before the decoder advances its OUTPUT frame — so a
+            // screenshot here can capture the PREVIOUSLY decoded frame while we
+            // report the new timestamp. That is the stale-thumbnail bug: a
+            // far-away hover (e.g. 13:44) showed the old frame (e.g. 00:48).
+            // A single frame-step on the paused, vo=null instance decodes
+            // exactly one fresh frame at/near the target.
+            let no_args: Vec<serde_json::Value> = vec![];
+            let _ = mpv.command("frame-step", &no_args, "thumb");
+            std::thread::sleep(std::time::Duration::from_millis(40));
+
+            // Post-step playback-time is the honest timestamp of the frame we
+            // are about to capture (frame-step nudges ~1 frame past target, so
+            // allow 1.0 s). If it drifted further, retry the seek rather than
+            // return a mislabelled frame. Format "double" only (never "node",
+            // landmine #3).
+            let actual_at = match mpv
+                .get_property("playback-time".into(), "double".into(), "thumb")
+                .ok()
+                .and_then(|v| v.as_f64())
+            {
+                Some(pt) if (pt - at_seconds).abs() <= 1.0 => pt,
+                _ => continue,
+            };
+
             let _ = std::fs::remove_file(&path);
             mpv.command(
                 "screenshot-to-file",
@@ -681,15 +705,6 @@ pub async fn extract_thumbnail(
             if let Ok(bytes) = std::fs::read(&path) {
                 if !bytes.is_empty() {
                     let _ = std::fs::remove_file(&path);
-                    // Read the actual playback-time once more for the
-                    // return shape (Fix 3b). Same safety as the poll
-                    // above. Falls back to the requested target if the
-                    // get_property happens to fail at the same moment.
-                    let actual_at = mpv
-                        .get_property("playback-time".into(), "double".into(), "thumb")
-                        .ok()
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(at_seconds);
                     return Ok(Some(ThumbResult {
                         data_url: format!("data:image/jpeg;base64,{}", b64_encode(&bytes)),
                         at:       actual_at,

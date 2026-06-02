@@ -2219,8 +2219,500 @@ function formatAgo(diffMs: number): string {
   return `${yr}y ago`;
 }
 
+// ---------------------------------------------------------------------------
+// Debug Panel — engine + mpv diagnostics + off-focus drop-rate test.
+//
+// Surfaced as a modal overlay opened from a button in the About section
+// rather than a Settings section. It's a diagnostic tool, not a setting,
+// and the modal pattern means the test runner can load a synthetic test
+// pattern + manage its own playback lifecycle without the user needing
+// to set up a stream and navigate back to Settings to run the test.
+// ---------------------------------------------------------------------------
+
+interface DebugEngineSnapshot {
+  engine: {
+    mpv2_active: boolean;
+    mpv2_running: boolean;
+    present_mode: string | null;
+  };
+  window: {
+    available: boolean;
+    hwnd_hex?: string;
+    is_foreground?: boolean;
+    is_visible?: boolean;
+    is_iconic?: boolean;
+    is_cloaked?: boolean;
+    cloak_reason?: number;
+    reason?: string;
+  };
+  mpv: {
+    video_codec?: string | null;
+    video_format?: string | null;
+    video_w?: number | null;
+    video_h?: number | null;
+    fps?: number | null;
+    estimated_vf_fps?: number | null;
+    display_fps?: number | null;
+    hwdec_current?: string | null;
+    audio_codec?: string | null;
+    pixelformat?: string | null;
+    primaries?: string | null;
+    gamma?: string | null;
+    hdr_detected?: boolean;
+    hdr_kind?: string | null;
+    dv_profile?: number | null;
+    dv_detected?: boolean;
+    frame_drop_count?: number | null;
+    decoder_frame_drop_count?: number | null;
+    vo_delayed_frame_count?: number | null;
+    paused?: boolean;
+    time_pos?: number | null;
+    duration?: number | null;
+    volume?: number | null;
+    speed?: number | null;
+  } | null;
+}
+
+interface DropTestResult {
+  duration_secs: number;
+  initial_mode: string | null;
+  final_mode: string | null;
+  start_drop_count_vo: number;
+  end_drop_count_vo: number;
+  delta_vo: number;
+  rate_vo: number;
+  start_drop_count_dec: number;
+  end_drop_count_dec: number;
+  delta_dec: number;
+  rate_dec: number;
+  verdict: "clean" | "minor" | "drops";
+}
+
+function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const [snap, setSnap] = useState<DebugEngineSnapshot | null>(null);
+  const [snapError, setSnapError] = useState<string | null>(null);
+  const [running, setRunning] = useState(false);
+  const [duration, setDuration] = useState<number>(15);
+  const [result, setResult] = useState<DropTestResult | null>(null);
+  const [testError, setTestError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [loadingPattern, setLoadingPattern] = useState(false);
+
+  // Live 1 Hz polling of the engine snapshot. Only polls while the
+  // overlay is open — closing the overlay tears down the interval.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    const tick = () => {
+      invoke<DebugEngineSnapshot>("debug_engine_state")
+        .then((s) => {
+          if (cancelled) return;
+          setSnap(s);
+          setSnapError(null);
+        })
+        .catch((e) => {
+          if (cancelled) return;
+          setSnapError(String(e));
+        });
+    };
+    tick();
+    const h = setInterval(tick, 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(h);
+    };
+  }, [open]);
+
+  // Esc closes the overlay; backdrop click closes too (the click
+  // handler on the wrapper div). Both routes share the same path so
+  // playback can keep running if it was loaded by the test.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !running) {
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, running, onClose]);
+
+  const loadPattern = useCallback(async () => {
+    setLoadingPattern(true);
+    setTestError(null);
+    try {
+      // Stop whatever's currently playing first. mpv's loadfile-replace
+      // already swaps files, but the user reported repeated loads
+      // appearing to "stack and brighten" — likely a render-context
+      // state quirk on rapid re-load. An explicit stop in between is
+      // free insurance and makes each Load click idempotent.
+      try { await invoke("debug_stop_playback"); } catch {}
+      await invoke("debug_load_test_pattern");
+    } catch (e) {
+      setTestError(`Load test pattern failed: ${String(e)}`);
+    } finally {
+      setLoadingPattern(false);
+    }
+  }, []);
+
+  const stopPlayback = useCallback(async () => {
+    setTestError(null);
+    try {
+      await invoke("debug_stop_playback");
+    } catch (e) {
+      setTestError(`Stop playback failed: ${String(e)}`);
+    }
+  }, []);
+
+  const runTest = useCallback(async () => {
+    setRunning(true);
+    setResult(null);
+    setTestError(null);
+    try {
+      // If nothing is currently playing, auto-load the synthetic test
+      // pattern so the user doesn't have to set up a stream first.
+      // Detection: paused === undefined means no file loaded;
+      // paused === true/false means a file is loaded (even if paused).
+      const needsPattern = snap?.mpv?.paused === undefined ||
+        snap?.mpv?.paused === null;
+      if (needsPattern) {
+        await invoke("debug_load_test_pattern");
+        // Give mpv a moment to start decoding the pattern before
+        // sampling drop counters.
+        await new Promise((r) => setTimeout(r, 800));
+      }
+      const r = await invoke<DropTestResult>("debug_drop_test", {
+        durationSecs: duration,
+      });
+      setResult(r);
+    } catch (e) {
+      setTestError(String(e));
+    } finally {
+      setRunning(false);
+    }
+  }, [duration, snap]);
+
+  const copyDump = useCallback(async () => {
+    const blob = JSON.stringify(
+      {
+        timestamp: new Date().toISOString(),
+        aura_version: APP_VERSION,
+        engine_snapshot: snap,
+        last_drop_test: result,
+      },
+      null,
+      2,
+    );
+    try {
+      await navigator.clipboard.writeText(blob);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard unavailable — fall back to a download? Skip for now;
+      // user can still screenshot the panel.
+    }
+  }, [snap, result]);
+
+  if (!open) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-[9000] flex items-center justify-center
+                 bg-black/65 backdrop-blur-md
+                 animate-[settings-fade-in_140ms_ease-out]"
+      onClick={() => { if (!running) onClose(); }}
+    >
+      <div
+        className="w-[min(720px,calc(100vw-48px))]
+                   max-h-[calc(100vh-48px)] overflow-y-auto
+                   bg-[#0d1117]/96 border border-white/15 rounded-2xl
+                   shadow-glass-edge px-6 py-5 space-y-5"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between">
+          <h2 className="text-white/95 text-[15px] font-semibold tracking-wide">
+            Debug Panel
+          </h2>
+          <button
+            type="button"
+            onClick={() => { if (!running) onClose(); }}
+            disabled={running}
+            className="text-white/45 hover:text-white/85 text-[13px]
+                       disabled:opacity-30 disabled:cursor-default
+                       transition-colors"
+            aria-label="Close"
+          >
+            ✕
+          </button>
+        </div>
+
+        <p className="text-white/55 text-xs leading-relaxed">
+          Diagnostic surface for the mpv2 render-API engine. Live state
+          refreshes once per second; the drop-rate test reads mpv's own
+          counters at the start and end of a timed window. If nothing is
+          playing when you click Run, the test auto-loads a synthetic
+          SMPTE-bars pattern via mpv's lavfi source so you don't have
+          to set up a stream first.
+        </p>
+
+      {/* Engine + window */}
+      <div>
+        <p className="text-white/40 text-[10.5px] font-mono uppercase tracking-[0.18em] mb-2">
+          Engine + window
+        </p>
+        <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12.5px]">
+          <DebugRow label="AURA_MPV2 set" value={fmtBool(snap?.engine.mpv2_active)} />
+          <DebugRow label="Engine running" value={fmtBool(snap?.engine.mpv2_running)} />
+          <DebugRow label="Present mode" value={snap?.engine.present_mode ?? "—"} />
+          <DebugRow label="HWND" value={snap?.window.hwnd_hex ?? "—"} />
+          <DebugRow label="Foreground" value={fmtBool(snap?.window.is_foreground)} />
+          <DebugRow label="Visible (WS_VISIBLE)" value={fmtBool(snap?.window.is_visible)} />
+          <DebugRow label="Minimised (IsIconic)" value={fmtBool(snap?.window.is_iconic)} />
+          <DebugRow label="Cloaked (DWMWA_CLOAKED)" value={fmtBool(snap?.window.is_cloaked)} />
+        </div>
+      </div>
+
+      <div className="h-px bg-white/6" />
+
+      {/* Video decode */}
+      <div>
+        <p className="text-white/40 text-[10.5px] font-mono uppercase tracking-[0.18em] mb-2">
+          Video decode (mpv)
+        </p>
+        {snap?.engine.mpv2_running ? (
+          <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12.5px]">
+            <DebugRow label="Codec" value={snap?.mpv?.video_codec ?? "—"} />
+            <DebugRow
+              label="Resolution"
+              value={
+                snap?.mpv?.video_w && snap?.mpv?.video_h
+                  ? `${snap.mpv.video_w}×${snap.mpv.video_h}`
+                  : "—"
+              }
+            />
+            <DebugRow label="Source FPS" value={fmtFps(snap?.mpv?.fps)} />
+            <DebugRow label="Display FPS" value={fmtFps(snap?.mpv?.display_fps)} />
+            <DebugRow label="Hardware decode" value={snap?.mpv?.hwdec_current ?? "—"} />
+            <DebugRow label="Pixel format" value={snap?.mpv?.pixelformat ?? "—"} />
+            <DebugRow label="Primaries" value={snap?.mpv?.primaries ?? "—"} />
+            <DebugRow label="Gamma / transfer" value={snap?.mpv?.gamma ?? "—"} />
+            <DebugRow
+              label="HDR"
+              value={
+                snap?.mpv?.hdr_kind ??
+                (snap?.mpv?.hdr_detected ? "detected" : "—")
+              }
+            />
+            <DebugRow
+              label="Dolby Vision"
+              value={
+                snap?.mpv?.dv_detected
+                  ? `profile ${snap.mpv.dv_profile ?? "?"}`
+                  : "not detected"
+              }
+            />
+            <DebugRow label="Audio codec" value={snap?.mpv?.audio_codec ?? "—"} />
+            <DebugRow
+              label="Paused"
+              value={
+                snap?.mpv?.paused === undefined
+                  ? "—"
+                  : snap.mpv?.paused
+                    ? "yes"
+                    : "no"
+              }
+            />
+          </div>
+        ) : (
+          <p className="text-white/45 text-[12.5px] italic">
+            mpv2 engine not running (AURA_MPV2 unset or not yet initialised).
+          </p>
+        )}
+      </div>
+
+      <div className="h-px bg-white/6" />
+
+      {/* Drop counters (live) — cumulative since playback started.
+          The drop-test result below shows the DELTA across the test
+          window, which is the more meaningful figure for "did this
+          mode change cause drops?". */}
+      <div>
+        <p className="text-white/40 text-[10.5px] font-mono uppercase tracking-[0.18em] mb-2">
+          Drop counters (live — cumulative since playback start)
+        </p>
+        <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12.5px]">
+          <DebugRow
+            label="VO drops"
+            value={fmtCount(snap?.mpv?.frame_drop_count ?? null)}
+          />
+          <DebugRow
+            label="Decoder drops"
+            value={fmtCount(snap?.mpv?.decoder_frame_drop_count ?? null)}
+          />
+          <DebugRow
+            label="VO delayed frames"
+            value={fmtCount(snap?.mpv?.vo_delayed_frame_count ?? null)}
+          />
+        </div>
+      </div>
+
+      <div className="h-px bg-white/6" />
+
+      {/* Drop test */}
+      <div>
+        <p className="text-white/40 text-[10.5px] font-mono uppercase tracking-[0.18em] mb-2">
+          Off-focus drop test
+        </p>
+        <p className="text-white/55 text-[12px] leading-relaxed">
+          Click <span className="text-white/80">Run test</span> — if nothing
+          is playing, a synthetic SMPTE-bars pattern auto-loads via mpv's
+          lavfi source (no file, no network). Then move Aura to the state
+          you want to measure (alt-tab away, drag to another monitor,
+          minimise, etc.) and leave it there until the timer expires. The
+          result captures total drops and rate over the window, plus the
+          present-mode at start and end.
+        </p>
+        <div className="mt-3 flex items-center gap-3 flex-wrap">
+          <label className="text-white/55 text-[12px]">Duration</label>
+          <select
+            className="bg-white/5 border border-white/12 rounded-md px-2 py-1 text-[12.5px] text-white/90"
+            value={duration}
+            onChange={(e) => setDuration(Number(e.target.value))}
+            disabled={running}
+          >
+            <option value={5}>5 s</option>
+            <option value={10}>10 s</option>
+            <option value={15}>15 s</option>
+            <option value={30}>30 s</option>
+            <option value={60}>60 s</option>
+          </select>
+          <button
+            type="button"
+            onClick={runTest}
+            disabled={running || !snap?.engine.mpv2_running}
+            className="px-3 py-1 rounded-md bg-ln-accent/20 text-ln-accent
+                       hover:bg-ln-accent/30 active:bg-ln-accent/40
+                       border border-ln-accent/40
+                       text-[12.5px] font-semibold tracking-wide
+                       disabled:opacity-50 disabled:cursor-default
+                       transition-colors"
+          >
+            {running ? `Running… (${duration}s)` : "Run test"}
+          </button>
+          <button
+            type="button"
+            onClick={loadPattern}
+            disabled={running || loadingPattern || !snap?.engine.mpv2_running}
+            className="px-3 py-1 rounded-md bg-white/6 hover:bg-white/10 active:bg-white/14
+                       border border-white/15 text-white/80
+                       text-[12px]
+                       disabled:opacity-50 disabled:cursor-default
+                       transition-colors"
+            title="Load the SMPTE-bars test pattern without running the drop test"
+          >
+            {loadingPattern ? "Loading…" : "Load test pattern"}
+          </button>
+          <button
+            type="button"
+            onClick={stopPlayback}
+            disabled={running || !snap?.engine.mpv2_running}
+            className="px-3 py-1 rounded-md bg-white/6 hover:bg-white/10 active:bg-white/14
+                       border border-white/15 text-white/80
+                       text-[12px]
+                       disabled:opacity-50 disabled:cursor-default
+                       transition-colors"
+            title="Unload whatever is currently playing in the engine"
+          >
+            Stop playback
+          </button>
+        </div>
+
+        {testError && (
+          <p className="mt-2 text-rose-300/85 text-[12px]">{testError}</p>
+        )}
+        {result && (
+          <div className="mt-3 grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12.5px] bg-black/20 border border-white/8 rounded-lg px-3 py-3">
+            <DebugRow
+              label="Duration"
+              value={`${result.duration_secs.toFixed(2)} s`}
+            />
+            <DebugRow
+              label="Verdict"
+              value={
+                result.verdict === "clean"
+                  ? "✓ Clean"
+                  : result.verdict === "minor"
+                    ? "~ Minor"
+                    : "✗ Drops"
+              }
+            />
+            <DebugRow label="Mode at start" value={result.initial_mode ?? "—"} />
+            <DebugRow label="Mode at end" value={result.final_mode ?? "—"} />
+            <DebugRow
+              label="VO drops"
+              value={`${result.delta_vo} (${result.rate_vo.toFixed(2)} /s)`}
+            />
+            <DebugRow
+              label="Decoder drops"
+              value={`${result.delta_dec} (${result.rate_dec.toFixed(2)} /s)`}
+            />
+          </div>
+        )}
+      </div>
+
+      <div className="h-px bg-white/6" />
+
+      <div className="flex items-center justify-between">
+        <p className="text-white/45 text-[11.5px]">
+          {snapError ? (
+            <span className="text-rose-300/75">Snapshot error: {snapError}</span>
+          ) : (
+            "Snapshot polls every second."
+          )}
+        </p>
+        <button
+          type="button"
+          onClick={copyDump}
+          className="px-3 py-1 rounded-md bg-white/8 hover:bg-white/12 active:bg-white/16
+                     border border-white/15 text-white/80 text-[12px]
+                     transition-colors"
+        >
+          {copied ? "Copied" : "Copy diagnostic dump"}
+        </button>
+      </div>
+      </div>{/* /panel */}
+    </div>
+  );
+}
+
+function DebugRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-baseline justify-between gap-2">
+      <span className="text-white/55 truncate">{label}</span>
+      <span className="text-white/85 font-mono tabular-nums truncate text-right">
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function fmtBool(b: boolean | undefined): string {
+  if (b === undefined) return "—";
+  return b ? "yes" : "no";
+}
+function fmtCount(n: number | null | undefined): string {
+  if (n === null || n === undefined) return "—";
+  return n.toLocaleString();
+}
+function fmtFps(n: number | null | undefined): string {
+  if (n === null || n === undefined) return "—";
+  return `${n.toFixed(3)} fps`;
+}
+
 function AboutSection({ addonCount }: { addonCount: number }) {
   const [stats, setStats] = useState<AuraStats | null>(null);
+  const [debugOpen, setDebugOpen] = useState(false);
   useEffect(() => {
     invoke<AuraStats>("get_stats").then(setStats).catch(() => {});
   }, []);
@@ -2265,6 +2757,30 @@ function AboutSection({ addonCount }: { addonCount: number }) {
           />
         </div>
       </div>
+
+      <div className="h-px bg-white/6" />
+
+      {/* Debug panel — a one-button entry point to the diagnostic
+          overlay. Lives under About (not in the TOC) because it's a
+          tool, not a setting. The overlay manages its own playback
+          test lifecycle so the user doesn't need to set up a stream
+          to run the drop-rate test. */}
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-white/55 text-[12px] leading-relaxed">
+          Engine + mpv diagnostics and an off-focus drop-rate test
+          with a built-in test pattern.
+        </p>
+        <button
+          type="button"
+          onClick={() => setDebugOpen(true)}
+          className="shrink-0 px-3 py-1 rounded-md bg-white/8 hover:bg-white/12 active:bg-white/16
+                     border border-white/15 text-white/85 text-[12.5px]
+                     transition-colors"
+        >
+          Open Debug Panel
+        </button>
+      </div>
+      <DebugOverlay open={debugOpen} onClose={() => setDebugOpen(false)} />
     </Section>
   );
 }
@@ -2630,7 +3146,6 @@ const TOC_GROUPS: TocGroup[] = [
       { id: "sec-detail-page", label: "Detail Page" },
       { id: "sec-hover-panel", label: "Hover Meta Panel" },
       { id: "sec-open-links", label: "Open Links" },
-      { id: "sec-notifications", label: "Notifications" },
     ],
   },
   {
@@ -3857,8 +4372,16 @@ export default function SettingsView({ addons, session }: Props) {
           {/* TOC — sticky so it stays in view while the user scrolls.
               The search input now lives at the BOTTOM of this sidebar
               (instead of in a sticky page header) so the content
-              column doesn't lose vertical real estate to a fixed bar. */}
-          <aside className="sticky top-6 self-start">
+              column doesn't lose vertical real estate to a fixed bar.
+              `max-h: 100vh - 3rem` (24 px top sticky-offset + 24 px
+              bottom buffer) + `overflow-y-auto` bounds the aside to
+              the viewport so laptop / short-screen aspect ratios show
+              the full TOC with internal scrolling instead of forcing
+              the user to scroll the page itself to see lower entries. */}
+          <aside
+            className="sticky top-6 self-start overflow-y-auto"
+            style={{ maxHeight: "calc(100vh - 3rem)" }}
+          >
             <SettingsToc
               scrollRoot={scrollEl}
               search={{
@@ -4086,23 +4609,6 @@ export default function SettingsView({ addons, session }: Props) {
             />
           </Section>
 
-          {/* ── Notifications ─────────────────────────────────────────────
-              The bell's "new episode aired" notifications are scheduled
-              by NotificationsScanner against your library's series/anime
-              entries. By default the scanner notifies the moment an
-              addon publishes a recently-released episode; this toggle
-              additionally gates on stream availability for users whose
-              addon mix occasionally publishes episodes hours or days
-              before any source becomes scrapable. */}
-          <Section id="sec-notifications" title="Notifications">
-            <SettingToggle
-              label="Only notify when a stream is available"
-              description="When on, the bell waits to fire a new-episode notification until at least one playable stream is found across your installed addons. Adds a small per-episode network check at scan time (cached for 12 hours so re-scans are free). Off by default: the bell fires the moment an episode is marked released, even if scrapers haven't caught up yet."
-              value={aura.notifyOnlyWithStreams}
-              onChange={(v) => setLocal({ notifyOnlyWithStreams: v })}
-            />
-          </Section>
-
           <GroupHeader label="Playback" />
 
           {/* Video & Audio quality */}
@@ -4186,14 +4692,17 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Motion interpolation"
-                description="mpv's built-in GPU frame interpolation (video-sync=display-resample). Smooths low-frame-rate content (24 fps film, anime) on a high-refresh display. GPU-cheap. Tune the look with the kernel dropdown below."
+                description="mpv's built-in GPU frame interpolation (video-sync=display-resample). Smooths low-frame-rate content (24 fps film, anime) on a high-refresh display. GPU-cheap. Tune the look with the kernel dropdown below. Applies to anime only — it is skipped on live-action, where it adds judder."
                 value={!!aura.motionInterpolation}
                 onChange={(v) => {
+                  // Persist ONLY — do not apply live from Settings. Interp is
+                  // anime-gated and this view has no active-target context, so
+                  // a live invoke here would enable interpolation on whatever
+                  // is currently playing (incl. live-action), bypassing the
+                  // gate. The per-load path (enabled && animeFlag) applies it
+                  // correctly on the next play; the in-player MoreMenu toggle
+                  // handles live changes for the anime that's actually on screen.
                   setLocal({ motionInterpolation: v });
-                  invoke("set_motion_interpolation", {
-                    enabled: v,
-                    tscale: aura.interpolationTscale ?? "mitchell",
-                  }).catch(() => {});
                 }}
               />
               <SettingDropdown
@@ -4210,14 +4719,11 @@ export default function SettingsView({ addons, session }: Props) {
                 required
                 onChange={(v) => {
                   const k = v || "mitchell";
+                  // Persist ONLY — see the Motion-interpolation toggle above.
+                  // Applying live here would push interpolation onto whatever
+                  // is playing without the anime gate; the kernel takes effect
+                  // on the next play via the gated load path.
                   setLocal({ interpolationTscale: k });
-                  // Apply live only when interpolation is currently on.
-                  if (aura.motionInterpolation) {
-                    invoke("set_motion_interpolation", {
-                      enabled: true,
-                      tscale: k,
-                    }).catch(() => {});
-                  }
                 }}
               />
             </Section>
@@ -4681,7 +5187,11 @@ export default function SettingsView({ addons, session }: Props) {
             />
           )}
 
-          {/* About */}
+          {/* About — also hosts the Debug Panel button (overlay
+              modal). Debug surfaced via About-button instead of its
+              own page section because it's a diagnostic tool, not a
+              setting; the modal also manages its own playback test
+              lifecycle so the user doesn't need a stream loaded. */}
           <AboutSection addonCount={addons.length} />
           </div>{/* /content column */}
 

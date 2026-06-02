@@ -32,7 +32,7 @@
 // ---------------------------------------------------------------------------
 
 import type { AddonEntry, MetaDetail, VideoEntry } from "./types";
-import { getMetaDetailFallback } from "./metaCache";
+import { getRichestMetaDetail, peekRichestCachedDetailById } from "./metaCache";
 import {
   getManualWatchedState,
   setManualWatchedState,
@@ -67,6 +67,17 @@ function allAiredEpisodesWatched(sorted: VideoEntry[]): boolean {
   return aired.every((v) => getManualWatchedState(v.id) === "watched");
 }
 
+/** True when ANY episode is still upcoming — a parseable FUTURE air date.
+ *  A show with episodes yet to air is "caught up", NOT complete: the
+ *  series-root "watched" mark (which removes it from Continue Watching)
+ *  must wait until the finale has aired AND been watched with nothing
+ *  further scheduled. Undated entries count as aired (same rule as
+ *  isEpisodeAired), so a permanent "TBA" stub can't pin a finished show
+ *  to CW forever. */
+function hasFutureEpisode(sorted: VideoEntry[], now = Date.now()): boolean {
+  return sorted.some((v) => !isEpisodeAired(v, now));
+}
+
 export async function advanceWatchedAfter(
   seriesId: string,
   episodeId: string,
@@ -88,7 +99,13 @@ export async function advanceWatchedAfter(
     setManualWatchedState(episodeId, "watched");
   }
 
-  const detail = await getMetaDetailFallback(addons, mediaType, seriesId);
+  // Richest detail (most videos) — prefer DetailView's cached full episode
+  // list, else fetch the richest across addons. A leaner list (an addon
+  // that lists only AIRED episodes) would hide the upcoming episodes and
+  // make this mark the series complete on catch-up, dropping it from CW.
+  const detail =
+    peekRichestCachedDetailById(seriesId) ??
+    (await getRichestMetaDetail(addons, mediaType, seriesId));
   if (!detail || !detail.videos || detail.videos.length === 0) return;
 
   const sorted = sortedEpisodes(detail);
@@ -100,7 +117,14 @@ export async function advanceWatchedAfter(
   // episodes (e.g. catching up by skipping around) — once every aired
   // episode lands, the series should flip to watched regardless of
   // which one they just finished.
-  if (allAiredEpisodesWatched(sorted)) {
+  // Series-completion fires only when the FINALE is watched AND nothing
+  // further is scheduled. A still-airing show (any upcoming future-dated
+  // episode) is "caught up", not complete — marking the series-root
+  // watched here would drop it from Continue Watching the moment the user
+  // finishes the latest AIRED episode, even though more is coming. Gate on
+  // "no future episode" so caught-up series stay in CW until their actual
+  // finale airs and is watched.
+  if (allAiredEpisodesWatched(sorted) && !hasFutureEpisode(sorted)) {
     if (getManualWatchedState(seriesId) !== "watched") {
       setManualWatchedState(seriesId, "watched");
     }
@@ -141,8 +165,22 @@ export function recheckSeriesWatchedFlag(
   if (getManualWatchedState(seriesId) !== "watched") return;
 
   const sorted = sortedEpisodes(detail);
-  // Find the FIRST aired-but-unwatched episode. If none exist the
-  // series remains correctly watched.
+
+  // Completion invariant: a series is "watched" only when the finale has
+  // aired AND nothing further is scheduled. If upcoming episodes still
+  // exist the show is "caught up", not complete — un-mark it so it returns
+  // to Continue Watching (the state.timeOffset from the last watch is
+  // intact). No auto-bump: the user follows airing shows from CW and wants
+  // it there while waiting for the next episode. This also self-heals any
+  // series an earlier build wrongly marked complete on catch-up.
+  if (hasFutureEpisode(sorted)) {
+    setManualWatchedState(seriesId, null);
+    return;
+  }
+
+  // No upcoming episodes, but a NEW episode aired since the last watch
+  // (some aired episode is now unwatched). If none exist the series
+  // remains correctly watched.
   const firstUnwatchedAired = sorted.find(
     (v) => isEpisodeAired(v) && getManualWatchedState(v.id) !== "watched",
   );

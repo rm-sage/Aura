@@ -273,11 +273,18 @@ export default function HomeView({
       }
       setSettingsTick((t) => t + 1);
     };
+    // Same path as a settings change, but triggered when an addon's
+    // manifest is refreshed (post-configure auto-refresh, or the user
+    // clicking the Refresh icon) so home rows reflect newly-enabled
+    // catalogs without waiting for an unrelated setting flip.
+    const onManifestRefresh = () => setSettingsTick((t) => t + 1);
     window.addEventListener("aura:settings-changed", onChange);
     window.addEventListener("storage", onChange);
+    window.addEventListener("aura:addon-manifest-refreshed", onManifestRefresh);
     return () => {
       window.removeEventListener("aura:settings-changed", onChange);
       window.removeEventListener("storage", onChange);
+      window.removeEventListener("aura:addon-manifest-refreshed", onManifestRefresh);
     };
   }, []);
 
@@ -354,6 +361,21 @@ export default function HomeView({
       // holds 10 items per row instead of 100. The remaining items
       // come in lazily via `fetch_catalog_paginated` when the user
       // opens View all on a specific row.
+      //
+      // `bootstrapped` flips as soon as the FIRST row resolves (or
+      // 1.5 s elapses, whichever comes first). Earlier this awaited
+      // `Promise.all(initial.map(...))`, which let one slow addon
+      // (debrid mirror under load → 10 s reqwest timeout) hold the
+      // splash for the full timeout. The 8 s safety valve in
+      // App.tsx::aura:home-ready still catches the absolute worst
+      // case but is no longer the primary gate.
+      let firstSettled = false;
+      const markBootstrapped = () => {
+        if (firstSettled || cancelled) return;
+        firstSettled = true;
+        setBootstrapped(true);
+      };
+      const bootstrapFallback = setTimeout(markBootstrapped, 1500);
       await Promise.all(
         initial.map(async (row, idx) => {
           try {
@@ -369,6 +391,7 @@ export default function HomeView({
               if (next[idx]) next[idx] = { ...next[idx], items, loading: false };
               return next;
             });
+            markBootstrapped();
           } catch {
             if (cancelled) return;
             setRows((prev) => {
@@ -376,9 +399,14 @@ export default function HomeView({
               if (next[idx]) next[idx] = { ...next[idx], items: [], loading: false };
               return next;
             });
+            markBootstrapped();
           }
         })
       );
+      clearTimeout(bootstrapFallback);
+      // Defensive: if every row threw before the first-settled hook
+      // fired (initial = []? all sync throws?), set bootstrapped now
+      // so the splash doesn't strand.
       if (!cancelled) setBootstrapped(true);
     })();
 

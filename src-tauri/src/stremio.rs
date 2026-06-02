@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -20,22 +21,210 @@ const STREMIO_ACCOUNT_API: &str = "https://api.strem.io/api";
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 static ACCOUNT_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
-// Session-scoped manifest cache — avoids redundant /manifest.json fetches that
-// would otherwise fire on every home load, search, stream fetch, and subtitle
+// Manifest cache — avoids redundant /manifest.json fetches that would
+// otherwise fire on every home load, search, stream fetch, and subtitle
 // fetch. AIOStreams and other self-hosted addons build their manifest
-// dynamically (internal health checks per request) so repeated fetches show up
-// as high-frequency status hits in their logs.
+// dynamically (internal health checks per request) so repeated fetches
+// show up as high-frequency status hits in their logs.
+//
+// `MANIFEST_TTL` (24 h) is the single cache window — entries inside it
+// serve verbatim. Addon manifests describe long-lived capabilities
+// (catalogs / resources / id prefixes); they change at the cadence of
+// an addon redeploy, not per-request. Tolerating up to a day of
+// staleness dramatically improves cold-launch responsiveness for users
+// with several addons installed. The user-facing `Refresh` button
+// (`refresh_addon_manifest`) explicitly drops the entry to force a
+// fresh fetch when the user actually wants one.
+//
+// Disk persistence: the in-memory map is mirrored to
+// `app_data_dir/manifest-cache.json` on every successful insert
+// (synchronous JSON write through a temp-file + rename, ~10–50 ms).
+// At app boot, [`init_manifest_cache_path`] is called from lib.rs
+// setup with the data-dir path; that function also reads the file once
+// and populates memory with any entry still inside `MANIFEST_TTL`.
 static MANIFEST_CACHE: OnceLock<Mutex<HashMap<String, ManifestCacheEntry>>> = OnceLock::new();
-const MANIFEST_TTL: Duration = Duration::from_secs(300); // 5-minute TTL
+const MANIFEST_TTL: Duration = Duration::from_secs(86_400); // 24h
 
+/// On-disk cache file path. Set once at boot by [`init_manifest_cache_path`].
+/// When absent (test runs / pre-setup callers), disk persistence is a
+/// no-op and the cache behaves exactly as the prior in-memory-only version.
+static MANIFEST_CACHE_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Wire format version for the on-disk manifest cache. Bump on any
+/// breaking change to `WireManifest` / `WireCatalogEntry` so a stale
+/// file from an older Aura build is dropped instead of misparsed.
+const MANIFEST_CACHE_FILE_VERSION: u32 = 1;
+
+#[derive(Clone)]
 struct ManifestCacheEntry {
     wire:       WireManifest,
     has_search: bool,
-    cached_at:  Instant,
+    /// SystemTime so the entry can serialise to / deserialise from the
+    /// disk cache via Unix-epoch seconds. Compared via
+    /// `SystemTime::now().duration_since(cached_at)` — a clock that
+    /// goes backwards (`Err`) treats the entry as infinitely old, so
+    /// the next fetch revalidates.
+    cached_at:  SystemTime,
 }
 
 fn manifest_cache() -> &'static Mutex<HashMap<String, ManifestCacheEntry>> {
     MANIFEST_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// On-disk cache record. Owned `WireManifest` so the file is
+/// self-contained and decoupled from any one Aura process.
+#[derive(Deserialize, Serialize)]
+struct ManifestCacheDiskEntry {
+    wire: WireManifest,
+    has_search: bool,
+    /// Unix-epoch seconds at the moment of caching.
+    cached_at_unix: i64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ManifestCacheDiskFile {
+    version: u32,
+    entries: HashMap<String, ManifestCacheDiskEntry>,
+}
+
+/// Set the on-disk manifest cache file path and warm the in-memory map
+/// from it. Called from lib.rs setup once the Tauri app data directory
+/// is known. Safe to call more than once (subsequent calls are no-ops).
+///
+/// Disk-side errors are logged at `warn` and never propagated — a
+/// missing / corrupt / unreadable file simply means we start with an
+/// empty cache, identical to the pre-persistence behaviour.
+pub fn init_manifest_cache_path(path: PathBuf) {
+    if MANIFEST_CACHE_PATH.set(path.clone()).is_err() {
+        return; // already initialised; second call is a no-op
+    }
+    if !path.exists() {
+        crate::devlog!(
+            info, "catalog",
+            "manifest cache: no disk file yet (cold start)",
+        );
+        return;
+    }
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::devlog!(
+                warn, "catalog",
+                "manifest cache: read failed ({e}); starting with empty cache",
+            );
+            return;
+        }
+    };
+    let parsed: ManifestCacheDiskFile = match serde_json::from_str(&raw) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::devlog!(
+                warn, "catalog",
+                "manifest cache: parse failed ({e}); starting with empty cache",
+            );
+            return;
+        }
+    };
+    if parsed.version != MANIFEST_CACHE_FILE_VERSION {
+        crate::devlog!(
+            info, "catalog",
+            "manifest cache: file version {} doesn't match expected {} — discarding",
+            parsed.version, MANIFEST_CACHE_FILE_VERSION,
+        );
+        return;
+    }
+    let now = SystemTime::now();
+    let mut loaded = 0usize;
+    let mut dropped_stale = 0usize;
+    let mut cache = manifest_cache().lock().unwrap();
+    for (url, disk) in parsed.entries {
+        let cached_at = match u64::try_from(disk.cached_at_unix) {
+            Ok(secs) => UNIX_EPOCH + Duration::from_secs(secs),
+            Err(_) => continue, // negative timestamp = corrupt
+        };
+        match now.duration_since(cached_at) {
+            Ok(age) if age <= MANIFEST_TTL => {
+                cache.insert(url, ManifestCacheEntry {
+                    wire: disk.wire,
+                    has_search: disk.has_search,
+                    cached_at,
+                });
+                loaded += 1;
+            }
+            _ => dropped_stale += 1,
+        }
+    }
+    drop(cache);
+    crate::devlog!(
+        info, "catalog",
+        "manifest cache: warmed from disk ({loaded} entry/entries, {dropped_stale} dropped as stale)",
+    );
+}
+
+/// Persist the current in-memory manifest cache to the configured disk
+/// path. No-op when [`init_manifest_cache_path`] hasn't been called.
+/// Errors are logged but never propagated — disk persistence is an
+/// optimisation, not a correctness requirement.
+fn save_manifest_cache_to_disk() {
+    let Some(path) = MANIFEST_CACHE_PATH.get() else { return; };
+    // Snapshot under the lock; do the file write outside it so a slow
+    // I/O can't stall other fetches.
+    let snapshot = {
+        let cache = match manifest_cache().lock() {
+            Ok(c) => c,
+            Err(e) => {
+                crate::devlog!(
+                    warn, "catalog",
+                    "manifest cache: poisoned on save: {e}",
+                );
+                return;
+            }
+        };
+        let mut out: HashMap<String, ManifestCacheDiskEntry> =
+            HashMap::with_capacity(cache.len());
+        for (url, entry) in cache.iter() {
+            let cached_at_unix = match entry.cached_at.duration_since(UNIX_EPOCH) {
+                Ok(d) => d.as_secs() as i64,
+                Err(_) => continue, // cached_at < UNIX_EPOCH — shouldn't happen
+            };
+            out.insert(url.clone(), ManifestCacheDiskEntry {
+                wire: entry.wire.clone(),
+                has_search: entry.has_search,
+                cached_at_unix,
+            });
+        }
+        out
+    };
+    let file = ManifestCacheDiskFile {
+        version: MANIFEST_CACHE_FILE_VERSION,
+        entries: snapshot,
+    };
+    let json = match serde_json::to_vec(&file) {
+        Ok(b) => b,
+        Err(e) => {
+            crate::devlog!(
+                warn, "catalog",
+                "manifest cache: serialise failed: {e}",
+            );
+            return;
+        }
+    };
+    // Ensure parent dir exists (Tauri's data dir is created on first
+    // access — but if we somehow beat it, mkdir is a no-op when present).
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Atomic write: temp file + rename. Prevents a half-written cache
+    // file from breaking the next launch's parse.
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &json) {
+        crate::devlog!(warn, "catalog", "manifest cache: tmp write failed: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        crate::devlog!(warn, "catalog", "manifest cache: rename failed: {e}");
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 // Per-CATALOG soft-fail cache.
@@ -161,7 +350,7 @@ fn account_client() -> &'static reqwest::Client {
 // Stremio wire types
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct WireManifest {
     /// Manifest-level `id` (stable across deployments of the same addon —
     /// e.g. "com.linvo.cinemeta"). Optional in deserialization for
@@ -191,13 +380,13 @@ struct WireManifest {
     behavior_hints: WireBehaviorHints,
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 struct WireBehaviorHints {
     #[serde(default)]
     configurable: bool,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct WireCatalogEntry {
     #[serde(rename = "type")]
     media_type: String,
@@ -216,15 +405,31 @@ struct WireCatalogEntry {
 
 #[derive(Deserialize)]
 struct CatalogResponse {
+    /// Raw per-meta values; deserialised one-by-one in `fetch_catalog`
+    /// so a single malformed item doesn't poison the whole payload.
+    /// AniList / MAL catalogs occasionally surface entries that fail the
+    /// strict `id`/`type`/`name` requirement on `WireMeta` (numeric id
+    /// types, missing fields, etc.) — pre-this-refactor that wiped the
+    /// entire catalog with a top-level "error decoding response body".
     #[serde(default)]
-    metas: Vec<WireMeta>,
+    metas: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
 struct WireMeta {
+    /// Required. The Stremio addon spec mandates an id on every meta;
+    /// we drop the row if it's missing or empty.
     id: String,
-    #[serde(rename = "type")]
+    /// Required by the spec, but some community addons (AniList /
+    /// MAL-backed catalogs in particular) occasionally emit metas
+    /// without a `type` field — we default to empty and let downstream
+    /// resolve via id-prefix.
+    #[serde(rename = "type", default)]
     media_type: String,
+    /// Required by spec; default to empty so the catalog still renders
+    /// the entry and downstream code can detect "no title" gracefully
+    /// rather than wiping the whole payload.
+    #[serde(default)]
     name: String,
     poster: Option<String>,
     background: Option<String>,
@@ -638,6 +843,30 @@ fn cap(s: String, max: usize) -> String {
     if s.chars().count() <= max { s } else { s.chars().take(max).collect() }
 }
 
+/// Per-item-tolerant deserialiser. Returns the items that parse cleanly
+/// AND have a non-empty id; counts the ones that failed for the caller's
+/// log line. Used by every catalog / search call site so a single
+/// malformed meta entry can't blank out an entire payload. Spec-violating
+/// entries (numeric ids, missing `type`/`name`) are logged at the call
+/// site but never crash the response.
+fn parse_meta_array(raw: Vec<serde_json::Value>) -> (Vec<WireMeta>, usize, Vec<String>) {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut dropped = 0usize;
+    let mut errors = Vec::new();
+    for value in raw {
+        match serde_json::from_value::<WireMeta>(value.clone()) {
+            Ok(m) if !m.id.is_empty() => out.push(m),
+            Ok(_) => { dropped += 1; errors.push("empty id".to_string()); }
+            Err(e) => {
+                dropped += 1;
+                let preview: String = value.to_string().chars().take(160).collect();
+                errors.push(format!("{e} (raw: {preview})"));
+            }
+        }
+    }
+    (out, dropped, errors)
+}
+
 /// Clamp all text fields to safe lengths and strip dangerous poster URLs.
 fn sanitize_meta(m: WireMeta) -> MetaPreview {
     MetaPreview {
@@ -778,12 +1007,22 @@ fn encode_query(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 async fn fetch_manifest(base: &str) -> Result<(WireManifest, bool), String> {
-    // Cache hit — avoids redundant network calls on home load, search, stream
-    // and subtitle fan-outs. Lock is dropped before any await point.
+    // Cache hit — avoids redundant network calls on home load, search,
+    // stream and subtitle fan-outs. Lock is dropped before any await
+    // point. Manifests rarely change for installed addons (capabilities
+    // are tied to the addon's deploy, not per-request), and the
+    // user-facing `Refresh` button (`refresh_addon_manifest`) drops the
+    // entry to force a fresh fetch when needed. MANIFEST_TTL is the
+    // same window the disk-cache warm-start uses, so a cold launch can
+    // serve an addon's manifest from local storage instead of a
+    // network round-trip.
     {
         let cache = manifest_cache().lock().unwrap();
         if let Some(entry) = cache.get(base) {
-            if entry.cached_at.elapsed() < MANIFEST_TTL {
+            let age = SystemTime::now()
+                .duration_since(entry.cached_at)
+                .unwrap_or(Duration::MAX);
+            if age < MANIFEST_TTL {
                 return Ok((entry.wire.clone(), entry.has_search));
             }
         }
@@ -816,9 +1055,13 @@ async fn fetch_manifest(base: &str) -> Result<(WireManifest, bool), String> {
         cache.insert(base.to_string(), ManifestCacheEntry {
             wire:       wire.clone(),
             has_search,
-            cached_at:  Instant::now(),
+            cached_at:  SystemTime::now(),
         });
     }
+    // Persist to disk so the next cold launch's home-screen mount can
+    // serve the addon's capability list from local storage instead of
+    // refetching N manifests in parallel.
+    save_manifest_cache_to_disk();
 
     Ok((wire, has_search))
 }
@@ -915,8 +1158,78 @@ fn log_label(name: &str, url: &str) -> String {
     } else if !name.is_empty() {
         name.to_string()
     } else {
-        url.to_string()
+        redact_sensitive_url(url)
     }
+}
+
+/// Strip API-key / token shaped fragments from a URL before it's
+/// devlog'd. Stream addons routinely return URLs with debrid bearer
+/// keys embedded as `?api_key=…`, `?token=…`, or `/api_key/<key>/…`
+/// path segments — devlog'ing the raw URL persists them to
+/// `aura-mpv.log` AND the DevConsole ring buffer (which gets exported
+/// from the Help menu). The redacted form preserves the host and the
+/// non-secret path so debugging still works.
+///
+/// Conservative scope: redact ONLY parameters whose name matches the
+/// well-known secret-bearing keys. Aura's own addon URLs (configured by
+/// the user, e.g. AIOMetadata `?lang=en&…`) stay readable.
+pub(crate) fn redact_sensitive_url(input: &str) -> String {
+    // Path-segment form: `…/api_key/<value>/…` → `…/api_key/<redacted>/…`
+    const PATH_KEYS: &[&str] = &["api_key", "apikey", "token", "auth"];
+    // Query-param form: `?api_key=<value>` / `&token=<value>` → `<redacted>`
+    const QUERY_KEYS: &[&str] = &[
+        "api_key", "apikey", "apiKey", "token", "password", "pin", "auth", "key",
+    ];
+
+    let mut s = input.to_string();
+
+    // Pass 1: path-segment redaction. Walk each key marker and replace
+    // the segment following it (up to the next `/` or `?` or end).
+    for k in PATH_KEYS {
+        let marker = format!("/{}/", k);
+        let mut search_start = 0;
+        while let Some(idx) = s[search_start..].find(&marker) {
+            let abs = search_start + idx + marker.len();
+            // Find end of value: next '/' or '?' or end-of-string.
+            let tail = &s[abs..];
+            let end = tail
+                .find(|c: char| c == '/' || c == '?')
+                .unwrap_or(tail.len());
+            if end > 0 {
+                s.replace_range(abs..abs + end, "<redacted>");
+            }
+            // Advance past the redaction so we don't re-scan it.
+            search_start = abs + "<redacted>".len();
+            if search_start >= s.len() {
+                break;
+            }
+        }
+    }
+
+    // Pass 2: query-param redaction. Each `?key=` or `&key=` followed by
+    // value up to the next `&` or `#` or end.
+    for k in QUERY_KEYS {
+        let prefixes = [format!("?{k}="), format!("&{k}=")];
+        for prefix in &prefixes {
+            let mut search_start = 0;
+            while let Some(idx) = s[search_start..].find(prefix) {
+                let abs = search_start + idx + prefix.len();
+                let tail = &s[abs..];
+                let end = tail
+                    .find(|c: char| c == '&' || c == '#')
+                    .unwrap_or(tail.len());
+                if end > 0 {
+                    s.replace_range(abs..abs + end, "<redacted>");
+                }
+                search_start = abs + "<redacted>".len();
+                if search_start >= s.len() {
+                    break;
+                }
+            }
+        }
+    }
+
+    s
 }
 
 /// Force a fresh manifest fetch, bypassing the 5-minute MANIFEST_CACHE
@@ -934,6 +1247,9 @@ pub async fn refresh_addon_manifest(addon_url: String) -> Result<AddonManifest, 
     // catalog-level success caches keyed against this base so the
     // refresh actually surfaces the new state on next home load.
     manifest_cache().lock().unwrap().remove(&base);
+    // Mirror the eviction to disk so the next launch doesn't warm an
+    // entry the user just asked to discard.
+    save_manifest_cache_to_disk();
     let prefix = format!("{base}|");
     if let Ok(mut ok)   = catalog_ok_cache().lock()   { ok.retain(|k, _| !k.starts_with(&prefix)); }
     if let Ok(mut fail) = addon_fail_cache().lock()   { fail.retain(|k, _| !k.starts_with(&prefix)); }
@@ -1211,18 +1527,27 @@ pub async fn fetch_catalog(
         }
     };
 
-    let total = response.metas.len();
-    let metas: Vec<_> = match limit {
+    let total_raw = response.metas.len();
+    let raw_metas: Vec<_> = match limit {
         Some(n) => response.metas.into_iter().take(n as usize).collect(),
         None    => response.metas,
     };
+    let (metas, dropped, errors) = parse_meta_array(raw_metas);
+    for err in errors.iter().take(3) {
+        crate::devlog!(
+            warn, "catalog",
+            "[{}] {}/{} skipped malformed meta: {}",
+            label, catalog_type, catalog_id, err,
+        );
+    }
     let kept = metas.len();
     crate::devlog!(
         info, "catalog",
-        "[{}] {}/{} skip={} → {} item(s){}",
+        "[{}] {}/{} skip={} → {} item(s){}{}",
         label, catalog_type, catalog_id,
         skip.unwrap_or(0), kept,
-        if kept != total { format!(" (sliced from {total})") } else { String::new() },
+        if kept + dropped != total_raw { format!(" (sliced from {total_raw})") } else { String::new() },
+        if dropped > 0 { format!(" ({dropped} dropped)") } else { String::new() },
     );
     let sanitized: Vec<MetaPreview> = metas.into_iter().map(sanitize_meta).collect();
     // Stash successful first-page responses into the stale-fallback
@@ -1404,7 +1729,8 @@ pub async fn global_search(
                 if let Ok(resp) = client().get(&url).send().await {
                     if let Ok(resp) = resp.error_for_status() {
                         if let Ok(cr) = resp.json::<CatalogResponse>().await {
-                            results.extend(cr.metas.into_iter().map(sanitize_meta));
+                            let (metas, _, _) = parse_meta_array(cr.metas);
+                            results.extend(metas.into_iter().map(sanitize_meta));
                         }
                     }
                 }
@@ -1481,7 +1807,7 @@ pub async fn search_addon_grouped(
             ty = c.media_type,
             id = c.id,
         );
-        crate::devlog!(info, "search", "[{}] GET {url}", addon_name_str);
+        crate::devlog!(info, "search", "[{}] GET {}", addon_name_str, redact_sensitive_url(&url));
         let items: Vec<MetaPreview> = match client().get(&url).send().await {
             Ok(resp) => {
                 if !resp.status().is_success() {
@@ -1493,7 +1819,10 @@ pub async fn search_addon_grouped(
                     continue;
                 }
                 match resp.json::<CatalogResponse>().await {
-                    Ok(cr) => cr.metas.into_iter().map(sanitize_meta).collect(),
+                    Ok(cr) => {
+                        let (metas, _, _) = parse_meta_array(cr.metas);
+                        metas.into_iter().map(sanitize_meta).collect()
+                    }
                     Err(e) => {
                         crate::devlog!(
                             warn, "search",
@@ -1563,7 +1892,7 @@ pub async fn fetch_search_catalog_expanded(
     let url = format!(
         "{base}/catalog/{media_type}/{catalog_id}/search={encoded}&skip=0.json",
     );
-    crate::devlog!(info, "search", "[expand] GET {url}");
+    crate::devlog!(info, "search", "[expand] GET {}", redact_sensitive_url(&url));
     let resp = client()
         .get(&url)
         .send()
@@ -1576,8 +1905,9 @@ pub async fn fetch_search_catalog_expanded(
         .json::<CatalogResponse>()
         .await
         .map_err(|e| format!("JSON parse failed: {e}"))?;
-    let items: Vec<MetaPreview> = cr.metas.into_iter().map(sanitize_meta).collect();
-    crate::devlog!(info, "search", "[expand] {url} → {} item(s)", items.len());
+    let (metas, _, _) = parse_meta_array(cr.metas);
+    let items: Vec<MetaPreview> = metas.into_iter().map(sanitize_meta).collect();
+    crate::devlog!(info, "search", "[expand] {} → {} item(s)", redact_sensitive_url(&url), items.len());
     Ok(items)
 }
 
@@ -1635,7 +1965,7 @@ pub async fn global_search_grouped(
                     ty = c.media_type,
                     id = c.id,
                 );
-                crate::devlog!(info, "search", "[{}] GET {url}", addon_name_str);
+                crate::devlog!(info, "search", "[{}] GET {}", addon_name_str, redact_sensitive_url(&url));
                 let items: Vec<MetaPreview> = match client().get(&url).send().await {
                     Ok(resp) => {
                         if !resp.status().is_success() {
@@ -1647,7 +1977,10 @@ pub async fn global_search_grouped(
                             continue;
                         }
                         match resp.json::<CatalogResponse>().await {
-                            Ok(cr) => cr.metas.into_iter().map(sanitize_meta).collect(),
+                            Ok(cr) => {
+                                let (metas, _, _) = parse_meta_array(cr.metas);
+                                metas.into_iter().map(sanitize_meta).collect()
+                            }
                             Err(e) => {
                                 crate::devlog!(
                                     warn, "search",
@@ -1878,7 +2211,7 @@ pub async fn fetch_meta_detail(
     let url = format!("{base}/meta/{media_type}/{id}.json");
     let label = log_label("", &base);
 
-    crate::devlog!(info, "meta", "[{}] GET {}", label, url);
+    crate::devlog!(info, "meta", "[{}] GET {}", label, redact_sensitive_url(&url));
 
     let json: serde_json::Value = client()
         .get(&url)
@@ -2477,7 +2810,7 @@ fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
             .map(|first| ["filler", "recap"]
                 .iter()
                 .filter(|k| first.get(*k).is_some())
-                .map(|k| *k)
+                .copied()
                 .collect::<Vec<_>>())
             .unwrap_or_default();
         crate::devlog!(
@@ -2593,8 +2926,7 @@ fn cast_members_from_objects(
                     let photo = o.get("photo")
                         .and_then(|p| p.as_str())
                         .filter(|s| !s.is_empty())
-                        .map(|s| sanitize_url(Some(s.to_string())))
-                        .flatten();
+                        .and_then(|s| sanitize_url(Some(s.to_string())));
                     Some(CastMember {
                         name: cap(name.to_string(), per_entry),
                         character,
@@ -2901,7 +3233,7 @@ pub async fn fetch_streams(
             let addon_name = addon.name.clone();
 
             let url = format!("{base}/stream/{media_type}/{id}.json");
-            crate::devlog!(info, "streams", "[{}] GET {}", label, url);
+            crate::devlog!(info, "streams", "[{}] GET {}", label, redact_sensitive_url(&url));
 
             // Per-request 35 s timeout overrides the global 10 s default.
             // AIOStreams orchestrators (TorBox Search, MediaFusion, etc.)
@@ -3250,11 +3582,10 @@ fn infer_aio_stat_category(title: &str) -> AioCategory {
 /// and the immediately-following whitespace. Lightweight: walks the
 /// string and discards prefix codepoints that look like emoji.
 fn strip_leading_emoji(s: &str) -> &str {
-    let mut iter = s.char_indices();
     let mut end = 0;
-    while let Some((i, c)) = iter.next() {
+    for (i, c) in s.char_indices() {
         let is_emoji_prefix = (c as u32) >= 0x1F300       // misc symbols / pictographs +
-            || (c as u32) >= 0x2600 && (c as u32) <= 0x27BF // misc + dingbats
+            || ((c as u32) >= 0x2600 && (c as u32) <= 0x27BF) // misc + dingbats
             || c == '\u{FE0F}'                             // variation selector-16
             || c == '\u{200D}';                            // ZWJ
         if !is_emoji_prefix && !c.is_whitespace() {
@@ -3511,38 +3842,39 @@ pub async fn fetch_external_subtitles(
     let safe_type = cap(media_type, 32);
     let safe_id   = cap(id, 128);
 
-    let mut set: tokio::task::JoinSet<Vec<ExternalSubtitle>> = tokio::task::JoinSet::new();
-    for addon in addons {
+    let slot_len = addons.len();
+    let mut set: tokio::task::JoinSet<(usize, Vec<ExternalSubtitle>)> = tokio::task::JoinSet::new();
+    for (idx, addon) in addons.into_iter().enumerate() {
         let media_type = safe_type.clone();
         let id         = safe_id.clone();
         set.spawn(async move {
             let base = normalise_addon_base(&addon.url);
 
-            let Ok((wire, _)) = fetch_manifest(&base).await else { return vec![]; };
+            let Ok((wire, _)) = fetch_manifest(&base).await else { return (idx, vec![]); };
             let label = log_label(&wire.name, &base);
             if !manifest_has_subtitle_resource(&wire) {
-                return vec![];
+                return (idx, vec![]);
             }
             let addon_name = wire.name.clone();
 
             let url = format!("{base}/subtitles/{media_type}/{id}.json");
-            crate::devlog!(info, "subtitles", "[{}] GET {}", label, url);
+            crate::devlog!(info, "subtitles", "[{}] GET {}", label, redact_sensitive_url(&url));
             let Ok(resp) = client().get(&url).send().await else {
                 crate::devlog!(warn, "subtitles", "[{}] request failed", label);
-                return vec![];
+                return (idx, vec![]);
             };
             let Ok(resp) = resp.error_for_status() else {
                 crate::devlog!(warn, "subtitles", "[{}] HTTP error", label);
-                return vec![];
+                return (idx, vec![]);
             };
             let Ok(json) = resp.json::<serde_json::Value>().await else {
                 crate::devlog!(warn, "subtitles", "[{}] JSON parse failed", label);
-                return vec![];
+                return (idx, vec![]);
             };
 
             let Some(arr) = json.get("subtitles").and_then(|v| v.as_array()) else {
                 crate::devlog!(info, "subtitles", "[{}] no `subtitles` array", label);
-                return vec![];
+                return (idx, vec![]);
             };
 
             let kept: Vec<ExternalSubtitle> = arr.iter()
@@ -3550,18 +3882,30 @@ pub async fn fetch_external_subtitles(
                 .filter_map(|s| sanitize_external_subtitle(s, &addon_name))
                 .collect();
             crate::devlog!(info, "subtitles", "[{}] → {} subtitle(s)", label, kept.len());
-            kept
+            (idx, kept)
         });
+    }
+
+    // Collect into per-addon slots so the merged list follows installed-addon
+    // order regardless of which network task finished first. JoinSet yields in
+    // completion order — relying on that scrambled the subtitle list (the
+    // ordering bug). Dedupe-by-URL is applied in addon order.
+    let mut slots: Vec<Vec<ExternalSubtitle>> =
+        std::iter::repeat_with(Vec::new).take(slot_len).collect();
+    while let Some(task_result) = set.join_next().await {
+        if let Ok((idx, items)) = task_result {
+            if idx < slots.len() {
+                slots[idx] = items;
+            }
+        }
     }
 
     let mut all: Vec<ExternalSubtitle> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    while let Some(task_result) = set.join_next().await {
-        if let Ok(items) = task_result {
-            for s in items {
-                if seen.insert(s.url.clone()) {
-                    all.push(s);
-                }
+    for slot in slots {
+        for s in slot {
+            if seen.insert(s.url.clone()) {
+                all.push(s);
             }
         }
     }

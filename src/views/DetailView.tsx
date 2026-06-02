@@ -16,6 +16,8 @@ import type {
   VideoEntry,
 } from "../types";
 import { isVideoAired } from "../types";
+import { computeReleaseCountdowns, formatCountdown, formatTargetDate, nextAiringEpisode, useCountdownNow } from "../releaseCountdown";
+import EpisodeAirChip from "../EpisodeAirChip";
 import { loadAuraSettings } from "../auraSettings";
 import { useReleaseSignal } from "../releaseSignalStore";
 import { fetchReleaseSignal } from "../releaseSearch";
@@ -78,7 +80,7 @@ function streamCacheGet(key: string): StreamFetchResult | null {
 function streamCacheDelete(key: string): void {
   streamCache.delete(key);
 }
-import { useEpisodeProgress, useResumeVideoId } from "../LibraryContext";
+import { useEpisodeProgress, useResumeVideoId, useEpisodesBehind } from "../LibraryContext";
 import SpectralPulse from "../SpectralPulse";
 import WatchedBadge, { useWatchedVariant } from "../WatchedBadge";
 import { openContextMenu } from "../ContextMenu";
@@ -94,7 +96,7 @@ import ImageLoader from "../ImageLoader";
 import ErrorBoundary from "../ErrorBoundary";
 import { parseStream, chipStyleFor, type ChipKind } from "../streamMeta";
 import Tooltip from "../Tooltip";
-import { BrandLogo, ratingDomain } from "../logodev";
+import { BrandLogo, ratingDomain, groupRatingsByBrand } from "../logodev";
 import { hasUsableRating } from "../ratingValue";
 
 // ---------------------------------------------------------------------------
@@ -159,6 +161,11 @@ interface Props {
    *  initial mount effect runs). Lets the parent clear the hint so a
    *  later open from an unrelated card doesn't inherit it. */
   onConsumeOpenHint?: () => void;
+  /** When set, the episode row matching this id gets a persistent selection
+   *  ring (notification deep-link). Distinct from openOnEpisodeId, which only
+   *  selects the season + scrolls. */
+  highlightEpisodeId?: string | null;
+  onConsumeHighlight?: () => void;
   /** When true, suppress the "resume from CW" auto-route to streams
    *  mode. Used by the Library tab's series-click path: clicking a
    *  series in the Library should drop the user on the episode list
@@ -274,7 +281,7 @@ export default function DetailView(props: Props) {
   );
 }
 
-function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, openOnEpisodeId, onConsumeOpenHint, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
+function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
   const [detail, setDetail]                 = useState<MetaDetail | null>(null);
   const [streams, setStreams]               = useState<StreamEntry[]>([]);
   const [streamMeta, setStreamMeta]         = useState<StreamMetadata>({
@@ -355,6 +362,9 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
   //      doesn't ship a videos array — that's what was causing the
   //      "Continue Watching opens a blank page" complaint.
   const rawResumeVideoId = useResumeVideoId(meta.id);
+  // "N episodes behind" for an airing series (red, meta strip below). null
+  // when not airing or fully caught up.
+  const episodesBehind = useEpisodesBehind(detail?.videos, meta.id);
   // Library-tab clicks pass `ignoreResumeHint`, which suppresses the
   // CW resume behaviour: from Library, opening a series should drop
   // the user on the episode list at S01E01 regardless of where they
@@ -420,6 +430,15 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
   const [scrollOnceTo, setScrollOnceTo] = useState<string | null>(openOnEpisodeId ?? null);
   useEffect(() => {
     if (openOnEpisodeId) onConsumeOpenHint?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // Notification deep-link selection ring — snapshot at mount + consume the
+  // parent hint (mirrors scrollOnceTo) so a later unrelated open doesn't
+  // inherit it. Persists for this mount; only the matching row in its season
+  // lights up.
+  const [ringEpisodeId] = useState<string | null>(highlightEpisodeId ?? null);
+  useEffect(() => {
+    if (highlightEpisodeId) onConsumeHighlight?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   // Clear the local hint AFTER the EpisodesPanel has had a chance to
@@ -685,7 +704,7 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
     // crowd them past the six-tile cap. Otherwise sort by aggregator
     // weight DESC (IMDb 100, MAL 95, RT 90, …; addon-only sources 50).
     const ANIME_FIRST = ["myanimelist", "anilist", "mal rank", "mal popularity"];
-    return [...map.values()].sort((a, b) => {
+    const sorted = [...map.values()].sort((a, b) => {
       if (isAnime) {
         const ai = ANIME_FIRST.indexOf(a.source.toLowerCase());
         const bi = ANIME_FIRST.indexOf(b.source.toLowerCase());
@@ -697,6 +716,7 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
       }
       return (b.weight ?? 50) - (a.weight ?? 50);
     });
+    return groupRatingsByBrand(sorted);
   }, [detail?.ratings, aggregateRatings, isAnime]);
 
   // Fetch streams: movies use parent id; series/anime use the picked video
@@ -837,6 +857,19 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
     if (v) setActiveVideo(v);
   }, [detail?.videos, openInStreamsMode, openOnEpisodeId, isEpisodic, activeVideo]);
 
+  // Notification deep-link: populate the episode synopsis by selecting the
+  // ringed episode — WITHOUT switching to streams mode (stay on the list so the
+  // user sees the ring + scroll + synopsis together). Guarded on panelMode so it
+  // never fights a real episode click (which routes to streams).
+  useEffect(() => {
+    if (!ringEpisodeId) return;
+    if (activeVideo) return;
+    if (panelMode === "streams") return;
+    if (!isEpisodic) return;
+    const v = resolveResumeEpisode(ringEpisodeId, detail?.videos);
+    if (v) setActiveVideo(v);
+  }, [ringEpisodeId, detail?.videos, panelMode, isEpisodic, activeVideo]);
+
   const groupedStreams = useMemo(() => {
     const map = new Map<string, StreamEntry[]>();
     for (const s of streams) {
@@ -852,6 +885,9 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
     detail?.background ?? meta.background ??
     meta.fanart ?? meta.backdrop ?? meta.poster ?? null;
   const logoArt = detail?.logo ?? meta.logo ?? null;
+  // Series poster used as the thumbnail for UNAIRED episodes (instead of a
+  // blurred frame) — portrait poster cropped to the 16:9 thumb.
+  const episodeFallbackArt = detail?.poster ?? detail?.background ?? meta.poster ?? null;
 
   const openTransform = fromRect
     ? (() => {
@@ -1010,8 +1046,37 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
               </h1>
             )}
 
-            {/* Dense meta strip */}
-            <div className="flex items-center gap-3 flex-wrap text-[14px] font-mono uppercase tracking-[0.14em]">
+            {/* Dense meta strip.
+                Readability over bright hero art (e.g. a light anime
+                character face) is handled two ways:
+                  1. A localized scrim "plate" — a left-anchored dark
+                     gradient that fades to transparent on the right. It
+                     bleeds horizontally (negative L/R margin) and adds a
+                     little vertical padding, but deliberately sets NO
+                     top/bottom margin so the parent `space-y-7` rhythm is
+                     untouched. Unlike the hero's bottom gradient, this
+                     travels WITH the strip, so it backs the text wherever
+                     the content column places it (the strip sits mid-art,
+                     not at the bottom edge).
+                  2. text-shadow, which inherits to every chip / Stat /
+                     countdown glyph for a dark halo on top of the plate.
+                Together they keep the mid-tone mono text and the accent
+                countdown legible on any backdrop. */}
+            <div
+              className="flex items-center gap-3 flex-wrap text-[14px] font-mono uppercase tracking-[0.14em]"
+              style={{
+                textShadow: "0 1px 4px rgba(0,0,0,0.92), 0 0 10px rgba(0,0,0,0.6)",
+                background:
+                  "linear-gradient(100deg, rgba(0,0,0,0.62) 0%, rgba(0,0,0,0.44) 50%, rgba(0,0,0,0) 100%)",
+                paddingTop: "7px",
+                paddingBottom: "7px",
+                paddingLeft: "14px",
+                paddingRight: "28px",
+                marginLeft: "-14px",
+                marginRight: "-28px",
+                borderRadius: "10px",
+              }}
+            >
               {/* Anime chip leads the strip when applicable so the
                   classification reads first; the type chip (Movies /
                   Series) follows. Detection now folds in the meta-
@@ -1025,11 +1090,11 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
                 original_language:    detail?.original_language ?? null,
                 production_countries: detail?.production_countries ?? null,
               }) && (
-                <span className="px-2.5 py-1 rounded-sm bg-pink-500/15 border border-pink-400/30
-                                 text-pink-300 text-[12px] font-semibold">Anime</span>
+                <span className="px-2.5 py-1 rounded-sm bg-pink-500/25 border border-pink-400/40
+                                 text-pink-100 text-[12px] font-semibold backdrop-blur-sm">Anime</span>
               )}
-              <span className="px-2.5 py-1 rounded-sm bg-white/12 border border-white/18
-                               text-white/85 text-[12px] font-semibold">
+              <span className="px-2.5 py-1 rounded-sm bg-black/35 border border-white/25
+                               text-white/90 text-[12px] font-semibold backdrop-blur-sm">
                 {typeLabel(detail?.media_type ?? meta.media_type)}
               </span>
               {(detail?.release_info ?? meta.release_info) && (
@@ -1093,6 +1158,27 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
                 );
               })()}
               {detail?.runtime && <Stat label="Runtime" value={detail.runtime} />}
+              {episodesBehind != null && (
+                <span className="text-red-400 text-[13px] font-semibold">
+                  {episodesBehind} episode{episodesBehind === 1 ? "" : "s"} behind
+                </span>
+              )}
+              {/* Live release countdown(s) — MOVIES ONLY here. Series/anime
+                  next-episode/premiere countdowns now live on the episode
+                  list (the next-airing row's chip), so the meta strip carries
+                  only a film's cinematic / digital (~45d est.) dates.
+                  computeReleaseCountdowns returns only upcoming dates, so
+                  nothing renders for fully-released content. */}
+              {detail && computeReleaseCountdowns(detail)
+                .filter((c) => c.kind === "cinematic" || c.kind === "digital")
+                .map((c) => (
+                <CountdownStat
+                  key={c.kind}
+                  label={c.label}
+                  targetMs={c.targetMs}
+                  title={`${c.label}: ${formatTargetDate(c.targetMs)}`}
+                />
+              ))}
             </div>
 
             {/* Ratings row — surfaced as its own tile band below the
@@ -1106,7 +1192,10 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
                 merged with whatever the addon shipped. We render at
                 most six. */}
             {mergedRatings.length > 0 && (
-              <div className="flex items-center gap-2.5 flex-wrap -mt-1">
+              <div
+                className="flex items-center gap-2.5 flex-wrap -mt-1"
+                style={{ textShadow: "0 1px 3px rgba(0,0,0,0.85)" }}
+              >
                 {mergedRatings.slice(0, 6).map((r) => (
                   <RatingTile
                     key={r.source}
@@ -1160,16 +1249,34 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
 
             <div className="h-px w-20 bg-ln-accent/65" aria-hidden />
 
-            {/* Synopsis — larger size + weight for "Command Center" presence */}
-            {(detail?.description ?? meta.description) && (
-              <p
-                className="text-white/95 text-[18px] leading-[1.55] font-normal tracking-[0.005em]
-                           max-w-prose selectable"
-                style={{ textShadow: "0 1px 6px rgba(0,0,0,0.85)" }}
-              >
-                {detail?.description ?? meta.description}
-              </p>
-            )}
+            {/* Synopsis — larger size + weight for "Command Center" presence.
+                Season-aware: when a season is selected and that season has
+                its own overview (season_credits[s].overview), show it
+                instead of the show-level description, falling back to the
+                show description when absent. Populated for TMDB/TVDB
+                live-action seasons; empty for MAL/Kitsu anime (it then
+                falls through to the show description until AIOMetadata
+                surfaces per-season overviews). */}
+            {(() => {
+              const seasonOverview =
+                selectedSeason != null && detail?.season_credits
+                  ? detail.season_credits[String(selectedSeason)]?.overview
+                  : null;
+              const shown =
+                typeof seasonOverview === "string" && seasonOverview.trim()
+                  ? seasonOverview
+                  : (detail?.description ?? meta.description);
+              if (!shown) return null;
+              return (
+                <p
+                  className="text-white/95 text-[18px] leading-[1.55] font-normal tracking-[0.005em]
+                             max-w-prose selectable"
+                  style={{ textShadow: "0 1px 6px rgba(0,0,0,0.85)" }}
+                >
+                  {shown}
+                </p>
+              );
+            })()}
 
             {/* Per-episode synopsis — surfaces below the show synopsis
                 whenever the user has selected an episode in EpisodePane
@@ -1338,7 +1445,24 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
             onCopy={(text) => navigator.clipboard.writeText(text).catch(() => {})}
             onPlayExternal={(url) => openUrl(url).catch(() => {})}
             scrollToVideoId={scrollOnceTo}
+            highlightVideoId={ringEpisodeId}
+            seriesArt={episodeFallbackArt}
             onScrollHandled={handleScrollHandled}
+            // Per-season display names (e.g. anime cour titles like "Stone
+            // Wars") keyed by season number, for the label under the season
+            // dropdown. Populated for TMDB/TVDB live-action seasons; EMPTY
+            // for MAL/Kitsu anime today (so nothing renders until
+            // AIOMetadata surfaces season_credits[n].name for anime). Only
+            // non-empty names are forwarded.
+            seasonNames={(() => {
+              const sc = detail?.season_credits;
+              if (!sc) return undefined;
+              const out: Record<string, string> = {};
+              for (const [k, v] of Object.entries(sc)) {
+                if (typeof v?.name === "string" && v.name.trim()) out[k] = v.name;
+              }
+              return Object.keys(out).length ? out : undefined;
+            })()}
           />
           {/* AIOStreams notice badges — portal-rendered into the document
               body and anchored to the aside's left edge via getBoundingClientRect.
@@ -1365,6 +1489,32 @@ function Stat({ label, value }: { label: string; value: string }) {
     <span className="inline-flex items-baseline gap-1.5">
       <span className="text-white/45 text-[11px] tracking-[0.2em]">{label}</span>
       <span className="text-white/95 text-[14px] font-medium">{value}</span>
+    </span>
+  );
+}
+
+// Accent-coloured sibling of Stat for the live release countdown — same
+// baseline layout as the surrounding meta tiles so it sits cleanly in the
+// strip, but tinted with the theme accent + a clock glyph to read as a
+// "time until" element rather than a static fact. `title` carries the full
+// target date for hover.
+//
+// Owns its OWN 1 s tick via useCountdownNow so only this leaf re-renders
+// every second — DetailViewBody (cast grid, episode list, ratings) must NOT
+// tick. The parent computes the countdown SET once and passes targetMs.
+function CountdownStat({ label, targetMs, title }: { label: string; targetMs: number; title?: string }) {
+  const now = useCountdownNow();
+  return (
+    <span className="inline-flex items-center gap-1.5" title={title}>
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           strokeWidth="2" className="text-ln-accent/80" aria-hidden>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+      <span className="text-ln-accent/70 text-[11px] tracking-[0.2em]">{label}</span>
+      <span className="text-ln-accent text-[14px] font-semibold tabular-nums">
+        {formatCountdown(targetMs, now)}
+      </span>
     </span>
   );
 }
@@ -2047,12 +2197,19 @@ interface PanelProps {
   /** Season parsed from the catalog entry's title — forwarded to
    *  EpisodesPanel so e.g. "Dorohedoro Season 2" opens on season 2. */
   seasonHint?: number | null;
+  /** Per-season display names keyed by season number (string), for the
+   *  label under the season dropdown. Undefined when no named seasons. */
+  seasonNames?: Record<string, string>;
+  /** Notification deep-link: row matching this id gets a selection ring. */
+  highlightVideoId?: string | null;
+  /** Series poster shown as the thumbnail for unaired episodes. */
+  seriesArt?: string | null;
 }
 
 function UnifiedPanel({
   mode, isEpisodic, seriesId, seriesMediaType, videos, activeVideo, streams, streamMeta, streamsLoading,
   groupedStreams, metaLoading, onPickEpisode, onBackToEpisodes, onPlay, onCopy, onPlayExternal,
-  scrollToVideoId, onScrollHandled, seasonHint,
+  scrollToVideoId, onScrollHandled, seasonHint, seasonNames, highlightVideoId, seriesArt,
 }: PanelProps) {
   // The streams panel needs `position: relative` so the floating AIOStreams
   // status icons (rendered with `absolute -top-3 -left-3`) anchor to its
@@ -2092,6 +2249,9 @@ function UnifiedPanel({
             onScrollHandled={onScrollHandled}
             metaLoading={metaLoading}
             seasonHint={seasonHint}
+            seasonNames={seasonNames}
+            highlightVideoId={highlightVideoId}
+            seriesArt={seriesArt}
           />
         </div>
       ) : (
@@ -2128,7 +2288,7 @@ function UnifiedPanel({
 // ---------------------------------------------------------------------------
 
 const EpisodeRow = ({
-  video, seriesId, seriesMediaType, isActive, onPick, seasonVideos,
+  video, seriesId, seriesMediaType, isActive, onPick, seasonVideos, isNextAiring, isDeepLinked, seriesArt,
 }: {
   video: VideoEntry;
   seriesId: string;
@@ -2140,6 +2300,13 @@ const EpisodeRow = ({
   /** All episodes in the currently-displayed season, in episode order.
    *  Drives the "this & above / below / all" right-click bulk options. */
   seasonVideos: VideoEntry[];
+  /** True for the single earliest-future-dated episode across the series
+   *  (computed once by the panel). Drives the live "Airs in …" chip. */
+  isNextAiring?: boolean;
+  /** True for the notification deep-linked episode — adds a selection ring. */
+  isDeepLinked?: boolean;
+  /** Series poster — thumbnail fallback for unaired episodes. */
+  seriesArt?: string | null;
 }) => {
   const progress = useEpisodeProgress(seriesId, video.id);
   const watchedVariant = useWatchedVariant(video.id);
@@ -2166,6 +2333,13 @@ const EpisodeRow = ({
   // via useWatchedVariant). The transition makes the un-blur feel
   // intentional when the user marks an episode watched.
   const shouldBlur = blurEnabled && !isWatched;
+
+  // Unaired = a parseable FUTURE air date. isVideoAired treats missing /
+  // unparseable dates as aired, so undated specials stay untouched. The
+  // next-airing row (flagged by the panel) shows the live countdown chip;
+  // later unaired rows show a static "Airs <date>" + the same dim veil.
+  const unaired = !isVideoAired(video);
+  const airMs = unaired && video.released ? Date.parse(video.released) : null;
 
   return (
     <button
@@ -2344,13 +2518,20 @@ const EpisodeRow = ({
                   border
                   ${isActive
                     ? "bg-ln-accent/15 border-ln-accent/40"
-                    : "border-transparent hover:bg-white/6 border-white/0"}`}
+                    : "border-transparent hover:bg-white/6 border-white/0"}${isDeepLinked ? " ring-2 ring-ln-accent/80" : ""}`}
     >
       <div
         className="relative flex-shrink-0 w-40 rounded overflow-hidden bg-white/5 border border-white/10"
         style={{ aspectRatio: "16 / 9" }}
       >
-        {video.thumbnail ? (
+        {unaired && seriesArt ? (
+          <ImageLoader
+            src={seriesArt}
+            alt=""
+            className="absolute inset-0 w-full h-full"
+            imgClassName="w-full h-full object-cover"
+          />
+        ) : video.thumbnail ? (
           <ImageLoader
             src={video.thumbnail}
             alt=""
@@ -2367,6 +2548,13 @@ const EpisodeRow = ({
             aria-hidden
             className="absolute inset-0 bg-black/30 transition-opacity duration-300"
           />
+        )}
+
+        {/* Unaired veil — dims upcoming episodes so they read as "not yet
+            available" at a glance. Above the image, below the badges /
+            progress bar so those stay legible. */}
+        {unaired && (
+          <div aria-hidden className="absolute inset-0 bg-black/45" />
         )}
 
         {/* Watched / in-progress badge — top-LEFT, matches catalog
@@ -2434,6 +2622,12 @@ const EpisodeRow = ({
             />
           </div>
         )}
+
+        {/* Next-to-air countdown — CW-tile-style pill overlaid on the art.
+            Only the single next-airing episode renders it (one live tick). */}
+        {isNextAiring && airMs != null && (
+          <EpisodeAirChip targetMs={airMs} />
+        )}
       </div>
       <div className="flex-1 min-w-0 flex flex-col py-1 justify-center gap-1.5">
         <p className="flex items-baseline gap-3 font-mono text-[14px] tracking-[0.16em] uppercase">
@@ -2442,11 +2636,15 @@ const EpisodeRow = ({
               ? `E${String(video.episode).padStart(2, "0")}`
               : "EP"}
           </span>
-          {video.released && (
-            <span className="text-white/45">
+          {unaired && airMs != null ? (
+            <span className="text-white/45 tracking-wide whitespace-nowrap">
+              Airs {new Date(airMs).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}
+            </span>
+          ) : video.released ? (
+            <span className="text-white/45 tracking-wide whitespace-nowrap">
               {new Date(video.released).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}
             </span>
-          )}
+          ) : null}
         </p>
         <p className={`text-[19px] leading-snug font-medium line-clamp-2
                        ${isActive ? "text-white" : "text-white/95"}`}>
@@ -2464,7 +2662,7 @@ const EpisodeRow = ({
 
 function EpisodesPanel({
   seriesId, seriesMediaType, videos, activeVideo, onPick, scrollToVideoId, onScrollHandled,
-  metaLoading, seasonHint,
+  metaLoading, seasonHint, seasonNames, highlightVideoId, seriesArt,
 }: {
   seriesId: string;
   seriesMediaType: string;
@@ -2479,6 +2677,13 @@ function EpisodesPanel({
    *  in the cour-aggregated videos, UNLESS a resume / just-played
    *  target (scrollToVideoId) already pins a season — that wins. */
   seasonHint?: number | null;
+  /** Per-season display names keyed by season number — shown under the
+   *  dropdown (e.g. anime cour titles). Empty/undefined → nothing renders. */
+  seasonNames?: Record<string, string>;
+  /** Notification deep-link: the row matching this id gets a selection ring. */
+  highlightVideoId?: string | null;
+  /** Series poster shown as the thumbnail for unaired episodes. */
+  seriesArt?: string | null;
 }) {
   const seasons = useMemo(() => {
     const set = new Set<number>();
@@ -2502,6 +2707,12 @@ function EpisodesPanel({
   );
   const targetSeason = resolvedScrollTarget?.season ?? null;
   const resolvedScrollId = resolvedScrollTarget?.id ?? null;
+  // Resolve the deep-link ring target to the current videos shape (same path
+  // as the scroll target) so the right row lights up across legacy/cour ids.
+  const highlightId = useMemo(
+    () => resolveResumeEpisode(highlightVideoId, videos)?.id ?? highlightVideoId ?? null,
+    [videos, highlightVideoId],
+  );
 
   // Priority: resume / just-played season (targetSeason) > catalog
   // title season (seasonHint, only if that cour actually exists in the
@@ -2581,6 +2792,15 @@ function EpisodesPanel({
     list.sort((a, b) => (a.episode ?? 0) - (b.episode ?? 0));
     return list;
   }, [videos, season, seasons.length]);
+
+  // The single next-to-air episode across ALL seasons (not just the one
+  // displayed) — its row gets the live countdown chip. Recomputed only
+  // when the video list changes; no per-second tick here (the chip owns
+  // its own tick) so the list never re-renders on the clock.
+  const nextAiringId = useMemo(
+    () => nextAiringEpisode(videos)?.id ?? null,
+    [videos],
+  );
 
   // Scroll the requested video to the top of the list once it's
   // present in the DOM. We retry on a short tick because `videos` may
@@ -2693,6 +2913,7 @@ function EpisodesPanel({
                   seasons={seasons}
                   value={season}
                   onChange={setSeason}
+                  names={seasonNames}
                 />
                 <span className="absolute right-1 text-white/45 text-[13px] font-mono tracking-wider">
                   {inSeason.length} {inSeason.length === 1 ? "ep" : "eps"}
@@ -2719,6 +2940,9 @@ function EpisodesPanel({
                     isActive={activeVideo?.id === v.id}
                     onPick={onPick}
                     seasonVideos={inSeason}
+                    isNextAiring={v.id === nextAiringId}
+                    isDeepLinked={v.id === highlightId}
+                    seriesArt={seriesArt}
                   />
                 </div>
               ))}
@@ -2832,6 +3056,25 @@ const KIND_ORDER: MessageKind[] = ["error", "warning", "info", "stats"];
 /** Floating cluster of 1–4 status icons anchored OUTSIDE the panel's top-left
  *  corner. Each icon corresponds to a non-empty message kind and reveals the
  *  relevant rows in a hover tooltip. */
+/** When AIOStreams returns a "Digital Release Filter" notice (no digital
+ *  release available yet), the other notices (errors / stats / etc.) are just
+ *  noise — keep ONLY the Digital-Release-Filter message(s). */
+function suppressNoisyNotices(metadata: StreamMetadata): StreamMetadata {
+  const isDrf = (m: StreamMessage) =>
+    /digital release filter/i.test(m.title ?? "") ||
+    /digital release filter/i.test(m.description);
+  const all = [...metadata.errors, ...metadata.warnings, ...metadata.info, ...metadata.stats];
+  if (!all.some(isDrf)) return metadata;
+  const keep = (rows: StreamMessage[]) => rows.filter(isDrf);
+  return {
+    ...metadata,
+    errors:   keep(metadata.errors),
+    warnings: keep(metadata.warnings),
+    info:     keep(metadata.info),
+    stats:    keep(metadata.stats),
+  };
+}
+
 function StreamMetaBadges({
   metadata,
   anchorRef,
@@ -2877,6 +3120,14 @@ function StreamMetaBadges({
     // (or the fallback timeout in DetailViewBody).
     if (!entered) return;
     reposition();
+    // The entrance transform can still be settling when `entered` flips via the
+    // 480 ms fallback timeout (no transitionend fired) — the aside's rect is then
+    // the centre-scaled one, and nothing re-measures afterward (a ResizeObserver
+    // doesn't fire on an ancestor transform). Re-measure on a short cascade so the
+    // FINAL position lands post-settle and the cluster can't freeze mid-screen.
+    const raf = requestAnimationFrame(reposition);
+    const t1 = setTimeout(reposition, 220);
+    const t2 = setTimeout(reposition, 520);
     window.addEventListener("resize", reposition);
     window.addEventListener("scroll", reposition, true);
     // ResizeObserver — covers panel resizes that don't fire window resize
@@ -2885,17 +3136,21 @@ function StreamMetaBadges({
     const ro = el ? new ResizeObserver(reposition) : null;
     if (ro && el) ro.observe(el);
     return () => {
+      cancelAnimationFrame(raf);
+      clearTimeout(t1);
+      clearTimeout(t2);
       window.removeEventListener("resize", reposition);
       window.removeEventListener("scroll", reposition, true);
       ro?.disconnect();
     };
   }, [entered, reposition, anchorRef]);
 
+  const md = suppressNoisyNotices(metadata);
   const allBuckets: { kind: MessageKind; rows: StreamMessage[] }[] = [
-    { kind: "error",   rows: metadata.errors   },
-    { kind: "warning", rows: metadata.warnings },
-    { kind: "info",    rows: metadata.info     },
-    { kind: "stats",   rows: metadata.stats    },
+    { kind: "error",   rows: md.errors   },
+    { kind: "warning", rows: md.warnings },
+    { kind: "info",    rows: md.info     },
+    { kind: "stats",   rows: md.stats    },
   ];
   const buckets = allBuckets.filter((b) => b.rows.length > 0);
 
@@ -3115,11 +3370,12 @@ function StreamMessageRow({ message, kind }: { message: StreamMessage; kind: Mes
  *  AIOStreams returned status messages — replaces the "No streams found"
  *  fallback. */
 function StreamMessagesEmptyState({ metadata }: { metadata: StreamMetadata }) {
+  const md = suppressNoisyNotices(metadata);
   const allGroups: { kind: MessageKind; rows: StreamMessage[] }[] = [
-    { kind: "error",   rows: metadata.errors   },
-    { kind: "warning", rows: metadata.warnings },
-    { kind: "info",    rows: metadata.info     },
-    { kind: "stats",   rows: metadata.stats    },
+    { kind: "error",   rows: md.errors   },
+    { kind: "warning", rows: md.warnings },
+    { kind: "info",    rows: md.info     },
+    { kind: "stats",   rows: md.stats    },
   ];
   const groups = allGroups.filter((g) => g.rows.length > 0);
 

@@ -57,6 +57,24 @@ export function ratingDomain(source: string): string | null {
   return null;
 }
 
+/** Stable regroup so same-brand rating rows sit together (e.g. all MAL tiles:
+ *  score + rank + popularity, which carry different `source` strings). Preserves
+ *  input order WITHIN and BETWEEN brands — callers sort by weight first, then
+ *  this clusters by brand with each brand positioned at its highest-weight
+ *  (= first-seen) member. Unknown sources (ratingDomain null) group on the
+ *  lowercased source string. */
+export function groupRatingsByBrand<T extends { source: string }>(rows: T[]): T[] {
+  const order: string[] = [];
+  const groups = new Map<string, T[]>();
+  for (const r of rows) {
+    const key = ratingDomain(r.source) ?? r.source.toLowerCase();
+    let g = groups.get(key);
+    if (!g) { g = []; groups.set(key, g); order.push(key); }
+    g.push(r);
+  }
+  return order.flatMap((k) => groups.get(k)!);
+}
+
 /** Tooltip suffix disambiguating critic vs audience — ONLY for the
  *  sources that actually publish both axes (Rotten Tomatoes'
  *  Tomatometer vs Audience Score, Metacritic's Metascore vs User

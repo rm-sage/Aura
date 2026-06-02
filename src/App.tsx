@@ -55,9 +55,9 @@ import NextUpCta from "./NextUpCta";
 import EosSpotlight from "./EosSpotlight";
 import EpisodePanel from "./EpisodePanel";
 import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPreviousEpisode } from "./nextUp";
-import { getMetaDetailFallback, peekCachedDetailById, peekFreshestPostersByIds } from "./metaCache";
+import { getMetaDetailFallback, getRichestMetaDetail, peekCachedDetailById, peekRichestCachedDetailById, peekFreshestPostersByIds } from "./metaCache";
 import { PersistentCache } from "./persistentCache";
-import { loadAuraSettings } from "./auraSettings";
+import { applyReducedMotionAttribute, loadAuraSettings } from "./auraSettings";
 
 interface AniSkipResult {
   found: boolean;
@@ -89,6 +89,7 @@ interface BackendSettingsLite {
 }
 import type { ContextMenuItem } from "./ContextMenu";
 import { normalizeLibrary } from "./libraryNormalize";
+import { useLibraryArtRetry } from "./libraryArtRetry";
 import { LibraryProvider } from "./LibraryContext";
 import { NotificationsProvider, useNotifications } from "./NotificationsContext";
 import NotificationsBell from "./NotificationsBell";
@@ -105,6 +106,7 @@ import type {
   VideoEntry,
 } from "./types";
 import { isVideoAired } from "./types";
+import { nextAiringEpisode } from "./releaseCountdown";
 import type { UserSession, StremioAccount } from "./LoginView";
 import "./App.css";
 
@@ -959,6 +961,29 @@ function pickArt(...candidates: (string | null | undefined)[]): string | null {
   return null;
 }
 
+/** Robust anime check for the active playback target. Series episodes key
+ *  their anime signals (id-prefix, genres, localStorage cache) at the SERIES
+ *  ROOT — `target.id` is the EPISODE id (tt…:S:E) and never matches — so we
+ *  resolve `series_id` and feed the library item's genres. Mirrors the
+ *  stats-ticker detection; the single source of truth for "is the thing on
+ *  screen anime", shared by the motion-interpolation gate and in-player UI. */
+function activeTargetIsAnime(
+  target: ActiveScrobbleTarget,
+  library: LibraryItem[],
+): boolean {
+  const recordId = target.series_id ?? target.id;
+  const libItem = library.find((i) => i.id === recordId);
+  const stateGenres = (libItem?.state ?? {}).genres;
+  const genres = Array.isArray(stateGenres)
+    ? stateGenres.filter((g): g is string => typeof g === "string")
+    : undefined;
+  return isAnimeMeta({
+    media_type: target.media_type,
+    id:         recordId,
+    genres,
+  });
+}
+
 export default function App() {
   // ── Nav state ──
   const [activeView, setActiveView] = useState<NavView>("home");
@@ -1002,6 +1027,11 @@ export default function App() {
 
   // ── Library (Continue Watching + Calendar source) ──
   const [library, setLibrary] = useState<LibraryItem[]>([]);
+  // Backfill posters for art-less Library items (often unreleased), retrying
+  // ~hourly per id. In-memory only — never touches the Stremio cloud record.
+  useLibraryArtRetry(library, addons, (id, poster) => {
+    setLibrary((prev) => prev.map((it) => (it.id === id && !it.poster ? { ...it, poster } : it)));
+  });
   // Resume-from-progress prompt: when handlePlayStream sees a saved
   // timeOffset for the target, it sets `pendingResume` to a deferred
   // pair of resolvers (onResume / onStartOver). The prompt component
@@ -1016,6 +1046,21 @@ export default function App() {
    *  series root leaves the per-episode rows live on the server and the
    *  next sync re-surfaces them as ghost tiles. */
   const [rawLibrary, setRawLibrary] = useState<LibraryItem[]>([]);
+  // Always-current mirror of rawLibrary, read by callbacks that would
+  // otherwise have to list `rawLibrary` in their useCallback deps. Keeping
+  // handleLibraryRemove out of the rawLibrary dependency makes it
+  // referentially stable, so the LibraryView grid's memoized cards don't ALL
+  // re-render every time the library list churns (poster-warm, focus
+  // refetch). Updating a ref during render is safe — it's not observable
+  // state, just the latest value for imperative reads.
+  const rawLibraryRef = useRef(rawLibrary);
+  rawLibraryRef.current = rawLibrary;
+  // Same always-current mirror for the normalized library — lets the
+  // playback stats ticker resolve an item's genres (for anime detection)
+  // by series-root id without listing `library` in its effect deps (which
+  // would reset the 5 s tick timer every poster-warm/refetch).
+  const libraryRef = useRef(library);
+  libraryRef.current = library;
   /** False until the first library_get for the current session has resolved.
    *  Drives the LibraryView skeleton state — without this we'd flash an
    *  empty-state card during the initial fetch. */
@@ -1303,16 +1348,13 @@ export default function App() {
         // Apply preferred language tracks after MPV has had time to detect
         // the available audio/subtitle streams.
         //
-        // `media_type === "anime"` alone misses most titles — anime
-        // catalogs from AIOMetadata typically tag content as `series` or
-        // `movie` and rely on the `kitsu:` / `anilist:` / `mal:` /
-        // `anidb:` ID prefix to mark it as anime. `isAnimeMeta` checks
-        // both. Without this, every anime got the global English audio
-        // pref instead of the Japanese-first anime defaults.
-        const animeFlag = isAnimeMeta({
-          media_type: target.media_type,
-          id: target.id,
-        });
+        // Robust anime detection: series episodes key their signals at the
+        // SERIES ROOT (id-prefix / genres / cache), and `target.id` is the
+        // EPISODE id, so we resolve series_id + feed the library item's
+        // genres. Drives both the Japanese-first audio/sub defaults AND the
+        // motion-interpolation gate (interp is anime-only), so they stay
+        // consistent with the in-player toggle's `isAnime`.
+        const animeFlag = activeTargetIsAnime(target, libraryRef.current);
         setTimeout(() => {
           invoke("apply_lang_defaults", { isAnime: animeFlag }).catch(() => {});
           // Re-push the user's subtitle styling so a freshly-loaded
@@ -1330,7 +1372,7 @@ export default function App() {
           // so it never touches libmpv during the loadfile critical
           // section (landmine #3).
           invoke("set_motion_interpolation", {
-            enabled: !!motionInterpolation,
+            enabled: !!motionInterpolation && animeFlag,
             tscale: interpolationTscale ?? "mitchell",
           }).catch(() => {});
           // Hover-thumbnail pre-warm. `extract_thumbnail` lazily spins
@@ -2027,16 +2069,14 @@ export default function App() {
   //     toggle without restarting Aura)
   //   • Aura-level `reduceMotion` setting changes (user toggles via
   //     Settings → Appearance — dispatches `aura:settings-changed`)
-  // Lazy import (`require` style via dynamic) would defeat the
-  // tree-shake, so we import statically from auraSettings; the
-  // function is a one-line DOM write so the bundle cost is trivial.
+  // applyReducedMotionAttribute is statically imported (line 60) so
+  // this effect can run synchronously on first render — the previous
+  // dynamic `import("./auraSettings")` re-resolved a chunk that was
+  // already in the main bundle and introduced an unnecessary
+  // microtask delay before the first attribute write.
   useEffect(() => {
-    let importedApply: (() => void) | null = null;
-    import("./auraSettings").then((mod) => {
-      importedApply = mod.applyReducedMotionAttribute;
-      importedApply();
-    });
-    const apply = () => importedApply?.();
+    applyReducedMotionAttribute();
+    const apply = () => applyReducedMotionAttribute();
     const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
     mq.addEventListener("change", apply);
     window.addEventListener("aura:settings-changed", apply);
@@ -2294,7 +2334,16 @@ export default function App() {
       const meaningfulTime  = watchedElapsedRef.current >= 5 * 60;
       const playedEpisodeId = activeTarget.id;
       const isSeriesEpisode = activeTarget.series_id != null && activeTarget.series_id !== activeTarget.id;
-      if (meaningfulRatio && meaningfulTime && playedEpisodeId) {
+      // Respect the shared per-play guard: the 90%-autocomplete (onAdvance)
+      // and handleExitPlayback paths coordinate through autoHistoryWrittenId
+      // so an episode is logged once. Without this check, an episode that
+      // already crossed 90% (onAdvance wrote it + set the guard) gets a
+      // SECOND row here when the user then clicks "Play next episode" — the
+      // two writes carry different timestamps so addHistoryEntry's exact
+      // (id, played_at) dedup doesn't catch them. That's the observed
+      // double-add (~3-5 min apart) on binged anime.
+      if (meaningfulRatio && meaningfulTime && playedEpisodeId
+          && autoHistoryWrittenId.current !== playedEpisodeId) {
         // Same VideoEntry-first / id-parse-fallback shape as
         // handleExitPlayback's history append — see that block for
         // the rationale (post-AIOMetadata-patch non-tt ids would
@@ -2327,6 +2376,9 @@ export default function App() {
           duration:      dur || undefined,
           watched_seconds: watched,
         });
+        // Claim the guard so handleExitPlayback (and a same-play onAdvance)
+        // won't re-log this episode. Reset per-load in notifyNewLoad.
+        autoHistoryWrittenId.current = playedEpisodeId;
       }
     }
 
@@ -2375,6 +2427,7 @@ export default function App() {
   // END-CARD wording differs from a true finale).
   const [eosResolve, setEosResolve] = useState<"idle" | "resolving" | "ready" | "none">("idle");
   const [eosCaughtUpUnaired, setEosCaughtUpUnaired] = useState(false);
+  const [eosNextAirMs, setEosNextAirMs] = useState<number | null>(null);
   const [eosEpisodesOpen, setEosEpisodesOpen] = useState(false);
   /** Episode id whose EOS resolution has already been kicked off, so
    *  the resolution effect's own `setEosResolve("resolving")` re-run
@@ -2391,6 +2444,7 @@ export default function App() {
     if (!eosActive || !activeTarget) {
       setEosResolve("idle");
       setEosCaughtUpUnaired(false);
+      setEosNextAirMs(null);
       setEosEpisodesOpen(false);
       eosResolveStartedFor.current = null;
       return;
@@ -2427,15 +2481,27 @@ export default function App() {
       // up — next season not yet aired": re-run the walk ignoring the
       // aired filter (a far-future `now`); a hit there means a later
       // episode exists but simply hasn't aired.
+      // RICHEST detail (most videos) for the caught-up vs finale call —
+      // prefer the full episode list DetailView already cached, else fetch
+      // the richest across addons. peekCachedDetailById / getMetaDetailFallback
+      // can return a leaner entry (freshest-by-ts, or the FIRST addon with
+      // any videos) that omits future-dated episodes, making a still-airing
+      // show look finished (wrong "Series finale" + a missing countdown).
       const detail =
-        peekCachedDetailById(seriesId) ??
-        (await getMetaDetailFallback(addons, mediaType, seriesId));
+        peekRichestCachedDetailById(seriesId) ??
+        (await getRichestMetaDetail(addons, mediaType, seriesId));
       if (cancelled) return;
       const laterIgnoringAir = detail
         ? findNextEpisode(detail, currentId, Number.MAX_SAFE_INTEGER,
             loadAuraSettings().nextUpSkipFillerRecap)
         : null;
+      const nextAirMs = detail ? (nextAiringEpisode(detail.videos)?.targetMs ?? null) : null;
+      console.info(
+        `[eos] caught-up check seriesId=${seriesId} videos=${detail?.videos?.length ?? 0} ` +
+          `laterIgnoringAir=${laterIgnoringAir ? laterIgnoringAir.id : "none"} nextAirMs=${nextAirMs ?? "none"}`,
+      );
       setEosCaughtUpUnaired(!!laterIgnoringAir);
+      setEosNextAirMs(nextAirMs);
       setEosResolve("none");
     })();
     return () => { cancelled = true; };
@@ -2696,6 +2762,61 @@ export default function App() {
     void reconcileLibraryReleaseSignals(library, !session?.auth_key);
   }, [library, session?.auth_key]);
 
+  // Reactive mirror of the Queue page's "remove series once started"
+  // toggle. Synced via the settings-changed event so flipping it
+  // retroactively reconciles the queue below (not just on next playback).
+  const [queueRemoveSeriesInProgress, setQueueRemoveSeriesInProgress] = useState(
+    () => loadAuraSettings().queueRemoveSeriesInProgress,
+  );
+  useEffect(() => {
+    const sync = () =>
+      setQueueRemoveSeriesInProgress(loadAuraSettings().queueRemoveSeriesInProgress);
+    window.addEventListener("aura:settings-changed", sync);
+    return () => window.removeEventListener("aura:settings-changed", sync);
+  }, []);
+
+  // ── Queue ⇄ Library reconciliation ──
+  // The Queue is the local "planned" subset of manualWatched. It can drift
+  // from reality two ways; both are reconciled here whenever the library
+  // changes (or the toggle flips):
+  //
+  //   (a) Orphaned tombstone — "Mark as Planned" auto-adds to the library,
+  //       but a later removal (past build, cross-client sync, removal while
+  //       closed) can leave the planned mark behind for content the user no
+  //       longer has saved. Pruned when the library record is removed:true.
+  //       Keyed on removed:true SPECIFICALLY (not mere absence) because
+  //       Stremio is eventually consistent: a freshly-added planned item can
+  //       briefly vanish from the array during library_put → library_get,
+  //       and pruning on absence would race that into deleting a valid mark.
+  //
+  //   (b) Graduated out of "to watch" — a planned MOVIE that's been watched
+  //       (≥90%) or a planned SERIES that's in-progress (any episode started,
+  //       gated by the toggle). Manual "planned" masks the WatchedBadge's
+  //       auto-derived state, so without this an already-started/finished
+  //       planned item would linger in the Queue forever. Movies are
+  //       unconditional (a watched movie is done); series are preference.
+  useEffect(() => {
+    if (!libraryLoaded) return;
+    const planned = getPlannedQueue();
+    if (planned.length === 0) return;
+    const byId = new Map(library.map((it) => [it.id, it] as const));
+    for (const id of planned) {
+      const item = byId.get(id);
+      if (!item) continue;
+      if (item.removed) { setManualWatchedState(id, null); continue; }
+      const off = typeof item.state?.timeOffset === "number" ? item.state.timeOffset : 0;
+      const dur = typeof item.state?.duration === "number" ? item.state.duration : 0;
+      if (dur <= 0 || off <= 0) continue;
+      const mt = (item.media_type ?? "").toLowerCase();
+      const isSeries = mt === "series" || mt === "anime";
+      if (isSeries) {
+        if (queueRemoveSeriesInProgress) setManualWatchedState(id, null);
+      } else if (off / dur >= 0.9) {
+        setManualWatchedState(id, null);
+      }
+    }
+  }, [library, libraryLoaded, queueRemoveSeriesInProgress]);
+
   // Clear the store on sign-out / account switch so signals from a
   // prior scope don't leak into the next account's surfaces.
   useEffect(() => {
@@ -2776,10 +2897,23 @@ export default function App() {
       const last = lastStatsTickRef.current ?? now;
       const delta = (now - last) / 1000;
       lastStatsTickRef.current = now;
-      // Pick a kind based on media type + the anime detection hook.
+      // Pick a kind based on media type + anime detection. CRITICAL: use
+      // the SERIES-ROOT id (series_id), not activeTarget.id — for series
+      // the latter is the EPISODE id (tt…:S:E), which never matches the
+      // anime-id cache or genre signal (both keyed at the series root), so
+      // IMDb-id'd anime series (Frieren etc.) were mis-counted as Series.
+      // Also feed the library item's genres so anime tagged only by genre
+      // (no kitsu/mal id prefix) is caught — covers anime movies too.
+      const recordId = activeTarget.series_id ?? activeTarget.id;
+      const libItem = libraryRef.current.find((i) => i.id === recordId);
+      const stateGenres = (libItem?.state ?? {}).genres;
+      const genres = Array.isArray(stateGenres)
+        ? stateGenres.filter((g): g is string => typeof g === "string")
+        : undefined;
       const isAnime = isAnimeMeta({
         media_type: activeTarget.media_type,
-        id:         activeTarget.id,
+        id:         recordId,
+        genres,
       });
       const kind = isAnime
         ? "watched_anime_secs"
@@ -2789,6 +2923,18 @@ export default function App() {
     lastStatsTickRef.current = Date.now();
     return () => clearInterval(id);
   }, [activeTarget, paused]);
+
+  // ── Keep the display awake during active playback ──
+  // Under the mpv2 render engine, mpv (vo=libmpv) owns no window and can't
+  // run its own stop-screensaver, so the monitor would sleep mid-episode
+  // after the OS idle timeout. Assert the keep-awake hold whenever the
+  // player is up AND not paused; release otherwise (paused / browsing →
+  // normal sleep, matching mpv's default). The Rust side applies
+  // SetThreadExecutionState from the engine's render thread.
+  useEffect(() => {
+    invoke("set_keep_display_awake", { enabled: isPlayerActive && !paused })
+      .catch(() => {});
+  }, [isPlayerActive, paused]);
 
   // Home-view dwell time. The same 5 s cadence accumulates against
   // home_view_secs whenever activeView === "home" and the player isn't up.
@@ -2973,6 +3119,14 @@ export default function App() {
       setRawLibrary((prev) =>
         prev.filter((i) => libraryItemSeriesId(i.id) !== meta.id),
       );
+      // "Planned" auto-adds to the library, so removing from the library
+      // must also drop the Queue (planned) membership — otherwise an
+      // orphaned Queue tile lingers for content the user no longer has
+      // saved. Only "planned" is cleared; "watched"/"in-progress" are
+      // independent historical marks that should survive a library remove.
+      if (getManualWatchedState(meta.id) === "planned") {
+        setManualWatchedState(meta.id, null);
+      }
     } else {
       const newItem: LibraryItem = {
         id:         meta.id,
@@ -3033,6 +3187,11 @@ export default function App() {
     setRawLibrary((prev) =>
       prev.filter((i) => libraryItemSeriesId(i.id) !== item.id),
     );
+    // Drop Queue (planned) membership too — see handleLibraryToggle's
+    // remove branch for the rationale (planned ⟹ in library invariant).
+    if (getManualWatchedState(item.id) === "planned") {
+      setManualWatchedState(item.id, null);
+    }
 
     if (originPoint) {
       showFlyUpToast(`Removed from Library · ${item.name}`, {
@@ -3043,7 +3202,7 @@ export default function App() {
     }
 
     try {
-      const result = await libraryRemoveAll(session.auth_key, item.id, rawLibrary);
+      const result = await libraryRemoveAll(session.auth_key, item.id, rawLibraryRef.current);
       if (result.removedCount === 0) {
         // Nothing matched on the server — surface to the user, then
         // force a refresh so the optimistic state is reconciled.
@@ -3059,7 +3218,7 @@ export default function App() {
       if (String(err) === SESSION_EXPIRED) await handleSessionExpired();
       window.dispatchEvent(new CustomEvent("aura:library-changed"));
     }
-  }, [session, rawLibrary, handleSessionExpired]);
+  }, [session, handleSessionExpired]);
 
   // ── Card right-click — listens for "aura:card-context" events fired by
   //     CatalogCard / ContinueWatchingCard / PosterCard. App builds the menu
@@ -3480,26 +3639,19 @@ export default function App() {
     invoke<UserSession | null>("get_session")
       .then(async (sess) => {
         if (sess) {
-          // Pre-0.6.9 sessions in the keyring don't carry `user_id`.
-          // Backfill it from Stremio's `/getUser` BEFORE the scope
-          // hash is derived for the first time — otherwise the very
-          // first sync_pull_all uses the legacy auth_key-derived
-          // scope and re-asserts the cross-device-inconsistent
-          // bucket. Backfill failures are non-fatal; sync.rs falls
-          // back to the legacy scope so the user isn't locked out.
+          // Don't await `backfill_user_id` on boot any more. The
+          // history-store migration falls back to `legacyAuthScope`
+          // (a hash of `auth_key.slice(0, 12)`) whenever `user_id`
+          // is absent — that's been the legacy-session compat path
+          // since 0.6.x and works fine. Awaiting the round-trip
+          // here added 200–800 ms to every cold start on
+          // legacy-shaped sessions for no user-visible payoff;
+          // backfill still runs in the background so the NEXT
+          // launch's `get_session` picks up the persisted user_id.
           if (!sess.user_id) {
-            try {
-              const backfilled = await invoke<string | null>("backfill_user_id");
-              // Merge the backfilled user_id into the in-memory
-              // session BEFORE applySettingsScope runs — otherwise
-              // the scope derivation on this launch still falls
-              // back to the legacy auth_key prefix and the history-
-              // store migration can't anchor on the new user_id-
-              // based scope.
-              if (backfilled) sess = { ...sess, user_id: backfilled };
-            } catch (e) {
+            void invoke<string | null>("backfill_user_id").catch((e) => {
               console.warn(`[auth] backfill_user_id failed: ${String(e)}`);
-            }
+            });
           }
           await applySettingsScope(sess);
           setSession(sess);
@@ -3518,7 +3670,15 @@ export default function App() {
               }
             })
             .catch(() => {});
-          await Promise.all([loadSyncedAddons(sess), loadLibrary(sess)]);
+          // Library + synced-addons load is fire-and-forget. Each
+          // path already paints from its localStorage warm cache
+          // immediately on the synchronous setX(cached) inside its
+          // own function; awaiting the cloud refetch here just
+          // delayed the splash for a redundant network round-trip.
+          // The setters fire mid-flight via React state updates;
+          // nothing downstream of `authChecked` reads from them
+          // synchronously.
+          void Promise.all([loadSyncedAddons(sess), loadLibrary(sess)]);
         } else {
           await applySettingsScope(null);
           loadLocalAddons();
@@ -4343,6 +4503,11 @@ export default function App() {
    *  re-opening detail views from elsewhere doesn't re-anchor. */
   const [lastPlayedEpisodeId, setLastPlayedEpisodeId] = useState<string | null>(null);
   const consumeLastPlayedEpisode = useCallback(() => setLastPlayedEpisodeId(null), []);
+  // Notification deep-link ring: set ONLY by the notifications → open-meta path,
+  // so a normal post-playback return (which also uses lastPlayedEpisodeId for
+  // season select + scroll) does NOT get the selection ring.
+  const [deepLinkEpisodeId, setDeepLinkEpisodeId] = useState<string | null>(null);
+  const consumeDeepLinkEpisode = useCallback(() => setDeepLinkEpisodeId(null), []);
 
   // EOF auto-exit REMOVED (EOS Spotlight, 2026-05-19): the dead `eof`
   // carrier never fired (Rust never sets PlaybackState.eof). End-of-
@@ -4915,7 +5080,7 @@ export default function App() {
       // The most-recently-suppressed candidate is shown the next
       // time the user navigates back to a bell-visible surface.
       popupSuppressed={isPlayerActive || selectedMeta != null}
-      onOpenMeta={(metaId, mediaType) => {
+      onOpenMeta={(metaId, mediaType, videoId) => {
         // Reconstruct a MetaPreview from the LibraryItem when available
         // (covers the scanner's episode notifications since they always
         // refer to a series the user has in their library). Falls back to
@@ -4956,6 +5121,10 @@ export default function App() {
         // bell's host so the user expects to land there on a click.
         setActiveCatalog(null);
         setActiveView("home");
+        if (videoId) {
+          setLastPlayedEpisodeId(videoId); // season select + scroll-to-row
+          setDeepLinkEpisodeId(videoId);   // selection ring (notification only)
+        }
         openDetail(stub);
       }}
     />
@@ -4982,6 +5151,39 @@ export default function App() {
           renders below it. The `opaque` prop thickens the bar to fully
           black during playback so MPV's video doesn't bleed through. */}
       {!isFullscreen && <TitleBar opaque={isPlayerActive} />}
+
+      {/* ── FSO gap cover ──
+          The mpv2 engine renders its WGL surface 1px shorter than the
+          monitor in native fullscreen (see FSO_HEIGHT_INSET in
+          src-tauri/src/mpv2/engine.rs). That geometric break is what stops
+          Win11's DWM from promoting the surface to Independent Flip /
+          Multi-Plane Overlay — a promotion that would drop the engine out
+          of composition and make the React UI vanish, colours go raw, other
+          monitors flash black, and the toggle take 2-3 s. Occluding the
+          engine from above does NOT work (multi-plane GPUs give the engine
+          its own overlay plane regardless); the engine surface's OWN size
+          has to differ from the output. The downside is a 1px row at the
+          very bottom that the engine no longer paints — left bare it shows
+          desktop bleed-through (a bright line). This strip covers that row
+          with solid black so it reads as a thin letterbox edge instead.
+          A few px tall (not 1) so it reliably covers the gap even across
+          the engine's per-frame resize cadence; the overlap onto the
+          engine's bottom video row is imperceptible. Fullscreen-only. */}
+      {isFullscreen && (
+        <div
+          aria-hidden
+          style={{
+            position: "fixed",
+            bottom: 0,
+            left: 0,
+            width: "100%",
+            height: "2px",
+            background: "#000",
+            zIndex: 2147483647,
+            pointerEvents: "none",
+          }}
+        />
+      )}
 
       {/* ── Body ── */}
       {showLanding ? (
@@ -5192,6 +5394,7 @@ export default function App() {
       {isPlayerActive && (
         <PlayerOverlay
           activeTarget={activeTarget}
+          isAnime={activeTarget ? activeTargetIsAnime(activeTarget, library) : false}
           time={time}
           duration={duration}
           paused={paused}
@@ -5308,6 +5511,7 @@ export default function App() {
             loading={resolving && isSeriesLike}
             isSeries={isSeriesLike}
             caughtUpUnaired={eosCaughtUpUnaired}
+            nextAirTargetMs={eosNextAirMs}
             seriesArt={seriesArt}
             libraryById={libraryById}
             onPlayNext={onEosPlayNext}
@@ -5380,6 +5584,8 @@ export default function App() {
           openOnEpisodeId={lastPlayedEpisodeId}
           ignoreResumeHint={ignoreResumeOnNextOpen}
           onConsumeOpenHint={consumeLastPlayedEpisode}
+          highlightEpisodeId={deepLinkEpisodeId}
+          onConsumeHighlight={consumeDeepLinkEpisode}
           openInStreamsMode={openInStreamsMode}
           onConsumeOpenInStreamsMode={consumeOpenInStreamsMode}
         />
@@ -5496,7 +5702,7 @@ function NotificationsBridge({
    *  to NotificationsContext so the popup bubble is held until the
    *  user navigates back to a bell-visible surface. */
   popupSuppressed: boolean;
-  onOpenMeta: (metaId: string, mediaType?: string) => void;
+  onOpenMeta: (metaId: string, mediaType?: string, videoId?: string) => void;
 }) {
   const { addNotification, setPopupSuppressed, notifications, dismissNotification } = useNotifications();
 
@@ -5620,22 +5826,51 @@ function NotificationsBridge({
   }, [addNotification]);
 
   // aura:open-meta — fired by NotificationsPanel row clicks. The detail
-  // payload is `{ metaId, videoId?, mediaType? }`. We delegate to the
-  // App-level openDetail via the prop callback — videoId would be the
-  // resume hint for series, but DetailView already resolves resume from
-  // libraryState.video_id so we don't need to thread it explicitly.
+  // payload is `{ metaId, videoId?, mediaType? }`. We thread `videoId` through
+  // so an episode-release notification lands on the right season and scrolls
+  // to + rings that episode (onOpenMeta sets the season/scroll hint AND the
+  // notification-only selection ring).
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail as {
         metaId?: string;
         mediaType?: string;
+        videoId?: string;
       } | undefined;
       if (!detail?.metaId) return;
-      onOpenMeta(detail.metaId, detail.mediaType);
+      onOpenMeta(detail.metaId, detail.mediaType, detail.videoId);
     };
     window.addEventListener("aura:open-meta", handler);
     return () => window.removeEventListener("aura:open-meta", handler);
   }, [onOpenMeta]);
+
+  // aura:notify-force — DevConsole `notifyforce` command path. Bypasses
+  // the scanner + cloud entirely and pushes a synthesized notification
+  // through addNotification directly. Detail shape mirrors what the
+  // scanner would emit: { id, kind, title, subtitle?, data? }. Used to
+  // validate the bell/popup pipeline end-to-end when the cloud signal
+  // is empty (or the user just wants to see the UI fire).
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as {
+        id?: string;
+        kind?: "release" | "episode" | "notice" | "success" | "warning" | "error";
+        title?: string;
+        subtitle?: string;
+        data?: Record<string, unknown>;
+      } | undefined;
+      if (!detail?.id || !detail.kind || !detail.title) return;
+      addNotification({
+        id:       detail.id,
+        kind:     detail.kind,
+        title:    detail.title,
+        subtitle: detail.subtitle,
+        data:     detail.data,
+      });
+    };
+    window.addEventListener("aura:notify-force", handler);
+    return () => window.removeEventListener("aura:notify-force", handler);
+  }, [addNotification]);
 
   return (
     <NotificationsScanner

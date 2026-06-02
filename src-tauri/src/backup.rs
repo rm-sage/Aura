@@ -182,9 +182,9 @@ fn prune_dir(dir: &Path, max_keep: usize) -> usize {
         }
     }
 
-    // Newest first within each bucket.
-    manual.sort_by(|a, b| b.1.cmp(&a.1));
-    auto.sort_by(|a, b| b.1.cmp(&a.1));
+    // Newest first within each bucket (descending mtime).
+    manual.sort_by_key(|e| std::cmp::Reverse(e.1));
+    auto.sort_by_key(|e| std::cmp::Reverse(e.1));
 
     let mut removed = 0;
     for (path, _) in manual.into_iter().skip(max_keep) {
@@ -296,7 +296,7 @@ pub async fn list_user_backups<R: Runtime>(
             }
         }
     }
-    out.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+    out.sort_by_key(|m| std::cmp::Reverse(m.created_at_ms));
     Ok(out)
 }
 

@@ -32,6 +32,9 @@ import { getSortedEpisodes } from "./episodeSort";
 import { loadAuraSettings } from "./auraSettings";
 import { shouldBlurThumbnail, isEpisodeWatched } from "./episodeSpoilers";
 import { formatEpisodeTag } from "./nextUp";
+import { isVideoAired } from "./types";
+import { nextAiringEpisode, formatTargetDate } from "./releaseCountdown";
+import EpisodeAirChip from "./EpisodeAirChip";
 
 interface Props {
   open: boolean;
@@ -121,6 +124,13 @@ export default function EpisodePanel({
   const inSeason = useMemo(
     () => sorted.filter((v) => (v.season ?? 0) === season),
     [sorted, season],
+  );
+
+  // Next-to-air episode across ALL seasons — its row shows the live
+  // countdown chip. No per-second tick here; the chip owns its own.
+  const nextAiringId = useMemo(
+    () => nextAiringEpisode(sorted)?.id ?? null,
+    [sorted],
   );
 
   const blurThumbs = loadAuraSettings().blurUnwatchedThumbnails;
@@ -256,6 +266,12 @@ export default function EpisodePanel({
               const watched = isEpisodeWatched(libraryById, v.id);
               const blurThumb = shouldBlurThumbnail(libraryById, v.id, blurThumbs);
               const isPending = pendingPlayId === v.id;
+              // Unaired = parseable FUTURE air date (undated specials count
+              // as aired). The next-to-air row gets the live chip; later
+              // unaired rows a static date. Both dim the thumbnail.
+              const unaired = !isVideoAired(v);
+              const airMs = unaired && v.released ? Date.parse(v.released) : null;
+              const isNextAiring = v.id === nextAiringId;
               return (
                 <button
                   key={v.id}
@@ -303,6 +319,11 @@ export default function EpisodePanel({
                         </svg>
                       </div>
                     )}
+                    {/* Unaired veil — dims upcoming episodes (mirrors
+                        DetailView's EpisodeRow). */}
+                    {unaired && (
+                      <div aria-hidden className="absolute inset-0 bg-black/45" />
+                    )}
                     {watched && (
                       <span className="absolute bottom-1 right-1 w-4 h-4 rounded-full
                                        bg-emerald-500/90 border border-emerald-200/40
@@ -311,6 +332,10 @@ export default function EpisodePanel({
                           <path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
                         </svg>
                       </span>
+                    )}
+                    {/* Next-to-air countdown pill — CW-tile style overlay. */}
+                    {isNextAiring && airMs != null && (
+                      <EpisodeAirChip targetMs={airMs} />
                     )}
                   </div>
                   <div className="flex-1 min-w-0 py-0.5">
@@ -332,6 +357,11 @@ export default function EpisodePanel({
                     <p className="text-white/90 text-[13px] font-medium leading-tight mt-0.5 line-clamp-2">
                       {(v.title ?? "").trim() || "Untitled episode"}
                     </p>
+                    {unaired && airMs != null && (
+                      <p className="text-white/45 text-[11px] mt-1 whitespace-nowrap">
+                        Airs {formatTargetDate(airMs)}
+                      </p>
+                    )}
                   </div>
                   {isPending && (
                     <span

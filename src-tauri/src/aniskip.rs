@@ -560,7 +560,7 @@ pub async fn resolve_mal_id_by_title(
         // Cap the contribution so it can't outweigh title match.
         score += (50_000_u32.saturating_sub(a.mal_id.min(50_000)) / 5_000) as i32;
 
-        if score >= 100 && best.map_or(true, |(s, _)| score > s) {
+        if score >= 100 && best.is_none_or(|(s, _)| score > s) {
             best = Some((score, a.mal_id));
         }
     }
@@ -651,6 +651,13 @@ pub async fn set_skip_windows<R: Runtime>(
         *cache = payload.clone();
     }
     let _ = app.emit("aura:skip-windows", &payload);
+    #[cfg(target_os = "windows")]
+    if crate::mpv2::engine::enabled() && crate::mpv2::engine::is_running() {
+        return crate::mpv2::engine::submit_set_property(
+            "user-data/aura/skip-windows".into(),
+            crate::mpv2::engine::PropValue::String(json),
+        );
+    }
     tauri::async_runtime::spawn_blocking(move || {
         app.mpv()
             .set_property(

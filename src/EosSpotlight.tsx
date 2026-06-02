@@ -36,6 +36,7 @@ import type { LibraryItem, StreamEntry, VideoEntry } from "./types";
 import { formatEpisodeTag } from "./nextUp";
 import { loadAuraSettings } from "./auraSettings";
 import { isEpisodeWatched, shouldBlurSynopsis } from "./episodeSpoilers";
+import { formatCountdown, useCountdownNow } from "./releaseCountdown";
 
 interface Props {
   /** Series / movie display name for the END-CARD heading. */
@@ -53,6 +54,10 @@ interface Props {
   /** True when there IS no next AIRED episode but a later season is
    *  known/likely unaired ("Caught up" wording vs plain "finale"). */
   caughtUpUnaired: boolean;
+  /** Air timestamp (ms) of the next-to-air episode when caught up but the
+   *  season is still going — drives the END-CARD live countdown. null when
+   *  no upcoming date is known (true finale, or next ep unscheduled). */
+  nextAirTargetMs: number | null;
   /** Series landscape/portrait art — the Decision-6 fallback shown
    *  instead of a big blurred still for an unwatched next episode. */
   seriesArt: string | null;
@@ -82,8 +87,30 @@ interface Props {
   episodesOpen: boolean;
 }
 
+// Live "next episode airs in …" line for the caught-up END-CARD. Owns its
+// OWN 1 s tick so only this line re-renders each second (the card is
+// otherwise static). Mirrors DetailView's CountdownStat / EpisodeAirChip.
+function NextAirCountdown({ targetMs }: { targetMs: number }) {
+  const now = useCountdownNow();
+  return (
+    <p className="flex items-center justify-center gap-2 text-ln-accent text-[14px] leading-relaxed mb-6">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           strokeWidth="2" className="text-ln-accent" aria-hidden>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+      <span>
+        Next episode airs in{" "}
+        <span className="font-semibold tabular-nums">
+          {formatCountdown(targetMs, now)}
+        </span>
+      </span>
+    </p>
+  );
+}
+
 export default function EosSpotlight({
-  title, episode, stream, loading, isSeries, caughtUpUnaired,
+  title, episode, stream, loading, isSeries, caughtUpUnaired, nextAirTargetMs,
   seriesArt, libraryById, onPlayNext, onReplay, onExit, onOpenEpisodes,
   onDismiss, episodesOpen,
 }: Props) {
@@ -164,18 +191,16 @@ export default function EosSpotlight({
     ? Math.max(0, Math.min(100, ((initialSeconds - remaining) / initialSeconds) * 100))
     : 0;
 
-  // ── Decision 6 — never show a big blurred still ──
-  // When blurUnwatchedThumbnails is ON and the next episode is unwatched,
-  // render the SERIES art instead of the episode still. Watched episodes
-  // (or the setting off) show the real still. Synopsis still respects
-  // blurEpisodeSynopsis (blur + click-to-reveal), same as DetailView.
+  // Thumbnail source: real episode still when available, falling back
+  // to the series art on misses. The previous behaviour swapped to
+  // series art whenever blurUnwatchedThumbnails was on for an unwatched
+  // episode; that path is removed — blur the still in place instead.
   const epId = episode?.id ?? "";
   const epWatched = isNextUp ? isEpisodeWatched(libraryById, epId) : false;
-  const blurThumbSetting = settings.blurUnwatchedThumbnails;
-  const useSeriesArt =
-    isNextUp && blurThumbSetting && !epWatched;
+  const blurThumb =
+    isNextUp && settings.blurUnwatchedThumbnails && !epWatched;
   const thumbSrc = isNextUp
-    ? (useSeriesArt ? seriesArt : (episode!.thumbnail || seriesArt))
+    ? (episode!.thumbnail || seriesArt)
     : seriesArt;
 
   const [revealed, setRevealed] = useState(false);
@@ -238,7 +263,7 @@ export default function EosSpotlight({
               Up next
             </p>
             <div className="flex gap-6 items-stretch">
-              {/* ── Thumbnail / series-art (Decision 6) ── */}
+              {/* ── Thumbnail (blur on unwatched when the setting is on) ── */}
               <div
                 className="relative flex-shrink-0 w-[300px] max-w-[40vw] rounded-2xl
                            overflow-hidden bg-white/5 border border-white/10"
@@ -250,6 +275,7 @@ export default function EosSpotlight({
                     alt=""
                     className="absolute inset-0 w-full h-full"
                     imgClassName="w-full h-full object-cover"
+                    imgStyle={blurThumb ? { filter: "blur(16px) saturate(115%)", transform: "scale(1.08)" } : undefined}
                   />
                 ) : (
                   <div className="absolute inset-0 flex items-center justify-center text-white/25">
@@ -363,9 +389,6 @@ export default function EosSpotlight({
                   {isSeries && (
                     <button type="button" onClick={onOpenEpisodes} className={`${btnBase} ${btnGhost}`}>
                       Episodes
-                      <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                        <path d="M7 10l5 5 5-5z" />
-                      </svg>
                     </button>
                   )}
                   <button type="button" onClick={onExit} className={`${btnBase} ${btnGhost}`}>
@@ -396,15 +419,23 @@ export default function EosSpotlight({
               {caughtUpUnaired ? "Caught up" : isSeries ? "Series finale" : "Finished"}
             </p>
             <h2 className="text-white text-[24px] font-semibold leading-tight mb-2 max-w-[34ch]">
-              You’ve finished {title}
+              {caughtUpUnaired ? `You’ve caught up on ${title}!` : `You’ve finished ${title}`}
             </h2>
-            <p className="text-white/60 text-[13.5px] leading-relaxed mb-6 max-w-[42ch]">
-              {caughtUpUnaired
-                ? "You’re all caught up — the next season hasn’t aired yet."
-                : isSeries
+            {caughtUpUnaired ? (
+              nextAirTargetMs != null ? (
+                <NextAirCountdown targetMs={nextAirTargetMs} />
+              ) : (
+                <p className="text-white/60 text-[13.5px] leading-relaxed mb-6 max-w-[42ch]">
+                  You’re all caught up — the next episode hasn’t been scheduled yet.
+                </p>
+              )
+            ) : (
+              <p className="text-white/60 text-[13.5px] leading-relaxed mb-6 max-w-[42ch]">
+                {isSeries
                   ? "That’s the last available episode. Nicely done."
                   : "Thanks for watching."}
-            </p>
+              </p>
+            )}
             <div className="flex flex-wrap items-center justify-center gap-2.5">
               <button
                 type="button"
@@ -419,9 +450,6 @@ export default function EosSpotlight({
               {isSeries && (
                 <button type="button" onClick={onOpenEpisodes} className={`${btnBase} ${btnGhost}`}>
                   Episodes
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                    <path d="M7 10l5 5 5-5z" />
-                  </svg>
                 </button>
               )}
               <button type="button" onClick={onExit} className={`${btnBase} ${btnGhost}`}>

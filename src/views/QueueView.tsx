@@ -36,6 +36,7 @@ import { typeLabel } from "../aiometadata";
 import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "../FilterBar";
 import { closeHoverNow } from "../catalogHoverStore";
 import { useHoverCardActivation } from "../useHoverCardActivation";
+import { loadAuraSettings, saveAuraSettings } from "../auraSettings";
 
 // ---------------------------------------------------------------------------
 // QueueView — ordered list of items the user has marked as "planned".
@@ -77,6 +78,26 @@ function QueueViewBody({ library, onSelectMeta }: Props) {
   // drag-reorder; switching to year/rating/name re-sorts inside the
   // filtered subset, which is fine since the filter is opt-in.
   const [filters, setFilters] = useState<FilterState>(DEFAULT_FILTERS);
+  // "Remove series from Queue once started" toggle, mirrored from
+  // auraSettings + synced on settings change (the reconciliation effect in
+  // App.tsx reads the same setting and prunes accordingly). Movies always
+  // leave once watched, regardless of this toggle.
+  const [removeStartedSeries, setRemoveStartedSeries] = useState(
+    () => loadAuraSettings().queueRemoveSeriesInProgress,
+  );
+  useEffect(() => {
+    const sync = () =>
+      setRemoveStartedSeries(loadAuraSettings().queueRemoveSeriesInProgress);
+    window.addEventListener("aura:settings-changed", sync);
+    return () => window.removeEventListener("aura:settings-changed", sync);
+  }, []);
+  const toggleRemoveStartedSeries = () => {
+    const s = loadAuraSettings();
+    saveAuraSettings({
+      ...s,
+      queueRemoveSeriesInProgress: !s.queueRemoveSeriesInProgress,
+    });
+  };
 
   useEffect(() => {
     const sync = () => setOrderedIds(getPlannedQueue());
@@ -196,9 +217,32 @@ function QueueViewBody({ library, onSelectMeta }: Props) {
                   : `${orderedIds.length} planned · drag tiles to reorder.`}
               </p>
             </div>
-            {queuedAsMeta.length > 0 && (
-              <FilterMenu items={queuedAsMeta} state={filters} onChange={setFilters} />
-            )}
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={removeStartedSeries}
+                onClick={toggleRemoveStartedSeries}
+                title="When on, a series leaves the Queue once you start watching it (any episode). Movies always leave the Queue once watched."
+                className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium
+                           border border-white/10 bg-white/5 text-white/65
+                           hover:text-white/90 hover:bg-white/8 transition-colors"
+              >
+                <span
+                  className={`relative w-8 h-[18px] rounded-full transition-colors
+                              ${removeStartedSeries ? "bg-ln-accent/70" : "bg-white/15"}`}
+                >
+                  <span
+                    className={`absolute top-0.5 w-[14px] h-[14px] rounded-full bg-white transition-all
+                                ${removeStartedSeries ? "left-[18px]" : "left-0.5"}`}
+                  />
+                </span>
+                Remove started series
+              </button>
+              {queuedAsMeta.length > 0 && (
+                <FilterMenu items={queuedAsMeta} state={filters} onChange={setFilters} />
+              )}
+            </div>
           </div>
 
           {orderedIds.length === 0 ? (
