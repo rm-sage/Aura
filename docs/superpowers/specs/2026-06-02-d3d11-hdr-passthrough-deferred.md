@@ -1,6 +1,18 @@
 # DEFERRED — D3D11 render path for true HDR passthrough + tone-mapping
 
-Status: **DEFERRED** (filed 2026-06-02). Branch: future work on the render-API line.
+> **⚠ SUPERSEDED 2026-06-03 by
+> `docs/superpowers/specs/2026-06-03-mpv2-hdr-dxgi-interop-design.md`.**
+> This doc's central premise — "switch the engine to `MPV_RENDER_API_TYPE_D3D11`"
+> — is **factually wrong**: the libmpv render API has NO Direct3D backend (only
+> `opengl` + `sw`; see `src-tauri/src/mpv2/ffi.rs:251-259`). The correct approach
+> is a host-owned **DXGI flip swapchain** with mpv's OpenGL output bridged in via
+> **`WGL_NV_DX_interop2`**. Also corrected: `target-colorspace-hint` does NOT work
+> under `vo_libmpv`; HDR needs an FP16 FBO + `gpu-next`. Read the new spec; this
+> one is kept only for history. Also note the dependency chain below is stale —
+> Phase 7 is no longer a hard prerequisite (the thumb extractor that coupled HDR
+> to Phase 7 was ported to a headless `mpv2` FFI instance on 2026-06-03).
+
+Status: **SUPERSEDED** (was DEFERRED, filed 2026-06-02). Branch: future work on the render-API line.
 
 **Dependency chain (must land in order):**
 1. **Phase 7** — retire `tauri-plugin-libmpv` + legacy `--wid` path (currently

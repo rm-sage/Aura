@@ -1485,6 +1485,62 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             }
         }
 
+        // -- HDR mode at init --
+        // The legacy `player::init_mpv` applied the user's persisted HDR
+        // mode (target-colorspace-hint / tone-mapping / target-prim/trc/peak
+        // / hdr-compute-peak) at instance creation; the engine omitted it, so
+        // a fresh mpv2 launch ran with mpv's default tone-mapping until the
+        // user toggled HDR in Settings (which routes through
+        // `apply_hdr_settings` → `submit_set_property`). Mirror the legacy
+        // behaviour here so the first frame already honours the setting.
+        //
+        // NOTE on "passthrough": two things block real HDR here, both
+        // documented in `docs/superpowers/specs/2026-06-03-mpv2-hdr-dxgi-
+        // interop-design.md`. (1) `target-colorspace-hint` is only honoured
+        // by mpv's Wayland / D3D11 / winvk GPU contexts — NOT by `vo=libmpv`
+        // (the render API), so it's a silent no-op for this engine. (2) The
+        // WGL present surface below is an 8-bit SDR framebuffer that can't
+        // carry an HDR signal regardless. True passthrough needs the
+        // DXGI/`WGL_NV_DX_interop2` render path (an FP16 swapchain +
+        // host-owned `SetColorSpace1`). The SDR tone-map options
+        // (`target-prim`/`target-trc`/`target-peak`/`tone-mapping`) DO work
+        // here (they're `vo_gpu`-compatible and just tell mpv what to
+        // encode), so "sdr" and "off" are exactly right; "passthrough" is a
+        // harmless no-op until the DXGI work lands. Applying at init only
+        // changes the default — it does not regress the Settings-toggle path.
+        {
+            let snap = crate::settings::snapshot();
+            let mode = crate::player::resolve_hdr_mode(&snap);
+            let mut hdr_opts: indexmap::IndexMap<String, serde_json::Value> =
+                indexmap::IndexMap::new();
+            crate::player::apply_hdr_options(&mut hdr_opts, mode);
+            for (name, value) in hdr_opts.iter() {
+                let value_str = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Bool(b) => {
+                        if *b { "yes".to_string() } else { "no".to_string() }
+                    }
+                    // apply_hdr_options only ever emits scalars; skip anything
+                    // else rather than send a wrong-format value.
+                    _ => continue,
+                };
+                if let (Ok(name_c), Ok(value_c)) =
+                    (CString::new(name.as_str()), CString::new(value_str.as_str()))
+                {
+                    let r = (lib.set_property_string)(handle, name_c.as_ptr(), value_c.as_ptr());
+                    if r < 0 {
+                        crate::devlog!(
+                            warn, "mpv2",
+                            "HDR init option {name} = {value_str} failed: {}",
+                            err_str(&lib, r),
+                        );
+                    }
+                }
+            }
+            crate::devlog!(info, "mpv2", "HDR mode '{mode}' applied at engine init");
+        }
+
         let ir = (lib.initialize)(handle);
         if ir < 0 {
             crate::devlog!(
