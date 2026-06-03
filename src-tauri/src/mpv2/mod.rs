@@ -67,3 +67,12 @@ pub mod hello;
 // still without playback wiring; those land in Phase 2.2 / 2.4.
 #[cfg(target_os = "windows")]
 pub mod engine;
+
+// Headless hover-seek thumbnail engine — a self-owned `vo=null` libmpv
+// instance on a dedicated worker thread, replacing the plugin-backed
+// "thumb" named instance the scrubber used to drive. No render context
+// (headless), so it's independent of the main playback engine and of the
+// `AURA_MPV2` gate. Removing the plugin from the thumbnail path is the
+// blocker that retiring `tauri-plugin-libmpv` (Phase 7) was waiting on.
+#[cfg(target_os = "windows")]
+pub mod thumb;

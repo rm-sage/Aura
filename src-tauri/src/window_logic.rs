@@ -506,6 +506,14 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     // before app.exit() pulls the process out from under it.
                     #[cfg(target_os = "windows")]
                     crate::mpv2::engine::shutdown_if_running();
+                    // Headless thumbnail engine — no-op when no thumbnail was
+                    // ever requested (the worker is lazy). Otherwise sends
+                    // Shutdown and joins (bounded 2 s) so the thumb mpv handle
+                    // is destroyed before the process exits. audio=no, so it
+                    // holds no WASAPI device — this is tidiness, not a
+                    // correctness requirement.
+                    #[cfg(target_os = "windows")]
+                    crate::mpv2::thumb::shutdown();
                     clear_presence_inner();
                     // Reap the streaming-bridge subprocess so it doesn't
                     // outlive the parent. Without this the bridge keeps
