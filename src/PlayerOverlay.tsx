@@ -2450,31 +2450,19 @@ function Scrubber({
   // sees the loader during fetch latency, never a stale frame.
   const [thumbUrlSec, setThumbUrlSec] = useState<number | null>(null);
   const [thumbBusy, setThumbBusy] = useState(false);
-  const thumbCacheRef = useRef<Map<number, string>>(new Map());
   const thumbReqRef = useRef(0);
 
   useEffect(() => {
-    // Bump reqId FIRST — synchronously, before the cache check — so
-    // that ANY in-flight `.then` from a prior effect run is guaranteed
-    // to see a mismatch and discard, even on the cache-hit early
-    // return. Otherwise a stale fetch resolving during a cache-hit
-    // could overwrite the just-set thumbUrl with the prior sec's
-    // image (the supersession check at the .then catches this only if
-    // the bump happens before the .then runs — which is now always).
+    // Bump reqId FIRST so any in-flight `.then` from a prior effect run sees a
+    // mismatch and discards — the supersession guard that stops a late fetch
+    // painting over a newer hover.
     const reqId = ++thumbReqRef.current;
     if (!thumbnailAtRef.current || hoverIntSec == null) return;
     const sec = hoverIntSec;
-    const cached = thumbCacheRef.current.get(sec);
-    if (cached) {
-      setThumbUrl(cached);
-      setThumbUrlSec(sec);
-      setThumbBusy(false);
-      return;
-    }
-    // New, uncached position → drop the (now stale) frame immediately
-    // so the loader shows rather than the previous second's image.
-    // Pair with thumbUrlSec=null so the render gate falls back to the
-    // loader even if React is mid-commit on the prior URL.
+    // Always extract a FRESH frame for this second — no cache, no recycled or
+    // approximate frames (those showed a far-off "wrong" frame). Drop the prior
+    // frame immediately (+ thumbUrlSec=null) so the loader shows during fetch
+    // latency, never the previous second's image.
     setThumbUrl(null);
     setThumbUrlSec(null);
     setThumbBusy(true);
@@ -2485,15 +2473,6 @@ function Scrubber({
         .then((res) => {
           if (reqId !== thumbReqRef.current) return; // superseded
           if (res) {
-            const c = thumbCacheRef.current;
-            if (c.size > 240) c.clear(); // crude bound; ~a few MB of data URLs
-            // Cache at the ACTUAL playback-time the frame represents
-            // (Rust seek-confirmation poll guarantees pt ≈ requested ±0.5 s).
-            // Alias the requested second too when within 1 s tolerance so
-            // an immediate re-hover at the same integer-second is a hit.
-            const key = Math.max(0, Math.floor(res.at));
-            c.set(key, res.data_url);
-            if (Math.abs(res.at - sec) <= 1) c.set(sec, res.data_url);
             setThumbUrl(res.data_url);
             setThumbUrlSec(sec);
           } else {
@@ -2700,37 +2679,13 @@ function Scrubber({
               </div>
             </div>
           )}
-          {thumbnailAt && (thumbUrl || thumbBusy) && (() => {
-            // Nearest already-cached frame within ~30 s of the hovered second,
-            // shown DIMMED behind the loader while the exact second extracts —
-            // so scrubbing across an already-visited region feels instant and
-            // the empty-loader flash disappears. The exact (crisp) frame, gated
-            // on thumbUrlSec === hoverIntSec, paints over it the moment it lands.
-            const exactReady = thumbUrl != null && thumbUrlSec === hoverIntSec;
-            let approx: string | null = null;
-            if (!exactReady && hoverIntSec != null) {
-              let bestDist = Infinity;
-              for (const [k, v] of thumbCacheRef.current) {
-                const d = Math.abs(k - hoverIntSec);
-                if (d <= 30 && d < bestDist) { bestDist = d; approx = v; }
-              }
-            }
-            return (
+          {thumbnailAt && (thumbUrl || thumbBusy) && (
             <div className="relative w-40 aspect-video rounded-md overflow-hidden
                             aura-glass-menu shadow-[0_8px_24px_-8px_rgba(0,0,0,0.7)]">
-              {approx && (
-                <img
-                  src={approx}
-                  alt=""
-                  draggable={false}
-                  className="absolute inset-0 w-full h-full object-cover opacity-60"
-                />
-              )}
-              {/* Gate the crisp <img> on thumbUrlSec === hoverIntSec so a stale
-                  URL (from a prior sec's fetch resolving after the user moved,
-                  or React batching the state update across a hoverIntSec change)
-                  NEVER paints over a new hover. The dimmed approx frame / loader
-                  fills that gap. */}
+              {/* Gate the <img> on thumbUrlSec === hoverIntSec so a stale URL
+                  (a prior sec's fetch resolving after the user moved) NEVER
+                  paints over a new hover — the loader fills that gap. Each
+                  hover extracts a fresh frame; no cached/approximate frames. */}
               {thumbUrl && thumbUrlSec === hoverIntSec ? (
                 <img
                   src={thumbUrl}
@@ -2740,7 +2695,7 @@ function Scrubber({
                 />
               ) : (
                 <div className="absolute inset-0 flex items-center justify-center">
-                  {!approx && <div className="absolute inset-0 bg-white/5 animate-pulse" />}
+                  <div className="absolute inset-0 bg-white/5 animate-pulse" />
                   <svg
                     className="relative w-5 h-5 animate-spin text-white/70"
                     viewBox="0 0 24 24" fill="none" aria-hidden
@@ -2751,8 +2706,7 @@ function Scrubber({
                 </div>
               )}
             </div>
-            );
-          })()}
+          )}
           <div className="aura-glass-menu rounded px-2 py-0.5 text-[11px]
                           font-mono tabular-nums text-white/90">
             {fmtTime(hoverSec)}
