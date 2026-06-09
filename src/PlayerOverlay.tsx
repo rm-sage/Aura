@@ -2486,7 +2486,13 @@ function Scrubber({
           if (reqId !== thumbReqRef.current) return; // superseded
           if (res) {
             const c = thumbCacheRef.current;
-            if (c.size > 240) c.clear(); // crude bound; ~a few MB of data URLs
+            // Bounded LRU (~100): drop the oldest entry rather than clearing
+            // the whole cache, so warmth near the current scrub position is
+            // kept while RAM stays ~2-3x lower than the old 240/full-clear.
+            if (c.size >= 100) {
+              const oldest = c.keys().next().value;
+              if (oldest !== undefined) c.delete(oldest);
+            }
             // Cache at the ACTUAL playback-time the frame represents
             // (Rust seek-confirmation poll guarantees pt ≈ requested ±0.5 s).
             // Alias the requested second too when within 1 s tolerance so

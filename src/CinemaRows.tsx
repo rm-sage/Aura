@@ -21,9 +21,9 @@ import { formatCountdown, formatTargetDate, airingInfo, nextAiringEpisode, useCo
  *  `${addonUrl}|${type}|${id}`. Persists across DiscoveryRow remounts
  *  (e.g. settings tick re-bootstrapping the home rows) so a user who
  *  has already loaded a row's full list doesn't re-trigger pagination
- *  on subsequent clicks. Module-level Map; never cleared — cleared
- *  state is unnecessary since up to ~100 items × handful of catalogs
- *  is well under any sensible memory ceiling. */
+ *  on subsequent clicks. Module-level Map, bounded to a small LRU (~16
+ *  catalogs) at the write site below — each entry holds up to ~100
+ *  MetaPreview objects, so an unbounded session map was a slow heap leak. */
 const catalogPaginationCache = new Map<string, MetaPreview[]>();
 /** Max items the View-all popup paginates to, mirroring the user's
  *  spec ("up to 100 per catalog"). */
@@ -1110,7 +1110,16 @@ export const DiscoveryRow = memo(function DiscoveryRow(
         const deduped = dedupe(more);
         merged = deduped.length > 0 ? deduped : dedupedItems;
       }
-      if (cacheKey) catalogPaginationCache.set(cacheKey, merged);
+      if (cacheKey) {
+        // Bounded LRU (~16 catalogs): each entry holds up to 100 MetaPreview
+        // objects, so an unbounded session map of View-all results was a slow
+        // heap leak. The result re-paginates cheaply, so eviction is invisible.
+        if (catalogPaginationCache.size >= 16 && !catalogPaginationCache.has(cacheKey)) {
+          const oldest = catalogPaginationCache.keys().next().value;
+          if (oldest !== undefined) catalogPaginationCache.delete(oldest);
+        }
+        catalogPaginationCache.set(cacheKey, merged);
+      }
       setOverflowItems(merged);
     } catch {
       // Fall back to the items we already have so the popup isn't

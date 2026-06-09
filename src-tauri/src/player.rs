@@ -293,14 +293,16 @@ pub fn init_mpv<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     initial_options.insert("cache-pause-initial".into(),     serde_json::json!("no"));
     initial_options.insert("cache-secs".into(),              serde_json::json!(180));
     initial_options.insert("demuxer-readahead-secs".into(),  serde_json::json!(120));
-    // Big byte budgets — 1.5 GiB forward / 256 MiB back. The previous
-    // 512 MiB ceiling capped the cache to ~50 s of video on 4K remuxes
-    // at ~80 Mbps, so the demuxer ran dry mid-playback even though
-    // cache-secs was 120. With 1.5 GiB forward, even ~80 Mbps streams
-    // get a clean ~150 s of headroom and stay continuous through
-    // transient network jitter.
-    initial_options.insert("demuxer-max-bytes".into(),       serde_json::json!(1_536_u64 * 1024 * 1024));
-    initial_options.insert("demuxer-max-back-bytes".into(),  serde_json::json!(256_u64 * 1024 * 1024));
+    // Byte budgets — 768 MiB forward / 128 MiB back. `demuxer-readahead-secs`
+    // (120) is the usual binding constraint; this ceiling only caps the
+    // absolute worst case. 768 MiB still holds ~75-90 s forward on an
+    // ~80 Mbps 4K remux (far above cache-pause-wait=4 s) and the full 120 s
+    // at <=50 Mbps, so re-buffering is unchanged for the vast majority of
+    // streams while halving worst-case demuxer RAM (~875 MB saved at peak).
+    // Kept in sync with mpv2 engine.rs. Was 1.5 GiB/256 MiB — bump both back
+    // up if 4K-remux mid-playback underruns reappear.
+    initial_options.insert("demuxer-max-bytes".into(),       serde_json::json!(768_u64 * 1024 * 1024));
+    initial_options.insert("demuxer-max-back-bytes".into(),  serde_json::json!(128_u64 * 1024 * 1024));
     // Initial-fill threshold AND resume-after-underflow gate.
     // Tuned to 4.0: 2.0 was perceptibly faster to start playback but
     // produced constant rebuffer cycles on bandwidth-limited streams

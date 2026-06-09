@@ -1447,15 +1447,19 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             // Replay can scrub backwards without reloading.
             (b"keep-open\0", b"yes\0"),
             (b"keep-open-pause\0", b"yes\0"),
-            // Streaming cache — 1.5 GiB forward / 256 MiB back; start
+            // Streaming cache — 768 MiB forward / 128 MiB back; start
             // playback immediately rather than waiting for the cache
             // to pre-fill; re-buffer when the queue falls below 4 s.
+            // Kept in sync with the legacy --wid path (player.rs); the byte
+            // ceiling only caps the worst case (readahead-secs is the usual
+            // binding constraint) — still ~75-90 s forward at 80 Mbps. Was
+            // 1.5 GiB/256 MiB; bump both back up if 4K-remux underruns return.
             (b"cache\0", b"yes\0"),
             (b"cache-pause-initial\0", b"no\0"),
             (b"cache-secs\0", b"180\0"),
             (b"demuxer-readahead-secs\0", b"120\0"),
-            (b"demuxer-max-bytes\0", b"1610612736\0"),
-            (b"demuxer-max-back-bytes\0", b"268435456\0"),
+            (b"demuxer-max-bytes\0", b"805306368\0"),
+            (b"demuxer-max-back-bytes\0", b"134217728\0"),
             (b"cache-pause-wait\0", b"4.0\0"),
             (b"cache-pause\0", b"yes\0"),
             (b"network-timeout\0", b"60\0"),

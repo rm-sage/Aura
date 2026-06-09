@@ -283,6 +283,7 @@ fn is_catalog_soft_failed(base: &str, catalog_type: &str, catalog_id: &str) -> b
 fn mark_catalog_failed(base: &str, catalog_type: &str, catalog_id: &str) {
     let key = fail_key(base, catalog_type, catalog_id);
     if let Ok(mut cache) = addon_fail_cache().lock() {
+        cache.retain(|_, t| t.elapsed() < ADDON_FAIL_COOLDOWN);
         cache.insert(key, Instant::now());
     }
 }
@@ -316,6 +317,11 @@ fn store_catalog_metas(
     }
     let key = fail_key(base, catalog_type, catalog_id);
     if let Ok(mut cache) = catalog_ok_cache().lock() {
+        // Opportunistic eviction: drop entries past the stale TTL so the map
+        // tracks the last-10-min working set instead of every catalog browsed
+        // this session (stale entries are never served anyway). Bounds a
+        // previously session-unbounded HashMap of ~100-item MetaPreview vecs.
+        cache.retain(|_, (t, _)| t.elapsed() < CATALOG_STALE_TTL);
         cache.insert(key, (Instant::now(), metas.to_vec()));
     }
 }

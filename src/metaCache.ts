@@ -24,8 +24,10 @@ import { dedupedInvoke } from "./invokeDedupe";
 //   • Writes are debounced (500 ms) so a burst of catalog meta lookups
 //     turns into one localStorage write.
 //   • A soft size cap drops the oldest 25 % of entries when we cross
-//     1500 entries to keep the JSON blob under ~3 MB (well below the
-//     browser's 5 MB quota and Aura's other localStorage tenants).
+//     800 entries to keep the JSON blob under ~1.5 MB (well below the
+//     browser's 5 MB quota and Aura's other localStorage tenants). A
+//     media player rarely needs more than a few hundred distinct detail
+//     records live, and the synchronous peeks stay correct at this size.
 //   • Storage management UI in Settings → Storage exposes a clear
 //     button keyed to `aura:meta-cache:v1` for surgical invalidation.
 // ---------------------------------------------------------------------------
@@ -57,7 +59,7 @@ function ttlFor(mediaType: string): number {
  *  longest TTL is unconditionally stale regardless of media type. */
 const TTL_MAX_MS = TTL_MOVIE_MS;
 const STORAGE_KEY = "aura:meta-cache:v1";
-const MAX_ENTRIES = 1500;
+const MAX_ENTRIES = 800;
 const PERSIST_DEBOUNCE_MS = 500;
 
 const cache = new Map<string, CacheEntry>();
@@ -117,6 +119,14 @@ function persistNow() {
       const keep = sorted.slice(0, Math.floor(MAX_ENTRIES * 0.75));
       cache.clear();
       for (const [k, v] of keep) cache.set(k, v);
+      // Co-evict the id→year index so it can't outgrow the cache (it is
+      // otherwise never pruned — a slow monotonic leak of {year,ts} records).
+      // Rebuild it from the surviving entries only.
+      idYearIndex.clear();
+      for (const [k, v] of keep) {
+        const idPart = k.split("::")[2];
+        if (idPart) noteYear(idPart, v.detail, v.ts);
+      }
     }
     localStorage.setItem(STORAGE_KEY, JSON.stringify([...cache.entries()]));
   } catch {
@@ -341,5 +351,6 @@ export function peekFreshestPostersByIds(ids: Iterable<string>): Map<string, str
  *  actions that want to invalidate without touching localStorage. */
 export function clearMetaCache(): void {
   cache.clear();
+  idYearIndex.clear(); // otherwise the Storage→clear button leaves it resident
   try { localStorage.removeItem(STORAGE_KEY); } catch { /* ignore */ }
 }

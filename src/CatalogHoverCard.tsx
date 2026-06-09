@@ -261,6 +261,13 @@ function HoverPanel({
       .then((r) => {
         if (cancelled) return;
         const list = Array.isArray(r) ? r : [];
+        // Bounded LRU (~400): this session cache was previously uncapped, so a
+        // long browse across hundreds of cards grew it monotonically. Rating
+        // arrays are small, so 400 covers a heavy session well under ~200KB.
+        if (aggRatingsCache.size >= 400 && !aggRatingsCache.has(meta.id)) {
+          const oldest = aggRatingsCache.keys().next().value;
+          if (oldest !== undefined) aggRatingsCache.delete(oldest);
+        }
         aggRatingsCache.set(meta.id, list);
         setAggRatings(list);
       })
