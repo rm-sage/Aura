@@ -2700,16 +2700,37 @@ function Scrubber({
               </div>
             </div>
           )}
-          {thumbnailAt && (thumbUrl || thumbBusy) && (
+          {thumbnailAt && (thumbUrl || thumbBusy) && (() => {
+            // Nearest already-cached frame within ~30 s of the hovered second,
+            // shown DIMMED behind the loader while the exact second extracts —
+            // so scrubbing across an already-visited region feels instant and
+            // the empty-loader flash disappears. The exact (crisp) frame, gated
+            // on thumbUrlSec === hoverIntSec, paints over it the moment it lands.
+            const exactReady = thumbUrl != null && thumbUrlSec === hoverIntSec;
+            let approx: string | null = null;
+            if (!exactReady && hoverIntSec != null) {
+              let bestDist = Infinity;
+              for (const [k, v] of thumbCacheRef.current) {
+                const d = Math.abs(k - hoverIntSec);
+                if (d <= 30 && d < bestDist) { bestDist = d; approx = v; }
+              }
+            }
+            return (
             <div className="relative w-40 aspect-video rounded-md overflow-hidden
                             aura-glass-menu shadow-[0_8px_24px_-8px_rgba(0,0,0,0.7)]">
-              {/* Gate the <img> on thumbUrlSec === hoverIntSec so a stale
-                  URL (from a prior sec's fetch resolving after the user
-                  moved, or React batching the state update across a
-                  hoverIntSec change) NEVER paints over a new hover. The
-                  loader shows in that gap. Without this gate, the user-
-                  reported "old thumb shown for 1-2 s after a fresh hover
-                  before the new one resolves" symptom recurs. */}
+              {approx && (
+                <img
+                  src={approx}
+                  alt=""
+                  draggable={false}
+                  className="absolute inset-0 w-full h-full object-cover opacity-60"
+                />
+              )}
+              {/* Gate the crisp <img> on thumbUrlSec === hoverIntSec so a stale
+                  URL (from a prior sec's fetch resolving after the user moved,
+                  or React batching the state update across a hoverIntSec change)
+                  NEVER paints over a new hover. The dimmed approx frame / loader
+                  fills that gap. */}
               {thumbUrl && thumbUrlSec === hoverIntSec ? (
                 <img
                   src={thumbUrl}
@@ -2719,7 +2740,7 @@ function Scrubber({
                 />
               ) : (
                 <div className="absolute inset-0 flex items-center justify-center">
-                  <div className="absolute inset-0 bg-white/5 animate-pulse" />
+                  {!approx && <div className="absolute inset-0 bg-white/5 animate-pulse" />}
                   <svg
                     className="relative w-5 h-5 animate-spin text-white/70"
                     viewBox="0 0 24 24" fill="none" aria-hidden
@@ -2730,7 +2751,8 @@ function Scrubber({
                 </div>
               )}
             </div>
-          )}
+            );
+          })()}
           <div className="aura-glass-menu rounded px-2 py-0.5 text-[11px]
                           font-mono tabular-nums text-white/90">
             {fmtTime(hoverSec)}

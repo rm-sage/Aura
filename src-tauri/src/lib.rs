@@ -53,6 +53,7 @@ mod streaming;
 mod stremio;
 mod subtitles;
 mod sync;
+mod thumbs;
 mod tray;
 #[cfg(target_os = "windows")]
 mod win32;
@@ -2427,7 +2428,7 @@ pub fn run() {
             frame_step,
             set_audio_loudnorm,
             set_motion_interpolation,
-            player::extract_thumbnail,
+            thumbs::extract_thumbnail,
             set_volume,
             set_speed,
             seek_absolute,
