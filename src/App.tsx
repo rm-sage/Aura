@@ -54,6 +54,7 @@ import { setAutoBackupScope, startAutoBackup } from "./userDataBackup";
 import NextUpCta from "./NextUpCta";
 import EosSpotlight from "./EosSpotlight";
 import EpisodePanel from "./EpisodePanel";
+import SourceSwitcher, { streamKey } from "./SourceSwitcher";
 import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPreviousEpisode } from "./nextUp";
 import { getMetaDetailFallback, getRichestMetaDetail, peekCachedDetailById, peekRichestCachedDetailById, peekFreshestPostersByIds } from "./metaCache";
 import { PersistentCache } from "./persistentCache";
@@ -103,6 +104,7 @@ import type {
   LibraryItem,
   MetaPreview,
   StreamEntry,
+  StreamFetchResult,
   VideoEntry,
 } from "./types";
 import { isVideoAired } from "./types";
@@ -1202,6 +1204,11 @@ export default function App() {
           country?: string | null;
         };
       },
+      // In-player source switcher: when `forceStartSeconds` is set, bypass the
+      // resume prompt and (re-)load the picked stream at this live position —
+      // a swap-in-place. Everything else (resolve, preheat, post-load setup)
+      // runs unchanged. See src/SourceSwitcher.tsx.
+      opts?: { forceStartSeconds?: number },
     ) => {
       try {
         if (!stream.url && !stream.info_hash) return;
@@ -1227,7 +1234,10 @@ export default function App() {
         let resumeSeconds: number | null = null;
         let resumeDuration: number | null = null;
         const libRow = library.find((i) => i.id === targetSeriesId);
-        if (libRow) {
+        // A source swap forces resume at the live position (below), so skip
+        // the resume-prompt computation entirely — leaving resumeSeconds null
+        // means the prompt never shows.
+        if (libRow && opts?.forceStartSeconds == null) {
           const st = libRow.state ?? {};
           const off = typeof st.timeOffset === "number" ? st.timeOffset : 0;
           const dur = typeof st.duration === "number" ? st.duration : 0;
@@ -1273,6 +1283,12 @@ export default function App() {
             // whatever it was showing before the click.
             return;
           }
+        }
+
+        // In-player source swap: force resume at the live position (the
+        // resume-prompt computation was skipped above when this is set).
+        if (opts?.forceStartSeconds != null) {
+          resumeAt = opts.forceStartSeconds;
         }
 
         const raw = stream.url ?? `magnet:?xt=urn:btih:${stream.info_hash}`;
@@ -4116,6 +4132,81 @@ export default function App() {
     }
   }, [addons, activeTarget, handlePlayStream, advanceToQueueNext]);
 
+  // ── In-player source switcher ──────────────────────────────────────────
+  // Swap the stream SOURCE for the currently-playing item without leaving the
+  // player. Opened from PlayerOverlay's MoreMenu via the
+  // `aura:open-source-switcher` window event; fetches the alternative sources
+  // for the active target, then re-invokes the canonical handlePlayStream with
+  // forceStartSeconds = the live position (a swap-in-place).
+  const [switcherOpen, setSwitcherOpen] = useState(false);
+  const [switcherStreams, setSwitcherStreams] = useState<StreamEntry[]>([]);
+  const [switcherLoading, setSwitcherLoading] = useState(false);
+  const [switcherResolvingKey, setSwitcherResolvingKey] = useState<string | null>(null);
+
+  useEffect(() => {
+    const onOpen = () => {
+      if (!activeTarget) return;
+      const mt = (activeTarget.media_type ?? "").toLowerCase();
+      if (!["movie", "series", "anime"].includes(mt)) return; // not live channels
+      setSwitcherOpen(true);
+      setSwitcherLoading(true);
+      setSwitcherResolvingKey(null);
+      setSwitcherStreams([]);
+      // Same stream-addon scoping DetailView uses (respects the user's
+      // streamAddonUrls setting; fetch_streams gates by capability anyway).
+      const { streamAddonUrls } = loadAuraSettings();
+      const queryAddons = streamAddonUrls === null
+        ? addons
+        : streamAddonUrls
+            .map((url) => addons.find((a) => a.url === url))
+            .filter((a): a is AddonEntry => !!a);
+      invoke<StreamFetchResult>("fetch_streams", {
+        addons: queryAddons,
+        mediaType: activeTarget.media_type,
+        id: activeTarget.id,
+      })
+        .then((r) => setSwitcherStreams(Array.isArray(r) ? (r as StreamEntry[]) : (r?.streams ?? [])))
+        .catch(() => setSwitcherStreams([]))
+        .finally(() => setSwitcherLoading(false));
+    };
+    window.addEventListener("aura:open-source-switcher", onOpen);
+    return () => window.removeEventListener("aura:open-source-switcher", onOpen);
+  }, [activeTarget, addons]);
+
+  const onPickSource = useCallback((stream: StreamEntry) => {
+    if (!activeTarget) return;
+    // Picking the already-playing row is a no-op (the UI disables it too).
+    if (stream.url && stream.url === activeStreamUrl) { setSwitcherOpen(false); return; }
+    setSwitcherResolvingKey(streamKey(stream));
+    void handlePlayStream(stream, {
+      id:            activeTarget.id,
+      series_id:     activeTarget.series_id,
+      media_type:    activeTarget.media_type,
+      name:          activeTarget.name,
+      episode:       activeTarget.episode,
+      episode_title: activeTarget.episode_title,
+      season:        activeTarget.season,
+      episode_num:   activeTarget.episode_num,
+      // Re-nest the anime-detection signals ActiveScrobbleTarget carries so the
+      // swapped source keeps correct audio/sub default-track scoring.
+      scoring: {
+        original_language:    activeTarget.original_language ?? null,
+        production_countries: activeTarget.production_countries ?? [],
+        genres:               activeTarget.genres ?? undefined,
+        country:              null,
+      },
+    }, { forceStartSeconds: time > 1 ? time : 0 })
+      .catch(() => {
+        window.dispatchEvent(new CustomEvent("aura:player-toast", {
+          detail: { message: "Couldn't switch source" },
+        }));
+      })
+      .finally(() => {
+        setSwitcherResolvingKey(null);
+        setSwitcherOpen(false);
+      });
+  }, [activeTarget, activeStreamUrl, handlePlayStream, time]);
+
   useEffect(() => {
     const p = listen<string>("smtc-event", ({ payload }) => {
       switch (payload) {
@@ -5356,6 +5447,22 @@ export default function App() {
               </button>
               <button
                 type="button"
+                onClick={() => {
+                  // Dismiss the recovery modal and open the in-player source
+                  // switcher — when a stream dies, picking a different source
+                  // is usually the real fix (the switcher swaps in place at
+                  // the last-known position via handlePlayStream).
+                  setStreamBroken(false);
+                  window.dispatchEvent(new CustomEvent("aura:open-source-switcher"));
+                }}
+                className="px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
+                           text-white/85 bg-white/[0.06] border border-white/12
+                           hover:bg-white/[0.10] hover:text-white transition-colors"
+              >
+                Switch source
+              </button>
+              <button
+                type="button"
                 onClick={async () => {
                   if (!activeStreamUrl) {
                     setStreamBroken(false);
@@ -5459,6 +5566,21 @@ export default function App() {
               onPlayEpisode: onEosPlayEpisode,
             };
           })()}
+        />
+      )}
+
+      {/* In-player source switcher — sibling to PlayerOverlay; its own root is
+          fixed + z-[10001] (above PlayerOverlay's z-[9999]). */}
+      {activeTarget && (
+        <SourceSwitcher
+          open={switcherOpen}
+          onClose={() => setSwitcherOpen(false)}
+          streams={switcherStreams}
+          loading={switcherLoading}
+          onPick={onPickSource}
+          resolvingKey={switcherResolvingKey}
+          currentUrl={activeStreamUrl}
+          isFullscreen={isFullscreen}
         />
       )}
 
