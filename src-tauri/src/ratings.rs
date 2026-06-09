@@ -102,6 +102,19 @@ struct MdbRating {
 struct MdbResponse {
     #[serde(default)]
     ratings: Vec<MdbRating>,
+    /// Theatrical / primary release date (`YYYY-MM-DD`). Present on
+    /// movies; we capture it for the accurate "In Theaters" signal and
+    /// as the cinematic-countdown anchor. The struct historically
+    /// discarded every non-`ratings` key, so this is purely additive.
+    #[serde(default)]
+    released: Option<String>,
+    /// Digital / streaming (PVOD/EST) release date (`YYYY-MM-DD`). This
+    /// is the authoritative value that replaces Aura's old "theatrical
+    /// + 45 days" estimate for the Digital countdown. Empty / absent for
+    /// very recent theatrical titles whose digital window isn't announced
+    /// yet — callers fall back to the estimate in that case.
+    #[serde(default)]
+    released_digital: Option<String>,
 }
 
 async fn mdblist_to_aggregate(imdb_id: &str) -> Vec<AggregateRating> {
@@ -150,6 +163,74 @@ async fn mdblist_to_aggregate(imdb_id: &str) -> Vec<AggregateRating> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// MDBList release dates — accurate Digital / Theatrical dates for movies.
+//
+// The SAME MDBList response that powers the ratings branch already carries
+// `released` (theatrical) and `released_digital` (digital/PVOD). Aura used
+// to estimate the digital date as "theatrical + 45 days", which routinely
+// drifted 20–40+ days off the real date (Oppenheimer: estimate 2023-09-02
+// vs actual 2023-11-09). This reads the authoritative value instead, by
+// IMDb id, using the key Aura already bakes — no new credential.
+//
+// Kept as its own one-call fetch (rather than folding into the ratings
+// command's response) so the dates flow on a clean, independently-cached
+// path that doesn't perturb the ratings contract or its hover-card cache.
+// ---------------------------------------------------------------------------
+
+/// Normalise an MDBList date string: trim, and treat empty as absent so
+/// callers don't have to distinguish `Some("")` from a real date.
+fn norm_date(d: Option<String>) -> Option<String> {
+    d.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Fetch (theatrical, digital) release dates for a movie by IMDb id from
+/// MDBList. Best-effort: any failure (no key, network, parse, no record)
+/// yields `(None, None)` and the caller falls back to its estimate.
+async fn mdblist_release_dates(imdb_id: &str) -> (Option<String>, Option<String>) {
+    if MDBLIST_KEY.is_empty() {
+        return (None, None);
+    }
+    let resp = match client()
+        .get("https://mdblist.com/api/")
+        .query(&[("apikey", MDBLIST_KEY), ("i", imdb_id)])
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return (None, None),
+    };
+    let data: MdbResponse = match resp.json().await {
+        Ok(d) => d,
+        Err(_) => return (None, None),
+    };
+    (norm_date(data.released), norm_date(data.released_digital))
+}
+
+/// Movie release dates returned to the frontend. Both `YYYY-MM-DD` when
+/// known; either may be absent. The fields serialise as `theatrical` /
+/// `digital` (Rust field names → Tauri's outgoing JSON), matching the
+/// `ReleaseDates` TS interface in `src/releaseDates.ts`.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct MovieReleaseDates {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theatrical: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digital: Option<String>,
+}
+
+/// Accurate Digital + Theatrical release dates for a movie, by IMDb id.
+/// Non-`tt` ids resolve to empty (MDBList's `i` param is IMDb-keyed).
+/// Never errors — an unavailable date is simply `None`.
+#[tauri::command]
+pub async fn fetch_movie_release_dates(imdb_id: String) -> Result<MovieReleaseDates, String> {
+    if !imdb_id.starts_with("tt") {
+        return Ok(MovieReleaseDates::default());
+    }
+    let (theatrical, digital) = mdblist_release_dates(&imdb_id).await;
+    Ok(MovieReleaseDates { theatrical, digital })
 }
 
 // ---------------------------------------------------------------------------

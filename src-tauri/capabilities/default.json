@@ -45,6 +45,8 @@
     "allow-subtitles",
     "allow-api-keys",
     "allow-aggregate-ratings",
+    "allow-release-dates",
+    "allow-landscape-art",
     "allow-user-backups",
     "allow-smtc",
     "allow-stream-fetch",
