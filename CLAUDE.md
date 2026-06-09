@@ -93,6 +93,16 @@ These are mistakes that have specific, hard-to-diagnose symptoms. The HANDOFF.md
 - **Calendar meta**: 24-hour module-level `Map` cache keyed by `${addonUrl}::${type}::${id}` so re-mounting Calendar doesn't re-fetch every library item's meta.
 - **Addon manifest fields**: `AddonEntry.stream_types`, `id_prefixes`, `stream_id_prefixes` are populated at install/sync time. `fetch_streams` reads them directly — never re-fetches manifests per stream request (a transient network failure during that re-probe used to kill all stream lookups).
 
+## Performance & memory (build every feature memory-conscious)
+
+RAM discipline is a standing requirement — Aura is a long-running WebView2 + libmpv app and memory creep degrades the experience. When adding ANY feature:
+
+- **Bound every cache.** A module-level `Map`/object cache needs a size cap **and** eviction or TTL (mirror `metaCache.ts`: 1500-entry cap + LRU-by-`ts` + TTL). Never ship a "never cleared" Map. Persisted blobs (localStorage) need a cap too.
+- **Images are the top consumer.** Pass server-resize width hints (like `landscapeArt`'s `w=640`) instead of pulling full-size masters into small tiles; keep offscreen images unmounted (the `ImageLoader` IntersectionObserver pattern); don't mount hundreds of cards (virtualize / cap visible counts).
+- **Tear down idle native resources.** Don't keep a second libmpv / `mpv2` instance (e.g. the headless thumb extractor) resident when unused; prefer on-demand create + idle teardown.
+- **Always clean up.** `addEventListener`/`setInterval` in an effect must return a cleanup; `useSyncExternalStore` subscribers must unsubscribe. (And never add `get_property` polling during MPV state transitions — see landmines.)
+- **Tune buffers consciously.** MPV demuxer read-ahead (`demuxer-max-bytes`/`-back-bytes`) and any in-memory stream buffer should have a deliberate cap; surface the UX tradeoff when sizing.
+
 ## Where to look first by symptom
 
 - "Volume slider snaps back" / "speed doesn't change" → `lib.rs` setters; verify `mpv.set_property(...)` not `mpv.command("set_property", ...)`.
