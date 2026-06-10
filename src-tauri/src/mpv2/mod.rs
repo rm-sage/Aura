@@ -69,10 +69,9 @@ pub mod hello;
 pub mod engine;
 
 // Headless hover-seek thumbnail engine — a self-owned `vo=null` libmpv
-// instance on a dedicated worker thread, replacing the plugin-backed
-// "thumb" named instance the scrubber used to drive. No render context
-// (headless), so it's independent of the main playback engine and of the
-// `AURA_MPV2` gate. Removing the plugin from the thumbnail path is the
-// blocker that retiring `tauri-plugin-libmpv` (Phase 7) was waiting on.
+// instance on a dedicated worker thread, replacing the cold ffmpeg-per-hover
+// path. Warm (open stream + decoder reused across hovers) and never-stale
+// (each seek's screenshot is gated on mpv's `playback-restart` event). No
+// render context (headless), so it's independent of the main playback engine.
 #[cfg(target_os = "windows")]
 pub mod thumb;

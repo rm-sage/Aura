@@ -55,7 +55,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::ffi::{mpv_event_id, mpv_format, mpv_handle, Libmpv};
-use crate::player::ThumbResult;
+use crate::thumbs::ThumbResult;
 
 // ===========================================================================
 // Public API
@@ -169,8 +169,18 @@ fn discard_worker() {
 /// at process exit. The thumb instance runs `audio=no`, so it holds no
 /// WASAPI device; an un-joined teardown leaks nothing the OS won't reclaim.
 pub fn shutdown() {
-    let worker = worker_slot().lock().ok().and_then(|mut g| g.take());
-    let Some(ThumbWorker { tx, join }) = worker else {
+    // Hold the slot lock across the send + bounded join. Taking the worker out
+    // and THEN releasing the lock (the prior behaviour) left the slot None for
+    // the whole teardown, so a racing extract() → ensure_worker() would see
+    // None and spawn a SECOND instance this stop_video never tears down
+    // (defeating the free-RAM-on-stop intent). Holding the lock makes a
+    // concurrent ensure_worker() block until teardown completes, then
+    // deterministically spawn at most one fresh worker. The worker thread never
+    // locks the slot itself, so there's no deadlock.
+    let Ok(mut guard) = worker_slot().lock() else {
+        return;
+    };
+    let Some(ThumbWorker { tx, join }) = guard.take() else {
         return;
     };
     let _ = tx.send(ThumbControl::Shutdown);
@@ -189,6 +199,7 @@ pub fn shutdown() {
             );
         }
     }
+    // `guard` (slot now None) drops here, releasing the lock.
 }
 
 // ===========================================================================
@@ -215,6 +226,26 @@ fn run_worker(rx: Receiver<ThumbControl>) {
         match ctl {
             ThumbControl::Shutdown => break,
             ThumbControl::Extract(req) => {
+                // Coalesce rapid hovers: drain any newer requests already
+                // queued and skip straight to the LATEST, replying Ok(None) to
+                // the superseded ones (the scrubber's reqId guard ignores
+                // them). Keeps the worker always on the current hover instead
+                // of churning a backed-up queue — the rapid-scrub win.
+                let mut req = req;
+                let mut shutdown_after = false;
+                loop {
+                    match rx.try_recv() {
+                        Ok(ThumbControl::Extract(newer)) => {
+                            let _ = req.reply.send(Ok(None));
+                            req = newer;
+                        }
+                        Ok(ThumbControl::Shutdown) => {
+                            shutdown_after = true;
+                            break;
+                        }
+                        Err(_) => break, // queue empty (or disconnected)
+                    }
+                }
                 let ThumbRequest {
                     url,
                     at_seconds,
@@ -249,6 +280,9 @@ fn run_worker(rx: Receiver<ThumbControl>) {
                     }
                 };
                 let _ = reply.send(result);
+                if shutdown_after {
+                    break;
+                }
             }
         }
     }
@@ -322,11 +356,18 @@ unsafe fn init_instance() -> Result<ThumbInstance, String> {
     })
 }
 
-/// Run one extraction against the live instance. Faithful port of the
-/// plugin-backed algorithm: (re)loadfile on URL change, then a 6×-bounded
-/// retry of seek → confirm `playback-time` → frame-step → re-confirm →
-/// `screenshot-to-file` → read bytes. Each step's rationale is documented
-/// at the original site (`player.rs`); the comments below are abbreviated.
+/// Run one extraction against the live instance. (re)loadfile on URL change
+/// (gated on `FILE_LOADED`), then a bounded retry of seek → wait for
+/// `PLAYBACK_RESTART` → `screenshot-to-file` → read bytes.
+///
+/// The never-stale core: instead of polling `playback-time` (which tracks the
+/// DEMUXER position and can reach the target before the decoder advances its
+/// OUTPUT frame — the original stale-frame race), we gate the screenshot on
+/// mpv's `playback-restart` EVENT. mpv fires that exactly once it has
+/// completed the (exact, `hr-seek=yes`) seek AND decoded the first frame at
+/// the new position, so the frame we screenshot is guaranteed to be the sought
+/// one. Event-driven (`wait_event` blocks until the event), so it's both
+/// correct and fast — no fixed sleeps, no frame-step heuristic.
 unsafe fn process(
     inst: &mut ThumbInstance,
     url: &str,
@@ -335,17 +376,23 @@ unsafe fn process(
     let lib = &inst.lib;
     let handle = inst.handle;
 
-    // Drain any queued events so mpv's event ring can't overflow over a
-    // long session (we don't observe anything, but START_FILE / END_FILE /
-    // FILE_LOADED still queue). Cheap and keeps the instance healthy.
+    // Drain any queued events so the waits below only observe events from THIS
+    // request (and so mpv's event ring can't overflow over a long session).
     drain_events(lib, handle);
 
     if inst.loaded_url.as_deref() != Some(url) {
         run_command(lib, handle, &["loadfile", url, "replace"])
             .map_err(|e| format!("thumb loadfile: {e}"))?;
         inst.loaded_url = Some(url.to_string());
-        // Let demux/decode spin up before the first seek.
-        thread::sleep(Duration::from_millis(450));
+        // Wait for the demuxer to finish opening before the first seek —
+        // event-driven (far faster than a fixed sleep when the file opens
+        // quickly; correct when it's slow). Bounded so a dead URL can't hang
+        // the worker. On failure, drop the cached URL so the next request
+        // re-loads cleanly.
+        if !wait_for_event(lib, handle, mpv_event_id::FILE_LOADED, 6000) {
+            inst.loaded_url = None;
+            return Ok(None);
+        }
     }
 
     let mut path = std::env::temp_dir();
@@ -354,72 +401,99 @@ unsafe fn process(
     // mpv's `seek` accepts a numeric string for the position argument.
     let target = format!("{:.3}", at_seconds);
 
-    // Bounded retry — self-warms the headless decode pipeline on the first
-    // hover after a fresh loadfile (the first screenshot(s) can come back
-    // empty before a frame is produced). Warm hovers succeed on attempt 0.
-    for attempt in 0..6u32 {
+    // Up to 3 attempts: right after a fresh loadfile the cold decode pipeline
+    // occasionally needs a second seek before it emits playback-restart /
+    // produces a frame. Warm hovers succeed on attempt 0.
+    for attempt in 0..3u32 {
+        // Clear any pending events so the waits below only see THIS seek's.
+        drain_events(lib, handle);
         run_command(lib, handle, &["seek", &target, "absolute+exact"])
             .map_err(|e| format!("thumb seek: {e}"))?;
 
-        // Confirm the seek landed (demuxer position within ±0.5 s of the
-        // target) before screenshotting, so the JPEG isn't a stale frame
-        // from before the seek. Poll `playback-time` as DOUBLE — never
-        // NODE (CLAUDE.md landmine #3 dispatch-table fault path).
-        let deadline_ms: u32 = if attempt == 0 { 900 } else { 500 };
-        let mut waited_ms: u32 = 0;
-        let mut confirmed = false;
-        while waited_ms < deadline_ms {
-            thread::sleep(Duration::from_millis(25));
-            waited_ms += 25;
-            if let Some(pt) = get_double(lib, handle, b"playback-time\0") {
-                if (pt - at_seconds).abs() <= 0.5 {
-                    confirmed = true;
-                    break;
-                }
-            }
-        }
-        if !confirmed {
+        let timeout_ms = if attempt == 0 { 3000 } else { 1500 };
+        // Barrier: wait for OUR seek to START (SEEK event) before looking for
+        // the completion restart. mpv fires an IMPLICIT playback-restart after
+        // loadfile (first-frame decode at ~position 0); without this barrier a
+        // delayed one could be mistaken for the seek's restart → a frame-0
+        // screenshot labelled as the target second (the exact stale-frame bug).
+        // mpv emits SEEK at seek initiation and PLAYBACK_RESTART at completion,
+        // so a restart observed AFTER our SEEK is guaranteed to be ours.
+        if !wait_for_event(lib, handle, mpv_event_id::SEEK, timeout_ms) {
             continue;
         }
+        // The anti-stale gate proper: seek done + first frame at the new
+        // position decoded. Warm seeks fire it in tens of ms.
+        if !wait_for_event(lib, handle, mpv_event_id::PLAYBACK_RESTART, timeout_ms) {
+            continue; // seek didn't confirm in time — retry
+        }
 
-        // Force a decoded OUTPUT frame at the sought position. `playback-
-        // time` tracks the DEMUXER position, which can reach the target
-        // before the decoder advances its output frame — a screenshot here
-        // could grab the previously-decoded frame while we report the new
-        // timestamp (the stale-thumbnail bug). One frame-step on the
-        // paused instance decodes exactly one fresh frame near the target.
-        let _ = run_command(lib, handle, &["frame-step"]);
-        thread::sleep(Duration::from_millis(40));
-
-        // Post-step playback-time is the honest timestamp of the frame we
-        // are about to capture (frame-step nudges ~1 frame past target, so
-        // allow 1.0 s). If it drifted further, retry the seek rather than
-        // mislabel the frame.
-        let actual_at = match get_double(lib, handle, b"playback-time\0") {
-            Some(pt) if (pt - at_seconds).abs() <= 1.0 => pt,
-            _ => continue,
-        };
+        // Honest timestamp of the frame we're about to capture. `hr-seek=yes`
+        // lands exactly on the target; if the position is far off we somehow
+        // caught a restart that wasn't ours — retry rather than screenshot the
+        // wrong frame (belt-and-suspenders behind the SEEK barrier).
+        let actual_at = get_double(lib, handle, b"playback-time\0").unwrap_or(at_seconds);
+        if (actual_at - at_seconds).abs() > 1.0 {
+            continue;
+        }
 
         let _ = std::fs::remove_file(&path);
         run_command(lib, handle, &["screenshot-to-file", &path_fwd, "video"])
             .map_err(|e| format!("thumb screenshot: {e}"))?;
-        thread::sleep(Duration::from_millis(50));
 
-        if let Ok(bytes) = std::fs::read(&path) {
-            if !bytes.is_empty() {
-                let _ = std::fs::remove_file(&path);
-                return Ok(Some(ThumbResult {
-                    data_url: format!("data:image/jpeg;base64,{}", b64_encode(&bytes)),
-                    at: actual_at,
-                }));
+        // screenshot-to-file writes synchronously, but allow one short retry
+        // for the filesystem to flush the bytes.
+        for _ in 0..2 {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if !bytes.is_empty() {
+                    let _ = std::fs::remove_file(&path);
+                    return Ok(Some(ThumbResult {
+                        data_url: format!("data:image/jpeg;base64,{}", b64_encode(&bytes)),
+                        at: actual_at,
+                    }));
+                }
             }
+            thread::sleep(Duration::from_millis(20));
         }
     }
 
     // Nothing after the retries — graceful: scrubber stays on the
-    // timestamp-only tooltip.
+    // timestamp-only tooltip (or the ffmpeg fallback in thumbs.rs).
     let _ = std::fs::remove_file(&path);
     Ok(None)
+}
+
+/// Block-drain mpv's event queue until `target` fires or `timeout_ms` elapses,
+/// discarding other events. Event-driven (no polling): each `wait_event` call
+/// blocks until an event arrives or its sub-timeout, so `target` is observed
+/// the instant mpv emits it. Returns true iff `target` was seen; `SHUTDOWN`
+/// aborts the wait.
+unsafe fn wait_for_event(
+    lib: &Libmpv,
+    handle: *mut mpv_handle,
+    target: mpv_event_id,
+    timeout_ms: u64,
+) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        // Cap each blocking wait so the deadline is re-checked; libmpv takes
+        // the timeout in seconds.
+        let secs = remaining.as_secs_f64().min(0.5);
+        let ev = (lib.wait_event)(handle, secs);
+        if ev.is_null() {
+            continue;
+        }
+        let id = (*ev).event_id;
+        if id == target {
+            return true;
+        }
+        if id == mpv_event_id::SHUTDOWN {
+            return false;
+        }
+    }
 }
 
 // ===========================================================================
