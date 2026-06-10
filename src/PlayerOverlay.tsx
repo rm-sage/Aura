@@ -3260,6 +3260,21 @@ function MoreMenu({
           />
           <div className="my-1 mx-3 h-px bg-white/8" />
           <MoreItem icon={<RestartIcon />}  label="Restart from beginning" onClick={() => { onRestart(); setOpen(false); }} />
+          <MoreItem
+            icon={
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                <path d="M7 16V4M7 4 3 8M7 4l4 4" />
+                <path d="M17 8v12M17 20l4-4M17 20l-4-4" />
+              </svg>
+            }
+            label="Switch source"
+            disabled={!streamUrl}
+            onClick={() => {
+              window.dispatchEvent(new CustomEvent("aura:open-source-switcher"));
+              setOpen(false);
+            }}
+          />
           <div className="my-1 mx-3 h-px bg-white/8" />
           <MoreItem
             icon={<CopyIcon />}
