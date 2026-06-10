@@ -30,29 +30,37 @@ pub fn resolve_hdr_mode(s: &crate::settings::AppSettings) -> &'static str {
 /// the supplied option map. Used at MPV init AND by `apply_hdr_settings`
 /// to update a running instance without re-init.
 ///
-/// ## Why "passthrough" is mpv-tone-mapped HDR OUTPUT, not a hint
+/// ## Why "passthrough" uses the colorspace HINT (gpu-next reality)
 ///
-/// The earlier design used `target-colorspace-hint=yes`, which tells the
-/// d3d11 context to flip the swapchain to the CONTENT's colorspace and —
-/// crucially — makes mpv do NO tone mapping at all (source == target by
-/// definition). The display becomes responsible for compressing
-/// 1000+-nit-mastered highlights into what the panel can show, and
-/// monitors whose current OSD mode peaks lower than what Windows
-/// reports (the AW3425DW in DisplayHDR True Black, ~450 nits real vs a
-/// reported ~1000) CLIP instead — blown-out whites that NO `target-peak`
-/// value can fix, because the hint supersedes the target params for HDR
-/// content. Runtime rewrites of the colorspace plumbing to compensate
-/// made things worse (swapchain renegotiation mid-playback mis-encodes).
+/// Under `vo=gpu-next`, libplacebo's swapchain wrapper is the FINAL
+/// authority on the DXGI swapchain state, and the ONLY mechanism that
+/// flips it to HDR is the per-frame colorspace hint driven by
+/// `target-colorspace-hint`. mpv's own `d3d11-output-csp=pq` is applied
+/// one layer below at swapchain creation — and libplacebo immediately
+/// re-decides it: with the hint off it resets the swapchain to sRGB
+/// every frame (aura-mpv.log: "Initial swap chain configuration:
+/// R8G8B8A8_UNORM, RGB_FULL_G22_NONE_P709" right after mpv's own
+/// "Swapchain successfully configured to color space G2084"). PQ pixels
+/// rendered into that sRGB surface = raised milky blacks + muted
+/// highlights. (`d3d11-output-csp` was ALSO silently dropped for months
+/// by the Windows manifest version-lie — see windows-app-manifest.xml —
+/// but even with that fixed, the hint is what actually governs.)
 ///
-/// The fix is to make MPV the tone-mapper while still outputting HDR:
-/// force the swapchain to PQ (`d3d11-output-csp=pq` — deterministic,
-/// init-time, requires HDR enabled in Windows), declare an explicit
-/// BT.2020/PQ target, and tone-map content to `target-peak` =
-/// `hdr_target_peak_nits` (the panel's REAL peak; "auto" = whatever the
-/// display reports, for panels that report honestly). Everything is
-/// static per mode — no per-content probing, no mid-playback writes.
+/// On this mpv build (0.41+), explicit `target-*` options are folded
+/// INTO the hint before it is sent (vo_gpu_next.c) AND into the render
+/// target: the swapchain switches to 10-bit + PQ with HDR10 metadata
+/// (MaxMasteringLuminance = `target-peak`), and mpv STILL tone-maps
+/// content down to `target-peak`. The historical "hint disables tone
+/// mapping / supersedes target params" behavior — the original
+/// blown-out-whites failure on panels that under-report their real
+/// peak (AW3425DW in True Black: ~450 real vs ~1000 reported) — does
+/// not apply when the targets are explicit. So: hint=yes + explicit
+/// BT.2020/PQ/peak/contrast = tone-mapped HDR output with correct
+/// swapchain + metadata, switchable per load (the option set is
+/// runtime-updatable; the engine still only writes it between files).
 ///
-/// `peak_nits` is only consulted in "passthrough" mode; 0 = auto.
+/// `peak_nits` is only consulted in "passthrough" mode; 0 = auto
+/// (= the display-reported peak, for panels that report honestly).
 pub fn apply_hdr_options(
     options: &mut IndexMap<String, serde_json::Value>,
     mode: &str,
@@ -60,14 +68,13 @@ pub fn apply_hdr_options(
 ) {
     match mode {
         "passthrough" => {
-            // We own the target — the hint must be OFF or it would
-            // override the explicit target params for HDR content.
-            options.insert("target-colorspace-hint".into(), serde_json::json!("no"));
-            // Force the d3d11 swapchain to PQ so the HDR signal path is
-            // active regardless of content (SDR gets mapped into the PQ
-            // container at reference white). Reset to "auto" by the
-            // other modes below.
-            options.insert("d3d11-output-csp".into(),       serde_json::json!("pq"));
+            // THE switch that makes libplacebo negotiate the swapchain
+            // to 10-bit PQ + HDR10 metadata. Explicit target params
+            // below override the display-derived metadata in the hint.
+            options.insert("target-colorspace-hint".into(), serde_json::json!("yes"));
+            // libplacebo owns the swapchain colorspace via the hint;
+            // keep mpv's creation-level csp at its default.
+            options.insert("d3d11-output-csp".into(),       serde_json::json!("auto"));
             options.insert("target-prim".into(),            serde_json::json!("bt.2020"));
             options.insert("target-trc".into(),             serde_json::json!("pq"));
             // Infinite display contrast: with an explicit PQ target and
