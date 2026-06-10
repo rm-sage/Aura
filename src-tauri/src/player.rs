@@ -70,6 +70,15 @@ pub fn apply_hdr_options(
             options.insert("d3d11-output-csp".into(),       serde_json::json!("pq"));
             options.insert("target-prim".into(),            serde_json::json!("bt.2020"));
             options.insert("target-trc".into(),             serde_json::json!("pq"));
+            // Infinite display contrast: with an explicit PQ target and
+            // no contrast info, libplacebo assumes a finite (~1000:1)
+            // panel and BT.2390 LIFTS source blacks to that assumed
+            // floor — on an OLED that rendered as a uniform milky/white
+            // veil over both SDR and HDR content ("brightness/contrast
+            // looks off"). `inf` maps black to true black. (On a
+            // non-OLED this merely skips black-point compensation — a
+            // far smaller error than the veil.)
+            options.insert("target-contrast".into(),        serde_json::json!("inf"));
             options.insert("hdr-compute-peak".into(),       serde_json::json!("yes"));
             options.insert("tone-mapping".into(),           serde_json::json!("auto"));
             if peak_nits > 0 {
@@ -86,6 +95,7 @@ pub fn apply_hdr_options(
             // 203 cd/m² is BT.2408's reference SDR white.
             options.insert("target-colorspace-hint".into(), serde_json::json!("no"));
             options.insert("d3d11-output-csp".into(),       serde_json::json!("auto"));
+            options.insert("target-contrast".into(),        serde_json::json!("auto"));
             options.insert("target-prim".into(),            serde_json::json!("bt.709"));
             options.insert("target-trc".into(),             serde_json::json!("bt.1886"));
             options.insert("target-peak".into(),            serde_json::json!(203));
@@ -96,6 +106,7 @@ pub fn apply_hdr_options(
         _ => {
             options.insert("target-colorspace-hint".into(), serde_json::json!("no"));
             options.insert("d3d11-output-csp".into(),       serde_json::json!("auto"));
+            options.insert("target-contrast".into(),        serde_json::json!("auto"));
             options.insert("hdr-compute-peak".into(),       serde_json::json!("no"));
             options.insert("tone-mapping".into(),           serde_json::json!("clip"));
             options.insert("target-prim".into(),            serde_json::json!("auto"));
