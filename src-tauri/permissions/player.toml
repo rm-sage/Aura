@@ -129,6 +129,18 @@ identifier = "allow-aggregate-ratings"
 description = "Allows the frontend to query MDBList + Jikan (MAL) + AniList and any other ratings backend Aura adds, returning a unified list"
 commands.allow = ["fetch_aggregate_ratings"]
 
+# ── Accurate movie release dates (MDBList Digital/Theatrical) ────────────────
+[[permission]]
+identifier = "allow-release-dates"
+description = "Allows the frontend to fetch accurate movie Digital + Theatrical release dates from MDBList (drives the Digital countdown and the In Theaters tag)"
+commands.allow = ["fetch_movie_release_dates"]
+
+# ── Landscape (16:9) art resolution via AIOMeta ─────────────────────────────
+[[permission]]
+identifier = "allow-landscape-art"
+description = "Allows the frontend to resolve 16:9 landscape art for a title via the user's AIOMeta addon, for Continue Watching cards"
+commands.allow = ["fetch_landscape_art"]
+
 # ── User-data backups (Queue / History / manual marks / settings snapshot) ──
 [[permission]]
 identifier = "allow-user-backups"

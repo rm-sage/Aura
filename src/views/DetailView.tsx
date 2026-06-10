@@ -16,7 +16,8 @@ import type {
   VideoEntry,
 } from "../types";
 import { isVideoAired } from "../types";
-import { computeReleaseCountdowns, formatCountdown, formatTargetDate, nextAiringEpisode, useCountdownNow } from "../releaseCountdown";
+import { computeReleaseCountdowns, formatCountdown, formatTargetDate, isInTheaters, nextAiringEpisode, useCountdownNow } from "../releaseCountdown";
+import { useMovieReleaseDates } from "../releaseDates";
 import EpisodeAirChip from "../EpisodeAirChip";
 import { loadAuraSettings } from "../auraSettings";
 import { useReleaseSignal } from "../releaseSignalStore";
@@ -628,6 +629,11 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
     detail?.mal_id != null ||
     detail?.kitsu_id != null ||
     detail?.anidb_id != null;
+  // Accurate Digital + Theatrical dates (MDBList) — drives the accurate
+  // Digital countdown (replacing the +45-day estimate) and the "In
+  // Theaters" tag. null for non-movies / before the fetch lands, in which
+  // case the countdown falls back to the labeled estimate and the tag hides.
+  const releaseDates = useMovieReleaseDates(meta.id, detail?.media_type ?? meta.media_type);
   const [aggregateRatings, setAggregateRatings] = useState<AggregateRating[]>([]);
   useEffect(() => {
     setAggregateRatings([]);
@@ -1163,20 +1169,42 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
                   {episodesBehind} episode{episodesBehind === 1 ? "" : "s"} behind
                 </span>
               )}
+              {/* Persistent "In Theaters" tag — shown while a film's
+                  theatrical run is active (theatrical date passed, not yet
+                  digital, within the freshness window) per MDBList dates.
+                  Unlike the cinematic countdown (which vanishes once
+                  `released` passes), this is a static badge, not a ticking
+                  value. Movies only; hidden until accurate dates resolve. */}
+              {detail && isInTheaters(detail.media_type ?? meta.media_type, releaseDates) && (
+                <span
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-sm
+                             bg-amber-500/20 border border-amber-400/40 text-amber-100
+                             text-[12px] font-semibold backdrop-blur-sm"
+                  title="Currently in theaters"
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                    <path d="M22 10V6c0-1.1-.9-2-2-2H4c-1.1 0-1.99.9-1.99 2v4c1.1 0 1.99.9 1.99 2s-.89 2-2 2v4c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2v-4c-1.1 0-2-.9-2-2s.9-2 2-2z" />
+                  </svg>
+                  In Theaters
+                </span>
+              )}
               {/* Live release countdown(s) — MOVIES ONLY here. Series/anime
                   next-episode/premiere countdowns now live on the episode
                   list (the next-airing row's chip), so the meta strip carries
-                  only a film's cinematic / digital (~45d est.) dates.
+                  only a film's cinematic / digital dates. The Digital date is
+                  the authoritative MDBList value when known; otherwise the
+                  ~45-day PVOD estimate (rendered with a "~" prefix).
                   computeReleaseCountdowns returns only upcoming dates, so
                   nothing renders for fully-released content. */}
-              {detail && computeReleaseCountdowns(detail)
+              {detail && computeReleaseCountdowns(detail, Date.now(), releaseDates)
                 .filter((c) => c.kind === "cinematic" || c.kind === "digital")
                 .map((c) => (
                 <CountdownStat
                   key={c.kind}
                   label={c.label}
                   targetMs={c.targetMs}
-                  title={`${c.label}: ${formatTargetDate(c.targetMs)}`}
+                  estimated={c.estimated}
+                  title={`${c.label}${c.estimated ? " (estimated)" : ""}: ${formatTargetDate(c.targetMs)}`}
                 />
               ))}
             </div>
@@ -1502,7 +1530,7 @@ function Stat({ label, value }: { label: string; value: string }) {
 // Owns its OWN 1 s tick via useCountdownNow so only this leaf re-renders
 // every second — DetailViewBody (cast grid, episode list, ratings) must NOT
 // tick. The parent computes the countdown SET once and passes targetMs.
-function CountdownStat({ label, targetMs, title }: { label: string; targetMs: number; title?: string }) {
+function CountdownStat({ label, targetMs, title, estimated }: { label: string; targetMs: number; title?: string; estimated?: boolean }) {
   const now = useCountdownNow();
   return (
     <span className="inline-flex items-center gap-1.5" title={title}>
@@ -1513,7 +1541,8 @@ function CountdownStat({ label, targetMs, title }: { label: string; targetMs: nu
       </svg>
       <span className="text-ln-accent/70 text-[11px] tracking-[0.2em]">{label}</span>
       <span className="text-ln-accent text-[14px] font-semibold tabular-nums">
-        {formatCountdown(targetMs, now)}
+        {/* "~" marks an estimated (PVOD-window) date vs an authoritative one. */}
+        {estimated ? "~" : ""}{formatCountdown(targetMs, now)}
       </span>
     </span>
   );

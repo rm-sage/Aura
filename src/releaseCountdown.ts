@@ -40,12 +40,31 @@ export interface ReleaseCountdown {
   label: string;
   /** Target release timestamp (ms since epoch). */
   targetMs: number;
+  /** True when this target is the PVOD-window ESTIMATE (no authoritative
+   *  date was available) rather than a real date. Only ever set on the
+   *  `digital` kind; the UI marks estimated values (e.g. a "~" prefix). */
+  estimated?: boolean;
+}
+
+/** Authoritative release dates resolved from MDBList (see releaseDates.ts).
+ *  Both `YYYY-MM-DD`; either may be absent. Passed into
+ *  `computeReleaseCountdowns` / `isInTheaters` to replace the estimate. */
+export interface AccurateReleaseDates {
+  theatrical?: string | null;
+  digital?: string | null;
 }
 
 /** Days after theatrical release a film is assumed to hit digital when no
  *  authoritative digital date exists. The post-2021 PVOD / 45-day window is
  *  the industry norm; this is only an estimate (see module comment). */
 export const DIGITAL_WINDOW_DAYS = 45;
+
+/** Days after theatrical release a film is still treated as "in theaters"
+ *  when no digital date has landed. Guards old catalog titles (which often
+ *  carry a theatrical date but no recorded digital date) from reading as
+ *  "In Theaters" indefinitely. ~120 days covers a typical wide + limited
+ *  theatrical run. Only used by `isInTheaters`. */
+export const IN_THEATERS_WINDOW_DAYS = 120;
 
 const DAY_MS = 86_400_000;
 const HOUR_MS = 3_600_000;
@@ -84,6 +103,7 @@ function nextEpisodeRelease(
 export function computeReleaseCountdowns(
   detail: Pick<MetaDetail, "media_type" | "released" | "videos">,
   nowMs: number = Date.now(),
+  dates?: AccurateReleaseDates | null,
 ): ReleaseCountdown[] {
   const mediaType = (detail.media_type ?? "").toLowerCase();
   const isEpisodic = mediaType === "series" || mediaType === "anime";
@@ -100,19 +120,58 @@ export function computeReleaseCountdowns(
     ];
   }
 
-  // Movies (and any other non-episodic single-release content).
-  const cinematicMs = parseMs(detail.released);
+  // Movies (and any other non-episodic single-release content). Prefer
+  // MDBList's authoritative theatrical date when resolved, else the addon's
+  // `released` (usually the same value).
+  const cinematicMs = parseMs(dates?.theatrical) ?? parseMs(detail.released);
   if (cinematicMs == null) return [];
 
   const out: ReleaseCountdown[] = [];
   if (cinematicMs > nowMs) {
     out.push({ kind: "cinematic", label: "In Theaters", targetMs: cinematicMs });
   }
-  const digitalMs = cinematicMs + DIGITAL_WINDOW_DAYS * DAY_MS;
+  // Accurate digital date from MDBList when known; otherwise fall back to
+  // the PVOD-window estimate and flag it so the UI can mark it. The old
+  // fixed estimate routinely drifted 20–40+ days off the real date.
+  const accurateDigitalMs = parseMs(dates?.digital);
+  const digitalMs = accurateDigitalMs ?? cinematicMs + DIGITAL_WINDOW_DAYS * DAY_MS;
   if (digitalMs > nowMs) {
-    out.push({ kind: "digital", label: "Digital", targetMs: digitalMs });
+    out.push({
+      kind: "digital",
+      label: "Digital",
+      targetMs: digitalMs,
+      estimated: accurateDigitalMs == null,
+    });
   }
   return out;
+}
+
+/**
+ * Whether a movie is currently in theaters, from accurate MDBList dates.
+ * True when its theatrical date has passed, it hasn't reached digital yet
+ * (or digital is still unknown), AND the theatrical date is within the
+ * freshness window. Returns false for series/anime and whenever accurate
+ * dates aren't available — so the persistent "In Theaters" tag only shows
+ * on real data, never on the +45-day guess.
+ *
+ * The digital cutoff is the key discriminator: once the digital date
+ * passes, the film has entered the home window and drops out of "In
+ * Theaters" even if technically still on some screens.
+ */
+export function isInTheaters(
+  mediaType: string | null | undefined,
+  dates: AccurateReleaseDates | null | undefined,
+  nowMs: number = Date.now(),
+): boolean {
+  const mt = (mediaType ?? "").toLowerCase();
+  if (mt === "series" || mt === "anime") return false;
+  if (!dates) return false;
+  const theatrical = parseMs(dates.theatrical);
+  if (theatrical == null || theatrical > nowMs) return false;
+  if (nowMs - theatrical > IN_THEATERS_WINDOW_DAYS * DAY_MS) return false;
+  const digital = parseMs(dates.digital);
+  if (digital != null && digital <= nowMs) return false;
+  return true;
 }
 
 /**

@@ -3103,6 +3103,103 @@ fn normalise_addon_base(url: &str) -> String {
         .to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Landscape (16:9) art — AIOMeta art-resolution endpoint.
+//
+// AIOMeta owns art resolution (Fanart thumb → AniList banner → TMDB
+// backdrop → TVDB bg → poster-crop, with language/provider matching and
+// id-resolution Aura can't replicate client-side). Aura just asks for the
+// resolved 16:9 image + whether the title is already baked into it, so the
+// Continue-Watching card can render proper landscape art instead of a
+// portrait poster cropped into a 16:9 box.
+//
+// The endpoint lives on the user's AIOMeta install (the same per-user base
+// as the meta route, userUUID embedded in `addon_url`):
+//   GET {base}/api/art/landscape/{type}/{id}.json[?w=N]
+//
+// Best-effort: any failure (endpoint not yet deployed, network, parse)
+// returns an empty result so the card falls back to its existing
+// background/poster chain rather than erroring.
+// ---------------------------------------------------------------------------
+
+/// Resolved landscape art for one title. Deserialised from AIOMeta's
+/// camelCase JSON (`hasBakedTitle` / `dominantColor`) via deserialize-only
+/// renames, then re-serialised to React using the Rust field names — so the
+/// `LandscapeArt` TS interface reads snake_case (`has_baked_title` /
+/// `dominant_color`). See the `LibraryItem` note in CLAUDE.md for why the
+/// rename is deserialize-only.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LandscapeArt {
+    #[serde(default)]
+    pub id: String,
+    /// The chosen 16:9 image URL. `None` when AIOMeta found nothing usable.
+    #[serde(default)]
+    pub landscape: Option<String>,
+    /// Provenance, e.g. "fanart-thumb" | "anilist-banner" | "tmdb-backdrop"
+    /// | "tvdb-bg" | "poster-crop".
+    #[serde(default)]
+    pub source: Option<String>,
+    /// True when the title is already burned into `landscape` (Fanart thumb
+    /// etc.) — the client renders the image alone. When false the client may
+    /// overlay `logo` + a scrim.
+    #[serde(default, rename(deserialize = "hasBakedTitle"))]
+    pub has_baked_title: bool,
+    /// Language-matched logo for client overlay when `has_baked_title` is
+    /// false.
+    #[serde(default)]
+    pub logo: Option<String>,
+    /// Vertical poster fallback so the client never shows a blank tile.
+    #[serde(default)]
+    pub poster: Option<String>,
+    /// Optional dominant colour (`#rrggbb`) for scrim / loading placeholder.
+    #[serde(default, rename(deserialize = "dominantColor"))]
+    pub dominant_color: Option<String>,
+}
+
+/// Resolve 16:9 landscape art for a title from the user's AIOMeta addon.
+/// `width` is an optional server-side resize hint (px). Returns an empty
+/// `LandscapeArt` rather than erroring when the endpoint is unavailable, so
+/// the caller falls back to its own art chain.
+#[tauri::command]
+pub async fn fetch_landscape_art(
+    addon_url: String,
+    media_type: String,
+    id: String,
+    width: Option<u32>,
+) -> Result<LandscapeArt, String> {
+    validate_url(&addon_url)?;
+    let base = normalise_addon_base(&addon_url);
+    let mut url = format!("{base}/api/art/landscape/{media_type}/{id}.json");
+    if let Some(w) = width {
+        url.push_str(&format!("?w={w}"));
+    }
+    let label = log_label("", &base);
+
+    let resp = match client().get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            // Endpoint not deployed yet / network blip — quiet, the card
+            // falls back to its existing background/poster.
+            crate::devlog!(debug, "meta", "[{}] landscape art fetch failed: {}", label, e);
+            return Ok(LandscapeArt::default());
+        }
+    };
+    let resp = match resp.error_for_status() {
+        Ok(r) => r,
+        Err(e) => {
+            crate::devlog!(debug, "meta", "[{}] landscape art HTTP {:?}", label, e.status());
+            return Ok(LandscapeArt::default());
+        }
+    };
+    match resp.json::<LandscapeArt>().await {
+        Ok(art) => Ok(art),
+        Err(e) => {
+            crate::devlog!(debug, "meta", "[{}] landscape art parse error: {}", label, e);
+            Ok(LandscapeArt::default())
+        }
+    }
+}
+
 /// Cached-metadata version of the stream-resource gate — used by
 /// fetch_streams so we don't have to re-fetch every addon's manifest on
 /// every request. Reads `resources` / `stream_types` / `id_prefixes` /

@@ -34,7 +34,8 @@ import {
 } from "./catalogHoverStore";
 import { loadAuraSettings } from "./auraSettings";
 import { resolveDefaultMetaUrl } from "./addonDefaults";
-import { computeReleaseCountdowns, formatCountdown, formatTargetDate, useCountdownNow } from "./releaseCountdown";
+import { computeReleaseCountdowns, formatCountdown, formatTargetDate, isInTheaters, useCountdownNow } from "./releaseCountdown";
+import { useMovieReleaseDates } from "./releaseDates";
 
 const PANEL_W = 360;
 const GAP = 12;
@@ -147,18 +148,19 @@ function Heading({ children }: { children: React.ReactNode }) {
 /** Live, self-ticking release-countdown chip. Owns its own 1 s tick so only
  *  this node re-renders each second, not the whole hover panel (cast grid,
  *  ratings, etc.). */
-function HoverCountdownChip({ label, targetMs }: { label: string; targetMs: number }) {
+function HoverCountdownChip({ label, targetMs, estimated }: { label: string; targetMs: number; estimated?: boolean }) {
   const now = useCountdownNow();
   return (
     <span
-      title={formatTargetDate(targetMs)}
+      title={estimated ? `${formatTargetDate(targetMs)} (estimated)` : formatTargetDate(targetMs)}
       className="inline-flex items-center gap-1 text-[11.5px] font-semibold text-ln-accent"
     >
       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
         <circle cx="12" cy="12" r="9" />
         <path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
       </svg>
-      {label} in {formatCountdown(targetMs, now)}
+      {/* "~" marks the PVOD-window estimate vs an authoritative MDBList date. */}
+      {label} in {estimated ? "~" : ""}{formatCountdown(targetMs, now)}
     </span>
   );
 }
@@ -308,11 +310,15 @@ function HoverPanel({
   // airing or fully caught up.
   const episodesBehind = useEpisodesBehind(detail?.videos, meta.id);
 
+  // Accurate Digital + Theatrical dates (MDBList) for the Digital countdown
+  // and the "In Theaters" tag. null for non-movies / before it lands.
+  const releaseDates = useMovieReleaseDates(meta.id, meta.media_type);
+
   // Release countdown(s) — next-episode / premiere for series, cinematic +
   // digital for movies. Computed once per render; the hover panel is too
   // short-lived to need a live tick (see releaseCountdown.ts). No-op when
   // detail is still loading or nothing is upcoming.
-  const countdowns = detail ? computeReleaseCountdowns(detail) : [];
+  const countdowns = detail ? computeReleaseCountdowns(detail, Date.now(), releaseDates) : [];
 
   // Merge addon-supplied + aggregator ratings (aggregator wins on
   // source collision — it goes through ratings.rs label normalisation),
@@ -386,10 +392,26 @@ function HoverPanel({
         </p>
       )}
 
+      {/* Persistent "In Theaters" tag (movies only). Rendered separately
+          from the countdown row because that row can be empty for an
+          in-theaters film whose estimated digital date has also passed. */}
+      {isInTheaters(meta.media_type, releaseDates) && (
+        <div className="mt-1.5">
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded
+                           bg-amber-500/20 border border-amber-400/40 text-amber-100
+                           text-[11px] font-semibold">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+              <path d="M22 10V6c0-1.1-.9-2-2-2H4c-1.1 0-1.99.9-1.99 2v4c1.1 0 1.99.9 1.99 2s-.89 2-2 2v4c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2v-4c-1.1 0-2-.9-2-2s.9-2 2-2z" />
+            </svg>
+            In Theaters
+          </span>
+        </div>
+      )}
+
       {countdowns.length > 0 && (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1.5">
           {countdowns.map((c) => (
-            <HoverCountdownChip key={c.kind} label={c.label} targetMs={c.targetMs} />
+            <HoverCountdownChip key={c.kind} label={c.label} targetMs={c.targetMs} estimated={c.estimated} />
           ))}
         </div>
       )}

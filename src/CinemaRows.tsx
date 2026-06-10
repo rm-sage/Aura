@@ -16,6 +16,8 @@ import { closeHoverNow } from "./catalogHoverStore";
 import { useHoverCardActivation } from "./useHoverCardActivation";
 import { getReleaseSignal, useReleaseSignalsVersion } from "./releaseSignalStore";
 import { formatCountdown, formatTargetDate, airingInfo, nextAiringEpisode, useCountdownNow } from "./releaseCountdown";
+import { useLandscapeArt, LANDSCAPE_CARD_WIDTH } from "./landscapeArt";
+import { findAIOMetadataAddon } from "./aiometadata";
 
 /** Per-catalog cache for the View-all popup. Keyed by
  *  `${addonUrl}|${type}|${id}`. Persists across DiscoveryRow remounts
@@ -659,7 +661,25 @@ function CWReleaseCountdown({ seriesId, episodes }: { seriesId: string; episodes
 const ContinueWatchingCard = memo(function ContinueWatchingCard(
   { item, onSelect, addons }: ContinueWatchingCardProps
 ) {
-  const src = item.background ?? item.poster;
+  // Landscape (16:9) art via AIOMeta (the art source-of-truth). We prefer
+  // AIOMeta's resolved `landscape` over the item's own `background` because
+  // only AIOMeta tells us whether the chosen image already has a baked-in
+  // title — which drives the logo overlay below. The box is already 16:9, so
+  // a proper landscape fills it cleanly; the heavy crop only happened when
+  // an item had no landscape at all and a portrait poster got cover-fit.
+  // Until AIOMeta's endpoint ships, `art` is null and we fall back to the
+  // old `background ?? poster` chain — inert, not broken.
+  const aioAddon = useMemo(() => findAIOMetadataAddon(addons ?? []), [addons]);
+  const art = useLandscapeArt(item, aioAddon, LANDSCAPE_CARD_WIDTH);
+  const src = art?.landscape ?? item.background ?? item.poster;
+  // Overlay Aura's own logo whenever AIOMeta resolved a landscape with NO
+  // baked-in title (hasBakedTitle=false) and a logo is available — so a
+  // title-less backdrop (e.g. Cyberpunk: Edgerunners) still reads its name.
+  // All media types. NOTE: on an *airing* series card the centred
+  // next-episode countdown pill (z-10) can overlap the logo's right edge;
+  // the pill is opaque + sits above (z-[5]) so it stays readable. Finished
+  // series (no pill) and movies render the logo cleanly bottom-left.
+  const logoOverlay = art && !art.has_baked_title ? art.logo : null;
 
   const offset = typeof item.state?.timeOffset === "number" ? item.state.timeOffset : 0;
   const duration = typeof item.state?.duration === "number" ? item.state.duration : 0;
@@ -738,6 +758,20 @@ const ContinueWatchingCard = memo(function ContinueWatchingCard(
           )}
 
           <div className="absolute inset-x-0 bottom-0 h-1/3 bg-gradient-to-t from-black/70 to-transparent" />
+          {/* On-art logo (hasBakedTitle=false). Bottom-left, above the
+              gradient scrim for legibility, capped in size and kept below the
+              countdown pill's z-10 so an airing-series pill stays readable
+              where they meet. */}
+          {logoOverlay && (
+            <img
+              src={logoOverlay}
+              alt=""
+              draggable={false}
+              loading="lazy"
+              className="absolute bottom-2 left-2 max-h-[32%] max-w-[55%] object-contain object-left-bottom
+                         drop-shadow-[0_2px_4px_rgba(0,0,0,0.9)] pointer-events-none z-[5]"
+            />
+          )}
           {useSegmented ? (
             // Per-episode segmented bar for series/anime — each segment
             // is one episode in the current season. Falls back to the

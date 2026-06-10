@@ -2167,6 +2167,10 @@ pub fn run() {
             stremio::fetch_streams,
             // ── Multi-source ratings (MDBList + MAL via Jikan) ───────────────
             ratings::fetch_aggregate_ratings,
+            // ── Accurate movie Digital/Theatrical dates (MDBList) ────────────
+            ratings::fetch_movie_release_dates,
+            // ── Landscape (16:9) art resolution via AIOMeta ──────────────────
+            stremio::fetch_landscape_art,
             // ── Phase 5.5: external subtitles fan-out ────────────────────────
             stremio::fetch_external_subtitles,
             // ── User-data backups (manual & queue, history, settings) ───────
