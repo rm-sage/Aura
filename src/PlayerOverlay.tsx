@@ -3275,6 +3275,21 @@ function MoreMenu({
               setOpen(false);
             }}
           />
+          <MoreItem
+            icon={
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                <path d="M2 16.1A5 5 0 0 1 5.9 20M2 12.05A9 9 0 0 1 9.95 20M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6" />
+                <circle cx="2" cy="20" r="0.5" fill="currentColor" />
+              </svg>
+            }
+            label="Cast to device"
+            disabled={!streamUrl}
+            onClick={() => {
+              window.dispatchEvent(new CustomEvent("aura:open-cast-menu"));
+              setOpen(false);
+            }}
+          />
           <div className="my-1 mx-3 h-px bg-white/8" />
           <MoreItem
             icon={<CopyIcon />}

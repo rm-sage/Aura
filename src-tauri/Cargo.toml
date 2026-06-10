@@ -38,6 +38,21 @@ keyring = { version = "3", features = [
 ] }
 zeroize = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "macros", "process", "io-util", "time", "sync"] }
+# In-process streaming bridge (streaming.rs) — the loopback byte-range
+# proxy that used to live in the separate `aura-bridge` sidecar binary.
+# axum pinned to 0.7 (0.8 changed wildcard route syntax).
+axum = "0.7"
+futures-util = "0.3"
+# Casting (src/cast/): mDNS `_googlecast._tcp` discovery + a hand-rolled
+# CASTV2 client (cast/castv2.rs — length-prefixed protobuf frames with
+# JSON payloads; no protocol surface beyond what Aura uses). native-tls
+# resolves to SChannel on Windows (cast devices use self-signed certs,
+# so the connector accepts invalid certs for the LAN hop) — an accepted,
+# cast-scoped divergence from the crate's otherwise-rustls posture.
+# (rust_cast was rejected: it hard-depends on openssl-sys, which breaks
+# Windows source builds without a system OpenSSL.)
+native-tls = "0.2"
+mdns-sd = "0.11"
 tauri-plugin-deep-link = "2"
 # Single-instance enforcement — required so OAuth deep-links route to
 # the running Aura process instead of spawning a new one. Without this,

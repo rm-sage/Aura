@@ -24,6 +24,9 @@ mod addons;
 mod aniskip;
 mod auth;
 mod backup;
+// Casting (Chromecast CASTV2 + DLNA SOAP) — discovery, LAN media proxy,
+// load/control. See cast/mod.rs + docs/superpowers/specs/2026-06-09-casting.md.
+mod cast;
 mod cinema;
 mod crash_reporting;
 mod devlog;
@@ -2049,6 +2052,15 @@ pub fn run() {
             apply_hdr_settings,
             apply_subtitle_style,
             set_subtitle_position_runtime,
+            // ── Casting (Chromecast + DLNA) ───────────────────────────────────
+            cast::cast_discover,
+            cast::cast_load,
+            cast::cast_play,
+            cast::cast_pause,
+            cast::cast_seek,
+            cast::cast_stop,
+            cast::cast_status,
+            cast::cast_ffmpeg_present,
             set_native_fullscreen,
             // ── Per-title persistence (volume / shader / audio / sub) ───────
             per_title::get_title_state,

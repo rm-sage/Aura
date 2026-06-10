@@ -55,6 +55,9 @@ import NextUpCta from "./NextUpCta";
 import EosSpotlight from "./EosSpotlight";
 import EpisodePanel from "./EpisodePanel";
 import SourceSwitcher, { streamKey } from "./SourceSwitcher";
+import CastMenu from "./CastMenu";
+import CastSessionBar from "./CastSessionBar";
+import { useCastSession } from "./useCastSession";
 import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPreviousEpisode } from "./nextUp";
 import { getMetaDetailFallback, getRichestMetaDetail, peekCachedDetailById, peekRichestCachedDetailById, peekFreshestPostersByIds } from "./metaCache";
 import { PersistentCache } from "./persistentCache";
@@ -4208,6 +4211,27 @@ export default function App() {
       });
   }, [activeTarget, activeStreamUrl, handlePlayStream, time]);
 
+  // ── Casting (Chromecast + DLNA) ──
+  // Device picker + session state live in useCastSession; opened via the
+  // `aura:open-cast-menu` event from PlayerOverlay's MoreMenu. Local MPV
+  // pauses while the TV plays and resumes at the device's last position
+  // on stop. See src-tauri/src/cast/ + the 2026-06-09 casting spec.
+  const castTitle = activeTarget
+    ? activeTarget.media_type === "movie"
+      ? activeTarget.name
+      : `${activeTarget.name}${
+          activeTarget.season != null && activeTarget.episode_num != null
+            ? ` — S${String(activeTarget.season).padStart(2, "0")}E${String(activeTarget.episode_num).padStart(2, "0")}`
+            : ""
+        }`
+    : null;
+  const cast = useCastSession({
+    streamUrl: activeStreamUrl,
+    title: castTitle,
+    currentTime: time,
+    paused,
+  });
+
   useEffect(() => {
     const p = listen<string>("smtc-event", ({ payload }) => {
       switch (payload) {
@@ -5553,6 +5577,33 @@ export default function App() {
           onPick={onPickSource}
           resolvingKey={switcherResolvingKey}
           currentUrl={activeStreamUrl}
+          isFullscreen={isFullscreen}
+        />
+      )}
+
+      {/* Cast device picker + session bar — same sibling/z-layer pattern
+          as the source switcher. The bar shows while a cast session is
+          active (local MPV paused underneath). */}
+      {activeTarget && (
+        <CastMenu
+          open={cast.menuOpen}
+          onClose={cast.closeMenu}
+          devices={cast.devices}
+          scanning={cast.scanning}
+          onRescan={cast.rescan}
+          onPick={cast.pickDevice}
+          connectingId={cast.connectingId}
+          error={cast.error}
+          isFullscreen={isFullscreen}
+        />
+      )}
+      {cast.activeDevice && (
+        <CastSessionBar
+          deviceName={cast.activeDevice.name}
+          status={cast.status}
+          onTogglePlayPause={cast.togglePlayPause}
+          onSeekBy={cast.seekBy}
+          onStop={cast.stopCasting}
           isFullscreen={isFullscreen}
         />
       )}

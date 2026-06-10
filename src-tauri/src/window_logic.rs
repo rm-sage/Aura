@@ -425,6 +425,10 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     // React doesn't get a teardown when the process
                     // exits via app.exit). Capped at 2 s internally.
                     crate::scrobble::shutdown_blocking(&handle);
+                    // Cast teardown — best-effort, bounded: stops the
+                    // Chromecast heartbeat thread + receiver app so the
+                    // TV doesn't sit on a dead receiver splash.
+                    crate::cast::shutdown_blocking();
                     // Engine teardown — joins the engine thread, which runs
                     // the synchronous mute → stop → mpv_terminate_destroy
                     // sequence (the WASAPI-release discipline, landmine #9)

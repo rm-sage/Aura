@@ -117,7 +117,7 @@ RAM discipline is a standing requirement — Aura is a long-running WebView2 + l
 ## Conventions
 
 - F12 opens the in-app DevConsole (ring buffer, level filters, search). Rust logs come through via `crate::devlog!` macro which mirrors to stderr AND emits a `dev-log` Tauri event.
-- Rust log labels: `[bridge]`, `[player]`, `[streams]`, `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[ratings]`, `[rpc]`, `[win32]`, `[smtc]`, `[scrobble]`, `[publicmetadb]`, `[mpv]` — grep these in DevConsole or `aura-mpv.log`. (`[mpv]` is the playback engine — `src-tauri/src/mpv/`.)
+- Rust log labels: `[bridge]`, `[player]`, `[streams]`, `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[ratings]`, `[rpc]`, `[win32]`, `[smtc]`, `[scrobble]`, `[publicmetadb]`, `[mpv]`, `[cast]` — grep these in DevConsole or `aura-mpv.log`. (`[mpv]` is the playback engine — `src-tauri/src/mpv/`.)
 - libmpv writes its own verbose log to `%USERPROFILE%\aura-mpv.log` (truncated each MPV init, rotated to `.old` past 50 MB). The last few lines usually pinpoint a STATUS_ACCESS_VIOLATION.
 - Discord RPC uses application ID `1499651271357890610` (in `window_logic.rs`). Browse states are gated on `discord_rpc_browse_states` setting; playback states honor `discord_rpc_show_titles` + the per-title blocklist.
 - `src-tauri/lib/` contents are git-ignored (>100 MB): `libmpv-2.dll` (REQUIRED — download at `github.com/zhongfly/mpv-winbuild`) and `ffmpeg.exe` (silencedetect; absent ⇒ feature ships inert). `libmpv-wrapper.dll` is no longer used on this branch (it belonged to the removed `tauri-plugin-libmpv`) but keep it around while other branches still need it.

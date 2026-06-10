@@ -36,6 +36,21 @@ commands.allow = [
   "set_native_fullscreen",
 ]
 
+# ── Casting (Chromecast + DLNA) ───────────────────────────────────────────────
+[[permission]]
+identifier = "allow-cast"
+description = "Allows the frontend to discover LAN cast devices (Chromecast/DLNA), start/stop cast sessions, and control cast playback"
+commands.allow = [
+  "cast_discover",
+  "cast_load",
+  "cast_play",
+  "cast_pause",
+  "cast_seek",
+  "cast_stop",
+  "cast_status",
+  "cast_ffmpeg_present",
+]
+
 # ── Stremio catalog ───────────────────────────────────────────────────────────
 [[permission]]
 identifier = "allow-fetch-catalog"
