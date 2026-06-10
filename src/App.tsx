@@ -1360,20 +1360,23 @@ export default function App() {
           // Re-push the user's subtitle styling so a freshly-loaded
           // file inherits the saved size / colour / position / etc.
           invoke("apply_subtitle_style").catch(() => {});
-          // Loudness normalization re-applies on every stream load.
-          // Read fresh — the toggle (Settings or player's three-dots
-          // menu) writes through saveAuraSettings which busts the
-          // module-level snapshot, so this returns the current value.
-          const { loudnessNormalization, motionInterpolation, interpolationTscale } = loadAuraSettings();
-          invoke("set_audio_loudnorm", { enabled: !!loudnessNormalization }).catch(() => {});
-          // SVP Tier 1 — re-apply the persisted motion-interpolation
-          // setting on every load (the @auraInterp vf is per-file).
-          // Issued inside the same +1500 ms post-load gate as loudnorm
-          // so it never touches libmpv during the loadfile critical
-          // section (landmine #3).
+          // Loudness normalization is NOT re-applied per load anymore:
+          // the `af` property persists across loadfiles, the engine
+          // installs the filter at mpv init from the persisted setting,
+          // and the toggles (Settings / three-dots menu) handle live
+          // changes. The old per-load remove+add raced slow stream
+          // opens — the filter sat in the property without rebuilding
+          // the already-initialised audio chain until a seek forced it,
+          // i.e. "volume is wrong until I seek once".
+          const { motionInterpolation, interpolationTscale } = loadAuraSettings();
+          // Re-apply the persisted motion-interpolation setting on every
+          // load — unlike loudnorm this one IS load-dependent (the
+          // anime-only gate means it must flip per title). Issued inside
+          // this +1500 ms post-load gate so it never touches libmpv
+          // during the loadfile critical section (landmine #3).
           invoke("set_motion_interpolation", {
             enabled: !!motionInterpolation && animeFlag,
-            tscale: interpolationTscale ?? "mitchell",
+            tscale: interpolationTscale ?? "oversample",
           }).catch(() => {});
           // Hover-thumbnail pre-warm. `extract_thumbnail` lazily spins
           // up a SEPARATE "thumb" libmpv instance (audio=false, vo=null,
@@ -2925,12 +2928,10 @@ export default function App() {
   }, [activeTarget, paused]);
 
   // ── Keep the display awake during active playback ──
-  // Under the mpv2 render engine, mpv (vo=libmpv) owns no window and can't
-  // run its own stop-screensaver, so the monitor would sleep mid-episode
-  // after the OS idle timeout. Assert the keep-awake hold whenever the
-  // player is up AND not paused; release otherwise (paused / browsing →
-  // normal sleep, matching mpv's default). The Rust side applies
-  // SetThreadExecutionState from the engine's render thread.
+  // Belt-and-suspenders alongside mpv's own stop-screensaver: assert the
+  // keep-awake hold whenever the player is up AND not paused; release
+  // otherwise (paused / browsing → normal sleep). The Rust side applies
+  // SetThreadExecutionState from the engine's pump thread.
   useEffect(() => {
     invoke("set_keep_display_awake", { enabled: isPlayerActive && !paused })
       .catch(() => {});
@@ -5152,38 +5153,10 @@ export default function App() {
           black during playback so MPV's video doesn't bleed through. */}
       {!isFullscreen && <TitleBar opaque={isPlayerActive} />}
 
-      {/* ── FSO gap cover ──
-          The mpv2 engine renders its WGL surface 1px shorter than the
-          monitor in native fullscreen (see FSO_HEIGHT_INSET in
-          src-tauri/src/mpv2/engine.rs). That geometric break is what stops
-          Win11's DWM from promoting the surface to Independent Flip /
-          Multi-Plane Overlay — a promotion that would drop the engine out
-          of composition and make the React UI vanish, colours go raw, other
-          monitors flash black, and the toggle take 2-3 s. Occluding the
-          engine from above does NOT work (multi-plane GPUs give the engine
-          its own overlay plane regardless); the engine surface's OWN size
-          has to differ from the output. The downside is a 1px row at the
-          very bottom that the engine no longer paints — left bare it shows
-          desktop bleed-through (a bright line). This strip covers that row
-          with solid black so it reads as a thin letterbox edge instead.
-          A few px tall (not 1) so it reliably covers the gap even across
-          the engine's per-frame resize cadence; the overlap onto the
-          engine's bottom video row is imperceptible. Fullscreen-only. */}
-      {isFullscreen && (
-        <div
-          aria-hidden
-          style={{
-            position: "fixed",
-            bottom: 0,
-            left: 0,
-            width: "100%",
-            height: "2px",
-            background: "#000",
-            zIndex: 2147483647,
-            pointerEvents: "none",
-          }}
-        />
-      )}
+      {/* (The old "FSO gap cover" strip is gone: the engine consolidation
+          moved playback to --wid embedding, where mpv's own DXGI swapchain
+          opts out of Win11's Independent-Flip promotion, so the engine
+          surface covers the full monitor again and there is no 1px gap.) */}
 
       {/* ── Body ── */}
       {showLanding ? (

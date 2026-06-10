@@ -11,7 +11,6 @@ use discord_rich_presence::{
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, Runtime, WindowEvent};
-use tauri_plugin_libmpv::MpvExt;
 
 use crate::settings;
 
@@ -293,58 +292,18 @@ pub fn now_unix() -> i64 {
 // ---------------------------------------------------------------------------
 
 fn pause_mpv<R: Runtime>(app: &AppHandle<R>) {
+    let _ = app;
     #[cfg(target_os = "windows")]
-    if crate::mpv2::engine::enabled() && crate::mpv2::engine::is_running() {
-        // mpv2 path: queue a typed pause-true write. The engine is the
-        // only owner of the live mpv handle when AURA_MPV2 is set, so
-        // hitting `app.mpv()` would touch an un-init'd legacy instance.
-        let _ = crate::mpv2::engine::submit_set_property(
+    {
+        // Queue a typed pause-true write on the engine's command channel.
+        // (CLAUDE.md landmine #1 — pause must be a dedicated property
+        // write, never `command("set_property", …)`; the engine's
+        // PropValue path is exactly that.)
+        let _ = crate::mpv::engine::submit_set_property(
             "pause".into(),
-            crate::mpv2::engine::PropValue::Flag(true),
+            crate::mpv::engine::PropValue::Flag(true),
         );
-        return;
     }
-    let app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        // CLAUDE.md landmine #1: this libmpv build silently no-ops the
-        // generic `command("set_property", [name, value])` form. We
-        // MUST use the dedicated `set_property` FFI path, otherwise
-        // pause-on-focus-lost / pause-on-minimize fire the call but
-        // libmpv ignores it and playback keeps going. Symptom: user
-        // alt-tabs away expecting playback to halt; audio keeps
-        // bleeding through.
-        let _ = app.mpv().set_property(
-            "pause",
-            &serde_json::json!(true),
-            "main",
-        );
-    });
-}
-
-/// SYNCHRONOUS shutdown — used in the CloseRequested path so MPV is fully
-/// torn down BEFORE the process exits. The async spawn_blocking in
-/// `stop_mpv` returns immediately, which on Windows can leave the WASAPI
-/// audio device handle dangling and prevents Stremio / mpv.net from
-/// opening the same device on the next launch. Calling `mute=yes`,
-/// `stop`, then destroying the instance synchronously gives libmpv enough
-/// time to release the device cleanly.
-fn shutdown_mpv_sync<R: Runtime>(app: &AppHandle<R>) {
-    let mpv = app.mpv();
-    // 1. Mute first so any in-flight audio buffers don't squeak through
-    //    the device-close path (a known cause of "stuck" exclusive
-    //    locks). Per CLAUDE.md landmine #1 the `command("set_property",
-    //    ...)` form silently no-ops on this libmpv build, so the older
-    //    spelling here was failing to actually mute — defeating the
-    //    WASAPI lock-protection this whole shutdown sequence exists
-    //    for. Use the dedicated set_property FFI path.
-    let _ = mpv.set_property("mute", &serde_json::json!(true), "main");
-    // 2. Stop the loadfile. This unlinks the demuxer and releases the AO.
-    let _ = mpv.command("stop", &Vec::<serde_json::Value>::new(), "main");
-    // 3. Tear down the MPV instance. The plugin's `destroy` calls
-    //    `mpv_terminate_destroy` under the hood, which is the only way to
-    //    guarantee WASAPI hands the device back to the OS mixer.
-    let _ = mpv.destroy("main");
-    crate::devlog!(info, "player", "MPV shut down on close");
 }
 
 /// Install the window-event handler. Call from Tauri `setup`.
@@ -379,27 +338,9 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
             // (a plain SetWindowPos on MPV's child HWND) with no
             // video-zoom side effect, so no flicker.
             WindowEvent::Focused(true) => {
-                #[cfg(target_os = "windows")]
-                {
-                    // Skip when the mpv2 engine is running — it tracks
-                    // the parent's client rect every render tick and
-                    // SetWindowPos-es itself, so no Tauri-driven
-                    // backstop is needed (Phase 5).
-                    let engine_active = crate::mpv2::engine::enabled()
-                        && crate::mpv2::engine::is_running();
-                    if !engine_active {
-                        let parent_hwnd: isize =
-                            win.hwnd().ok().map(|h| h.0 as isize).unwrap_or(0);
-                        if parent_hwnd != 0 {
-                            let y_offset = if crate::win32::is_in_native_fullscreen() {
-                                0
-                            } else {
-                                36
-                            };
-                            crate::win32::resize_mpv_child_to_parent(parent_hwnd, y_offset);
-                        }
-                    }
-                }
+                // No geometry backstop needed — the engine tracks the
+                // parent's client rect every pump tick and resizes its
+                // host window (plus mpv's inner child) itself.
             }
             // Resized fires for minimise too — but the size payload isn't a
             // reliable signal across Tauri / Windows versions (sometimes
@@ -431,28 +372,13 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                 let minimised = matches!(win.is_minimized(), Ok(true));
                 if minimised {
                     if cfg.pause_on_minimize {
-                        crate::devlog!(info, "win", "minimised → pause MPV (resize skipped)");
+                        crate::devlog!(info, "win", "minimised → pause MPV");
                         pause_mpv(&handle);
-                    } else {
-                        crate::devlog!(info, "win", "minimised → resize skipped (pause-on-minimize off)");
                     }
                     return;
                 }
-                #[cfg(target_os = "windows")]
-                {
-                    let engine_active = crate::mpv2::engine::enabled()
-                        && crate::mpv2::engine::is_running();
-                    if !engine_active {
-                        let parent_hwnd: isize = win.hwnd().ok().map(|h| h.0 as isize).unwrap_or(0);
-                        if parent_hwnd != 0 {
-                            // y_offset = 0 in fullscreen (we sit at monitor top
-                            // and the title bar is unmounted), 36 windowed
-                            // (TitleBar component height).
-                            let y_offset = if crate::win32::is_in_native_fullscreen() { 0 } else { 36 };
-                            crate::win32::resize_mpv_child_to_parent(parent_hwnd, y_offset);
-                        }
-                    }
-                }
+                // Non-minimise resizes need no backstop here — the
+                // engine's pump loop tracks the parent rect itself.
             }
             WindowEvent::CloseRequested { api, .. } => {
                 // Belt-and-suspenders — restore the Windows taskbar in
@@ -499,13 +425,20 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     // React doesn't get a teardown when the process
                     // exits via app.exit). Capped at 2 s internally.
                     crate::scrobble::shutdown_blocking(&handle);
-                    shutdown_mpv_sync(&handle);
-                    // Phase 2.1 mpv2 engine — no-op when AURA_MPV2_ENGINE
-                    // wasn't set. When it was, this joins the dedicated
-                    // render thread so its mpv handle is fully torn down
+                    // Engine teardown — joins the engine thread, which runs
+                    // the synchronous mute → stop → mpv_terminate_destroy
+                    // sequence (the WASAPI-release discipline, landmine #9)
                     // before app.exit() pulls the process out from under it.
                     #[cfg(target_os = "windows")]
-                    crate::mpv2::engine::shutdown_if_running();
+                    crate::mpv::engine::shutdown_if_running();
+                    // Headless thumbnail engine — no-op when no thumbnail was
+                    // ever requested (the worker is lazy). Otherwise sends
+                    // Shutdown and joins (bounded 2 s) so the thumb mpv handle
+                    // is destroyed before the process exits. audio=no, so it
+                    // holds no WASAPI device — this is tidiness, not a
+                    // correctness requirement.
+                    #[cfg(target_os = "windows")]
+                    crate::mpv::thumb::shutdown();
                     clear_presence_inner();
                     // Reap the streaming-bridge subprocess so it doesn't
                     // outlive the parent. Without this the bridge keeps

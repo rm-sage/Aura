@@ -184,12 +184,34 @@ pub struct AppSettings {
     #[serde(default = "default_hdr_mode")]
     pub hdr_mode: String,
 
+    /// Display peak brightness override for HDR passthrough, in nits.
+    /// 0 = auto (trust the display capabilities Windows reports through
+    /// the swapchain). Non-zero pins mpv's `target-peak` so the HDR
+    /// signal is tone-mapped to the panel's REAL peak — needed when the
+    /// monitor's OSD mode and what Windows believes disagree (e.g. an
+    /// OLED switched to DisplayHDR True Black ~400/465-nit mode while
+    /// Windows still reports the 1000-nit mode), which otherwise blows
+    /// out highlights. Only consulted in "passthrough" mode.
+    #[serde(default)]
+    pub hdr_target_peak_nits: u32,
+
     // ── Audio ──────────────────────────────────────────────────────────────
     /// WASAPI exclusive mode + bitstream passthrough for AVR/soundbar.
     /// Takes effect on next app restart. Default off so other audio apps
     /// keep their device access.
     #[serde(default)]
     pub audio_passthrough: bool,
+
+    /// EBU R128 loudness normalization (the `@loudnorm` audio filter).
+    /// MIRROR of the frontend `auraSettings.loudnessNormalization` flag —
+    /// the frontend stays the user-facing source of truth and re-persists
+    /// this on every toggle via `set_audio_loudnorm`. The backend copy
+    /// exists so the engine can install the filter at mpv init (before
+    /// the first loadfile), which is what makes normalized volume
+    /// consistent from the first audio frame instead of only after a
+    /// seek forced an audio-chain rebuild.
+    #[serde(default)]
+    pub loudness_normalization: bool,
 
     /// Last-used playback volume (0..100). Applied to every newly-loaded
     /// stream so the user's chosen level survives across titles and
@@ -338,8 +360,10 @@ impl Default for AppSettings {
             opensubtitles_api_key:       String::new(),
             hdr_enabled:                 true,
             hdr_mode:                    default_hdr_mode(),
+            hdr_target_peak_nits:        0,
             next_up_lead_seconds:        default_next_up_lead_seconds(),
             audio_passthrough:           false,
+            loudness_normalization:      false,
             last_volume:                 default_last_volume(),
             subtitle_font_size:          default_sub_font_size(),
             subtitle_position:           default_sub_position(),

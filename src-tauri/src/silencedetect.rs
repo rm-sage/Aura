@@ -88,7 +88,7 @@ fn ffmpeg_bin(app: &tauri::AppHandle) -> std::ffi::OsString {
 /// outright suspicious) to users. Every ffmpeg invocation in this module
 /// goes through here so the flag can't be forgotten at a call site. This
 /// mirrors the bridge subprocess spawn in `lib.rs`.
-fn ffmpeg_command(app: &tauri::AppHandle) -> Command {
+pub(crate) fn ffmpeg_command(app: &tauri::AppHandle) -> Command {
     let mut cmd = Command::new(ffmpeg_bin(app));
     #[cfg(target_os = "windows")]
     {

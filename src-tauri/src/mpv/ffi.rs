@@ -33,7 +33,7 @@
 //!
 //! This is the bindings layer only. [`Libmpv`] loads the DLL and resolves
 //! the symbols; there is no safe wrapper, no render context, no window.
-//! Nothing here is wired into Aura's runtime yet (see `mpv2/mod.rs`).
+//! Nothing here is wired into Aura's runtime yet (see `mpv/mod.rs`).
 
 use std::ffi::{c_char, c_int, c_void};
 use std::os::raw::c_ulong;
@@ -743,7 +743,7 @@ pub type MpvRenderContextFreeFn = unsafe extern "C" fn(ctx: *mut mpv_render_cont
 /// spec calls for, and it keeps every later phase free of lifetime
 /// parameters on the binding type.
 ///
-/// Not wired into Aura yet — see `mpv2/mod.rs`.
+/// Not wired into Aura yet — see `mpv/mod.rs`.
 pub struct Libmpv {
     /// Owning handle to `libmpv-2.dll`. MUST outlive every function
     /// pointer below. Declared LAST in this struct on purpose: Rust drops

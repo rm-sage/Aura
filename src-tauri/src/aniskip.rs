@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
-use tauri_plugin_libmpv::MpvExt;
 
 // ---------------------------------------------------------------------------
 // AniSkip API client.
@@ -652,23 +651,15 @@ pub async fn set_skip_windows<R: Runtime>(
     }
     let _ = app.emit("aura:skip-windows", &payload);
     #[cfg(target_os = "windows")]
-    if crate::mpv2::engine::enabled() && crate::mpv2::engine::is_running() {
-        return crate::mpv2::engine::submit_set_property(
-            "user-data/aura/skip-windows".into(),
-            crate::mpv2::engine::PropValue::String(json),
-        );
+    return crate::mpv::engine::submit_set_property(
+        "user-data/aura/skip-windows".into(),
+        crate::mpv::engine::PropValue::String(json),
+    );
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = json;
+        Err("playback engine is Windows-only".into())
     }
-    tauri::async_runtime::spawn_blocking(move || {
-        app.mpv()
-            .set_property(
-                "user-data/aura/skip-windows",
-                &serde_json::Value::String(json),
-                "main",
-            )
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 // ---------------------------------------------------------------------------

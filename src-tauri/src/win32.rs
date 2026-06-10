@@ -2,23 +2,26 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Tiny Win32 helper — force-resize the embedded MPV child window so it
-//! tracks the parent's client area on every parent resize / fullscreen
+//! tracks its parent's client area on every parent resize / fullscreen
 //! toggle.
 //!
-//! `tauri-plugin-libmpv` embeds MPV via the `--wid=<HWND>` option. The
-//! embedded child window doesn't propagate WM_SIZE in every libmpv build,
-//! so after a parent resize the video stays at its old geometry. The
-//! standard fix is `SetWindowPos(child, …, x, y, new_w, new_h)`.
+//! The mpv engine embeds MPV via the `wid=<HWND>` option (pointed at the
+//! engine's host child window). The embedded child window doesn't
+//! propagate WM_SIZE in every libmpv build, so after a parent resize the
+//! video stays at its old geometry. The standard fix is
+//! `SetWindowPos(child, …, x, y, new_w, new_h)` — the engine's pump loop
+//! calls this with the host HWND + y_offset 0 whenever the host moves.
 //!
-//! `y_offset` allows the caller to push the child below the webview title
-//! bar in windowed mode (36 px) without covering it. In fullscreen mode the
-//! title bar is unmounted so y_offset = 0.
+//! `y_offset` allows a caller to push the child below the webview title
+//! bar (36 px) when targeting a parent whose client area includes it; the
+//! engine's host window already sits below the title bar, so its calls
+//! pass 0.
 //!
-//! IMPORTANT: the parent window has BOTH the WebView2 host AND the MPV
-//! child as direct children. Naive `EnumChildWindows` resizes BOTH, which
-//! clips the WebView2 (and therefore the React title bar / overlay) on
-//! every fullscreen toggle. We filter by class name so only MPV-related
-//! children get repositioned.
+//! IMPORTANT (kept for any future caller targeting the MAIN window): the
+//! main window has BOTH the WebView2 host AND video children. Naive
+//! `EnumChildWindows` resizes BOTH, which clips the WebView2 (and
+//! therefore the React title bar / overlay). We filter by class name so
+//! only MPV-related children get repositioned.
 //!
 //! We avoid pulling `windows-sys` as a dependency by dynamically loading
 //! `user32.dll` via `libloading` (already a dep for the libmpv DLL probe).
@@ -406,7 +409,7 @@ pub fn is_in_native_fullscreen() -> bool {
 
 /// Keep the display + system awake during playback (or release that hold).
 ///
-/// WHY THIS EXISTS: under the mpv2 render-API engine, mpv renders into a
+/// WHY THIS EXISTS: under the mpv render-API engine, mpv renders into a
 /// surface WE own (`vo=libmpv`) and no longer manages a video-output
 /// window — so mpv's built-in `stop-screensaver` can't fire, and after the
 /// OS idle timeout the monitors sleep mid-playback. (The legacy `--wid`
@@ -418,7 +421,7 @@ pub fn is_in_native_fullscreen() -> bool {
 /// than a one-shot idle-timer poke), so we set it once on the playing↔
 /// paused transition instead of heartbeating. CRITICAL: the continuous
 /// state is PER-THREAD — `inhibit(true)` and the matching `inhibit(false)`
-/// MUST run on the same thread. The mpv2 engine calls this only from its
+/// MUST run on the same thread. The mpv engine calls this only from its
 /// single long-lived render thread, satisfying that. The state also clears
 /// automatically when that thread terminates (app shutdown), so the
 /// display can sleep again on exit.

@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde::Serialize;
 use tauri::Manager;
-use tauri_plugin_libmpv::MpvExt;
 
 // ---------------------------------------------------------------------------
 // Shader profiles
@@ -208,87 +207,36 @@ pub async fn set_shader_profile(app: tauri::AppHandle, profile: u8) -> Result<()
         resolved_paths.push(cleaned.replace('\\', "/"));
     }
 
+    // `glsl-shaders` is a CLI-list option (semicolon-separated). It can
+    // NOT be assigned via `set_property` with a single path — libmpv
+    // rejects that with "invalid parameter". The correct protocol is
+    // `change-list <name> <op> <value>`:
+    //   • change-list glsl-shaders clr ""        → drop all
+    //   • change-list glsl-shaders set "<path>"  → replace (one)
+    //   • change-list glsl-shaders append "<p>"  → add another
+    //
+    // For multi-file chains (Anime4K Mode A and friends): clear first,
+    // then `set` the FIRST file, then `append` each remaining file in
+    // order. The chain order matters — Anime4K expects clamp → restore →
+    // upscale → downscale → upscale.
     #[cfg(target_os = "windows")]
-    let mpv2_active = crate::mpv2::engine::enabled() && crate::mpv2::engine::is_running();
-    #[cfg(not(target_os = "windows"))]
-    let mpv2_active = false;
-    if mpv2_active {
-        // mpv2 path: drive the same change-list protocol via the engine's
-        // command channel. `clr` first, then `set` for the head of the
-        // chain, then `append` for the rest — preserves Anime4K-style
-        // ordering across multi-file profiles.
-        #[cfg(target_os = "windows")]
-        {
-            crate::mpv2::engine::submit_command(vec![
-                "change-list".into(), "glsl-shaders".into(), "clr".into(), "".into(),
+    {
+        crate::mpv::engine::submit_command(vec![
+            "change-list".into(), "glsl-shaders".into(), "clr".into(), "".into(),
+        ])?;
+        for (i, path) in resolved_paths.iter().enumerate() {
+            let op = if i == 0 { "set" } else { "append" };
+            crate::devlog!(info, "cinema", "glsl-shaders {} {}", op, path);
+            crate::mpv::engine::submit_command(vec![
+                "change-list".into(),
+                "glsl-shaders".into(),
+                op.into(),
+                path.clone(),
             ])?;
-            for (i, path) in resolved_paths.iter().enumerate() {
-                let op = if i == 0 { "set" } else { "append" };
-                crate::devlog!(info, "cinema", "glsl-shaders {} {}", op, path);
-                crate::mpv2::engine::submit_command(vec![
-                    "change-list".into(),
-                    "glsl-shaders".into(),
-                    op.into(),
-                    path.clone(),
-                ])?;
-            }
         }
-    } else {
-        tauri::async_runtime::spawn_blocking({
-            let app = app.clone();
-            move || -> Result<(), String> {
-                let mpv = app.mpv();
-
-                // `glsl-shaders` is a CLI-list option (semicolon-separated). It
-                // can NOT be assigned via `set_property` with a single path —
-                // libmpv rejects that with "invalid parameter". The correct
-                // protocol is `change-list <name> <op> <value>`:
-                //   • change-list glsl-shaders clr ""        → drop all
-                //   • change-list glsl-shaders set "<path>"  → replace (one)
-                //   • change-list glsl-shaders append "<p>"  → add another
-                //
-                // For multi-file chains (Anime4K Mode A and friends): clear
-                // first, then `set` the FIRST file, then `append` each
-                // remaining file in order. The chain order matters — Anime4K
-                // expects clamp → restore → upscale → downscale → upscale.
-                mpv.command(
-                    "change-list",
-                    &vec![
-                        serde_json::json!("glsl-shaders"),
-                        serde_json::json!("clr"),
-                        serde_json::json!(""),
-                    ],
-                    "main",
-                )
-                .map_err(|e| {
-                    crate::devlog!(warn, "cinema", "glsl-shaders clr failed: {}", e);
-                    e.to_string()
-                })?;
-
-                for (i, path) in resolved_paths.iter().enumerate() {
-                    let op = if i == 0 { "set" } else { "append" };
-                    crate::devlog!(info, "cinema", "glsl-shaders {} {}", op, path);
-                    mpv.command(
-                        "change-list",
-                        &vec![
-                            serde_json::json!("glsl-shaders"),
-                            serde_json::json!(op),
-                            serde_json::json!(path.clone()),
-                        ],
-                        "main",
-                    )
-                    .map_err(|e| {
-                        crate::devlog!(warn, "cinema", "glsl-shaders {} {} failed: {}", op, path, e);
-                        e.to_string()
-                    })?;
-                }
-
-                Ok(())
-            }
-        })
-        .await
-        .map_err(|e| e.to_string())??;
     }
+    #[cfg(not(target_os = "windows"))]
+    return Err("playback engine is Windows-only".into());
 
     ACTIVE_PROFILE.store(profile, Ordering::Relaxed);
     Ok(())

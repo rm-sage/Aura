@@ -1,6 +1,20 @@
-# Render-API Rewrite — Phase 7: Retire the legacy plugin (BLOCKED — needs a thumb-instance decision)
+# Render-API Rewrite — Phase 7: Retire the legacy plugin (UNBLOCKED 2026-06-03 — thumb ported)
 
-Status: PAUSED (2026-06-02). Branch `feat/render-api-rewrite`. Was STAGED 2026-05-29.
+Status: UNBLOCKED (2026-06-03), ready to execute. Branch `feat/render-api-rewrite`
+(stale — main has since absorbed the engine; execute from a fresh branch off `main`).
+Was PAUSED 2026-06-02 on the thumb-instance decision; STAGED 2026-05-29.
+
+> **✅ BLOCKER RESOLVED 2026-06-03 — option (b) chosen and implemented.** The
+> thumbnail extractor no longer touches `tauri-plugin-libmpv`: it was ported to a
+> headless `mpv2` FFI instance (`src-tauri/src/mpv2/thumb.rs`, a self-owned
+> `vo=null` `mpv_handle` on a dedicated worker thread; `player.rs::extract_thumbnail`
+> now delegates to `mpv2::thumb::extract`). Compile-verified (`cargo check` +
+> `tsc`); awaiting HW smoke test of hover thumbnails. With this, the plugin is used
+> ONLY by the legacy `--wid` main-playback fallback (`AURA_MPV2=0`), so Phase 7's
+> remaining job is exactly the changeset below. **Re-confirm every anchor BY
+> CONTENT (line numbers have drifted further) and use the compiler as the worklist
+> (remove `MpvExt` imports first → `cargo check` lists every `app.mpv()` site).**
+> The BLOCKER note below is retained for history.
 
 > **⚠ BLOCKER found 2026-06-02 — do NOT apply this changeset as-is; it is
 > incomplete and would BREAK hover thumbnails.**
