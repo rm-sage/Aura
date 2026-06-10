@@ -30,13 +30,29 @@ pub fn resolve_hdr_mode(s: &crate::settings::AppSettings) -> &'static str {
 /// the supplied option map. Used at MPV init AND by `apply_hdr_settings`
 /// to update a running instance without re-init.
 ///
-/// `peak_nits` is the `hdr_target_peak_nits` setting — only consulted in
-/// "passthrough" mode. 0 = auto (trust the display caps Windows reports);
-/// non-zero pins `target-peak` so mpv tone-maps down to the panel's REAL
-/// peak when the reported value is wrong (e.g. an OLED in DisplayHDR
-/// True Black mode whose ~400/465-nit limit Windows doesn't know about —
-/// without the pin, 1000-nit-mastered highlights pass through untouched
-/// and the panel clips them, the "blown-out whites" symptom).
+/// ## Why "passthrough" is mpv-tone-mapped HDR OUTPUT, not a hint
+///
+/// The earlier design used `target-colorspace-hint=yes`, which tells the
+/// d3d11 context to flip the swapchain to the CONTENT's colorspace and —
+/// crucially — makes mpv do NO tone mapping at all (source == target by
+/// definition). The display becomes responsible for compressing
+/// 1000+-nit-mastered highlights into what the panel can show, and
+/// monitors whose current OSD mode peaks lower than what Windows
+/// reports (the AW3425DW in DisplayHDR True Black, ~450 nits real vs a
+/// reported ~1000) CLIP instead — blown-out whites that NO `target-peak`
+/// value can fix, because the hint supersedes the target params for HDR
+/// content. Runtime rewrites of the colorspace plumbing to compensate
+/// made things worse (swapchain renegotiation mid-playback mis-encodes).
+///
+/// The fix is to make MPV the tone-mapper while still outputting HDR:
+/// force the swapchain to PQ (`d3d11-output-csp=pq` — deterministic,
+/// init-time, requires HDR enabled in Windows), declare an explicit
+/// BT.2020/PQ target, and tone-map content to `target-peak` =
+/// `hdr_target_peak_nits` (the panel's REAL peak; "auto" = whatever the
+/// display reports, for panels that report honestly). Everything is
+/// static per mode — no per-content probing, no mid-playback writes.
+///
+/// `peak_nits` is only consulted in "passthrough" mode; 0 = auto.
 pub fn apply_hdr_options(
     options: &mut IndexMap<String, serde_json::Value>,
     mode: &str,
@@ -44,12 +60,18 @@ pub fn apply_hdr_options(
 ) {
     match mode {
         "passthrough" => {
-            options.insert("target-colorspace-hint".into(), serde_json::json!("yes"));
+            // We own the target — the hint must be OFF or it would
+            // override the explicit target params for HDR content.
+            options.insert("target-colorspace-hint".into(), serde_json::json!("no"));
+            // Force the d3d11 swapchain to PQ so the HDR signal path is
+            // active regardless of content (SDR gets mapped into the PQ
+            // container at reference white). Reset to "auto" by the
+            // other modes below.
+            options.insert("d3d11-output-csp".into(),       serde_json::json!("pq"));
+            options.insert("target-prim".into(),            serde_json::json!("bt.2020"));
+            options.insert("target-trc".into(),             serde_json::json!("pq"));
             options.insert("hdr-compute-peak".into(),       serde_json::json!("yes"));
             options.insert("tone-mapping".into(),           serde_json::json!("auto"));
-            // Don't pin target-prim / target-trc — let the display auto-detect.
-            options.insert("target-prim".into(),            serde_json::json!("auto"));
-            options.insert("target-trc".into(),             serde_json::json!("auto"));
             if peak_nits > 0 {
                 options.insert("target-peak".into(),        serde_json::json!(peak_nits));
             } else {
@@ -63,6 +85,7 @@ pub fn apply_hdr_options(
             // (auto can over-boost on bright HDR content). target-peak
             // 203 cd/m² is BT.2408's reference SDR white.
             options.insert("target-colorspace-hint".into(), serde_json::json!("no"));
+            options.insert("d3d11-output-csp".into(),       serde_json::json!("auto"));
             options.insert("target-prim".into(),            serde_json::json!("bt.709"));
             options.insert("target-trc".into(),             serde_json::json!("bt.1886"));
             options.insert("target-peak".into(),            serde_json::json!(203));
@@ -72,6 +95,7 @@ pub fn apply_hdr_options(
         // "off" and any unknown value
         _ => {
             options.insert("target-colorspace-hint".into(), serde_json::json!("no"));
+            options.insert("d3d11-output-csp".into(),       serde_json::json!("auto"));
             options.insert("hdr-compute-peak".into(),       serde_json::json!("no"));
             options.insert("tone-mapping".into(),           serde_json::json!("clip"));
             options.insert("target-prim".into(),            serde_json::json!("auto"));
