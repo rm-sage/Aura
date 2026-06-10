@@ -3192,7 +3192,35 @@ pub async fn fetch_landscape_art(
         }
     };
     match resp.json::<LandscapeArt>().await {
-        Ok(art) => Ok(art),
+        Ok(mut art) => {
+            // Baked-title backstop. AIOMeta's hasBakedTitle detection has
+            // been observed returning `false` for art classes that ALWAYS
+            // carry the title — fanart.tv's thumb category literally
+            // requires the show logo by submission rules, and a cropped
+            // poster virtually always contains it. The client then
+            // overlaid its own logo on top of the baked one (double-title
+            // CW cards: Witch Hat Atelier, Daemons of the Shadow Realm).
+            // Force the flag for those sources here, at the single
+            // resolution boundary, so every consumer renders one title.
+            // Textless-by-convention sources (tmdb-backdrop, tvdb-bg,
+            // anilist-banner) keep the server's verdict.
+            if !art.has_baked_title {
+                let always_titled = matches!(
+                    art.source.as_deref(),
+                    Some("fanart-thumb") | Some("poster-crop"),
+                );
+                if always_titled {
+                    crate::devlog!(
+                        debug, "meta",
+                        "[{}] landscape art source '{}' is always-titled — overriding hasBakedTitle=false",
+                        label,
+                        art.source.as_deref().unwrap_or(""),
+                    );
+                    art.has_baked_title = true;
+                }
+            }
+            Ok(art)
+        }
         Err(e) => {
             crate::devlog!(debug, "meta", "[{}] landscape art parse error: {}", label, e);
             Ok(LandscapeArt::default())
