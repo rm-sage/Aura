@@ -18,7 +18,7 @@
 // posture as silencedetect: http(s) only + `-protocol_whitelist`. Passes the
 // direct `streamUrl` (NOT the 127.0.0.1:11471 bridge — TLS-cert mismatch breaks
 // it, per the CLAUDE.md streaming-bridge constraint). Runs entirely outside the
-// main mpv2 render instance, so the MPV landmines (#2 WASAPI, #3 seek
+// main mpv render instance, so the MPV landmines (#2 WASAPI, #3 seek
 // crit-section, #4 observed-property channel) do not apply.
 // ---------------------------------------------------------------------------
 
@@ -75,7 +75,7 @@ pub struct ThumbResult {
 
 /// Extract a single seek-accurate JPEG thumbnail at `at_seconds` from `url`.
 ///
-/// Primary path is the warm headless libmpv FFI engine (`mpv2::thumb`): fast on
+/// Primary path is the warm headless libmpv FFI engine (`mpv::thumb`): fast on
 /// repeated hovers (open stream + decoder reused) and never-stale (screenshot
 /// gated on mpv's `playback-restart` event). Falls back to a cold
 /// ffmpeg-per-hover extraction. Best-effort throughout: any failure resolves to
@@ -104,7 +104,7 @@ pub async fn extract_thumbnail(
     #[cfg(target_os = "windows")]
     {
         let u = url.clone();
-        match tokio::task::spawn_blocking(move || crate::mpv2::thumb::extract(u, at_seconds)).await {
+        match tokio::task::spawn_blocking(move || crate::mpv::thumb::extract(u, at_seconds)).await {
             Ok(Ok(Some(r))) => return Ok(Some(r)),
             // No frame OR a coalesced (superseded) rapid-hover request — return
             // None directly. NOT a fallback case: the next hover retries, and

@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `mpv2::thumb` — headless hover-seek thumbnail engine on direct libmpv FFI.
+//! `mpv::thumb` — headless hover-seek thumbnail engine on direct libmpv FFI.
 //!
 //! # What this replaces
 //!
@@ -26,7 +26,7 @@
 //!
 //! # Threading model
 //!
-//! A single dedicated worker thread (`aura-mpv2-thumb`) owns the
+//! A single dedicated worker thread (`aura-mpv-thumb`) owns the
 //! `*mut mpv_handle` and the [`Libmpv`] loader for its entire lifetime. The
 //! raw pointer never crosses a thread boundary, so no `unsafe impl Send` is
 //! needed and ops are naturally serialised (the JS side single-flights and
@@ -120,7 +120,7 @@ pub fn extract(url: String, at_seconds: f64) -> Result<Option<ThumbResult>, Stri
             }
             Err(_) => {
                 crate::devlog!(
-                    warn, "mpv2",
+                    warn, "mpv",
                     "thumb worker channel closed (attempt {attempt}) — respawning",
                 );
                 discard_worker();
@@ -131,7 +131,7 @@ pub fn extract(url: String, at_seconds: f64) -> Result<Option<ThumbResult>, Stri
 }
 
 /// Lazily start the worker if none is live and return a clone of its
-/// command sender. Spawns the dedicated `aura-mpv2-thumb` thread on first
+/// command sender. Spawns the dedicated `aura-mpv-thumb` thread on first
 /// use; subsequent calls just clone the existing sender.
 fn ensure_worker() -> Result<Sender<ThumbControl>, String> {
     let mut guard = worker_slot()
@@ -140,7 +140,7 @@ fn ensure_worker() -> Result<Sender<ThumbControl>, String> {
     if guard.is_none() {
         let (tx, rx) = mpsc::channel::<ThumbControl>();
         let join = thread::Builder::new()
-            .name("aura-mpv2-thumb".into())
+            .name("aura-mpv-thumb".into())
             .spawn(move || run_worker(rx))
             .map_err(|e| format!("failed to spawn thumb worker: {e}"))?;
         *guard = Some(ThumbWorker { tx, join: Some(join) });
@@ -194,7 +194,7 @@ pub fn shutdown() {
         });
         if done_rx.recv_timeout(Duration::from_secs(2)).is_err() {
             crate::devlog!(
-                warn, "mpv2",
+                warn, "mpv",
                 "thumb worker did not exit within 2 s — detaching for OS reap",
             );
         }
@@ -275,7 +275,7 @@ fn run_worker(rx: Receiver<ThumbControl>) {
                         if let Some(inst) = instance.take() {
                             unsafe { (inst.lib.terminate_destroy)(inst.handle) };
                         }
-                        crate::devlog!(error, "mpv2", "thumb extraction panicked — instance reset");
+                        crate::devlog!(error, "mpv", "thumb extraction panicked — instance reset");
                         Err("thumb extraction panicked".to_string())
                     }
                 };
@@ -289,7 +289,7 @@ fn run_worker(rx: Receiver<ThumbControl>) {
 
     if let Some(inst) = instance.take() {
         unsafe { (inst.lib.terminate_destroy)(inst.handle) };
-        crate::devlog!(info, "mpv2", "thumb instance destroyed");
+        crate::devlog!(info, "mpv", "thumb instance destroyed");
     }
 }
 
@@ -332,7 +332,7 @@ unsafe fn init_instance() -> Result<ThumbInstance, String> {
         );
         if r < 0 {
             crate::devlog!(
-                warn, "mpv2",
+                warn, "mpv",
                 "thumb option {} = {} failed: {}",
                 String::from_utf8_lossy(&name[..name.len().saturating_sub(1)]),
                 String::from_utf8_lossy(&value[..value.len().saturating_sub(1)]),
@@ -348,7 +348,7 @@ unsafe fn init_instance() -> Result<ThumbInstance, String> {
         return Err(format!("mpv_initialize failed (thumb): {e}"));
     }
 
-    crate::devlog!(info, "mpv2", "thumb headless instance initialised (direct FFI)");
+    crate::devlog!(info, "mpv", "thumb headless instance initialised (direct FFI)");
     Ok(ThumbInstance {
         lib,
         handle,

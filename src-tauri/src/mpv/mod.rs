@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `mpv2` — Aura's direct-FFI libmpv layer (the only playback path).
+//! `mpv` — Aura's direct-FFI libmpv layer (the only playback path).
 //!
 //! Replaced `tauri-plugin-libmpv` / `libmpv-wrapper.dll` entirely: [`ffi`]
 //! binds `libmpv-2.dll` directly via `libloading` (mirroring the pattern

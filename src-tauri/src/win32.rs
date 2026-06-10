@@ -5,7 +5,7 @@
 //! tracks its parent's client area on every parent resize / fullscreen
 //! toggle.
 //!
-//! The mpv2 engine embeds MPV via the `wid=<HWND>` option (pointed at the
+//! The mpv engine embeds MPV via the `wid=<HWND>` option (pointed at the
 //! engine's host child window). The embedded child window doesn't
 //! propagate WM_SIZE in every libmpv build, so after a parent resize the
 //! video stays at its old geometry. The standard fix is
@@ -409,7 +409,7 @@ pub fn is_in_native_fullscreen() -> bool {
 
 /// Keep the display + system awake during playback (or release that hold).
 ///
-/// WHY THIS EXISTS: under the mpv2 render-API engine, mpv renders into a
+/// WHY THIS EXISTS: under the mpv render-API engine, mpv renders into a
 /// surface WE own (`vo=libmpv`) and no longer manages a video-output
 /// window — so mpv's built-in `stop-screensaver` can't fire, and after the
 /// OS idle timeout the monitors sleep mid-playback. (The legacy `--wid`
@@ -421,7 +421,7 @@ pub fn is_in_native_fullscreen() -> bool {
 /// than a one-shot idle-timer poke), so we set it once on the playing↔
 /// paused transition instead of heartbeating. CRITICAL: the continuous
 /// state is PER-THREAD — `inhibit(true)` and the matching `inhibit(false)`
-/// MUST run on the same thread. The mpv2 engine calls this only from its
+/// MUST run on the same thread. The mpv engine calls this only from its
 /// single long-lived render thread, satisfying that. The state also clears
 /// automatically when that thread terminates (app shutdown), so the
 /// display can sleep again on exit.

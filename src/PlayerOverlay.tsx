@@ -3197,7 +3197,7 @@ function MoreMenu({
     // (the smoothness dial) lives in Settings.
     invoke("set_motion_interpolation", {
       enabled: next,
-      tscale: loadAuraSettings().interpolationTscale ?? "mitchell",
+      tscale: loadAuraSettings().interpolationTscale ?? "oversample",
     }).catch(() => {});
     showFlash(next ? "Motion interpolation on" : "Motion interpolation off");
   };

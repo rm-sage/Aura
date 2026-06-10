@@ -37,7 +37,7 @@ When inspecting bundle output for confirmed CSS rules (e.g. verifying a Tailwind
 
 - **Rust host** owns: MPV instance, axum streaming bridge on `127.0.0.1:11471`, Stremio account API, addon fan-out, OS integrations (SMTC, Discord RPC, keyring), Win32 fullscreen.
 - **WebView2 webview** is the React UI. Configured `decorations: false`, `transparent: true`, `shadow: false` in `tauri.conf.json`.
-- **MPV** is driven by `src-tauri/src/mpv2/engine.rs` — direct FFI against `libmpv-2.dll` (`mpv2/ffi.rs`), embedded via `wid=<host hwnd>` into an engine-owned host child window of the main window (`HWND_BOTTOM`, below the WebView2). The engine thread owns the mpv handle, a command channel (every playback Tauri command submits to it), the event drain (→ `mpv-event-main` → observer bridge → `playback-update`), and per-tick geometry tracking of the parent's client rect (36 px title-bar inset windowed, 0 in fullscreen). `tauri-plugin-libmpv` / `libmpv-wrapper.dll` were REMOVED in the engine consolidation; the render-context path was too (it couldn't reach `vo=gpu-next`, so no HDR passthrough). The webview's transparency is what lets the MPV layer show through; never paint a non-transparent background on the app shell. `AURA_MPV2` is parsed-but-ignored (warns if set to an off value).
+- **MPV** is driven by `src-tauri/src/mpv/engine.rs` — direct FFI against `libmpv-2.dll` (`mpv/ffi.rs`), embedded via `wid=<host hwnd>` into an engine-owned host child window of the main window (`HWND_BOTTOM`, below the WebView2). The engine thread owns the mpv handle, a command channel (every playback Tauri command submits to it), the event drain (→ `mpv-event-main` → observer bridge → `playback-update`), and per-tick geometry tracking of the parent's client rect (36 px title-bar inset windowed, 0 in fullscreen). `tauri-plugin-libmpv` / `libmpv-wrapper.dll` were REMOVED in the engine consolidation; the render-context path was too (it couldn't reach `vo=gpu-next`, so no HDR passthrough). The webview's transparency is what lets the MPV layer show through; never paint a non-transparent background on the app shell. `AURA_MPV2` is parsed-but-ignored (warns if set to an off value).
 
 ### Streaming bridge — HTTPS bypass is intentional
 
@@ -80,7 +80,7 @@ These are mistakes that have specific, hard-to-diagnose symptoms. The HANDOFF.md
 6. **Do not unmount `<TitleBar>` during windowed playback.** Stays visible (with `opaque` prop) in windowed; only unmount in true OS fullscreen. PlayerOverlay's top action bar must offset 36 px in windowed mode to avoid overlapping it.
 7. **Do not use `data-tauri-drag-region` for the title bar.** It leaves the cursor stuck on simple clicks. Use explicit `onPointerDown → getCurrentWindow().startDragging()`.
 8. **Do not set `glsl-shaders` via `set_property`.** Use `change-list glsl-shaders set "<forward-slash-path>"` and strip `\\?\` UNC prefixes from the path string first.
-9. **Tear mpv down synchronously in `CloseRequested`.** `tauri::async_runtime::spawn_blocking` returns immediately; the process can exit before WASAPI is released. `mpv2::engine::shutdown_if_running()` joins the engine thread, whose teardown does the right sequence (mute → stop → `mpv_terminate_destroy`).
+9. **Tear mpv down synchronously in `CloseRequested`.** `tauri::async_runtime::spawn_blocking` returns immediately; the process can exit before WASAPI is released. `mpv::engine::shutdown_if_running()` joins the engine thread, whose teardown does the right sequence (mute → stop → `mpv_terminate_destroy`).
 10. **Do not reparent the MPV child to top-level.** Tried (`SetParent(NULL)` + `WS_POPUP`) for "true exclusive fullscreen" — libmpv's render context didn't survive the reparent and video disappeared. Stick with the child-window architecture; `win32::enter_native_fullscreen` resizes the PARENT to monitor rect with `WS_POPUP` + `HWND_TOPMOST` instead.
 
 ## Win32 fullscreen reality check
@@ -97,7 +97,7 @@ These are mistakes that have specific, hard-to-diagnose symptoms. The HANDOFF.md
 
 - "Volume slider snaps back" / "speed doesn't change" → `lib.rs` setters; verify `submit_set_property(...)` not `submit_command(vec!["set_property", ...])`.
 - "MPV renders behind UI" / black bar at top → `App.tsx` TitleBar `opaque` prop, body `hidden` class while playing, `.aura-app-shell` background must be transparent always.
-- "MPV doesn't fill window after fullscreen toggle" → the engine's pump-loop geometry resync in `mpv2/engine.rs` (polls parent rect + `is_in_native_fullscreen` every ~5 ms, resizes host + mpv child via `win32::resize_mpv_child_to_parent`). `refresh_video` only does the video-zoom nudge now.
+- "MPV doesn't fill window after fullscreen toggle" → the engine's pump-loop geometry resync in `mpv/engine.rs` (polls parent rect + `is_in_native_fullscreen` every ~5 ms, resizes host + mpv child via `win32::resize_mpv_child_to_parent`). `refresh_video` only does the video-zoom nudge now.
 - "App crashes on play" (STATUS_ACCESS_VIOLATION) → MPV property race; check polling and observed-property formats.
 - "Native browser context menu appears" → `main.tsx` capture-phase `contextmenu` listener; must install BEFORE React mounts.
 - "Streams from addon X don't appear" → DevConsole filter for `[X]`; `fetch_streams` logs manifest gate decisions.
@@ -107,7 +107,7 @@ These are mistakes that have specific, hard-to-diagnose symptoms. The HANDOFF.md
 ## Conventions
 
 - F12 opens the in-app DevConsole (ring buffer, level filters, search). Rust logs come through via `crate::devlog!` macro which mirrors to stderr AND emits a `dev-log` Tauri event.
-- Rust log labels: `[bridge]`, `[player]`, `[streams]`, `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[ratings]`, `[rpc]`, `[win32]`, `[smtc]`, `[scrobble]`, `[publicmetadb]`, `[mpv2]` — grep these in DevConsole or `aura-mpv.log`. (`[mpv2]` is the playback engine — `src-tauri/src/mpv2/`.)
+- Rust log labels: `[bridge]`, `[player]`, `[streams]`, `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[ratings]`, `[rpc]`, `[win32]`, `[smtc]`, `[scrobble]`, `[publicmetadb]`, `[mpv]` — grep these in DevConsole or `aura-mpv.log`. (`[mpv]` is the playback engine — `src-tauri/src/mpv/`.)
 - libmpv writes its own verbose log to `%USERPROFILE%\aura-mpv.log` (truncated each MPV init, rotated to `.old` past 50 MB). The last few lines usually pinpoint a STATUS_ACCESS_VIOLATION.
 - Discord RPC uses application ID `1499651271357890610` (in `window_logic.rs`). Browse states are gated on `discord_rpc_browse_states` setting; playback states honor `discord_rpc_show_titles` + the per-title blocklist.
 - `src-tauri/lib/` contents are git-ignored (>100 MB): `libmpv-2.dll` (REQUIRED — download at `github.com/zhongfly/mpv-winbuild`) and `ffmpeg.exe` (silencedetect; absent ⇒ feature ships inert). `libmpv-wrapper.dll` is no longer used on this branch (it belonged to the removed `tauri-plugin-libmpv`) but keep it around while other branches still need it.

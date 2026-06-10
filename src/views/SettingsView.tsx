@@ -93,10 +93,19 @@ interface BackendSettings {
   /** Tri-state HDR pipeline: "off" | "sdr" | "passthrough". See
    *  src-tauri/src/settings.rs for the property fan-out per mode. */
   hdr_mode: string;
+  /** Passthrough-only display-peak override in nits (mpv target-peak).
+   *  0 = auto (trust the caps Windows reports). Fixes blown-out
+   *  highlights when the panel's current OSD mode peaks lower than
+   *  Windows believes (OLED True Black modes). */
+  hdr_target_peak_nits: number;
   /** Lead time (seconds before episode end) for the Next-Up CTA.
    *  0 disables the feature. */
   next_up_lead_seconds: number;
   audio_passthrough: boolean;
+  /** Backend mirror of auraSettings.loudnessNormalization — written by
+   *  the set_audio_loudnorm command so the engine can install the
+   *  @loudnorm filter at mpv init. Not edited directly from this view. */
+  loudness_normalization: boolean;
   keybindings: Record<string, string>;
   skip_op_mode: string;
   skip_ed_mode: string;
@@ -1617,6 +1626,72 @@ function ConfirmModal({
 /** Lead-time row for the Next-Up CTA. Rendered as a labelled number
  *  field with chip-style presets (off / 30 / 60 / 90 / 120 s) so the
  *  common cases are one click away while still allowing custom values. */
+function HdrPeakNitsRow({
+  value, onChange,
+}: { value: number; onChange: (v: number) => void }) {
+  // Common panel peaks: DisplayHDR True Black 400 OLEDs really peak
+  // ~400-465 nits; HDR600 / HDR1000 monitors at their certification
+  // levels. 0 = trust what Windows reports for the display.
+  const PRESETS = [0, 400, 465, 600, 1000];
+  const clamped = Math.max(0, Math.min(10000, value));
+  return (
+    <div
+      className="space-y-2"
+      data-settings-row=""
+      data-settings-label="HDR display peak (nits)"
+      data-settings-description="Passthrough only: the brightness mpv tone-maps HDR content down to. Leave on Auto unless highlights look blown out — that means Windows is reporting a higher peak than your panel's current mode can show (common on OLEDs in DisplayHDR True Black mode; try 400-465)."
+    >
+      <div>
+        <p className="text-white/75 text-sm font-medium">HDR display peak (nits)</p>
+        <p className="text-white/35 text-xs mt-0.5">
+          The brightness mpv tone-maps HDR content down to in Passthrough
+          mode. Leave on Auto unless highlights look blown out — that means
+          Windows is reporting a higher peak than your panel's current mode
+          can actually show (common on OLEDs in DisplayHDR True Black mode;
+          try 400–465).
+        </p>
+      </div>
+      <div className="flex items-center gap-2 flex-wrap">
+        {PRESETS.map((p) => {
+          const active = clamped === p;
+          const label = p === 0 ? "Auto" : `${p}`;
+          return (
+            <button
+              key={p}
+              type="button"
+              onClick={() => onChange(p)}
+              className={[
+                "px-3 py-1 rounded-full text-[12px] font-medium border transition-colors",
+                active
+                  ? "bg-ln-accent/20 text-ln-accent border-ln-accent/40"
+                  : "bg-white/5 text-white/65 border-white/10 hover:bg-white/10",
+              ].join(" ")}
+            >
+              {label}
+            </button>
+          );
+        })}
+        <div className="flex items-center gap-2 ml-1 text-[12px]">
+          <input
+            type="number"
+            min={0}
+            max={10000}
+            value={clamped}
+            onChange={(e) => {
+              const n = Number(e.target.value);
+              if (Number.isFinite(n)) onChange(Math.max(0, Math.min(10000, Math.round(n))));
+            }}
+            className="w-20 bg-white/5 border border-white/10 rounded-lg px-2 py-1
+                       text-white/85 outline-none focus:border-white/25 transition-colors
+                       text-center tabular-nums"
+          />
+          <span className="text-white/40">nits (0 = auto)</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function NextUpLeadTimeRow({
   value, onChange,
 }: { value: number; onChange: (v: number) => void }) {
@@ -2231,8 +2306,8 @@ function formatAgo(diffMs: number): string {
 
 interface DebugEngineSnapshot {
   engine: {
-    mpv2_active: boolean;
-    mpv2_running: boolean;
+    mpv_active: boolean;
+    mpv_running: boolean;
     present_mode: string | null;
   };
   window: {
@@ -2448,7 +2523,7 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
         </div>
 
         <p className="text-white/55 text-xs leading-relaxed">
-          Diagnostic surface for the mpv2 render-API engine. Live state
+          Diagnostic surface for the mpv playback engine. Live state
           refreshes once per second; the drop-rate test reads mpv's own
           counters at the start and end of a timed window. If nothing is
           playing when you click Run, the test auto-loads a synthetic
@@ -2462,8 +2537,8 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
           Engine + window
         </p>
         <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12.5px]">
-          <DebugRow label="AURA_MPV2 set" value={fmtBool(snap?.engine.mpv2_active)} />
-          <DebugRow label="Engine running" value={fmtBool(snap?.engine.mpv2_running)} />
+          <DebugRow label="Engine active" value={fmtBool(snap?.engine.mpv_active)} />
+          <DebugRow label="Engine running" value={fmtBool(snap?.engine.mpv_running)} />
           <DebugRow label="Present mode" value={snap?.engine.present_mode ?? "—"} />
           <DebugRow label="HWND" value={snap?.window.hwnd_hex ?? "—"} />
           <DebugRow label="Foreground" value={fmtBool(snap?.window.is_foreground)} />
@@ -2480,7 +2555,7 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
         <p className="text-white/40 text-[10.5px] font-mono uppercase tracking-[0.18em] mb-2">
           Video decode (mpv)
         </p>
-        {snap?.engine.mpv2_running ? (
+        {snap?.engine.mpv_running ? (
           <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12.5px]">
             <DebugRow label="Codec" value={snap?.mpv?.video_codec ?? "—"} />
             <DebugRow
@@ -2526,7 +2601,7 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
           </div>
         ) : (
           <p className="text-white/45 text-[12.5px] italic">
-            mpv2 engine not running (AURA_MPV2 unset or not yet initialised).
+            Playback engine not running (not yet initialised).
           </p>
         )}
       </div>
@@ -2590,7 +2665,7 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
           <button
             type="button"
             onClick={runTest}
-            disabled={running || !snap?.engine.mpv2_running}
+            disabled={running || !snap?.engine.mpv_running}
             className="px-3 py-1 rounded-md bg-ln-accent/20 text-ln-accent
                        hover:bg-ln-accent/30 active:bg-ln-accent/40
                        border border-ln-accent/40
@@ -2603,7 +2678,7 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
           <button
             type="button"
             onClick={loadPattern}
-            disabled={running || loadingPattern || !snap?.engine.mpv2_running}
+            disabled={running || loadingPattern || !snap?.engine.mpv_running}
             className="px-3 py-1 rounded-md bg-white/6 hover:bg-white/10 active:bg-white/14
                        border border-white/15 text-white/80
                        text-[12px]
@@ -2616,7 +2691,7 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
           <button
             type="button"
             onClick={stopPlayback}
-            disabled={running || !snap?.engine.mpv2_running}
+            disabled={running || !snap?.engine.mpv_running}
             className="px-3 py-1 rounded-md bg-white/6 hover:bg-white/10 active:bg-white/14
                        border border-white/15 text-white/80
                        text-[12px]
@@ -4641,6 +4716,22 @@ export default function SettingsView({ addons, session }: Props) {
                   invoke("apply_hdr_settings", { mode }).catch(() => {});
                 }}
               />
+              {(backend.hdr_mode ?? "").trim().toLowerCase() === "passthrough" && (
+                <>
+                  <div className="h-px bg-white/6" />
+                  <HdrPeakNitsRow
+                    value={backend.hdr_target_peak_nits ?? 0}
+                    onChange={async (v) => {
+                      await patchBackend({ hdr_target_peak_nits: v });
+                      // Re-push the passthrough option set so the new
+                      // target-peak applies to the running instance
+                      // immediately (apply_hdr_settings re-reads the
+                      // freshly-saved snapshot for the peak value).
+                      invoke("apply_hdr_settings", { mode: "passthrough" }).catch(() => {});
+                    }}
+                  />
+                </>
+              )}
               <div className="h-px bg-white/6" />
               <NextUpLeadTimeRow
                 value={backend.next_up_lead_seconds ?? 60}

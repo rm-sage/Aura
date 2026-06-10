@@ -651,9 +651,9 @@ pub async fn set_skip_windows<R: Runtime>(
     }
     let _ = app.emit("aura:skip-windows", &payload);
     #[cfg(target_os = "windows")]
-    return crate::mpv2::engine::submit_set_property(
+    return crate::mpv::engine::submit_set_property(
         "user-data/aura/skip-windows".into(),
-        crate::mpv2::engine::PropValue::String(json),
+        crate::mpv::engine::PropValue::String(json),
     );
     #[cfg(not(target_os = "windows"))]
     {

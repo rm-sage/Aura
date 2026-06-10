@@ -498,7 +498,7 @@ pub async fn add_subtitle_to_mpv(
                 args.push(lang_str);
             }
         }
-        crate::mpv2::engine::submit_command(args)
+        crate::mpv::engine::submit_command(args)
     }
     #[cfg(not(target_os = "windows"))]
     {

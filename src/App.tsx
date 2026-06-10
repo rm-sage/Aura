@@ -1360,20 +1360,23 @@ export default function App() {
           // Re-push the user's subtitle styling so a freshly-loaded
           // file inherits the saved size / colour / position / etc.
           invoke("apply_subtitle_style").catch(() => {});
-          // Loudness normalization re-applies on every stream load.
-          // Read fresh — the toggle (Settings or player's three-dots
-          // menu) writes through saveAuraSettings which busts the
-          // module-level snapshot, so this returns the current value.
-          const { loudnessNormalization, motionInterpolation, interpolationTscale } = loadAuraSettings();
-          invoke("set_audio_loudnorm", { enabled: !!loudnessNormalization }).catch(() => {});
-          // SVP Tier 1 — re-apply the persisted motion-interpolation
-          // setting on every load (the @auraInterp vf is per-file).
-          // Issued inside the same +1500 ms post-load gate as loudnorm
-          // so it never touches libmpv during the loadfile critical
-          // section (landmine #3).
+          // Loudness normalization is NOT re-applied per load anymore:
+          // the `af` property persists across loadfiles, the engine
+          // installs the filter at mpv init from the persisted setting,
+          // and the toggles (Settings / three-dots menu) handle live
+          // changes. The old per-load remove+add raced slow stream
+          // opens — the filter sat in the property without rebuilding
+          // the already-initialised audio chain until a seek forced it,
+          // i.e. "volume is wrong until I seek once".
+          const { motionInterpolation, interpolationTscale } = loadAuraSettings();
+          // Re-apply the persisted motion-interpolation setting on every
+          // load — unlike loudnorm this one IS load-dependent (the
+          // anime-only gate means it must flip per title). Issued inside
+          // this +1500 ms post-load gate so it never touches libmpv
+          // during the loadfile critical section (landmine #3).
           invoke("set_motion_interpolation", {
             enabled: !!motionInterpolation && animeFlag,
-            tscale: interpolationTscale ?? "mitchell",
+            tscale: interpolationTscale ?? "oversample",
           }).catch(() => {});
           // Hover-thumbnail pre-warm. `extract_thumbnail` lazily spins
           // up a SEPARATE "thumb" libmpv instance (audio=false, vo=null,
@@ -2925,12 +2928,10 @@ export default function App() {
   }, [activeTarget, paused]);
 
   // ── Keep the display awake during active playback ──
-  // Under the mpv2 render engine, mpv (vo=libmpv) owns no window and can't
-  // run its own stop-screensaver, so the monitor would sleep mid-episode
-  // after the OS idle timeout. Assert the keep-awake hold whenever the
-  // player is up AND not paused; release otherwise (paused / browsing →
-  // normal sleep, matching mpv's default). The Rust side applies
-  // SetThreadExecutionState from the engine's render thread.
+  // Belt-and-suspenders alongside mpv's own stop-screensaver: assert the
+  // keep-awake hold whenever the player is up AND not paused; release
+  // otherwise (paused / browsing → normal sleep). The Rust side applies
+  // SetThreadExecutionState from the engine's pump thread.
   useEffect(() => {
     invoke("set_keep_display_awake", { enabled: isPlayerActive && !paused })
       .catch(() => {});

@@ -299,9 +299,9 @@ fn pause_mpv<R: Runtime>(app: &AppHandle<R>) {
         // (CLAUDE.md landmine #1 — pause must be a dedicated property
         // write, never `command("set_property", …)`; the engine's
         // PropValue path is exactly that.)
-        let _ = crate::mpv2::engine::submit_set_property(
+        let _ = crate::mpv::engine::submit_set_property(
             "pause".into(),
-            crate::mpv2::engine::PropValue::Flag(true),
+            crate::mpv::engine::PropValue::Flag(true),
         );
     }
 }
@@ -430,7 +430,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     // sequence (the WASAPI-release discipline, landmine #9)
                     // before app.exit() pulls the process out from under it.
                     #[cfg(target_os = "windows")]
-                    crate::mpv2::engine::shutdown_if_running();
+                    crate::mpv::engine::shutdown_if_running();
                     // Headless thumbnail engine — no-op when no thumbnail was
                     // ever requested (the worker is lazy). Otherwise sends
                     // Shutdown and joins (bounded 2 s) so the thumb mpv handle
@@ -438,7 +438,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     // holds no WASAPI device — this is tidiness, not a
                     // correctness requirement.
                     #[cfg(target_os = "windows")]
-                    crate::mpv2::thumb::shutdown();
+                    crate::mpv::thumb::shutdown();
                     clear_presence_inner();
                     // Reap the streaming-bridge subprocess so it doesn't
                     // outlive the parent. Without this the bridge keeps

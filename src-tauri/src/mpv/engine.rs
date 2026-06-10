@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `mpv2::engine` — Aura's single playback engine: direct-FFI libmpv
+//! `mpv::engine` — Aura's single playback engine: direct-FFI libmpv
 //! embedded via `--wid` into an engine-owned host child window.
 //!
 //! ## Consolidation history (2026-06)
@@ -16,7 +16,7 @@
 //!   * the render API on this libmpv build is hardcoded to `gl_video` —
 //!     `vo=gpu-next` (and with it scRGB/HDR passthrough) is unreachable;
 //!     real HDR needed a host DXGI flip swapchain + `WGL_NV_DX_interop2`
-//!     (see `docs/superpowers/specs/2026-06-03-mpv2-hdr-dxgi-interop-
+//!     (see `docs/superpowers/specs/2026-06-03-mpv-hdr-dxgi-interop-
 //!     design.md`), an L-effort, HW-gated build;
 //!   * `--wid` + `vo=gpu-next` + d3d11 does correct HDR/Dolby-Vision
 //!     passthrough today (`target-colorspace-hint` is honoured by the
@@ -49,7 +49,7 @@
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::ptr;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering},
     mpsc::{self, Receiver, Sender, TryRecvError},
     Mutex, OnceLock,
 };
@@ -62,7 +62,9 @@ use windows::Win32::Foundation::{
     RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, EndPaint, PAINTSTRUCT,
+    BeginPaint, CreateSolidBrush, EndPaint, EnumDisplaySettingsW, GetMonitorInfoW,
+    MonitorFromWindow, DEVMODEW, ENUM_CURRENT_SETTINGS, MONITORINFO, MONITORINFOEXW,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
 use windows::Win32::Foundation::COLORREF;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -173,7 +175,63 @@ fn engine_slot() -> &'static Mutex<Option<EngineHandle>> {
     ENGINE.get_or_init(|| Mutex::new(None))
 }
 
-/// Historical env-var gate for the mpv2 path. It used to select between
+/// Parent (main window) HWND, published by [`start`] so helpers that need
+/// monitor-relative queries can reach it from any thread without holding
+/// engine state. 0 = engine never started.
+static PARENT_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// Refresh rate (Hz) of the monitor the main window currently occupies.
+///
+/// Used by `set_motion_interpolation` to pin mpv's
+/// `display-fps-override`: in `--wid` embedded mode mpv doesn't own a
+/// top-level window, so its own vsync/display-FPS estimation is
+/// unreliable — and `video-sync=display-resample` with a mis-estimated
+/// display FPS resamples video to the wrong clock, which manifests as
+/// severe, constant frame drops the moment interpolation turns on.
+/// `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` on the window's monitor
+/// returns the mode's true vertical refresh, sidestepping the estimate.
+pub fn parent_display_refresh_hz() -> Option<f64> {
+    let raw = PARENT_HWND.load(Ordering::Acquire);
+    if raw == 0 {
+        return None;
+    }
+    unsafe {
+        let hwnd = HWND(raw as *mut c_void);
+        let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if hmon.is_invalid() {
+            return None;
+        }
+        let mut mi = MONITORINFOEXW::default();
+        mi.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if !GetMonitorInfoW(hmon, &mut mi as *mut MONITORINFOEXW as *mut MONITORINFO)
+            .as_bool()
+        {
+            return None;
+        }
+        let mut dm = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
+        if !EnumDisplaySettingsW(
+            PCWSTR(mi.szDevice.as_ptr()),
+            ENUM_CURRENT_SETTINGS,
+            &mut dm,
+        )
+        .as_bool()
+        {
+            return None;
+        }
+        let hz = dm.dmDisplayFrequency;
+        // 23..1000 sanity window — 0/1 mean "hardware default" (unusable),
+        // and anything outside the window is a driver-reporting artifact.
+        if !(23..=1000).contains(&hz) {
+            return None;
+        }
+        Some(hz as f64)
+    }
+}
+
+/// Historical env-var gate for the mpv path. It used to select between
 /// this engine and the legacy `tauri-plugin-libmpv` `--wid` path; the
 /// legacy path was removed in the engine consolidation, so the variable
 /// no longer changes anything. Kept only so [`legacy_env_requested`] can
@@ -195,7 +253,7 @@ pub fn legacy_env_requested() -> bool {
 }
 
 /// Whether the engine thread is currently running. Tauri command handlers
-/// gate on this to decide between the mpv2 path and the legacy path.
+/// gate on this to decide between the mpv path and the legacy path.
 pub fn is_running() -> bool {
     engine_slot()
         .lock()
@@ -218,7 +276,7 @@ pub fn is_running() -> bool {
 pub fn start(parent_hwnd: isize, emit: EngineEmit) {
     if parent_hwnd == 0 {
         crate::devlog!(
-            error, "mpv2",
+            error, "mpv",
             "parent HWND is 0 — engine not spawned; playback will be unavailable",
         );
         return;
@@ -226,7 +284,7 @@ pub fn start(parent_hwnd: isize, emit: EngineEmit) {
     let mut slot = match engine_slot().lock() {
         Ok(s) => s,
         Err(e) => {
-            crate::devlog!(error, "mpv2", "engine slot poisoned on start: {e}");
+            crate::devlog!(error, "mpv", "engine slot poisoned on start: {e}");
             return;
         }
     };
@@ -234,18 +292,19 @@ pub fn start(parent_hwnd: isize, emit: EngineEmit) {
         return;
     }
     crate::devlog!(
-        info, "mpv2",
+        info, "mpv",
         "spawning playback engine — FFI --wid embedding (parent HWND {parent_hwnd:#x})",
     );
+    PARENT_HWND.store(parent_hwnd, Ordering::Release);
 
     let (tx, rx) = mpsc::channel::<EngineCommand>();
     let join = match thread::Builder::new()
-        .name("aura-mpv2-engine".into())
+        .name("aura-mpv-engine".into())
         .spawn(move || run_engine(rx, parent_hwnd, emit))
     {
         Ok(j) => j,
         Err(e) => {
-            crate::devlog!(error, "mpv2", "failed to spawn engine thread: {e}");
+            crate::devlog!(error, "mpv", "failed to spawn engine thread: {e}");
             return;
         }
     };
@@ -328,7 +387,7 @@ pub fn shutdown_if_running() {
     let mut slot = match engine_slot().lock() {
         Ok(s) => s,
         Err(e) => {
-            crate::devlog!(error, "mpv2", "engine slot poisoned on shutdown: {e}");
+            crate::devlog!(error, "mpv", "engine slot poisoned on shutdown: {e}");
             return;
         }
     };
@@ -341,7 +400,7 @@ pub fn shutdown_if_running() {
     if let Some(j) = join {
         join_with_message_pump(j);
     }
-    crate::devlog!(info, "mpv2", "engine shut down");
+    crate::devlog!(info, "mpv", "engine shut down");
 }
 
 /// Wait for the engine thread to finish while continuing to pump Win32
@@ -378,7 +437,7 @@ fn join_with_message_pump(j: JoinHandle<()>) {
             .min(u32::MAX as u128) as u32;
         if remaining_ms == 0 {
             crate::devlog!(
-                warn, "mpv2",
+                warn, "mpv",
                 "engine join timed out after 5 s — detaching thread",
             );
             std::mem::forget(j);
@@ -401,7 +460,7 @@ fn join_with_message_pump(j: JoinHandle<()>) {
         }
         if res == WAIT_TIMEOUT {
             crate::devlog!(
-                warn, "mpv2",
+                warn, "mpv",
                 "engine join timed out — detaching thread",
             );
             std::mem::forget(j);
@@ -409,7 +468,7 @@ fn join_with_message_pump(j: JoinHandle<()>) {
         }
         if res == WAIT_FAILED {
             crate::devlog!(
-                error, "mpv2",
+                error, "mpv",
                 "MsgWaitForMultipleObjects failed — detaching thread",
             );
             std::mem::forget(j);
@@ -427,7 +486,7 @@ fn join_with_message_pump(j: JoinHandle<()>) {
         }
     }
     if let Err(e) = j.join() {
-        crate::devlog!(error, "mpv2", "engine thread join panicked: {e:?}");
+        crate::devlog!(error, "mpv", "engine thread join panicked: {e:?}");
     }
 }
 
@@ -435,7 +494,7 @@ fn join_with_message_pump(j: JoinHandle<()>) {
 // Render-thread internals
 // ===========================================================================
 
-const CLASS_NAME: PCWSTR = w!("AuraMpv2EngineWindow");
+const CLASS_NAME: PCWSTR = w!("AuraMpvEngineWindow");
 const WINDOW_NAME: PCWSTR = w!("Aura render-API engine");
 
 /// Title-bar inset for the engine window in windowed mode — matches the
@@ -805,7 +864,7 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
             let m = (*ev).data as *const mpv_event_log_message;
             if !m.is_null() {
                 crate::devlog!(
-                    debug, "mpv2",
+                    debug, "mpv",
                     "mpv/{} {}",
                     cstr((*m).prefix).trim(),
                     cstr((*m).text).trim_end(),
@@ -832,14 +891,20 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
                 //     first when CPU-bound.
                 // Only logs on change (mpv fires PROPERTY_CHANGE on
                 // transitions), so no spam.
+                // Debug level: during a sustained drop storm these fire
+                // on every increment — at info they flooded the ring
+                // buffer + stderr + the Tauri event channel (an overhead
+                // amplifier exactly when the system is already behind).
+                // The debug panel's drop test reads the counters via
+                // get_property instead.
                 if name == "frame-drop-count" {
                     crate::devlog!(
-                        info, "mpv2",
+                        debug, "mpv",
                         "frame-drop-count → {data} (VO)",
                     );
                 } else if name == "decoder-frame-drop-count" {
                     crate::devlog!(
-                        info, "mpv2",
+                        debug, "mpv",
                         "decoder-frame-drop-count → {data} (decoder)",
                     );
                 }
@@ -862,7 +927,7 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
                 emit("end-file", serde_json::Value::Object(payload));
             }
         } else if id == mpv_event_id::SHUTDOWN {
-            crate::devlog!(warn, "mpv2", "mpv emitted SHUTDOWN");
+            crate::devlog!(warn, "mpv", "mpv emitted SHUTDOWN");
             break;
         }
     }
@@ -1038,7 +1103,7 @@ unsafe fn parent_client_inset(parent: HWND) -> (i32, i32, i32, i32) {
 /// tears down mpv synchronously (mute → stop → terminate_destroy — the
 /// WASAPI-release discipline, CLAUDE.md landmine #9).
 fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit) {
-    crate::devlog!(info, "mpv2", "engine thread started");
+    crate::devlog!(info, "mpv", "engine thread started");
 
     unsafe {
         // -- Win32 host child window under the Tauri main HWND --
@@ -1052,7 +1117,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         let parent = HWND(parent_hwnd as *mut c_void);
         if !IsWindow(Some(parent)).as_bool() {
             crate::devlog!(
-                error, "mpv2",
+                error, "mpv",
                 "parent HWND {parent_hwnd:#x} is not a valid window",
             );
             return;
@@ -1061,7 +1126,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         let hmodule = match GetModuleHandleW(PCWSTR::null()) {
             Ok(h) => h,
             Err(e) => {
-                crate::devlog!(error, "mpv2", "GetModuleHandleW failed: {e}");
+                crate::devlog!(error, "mpv", "GetModuleHandleW failed: {e}");
                 return;
             }
         };
@@ -1086,7 +1151,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         if RegisterClassW(&wc) == 0 {
             let e = GetLastError();
             if e != ERROR_CLASS_ALREADY_EXISTS {
-                crate::devlog!(error, "mpv2", "RegisterClassW failed: {e:?}");
+                crate::devlog!(error, "mpv", "RegisterClassW failed: {e:?}");
                 return;
             }
         }
@@ -1108,7 +1173,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         ) {
             Ok(h) => h,
             Err(e) => {
-                crate::devlog!(error, "mpv2", "CreateWindowExW failed: {e}");
+                crate::devlog!(error, "mpv", "CreateWindowExW failed: {e}");
                 return;
             }
         };
@@ -1122,10 +1187,10 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         ) {
-            crate::devlog!(warn, "mpv2", "SetWindowPos(HWND_BOTTOM) failed: {e}");
+            crate::devlog!(warn, "mpv", "SetWindowPos(HWND_BOTTOM) failed: {e}");
         }
         crate::devlog!(
-            info, "mpv2",
+            info, "mpv",
             "engine host window created at ({init_x},{init_y}) {init_w}x{init_h}",
         );
 
@@ -1133,20 +1198,20 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         let lib = match Libmpv::load() {
             Ok(l) => l,
             Err(e) => {
-                crate::devlog!(error, "mpv2", "Libmpv::load failed: {e}");
+                crate::devlog!(error, "mpv", "Libmpv::load failed: {e}");
                 let _ = DestroyWindow(hwnd);
                 return;
             }
         };
         crate::devlog!(
-            info, "mpv2",
+            info, "mpv",
             "libmpv-2.dll loaded — client API version {:#x}",
             (lib.client_api_version)(),
         );
 
         let handle = (lib.create)();
         if handle.is_null() {
-            crate::devlog!(error, "mpv2", "mpv_create returned NULL");
+            crate::devlog!(error, "mpv", "mpv_create returned NULL");
             let _ = DestroyWindow(hwnd);
             return;
         }
@@ -1165,7 +1230,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             );
             if r < 0 {
                 crate::devlog!(
-                    error, "mpv2",
+                    error, "mpv",
                     "set wid={wid:#x} failed: {} — no video surface; aborting engine",
                     err_str(&lib, r),
                 );
@@ -1257,7 +1322,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             );
             if r < 0 {
                 crate::devlog!(
-                    warn, "mpv2",
+                    warn, "mpv",
                     "init option {} = {} failed: {}",
                     String::from_utf8_lossy(&name[..name.len().saturating_sub(1)]),
                     String::from_utf8_lossy(&value[..value.len().saturating_sub(1)]),
@@ -1281,7 +1346,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 b"yes\0".as_ptr() as *const c_char,
             );
             if r < 0 {
-                crate::devlog!(warn, "mpv2", "audio-exclusive=yes failed: {}", err_str(&lib, r));
+                crate::devlog!(warn, "mpv", "audio-exclusive=yes failed: {}", err_str(&lib, r));
             }
             let r = (lib.set_property_string)(
                 handle,
@@ -1289,9 +1354,32 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 b"ac3,dts,dts-hd,eac3,truehd\0".as_ptr() as *const c_char,
             );
             if r < 0 {
-                crate::devlog!(warn, "mpv2", "audio-spdif failed: {}", err_str(&lib, r));
+                crate::devlog!(warn, "mpv", "audio-spdif failed: {}", err_str(&lib, r));
             }
-            crate::devlog!(info, "mpv2", "audio passthrough enabled (user setting)");
+            crate::devlog!(info, "mpv", "audio passthrough enabled (user setting)");
+        }
+
+        // -- Loudness normalization at init (settings-gated) --
+        // Install the @loudnorm filter into the initial `af` option so it
+        // is part of the audio chain from the very first frame of the
+        // very first loadfile. The old flow (frontend re-adding it via
+        // `af add` ~1.5 s after each load) raced slow stream opens: the
+        // filter landed in the af property but the already-built audio
+        // chain didn't always pick it up until a seek forced a rebuild —
+        // the "volume is wrong until I seek once" symptom. Skipped under
+        // audio passthrough (bitstream bypasses the filter graph; the UI
+        // enforces the same exclusivity).
+        if snap.loudness_normalization && !snap.audio_passthrough {
+            let r = (lib.set_property_string)(
+                handle,
+                b"af\0".as_ptr() as *const c_char,
+                b"@loudnorm:loudnorm=I=-23:LRA=7:TP=-2\0".as_ptr() as *const c_char,
+            );
+            if r < 0 {
+                crate::devlog!(warn, "mpv", "init af=@loudnorm failed: {}", err_str(&lib, r));
+            } else {
+                crate::devlog!(info, "mpv", "loudness normalization installed at init");
+            }
         }
 
         // -- Diagnostic log file --
@@ -1309,9 +1397,9 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                     path_c.as_ptr(),
                 );
                 if r < 0 {
-                    crate::devlog!(warn, "mpv2", "log-file failed: {}", err_str(&lib, r));
+                    crate::devlog!(warn, "mpv", "log-file failed: {}", err_str(&lib, r));
                 } else {
-                    crate::devlog!(info, "mpv2", "mpv log: {log_path}");
+                    crate::devlog!(info, "mpv", "mpv log: {log_path}");
                 }
             }
             let _ = (lib.set_property_string)(
@@ -1339,7 +1427,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             let mode = crate::player::resolve_hdr_mode(&snap);
             let mut hdr_opts: indexmap::IndexMap<String, serde_json::Value> =
                 indexmap::IndexMap::new();
-            crate::player::apply_hdr_options(&mut hdr_opts, mode);
+            crate::player::apply_hdr_options(&mut hdr_opts, mode, snap.hdr_target_peak_nits);
             for (name, value) in hdr_opts.iter() {
                 let value_str = match value {
                     serde_json::Value::String(s) => s.clone(),
@@ -1357,20 +1445,20 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                     let r = (lib.set_property_string)(handle, name_c.as_ptr(), value_c.as_ptr());
                     if r < 0 {
                         crate::devlog!(
-                            warn, "mpv2",
+                            warn, "mpv",
                             "HDR init option {name} = {value_str} failed: {}",
                             err_str(&lib, r),
                         );
                     }
                 }
             }
-            crate::devlog!(info, "mpv2", "HDR mode '{mode}' applied at engine init");
+            crate::devlog!(info, "mpv", "HDR mode '{mode}' applied at engine init");
         }
 
         let ir = (lib.initialize)(handle);
         if ir < 0 {
             crate::devlog!(
-                error, "mpv2",
+                error, "mpv",
                 "mpv_initialize failed: {}", err_str(&lib, ir),
             );
             (lib.terminate_destroy)(handle);
@@ -1411,7 +1499,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             let r = (lib.observe_property)(handle, 0, name.as_ptr() as *const c_char, fmt);
             if r < 0 {
                 crate::devlog!(
-                    warn, "mpv2",
+                    warn, "mpv",
                     "observe_property('{}') failed: {}",
                     String::from_utf8_lossy(&name[..name.len() - 1]),
                     err_str(&lib, r),
@@ -1426,7 +1514,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         let mut mode = detect_present_mode(parent);
         CURRENT_MODE.store(mode.as_u8(), Ordering::Release);
         crate::devlog!(
-            info, "mpv2",
+            info, "mpv",
             "engine ready — parent visibility: {}",
             mode.label(),
         );
@@ -1458,7 +1546,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 crate::win32::set_display_sleep_inhibited(want_awake);
                 display_awake_applied = want_awake;
                 crate::devlog!(
-                    debug, "mpv2",
+                    debug, "mpv",
                     "display sleep inhibit → {want_awake}",
                 );
             }
@@ -1470,12 +1558,12 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 DispatchMessageW(&msg);
             }
             if !IsWindow(Some(hwnd)).as_bool() {
-                crate::devlog!(warn, "mpv2", "engine window closed externally — ending");
+                crate::devlog!(warn, "mpv", "engine window closed externally — ending");
                 break;
             }
             if !IsWindow(Some(parent)).as_bool() {
                 crate::devlog!(
-                    warn, "mpv2",
+                    warn, "mpv",
                     "parent window destroyed — engine ending",
                 );
                 break;
@@ -1496,7 +1584,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         // and require a manual click to start playback.
                         if let Err(e) = set_pause(&lib, handle, false) {
                             crate::devlog!(
-                                warn, "mpv2",
+                                warn, "mpv",
                                 "set_pause(false) pre-loadfile failed: {e}",
                             );
                         }
@@ -1512,31 +1600,31 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         }
                         match run_mpv_command(&lib, handle, &args_v) {
                             Ok(()) => crate::devlog!(
-                                info, "mpv2",
+                                info, "mpv",
                                 "loadfile accepted: {url}{}",
                                 start_opt.as_deref().map(|s| format!(" {s}")).unwrap_or_default(),
                             ),
                             Err(e) => crate::devlog!(
-                                warn, "mpv2", "loadfile failed: {e}",
+                                warn, "mpv", "loadfile failed: {e}",
                             ),
                         }
                         // Belt-and-suspenders: some libmpv builds reset the
                         // pause flag during demuxer init, so clear again.
                         if let Err(e) = set_pause(&lib, handle, false) {
                             crate::devlog!(
-                                warn, "mpv2",
+                                warn, "mpv",
                                 "set_pause(false) post-loadfile failed: {e}",
                             );
                         }
                     }
                     Ok(EngineCommand::TogglePause) => {
                         if let Err(e) = run_mpv_command(&lib, handle, &["cycle", "pause"]) {
-                            crate::devlog!(warn, "mpv2", "cycle pause failed: {e}");
+                            crate::devlog!(warn, "mpv", "cycle pause failed: {e}");
                         }
                     }
                     Ok(EngineCommand::SetVolume(v)) => {
                         if let Err(e) = set_volume(&lib, handle, v) {
-                            crate::devlog!(warn, "mpv2", "set volume failed: {e}");
+                            crate::devlog!(warn, "mpv", "set volume failed: {e}");
                         }
                     }
                     Ok(EngineCommand::Command(args)) => {
@@ -1544,7 +1632,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                             args.iter().map(String::as_str).collect();
                         if let Err(e) = run_mpv_command(&lib, handle, &borrowed) {
                             crate::devlog!(
-                                warn, "mpv2",
+                                warn, "mpv",
                                 "command {:?} failed: {e}", borrowed,
                             );
                         }
@@ -1554,7 +1642,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                             set_property_generic(&lib, handle, &name, &value)
                         {
                             crate::devlog!(
-                                warn, "mpv2",
+                                warn, "mpv",
                                 "set_property('{name}') failed: {e}",
                             );
                         }
@@ -1585,7 +1673,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 mode = now_mode;
                 CURRENT_MODE.store(mode.as_u8(), Ordering::Release);
                 crate::devlog!(
-                    info, "mpv2",
+                    info, "mpv",
                     "parent visibility → {}",
                     mode.label(),
                 );
@@ -1633,7 +1721,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         | SWP_NOCOPYBITS
                         | SWP_DEFERERASE,
                 ) {
-                    crate::devlog!(warn, "mpv2", "host SetWindowPos failed: {e}");
+                    crate::devlog!(warn, "mpv", "host SetWindowPos failed: {e}");
                 }
                 last_geom = target_geom;
                 // Inner child fills the host exactly (y_offset 0 — the
@@ -1667,6 +1755,6 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         // Reset the published mode so debug callers see "not running"
         // after teardown.
         CURRENT_MODE.store(255, Ordering::Release);
-        crate::devlog!(info, "mpv2", "engine torn down cleanly");
+        crate::devlog!(info, "mpv", "engine torn down cleanly");
     }
 }

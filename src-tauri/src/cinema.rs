@@ -221,13 +221,13 @@ pub async fn set_shader_profile(app: tauri::AppHandle, profile: u8) -> Result<()
     // upscale → downscale → upscale.
     #[cfg(target_os = "windows")]
     {
-        crate::mpv2::engine::submit_command(vec![
+        crate::mpv::engine::submit_command(vec![
             "change-list".into(), "glsl-shaders".into(), "clr".into(), "".into(),
         ])?;
         for (i, path) in resolved_paths.iter().enumerate() {
             let op = if i == 0 { "set" } else { "append" };
             crate::devlog!(info, "cinema", "glsl-shaders {} {}", op, path);
-            crate::mpv2::engine::submit_command(vec![
+            crate::mpv::engine::submit_command(vec![
                 "change-list".into(),
                 "glsl-shaders".into(),
                 op.into(),

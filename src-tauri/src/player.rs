@@ -29,9 +29,18 @@ pub fn resolve_hdr_mode(s: &crate::settings::AppSettings) -> &'static str {
 /// Push the right MPV property values for the resolved HDR mode into
 /// the supplied option map. Used at MPV init AND by `apply_hdr_settings`
 /// to update a running instance without re-init.
+///
+/// `peak_nits` is the `hdr_target_peak_nits` setting — only consulted in
+/// "passthrough" mode. 0 = auto (trust the display caps Windows reports);
+/// non-zero pins `target-peak` so mpv tone-maps down to the panel's REAL
+/// peak when the reported value is wrong (e.g. an OLED in DisplayHDR
+/// True Black mode whose ~400/465-nit limit Windows doesn't know about —
+/// without the pin, 1000-nit-mastered highlights pass through untouched
+/// and the panel clips them, the "blown-out whites" symptom).
 pub fn apply_hdr_options(
     options: &mut IndexMap<String, serde_json::Value>,
     mode: &str,
+    peak_nits: u32,
 ) {
     match mode {
         "passthrough" => {
@@ -41,7 +50,11 @@ pub fn apply_hdr_options(
             // Don't pin target-prim / target-trc — let the display auto-detect.
             options.insert("target-prim".into(),            serde_json::json!("auto"));
             options.insert("target-trc".into(),             serde_json::json!("auto"));
-            options.insert("target-peak".into(),            serde_json::json!("auto"));
+            if peak_nits > 0 {
+                options.insert("target-peak".into(),        serde_json::json!(peak_nits));
+            } else {
+                options.insert("target-peak".into(),        serde_json::json!("auto"));
+            }
         }
         "sdr" => {
             // Active HDR→SDR tone-map. compute-peak detects the source's
@@ -70,7 +83,7 @@ pub fn apply_hdr_options(
 
 // NOTE on the AniSkip Lua script (`scripts/skip-windows.lua`): the legacy
 // plugin path installed it to <app_data_dir>/scripts and loaded it via a
-// post-init `load-script` command. The mpv2 engine NEVER loaded it (since
+// post-init `load-script` command. The mpv engine NEVER loaded it (since
 // v0.9.0 made the engine the default, the script has been dormant) — the
 // OP/ED auto-skip that users actually exercise is the React-side
 // skip-window logic fed by `aniskip.rs`'s `aura:skip-windows` event. The
