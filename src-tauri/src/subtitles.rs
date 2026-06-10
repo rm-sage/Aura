@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, Runtime};
-use tauri_plugin_libmpv::MpvExt;
 
 // ---------------------------------------------------------------------------
 // OpenSubtitles bridge — api.opensubtitles.com REST v1
@@ -484,38 +483,26 @@ pub async fn add_subtitle_to_mpv(
     let normalised = path.replace('\\', "/");
     let mode = flag.unwrap_or_else(|| "select".into());
     #[cfg(target_os = "windows")]
-    if crate::mpv2::engine::enabled() && crate::mpv2::engine::is_running() {
-        let mut args: Vec<String> = vec![
-            "sub-add".into(),
-            normalised.clone(),
-            mode.clone(),
-        ];
-        if title.is_some() || lang.is_some() {
-            args.push(title.clone().unwrap_or_default());
-            if let Some(lang_str) = lang.clone() {
-                args.push(lang_str);
-            }
-        }
-        return crate::mpv2::engine::submit_command(args);
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut args: Vec<serde_json::Value> = vec![
-            serde_json::json!(normalised),
-            serde_json::json!(mode),
-        ];
+    {
         // `sub-add <file> <flags> <title> <lang>` — positional. We must
         // pass title (even if empty) before lang, otherwise MPV interprets
         // `lang` as the title.
+        let mut args: Vec<String> = vec![
+            "sub-add".into(),
+            normalised,
+            mode,
+        ];
         if title.is_some() || lang.is_some() {
-            args.push(serde_json::json!(title.unwrap_or_default()));
+            args.push(title.unwrap_or_default());
             if let Some(lang_str) = lang {
-                args.push(serde_json::json!(lang_str));
+                args.push(lang_str);
             }
         }
-        app.mpv()
-            .command("sub-add", &args, "main")
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
+        crate::mpv2::engine::submit_command(args)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (normalised, mode, title, lang);
+        Err("playback engine is Windows-only".into())
+    }
 }

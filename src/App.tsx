@@ -5152,38 +5152,10 @@ export default function App() {
           black during playback so MPV's video doesn't bleed through. */}
       {!isFullscreen && <TitleBar opaque={isPlayerActive} />}
 
-      {/* ── FSO gap cover ──
-          The mpv2 engine renders its WGL surface 1px shorter than the
-          monitor in native fullscreen (see FSO_HEIGHT_INSET in
-          src-tauri/src/mpv2/engine.rs). That geometric break is what stops
-          Win11's DWM from promoting the surface to Independent Flip /
-          Multi-Plane Overlay — a promotion that would drop the engine out
-          of composition and make the React UI vanish, colours go raw, other
-          monitors flash black, and the toggle take 2-3 s. Occluding the
-          engine from above does NOT work (multi-plane GPUs give the engine
-          its own overlay plane regardless); the engine surface's OWN size
-          has to differ from the output. The downside is a 1px row at the
-          very bottom that the engine no longer paints — left bare it shows
-          desktop bleed-through (a bright line). This strip covers that row
-          with solid black so it reads as a thin letterbox edge instead.
-          A few px tall (not 1) so it reliably covers the gap even across
-          the engine's per-frame resize cadence; the overlap onto the
-          engine's bottom video row is imperceptible. Fullscreen-only. */}
-      {isFullscreen && (
-        <div
-          aria-hidden
-          style={{
-            position: "fixed",
-            bottom: 0,
-            left: 0,
-            width: "100%",
-            height: "2px",
-            background: "#000",
-            zIndex: 2147483647,
-            pointerEvents: "none",
-          }}
-        />
-      )}
+      {/* (The old "FSO gap cover" strip is gone: the engine consolidation
+          moved playback to --wid embedding, where mpv's own DXGI swapchain
+          opts out of Win11's Independent-Flip promotion, so the engine
+          surface covers the full monitor again and there is no 1px gap.) */}
 
       {/* ── Body ── */}
       {showLanding ? (

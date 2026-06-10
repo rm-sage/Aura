@@ -1,77 +1,85 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `mpv2::engine` — Phase-2.1 long-lived render-context engine.
+//! `mpv2::engine` — Aura's single playback engine: direct-FFI libmpv
+//! embedded via `--wid` into an engine-owned host child window.
 //!
-//! Promotes the verified hello-world setup ([`super::hello`]) into a
-//! persistent owner: a dedicated render thread that holds the Win32 window,
-//! the WGL context, the mpv handle and the render context for the lifetime
-//! of the app, and a small command channel so other threads can signal it.
+//! ## Consolidation history (2026-06)
 //!
-//! Phase 2.1 deliberately stops short of:
-//!   * **parenting the GL window under the Tauri main HWND** (Phase 2.2 — for
-//!     now the window is still top-level so the engine is visible above
-//!     Aura's opaque shell, exactly like the hello-world);
-//!   * the **dual-mode focused/unfocused present loop** (Phase 2.3 — for now
-//!     the loop sleeps ~16 ms between frames, identical cadence to the
-//!     hello-world);
-//!   * any **playback commands** (Phase 2.4 — for now [`EngineCommand`]
-//!     carries only `Shutdown`).
+//! This module started life as the render-API rewrite (mpv driven through
+//! `mpv_render_context_*` into an engine-owned WGL surface, to fix DWM
+//! throttling of the `--wid` child's presentation while Aura was
+//! backgrounded). The render path shipped as the default in v0.9.0 but was
+//! **consolidated away** in favour of `--wid` embedding on the same FFI
+//! foundation, because:
 //!
-//! Its job is to prove the steady-state plumbing: a long-running render
-//! thread, the update-callback wiring, a real command channel, and a clean
-//! teardown from the Tauri close handler. With no file loaded the engine
-//! paints a steady teal clear forever — the "is the engine alive?" indicator
-//! — and exits via [`shutdown_if_running`] when the user closes Aura.
+//!   * the render API on this libmpv build is hardcoded to `gl_video` —
+//!     `vo=gpu-next` (and with it scRGB/HDR passthrough) is unreachable;
+//!     real HDR needed a host DXGI flip swapchain + `WGL_NV_DX_interop2`
+//!     (see `docs/superpowers/specs/2026-06-03-mpv2-hdr-dxgi-interop-
+//!     design.md`), an L-effort, HW-gated build;
+//!   * `--wid` + `vo=gpu-next` + d3d11 does correct HDR/Dolby-Vision
+//!     passthrough today (`target-colorspace-hint` is honoured by the
+//!     d3d11 GPU context), and mpv's own DXGI swapchain opts out of the
+//!     Win11 Independent-Flip/MPO promotion that plagued the WGL surface;
+//!   * dropping the render path also drops `tauri-plugin-libmpv` /
+//!     `libmpv-wrapper.dll` (the legacy plugin) entirely — one engine,
+//!     one DLL (`libmpv-2.dll`), one event channel.
 //!
-//! Drives playback by DEFAULT now. Set `AURA_MPV2=0` (or `false`/`off`/`no`)
-//! to fall back to the legacy `--wid` `tauri-plugin-libmpv` path — the
-//! escape hatch kept until Phase 7 removes that dependency. Independent
-//! from `AURA_MPV2_HELLO` (the Phase-1 verification scaffolding).
+//! The known cost is the original off-focus DWM throttling of a `--wid`
+//! child's swapchain — accepted for now; the FFI foundation kept here is
+//! the basis for optimising that later.
+//!
+//! ## Architecture
+//!
+//! A dedicated engine thread owns a plain Win32 host child window (black
+//! class brush, `HWND_BOTTOM` so the transparent WebView2 stays on top),
+//! creates the mpv handle with `wid=<host HWND>` + `vo=gpu-next` +
+//! `hwdec=auto`, and then runs a light pump loop: drain mpv events →
+//! drain the command channel → resync geometry to the parent's client
+//! rect → sleep [`TICK`]. mpv owns rendering/presentation entirely (its
+//! child window of the host), so there is no render loop here.
+//!
+//! `AURA_MPV2` is no longer honoured — the legacy plugin path it selected
+//! is gone. Setting it to an off value logs a warning at startup (see
+//! [`legacy_env_requested`]).
 //!
 //! Windows-only — gated at the `mod` declaration in [`super`].
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
-use std::mem::size_of;
 use std::ptr;
 use std::sync::{
     atomic::{AtomicBool, AtomicU8, Ordering},
     mpsc::{self, Receiver, Sender, TryRecvError},
-    Arc, Mutex, OnceLock,
+    Mutex, OnceLock,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use windows::core::{w, PCSTR, PCWSTR};
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT,
+    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT,
     RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, EndPaint, GetDC, ReleaseDC, HDC, PAINTSTRUCT,
+    BeginPaint, CreateSolidBrush, EndPaint, PAINTSTRUCT,
 };
 use windows::Win32::Foundation::COLORREF;
-use windows::Win32::Graphics::OpenGL::{
-    glGetString, glViewport, wglCreateContext, wglDeleteContext, wglGetProcAddress,
-    wglMakeCurrent, ChoosePixelFormat, SetPixelFormat, SwapBuffers, GL_RENDERER,
-    GL_VERSION, HGLRC, PFD_DOUBLEBUFFER, PFD_DRAW_TO_WINDOW, PFD_SUPPORT_OPENGL,
-    PFD_TYPE_RGBA, PIXELFORMATDESCRIPTOR,
-};
-use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     GetForegroundWindow, IsIconic, IsWindow, IsWindowVisible,
     MsgWaitForMultipleObjects, PeekMessageW, RegisterClassW, SetWindowPos,
-    TranslateMessage, CS_OWNDC, HWND_BOTTOM, MSG, PM_REMOVE, QS_ALLINPUT,
+    TranslateMessage, HWND_BOTTOM, MSG, PM_REMOVE, QS_ALLINPUT,
     SWP_DEFERERASE, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, WINDOW_EX_STYLE, WM_PAINT, WNDCLASSW, WS_CHILD, WS_VISIBLE,
+    SWP_NOZORDER, WINDOW_EX_STYLE, WM_PAINT, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
+    WS_VISIBLE,
 };
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 
 use super::ffi::{
     mpv_event_end_file, mpv_event_id, mpv_event_log_message, mpv_event_property,
-    mpv_format, mpv_handle, mpv_opengl_fbo, mpv_opengl_init_params, mpv_render_context,
-    mpv_render_param, mpv_render_param_type, Libmpv, MPV_RENDER_API_TYPE_OPENGL,
+    mpv_format, mpv_handle, Libmpv,
 };
 
 // ===========================================================================
@@ -123,8 +131,8 @@ pub enum GetFormat {
 ///   needs pre/post pause clears, `TogglePause` / `SetVolume` are
 ///   submitted often enough to justify dedicated dispatch).
 /// * Generic `Command` / `SetProperty` / `GetProperty` variants for the
-///   long tail — every other `app.mpv().command(...)` / `set_property(...)`
-///   / `get_property(...)` site in lib.rs routes through these.
+///   long tail — every other command / property site in lib.rs routes
+///   through these.
 /// * `GetProperty` carries a synchronous reply `Sender` so the calling
 ///   Tauri command can await the result.
 enum EngineCommand {
@@ -157,7 +165,7 @@ struct EngineHandle {
 }
 
 /// Process-global slot for the live engine. `OnceLock<Mutex<Option<_>>>` so
-/// [`start_if_requested`] / [`shutdown_if_running`] can be called from
+/// [`start`] / [`shutdown_if_running`] can be called from
 /// arbitrary call sites without threading a Tauri-managed state through.
 static ENGINE: OnceLock<Mutex<Option<EngineHandle>>> = OnceLock::new();
 
@@ -165,30 +173,24 @@ fn engine_slot() -> &'static Mutex<Option<EngineHandle>> {
     ENGINE.get_or_init(|| Mutex::new(None))
 }
 
-/// Master env-var gate for the mpv2 path. The engine is the DEFAULT
-/// playback path now: [`start_if_requested`] spawns it AND the Tauri
-/// command handlers route playback through it
-/// ([`submit_load_file`] / [`submit_toggle_pause`] / [`submit_set_volume`])
-/// unless this variable is explicitly set to an off value, which restores
-/// the legacy `--wid` engine. Single switch by design so partial runs
-/// (engine without command routing or vice versa) can't accidentally
-/// happen.
+/// Historical env-var gate for the mpv2 path. It used to select between
+/// this engine and the legacy `tauri-plugin-libmpv` `--wid` path; the
+/// legacy path was removed in the engine consolidation, so the variable
+/// no longer changes anything. Kept only so [`legacy_env_requested`] can
+/// warn users whose launch scripts still set `AURA_MPV2=0`.
 pub const ENV_VAR: &str = "AURA_MPV2";
 
-/// Whether the mpv2 engine should drive playback this process.
-///
-/// DEFAULT ON. The engine is disabled only when [`ENV_VAR`] is explicitly
-/// set to an off value — `0`, `false`, `off`, or `no` (case-insensitive,
-/// trimmed). Unset, empty, or any other value → ON. `$env:AURA_MPV2=0`
-/// (or `=off`) is the documented escape hatch back to the legacy `--wid`
-/// path, kept until Phase 7 deletes the legacy plugin.
-pub fn enabled() -> bool {
+/// True when [`ENV_VAR`] is explicitly set to an off value — `0`,
+/// `false`, `off`, or `no` (case-insensitive, trimmed). The setup path
+/// devlogs a warning in that case: the legacy engine this used to select
+/// no longer exists, so the variable is ignored.
+pub fn legacy_env_requested() -> bool {
     match std::env::var(ENV_VAR) {
-        Ok(raw) => !matches!(
+        Ok(raw) => matches!(
             raw.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "off" | "no",
         ),
-        Err(_) => true,
+        Err(_) => false,
     }
 }
 
@@ -201,25 +203,23 @@ pub fn is_running() -> bool {
         .unwrap_or(false)
 }
 
-/// Spawn the engine (the default path) — a no-op only when [`ENV_VAR`] is
-/// set to an off value. Idempotent: a second call while the engine is
-/// already running returns without doing anything.
+/// Spawn the engine — Aura's only playback path. Idempotent: a second
+/// call while the engine is already running returns without doing
+/// anything.
 ///
 /// `parent_hwnd` is the Tauri main window's HWND, passed as `isize` so it
-/// can cross the thread boundary (`HWND` itself is not `Send`). The render
-/// thread re-wraps it. Passing 0 disables the engine even when the env var
-/// is set — used as a defensive fall-through when the main window's HWND
-/// can't be resolved at setup time. `emit` is the channel the render
-/// thread uses to push mpv events (property changes, end-of-file, …) back
-/// to the frontend through Tauri.
-pub fn start_if_requested(parent_hwnd: isize, emit: EngineEmit) {
-    if !enabled() {
-        return;
-    }
+/// can cross the thread boundary (`HWND` itself is not `Send`). The engine
+/// thread re-wraps it. Passing 0 skips the spawn entirely — a defensive
+/// fall-through when the main window's HWND can't be resolved at setup
+/// time (every playback command then fails with "engine not running"
+/// instead of crashing). `emit` is the channel the engine thread uses to
+/// push mpv events (property changes, end-of-file, …) back to the
+/// frontend through Tauri.
+pub fn start(parent_hwnd: isize, emit: EngineEmit) {
     if parent_hwnd == 0 {
         crate::devlog!(
-            warn, "mpv2",
-            "engine enabled but parent HWND is 0 — engine not spawned (legacy --wid init kept as fallback)",
+            error, "mpv2",
+            "parent HWND is 0 — engine not spawned; playback will be unavailable",
         );
         return;
     }
@@ -235,7 +235,7 @@ pub fn start_if_requested(parent_hwnd: isize, emit: EngineEmit) {
     }
     crate::devlog!(
         info, "mpv2",
-        "spawning long-lived render engine — default path (parent HWND {parent_hwnd:#x})",
+        "spawning playback engine — FFI --wid embedding (parent HWND {parent_hwnd:#x})",
     );
 
     let (tx, rx) = mpsc::channel::<EngineCommand>();
@@ -321,9 +321,9 @@ fn submit(cmd: EngineCommand) -> Result<(), String> {
 
 /// Tear down the engine if one is running. Safe to call when none was
 /// started — used unconditionally from the `CloseRequested` path so the
-/// render thread exits before the process does (matches the WASAPI-clean
-/// shutdown discipline `shutdown_mpv_sync` follows for the legacy mpv
-/// instance — see `window_logic.rs`).
+/// engine thread (and with it mpv's synchronous mute → stop →
+/// terminate_destroy teardown — the WASAPI-clean shutdown discipline,
+/// landmine #9) completes before the process exits.
 pub fn shutdown_if_running() {
     let mut slot = match engine_slot().lock() {
         Ok(s) => s,
@@ -451,21 +451,14 @@ const TITLE_BAR_H: i32 = 36;
 const FALLBACK_W: i32 = 720;
 const FALLBACK_H: i32 = 460;
 
-/// Unfocused-mode present cadence — 60 fps nominal (16.667 ms). The exact
-/// rate isn't load-bearing — what matters is that the spacing is regular
-/// and that `mpv_render_context_report_swap` is called at this cadence so
-/// mpv's display-resample doesn't think the swap chain stalled while DWM
-/// is throttling our non-foreground composition. `pin_process_scheduling`
-/// holds `timeBeginPeriod(1)` for the process lifetime, so `thread::sleep`
-/// granularity here is ~1 ms — close enough.
-const UNFOCUSED_FRAME: Duration = Duration::from_micros(16_667);
-
-/// `BOOL wglSwapIntervalEXT(int interval)` — WGL_EXT_swap_control. 0 turns
-/// vsync off (`SwapBuffers` returns immediately); 1 waits for the next
-/// vblank before returning. Resolved at runtime via `wglGetProcAddress`;
-/// the call is the standard handle for toggling between vsync-blocked and
-/// timer-paced present modes.
-type WglSwapIntervalExtFn = unsafe extern "system" fn(interval: c_int) -> i32;
+/// Engine pump cadence. mpv owns rendering/presentation entirely under
+/// `--wid` embedding, so this loop only drains mpv events, drains the
+/// command channel, and resyncs geometry — 5 ms keeps command latency
+/// (pause/seek/volume) and event latency (time-pos at ~30 Hz) invisible
+/// while costing ~0 CPU. `pin_process_scheduling` holds
+/// `timeBeginPeriod(1)` for the process lifetime, so `thread::sleep`
+/// granularity here is ~1 ms.
+const TICK: Duration = Duration::from_millis(5);
 
 /// Current [`PresentMode`] discriminant, published from the render thread
 /// on every mode transition. 255 = engine not running. Read by the debug
@@ -494,25 +487,18 @@ pub fn current_present_mode() -> Option<PresentMode> {
     PresentMode::from_u8(CURRENT_MODE.load(Ordering::Acquire))
 }
 
-/// Engine wndproc. Only `WM_PAINT` is special-cased; everything else
+/// Host-window wndproc. Only `WM_PAINT` is special-cased; everything else
 /// (including `WM_SIZE`, `WM_ERASEBKGND`, `WM_WINDOWPOSCHANGED`) goes to
-/// the default handler. The render thread polls the parent's client rect
-/// every tick and `SetWindowPos`-es itself when the parent has moved,
+/// the default handler. The engine thread polls the parent's client rect
+/// every tick and `SetWindowPos`-es the host when the parent has moved,
 /// driving its own resize — the wndproc doesn't need a fast-path because
-/// the render thread is already the source of geometry change.
+/// the engine thread is already the source of geometry change.
 ///
 /// * `WM_PAINT` → BeginPaint / EndPaint with no GDI work, return 0. The
-///   actual painting is the render thread's continuous SwapBuffers; this
-///   only validates the paint rect so Windows doesn't immediately re-fire
-///   WM_PAINT.
-///
-/// Phase 2.2 ran an inline `glClear` + `SwapBuffers` from `WM_SIZE` to
-/// close the latency window during drag-resize, but the glClear's teal
-/// fill WAS the visible cyan flicker — every cross-thread `SetWindowPos`
-/// caused a one-frame teal flash before the next render tick painted the
-/// real frame. Removed in Phase 5 in favour of engine-driven resize +
-/// black class brush; stale content for ≤16 ms is preferable to a teal
-/// blink.
+///   actual painting is mpv's child window (full host coverage); the host
+///   itself only ever shows its black class brush during resize gaps.
+///   This handler just validates the paint rect so Windows doesn't
+///   immediately re-fire WM_PAINT.
 unsafe extern "system" fn engine_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -526,50 +512,6 @@ unsafe extern "system" fn engine_wndproc(
         return LRESULT(0);
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
-}
-
-/// Two-tier `get_proc_address` for `mpv_opengl_init_params`: try
-/// `wglGetProcAddress` first (extensions + modern core), fall back to
-/// `GetProcAddress` on `opengl32.dll` for GL 1.1 core. Same logic as
-/// [`super::hello::aura_get_proc_address`]; duplicated rather than factored
-/// to keep the Phase-1 hello-world artifact untouched.
-unsafe extern "C" fn aura_get_proc_address(
-    ctx: *mut c_void,
-    name: *const c_char,
-) -> *mut c_void {
-    if name.is_null() {
-        return ptr::null_mut();
-    }
-    let pcstr = PCSTR(name as *const u8);
-
-    if let Some(f) = wglGetProcAddress(pcstr) {
-        let addr = f as usize as isize;
-        if !matches!(addr, 0 | 1 | 2 | 3 | -1) {
-            return f as usize as *mut c_void;
-        }
-    }
-
-    let opengl32 = HMODULE(ctx);
-    if !opengl32.is_invalid() {
-        if let Some(f) = GetProcAddress(opengl32, pcstr) {
-            return f as usize as *mut c_void;
-        }
-    }
-
-    ptr::null_mut()
-}
-
-/// mpv's update callback. Invoked from arbitrary threads when a new video
-/// frame is ready. `cb_ctx` is the `*const AtomicBool` we handed mpv via
-/// [`Arc::into_raw`] — flip it, the render thread will pick it up.
-///
-/// The callback contract forbids re-entering mpv from here, so we only
-/// touch the atomic.
-unsafe extern "C" fn on_mpv_update(cb_ctx: *mut c_void) {
-    let flag = cb_ctx as *const AtomicBool;
-    if !flag.is_null() {
-        (*flag).store(true, Ordering::Release);
-    }
 }
 
 /// `<null>`-safe NUL-terminated-C-string → owned `String`.
@@ -926,98 +868,19 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
     }
 }
 
-/// Resolve `wglSwapIntervalEXT` via `wglGetProcAddress`. Returns `None` if
-/// the driver doesn't advertise the extension (rare on Windows; every
-/// major GPU vendor exports it) — in that case the dual-mode loop falls
-/// back to pure timer pacing in both branches. Must be called with a GL
-/// context current on the calling thread, since `wglGetProcAddress` reads
-/// from the current context's ICD.
-unsafe fn resolve_swap_interval() -> Option<WglSwapIntervalExtFn> {
-    let name = PCSTR(b"wglSwapIntervalEXT\0".as_ptr());
-    let f = wglGetProcAddress(name)?;
-    let addr = f as usize as isize;
-    if matches!(addr, 0 | 1 | 2 | 3 | -1) {
-        return None;
-    }
-    // Both source and target are `unsafe extern "system" fn` pointers,
-    // identical size and ABI on Windows — transmuting between function
-    // signatures of the same calling convention is the standard pattern
-    // for typed extension loaders.
-    Some(std::mem::transmute::<_, WglSwapIntervalExtFn>(f))
-}
-
-/// Apply mpv's `framedrop` property. It's now uniformly `vo` (mpv's own
-/// default — drop late frames at the renderer) regardless of mode; see
-/// [`PresentMode::framedrop`]. This still runs on each mode transition so
-/// the property is re-asserted, but it no longer varies by focus.
-///
-/// History: an earlier design used `framedrop=no` while backgrounded to
-/// "present every frame", but that made mpv hoard late frames during
-/// DWM's background-present throttle and then dump the backlog as a
-/// catch-up drop burst the instant focus returned — the off-focus
-/// regression. `vo` (steady dropping, matching what legacy `--wid` did)
-/// is the fix.
-///
-/// Errors are devlog'd at `warn` and otherwise ignored — `framedrop`
-/// is a runtime hint, not a correctness requirement.
-unsafe fn apply_framedrop_policy(
-    lib: &Libmpv,
-    handle: *mut mpv_handle,
-    mode: PresentMode,
-) {
-    let value = mode.framedrop();
-    let r = (lib.set_property_string)(
-        handle,
-        b"framedrop\0".as_ptr() as *const c_char,
-        value.as_ptr() as *const c_char,
-    );
-    let value_label = std::str::from_utf8(&value[..value.len().saturating_sub(1)])
-        .unwrap_or("?");
-    if r < 0 {
-        crate::devlog!(
-            warn, "mpv2",
-            "set framedrop={value_label} failed: {}",
-            err_str(lib, r),
-        );
-    } else {
-        crate::devlog!(
-            debug, "mpv2",
-            "framedrop = {value_label} (mode={})",
-            mode.label(),
-        );
-    }
-}
-
-/// Three-state present mode the render thread switches between based on
-/// the parent window's foreground / visibility state. Each state picks a
-/// distinct (swap-interval, report_swap, framedrop) policy so playback
-/// quality matches the user's actual viewing scenario.
+/// Three-state visibility classification of the parent window, retained
+/// from the render-engine era as **telemetry only** — under `--wid`
+/// embedding mpv owns presentation, so nothing here changes playback
+/// behaviour. The engine publishes the current mode to [`CURRENT_MODE`]
+/// (read by the Settings → Debug panel) and devlogs transitions, which
+/// remains the easiest way to correlate off-focus frame-drop reports
+/// with the window state they happened in.
 ///
 /// * [`Foreground`] — the parent IS `GetForegroundWindow()` AND visible.
-///   Full-quality mode: `wglSwapIntervalEXT(1)` (vsync-blocked), every
-///   present reports the swap to mpv, and `framedrop=vo` drops frames
-///   that would arrive late (mpv's default behaviour for tight a/v sync).
-///
 /// * [`VisibleBackground`] — visible but NOT foreground (Aura on monitor
-///   2, or alongside a foreground app). Now treated IDENTICALLY to
-///   [`Foreground`]: vsync (`swap-interval=1`) + `report_swap` +
-///   `framedrop=vo`. DWM throttles a background window's present, but
-///   that's fine — vsync-blocked SwapBuffers keeps `report_swap` honest
-///   (mpv learns the real, throttled cadence) and `framedrop=vo` drops
-///   late frames steadily to track it, the same as the legacy `--wid`
-///   path. (The earlier `framedrop=no` here hoarded late frames and
-///   dumped a catch-up burst on refocus — the off-focus regression.)
-///   Kept as a distinct variant from Foreground only for diagnostic
-///   logging.
-///
+///   2, or alongside a foreground app).
 /// * [`Hidden`] — minimised, DWM-cloaked (different virtual desktop /
-///   UWP shell-ghost), or otherwise not visible. The user can't see
-///   playback. Non-blocking present path so the engine stays responsive
-///   to commands / shutdown while the window is suspended:
-///   `swap-interval=0` (SwapBuffers can't block on a suspended present) +
-///   a 60 Hz render timer + no `report_swap` (no real flip to anchor to).
-///   `framedrop=vo` like every other mode, so it drops steadily rather
-///   than hoarding a backlog that would burst on un-minimise.
+///   UWP shell-ghost), or otherwise not visible.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum PresentMode {
     Foreground,
@@ -1061,39 +924,10 @@ impl PresentMode {
     /// Human-readable label for devlog messages.
     fn label(self) -> &'static str {
         match self {
-            PresentMode::Foreground => "foreground (full quality)",
-            PresentMode::VisibleBackground => "visible-background (no-drop)",
-            PresentMode::Hidden => "hidden (background)",
+            PresentMode::Foreground => "foreground",
+            PresentMode::VisibleBackground => "visible-background",
+            PresentMode::Hidden => "hidden",
         }
-    }
-    /// `wglSwapIntervalEXT` value for this mode. `1` vsync-locks the
-    /// next SwapBuffers to vblank; `0` returns immediately.
-    fn swap_interval(self) -> c_int {
-        match self {
-            PresentMode::Foreground | PresentMode::VisibleBackground => 1,
-            PresentMode::Hidden => 0,
-        }
-    }
-    /// Whether `mpv_render_context_report_swap` should fire after each
-    /// SwapBuffers. We lie to mpv about timing in Hidden mode because
-    /// the swap there isn't vsync-anchored to anything mpv can use.
-    fn report_swap(self) -> bool {
-        match self {
-            PresentMode::Foreground | PresentMode::VisibleBackground => true,
-            PresentMode::Hidden => false,
-        }
-    }
-    /// mpv `framedrop` property value — now uniformly `vo` (mpv's own
-    /// default: drop late frames at the renderer). The old per-mode `no`
-    /// for background states WAS the off-focus-burst regression: while DWM
-    /// throttles a background window's present, `framedrop=no` made mpv
-    /// HOARD the late frames instead of dropping them, then dump the whole
-    /// backlog as a catch-up drop burst the instant focus returned. `vo`
-    /// drops steadily instead (no backlog → no burst) — exactly what the
-    /// legacy `--wid` path did. Kept as a method (call sites + logging
-    /// stay put); the value just no longer varies by mode.
-    fn framedrop(self) -> &'static [u8] {
-        b"vo\0"
     }
 }
 
@@ -1169,80 +1003,52 @@ unsafe fn is_parent_actually_visible(parent: HWND) -> bool {
     true
 }
 
-/// FSO ("Fullscreen Optimization") geometry-break inset, in device
-/// pixels. Subtracted from the engine child's height when the parent is
-/// in native fullscreen so the GL surface does NOT exactly cover the
-/// monitor.
-///
-/// Win11's DWM auto-promotes any swapchain-backed window that covers a
-/// full output to Independent Flip / Multi-Plane Overlay mode (the same
-/// promotion exclusive-fullscreen games get). When that fires the
-/// engine's WGL surface drops out of DWM composition, which produces
-/// FOUR simultaneous symptoms:
-///   1. WebView2 (transparent overlay above the GL child in z-order)
-///      stops compositing over the surface → the React UI vanishes.
-///   2. The display pipeline bypasses DWM's ICM colour management →
-///      colours look "vivid" / over-saturated (raw gamma, no profile).
-///   3. DWM re-sorts every other output's compositor as part of the
-///      transition → secondary monitors flash black for a beat.
-///   4. The acquire path is a real mode transition → ~2-3 seconds of
-///      latency between toggling fullscreen and a stable picture.
-///
-/// VERIFIED FIX (hardware test): shrinking the engine surface 1px shorter
-/// than the monitor stops the promotion outright — DWM can't hand a
-/// non-output-sized window a full-screen overlay plane, so it must
-/// composite. Confirmed the OTHER way round does NOT work: putting opaque
-/// content ABOVE a full-size engine (a 1px WebView2 marker) failed,
-/// because the RTX 4090 supports multi-plane overlays and simply put the
-/// engine on its own plane regardless. The disqualifier MUST be the
-/// engine surface's own geometry, not occlusion from above. The 1px gap
-/// is covered by a black strip in the React layer (App.tsx) so it reads
-/// as a thin letterbox line rather than desktop bleed-through.
-///
-/// Pre-mpv2 (legacy `--wid` mpv child) didn't have this problem because
-/// libmpv's own DirectX swapchain explicitly opts out via DXGI flags
-/// (`SetFullscreenState(FALSE)`). WGL has no equivalent API — we go
-/// through the NVIDIA ICD's hidden DXGI swap chain with no opt-out. The
-/// canonical workaround (RPCS3, PCSX2, many borderless-fullscreen game
-/// launchers) is exactly this 1px geometric break.
-const FSO_HEIGHT_INSET: i32 = 1;
-
-/// Compute the engine child's target geometry from its parent's client
+/// Compute the host child's target geometry from its parent's client
 /// rect: full client width, full client height minus the title-bar inset
-/// (which is 0 in fullscreen, [`TITLE_BAR_H`] windowed) minus the FSO
-/// break inset ([`FSO_HEIGHT_INSET`] in fullscreen, 0 windowed — see the
-/// constant's comment for the full rationale). On failure or a degenerate
-/// rect, falls back to a small visible default so the engine can still
-/// come up and the per-frame resync can correct on the next iteration
-/// once the parent settles.
+/// (which is 0 in fullscreen, [`TITLE_BAR_H`] windowed). On failure or a
+/// degenerate rect, falls back to a small visible default so the engine
+/// can still come up and the per-tick resync can correct on the next
+/// iteration once the parent settles.
+///
+/// NOTE: the render-engine era subtracted a 1px "FSO break" from the
+/// fullscreen height so the WGL surface never exactly covered the
+/// monitor (Win11 DWM promotes output-sized swapchains to Independent
+/// Flip / MPO, which dropped the WebView2 overlay out of composition).
+/// That inset is GONE here on purpose: mpv's own DXGI swapchain opts out
+/// of the promotion (`SetFullscreenState(FALSE)`), which is why the
+/// original legacy `--wid` child never had the problem — and this host
+/// window carries no swapchain of its own, only mpv's child does.
 unsafe fn parent_client_inset(parent: HWND) -> (i32, i32, i32, i32) {
     let in_fs = crate::win32::is_in_native_fullscreen();
     let y_off = if in_fs { 0 } else { TITLE_BAR_H };
-    let bottom_inset = if in_fs { FSO_HEIGHT_INSET } else { 0 };
     let mut rc = RECT::default();
     if GetClientRect(parent, &mut rc).is_ok()
         && rc.right > rc.left
         && rc.bottom > rc.top
     {
         let w = rc.right - rc.left;
-        let h = (rc.bottom - rc.top - y_off - bottom_inset).max(1);
+        let h = (rc.bottom - rc.top - y_off).max(1);
         return (0, y_off, w, h);
     }
     (0, y_off, FALLBACK_W, FALLBACK_H)
 }
 
-/// Render-thread body. Sets everything up, runs until `Shutdown` is
-/// received (or the window is closed externally), then tears down.
+/// Engine-thread body. Sets everything up, runs the pump loop until
+/// `Shutdown` is received (or the window is closed externally), then
+/// tears down mpv synchronously (mute → stop → terminate_destroy — the
+/// WASAPI-release discipline, CLAUDE.md landmine #9).
 fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit) {
     crate::devlog!(info, "mpv2", "engine thread started");
 
     unsafe {
-        // -- Win32 child window under the Tauri main HWND --
-        // Phase 2.2: the engine's GL surface lives as a WS_CHILD of the
-        // Tauri main window, exactly where the legacy `--wid` mpv child
-        // sits today. Z-order is pushed to HWND_BOTTOM right after
-        // creation so the transparent WebView2 stays on top and continues
-        // to receive all input.
+        // -- Win32 host child window under the Tauri main HWND --
+        // mpv's `--wid` child parents into this host, which lives as a
+        // WS_CHILD of the Tauri main window — exactly where the legacy
+        // plugin's mpv child sat. Z-order is pushed to HWND_BOTTOM right
+        // after creation so the transparent WebView2 stays on top and
+        // continues to receive all input. WS_CLIPCHILDREN keeps the
+        // host's black background brush from painting over mpv's child
+        // during WM_ERASEBKGND.
         let parent = HWND(parent_hwnd as *mut c_void);
         if !IsWindow(Some(parent)).as_bool() {
             crate::devlog!(
@@ -1262,22 +1068,15 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         let hinstance = HINSTANCE(hmodule.0);
 
         // Background brush filled with black. DefWindowProc uses this for
-        // WM_ERASEBKGND, so any GDI fill that happens between a resize and
-        // the next render-tick SwapBuffers shows black — matching mpv's
+        // WM_ERASEBKGND, so any GDI fill that happens in a resize gap
+        // before mpv's child repaints shows black — matching mpv's
         // letterbox / idle colour, perceptually invisible against video
-        // content. Phase 2.2 used a teal brush as a "render thread is
-        // alive" signal; that bled through as cyan flicker during
-        // drag-resize on every cross-thread SetWindowPos because the
-        // brush would paint AND the WM_SIZE handler would do an explicit
-        // teal glClear. Black brush + WM_SIZE pass-through (see
-        // [`engine_wndproc`]) + engine-driven per-frame resize (below) is
-        // Phase 5's resolution.
+        // content.
         //
         // The brush is leaked for process lifetime — one allocation per
         // process, matches the once-per-process RegisterClassW semantics.
         let black_brush = CreateSolidBrush(COLORREF(0));
         let wc = WNDCLASSW {
-            style: CS_OWNDC,
             lpfnWndProc: Some(engine_wndproc),
             hInstance: hinstance,
             lpszClassName: CLASS_NAME,
@@ -1297,7 +1096,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             WINDOW_EX_STYLE(0),
             CLASS_NAME,
             WINDOW_NAME,
-            WS_CHILD | WS_VISIBLE,
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
             init_x,
             init_y,
             init_w,
@@ -1327,72 +1126,15 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         }
         crate::devlog!(
             info, "mpv2",
-            "engine child window created at ({init_x},{init_y}) {init_w}x{init_h}",
+            "engine host window created at ({init_x},{init_y}) {init_w}x{init_h}",
         );
 
-        // -- WGL pixel format + context --
-        let hdc = GetDC(Some(hwnd));
-        if hdc.is_invalid() {
-            crate::devlog!(error, "mpv2", "GetDC returned an invalid DC");
-            let _ = DestroyWindow(hwnd);
-            return;
-        }
-
-        let pfd = PIXELFORMATDESCRIPTOR {
-            nSize: size_of::<PIXELFORMATDESCRIPTOR>() as u16,
-            nVersion: 1,
-            dwFlags: PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
-            iPixelType: PFD_TYPE_RGBA,
-            cColorBits: 32,
-            cDepthBits: 24,
-            cStencilBits: 8,
-            ..Default::default()
-        };
-        let pf = ChoosePixelFormat(hdc, &pfd);
-        if pf == 0 {
-            crate::devlog!(error, "mpv2", "ChoosePixelFormat found no match");
-            ReleaseDC(Some(hwnd), hdc);
-            let _ = DestroyWindow(hwnd);
-            return;
-        }
-        if let Err(e) = SetPixelFormat(hdc, pf, &pfd) {
-            crate::devlog!(error, "mpv2", "SetPixelFormat failed: {e}");
-            ReleaseDC(Some(hwnd), hdc);
-            let _ = DestroyWindow(hwnd);
-            return;
-        }
-
-        let hglrc = match wglCreateContext(hdc) {
-            Ok(c) => c,
-            Err(e) => {
-                crate::devlog!(error, "mpv2", "wglCreateContext failed: {e}");
-                ReleaseDC(Some(hwnd), hdc);
-                let _ = DestroyWindow(hwnd);
-                return;
-            }
-        };
-        if let Err(e) = wglMakeCurrent(hdc, hglrc) {
-            crate::devlog!(error, "mpv2", "wglMakeCurrent failed: {e}");
-            let _ = wglDeleteContext(hglrc);
-            ReleaseDC(Some(hwnd), hdc);
-            let _ = DestroyWindow(hwnd);
-            return;
-        }
-        crate::devlog!(
-            info, "mpv2",
-            "WGL context current — GL_VERSION='{}', GL_RENDERER='{}'",
-            cstr(glGetString(GL_VERSION) as *const c_char),
-            cstr(glGetString(GL_RENDERER) as *const c_char),
-        );
-
-        let opengl32 = GetModuleHandleW(w!("opengl32.dll")).unwrap_or_default();
-
-        // -- mpv handle + render context --
+        // -- mpv handle, embedded via wid --
         let lib = match Libmpv::load() {
             Ok(l) => l,
             Err(e) => {
                 crate::devlog!(error, "mpv2", "Libmpv::load failed: {e}");
-                teardown_wgl(hwnd, hdc, hglrc);
+                let _ = DestroyWindow(hwnd);
                 return;
             }
         };
@@ -1405,27 +1147,55 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         let handle = (lib.create)();
         if handle.is_null() {
             crate::devlog!(error, "mpv2", "mpv_create returned NULL");
-            teardown_wgl(hwnd, hdc, hglrc);
+            let _ = DestroyWindow(hwnd);
             return;
         }
 
+        // `wid` BEFORE mpv_initialize — pre-init writes go through mpv's
+        // option path, and `wid` is init-only. mpv creates its own child
+        // window inside the host, sized to the host's client area, and
+        // owns the d3d11 swapchain + presentation from there on.
+        {
+            let mut wid: i64 = hwnd.0 as i64;
+            let r = (lib.set_property)(
+                handle,
+                b"wid\0".as_ptr() as *const c_char,
+                mpv_format::INT64,
+                &mut wid as *mut _ as *mut c_void,
+            );
+            if r < 0 {
+                crate::devlog!(
+                    error, "mpv2",
+                    "set wid={wid:#x} failed: {} — no video surface; aborting engine",
+                    err_str(&lib, r),
+                );
+                (lib.terminate_destroy)(handle);
+                let _ = DestroyWindow(hwnd);
+                return;
+            }
+        }
+
+        // `vo=gpu-next` — the libplacebo-based renderer the legacy path
+        // always used, and the whole point of the consolidation: under a
+        // real window (vs `vo=libmpv`) it drives the d3d11 GPU context,
+        // which honours `target-colorspace-hint` for true HDR/DV
+        // passthrough and opts its swapchain out of Win11's
+        // Independent-Flip promotion.
         (lib.set_property_string)(
             handle,
             b"vo\0".as_ptr() as *const c_char,
-            b"libmpv\0".as_ptr() as *const c_char,
+            b"gpu-next\0".as_ptr() as *const c_char,
         );
 
         // -- Initial playback options --
-        // Mirrors the legacy `player::init_mpv` set for the options that
-        // are decode/cache-stage (the render path differs: legacy uses
-        // `vo=gpu-next`, mpv2 must use `vo=libmpv` for the render-API
-        // contract — that's the only intentional divergence). Without
-        // `hwdec=auto` mpv defaults to software decode, which means
-        // 4K HEVC 10-bit playback bottlenecks the CPU and produces a
-        // steady VO drop pattern even in focused/visible mode. With
-        // hwdec=auto, NVDEC / D3D11VA / DXVA take over and the GPU
-        // handles the decode. The cache tuning matches the legacy
-        // path's "no 1-second stall on stream start" behaviour
+        // The full `player::init_mpv` option set the legacy plugin path
+        // used, carried over verbatim now that this engine IS the `--wid`
+        // path. Without `hwdec=auto` mpv defaults to software decode,
+        // which means 4K HEVC 10-bit playback bottlenecks the CPU and
+        // produces a steady VO drop pattern even in focused/visible
+        // mode. With hwdec=auto, NVDEC / D3D11VA / DXVA take over and
+        // the GPU handles the decode. The cache tuning matches the
+        // legacy path's "no 1-second stall on stream start" behaviour
         // (cache-pause-initial=no, big demuxer-max-bytes, etc.) and
         // the libavformat reconnect flags keep playback alive through
         // transient HTTP errors from debrid hosts.
@@ -1433,16 +1203,27 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         // Each value is a literal C string set BEFORE mpv_initialize
         // so the option goes through mpv's "option" path rather than
         // the runtime property path — same approach the legacy
-        // `MpvConfig.initial_options` plumbing uses internally.
+        // `MpvConfig.initial_options` plumbing used internally.
         // Failures are devlog'd at `warn` but never fatal: mpv may
         // reject an unknown option on a future libmpv version without
         // breaking the rest of init.
         const INIT_OPTS: &[(&[u8], &[u8])] = &[
             // GPU decode — the actual fix for the focused 4K HEVC drops.
             (b"hwdec\0", b"auto\0"),
-            // Render-side defaults that match legacy gpu-next behaviour.
             (b"keepaspect\0", b"yes\0"),
             (b"background\0", b"none\0"),
+            // 50% initial volume — comfortable headphone-safe default;
+            // matches the PlaybackState bridge's assumed initial value
+            // (mpv's own default of 100 is too loud for first play).
+            (b"volume\0", b"50\0"),
+            // Subtitle styling baseline — `apply_subtitle_style`
+            // re-asserts the user's persisted values on every
+            // load_video; these are just sane first-paint defaults.
+            (b"sub-pos\0", b"95\0"),
+            (b"sub-font-size\0", b"45\0"),
+            (b"sub-border-size\0", b"3\0"),
+            (b"sub-shadow-offset\0", b"2\0"),
+            (b"sub-color\0", b"#FFFFFFFF\0"),
             // Keep the last frame around at EOF so EOS Spotlight /
             // Replay can scrub backwards without reloading.
             (b"keep-open\0", b"yes\0"),
@@ -1485,31 +1266,76 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             }
         }
 
+        // -- Audio passthrough (settings-gated, default OFF) --
+        // CRITICAL: never enable by default — `audio-exclusive=yes` puts
+        // WASAPI into exclusive mode (locks the output device system-wide
+        // until Aura exits cleanly; a crash leaves it locked until
+        // reboot), and `audio-spdif` implies the same exclusivity. Only
+        // users who explicitly opted in via Settings get bitstream
+        // passthrough. Mirrors the legacy `player::init_mpv` block.
+        let snap = crate::settings::snapshot();
+        if snap.audio_passthrough {
+            let r = (lib.set_property_string)(
+                handle,
+                b"audio-exclusive\0".as_ptr() as *const c_char,
+                b"yes\0".as_ptr() as *const c_char,
+            );
+            if r < 0 {
+                crate::devlog!(warn, "mpv2", "audio-exclusive=yes failed: {}", err_str(&lib, r));
+            }
+            let r = (lib.set_property_string)(
+                handle,
+                b"audio-spdif\0".as_ptr() as *const c_char,
+                b"ac3,dts,dts-hd,eac3,truehd\0".as_ptr() as *const c_char,
+            );
+            if r < 0 {
+                crate::devlog!(warn, "mpv2", "audio-spdif failed: {}", err_str(&lib, r));
+            }
+            crate::devlog!(info, "mpv2", "audio passthrough enabled (user setting)");
+        }
+
+        // -- Diagnostic log file --
+        // mpv writes its own verbose log to %USERPROFILE%\aura-mpv.log
+        // (rotated to .old past 50 MB by the helper). The last few lines
+        // usually pinpoint a STATUS_ACCESS_VIOLATION — the render-engine
+        // era lost this surface (it only had request_log_messages →
+        // DevConsole); restored here for crash forensics parity with the
+        // legacy path. See CLAUDE.md "Conventions".
+        if let Some(log_path) = crate::player::mpv_log_file_path() {
+            if let Ok(path_c) = CString::new(log_path.clone()) {
+                let r = (lib.set_property_string)(
+                    handle,
+                    b"log-file\0".as_ptr() as *const c_char,
+                    path_c.as_ptr(),
+                );
+                if r < 0 {
+                    crate::devlog!(warn, "mpv2", "log-file failed: {}", err_str(&lib, r));
+                } else {
+                    crate::devlog!(info, "mpv2", "mpv log: {log_path}");
+                }
+            }
+            let _ = (lib.set_property_string)(
+                handle,
+                b"msg-level\0".as_ptr() as *const c_char,
+                b"all=v\0".as_ptr() as *const c_char,
+            );
+        }
+
         // -- HDR mode at init --
-        // The legacy `player::init_mpv` applied the user's persisted HDR
-        // mode (target-colorspace-hint / tone-mapping / target-prim/trc/peak
-        // / hdr-compute-peak) at instance creation; the engine omitted it, so
-        // a fresh mpv2 launch ran with mpv's default tone-mapping until the
-        // user toggled HDR in Settings (which routes through
-        // `apply_hdr_settings` → `submit_set_property`). Mirror the legacy
-        // behaviour here so the first frame already honours the setting.
+        // Apply the user's persisted HDR mode (target-colorspace-hint /
+        // tone-mapping / target-prim/trc/peak / hdr-compute-peak) at
+        // instance creation so the first frame already honours the
+        // setting; the Settings toggle keeps routing live changes through
+        // `apply_hdr_settings` → `submit_set_property`.
         //
-        // NOTE on "passthrough": two things block real HDR here, both
-        // documented in `docs/superpowers/specs/2026-06-03-mpv2-hdr-dxgi-
-        // interop-design.md`. (1) `target-colorspace-hint` is only honoured
-        // by mpv's Wayland / D3D11 / winvk GPU contexts — NOT by `vo=libmpv`
-        // (the render API), so it's a silent no-op for this engine. (2) The
-        // WGL present surface below is an 8-bit SDR framebuffer that can't
-        // carry an HDR signal regardless. True passthrough needs the
-        // DXGI/`WGL_NV_DX_interop2` render path (an FP16 swapchain +
-        // host-owned `SetColorSpace1`). The SDR tone-map options
-        // (`target-prim`/`target-trc`/`target-peak`/`tone-mapping`) DO work
-        // here (they're `vo_gpu`-compatible and just tell mpv what to
-        // encode), so "sdr" and "off" are exactly right; "passthrough" is a
-        // harmless no-op until the DXGI work lands. Applying at init only
-        // changes the default — it does not regress the Settings-toggle path.
+        // Under `--wid` + `vo=gpu-next` + the d3d11 GPU context,
+        // "passthrough" (`target-colorspace-hint=yes`) is REAL HDR
+        // passthrough — the d3d11 context honours the hint and flips the
+        // swapchain colour space. This is what the render-API engine
+        // could never do (`vo=libmpv` ignores the hint; its WGL surface
+        // was 8-bit SDR) and the reason the DXGI-interop design
+        // (2026-06-03 spec) is superseded by this consolidation.
         {
-            let snap = crate::settings::snapshot();
             let mode = crate::player::resolve_hdr_mode(&snap);
             let mut hdr_opts: indexmap::IndexMap<String, serde_json::Value> =
                 indexmap::IndexMap::new();
@@ -1548,7 +1374,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 "mpv_initialize failed: {}", err_str(&lib, ir),
             );
             (lib.terminate_destroy)(handle);
-            teardown_wgl(hwnd, hdc, hglrc);
+            let _ = DestroyWindow(hwnd);
             return;
         }
         (lib.request_log_messages)(handle, b"info\0".as_ptr() as *const c_char);
@@ -1593,100 +1419,27 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             }
         }
 
-        let mut gl_init = mpv_opengl_init_params {
-            get_proc_address: Some(aura_get_proc_address),
-            get_proc_address_ctx: opengl32.0,
-        };
-        let mut params = [
-            mpv_render_param {
-                r#type: mpv_render_param_type::API_TYPE,
-                data: MPV_RENDER_API_TYPE_OPENGL.as_ptr() as *mut c_void,
-            },
-            mpv_render_param {
-                r#type: mpv_render_param_type::OPENGL_INIT_PARAMS,
-                data: &mut gl_init as *mut _ as *mut c_void,
-            },
-            mpv_render_param {
-                r#type: mpv_render_param_type::INVALID,
-                data: ptr::null_mut(),
-            },
-        ];
-        let mut rctx: *mut mpv_render_context = ptr::null_mut();
-        let cr = (lib.render_context_create)(&mut rctx, handle, params.as_mut_ptr());
-        if cr < 0 || rctx.is_null() {
-            crate::devlog!(
-                error, "mpv2",
-                "mpv_render_context_create failed: {}",
-                err_str(&lib, cr),
-            );
-            (lib.terminate_destroy)(handle);
-            teardown_wgl(hwnd, hdc, hglrc);
-            return;
-        }
-        crate::devlog!(
-            info, "mpv2",
-            "mpv_render_context_create OK — engine render context live",
-        );
-
-        // Update-callback context. We hand mpv a stable `*const AtomicBool`
-        // by leaking an `Arc::into_raw` clone; the matching `Arc::from_raw`
-        // in teardown reclaims it. The Arc is leaked specifically because
-        // mpv may invoke the callback from any thread until
-        // `render_context_free` returns, so the pointer must outlive every
-        // possible callback.
-        let needs_render = Arc::new(AtomicBool::new(false));
-        let cb_ctx = Arc::into_raw(needs_render.clone()) as *mut c_void;
-        (lib.render_context_set_update_callback)(
-            rctx, Some(on_mpv_update), cb_ctx,
-        );
-
-        // -- Dual-mode present pacing setup --
-        // Resolve wglSwapIntervalEXT once. If absent, both branches fall
-        // back to pure timer pacing (no vsync wait) — playback still
-        // works, just without the extra-smooth focused-mode vblank lock.
-        let wgl_swap_interval = resolve_swap_interval();
-        if wgl_swap_interval.is_none() {
-            crate::devlog!(
-                warn, "mpv2",
-                "wglSwapIntervalEXT not available — both modes will be timer-paced",
-            );
-        }
-        // Three-state present mode: see `PresentMode` doc for the full
-        // rationale. Foreground gets full-quality (vsync + report_swap +
-        // framedrop=vo); visible-but-not-foreground gets no-drop
-        // (vsync + report_swap + framedrop=no — DWM throttles
-        // non-foreground presents and mpv's default framedrop would
-        // see the slow swaps as "late frames" and drop them); hidden
-        // gets the background path (no vsync, no report_swap, no
-        // framedrop).
+        // -- Visibility telemetry --
+        // PresentMode is observation-only under --wid (mpv owns its own
+        // presentation); see the enum doc. Published for the debug panel
+        // and devlog'd on transitions.
         let mut mode = detect_present_mode(parent);
-        if let Some(set_swap) = wgl_swap_interval {
-            let interval = mode.swap_interval();
-            let r = set_swap(interval);
-            crate::devlog!(
-                info, "mpv2",
-                "wglSwapIntervalEXT({interval}) → {r} (nonzero = ok)",
-            );
-        }
-        apply_framedrop_policy(&lib, handle, mode);
         CURRENT_MODE.store(mode.as_u8(), Ordering::Release);
         crate::devlog!(
             info, "mpv2",
-            "engine starting in {} present mode",
+            "engine ready — parent visibility: {}",
             mode.label(),
         );
 
-        // -- Render loop --
-        // Dual-mode pacing per the render-API spec:
-        //   * Focused: swap-interval=1, SwapBuffers itself is the clock.
-        //   * Unfocused: swap-interval=0 + a fixed timer cadence — DWM
-        //     throttles a non-foreground window's compositor, so vsync
-        //     would stall us; we drive render+report_swap at a steady
-        //     ~60 Hz instead so mpv's display-resample model stays fed.
-        // Mode switches are detected by polling GetForegroundWindow each
-        // tick (cheap; the win32 transition is what off-focus-drop is
-        // really about, so we react inside one frame of the change).
-        let mut frame_count: u64 = 0;
+        // -- Pump loop --
+        // mpv renders and presents entirely on its own threads under
+        // `--wid`; this loop only:
+        //   1. services the host window's message queue,
+        //   2. drains the engine command channel,
+        //   3. drains mpv's event queue into the Tauri bridge,
+        //   4. tracks the parent's client rect / fullscreen state and
+        //      resizes the host (plus mpv's inner child) on change,
+        //   5. publishes visibility telemetry + display-sleep inhibit.
         let mut shutting_down = false;
         let mut last_geom = (init_x, init_y, init_w, init_h);
         // Tracks the last display-sleep-inhibit state we asserted, so we
@@ -1694,7 +1447,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         // every frame). Starts false = not inhibited.
         let mut display_awake_applied = false;
         loop {
-            let frame_start = Instant::now();
+            let tick_start = Instant::now();
 
             // Keep the monitor awake while the frontend says playback is
             // active + unpaused. Applied here (the render thread) because
@@ -1821,66 +1574,47 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 break;
             }
 
-            // Detect mode transitions across all three states.
-            // Foreground → VisibleBackground happens on alt-tab to
-            // another monitor; VisibleBackground → Hidden happens on
-            // minimise / virtual-desktop switch; etc. Each switch
-            // re-applies the appropriate swap-interval + framedrop
-            // policy so playback is right for the new context.
+            // Visibility-transition telemetry. Foreground →
+            // VisibleBackground happens on alt-tab to another monitor;
+            // VisibleBackground → Hidden on minimise / virtual-desktop
+            // switch; etc. Nothing is applied to mpv — this exists so
+            // off-focus playback reports can be correlated with the
+            // window state in DevConsole.
             let now_mode = detect_present_mode(parent);
             if now_mode != mode {
                 mode = now_mode;
-                if let Some(set_swap) = wgl_swap_interval {
-                    let interval = mode.swap_interval();
-                    let r = set_swap(interval);
-                    crate::devlog!(
-                        debug, "mpv2",
-                        "wglSwapIntervalEXT({interval}) → {r}",
-                    );
-                }
-                apply_framedrop_policy(&lib, handle, mode);
                 CURRENT_MODE.store(mode.as_u8(), Ordering::Release);
                 crate::devlog!(
                     info, "mpv2",
-                    "engine present mode → {}",
+                    "parent visibility → {}",
                     mode.label(),
                 );
             }
 
-            // Phase 5 — engine owns its resize. Poll the PARENT's client
-            // rect every tick; if our cached geometry differs, SetWindowPos
-            // ourselves to match. Same-thread `SetWindowPos` on our own
-            // HWND invokes our wndproc inline (no cross-thread message),
-            // so this is cheap and deadlock-free.
-            //
-            // Driving resize from the render thread (vs. the old path of
-            // Tauri's onResized → `refresh_video` → `EnumChildWindows` +
-            // `SetWindowPos` on the main thread) closes two latencies:
-            // the JS round-trip and the cross-thread SendMessage to our
-            // wndproc. During a drag-resize the engine reacts within one
-            // render tick (~16 ms) instead of however long the JS hop
-            // takes, which kills the visible stale-frame gap.
+            // Geometry resync — poll the PARENT's client rect + fullscreen
+            // state every tick; on change, SetWindowPos the host to match
+            // (same-thread → our wndproc runs inline, cheap and
+            // deadlock-free) and then snap mpv's inner child to the host's
+            // new client area. mpv's `--wid` child does NOT track its
+            // parent's size on this build (the documented reason
+            // `win32::resize_mpv_child_to_parent` exists), so the inner
+            // resize is required; it's a no-op while no video is loaded
+            // (mpv hasn't created the child yet — when it does, it sizes
+            // to the host's CURRENT client area, which this loop keeps
+            // correct, so first-frame geometry is right by construction).
             //
             // `SWP_NOCOPYBITS | SWP_DEFERERASE` suppresses GDI's bitblt
-            // copy + WM_ERASEBKGND fill — both produce visible frame
-            // artifacts when the next render tick is about to overwrite
-            // the surface anyway.
+            // copy + WM_ERASEBKGND fill — both produce visible artifacts
+            // when mpv is about to repaint the surface anyway.
             let in_fs = crate::win32::is_in_native_fullscreen();
             let y_off = if in_fs { 0 } else { TITLE_BAR_H };
-            // Match parent_client_inset: shave FSO_HEIGHT_INSET pixels off
-            // the bottom in fullscreen so the GL surface is NOT exactly
-            // monitor-sized. See the constant's comment — this is the
-            // verified disqualifier for Win11's Independent Flip / MPO
-            // promotion (occlusion from above does NOT work on multi-plane
-            // GPUs). The gap is covered by a black strip in App.tsx.
-            let bottom_inset = if in_fs { FSO_HEIGHT_INSET } else { 0 };
             let mut parent_rc = RECT::default();
             let (target_w, target_h) = if GetClientRect(parent, &mut parent_rc).is_ok()
                 && parent_rc.right > parent_rc.left
                 && parent_rc.bottom > parent_rc.top
             {
                 let pw = parent_rc.right - parent_rc.left;
-                let ph = (parent_rc.bottom - parent_rc.top - y_off - bottom_inset).max(1);
+                let ph = (parent_rc.bottom - parent_rc.top - y_off).max(1);
                 (pw, ph)
             } else {
                 (last_geom.2, last_geom.3)
@@ -1899,135 +1633,40 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         | SWP_NOCOPYBITS
                         | SWP_DEFERERASE,
                 ) {
-                    crate::devlog!(warn, "mpv2", "self SetWindowPos failed: {e}");
+                    crate::devlog!(warn, "mpv2", "host SetWindowPos failed: {e}");
                 }
                 last_geom = target_geom;
+                // Inner child fills the host exactly (y_offset 0 — the
+                // title-bar inset is already the host's own position).
+                crate::win32::resize_mpv_child_to_parent(hwnd.0 as isize, 0);
             }
-            let (cw, ch) = (target_w, target_h);
-
-            glViewport(0, 0, cw, ch);
 
             drain_mpv_events(&lib, handle, &emit);
 
-            // Consume the update-callback flag and the render-context's
-            // own update bitset for completeness, but DO NOT use them to
-            // gate mpv_render_context_render. mpv must be invoked every
-            // present so the FBO content tracks the current playback
-            // state — when the video frame rate is lower than the swap
-            // rate (e.g. 23.976 fps video on a 144 Hz monitor in
-            // focused/vsync-blocked mode), mpv internally re-paints the
-            // most-recent frame; an `if frame_ready` gate would leave
-            // the FBO unrendered on those ticks and SwapBuffers would
-            // present whatever was left in the back buffer (an old
-            // clear). The user-visible symptom was cyan flashes when the
-            // player had focus — fixed by rendering unconditionally.
-            let _ = needs_render.swap(false, Ordering::AcqRel);
-            let _ = (lib.render_context_update)(rctx);
-
-            let mut fbo = mpv_opengl_fbo {
-                fbo: 0,
-                w: cw,
-                h: ch,
-                internal_format: 0,
-            };
-            let mut flip_y: c_int = 1;
-            let mut rparams = [
-                mpv_render_param {
-                    r#type: mpv_render_param_type::OPENGL_FBO,
-                    data: &mut fbo as *mut _ as *mut c_void,
-                },
-                mpv_render_param {
-                    r#type: mpv_render_param_type::FLIP_Y,
-                    data: &mut flip_y as *mut _ as *mut c_void,
-                },
-                mpv_render_param {
-                    r#type: mpv_render_param_type::INVALID,
-                    data: ptr::null_mut(),
-                },
-            ];
-            let r = (lib.render_context_render)(rctx, rparams.as_mut_ptr());
-            if r < 0 {
-                crate::devlog!(
-                    warn, "mpv2",
-                    "render_context_render: {}", err_str(&lib, r),
-                );
-            } else {
-                frame_count = frame_count.saturating_add(1);
-                if frame_count == 1 {
-                    crate::devlog!(
-                        info, "mpv2",
-                        "first mpv frame rendered by engine",
-                    );
-                }
-            }
-
-            let _ = SwapBuffers(hdc);
-            // Only report_swap when focused. In focused mode
-            // SwapBuffers blocks on vblank, so the call sequence
-            // models a real flip: mpv learns accurate vsync timing
-            // and its display-sync prediction model works correctly.
-            //
-            // In unfocused mode SwapBuffers returns immediately
-            // (swap-interval=0) while DWM throttles the actual
-            // composite. Calling report_swap here would tell mpv
-            // "vsync at 60 Hz" while the real flip happens whenever
-            // DWM decides — that misinformation builds an incorrect
-            // prediction model and was the source of the ~16% drop
-            // rate observed pre-fix. Suppressing the call lets mpv
-            // fall back to its audio-clock-only timing model, which
-            // doesn't depend on vsync prediction. Paired with
-            // `framedrop=no` (set by apply_framedrop_policy on focus
-            // change) the engine plays every decoded frame in
-            // unfocused mode rather than dropping ones it incorrectly
-            // judges as "late".
-            if mode.report_swap() {
-                (lib.render_context_report_swap)(rctx);
-            }
-
-            // Pacing branch:
-            //   * Foreground / VisibleBackground: SwapBuffers is the
-            //     clock (swap-interval=1 blocks on vblank — DWM-throttled
-            //     in the background case, vsync-locked in the foreground
-            //     case, either way we don't need to add our own sleep).
-            //   * Hidden: SwapBuffers returns immediately; sleep until
-            //     the next steady 60 Hz tick so the loop doesn't spin.
-            if matches!(mode, PresentMode::Hidden) {
-                let elapsed = frame_start.elapsed();
-                if elapsed < UNFOCUSED_FRAME {
-                    thread::sleep(UNFOCUSED_FRAME - elapsed);
-                }
+            // Steady pump cadence — see TICK.
+            let elapsed = tick_start.elapsed();
+            if elapsed < TICK {
+                thread::sleep(TICK - elapsed);
             }
         }
 
         // -- Teardown --
-        // Order matters: deregister update callback BEFORE freeing the
-        // render context so a late callback can't dereference a freed Arc;
-        // free the render context BEFORE giving up the GL context; reclaim
-        // the leaked Arc BEFORE dropping `lib` (so any in-flight callback
-        // is also blocked by the deregistration above).
-        (lib.render_context_set_update_callback)(rctx, None, ptr::null_mut());
-        (lib.render_context_free)(rctx);
-        drop(Arc::from_raw(cb_ctx as *const AtomicBool));
+        // WASAPI-release discipline (CLAUDE.md landmine #9), formerly
+        // `window_logic::shutdown_mpv_sync` on the legacy plugin: mute
+        // first so in-flight audio buffers don't squeak through the
+        // device-close path, `stop` to unlink the demuxer and release the
+        // AO, then `mpv_terminate_destroy` — all synchronous on this
+        // thread, and the CloseRequested handler joins this thread before
+        // `app.exit()`, so the audio device is guaranteed back with the
+        // OS mixer before the process dies.
+        let _ = set_property_generic(&lib, handle, "mute", &PropValue::Flag(true));
+        let _ = run_mpv_command(&lib, handle, &["stop"]);
         (lib.terminate_destroy)(handle);
-        teardown_wgl(hwnd, hdc, hglrc);
+        let _ = DestroyWindow(hwnd);
 
         // Reset the published mode so debug callers see "not running"
         // after teardown.
         CURRENT_MODE.store(255, Ordering::Release);
-        crate::devlog!(
-            info, "mpv2",
-            "engine torn down cleanly ({frame_count} mpv frame(s) rendered)",
-        );
+        crate::devlog!(info, "mpv2", "engine torn down cleanly");
     }
-}
-
-/// Common WGL/window teardown — runs after mpv is destroyed (or on an early
-/// init-failure bail-out where mpv was never created). Idempotent on the
-/// "context-not-current" branch, so the early-exit call sites can use it
-/// without first un-currenting anything.
-unsafe fn teardown_wgl(hwnd: HWND, hdc: HDC, hglrc: HGLRC) {
-    let _ = wglMakeCurrent(HDC::default(), HGLRC::default());
-    let _ = wglDeleteContext(hglrc);
-    ReleaseDC(Some(hwnd), hdc);
-    let _ = DestroyWindow(hwnd);
 }

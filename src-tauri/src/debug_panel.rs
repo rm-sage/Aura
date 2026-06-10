@@ -147,8 +147,11 @@ fn read_window_state(_parent_hwnd: isize) -> Value {
 /// One-shot live snapshot. Frontend polls this every second.
 #[tauri::command]
 pub fn debug_engine_state(app: AppHandle) -> Value {
+    // Always true since the engine consolidation — the mpv2 engine is the
+    // only playback path. Kept in the payload so the frontend panel's
+    // shape doesn't change.
     #[cfg(target_os = "windows")]
-    let mpv2_active = crate::mpv2::engine::enabled();
+    let mpv2_active = true;
     #[cfg(not(target_os = "windows"))]
     let mpv2_active = false;
 
@@ -202,13 +205,9 @@ pub fn debug_engine_state(app: AppHandle) -> Value {
 pub async fn debug_load_test_pattern() -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        use crate::mpv2::engine::{enabled as engine_enabled, is_running, submit_load_file};
-        if !engine_enabled() || !is_running() {
-            return Err(
-                "debug_load_test_pattern: mpv2 engine not running (it is the \
-                 default path — did you launch with AURA_MPV2=0?)."
-                    .into(),
-            );
+        use crate::mpv2::engine::{is_running, submit_load_file};
+        if !is_running() {
+            return Err("debug_load_test_pattern: mpv2 engine not running.".into());
         }
         // 1280×720 SMPTE bars at 24 fps. `duration=3600` caps the source
         // at one hour so even the 60 s drop test has plenty of headroom.
@@ -236,8 +235,8 @@ pub async fn debug_load_test_pattern() -> Result<(), String> {
 pub fn debug_stop_playback() -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        use crate::mpv2::engine::{enabled as engine_enabled, is_running, submit_command};
-        if !engine_enabled() || !is_running() {
+        use crate::mpv2::engine::{is_running, submit_command};
+        if !is_running() {
             return Err("debug_stop_playback: mpv2 engine not running.".into());
         }
         submit_command(vec!["stop".into()])
@@ -272,14 +271,11 @@ pub async fn debug_drop_test(duration_secs: u32) -> Result<Value, String> {
     #[cfg(target_os = "windows")]
     {
         use crate::mpv2::engine::{
-            current_present_mode, enabled as engine_enabled, is_running, submit_get_property,
-            GetFormat,
+            current_present_mode, is_running, submit_get_property, GetFormat,
         };
-        if !engine_enabled() || !is_running() {
+        if !is_running() {
             return Err(
-                "debug_drop_test: mpv2 engine not running (it is the default \
-                 path — did you launch with AURA_MPV2=0?). Load a stream first."
-                    .into(),
+                "debug_drop_test: mpv2 engine not running. Load a stream first.".into(),
             );
         }
 
