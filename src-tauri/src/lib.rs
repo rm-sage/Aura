@@ -442,6 +442,14 @@ async fn load_video(
 #[tauri::command]
 async fn stop_video(app: tauri::AppHandle) -> Result<(), String> {
     crate::devlog!(info, "player", "stop_video");
+    // Tear down the warm headless thumbnail instance when leaving playback so
+    // its libmpv core + open stream + demuxer cache don't sit resident while
+    // idle. The next play's pre-warm (App.tsx) re-spawns it. Fire-and-forget,
+    // off the async runtime (shutdown() does a bounded join).
+    #[cfg(target_os = "windows")]
+    {
+        let _ = tauri::async_runtime::spawn_blocking(crate::mpv2::thumb::shutdown);
+    }
     #[cfg(target_os = "windows")]
     if mpv2::engine::enabled() && mpv2::engine::is_running() {
         return mpv2::engine::submit_command(vec!["stop".into()]);

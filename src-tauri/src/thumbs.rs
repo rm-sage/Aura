@@ -74,9 +74,12 @@ pub struct ThumbResult {
 }
 
 /// Extract a single seek-accurate JPEG thumbnail at `at_seconds` from `url`.
-/// Best-effort: any failure (kill-switch, bad url, ffmpeg error, timeout,
-/// empty output) resolves to `Ok(None)` so the scrubber falls back to the
-/// timestamp tooltip rather than erroring.
+///
+/// Primary path is the warm headless libmpv FFI engine (`mpv2::thumb`): fast on
+/// repeated hovers (open stream + decoder reused) and never-stale (screenshot
+/// gated on mpv's `playback-restart` event). Falls back to a cold
+/// ffmpeg-per-hover extraction. Best-effort throughout: any failure resolves to
+/// `Ok(None)` so the scrubber falls back to the timestamp tooltip.
 #[tauri::command]
 pub async fn extract_thumbnail(
     app: AppHandle,
@@ -96,9 +99,37 @@ pub async fn extract_thumbnail(
         return Ok(None);
     }
 
-    // Bound concurrency. A closed semaphore is impossible (it's static + never
-    // closed), so the acquire only fails on a poisoned runtime — treat as a
-    // soft miss.
+    // Primary: warm headless libmpv FFI engine. It blocks on a worker-thread
+    // round-trip, so it must run on a blocking thread, never the async runtime.
+    #[cfg(target_os = "windows")]
+    {
+        let u = url.clone();
+        match tokio::task::spawn_blocking(move || crate::mpv2::thumb::extract(u, at_seconds)).await {
+            Ok(Ok(Some(r))) => return Ok(Some(r)),
+            // No frame OR a coalesced (superseded) rapid-hover request — return
+            // None directly. NOT a fallback case: the next hover retries, and
+            // falling back to ffmpeg here would spawn a cold ffmpeg per skipped
+            // hover. ffmpeg is only for a HARD FFI failure (Err) below.
+            Ok(Ok(None)) => return Ok(None),
+            Ok(Err(e)) => crate::devlog!(debug, "thumbs", "ffi thumb error, ffmpeg fallback: {e}"),
+            Err(e) => crate::devlog!(debug, "thumbs", "ffi thumb join error, ffmpeg fallback: {e}"),
+        }
+    }
+
+    // Fallback: cold ffmpeg-per-hover.
+    extract_via_ffmpeg(&app, &url, at_seconds).await
+}
+
+/// Cold ffmpeg-per-hover extraction via the bundled `lib/ffmpeg.exe`. ~1-3 s
+/// (re-opens the stream each call); used only when the warm FFI engine is
+/// unavailable or yields nothing. `url` is pre-validated http(s).
+async fn extract_via_ffmpeg(
+    app: &AppHandle,
+    url: &str,
+    at_seconds: f64,
+) -> Result<Option<ThumbResult>, String> {
+    // Bound concurrency. A closed semaphore is impossible (static + never
+    // closed), so the acquire only fails on a poisoned runtime — soft miss.
     let _permit = match THUMB_GATE.acquire().await {
         Ok(p) => p,
         Err(_) => return Ok(None),
@@ -111,13 +142,13 @@ pub async fn extract_thumbnail(
     let label: String = url.chars().take(80).collect();
     let ss = format!("{at_seconds}");
 
-    let mut cmd = crate::silencedetect::ffmpeg_command(&app);
+    let mut cmd = crate::silencedetect::ffmpeg_command(app);
     cmd.args(["-hide_banner", "-nostdin", "-loglevel", "error"]);
     cmd.args(["-protocol_whitelist", "http,https,tcp,tls,crypto"]);
-    // `-ss` BEFORE `-i` = fast keyframe-snapped input seek (decodes only the
-    // frame it lands on, not from 0). One frame, 320 px wide, ~q4 JPEG.
+    // `-ss` BEFORE `-i` = fast input seek (accurate by default via mpv/ffmpeg's
+    // accurate_seek). One frame, 320 px wide, ~q4 JPEG.
     cmd.arg("-ss").arg(&ss);
-    cmd.arg("-i").arg(&url);
+    cmd.arg("-i").arg(url);
     cmd.args(["-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "4", "-y"]);
     cmd.arg(&out_str);
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());

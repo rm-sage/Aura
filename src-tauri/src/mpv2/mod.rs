@@ -67,3 +67,11 @@ pub mod hello;
 // still without playback wiring; those land in Phase 2.2 / 2.4.
 #[cfg(target_os = "windows")]
 pub mod engine;
+
+// Headless hover-seek thumbnail engine — a self-owned `vo=null` libmpv
+// instance on a dedicated worker thread, replacing the cold ffmpeg-per-hover
+// path. Warm (open stream + decoder reused across hovers) and never-stale
+// (each seek's screenshot is gated on mpv's `playback-restart` event). No
+// render context (headless), so it's independent of the main playback engine.
+#[cfg(target_os = "windows")]
+pub mod thumb;
