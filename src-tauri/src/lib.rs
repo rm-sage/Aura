@@ -325,6 +325,11 @@ async fn load_video(
     // / 0 / NaN all mean "play from the beginning" — matches the
     // previous behaviour.
     start_seconds: Option<f64>,
+    // Stream-name HDR labelling (frontend parseStream). Under the
+    // "passthrough" HDR mode this routes the engine's per-load output
+    // selection (PQ set for HDR-labelled streams, plain SDR otherwise)
+    // — see the LoadFile arm in mpv::engine. None/false → SDR output.
+    content_hdr_hint: Option<bool>,
 ) -> Result<(), String> {
     let normalised = path.replace('\\', "/");
     // Defence in depth: only http(s) URLs, the localhost streaming
@@ -361,10 +366,10 @@ async fn load_video(
     // (thread-spawn or HWND-resolution failure) this returns a clear
     // "engine not running" error instead of crashing.
     #[cfg(target_os = "windows")]
-    return mpv::engine::submit_load_file(normalised, start_seconds);
+    return mpv::engine::submit_load_file(normalised, start_seconds, content_hdr_hint);
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (normalised, start_seconds);
+        let _ = (normalised, start_seconds, content_hdr_hint);
         Err("playback engine is Windows-only".into())
     }
 }

@@ -142,6 +142,11 @@ enum EngineCommand {
     LoadFile {
         url: String,
         start_seconds: Option<f64>,
+        /// Stream-name HDR labelling (parsed frontend-side). Under the
+        /// "passthrough" HDR mode this routes the load to the PQ output
+        /// set (Some(true)) or the plain SDR set (anything else) BEFORE
+        /// the loadfile — per-content output without mid-playback writes.
+        hdr_hint: Option<bool>,
     },
     TogglePause,
     SetVolume(f64),
@@ -314,8 +319,12 @@ pub fn start(parent_hwnd: isize, emit: EngineEmit) {
 
 /// Submit a `LoadFile` command. Returns an error if the engine isn't
 /// running (master gate off or pre-startup) or the channel is closed.
-pub fn submit_load_file(url: String, start_seconds: Option<f64>) -> Result<(), String> {
-    submit(EngineCommand::LoadFile { url, start_seconds })
+pub fn submit_load_file(
+    url: String,
+    start_seconds: Option<f64>,
+    hdr_hint: Option<bool>,
+) -> Result<(), String> {
+    submit(EngineCommand::LoadFile { url, start_seconds, hdr_hint })
 }
 
 /// Submit a `TogglePause` command.
@@ -571,6 +580,46 @@ unsafe extern "system" fn engine_wndproc(
         return LRESULT(0);
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// Write the HDR option set for `mode` (see `player::apply_hdr_options`)
+/// to the handle as string properties. Used at engine init AND per-load
+/// from the pump loop's LoadFile arm — the per-load path engages the PQ
+/// output only for HDR-labelled streams, applied BETWEEN files (before
+/// the loadfile command), never mid-playback.
+unsafe fn apply_hdr_mode_set(
+    lib: &Libmpv,
+    handle: *mut mpv_handle,
+    mode: &str,
+    peak_nits: u32,
+) {
+    let mut opts: indexmap::IndexMap<String, serde_json::Value> =
+        indexmap::IndexMap::new();
+    crate::player::apply_hdr_options(&mut opts, mode, peak_nits);
+    for (name, value) in opts.iter() {
+        let value_str = match value {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => {
+                if *b { "yes".to_string() } else { "no".to_string() }
+            }
+            // apply_hdr_options only ever emits scalars; skip anything
+            // else rather than send a wrong-format value.
+            _ => continue,
+        };
+        if let (Ok(name_c), Ok(value_c)) =
+            (CString::new(name.as_str()), CString::new(value_str.as_str()))
+        {
+            let r = (lib.set_property_string)(handle, name_c.as_ptr(), value_c.as_ptr());
+            if r < 0 {
+                crate::devlog!(
+                    warn, "mpv",
+                    "HDR option {name} = {value_str} failed: {}",
+                    err_str(lib, r),
+                );
+            }
+        }
+    }
 }
 
 /// `<null>`-safe NUL-terminated-C-string → owned `String`.
@@ -1414,49 +1463,27 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         }
 
         // -- HDR mode at init --
-        // Apply the user's persisted HDR mode (target-colorspace-hint /
-        // tone-mapping / target-prim/trc/peak / hdr-compute-peak) at
-        // instance creation so the first frame already honours the
-        // setting; the Settings toggle keeps routing live changes through
-        // `apply_hdr_settings` → `submit_set_property`.
+        // Apply the user's persisted HDR mode at instance creation so
+        // the first frame already honours the setting.
         //
-        // Under `--wid` + `vo=gpu-next` + the d3d11 GPU context,
-        // "passthrough" (`target-colorspace-hint=yes`) is REAL HDR
-        // passthrough — the d3d11 context honours the hint and flips the
-        // swapchain colour space. This is what the render-API engine
-        // could never do (`vo=libmpv` ignores the hint; its WGL surface
-        // was 8-bit SDR) and the reason the DXGI-interop design
-        // (2026-06-03 spec) is superseded by this consolidation.
+        // "passthrough" is PER-CONTENT: the PQ output path (forced PQ
+        // swapchain + mpv tone-mapping to the panel's real peak) only
+        // makes sense for HDR sources — SDR rendered into a PQ
+        // container sits at the 203-nit reference, visibly dimmer and
+        // flatter than the Windows SDR-brightness level every other
+        // window gets. So under passthrough the engine starts on the
+        // plain SDR output and flips per LOAD based on the stream's
+        // HDR labelling (see the LoadFile arm in the pump loop) — the
+        // switch happens BETWEEN files only, never mid-playback (the
+        // documented blow-out hazard).
         {
             let mode = crate::player::resolve_hdr_mode(&snap);
-            let mut hdr_opts: indexmap::IndexMap<String, serde_json::Value> =
-                indexmap::IndexMap::new();
-            crate::player::apply_hdr_options(&mut hdr_opts, mode, snap.hdr_target_peak_nits);
-            for (name, value) in hdr_opts.iter() {
-                let value_str = match value {
-                    serde_json::Value::String(s) => s.clone(),
-                    serde_json::Value::Number(n) => n.to_string(),
-                    serde_json::Value::Bool(b) => {
-                        if *b { "yes".to_string() } else { "no".to_string() }
-                    }
-                    // apply_hdr_options only ever emits scalars; skip anything
-                    // else rather than send a wrong-format value.
-                    _ => continue,
-                };
-                if let (Ok(name_c), Ok(value_c)) =
-                    (CString::new(name.as_str()), CString::new(value_str.as_str()))
-                {
-                    let r = (lib.set_property_string)(handle, name_c.as_ptr(), value_c.as_ptr());
-                    if r < 0 {
-                        crate::devlog!(
-                            warn, "mpv",
-                            "HDR init option {name} = {value_str} failed: {}",
-                            err_str(&lib, r),
-                        );
-                    }
-                }
-            }
-            crate::devlog!(info, "mpv", "HDR mode '{mode}' applied at engine init");
+            let effective = if mode == "passthrough" { "sdr" } else { mode };
+            apply_hdr_mode_set(&lib, handle, effective, snap.hdr_target_peak_nits);
+            crate::devlog!(
+                info, "mpv",
+                "HDR mode '{mode}' (initial output set: '{effective}') applied at engine init",
+            );
         }
 
         let ir = (lib.initialize)(handle);
@@ -1582,7 +1609,34 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         shutting_down = true;
                         break;
                     }
-                    Ok(EngineCommand::LoadFile { url, start_seconds }) => {
+                    Ok(EngineCommand::LoadFile { url, start_seconds, hdr_hint }) => {
+                        // Per-load HDR routing (passthrough mode only):
+                        // the PQ output set engages only for HDR-labelled
+                        // streams; everything else gets the plain SDR
+                        // output so it composites at the Windows SDR
+                        // brightness like every other window. Applied
+                        // HERE — between files, before the loadfile —
+                        // never mid-playback (the documented blow-out
+                        // hazard).
+                        {
+                            let snap = crate::settings::snapshot();
+                            let mode = crate::player::resolve_hdr_mode(&snap);
+                            if mode == "passthrough" {
+                                let effective = if hdr_hint == Some(true) {
+                                    "passthrough"
+                                } else {
+                                    "sdr"
+                                };
+                                apply_hdr_mode_set(
+                                    &lib, handle, effective,
+                                    snap.hdr_target_peak_nits,
+                                );
+                                crate::devlog!(
+                                    info, "mpv",
+                                    "per-load HDR output set: '{effective}' (hint={hdr_hint:?})",
+                                );
+                            }
+                        }
                         // Pre-loadfile pause clear: an inherited pause flag
                         // from a previous file would carry over otherwise
                         // and require a manual click to start playback.

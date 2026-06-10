@@ -216,7 +216,7 @@ pub async fn debug_load_test_pattern() -> Result<(), String> {
         let url =
             "av://lavfi:smptebars=size=1280x720:rate=24:duration=3600".to_string();
         crate::devlog!(info, "debug-panel", "loading lavfi test pattern: {url}");
-        submit_load_file(url, None)
+        submit_load_file(url, None, None)
     }
     #[cfg(not(target_os = "windows"))]
     {
