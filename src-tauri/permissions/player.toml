@@ -36,6 +36,12 @@ commands.allow = [
   "set_native_fullscreen",
 ]
 
+# ── Live TV (IPTV) ────────────────────────────────────────────────────────────
+[[permission]]
+identifier = "allow-iptv"
+description = "Allows the frontend to fetch IPTV playlists / EPG / Xtream API responses through the backend (IPTV-client UA, size-capped)"
+commands.allow = ["iptv_fetch_text"]
+
 # ── Stremio catalog ───────────────────────────────────────────────────────────
 [[permission]]
 identifier = "allow-fetch-catalog"

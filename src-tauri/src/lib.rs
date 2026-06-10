@@ -35,6 +35,8 @@ mod media_controls;
 // thumbnail instance). Replaced `tauri-plugin-libmpv` entirely; see
 // mpv/mod.rs for the consolidation history.
 mod debug_panel;
+// IPTV (Live TV) network hop — see src/iptv/ for the TS parsers.
+mod iptv;
 mod mpv;
 mod popup_nav;
 mod player;
@@ -2047,6 +2049,8 @@ pub fn run() {
             refresh_video,
             apply_lang_defaults,
             apply_hdr_settings,
+            // ── Live TV (IPTV) network hop ───────────────────────────────────
+            iptv::iptv_fetch_text,
             apply_subtitle_style,
             set_subtitle_position_runtime,
             set_native_fullscreen,

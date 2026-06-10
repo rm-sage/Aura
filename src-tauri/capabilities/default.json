@@ -26,6 +26,7 @@
     "core:webview:allow-webview-close",
     "deep-link:default",
     "allow-load-video",
+    "allow-iptv",
     "allow-player-controls",
     "allow-fetch-catalog",
     "allow-addon-manifest",

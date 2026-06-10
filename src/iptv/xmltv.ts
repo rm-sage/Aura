@@ -1,0 +1,157 @@
+// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+// ---------------------------------------------------------------------------
+// XMLTV EPG parser (Live TV spec §1). Hand-rolled scanning over the
+// document string — no DOMParser (EPGs reach tens of MB; building a DOM
+// doubles the peak). The Rust fetch command enforces the size cap, so
+// this parser works on a bounded in-memory string. The reference design
+// streamed chunks off the network; that refinement can come with the UI
+// phase if real EPGs prove too large for the cap.
+//
+// We extract exactly what the guide needs from each <programme> block:
+// start/stop attrs, channel attr, <title>, <desc>, first <category>,
+// <icon src>.
+// ---------------------------------------------------------------------------
+
+import type { EpgIndex, EpgProgram } from "./types";
+
+/** `YYYYMMDDHHMMSS [±HHMM]` → epoch ms. Null on malformed input. */
+export function parseXmltvTime(raw: string): number | null {
+  const m = raw.trim().match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:\s*([+-])(\d{2})(\d{2}))?/);
+  if (!m) return null;
+  const [, y, mo, d, h, mi, s, sign, tzh, tzm] = m;
+  let ms = Date.UTC(+y, +mo - 1, +d, +h, +mi, +s);
+  if (sign && tzh && tzm) {
+    const offsetMin = (+tzh * 60 + +tzm) * (sign === "-" ? -1 : 1);
+    ms -= offsetMin * 60_000;
+  }
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/** Parse every `<programme>` block. Tolerant: malformed blocks are
+ *  skipped, not fatal. */
+export function parseXmltv(xml: string): EpgProgram[] {
+  const out: EpgProgram[] = [];
+  let from = 0;
+  for (;;) {
+    const open = xml.indexOf("<programme", from);
+    if (open === -1) break;
+    const openEnd = xml.indexOf(">", open);
+    if (openEnd === -1) break;
+    const close = xml.indexOf("</programme>", openEnd);
+    if (close === -1) break;
+    from = close + "</programme>".length;
+
+    const tag = xml.slice(open, openEnd + 1);
+    const body = xml.slice(openEnd + 1, close);
+
+    const start = attrValue(tag, "start").map(parseXmltvTime).find((v) => v != null) ?? null;
+    const stop = attrValue(tag, "stop").map(parseXmltvTime).find((v) => v != null) ?? null;
+    const channel = attrValue(tag, "channel")[0] ?? "";
+    if (start == null || stop == null || !channel || stop <= start) continue;
+
+    out.push({
+      channelTvgId: channel,
+      title: childText(body, "title") ?? "",
+      description: childText(body, "desc") ?? "",
+      startMs: start,
+      endMs: stop,
+      category: childText(body, "category"),
+      iconUrl: attrOfChild(body, "icon", "src"),
+    });
+  }
+  return out;
+}
+
+/** Programs grouped by tvg-id, each list sorted by start time. */
+export function indexProgramsByChannel(programs: EpgProgram[]): EpgIndex {
+  const byChannel = new Map<string, EpgProgram[]>();
+  for (const p of programs) {
+    const list = byChannel.get(p.channelTvgId);
+    if (list) list.push(p);
+    else byChannel.set(p.channelTvgId, [p]);
+  }
+  for (const list of byChannel.values()) {
+    list.sort((a, b) => a.startMs - b.startMs);
+  }
+  return { byChannel, fetchedAt: Date.now() };
+}
+
+/** Binary-search the on-air program at `nowMs` (lists are start-sorted). */
+export function findCurrent(
+  programs: EpgProgram[] | undefined,
+  nowMs: number,
+): EpgProgram | null {
+  if (!programs || programs.length === 0) return null;
+  let lo = 0;
+  let hi = programs.length - 1;
+  let candidate = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (programs[mid].startMs <= nowMs) {
+      candidate = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  if (candidate === -1) return null;
+  const p = programs[candidate];
+  return p.endMs > nowMs ? p : null;
+}
+
+// ── Tiny scanning helpers ──────────────────────────────────────────────
+
+/** All values of `name="…"` inside an opening tag (usually 0 or 1). */
+function attrValue(tag: string, name: string): string[] {
+  const re = new RegExp(`${name}\\s*=\\s*"([^"]*)"`, "g");
+  const out: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(tag)) !== null) out.push(m[1]);
+  return out;
+}
+
+/** Text of the FIRST `<tag …>…</tag>` child, CDATA + entities decoded. */
+function childText(body: string, tag: string): string | null {
+  const open = body.indexOf(`<${tag}`);
+  if (open === -1) return null;
+  const openEnd = body.indexOf(">", open);
+  if (openEnd === -1) return null;
+  // Self-closing (<icon src="…"/>) has no text.
+  if (body[openEnd - 1] === "/") return null;
+  const close = body.indexOf(`</${tag}>`, openEnd);
+  if (close === -1) return null;
+  let text = body.slice(openEnd + 1, close).trim();
+  const cdata = text.match(/^<!\[CDATA\[([\s\S]*)\]\]>$/);
+  if (cdata) text = cdata[1];
+  return decodeEntities(text).trim() || null;
+}
+
+/** Attribute of the first `<tag …>` child (e.g. `<icon src="…"/>`). */
+function attrOfChild(body: string, tag: string, attr: string): string | null {
+  const open = body.indexOf(`<${tag}`);
+  if (open === -1) return null;
+  const openEnd = body.indexOf(">", open);
+  if (openEnd === -1) return null;
+  return attrValue(body.slice(open, openEnd + 1), attr)[0] ?? null;
+}
+
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => safeFromCode(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => safeFromCode(parseInt(d, 10)))
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+function safeFromCode(code: number): string {
+  try {
+    return String.fromCodePoint(code);
+  } catch {
+    return "";
+  }
+}

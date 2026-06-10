@@ -38,6 +38,9 @@ keyring = { version = "3", features = [
 ] }
 zeroize = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "macros", "process", "io-util", "time", "sync"] }
+# Streamed-body handling (IPTV fetch size-cap enforcement, and shared
+# with the in-process bridge / cast proxies on their branches).
+futures-util = "0.3"
 tauri-plugin-deep-link = "2"
 # Single-instance enforcement — required so OAuth deep-links route to
 # the running Aura process instead of spawning a new one. Without this,
