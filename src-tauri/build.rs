@@ -57,5 +57,14 @@ fn main() {
     println!("cargo:rerun-if-env-changed=AURA_MDBLIST_KEY");
     println!("cargo:rerun-if-env-changed=AURA_PUBLICMETADB_KEY");
 
-    tauri_build::build()
+    // Custom Windows manifest: tauri-build's default has NO <compatibility>
+    // section, so Windows version-lies 6.2 to the process and libmpv's
+    // d3d11 context refuses to configure the swapchain colorspace
+    // (IsWindows10OrGreater() == false) — HDR output renders PQ-into-sRGB,
+    // i.e. washed-out. See windows-app-manifest.xml for the full story.
+    println!("cargo:rerun-if-changed=windows-app-manifest.xml");
+    let windows = tauri_build::WindowsAttributes::new()
+        .app_manifest(include_str!("windows-app-manifest.xml"));
+    tauri_build::try_build(tauri_build::Attributes::new().windows_attributes(windows))
+        .expect("failed to run tauri-build");
 }
