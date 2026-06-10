@@ -1023,8 +1023,23 @@ async fn get_tracks() -> Result<Vec<TrackEntry>, String> {
 /// player::apply_hdr_options for what each mode emits to MPV. Unknown
 /// strings collapse to "sdr" (the safe default).
 #[tauri::command]
-async fn apply_hdr_settings(app: tauri::AppHandle, mode: String) -> Result<(), String> {
-    crate::devlog!(info, "player", "apply_hdr_settings({mode})");
+async fn apply_hdr_settings(
+    app: tauri::AppHandle,
+    mode: String,
+    // Optional content-type hint from the frontend's post-load probe of
+    // `video-params/gamma`. The `hdr_target_peak_nits` pin exists to keep
+    // HDR highlights from blowing out when Windows over-reports the
+    // panel's peak — but pinning `target-peak` for SDR sources DIMS them
+    // (mpv renders SDR reference white at ~203/<peak> of the output range
+    // instead of full signal). `Some(false)` (known-SDR content) therefore
+    // drops the pin back to auto; `Some(true)` / `None` (HDR content, or a
+    // Settings-toggle call with nothing loaded) keeps it.
+    content_is_hdr: Option<bool>,
+) -> Result<(), String> {
+    crate::devlog!(
+        info, "player",
+        "apply_hdr_settings({mode}, content_is_hdr={content_is_hdr:?})",
+    );
 
     // Normalise so persisted values match what player::resolve_hdr_mode
     // expects. Empty / unknown → "sdr".
@@ -1033,14 +1048,17 @@ async fn apply_hdr_settings(app: tauri::AppHandle, mode: String) -> Result<(), S
         _ => "sdr".to_string(),
     };
 
-    // Persist so next MPV init picks it up. Also keep the legacy
-    // hdr_enabled boolean in lockstep so old code paths reading it
-    // (Discord RPC, telemetry, etc.) stay coherent: "off" → false,
-    // anything else → true.
+    // Persist so next MPV init picks it up — but skip the disk write when
+    // nothing changed (the content-aware re-apply calls this on every
+    // stream load). Keep the legacy hdr_enabled boolean in lockstep so
+    // old code paths reading it (Discord RPC, telemetry, etc.) stay
+    // coherent: "off" → false, anything else → true.
     let mut s = settings::snapshot();
-    s.hdr_mode = mode_norm.clone();
-    s.hdr_enabled = mode_norm != "off";
-    settings::save(&app, &s)?;
+    if s.hdr_mode != mode_norm || s.hdr_enabled != (mode_norm != "off") {
+        s.hdr_mode = mode_norm.clone();
+        s.hdr_enabled = mode_norm != "off";
+        settings::save(&app, &s)?;
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -1050,12 +1068,13 @@ async fn apply_hdr_settings(app: tauri::AppHandle, mode: String) -> Result<(), S
         // overwritten — no residual property drift between toggles.
         // Best-effort per property: anything mpv rejects is devlog'd
         // rather than aborting the rest of the block.
+        let peak_nits = if content_is_hdr == Some(false) {
+            0 // SDR content → target-peak=auto, no SDR dimming
+        } else {
+            settings::snapshot().hdr_target_peak_nits
+        };
         let mut opts: indexmap::IndexMap<String, serde_json::Value> = indexmap::IndexMap::new();
-        crate::player::apply_hdr_options(
-            &mut opts,
-            &mode_norm,
-            settings::snapshot().hdr_target_peak_nits,
-        );
+        crate::player::apply_hdr_options(&mut opts, &mode_norm, peak_nits);
         for (key, value) in opts.iter() {
             if let Some(pv) = json_to_propvalue(value) {
                 if let Err(e) = mpv::engine::submit_set_property(key.clone(), pv) {

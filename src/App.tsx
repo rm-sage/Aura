@@ -4813,6 +4813,40 @@ export default function App() {
     return () => { timers.forEach(clearTimeout); };
   }, [durationReady]);
 
+  // ── Content-aware HDR passthrough peak ──
+  // The "HDR display peak (nits)" override pins mpv's target-peak so HDR
+  // highlights tone-map to the panel's REAL peak — but a global pin also
+  // dims SDR content (mpv renders SDR reference white at ~203/<peak> of
+  // the output range instead of full signal). Once playback is ready
+  // (duration > 0 + 1.5 s grace — same landmine-#3-safe gate as the
+  // tracks one-shot), probe the loaded file's transfer curve and
+  // re-apply the passthrough option set with the content type, so the
+  // pin only applies to genuinely-HDR sources (pq/hlg). No-op unless the
+  // user's HDR mode is passthrough.
+  useEffect(() => {
+    if (!durationReady) return;
+    const t = setTimeout(async () => {
+      try {
+        const s = await invoke<{ hdr_mode?: string }>("get_settings");
+        if ((s?.hdr_mode ?? "").trim().toLowerCase() !== "passthrough") return;
+        const gamma = await invoke<string>("get_property", {
+          name: "video-params/gamma",
+          format: "string",
+        });
+        const contentIsHdr = gamma === "pq" || gamma === "hlg";
+        await invoke("apply_hdr_settings", {
+          mode: "passthrough",
+          contentIsHdr,
+        });
+      } catch {
+        // Probe failed (no video track yet / property unavailable) —
+        // leave the pinned peak in place; that's the safe default for
+        // HDR content and the next load re-probes.
+      }
+    }, 1500);
+    return () => clearTimeout(t);
+  }, [durationReady]);
+
   useEffect(() => {
     const html = document.documentElement;
     const body = document.body;
