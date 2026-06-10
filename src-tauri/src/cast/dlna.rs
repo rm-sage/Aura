@@ -128,14 +128,19 @@ async fn describe_renderer(location: &str) -> Option<CastDeviceInfo> {
     })
 }
 
-/// First `<serviceType>…AVTransport…</serviceType>` block's
-/// `<controlURL>` value.
+/// The AVTransport `<service>` block's `<controlURL>` value. Anchors on
+/// the full serviceType URN (not the bare word "AVTransport", which can
+/// legitimately appear in friendlyName / vendor serviceIds and would
+/// make the scan grab a different service's controlURL).
 fn find_avtransport_control_url(xml: &str) -> Option<String> {
     let mut search_from = 0usize;
-    while let Some(rel_idx) = xml[search_from..].find("AVTransport") {
+    while let Some(rel_idx) =
+        xml[search_from..].find("urn:schemas-upnp-org:service:AVTransport")
+    {
         let idx = search_from + rel_idx;
         // controlURL appears inside the same <service> element — scan
-        // forward to the closing </service> and look inside the slice.
+        // forward to the closing </service> and look inside the slice
+        // (UPnP puts serviceType first in the service block).
         let service_end = xml[idx..].find("</service>").map(|e| idx + e)?;
         if let Some(url) = tag_text(&xml[idx..service_end], "controlURL") {
             return Some(url);

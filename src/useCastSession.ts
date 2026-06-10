@@ -102,6 +102,10 @@ export function useCastSession({
     const url = urlRef.current;
     if (!url) return;
     const gen = ++genRef.current;
+    // Capture the pause state at INVOCATION time — castLoad can take a
+    // second or two, and a user toggling local playback meanwhile must
+    // not make the post-load handoff re-toggle the wrong way.
+    const pausedAtPick = pausedRef.current;
     setConnectingId(device.id);
     setError(null);
     castLoad({
@@ -115,7 +119,7 @@ export function useCastSession({
         setActiveDevice(device);
         setMenuOpen(false);
         // Hand off: quiet the local player while the TV plays.
-        if (!pausedRef.current) {
+        if (!pausedAtPick) {
           invoke("toggle_pause").catch(() => {});
         }
       })

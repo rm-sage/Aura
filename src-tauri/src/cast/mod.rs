@@ -188,39 +188,55 @@ pub async fn cast_load(
     let content_type = guess_content_type(&url, is_hls);
     let start = start_seconds.filter(|v| v.is_finite() && *v > 0.0).unwrap_or(0.0);
 
-    match device.kind.as_str() {
+    let result: Result<(), String> = match device.kind.as_str() {
         "chromecast" => {
             let dev = device.clone();
             let media_url2 = media_url.clone();
             let ct = content_type.to_string();
-            let session = tauri::async_runtime::spawn_blocking(move || {
+            match tauri::async_runtime::spawn_blocking(move || {
                 chromecast_load_blocking(&dev, &media_url2, &ct, title.as_deref(), poster.as_deref(), start)
             })
             .await
             .map_err(|e| e.to_string())?
-            .map_err(humanize_cast_error)?;
-            *active_slot().lock().unwrap() = Some(ActiveSession::Chromecast(session));
-            Ok(())
+            {
+                Ok(session) => {
+                    *active_slot().lock().unwrap() = Some(ActiveSession::Chromecast(session));
+                    Ok(())
+                }
+                Err(e) => Err(humanize_cast_error(e)),
+            }
         }
         "dlna" => {
-            let control_url = device
-                .control_url
-                .clone()
-                .ok_or("DLNA device has no AVTransport control URL")?;
-            dlna::load(&control_url, &media_url, content_type, title.as_deref()).await?;
-            if start > 1.0 {
-                // Some renderers need a beat between Play and Seek.
-                tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-                let _ = dlna::seek(&control_url, start).await;
+            let load_res: Result<(), String> = async {
+                let control_url = device
+                    .control_url
+                    .clone()
+                    .ok_or("DLNA device has no AVTransport control URL")?;
+                dlna::load(&control_url, &media_url, content_type, title.as_deref()).await?;
+                if start > 1.0 {
+                    // Some renderers need a beat between Play and Seek.
+                    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                    let _ = dlna::seek(&control_url, start).await;
+                }
+                *active_slot().lock().unwrap() = Some(ActiveSession::Dlna(DlnaSession {
+                    device_name: device.name.clone(),
+                    control_url,
+                }));
+                Ok(())
             }
-            *active_slot().lock().unwrap() = Some(ActiveSession::Dlna(DlnaSession {
-                device_name: device.name.clone(),
-                control_url,
-            }));
-            Ok(())
+            .await;
+            load_res
         }
         other => Err(format!("unsupported cast device kind '{other}'")),
+    };
+
+    // A failed load leaves no active session — drop the proxy session we
+    // just registered so repeated failures can't pile entries up (no
+    // other session can be live here; we stopped any active one above).
+    if result.is_err() {
+        media_server::clear_sessions();
     }
+    result
 }
 
 #[tauri::command]
@@ -456,7 +472,7 @@ fn chromecast_load_blocking(
     let mut conn = castv2::CastConnection::connect(&device.host, device.port)?;
     let (transport_id, app_session_id) = conn.launch(CAST_RECEIVER_APP_ID)?;
     conn.connect_transport(&transport_id)?;
-    let media_session_id = conn.media_load(
+    let mut media_session_id = conn.media_load(
         &transport_id,
         media_url,
         content_type,
@@ -464,6 +480,15 @@ fn chromecast_load_blocking(
         poster,
         start_seconds,
     )?;
+    // An unsolicited MEDIA_STATUS broadcast can satisfy the LOAD wait
+    // without carrying a mediaSessionId — resolve it with a follow-up
+    // GET_STATUS so the session record is complete. (Control commands
+    // also self-heal via get_status when this stays None.)
+    if media_session_id.is_none() {
+        if let Ok((_, _, _, ms)) = conn.media_status(&transport_id) {
+            media_session_id = ms;
+        }
+    }
 
     crate::devlog!(
         info, "cast",

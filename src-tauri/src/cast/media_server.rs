@@ -40,6 +40,11 @@ struct ProxySession {
 
 /// Bound port (0 = not started yet) + the session table.
 static PORT: OnceLock<u16> = OnceLock::new();
+/// Serialises first-start so two concurrent first casts can't both bind
+/// (the loser's listener would be orphaned and its caller handed a port
+/// nothing listens on). tokio Mutex because the bind awaits inside the
+/// critical section.
+static START_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static SESSIONS: OnceLock<Mutex<HashMap<String, ProxySession>>> = OnceLock::new();
 
 fn sessions() -> &'static Mutex<HashMap<String, ProxySession>> {
@@ -90,6 +95,15 @@ pub fn clear_sessions() {
 }
 
 async fn ensure_started() -> Result<u16, String> {
+    if let Some(p) = PORT.get() {
+        return Ok(*p);
+    }
+    let _guard = START_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    // Double-check under the lock — a racing first cast may have just
+    // finished the bind.
     if let Some(p) = PORT.get() {
         return Ok(*p);
     }

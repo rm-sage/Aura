@@ -414,6 +414,11 @@ fn decode_cast_message(buf: &[u8]) -> Result<Frame, String> {
     while pos < buf.len() {
         let tag = read_varint(buf, &mut pos).ok_or("bad protobuf tag")?;
         let field = (tag >> 3) as u32;
+        // CastMessage has 7 fields; anything implausibly large means a
+        // truncated/corrupt frame masquerading as valid protobuf.
+        if field == 0 || field > 127 {
+            return Err(format!("implausible protobuf field number {field}"));
+        }
         let wire = (tag & 0x7) as u8;
         match wire {
             0 => {
