@@ -16,8 +16,9 @@
 // dispatched from PlayerOverlay's MoreMenu.
 // ---------------------------------------------------------------------------
 
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import type { StreamEntry } from "./types";
+import { parseStream, chipStyleFor, type ChipKind } from "./streamMeta";
 
 /** Stable identity for a stream row — used for the "now playing" + resolving
  *  markers. Mirrors how App keys the swap. */
@@ -39,6 +40,24 @@ interface SourceSwitcherProps {
   isFullscreen: boolean;
 }
 
+/** Compact quality chips for a row — the same parse + palette the
+ *  DetailView stream list uses (`parseStream` / `chipStyleFor`), trimmed
+ *  to the handful that matter when comparing sources at a glance. */
+function rowChips(s: StreamEntry): { kind: ChipKind; label: string }[] {
+  const p = parseStream(s);
+  const chips: { kind: ChipKind; label: string }[] = [];
+  if (p.resolution) chips.push({ kind: "resolution", label: p.resolution });
+  const quality = p.quality ?? p.ripType;
+  if (quality) chips.push({ kind: "quality", label: quality });
+  if (p.hdr) chips.push({ kind: "hdr", label: p.hdr });
+  const codec = p.codec ?? p.encode;
+  if (codec) chips.push({ kind: "codec", label: codec });
+  if (p.size) chips.push({ kind: "size", label: p.size });
+  if (p.seeders != null) chips.push({ kind: "seeders", label: `${p.seeders} seed` });
+  if (p.cachedStatus === "cached") chips.push({ kind: "service", label: "⚡ cached" });
+  return chips.slice(0, 6);
+}
+
 export default function SourceSwitcher({
   open, onClose, streams, loading, onPick, resolvingKey, currentUrl, isFullscreen,
 }: SourceSwitcherProps) {
@@ -51,6 +70,15 @@ export default function SourceSwitcher({
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
   }, [open, onClose]);
+
+  // Parse once per stream list, not once per render of every row —
+  // resolvingKey/loading state flips would otherwise re-run the regex
+  // parse across the whole list.
+  const chipsByKey = useMemo(() => {
+    const m = new Map<string, { kind: ChipKind; label: string }[]>();
+    for (const s of streams) m.set(streamKey(s), rowChips(s));
+    return m;
+  }, [streams]);
 
   if (!open) return null;
 
@@ -121,6 +149,21 @@ export default function SourceSwitcher({
                        title={s.filename ?? s.title}>
                       {s.title}
                     </p>
+                    {(chipsByKey.get(key) ?? []).length > 0 && (
+                      <div className="flex flex-wrap items-center gap-1 mt-1">
+                        {(chipsByKey.get(key) ?? []).map((c, i) => {
+                          const st = chipStyleFor(c.kind);
+                          return (
+                            <span
+                              key={`${c.kind}:${i}`}
+                              className={`px-1.5 py-[1px] rounded border text-[10px] font-medium tracking-wide ${st.bg} ${st.fg} ${st.border}`}
+                            >
+                              {c.label}
+                            </span>
+                          );
+                        })}
+                      </div>
+                    )}
                     {s.description && (
                       <p className="text-white/40 text-[11.5px] leading-snug line-clamp-1 mt-0.5">
                         {s.description}
