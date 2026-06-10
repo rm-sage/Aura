@@ -4819,29 +4819,36 @@ export default function App() {
   // dims SDR content (mpv renders SDR reference white at ~203/<peak> of
   // the output range instead of full signal). Once playback is ready
   // (duration > 0 + 1.5 s grace — same landmine-#3-safe gate as the
-  // tracks one-shot), probe the loaded file's transfer curve and
-  // re-apply the passthrough option set with the content type, so the
-  // pin only applies to genuinely-HDR sources (pq/hlg). No-op unless the
-  // user's HDR mode is passthrough.
+  // tracks one-shot), probe the loaded file's transfer curve and let the
+  // backend adjust ONLY `target-peak` (apply_hdr_content_peak no-ops
+  // unless the user's HDR mode is passthrough, and read-compare-writes
+  // so an HDR film whose pin is already in place touches nothing).
+  //
+  // DO NOT switch this back to re-applying the full passthrough option
+  // set (apply_hdr_settings): rewriting target-colorspace-hint/trc/prim
+  // on a live gpu-next d3d11 pipeline forces a swapchain colorspace
+  // renegotiation that was observed to blow out BOTH SDR and HDR
+  // playback. target-peak alone is a pure render parameter.
   useEffect(() => {
     if (!durationReady) return;
     const t = setTimeout(async () => {
       try {
-        const s = await invoke<{ hdr_mode?: string }>("get_settings");
-        if ((s?.hdr_mode ?? "").trim().toLowerCase() !== "passthrough") return;
         const gamma = await invoke<string>("get_property", {
           name: "video-params/gamma",
           format: "string",
         });
-        const contentIsHdr = gamma === "pq" || gamma === "hlg";
-        await invoke("apply_hdr_settings", {
-          mode: "passthrough",
-          contentIsHdr,
+        const g = (gamma ?? "").trim().toLowerCase();
+        // Only an EXPLICITLY-SDR transfer drops the pin; pq/hlg, unknown
+        // values, and probe oddities all keep it (worst case: slightly
+        // dim SDR — never blown-out HDR highlights).
+        const isExplicitSdr =
+          /^(bt\.1886|srgb|gamma[\d.]+|linear|pal|st428)$/.test(g);
+        await invoke("apply_hdr_content_peak", {
+          contentIsHdr: !isExplicitSdr,
         });
       } catch {
         // Probe failed (no video track yet / property unavailable) —
-        // leave the pinned peak in place; that's the safe default for
-        // HDR content and the next load re-probes.
+        // leave the engine state alone; the next load re-probes.
       }
     }, 1500);
     return () => clearTimeout(t);

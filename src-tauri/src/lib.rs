@@ -1023,23 +1023,8 @@ async fn get_tracks() -> Result<Vec<TrackEntry>, String> {
 /// player::apply_hdr_options for what each mode emits to MPV. Unknown
 /// strings collapse to "sdr" (the safe default).
 #[tauri::command]
-async fn apply_hdr_settings(
-    app: tauri::AppHandle,
-    mode: String,
-    // Optional content-type hint from the frontend's post-load probe of
-    // `video-params/gamma`. The `hdr_target_peak_nits` pin exists to keep
-    // HDR highlights from blowing out when Windows over-reports the
-    // panel's peak — but pinning `target-peak` for SDR sources DIMS them
-    // (mpv renders SDR reference white at ~203/<peak> of the output range
-    // instead of full signal). `Some(false)` (known-SDR content) therefore
-    // drops the pin back to auto; `Some(true)` / `None` (HDR content, or a
-    // Settings-toggle call with nothing loaded) keeps it.
-    content_is_hdr: Option<bool>,
-) -> Result<(), String> {
-    crate::devlog!(
-        info, "player",
-        "apply_hdr_settings({mode}, content_is_hdr={content_is_hdr:?})",
-    );
+async fn apply_hdr_settings(app: tauri::AppHandle, mode: String) -> Result<(), String> {
+    crate::devlog!(info, "player", "apply_hdr_settings({mode})");
 
     // Normalise so persisted values match what player::resolve_hdr_mode
     // expects. Empty / unknown → "sdr".
@@ -1048,9 +1033,8 @@ async fn apply_hdr_settings(
         _ => "sdr".to_string(),
     };
 
-    // Persist so next MPV init picks it up — but skip the disk write when
-    // nothing changed (the content-aware re-apply calls this on every
-    // stream load). Keep the legacy hdr_enabled boolean in lockstep so
+    // Persist so next MPV init picks it up — skipping the disk write when
+    // nothing changed. Keep the legacy hdr_enabled boolean in lockstep so
     // old code paths reading it (Discord RPC, telemetry, etc.) stay
     // coherent: "off" → false, anything else → true.
     let mut s = settings::snapshot();
@@ -1068,13 +1052,21 @@ async fn apply_hdr_settings(
         // overwritten — no residual property drift between toggles.
         // Best-effort per property: anything mpv rejects is devlog'd
         // rather than aborting the rest of the block.
-        let peak_nits = if content_is_hdr == Some(false) {
-            0 // SDR content → target-peak=auto, no SDR dimming
-        } else {
-            settings::snapshot().hdr_target_peak_nits
-        };
+        //
+        // NOTE: this full-set push (target-colorspace-hint / trc / prim /
+        // peak) is for explicit Settings changes ONLY. Do NOT call it
+        // per-load or mid-playback as a matter of routine — rewriting the
+        // colorspace plumbing on a live gpu-next d3d11 pipeline forces a
+        // swapchain renegotiation that has been observed to leave the
+        // output in a blown-out (mis-encoded) state. Per-content
+        // adjustment goes through `apply_hdr_content_peak` below, which
+        // touches only the `target-peak` render parameter.
         let mut opts: indexmap::IndexMap<String, serde_json::Value> = indexmap::IndexMap::new();
-        crate::player::apply_hdr_options(&mut opts, &mode_norm, peak_nits);
+        crate::player::apply_hdr_options(
+            &mut opts,
+            &mode_norm,
+            settings::snapshot().hdr_target_peak_nits,
+        );
         for (key, value) in opts.iter() {
             if let Some(pv) = json_to_propvalue(value) {
                 if let Err(e) = mpv::engine::submit_set_property(key.clone(), pv) {
@@ -1091,6 +1083,86 @@ async fn apply_hdr_settings(
     }
     #[cfg(not(target_os = "windows"))]
     Err("playback engine is Windows-only".into())
+}
+
+/// Per-content `target-peak` adjustment for HDR passthrough.
+///
+/// The `hdr_target_peak_nits` pin exists so HDR highlights tone-map to
+/// the panel's REAL peak when Windows over-reports it — but a global pin
+/// also dims SDR sources (mpv renders SDR reference white at
+/// ~203/<peak> of the output range instead of full signal). The frontend
+/// probes the loaded file's transfer curve once playback is ready and
+/// calls this with the result; SDR content drops `target-peak` to 203
+/// (SDR reference white at full signal — matches Tone-map-mode
+/// brightness), everything else gets the user's pin (or auto when the
+/// pin is 0).
+///
+/// CRITICAL CONSTRAINTS (learned the hard way — a per-load re-push of
+/// the full passthrough option set blew out BOTH SDR and HDR playback):
+///   • Touch ONLY `target-peak` — it's a pure render parameter. Never
+///     rewrite `target-colorspace-hint` / `target-trc` / `target-prim`
+///     on a live pipeline; that forces a d3d11 swapchain colorspace
+///     renegotiation that can leave the output mis-encoded (blown out).
+///   • Read-compare-write: skip the write when the engine's current
+///     value already matches, so the common case (HDR film with the pin
+///     already applied at init) touches nothing at all.
+///   • No-op entirely unless the user's HDR mode is "passthrough".
+#[tauri::command]
+async fn apply_hdr_content_peak(content_is_hdr: bool) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let s = settings::snapshot();
+        if crate::player::resolve_hdr_mode(&s) != "passthrough" {
+            return Ok(());
+        }
+        let desired: String = if content_is_hdr {
+            if s.hdr_target_peak_nits > 0 {
+                s.hdr_target_peak_nits.to_string()
+            } else {
+                "auto".to_string()
+            }
+        } else {
+            "203".to_string()
+        };
+        // The engine's reply channel blocks; keep the read off the Tauri
+        // runtime (same pattern as `get_property`).
+        let current = tauri::async_runtime::spawn_blocking(|| {
+            mpv::engine::submit_get_property(
+                "target-peak".into(),
+                mpv::engine::GetFormat::String,
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .ok()
+        .and_then(|v| v.as_str().map(String::from));
+        // Numeric-aware equality — mpv prints a stored 450 back as
+        // "450.000000", which must still count as "already set".
+        let already_set = match current.as_deref() {
+            Some(c) if c == desired => true,
+            Some(c) => match (c.parse::<f64>(), desired.parse::<f64>()) {
+                (Ok(a), Ok(b)) => (a - b).abs() < 0.5,
+                _ => false,
+            },
+            None => false,
+        };
+        if already_set {
+            return Ok(());
+        }
+        crate::devlog!(
+            info, "player",
+            "apply_hdr_content_peak: content_is_hdr={content_is_hdr} → target-peak {current:?} → {desired}",
+        );
+        mpv::engine::submit_set_property(
+            "target-peak".into(),
+            mpv::engine::PropValue::String(desired),
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = content_is_hdr;
+        Err("playback engine is Windows-only".into())
+    }
 }
 
 /// Native borderless fullscreen — bypasses Tauri's `setFullscreen`,
@@ -2066,6 +2138,7 @@ pub fn run() {
             refresh_video,
             apply_lang_defaults,
             apply_hdr_settings,
+            apply_hdr_content_peak,
             apply_subtitle_style,
             set_subtitle_position_runtime,
             set_native_fullscreen,
