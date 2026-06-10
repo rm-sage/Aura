@@ -672,14 +672,18 @@ const ContinueWatchingCard = memo(function ContinueWatchingCard(
   const aioAddon = useMemo(() => findAIOMetadataAddon(addons ?? []), [addons]);
   const art = useLandscapeArt(item, aioAddon, LANDSCAPE_CARD_WIDTH);
   const src = art?.landscape ?? item.background ?? item.poster;
-  // Overlay Aura's own logo whenever AIOMeta resolved a landscape with NO
-  // baked-in title (hasBakedTitle=false) and a logo is available — so a
-  // title-less backdrop (e.g. Cyberpunk: Edgerunners) still reads its name.
-  // All media types. NOTE: on an *airing* series card the centred
-  // next-episode countdown pill (z-10) can overlap the logo's right edge;
-  // the pill is opaque + sits above (z-[5]) so it stays readable. Finished
-  // series (no pill) and movies render the logo cleanly bottom-left.
-  const logoOverlay = art && !art.has_baked_title ? art.logo : null;
+  // Logo overlay: REMOVED. Two rounds of heuristics (deny-list, then a
+  // textless-by-platform-rule allowlist) still produced double-title
+  // cards, because hasBakedTitle under-reports in ways no client-side
+  // source heuristic can see — e.g. anime TMDB backdrops with burned-in
+  // title cards despite TMDB's textless rule. The card prints the title
+  // beneath the art regardless, so the overlay's only payoff was
+  // cosmetic while its failure mode looked broken. The render block
+  // below is kept inert — re-enable only once AIOMeta's hasBakedTitle
+  // is image-derived (server-side text detection) rather than
+  // source-class-derived, by restoring:
+  //   const logoOverlay = art && !art.has_baked_title ? art.logo : null;
+  const logoOverlay: string | null = null;
 
   const offset = typeof item.state?.timeOffset === "number" ? item.state.timeOffset : 0;
   const duration = typeof item.state?.duration === "number" ? item.state.duration : 0;
