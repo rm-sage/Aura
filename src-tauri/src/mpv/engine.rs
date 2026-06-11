@@ -20,11 +20,12 @@
 //!     design.md`), an L-effort, HW-gated build;
 //!   * `--wid` + `vo=gpu-next` + d3d11 does correct HDR/Dolby-Vision
 //!     passthrough today (`target-colorspace-hint` is honoured by the
-//!     d3d11 GPU context); the swapchain is presented via a
-//!     DirectComposition visual (`d3d11-output-mode=composition`) so it is
-//!     never promoted to Win11 Independent-Flip/MPO — which would direct-
-//!     scan our PQ signal to the panel and let the OLED lift near-blacks
-//!     (see the `d3d11-output-mode` init option for the full rationale);
+//!     d3d11 GPU context). NOTE: the default hwnd swapchain IS eligible
+//!     for Win11 Independent-Flip/MPO promotion; when promoted, our PQ
+//!     signal is direct-scanned and this QD-OLED's True-Black HDR mode
+//!     lifts near-blacks (correct only while DWM composes). This is not
+//!     app-fixable — `d3d11-output-mode=composition` breaks `--wid` and an
+//!     in-app overlay can't defeat hardware MPO (see the init-opts note);
 //!   * dropping the render path also drops `tauri-plugin-libmpv` /
 //!     `libmpv-wrapper.dll` (the legacy plugin) entirely — one engine,
 //!     one DLL (`libmpv-2.dll`), one event channel.
@@ -1296,10 +1297,9 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         // always used, and the whole point of the consolidation: under a
         // real window (vs `vo=libmpv`) it drives the d3d11 GPU context,
         // which honours `target-colorspace-hint` for true HDR/DV
-        // passthrough. (Independent-Flip/MPO promotion is opted out of via
-        // `d3d11-output-mode=composition` in INIT_OPTS below, NOT by
-        // gpu-next itself — the default hwnd swapchain IS promotion-
-        // eligible.)
+        // passthrough. (The d3d11 swapchain IS Independent-Flip/MPO-
+        // eligible; that promotion is the source of the QD-OLED scanout
+        // black-lift and is not app-fixable — see the INIT_OPTS note.)
         (lib.set_property_string)(
             handle,
             b"vo\0".as_ptr() as *const c_char,
@@ -1345,33 +1345,20 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             // (below the WebView2), so dropping to 2-bit alpha is a no-op
             // for us; 10-bit also reduces banding in SDR dark gradients.
             (b"d3d11-output-format\0", b"rgb10_a2\0"),
-            // Present through a DirectComposition visual
-            // (CreateSwapChainForComposition, window=NULL) instead of
-            // CreateSwapChainForHwnd. A composition swapchain is NOT
-            // allocated as a "displayable" surface, so Windows can DWM-
-            // composite it but NEVER promotes it to Independent Flip / MPO
-            // direct scanout — while SetColorSpace1(PQ/HDR10) is still
-            // applied identically, so flip-model HDR is preserved.
-            //
-            // WHY THIS MATTERS (the raised-blacks fix): in direct scanout
-            // the OLED receives our PQ signal verbatim and applies ITS OWN
-            // near-black EOTF, which LIFTS the black floor on this QD-OLED
-            // (the "raised blacks while playing, always in fullscreen,
-            // correct when paused" report). Forcing DWM composition moves
-            // the PQ→panel mapping into the GPU/compositor shader path
-            // (which renders true black, matching the paused look). This is
-            // the ONLY reliable, app-controllable lever: an in-webview
-            // overlay can't defeat MPO (NVIDIA hardware-blends overlay
-            // planes), metadata can't (the lift is panel-intrinsic), and
-            // d3d11-flip=no would drop to the blt model and break HDR. The
-            // earlier WGL path dodged promotion only by GEOMETRY (a
-            // sub-monitor child fails DirectFlip's full-coverage test, the
-            // origin of the long-gone "1px FSO" inset) — composition mode
-            // is the supported equivalent that also holds at exact-monitor
-            // fullscreen. Cost: gives up direct-scanout efficiency (DWM
-            // throttling off-focus — already an accepted cost), negligible
-            // for video. SDR is composited too; harmless.
-            (b"d3d11-output-mode\0", b"composition\0"),
+            // NOTE — `d3d11-output-mode=composition` was tried here to stop
+            // Independent-Flip/MPO promotion (the source of the QD-OLED's
+            // raised-black-in-direct-scanout behaviour). It is INCOMPATIBLE
+            // with `--wid`: composition mode calls
+            // CreateSwapChainForComposition with window=NULL and needs the
+            // embedder to create/size a DirectComposition visual, which a
+            // bare child-window embed does not. mpv's d3d11 ctx then fails
+            // ("Failed to get height and width!") and falls back to the
+            // winvk (Vulkan) context with an 8-bit SDR sRGB swapchain — HDR
+            // breaks entirely. Do NOT re-add it without owning the DComp
+            // visual. The raised-black scanout behaviour is the panel's own
+            // near-black EOTF in its True-Black HDR mode (masked only when
+            // DWM composes) and is not app-fixable; see HANDOFF / the HDR
+            // memory for the full dead-end analysis.
             // 50% initial volume — comfortable headphone-safe default;
             // matches the PlaybackState bridge's assumed initial value
             // (mpv's own default of 100 is too loud for first play).
