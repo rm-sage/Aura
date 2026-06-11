@@ -72,6 +72,20 @@ pub fn apply_hdr_options(
             // to 10-bit PQ + HDR10 metadata. Explicit target params
             // below override the display-derived metadata in the hint.
             options.insert("target-colorspace-hint".into(), serde_json::json!("yes"));
+            // Strict (the default) makes the renderer use the swapchain's
+            // NEGOTIATED colorspace for the render target and apply our
+            // target-* only where the swapchain reported nothing. When the
+            // d3d11 swapchain negotiation reports back the display's own
+            // characterization (its inflated ~1000-nit peak, or an SDR
+            // transfer when the format negotiation faltered), our explicit
+            // target-trc=pq / target-peak get SKIPPED — so mpv tone-maps to
+            // the display peak, not the user's. True Black panels (~450 real
+            // nits) then CLIP every highlight above their real peak: the
+            // "blown highlights, ignores my nits, looks better in Peak-1000
+            // mode" report. `no` makes the explicit BT.2020/PQ/peak/contrast
+            // below authoritative — mpv tone-maps content to the user's peak
+            // and forces the swapchain to match.
+            options.insert("target-colorspace-hint-strict".into(), serde_json::json!("no"));
             // libplacebo owns the swapchain colorspace via the hint;
             // keep mpv's creation-level csp at its default.
             options.insert("d3d11-output-csp".into(),       serde_json::json!("auto"));
@@ -101,6 +115,7 @@ pub fn apply_hdr_options(
             // (auto can over-boost on bright HDR content). target-peak
             // 203 cd/m² is BT.2408's reference SDR white.
             options.insert("target-colorspace-hint".into(), serde_json::json!("no"));
+            options.insert("target-colorspace-hint-strict".into(), serde_json::json!("yes"));
             options.insert("d3d11-output-csp".into(),       serde_json::json!("auto"));
             options.insert("target-contrast".into(),        serde_json::json!("auto"));
             options.insert("target-prim".into(),            serde_json::json!("bt.709"));
@@ -112,6 +127,7 @@ pub fn apply_hdr_options(
         // "off" and any unknown value
         _ => {
             options.insert("target-colorspace-hint".into(), serde_json::json!("no"));
+            options.insert("target-colorspace-hint-strict".into(), serde_json::json!("yes"));
             options.insert("d3d11-output-csp".into(),       serde_json::json!("auto"));
             options.insert("target-contrast".into(),        serde_json::json!("auto"));
             options.insert("hdr-compute-peak".into(),       serde_json::json!("no"));

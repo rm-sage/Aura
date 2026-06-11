@@ -1326,6 +1326,20 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             (b"hwdec\0", b"auto\0"),
             (b"keepaspect\0", b"yes\0"),
             (b"background\0", b"none\0"),
+            // Force a 10-bit DXGI swapchain. mpv creates the swapchain
+            // 10-bit (R10G10B10A2) on a >8bpc HDR output, but libplacebo
+            // re-picks the format when it wraps the swapchain, and the
+            // default 'auto' path was DOWNGRADING it to 8-bit R8G8B8A8
+            // (aura-mpv.log: "Attempting to reconfigure swap chain format:
+            // R10G10B10A2_UNORM -> R8G8B8A8_UNORM"). libplacebo only
+            // selects the PQ HDR10 colorspace (G2084) on a 10-bit format —
+            // an 8-bit surface falls back to G22_NONE_P2020 (SDR gamma in a
+            // BT.2020 container), which is exactly the blown-highlights
+            // failure. `rgb10_a2` pins color_bits=10/alpha_bits=2 so the
+            // HDR10 path stays eligible. The mpv child window is opaque
+            // (below the WebView2), so dropping to 2-bit alpha is a no-op
+            // for us; 10-bit also reduces banding in SDR dark gradients.
+            (b"d3d11-output-format\0", b"rgb10_a2\0"),
             // 50% initial volume — comfortable headphone-safe default;
             // matches the PlaybackState bridge's assumed initial value
             // (mpv's own default of 100 is too loud for first play).
