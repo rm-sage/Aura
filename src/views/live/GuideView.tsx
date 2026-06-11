@@ -18,7 +18,8 @@ import type { IptvChannel, EpgProgram } from "../../iptv/types";
 // how deep the EPG goes.
 // ---------------------------------------------------------------------------
 
-const CHANNEL_COL_W = 168; // px — sticky left column
+const CHANNEL_COL_W = 220; // px — sticky left column (wide enough that most
+                           // channel names don't truncate)
 const ROW_H = 44; // px
 const PX_PER_MIN = 5; // 300 px / hour
 const WINDOW_HOURS = 8; // visible/scrollable span forward from the hour
