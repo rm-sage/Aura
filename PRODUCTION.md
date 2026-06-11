@@ -90,37 +90,24 @@ These require accounts / signing keys / hosted endpoints.
 - **Skipped for now**: deferred until/unless the user changes mind on
   signing.
 
-### Production bundling — aura-bridge sidecar
+### Streaming bridge — in-process (no sidecar to bundle)
 
-- **Goal**: Ship `aura-bridge.exe` next to Aura's main executable in
-  the installer so end users get the bridge automatically.
-- **Wired via**: `bundle.externalBin: ["binaries/aura-bridge"]` in
-  `tauri.conf.json` + `scripts/stage-bridge.cjs` staging script +
-  `pnpm bundle:stage` and `pnpm bundle:release` package.json scripts.
-- **Release flow**:
-  1. Build `aura-bridge.exe` from the (separate, private) bridge
-     repo's `cargo build --release`.
-  2. From this repo, run:
-     ```
-     $env:AURA_BRIDGE_BIN = "C:\path\to\aura-bridge.exe"
-     pnpm bundle:release
-     ```
-     which auto-stages the binary at
-     `src-tauri/binaries/aura-bridge-<target_triple>.exe` and then
-     runs `tauri build`. The bundler picks it up and places it
-     alongside the main exe in the produced installer / MSI.
-  3. If `AURA_BRIDGE_BIN` isn't set, the staging script auto-walks
-     a small set of likely locations (sibling `aura-bridge/target/...`
-     dirs, `src-tauri/target/...`) and uses the first match.
-- **What ends up installed**: when a user installs the produced
-  `.msi`, both `aura.exe` and `aura-bridge.exe` land in the same
-  install directory. Aura's runtime spawn path finds the bridge at
-  `<exe_dir>/aura-bridge.exe` (candidate #1 in `bridge_candidate_paths`)
-  and launches it on app start. No manual user action required.
-- **Dev workflow**: `pnpm tauri dev` doesn't go through the bundler.
-  For dev you can place `aura-bridge.exe` at
-  `src-tauri/target/debug/aura-bridge.exe` (or `target/release/...`
-  for `--release` runs) and the same spawn-path lookup finds it.
+The loopback byte-range / live HTTP proxy runs **in-process** as an axum
+server on `127.0.0.1:11471`, started by `streaming::start_in_process()`
+during Tauri setup (`src-tauri/src/streaming.rs`). There is **no sidecar
+binary** to build, stage, or bundle anymore — it was re-internalised.
+
+- **Release flow**: nothing bridge-specific. `pnpm bundle:release` is plain
+  `tauri build`; there is no `externalBin`, no `scripts/stage-bridge.cjs`,
+  and no `AURA_BRIDGE_BIN`.
+- **Dev workflow**: nothing to place on disk — the server starts with the
+  app. The `[bridge] in-process bridge listening on http://127.0.0.1:11471`
+  DevConsole line confirms it bound. If the port is already taken (e.g. an
+  orphaned `aura-bridge.exe` from a pre-internalisation build), the bind
+  fails gracefully (logged; HTTPS/HLS streams are unaffected since they
+  bypass the bridge).
+- **Legacy**: the old private `aura-bridge` crate is retired; `aura-bridge/`
+  is git-ignored and only old local checkouts may still exist.
 
 ### Crash reporting (remote)
 
