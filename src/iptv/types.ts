@@ -68,5 +68,10 @@ export interface EpgProgram {
 export interface EpgIndex {
   /** tvg-id → programs sorted by startMs. */
   byChannel: Map<string, EpgProgram[]>;
+  /** normalized `<display-name>` → EPG channel id, for the name-based
+   *  fallback join when a channel's tvg-id matches no EPG channel id
+   *  (e.g. an iptv-org playlist paired with a differently-keyed EPG).
+   *  Names that map to >1 distinct id are dropped (ambiguous). */
+  nameToId: Map<string, string>;
   fetchedAt: number;
 }

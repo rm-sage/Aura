@@ -16,7 +16,7 @@
 // ---------------------------------------------------------------------------
 
 import { iptvFetchText } from "./fetch";
-import { parseXmltv, indexProgramsByChannel } from "./xmltv";
+import { parseXmltv, indexProgramsByChannel, parseXmltvChannelNames } from "./xmltv";
 import { resolveChannelEpg, findSharedTvgIds } from "./epgResolver";
 import { classifyIptvError } from "./store";
 import type { EpgIndex, EpgProgram, IptvChannel } from "./types";
@@ -119,7 +119,11 @@ async function doFetch(sourceId: string, epgUrl: string, channels: IptvChannel[]
     if (programs.length === 0) {
       throw new Error("The EPG loaded but contained no programmes.");
     }
-    const index = indexProgramsByChannel(programs);
+    // Build the name→id index too so the resolver can fall back to a
+    // display-name match when the playlist's tvg-ids don't line up with
+    // this EPG's channel ids.
+    const nameToId = parseXmltvChannelNames(body);
+    const index = indexProgramsByChannel(programs, nameToId);
     const shared = findSharedTvgIds(channels);
     _bySource.set(sourceId, { index, shared, url: epgUrl, lastUsed: Date.now() });
     enforceCap();

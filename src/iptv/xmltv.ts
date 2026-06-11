@@ -64,8 +64,13 @@ export function parseXmltv(xml: string): EpgProgram[] {
   return out;
 }
 
-/** Programs grouped by tvg-id, each list sorted by start time. */
-export function indexProgramsByChannel(programs: EpgProgram[]): EpgIndex {
+/** Programs grouped by tvg-id, each list sorted by start time. The optional
+ *  `nameToId` (from `parseXmltvChannelNames`) is folded in for the resolver's
+ *  name-based fallback; pass an empty map when not building one. */
+export function indexProgramsByChannel(
+  programs: EpgProgram[],
+  nameToId?: Map<string, string>,
+): EpgIndex {
   const byChannel = new Map<string, EpgProgram[]>();
   for (const p of programs) {
     const list = byChannel.get(p.channelTvgId);
@@ -75,7 +80,50 @@ export function indexProgramsByChannel(programs: EpgProgram[]): EpgIndex {
   for (const list of byChannel.values()) {
     list.sort((a, b) => a.startMs - b.startMs);
   }
-  return { byChannel, fetchedAt: Date.now() };
+  return { byChannel, nameToId: nameToId ?? new Map(), fetchedAt: Date.now() };
+}
+
+/** Build a normalized-display-name → channel-id map from every `<channel>`
+ *  block. A name that resolves to more than one distinct channel id is
+ *  dropped (ambiguous) so the fallback never guesses between collisions. */
+export function parseXmltvChannelNames(xml: string): Map<string, string> {
+  const nameToId = new Map<string, string>();
+  const ambiguous = new Set<string>();
+  let from = 0;
+  for (;;) {
+    const open = xml.indexOf("<channel", from);
+    if (open === -1) break;
+    const openEnd = xml.indexOf(">", open);
+    if (openEnd === -1) break;
+    const close = xml.indexOf("</channel>", openEnd);
+    if (close === -1) break;
+    from = close + "</channel>".length;
+
+    const tag = xml.slice(open, openEnd + 1);
+    const body = xml.slice(openEnd + 1, close);
+    const id = attrValue(tag, "id")[0] ?? "";
+    if (!id) continue;
+    for (const dn of childTexts(body, "display-name")) {
+      const key = normalizeChannelName(dn);
+      if (!key) continue;
+      const existing = nameToId.get(key);
+      if (existing === undefined) nameToId.set(key, id);
+      else if (existing !== id) ambiguous.add(key);
+    }
+  }
+  for (const key of ambiguous) nameToId.delete(key);
+  return nameToId;
+}
+
+/** Normalize a channel display-name for fuzzy EPG joining: lowercase, drop
+ *  common quality/format tags, strip all non-alphanumerics. Digits are kept
+ *  so "ESPN 2" ("espn2") never collapses onto "ESPN" ("espn"). Shared by the
+ *  index builder and the resolver — they MUST normalize identically. */
+export function normalizeChannelName(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/\b(fhd|uhd|hd|sd|4k|8k|hevc|h\.?265|h\.?264|raw|backup|feed)\b/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, "");
 }
 
 /** Binary-search the on-air program at `nowMs` (lists are start-sorted). */
@@ -126,6 +174,32 @@ function childText(body: string, tag: string): string | null {
   const cdata = text.match(/^<!\[CDATA\[([\s\S]*)\]\]>$/);
   if (cdata) text = cdata[1];
   return decodeEntities(text).trim() || null;
+}
+
+/** Text of EVERY `<tag …>…</tag>` child (CDATA + entities decoded). Used
+ *  for `<display-name>`, which can repeat within one `<channel>` block. */
+function childTexts(body: string, tag: string): string[] {
+  const out: string[] = [];
+  let from = 0;
+  for (;;) {
+    const open = body.indexOf(`<${tag}`, from);
+    if (open === -1) break;
+    const openEnd = body.indexOf(">", open);
+    if (openEnd === -1) break;
+    if (body[openEnd - 1] === "/") {
+      from = openEnd + 1;
+      continue;
+    }
+    const close = body.indexOf(`</${tag}>`, openEnd);
+    if (close === -1) break;
+    let text = body.slice(openEnd + 1, close).trim();
+    const cdata = text.match(/^<!\[CDATA\[([\s\S]*)\]\]>$/);
+    if (cdata) text = cdata[1];
+    const dec = decodeEntities(text).trim();
+    if (dec) out.push(dec);
+    from = close + `</${tag}>`.length;
+  }
+  return out;
 }
 
 /** Attribute of the first `<tag …>` child (e.g. `<icon src="…"/>`). */
