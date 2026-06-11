@@ -138,6 +138,46 @@ export async function addPlaylistSource(
   return source;
 }
 
+/** Edit an existing source in place. Applies the provided fields, optionally
+ *  updates the keyring password (Xtream only; empty/undefined = keep the
+ *  current one), persists, and force-refetches so the change takes effect.
+ *  The Xtream object is stripped of any password before persisting (keyring
+ *  only), mirroring addPlaylistSource. */
+export async function updatePlaylistSource(
+  id: string,
+  patch: Partial<Pick<IptvPlaylistSource, "name" | "url" | "epgUrl" | "xtream">>,
+  password?: string,
+): Promise<void> {
+  const idx = _state.sources.findIndex((s) => s.id === id);
+  if (idx === -1) return;
+  const cur = _state.sources[idx];
+  const xtream = patch.xtream
+    ? { server: patch.xtream.server, username: patch.xtream.username }
+    : patch.xtream;
+  const next: IptvPlaylistSource = {
+    ...cur,
+    ...(patch.name !== undefined ? { name: patch.name } : {}),
+    ...(patch.url !== undefined ? { url: patch.url } : {}),
+    ...(patch.epgUrl !== undefined ? { epgUrl: patch.epgUrl } : {}),
+    ...(patch.xtream !== undefined ? { xtream } : {}),
+  };
+  _state.sources = [..._state.sources.slice(0, idx), next, ..._state.sources.slice(idx + 1)];
+
+  if (password && password.length > 0) {
+    try {
+      await invoke("iptv_set_xtream_password", { playlistId: id, password });
+    } catch (e) {
+      console.warn("[iptv] keyring write failed", e);
+    }
+  }
+
+  // The cached playlist/EPG are now stale (url/creds/epg may have changed).
+  _state.playlists.delete(id);
+  emit();
+  await persistSources();
+  await refreshPlaylist(id, { force: true }).catch(() => {});
+}
+
 /** Remove a source: drop from settings, clear its keyring password and
  *  cached playlist/error. */
 export async function removePlaylistSource(id: string): Promise<void> {

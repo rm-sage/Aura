@@ -2,17 +2,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useRef, useState } from "react";
-import { addPlaylistSource } from "../../iptv/store";
+import { addPlaylistSource, updatePlaylistSource } from "../../iptv/store";
+import type { IptvPlaylistSource } from "../../iptv/types";
 
 // ---------------------------------------------------------------------------
-// PlaylistForm — modal to add a Live TV playlist. Two tabs:
-//   • M3U     — paste a full playlist URL.
+// PlaylistForm — modal to add OR edit a Live TV playlist. Two tabs:
+//   • M3U     — paste a full playlist URL (+ optional EPG URL).
 //   • Xtream  — server + username + password. The password is written to
 //               the OS keyring (never persisted in settings); the store
 //               merges it back in at fetch time and pulls channels via the
 //               Xtream player API. (live-tv spec Decision D + Phase 2.)
-// The "Add" action persists through the store (Rust AppSettings) and kicks
-// off an immediate fetch; the parent switches to the new source on success.
+// Persists through the store (Rust AppSettings) and re-fetches immediately;
+// the parent switches to / stays on the source on success. In EDIT mode the
+// kind is locked (no tab switch) and the Xtream password field can be left
+// blank to keep the existing keyring value.
 // ---------------------------------------------------------------------------
 
 type Tab = "m3u" | "xtream";
@@ -20,18 +23,21 @@ type Tab = "m3u" | "xtream";
 interface Props {
   onClose: () => void;
   onAdded: (sourceId: string) => void;
+  /** When set, the form edits this source in place instead of adding. */
+  editSource?: IptvPlaylistSource | null;
 }
 
-export default function PlaylistForm({ onClose, onAdded }: Props) {
-  const [tab, setTab] = useState<Tab>("m3u");
-  const [name, setName] = useState("");
+export default function PlaylistForm({ onClose, onAdded, editSource }: Props) {
+  const editing = !!editSource;
+  const [tab, setTab] = useState<Tab>(editSource?.kind === "xtream" ? "xtream" : "m3u");
+  const [name, setName] = useState(editSource?.name ?? "");
   // M3U
-  const [url, setUrl] = useState("");
-  const [epgUrl, setEpgUrl] = useState("");
+  const [url, setUrl] = useState(editSource?.kind !== "xtream" ? editSource?.url ?? "" : "");
+  const [epgUrl, setEpgUrl] = useState(editSource?.epgUrl ?? "");
   // Xtream
-  const [server, setServer] = useState("");
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
+  const [server, setServer] = useState(editSource?.xtream?.server ?? "");
+  const [username, setUsername] = useState(editSource?.xtream?.username ?? "");
+  const [password, setPassword] = useState(""); // blank in edit = keep current
 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -53,7 +59,10 @@ export default function PlaylistForm({ onClose, onAdded }: Props) {
     !saving &&
     (tab === "m3u"
       ? url.trim().length > 0
-      : server.trim().length > 0 && username.trim().length > 0 && password.length > 0);
+      : server.trim().length > 0 &&
+        username.trim().length > 0 &&
+        // In edit mode a blank password keeps the existing keyring value.
+        (editing || password.length > 0));
 
   const submit = async () => {
     if (!canSubmit) return;
@@ -65,29 +74,38 @@ export default function PlaylistForm({ onClose, onAdded }: Props) {
         if (!/^https?:\/\//i.test(u)) throw new Error("Enter a full http(s):// playlist URL.");
         const epg = epgUrl.trim();
         if (epg && !/^https?:\/\//i.test(epg)) throw new Error("The EPG URL must be a full http(s):// URL.");
-        const source = await addPlaylistSource({
+        const fields = {
           name: name.trim() || hostnameOf(u) || "Playlist",
           url: u,
-          kind: "m3u",
+          kind: "m3u" as const,
           epgUrl: epg || null,
-        });
-        onAdded(source.id);
+        };
+        if (editing && editSource) {
+          await updatePlaylistSource(editSource.id, fields);
+          onAdded(editSource.id);
+        } else {
+          const source = await addPlaylistSource(fields);
+          onAdded(source.id);
+        }
       } else {
         const base = normalizeServer(server.trim());
         if (!base) throw new Error("Enter the server URL, e.g. http://line.provider.com:8080");
-        const source = await addPlaylistSource(
-          {
-            name: name.trim() || hostnameOf(base) || "Xtream",
-            url: base,
-            kind: "xtream",
-            xtream: { server: base, username: username.trim() },
-          },
-          password,
-        );
-        onAdded(source.id);
+        const fields = {
+          name: name.trim() || hostnameOf(base) || "Xtream",
+          url: base,
+          kind: "xtream" as const,
+          xtream: { server: base, username: username.trim() },
+        };
+        if (editing && editSource) {
+          await updatePlaylistSource(editSource.id, fields, password);
+          onAdded(editSource.id);
+        } else {
+          const source = await addPlaylistSource(fields, password);
+          onAdded(source.id);
+        }
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Couldn't add the playlist.");
+      setError(e instanceof Error ? e.message : "Couldn't save the playlist.");
       setSaving(false);
     }
   };
@@ -99,13 +117,15 @@ export default function PlaylistForm({ onClose, onAdded }: Props) {
     >
       <div
         role="dialog"
-        aria-label="Add playlist"
+        aria-label={editing ? "Edit playlist" : "Add playlist"}
         className="w-[460px] max-w-[92vw] rounded-2xl border border-white/12
                    bg-[rgba(16,16,20,0.98)] backdrop-blur-2xl shadow-glass-edge p-5"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-white/95 text-lg font-semibold">Add playlist</h2>
+          <h2 className="text-white/95 text-lg font-semibold">
+            {editing ? "Edit playlist" : "Add playlist"}
+          </h2>
           <button
             type="button"
             onClick={onClose}
@@ -117,15 +137,18 @@ export default function PlaylistForm({ onClose, onAdded }: Props) {
           </button>
         </div>
 
-        {/* Tabs */}
-        <div className="flex gap-1 p-1 rounded-xl bg-white/5 border border-white/8 mb-4">
-          <TabButton active={tab === "m3u"} onClick={() => setTab("m3u")}>
-            M3U URL
-          </TabButton>
-          <TabButton active={tab === "xtream"} onClick={() => setTab("xtream")}>
-            Xtream Login
-          </TabButton>
-        </div>
+        {/* Tabs — locked to the source's kind when editing (can't change an
+            M3U into an Xtream login in place). */}
+        {!editing && (
+          <div className="flex gap-1 p-1 rounded-xl bg-white/5 border border-white/8 mb-4">
+            <TabButton active={tab === "m3u"} onClick={() => setTab("m3u")}>
+              M3U URL
+            </TabButton>
+            <TabButton active={tab === "xtream"} onClick={() => setTab("xtream")}>
+              Xtream Login
+            </TabButton>
+          </div>
+        )}
 
         <div className="space-y-3">
           {tab === "m3u" ? (
@@ -179,6 +202,7 @@ export default function PlaylistForm({ onClose, onAdded }: Props) {
                     onChange={(e) => setPassword(e.target.value)}
                     onKeyDown={(e) => e.key === "Enter" && submit()}
                     autoComplete="off"
+                    placeholder={editing ? "•••••• (unchanged)" : undefined}
                     className={inputCls}
                   />
                 </Field>
@@ -222,7 +246,7 @@ export default function PlaylistForm({ onClose, onAdded }: Props) {
                        bg-ln-accent/15 text-ln-accent border-ln-accent/30 hover:bg-ln-accent/25
                        disabled:opacity-40 disabled:cursor-not-allowed"
           >
-            {saving ? "Adding…" : "Add playlist"}
+            {saving ? (editing ? "Saving…" : "Adding…") : editing ? "Save changes" : "Add playlist"}
           </button>
         </div>
       </div>

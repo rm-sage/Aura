@@ -19,7 +19,7 @@ import {
   dropEpg,
   type NowNext,
 } from "../iptv/epgStore";
-import type { IptvChannel, IptvPlaylist } from "../iptv/types";
+import type { IptvChannel, IptvPlaylist, IptvPlaylistSource } from "../iptv/types";
 import PlaylistForm from "./live/PlaylistForm";
 import GuideView from "./live/GuideView";
 
@@ -91,6 +91,7 @@ function LiveBody({ active, onPlayChannel }: Props) {
   const [selectedGroup, setSelectedGroup] = useState<string>("All");
   const [query, setQuery] = useState("");
   const [formOpen, setFormOpen] = useState(false);
+  const [editingSource, setEditingSource] = useState<IptvPlaylistSource | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("grid");
 
   // Load configured sources on first activation.
@@ -185,6 +186,13 @@ function LiveBody({ active, onPlayChannel }: Props) {
               selectedId={selectedSourceId}
               onSelect={setSelectedSourceId}
               onRefresh={(id) => refreshPlaylist(id, { force: true })}
+              onEdit={(id) => {
+                const src = state.sources.find((s) => s.id === id) ?? null;
+                if (src) {
+                  setEditingSource(src);
+                  setFormOpen(true);
+                }
+              }}
               onRemove={(id) => {
                 dropEpg(id);
                 void removePlaylistSource(id);
@@ -193,7 +201,10 @@ function LiveBody({ active, onPlayChannel }: Props) {
           )}
           <button
             type="button"
-            onClick={() => setFormOpen(true)}
+            onClick={() => {
+              setEditingSource(null);
+              setFormOpen(true);
+            }}
             className="px-3.5 h-9 rounded-xl text-[13px] font-medium border transition-colors
                        bg-ln-accent/15 text-ln-accent border-ln-accent/30 hover:bg-ln-accent/25"
           >
@@ -204,7 +215,13 @@ function LiveBody({ active, onPlayChannel }: Props) {
 
       {/* Body */}
       {state.sources.length === 0 ? (
-        <EmptyState loaded={state.loaded} onAdd={() => setFormOpen(true)} />
+        <EmptyState
+          loaded={state.loaded}
+          onAdd={() => {
+            setEditingSource(null);
+            setFormOpen(true);
+          }}
+        />
       ) : (
         <div className="flex-1 flex min-h-0">
           {/* Category sidebar */}
@@ -302,9 +319,14 @@ function LiveBody({ active, onPlayChannel }: Props) {
 
       {formOpen && (
         <PlaylistForm
-          onClose={() => setFormOpen(false)}
+          editSource={editingSource}
+          onClose={() => {
+            setFormOpen(false);
+            setEditingSource(null);
+          }}
           onAdded={(id) => {
             setFormOpen(false);
+            setEditingSource(null);
             setSelectedSourceId(id);
           }}
         />
@@ -464,12 +486,14 @@ function SourcePicker({
   selectedId,
   onSelect,
   onRefresh,
+  onEdit,
   onRemove,
 }: {
   sources: { id: string; name: string }[];
   selectedId: string | null;
   onSelect: (id: string) => void;
   onRefresh: (id: string) => void;
+  onEdit: (id: string) => void;
   onRemove: (id: string) => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -530,6 +554,20 @@ function SourcePicker({
                 >
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
                     <path d="M17.65 6.35A7.95 7.95 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  title="Edit"
+                  onClick={() => {
+                    onEdit(s.id);
+                    setOpen(false);
+                  }}
+                  className="w-7 h-7 rounded-lg flex items-center justify-center text-white/40
+                             hover:text-white/90 hover:bg-white/10 flex-shrink-0"
+                >
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a.996.996 0 0 0 0-1.41l-2.34-2.34a.996.996 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" />
                   </svg>
                 </button>
                 <button
