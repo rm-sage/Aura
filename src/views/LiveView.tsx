@@ -33,6 +33,7 @@ import {
 import PlaylistForm from "./live/PlaylistForm";
 import GuideView from "./live/GuideView";
 import MultiView from "./live/MultiView";
+import { openChannelMenu } from "../iptv/channelMenu";
 
 /** Guide rows are heavier than grid cards (sticky cells + per-row timeline);
  *  cap them tighter than the grid so a huge category stays responsive. */
@@ -375,7 +376,7 @@ function LiveBody({ active, onPlayChannel }: Props) {
                 ) : (
                   <div
                     className="grid gap-3"
-                    style={{ gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))" }}
+                    style={{ gridTemplateColumns: "repeat(auto-fill, minmax(186px, 1fr))" }}
                   >
                     {visibleFavorites.map((fav) => (
                       <ChannelCard
@@ -389,6 +390,14 @@ function LiveBody({ active, onPlayChannel }: Props) {
                           toggleFavorite(fav.sourceId, fav.sourceName, fav.channel)
                         }
                         sourceLabel={fav.sourceName}
+                        onContextMenu={(e) =>
+                          openChannelMenu(e, {
+                            channel: fav.channel,
+                            sourceId: fav.sourceId,
+                            sourceName: fav.sourceName,
+                            onPlay: () => playFavorite(fav),
+                          })
+                        }
                       />
                     ))}
                   </div>
@@ -427,7 +436,7 @@ function LiveBody({ active, onPlayChannel }: Props) {
                 ) : (
                   <div
                     className="grid gap-3"
-                    style={{ gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))" }}
+                    style={{ gridTemplateColumns: "repeat(auto-fill, minmax(186px, 1fr))" }}
                   >
                     {visible.map((ch) => (
                       <ChannelCard
@@ -440,6 +449,15 @@ function LiveBody({ active, onPlayChannel }: Props) {
                         onToggleFavorite={() =>
                           selectedSourceId &&
                           toggleFavorite(selectedSourceId, playlist?.name ?? selectedSourceId, ch)
+                        }
+                        onContextMenu={(e) =>
+                          selectedSourceId &&
+                          openChannelMenu(e, {
+                            channel: ch,
+                            sourceId: selectedSourceId,
+                            sourceName: playlist?.name ?? selectedSourceId,
+                            onPlay: () => playlist && onPlayChannel(ch, playlist),
+                          })
                         }
                       />
                     ))}
@@ -482,6 +500,7 @@ const ChannelCard = memo(function ChannelCard({
   favorited,
   onToggleFavorite,
   sourceLabel,
+  onContextMenu,
 }: {
   channel: IptvChannel;
   nowNext: NowNext | null;
@@ -491,6 +510,7 @@ const ChannelCard = memo(function ChannelCard({
   onToggleFavorite: () => void;
   /** Shown under the name in the favourites view (which playlist it's from). */
   sourceLabel?: string;
+  onContextMenu?: (e: React.MouseEvent) => void;
 }) {
   const now = nowNext?.now ?? null;
   const progress =
@@ -503,6 +523,7 @@ const ChannelCard = memo(function ChannelCard({
       tabIndex={0}
       onClick={onPlay}
       onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && onPlay()}
+      onContextMenu={onContextMenu}
       title={now ? `${channel.name} — ${now.title}` : channel.name}
       className="group relative flex flex-col items-stretch text-left rounded-xl overflow-hidden
                  border border-white/8 bg-white/[0.03] hover:bg-white/[0.07]
@@ -845,7 +866,7 @@ function GridSkeleton() {
   return (
     <div
       className="grid gap-3"
-      style={{ gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))" }}
+      style={{ gridTemplateColumns: "repeat(auto-fill, minmax(186px, 1fr))" }}
     >
       {Array.from({ length: 18 }).map((_, i) => (
         <div key={i} className="rounded-xl overflow-hidden border border-white/8 bg-white/[0.03]">

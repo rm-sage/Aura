@@ -4,6 +4,7 @@
 import { memo, useMemo, useRef, useEffect, useReducer } from "react";
 import { channelPrograms } from "../../iptv/epgStore";
 import { isFavorite, toggleFavorite, subscribeFavorites } from "../../iptv/favoritesStore";
+import { openChannelMenu } from "../../iptv/channelMenu";
 import type { IptvChannel, EpgProgram } from "../../iptv/types";
 
 // ---------------------------------------------------------------------------
@@ -213,6 +214,9 @@ const GuideRow = memo(function GuideRow({
         <button
           type="button"
           onClick={onPlay}
+          onContextMenu={(e) =>
+            openChannelMenu(e, { channel, sourceId, sourceName, onPlay })
+          }
           title={channel.name}
           className="w-full h-full flex items-center gap-2 px-2.5 pr-7 text-left
                      hover:bg-white/[0.06] transition-colors"
