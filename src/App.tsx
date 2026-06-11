@@ -1078,6 +1078,10 @@ export default function App() {
    *  replay / stream-broken reload sites can re-send the same hint
    *  without threading it through state. */
   const lastHdrHintRef = useRef<boolean>(false);
+  /** Reactive mirror of `lastHdrHintRef` for render-time gating of the
+   *  MPO-defeat composition layer (see `forceComposite`). Set on every
+   *  play, cleared on exit. */
+  const [contentIsHdr, setContentIsHdr] = useState(false);
   /** The DIRECT (un-proxied) URL of the playing stream, kept for the
    *  PlayerOverlay's Copy / Download / External-player utilities. Cleared
    *  when playback exits. */
@@ -1357,6 +1361,7 @@ export default function App() {
           try { return parseStream(stream).hdr != null; } catch { return false; }
         })();
         lastHdrHintRef.current = contentHdrHint;
+        setContentIsHdr(contentHdrHint);
 
         const t0load = Date.now();
         await invoke("load_video", {
@@ -1984,6 +1989,11 @@ export default function App() {
   const [avoidDubs,          setAvoidDubs]          = useState(false);
   const [userRegion,         setUserRegion]         = useState("");
   const [nextUpLeadSeconds,  setNextUpLeadSeconds]  = useState(60);
+  /** Reactive mirror of the backend `hdr_mode` setting. Only "passthrough"
+   *  drives the PQ d3d11 swapchain, which is the lone path the MPO-defeat
+   *  composition layer needs to guard (see `forceComposite` below). Synced
+   *  on load + every `aura:settings-changed`. */
+  const [hdrMode,            setHdrMode]            = useState("");
   useEffect(() => {
     const loadSettings = () =>
       invoke<{
@@ -1994,6 +2004,7 @@ export default function App() {
         avoid_dubs?: boolean;
         user_region?: string;
         next_up_lead_seconds?: number;
+        hdr_mode?: string;
       }>("get_settings")
         .then((s) => {
           setKeybindings(s.keybindings ?? {});
@@ -2002,6 +2013,7 @@ export default function App() {
           setAudioPriority(s.audio_priority ?? []);
           setAvoidDubs(!!s.avoid_dubs);
           setUserRegion(s.user_region ?? "");
+          setHdrMode((s.hdr_mode ?? "").trim().toLowerCase());
           if (typeof s.next_up_lead_seconds === "number") {
             // Clamp here mirroring the Settings UI clamp [0, 300].
             // 0 means the user disabled the CTA entirely.
@@ -4505,6 +4517,7 @@ export default function App() {
     setActiveStreamUrl(null);
     setActiveExternalSubs([]);
     setActiveScoringMeta(null);
+    setContentIsHdr(false);
     // EOS Spotlight: ensure the end screen is torn down the instant the
     // player exits, independent of the activeTarget-reset effect's
     // ordering (the Spotlight's own Exit button routes here).
@@ -5400,6 +5413,38 @@ export default function App() {
       <NotificationsBell library={library} />
 
       </div>
+      )}
+
+      {/* ── MPO-defeat composition guard (HDR passthrough only) ──────────
+          A full-viewport, ~imperceptible black layer painted INTO the
+          WebView2 surface over the MPV child window. Because the webview
+          region above the video is no longer fully transparent, Windows
+          DWM can no longer promote the MPV d3d11 swapchain to Independent
+          Flip / MPO direct-scanout — it must composite the frame.
+
+          Why that matters: in direct-scanout, our HDR10 metadata
+          (MaxMasteringLuminance = the user's peak, MinMasteringLuminance
+          ≈ 0 from target-contrast=inf) reaches the panel, whose OWN
+          tone-mapper then LIFTS the black floor — the "raised blacks while
+          playing, always in fullscreen, correct when paused" report. The
+          DWM-composed path instead re-emits the wire signal from the
+          panel's EDID calibration → true black (exactly the paused look).
+          Forcing composition makes every state match that correct look.
+          Confirmed Windows behaviour (mpv #15175/#16053/#17570); the only
+          app-side lever is keeping the surface composited.
+
+          Black at ~0.8 % alpha is imperceptible AND cannot raise blacks:
+          black-over-black stays black; it only scales everything else by
+          ~(1 − α), an invisible <1 % gain trim that never touches the
+          shadow floor. pointer-events-none keeps it fully click-through.
+          Gated to passthrough + HDR-labelled content so SDR / tone-mapped
+          playback keeps the efficient direct-scanout path. */}
+      {isPlayerActive && hdrMode === "passthrough" && contentIsHdr && (
+        <div
+          aria-hidden
+          className="fixed inset-0 pointer-events-none"
+          style={{ zIndex: 1, backgroundColor: "rgba(0,0,0,0.008)" }}
+        />
       )}
 
       {/* ── PlayerOverlay — z-9999, transparent, mounts as soon as the
