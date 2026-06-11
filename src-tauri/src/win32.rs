@@ -91,6 +91,67 @@ struct Rect {
     bottom: i32,
 }
 
+// ---------------------------------------------------------------------------
+// Background-playback performance — the same two levers a browser pulls so
+// media keeps full frame rate when the window loses focus.
+//
+// Windows throttles background apps three ways: DWM present-throttling of the
+// occluded window (the stubborn one), background timer coarsening, and Win11
+// EcoQoS / power throttling that slows the process outright. Browsers opt out
+// of the latter two for audible media. We do the same, process-wide + once:
+//   1. SetProcessInformation(ProcessPowerThrottling) with ExecutionSpeed in
+//      the control mask and the state bit CLEARED → "don't throttle me".
+//   2. timeBeginPeriod(1) → 1 ms timer resolution so a coarsened background
+//      timer can't stall the decode/present cadence.
+// Held for the process lifetime; the idle cost is negligible for a media app.
+// This does NOT defeat DWM present-throttling (that needs the render-path
+// rewrite) but removes the EcoQoS + timer halves, which is what browsers do.
+// ---------------------------------------------------------------------------
+#[cfg(target_os = "windows")]
+pub fn apply_playback_perf_opts() {
+    #[repr(C)]
+    struct PowerThrottlingState {
+        version: u32,
+        control_mask: u32,
+        state_mask: u32,
+    }
+    const PROCESS_POWER_THROTTLING_CURRENT_VERSION: u32 = 1;
+    const PROCESS_POWER_THROTTLING_EXECUTION_SPEED: u32 = 0x1;
+    // PROCESS_INFORMATION_CLASS::ProcessPowerThrottling
+    const PROCESS_POWER_THROTTLING_CLASS: i32 = 4;
+
+    #[link(name = "winmm")]
+    extern "system" {
+        fn timeBeginPeriod(uperiod: u32) -> u32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetProcessInformation(h: *mut c_void, class: i32, info: *mut c_void, size: u32) -> i32;
+        fn GetCurrentProcess() -> *mut c_void;
+    }
+
+    unsafe {
+        let state = PowerThrottlingState {
+            version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            control_mask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            state_mask: 0, // 0 = execution-speed throttling OFF
+        };
+        let ok = SetProcessInformation(
+            GetCurrentProcess(),
+            PROCESS_POWER_THROTTLING_CLASS,
+            &state as *const _ as *mut c_void,
+            std::mem::size_of::<PowerThrottlingState>() as u32,
+        );
+        if ok == 0 {
+            crate::devlog!(warn, "win32", "power-throttling opt-out failed (older Windows?)");
+        } else {
+            crate::devlog!(info, "win32", "EcoQoS power-throttling disabled for full-rate background playback");
+        }
+        // 1 ms timer resolution, held for the process lifetime.
+        timeBeginPeriod(1);
+    }
+}
+
 type GetClientRectFn = unsafe extern "system" fn(*mut c_void, *mut Rect) -> i32;
 type SetWindowPosFn  = unsafe extern "system" fn(
     *mut c_void, *mut c_void, i32, i32, i32, i32, u32,

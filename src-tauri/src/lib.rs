@@ -304,6 +304,23 @@ async fn set_audio_loudnorm(app: tauri::AppHandle, enabled: bool) -> Result<(), 
     }
 }
 
+/// Set mpv's `http-proxy` for subsequent stream loads (the per-playlist Live
+/// TV proxy). Empty string clears it. The frontend awaits this BEFORE invoking
+/// `load_video`; both submit to the engine's ordered command channel, so the
+/// proxy is in effect by the time the stream opens. A forward proxy (vs a URL
+/// rewrite) is used because it leaves the stream URL untouched, so HLS segment
+/// URIs still resolve against the real origin. Non-fatal: if the engine isn't
+/// up yet the worst case is the first stream loads unproxied.
+#[tauri::command]
+async fn set_http_proxy(proxy: String) -> Result<(), String> {
+    crate::devlog!(
+        info, "player",
+        "set_http_proxy({})",
+        if proxy.trim().is_empty() { "cleared" } else { "set" },
+    );
+    mpv::engine::submit_set_property("http-proxy".into(), mpv::engine::PropValue::String(proxy))
+}
+
 /// Motion interpolation — mpv's BUILT-IN GPU frame interpolation.
 ///
 /// `video-sync=display-resample` retimes frames to the display refresh
@@ -1571,6 +1588,12 @@ pub fn run() {
             // ── System Media Transport Controls (SMTC, Windows) ────────────────
             media_controls::install(app.handle());
 
+            // ── Background-playback perf (full frame rate when unfocused) ──────
+            // Opt out of Win11 EcoQoS throttling + raise timer resolution, the
+            // two levers browsers use to keep media smooth in the background.
+            #[cfg(target_os = "windows")]
+            win32::apply_playback_perf_opts();
+
             // ── Streaming bridge (in-process) ──────────────────────────────
             // The loopback byte-range proxy runs on Tauri's shared tokio
             // runtime inside this process — no sidecar binary to stage,
@@ -1803,6 +1826,7 @@ pub fn run() {
             frame_step,
             set_audio_loudnorm,
             set_motion_interpolation,
+            set_http_proxy,
             thumbs::extract_thumbnail,
             set_volume,
             set_speed,
