@@ -1217,7 +1217,9 @@ export default function App() {
       // resume prompt and (re-)load the picked stream at this live position —
       // a swap-in-place. Everything else (resolve, preheat, post-load setup)
       // runs unchanged. See src/SourceSwitcher.tsx.
-      opts?: { forceStartSeconds?: number },
+      // `proxyUrl`: per-playlist Live TV forward proxy (mpv http-proxy); null/
+      // undefined plays direct (and clears any proxy left by a prior stream).
+      opts?: { forceStartSeconds?: number; proxyUrl?: string | null },
     ) => {
       try {
         if (!stream.url && !stream.info_hash) return;
@@ -1308,8 +1310,16 @@ export default function App() {
         // see exactly which phase is slow when a stream hangs at
         // "Loading… N%".
         notifyNewLoad();
+        // Per-playlist Live TV proxy: set (or clear, with "") mpv's http-proxy
+        // before resolving + loading. Awaited so the SetProperty lands on the
+        // engine's ordered command channel ahead of the LoadFile, and always
+        // sent so a prior proxied stream doesn't leak its proxy into this one.
+        await invoke("set_http_proxy", { proxy: opts?.proxyUrl ?? "" }).catch(() => {});
         const t0resolve = Date.now();
-        const resolved = await invoke<string>("resolve_stream", { rawUrl: raw });
+        const resolved = await invoke<string>("resolve_stream", {
+          rawUrl: raw,
+          viaProxy: !!opts?.proxyUrl,
+        });
         logLoadEvent("resolve_stream returned", {
           dt: Date.now() - t0resolve,
           scheme: resolved.startsWith("https://") ? "https" :
@@ -2464,7 +2474,7 @@ export default function App() {
         media_type: "tv",
         name:       channel.name,
       };
-      void handlePlayStream(stream, target);
+      void handlePlayStream(stream, target, { proxyUrl: playlist.proxyUrl ?? null });
     },
     [handlePlayStream],
   );

@@ -44,6 +44,10 @@ pub struct IptvPlaylistSource {
     pub kind: Option<String>,
     #[serde(default)]
     pub xtream: Option<XtreamRef>,
+    /// Optional forward-proxy URL (mpv `http-proxy`) every stream from this
+    /// playlist tunnels through. None = direct.
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

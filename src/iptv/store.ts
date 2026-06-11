@@ -153,7 +153,7 @@ export async function addPlaylistSource(
  *  only), mirroring addPlaylistSource. */
 export async function updatePlaylistSource(
   id: string,
-  patch: Partial<Pick<IptvPlaylistSource, "name" | "url" | "epgUrl" | "xtream">>,
+  patch: Partial<Pick<IptvPlaylistSource, "name" | "url" | "epgUrl" | "xtream" | "proxyUrl">>,
   password?: string,
 ): Promise<void> {
   const idx = _state.sources.findIndex((s) => s.id === id);
@@ -168,6 +168,7 @@ export async function updatePlaylistSource(
     ...(patch.url !== undefined ? { url: patch.url } : {}),
     ...(patch.epgUrl !== undefined ? { epgUrl: patch.epgUrl } : {}),
     ...(patch.xtream !== undefined ? { xtream } : {}),
+    ...(patch.proxyUrl !== undefined ? { proxyUrl: patch.proxyUrl } : {}),
   };
   _state.sources = [..._state.sources.slice(0, idx), next, ..._state.sources.slice(idx + 1)];
 
@@ -302,6 +303,7 @@ async function fetchAndParse(source: IptvPlaylistSource): Promise<IptvPlaylist> 
       channels,
       fetchedAt: Date.now(),
       groups,
+      proxyUrl: source.proxyUrl ?? null,
     };
   }
 
@@ -322,6 +324,7 @@ async function fetchAndParse(source: IptvPlaylistSource): Promise<IptvPlaylist> 
     channels,
     fetchedAt: Date.now(),
     groups,
+    proxyUrl: source.proxyUrl ?? null,
   };
 }
 

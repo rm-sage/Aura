@@ -38,6 +38,9 @@ export interface IptvPlaylist {
   fetchedAt: number;
   /** Distinct group names in first-appearance order. */
   groups: string[];
+  /** Forward-proxy URL this playlist's streams should tunnel through
+   *  (mpv `http-proxy`), copied from the source. null = direct. */
+  proxyUrl?: string | null;
 }
 
 /** A configured playlist source (what the user enters; persisted).
@@ -53,6 +56,11 @@ export interface IptvPlaylistSource {
   epgUrl?: string | null;
   kind?: "m3u" | "xtream" | "epg";
   xtream?: { server: string; username: string; password?: string } | null;
+  /** Optional forward-proxy (e.g. `http://host:8888`) every stream from
+   *  this playlist tunnels through via mpv's `http-proxy` — changes the
+   *  source IP without breaking HLS segment resolution. null/absent =
+   *  direct. See the Live TV proxy field in PlaylistForm. */
+  proxyUrl?: string | null;
 }
 
 export interface EpgProgram {

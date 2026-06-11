@@ -231,6 +231,9 @@ function LiveBody({ active, onPlayChannel }: Props) {
       channels: [],
       fetchedAt: 0,
       groups: [],
+      // Carry the origin source's proxy so a favourite plays through the same
+      // proxy as it would from its own playlist.
+      proxyUrl: state.sources.find((s) => s.id === fav.sourceId)?.proxyUrl ?? null,
     });
   };
 

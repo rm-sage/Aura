@@ -38,6 +38,8 @@ export default function PlaylistForm({ onClose, onAdded, editSource }: Props) {
   const [server, setServer] = useState(editSource?.xtream?.server ?? "");
   const [username, setUsername] = useState(editSource?.xtream?.username ?? "");
   const [password, setPassword] = useState(""); // blank in edit = keep current
+  // Shared optional forward proxy (mpv http-proxy) for this playlist's streams
+  const [proxyUrl, setProxyUrl] = useState(editSource?.proxyUrl ?? "");
 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -79,6 +81,7 @@ export default function PlaylistForm({ onClose, onAdded, editSource }: Props) {
           url: u,
           kind: "m3u" as const,
           epgUrl: epg || null,
+          proxyUrl: proxyUrl.trim() || null,
         };
         if (editing && editSource) {
           await updatePlaylistSource(editSource.id, fields);
@@ -95,6 +98,7 @@ export default function PlaylistForm({ onClose, onAdded, editSource }: Props) {
           url: base,
           kind: "xtream" as const,
           xtream: { server: base, username: username.trim() },
+          proxyUrl: proxyUrl.trim() || null,
         };
         if (editing && editSource) {
           await updatePlaylistSource(editSource.id, fields, password);
@@ -216,6 +220,16 @@ export default function PlaylistForm({ onClose, onAdded, editSource }: Props) {
               onChange={(e) => setName(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && submit()}
               placeholder="My provider"
+              className={inputCls}
+            />
+          </Field>
+
+          <Field label="Proxy URL (optional)">
+            <input
+              value={proxyUrl}
+              onChange={(e) => setProxyUrl(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submit()}
+              placeholder="http://host:8888  — tunnel this playlist's streams"
               className={inputCls}
             />
           </Field>

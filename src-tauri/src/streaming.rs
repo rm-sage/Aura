@@ -216,10 +216,15 @@ fn percent_decode(s: &str) -> Option<String> {
 /// - `http://`      → in-process bridge proxy (single-file plain-HTTP streams).
 /// - other          → returned as-is (MPV decides what to do).
 ///
+/// `via_proxy` (Live TV per-playlist proxy): when true, plain-HTTP URLs are
+/// returned DIRECT instead of through the local bridge, because mpv is tunneling
+/// everything through its `http-proxy` for this load — routing through the
+/// 127.0.0.1 bridge would make mpv ask the remote proxy to fetch loopback.
+///
 /// The parameter is named `raw_url` (not `url`) so the JS caller passes
 /// `{ rawUrl: ... }` — keeping the call-site explicit about what shape it is.
 #[tauri::command]
-pub async fn resolve_stream(raw_url: String) -> Result<String, String> {
+pub async fn resolve_stream(raw_url: String, via_proxy: Option<bool>) -> Result<String, String> {
     let lower = raw_url.to_lowercase();
 
     if lower.starts_with("magnet:") {
@@ -257,7 +262,14 @@ pub async fn resolve_stream(raw_url: String) -> Result<String, String> {
 
     // Plaintext HTTP: route through the in-process bridge so we can add headers
     // / fix up byte-range edge cases. Cheap enough on the loopback interface.
+    // EXCEPT when this load is proxied (via_proxy) — then mpv tunnels through
+    // its http-proxy and must reach the origin directly, not the loopback
+    // bridge.
     if lower.starts_with("http://") {
+        if via_proxy == Some(true) {
+            crate::devlog!(info, "bridge", "resolve_stream(http, via proxy) → direct");
+            return Ok(raw_url);
+        }
         let encoded = percent_encode(&raw_url);
         crate::devlog!(info, "bridge", "resolve_stream(http) → bridge proxy");
         return Ok(format!("http://127.0.0.1:{BRIDGE_PORT}/proxy/{encoded}"));

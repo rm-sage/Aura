@@ -16,6 +16,7 @@ commands.allow = [
   "frame_step",
   "set_audio_loudnorm",
   "set_motion_interpolation",
+  "set_http_proxy",
   "extract_thumbnail",
   "seek_absolute",
   "set_volume",
