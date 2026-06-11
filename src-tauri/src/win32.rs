@@ -626,78 +626,85 @@ pub fn signal_fullscreen_to_shell(
 /// Move the parent window to its current monitor's full bounds. Saves
 /// the previous bounds so `exit_native_fullscreen` can restore them.
 // ---------------------------------------------------------------------------
-// MPO "poison pill" (experimental, env-gated) — Poison Pill 2
+// MPO "poison pill" — force DWM composition for Aura's window so the MPV
+// child swapchain is never promoted to an Independent-Flip / Multi-Plane-
+// Overlay hardware plane.
 //
-// On displays where Windows promotes Aura's MPV child swapchain to an
-// Independent-Flip / Multi-Plane-Overlay hardware plane, the panel receives
-// the raw PQ signal and applies its OWN near-black EOTF (raised blacks on
-// some QD-OLEDs). Forcing DWM to composite the window instead fixes it, but
-// every per-app lever tried (in-webview overlay, d3d11-output-mode, geometry)
-// either can't defeat hardware plane-blending or breaks --wid.
+// WHY: on direct scanout the panel receives the raw PQ signal and applies
+// its OWN near-black EOTF (raised blacks on some QD-OLEDs). DWM composition
+// re-maps through the panel's EDID calibration → true black. Every other
+// per-app lever failed (in-webview overlay can't beat HW plane-blending,
+// d3d11-output-mode=composition breaks --wid, metadata can't move the panel
+// EOTF). A NON-RECTANGULAR window region is the one that works: overlay
+// planes are strictly rectangular, so a clipped window can't be promoted →
+// DWM composites it. Global MPO stays enabled for other apps (games' RTX
+// HDR); only Aura's window tree becomes plane-ineligible. No alpha → the
+// window stays fully opaque (the layered-alpha variant fixed the blacks too
+// but bled the desktop through at ~0.4 %).
 //
-// This lever targets the TOP-LEVEL window (the mpv child's ancestor): giving
-// it a NON-RECTANGULAR window region disqualifies it from hardware overlay /
-// Independent-Flip promotion (overlay planes are strictly rectangular), so
-// DWM is forced to composite the whole tree — restoring the panel's EDID
-// calibration mapping (true blacks). Global MPO stays enabled for other apps
-// (games' RTX HDR); only Aura's window tree becomes plane-ineligible.
+// GATING: applied only when `hdr_mode == "passthrough"` (the lone case the
+// black-lift matters) — SDR / off playback keeps the efficient direct-scanout
+// path and no clipped pixels. Re-evaluated at startup, on every HDR-settings
+// change (apply_hdr_settings), and after each fullscreen transition (a
+// SetWindowPos with SWP_FRAMECHANGED can clear the region).
 //
-// WHY NOT the constant-alpha variant (Poison Pill 2): a layered window with
-// alpha 254 DID force composition and fixed the blacks, but the constant
-// alpha attenuates the ENTIRE window output against the desktop — the opaque
-// video became ~0.4 % transparent and the desktop bled through (worst in
-// dark scenes on OLED). The region approach adds NO alpha, so the window
-// stays fully opaque; only a single corner pixel is clipped.
-//
-// EXPERIMENTAL: gated behind `AURA_FORCE_COMPOSITION=1` (toggle per-launch,
-// no rebuild). The region is "everything except a 1×1 px notch at the top-
-// left corner" sized larger than any monitor, so it covers the window at
-// every size with no resize tracking; the notch is at the extreme corner
-// (already inside a rounded/transparent corner), so it's imperceptible.
-fn mpo_poison_active() -> bool {
-    std::env::var("AURA_FORCE_COMPOSITION")
-        .map(|v| {
-            let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
-        })
-        .unwrap_or(false)
+// REGION SHAPE is mode-aware:
+//   • Fullscreen — a 1×1 px corner notch. The whole window IS the video, so
+//     Independent Flip demands EXACT full-rect coverage and any notch breaks
+//     it. Imperceptible (corner pixel, inside the rounded/transparent edge).
+//   • Windowed — a FULL-WIDTH 1px strip just below the 36px title-bar inset.
+//     The video is a SUB-plane MPO overlay here; a corner/edge notch only
+//     shrinks its rectangle (the driver inscribes around it). A full-width
+//     strip SPLITS the child's visible region into two disconnected
+//     rectangles — a single overlay plane can't be two rectangles, so MPO
+//     must composite. Cost: a faint 1px line near the top of the video.
+fn hdr_passthrough_active() -> bool {
+    crate::player::resolve_hdr_mode(&crate::settings::snapshot()) == "passthrough"
 }
 
-/// Apply (or re-assert) the MPO poison on the top-level window: set a
-/// non-rectangular window region (whole window minus a 1px corner notch).
-/// No-op unless `AURA_FORCE_COMPOSITION` is set. Idempotent — safe to call
-/// at startup and re-assert after every fullscreen transition (SetWindowPos
-/// with SWP_FRAMECHANGED can clear the window region).
+/// Apply (or clear) the MPO poison on the top-level window based on the
+/// current HDR mode + windowed/fullscreen state. Idempotent — safe to call
+/// at startup, on HDR-settings change, and after every fullscreen
+/// transition. When passthrough is off, any previously-set region is cleared
+/// (back to a normal rectangular window).
 pub fn apply_mpo_poison(parent_hwnd: isize) {
-    if !mpo_poison_active() || parent_hwnd == 0 {
+    if parent_hwnd == 0 {
         return;
     }
     unsafe {
         let Ok(user32) = libloading::Library::new("user32.dll") else { return; };
+        let Ok(set_window_rgn) = user32.get::<SetWindowRgnFn>(b"SetWindowRgn\0") else { return; };
+        let hwnd = parent_hwnd as *mut c_void;
+
+        if !hdr_passthrough_active() {
+            // Not passthrough → no black-lift risk; remove any region so the
+            // window is a normal rectangle (full direct-scanout path).
+            set_window_rgn(hwnd, std::ptr::null_mut(), 1);
+            return;
+        }
+
         let Ok(gdi32) = libloading::Library::new("gdi32.dll") else { return; };
         let Ok(create_rect_rgn) = gdi32.get::<CreateRectRgnFn>(b"CreateRectRgn\0") else { return; };
         let Ok(combine_rgn) = gdi32.get::<CombineRgnFn>(b"CombineRgn\0") else { return; };
         let Ok(delete_object) = gdi32.get::<DeleteObjectFn>(b"DeleteObject\0") else { return; };
-        let Ok(set_window_rgn) = user32.get::<SetWindowRgnFn>(b"SetWindowRgn\0") else { return; };
 
-        let hwnd = parent_hwnd as *mut c_void;
-        // Region larger than any monitor, minus a 1px notch on the LEFT
-        // EDGE, 50 px down. Position matters: in WINDOWED mode the MPV
-        // child is inset 36 px from the top (title bar), so a notch at the
-        // window corner (0,0) lands in the title bar — NOT over the video —
-        // and the video child plane stays a clean rectangle that MPO still
-        // promotes (windowed raised blacks). y=50 is below the 36px inset,
-        // so the notch clips the child's visible region in BOTH windowed
-        // and fullscreen → non-rectangular video plane → DWM composites.
-        // x=0,y=50 is a single pixel on the far-left edge: imperceptible.
+        // Region larger than any monitor (so it needs no resize tracking),
+        // minus a mode-aware notch (see the header comment).
         let full = create_rect_rgn(0, 0, 32767, 32767);
-        let notch = create_rect_rgn(0, 50, 1, 51);
+        let notch = if is_in_native_fullscreen() {
+            create_rect_rgn(0, 0, 1, 1)
+        } else {
+            // Full-width 1px strip at y=37 — below the 36px title-bar inset,
+            // so it lands over (and splits) the windowed video sub-plane.
+            create_rect_rgn(0, 37, 32767, 38)
+        };
         combine_rgn(full, full, notch, RGN_DIFF);
         delete_object(notch);
         // SetWindowRgn TAKES OWNERSHIP of `full` — must NOT delete it here.
         let r = set_window_rgn(hwnd, full, 1);
         crate::devlog!(info, "win32",
-            "MPO poison: non-rectangular window region applied (SetWindowRgn rc={r})",
+            "MPO poison: region applied (fullscreen={}, SetWindowRgn rc={r})",
+            is_in_native_fullscreen(),
         );
     }
 }
