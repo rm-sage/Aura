@@ -10,6 +10,7 @@ import {
   loadIptvSources,
   removePlaylistSource,
   refreshPlaylist,
+  setDefaultPlaylist,
 } from "../iptv/store";
 import {
   subscribeEpg,
@@ -120,16 +121,21 @@ function LiveBody({ active, onPlayChannel }: Props) {
     if (active) void loadIptvSources();
   }, [active]);
 
-  // Auto-select the first source once sources resolve / change.
+  // Auto-select on first load (or when the current selection disappears):
+  // the configured default playlist if it still exists, else the first.
   useEffect(() => {
     if (state.sources.length === 0) {
       setSelectedSourceId(null);
       return;
     }
     if (!selectedSourceId || !state.sources.some((s) => s.id === selectedSourceId)) {
-      setSelectedSourceId(state.sources[0].id);
+      const def =
+        state.defaultId && state.sources.some((s) => s.id === state.defaultId)
+          ? state.defaultId
+          : state.sources[0].id;
+      setSelectedSourceId(def);
     }
-  }, [state.sources, selectedSourceId]);
+  }, [state.sources, selectedSourceId, state.defaultId]);
 
   // Reset group/search when switching source.
   useEffect(() => {
@@ -243,6 +249,8 @@ function LiveBody({ active, onPlayChannel }: Props) {
             <SourcePicker
               sources={state.sources}
               selectedId={selectedSourceId}
+              defaultId={state.defaultId}
+              onSetDefault={(id) => void setDefaultPlaylist(id)}
               onSelect={setSelectedSourceId}
               onRefresh={(id) => refreshPlaylist(id, { force: true })}
               onEdit={(id) => {
@@ -645,6 +653,8 @@ function GroupRow({
 function SourcePicker({
   sources,
   selectedId,
+  defaultId,
+  onSetDefault,
   onSelect,
   onRefresh,
   onEdit,
@@ -652,6 +662,8 @@ function SourcePicker({
 }: {
   sources: { id: string; name: string }[];
   selectedId: string | null;
+  defaultId: string | null;
+  onSetDefault: (id: string) => void;
   onSelect: (id: string) => void;
   onRefresh: (id: string) => void;
   onEdit: (id: string) => void;
@@ -705,6 +717,25 @@ function SourcePicker({
                   >
                     {s.name}
                   </span>
+                </button>
+                <button
+                  type="button"
+                  title={s.id === defaultId ? "Default playlist (click to unset)" : "Set as default"}
+                  onClick={() => onSetDefault(s.id)}
+                  className={[
+                    "w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 transition-colors",
+                    s.id === defaultId
+                      ? "text-ln-accent hover:bg-white/10"
+                      : "text-white/40 hover:text-white/90 hover:bg-white/10",
+                  ].join(" ")}
+                >
+                  <svg width="15" height="15" viewBox="0 0 24 24"
+                       fill={s.id === defaultId ? "currentColor" : "none"}
+                       stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                    {/* pin */}
+                    <path d="M9 4h6l-1 5 3 3v2H7v-2l3-3-1-5z" />
+                    <path d="M12 16v4" />
+                  </svg>
                 </button>
                 <button
                   type="button"

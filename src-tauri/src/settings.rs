@@ -284,6 +284,11 @@ pub struct AppSettings {
     /// playlist id (see `iptv.rs`). Default empty.
     #[serde(default)]
     pub iptv_playlists: Vec<crate::iptv::IptvPlaylistSource>,
+    /// Id of the playlist Live TV should auto-select on open (instead of the
+    /// first one). None = no default → fall back to the first source. Syncs +
+    /// backs up with the rest of settings like `iptv_playlists`.
+    #[serde(default)]
+    pub iptv_default_playlist_id: Option<String>,
 }
 
 fn default_theme() -> String { "mica".into() }
@@ -390,6 +395,7 @@ impl Default for AppSettings {
             skip_treat_mixed_op_as_op:   true,
             gpu_acceleration:            true,
             iptv_playlists:              Vec::new(),
+            iptv_default_playlist_id:    None,
         }
     }
 }

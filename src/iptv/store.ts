@@ -44,6 +44,9 @@ interface IptvState {
   errors: Map<string, string>;
   /** True once the first loadIptvSources() has resolved. */
   loaded: boolean;
+  /** Playlist id Live TV auto-selects on open (persisted in AppSettings).
+   *  null = no default → fall back to the first source. */
+  defaultId: string | null;
 }
 
 const _state: IptvState = {
@@ -52,6 +55,7 @@ const _state: IptvState = {
   loading: new Set(),
   errors: new Map(),
   loaded: false,
+  defaultId: null,
 };
 
 /** In-flight fetch promises per source id, so concurrent refresh calls
@@ -85,8 +89,11 @@ export function getIptvState(): Readonly<IptvState> {
 export async function loadIptvSources(): Promise<void> {
   let sources: IptvPlaylistSource[] = [];
   try {
-    const s = await invoke<{ iptv_playlists?: IptvPlaylistSource[] }>("get_settings");
+    const s = await invoke<{ iptv_playlists?: IptvPlaylistSource[]; iptv_default_playlist_id?: string | null }>(
+      "get_settings",
+    );
     sources = Array.isArray(s.iptv_playlists) ? s.iptv_playlists : [];
+    _state.defaultId = s.iptv_default_playlist_id ?? null;
   } catch {
     sources = [];
   }
@@ -187,18 +194,41 @@ export async function updatePlaylistSource(
 }
 
 /** Remove a source: drop from settings, clear its keyring password and
- *  cached playlist/error. */
+ *  cached playlist/error. Clears the default if it pointed here. */
 export async function removePlaylistSource(id: string): Promise<void> {
   _state.sources = _state.sources.filter((s) => s.id !== id);
   _state.playlists.delete(id);
   _state.errors.delete(id);
   _state.loading.delete(id);
+  const wasDefault = _state.defaultId === id;
+  if (wasDefault) _state.defaultId = null;
   emit();
   await persistSources();
+  if (wasDefault) {
+    try {
+      await invoke("update_settings", { patch: { iptv_default_playlist_id: null } });
+    } catch (e) {
+      console.warn("[iptv] clear default failed", e);
+    }
+  }
   try {
     await invoke("iptv_clear_xtream_password", { playlistId: id });
   } catch {
     /* best effort */
+  }
+}
+
+/** Set (or clear, with null) the default playlist that Live TV auto-selects
+ *  on open. Persisted in AppSettings so it syncs + backs up. Passing the id
+ *  that is already the default toggles it off. */
+export async function setDefaultPlaylist(id: string | null): Promise<void> {
+  const next = _state.defaultId === id ? null : id;
+  _state.defaultId = next;
+  emit();
+  try {
+    await invoke("update_settings", { patch: { iptv_default_playlist_id: next } });
+  } catch (e) {
+    console.warn("[iptv] set default failed", e);
   }
 }
 
