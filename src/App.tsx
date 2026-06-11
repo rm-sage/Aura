@@ -2473,6 +2473,7 @@ export default function App() {
         id:         `iptv:${channel.id}`,
         media_type: "tv",
         name:       channel.name,
+        logo:       channel.logo ?? undefined,
       };
       void handlePlayStream(stream, target, { proxyUrl: playlist.proxyUrl ?? null });
     },
@@ -4996,7 +4997,21 @@ export default function App() {
     let largeImage: string | null = null;
     let largeText: string | null = null;
 
-    if (activeTarget && duration > 0) {
+    if (isLivePlayback && activeTarget) {
+      // Live TV — duration is 0, so it never reaches the VOD branch below.
+      // Show the channel + an elapsed-since-tune-in timer; the backend's
+      // show_titles / blocklist gates apply because is_playback is true.
+      isPlayback = true;
+      title = activeTarget.name;
+      subtitle = paused ? "Live TV · Paused" : "Watching Live TV";
+      sceneKey = `live:${activeTarget.id}`;
+      useTimestamp = !paused;
+      // Channel logo only when HTTPS — Discord rejects raw http image URLs;
+      // otherwise the backend falls back to the Aura logo.
+      const logo = activeTarget.logo ?? null;
+      largeImage = logo && logo.startsWith("https://") ? logo : null;
+      largeText = activeTarget.name;
+    } else if (activeTarget && duration > 0) {
       isPlayback = true;
       title = activeTarget.name;
       subtitle = paused
@@ -5061,7 +5076,7 @@ export default function App() {
     // dep array deliberately doesn't include `time`, otherwise Discord
     // would get spammed every second.
     let startedAt = presenceStartedAt.current ?? 0;
-    if (isPlayback && useTimestamp && time > 0) {
+    if (isPlayback && useTimestamp && time > 0 && !isLivePlayback) {
       startedAt = Math.floor(Date.now() / 1000) - Math.floor(time);
     }
 
@@ -5093,7 +5108,7 @@ export default function App() {
     }, 400);
   }, [
     authChecked, session, landingDismissed,
-    activeTarget, duration, paused,
+    activeTarget, duration, paused, isLivePlayback,
     selectedMeta, activeCatalog,
     activeView, homeSearchActive,
   ]);
