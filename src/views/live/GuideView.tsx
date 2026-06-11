@@ -114,13 +114,25 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
           </div>
         </div>
 
-        {/* Now line — spans all rows, over the timeline only. */}
+        {/* Now line — red, spanning all rows, with a "LIVE" pill at the top
+            (over the ruler). Red is the universal live-TV cue (à la Harbor). */}
         {nowX >= 0 && nowX <= timelineW && (
-          <span
+          <div
             aria-hidden
-            className="absolute top-0 bottom-0 w-px bg-ln-accent/70 z-10 pointer-events-none"
+            className="absolute top-0 bottom-0 z-30 pointer-events-none"
             style={{ left: CHANNEL_COL_W + nowX }}
-          />
+          >
+            <span
+              className="absolute top-0 bottom-0 w-px bg-red-500/85"
+              style={{ boxShadow: "0 0 6px rgba(239,68,68,0.55)" }}
+            />
+            <span
+              className="absolute top-0 -translate-x-1/2 px-1.5 h-[18px] flex items-center rounded-full
+                         bg-red-500 text-white text-[9px] font-bold tracking-wider leading-none"
+            >
+              LIVE
+            </span>
+          </div>
         )}
 
         {/* Channel rows */}
@@ -241,7 +253,7 @@ const GuideRow = memo(function GuideRow({
             className={[
               "absolute top-[3px] bottom-[3px] rounded-md px-2 overflow-hidden text-left transition-colors",
               live
-                ? "bg-ln-accent/15 border border-ln-accent/30 hover:bg-ln-accent/25"
+                ? "bg-red-500/[0.14] border border-red-500/45 hover:bg-red-500/25"
                 : "bg-white/[0.05] border border-white/8 hover:bg-white/[0.10]",
             ].join(" ")}
             style={{ left, width }}
@@ -249,8 +261,13 @@ const GuideRow = memo(function GuideRow({
             <span className="block text-[11.5px] text-white/85 font-medium truncate leading-tight mt-0.5">
               {p.title}
             </span>
-            <span className="block text-[10px] text-white/40 truncate leading-tight">
-              {fmtTime(p.startMs)}
+            <span
+              className={[
+                "block text-[10px] truncate leading-tight",
+                live ? "text-red-300/90 font-semibold" : "text-white/40",
+              ].join(" ")}
+            >
+              {live ? "● LIVE" : fmtTime(p.startMs)}
             </span>
           </button>
         ))}
