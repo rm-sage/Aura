@@ -1202,6 +1202,9 @@ export default function App() {
         series_id?: string;
         media_type: string;
         name: string;
+        /** Explicit art (Live TV passes the channel logo); preferred over the
+         *  selectedMeta / library lookup below. */
+        logo?: string | null;
         episode?: string;
         episode_title?: string;
         season?: number;
@@ -1891,6 +1894,7 @@ export default function App() {
         // (the exact card the user clicked) first, falling back to the
         // selected library item.
         const logo =
+          target.logo ??
           selectedMeta?.logo ??
           library.find((i) => i.id === target.id)?.logo ??
           null;
@@ -5450,7 +5454,11 @@ export default function App() {
           <DiscoverView addons={addons} onSelectMeta={openDetail} />
         )}
         {activeView === "live" && (
-          <LiveView active={activeView === "live"} onPlayChannel={handlePlayChannel} />
+          <LiveView
+            active={activeView === "live"}
+            playerActive={isPlayerActive}
+            onPlayChannel={handlePlayChannel}
+          />
         )}
         {activeView === "calendar" && (
           <CalendarView library={library} addons={addons} onSelectMeta={openDetail} />

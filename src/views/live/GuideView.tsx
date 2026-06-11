@@ -114,7 +114,7 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
           {/* Time ruler */}
           <div className="flex border-b border-white/8" style={{ height: RULER_H }}>
             <div
-              className="sticky left-0 z-10 flex-shrink-0 bg-[rgba(12,12,16,0.96)] border-r border-white/8"
+              className="sticky left-0 z-[40] flex-shrink-0 bg-[rgba(12,12,16,0.96)] border-r border-white/8"
               style={{ width: CHANNEL_COL_W }}
             />
             <div className="relative flex-shrink-0" style={{ width: timelineW }}>
@@ -207,7 +207,7 @@ const GuideRow = memo(function GuideRow({
     <div className="flex border-b border-white/[0.05]" style={{ height: ROW_H }}>
       {/* Sticky channel cell — play button + favourite star. */}
       <div
-        className="group sticky left-0 z-[5] flex-shrink-0 relative
+        className="group sticky left-0 z-[40] flex-shrink-0 relative
                    bg-[rgba(12,12,16,0.92)] border-r border-white/8"
         style={{ width: CHANNEL_COL_W }}
       >

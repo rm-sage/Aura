@@ -33,16 +33,36 @@ function bridgeUrl(url: string): string {
   return BRIDGE + encodeURIComponent(url);
 }
 
-/** hls.js loader that routes every request (manifest, segments, keys) through
- *  the in-process bridge — hls.js resolves segment URLs against the original
- *  manifest base first, so each `context.url` is absolute before we wrap it. */
+/** Is this an HLS manifest URL? hls.js only plays HLS — raw `.ts`/`.mp4`
+ *  live URLs (Xtream `output=ts`, generic M3U) must not be handed to it. */
+function isHlsUrl(url: string): boolean {
+  return /\.m3u8?(\?|#|$)/i.test(url);
+}
+
+/** hls.js loader that fetches every request through the CORS-enabled bridge,
+ *  but reports the ORIGINAL (unwrapped) URL back to hls.js as the response
+ *  URL. Critical: hls.js resolves child URIs (segments, variants, keys)
+ *  against the response URL — if we let that be the bridge-wrapped URL, a
+ *  relative or absolute-path segment resolves against 127.0.0.1 and then gets
+ *  wrapped AGAIN (double-wrapped → the bridge fetches itself → 400). Restoring
+ *  the original URL makes children resolve against the real origin, so each is
+ *  wrapped exactly once. */
 class BridgeProxyLoader extends Hls.DefaultConfig.loader {
   load(
     context: LoaderContext,
     config: LoaderConfiguration,
     callbacks: LoaderCallbacks<LoaderContext>,
   ): void {
-    if (context.url) context.url = bridgeUrl(context.url);
+    const original = context.url;
+    if (original) context.url = bridgeUrl(original);
+    const realOnSuccess = callbacks.onSuccess;
+    callbacks.onSuccess = (response, stats, ctx, networkDetails) => {
+      if (original) {
+        response.url = original;
+        if (ctx) ctx.url = original;
+      }
+      realOnSuccess(response, stats, ctx, networkDetails);
+    };
     super.load(context, config, callbacks);
   }
 }
@@ -52,9 +72,12 @@ interface Props {
   channels: IptvChannel[];
   /** Promote a tile into the main mpv player (double-click). */
   onPlayChannel: (channel: IptvChannel) => void;
+  /** True when the main player is active (covering Live TV). All tiles
+   *  suspend so they stop holding provider connections / MSE buffers. */
+  suspended?: boolean;
 }
 
-export default function MultiView({ channels, onPlayChannel }: Props) {
+export default function MultiView({ channels, onPlayChannel, suspended }: Props) {
   const [layout, setLayout] = useState<Layout>("2x2");
   const count = TILE_COUNT[layout];
   // Tile slots; resized (preserving existing assignments) when layout changes.
@@ -136,6 +159,7 @@ export default function MultiView({ channels, onPlayChannel }: Props) {
               key={i}
               channel={ch}
               audio={i === audioTile}
+              suspended={!!suspended}
               onFocusAudio={() => setAudioTile(i)}
               onPick={() => setPicking(i)}
               onClear={() => {
@@ -171,6 +195,7 @@ export default function MultiView({ channels, onPlayChannel }: Props) {
 const Tile = memo(function Tile({
   channel,
   audio,
+  suspended,
   onFocusAudio,
   onPick,
   onClear,
@@ -178,19 +203,27 @@ const Tile = memo(function Tile({
 }: {
   channel: IptvChannel | null;
   audio: boolean;
+  suspended: boolean;
   onFocusAudio: () => void;
   onPick: () => void;
   onClear: () => void;
   onExpand: () => void;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const [status, setStatus] = useState<"idle" | "loading" | "playing" | "error">("idle");
+  const [status, setStatus] = useState<"idle" | "loading" | "playing" | "error" | "unsupported">("idle");
 
-  // (Re)attach hls.js whenever the tile's channel changes.
+  // (Re)attach hls.js whenever the tile's channel changes. Suspended (main
+  // player active) tears the instance down so it stops streaming.
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !channel) {
+    if (!video || !channel || suspended) {
       setStatus("idle");
+      return;
+    }
+    // hls.js only plays HLS — a raw .ts/.mp4 channel can't preview in the grid
+    // (it still opens fine in the main player on double-click).
+    if (!isHlsUrl(channel.url)) {
+      setStatus("unsupported");
       return;
     }
     setStatus("loading");
@@ -199,6 +232,7 @@ const Tile = memo(function Tile({
       setStatus("error");
       return;
     }
+    let recoverCount = 0;
     const hls = new Hls({
       // Tiny live buffer — these are previews, keep RAM bounded.
       maxBufferLength: 12,
@@ -219,9 +253,14 @@ const Tile = memo(function Tile({
     hls.on(Hls.Events.ERROR, (_e, data) => {
       if (cancelled) return;
       if (data.fatal) {
-        // Try one recovery for network/media, else give up.
-        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
-        else setStatus("error");
+        // Cap media-error recovery (hls.js doesn't self-limit it) so a
+        // persistently broken stream can't loop forever pinning CPU.
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && recoverCount < 2) {
+          recoverCount++;
+          hls.recoverMediaError();
+        } else {
+          setStatus("error");
+        }
       }
     });
     hls.loadSource(channel.url);
@@ -231,7 +270,7 @@ const Tile = memo(function Tile({
       cancelled = true;
       hls.destroy();
     };
-  }, [channel]);
+  }, [channel, suspended]);
 
   // Mute everything except the audio-focused tile.
   useEffect(() => {
@@ -275,6 +314,12 @@ const Tile = memo(function Tile({
         <span className="absolute inset-0 flex flex-col items-center justify-center gap-1 text-white/55 text-[12px] px-3 text-center">
           <span className="text-red-300/80 font-medium">Stream offline</span>
           <span className="text-white/35 text-[11px]">Provider may be throttling — try another channel.</span>
+        </span>
+      )}
+      {status === "unsupported" && (
+        <span className="absolute inset-0 flex flex-col items-center justify-center gap-1 text-white/55 text-[12px] px-3 text-center">
+          <span className="text-white/70 font-medium">Not previewable here</span>
+          <span className="text-white/35 text-[11px]">This stream isn't HLS — double-click to open it in the player.</span>
         </span>
       )}
 

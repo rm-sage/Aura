@@ -58,6 +58,8 @@ const MAX_VISIBLE = 400;
 
 interface Props {
   active: boolean;
+  /** True when the main player covers Live TV — suspends Multiview tiles. */
+  playerActive?: boolean;
   onPlayChannel: (channel: IptvChannel, playlist: IptvPlaylist) => void;
 }
 
@@ -102,7 +104,7 @@ export default function LiveView(props: Props) {
   );
 }
 
-function LiveBody({ active, onPlayChannel }: Props) {
+function LiveBody({ active, playerActive, onPlayChannel }: Props) {
   const state = useIptv();
   const epgVer = useEpgVersion();
   const favVer = useFavoritesVersion();
@@ -406,6 +408,7 @@ function LiveBody({ active, onPlayChannel }: Props) {
             ) : viewMode === "multiview" ? (
               <MultiView
                 channels={filtered}
+                suspended={playerActive}
                 onPlayChannel={(ch) => playlist && onPlayChannel(ch, playlist)}
               />
             ) : viewMode === "guide" ? (
