@@ -42,9 +42,13 @@ keyring = { version = "3", features = [
 ] }
 zeroize = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "macros", "process", "io-util", "time", "sync"] }
-# Streamed-body handling (IPTV fetch size-cap enforcement, and shared
-# with the in-process bridge / cast proxies on their branches).
+# Streamed-body handling (IPTV fetch size-cap enforcement, and the
+# in-process streaming bridge body forwarding).
 futures-util = "0.3"
+# In-process streaming bridge (streaming.rs) — the loopback byte-range /
+# live proxy that used to live in the separate `aura-bridge` sidecar binary.
+# axum pinned to 0.7 (0.8 changed wildcard route syntax).
+axum = "0.7"
 tauri-plugin-deep-link = "2"
 # Single-instance enforcement — required so OAuth deep-links route to
 # the running Aura process instead of spawning a new one. Without this,

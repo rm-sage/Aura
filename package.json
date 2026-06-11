@@ -11,8 +11,7 @@
     "tauri": "tauri",
     "tsc:check": "tsc --noEmit",
     "build:analyze": "tsc && vite build --mode production && node ./scripts/bundle-report.cjs",
-    "bundle:stage": "node ./scripts/stage-bridge.cjs",
-    "bundle:release": "node ./scripts/stage-bridge.cjs && tauri build",
+    "bundle:release": "tauri build",
     "release": "pwsh ./scripts/release.ps1"
   },
   "dependencies": {

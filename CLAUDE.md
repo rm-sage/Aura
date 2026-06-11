@@ -41,7 +41,7 @@ When inspecting bundle output for confirmed CSS rules (e.g. verifying a Tailwind
 
 ### Streaming bridge — HTTPS bypass is intentional
 
-`src-tauri/src/streaming.rs` runs an axum server on `:11471` that proxies HTTP and (will) handle magnets. **HTTPS streams BYPASS the bridge entirely** and go straight to MPV. Don't undo that — many addon hosts (e.g. `stremthru.animasec.dev`) have TLS certs that don't match `127.0.0.1`, and routing through the local proxy breaks playback.
+`src-tauri/src/streaming.rs` runs an **in-process** axum server on `:11471` (started by `streaming::start_in_process()` in `lib.rs` setup; no sidecar binary — the old `aura-bridge` exe was re-internalised) that proxies single-file plain HTTP and (will) handle magnets. **HTTPS streams — and ALL HLS (`.m3u8`/`.m3u`, even over HTTP) — BYPASS the bridge entirely** and go straight to MPV (`resolve_stream`'s `is_hls` check). Don't undo either bypass: many addon hosts (e.g. `stremthru.animasec.dev`) have TLS certs that don't match `127.0.0.1`; and a proxied HLS manifest breaks MPV's relative segment-URI resolution (absolute-path segments like `/live/.../seg.ts` resolve against `127.0.0.1` → 404) and trips provider User-Agent gating.
 
 ### Tauri command registration is three places, all required
 

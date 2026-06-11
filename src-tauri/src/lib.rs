@@ -60,218 +60,10 @@ mod tray;
 mod win32;
 mod window_logic;
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::{Emitter, Listener, Manager};
-
-// ---------------------------------------------------------------------------
-// Bridge subprocess handle. Stored here (not in `streaming.rs`) because
-// it depends on `std::process::Child` and is shutdown-coordinated from
-// the same place that handles graceful exit. `OnceLock<Mutex<...>>` so
-// the spawn path can register the handle from `setup` and the
-// shutdown path can take it from anywhere.
-// ---------------------------------------------------------------------------
-
-static BRIDGE_CHILD: OnceLock<Mutex<Option<std::process::Child>>> = OnceLock::new();
-
-fn bridge_child_slot() -> &'static Mutex<Option<std::process::Child>> {
-    BRIDGE_CHILD.get_or_init(|| Mutex::new(None))
-}
-
-/// Walk a small candidate list trying to find the aura-bridge binary,
-/// then spawn it as a detached subprocess. Failure is logged and
-/// silenced — HTTPS streams keep working without the bridge, only
-/// plain-HTTP streams need it.
-fn spawn_bridge_subprocess() {
-    let candidates = bridge_candidate_paths();
-    let mut chosen: Option<std::path::PathBuf> = None;
-    for c in &candidates {
-        if c.exists() {
-            chosen = Some(c.clone());
-            break;
-        }
-    }
-    let Some(path) = chosen else {
-        crate::devlog!(
-            warn, "bridge",
-            "aura-bridge binary not found alongside the Aura executable; plain-HTTP stream proxying is disabled. HTTPS streams continue to work as normal (they bypass the bridge entirely)."
-        );
-        return;
-    };
-
-    crate::devlog!(info, "bridge", "spawning bridge subprocess: {}", path.display());
-    let mut cmd = std::process::Command::new(&path);
-    // Detach stdio. The bridge's println/eprintln output isn't
-    // piped back to the parent — if you need it, change these to
-    // .piped() and read in a background thread.
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    #[cfg(target_os = "windows")]
-    {
-        // Suppress the bridge's console window when launched from a
-        // GUI-built Aura. CREATE_NO_WINDOW = 0x08000000.
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
-    }
-    match cmd.spawn() {
-        Ok(child) => {
-            #[cfg(target_os = "windows")]
-            attach_child_to_kill_on_close_job(&child);
-            *bridge_child_slot().lock().unwrap() = Some(child);
-            crate::devlog!(info, "bridge", "bridge subprocess running");
-        }
-        Err(e) => {
-            crate::devlog!(warn, "bridge", "spawn failed: {}", e);
-        }
-    }
-}
-
-/// Attach the spawned bridge child to a Win32 Job Object configured with
-/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. When Aura's process handle
-/// closes — including a hard crash, taskkill, or the debugger detaching
-/// without a graceful shutdown — Windows automatically terminates every
-/// process in the job. Without this, an orphaned `aura-bridge.exe`
-/// keeps `target/debug/` files mapped, blocking the next `pnpm tauri
-/// dev` build with `Os { code: 5, kind: PermissionDenied }` from
-/// `tauri-build`.
-///
-/// The job handle is intentionally leaked for the lifetime of the
-/// process; closing it would trigger the kill before Aura itself
-/// exits. Windows reclaims the handle on process termination.
-///
-/// Implemented with raw FFI declarations rather than the `windows`
-/// crate so we don't have to carry an extra feature gate.
-#[cfg(target_os = "windows")]
-fn attach_child_to_kill_on_close_job(child: &std::process::Child) {
-    use std::ffi::c_void;
-    use std::os::windows::io::AsRawHandle;
-    use std::sync::OnceLock;
-
-    type HANDLE = *mut c_void;
-    type BOOL = i32;
-
-    // JOBOBJECT_BASIC_LIMIT_INFORMATION + JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-    // shapes mirror winnt.h. We only set `LimitFlags`; the rest stay zeroed.
-    #[repr(C)]
-    #[derive(Default)]
-    struct IoCounters {
-        read_op_count: u64,
-        write_op_count: u64,
-        other_op_count: u64,
-        read_transfer_count: u64,
-        write_transfer_count: u64,
-        other_transfer_count: u64,
-    }
-    #[repr(C)]
-    #[derive(Default)]
-    struct BasicLimit {
-        per_process_user_time_limit: i64,
-        per_job_user_time_limit: i64,
-        limit_flags: u32,
-        minimum_working_set_size: usize,
-        maximum_working_set_size: usize,
-        active_process_limit: u32,
-        affinity: usize,
-        priority_class: u32,
-        scheduling_class: u32,
-    }
-    #[repr(C)]
-    #[derive(Default)]
-    struct ExtendedLimit {
-        basic: BasicLimit,
-        io_info: IoCounters,
-        process_memory_limit: usize,
-        job_memory_limit: usize,
-        peak_process_memory_used: usize,
-        peak_job_memory_used: usize,
-    }
-
-    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
-    const JOBOBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
-
-    extern "system" {
-        fn CreateJobObjectW(lp_job_attributes: *mut c_void, lp_name: *const u16) -> HANDLE;
-        fn SetInformationJobObject(
-            h_job: HANDLE,
-            class: i32,
-            info: *const c_void,
-            len: u32,
-        ) -> BOOL;
-        fn AssignProcessToJobObject(h_job: HANDLE, h_process: HANDLE) -> BOOL;
-    }
-
-    static JOB: OnceLock<usize> = OnceLock::new();
-    let job_raw = *JOB.get_or_init(|| unsafe {
-        let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
-        if job.is_null() {
-            crate::devlog!(warn, "bridge", "CreateJobObjectW failed — orphan-on-crash protection disabled");
-            return 0_usize;
-        }
-        let info = ExtendedLimit {
-            basic: BasicLimit {
-                limit_flags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        if SetInformationJobObject(
-            job,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            &info as *const _ as *const c_void,
-            std::mem::size_of::<ExtendedLimit>() as u32,
-        ) == 0
-        {
-            crate::devlog!(warn, "bridge", "SetInformationJobObject failed — orphan-on-crash protection disabled");
-            return 0_usize;
-        }
-        job as usize
-    });
-    if job_raw == 0 {
-        return;
-    }
-    let job = job_raw as HANDLE;
-    let proc = child.as_raw_handle() as HANDLE;
-    if unsafe { AssignProcessToJobObject(job, proc) } == 0 {
-        crate::devlog!(warn, "bridge", "AssignProcessToJobObject failed — bridge may orphan on crash");
-    } else {
-        crate::devlog!(info, "bridge", "bridge attached to kill-on-close job (orphan-proof)");
-    }
-}
-
-/// Candidate paths to try, in priority order:
-///   1. `<exe_dir>/aura-bridge[.exe]` — sidecar deployment
-///   2. `<exe_dir>/../aura-bridge[.exe]`               — one dir up
-///
-/// Only the first candidate matches the production layout (the bridge
-/// binary sits next to Aura's own .exe). The second covers a fallback
-/// where a packager might place it one level up. Both are anchored at
-/// the running exe so they don't leak any hint about source locations.
-fn bridge_candidate_paths() -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    let bin_name = if cfg!(target_os = "windows") { "aura-bridge.exe" } else { "aura-bridge" };
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            out.push(dir.join(bin_name));
-            if let Some(parent) = dir.parent() {
-                out.push(parent.join(bin_name));
-            }
-        }
-    }
-    out
-}
-
-/// Kill the bridge subprocess if it's running. Called from the
-/// shutdown path when the main window closes.
-pub fn shutdown_bridge_subprocess() {
-    if let Some(mut child) = bridge_child_slot().lock().unwrap().take() {
-        let _ = child.kill();
-        let _ = child.wait();
-        crate::devlog!(info, "bridge", "bridge subprocess shut down");
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Shared playback state (updated by the mpv-event-main observer bridge)
@@ -1779,28 +1571,14 @@ pub fn run() {
             // ── System Media Transport Controls (SMTC, Windows) ────────────────
             media_controls::install(app.handle());
 
-            // ── Streaming bridge subprocess ────────────────────────────────
-            // The bridge is a separate `aura-bridge` binary (sibling
-            // crate). On startup we spawn it as a child process; on
-            // app shutdown the child is killed via the on_window_event
-            // handler in window_logic. The binary is searched for in
-            // a few well-known locations:
-            //
-            //   1. <exe_dir>/aura-bridge.exe         — bundled sidecar
-            //   2. <repo>/aura-bridge/target/release — release build
-            //   3. <repo>/aura-bridge/target/debug   — dev build
-            //
-            // Falling back through these means devs running `pnpm
-            // tauri dev` get the binary picked up automatically as
-            // long as they ran `cargo build` in the bridge crate at
-            // least once. Production installs ship the bundled
-            // sidecar at slot #1.
-            //
-            // If no binary is found we log a warning and let the app
-            // continue — only HTTP streams need the bridge; HTTPS
-            // bypasses entirely (per resolve_stream's routing
-            // rules), so most playback still works without it.
-            spawn_bridge_subprocess();
+            // ── Streaming bridge (in-process) ──────────────────────────────
+            // The loopback byte-range proxy runs on Tauri's shared tokio
+            // runtime inside this process — no sidecar binary to stage,
+            // bundle, spawn, or reap. Bind failure is logged and
+            // swallowed inside start_in_process (only plain-HTTP streams
+            // need the proxy; HTTPS bypasses the bridge entirely per
+            // resolve_stream's routing rules).
+            streaming::start_in_process();
 
             // ── Deep-link handler ─────────────────────────────────────────
             // Emits `deep-link` events to the frontend for both aura:// and

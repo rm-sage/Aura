@@ -167,8 +167,8 @@ if ($SkipBuild) {
 
 Write-Host "[release] running pnpm tauri build..." -ForegroundColor Cyan
 
-# Use the same staged-bridge path as bundle:release so the bridge sidecar
-# is copied into place before tauri-build sees it.
+# bundle:release is plain `tauri build` — the streaming bridge runs
+# in-process (streaming.rs), so there is no sidecar binary to stage.
 & pnpm bundle:release
 $buildExit = $LASTEXITCODE
 

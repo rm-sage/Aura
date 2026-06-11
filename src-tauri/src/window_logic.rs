@@ -440,13 +440,10 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     #[cfg(target_os = "windows")]
                     crate::mpv::thumb::shutdown();
                     clear_presence_inner();
-                    // Reap the streaming-bridge subprocess so it doesn't
-                    // outlive the parent. Without this the bridge keeps
-                    // its TCP listener bound to 11471 and the next Aura
-                    // launch can't bind the same port (the OS holds it
-                    // for ~30 s in TIME_WAIT before the parent's death
-                    // releases it via Windows' job-object semantics).
-                    crate::shutdown_bridge_subprocess();
+                    // (The streaming bridge needs no shutdown step — it
+                    // runs in-process on the tokio runtime and dies with
+                    // the process; the loopback listener is released by
+                    // the OS immediately on exit.)
                     handle.exit(0);
                 }
             }
