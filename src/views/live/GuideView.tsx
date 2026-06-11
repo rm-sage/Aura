@@ -23,6 +23,8 @@ const CHANNEL_COL_W = 220; // px — sticky left column (wide enough that most
 const ROW_H = 44; // px
 const PX_PER_MIN = 5; // 300 px / hour
 const WINDOW_HOURS = 8; // visible/scrollable span forward from the hour
+const RULER_H = 30; // px — time-ruler row height
+const LIVE_STRIP_H = 20; // px — strip above the ruler that holds the LIVE pill
 
 interface Props {
   channels: IptvChannel[];
@@ -92,47 +94,55 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
       style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
     >
       <div style={{ width: CHANNEL_COL_W + timelineW, position: "relative" }}>
-        {/* Time ruler (sticky top) */}
-        <div
-          className="sticky top-0 z-20 flex bg-[rgba(12,12,16,0.96)] backdrop-blur-sm border-b border-white/8"
-          style={{ height: 30 }}
-        >
-          <div
-            className="sticky left-0 z-10 flex-shrink-0 bg-[rgba(12,12,16,0.96)] border-r border-white/8"
-            style={{ width: CHANNEL_COL_W }}
-          />
-          <div className="relative flex-shrink-0" style={{ width: timelineW }}>
-            {hours.map((h) => (
+        {/* Sticky header: a LIVE-pill strip ABOVE the time ruler, so the pill
+            never overlaps the hour labels or the top programme row. */}
+        <div className="sticky top-0 z-20 bg-[rgba(12,12,16,0.96)] backdrop-blur-sm">
+          {/* LIVE pill strip — pill sits flush to the strip's bottom, just
+              above the ruler, with the now-line descending from its base. */}
+          <div className="relative" style={{ height: LIVE_STRIP_H }}>
+            {nowX >= 0 && nowX <= timelineW && (
               <span
-                key={h.x}
-                className="absolute top-0 h-full flex items-center text-[11px] text-white/45 font-medium border-l border-white/8 pl-1.5"
-                style={{ left: h.x }}
+                className="absolute bottom-0 -translate-x-1/2 px-1.5 h-[16px] flex items-center rounded-full
+                           bg-red-500 text-white text-[9px] font-bold tracking-wider leading-none"
+                style={{ left: CHANNEL_COL_W + nowX }}
               >
-                {h.label}
+                LIVE
               </span>
-            ))}
+            )}
+          </div>
+          {/* Time ruler */}
+          <div className="flex border-b border-white/8" style={{ height: RULER_H }}>
+            <div
+              className="sticky left-0 z-10 flex-shrink-0 bg-[rgba(12,12,16,0.96)] border-r border-white/8"
+              style={{ width: CHANNEL_COL_W }}
+            />
+            <div className="relative flex-shrink-0" style={{ width: timelineW }}>
+              {hours.map((h) => (
+                <span
+                  key={h.x}
+                  className="absolute top-0 h-full flex items-center text-[11px] text-white/45 font-medium border-l border-white/8 pl-1.5"
+                  style={{ left: h.x }}
+                >
+                  {h.label}
+                </span>
+              ))}
+            </div>
           </div>
         </div>
 
-        {/* Now line — red, spanning all rows, with a "LIVE" pill at the top
-            (over the ruler). Red is the universal live-TV cue (à la Harbor). */}
+        {/* Now line — a thin red vertical line from the LIVE pill's base down
+            through the ruler + all rows. Just the 1px line crosses the ruler
+            (harmless); the pill itself is up in its own strip. */}
         {nowX >= 0 && nowX <= timelineW && (
-          <div
+          <span
             aria-hidden
-            className="absolute top-0 bottom-0 z-30 pointer-events-none"
-            style={{ left: CHANNEL_COL_W + nowX }}
-          >
-            <span
-              className="absolute top-0 bottom-0 w-px bg-red-500/85"
-              style={{ boxShadow: "0 0 6px rgba(239,68,68,0.55)" }}
-            />
-            <span
-              className="absolute top-0 -translate-x-1/2 px-1.5 h-[18px] flex items-center rounded-full
-                         bg-red-500 text-white text-[9px] font-bold tracking-wider leading-none"
-            >
-              LIVE
-            </span>
-          </div>
+            className="absolute bottom-0 w-px bg-red-500/85 z-30 pointer-events-none"
+            style={{
+              left: CHANNEL_COL_W + nowX,
+              top: LIVE_STRIP_H,
+              boxShadow: "0 0 6px rgba(239,68,68,0.55)",
+            }}
+          />
         )}
 
         {/* Channel rows */}
