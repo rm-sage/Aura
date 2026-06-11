@@ -4730,6 +4730,32 @@ export default function SettingsView({ addons, session }: Props) {
                       invoke("apply_hdr_settings", { mode: "passthrough" }).catch(() => {});
                     }}
                   />
+                  {/* Multi-plane-overlay caveat. On displays where Windows
+                      has more than one hardware overlay (MPO) plane, it
+                      direct-scans the video plane straight to the panel
+                      during playback — the panel then applies its own HDR
+                      tone curve, which on some OLEDs raises black levels /
+                      shifts colour while playing (correct only when paused
+                      or windowed). This is a Windows/panel behaviour Aura
+                      can't override; surface it so the user knows the lever
+                      is monitor-side. */}
+                  <div
+                    className="rounded-lg bg-amber-400/10 border border-amber-300/15 px-3 py-2"
+                    data-settings-row=""
+                    data-settings-label="HDR passthrough — display note"
+                    data-settings-description="On displays with more than one hardware overlay (MPO) plane, Windows sends HDR straight to the panel during playback, so the panel's own tone curve takes over and may raise black levels or shift colour while playing (it looks correct when paused). This is a Windows/monitor behaviour Aura can't change — if blacks look milky, try a different HDR mode in your monitor's menu (e.g. Peak 1000 instead of DisplayHDR True Black) or check for a monitor firmware update."
+                  >
+                    <p className="text-amber-200/80 text-xs leading-relaxed">
+                      <span className="font-semibold">Display note:</span> on
+                      monitors with more than one hardware overlay (MPO) plane,
+                      Windows sends HDR straight to the panel during playback,
+                      so the panel's own tone curve can raise black levels or
+                      shift colour while playing (it looks correct when paused).
+                      Aura can't override this. If blacks look milky, switch your
+                      monitor's HDR mode (e.g. Peak 1000 instead of DisplayHDR
+                      True Black) or check for a monitor firmware update.
+                    </p>
+                  </div>
                 </>
               )}
               <div className="h-px bg-white/6" />
