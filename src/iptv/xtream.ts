@@ -6,10 +6,18 @@
 // URL building, and the live-channel mapping. The network hop goes
 // through the `iptv_fetch_text` Rust command (see ./fetch) so the
 // IPTV-client User-Agent and CORS-free fetch happen backend-side.
+//
+// ROBUSTNESS: the primary path is the player API (`player_api.php`), but
+// many panels disable it while still serving the M3U export (`get.php?
+// type=m3u_plus`). So `fetchXtreamLiveChannels` falls back to parsing that
+// export when the player API errors or returns zero streams — otherwise a
+// perfectly good account reads as "nothing loads". Each attempt logs a
+// concise (credential-redacted) diagnostic to the DevConsole.
 // ---------------------------------------------------------------------------
 
 import type { IptvChannel } from "./types";
 import { iptvFetchText } from "./fetch";
+import { parseM3u } from "./m3u";
 
 export interface XtreamCreds {
   base: string;
@@ -64,11 +72,52 @@ interface XtreamStream {
   tv_archive?: number;
 }
 
-/** Fetch live channels via the Xtream player API (categories + streams
- *  in parallel) and map them into Aura's channel shape. */
+/** Fetch live channels for an Xtream account. Tries the player API first
+ *  (categories + streams, mapped into Aura's channel shape); on any failure
+ *  OR an empty result, falls back to the M3U export. Throws only when BOTH
+ *  paths yield nothing, with a message that points at the likely cause. */
 export async function fetchXtreamLiveChannels(
   creds: XtreamCreds,
 ): Promise<IptvChannel[]> {
+  // 1) Player API.
+  try {
+    const channels = await fetchViaPlayerApi(creds);
+    if (channels.length > 0) {
+      console.info(`[iptv] xtream player_api → ${channels.length} channels (${redactBase(creds.base)})`);
+      return channels;
+    }
+    console.warn(`[iptv] xtream player_api returned 0 streams — trying M3U export (${redactBase(creds.base)})`);
+  } catch (e) {
+    console.warn(`[iptv] xtream player_api failed (${errStr(e)}) — trying M3U export (${redactBase(creds.base)})`);
+  }
+
+  // 2) M3U export fallback (get.php?type=m3u_plus). Panels that disable the
+  //    player API almost always still serve this.
+  try {
+    const { playlist } = buildXtreamUrls(creds);
+    const body = await iptvFetchText(playlist);
+    if (body.includes("#EXTINF")) {
+      const { channels } = parseM3u(body, playlist);
+      if (channels.length > 0) {
+        console.info(`[iptv] xtream m3u export → ${channels.length} channels (${redactBase(creds.base)})`);
+        return channels;
+      }
+    } else {
+      console.warn(`[iptv] xtream m3u export had no #EXTINF entries (${redactBase(creds.base)})`);
+    }
+  } catch (e) {
+    console.warn(`[iptv] xtream m3u export failed (${errStr(e)}) (${redactBase(creds.base)})`);
+  }
+
+  throw new Error(
+    "Couldn't load any channels from this Xtream login. The provider's player API and M3U export both returned nothing — usually wrong server/port, expired credentials, or a disabled account.",
+  );
+}
+
+/** Player-API path: categories + live streams in parallel, mapped to
+ *  Aura's channel shape. Distinguishes the auth-failure object response
+ *  ({user_info:{auth:0}}) from a genuine empty list. */
+async function fetchViaPlayerApi(creds: XtreamCreds): Promise<IptvChannel[]> {
   const q = `username=${encodeURIComponent(creds.username)}&password=${encodeURIComponent(creds.password)}`;
   const api = `${creds.base}/player_api.php?${q}`;
   const [catsText, streamsText] = await Promise.all([
@@ -77,13 +126,21 @@ export async function fetchXtreamLiveChannels(
   ]);
 
   let cats: XtreamCategory[] = [];
-  let streams: XtreamStream[] = [];
+  let streams: unknown;
   try { cats = JSON.parse(catsText) ?? []; } catch { /* tolerated — uncategorised */ }
-  try { streams = JSON.parse(streamsText) ?? []; } catch (e) {
-    throw new Error(`Xtream get_live_streams returned unparseable JSON: ${e}`);
+  try {
+    streams = JSON.parse(streamsText);
+  } catch (e) {
+    throw new Error(
+      `player_api returned non-JSON (${errStr(e)}; first bytes: ${snippet(streamsText)})`,
+    );
   }
+
+  // Auth failure / error surface as an object, not a list.
   if (!Array.isArray(streams)) {
-    throw new Error("Xtream get_live_streams did not return a list (bad credentials?)");
+    const auth = (streams as { user_info?: { auth?: number } })?.user_info?.auth;
+    if (auth === 0) throw new Error("provider rejected the credentials (auth=0)");
+    throw new Error(`player_api get_live_streams was not a list (${snippet(streamsText)})`);
   }
 
   const catName = new Map<string, string>();
@@ -93,7 +150,7 @@ export async function fetchXtreamLiveChannels(
     }
   }
 
-  return streams
+  return (streams as XtreamStream[])
     .filter((s) => s && s.stream_id != null)
     .map((s) => {
       const tvgId = s.epg_channel_id ?? "";
@@ -110,4 +167,23 @@ export async function fetchXtreamLiveChannels(
         attrs: {},
       } satisfies IptvChannel;
     });
+}
+
+/** `proto//host` with no credentials — safe to log. */
+function redactBase(base: string): string {
+  try {
+    return new URL(base).host;
+  } catch {
+    return "provider";
+  }
+}
+
+function errStr(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/** First ~120 chars of a body, single-lined, for diagnostics. Never used
+ *  on URLs (which carry credentials) — only on response bodies. */
+function snippet(s: string): string {
+  return s.replace(/\s+/g, " ").trim().slice(0, 120);
 }
