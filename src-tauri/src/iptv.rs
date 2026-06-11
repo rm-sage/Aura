@@ -15,6 +15,92 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// Persisted playlist source (lives in AppSettings.iptv_playlists). Mirrors
+// the TS `IptvPlaylistSource` in src/iptv/types.ts. `rename_all="camelCase"`
+// because we own BOTH ends of this wire format and want camelCase JSON in
+// each direction (unlike the LibraryItem case in CLAUDE.md, where the
+// inbound wire names differed from the TS interface).
+//
+// SECURITY (live-tv spec Decision D): the Xtream PASSWORD is NOT stored
+// here — it lives in the OS keyring keyed by playlist id (see the keyring
+// helpers below). `XtreamRef` carries only the server + username (the
+// username is the account identifier, not the secret, and already appears
+// in plaintext in M3U URLs). serde drops any extra `password` the frontend
+// sends, so a stray cred can't leak into settings.json.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IptvPlaylistSource {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub epg_url: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub xtream: Option<XtreamRef>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct XtreamRef {
+    pub server: String,
+    #[serde(default)]
+    pub username: String,
+}
+
+// ---------------------------------------------------------------------------
+// Xtream password → OS keyring (DPAPI on Windows, via the same `keyring`
+// crate api_keyring.rs uses). Dedicated service so the per-playlist entries
+// don't collide with the api-keys allowlist. Empty value = delete.
+// ---------------------------------------------------------------------------
+
+const XTREAM_KEYRING_SERVICE: &str = "aura-iptv-xtream";
+
+fn xtream_entry(playlist_id: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(XTREAM_KEYRING_SERVICE, playlist_id).map_err(|e| e.to_string())
+}
+
+/// Store the Xtream password for `playlist_id`. Empty deletes the entry.
+#[tauri::command]
+pub async fn iptv_set_xtream_password(playlist_id: String, password: String) -> Result<(), String> {
+    let e = xtream_entry(&playlist_id)?;
+    if password.is_empty() {
+        return iptv_clear_xtream_password(playlist_id).await;
+    }
+    e.set_password(&password).map_err(|e| e.to_string())
+}
+
+/// Read the Xtream password for `playlist_id`. Returns "" when absent
+/// (fresh, cleared, or keyring unavailable) so the caller can treat the
+/// missing-creds case uniformly.
+#[tauri::command]
+pub async fn iptv_get_xtream_password(playlist_id: String) -> Result<String, String> {
+    let e = xtream_entry(&playlist_id)?;
+    match e.get_password() {
+        Ok(p) => Ok(p),
+        Err(keyring::Error::NoEntry) => Ok(String::new()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// Drop the stored Xtream password for `playlist_id`. Idempotent.
+#[tauri::command]
+pub async fn iptv_clear_xtream_password(playlist_id: String) -> Result<(), String> {
+    let e = match xtream_entry(&playlist_id) {
+        Ok(e) => e,
+        Err(_) => return Ok(()),
+    };
+    match e.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(err) => Err(err.to_string()),
+    }
+}
 
 /// Providers fingerprint players; this UA matches the widely-allowed
 /// IPTV Smarters client (the reference implementation ships the same).

@@ -40,14 +40,19 @@ export interface IptvPlaylist {
   groups: string[];
 }
 
-/** A configured playlist source (what the user enters; persisted). */
+/** A configured playlist source (what the user enters; persisted).
+ *  NOTE: the Xtream `password` is NOT persisted in settings — it lives in
+ *  the OS keyring keyed by playlist id (`iptv_get/set_xtream_password`).
+ *  The persisted `xtream` carries only `{ server, username }`; the store
+ *  merges the password back in (optional below) before building fetch
+ *  URLs. See the live-tv spec Decision D. */
 export interface IptvPlaylistSource {
   id: string;
   name: string;
   url: string;
   epgUrl?: string | null;
   kind?: "m3u" | "xtream" | "epg";
-  xtream?: { server: string; username: string; password: string } | null;
+  xtream?: { server: string; username: string; password?: string } | null;
 }
 
 export interface EpgProgram {

@@ -2051,6 +2051,9 @@ pub fn run() {
             apply_hdr_settings,
             // ── Live TV (IPTV) network hop ───────────────────────────────────
             iptv::iptv_fetch_text,
+            iptv::iptv_set_xtream_password,
+            iptv::iptv_get_xtream_password,
+            iptv::iptv_clear_xtream_password,
             apply_subtitle_style,
             set_subtitle_position_runtime,
             set_native_fullscreen,
