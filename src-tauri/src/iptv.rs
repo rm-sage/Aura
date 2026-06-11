@@ -215,5 +215,9 @@ fn classify_send_error(e: reqwest::Error) -> String {
     if e.is_connect() {
         return "Couldn't connect to the provider (DNS / connection refused). Check the URL and your network.".into();
     }
-    format!("Fetch failed: {e}")
+    // reqwest's Display for a send error can embed the full request URL, which
+    // for an Xtream call carries `username`/`password` in the query — strip it
+    // so the credential never lands in the (verbatim-surfaced) error string /
+    // DevConsole. `without_url` drops the attached URL from Display.
+    format!("Fetch failed: {}", e.without_url())
 }

@@ -95,6 +95,13 @@ export function parseXmltvChannelNames(xml: string): Map<string, string> {
     if (open === -1) break;
     const openEnd = xml.indexOf(">", open);
     if (openEnd === -1) break;
+    // Self-closing <channel .../> has no body — without this guard, `close`
+    // below would jump to the NEXT channel's </channel>, swallowing it and
+    // mis-attributing its display-names to this id.
+    if (xml[openEnd - 1] === "/") {
+      from = openEnd + 1;
+      continue;
+    }
     const close = xml.indexOf("</channel>", openEnd);
     if (close === -1) break;
     from = close + "</channel>".length;
@@ -118,11 +125,16 @@ export function parseXmltvChannelNames(xml: string): Map<string, string> {
 /** Normalize a channel display-name for fuzzy EPG joining: lowercase, drop
  *  common quality/format tags, strip all non-alphanumerics. Digits are kept
  *  so "ESPN 2" ("espn2") never collapses onto "ESPN" ("espn"). Shared by the
- *  index builder and the resolver — they MUST normalize identically. */
+ *  index builder and the resolver — they MUST normalize identically.
+ *
+ *  The strip-set is intentionally limited to UNAMBIGUOUS quality/codec tags.
+ *  Words like "raw"/"feed"/"backup" are NOT stripped: they're substantive
+ *  parts of real names ("WWE Raw", "NFL RedZone Feed"), so stripping them
+ *  collapsed distinct channels onto the wrong EPG id. */
 export function normalizeChannelName(s: string): string {
   return s
     .toLowerCase()
-    .replace(/\b(fhd|uhd|hd|sd|4k|8k|hevc|h\.?265|h\.?264|raw|backup|feed)\b/g, " ")
+    .replace(/\b(fhd|uhd|hd|sd|4k|8k|hevc|h\.?265|h\.?264)\b/g, " ")
     .replace(/[^\p{L}\p{N}]+/gu, "");
 }
 

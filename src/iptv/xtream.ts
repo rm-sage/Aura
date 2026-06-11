@@ -97,7 +97,12 @@ export async function fetchXtreamLiveChannels(
     const { playlist } = buildXtreamUrls(creds);
     const body = await iptvFetchText(playlist);
     if (body.includes("#EXTINF")) {
-      const { channels } = parseM3u(body, playlist);
+      const parsed = parseM3u(body, playlist);
+      // Re-key into the SAME `xt:<stream_id>` id scheme the player-API path
+      // uses, so a source's channel identity is stable regardless of which
+      // path served it. Without this, favourites (keyed `sourceId::channelId`)
+      // silently break the first time a source falls back to the M3U export.
+      const channels = rekeyXtreamM3u(parsed.channels);
       if (channels.length > 0) {
         console.info(`[iptv] xtream m3u export → ${channels.length} channels (${redactBase(creds.base)})`);
         return channels;
@@ -127,7 +132,10 @@ async function fetchViaPlayerApi(creds: XtreamCreds): Promise<IptvChannel[]> {
 
   let cats: XtreamCategory[] = [];
   let streams: unknown;
-  try { cats = JSON.parse(catsText) ?? []; } catch { /* tolerated — uncategorised */ }
+  try {
+    const parsed = JSON.parse(catsText);
+    cats = Array.isArray(parsed) ? parsed : [];
+  } catch { /* tolerated — uncategorised */ }
   try {
     streams = JSON.parse(streamsText);
   } catch (e) {
@@ -167,6 +175,28 @@ async function fetchViaPlayerApi(creds: XtreamCreds): Promise<IptvChannel[]> {
         attrs: {},
       } satisfies IptvChannel;
     });
+}
+
+/** Re-key M3U-export channels into the player-API `xt:<stream_id>` scheme by
+ *  pulling the numeric stream id out of each `…/live/<u>/<p>/<id>.<ext>` URL.
+ *  Channels whose URL doesn't carry a numeric id keep their parsed id. */
+function rekeyXtreamM3u(channels: IptvChannel[]): IptvChannel[] {
+  return channels.map((ch) => {
+    const sid = xtreamStreamId(ch.url);
+    return sid ? { ...ch, id: `xt:${sid}` } : ch;
+  });
+}
+
+/** Extract the numeric Xtream stream id from a live URL's last path segment
+ *  (`…/12345.ts` → "12345"). Null when the basename isn't a bare number. */
+function xtreamStreamId(url: string): string | null {
+  try {
+    const last = new URL(url).pathname.split("/").filter(Boolean).pop() ?? "";
+    const base = last.replace(/\.[a-z0-9]+$/i, "");
+    return /^\d+$/.test(base) ? base : null;
+  } catch {
+    return null;
+  }
 }
 
 /** `proto//host` with no credentials — safe to log. */
