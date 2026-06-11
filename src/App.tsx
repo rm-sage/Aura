@@ -1226,6 +1226,13 @@ export default function App() {
     ) => {
       try {
         if (!stream.url && !stream.info_hash) return;
+        // Live TV carve-out, computed from `target` (isLivePlayback derives
+        // from activeTarget, which isn't set yet mid-load). A live channel has
+        // no byte-range CDN edge to preheat and no useful scrubber thumbnails,
+        // and both of those open an EXTRA upstream connection — wasteful, and
+        // costly against a provider's simultaneous-stream cap.
+        const isLiveTarget =
+          target.media_type === "tv" || target.id.startsWith("iptv:");
         // User actually engaged with this series → clear the
         // auto-bumped CW-suppression flag (recheck-watched flow).
         // The series can now re-enter CW as normal once the player
@@ -1339,7 +1346,7 @@ export default function App() {
         // connects normally" (which it would have anyway). Skip for
         // magnet URLs (no HTTP edge to preheat) and for `http://127.
         // 0.0.1:` bridge URLs (the bridge sits on the loopback).
-        if (resolved.startsWith("https://") || (resolved.startsWith("http://") && !resolved.startsWith("http://127.0.0.1:"))) {
+        if (!isLiveTarget && (resolved.startsWith("https://") || (resolved.startsWith("http://") && !resolved.startsWith("http://127.0.0.1:")))) {
           const preheatStart = Date.now();
           void fetch(resolved, {
             method: "GET",
@@ -1427,7 +1434,7 @@ export default function App() {
           // clear of the loadfile critical section (landmine #3) and
           // touches a different instance entirely (never the "main"
           // mpv). No-op for magnet streams (no stream.url).
-          if (stream.url) {
+          if (stream.url && !isLiveTarget) {
             void invoke("extract_thumbnail", {
               url: stream.url,
               atSeconds: 1,
@@ -1951,6 +1958,13 @@ export default function App() {
   const subsFetchedFor = useRef<string | null>(null);
   useEffect(() => {
     if (!activeTarget) return;
+    // Live TV has no IMDb id / episode / Stremio meta to match — searching
+    // subtitle addons for `tv/iptv:<id>` just fans out junk lookups to every
+    // installed subtitle addon (incl. the user's VPS) per tune-in. Skip it.
+    if (isLivePlayback) {
+      setActiveExternalSubs([]);
+      return;
+    }
     const key = `${activeTarget.media_type}:${activeTarget.id}`;
     if (subsFetchedFor.current === key) return;
     subsFetchedFor.current = key;
@@ -1962,7 +1976,7 @@ export default function App() {
     })
       .then((subs) => setActiveExternalSubs(subs ?? []))
       .catch(() => setActiveExternalSubs([]));
-  }, [activeTarget, addons]);
+  }, [activeTarget, addons, isLivePlayback]);
 
   // ── Subtitle picker overlay ──
   const [subsOpen, setSubsOpen] = useState(false);
@@ -2953,16 +2967,18 @@ export default function App() {
   //     home_view_secs counter is bumped from the Home view directly.
   const lastStatsTickRef = useRef<number | null>(null);
   useEffect(() => {
-    if (!activeTarget) {
+    // Live TV isn't a VOD "stream played" and a 24/7 channel left on would
+    // pollute the watch-time stats — carve it out like scrobble/history do.
+    if (!activeTarget || isLivePlayback) {
       lastStatsTickRef.current = null;
       return;
     }
     // First-time per session — count this as a stream played.
     invoke("bump_stat", { kind: "streams_played", delta: 1 }).catch(() => {});
     lastStatsTickRef.current = Date.now();
-  }, [activeTarget?.id, activeTarget?.media_type]);
+  }, [activeTarget?.id, activeTarget?.media_type, isLivePlayback]);
   useEffect(() => {
-    if (!activeTarget || paused) {
+    if (!activeTarget || paused || isLivePlayback) {
       lastStatsTickRef.current = null;
       return;
     }
@@ -2996,7 +3012,7 @@ export default function App() {
     }, 5000);
     lastStatsTickRef.current = Date.now();
     return () => clearInterval(id);
-  }, [activeTarget, paused]);
+  }, [activeTarget, paused, isLivePlayback]);
 
   // ── Keep the display awake during active playback ──
   // Belt-and-suspenders alongside mpv's own stop-screensaver: assert the

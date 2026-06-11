@@ -1536,6 +1536,9 @@ export default function PlayerOverlay({
   const extSubFallbackRef = useRef(false);
   useEffect(() => {
     if (extSubFallbackRef.current) return;
+    // Live TV has no persistent subtitles — never auto-load one (the upstream
+    // external-sub fetch is already skipped for live, this is belt-and-braces).
+    if (isLive) return;
     // Need the initial fetch to have produced data so an empty embedded
     // list is a real "no subs" answer rather than "we haven't fetched yet".
     if (tracks.length === 0) return;
@@ -1559,7 +1562,7 @@ export default function PlayerOverlay({
     })
       .then(() => window.dispatchEvent(new Event("aura:tracks-refresh")))
       .catch(() => {});
-  }, [tracks.length, embeddedSubTracks.length, externalSubs, preferredSubLang]);
+  }, [tracks.length, embeddedSubTracks.length, externalSubs, preferredSubLang, isLive]);
 
   // ── Audio auto-select ─────────────────────────────────────────────
   // Replaces the old simple lang-prefix match with the full scoring
