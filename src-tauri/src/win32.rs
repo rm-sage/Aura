@@ -314,6 +314,11 @@ type GetForegroundWindowFn =
 /// user lands back in the same window state when they exit.
 type IsZoomedFn =
     unsafe extern "system" fn(*mut c_void) -> i32;
+/// SetLayeredWindowAttributes(hwnd, crKey COLORREF, bAlpha u8, dwFlags) —
+/// drives the MPO "poison pill" (constant window alpha). LWA_ALPHA flag.
+type SetLayeredWindowAttributesFn =
+    unsafe extern "system" fn(*mut c_void, u32, u8, u32) -> i32;
+const LWA_ALPHA: u32 = 0x0000_0002;
 
 /// Window-style longptr index.
 const GWL_STYLE: i32 = -16;
@@ -611,6 +616,68 @@ pub fn signal_fullscreen_to_shell(
 
 /// Move the parent window to its current monitor's full bounds. Saves
 /// the previous bounds so `exit_native_fullscreen` can restore them.
+// ---------------------------------------------------------------------------
+// MPO "poison pill" (experimental, env-gated) — Poison Pill 2
+//
+// On displays where Windows promotes Aura's MPV child swapchain to an
+// Independent-Flip / Multi-Plane-Overlay hardware plane, the panel receives
+// the raw PQ signal and applies its OWN near-black EOTF (raised blacks on
+// some QD-OLEDs). Forcing DWM to composite the window instead fixes it, but
+// every per-app lever tried (in-webview overlay, d3d11-output-mode, geometry)
+// either can't defeat hardware plane-blending or breaks --wid.
+//
+// This lever targets the TOP-LEVEL window (the mpv child's ancestor): giving
+// it a constant, non-255 layer alpha forces DWM to flatten the whole visual
+// tree before attenuating it — a hardware overlay can't apply "root × 0.996"
+// to an independent video plane, so the child can no longer be direct-
+// scanned. Global MPO stays enabled for other apps (games' RTX HDR), only
+// Aura's window tree becomes plane-ineligible.
+//
+// EXPERIMENTAL: gated behind `AURA_FORCE_COMPOSITION=1` so it can be toggled
+// per-launch without a rebuild. Risk: the constant alpha doesn't cleanly
+// coexist with the per-pixel transparency the WebView2 already uses — if it
+// breaks the transparent overlay (mpv stops showing through, or the UI
+// vanishes), unset the env var. Alpha 254/255 is visually imperceptible.
+fn mpo_poison_active() -> bool {
+    std::env::var("AURA_FORCE_COMPOSITION")
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
+/// Apply (or re-assert) Poison Pill 2 on the top-level window: ensure
+/// WS_EX_LAYERED is set, then a constant 254/255 alpha via
+/// SetLayeredWindowAttributes. No-op unless `AURA_FORCE_COMPOSITION` is set.
+/// Idempotent — safe to call at startup and re-assert after every fullscreen
+/// transition (style changes can drop the layered attributes).
+pub fn apply_mpo_poison(parent_hwnd: isize) {
+    if !mpo_poison_active() || parent_hwnd == 0 {
+        return;
+    }
+    unsafe {
+        let Ok(user32) = libloading::Library::new("user32.dll") else { return; };
+        let Ok(get_long) = user32.get::<GetWindowLongPtrWFn>(b"GetWindowLongPtrW\0") else { return; };
+        let Ok(set_long) = user32.get::<SetWindowLongPtrWFn>(b"SetWindowLongPtrW\0") else { return; };
+        let Ok(set_layered) =
+            user32.get::<SetLayeredWindowAttributesFn>(b"SetLayeredWindowAttributes\0")
+        else { return; };
+
+        let hwnd = parent_hwnd as *mut c_void;
+        let ex = get_long(hwnd, GWL_EXSTYLE);
+        if ex & WS_EX_LAYERED == 0 {
+            set_long(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+        }
+        // Constant alpha forces whole-tree composition (the point). crKey=0
+        // is ignored without LWA_COLORKEY. bAlpha=254 ≈ 99.6 % opacity.
+        let r = set_layered(hwnd, 0, 254, LWA_ALPHA);
+        crate::devlog!(info, "win32",
+            "MPO poison: WS_EX_LAYERED + constant alpha 254 applied (SetLayeredWindowAttributes rc={r})",
+        );
+    }
+}
+
 pub fn enter_native_fullscreen(parent_hwnd: isize) -> Result<(), String> {
     if parent_hwnd == 0 {
         return Err("invalid hwnd".into());
@@ -712,7 +779,16 @@ pub fn enter_native_fullscreen(parent_hwnd: isize) -> Result<(), String> {
         //     taskbar bug). We only log when something changed.
         let current_ex_style = get_window_long(parent, GWL_EXSTYLE);
         *SAVED_EX_STYLE.lock().unwrap() = Some(current_ex_style);
-        let fullscreen_ex_style = current_ex_style & !(WS_EX_LAYERED | WS_EX_TRANSPARENT);
+        // When the MPO poison is active we must KEEP WS_EX_LAYERED through
+        // fullscreen — stripping it would re-enable plane promotion exactly
+        // where the QD-OLED black-lift is worst (full-monitor coverage). The
+        // layered alpha is re-asserted at the end of this fn.
+        let strip_mask = if mpo_poison_active() {
+            WS_EX_TRANSPARENT
+        } else {
+            WS_EX_LAYERED | WS_EX_TRANSPARENT
+        };
+        let fullscreen_ex_style = current_ex_style & !strip_mask;
         if fullscreen_ex_style != current_ex_style {
             set_window_long(parent, GWL_EXSTYLE, fullscreen_ex_style);
             crate::devlog!(info, "win32",
@@ -820,6 +896,11 @@ pub fn enter_native_fullscreen(parent_hwnd: isize) -> Result<(), String> {
         crate::devlog!(info, "win32", "ITaskbarList2 signalled fullscreen=true");
     }
 
+    // Re-assert the MPO poison (constant layer alpha) now that all
+    // style / position changes have settled — a SetWindowLongPtr on
+    // GWL_STYLE can drop the layered attributes. No-op unless gated on.
+    apply_mpo_poison(parent_hwnd);
+
     Ok(())
 }
 
@@ -921,6 +1002,11 @@ pub fn exit_native_fullscreen(parent_hwnd: isize) -> Result<(), String> {
     } else {
         crate::devlog!(info, "win32", "ITaskbarList2 signalled fullscreen=false");
     }
+
+    // Re-assert the MPO poison after the windowed-mode style restore — the
+    // saved ex-style brought WS_EX_LAYERED back, but the constant alpha must
+    // be re-set whenever the layered bit is re-applied. No-op unless gated on.
+    apply_mpo_poison(parent_hwnd);
 
     Ok(())
 }
