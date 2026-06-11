@@ -52,10 +52,12 @@ export default function GuideView({ channels, sourceId, nowMs, hasEpg, onPlayCha
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [windowStart]);
 
-  // Hour tick marks across the ruler.
+  // Hour tick marks across the ruler. Stop BEFORE windowEnd — a tick at the
+  // very right edge (x === timelineW) renders its label outside the timeline
+  // box, where it shows as unstyled overflow text.
   const hours = useMemo(() => {
     const out: { x: number; label: string }[] = [];
-    for (let t = windowStart; t <= windowEnd; t += 3_600_000) {
+    for (let t = windowStart; t < windowEnd; t += 3_600_000) {
       out.push({
         x: ((t - windowStart) / 60_000) * PX_PER_MIN,
         label: new Date(t).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
