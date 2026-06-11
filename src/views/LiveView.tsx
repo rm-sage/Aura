@@ -11,6 +11,14 @@ import {
   removePlaylistSource,
   refreshPlaylist,
 } from "../iptv/store";
+import {
+  subscribeEpg,
+  loadEpg,
+  resolveNowNext,
+  hasEpg,
+  dropEpg,
+  type NowNext,
+} from "../iptv/epgStore";
 import type { IptvChannel, IptvPlaylist } from "../iptv/types";
 import PlaylistForm from "./live/PlaylistForm";
 
@@ -42,6 +50,25 @@ function useIptv() {
   return getIptvState();
 }
 
+/** A version counter that bumps whenever the EPG store changes (load /
+ *  error / evict), so consumers re-resolve now/next. */
+function useEpgVersion(): number {
+  const [v, bump] = useReducer((n: number) => n + 1, 0);
+  useEffect(() => subscribeEpg(bump), []);
+  return v;
+}
+
+/** Current wall-clock ms, refreshed on an interval so now/next + progress
+ *  bars advance. 30 s granularity is plenty for programme boundaries. */
+function useNowTick(intervalMs = 30_000): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), intervalMs);
+    return () => window.clearInterval(id);
+  }, [intervalMs]);
+  return now;
+}
+
 export default function LiveView(props: Props) {
   return (
     <ErrorBoundary scope="LiveTV">
@@ -52,6 +79,8 @@ export default function LiveView(props: Props) {
 
 function LiveBody({ active, onPlayChannel }: Props) {
   const state = useIptv();
+  const epgVer = useEpgVersion();
+  const nowMs = useNowTick();
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
   const [selectedGroup, setSelectedGroup] = useState<string>("All");
   const [query, setQuery] = useState("");
@@ -83,6 +112,16 @@ function LiveBody({ active, onPlayChannel }: Props) {
   const loading = selectedSourceId ? state.loading.has(selectedSourceId) : false;
   const error = selectedSourceId ? state.errors.get(selectedSourceId) ?? null : null;
 
+  // Load the EPG for the active playlist (no-op when it has no epgUrl, or
+  // when a fresh parse is already cached).
+  useEffect(() => {
+    if (playlist && selectedSourceId) {
+      void loadEpg(selectedSourceId, playlist.epgUrl, playlist.channels);
+    }
+  }, [selectedSourceId, playlist]);
+
+  const epgReady = selectedSourceId ? hasEpg(selectedSourceId) : false;
+
   // Group counts for the sidebar (computed once per playlist).
   const groups = useMemo(() => {
     if (!playlist) return [];
@@ -107,6 +146,21 @@ function LiveBody({ active, onPlayChannel }: Props) {
 
   const visible = filtered.length > MAX_VISIBLE ? filtered.slice(0, MAX_VISIBLE) : filtered;
 
+  // Resolve now/next for the visible cards ONCE per render (not per card) —
+  // keyed on the visible set, source, the 30 s now-tick, and the EPG version
+  // (so it re-resolves when the EPG finishes loading). `epgVer` participates
+  // only as a re-trigger. Bounded to MAX_VISIBLE entries.
+  const nowNextByChannel = useMemo(() => {
+    const map = new Map<string, NowNext>();
+    if (!selectedSourceId || !epgReady) return map;
+    for (const ch of visible) {
+      const nn = resolveNowNext(selectedSourceId, ch, nowMs);
+      if (nn && (nn.now || nn.next)) map.set(ch.id, nn);
+    }
+    return map;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible, selectedSourceId, nowMs, epgReady, epgVer]);
+
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
       {/* Header */}
@@ -124,7 +178,10 @@ function LiveBody({ active, onPlayChannel }: Props) {
               selectedId={selectedSourceId}
               onSelect={setSelectedSourceId}
               onRefresh={(id) => refreshPlaylist(id, { force: true })}
-              onRemove={(id) => removePlaylistSource(id)}
+              onRemove={(id) => {
+                dropEpg(id);
+                void removePlaylistSource(id);
+              }}
             />
           )}
           <button
@@ -210,6 +267,8 @@ function LiveBody({ active, onPlayChannel }: Props) {
                     <ChannelCard
                       key={ch.id}
                       channel={ch}
+                      nowNext={nowNextByChannel.get(ch.id) ?? null}
+                      nowMs={nowMs}
                       onPlay={() => playlist && onPlayChannel(ch, playlist)}
                     />
                   ))}
@@ -240,16 +299,25 @@ function LiveBody({ active, onPlayChannel }: Props) {
 
 const ChannelCard = memo(function ChannelCard({
   channel,
+  nowNext,
+  nowMs,
   onPlay,
 }: {
   channel: IptvChannel;
+  nowNext: NowNext | null;
+  nowMs: number;
   onPlay: () => void;
 }) {
+  const now = nowNext?.now ?? null;
+  const progress =
+    now && now.endMs > now.startMs
+      ? Math.max(0, Math.min(1, (nowMs - now.startMs) / (now.endMs - now.startMs)))
+      : null;
   return (
     <button
       type="button"
       onClick={onPlay}
-      title={channel.name}
+      title={now ? `${channel.name} — ${now.title}` : channel.name}
       className="group flex flex-col items-stretch text-left rounded-xl overflow-hidden
                  border border-white/8 bg-white/[0.03] hover:bg-white/[0.07]
                  hover:border-white/15 transition-colors"
@@ -276,10 +344,25 @@ const ChannelCard = memo(function ChannelCard({
             <path d="M8 5v14l11-7z" />
           </svg>
         </span>
+        {/* Live progress bar across the current programme. */}
+        {progress != null && (
+          <span aria-hidden className="absolute inset-x-0 bottom-0 h-[3px] bg-black/40">
+            <span
+              className="block h-full bg-ln-accent/80"
+              style={{ width: `${(progress * 100).toFixed(1)}%` }}
+            />
+          </span>
+        )}
       </div>
       <div className="px-2.5 py-2">
         <p className="text-[12.5px] text-white/85 font-medium truncate">{channel.name}</p>
-        <p className="text-[10.5px] text-white/35 truncate">{channel.group}</p>
+        {now ? (
+          <p className="text-[10.5px] text-ln-accent/80 truncate" title={now.title}>
+            {now.title}
+          </p>
+        ) : (
+          <p className="text-[10.5px] text-white/35 truncate">{channel.group}</p>
+        )}
       </div>
     </button>
   );
