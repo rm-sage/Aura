@@ -27,6 +27,7 @@ export default function PlaylistForm({ onClose, onAdded }: Props) {
   const [name, setName] = useState("");
   // M3U
   const [url, setUrl] = useState("");
+  const [epgUrl, setEpgUrl] = useState("");
   // Xtream
   const [server, setServer] = useState("");
   const [username, setUsername] = useState("");
@@ -62,10 +63,13 @@ export default function PlaylistForm({ onClose, onAdded }: Props) {
       if (tab === "m3u") {
         const u = url.trim();
         if (!/^https?:\/\//i.test(u)) throw new Error("Enter a full http(s):// playlist URL.");
+        const epg = epgUrl.trim();
+        if (epg && !/^https?:\/\//i.test(epg)) throw new Error("The EPG URL must be a full http(s):// URL.");
         const source = await addPlaylistSource({
           name: name.trim() || hostnameOf(u) || "Playlist",
           url: u,
           kind: "m3u",
+          epgUrl: epg || null,
         });
         onAdded(source.id);
       } else {
@@ -125,16 +129,27 @@ export default function PlaylistForm({ onClose, onAdded }: Props) {
 
         <div className="space-y-3">
           {tab === "m3u" ? (
-            <Field label="Playlist URL (M3U / M3U8)">
-              <input
-                ref={firstFieldRef}
-                value={url}
-                onChange={(e) => setUrl(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && submit()}
-                placeholder="https://provider.example/get.php?username=…&type=m3u_plus"
-                className={inputCls}
-              />
-            </Field>
+            <>
+              <Field label="Playlist URL (M3U / M3U8)">
+                <input
+                  ref={firstFieldRef}
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && submit()}
+                  placeholder="https://provider.example/get.php?username=…&type=m3u_plus"
+                  className={inputCls}
+                />
+              </Field>
+              <Field label="EPG URL (XMLTV, optional)">
+                <input
+                  value={epgUrl}
+                  onChange={(e) => setEpgUrl(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && submit()}
+                  placeholder="https://provider.example/epg.xml  (for the TV guide)"
+                  className={inputCls}
+                />
+              </Field>
+            </>
           ) : (
             <>
               <Field label="Server URL">

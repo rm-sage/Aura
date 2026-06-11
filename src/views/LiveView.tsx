@@ -21,11 +21,17 @@ import {
 } from "../iptv/epgStore";
 import type { IptvChannel, IptvPlaylist } from "../iptv/types";
 import PlaylistForm from "./live/PlaylistForm";
+import GuideView from "./live/GuideView";
+
+/** Guide rows are heavier than grid cards (sticky cells + per-row timeline);
+ *  cap them tighter than the grid so a huge category stays responsive. */
+const GUIDE_MAX_ROWS = 150;
+type ViewMode = "grid" | "guide";
 
 // ---------------------------------------------------------------------------
 // LiveView — Live TV (IPTV) browser. Source picker + group sidebar + search
-// + channel grid. Phase 1 (M3U). Channels play through the normal player via
-// the `onPlayChannel` callback (App wires the synthetic stream/target +
+// + channel grid OR EPG guide grid. Channels play through the normal player
+// via the `onPlayChannel` callback (App wires the synthetic stream/target +
 // isLive flag). Restyled to Aura's glass/spectral tokens.
 //
 // MEMORY: the channel grid is CAPPED to MAX_VISIBLE rendered cards and uses
@@ -85,6 +91,7 @@ function LiveBody({ active, onPlayChannel }: Props) {
   const [selectedGroup, setSelectedGroup] = useState<string>("All");
   const [query, setQuery] = useState("");
   const [formOpen, setFormOpen] = useState(false);
+  const [viewMode, setViewMode] = useState<ViewMode>("grid");
 
   // Load configured sources on first activation.
   useEffect(() => {
@@ -224,7 +231,7 @@ function LiveBody({ active, onPlayChannel }: Props) {
 
           {/* Channel area */}
           <div className="flex-1 flex flex-col min-w-0">
-            {/* Search + count */}
+            {/* Search + count + view toggle */}
             <div className="px-6 py-3 flex items-center gap-3 flex-wrap">
               <input
                 value={query}
@@ -237,44 +244,58 @@ function LiveBody({ active, onPlayChannel }: Props) {
               {playlist && (
                 <span className="text-white/35 text-xs">
                   {filtered.length.toLocaleString()} channel{filtered.length === 1 ? "" : "s"}
-                  {filtered.length > MAX_VISIBLE && ` · showing first ${MAX_VISIBLE} (refine to see all)`}
+                  {viewMode === "grid" && filtered.length > MAX_VISIBLE &&
+                    ` · showing first ${MAX_VISIBLE} (refine to see all)`}
+                  {viewMode === "guide" && filtered.length > GUIDE_MAX_ROWS &&
+                    ` · guide showing first ${GUIDE_MAX_ROWS} (refine to see all)`}
                 </span>
               )}
+              <ViewModeToggle mode={viewMode} onChange={setViewMode} />
             </div>
 
-            {/* Grid */}
-            <div
-              className="flex-1 overflow-y-auto px-6 pb-8"
-              style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
-            >
-              {loading && !playlist ? (
-                <GridSkeleton />
-              ) : error ? (
-                <ErrorState
-                  message={error}
-                  onRetry={() => selectedSourceId && refreshPlaylist(selectedSourceId, { force: true })}
-                />
-              ) : visible.length === 0 ? (
-                <p className="text-white/40 text-sm py-12 text-center">
-                  {query ? "No channels match your search." : "No channels in this group."}
-                </p>
-              ) : (
-                <div
-                  className="grid gap-3"
-                  style={{ gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))" }}
-                >
-                  {visible.map((ch) => (
-                    <ChannelCard
-                      key={ch.id}
-                      channel={ch}
-                      nowNext={nowNextByChannel.get(ch.id) ?? null}
-                      nowMs={nowMs}
-                      onPlay={() => playlist && onPlayChannel(ch, playlist)}
-                    />
-                  ))}
-                </div>
-              )}
-            </div>
+            {/* Body — grid or guide */}
+            {viewMode === "guide" ? (
+              <GuideView
+                channels={filtered.slice(0, GUIDE_MAX_ROWS)}
+                sourceId={selectedSourceId ?? ""}
+                nowMs={nowMs}
+                hasEpg={epgReady}
+                onPlayChannel={(ch) => playlist && onPlayChannel(ch, playlist)}
+              />
+            ) : (
+              <div
+                className="flex-1 overflow-y-auto px-6 pb-8"
+                style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
+              >
+                {loading && !playlist ? (
+                  <GridSkeleton />
+                ) : error ? (
+                  <ErrorState
+                    message={error}
+                    onRetry={() => selectedSourceId && refreshPlaylist(selectedSourceId, { force: true })}
+                  />
+                ) : visible.length === 0 ? (
+                  <p className="text-white/40 text-sm py-12 text-center">
+                    {query ? "No channels match your search." : "No channels in this group."}
+                  </p>
+                ) : (
+                  <div
+                    className="grid gap-3"
+                    style={{ gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))" }}
+                  >
+                    {visible.map((ch) => (
+                      <ChannelCard
+                        key={ch.id}
+                        channel={ch}
+                        nowNext={nowNextByChannel.get(ch.id) ?? null}
+                        nowMs={nowMs}
+                        onPlay={() => playlist && onPlayChannel(ch, playlist)}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -373,6 +394,30 @@ const ChannelGlyph = () => (
     <path d="M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h5v2h8v-2h5c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 14H3V5h18v12z" />
   </svg>
 );
+
+// ---------------------------------------------------------------------------
+// Grid / Guide view toggle
+// ---------------------------------------------------------------------------
+
+function ViewModeToggle({ mode, onChange }: { mode: ViewMode; onChange: (m: ViewMode) => void }) {
+  return (
+    <div className="ml-auto flex gap-1 p-1 rounded-xl bg-white/5 border border-white/8">
+      {(["grid", "guide"] as const).map((m) => (
+        <button
+          key={m}
+          type="button"
+          onClick={() => onChange(m)}
+          className={[
+            "px-3 h-7 rounded-lg text-[12px] font-medium capitalize transition-colors",
+            mode === m ? "bg-ln-accent/20 text-ln-accent" : "text-white/55 hover:text-white/85",
+          ].join(" ")}
+        >
+          {m}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Group sidebar row
