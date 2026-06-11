@@ -24,6 +24,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { iptvFetchText } from "./fetch";
 import { parseM3u, groupChannels } from "./m3u";
+import { fetchXtreamLiveChannels, buildXtreamUrls, type XtreamCreds } from "./xtream";
 import type { IptvPlaylist, IptvPlaylistSource } from "./types";
 
 const CHANGE_EVENT = "aura:iptv-changed";
@@ -193,11 +194,39 @@ async function doFetch(source: IptvPlaylistSource): Promise<void> {
   }
 }
 
-/** Resolve a source to a parsed playlist. Phase 1 handles `m3u` (and any
- *  source whose url is a plain playlist). Xtream (`kind === "xtream"`) is
- *  wired in Phase 2 — for now it falls through to the M3U path using the
- *  source url, which already works for Xtream `get.php` playlist URLs. */
+/** Resolve a source to a parsed playlist. `xtream` uses the player API
+ *  (categories + live streams) with the keyring password merged in;
+ *  everything else is fetched as an M3U body. */
 async function fetchAndParse(source: IptvPlaylistSource): Promise<IptvPlaylist> {
+  if (source.kind === "xtream" && source.xtream) {
+    const password = await getXtreamPassword(source.id);
+    if (!password) {
+      throw new Error("No saved password for this Xtream login. Remove and re-add it.");
+    }
+    const creds: XtreamCreds = {
+      base: source.xtream.server,
+      username: source.xtream.username,
+      password,
+    };
+    const channels = await fetchXtreamLiveChannels(creds);
+    if (channels.length === 0) {
+      throw new Error("Xtream returned no live channels (check the subscription / credentials).");
+    }
+    const groups = [...groupChannels(channels).keys()];
+    // EPG URL is derived fresh (carries the keyring password) — never
+    // persisted. The in-memory playlist holds it only for the EPG phase.
+    const epgUrl = source.epgUrl ?? buildXtreamUrls(creds).epg;
+    return {
+      id: source.id,
+      name: source.name,
+      url: source.url,
+      epgUrl,
+      channels,
+      fetchedAt: Date.now(),
+      groups,
+    };
+  }
+
   const body = await iptvFetchText(source.url);
   if (!body.trim().startsWith("#EXTM3U") && !body.includes("#EXTINF")) {
     throw new Error("That URL didn't return an M3U playlist (no #EXTINF entries found).");
@@ -229,6 +258,16 @@ export function classifyIptvError(e: unknown): string {
   // status / connection / timeout cases — pass those through verbatim.
   if (raw && raw.length > 0 && raw !== "[object Object]") return raw;
   return "Couldn't load this playlist. Check the URL and your connection.";
+}
+
+/** Read an Xtream login's password from the OS keyring (empty when
+ *  absent / keyring unavailable). */
+async function getXtreamPassword(playlistId: string): Promise<string> {
+  try {
+    return await invoke<string>("iptv_get_xtream_password", { playlistId });
+  } catch {
+    return "";
+  }
 }
 
 /** Tiny non-crypto string hash for synthetic ids (mirrors m3u.ts). */
