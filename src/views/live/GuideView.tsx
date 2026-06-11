@@ -1,8 +1,9 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { memo, useMemo, useRef, useEffect } from "react";
+import { memo, useMemo, useRef, useEffect, useReducer } from "react";
 import { channelPrograms } from "../../iptv/epgStore";
+import { isFavorite, toggleFavorite, subscribeFavorites } from "../../iptv/favoritesStore";
 import type { IptvChannel, EpgProgram } from "../../iptv/types";
 
 // ---------------------------------------------------------------------------
@@ -25,12 +26,16 @@ const WINDOW_HOURS = 8; // visible/scrollable span forward from the hour
 interface Props {
   channels: IptvChannel[];
   sourceId: string;
+  sourceName: string;
   nowMs: number;
   hasEpg: boolean;
   onPlayChannel: (channel: IptvChannel) => void;
 }
 
-export default function GuideView({ channels, sourceId, nowMs, hasEpg, onPlayChannel }: Props) {
+export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEpg, onPlayChannel }: Props) {
+  // Re-render the rows when favourites change so the stars stay in sync.
+  const [, bumpFav] = useReducer((n: number) => n + 1, 0);
+  useEffect(() => subscribeFavorites(bumpFav), []);
   // Window: floor `now` to the hour so the in-progress programme is visible,
   // spanning WINDOW_HOURS forward. Recomputed only when the hour rolls over.
   const windowStart = useMemo(() => {
@@ -123,6 +128,8 @@ export default function GuideView({ channels, sourceId, nowMs, hasEpg, onPlayCha
             key={ch.id}
             channel={ch}
             sourceId={sourceId}
+            sourceName={sourceName}
+            favorited={isFavorite(sourceId, ch.id)}
             windowStart={windowStart}
             windowEnd={windowEnd}
             nowMs={nowMs}
@@ -138,6 +145,8 @@ export default function GuideView({ channels, sourceId, nowMs, hasEpg, onPlayCha
 const GuideRow = memo(function GuideRow({
   channel,
   sourceId,
+  sourceName,
+  favorited,
   windowStart,
   windowEnd,
   nowMs,
@@ -146,6 +155,8 @@ const GuideRow = memo(function GuideRow({
 }: {
   channel: IptvChannel;
   sourceId: string;
+  sourceName: string;
+  favorited: boolean;
   windowStart: number;
   windowEnd: number;
   nowMs: number;
@@ -170,29 +181,53 @@ const GuideRow = memo(function GuideRow({
 
   return (
     <div className="flex border-b border-white/[0.05]" style={{ height: ROW_H }}>
-      {/* Sticky channel cell — also the play button. */}
-      <button
-        type="button"
-        onClick={onPlay}
-        title={channel.name}
-        className="sticky left-0 z-[5] flex-shrink-0 flex items-center gap-2 px-2.5
-                   bg-[rgba(12,12,16,0.92)] border-r border-white/8 text-left
-                   hover:bg-white/[0.06] transition-colors"
+      {/* Sticky channel cell — play button + favourite star. */}
+      <div
+        className="group sticky left-0 z-[5] flex-shrink-0 relative
+                   bg-[rgba(12,12,16,0.92)] border-r border-white/8"
         style={{ width: CHANNEL_COL_W }}
       >
-        {channel.logo ? (
-          <img
-            src={channel.logo}
-            alt=""
-            loading="lazy"
-            className="w-8 h-8 object-contain flex-shrink-0"
-            onError={(e) => { (e.currentTarget.style.visibility = "hidden"); }}
-          />
-        ) : (
-          <span className="w-8 h-8 flex-shrink-0" />
-        )}
-        <span className="text-[12px] text-white/80 font-medium truncate">{channel.name}</span>
-      </button>
+        <button
+          type="button"
+          onClick={onPlay}
+          title={channel.name}
+          className="w-full h-full flex items-center gap-2 px-2.5 pr-7 text-left
+                     hover:bg-white/[0.06] transition-colors"
+        >
+          {channel.logo ? (
+            <img
+              src={channel.logo}
+              alt=""
+              loading="lazy"
+              className="w-8 h-8 object-contain flex-shrink-0"
+              onError={(e) => { (e.currentTarget.style.visibility = "hidden"); }}
+            />
+          ) : (
+            <span className="w-8 h-8 flex-shrink-0" />
+          )}
+          <span className="text-[12px] text-white/80 font-medium truncate">{channel.name}</span>
+        </button>
+        <button
+          type="button"
+          aria-label={favorited ? "Remove from favorites" : "Add to favorites"}
+          title={favorited ? "Remove from favorites" : "Add to favorites"}
+          onClick={(e) => {
+            e.stopPropagation();
+            toggleFavorite(sourceId, sourceName, channel);
+          }}
+          className={[
+            "absolute top-1/2 -translate-y-1/2 right-1 w-6 h-6 rounded-md flex items-center justify-center transition-all",
+            favorited
+              ? "opacity-100 text-amber-300"
+              : "opacity-0 group-hover:opacity-100 text-white/40 hover:text-amber-300",
+          ].join(" ")}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill={favorited ? "currentColor" : "none"}
+               stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round">
+            <path d="M12 2.5l2.9 6.1 6.6.9-4.8 4.7 1.2 6.6L12 18.6 6.1 21.8l1.2-6.6L2.5 9.5l6.6-.9z" />
+          </svg>
+        </button>
+      </div>
 
       {/* Timeline */}
       <div className="relative flex-shrink-0" style={{ width: timelineW }}>

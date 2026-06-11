@@ -20,8 +20,20 @@ import {
   type NowNext,
 } from "../iptv/epgStore";
 import type { IptvChannel, IptvPlaylist, IptvPlaylistSource } from "../iptv/types";
+import {
+  subscribeFavorites,
+  getFavorites,
+  favoriteCount,
+  isFavorite,
+  toggleFavorite,
+  dropFavoritesForSource,
+  type FavoriteChannel,
+} from "../iptv/favoritesStore";
 import PlaylistForm from "./live/PlaylistForm";
 import GuideView from "./live/GuideView";
+
+/** Sentinel `selectedGroup` value for the cross-playlist favourites view. */
+const FAVORITES_GROUP = "__favorites__";
 
 /** Guide rows are heavier than grid cards (sticky cells + per-row timeline);
  *  cap them tighter than the grid so a huge category stays responsive. */
@@ -64,6 +76,13 @@ function useEpgVersion(): number {
   return v;
 }
 
+/** Version counter that bumps on every favourites change (star/unstar). */
+function useFavoritesVersion(): number {
+  const [v, bump] = useReducer((n: number) => n + 1, 0);
+  useEffect(() => subscribeFavorites(bump), []);
+  return v;
+}
+
 /** Current wall-clock ms, refreshed on an interval so now/next + progress
  *  bars advance. 30 s granularity is plenty for programme boundaries. */
 function useNowTick(intervalMs = 30_000): number {
@@ -86,6 +105,7 @@ export default function LiveView(props: Props) {
 function LiveBody({ active, onPlayChannel }: Props) {
   const state = useIptv();
   const epgVer = useEpgVersion();
+  const favVer = useFavoritesVersion();
   const nowMs = useNowTick();
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
   const [selectedGroup, setSelectedGroup] = useState<string>("All");
@@ -169,6 +189,30 @@ function LiveBody({ active, onPlayChannel }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, selectedSourceId, nowMs, epgReady, epgVer]);
 
+  // ── Favourites (cross-playlist) ──────────────────────────────────────
+  const favoritesView = selectedGroup === FAVORITES_GROUP;
+  const totalFavorites = useMemo(() => favoriteCount(), [favVer]);
+  const favorites = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const list = [...getFavorites()];
+    return q ? list.filter((f) => f.channel.name.toLowerCase().includes(q)) : list;
+  }, [favVer, query]);
+
+  /** Play a favourite — its origin playlist may not be the selected one, so
+   *  synthesise the minimal playlist handlePlayChannel needs (it only reads
+   *  `.name`). */
+  const playFavorite = (fav: FavoriteChannel) => {
+    onPlayChannel(fav.channel, {
+      id: fav.sourceId,
+      name: fav.sourceName,
+      url: "",
+      epgUrl: null,
+      channels: [],
+      fetchedAt: 0,
+      groups: [],
+    });
+  };
+
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
       {/* Header */}
@@ -195,6 +239,7 @@ function LiveBody({ active, onPlayChannel }: Props) {
               }}
               onRemove={(id) => {
                 dropEpg(id);
+                dropFavoritesForSource(id);
                 void removePlaylistSource(id);
               }}
             />
@@ -230,6 +275,13 @@ function LiveBody({ active, onPlayChannel }: Props) {
             style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
           >
             <GroupRow
+              label="★ Favorites"
+              count={totalFavorites}
+              active={favoritesView}
+              onClick={() => setSelectedGroup(FAVORITES_GROUP)}
+              accent
+            />
+            <GroupRow
               label="All channels"
               count={playlist?.channels.length ?? 0}
               active={selectedGroup === "All"}
@@ -253,12 +305,16 @@ function LiveBody({ active, onPlayChannel }: Props) {
               <input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search channels…"
+                placeholder={favoritesView ? "Search favorites…" : "Search channels…"}
                 className="h-9 w-64 max-w-full px-3 rounded-xl bg-white/5 border border-white/10
                            text-[13px] text-white/90 placeholder:text-white/30
                            focus:outline-none focus:border-ln-accent/40"
               />
-              {playlist && (
+              {favoritesView ? (
+                <span className="text-white/35 text-xs">
+                  {favorites.length.toLocaleString()} favorite{favorites.length === 1 ? "" : "s"}
+                </span>
+              ) : playlist ? (
                 <span className="text-white/35 text-xs">
                   {filtered.length.toLocaleString()} channel{filtered.length === 1 ? "" : "s"}
                   {viewMode === "grid" && filtered.length > MAX_VISIBLE &&
@@ -266,15 +322,49 @@ function LiveBody({ active, onPlayChannel }: Props) {
                   {viewMode === "guide" && filtered.length > GUIDE_MAX_ROWS &&
                     ` · guide showing first ${GUIDE_MAX_ROWS} (refine to see all)`}
                 </span>
-              )}
-              <ViewModeToggle mode={viewMode} onChange={setViewMode} />
+              ) : null}
+              {!favoritesView && <ViewModeToggle mode={viewMode} onChange={setViewMode} />}
             </div>
 
-            {/* Body — grid or guide */}
-            {viewMode === "guide" ? (
+            {/* Body — favourites, guide, or grid */}
+            {favoritesView ? (
+              <div
+                className="flex-1 overflow-y-auto px-6 pb-8"
+                style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
+              >
+                {favorites.length === 0 ? (
+                  <p className="text-white/40 text-sm py-12 text-center max-w-md mx-auto">
+                    {query
+                      ? "No favorites match your search."
+                      : "No favorites yet. Hover a channel and tap the ★ to add it here — favorites span every playlist."}
+                  </p>
+                ) : (
+                  <div
+                    className="grid gap-3"
+                    style={{ gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))" }}
+                  >
+                    {favorites.map((fav) => (
+                      <ChannelCard
+                        key={fav.key}
+                        channel={fav.channel}
+                        nowNext={resolveNowNext(fav.sourceId, fav.channel, nowMs)}
+                        nowMs={nowMs}
+                        onPlay={() => playFavorite(fav)}
+                        favorited
+                        onToggleFavorite={() =>
+                          toggleFavorite(fav.sourceId, fav.sourceName, fav.channel)
+                        }
+                        sourceLabel={fav.sourceName}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            ) : viewMode === "guide" ? (
               <GuideView
                 channels={filtered.slice(0, GUIDE_MAX_ROWS)}
                 sourceId={selectedSourceId ?? ""}
+                sourceName={playlist?.name ?? selectedSourceId ?? ""}
                 nowMs={nowMs}
                 hasEpg={epgReady}
                 onPlayChannel={(ch) => playlist && onPlayChannel(ch, playlist)}
@@ -307,6 +397,11 @@ function LiveBody({ active, onPlayChannel }: Props) {
                         nowNext={nowNextByChannel.get(ch.id) ?? null}
                         nowMs={nowMs}
                         onPlay={() => playlist && onPlayChannel(ch, playlist)}
+                        favorited={!!selectedSourceId && isFavorite(selectedSourceId, ch.id)}
+                        onToggleFavorite={() =>
+                          selectedSourceId &&
+                          toggleFavorite(selectedSourceId, playlist?.name ?? selectedSourceId, ch)
+                        }
                       />
                     ))}
                   </div>
@@ -345,11 +440,18 @@ const ChannelCard = memo(function ChannelCard({
   nowNext,
   nowMs,
   onPlay,
+  favorited,
+  onToggleFavorite,
+  sourceLabel,
 }: {
   channel: IptvChannel;
   nowNext: NowNext | null;
   nowMs: number;
   onPlay: () => void;
+  favorited: boolean;
+  onToggleFavorite: () => void;
+  /** Shown under the name in the favourites view (which playlist it's from). */
+  sourceLabel?: string;
 }) {
   const now = nowNext?.now ?? null;
   const progress =
@@ -357,14 +459,40 @@ const ChannelCard = memo(function ChannelCard({
       ? Math.max(0, Math.min(1, (nowMs - now.startMs) / (now.endMs - now.startMs)))
       : null;
   return (
-    <button
-      type="button"
+    <div
+      role="button"
+      tabIndex={0}
       onClick={onPlay}
+      onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && onPlay()}
       title={now ? `${channel.name} — ${now.title}` : channel.name}
-      className="group flex flex-col items-stretch text-left rounded-xl overflow-hidden
+      className="group relative flex flex-col items-stretch text-left rounded-xl overflow-hidden
                  border border-white/8 bg-white/[0.03] hover:bg-white/[0.07]
-                 hover:border-white/15 transition-colors"
+                 hover:border-white/15 transition-colors cursor-pointer
+                 focus:outline-none focus-visible:border-ln-accent/50"
     >
+      {/* Favourite toggle — visible on hover, or always when favourited.
+          stopPropagation so the star doesn't trigger playback. */}
+      <button
+        type="button"
+        aria-label={favorited ? "Remove from favorites" : "Add to favorites"}
+        title={favorited ? "Remove from favorites" : "Add to favorites"}
+        onClick={(e) => {
+          e.stopPropagation();
+          onToggleFavorite();
+        }}
+        className={[
+          "absolute top-1.5 right-1.5 z-10 w-7 h-7 rounded-lg flex items-center justify-center transition-all",
+          favorited
+            ? "opacity-100 text-amber-300 bg-black/40 hover:bg-black/55"
+            : "opacity-0 group-hover:opacity-100 text-white/70 bg-black/40 hover:bg-black/55 hover:text-amber-300",
+        ].join(" ")}
+      >
+        <svg width="16" height="16" viewBox="0 0 24 24" fill={favorited ? "currentColor" : "none"}
+             stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round">
+          <path d="M12 2.5l2.9 6.1 6.6.9-4.8 4.7 1.2 6.6L12 18.6 6.1 21.8l1.2-6.6L2.5 9.5l6.6-.9z" />
+        </svg>
+      </button>
+
       {/* overflow-hidden + the absolutely-positioned image keep the logo
           strictly inside the 16:9 box. Without absolute positioning, a
           logo's intrinsic size can force the aspect-ratio box taller than
@@ -409,10 +537,10 @@ const ChannelCard = memo(function ChannelCard({
             {now.title}
           </p>
         ) : (
-          <p className="text-[10.5px] text-white/35 truncate">{channel.group}</p>
+          <p className="text-[10.5px] text-white/35 truncate">{sourceLabel ?? channel.group}</p>
         )}
       </div>
-    </button>
+    </div>
   );
 });
 
@@ -455,11 +583,15 @@ function GroupRow({
   count,
   active,
   onClick,
+  accent,
 }: {
   label: string;
   count: number;
   active: boolean;
   onClick: () => void;
+  /** Subtle amber tint + bottom divider — marks the cross-playlist
+   *  "★ Favorites" row apart from the per-playlist groups. */
+  accent?: boolean;
 }) {
   return (
     <button
@@ -467,7 +599,14 @@ function GroupRow({
       onClick={onClick}
       className={[
         "w-full flex items-center justify-between gap-2 px-4 h-9 text-left transition-colors",
-        active ? "text-ln-accent bg-ln-accent/10" : "text-white/60 hover:text-white/90 hover:bg-white/[0.05]",
+        accent ? "border-b border-white/8 mb-1" : "",
+        active
+          ? accent
+            ? "text-amber-300 bg-amber-300/10"
+            : "text-ln-accent bg-ln-accent/10"
+          : accent
+            ? "text-amber-200/80 hover:text-amber-200 hover:bg-amber-300/[0.06]"
+            : "text-white/60 hover:text-white/90 hover:bg-white/[0.05]",
       ].join(" ")}
     >
       <span className="text-[12.5px] font-medium truncate">{label}</span>
