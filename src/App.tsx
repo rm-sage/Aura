@@ -4554,22 +4554,34 @@ export default function App() {
   // resets per channel; VOD streams keep the immediate-modal behaviour.
   const LIVE_MAX_RETRIES = 2;
   const liveRetryRef = useRef(0);
-  useEffect(() => { liveRetryRef.current = 0; }, [activeTarget?.id]);
+  // True while a live channel is mid-auto-retry: suppresses the broken-stream
+  // modal (we show a subtle "Reconnecting…" indicator instead) so the user
+  // doesn't see the popup flash on/off between attempts.
+  const [liveReconnecting, setLiveReconnecting] = useState(false);
+  useEffect(() => { liveRetryRef.current = 0; setLiveReconnecting(false); }, [activeTarget?.id]);
   useEffect(() => {
-    if (!streamBroken || !isLivePlayback || !activeStreamUrl) return;
-    if (liveRetryRef.current >= LIVE_MAX_RETRIES) return; // exhausted → show modal
+    // Not the auto-retry case (resolved / not live / no url / exhausted) →
+    // clear the reconnecting flag; if streamBroken is still set + exhausted,
+    // the modal shows.
+    if (!streamBroken || !isLivePlayback || !activeStreamUrl) { setLiveReconnecting(false); return; }
+    if (liveRetryRef.current >= LIVE_MAX_RETRIES) { setLiveReconnecting(false); return; }
     const attempt = liveRetryRef.current + 1;
     liveRetryRef.current = attempt;
     console.info(`[live] channel error — auto-retry ${attempt}/${LIVE_MAX_RETRIES}`);
+    // Show "Reconnecting…" instead of the modal for the duration of the wait.
+    // NOTE: we deliberately do NOT clear streamBroken here — doing so would
+    // change this effect's deps and cancel the timeout via cleanup. The modal
+    // is hidden purely via `liveReconnecting`; notifyNewLoad (on fire) clears
+    // streamBroken.
+    setLiveReconnecting(true);
     const t = window.setTimeout(() => {
-      setStreamBroken(false);
       notifyNewLoad();
       invoke("load_video", { path: activeStreamUrl, startSeconds: null }).catch((e) => {
         console.error("[live] auto-retry reload failed", e);
       });
     }, 2500);
     return () => window.clearTimeout(t);
-    // notifyNewLoad / setStreamBroken are stable from usePlayback.
+    // notifyNewLoad is stable from usePlayback.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [streamBroken, isLivePlayback, activeStreamUrl]);
 
@@ -5466,7 +5478,20 @@ export default function App() {
           the resume offset; Exit drops out to the detail view.
           Sits ABOVE PlayerOverlay so the user can't accidentally
           interact with the dead controls underneath. */}
-      {streamBroken && isPlayerActive && (
+      {/* Subtle "Reconnecting…" indicator shown while a live channel is
+          mid-auto-retry — replaces the full broken-stream modal so the popup
+          doesn't flash on/off between attempts. */}
+      {liveReconnecting && isPlayerActive && (
+        <div className="fixed inset-0 z-[10500] flex items-center justify-center pointer-events-none">
+          <div className="flex items-center gap-2.5 px-4 py-2.5 rounded-xl
+                          bg-black/70 backdrop-blur-md border border-white/12 text-white/85">
+            <span className="w-3.5 h-3.5 rounded-full border-2 border-white/30 border-t-ln-accent animate-spin" />
+            <span className="text-[13px] font-medium">Reconnecting to channel…</span>
+          </div>
+        </div>
+      )}
+
+      {streamBroken && isPlayerActive && !liveReconnecting && (
         <div
           // z-[10500] sits above PlayerOverlay's z-[9999] click-capture
           // layer AND its z-[10000] submenu portals. Without this,

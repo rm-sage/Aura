@@ -343,13 +343,18 @@ const ChannelCard = memo(function ChannelCard({
                  border border-white/8 bg-white/[0.03] hover:bg-white/[0.07]
                  hover:border-white/15 transition-colors"
     >
-      <div className="relative aspect-video bg-black/40 flex items-center justify-center">
+      {/* overflow-hidden + the absolutely-positioned image keep the logo
+          strictly inside the 16:9 box. Without absolute positioning, a
+          logo's intrinsic size can force the aspect-ratio box taller than
+          16:9 (min-content), which after a playback→browse re-layout
+          stretched some cards into giant tiles. */}
+      <div className="relative aspect-video bg-black/40 overflow-hidden flex items-center justify-center">
         {channel.logo ? (
           <ImageLoader
             src={channel.logo}
             alt={channel.name}
             loading="lazy"
-            className="w-full h-full"
+            className="absolute inset-0"
             imgClassName="w-full h-full object-contain p-3"
             fallback={<ChannelGlyph />}
           />

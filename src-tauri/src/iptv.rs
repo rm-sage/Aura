@@ -179,6 +179,32 @@ pub async fn iptv_fetch_text(url: String) -> Result<String, String> {
         out.len() / 1024,
         crate::stremio::redact_sensitive_url(&url),
     );
+
+    // Gzip detection: many XMLTV EPGs ship as `.xml.gz` FILES — the body is
+    // gzip-compressed (magic 1F 8B) but served as a plain file (no
+    // Content-Encoding), so reqwest's transfer-decompression never runs and
+    // the raw bytes are gzip garbage that the XMLTV parser finds zero
+    // <programme> blocks in. Inflate it here. MultiGzDecoder handles the
+    // multi-member streams some providers concatenate. Best-effort: on
+    // inflate failure fall back to the raw bytes rather than erroring.
+    if out.len() >= 2 && out[0] == 0x1f && out[1] == 0x8b {
+        use std::io::Read;
+        let mut decoder = flate2::read::MultiGzDecoder::new(&out[..]);
+        let mut decoded = String::new();
+        match decoder.read_to_string(&mut decoded) {
+            Ok(n) => {
+                crate::devlog!(debug, "iptv", "gunzipped EPG → {} KiB", n / 1024);
+                return Ok(decoded);
+            }
+            Err(e) => {
+                crate::devlog!(
+                    warn, "iptv",
+                    "gzip body but inflate failed ({e}) — returning raw bytes",
+                );
+            }
+        }
+    }
+
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
