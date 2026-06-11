@@ -1271,8 +1271,11 @@ export default function PlayerOverlay({
   // the user rewind through mpv's demuxer back-buffer (the 128 MiB the
   // engine already keeps — RAM-only, freed on stop, nothing on the VPS).
   // The estimator rides `time` + wallclock; no new mpv property reads, so
-  // none of the get_property-race landmines apply. See `useLiveDvr`.
-  const dvr = useLiveDvr(isLive, time);
+  // none of the get_property-race landmines apply. See `useLiveDvr`. The
+  // target id keys the estimator so switching channels (isLive stays true,
+  // time resets to ~0) re-anchors to the new edge instead of showing the
+  // fresh channel as "behind live".
+  const dvr = useLiveDvr(isLive, time, activeTarget?.id ?? null);
 
   // AniSkip OP/ED/recap windows for the current episode. Surfaced as
   // amber bands on the scrubber so the user can see where skip
@@ -2444,22 +2447,28 @@ interface LiveDvrState {
   position: number;
 }
 
-function useLiveDvr(isLive: boolean, time: number): LiveDvrState {
-  const anchor = useRef<{ t: number; wall: number; init: boolean }>({ t: 0, wall: 0, init: false });
+function useLiveDvr(isLive: boolean, time: number, streamKey: string | null): LiveDvrState {
+  const anchor = useRef<{ t: number; wall: number; init: boolean; key: string | null }>({
+    t: 0, wall: 0, init: false, key: null,
+  });
   const [state, setState] = useState<LiveDvrState>({ atLive: true, edge: 0, windowStart: 0, position: 0 });
 
   useEffect(() => {
     if (!isLive) {
       anchor.current.init = false;
+      anchor.current.key = streamKey;
       return;
     }
     const now = Date.now() / 1000;
-    const est = anchor.current.t + (now - anchor.current.wall);
 
-    // First sample, or a discontinuity (new channel / stream restart) where
-    // `time` drops well below the window floor → re-anchor to the live edge.
-    if (!anchor.current.init || time < est - DVR_WINDOW_S - 60) {
-      anchor.current = { t: time, wall: now, init: true };
+    // First sample, a CHANNEL SWITCH (streamKey changed — isLive stays true so
+    // the !isLive reset above never fires, and a fresh channel's `time` resets
+    // to ~0 which the est-relative test below can miss), or an in-channel
+    // stream restart where `time` drops well below the window floor → discard
+    // the prior anchor and re-anchor to the new live edge on this sample.
+    const est = anchor.current.t + (now - anchor.current.wall);
+    if (!anchor.current.init || anchor.current.key !== streamKey || time < est - DVR_WINDOW_S - 60) {
+      anchor.current = { t: time, wall: now, init: true, key: streamKey };
       setState({
         atLive: true,
         edge: time,
@@ -2472,7 +2481,7 @@ function useLiveDvr(isLive: boolean, time: number): LiveDvrState {
     let atLive: boolean;
     if (time >= est - DVR_EDGE_TOL_S) {
       // Riding the edge — advance the anchor with the freshest sample.
-      anchor.current = { t: time, wall: now, init: true };
+      anchor.current = { t: time, wall: now, init: true, key: streamKey };
       atLive = true;
     } else {
       atLive = false;
@@ -2484,7 +2493,7 @@ function useLiveDvr(isLive: boolean, time: number): LiveDvrState {
       windowStart: Math.max(0, edge - DVR_WINDOW_S),
       position: Math.min(Math.max(time, 0), edge),
     });
-  }, [isLive, time]);
+  }, [isLive, time, streamKey]);
 
   return state;
 }
