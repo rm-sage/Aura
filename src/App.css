@@ -648,10 +648,17 @@ select,
     position: absolute;
     inset: 0;
     pointer-events: none;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n' x='0' y='0'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='1' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    /* Higher baseFrequency (0.9) + a smaller tile (110px) push the grain
+       toward per-pixel, which is what actually breaks an 8-bit band edge —
+       a coarse 200px tile leaves the band visible between grains. Amplitude
+       (opacity) bumped 0.04 → 0.09: the old value was below ~1 LSB of
+       effective perturbation through `overlay`, so it dithered almost
+       nothing and the wide low-contrast sweep gradients banded visibly
+       (the moving vertical lines). */
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n' x='0' y='0'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
     background-repeat: repeat;
-    background-size: 200px 200px;
-    opacity: 0.04;
+    background-size: 110px 110px;
+    opacity: 0.09;
     mix-blend-mode: overlay;
   }
 
