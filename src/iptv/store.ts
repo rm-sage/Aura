@@ -25,6 +25,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { iptvFetchText } from "./fetch";
 import { parseM3u, groupChannels } from "./m3u";
 import { fetchXtreamLiveChannels, buildXtreamUrls, type XtreamCreds } from "./xtream";
+import { dropEpg } from "./epgStore";
 import type { IptvPlaylist, IptvPlaylistSource } from "./types";
 
 const CHANGE_EVENT = "aura:iptv-changed";
@@ -173,6 +174,13 @@ export async function updatePlaylistSource(
 
   // The cached playlist/EPG are now stale (url/creds/epg may have changed).
   _state.playlists.delete(id);
+  // If the EPG URL changed — especially CLEARED to null — drop the cached
+  // EPG too. loadEpg() early-returns on a null url, so without this the old
+  // EPG would linger (hasEpg stays true, guide keeps serving removed
+  // programmes) until an unrelated LRU eviction or restart.
+  if (patch.epgUrl !== undefined && patch.epgUrl !== cur.epgUrl) {
+    dropEpg(id);
+  }
   emit();
   await persistSources();
   await refreshPlaylist(id, { force: true }).catch(() => {});

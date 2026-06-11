@@ -52,12 +52,17 @@ function load(): FavoriteChannel[] {
 }
 
 function isValidFavorite(f: unknown): f is FavoriteChannel {
+  const fav = f as FavoriteChannel;
   return (
     !!f &&
-    typeof (f as FavoriteChannel).key === "string" &&
-    typeof (f as FavoriteChannel).sourceId === "string" &&
-    !!(f as FavoriteChannel).channel &&
-    typeof (f as FavoriteChannel).channel.url === "string"
+    typeof fav.key === "string" &&
+    typeof fav.sourceId === "string" &&
+    !!fav.channel &&
+    // channel.id is the identity half of `key` — without it the un-star
+    // recompute (favKey(sourceId, channel.id)) can't match the stored key.
+    typeof fav.channel.id === "string" &&
+    fav.channel.id.length > 0 &&
+    typeof fav.channel.url === "string"
   );
 }
 

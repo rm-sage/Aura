@@ -32,9 +32,6 @@ import {
 import PlaylistForm from "./live/PlaylistForm";
 import GuideView from "./live/GuideView";
 
-/** Sentinel `selectedGroup` value for the cross-playlist favourites view. */
-const FAVORITES_GROUP = "__favorites__";
-
 /** Guide rows are heavier than grid cards (sticky cells + per-row timeline);
  *  cap them tighter than the grid so a huge category stays responsive. */
 const GUIDE_MAX_ROWS = 150;
@@ -109,6 +106,10 @@ function LiveBody({ active, onPlayChannel }: Props) {
   const nowMs = useNowTick();
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
   const [selectedGroup, setSelectedGroup] = useState<string>("All");
+  // Cross-playlist favourites view — kept as its OWN flag (not a sentinel
+  // group name) so it can't collide with a real provider group and so a
+  // source switch / removal doesn't silently dismiss it.
+  const [favoritesView, setFavoritesView] = useState(false);
   const [query, setQuery] = useState("");
   const [formOpen, setFormOpen] = useState(false);
   const [editingSource, setEditingSource] = useState<IptvPlaylistSource | null>(null);
@@ -190,13 +191,27 @@ function LiveBody({ active, onPlayChannel }: Props) {
   }, [visible, selectedSourceId, nowMs, epgReady, epgVer]);
 
   // ── Favourites (cross-playlist) ──────────────────────────────────────
-  const favoritesView = selectedGroup === FAVORITES_GROUP;
   const totalFavorites = useMemo(() => favoriteCount(), [favVer]);
   const favorites = useMemo(() => {
     const q = query.trim().toLowerCase();
     const list = [...getFavorites()];
     return q ? list.filter((f) => f.channel.name.toLowerCase().includes(q)) : list;
   }, [favVer, query]);
+  // Cap the rendered favourites (same MAX_VISIBLE budget as the channel grid
+  // — don't mount hundreds of cards) and resolve now/next ONCE per render
+  // into a keyed map instead of an inline call per card (which defeated the
+  // card memo and re-ran up to 500 EPG scans every 30s tick).
+  const visibleFavorites =
+    favorites.length > MAX_VISIBLE ? favorites.slice(0, MAX_VISIBLE) : favorites;
+  const favNowNextByKey = useMemo(() => {
+    const map = new Map<string, NowNext>();
+    for (const fav of visibleFavorites) {
+      const nn = resolveNowNext(fav.sourceId, fav.channel, nowMs);
+      if (nn && (nn.now || nn.next)) map.set(fav.key, nn);
+    }
+    return map;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visibleFavorites, nowMs, epgVer]);
 
   /** Play a favourite — its origin playlist may not be the selected one, so
    *  synthesise the minimal playlist handlePlayChannel needs (it only reads
@@ -278,22 +293,28 @@ function LiveBody({ active, onPlayChannel }: Props) {
               label="★ Favorites"
               count={totalFavorites}
               active={favoritesView}
-              onClick={() => setSelectedGroup(FAVORITES_GROUP)}
+              onClick={() => setFavoritesView(true)}
               accent
             />
             <GroupRow
               label="All channels"
               count={playlist?.channels.length ?? 0}
-              active={selectedGroup === "All"}
-              onClick={() => setSelectedGroup("All")}
+              active={!favoritesView && selectedGroup === "All"}
+              onClick={() => {
+                setFavoritesView(false);
+                setSelectedGroup("All");
+              }}
             />
             {groups.map((g) => (
               <GroupRow
                 key={g.name}
                 label={g.name}
                 count={g.count}
-                active={selectedGroup === g.name}
-                onClick={() => setSelectedGroup(g.name)}
+                active={!favoritesView && selectedGroup === g.name}
+                onClick={() => {
+                  setFavoritesView(false);
+                  setSelectedGroup(g.name);
+                }}
               />
             ))}
           </aside>
@@ -313,6 +334,7 @@ function LiveBody({ active, onPlayChannel }: Props) {
               {favoritesView ? (
                 <span className="text-white/35 text-xs">
                   {favorites.length.toLocaleString()} favorite{favorites.length === 1 ? "" : "s"}
+                  {favorites.length > MAX_VISIBLE && ` · showing first ${MAX_VISIBLE} (refine to see all)`}
                 </span>
               ) : playlist ? (
                 <span className="text-white/35 text-xs">
@@ -343,11 +365,11 @@ function LiveBody({ active, onPlayChannel }: Props) {
                     className="grid gap-3"
                     style={{ gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))" }}
                   >
-                    {favorites.map((fav) => (
+                    {visibleFavorites.map((fav) => (
                       <ChannelCard
                         key={fav.key}
                         channel={fav.channel}
-                        nowNext={resolveNowNext(fav.sourceId, fav.channel, nowMs)}
+                        nowNext={favNowNextByKey.get(fav.key) ?? null}
                         nowMs={nowMs}
                         onPlay={() => playFavorite(fav)}
                         favorited
