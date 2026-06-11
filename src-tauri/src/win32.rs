@@ -681,11 +681,17 @@ pub fn apply_mpo_poison(parent_hwnd: isize) {
         let Ok(set_window_rgn) = user32.get::<SetWindowRgnFn>(b"SetWindowRgn\0") else { return; };
 
         let hwnd = parent_hwnd as *mut c_void;
-        // Region larger than any monitor, minus a 1×1 px notch at (0,0).
-        // SetWindowRgn clips to the window, so the effective shape is
-        // "window minus the corner pixel" at any size → non-rectangular.
+        // Region larger than any monitor, minus a 1px notch on the LEFT
+        // EDGE, 50 px down. Position matters: in WINDOWED mode the MPV
+        // child is inset 36 px from the top (title bar), so a notch at the
+        // window corner (0,0) lands in the title bar — NOT over the video —
+        // and the video child plane stays a clean rectangle that MPO still
+        // promotes (windowed raised blacks). y=50 is below the 36px inset,
+        // so the notch clips the child's visible region in BOTH windowed
+        // and fullscreen → non-rectangular video plane → DWM composites.
+        // x=0,y=50 is a single pixel on the far-left edge: imperceptible.
         let full = create_rect_rgn(0, 0, 32767, 32767);
-        let notch = create_rect_rgn(0, 0, 1, 1);
+        let notch = create_rect_rgn(0, 50, 1, 51);
         combine_rgn(full, full, notch, RGN_DIFF);
         delete_object(notch);
         // SetWindowRgn TAKES OWNERSHIP of `full` — must NOT delete it here.
