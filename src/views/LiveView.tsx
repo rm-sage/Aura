@@ -32,11 +32,12 @@ import {
 } from "../iptv/favoritesStore";
 import PlaylistForm from "./live/PlaylistForm";
 import GuideView from "./live/GuideView";
+import MultiView from "./live/MultiView";
 
 /** Guide rows are heavier than grid cards (sticky cells + per-row timeline);
  *  cap them tighter than the grid so a huge category stays responsive. */
 const GUIDE_MAX_ROWS = 150;
-type ViewMode = "grid" | "guide";
+type ViewMode = "grid" | "guide" | "multiview";
 
 // ---------------------------------------------------------------------------
 // LiveView — Live TV (IPTV) browser. Source picker + group sidebar + search
@@ -393,6 +394,11 @@ function LiveBody({ active, onPlayChannel }: Props) {
                   </div>
                 )}
               </div>
+            ) : viewMode === "multiview" ? (
+              <MultiView
+                channels={filtered}
+                onPlayChannel={(ch) => playlist && onPlayChannel(ch, playlist)}
+              />
             ) : viewMode === "guide" ? (
               <GuideView
                 channels={filtered.slice(0, GUIDE_MAX_ROWS)}
@@ -590,7 +596,7 @@ const ChannelGlyph = () => (
 function ViewModeToggle({ mode, onChange }: { mode: ViewMode; onChange: (m: ViewMode) => void }) {
   return (
     <div className="ml-auto flex gap-1 p-1 rounded-xl bg-white/5 border border-white/8">
-      {(["grid", "guide"] as const).map((m) => (
+      {(["grid", "guide", "multiview"] as const).map((m) => (
         <button
           key={m}
           type="button"

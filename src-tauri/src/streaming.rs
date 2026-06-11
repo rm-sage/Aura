@@ -28,7 +28,7 @@ use std::time::Duration;
 use axum::{
     body::Body,
     extract::Path as AxumPath,
-    http::{HeaderName, StatusCode},
+    http::{HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
@@ -127,10 +127,49 @@ async fn proxy_stream(
                 }
             }
         }
+        // CORS — so hls.js running in the WebView (origin tauri.localhost) can
+        // fetch IPTV segments through the bridge for the Multiview grid. The
+        // bridge is loopback-only; `*` is safe here. Harmless for the MPV path
+        // (MPV ignores CORS). Expose the range headers so hls.js can read them.
+        add_cors(headers);
     }
 
     resp.body(body)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// CORS preflight for the proxy route — hls.js's Range-bearing segment GETs
+/// trigger an OPTIONS preflight. Answer it with permissive loopback CORS.
+async fn proxy_preflight() -> Response {
+    let mut resp = Response::builder().status(StatusCode::NO_CONTENT);
+    if let Some(headers) = resp.headers_mut() {
+        add_cors(headers);
+        headers.insert(
+            HeaderName::from_static("access-control-allow-methods"),
+            HeaderValue::from_static("GET, OPTIONS"),
+        );
+        headers.insert(
+            HeaderName::from_static("access-control-max-age"),
+            HeaderValue::from_static("600"),
+        );
+    }
+    resp.body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn add_cors(headers: &mut axum::http::HeaderMap) {
+    headers.insert(
+        HeaderName::from_static("access-control-allow-origin"),
+        HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        HeaderName::from_static("access-control-allow-headers"),
+        HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        HeaderName::from_static("access-control-expose-headers"),
+        HeaderValue::from_static("*"),
+    );
 }
 
 /// Reserved magnet endpoint. Permanently 501 — Aura is Stremio-addon-only
@@ -156,7 +195,7 @@ pub fn start_in_process() {
     tauri::async_runtime::spawn(async {
         let app = Router::new()
             .route("/health", get(health))
-            .route("/proxy/*encoded", get(proxy_stream))
+            .route("/proxy/*encoded", get(proxy_stream).options(proxy_preflight))
             .route("/magnet/*encoded", get(magnet_stream));
 
         let addr = SocketAddr::from(([127, 0, 0, 1], BRIDGE_PORT));
