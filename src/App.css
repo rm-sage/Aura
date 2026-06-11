@@ -655,10 +655,14 @@ select,
        effective perturbation through `overlay`, so it dithered almost
        nothing and the wide low-contrast sweep gradients banded visibly
        (the moving vertical lines). */
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n' x='0' y='0'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    /* numOctaves=1 (was 2) drops the coarse, most-visible grain component and
+       keeps only the fine high-frequency noise that breaks band edges, so it
+       reads as much less "noisy". baseFrequency 0.95 keeps the grain ~per-
+       pixel; opacity eased 0.09 → 0.07 — still enough dither, less visible. */
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n' x='0' y='0'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.95' numOctaves='1' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
     background-repeat: repeat;
-    background-size: 110px 110px;
-    opacity: 0.09;
+    background-size: 100px 100px;
+    opacity: 0.07;
     mix-blend-mode: overlay;
   }
 
