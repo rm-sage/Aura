@@ -44,6 +44,24 @@ pub async fn resolve_stream(raw_url: String) -> Result<String, String> {
         return Ok(format!("http://127.0.0.1:{BRIDGE_PORT}/magnet/{encoded}"));
     }
 
+    // HLS manifests (.m3u8 / .m3u) are NEVER proxied — for HTTP or HTTPS.
+    // MPV resolves the segment / variant / key URIs inside a manifest
+    // RELATIVE to the URL it loaded. A proxied manifest therefore makes MPV
+    // resolve those against the 127.0.0.1 bridge:
+    //   - an absolute-path segment ("/live/.../seg.ts", very common) resolves
+    //     to http://127.0.0.1:11471/live/... — a route the bridge doesn't
+    //     serve → 404 → playback dies;
+    //   - and the bridge fetches the manifest with its OWN User-Agent, which
+    //     IPTV providers routinely gate (they accept MPV's Lavf UA but reject
+    //     unknown ones).
+    // Letting MPV fetch HLS directly makes Aura behave exactly like standalone
+    // mpv (its own player UA, segments resolved against the real origin) — the
+    // same reason HTTPS already bypasses below.
+    if is_hls(&lower) {
+        crate::devlog!(info, "bridge", "resolve_stream(hls) → direct (no proxy)");
+        return Ok(raw_url);
+    }
+
     // HTTPS: no proxy. Bypass keeps MPV connecting straight to the upstream
     // host so its TLS cert validates and we don't double-buffer through the
     // local axum server. This is what the user expects for VPS-hosted streams
@@ -63,6 +81,13 @@ pub async fn resolve_stream(raw_url: String) -> Result<String, String> {
 
     crate::devlog!(warn, "bridge", "resolve_stream(unknown scheme) → passthrough");
     Ok(raw_url)
+}
+
+/// HLS manifest? Decided by the path extension, ignoring any query string
+/// (`…/517527.m3u8?token=…`). HLS must bypass the bridge — see resolve_stream.
+fn is_hls(lower_url: &str) -> bool {
+    let path = lower_url.split('?').next().unwrap_or(lower_url);
+    path.ends_with(".m3u8") || path.ends_with(".m3u")
 }
 
 // ---------------------------------------------------------------------------

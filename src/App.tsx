@@ -2443,9 +2443,10 @@ export default function App() {
    *  live stream. The `isLivePlayback` derivation below keys off that
    *  shape to suppress the scrubber, resume prompt, scrobble, and
    *  history / Continue-Watching writes — none of which make sense for an
-   *  infinite live stream. resolve_stream already routes HTTPS `.m3u8`
-   *  direct and HTTP `.ts` through the bridge, so no playback change is
-   *  needed. */
+   *  infinite live stream. resolve_stream routes HLS (.m3u8, HTTP or HTTPS)
+   *  DIRECT to MPV — a proxied manifest breaks segment-URI resolution and
+   *  trips provider UA gating — and only single-file HTTP (.ts/.mp4) goes
+   *  through the bridge, so no playback change is needed here. */
   const handlePlayChannel = useCallback(
     (channel: IptvChannel, playlist: IptvPlaylist) => {
       if (!channel.url) return;
