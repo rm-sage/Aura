@@ -1688,12 +1688,14 @@ pub fn run() {
                 if let Ok(handle) = window.hwnd() {
                     let parent_hwnd = handle.0 as isize;
                     win32::recover_window_state(parent_hwnd);
-                    // Experimental MPO "poison pill" (Poison Pill 2): when
+                    // Experimental MPO "poison pill": when
                     // AURA_FORCE_COMPOSITION=1, give the top-level window a
-                    // constant layer alpha so Windows can't promote the MPV
-                    // child swapchain to direct scanout (fixes the QD-OLED
-                    // raised-black-in-HDR behaviour without disabling MPO
-                    // globally). No-op unless the env var is set.
+                    // non-rectangular region (1px corner notch) so Windows
+                    // can't promote the MPV child swapchain to direct
+                    // scanout (fixes the QD-OLED raised-black-in-HDR
+                    // behaviour without disabling MPO globally, and without
+                    // the desktop bleed-through the layered-alpha variant
+                    // had). No-op unless the env var is set.
                     win32::apply_mpo_poison(parent_hwnd);
                 }
             }
