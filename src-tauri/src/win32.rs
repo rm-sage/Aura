@@ -760,10 +760,12 @@ unsafe fn apply_mpv_child_poison(child: *mut c_void, w: i32, h: i32) {
     let Ok(combine_rgn) = gdi32.get::<CombineRgnFn>(b"CombineRgn\0") else { return; };
     let Ok(delete_object) = gdi32.get::<DeleteObjectFn>(b"DeleteObject\0") else { return; };
 
-    // Full child rect minus a FULL-WIDTH 1px strip a few px down — splits the
-    // plane into two disconnected rectangles. STRIP_Y=4 keeps the black line
-    // near the top edge (least visible) while leaving a clear piece above.
-    const STRIP_Y: i32 = 4;
+    // Full child rect minus a FULL-WIDTH 1px strip. The strip must NOT be at
+    // y=0 (that would just shrink the rect to y>=1 — still one rectangle the
+    // driver inscribes); y=1 leaves the y=0 row above so the region is two
+    // disconnected rectangles (non-promotable → composite). y=1 puts the
+    // black line at the very top edge of the video, right under the title bar.
+    const STRIP_Y: i32 = 1;
     let full = create_rect_rgn(0, 0, w, h);
     let strip = create_rect_rgn(0, STRIP_Y, w, STRIP_Y + 1);
     combine_rgn(full, full, strip, RGN_DIFF);

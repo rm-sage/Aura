@@ -903,7 +903,15 @@ fn end_file_reason_to_str(reason: c_int) -> &'static str {
 /// Other events (start-file / file-loaded / seek / playback-restart, …)
 /// aren't consumed by the bridge today, so they're discarded silently —
 /// Phase 4 can extend this when a setter or observer needs them.
-unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineEmit) {
+/// Drain pending mpv events. Returns `true` if a `VIDEO_RECONFIG` was seen
+/// — mpv's VO (re)created/resized its `--wid` child window, which is the
+/// reliable signal that the geometry pump must re-run `resize_mpv_child_to_parent`
+/// (to size the child AND re-apply the windowed MPO-poison region on the new
+/// child). Without this, the region only landed on the next host-geometry
+/// change (e.g. a fullscreen toggle), so initial-playback windowed blacks
+/// stayed raised until the user toggled fullscreen.
+unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineEmit) -> bool {
+    let mut video_reconfig = false;
     loop {
         let ev = (lib.wait_event)(handle, 0.0);
         if ev.is_null() {
@@ -912,6 +920,10 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
         let id = (*ev).event_id;
         if id == mpv_event_id::NONE {
             break;
+        }
+        if id == mpv_event_id::VIDEO_RECONFIG {
+            video_reconfig = true;
+            continue;
         }
         if id == mpv_event_id::LOG_MESSAGE {
             let m = (*ev).data as *const mpv_event_log_message;
@@ -984,6 +996,7 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
             break;
         }
     }
+    video_reconfig
 }
 
 /// Three-state visibility classification of the parent window, retained
@@ -1820,7 +1833,16 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 crate::win32::resize_mpv_child_to_parent(hwnd.0 as isize, 0);
             }
 
-            drain_mpv_events(&lib, handle, &emit);
+            // VIDEO_RECONFIG = mpv (re)created/resized its --wid child (first
+            // frame, resolution change, track switch). Force the next pump
+            // iteration to re-run the child resize so it (a) sizes the new
+            // child and (b) re-applies the windowed MPO-poison region onto
+            // it — without this the region only landed on a host-geometry
+            // change (e.g. a fullscreen toggle), leaving initial-playback
+            // windowed blacks raised. Sentinel guarantees target_geom differs.
+            if drain_mpv_events(&lib, handle, &emit) {
+                last_geom = (i32::MIN, i32::MIN, i32::MIN, i32::MIN);
+            }
 
             // Steady pump cadence — see TICK.
             let elapsed = tick_start.elapsed();
