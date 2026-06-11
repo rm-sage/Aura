@@ -999,6 +999,11 @@ interface Props {
    *  motion-interpolation toggle — interpolation is anime-only. */
   isAnime: boolean;
 
+  /** True for Live TV channels (synthetic `iptv:` target). Replaces the
+   *  seek scrubber with a LIVE indicator — an infinite live stream has no
+   *  duration to scrub, and resume/skip controls are meaningless. */
+  isLive?: boolean;
+
   // Playback state
   time: number;
   duration: number;
@@ -1219,6 +1224,7 @@ const SPEED_OPTIONS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4];
 export default function PlayerOverlay({
   activeTarget,
   isAnime,
+  isLive = false,
   time, duration, paused, volume, speed, buffering, bufferPct, firstFrameSeen,
   togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
   onExitPlayback,
@@ -2043,30 +2049,33 @@ export default function PlayerOverlay({
           className="aura-glass-bar rounded-2xl px-4 pt-2 pb-3 w-full max-w-[1100px]
                      pointer-events-auto"
         >
-          {/* ── Scrubber (full-width row) ── */}
-          <div className="px-1.5 pt-0.5">
-            <Scrubber
-              value={displayTime}
-              max={duration || 1}
-              onScrubStart={() => setScrubValue(time)}
-              onScrub={(v) => setScrubValue(v)}
-              onScrubEnd={(v) => {
-                seekAbsolute(v);
-                setScrubValue(null);
-              }}
-              progressPct={progress}
-              segments={skipWindowsForScrub}
-              thumbnailAt={
-                streamUrl
-                  ? (sec) =>
-                      invoke<{ data_url: string; at: number } | null>("extract_thumbnail", {
-                        url: streamUrl,
-                        atSeconds: sec,
-                      }).catch(() => null)
-                  : undefined
-              }
-            />
-          </div>
+          {/* ── Scrubber (full-width row) — hidden for Live TV: an
+              infinite live stream has no duration to scrub. ── */}
+          {!isLive && (
+            <div className="px-1.5 pt-0.5">
+              <Scrubber
+                value={displayTime}
+                max={duration || 1}
+                onScrubStart={() => setScrubValue(time)}
+                onScrub={(v) => setScrubValue(v)}
+                onScrubEnd={(v) => {
+                  seekAbsolute(v);
+                  setScrubValue(null);
+                }}
+                progressPct={progress}
+                segments={skipWindowsForScrub}
+                thumbnailAt={
+                  streamUrl
+                    ? (sec) =>
+                        invoke<{ data_url: string; at: number } | null>("extract_thumbnail", {
+                          url: streamUrl,
+                          atSeconds: sec,
+                        }).catch(() => null)
+                    : undefined
+                }
+              />
+            </div>
+          )}
 
           {/* ── Button row — order: Rewind ▶ Play/Pause ▶ Forward ── */}
           {/* gap-1.5 (6 px) keeps the row tight; pill buttons (Speed,
@@ -2074,13 +2083,18 @@ export default function PlayerOverlay({
               so they don't visually bloat against the round neighbours
               and the rhythm stays even across the bar. */}
           <div className="flex items-center gap-1.5 mt-1">
-            <IconButton
-              onClick={() => seekRelative(-10)}
-              label="Skip back 10 seconds"
-              tooltip="Back 10 s"
-            >
-              <ReplayIcon />
-            </IconButton>
+            {/* Skip buttons hidden for Live TV — seeking an infinite live
+                stream is meaningless (and forward-seeking past the live
+                edge fails). Play/pause stays (pauses the live buffer). */}
+            {!isLive && (
+              <IconButton
+                onClick={() => seekRelative(-10)}
+                label="Skip back 10 seconds"
+                tooltip="Back 10 s"
+              >
+                <ReplayIcon />
+              </IconButton>
+            )}
 
             <Tooltip text={paused ? "Play (Space)" : "Pause (Space)"} pos="top">
               <button
@@ -2094,20 +2108,30 @@ export default function PlayerOverlay({
               </button>
             </Tooltip>
 
-            <IconButton
-              onClick={() => seekRelative(10)}
-              label="Skip forward 10 seconds"
-              tooltip="Forward 10 s"
-            >
-              <ForwardIcon />
-            </IconButton>
+            {!isLive && (
+              <IconButton
+                onClick={() => seekRelative(10)}
+                label="Skip forward 10 seconds"
+                tooltip="Forward 10 s"
+              >
+                <ForwardIcon />
+              </IconButton>
+            )}
 
-            {/* Time display — current / total */}
-            <div className="ml-2 flex items-center gap-2 text-white/85 font-mono text-[12.5px] tabular-nums">
-              <span>{fmt(displayTime)}</span>
-              <span className="text-white/30">/</span>
-              <span className="text-white/55">{fmt(duration)}</span>
-            </div>
+            {/* Time display — current / total. For Live TV, a LIVE badge
+                replaces the timestamp (no fixed duration). */}
+            {isLive ? (
+              <div className="ml-2 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-red-500" style={{ boxShadow: "0 0 8px rgba(239,68,68,0.7)" }} />
+                <span className="text-red-300/90 font-semibold text-[12px] tracking-wide">LIVE</span>
+              </div>
+            ) : (
+              <div className="ml-2 flex items-center gap-2 text-white/85 font-mono text-[12.5px] tabular-nums">
+                <span>{fmt(displayTime)}</span>
+                <span className="text-white/30">/</span>
+                <span className="text-white/55">{fmt(duration)}</span>
+              </div>
+            )}
 
             {/* Skip-window button — surfaces inline when playback is
                 currently inside a known OP/ED/Recap window, so the user
@@ -2115,12 +2139,14 @@ export default function PlayerOverlay({
                 Lua script's auto / prompt behaviour. When no windows
                 exist for the current stream, doubles as a "Detect"
                 affordance (silencedetect manual fallback). */}
-            <SkipWindowButton
-              time={time}
-              seekAbsolute={seekAbsolute}
-              streamUrl={streamUrl}
-              mediaType={activeTarget?.media_type}
-            />
+            {!isLive && (
+              <SkipWindowButton
+                time={time}
+                seekAbsolute={seekAbsolute}
+                streamUrl={streamUrl}
+                mediaType={activeTarget?.media_type}
+              />
+            )}
 
             {/* Spacer */}
             <div className="flex-1" />

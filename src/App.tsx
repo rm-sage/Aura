@@ -10,6 +10,8 @@ import BootSplash from "./BootSplash";
 import ResizeHandles from "./ResizeHandles";
 import HomeView from "./views/HomeView";
 import DiscoverView from "./views/DiscoverView";
+import LiveView from "./views/LiveView";
+import type { IptvChannel, IptvPlaylist } from "./iptv/types";
 import LibraryView from "./views/LibraryView";
 import AddonsView from "./views/AddonsView";
 import CalendarView from "./views/CalendarView";
@@ -1088,6 +1090,13 @@ export default function App() {
   } | null>(null);
 
   const isPlayerActive = activeTarget != null;
+  /** True when the active stream is a Live TV channel (synthetic `iptv:`
+   *  target / media_type "tv"). Drives the live carve-outs: no scrubber,
+   *  no resume prompt, no scrobble, no history / Continue-Watching write
+   *  — an infinite live stream has no meaningful position or completion. */
+  const isLivePlayback =
+    activeTarget != null &&
+    (activeTarget.media_type === "tv" || activeTarget.id.startsWith("iptv:"));
 
   // ── Playback hook — gated on activeTarget so the polling fallback only
   //     runs while a stream is loaded.
@@ -2428,6 +2437,36 @@ export default function App() {
     }
     setNextUpInfo(null);
   }, [activeTarget]);
+
+  /** Play a Live TV channel. Builds a synthetic StreamEntry + an `iptv:`
+   *  target with media_type "tv" so the rest of the app treats it as a
+   *  live stream. The `isLivePlayback` derivation below keys off that
+   *  shape to suppress the scrubber, resume prompt, scrobble, and
+   *  history / Continue-Watching writes — none of which make sense for an
+   *  infinite live stream. resolve_stream already routes HTTPS `.m3u8`
+   *  direct and HTTP `.ts` through the bridge, so no playback change is
+   *  needed. */
+  const handlePlayChannel = useCallback(
+    (channel: IptvChannel, playlist: IptvPlaylist) => {
+      if (!channel.url) return;
+      const stream: StreamEntry = {
+        title:       channel.name,
+        addon_name:  playlist.name,
+        url:         channel.url,
+        info_hash:   null,
+        file_idx:    null,
+        description: null,
+        filename:    null,
+      };
+      const target = {
+        id:         `iptv:${channel.id}`,
+        media_type: "tv",
+        name:       channel.name,
+      };
+      void handlePlayStream(stream, target);
+    },
+    [handlePlayStream],
+  );
 
   // ── EOS Spotlight wiring (2026-05-19) ───────────────────────────────
   // Pure id→LibraryItem index for the spoiler gate (mirrors what
@@ -3829,7 +3868,9 @@ export default function App() {
   // it receives at scrobble_start time.
   const scrobbleScope = session?.auth_key ? session.auth_key.slice(0, 12) : "guest";
   useScrobble({
-    active: activeTarget,
+    // Live TV channels never scrobble — there's no episode/completion to
+    // report. Passing null keeps the hook fully inert for `iptv:` targets.
+    active: isLivePlayback ? null : activeTarget,
     playback: { time, duration, paused },
     scope: scrobbleScope,
   });
@@ -4327,6 +4368,9 @@ export default function App() {
     (sess: UserSession | null, target: ActiveScrobbleTarget | null) => {
       const { time, duration } = playbackRef.current;
       if (!sess?.auth_key || !target || duration <= 0) return;
+      // Live TV: no Continue-Watching / progress write — an `iptv:` target
+      // has no library record and no meaningful resume position.
+      if (target.media_type === "tv" || target.id.startsWith("iptv:")) return;
       if (time < PROGRESS_WARMUP_S) return;
       // Skip if we already wrote this exact second — prevents duplicate writes
       // when pause and unmount fire close together.
@@ -4405,7 +4449,7 @@ export default function App() {
     // finished episode. Right-click "Mark as Watched" on a poster
     // happens OUTSIDE the player overlay, so handleExitPlayback
     // doesn't run for those flips at all and the gate isn't needed.
-    if (activeTarget && playedEpisodeId) {
+    if (activeTarget && playedEpisodeId && !isLivePlayback) {
       const watched = time;
       const dur     = duration;
       // Both conditions must hold: at least 80 % progress AND at least
@@ -4497,7 +4541,7 @@ export default function App() {
       // unrelated DetailView open doesn't inherit the hint.
       setLastPlayedEpisodeId(playedEpisodeId);
     }
-  }, [session, flushProgress, activeTarget, time, duration, library, selectedMeta]);
+  }, [session, flushProgress, activeTarget, isLivePlayback, time, duration, library, selectedMeta]);
 
   // ── EOS Spotlight action handlers ───────────────────────────────────
   // Defined here (not next to the resolution effect above) because they
@@ -5337,6 +5381,9 @@ export default function App() {
         {activeView === "discover" && (
           <DiscoverView addons={addons} onSelectMeta={openDetail} />
         )}
+        {activeView === "live" && (
+          <LiveView active={activeView === "live"} onPlayChannel={handlePlayChannel} />
+        )}
         {activeView === "calendar" && (
           <CalendarView library={library} addons={addons} onSelectMeta={openDetail} />
         )}
@@ -5475,6 +5522,7 @@ export default function App() {
         <PlayerOverlay
           activeTarget={activeTarget}
           isAnime={activeTarget ? activeTargetIsAnime(activeTarget, library) : false}
+          isLive={isLivePlayback}
           time={time}
           duration={duration}
           paused={paused}
