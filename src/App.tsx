@@ -4543,6 +4543,36 @@ export default function App() {
     }
   }, [session, flushProgress, activeTarget, isLivePlayback, time, duration, library, selectedMeta]);
 
+  // ── Live channel auto-retry (leeway before the broken-stream modal) ──
+  // IPTV channels hiccup constantly on the provider side (transient 5xx,
+  // brief 404s while the edge re-resolves, max-connection bumps). For a LIVE
+  // target, when a load/heartbeat failure flips `streamBroken`, silently
+  // reload the channel a couple of times on a short backoff BEFORE surfacing
+  // the recovery modal — a momentary blip shouldn't throw the whole "Channel
+  // unavailable" popup. A genuinely dead channel exhausts the retries and the
+  // modal then shows (with live-specific copy, no "Switch source"). Counter
+  // resets per channel; VOD streams keep the immediate-modal behaviour.
+  const LIVE_MAX_RETRIES = 2;
+  const liveRetryRef = useRef(0);
+  useEffect(() => { liveRetryRef.current = 0; }, [activeTarget?.id]);
+  useEffect(() => {
+    if (!streamBroken || !isLivePlayback || !activeStreamUrl) return;
+    if (liveRetryRef.current >= LIVE_MAX_RETRIES) return; // exhausted → show modal
+    const attempt = liveRetryRef.current + 1;
+    liveRetryRef.current = attempt;
+    console.info(`[live] channel error — auto-retry ${attempt}/${LIVE_MAX_RETRIES}`);
+    const t = window.setTimeout(() => {
+      setStreamBroken(false);
+      notifyNewLoad();
+      invoke("load_video", { path: activeStreamUrl, startSeconds: null }).catch((e) => {
+        console.error("[live] auto-retry reload failed", e);
+      });
+    }, 2500);
+    return () => window.clearTimeout(t);
+    // notifyNewLoad / setStreamBroken are stable from usePlayback.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streamBroken, isLivePlayback, activeStreamUrl]);
+
   // ── EOS Spotlight action handlers ───────────────────────────────────
   // Defined here (not next to the resolution effect above) because they
   // depend on `handleExitPlayback`, which is block-scoped just above.
@@ -5448,12 +5478,18 @@ export default function App() {
         >
           <div className="aura-glass-menu rounded-2xl max-w-[420px] w-[92%] p-6 text-white">
             <h2 className="text-[16px] font-semibold tracking-tight mb-2">
-              {firstFrameSeen ? "Stream connection lost" : "Stream unavailable"}
+              {isLivePlayback
+                ? (firstFrameSeen ? "Channel connection lost" : "Channel unavailable")
+                : (firstFrameSeen ? "Stream connection lost" : "Stream unavailable")}
             </h2>
             <p className="text-white/70 text-[13px] leading-relaxed mb-5">
-              {firstFrameSeen
-                ? "Aura hasn't received a playback heartbeat in 8 s. The most common cause is a transient DNS / TCP failure during a seek. Try reloading from your last position, or exit and pick another source."
-                : "Aura couldn't open the stream. The addon's host may be down or unreachable (DNS / TCP failure). Try reloading, or exit and pick a different source."}
+              {isLivePlayback
+                ? (firstFrameSeen
+                    ? "This channel dropped its connection. Live streams can hiccup on the provider side — Aura already retried a couple of times. Reload to try again, or exit and pick another channel."
+                    : "Aura couldn't open this channel (the provider returned an error — often a removed or temporarily-down channel). Aura already retried a couple of times. Reload to try again, or exit and pick another channel.")
+                : (firstFrameSeen
+                    ? "Aura hasn't received a playback heartbeat in 8 s. The most common cause is a transient DNS / TCP failure during a seek. Try reloading from your last position, or exit and pick another source."
+                    : "Aura couldn't open the stream. The addon's host may be down or unreachable (DNS / TCP failure). Try reloading, or exit and pick a different source.")}
             </p>
             <div className="flex justify-end gap-2">
               <button
@@ -5465,22 +5501,27 @@ export default function App() {
               >
                 Exit player
               </button>
-              <button
-                type="button"
-                onClick={() => {
-                  // Dismiss the recovery modal and open the in-player source
-                  // switcher — when a stream dies, picking a different source
-                  // is usually the real fix (the switcher swaps in place at
-                  // the last-known position via handlePlayStream).
-                  setStreamBroken(false);
-                  window.dispatchEvent(new CustomEvent("aura:open-source-switcher"));
-                }}
-                className="px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
-                           text-white/85 bg-white/[0.06] border border-white/12
-                           hover:bg-white/[0.10] hover:text-white transition-colors"
-              >
-                Switch source
-              </button>
+              {/* "Switch source" is meaningless for a Live TV channel (one
+                  URL, no alternate-source list), so it's hidden for live —
+                  the user picks a different CHANNEL from the grid instead. */}
+              {!isLivePlayback && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    // Dismiss the recovery modal and open the in-player source
+                    // switcher — when a stream dies, picking a different source
+                    // is usually the real fix (the switcher swaps in place at
+                    // the last-known position via handlePlayStream).
+                    setStreamBroken(false);
+                    window.dispatchEvent(new CustomEvent("aura:open-source-switcher"));
+                  }}
+                  className="px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
+                             text-white/85 bg-white/[0.06] border border-white/12
+                             hover:bg-white/[0.10] hover:text-white transition-colors"
+                >
+                  Switch source
+                </button>
+              )}
               <button
                 type="button"
                 onClick={async () => {
