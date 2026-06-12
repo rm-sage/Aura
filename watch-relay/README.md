@@ -27,12 +27,14 @@ The deploy prints a URL like:
 https://aura-watch-relay.<your-subdomain>.workers.dev
 ```
 
-In **Aura → Settings → Watch Together**, set the **Relay URL** to that host with
-the `wss://` scheme:
+**The client ships with a baked-in default relay** (`DEFAULT_RELAY_URL` in
+`src/watchTogether/store.ts`), so users only need a room **code** to join — no
+URL to paste. If you're self-hosting your own relay, set `DEFAULT_RELAY_URL` to
+your deployed Worker (with the `wss://` scheme,
+`wss://aura-watch-relay.<your-subdomain>.workers.dev`).
 
-```
-wss://aura-watch-relay.<your-subdomain>.workers.dev
-```
+Individual installs can still override it at runtime in the player's **More
+menu → Watch Together → Relay settings**.
 
 That's it — create a room in the player and share the code.
 

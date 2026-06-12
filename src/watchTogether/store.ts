@@ -101,8 +101,16 @@ function emit() {
 }
 
 // ── Config ─────────────────────────────────────────────────────────────────
+/** Baked-in default relay (a deployed Cloudflare Worker) so users only need a
+ *  room code to join a party — no relay URL to paste. Overridable per-install
+ *  in the panel's "Relay settings". */
+const DEFAULT_RELAY_URL = "wss://aura-watch-relay.rmsage95.workers.dev";
 export function getRelayUrl(): string {
-  try { return localStorage.getItem(LS_URL) || ""; } catch { return ""; }
+  try {
+    const v = localStorage.getItem(LS_URL);
+    if (v && v.trim()) return v.trim();
+  } catch { /* ignore */ }
+  return DEFAULT_RELAY_URL;
 }
 export function getDisplayName(): string {
   try {

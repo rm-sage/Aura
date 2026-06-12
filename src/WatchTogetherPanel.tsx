@@ -102,8 +102,11 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
             joinCode={joinCode}
             onName={setName}
             onJoinCode={setJoinCode}
-            onCreate={() => { persistConfig(); createRoom(); }}
-            onJoin={() => { persistConfig(); joinRoom(joinCode); }}
+            // Persist only the name here — the relay URL defaults to the baked-in
+            // Worker unless explicitly overridden in Relay settings, so we avoid
+            // pinning localStorage to the current default.
+            onCreate={() => { setWatchConfig({ displayName: name }); createRoom(); }}
+            onJoin={() => { setWatchConfig({ displayName: name }); joinRoom(joinCode); }}
             onEditRelay={() => setEditingConfig(true)}
           />
         ) : (
