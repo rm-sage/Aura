@@ -17,6 +17,7 @@ import {
   loadEpg,
   resolveNowNext,
   hasEpg,
+  isEpgLoading,
   dropEpg,
   type NowNext,
 } from "../iptv/epgStore";
@@ -159,7 +160,10 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
     }
   }, [selectedSourceId, playlist]);
 
+  // Re-derived each render; the component re-renders on EPG store changes via
+  // useEpgVersion(), so these track load start/finish.
   const epgReady = selectedSourceId ? hasEpg(selectedSourceId) : false;
+  const epgLoading = selectedSourceId ? isEpgLoading(selectedSourceId) : false;
 
   // Group counts for the sidebar (computed once per playlist).
   const groups = useMemo(() => {
@@ -418,6 +422,7 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
                 sourceName={playlist?.name ?? selectedSourceId ?? ""}
                 nowMs={nowMs}
                 hasEpg={epgReady}
+                epgLoading={epgLoading}
                 onPlayChannel={(ch) => playlist && onPlayChannel(ch, playlist)}
               />
             ) : (

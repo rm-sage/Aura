@@ -34,10 +34,11 @@ interface Props {
   sourceName: string;
   nowMs: number;
   hasEpg: boolean;
+  epgLoading: boolean;
   onPlayChannel: (channel: IptvChannel) => void;
 }
 
-export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEpg, onPlayChannel }: Props) {
+export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEpg, epgLoading, onPlayChannel }: Props) {
   // Re-render the rows when favourites change so the stars stay in sync.
   const [, bumpFav] = useReducer((n: number) => n + 1, 0);
   useEffect(() => subscribeFavorites(bumpFav), []);
@@ -94,11 +95,18 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
 
   if (!hasEpg) {
     return (
-      <div className="flex-1 flex items-center justify-center text-center px-6">
-        <p className="text-white/40 text-sm max-w-sm">
-          No EPG loaded for this playlist. Add an EPG (XMLTV) URL to the playlist,
-          or use an Xtream login (its guide is fetched automatically).
-        </p>
+      <div className="flex-1 flex flex-col items-center justify-center text-center px-6 gap-3">
+        {epgLoading ? (
+          <>
+            <span className="w-7 h-7 rounded-full border-2 border-white/15 border-t-ln-accent animate-spin" />
+            <p className="text-white/45 text-sm">Loading the TV guide…</p>
+          </>
+        ) : (
+          <p className="text-white/40 text-sm max-w-sm">
+            No EPG loaded for this playlist. Add an EPG (XMLTV) URL to the playlist,
+            or use an Xtream login (its guide is fetched automatically).
+          </p>
+        )}
       </div>
     );
   }
