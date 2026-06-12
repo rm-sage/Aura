@@ -147,13 +147,14 @@ export default function MultiView({ channels, onPlayChannel, suspended }: Props)
           Clear all
         </button>
 
-        {/* Volume for the audio-focused tile (others stay muted). Persisted. */}
-        <div className="flex items-center gap-2 ml-auto">
+        {/* Volume for the audio-focused tile (others stay muted). Persisted.
+            Grouped next to the controls (not pushed right) for visibility. */}
+        <div className="flex items-center gap-2 ml-1 pl-2 border-l border-white/10">
           <button
             type="button"
             onClick={() => changeVolume(volume > 0 ? 0 : 0.5)}
             aria-label={volume > 0 ? "Mute" : "Unmute"}
-            className="w-8 h-8 rounded-lg flex items-center justify-center text-white/60 hover:text-white hover:bg-white/10"
+            className="w-8 h-8 rounded-lg flex items-center justify-center text-white/60 hover:text-white hover:bg-white/10 flex-shrink-0"
           >
             <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor">
               {volume === 0 ? (
@@ -165,16 +166,10 @@ export default function MultiView({ channels, onPlayChannel, suspended }: Props)
               )}
             </svg>
           </button>
-          <input
-            type="range"
-            min={0}
-            max={1}
-            step={0.02}
-            value={volume}
-            onChange={(e) => changeVolume(parseFloat(e.target.value))}
-            aria-label="Multiview volume"
-            className="w-28 accent-ln-accent cursor-pointer"
-          />
+          <VolumeSlider value={volume} onChange={changeVolume} />
+          <span className="text-[11.5px] text-white/60 tabular-nums w-7 text-right">
+            {Math.round(volume * 100)}
+          </span>
         </div>
       </div>
 
@@ -226,6 +221,56 @@ export default function MultiView({ channels, onPlayChannel, suspended }: Props)
           }}
         />
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Custom volume slider — themed fill (ln-accent) + draggable thumb. The native
+// range input rendered as an invisible track + a stray dot; this matches the
+// app's aesthetic and is theme-coloured.
+// ---------------------------------------------------------------------------
+
+function VolumeSlider({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const setFromX = (clientX: number) => {
+    const el = ref.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    onChange(Math.max(0, Math.min(1, (clientX - r.left) / r.width)));
+  };
+  const pct = Math.round(value * 100);
+  return (
+    <div
+      ref={ref}
+      role="slider"
+      aria-label="Multiview volume"
+      aria-valuenow={pct}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      tabIndex={0}
+      onPointerDown={(e) => {
+        e.currentTarget.setPointerCapture(e.pointerId);
+        setFromX(e.clientX);
+      }}
+      onPointerMove={(e) => {
+        if (e.buttons) setFromX(e.clientX);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "ArrowLeft") onChange(Math.max(0, value - 0.05));
+        else if (e.key === "ArrowRight") onChange(Math.min(1, value + 0.05));
+      }}
+      className="group relative w-28 h-1.5 rounded-full bg-white/15 cursor-pointer flex-shrink-0
+                 focus:outline-none focus-visible:ring-2 focus-visible:ring-ln-accent/40"
+    >
+      <span
+        className="absolute inset-y-0 left-0 rounded-full bg-ln-accent"
+        style={{ width: `${pct}%` }}
+      />
+      <span
+        className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-3 h-3 rounded-full bg-white shadow"
+        style={{ left: `${pct}%` }}
+      />
     </div>
   );
 }
