@@ -117,5 +117,40 @@ Store mechanics: `broadcastControl()` mirrors the sent state into the local
 `amStagingHost`, `setLocalStaging`, `everyoneReady`, `readyCount`,
 `openRoomVideo`. Relay carries the new fields (length-capped).
 
+## v3 — Vote to Watch + leader-only delegation (2026-06-12)
+
+- **Leader-only stream delegation.** Only the party LEADER (lowest member id)
+  may establish or change the party stream now. `notifyLocalControl` gates on
+  `isLeader || matches` (followers can still drive play/pause/seek on the shared
+  title); `startPartyStream` requires `isLeader`. Client-advisory under the
+  private room-code model (the relay does not enforce leadership for `control`
+  frames — documented).
+
+- **Vote to Watch.** Any member right-clicks a catalog item (every surface —
+  home/library/queue/calendar/discover/catalog/search/hero — routes through
+  App's `aura:card-context` menu) → "Vote to Watch" (shown only in a party).
+  - ≤3 concurrent polls, 60 s each. Proposer auto-casts yes. **Unanimous yes**
+    (every current roster member casts yes) WINS; any **no** fails; the TTL
+    expires undecided. A 4th proposal → `vote-error` toast.
+  - `PartyVotesOverlay` (app-level, right-edge stack): active polls (poster +
+    Yes/No + a depleting 60 s countdown ring) and won polls (pinned,
+    dismissable, click → the title's details via `aura:open-meta`) with a
+    theme-accent (`--ln-accent`) color burst on win.
+  - **Relay** (`watch-relay/worker.js`, the DO is authoritative): `vote-start` /
+    `vote-cast` handlers; storage key `votes` (≤3, lazy TTL sweep); frames
+    `votes` (full active list), `vote-won`, `vote-error`. Win/fail evaluated by
+    **roster membership** (`roster.every(m => voters.includes(m.id))`), not a raw
+    count, so join/leave can't false-win or deadlock. New joiners are **seeded**
+    with the active votes on `welcome` (else their silent presence deadlocks
+    unanimity — the key review-caught blocker). Empty-room storage is cleared.
+  - Won votes are a NAVIGATION suggestion, not an auto-room-state change: the
+    group picks the title, then the LEADER delegates the actual stream.
+
+Wire types added (`types.ts`): `VotePoll` + `votes` / `vote-won` / `vote-error`
+ServerMsg frames. Store: `activeVotes` / `wonVotes` / `voteError` + `startVote` /
+`castVote` / `dismissWonVote` / `voteRemainingMs` / `haveVoted`. Client guards
+(cap/dup/render) ignore client-expired-but-unswept polls.
+
 ## Not hardware/multi-client tested at build time — needs the relay deployed +
-two clients to validate end-to-end.
+two clients to validate end-to-end. (v3: REDEPLOY the relay — `cd watch-relay;
+npx wrangler deploy` — for votes + the v2 stream-sharing to work.)

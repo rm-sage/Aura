@@ -135,25 +135,30 @@ ones stay deferred (see "Still deferred" below).
   (credential-isolation risk) and the long-lived streaming/iptv/cast clients. No
   `https_only` client was merged or weakened.
 
-## ⏸ Still deferred (need a visual / playback / HW smoke test — do with the app running)
+## ✅ Applied 2026-06-12 (branch `feat/party-votes-and-ram-ab`, merged to main + pushed) — A + B
 
-- **A — HeroCarousel backdrop windowing** (~38 MB). The 2.4 s two-layer cross-fade
-  needs outgoing+incoming layers to coexist for the whole transition; a 3-layer window
-  is safe for auto-advance + wrap but **empirically breaks on mid-fade manual jumps**
-  (dot/arrow nav can jump arbitrarily). Needs visual verification of every transition.
-- **B — Window the 100-item grids** (~55–85 MB across Discover / CatalogPage /
-  CinemaRows popup). The proven `useLibraryRowWindow` ports, **but** all three cards
-  lack the fixed-height title container LibraryCard has, so row-stride measurement
-  drifts when titles wrap / filters change → scroll gaps. Fix card structure first,
-  then verify on 1080p + ultrawide.
-- **C — Unmount the browse tree during playback** (~5–8 MB). **Landmine #6** zone
-  (opaque flash over the MPV child). Safer partial = key-based HomeView/HeroCarousel
-  remount (~3 MB, proven `resetKey` path). Either way needs a windowed-playback smoke
-  test for cleanup-race stutter.
-- **D — Slim the warm-start library blob** (~8–12 MB). Dropping `state.genres` from
-  the warm-start copy risks mis-gating IMDb-id anime in the ~1–2 s window before the
-  fresh `library_get` re-seeds (`markAnimeId`). Verify the re-seed path under a startup
-  right-click smoke test before slimming.
+- **A — HeroCarousel backdrop windowing** (~38 MB). Only the backdrops the cross-fade
+  needs mount: `{prev, current, next}` + the slide being faded FROM. The outgoing slide
+  is derived during RENDER (from `prevIndexRef`, which still holds the old index on the
+  post-jump commit) — not a post-paint effect — so even a non-adjacent dot jump mounts
+  it in the same frame and its fade-OUT fires (no hard cut, no wasted re-decode). A
+  freshly-mounted non-adjacent target appears at full opacity (no fade-IN) — accepted.
+- **B — Window the 100-item grids** (Discover / CatalogPage / CinemaRows "View all"
+  popup). New shared `src/useRowWindow.ts` (a faithful generalization of LibraryView's
+  private `useLibraryRowWindow` — Library left untouched) + a fixed-height title block on
+  each card (`h-14` for the 13 px Discover/Catalog cards; `h-[5.25rem]` for the 19 px
+  popup card, sized for a 2-line title + year). Popup column count read from
+  `--catalog-popup-cols` via a stable module-level `resolveCols`; scroll resets on
+  filter/catalog change; the hook clamps the window so a shrinking list can't blank the
+  grid. `CatalogCard`'s `fixedTitle` is opt-in so the non-windowed home rows stay
+  byte-identical. **NEEDS A VISUAL PASS** on the three grids (1080p + ultrawide).
+
+## ❌ Dropped indefinitely (2026-06-12, user decision — low gain, higher risk)
+
+- **C — Unmount the browse tree during playback** (~5–8 MB). Landmine #6 zone (opaque
+  flash over the MPV child). Not worth the regression risk vs the modest win.
+- **D — Slim the warm-start library blob** (~8–12 MB). Risks mis-gating IMDb-id anime in
+  the ~1–2 s window before the fresh `library_get` re-seeds. Not worth it.
 
 ## Standing rule
 See CLAUDE.md → "Performance & memory": every new feature ships with bounded caches, resized images,
