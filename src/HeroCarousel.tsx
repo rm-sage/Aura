@@ -113,6 +113,19 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
   /** Indices where we've detected a dual-layer fallback (low-res or portrait-only). */
   const [dualLayer, setDualLayer] = useState<Set<number>>(new Set());
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
+  // RAM: only the backdrops needed for the cross-fade stay mounted (each full
+  // 21:9 art is ~5 MB decoded). `transitionFrom` keeps the OUTGOING slide
+  // mounted for the fade duration so even an arbitrary dot-jump cross-fades
+  // cleanly; afterwards only {prev, current, next} remain decoded.
+  const [transitionFrom, setTransitionFrom] = useState<number | null>(null);
+  const prevIndexRef = useRef(index);
+  useEffect(() => {
+    if (prevIndexRef.current === index) return;
+    setTransitionFrom(prevIndexRef.current);
+    prevIndexRef.current = index;
+    const t = setTimeout(() => setTransitionFrom(null), FADE_DURATION_MS);
+    return () => clearTimeout(t);
+  }, [index]);
 
   const reportDualLayer = useCallback((i: number) => {
     setDualLayer((prev) => {
@@ -148,6 +161,22 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
   if (items.length === 0) return null;
 
   const current = items[index];
+
+  // Mounted-backdrop window: current ± 1 (preload for next/prev/auto-advance)
+  // plus the slide we're fading FROM. Everything else stays unmounted so its
+  // decoded bitmap is freed. The outgoing slide is derived during RENDER: on the
+  // commit right after an index change, prevIndexRef still holds the old index
+  // (the effect below advances it post-paint), so even a non-adjacent dot jump
+  // mounts the outgoing slide in the SAME frame and its fade-OUT fires (rather
+  // than a hard cut + a pointless re-mount). During the fade it's transitionFrom.
+  const outgoing = prevIndexRef.current !== index ? prevIndexRef.current : transitionFrom;
+  const n = items.length;
+  const windowed = new Set<number>([index]);
+  if (n > 1) {
+    windowed.add((index - 1 + n) % n);
+    windowed.add((index + 1) % n);
+  }
+  if (outgoing != null && outgoing < n && outgoing !== index) windowed.add(outgoing);
 
   return (
     <div
@@ -201,17 +230,20 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
       data-meta-card={`${current.media_type}:${current.id}`}
       role={onSelect ? "button" : undefined}
     >
-      {/* Backdrop layers — render every item so cross-fade works.
-          Priority: background → fanart → backdrop → poster (heavy blur).
-          Each item also reports its natural width on load so we can detect
-          low-resolution backdrops and lay a sharp poster on top. */}
+      {/* Backdrop layers — only the windowed indices ({prev,current,next} +
+          the fading-out slide) mount, so offscreen 21:9 art doesn't stay
+          decoded (~5 MB each). Priority: background → fanart → backdrop →
+          poster (heavy blur). Each item reports its natural width on load so we
+          can detect low-resolution backdrops and lay a sharp poster on top. */}
       {items.map((item, i) => (
-        <HeroBackdrop
-          key={item.id}
-          item={item}
-          active={i === index}
-          onDualLayer={() => reportDualLayer(i)}
-        />
+        windowed.has(i) ? (
+          <HeroBackdrop
+            key={item.id}
+            item={item}
+            active={i === index}
+            onDualLayer={() => reportDualLayer(i)}
+          />
+        ) : null
       ))}
 
       {/* Catalog-source chip — small pill at the top-left identifying

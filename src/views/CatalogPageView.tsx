@@ -1,12 +1,13 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { MetaPreview } from "../types";
 import ImageLoader from "../ImageLoader";
 import ErrorBoundary from "../ErrorBoundary";
 import { withTypeSuffix } from "../aiometadata";
+import { useRowWindow } from "../useRowWindow";
 import {
   FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState,
 } from "../FilterBar";
@@ -80,9 +81,22 @@ function CatalogPageBody({ target, onBack, onSelectMeta }: Props) {
 
   const title = withTypeSuffix(target.catalogName, target.mediaType);
 
+  // Row-virtualization: only mount viewport rows of the (up to 100-item) grid.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const gridWrapperRef = useRef<HTMLDivElement>(null);
+  const gridRef = useRef<HTMLDivElement>(null);
+  const win = useRowWindow(scrollRef, gridWrapperRef, gridRef, filtered.length, {
+    gap: 20, minCardW: 180, estRowStride: 320,
+  });
+  const visible = filtered.slice(win.start, win.end);
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: 0 });
+  }, [target.catalogId, target.addonUrl, filters]);
+
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
       <div
+        ref={scrollRef}
         className="flex-1 overflow-y-auto"
         style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
       >
@@ -132,11 +146,22 @@ function CatalogPageBody({ target, onBack, onSelectMeta }: Props) {
               </p>
             </div>
           ) : (
-            <div className="grid gap-5 pb-6"
-                 style={{ gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))" }}>
-              {filtered.map((m) => (
-                <CatalogPosterCard key={`${m.media_type}:${m.id}`} meta={m} onSelect={onSelectMeta} />
-              ))}
+            <div ref={gridWrapperRef} style={{ position: "relative", height: win.totalHeight }}>
+              <div
+                ref={gridRef}
+                className="grid gap-5"
+                style={{
+                  position: "absolute",
+                  top: win.offsetY,
+                  left: 0,
+                  right: 0,
+                  gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                }}
+              >
+                {visible.map((m) => (
+                  <CatalogPosterCard key={`${m.media_type}:${m.id}`} meta={m} onSelect={onSelectMeta} />
+                ))}
+              </div>
             </div>
           )}
         </div>
@@ -193,7 +218,10 @@ function CatalogPosterCard({
           />
         ) : null}
       </div>
-      <div className="px-0.5">
+      {/* Fixed-height label block so every card is the SAME total height —
+          the windowing hook derives row stride from one measured card. The
+          parent button's `gap-2` already spaces it from the poster. */}
+      <div className="px-0.5 h-14 overflow-hidden">
         <p className="text-white/85 text-[13px] font-medium leading-tight line-clamp-2 text-center">
           {meta.name}
         </p>

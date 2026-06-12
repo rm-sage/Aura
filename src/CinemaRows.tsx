@@ -1,9 +1,10 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "./FilterBar";
+import { useRowWindow } from "./useRowWindow";
 import { invoke } from "@tauri-apps/api/core";
 import type { MetaPreview, LibraryItem, AddonEntry, VideoEntry } from "./types";
 import { isVideoAired } from "./types";
@@ -881,9 +882,13 @@ export const ContinueWatchingRow = memo(function ContinueWatchingRow(
 interface CatalogCardProps {
   meta: MetaPreview;
   onSelect?: (meta: MetaPreview) => void;
+  /** Constrain the title/year block to a fixed height so cards are uniform —
+   *  required by the View-all popup's row-virtualization (which derives row
+   *  stride from one measured card). Home rows leave it off (unchanged). */
+  fixedTitle?: boolean;
 }
 
-export const CatalogCard = memo(function CatalogCard({ meta, onSelect }: CatalogCardProps) {
+export const CatalogCard = memo(function CatalogCard({ meta, onSelect, fixedTitle }: CatalogCardProps) {
   // Pull progress from the library context — drives the bottom progress
   // bar (partial) and the corner check (watched). Both are rendered as
   // unobtrusive overlays so they don't compete with the poster art.
@@ -983,14 +988,30 @@ export const CatalogCard = memo(function CatalogCard({ meta, onSelect }: Catalog
           Castle (Movie 2)") and long localized show names. Cheap
           universal solution; no extra components / no per-cell event
           handlers. Same pattern wired into CW + Library tiles below. */}
-      <p
-        className="text-white/90 text-[19px] font-medium leading-tight line-clamp-2 text-center"
-        title={meta.name}
-      >
-        {meta.name}
-      </p>
-      {displayYear && (
-        <p className="text-white/55 text-[15.5px] mt-0.5 text-center font-mono">{displayYear}</p>
+      {fixedTitle ? (
+        <div className="h-[5.25rem] overflow-hidden">
+          <p
+            className="text-white/90 text-[19px] font-medium leading-tight line-clamp-2 text-center"
+            title={meta.name}
+          >
+            {meta.name}
+          </p>
+          {displayYear && (
+            <p className="text-white/55 text-[15.5px] mt-0.5 text-center font-mono">{displayYear}</p>
+          )}
+        </div>
+      ) : (
+        <>
+          <p
+            className="text-white/90 text-[19px] font-medium leading-tight line-clamp-2 text-center"
+            title={meta.name}
+          >
+            {meta.name}
+          </p>
+          {displayYear && (
+            <p className="text-white/55 text-[15.5px] mt-0.5 text-center font-mono">{displayYear}</p>
+          )}
+        </>
       )}
     </button>
   );
@@ -1287,6 +1308,18 @@ function RowFrame({
 // the two surfaces feel consistent. ESC + click-outside both close.
 // ---------------------------------------------------------------------------
 
+// Stable options for the popup's row-window hook. Module-level so the hook's
+// layout effect (which deps on resolveCols) doesn't recreate its ResizeObserver
+// every render. Column count is CSS-var-driven (--catalog-popup-cols).
+const POPUP_ROW_WINDOW_OPTS = {
+  gap: 16, // gap-4
+  estRowStride: 470,
+  resolveCols: (_w: number, grid: HTMLElement | null) => {
+    const raw = grid ? getComputedStyle(grid).getPropertyValue("--catalog-popup-cols").trim() : "";
+    return parseInt(raw, 10) || 4;
+  },
+};
+
 function CatalogOverlay({
   title, items, loading, onClose, onSelectMeta,
 }: {
@@ -1309,6 +1342,18 @@ function CatalogOverlay({
     () => applyFilters(items, filters),
     [items, filters],
   );
+
+  // Row-virtualization for the (up to 100-item) popup grid. Column count is
+  // CSS-var-driven (--catalog-popup-cols), so resolveCols reads it off the grid.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const gridWrapperRef = useRef<HTMLDivElement>(null);
+  const gridRef = useRef<HTMLDivElement>(null);
+  const win = useRowWindow(scrollRef, gridWrapperRef, gridRef, filteredItems.length, POPUP_ROW_WINDOW_OPTS);
+  const windowed = filteredItems.slice(win.start, win.end);
+  // A shrinking filter can leave the window pointing past the new end → reset.
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: 0 });
+  }, [filters]);
 
   // Two rAF ticks = one painted frame; lets the initial opacity/scale
   // commit before we transition to the entered state.
@@ -1390,29 +1435,48 @@ function CatalogOverlay({
             View-all (mounts tall in one synchronous render, unlike
             paginated catalogs that re-render tall after a fetch). */}
         <div
+          ref={scrollRef}
           className="flex-1 min-h-0 overflow-y-auto p-6"
           style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
         >
-          <div
-            className="grid gap-4"
-            style={{ gridTemplateColumns: "repeat(var(--catalog-popup-cols), minmax(0, 1fr))" }}
-          >
-            {loading && items.length === 0
-              ? Array.from({ length: 12 }).map((_, i) => (
-                  <div
-                    key={`skeleton-${i}`}
-                    className="rounded-xl bg-white/5 image-loader-skeleton"
-                    style={{ aspectRatio: "2 / 3" }}
-                  />
-                ))
-              : filteredItems.map((meta) => (
+          {loading && items.length === 0 ? (
+            <div
+              className="grid gap-4"
+              style={{ gridTemplateColumns: "repeat(var(--catalog-popup-cols), minmax(0, 1fr))" }}
+            >
+              {Array.from({ length: 12 }).map((_, i) => (
+                <div
+                  key={`skeleton-${i}`}
+                  className="rounded-xl bg-white/5 image-loader-skeleton"
+                  style={{ aspectRatio: "2 / 3" }}
+                />
+              ))}
+            </div>
+          ) : (
+            // Spacer reflects the full list height; only viewport rows mount.
+            <div ref={gridWrapperRef} style={{ position: "relative", height: win.totalHeight }}>
+              <div
+                ref={gridRef}
+                className="grid gap-4"
+                style={{
+                  position: "absolute",
+                  top: win.offsetY,
+                  left: 0,
+                  right: 0,
+                  gridTemplateColumns: "repeat(var(--catalog-popup-cols), minmax(0, 1fr))",
+                }}
+              >
+                {windowed.map((meta) => (
                   <CatalogCard
                     key={`${meta.media_type}:${meta.id}`}
                     meta={meta}
+                    fixedTitle
                     onSelect={onSelectMeta ? (m) => { onClose(); onSelectMeta(m); } : undefined}
                   />
                 ))}
-          </div>
+              </div>
+            </div>
+          )}
           {!loading && filteredItems.length === 0 && items.length > 0 && (
             <div className="text-center py-10 text-white/55 text-sm">
               No items match the current filter.

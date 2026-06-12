@@ -11,6 +11,7 @@ import WatchedBadge from "../WatchedBadge";
 import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "../FilterBar";
 import { useHoverCardActivation } from "../useHoverCardActivation";
 import { closeHoverNow } from "../catalogHoverStore";
+import { useRowWindow } from "../useRowWindow";
 
 // ---------------------------------------------------------------------------
 // DiscoverView — browse any addon's catalogs, including ones the addon has
@@ -160,9 +161,24 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
     return applyFilters(items, filters);
   }, [items, filters]);
 
+  // Row-virtualization: only mount viewport rows of the (up to 100-item) grid.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const gridWrapperRef = useRef<HTMLDivElement>(null);
+  const gridRef = useRef<HTMLDivElement>(null);
+  const win = useRowWindow(scrollRef, gridWrapperRef, gridRef, filtered.length, {
+    gap: 20, minCardW: 180, estRowStride: 320,
+  });
+  const visible = filtered.slice(win.start, win.end);
+  // Reset scroll when the visible set changes (new catalog / filter), or a deep
+  // scroll position would leave the window pointing past the shorter new list.
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: 0 });
+  }, [selectedAddonUrl, selectedCatalogId, filters]);
+
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
       <div
+        ref={scrollRef}
         className="flex-1 overflow-y-auto"
         style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
       >
@@ -253,15 +269,26 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
               </p>
             </div>
           ) : (
-            <div className="grid gap-5 pb-6"
-                 style={{ gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))" }}>
-              {filtered.map((m) => (
-                <DiscoverPosterCard
-                  key={`${m.media_type}:${m.id}`}
-                  meta={m}
-                  onSelect={onSelectMeta}
-                />
-              ))}
+            <div ref={gridWrapperRef} style={{ position: "relative", height: win.totalHeight }}>
+              <div
+                ref={gridRef}
+                className="grid gap-5"
+                style={{
+                  position: "absolute",
+                  top: win.offsetY,
+                  left: 0,
+                  right: 0,
+                  gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                }}
+              >
+                {visible.map((m) => (
+                  <DiscoverPosterCard
+                    key={`${m.media_type}:${m.id}`}
+                    meta={m}
+                    onSelect={onSelectMeta}
+                  />
+                ))}
+              </div>
             </div>
           )}
         </div>
@@ -439,12 +466,16 @@ const DiscoverPosterCard = memo(function DiscoverPosterCard({
         <WatchedBadge metaId={meta.id} mediaType={meta.media_type}
           className="absolute top-1.5 left-1.5" />
       </div>
-      <p className="text-white/85 text-[13px] mt-2 mx-1 line-clamp-2 leading-snug">
-        {meta.name}
-      </p>
-      {meta.release_info && (
-        <p className="text-white/40 text-[11px] font-mono mx-1">{meta.release_info}</p>
-      )}
+      {/* Fixed-height label block so every card is the SAME total height —
+          the windowing hook derives row stride from one measured card. */}
+      <div className="px-0.5 h-14 overflow-hidden mt-2">
+        <p className="text-white/85 text-[13px] mx-1 line-clamp-2 leading-snug">
+          {meta.name}
+        </p>
+        {meta.release_info && (
+          <p className="text-white/40 text-[11px] font-mono mx-1">{meta.release_info}</p>
+        )}
+      </div>
     </button>
   );
 });
