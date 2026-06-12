@@ -1,0 +1,16 @@
+{
+  "name": "aura-watch-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Aura Watch-Together relay — Cloudflare Worker + Durable Object",
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "tail": "wrangler tail",
+    "secret": "wrangler secret put APP_TOKEN"
+  },
+  "devDependencies": {
+    "wrangler": "^3.80.0"
+  }
+}

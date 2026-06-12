@@ -61,6 +61,8 @@ import SourceSwitcher, { streamKey } from "./SourceSwitcher";
 import CastMenu from "./CastMenu";
 import CastSessionBar from "./CastSessionBar";
 import { useCastSession } from "./useCastSession";
+import WatchTogetherPanel from "./WatchTogetherPanel";
+import { setPlaybackBridge, notifyLocalControl, notifyLocalVideo } from "./watchTogether/store";
 import { parseStream } from "./streamMeta";
 import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPreviousEpisode } from "./nextUp";
 import { getMetaDetailFallback, getRichestMetaDetail, peekCachedDetailById, peekRichestCachedDetailById, peekFreshestPostersByIds } from "./metaCache";
@@ -1143,6 +1145,70 @@ export default function App() {
     notifyNewLoad, logLoadEvent,
     watchedElapsedRef,
   } = usePlayback(isPlayerActive);
+
+  // ── Watch-Together ──────────────────────────────────────────────────────
+  // Refs the playback bridge reads, so the bridge is registered ONCE and never
+  // captures a stale closure. The bridge drives local playback only through
+  // the existing seek/pause controls (raw → no re-broadcast). See
+  // src/watchTogether/. The broadcast-wrapped controls below are what the
+  // on-screen controls + keybindings call (NOT programmatic/internal pauses).
+  const wtTimeRef = useRef(time); wtTimeRef.current = time;
+  const wtPausedRef = useRef(paused); wtPausedRef.current = paused;
+  const wtTargetRef = useRef(activeTarget); wtTargetRef.current = activeTarget;
+  const wtSeekRef = useRef(seekAbsolute); wtSeekRef.current = seekAbsolute;
+  const wtTogglePauseRef = useRef(togglePause); wtTogglePauseRef.current = togglePause;
+  // `togglePause` is a relative, fire-and-forget command and the observed
+  // `paused`/`wtPausedRef` only update on the next MPV event — so a remote
+  // apply that toggles against the lagging ref can desync when two control
+  // frames land inside the event round-trip. Track the INTENDED pause state,
+  // updated SYNCHRONOUSLY on every command, and reconcile it from the real
+  // state when that actually changes.
+  const wtIntendedPausedRef = useRef(paused);
+  useEffect(() => { wtIntendedPausedRef.current = paused; }, [paused]);
+  useEffect(() => {
+    setPlaybackBridge({
+      getLocal: () => ({
+        paused: wtPausedRef.current,
+        position: wtTimeRef.current,
+        videoKey: wtTargetRef.current?.id ?? null,
+        title: wtTargetRef.current?.name ?? null,
+      }),
+      apply: (remotePaused: boolean, position: number) => {
+        if (Math.abs(wtTimeRef.current - position) > 0.4) wtSeekRef.current(position);
+        if (wtIntendedPausedRef.current !== remotePaused) {
+          wtTogglePauseRef.current();
+          wtIntendedPausedRef.current = remotePaused;
+        }
+      },
+    });
+    return () => setPlaybackBridge(null);
+  }, []);
+  const wtTogglePause = useCallback(() => {
+    const next = !wtIntendedPausedRef.current;
+    togglePause();
+    wtIntendedPausedRef.current = next;
+    notifyLocalControl({ paused: next, position: wtTimeRef.current });
+  }, [togglePause]);
+  const wtSeekAbsolute = useCallback((t: number) => {
+    seekAbsolute(t);
+    notifyLocalControl({ paused: wtIntendedPausedRef.current, position: t });
+  }, [seekAbsolute]);
+  const wtSeekRelative = useCallback((d: number) => {
+    seekRelative(d);
+    notifyLocalControl({ paused: wtIntendedPausedRef.current, position: wtTimeRef.current + d });
+  }, [seekRelative]);
+  // Tell the room what we're watching whenever the active title changes (so
+  // presence + sync-gating stay current). Fires after the ref updates.
+  useEffect(() => {
+    notifyLocalVideo();
+  }, [activeTarget?.id]);
+  // Open the room panel from PlayerOverlay's More menu.
+  const [watchPanelOpen, setWatchPanelOpen] = useState(false);
+  useEffect(() => {
+    const open = () => setWatchPanelOpen(true);
+    window.addEventListener("aura:open-watch-together", open);
+    return () => window.removeEventListener("aura:open-watch-together", open);
+  }, []);
 
   // ── Detail-view state (selected meta + click-rect for shared-element open) ──
   // Restored from the session route on reload (no rect → opens without the
@@ -4099,9 +4165,9 @@ export default function App() {
     bindings: keybindings,
     enabled: !showLogin,
     handlers: {
-      "toggle-pause":     () => togglePause(),
-      "seek-back":        () => seekRelative(-10),
-      "seek-forward":     () => seekRelative(10),
+      "toggle-pause":     () => wtTogglePause(),
+      "seek-back":        () => wtSeekRelative(-10),
+      "seek-forward":     () => wtSeekRelative(10),
       "volume-up":        () => bumpVolumeFromKey(2),
       "volume-down":      () => bumpVolumeFromKey(-2),
       "toggle-osd":       () => window.dispatchEvent(new CustomEvent("aura:toggle-osd")),
@@ -5739,9 +5805,9 @@ export default function App() {
           buffering={buffering}
           bufferPct={bufferPct}
           firstFrameSeen={firstFrameSeen}
-          togglePause={togglePause}
-          seekRelative={seekRelative}
-          seekAbsolute={seekAbsolute}
+          togglePause={wtTogglePause}
+          seekRelative={wtSeekRelative}
+          seekAbsolute={wtSeekAbsolute}
           commitVolume={commitVolumeAndSave}
           commitSpeed={commitSpeed}
           onExitPlayback={handleExitPlayback}
@@ -5829,6 +5895,11 @@ export default function App() {
           isFullscreen={isFullscreen}
         />
       )}
+
+      {/* Watch-Together room panel — opened from the More menu. Available
+          whenever the app is up (you can set the relay URL / create a room
+          before playback), so it's not gated on activeTarget. */}
+      <WatchTogetherPanel open={watchPanelOpen} onClose={() => setWatchPanelOpen(false)} />
       {cast.activeDevice && (
         <CastSessionBar
           deviceName={cast.activeDevice.name}
