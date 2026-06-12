@@ -18,7 +18,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import type { AddonEntry, MetaPreview, MetaDetail } from "./types";
-import { getMetaDetail } from "./metaCache";
+import { getMetaDetail, getMetaDetailFallback } from "./metaCache";
 import { useEpisodesBehind } from "./LibraryContext";
 import { dedupedInvoke } from "./invokeDedupe";
 import { BrandLogo, ratingDomain, ratingKindNote, groupRatingsByBrand } from "./logodev";
@@ -213,12 +213,15 @@ function HoverPanel({
         setLoading(false);
         return;
       }
+      const alt = meta.media_type === "series" ? "anime"
+        : meta.media_type === "anime" ? "series" : null;
       let d = await getMetaDetail(provider, meta.media_type, meta.id);
-      if (!d) {
-        const alt = meta.media_type === "series" ? "anime"
-          : meta.media_type === "anime" ? "series" : null;
-        if (alt) d = await getMetaDetail(provider, alt, meta.id);
-      }
+      if (!d && alt) d = await getMetaDetail(provider, alt, meta.id);
+      // Fall back across ALL meta-capable addons (mirrors the detail page)
+      // when the preferred provider has nothing for this item — fixes hover
+      // meta missing for items only another addon serves.
+      if (!d) d = await getMetaDetailFallback(addons, meta.media_type, meta.id);
+      if (!d && alt) d = await getMetaDetailFallback(addons, alt, meta.id);
       if (cancelled) return;
       setDetail(d);
       setLoading(false);
