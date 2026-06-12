@@ -543,6 +543,10 @@ function usePlayback(playerActive: boolean) {
    *  is slow when a stream feels stuck loading. Reset each time
    *  a new stream starts loading. */
   const loadStartedAtRef = useRef<number>(0);
+  /** Guards the 45 s load watchdog so it fires ONCE per load instead of
+   *  re-warning + re-flipping streamBroken every 2 s forever. Reset on each
+   *  fresh load (notifyNewLoad). */
+  const loadWatchdogFiredRef = useRef(false);
   /** Set of load-event names already emitted for the current
    *  load. Stops the same milestone from spamming the log on
    *  every poll tick (e.g. "duration appeared"). */
@@ -896,8 +900,12 @@ function usePlayback(playerActive: boolean) {
     const LOAD_TIMEOUT_MS = 45000;
     const id = window.setInterval(() => {
       const start = loadStartedAtRef.current;
-      if (start === 0) return;
+      if (start === 0 || loadWatchdogFiredRef.current) return;
       if (Date.now() - start >= LOAD_TIMEOUT_MS) {
+        // Fire ONCE per load — the guard (reset in notifyNewLoad) stops this
+        // from re-warning + re-flipping streamBroken every 2 s indefinitely
+        // when a load stays wedged.
+        loadWatchdogFiredRef.current = true;
         console.warn("[playback] load watchdog: no first frame in 45 s");
         setStreamBroken(true);
       }
@@ -911,6 +919,7 @@ function usePlayback(playerActive: boolean) {
    *  overlay only hides once MPV is genuinely ready to play. */
   const notifyNewLoad = useCallback(() => {
     loadStartedAtRef.current = Date.now();
+    loadWatchdogFiredRef.current = false;
     loadEventsSeenRef.current = new Set();
     lastTimeUpdateAtRef.current = 0;
     lastCacheBufferLogRef.current = null;
