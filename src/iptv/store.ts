@@ -34,6 +34,20 @@ const CHANGE_EVENT = "aura:iptv-changed";
  *  change" against a stale list after the provider adds channels. */
 const PARSE_TTL_MS = 30 * 60 * 1000;
 
+/** Bundled, always-offered default playlist: iptv-org's free global index +
+ *  a broad community XMLTV EPG (epgshare01 ALL_SOURCES — gzip, matched via the
+ *  resolver's tvg-id + name fallback; won't cover every channel and is large).
+ *  Seeded ONCE per install (see loadIptvSources) so a new user has something to
+ *  try Live TV with; fully removable afterward. */
+const DEFAULT_PLAYLIST: IptvPlaylistSource = {
+  id: "iptv_org",
+  name: "iptv-org (Free)",
+  url: "https://iptv-org.github.io/iptv/index.m3u",
+  kind: "m3u",
+  epgUrl: "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.xml.gz",
+};
+const DEFAULT_SEEDED_KEY = "aura.iptv.defaultSeeded";
+
 interface IptvState {
   sources: IptvPlaylistSource[];
   /** source id → parsed playlist. */
@@ -97,8 +111,25 @@ export async function loadIptvSources(): Promise<void> {
   } catch {
     sources = [];
   }
+  // Seed the bundled iptv-org playlist ONCE per install (so a new user has a
+  // working Live TV starting point), then never force it again — the user can
+  // remove it permanently. Deduped by URL so the current user's existing
+  // iptv-org entry isn't duplicated.
+  let seededNow = false;
+  try {
+    if (!localStorage.getItem(DEFAULT_SEEDED_KEY)) {
+      localStorage.setItem(DEFAULT_SEEDED_KEY, "1");
+      if (!sources.some((s) => s.url === DEFAULT_PLAYLIST.url)) {
+        sources = [DEFAULT_PLAYLIST, ...sources];
+        seededNow = true;
+      }
+    }
+  } catch {
+    /* localStorage unavailable — skip seeding */
+  }
   _state.sources = sources;
   _state.loaded = true;
+  if (seededNow) await persistSources();
   emit();
   // Passive-refresh each source (TTL-gated; no-op if fresh).
   await Promise.all(sources.map((src) => refreshPlaylist(src.id).catch(() => {})));
