@@ -64,9 +64,11 @@ import { useCastSession } from "./useCastSession";
 import WatchTogetherPanel from "./WatchTogetherPanel";
 import PartyButton from "./PartyButton";
 import PlayerPartyHud from "./PlayerPartyHud";
+import PartyVotesOverlay from "./PartyVotesOverlay";
 import {
   setPlaybackBridge, notifyLocalControl, notifyLocalVideo, resyncToRoom,
   startPartyStream, setLocalStaging, amStagingHost, everyoneReady, getWatchState,
+  startVote,
 } from "./watchTogether/store";
 import { useWatchTogether } from "./watchTogether/useWatchTogether";
 import { streamLabel, streamMatchKey } from "./watchTogether/streamMatch";
@@ -3720,6 +3722,33 @@ export default function App() {
         },
       });
 
+      // ── Vote to Watch (party only) ────────────────────────────────
+      // Only present while connected to a watch party. Proposes a poll
+      // for this title; the relay caps it at 3 concurrent (startVote also
+      // pre-checks + surfaces the error). Title-level only (this listener
+      // never fires for episode rows — those use DetailView's own menu).
+      if (getWatchState().status === "connected") {
+        items.push({
+          kind: "action",
+          label: "Vote to Watch",
+          tone: "notice",
+          icon: (
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+              <path d="M2 21h4V9H2v12zm20-11c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06L13.17 1 6.59 7.59C6.22 7.95 6 8.45 6 9v10c0 1.1.9 2 2 2h9c.83 0 1.54-.5 1.84-1.22l3.02-7.05c.09-.23.14-.47.14-.73v-2z" />
+            </svg>
+          ),
+          onClick: () => {
+            const ok = startVote({
+              metaId: meta.id,
+              mediaType: meta.media_type,
+              title: meta.name,
+              poster: meta.poster ?? null,
+            });
+            if (ok) showFlyUpToast(`Vote started · ${meta.name}`, { x, y, tone: "success" });
+          },
+        });
+      }
+
       // ── Bottom-anchored danger row ────────────────────────────────
       // Always last, always preceded by a divider. Layout discipline
       // here is what stops the user mis-clicking destructive options
@@ -5769,6 +5798,9 @@ export default function App() {
           lives inside this bell's popup header. */}
       <NotificationsBell library={library} />
       <PartyButton />
+      {/* "Vote to Watch" stack — active polls + won winners + cap errors.
+          Renders nothing unless in a party with something to show. */}
+      <PartyVotesOverlay />
 
       </div>
       )}

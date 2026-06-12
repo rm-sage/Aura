@@ -40,13 +40,41 @@ export interface RoomState {
   driverId: string | null;
 }
 
+/** A "Vote to Watch" poll — any member proposes a title; the party votes
+ *  yes/no; unanimous yes wins, any no fails, 60 s with no decision expires.
+ *  Up to 3 can be active at once. The relay is authoritative for the tally. */
+export interface VotePoll {
+  id: string;
+  /** Series-root id (or movie id) — what a winning vote navigates to. */
+  metaId: string;
+  mediaType: string | null;
+  title: string;
+  poster: string | null;
+  proposedBy: string;
+  proposedByName: string;
+  /** Relay (server-clock) ms timestamps. */
+  startedAt: number;
+  expiresAt: number;
+  yes: number;
+  no: number;
+  /** Member ids that have already cast — so the UI can disable re-voting and
+   *  show "X of N voted". */
+  voters: string[];
+}
+
 /** Server → client frames. */
 export type ServerMsg =
   | { t: "welcome"; selfId: string; serverNow: number; state: RoomState; members: WatchMember[] }
   | { t: "members"; members: WatchMember[] }
   | ({ t: "control" } & RoomState)
   | { t: "tick"; position: number; paused: boolean; driverId: string | null }
-  | { t: "video"; from: string; videoKey: string | null; title: string | null };
+  | { t: "video"; from: string; videoKey: string | null; title: string | null }
+  /** Full active-vote list (broadcast on any change / expiry sweep). */
+  | { t: "votes"; votes: VotePoll[] }
+  /** A vote reached unanimous yes — clients persist it as a dismissable card. */
+  | { t: "vote-won"; vote: VotePoll }
+  /** Sent to the initiator only (3-vote cap reached, or duplicate). */
+  | { t: "vote-error"; reason: string };
 
 /** A snapshot of LOCAL playback the store reads to broadcast / tick. */
 export interface LocalPlayback {

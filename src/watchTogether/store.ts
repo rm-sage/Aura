@@ -18,7 +18,7 @@
 // ---------------------------------------------------------------------------
 
 import type {
-  WatchMember, RoomState, ServerMsg, PlaybackBridge,
+  WatchMember, RoomState, ServerMsg, PlaybackBridge, VotePoll,
 } from "./types";
 
 const LS_URL = "aura.watch.relayUrl";
@@ -75,6 +75,12 @@ export interface WatchUiState {
   inSync: boolean;
   isLeader: boolean;
   error: string | null;
+  /** "Vote to Watch" polls currently open (relay-authoritative, ≤3). */
+  activeVotes: VotePoll[];
+  /** Won votes pinned on screen until manually dismissed (click → details). */
+  wonVotes: VotePoll[];
+  /** Transient error (e.g. 3-vote cap reached); auto-clears. */
+  voteError: string | null;
 }
 
 const BLANK_ROOM = {
@@ -92,6 +98,9 @@ const ui: WatchUiState = {
   inSync: false,
   isLeader: false,
   error: null,
+  activeVotes: [],
+  wonVotes: [],
+  voteError: null,
 };
 
 // ── Connection / runtime (not part of the emitted UI state) ────────────────
@@ -195,6 +204,9 @@ export function leaveRoom(): void {
   ui.inSync = false;
   ui.isLeader = false;
   ui.error = null;
+  ui.activeVotes = [];
+  ui.wonVotes = [];
+  ui.voteError = null;
   emit();
 }
 
@@ -331,6 +343,23 @@ function handleMessage(data: string) {
     case "video":
       // Presence-only; the following `members` frame carries the roster.
       break;
+    case "votes":
+      ui.activeVotes = msg.votes;
+      emit();
+      break;
+    case "vote-won": {
+      // Pin the winner (dedupe) and drop it from the active list immediately
+      // (the trailing `votes` frame confirms, but don't wait for it).
+      if (!ui.wonVotes.some((v) => v.id === msg.vote.id)) {
+        ui.wonVotes = [msg.vote, ...ui.wonVotes].slice(0, 6);
+      }
+      ui.activeVotes = ui.activeVotes.filter((v) => v.id !== msg.vote.id);
+      emit();
+      break;
+    }
+    case "vote-error":
+      setVoteError(msg.reason);
+      break;
     default:
       break;
   }
@@ -442,9 +471,12 @@ function stopLeaderTimer() {
 export function notifyLocalControl(next?: { paused: boolean; position: number }): void {
   if (ui.status !== "connected" || !bridge) return;
   const local = bridge.getLocal();
-  const establishing = ui.roomVideoKey == null;
   const matches = local.videoKey != null && local.videoKey === ui.roomVideoKey;
-  if (!establishing && !matches) return;
+  // ONLY the party LEADER may establish or change the party stream. Followers
+  // can still drive play/pause/seek, but ONLY when their local title already
+  // matches the room's (in sync) — a follower never delegates a stream, and a
+  // follower off watching something else can't broadcast at all.
+  if (!ui.isLeader && !matches) return;
   broadcastControl(next?.paused ?? local.paused, next?.position ?? local.position);
 }
 
@@ -486,10 +518,11 @@ function broadcastControl(paused: boolean, position: number) {
 }
 
 /** Start (or switch) the party's stream and HOLD it (staging) for the party to
- *  join. Bypasses the in-sync gate — this IS the new party content. Called by
- *  the host right after their stream loads (paused). */
+ *  join. Bypasses the in-sync gate — this IS the new party content. LEADER ONLY
+ *  (only the leader delegates a stream); called by the host right after their
+ *  stream loads (paused). */
 export function startPartyStream(): void {
-  if (ui.status !== "connected" || !bridge) return;
+  if (ui.status !== "connected" || !bridge || !ui.isLeader) return;
   localStaging = true;
   broadcastControl(true, 0);
 }
@@ -554,4 +587,74 @@ export function notifyLocalVideo(): void {
 export function resyncToRoom(): void {
   if (!bridge || !ui.inSync || !lastRoomState) return;
   applyRemote(lastRoomState.paused, expectedPosition(lastRoomState));
+}
+
+// ── Vote to Watch ────────────────────────────────────────────────────────────
+
+/** Total lifetime of a poll (mirrors the relay's VOTE_TTL_MS) — the denominator
+ *  for the countdown ring. */
+export const VOTE_TOTAL_MS = 60 * 1000;
+export const VOTE_MAX_ACTIVE = 3;
+
+let voteErrorTimer: ReturnType<typeof setTimeout> | null = null;
+function setVoteError(reason: string) {
+  ui.voteError = reason;
+  emit();
+  if (voteErrorTimer) clearTimeout(voteErrorTimer);
+  voteErrorTimer = setTimeout(() => { ui.voteError = null; emit(); }, 4000);
+}
+export function clearVoteError(): void {
+  if (voteErrorTimer) { clearTimeout(voteErrorTimer); voteErrorTimer = null; }
+  ui.voteError = null;
+  emit();
+}
+
+/** Propose a "Vote to Watch" poll for a catalog item. Returns false (with a
+ *  surfaced error) if not in a party or the 3-vote cap is already reached. */
+export function startVote(item: {
+  metaId: string; mediaType: string | null; title: string; poster: string | null;
+}): boolean {
+  if (ui.status !== "connected") {
+    setVoteError("Join a watch party first.");
+    return false;
+  }
+  // Guard against the LIVE polls only — a client-expired-but-not-yet-swept poll
+  // (quiet room, no relay traffic since its deadline) must not falsely block a
+  // new proposal that the relay would actually accept.
+  const live = ui.activeVotes.filter((v) => voteRemainingMs(v) > 0);
+  if (live.length >= VOTE_MAX_ACTIVE) {
+    setVoteError(`Only ${VOTE_MAX_ACTIVE} votes can run at once.`);
+    return false;
+  }
+  if (live.some((v) => v.metaId === item.metaId)) {
+    setVoteError("There's already a vote for that title.");
+    return false;
+  }
+  send({
+    t: "vote-start",
+    metaId: item.metaId, mediaType: item.mediaType,
+    title: item.title, poster: item.poster,
+  });
+  return true;
+}
+
+/** Cast (or change is not allowed — one vote per member) on an active poll. */
+export function castVote(voteId: string, choice: "yes" | "no"): void {
+  if (ui.status !== "connected") return;
+  send({ t: "vote-cast", voteId, choice });
+}
+
+/** Whether WE have already cast on a poll (drives button state). */
+export function haveVoted(vote: VotePoll): boolean {
+  return ui.selfId != null && vote.voters.includes(ui.selfId);
+}
+
+/** Remaining ms on a poll, on our calibrated view of the server clock. */
+export function voteRemainingMs(vote: VotePoll): number {
+  return Math.max(0, vote.expiresAt - (Date.now() + serverClockOffset));
+}
+
+export function dismissWonVote(id: string): void {
+  ui.wonVotes = ui.wonVotes.filter((v) => v.id !== id);
+  emit();
 }
