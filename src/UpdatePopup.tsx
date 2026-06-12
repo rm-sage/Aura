@@ -23,7 +23,7 @@
 // rather than inline styles so we share the @layer-components scoping
 // and theme cross-fade behaviour with the rest of the app.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import type { UpdateInfo } from "./updaterPlugin";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
@@ -134,11 +134,28 @@ function truncateNotes(body: string): string {
  *  to preserve content. */
 type NoteBlock =
   | { kind: "rule" }
-  | { kind: "heading"; text: string }
+  | { kind: "heading"; text: string; level: 1 | 2 }
+  | { kind: "lead"; text: string }
   | { kind: "bullets"; items: string[] }
   | { kind: "paragraph"; text: string };
 
 const RULE_RE = /^[─━═\-_=]{6,}$/;
+// Markdown-ish heading: `# Title` (level 1) / `## Section` (level 2). Trailing
+// `#`s tolerated. The older `rule + UPPERCASE LINE + rule` form is still parsed
+// (old release tags) and folded to a level-2 heading.
+const HEADING_RE = /^(#{1,3})\s+(.+?)\s*#*$/;
+
+/** Render a line's inline emphasis: `**bold**` → a brighter strong span.
+ *  Everything else passes through. Used in lead/bullet/paragraph text so
+ *  feature names can stand out without a full markdown engine. */
+function renderInline(text: string): ReactNode[] {
+  return text.split(/(\*\*[^*]+?\*\*)/g).map((part, i) => {
+    const m = /^\*\*([^*]+?)\*\*$/.exec(part);
+    return m
+      ? <strong key={i} className="text-white font-semibold">{m[1]}</strong>
+      : <span key={i}>{part}</span>;
+  });
+}
 
 function parseNoteBlocks(notes: string): NoteBlock[] {
   const lines = notes.split(/\r?\n/);
@@ -148,6 +165,13 @@ function parseNoteBlocks(notes: string): NoteBlock[] {
     const line = lines[i];
     const trimmed = line.trim();
     if (!trimmed) {
+      i += 1;
+      continue;
+    }
+    // Markdown-ish heading line (`#`/`##`/`###`).
+    const h = HEADING_RE.exec(trimmed);
+    if (h) {
+      blocks.push({ kind: "heading", text: h[2].trim(), level: h[1].length <= 1 ? 1 : 2 });
       i += 1;
       continue;
     }
@@ -164,7 +188,7 @@ function parseNoteBlocks(notes: string): NoteBlock[] {
         candidate === candidate.toUpperCase() &&
         !RULE_RE.test(candidate);
       if (isHeading) {
-        blocks.push({ kind: "heading", text: candidate });
+        blocks.push({ kind: "heading", text: candidate, level: 2 });
         i = j + 1;
         // Swallow a closing rule if it immediately follows.
         while (i < lines.length && !lines[i].trim()) i += 1;
@@ -222,7 +246,12 @@ function parseNoteBlocks(notes: string): NoteBlock[] {
       para.push(curTrim);
       i += 1;
     }
-    blocks.push({ kind: "paragraph", text: para.join(" ") });
+    // The opening paragraph reads as a lead/tagline — style it brighter.
+    blocks.push(
+      blocks.length === 0
+        ? { kind: "lead", text: para.join(" ") }
+        : { kind: "paragraph", text: para.join(" ") },
+    );
   }
   return blocks;
 }
@@ -347,19 +376,32 @@ export default function UpdatePopup({
                       />
                     );
                   case "heading":
-                    return (
+                    return block.level === 1 ? (
                       <h3
                         key={idx}
-                        className="text-[color:rgb(91,164,255)] text-[11px]
-                                   font-semibold tracking-[0.2em] uppercase
-                                   pt-1"
+                        className="flex items-center gap-2.5 text-white text-[15px]
+                                   font-semibold tracking-tight pt-1"
                       >
+                        <span className="w-1.5 h-1.5 rounded-full bg-ln-accent shadow-accent-glow" />
                         {block.text}
                       </h3>
+                    ) : (
+                      <h4 key={idx} className="flex items-center gap-2 pt-2">
+                        <span className="w-[3px] h-[13px] rounded-full bg-ln-accent/70 shrink-0" />
+                        <span className="text-[color:rgb(91,164,255)] text-[11px] font-bold tracking-[0.16em] uppercase">
+                          {block.text}
+                        </span>
+                      </h4>
+                    );
+                  case "lead":
+                    return (
+                      <p key={idx} className="text-white/90 text-[13.5px] leading-relaxed">
+                        {renderInline(block.text)}
+                      </p>
                     );
                   case "bullets":
                     return (
-                      <ul key={idx} className="space-y-2 pl-1">
+                      <ul key={idx} className="space-y-1.5 pl-1">
                         {block.items.map((item, j) => (
                           <li
                             key={j}
@@ -368,7 +410,7 @@ export default function UpdatePopup({
                             <span className="text-[color:rgb(91,164,255)]/70 mt-[2px] shrink-0">
                               •
                             </span>
-                            <span className="flex-1">{item}</span>
+                            <span className="flex-1">{renderInline(item)}</span>
                           </li>
                         ))}
                       </ul>
@@ -376,7 +418,7 @@ export default function UpdatePopup({
                   case "paragraph":
                     return (
                       <p key={idx} className="text-white/75">
-                        {block.text}
+                        {renderInline(block.text)}
                       </p>
                     );
                 }

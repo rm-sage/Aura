@@ -26,6 +26,24 @@ export function streamKey(s: StreamEntry): string {
   return s.info_hash ?? s.url ?? `${s.addon_name}:${s.title}`;
 }
 
+/** Whether `row` is the same SOURCE as the currently-playing stream `cur`.
+ *  Deliberately does NOT compare raw `url`s first: debrid links re-resolve to a
+ *  fresh url on every fetch, so the switcher's own fetch yields a different url
+ *  than the one that's playing (set from DetailView's fetch). That mismatch is
+ *  why the row went un-highlighted on the FIRST play but matched after a swap
+ *  (the swap played a row from this very list). Match on cross-fetch-stable
+ *  identity instead: info_hash, then addon + release filename, then url. */
+export function sameStreamSource(row: StreamEntry, cur: StreamEntry | null): boolean {
+  if (!cur) return false;
+  if (row.info_hash && cur.info_hash) return row.info_hash === cur.info_hash;
+  const rf = row.filename ?? row.title ?? null;
+  const cf = cur.filename ?? cur.title ?? null;
+  if (row.addon_name && cur.addon_name && rf && cf) {
+    return row.addon_name === cur.addon_name && rf === cf;
+  }
+  return row.url != null && row.url === cur.url;
+}
+
 interface SourceSwitcherProps {
   open: boolean;
   onClose: () => void;
@@ -34,8 +52,9 @@ interface SourceSwitcherProps {
   onPick: (stream: StreamEntry) => void;
   /** streamKey() of the row mid-resolve (spinner), or null. */
   resolvingKey: string | null;
-  /** Raw URL of the currently-playing stream (== activeStreamUrl). */
-  currentUrl: string | null;
+  /** The currently-playing stream — matched on stable identity (not raw url,
+   *  which differs across fetches for debrid sources). */
+  currentStream: StreamEntry | null;
   /** Windowed playback keeps the 36px Win32 title bar — offset for it. */
   isFullscreen: boolean;
 }
@@ -59,7 +78,7 @@ function rowChips(s: StreamEntry): { kind: ChipKind; label: string }[] {
 }
 
 export default function SourceSwitcher({
-  open, onClose, streams, loading, onPick, resolvingKey, currentUrl, isFullscreen,
+  open, onClose, streams, loading, onPick, resolvingKey, currentStream, isFullscreen,
 }: SourceSwitcherProps) {
   // Esc closes (capture phase so it wins over the player's global keybinds).
   useEffect(() => {
@@ -119,7 +138,7 @@ export default function SourceSwitcher({
           ) : (
             streams.map((s) => {
               const key = streamKey(s);
-              const isCurrent = s.url != null && s.url === currentUrl;
+              const isCurrent = sameStreamSource(s, currentStream);
               const resolving = resolvingKey === key;
               return (
                 <button

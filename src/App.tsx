@@ -57,7 +57,7 @@ import { setAutoBackupScope, startAutoBackup } from "./userDataBackup";
 import NextUpCta from "./NextUpCta";
 import EosSpotlight from "./EosSpotlight";
 import EpisodePanel from "./EpisodePanel";
-import SourceSwitcher, { streamKey } from "./SourceSwitcher";
+import SourceSwitcher, { streamKey, sameStreamSource } from "./SourceSwitcher";
 import CastMenu from "./CastMenu";
 import CastSessionBar from "./CastSessionBar";
 import { useCastSession } from "./useCastSession";
@@ -1132,6 +1132,10 @@ export default function App() {
    *  PlayerOverlay's Copy / Download / External-player utilities. Cleared
    *  when playback exits. */
   const [activeStreamUrl, setActiveStreamUrl] = useState<string | null>(null);
+  /** The currently-playing StreamEntry (not just its url) — the source switcher
+   *  matches its "Now Playing" row on this by stable identity, since debrid urls
+   *  re-resolve per fetch and wouldn't match a freshly-fetched switcher list. */
+  const [currentStream, setCurrentStream] = useState<StreamEntry | null>(null);
   /** External subtitle tracks for the active stream — addon-supplied
    *  .srt/.vtt URLs. Merged with MPV's track-list in the subtitle dropdown. */
   const [activeExternalSubs, setActiveExternalSubs] = useState<ExternalSubtitle[]>([]);
@@ -2133,6 +2137,7 @@ export default function App() {
         // Download / External-player open the genuine source — proxying
         // through 127.0.0.1 makes no sense for those utilities.
         setActiveStreamUrl(stream.url ?? null);
+        setCurrentStream(stream); // drives the source switcher's "Now Playing" match
         // Look up the logo for the buffering overlay. Try the selected meta
         // (the exact card the user clicked) first, falling back to the
         // selected library item.
@@ -4512,8 +4517,9 @@ export default function App() {
 
   const onPickSource = useCallback((stream: StreamEntry) => {
     if (!activeTarget) return;
-    // Picking the already-playing row is a no-op (the UI disables it too).
-    if (stream.url && stream.url === activeStreamUrl) { setSwitcherOpen(false); return; }
+    // Picking the already-playing row is a no-op (the UI disables it too) —
+    // match on stable identity, not the volatile (debrid-re-resolved) url.
+    if (sameStreamSource(stream, currentStream)) { setSwitcherOpen(false); return; }
     setSwitcherResolvingKey(streamKey(stream));
     // The live position wins; but if the user switched within the first
     // seconds (e.g. the original source failed to start), fall back to the
@@ -4554,7 +4560,7 @@ export default function App() {
         setSwitcherResolvingKey(null);
         setSwitcherOpen(false);
       });
-  }, [activeTarget, activeStreamUrl, handlePlayStream, time]);
+  }, [activeTarget, currentStream, handlePlayStream, time]);
 
   // ── Casting (Chromecast + DLNA) ──
   // Device picker + session state live in useCastSession; opened via the
@@ -4860,6 +4866,7 @@ export default function App() {
     }
     setActiveTarget(null);
     setActiveStreamUrl(null);
+    setCurrentStream(null);
     setActiveExternalSubs([]);
     setActiveScoringMeta(null);
     // EOS Spotlight: ensure the end screen is torn down the instant the
@@ -6035,10 +6042,10 @@ export default function App() {
           open={switcherOpen}
           onClose={() => setSwitcherOpen(false)}
           streams={switcherStreams}
+          currentStream={currentStream}
           loading={switcherLoading}
           onPick={onPickSource}
           resolvingKey={switcherResolvingKey}
-          currentUrl={activeStreamUrl}
           isFullscreen={isFullscreen}
         />
       )}
