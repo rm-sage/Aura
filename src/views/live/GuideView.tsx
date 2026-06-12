@@ -1,7 +1,8 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { memo, useMemo, useRef, useEffect, useReducer } from "react";
+import { memo, useMemo, useRef, useEffect, useReducer, useState, type CSSProperties } from "react";
+import { createPortal } from "react-dom";
 import { channelPrograms } from "../../iptv/epgStore";
 import { isFavorite, toggleFavorite, subscribeFavorites } from "../../iptv/favoritesStore";
 import { openChannelMenu } from "../../iptv/channelMenu";
@@ -40,6 +41,10 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
   // Re-render the rows when favourites change so the stars stay in sync.
   const [, bumpFav] = useReducer((n: number) => n + 1, 0);
   useEffect(() => subscribeFavorites(bumpFav), []);
+
+  // Floating programme hover card (portaled to body so it escapes the guide's
+  // scroll overflow).
+  const [hover, setHover] = useState<HoverState | null>(null);
   // Window: floor `now` to the hour so the in-progress programme is visible,
   // spanning WINDOW_HOURS forward. Recomputed only when the hour rolls over.
   const windowStart = useMemo(() => {
@@ -60,6 +65,16 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
     // Only re-center when the window resets (hour roll), not every tick.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [windowStart]);
+
+  // Clear the hover card on scroll — it's positioned at the block's rect at
+  // hover time, so scrolling would otherwise strand it mid-viewport.
+  useEffect(() => {
+    if (!hover) return;
+    const el = scrollRef.current;
+    const clear = () => setHover(null);
+    el?.addEventListener("scroll", clear, { passive: true });
+    return () => el?.removeEventListener("scroll", clear);
+  }, [hover]);
 
   // Hour tick marks across the ruler. Stop BEFORE windowEnd — a tick at the
   // very right edge (x === timelineW) renders its label outside the timeline
@@ -164,9 +179,15 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
             nowMs={nowMs}
             timelineW={timelineW}
             onPlay={() => onPlayChannel(ch)}
+            onBlockHover={(p, el, live) =>
+              setHover({ p, rect: el.getBoundingClientRect(), live })
+            }
+            onBlockLeave={() => setHover(null)}
           />
         ))}
       </div>
+
+      <ProgramHoverCard hover={hover} />
     </div>
   );
 }
@@ -181,6 +202,8 @@ const GuideRow = memo(function GuideRow({
   nowMs,
   timelineW,
   onPlay,
+  onBlockHover,
+  onBlockLeave,
 }: {
   channel: IptvChannel;
   sourceId: string;
@@ -191,6 +214,8 @@ const GuideRow = memo(function GuideRow({
   nowMs: number;
   timelineW: number;
   onPlay: () => void;
+  onBlockHover: (p: EpgProgram, el: HTMLElement, live: boolean) => void;
+  onBlockLeave: () => void;
 }) {
   // Programmes intersecting the window, with their pixel geometry.
   const blocks = useMemo(() => {
@@ -268,7 +293,8 @@ const GuideRow = memo(function GuideRow({
             key={`${p.startMs}`}
             type="button"
             onClick={onPlay}
-            title={`${p.title}\n${fmtRange(p.startMs, p.endMs)}${p.description ? "\n\n" + p.description : ""}`}
+            onMouseEnter={(e) => onBlockHover(p, e.currentTarget, live)}
+            onMouseLeave={onBlockLeave}
             className={[
               "absolute top-[3px] bottom-[3px] rounded-md px-2 overflow-hidden text-left transition-colors",
               live
@@ -300,4 +326,71 @@ function fmtTime(ms: number): string {
 }
 function fmtRange(a: number, b: number): string {
   return `${fmtTime(a)} – ${fmtTime(b)}`;
+}
+function fmtDur(ms: number): string {
+  const m = Math.round(ms / 60_000);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  const r = m % 60;
+  return r ? `${h}h ${r}m` : `${h}h`;
+}
+
+// ---------------------------------------------------------------------------
+// Programme hover card — Harbor-style floating detail popover. Portaled to
+// <body> so it escapes the guide's scroll overflow; positioned at the hovered
+// block's rect (flips above the block in the lower part of the screen).
+// ---------------------------------------------------------------------------
+
+interface HoverState {
+  p: EpgProgram;
+  rect: DOMRect;
+  live: boolean;
+}
+
+const HOVER_CARD_W = 300;
+
+function ProgramHoverCard({ hover }: { hover: HoverState | null }) {
+  if (!hover) return null;
+  const { p, rect, live } = hover;
+  const margin = 10;
+  let left = rect.left;
+  if (left + HOVER_CARD_W > window.innerWidth - margin) {
+    left = window.innerWidth - HOVER_CARD_W - margin;
+  }
+  left = Math.max(margin, left);
+  // Below the block normally; flip to bottom-anchored above it in the lower
+  // 45% of the screen (no card-height measurement needed).
+  const flipUp = rect.bottom > window.innerHeight * 0.55;
+  const pos: CSSProperties = flipUp
+    ? { left, bottom: window.innerHeight - rect.top + 6 }
+    : { left, top: rect.bottom + 6 };
+
+  return createPortal(
+    <div
+      className="fixed z-[300] pointer-events-none rounded-xl border border-white/12
+                 bg-[rgba(16,16,20,0.98)] backdrop-blur-2xl shadow-glass-edge p-3.5"
+      style={{ width: HOVER_CARD_W, ...pos }}
+    >
+      {live && (
+        <span className="inline-flex items-center gap-1.5 mb-1.5 px-2 h-[18px] rounded-full
+                         bg-red-500/15 text-red-300/90 text-[10px] font-bold tracking-wider">
+          <span className="w-1.5 h-1.5 rounded-full bg-red-500" />
+          LIVE
+        </span>
+      )}
+      <p className="text-white/95 text-[13.5px] font-semibold leading-snug">{p.title}</p>
+      <p className="text-white/45 text-[11.5px] mt-1 tabular-nums">
+        {fmtRange(p.startMs, p.endMs)} · {fmtDur(p.endMs - p.startMs)}
+      </p>
+      {p.description && (
+        <p className="text-white/65 text-[12px] leading-relaxed mt-2 line-clamp-6">
+          {p.description}
+        </p>
+      )}
+      {p.category && (
+        <p className="text-white/35 text-[10.5px] mt-2 uppercase tracking-wide">{p.category}</p>
+      )}
+    </div>,
+    document.body,
+  );
 }
