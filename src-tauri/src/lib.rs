@@ -119,6 +119,9 @@ async fn load_video(
     // / 0 / NaN all mean "play from the beginning" — matches the
     // previous behaviour.
     start_seconds: Option<f64>,
+    // Optional forward proxy (per-playlist Live TV proxy) applied as a
+    // per-file `http-proxy` loadfile option. None = direct.
+    http_proxy: Option<String>,
 ) -> Result<(), String> {
     let normalised = path.replace('\\', "/");
     // Defence in depth: only http(s) URLs, the localhost streaming
@@ -155,10 +158,10 @@ async fn load_video(
     // (thread-spawn or HWND-resolution failure) this returns a clear
     // "engine not running" error instead of crashing.
     #[cfg(target_os = "windows")]
-    return mpv::engine::submit_load_file(normalised, start_seconds);
+    return mpv::engine::submit_load_file(normalised, start_seconds, http_proxy);
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (normalised, start_seconds);
+        let _ = (normalised, start_seconds, http_proxy);
         Err("playback engine is Windows-only".into())
     }
 }
@@ -302,23 +305,6 @@ async fn set_audio_loudnorm(app: tauri::AppHandle, enabled: bool) -> Result<(), 
         }
         Ok(())
     }
-}
-
-/// Set mpv's `http-proxy` for subsequent stream loads (the per-playlist Live
-/// TV proxy). Empty string clears it. The frontend awaits this BEFORE invoking
-/// `load_video`; both submit to the engine's ordered command channel, so the
-/// proxy is in effect by the time the stream opens. A forward proxy (vs a URL
-/// rewrite) is used because it leaves the stream URL untouched, so HLS segment
-/// URIs still resolve against the real origin. Non-fatal: if the engine isn't
-/// up yet the worst case is the first stream loads unproxied.
-#[tauri::command]
-async fn set_http_proxy(proxy: String) -> Result<(), String> {
-    crate::devlog!(
-        info, "player",
-        "set_http_proxy({})",
-        if proxy.trim().is_empty() { "cleared" } else { "set" },
-    );
-    mpv::engine::submit_set_property("http-proxy".into(), mpv::engine::PropValue::String(proxy))
 }
 
 /// Motion interpolation — mpv's BUILT-IN GPU frame interpolation.
@@ -1826,7 +1812,6 @@ pub fn run() {
             frame_step,
             set_audio_loudnorm,
             set_motion_interpolation,
-            set_http_proxy,
             thumbs::extract_thumbnail,
             set_volume,
             set_speed,

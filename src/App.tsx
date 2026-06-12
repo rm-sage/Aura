@@ -1320,12 +1320,10 @@ export default function App() {
         // see exactly which phase is slow when a stream hangs at
         // "Loading… N%".
         notifyNewLoad();
-        // Per-playlist Live TV proxy: set (or clear, with "") mpv's http-proxy
-        // before resolving + loading. Awaited so the SetProperty lands on the
-        // engine's ordered command channel ahead of the LoadFile, and always
-        // sent so a prior proxied stream doesn't leak its proxy into this one.
-        await invoke("set_http_proxy", { proxy: opts?.proxyUrl ?? "" }).catch(() => {});
         const t0resolve = Date.now();
+        // Per-playlist Live TV proxy: viaProxy bypasses the local bridge so mpv
+        // reaches the origin directly, then load_video applies the proxy as a
+        // PER-FILE http-proxy option (auto-scoped to this load).
         const resolved = await invoke<string>("resolve_stream", {
           rawUrl: raw,
           viaProxy: !!opts?.proxyUrl,
@@ -1375,6 +1373,7 @@ export default function App() {
           // saved offset didn't meet the prompt threshold. mpv treats
           // a missing start_seconds as 0 (play from the beginning).
           startSeconds:   resumeAt ?? null,
+          httpProxy:      opts?.proxyUrl ?? null,
         });
         logLoadEvent("load_video returned (MPV accepted loadfile)", {
           dt: Date.now() - t0load,

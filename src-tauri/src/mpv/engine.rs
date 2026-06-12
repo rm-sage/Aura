@@ -142,6 +142,12 @@ enum EngineCommand {
     LoadFile {
         url: String,
         start_seconds: Option<f64>,
+        /// Optional forward proxy applied as a PER-FILE `http-proxy` loadfile
+        /// option (auto-scoped + reset when the file ends) — the per-playlist
+        /// Live TV proxy. Per-file is used over a global set_property because a
+        /// runtime global `http-proxy` change doesn't reliably apply to the
+        /// next loadfile's stream open.
+        http_proxy: Option<String>,
     },
     TogglePause,
     SetVolume(f64),
@@ -314,8 +320,12 @@ pub fn start(parent_hwnd: isize, emit: EngineEmit) {
 
 /// Submit a `LoadFile` command. Returns an error if the engine isn't
 /// running (master gate off or pre-startup) or the channel is closed.
-pub fn submit_load_file(url: String, start_seconds: Option<f64>) -> Result<(), String> {
-    submit(EngineCommand::LoadFile { url, start_seconds })
+pub fn submit_load_file(
+    url: String,
+    start_seconds: Option<f64>,
+    http_proxy: Option<String>,
+) -> Result<(), String> {
+    submit(EngineCommand::LoadFile { url, start_seconds, http_proxy })
 }
 
 /// Submit a `TogglePause` command.
@@ -1582,7 +1592,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         shutting_down = true;
                         break;
                     }
-                    Ok(EngineCommand::LoadFile { url, start_seconds }) => {
+                    Ok(EngineCommand::LoadFile { url, start_seconds, http_proxy }) => {
                         // Pre-loadfile pause clear: an inherited pause flag
                         // from a previous file would carry over otherwise
                         // and require a manual click to start playback.
@@ -1592,21 +1602,36 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                                 "set_pause(false) pre-loadfile failed: {e}",
                             );
                         }
-                        let start_opt = start_seconds
-                            .filter(|v| v.is_finite() && *v > 0.0)
-                            .map(|t| format!("start={:.3}", t.min(86_400.0 * 7.0)));
+                        // Per-file options (comma-joined): start + http-proxy.
+                        // NOTE: values must not contain a comma (the option-list
+                        // separator) — fine for `start=` and a normal proxy URL.
+                        let mut opts: Vec<String> = Vec::new();
+                        if let Some(t) = start_seconds.filter(|v| v.is_finite() && *v > 0.0) {
+                            opts.push(format!("start={:.3}", t.min(86_400.0 * 7.0)));
+                        }
+                        if let Some(px) = http_proxy.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            opts.push(format!("http-proxy={px}"));
+                        }
+                        let opts_str = opts.join(",");
                         let mut args_v: Vec<&str> = vec!["loadfile", &url, "replace"];
-                        if let Some(s) = start_opt.as_deref() {
+                        if !opts_str.is_empty() {
                             // Positional 3 ("0") is the file-index — required
                             // when supplying a 4th-positional options string.
                             args_v.push("0");
-                            args_v.push(s);
+                            args_v.push(&opts_str);
                         }
+                        // Redacted log — never print the proxy URL (it can
+                        // carry user:pass). Just note start + whether proxied.
+                        let proxied = opts.iter().any(|o| o.starts_with("http-proxy="));
+                        let start_log = start_seconds
+                            .filter(|v| v.is_finite() && *v > 0.0)
+                            .map(|t| format!(" start={:.1}", t))
+                            .unwrap_or_default();
                         match run_mpv_command(&lib, handle, &args_v) {
                             Ok(()) => crate::devlog!(
                                 info, "mpv",
-                                "loadfile accepted: {url}{}",
-                                start_opt.as_deref().map(|s| format!(" {s}")).unwrap_or_default(),
+                                "loadfile accepted: {url}{start_log}{}",
+                                if proxied { " [via proxy]" } else { "" },
                             ),
                             Err(e) => crate::devlog!(
                                 warn, "mpv", "loadfile failed: {e}",
