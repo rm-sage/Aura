@@ -272,7 +272,7 @@ function Room({
         </div>
       ) : (
         <div className="rounded-xl bg-amber-400/[0.08] border border-amber-400/20 px-3 py-2.5">
-          <p className="text-amber-200/90 text-[12px] leading-snug">
+          <p className="text-amber-200/90 text-[12px] leading-snug break-words">
             The party is watching{roomTitle ? <> <span className="font-semibold">{roomTitle}</span></> : " a title"}
             {roomStreamLabel ? <span className="text-amber-200/60"> · {roomStreamLabel}</span> : null}.
           </p>

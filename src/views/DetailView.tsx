@@ -437,6 +437,13 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // null and the EpisodesPanel landed on the top of the list instead
   // of the just-played episode.
   const [scrollOnceTo, setScrollOnceTo] = useState<string | null>(openOnEpisodeId ?? null);
+  // A NEVER-cleared mount snapshot of the open-episode hint. `scrollOnceTo`
+  // gets nulled once the scroll lands, and the `openOnEpisodeId` PROP is
+  // consumed on mount (onConsumeOpenHint → parent sets it null next tick), so
+  // neither survives long enough to drive the stream fetch / activeVideo
+  // resolution for a watch-party "Join & sync" (where the episode comes only
+  // from this hint). This snapshot does.
+  const [openEpisodeSnapshot] = useState<string | null>(openOnEpisodeId ?? null);
   useEffect(() => {
     if (openOnEpisodeId) onConsumeOpenHint?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -749,7 +756,13 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // before; `force` only matters for the manual refresh path.
   const runStreamFetch = useCallback((force = false): (() => void) | void => {
     let cancelled = false;
-    const episodicId = activeVideo?.id ?? resumeVideoId;
+    // `openEpisodeSnapshot` is the explicitly-requested episode (e.g. a
+    // watch-party "Join & sync" lands here with the room's videoKey). Use the
+    // mount-stable SNAPSHOT (not the live prop, which is consumed/nulled on
+    // mount) as the final fallback so streams fetch for the RIGHT episode even
+    // before the meta detail's `videos` array resolves (activeVideo null) and
+    // when Stremio's library state.video_id (resumeVideoId) is stale/absent.
+    const episodicId = activeVideo?.id ?? resumeVideoId ?? openEpisodeSnapshot;
     if (isEpisodic && !episodicId) {
       setStreams([]);
       setStreamsLoading(false);
@@ -816,7 +829,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
       .catch(() => {})
       .finally(() => { if (!cancelled) setStreamsLoading(false); });
     return () => { cancelled = true; };
-  }, [addons, meta.id, meta.media_type, activeVideo, resumeVideoId, isEpisodic]);
+  }, [addons, meta.id, meta.media_type, activeVideo, resumeVideoId, isEpisodic, openEpisodeSnapshot]);
 
   useEffect(() => runStreamFetch(), [runStreamFetch]);
 
@@ -866,10 +879,13 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     if (activeVideo) return;
     if (!isEpisodic) return;
     if (!openInStreamsMode) return;
-    if (!openOnEpisodeId) return;
-    const v = resolveResumeEpisode(openOnEpisodeId, detail?.videos);
+    // Use the mount-stable snapshot — the live prop is nulled on mount, which
+    // would otherwise leave activeVideo unset (and the streams panel empty)
+    // once detail.videos finally resolve.
+    if (!openEpisodeSnapshot) return;
+    const v = resolveResumeEpisode(openEpisodeSnapshot, detail?.videos);
     if (v) setActiveVideo(v);
-  }, [detail?.videos, openInStreamsMode, openOnEpisodeId, isEpisodic, activeVideo]);
+  }, [detail?.videos, openInStreamsMode, openEpisodeSnapshot, isEpisodic, activeVideo]);
 
   // Notification deep-link: populate the episode synopsis by selecting the
   // ringed episode — WITHOUT switching to streams mode (stay on the list so the
