@@ -1276,6 +1276,17 @@ export default function PlayerOverlay({
   // time resets to ~0) re-anchors to the new edge instead of showing the
   // fresh channel as "behind live".
   const dvr = useLiveDvr(isLive, time, activeTarget?.id ?? null);
+  // Go Live: jump a few seconds behind the live edge, but debounced + a no-op
+  // when already live, so spam-clicking can't seek-storm mpv (which stalled
+  // forward buffering until the clicking stopped).
+  const lastGoLiveRef = useRef(0);
+  const goLive = () => {
+    const t = Date.now();
+    if (t - lastGoLiveRef.current < 800) return;
+    lastGoLiveRef.current = t;
+    if (dvr.atLive) return;
+    seekAbsolute(Math.max(dvr.windowStart, dvr.edge - 3));
+  };
 
   // AniSkip OP/ED/recap windows for the current episode. Surfaced as
   // amber bands on the scrubber so the user can see where skip
@@ -2097,7 +2108,7 @@ export default function PlayerOverlay({
               position={dvr.position}
               atLive={dvr.atLive}
               onSeek={(t) => seekAbsolute(t)}
-              onGoLive={() => seekAbsolute(Math.max(dvr.windowStart, dvr.edge - 3))}
+              onGoLive={goLive}
             />
           )}
 
@@ -2502,15 +2513,18 @@ function useLiveDvr(isLive: boolean, time: number, streamKey: string | null): Li
       return;
     }
 
-    let atLive: boolean;
-    if (time >= est - DVR_EDGE_TOL_S) {
-      // Riding the edge — advance the anchor with the freshest sample.
+    const atLive = time >= est - DVR_EDGE_TOL_S;
+    // Advance the edge anchor ONLY for a genuinely NEWER live frame (time
+    // beyond the wallclock estimate), never just because we're near the edge.
+    // Re-anchoring on "near" collapsed the estimate backward after a Go-Live
+    // seek to (edge − 3): that seeked position is within tolerance, so it used
+    // to reset edge = edge − 3, and each repeated click walked the edge (and
+    // the seek target) backward toward the start of the stream. Keeping the
+    // edge monotonic means Go Live always targets the true live frontier.
+    if (time > est) {
       anchor.current = { t: time, wall: now, init: true, key: streamKey };
-      atLive = true;
-    } else {
-      atLive = false;
     }
-    const edge = anchor.current.t + (Date.now() / 1000 - anchor.current.wall);
+    const edge = anchor.current.t + (now - anchor.current.wall);
     commit({
       atLive,
       edge,
