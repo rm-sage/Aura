@@ -51,6 +51,17 @@ commands.allow = [
   "cast_ffmpeg_present",
 ]
 
+# ── Live TV (IPTV) ────────────────────────────────────────────────────────────
+[[permission]]
+identifier = "allow-iptv"
+description = "Allows the frontend to fetch IPTV playlists / EPG / Xtream API responses through the backend (IPTV-client UA, size-capped) and store Xtream passwords in the OS keyring"
+commands.allow = [
+  "iptv_fetch_text",
+  "iptv_set_xtream_password",
+  "iptv_get_xtream_password",
+  "iptv_clear_xtream_password",
+]
+
 # ── Stremio catalog ───────────────────────────────────────────────────────────
 [[permission]]
 identifier = "allow-fetch-catalog"

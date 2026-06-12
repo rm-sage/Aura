@@ -18,10 +18,10 @@ src-tauri/binaries/
 src-tauri/gen/
 src-tauri/node_modules/
 
-# ─── Closed-source helper crate ────────────────────────────────────────────
-# aura-bridge lives in a separate private repo; the compiled binary is
-# staged into src-tauri/target/{debug,release}/ at build time. The
-# runtime spawn path in lib.rs handles a missing binary gracefully.
+# ─── Retired helper crate (local leftovers only) ───────────────────────────
+# The aura-bridge sidecar was re-internalised into src-tauri/src/streaming.rs
+# (in-process axum server). Old local checkouts of the private crate may still
+# exist on disk, so keep it ignored; nothing on this branch builds or ships it.
 aura-bridge/
 
 # ─── Environment / secrets ─────────────────────────────────────────────────

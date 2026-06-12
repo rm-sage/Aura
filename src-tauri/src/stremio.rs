@@ -3193,26 +3193,32 @@ pub async fn fetch_landscape_art(
     };
     match resp.json::<LandscapeArt>().await {
         Ok(mut art) => {
-            // Baked-title backstop. AIOMeta's hasBakedTitle detection has
-            // been observed returning `false` for art classes that ALWAYS
-            // carry the title — fanart.tv's thumb category literally
-            // requires the show logo by submission rules, and a cropped
-            // poster virtually always contains it. The client then
-            // overlaid its own logo on top of the baked one (double-title
-            // CW cards: Witch Hat Atelier, Daemons of the Shadow Realm).
-            // Force the flag for those sources here, at the single
-            // resolution boundary, so every consumer renders one title.
-            // Textless-by-convention sources (tmdb-backdrop, tvdb-bg,
-            // anilist-banner) keep the server's verdict.
+            // Baked-title backstop, ALLOWLIST form. AIOMeta's
+            // hasBakedTitle detection under-reports (the client then
+            // overlays its own logo on top of a baked one — double-title
+            // CW cards). The first fix denylisted fanart-thumb/
+            // poster-crop, but doubles persisted on other titles —
+            // either the wire `source` strings differ from the spec'd
+            // provenance values or AniList banners carry baked logos
+            // (they very often do; banners are key art). So: trust
+            // hasBakedTitle=false ONLY for sources that are textless by
+            // PLATFORM RULE — TMDB backdrops and TVDB backgrounds both
+            // mandate no text/logos in their submission guidelines.
+            // Everything else (fanart thumbs, AniList banners, poster
+            // crops, unknown/new sources) is treated as already-titled,
+            // which kills the entire double-logo class at the single
+            // resolution boundary. Worst case is a missing overlay on a
+            // genuinely-textless banner — the card prints the title
+            // underneath regardless.
             if !art.has_baked_title {
-                let always_titled = matches!(
+                let textless_by_rule = matches!(
                     art.source.as_deref(),
-                    Some("fanart-thumb") | Some("poster-crop"),
+                    Some("tmdb-backdrop") | Some("tvdb-bg"),
                 );
-                if always_titled {
+                if !textless_by_rule {
                     crate::devlog!(
                         debug, "meta",
-                        "[{}] landscape art source '{}' is always-titled — overriding hasBakedTitle=false",
+                        "[{}] landscape art source '{}' not textless-by-rule — overriding hasBakedTitle=false",
                         label,
                         art.source.as_deref().unwrap_or(""),
                     );

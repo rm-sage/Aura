@@ -30,13 +30,37 @@ pub fn resolve_hdr_mode(s: &crate::settings::AppSettings) -> &'static str {
 /// the supplied option map. Used at MPV init AND by `apply_hdr_settings`
 /// to update a running instance without re-init.
 ///
-/// `peak_nits` is the `hdr_target_peak_nits` setting — only consulted in
-/// "passthrough" mode. 0 = auto (trust the display caps Windows reports);
-/// non-zero pins `target-peak` so mpv tone-maps down to the panel's REAL
-/// peak when the reported value is wrong (e.g. an OLED in DisplayHDR
-/// True Black mode whose ~400/465-nit limit Windows doesn't know about —
-/// without the pin, 1000-nit-mastered highlights pass through untouched
-/// and the panel clips them, the "blown-out whites" symptom).
+/// ## Why "passthrough" uses the colorspace HINT (gpu-next reality)
+///
+/// Under `vo=gpu-next`, libplacebo's swapchain wrapper is the FINAL
+/// authority on the DXGI swapchain state, and the ONLY mechanism that
+/// flips it to HDR is the per-frame colorspace hint driven by
+/// `target-colorspace-hint`. mpv's own `d3d11-output-csp=pq` is applied
+/// one layer below at swapchain creation — and libplacebo immediately
+/// re-decides it: with the hint off it resets the swapchain to sRGB
+/// every frame (aura-mpv.log: "Initial swap chain configuration:
+/// R8G8B8A8_UNORM, RGB_FULL_G22_NONE_P709" right after mpv's own
+/// "Swapchain successfully configured to color space G2084"). PQ pixels
+/// rendered into that sRGB surface = raised milky blacks + muted
+/// highlights. (`d3d11-output-csp` was ALSO silently dropped for months
+/// by the Windows manifest version-lie — see windows-app-manifest.xml —
+/// but even with that fixed, the hint is what actually governs.)
+///
+/// On this mpv build (0.41+), explicit `target-*` options are folded
+/// INTO the hint before it is sent (vo_gpu_next.c) AND into the render
+/// target: the swapchain switches to 10-bit + PQ with HDR10 metadata
+/// (MaxMasteringLuminance = `target-peak`), and mpv STILL tone-maps
+/// content down to `target-peak`. The historical "hint disables tone
+/// mapping / supersedes target params" behavior — the original
+/// blown-out-whites failure on panels that under-report their real
+/// peak (AW3425DW in True Black: ~450 real vs ~1000 reported) — does
+/// not apply when the targets are explicit. So: hint=yes + explicit
+/// BT.2020/PQ/peak/contrast = tone-mapped HDR output with correct
+/// swapchain + metadata, switchable per load (the option set is
+/// runtime-updatable; the engine still only writes it between files).
+///
+/// `peak_nits` is only consulted in "passthrough" mode; 0 = auto
+/// (= the display-reported peak, for panels that report honestly).
 pub fn apply_hdr_options(
     options: &mut IndexMap<String, serde_json::Value>,
     mode: &str,
@@ -44,12 +68,40 @@ pub fn apply_hdr_options(
 ) {
     match mode {
         "passthrough" => {
+            // THE switch that makes libplacebo negotiate the swapchain
+            // to 10-bit PQ + HDR10 metadata. Explicit target params
+            // below override the display-derived metadata in the hint.
             options.insert("target-colorspace-hint".into(), serde_json::json!("yes"));
+            // Strict (the default) makes the renderer use the swapchain's
+            // NEGOTIATED colorspace for the render target and apply our
+            // target-* only where the swapchain reported nothing. When the
+            // d3d11 swapchain negotiation reports back the display's own
+            // characterization (its inflated ~1000-nit peak, or an SDR
+            // transfer when the format negotiation faltered), our explicit
+            // target-trc=pq / target-peak get SKIPPED — so mpv tone-maps to
+            // the display peak, not the user's. True Black panels (~450 real
+            // nits) then CLIP every highlight above their real peak: the
+            // "blown highlights, ignores my nits, looks better in Peak-1000
+            // mode" report. `no` makes the explicit BT.2020/PQ/peak/contrast
+            // below authoritative — mpv tone-maps content to the user's peak
+            // and forces the swapchain to match.
+            options.insert("target-colorspace-hint-strict".into(), serde_json::json!("no"));
+            // libplacebo owns the swapchain colorspace via the hint;
+            // keep mpv's creation-level csp at its default.
+            options.insert("d3d11-output-csp".into(),       serde_json::json!("auto"));
+            options.insert("target-prim".into(),            serde_json::json!("bt.2020"));
+            options.insert("target-trc".into(),             serde_json::json!("pq"));
+            // Infinite display contrast: with an explicit PQ target and
+            // no contrast info, libplacebo assumes a finite (~1000:1)
+            // panel and BT.2390 LIFTS source blacks to that assumed
+            // floor — on an OLED that rendered as a uniform milky/white
+            // veil over both SDR and HDR content ("brightness/contrast
+            // looks off"). `inf` maps black to true black. (On a
+            // non-OLED this merely skips black-point compensation — a
+            // far smaller error than the veil.)
+            options.insert("target-contrast".into(),        serde_json::json!("inf"));
             options.insert("hdr-compute-peak".into(),       serde_json::json!("yes"));
             options.insert("tone-mapping".into(),           serde_json::json!("auto"));
-            // Don't pin target-prim / target-trc — let the display auto-detect.
-            options.insert("target-prim".into(),            serde_json::json!("auto"));
-            options.insert("target-trc".into(),             serde_json::json!("auto"));
             if peak_nits > 0 {
                 options.insert("target-peak".into(),        serde_json::json!(peak_nits));
             } else {
@@ -63,6 +115,9 @@ pub fn apply_hdr_options(
             // (auto can over-boost on bright HDR content). target-peak
             // 203 cd/m² is BT.2408's reference SDR white.
             options.insert("target-colorspace-hint".into(), serde_json::json!("no"));
+            options.insert("target-colorspace-hint-strict".into(), serde_json::json!("yes"));
+            options.insert("d3d11-output-csp".into(),       serde_json::json!("auto"));
+            options.insert("target-contrast".into(),        serde_json::json!("auto"));
             options.insert("target-prim".into(),            serde_json::json!("bt.709"));
             options.insert("target-trc".into(),             serde_json::json!("bt.1886"));
             options.insert("target-peak".into(),            serde_json::json!(203));
@@ -72,6 +127,9 @@ pub fn apply_hdr_options(
         // "off" and any unknown value
         _ => {
             options.insert("target-colorspace-hint".into(), serde_json::json!("no"));
+            options.insert("target-colorspace-hint-strict".into(), serde_json::json!("yes"));
+            options.insert("d3d11-output-csp".into(),       serde_json::json!("auto"));
+            options.insert("target-contrast".into(),        serde_json::json!("auto"));
             options.insert("hdr-compute-peak".into(),       serde_json::json!("no"));
             options.insert("tone-mapping".into(),           serde_json::json!("clip"));
             options.insert("target-prim".into(),            serde_json::json!("auto"));

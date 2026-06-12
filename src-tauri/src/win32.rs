@@ -91,6 +91,67 @@ struct Rect {
     bottom: i32,
 }
 
+// ---------------------------------------------------------------------------
+// Background-playback performance — the same two levers a browser pulls so
+// media keeps full frame rate when the window loses focus.
+//
+// Windows throttles background apps three ways: DWM present-throttling of the
+// occluded window (the stubborn one), background timer coarsening, and Win11
+// EcoQoS / power throttling that slows the process outright. Browsers opt out
+// of the latter two for audible media. We do the same, process-wide + once:
+//   1. SetProcessInformation(ProcessPowerThrottling) with ExecutionSpeed in
+//      the control mask and the state bit CLEARED → "don't throttle me".
+//   2. timeBeginPeriod(1) → 1 ms timer resolution so a coarsened background
+//      timer can't stall the decode/present cadence.
+// Held for the process lifetime; the idle cost is negligible for a media app.
+// This does NOT defeat DWM present-throttling (that needs the render-path
+// rewrite) but removes the EcoQoS + timer halves, which is what browsers do.
+// ---------------------------------------------------------------------------
+#[cfg(target_os = "windows")]
+pub fn apply_playback_perf_opts() {
+    #[repr(C)]
+    struct PowerThrottlingState {
+        version: u32,
+        control_mask: u32,
+        state_mask: u32,
+    }
+    const PROCESS_POWER_THROTTLING_CURRENT_VERSION: u32 = 1;
+    const PROCESS_POWER_THROTTLING_EXECUTION_SPEED: u32 = 0x1;
+    // PROCESS_INFORMATION_CLASS::ProcessPowerThrottling
+    const PROCESS_POWER_THROTTLING_CLASS: i32 = 4;
+
+    #[link(name = "winmm")]
+    extern "system" {
+        fn timeBeginPeriod(uperiod: u32) -> u32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetProcessInformation(h: *mut c_void, class: i32, info: *mut c_void, size: u32) -> i32;
+        fn GetCurrentProcess() -> *mut c_void;
+    }
+
+    unsafe {
+        let state = PowerThrottlingState {
+            version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            control_mask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            state_mask: 0, // 0 = execution-speed throttling OFF
+        };
+        let ok = SetProcessInformation(
+            GetCurrentProcess(),
+            PROCESS_POWER_THROTTLING_CLASS,
+            &state as *const _ as *mut c_void,
+            std::mem::size_of::<PowerThrottlingState>() as u32,
+        );
+        if ok == 0 {
+            crate::devlog!(warn, "win32", "power-throttling opt-out failed (older Windows?)");
+        } else {
+            crate::devlog!(info, "win32", "EcoQoS power-throttling disabled for full-rate background playback");
+        }
+        // 1 ms timer resolution, held for the process lifetime.
+        timeBeginPeriod(1);
+    }
+}
+
 type GetClientRectFn = unsafe extern "system" fn(*mut c_void, *mut Rect) -> i32;
 type SetWindowPosFn  = unsafe extern "system" fn(
     *mut c_void, *mut c_void, i32, i32, i32, i32, u32,
@@ -113,6 +174,12 @@ thread_local! {
     // (possibly because the vo subsystem hasn't created one yet).
     static RESIZED: Cell<u32> = const { Cell::new(0) };
     static SKIPPED: Cell<u32> = const { Cell::new(0) };
+
+    // The most-recently-resized MPV child HWND (the swapchain-owning window).
+    // Captured so resize_mpv_child_to_parent can clip THAT window for the
+    // windowed MPO poison — the disqualifier has to be on the plane's own
+    // window, not the top-level (see apply_mpo_poison / mpv_child_poison).
+    static MPV_CHILD: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
 }
 
 /// Read the window's class name as a lowercase Rust String.
@@ -181,6 +248,7 @@ unsafe extern "system" fn cb(child: *mut c_void, _lparam: isize) -> i32 {
             crate::devlog!(warn, "win32", "SetWindowPos failed for '{}'", class);
         } else {
             RESIZED.with(|c| c.set(c.get() + 1));
+            MPV_CHILD.with(|c| c.set(child));
         }
     }
     1 // continue enumeration
@@ -226,10 +294,27 @@ pub fn resize_mpv_child_to_parent(parent_hwnd: isize, y_offset: i32) {
         CTX.with(|c| c.set(Some((swp_fn, gcn_fn, y_offset, width, adjusted_h))));
         RESIZED.with(|c| c.set(0));
         SKIPPED.with(|c| c.set(0));
+        MPV_CHILD.with(|c| c.set(std::ptr::null_mut()));
         let _ = enum_child_windows(parent, Some(cb), 0);
         let resized = RESIZED.with(|c| c.get());
         let skipped = SKIPPED.with(|c| c.get());
+        let mpv_child = MPV_CHILD.with(|c| c.get());
         CTX.with(|c| c.set(None));
+
+        // WINDOWED MPO poison: clip the MPV child (the swapchain-owning
+        // window) so its video plane can't be promoted to a hardware overlay
+        // in windowed mode → DWM composites → the QD-OLED gets the EDID-
+        // calibrated signal (true black). The fullscreen case is handled by
+        // the top-level corner notch in apply_mpo_poison; here we target the
+        // CHILD because the driver grades the child plane's own rectangle,
+        // which a top-level region never touches (that's why the old
+        // top-level windowed strip was a no-op). A hole in the MPV child
+        // exposes the host window's BLACK class brush behind it, so the
+        // artifact is a 1px black line near the top of the video — not a
+        // see-through gap. Gated to passthrough + windowed; cleared otherwise.
+        if !mpv_child.is_null() && !rect_is_empty(width, adjusted_h) {
+            apply_mpv_child_poison(mpv_child, width, adjusted_h);
+        }
         // Demote to debug when there's no MPV child to resize (the
         // common case while the user is browsing without a stream
         // playing — focus / resize events still trigger this path
@@ -314,6 +399,20 @@ type GetForegroundWindowFn =
 /// user lands back in the same window state when they exit.
 type IsZoomedFn =
     unsafe extern "system" fn(*mut c_void) -> i32;
+/// Region APIs (gdi32 + user32) driving the MPO "poison pill": a
+/// non-rectangular window region disqualifies the window from hardware
+/// overlay / Independent-Flip promotion without adding any alpha (so the
+/// window stays fully opaque — no desktop bleed-through).
+type CreateRectRgnFn =
+    unsafe extern "system" fn(i32, i32, i32, i32) -> *mut c_void;
+type CombineRgnFn =
+    unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, i32) -> i32;
+type DeleteObjectFn =
+    unsafe extern "system" fn(*mut c_void) -> i32;
+type SetWindowRgnFn =
+    unsafe extern "system" fn(*mut c_void, *mut c_void, i32) -> i32;
+/// CombineRgn mode: Src1 − Src2.
+const RGN_DIFF: i32 = 4;
 
 /// Window-style longptr index.
 const GWL_STYLE: i32 = -16;
@@ -611,6 +710,133 @@ pub fn signal_fullscreen_to_shell(
 
 /// Move the parent window to its current monitor's full bounds. Saves
 /// the previous bounds so `exit_native_fullscreen` can restore them.
+// ---------------------------------------------------------------------------
+// MPO "poison pill" — force DWM composition for Aura's window so the MPV
+// child swapchain is never promoted to an Independent-Flip / Multi-Plane-
+// Overlay hardware plane.
+//
+// WHY: on direct scanout the panel receives the raw PQ signal and applies
+// its OWN near-black EOTF (raised blacks on some QD-OLEDs). DWM composition
+// re-maps through the panel's EDID calibration → true black. Every other
+// per-app lever failed (in-webview overlay can't beat HW plane-blending,
+// d3d11-output-mode=composition breaks --wid, metadata can't move the panel
+// EOTF). A NON-RECTANGULAR window region is the one that works: overlay
+// planes are strictly rectangular, so a clipped window can't be promoted →
+// DWM composites it. Global MPO stays enabled for other apps (games' RTX
+// HDR); only Aura's window tree becomes plane-ineligible. No alpha → the
+// window stays fully opaque (the layered-alpha variant fixed the blacks too
+// but bled the desktop through at ~0.4 %).
+//
+// GATING: applied only when `hdr_mode == "passthrough"` (the lone case the
+// black-lift matters) — SDR / off playback keeps the efficient direct-scanout
+// path and no clipped pixels. Re-evaluated at startup, on every HDR-settings
+// change (apply_hdr_settings), and after each fullscreen transition (a
+// SetWindowPos with SWP_FRAMECHANGED can clear the region).
+//
+// WHICH WINDOW gets clipped is mode-dependent — this was the hard-won fix:
+//   • Fullscreen → the TOP-LEVEL window (apply_mpo_poison), a 1×1 corner
+//     notch. The whole window IS the video, so Independent Flip demands EXACT
+//     full-monitor coverage; any top-level notch breaks it. Imperceptible.
+//   • Windowed → the MPV CHILD window itself (apply_mpv_child_poison, driven
+//     from resize_mpv_child_to_parent), a FULL-WIDTH 1px strip. Here the video
+//     is a child SUB-plane the driver grades on the CHILD's own rectangle — a
+//     TOP-LEVEL region never subtracts from it (that's why the old top-level
+//     windowed strip was a confirmed no-op). Clipping the child's OWN window
+//     splits its visible region into two disconnected rectangles → no single
+//     overlay → DWM composites. The hole exposes the host's black brush, so
+//     the artifact is a 1px BLACK line near the top of the video.
+fn hdr_passthrough_active() -> bool {
+    crate::player::resolve_hdr_mode(&crate::settings::snapshot()) == "passthrough"
+}
+
+/// Apply (or clear) the MPO poison on the top-level window based on the
+/// current HDR mode + windowed/fullscreen state. Idempotent — safe to call
+/// at startup, on HDR-settings change, and after every fullscreen
+/// transition. When passthrough is off, any previously-set region is cleared
+/// (back to a normal rectangular window).
+pub fn apply_mpo_poison(parent_hwnd: isize) {
+    if parent_hwnd == 0 {
+        return;
+    }
+    unsafe {
+        let Ok(user32) = libloading::Library::new("user32.dll") else { return; };
+        let Ok(set_window_rgn) = user32.get::<SetWindowRgnFn>(b"SetWindowRgn\0") else { return; };
+        let hwnd = parent_hwnd as *mut c_void;
+
+        // The top-level notch ONLY does anything in fullscreen (whole-window
+        // Independent Flip needs exact full-monitor coverage, so a corner
+        // pixel breaks it). In WINDOWED mode the video is a child SUB-plane
+        // the driver grades on the CHILD's own rectangle, which a top-level
+        // region never touches — that path is handled by apply_mpv_child_poison
+        // (clips the MPV child itself). So here: corner notch in fullscreen-
+        // passthrough; clear the top-level region otherwise.
+        if !hdr_passthrough_active() || !is_in_native_fullscreen() {
+            set_window_rgn(hwnd, std::ptr::null_mut(), 1);
+            return;
+        }
+
+        let Ok(gdi32) = libloading::Library::new("gdi32.dll") else { return; };
+        let Ok(create_rect_rgn) = gdi32.get::<CreateRectRgnFn>(b"CreateRectRgn\0") else { return; };
+        let Ok(combine_rgn) = gdi32.get::<CombineRgnFn>(b"CombineRgn\0") else { return; };
+        let Ok(delete_object) = gdi32.get::<DeleteObjectFn>(b"DeleteObject\0") else { return; };
+
+        // Fullscreen: region larger than any monitor minus a 1×1 corner notch
+        // (imperceptible; breaks exact-coverage Independent Flip).
+        let full = create_rect_rgn(0, 0, 32767, 32767);
+        let notch = create_rect_rgn(0, 0, 1, 1);
+        combine_rgn(full, full, notch, RGN_DIFF);
+        delete_object(notch);
+        // SetWindowRgn TAKES OWNERSHIP of `full` — must NOT delete it here.
+        let r = set_window_rgn(hwnd, full, 1);
+        crate::devlog!(info, "win32",
+            "MPO poison: top-level fullscreen corner notch applied (SetWindowRgn rc={r})",
+        );
+    }
+}
+
+/// `true` when the resize computed an empty client rect — nothing to clip.
+fn rect_is_empty(w: i32, h: i32) -> bool {
+    w <= 0 || h <= 0
+}
+
+/// WINDOWED MPO poison on the MPV child (the swapchain-owning window). Splits
+/// the child's visible region with a full-width 1px strip so its video plane
+/// can't be a single hardware overlay → DWM composites → true black on the
+/// QD-OLED. Gated to passthrough + windowed; clears the region otherwise.
+/// The hole exposes the host window's black class brush → the artifact is a
+/// 1px BLACK line near the top of the video, not a see-through gap.
+unsafe fn apply_mpv_child_poison(child: *mut c_void, w: i32, h: i32) {
+    let Ok(user32) = libloading::Library::new("user32.dll") else { return; };
+    let Ok(set_window_rgn) = user32.get::<SetWindowRgnFn>(b"SetWindowRgn\0") else { return; };
+
+    // Only the windowed-passthrough case needs it. Fullscreen is handled by
+    // the top-level corner notch; SDR/off keeps the efficient scanout path.
+    if !hdr_passthrough_active() || is_in_native_fullscreen() {
+        set_window_rgn(child, std::ptr::null_mut(), 1);
+        return;
+    }
+
+    let Ok(gdi32) = libloading::Library::new("gdi32.dll") else { return; };
+    let Ok(create_rect_rgn) = gdi32.get::<CreateRectRgnFn>(b"CreateRectRgn\0") else { return; };
+    let Ok(combine_rgn) = gdi32.get::<CombineRgnFn>(b"CombineRgn\0") else { return; };
+    let Ok(delete_object) = gdi32.get::<DeleteObjectFn>(b"DeleteObject\0") else { return; };
+
+    // Full child rect minus a FULL-WIDTH 1px strip. The strip must NOT be at
+    // y=0 (that would just shrink the rect to y>=1 — still one rectangle the
+    // driver inscribes); y=1 leaves the y=0 row above so the region is two
+    // disconnected rectangles (non-promotable → composite). y=1 puts the
+    // black line at the very top edge of the video, right under the title bar.
+    const STRIP_Y: i32 = 1;
+    let full = create_rect_rgn(0, 0, w, h);
+    let strip = create_rect_rgn(0, STRIP_Y, w, STRIP_Y + 1);
+    combine_rgn(full, full, strip, RGN_DIFF);
+    delete_object(strip);
+    let r = set_window_rgn(child, full, 1); // takes ownership of `full`
+    crate::devlog!(info, "win32",
+        "MPO poison: MPV child region applied {w}x{h} strip@{STRIP_Y} (SetWindowRgn rc={r})",
+    );
+}
+
 pub fn enter_native_fullscreen(parent_hwnd: isize) -> Result<(), String> {
     if parent_hwnd == 0 {
         return Err("invalid hwnd".into());
@@ -820,6 +1046,12 @@ pub fn enter_native_fullscreen(parent_hwnd: isize) -> Result<(), String> {
         crate::devlog!(info, "win32", "ITaskbarList2 signalled fullscreen=true");
     }
 
+    // Re-assert the MPO poison (non-rectangular region) now that all
+    // style / position changes have settled — the SetWindowPos with
+    // SWP_FRAMECHANGED above can clear the window region. No-op unless
+    // gated on.
+    apply_mpo_poison(parent_hwnd);
+
     Ok(())
 }
 
@@ -921,6 +1153,11 @@ pub fn exit_native_fullscreen(parent_hwnd: isize) -> Result<(), String> {
     } else {
         crate::devlog!(info, "win32", "ITaskbarList2 signalled fullscreen=false");
     }
+
+    // Re-assert the MPO poison after the windowed-mode restore — the
+    // SetWindowPos with SWP_FRAMECHANGED above can clear the window region.
+    // No-op unless gated on.
+    apply_mpo_poison(parent_hwnd);
 
     Ok(())
 }

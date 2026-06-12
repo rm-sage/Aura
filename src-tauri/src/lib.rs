@@ -38,6 +38,8 @@ mod media_controls;
 // thumbnail instance). Replaced `tauri-plugin-libmpv` entirely; see
 // mpv/mod.rs for the consolidation history.
 mod debug_panel;
+// IPTV (Live TV) network hop — see src/iptv/ for the TS parsers.
+mod iptv;
 mod mpv;
 mod popup_nav;
 mod player;
@@ -61,218 +63,10 @@ mod tray;
 mod win32;
 mod window_logic;
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::{Emitter, Listener, Manager};
-
-// ---------------------------------------------------------------------------
-// Bridge subprocess handle. Stored here (not in `streaming.rs`) because
-// it depends on `std::process::Child` and is shutdown-coordinated from
-// the same place that handles graceful exit. `OnceLock<Mutex<...>>` so
-// the spawn path can register the handle from `setup` and the
-// shutdown path can take it from anywhere.
-// ---------------------------------------------------------------------------
-
-static BRIDGE_CHILD: OnceLock<Mutex<Option<std::process::Child>>> = OnceLock::new();
-
-fn bridge_child_slot() -> &'static Mutex<Option<std::process::Child>> {
-    BRIDGE_CHILD.get_or_init(|| Mutex::new(None))
-}
-
-/// Walk a small candidate list trying to find the aura-bridge binary,
-/// then spawn it as a detached subprocess. Failure is logged and
-/// silenced — HTTPS streams keep working without the bridge, only
-/// plain-HTTP streams need it.
-fn spawn_bridge_subprocess() {
-    let candidates = bridge_candidate_paths();
-    let mut chosen: Option<std::path::PathBuf> = None;
-    for c in &candidates {
-        if c.exists() {
-            chosen = Some(c.clone());
-            break;
-        }
-    }
-    let Some(path) = chosen else {
-        crate::devlog!(
-            warn, "bridge",
-            "aura-bridge binary not found alongside the Aura executable; plain-HTTP stream proxying is disabled. HTTPS streams continue to work as normal (they bypass the bridge entirely)."
-        );
-        return;
-    };
-
-    crate::devlog!(info, "bridge", "spawning bridge subprocess: {}", path.display());
-    let mut cmd = std::process::Command::new(&path);
-    // Detach stdio. The bridge's println/eprintln output isn't
-    // piped back to the parent — if you need it, change these to
-    // .piped() and read in a background thread.
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    #[cfg(target_os = "windows")]
-    {
-        // Suppress the bridge's console window when launched from a
-        // GUI-built Aura. CREATE_NO_WINDOW = 0x08000000.
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
-    }
-    match cmd.spawn() {
-        Ok(child) => {
-            #[cfg(target_os = "windows")]
-            attach_child_to_kill_on_close_job(&child);
-            *bridge_child_slot().lock().unwrap() = Some(child);
-            crate::devlog!(info, "bridge", "bridge subprocess running");
-        }
-        Err(e) => {
-            crate::devlog!(warn, "bridge", "spawn failed: {}", e);
-        }
-    }
-}
-
-/// Attach the spawned bridge child to a Win32 Job Object configured with
-/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. When Aura's process handle
-/// closes — including a hard crash, taskkill, or the debugger detaching
-/// without a graceful shutdown — Windows automatically terminates every
-/// process in the job. Without this, an orphaned `aura-bridge.exe`
-/// keeps `target/debug/` files mapped, blocking the next `pnpm tauri
-/// dev` build with `Os { code: 5, kind: PermissionDenied }` from
-/// `tauri-build`.
-///
-/// The job handle is intentionally leaked for the lifetime of the
-/// process; closing it would trigger the kill before Aura itself
-/// exits. Windows reclaims the handle on process termination.
-///
-/// Implemented with raw FFI declarations rather than the `windows`
-/// crate so we don't have to carry an extra feature gate.
-#[cfg(target_os = "windows")]
-fn attach_child_to_kill_on_close_job(child: &std::process::Child) {
-    use std::ffi::c_void;
-    use std::os::windows::io::AsRawHandle;
-    use std::sync::OnceLock;
-
-    type HANDLE = *mut c_void;
-    type BOOL = i32;
-
-    // JOBOBJECT_BASIC_LIMIT_INFORMATION + JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-    // shapes mirror winnt.h. We only set `LimitFlags`; the rest stay zeroed.
-    #[repr(C)]
-    #[derive(Default)]
-    struct IoCounters {
-        read_op_count: u64,
-        write_op_count: u64,
-        other_op_count: u64,
-        read_transfer_count: u64,
-        write_transfer_count: u64,
-        other_transfer_count: u64,
-    }
-    #[repr(C)]
-    #[derive(Default)]
-    struct BasicLimit {
-        per_process_user_time_limit: i64,
-        per_job_user_time_limit: i64,
-        limit_flags: u32,
-        minimum_working_set_size: usize,
-        maximum_working_set_size: usize,
-        active_process_limit: u32,
-        affinity: usize,
-        priority_class: u32,
-        scheduling_class: u32,
-    }
-    #[repr(C)]
-    #[derive(Default)]
-    struct ExtendedLimit {
-        basic: BasicLimit,
-        io_info: IoCounters,
-        process_memory_limit: usize,
-        job_memory_limit: usize,
-        peak_process_memory_used: usize,
-        peak_job_memory_used: usize,
-    }
-
-    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
-    const JOBOBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
-
-    extern "system" {
-        fn CreateJobObjectW(lp_job_attributes: *mut c_void, lp_name: *const u16) -> HANDLE;
-        fn SetInformationJobObject(
-            h_job: HANDLE,
-            class: i32,
-            info: *const c_void,
-            len: u32,
-        ) -> BOOL;
-        fn AssignProcessToJobObject(h_job: HANDLE, h_process: HANDLE) -> BOOL;
-    }
-
-    static JOB: OnceLock<usize> = OnceLock::new();
-    let job_raw = *JOB.get_or_init(|| unsafe {
-        let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
-        if job.is_null() {
-            crate::devlog!(warn, "bridge", "CreateJobObjectW failed — orphan-on-crash protection disabled");
-            return 0_usize;
-        }
-        let info = ExtendedLimit {
-            basic: BasicLimit {
-                limit_flags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        if SetInformationJobObject(
-            job,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            &info as *const _ as *const c_void,
-            std::mem::size_of::<ExtendedLimit>() as u32,
-        ) == 0
-        {
-            crate::devlog!(warn, "bridge", "SetInformationJobObject failed — orphan-on-crash protection disabled");
-            return 0_usize;
-        }
-        job as usize
-    });
-    if job_raw == 0 {
-        return;
-    }
-    let job = job_raw as HANDLE;
-    let proc = child.as_raw_handle() as HANDLE;
-    if unsafe { AssignProcessToJobObject(job, proc) } == 0 {
-        crate::devlog!(warn, "bridge", "AssignProcessToJobObject failed — bridge may orphan on crash");
-    } else {
-        crate::devlog!(info, "bridge", "bridge attached to kill-on-close job (orphan-proof)");
-    }
-}
-
-/// Candidate paths to try, in priority order:
-///   1. `<exe_dir>/aura-bridge[.exe]` — sidecar deployment
-///   2. `<exe_dir>/../aura-bridge[.exe]`               — one dir up
-///
-/// Only the first candidate matches the production layout (the bridge
-/// binary sits next to Aura's own .exe). The second covers a fallback
-/// where a packager might place it one level up. Both are anchored at
-/// the running exe so they don't leak any hint about source locations.
-fn bridge_candidate_paths() -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    let bin_name = if cfg!(target_os = "windows") { "aura-bridge.exe" } else { "aura-bridge" };
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            out.push(dir.join(bin_name));
-            if let Some(parent) = dir.parent() {
-                out.push(parent.join(bin_name));
-            }
-        }
-    }
-    out
-}
-
-/// Kill the bridge subprocess if it's running. Called from the
-/// shutdown path when the main window closes.
-pub fn shutdown_bridge_subprocess() {
-    if let Some(mut child) = bridge_child_slot().lock().unwrap().take() {
-        let _ = child.kill();
-        let _ = child.wait();
-        crate::devlog!(info, "bridge", "bridge subprocess shut down");
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Shared playback state (updated by the mpv-event-main observer bridge)
@@ -328,6 +122,14 @@ async fn load_video(
     // / 0 / NaN all mean "play from the beginning" — matches the
     // previous behaviour.
     start_seconds: Option<f64>,
+    // Optional forward proxy (per-playlist Live TV proxy) applied as a
+    // per-file `http-proxy` loadfile option. None = direct.
+    http_proxy: Option<String>,
+    // Stream-name HDR labelling (frontend parseStream). Under the
+    // "passthrough" HDR mode this routes the engine's per-load output
+    // selection (PQ set for HDR-labelled streams, plain SDR otherwise)
+    // — see the LoadFile arm in mpv::engine. None/false → SDR output.
+    content_hdr_hint: Option<bool>,
 ) -> Result<(), String> {
     let normalised = path.replace('\\', "/");
     // Defence in depth: only http(s) URLs, the localhost streaming
@@ -364,10 +166,10 @@ async fn load_video(
     // (thread-spawn or HWND-resolution failure) this returns a clear
     // "engine not running" error instead of crashing.
     #[cfg(target_os = "windows")]
-    return mpv::engine::submit_load_file(normalised, start_seconds);
+    return mpv::engine::submit_load_file(normalised, start_seconds, http_proxy, content_hdr_hint);
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (normalised, start_seconds);
+        let _ = (normalised, start_seconds, http_proxy, content_hdr_hint);
         Err("playback engine is Windows-only".into())
     }
 }
@@ -1036,14 +838,16 @@ async fn apply_hdr_settings(app: tauri::AppHandle, mode: String) -> Result<(), S
         _ => "sdr".to_string(),
     };
 
-    // Persist so next MPV init picks it up. Also keep the legacy
-    // hdr_enabled boolean in lockstep so old code paths reading it
-    // (Discord RPC, telemetry, etc.) stay coherent: "off" → false,
-    // anything else → true.
+    // Persist so next MPV init picks it up — skipping the disk write when
+    // nothing changed. Keep the legacy hdr_enabled boolean in lockstep so
+    // old code paths reading it (Discord RPC, telemetry, etc.) stay
+    // coherent: "off" → false, anything else → true.
     let mut s = settings::snapshot();
-    s.hdr_mode = mode_norm.clone();
-    s.hdr_enabled = mode_norm != "off";
-    settings::save(&app, &s)?;
+    if s.hdr_mode != mode_norm || s.hdr_enabled != (mode_norm != "off") {
+        s.hdr_mode = mode_norm.clone();
+        s.hdr_enabled = mode_norm != "off";
+        settings::save(&app, &s)?;
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -1053,6 +857,16 @@ async fn apply_hdr_settings(app: tauri::AppHandle, mode: String) -> Result<(), S
         // overwritten — no residual property drift between toggles.
         // Best-effort per property: anything mpv rejects is devlog'd
         // rather than aborting the rest of the block.
+        //
+        // NOTE: this full-set push is for explicit Settings changes
+        // ONLY — never call it per-load or mid-playback as routine.
+        // Rewriting colorspace plumbing on a live gpu-next d3d11
+        // pipeline forces a swapchain renegotiation that has been
+        // observed to leave the output blown out / mis-encoded. The HDR
+        // modes are designed to be fully static per mode (see
+        // player::apply_hdr_options) precisely so nothing needs to
+        // change per content. A mode change mid-playback may only take
+        // full effect (swapchain colorspace) on the next loadfile.
         let mut opts: indexmap::IndexMap<String, serde_json::Value> = indexmap::IndexMap::new();
         crate::player::apply_hdr_options(
             &mut opts,
@@ -1070,6 +884,13 @@ async fn apply_hdr_settings(app: tauri::AppHandle, mode: String) -> Result<(), S
                     "apply_hdr {key}={value:?} → unsupported JSON shape for PropValue",
                 );
             }
+        }
+
+        // Re-evaluate the MPO poison: it's gated on hdr_mode=="passthrough",
+        // so toggling the mode here must apply (passthrough) or clear (other)
+        // the window region without waiting for a restart.
+        if let Some(hwnd) = app.get_webview_window("main").and_then(|w| w.hwnd().ok()) {
+            win32::apply_mpo_poison(hwnd.0 as isize);
         }
         Ok(())
     }
@@ -1674,6 +1495,13 @@ pub fn run() {
                 if let Ok(handle) = window.hwnd() {
                     let parent_hwnd = handle.0 as isize;
                     win32::recover_window_state(parent_hwnd);
+                    // MPO "poison pill": when hdr_mode==passthrough, give the
+                    // top-level window a non-rectangular region so Windows
+                    // can't promote the MPV child swapchain to direct scanout
+                    // (fixes the QD-OLED raised-black-in-HDR behaviour without
+                    // disabling MPO globally). No-op for SDR / off. Re-applied
+                    // on HDR-settings change + fullscreen transitions.
+                    win32::apply_mpo_poison(parent_hwnd);
                 }
             }
 
@@ -1780,28 +1608,20 @@ pub fn run() {
             // ── System Media Transport Controls (SMTC, Windows) ────────────────
             media_controls::install(app.handle());
 
-            // ── Streaming bridge subprocess ────────────────────────────────
-            // The bridge is a separate `aura-bridge` binary (sibling
-            // crate). On startup we spawn it as a child process; on
-            // app shutdown the child is killed via the on_window_event
-            // handler in window_logic. The binary is searched for in
-            // a few well-known locations:
-            //
-            //   1. <exe_dir>/aura-bridge.exe         — bundled sidecar
-            //   2. <repo>/aura-bridge/target/release — release build
-            //   3. <repo>/aura-bridge/target/debug   — dev build
-            //
-            // Falling back through these means devs running `pnpm
-            // tauri dev` get the binary picked up automatically as
-            // long as they ran `cargo build` in the bridge crate at
-            // least once. Production installs ship the bundled
-            // sidecar at slot #1.
-            //
-            // If no binary is found we log a warning and let the app
-            // continue — only HTTP streams need the bridge; HTTPS
-            // bypasses entirely (per resolve_stream's routing
-            // rules), so most playback still works without it.
-            spawn_bridge_subprocess();
+            // ── Background-playback perf (full frame rate when unfocused) ──────
+            // Opt out of Win11 EcoQoS throttling + raise timer resolution, the
+            // two levers browsers use to keep media smooth in the background.
+            #[cfg(target_os = "windows")]
+            win32::apply_playback_perf_opts();
+
+            // ── Streaming bridge (in-process) ──────────────────────────────
+            // The loopback byte-range proxy runs on Tauri's shared tokio
+            // runtime inside this process — no sidecar binary to stage,
+            // bundle, spawn, or reap. Bind failure is logged and
+            // swallowed inside start_in_process (only plain-HTTP streams
+            // need the proxy; HTTPS bypasses the bridge entirely per
+            // resolve_stream's routing rules).
+            streaming::start_in_process();
 
             // ── Deep-link handler ─────────────────────────────────────────
             // Emits `deep-link` events to the frontend for both aura:// and
@@ -2050,6 +1870,11 @@ pub fn run() {
             refresh_video,
             apply_lang_defaults,
             apply_hdr_settings,
+            // ── Live TV (IPTV) network hop ───────────────────────────────────
+            iptv::iptv_fetch_text,
+            iptv::iptv_set_xtream_password,
+            iptv::iptv_get_xtream_password,
+            iptv::iptv_clear_xtream_password,
             apply_subtitle_style,
             set_subtitle_position_runtime,
             // ── Casting (Chromecast + DLNA) ───────────────────────────────────

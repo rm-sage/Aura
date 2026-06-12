@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Custom Windows application manifest. REPLACES tauri-build's default
+  (app_manifest() does not merge), so this must carry everything:
+
+  1. Common-Controls v6 dependency, copied verbatim from tauri-build's
+     default manifest (crates/tauri-build/src/windows-app-manifest.xml).
+     Required for Tauri's themed native dialogs/menus; dropping it breaks
+     them.
+
+  2. <compatibility> supportedOS GUIDs, THE REASON THIS FILE EXISTS.
+     Without the Windows 10 GUID, Windows version-lies 6.2 (Windows 8)
+     to the ENTIRE process, including libmpv-2.dll, whose d3d11 context
+     gates swapchain colorspace configuration on IsWindows10OrGreater()
+     (mpv video/out/gpu/d3d11_helpers.c). With the lie in effect,
+     `d3d11-output-csp=pq` is silently dropped:
+       "User selected a D3D11 color space RGB_FULL_G2084_NONE_P2020 (12),
+        but configuration of color spaces is only supported from
+        Windows 10! The default configuration has been left as-is."
+     and mpv then encodes PQ pixels into an sRGB swapchain: washed-out
+     gray blacks, muted highlights, dingy subtitles on all HDR playback.
+     The GUID makes IsWindows10OrGreater() return true, the swapchain
+     flips to PQ, and HDR passthrough renders correctly. (Bonus: the same
+     check also unlocks DXGI_SWAP_EFFECT_FLIP_DISCARD over FLIP_SEQUENTIAL.)
+     NOTE: keep this file pure ASCII; it is piped through an .rc string
+     resource and non-ASCII bytes risk invalidating the XML, which would
+     make the exe fail to launch (side-by-side error).
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 / Windows 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+      <!-- Windows 8.1 -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+      <!-- Windows 8 -->
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/>
+      <!-- Windows 7 -->
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/>
+    </application>
+  </compatibility>
+</assembly>

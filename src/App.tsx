@@ -6,10 +6,13 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 
 import NavSidebar, { type NavView } from "./NavSidebar";
+import { loadSessionRoute, saveSessionRoute } from "./sessionRoute";
 import BootSplash from "./BootSplash";
 import ResizeHandles from "./ResizeHandles";
 import HomeView from "./views/HomeView";
 import DiscoverView from "./views/DiscoverView";
+import LiveView from "./views/LiveView";
+import type { IptvChannel, IptvPlaylist } from "./iptv/types";
 import LibraryView from "./views/LibraryView";
 import AddonsView from "./views/AddonsView";
 import CalendarView from "./views/CalendarView";
@@ -58,6 +61,7 @@ import SourceSwitcher, { streamKey } from "./SourceSwitcher";
 import CastMenu from "./CastMenu";
 import CastSessionBar from "./CastSessionBar";
 import { useCastSession } from "./useCastSession";
+import { parseStream } from "./streamMeta";
 import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPreviousEpisode } from "./nextUp";
 import { getMetaDetailFallback, getRichestMetaDetail, peekCachedDetailById, peekRichestCachedDetailById, peekFreshestPostersByIds } from "./metaCache";
 import { PersistentCache } from "./persistentCache";
@@ -562,6 +566,11 @@ function usePlayback(playerActive: boolean) {
   // contains a numeric value (NOT just non-zero ones, so a paused
   // file that's still receiving heartbeats counts as alive).
   const lastTimeUpdateAtRef = useRef<number>(0);
+  // Wall-clock of the last user seek. A seek (e.g. fast-forwarding a live
+  // stream toward the edge) makes mpv cache-pause while it refills, halting
+  // time-pos — that's a buffer, NOT a broken stream, so the stale-heartbeat
+  // detector gives a grace window after any seek before flagging a break.
+  const lastSeekAtRef = useRef<number>(0);
 
   useEffect(() => {
     // Previous tick's `payload.paused` for the keep-open EOS branch
@@ -810,6 +819,13 @@ function usePlayback(playerActive: boolean) {
       // the near-end EOS check above — moving it back up would re-
       // introduce the keep-open EOS regression.
       if (paused) return;
+      // Post-seek grace: a seek (e.g. fast-forwarding a live stream toward the
+      // edge) makes mpv cache-pause while it refills, halting time-pos. That's
+      // a buffer, not a break — don't flag broken for a while after a seek.
+      // (Live has no `duration`, so `nearEnd` can't disambiguate it as EOS;
+      // this grace is what keeps FF-to-the-edge from tripping the modal.)
+      const SEEK_GRACE_MS = 15000;
+      if (Date.now() - lastSeekAtRef.current < SEEK_GRACE_MS) return;
       if (staleFor >= BROKEN_STALE_MS) {
         if (nearEnd) {
           // Near-end stall → end-of-stream, not a break. App owns the
@@ -925,11 +941,17 @@ function usePlayback(playerActive: boolean) {
 
   const togglePause   = useCallback(() => invoke("toggle_pause").catch(() => {}), []);
   const seekRelative  = useCallback(
-    (s: number) => invoke("seek_relative", { seconds: s }).catch(() => {}),
+    (s: number) => {
+      lastSeekAtRef.current = Date.now();
+      return invoke("seek_relative", { seconds: s }).catch(() => {});
+    },
     [],
   );
   const seekAbsolute  = useCallback(
-    (t: number) => invoke("seek_absolute",  { time: t }).catch(() => {}),
+    (t: number) => {
+      lastSeekAtRef.current = Date.now();
+      return invoke("seek_absolute",  { time: t }).catch(() => {});
+    },
     [],
   );
   /** Optimistic volume — set local state immediately so the slider stays
@@ -991,7 +1013,13 @@ function activeTargetIsAnime(
 
 export default function App() {
   // ── Nav state ──
-  const [activeView, setActiveView] = useState<NavView>("home");
+  // Restore the route from sessionStorage on a webview reload (Ctrl+R / F5)
+  // so the user lands back on the page they were viewing rather than Home.
+  // sessionStorage is cleared on app close, so a cold start still opens Home.
+  // The lazy initializer runs once on mount; selectedMeta's does the same.
+  const [activeView, setActiveView] = useState<NavView>(
+    () => loadSessionRoute()?.view ?? "home",
+  );
   const [homeResetKey, setHomeResetKey] = useState(0);
 
   // ── Auto-updater state ──
@@ -1073,6 +1101,13 @@ export default function App() {
 
   // ── Active scrobble / RPC / SMTC target ──
   const [activeTarget, setActiveTarget] = useState<ActiveScrobbleTarget | null>(null);
+  /** Whether the active stream's NAME labelled it as HDR/DV content.
+   *  Passed to `load_video` as `contentHdrHint` so the engine can pick
+   *  the per-load HDR output set (PQ for HDR content, plain SDR
+   *  otherwise) while hdr_mode=passthrough. Kept in a ref so the EOS
+   *  replay / stream-broken reload sites can re-send the same hint
+   *  without threading it through state. */
+  const lastHdrHintRef = useRef<boolean>(false);
   /** The DIRECT (un-proxied) URL of the playing stream, kept for the
    *  PlayerOverlay's Copy / Download / External-player utilities. Cleared
    *  when playback exits. */
@@ -1091,6 +1126,13 @@ export default function App() {
   } | null>(null);
 
   const isPlayerActive = activeTarget != null;
+  /** True when the active stream is a Live TV channel (synthetic `iptv:`
+   *  target / media_type "tv"). Drives the live carve-outs: no scrubber,
+   *  no resume prompt, no scrobble, no history / Continue-Watching write
+   *  — an infinite live stream has no meaningful position or completion. */
+  const isLivePlayback =
+    activeTarget != null &&
+    (activeTarget.media_type === "tv" || activeTarget.id.startsWith("iptv:"));
 
   // ── Playback hook — gated on activeTarget so the polling fallback only
   //     runs while a stream is loaded.
@@ -1103,8 +1145,18 @@ export default function App() {
   } = usePlayback(isPlayerActive);
 
   // ── Detail-view state (selected meta + click-rect for shared-element open) ──
-  const [selectedMeta, setSelectedMeta] = useState<MetaPreview | null>(null);
+  // Restored from the session route on reload (no rect → opens without the
+  // shared-element zoom, which is correct: there's no originating card).
+  const [selectedMeta, setSelectedMeta] = useState<MetaPreview | null>(
+    () => loadSessionRoute()?.detail ?? null,
+  );
   const [selectedRect, setSelectedRect] = useState<DOMRect | null>(null);
+
+  // Persist the browse route (active tab + open detail) on every change so a
+  // webview reload can restore it. Cheap — a small JSON write to sessionStorage.
+  useEffect(() => {
+    saveSessionRoute({ view: activeView, detail: selectedMeta });
+  }, [activeView, selectedMeta]);
 
   // ── Catalog deep-view state (clicking "View All" on Home) ──
   // Holdover from the old "View All → catalog deep view" navigation.
@@ -1196,6 +1248,9 @@ export default function App() {
         series_id?: string;
         media_type: string;
         name: string;
+        /** Explicit art (Live TV passes the channel logo); preferred over the
+         *  selectedMeta / library lookup below. */
+        logo?: string | null;
         episode?: string;
         episode_title?: string;
         season?: number;
@@ -1211,10 +1266,19 @@ export default function App() {
       // resume prompt and (re-)load the picked stream at this live position —
       // a swap-in-place. Everything else (resolve, preheat, post-load setup)
       // runs unchanged. See src/SourceSwitcher.tsx.
-      opts?: { forceStartSeconds?: number },
+      // `proxyUrl`: per-playlist Live TV forward proxy (mpv http-proxy); null/
+      // undefined plays direct (and clears any proxy left by a prior stream).
+      opts?: { forceStartSeconds?: number; proxyUrl?: string | null },
     ) => {
       try {
         if (!stream.url && !stream.info_hash) return;
+        // Live TV carve-out, computed from `target` (isLivePlayback derives
+        // from activeTarget, which isn't set yet mid-load). A live channel has
+        // no byte-range CDN edge to preheat and no useful scrubber thumbnails,
+        // and both of those open an EXTRA upstream connection — wasteful, and
+        // costly against a provider's simultaneous-stream cap.
+        const isLiveTarget =
+          target.media_type === "tv" || target.id.startsWith("iptv:");
         // User actually engaged with this series → clear the
         // auto-bumped CW-suppression flag (recheck-watched flow).
         // The series can now re-enter CW as normal once the player
@@ -1303,7 +1367,13 @@ export default function App() {
         // "Loading… N%".
         notifyNewLoad();
         const t0resolve = Date.now();
-        const resolved = await invoke<string>("resolve_stream", { rawUrl: raw });
+        // Per-playlist Live TV proxy: viaProxy bypasses the local bridge so mpv
+        // reaches the origin directly, then load_video applies the proxy as a
+        // PER-FILE http-proxy option (auto-scoped to this load).
+        const resolved = await invoke<string>("resolve_stream", {
+          rawUrl: raw,
+          viaProxy: !!opts?.proxyUrl,
+        });
         logLoadEvent("resolve_stream returned", {
           dt: Date.now() - t0resolve,
           scheme: resolved.startsWith("https://") ? "https" :
@@ -1320,7 +1390,7 @@ export default function App() {
         // connects normally" (which it would have anyway). Skip for
         // magnet URLs (no HTTP edge to preheat) and for `http://127.
         // 0.0.1:` bridge URLs (the bridge sits on the loopback).
-        if (resolved.startsWith("https://") || (resolved.startsWith("http://") && !resolved.startsWith("http://127.0.0.1:"))) {
+        if (!isLiveTarget && (resolved.startsWith("https://") || (resolved.startsWith("http://") && !resolved.startsWith("http://127.0.0.1:")))) {
           const preheatStart = Date.now();
           void fetch(resolved, {
             method: "GET",
@@ -1342,6 +1412,17 @@ export default function App() {
             });
         }
 
+        // HDR-content hint from the stream NAME (addon-supplied labels —
+        // "HDR", "DV", "DV+HDR"). Drives the engine's per-load output
+        // routing under hdr_mode=passthrough: only HDR-labelled content
+        // gets the PQ swapchain path; SDR streams render exactly as
+        // passthrough-off. parseStream never throws in practice but the
+        // guard keeps a malformed entry from killing playback.
+        const contentHdrHint = (() => {
+          try { return parseStream(stream).hdr != null; } catch { return false; }
+        })();
+        lastHdrHintRef.current = contentHdrHint;
+
         const t0load = Date.now();
         await invoke("load_video", {
           path:           resolved,
@@ -1349,6 +1430,8 @@ export default function App() {
           // saved offset didn't meet the prompt threshold. mpv treats
           // a missing start_seconds as 0 (play from the beginning).
           startSeconds:   resumeAt ?? null,
+          httpProxy:      opts?.proxyUrl ?? null,
+          contentHdrHint,
         });
         logLoadEvent("load_video returned (MPV accepted loadfile)", {
           dt: Date.now() - t0load,
@@ -1408,7 +1491,7 @@ export default function App() {
           // clear of the loadfile critical section (landmine #3) and
           // touches a different instance entirely (never the "main"
           // mpv). No-op for magnet streams (no stream.url).
-          if (stream.url) {
+          if (stream.url && !isLiveTarget) {
             void invoke("extract_thumbnail", {
               url: stream.url,
               atSeconds: 1,
@@ -1875,6 +1958,7 @@ export default function App() {
         // (the exact card the user clicked) first, falling back to the
         // selected library item.
         const logo =
+          target.logo ??
           selectedMeta?.logo ??
           library.find((i) => i.id === target.id)?.logo ??
           null;
@@ -1931,6 +2015,13 @@ export default function App() {
   const subsFetchedFor = useRef<string | null>(null);
   useEffect(() => {
     if (!activeTarget) return;
+    // Live TV has no IMDb id / episode / Stremio meta to match — searching
+    // subtitle addons for `tv/iptv:<id>` just fans out junk lookups to every
+    // installed subtitle addon (incl. the user's VPS) per tune-in. Skip it.
+    if (isLivePlayback) {
+      setActiveExternalSubs([]);
+      return;
+    }
     const key = `${activeTarget.media_type}:${activeTarget.id}`;
     if (subsFetchedFor.current === key) return;
     subsFetchedFor.current = key;
@@ -1942,7 +2033,7 @@ export default function App() {
     })
       .then((subs) => setActiveExternalSubs(subs ?? []))
       .catch(() => setActiveExternalSubs([]));
-  }, [activeTarget, addons]);
+  }, [activeTarget, addons, isLivePlayback]);
 
   // ── Subtitle picker overlay ──
   const [subsOpen, setSubsOpen] = useState(false);
@@ -2432,6 +2523,38 @@ export default function App() {
     setNextUpInfo(null);
   }, [activeTarget]);
 
+  /** Play a Live TV channel. Builds a synthetic StreamEntry + an `iptv:`
+   *  target with media_type "tv" so the rest of the app treats it as a
+   *  live stream. The `isLivePlayback` derivation below keys off that
+   *  shape to suppress the scrubber, resume prompt, scrobble, and
+   *  history / Continue-Watching writes — none of which make sense for an
+   *  infinite live stream. resolve_stream routes HLS (.m3u8, HTTP or HTTPS)
+   *  DIRECT to MPV — a proxied manifest breaks segment-URI resolution and
+   *  trips provider UA gating — and only single-file HTTP (.ts/.mp4) goes
+   *  through the bridge, so no playback change is needed here. */
+  const handlePlayChannel = useCallback(
+    (channel: IptvChannel, playlist: IptvPlaylist) => {
+      if (!channel.url) return;
+      const stream: StreamEntry = {
+        title:       channel.name,
+        addon_name:  playlist.name,
+        url:         channel.url,
+        info_hash:   null,
+        file_idx:    null,
+        description: null,
+        filename:    null,
+      };
+      const target = {
+        id:         `iptv:${channel.id}`,
+        media_type: "tv",
+        name:       channel.name,
+        logo:       channel.logo ?? undefined,
+      };
+      void handlePlayStream(stream, target, { proxyUrl: playlist.proxyUrl ?? null });
+    },
+    [handlePlayStream],
+  );
+
   // ── EOS Spotlight wiring (2026-05-19) ───────────────────────────────
   // Pure id→LibraryItem index for the spoiler gate (mirrors what
   // LibraryProvider builds; passed to EosSpotlight + EpisodePanel so the
@@ -2901,16 +3024,18 @@ export default function App() {
   //     home_view_secs counter is bumped from the Home view directly.
   const lastStatsTickRef = useRef<number | null>(null);
   useEffect(() => {
-    if (!activeTarget) {
+    // Live TV isn't a VOD "stream played" and a 24/7 channel left on would
+    // pollute the watch-time stats — carve it out like scrobble/history do.
+    if (!activeTarget || isLivePlayback) {
       lastStatsTickRef.current = null;
       return;
     }
     // First-time per session — count this as a stream played.
     invoke("bump_stat", { kind: "streams_played", delta: 1 }).catch(() => {});
     lastStatsTickRef.current = Date.now();
-  }, [activeTarget?.id, activeTarget?.media_type]);
+  }, [activeTarget?.id, activeTarget?.media_type, isLivePlayback]);
   useEffect(() => {
-    if (!activeTarget || paused) {
+    if (!activeTarget || paused || isLivePlayback) {
       lastStatsTickRef.current = null;
       return;
     }
@@ -2944,7 +3069,7 @@ export default function App() {
     }, 5000);
     lastStatsTickRef.current = Date.now();
     return () => clearInterval(id);
-  }, [activeTarget, paused]);
+  }, [activeTarget, paused, isLivePlayback]);
 
   // ── Keep the display awake during active playback ──
   // Belt-and-suspenders alongside mpv's own stop-screensaver: assert the
@@ -3832,7 +3957,9 @@ export default function App() {
   // it receives at scrobble_start time.
   const scrobbleScope = session?.auth_key ? session.auth_key.slice(0, 12) : "guest";
   useScrobble({
-    active: activeTarget,
+    // Live TV channels never scrobble — there's no episode/completion to
+    // report. Passing null keeps the hook fully inert for `iptv:` targets.
+    active: isLivePlayback ? null : activeTarget,
     playback: { time, duration, paused },
     scope: scrobbleScope,
   });
@@ -4270,13 +4397,18 @@ export default function App() {
   }, [activeTarget, duration]);
 
   // ── SMTC: push playback state on every pause / time change at low rate ──
+  // Deduped to whole-second granularity: `time` ticks many times/sec, but the
+  // OS media flyout only needs second resolution, so we skip redundant IPC
+  // (this was firing an invoke per time-pos event — a chunk of the live-
+  // playback UI lag, where the position is meaningless anyway).
+  const lastSmtcRef = useRef<string>("");
   useEffect(() => {
     if (!activeTarget) return;
-    invoke("smtc_set_playback", {
-      playing: duration > 0,
-      paused,
-      position: time,
-    }).catch(() => {});
+    const payload = { playing: duration > 0, paused, position: Math.round(time) };
+    const sig = `${payload.playing}|${payload.paused}|${payload.position}`;
+    if (sig === lastSmtcRef.current) return;
+    lastSmtcRef.current = sig;
+    invoke("smtc_set_playback", payload).catch(() => {});
   }, [activeTarget, paused, duration, time]);
 
   // ── Global wheel-to-volume — only while the player overlay is up.
@@ -4351,6 +4483,9 @@ export default function App() {
     (sess: UserSession | null, target: ActiveScrobbleTarget | null) => {
       const { time, duration } = playbackRef.current;
       if (!sess?.auth_key || !target || duration <= 0) return;
+      // Live TV: no Continue-Watching / progress write — an `iptv:` target
+      // has no library record and no meaningful resume position.
+      if (target.media_type === "tv" || target.id.startsWith("iptv:")) return;
       if (time < PROGRESS_WARMUP_S) return;
       // Skip if we already wrote this exact second — prevents duplicate writes
       // when pause and unmount fire close together.
@@ -4429,7 +4564,7 @@ export default function App() {
     // finished episode. Right-click "Mark as Watched" on a poster
     // happens OUTSIDE the player overlay, so handleExitPlayback
     // doesn't run for those flips at all and the gate isn't needed.
-    if (activeTarget && playedEpisodeId) {
+    if (activeTarget && playedEpisodeId && !isLivePlayback) {
       const watched = time;
       const dur     = duration;
       // Both conditions must hold: at least 80 % progress AND at least
@@ -4521,7 +4656,49 @@ export default function App() {
       // unrelated DetailView open doesn't inherit the hint.
       setLastPlayedEpisodeId(playedEpisodeId);
     }
-  }, [session, flushProgress, activeTarget, time, duration, library, selectedMeta]);
+  }, [session, flushProgress, activeTarget, isLivePlayback, time, duration, library, selectedMeta]);
+
+  // ── Live channel auto-retry (leeway before the broken-stream modal) ──
+  // IPTV channels hiccup constantly on the provider side (transient 5xx,
+  // brief 404s while the edge re-resolves, max-connection bumps). For a LIVE
+  // target, when a load/heartbeat failure flips `streamBroken`, silently
+  // reload the channel a couple of times on a short backoff BEFORE surfacing
+  // the recovery modal — a momentary blip shouldn't throw the whole "Channel
+  // unavailable" popup. A genuinely dead channel exhausts the retries and the
+  // modal then shows (with live-specific copy, no "Switch source"). Counter
+  // resets per channel; VOD streams keep the immediate-modal behaviour.
+  const LIVE_MAX_RETRIES = 2;
+  const liveRetryRef = useRef(0);
+  // True while a live channel is mid-auto-retry: suppresses the broken-stream
+  // modal (we show a subtle "Reconnecting…" indicator instead) so the user
+  // doesn't see the popup flash on/off between attempts.
+  const [liveReconnecting, setLiveReconnecting] = useState(false);
+  useEffect(() => { liveRetryRef.current = 0; setLiveReconnecting(false); }, [activeTarget?.id]);
+  useEffect(() => {
+    // Not the auto-retry case (resolved / not live / no url / exhausted) →
+    // clear the reconnecting flag; if streamBroken is still set + exhausted,
+    // the modal shows.
+    if (!streamBroken || !isLivePlayback || !activeStreamUrl) { setLiveReconnecting(false); return; }
+    if (liveRetryRef.current >= LIVE_MAX_RETRIES) { setLiveReconnecting(false); return; }
+    const attempt = liveRetryRef.current + 1;
+    liveRetryRef.current = attempt;
+    console.info(`[live] channel error — auto-retry ${attempt}/${LIVE_MAX_RETRIES}`);
+    // Show "Reconnecting…" instead of the modal for the duration of the wait.
+    // NOTE: we deliberately do NOT clear streamBroken here — doing so would
+    // change this effect's deps and cancel the timeout via cleanup. The modal
+    // is hidden purely via `liveReconnecting`; notifyNewLoad (on fire) clears
+    // streamBroken.
+    setLiveReconnecting(true);
+    const t = window.setTimeout(() => {
+      notifyNewLoad();
+      invoke("load_video", { path: activeStreamUrl, startSeconds: null }).catch((e) => {
+        console.error("[live] auto-retry reload failed", e);
+      });
+    }, 2500);
+    return () => window.clearTimeout(t);
+    // notifyNewLoad is stable from usePlayback.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streamBroken, isLivePlayback, activeStreamUrl]);
 
   // ── EOS Spotlight action handlers ───────────────────────────────────
   // Defined here (not next to the resolution effect above) because they
@@ -4536,7 +4713,7 @@ export default function App() {
     setEosActive(false);
     notifyNewLoad();
     try {
-      await invoke("load_video", { path: activeStreamUrl, startSeconds: null });
+      await invoke("load_video", { path: activeStreamUrl, startSeconds: null, contentHdrHint: lastHdrHintRef.current });
     } catch (e) {
       console.error("[eos] replay failed", e);
     }
@@ -4837,6 +5014,14 @@ export default function App() {
     return () => { timers.forEach(clearTimeout); };
   }, [durationReady]);
 
+  // (The per-content HDR target-peak probe that used to live here is
+  // deliberately GONE. Lesson from hardware: ANY runtime write into the
+  // HDR option set — even a single target-peak — destabilises the live
+  // gpu-next d3d11 pipeline into blown-out output. The HDR modes are
+  // now fully static per mode (player::apply_hdr_options): passthrough
+  // forces a PQ swapchain at init and lets MPV tone-map everything to
+  // the panel's real peak, so nothing needs to change per content.)
+
   useEffect(() => {
     const html = document.documentElement;
     const body = document.body;
@@ -4923,7 +5108,21 @@ export default function App() {
     let largeImage: string | null = null;
     let largeText: string | null = null;
 
-    if (activeTarget && duration > 0) {
+    if (isLivePlayback && activeTarget) {
+      // Live TV — duration is 0, so it never reaches the VOD branch below.
+      // Show the channel + an elapsed-since-tune-in timer; the backend's
+      // show_titles / blocklist gates apply because is_playback is true.
+      isPlayback = true;
+      title = activeTarget.name;
+      subtitle = paused ? "Live TV · Paused" : "Watching Live TV";
+      sceneKey = `live:${activeTarget.id}`;
+      useTimestamp = !paused;
+      // Channel logo only when HTTPS — Discord rejects raw http image URLs;
+      // otherwise the backend falls back to the Aura logo.
+      const logo = activeTarget.logo ?? null;
+      largeImage = logo && logo.startsWith("https://") ? logo : null;
+      largeText = activeTarget.name;
+    } else if (activeTarget && duration > 0) {
       isPlayback = true;
       title = activeTarget.name;
       subtitle = paused
@@ -4988,7 +5187,7 @@ export default function App() {
     // dep array deliberately doesn't include `time`, otherwise Discord
     // would get spammed every second.
     let startedAt = presenceStartedAt.current ?? 0;
-    if (isPlayback && useTimestamp && time > 0) {
+    if (isPlayback && useTimestamp && time > 0 && !isLivePlayback) {
       startedAt = Math.floor(Date.now() / 1000) - Math.floor(time);
     }
 
@@ -5020,7 +5219,7 @@ export default function App() {
     }, 400);
   }, [
     authChecked, session, landingDismissed,
-    activeTarget, duration, paused,
+    activeTarget, duration, paused, isLivePlayback,
     selectedMeta, activeCatalog,
     activeView, homeSearchActive,
   ]);
@@ -5361,6 +5560,13 @@ export default function App() {
         {activeView === "discover" && (
           <DiscoverView addons={addons} onSelectMeta={openDetail} />
         )}
+        {activeView === "live" && (
+          <LiveView
+            active={activeView === "live"}
+            playerActive={isPlayerActive}
+            onPlayChannel={handlePlayChannel}
+          />
+        )}
         {activeView === "calendar" && (
           <CalendarView library={library} addons={addons} onSelectMeta={openDetail} />
         )}
@@ -5413,7 +5619,20 @@ export default function App() {
           the resume offset; Exit drops out to the detail view.
           Sits ABOVE PlayerOverlay so the user can't accidentally
           interact with the dead controls underneath. */}
-      {streamBroken && isPlayerActive && (
+      {/* Subtle "Reconnecting…" indicator shown while a live channel is
+          mid-auto-retry — replaces the full broken-stream modal so the popup
+          doesn't flash on/off between attempts. */}
+      {liveReconnecting && isPlayerActive && (
+        <div className="fixed inset-0 z-[10500] flex items-center justify-center pointer-events-none">
+          <div className="flex items-center gap-2.5 px-4 py-2.5 rounded-xl
+                          bg-black/70 backdrop-blur-md border border-white/12 text-white/85">
+            <span className="w-3.5 h-3.5 rounded-full border-2 border-white/30 border-t-ln-accent animate-spin" />
+            <span className="text-[13px] font-medium">Reconnecting to channel…</span>
+          </div>
+        </div>
+      )}
+
+      {streamBroken && isPlayerActive && !liveReconnecting && (
         <div
           // z-[10500] sits above PlayerOverlay's z-[9999] click-capture
           // layer AND its z-[10000] submenu portals. Without this,
@@ -5425,12 +5644,18 @@ export default function App() {
         >
           <div className="aura-glass-menu rounded-2xl max-w-[420px] w-[92%] p-6 text-white">
             <h2 className="text-[16px] font-semibold tracking-tight mb-2">
-              {firstFrameSeen ? "Stream connection lost" : "Stream unavailable"}
+              {isLivePlayback
+                ? (firstFrameSeen ? "Channel connection lost" : "Channel unavailable")
+                : (firstFrameSeen ? "Stream connection lost" : "Stream unavailable")}
             </h2>
             <p className="text-white/70 text-[13px] leading-relaxed mb-5">
-              {firstFrameSeen
-                ? "Aura hasn't received a playback heartbeat in 8 s. The most common cause is a transient DNS / TCP failure during a seek. Try reloading from your last position, or exit and pick another source."
-                : "Aura couldn't open the stream. The addon's host may be down or unreachable (DNS / TCP failure). Try reloading, or exit and pick a different source."}
+              {isLivePlayback
+                ? (firstFrameSeen
+                    ? "This channel dropped its connection. Live streams can hiccup on the provider side — Aura already retried a couple of times. Reload to try again, or exit and pick another channel."
+                    : "Aura couldn't open this channel (the provider returned an error — often a removed or temporarily-down channel). Aura already retried a couple of times. Reload to try again, or exit and pick another channel.")
+                : (firstFrameSeen
+                    ? "Aura hasn't received a playback heartbeat in 8 s. The most common cause is a transient DNS / TCP failure during a seek. Try reloading from your last position, or exit and pick another source."
+                    : "Aura couldn't open the stream. The addon's host may be down or unreachable (DNS / TCP failure). Try reloading, or exit and pick a different source.")}
             </p>
             <div className="flex justify-end gap-2">
               <button
@@ -5442,22 +5667,27 @@ export default function App() {
               >
                 Exit player
               </button>
-              <button
-                type="button"
-                onClick={() => {
-                  // Dismiss the recovery modal and open the in-player source
-                  // switcher — when a stream dies, picking a different source
-                  // is usually the real fix (the switcher swaps in place at
-                  // the last-known position via handlePlayStream).
-                  setStreamBroken(false);
-                  window.dispatchEvent(new CustomEvent("aura:open-source-switcher"));
-                }}
-                className="px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
-                           text-white/85 bg-white/[0.06] border border-white/12
-                           hover:bg-white/[0.10] hover:text-white transition-colors"
-              >
-                Switch source
-              </button>
+              {/* "Switch source" is meaningless for a Live TV channel (one
+                  URL, no alternate-source list), so it's hidden for live —
+                  the user picks a different CHANNEL from the grid instead. */}
+              {!isLivePlayback && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    // Dismiss the recovery modal and open the in-player source
+                    // switcher — when a stream dies, picking a different source
+                    // is usually the real fix (the switcher swaps in place at
+                    // the last-known position via handlePlayStream).
+                    setStreamBroken(false);
+                    window.dispatchEvent(new CustomEvent("aura:open-source-switcher"));
+                  }}
+                  className="px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
+                             text-white/85 bg-white/[0.06] border border-white/12
+                             hover:bg-white/[0.10] hover:text-white transition-colors"
+                >
+                  Switch source
+                </button>
+              )}
               <button
                 type="button"
                 onClick={async () => {
@@ -5478,6 +5708,7 @@ export default function App() {
                     await invoke("load_video", {
                       path: activeStreamUrl,
                       startSeconds: resumeAt,
+                      contentHdrHint: lastHdrHintRef.current,
                     });
                   } catch (e) {
                     console.error("Reload failed", e);
@@ -5499,6 +5730,7 @@ export default function App() {
         <PlayerOverlay
           activeTarget={activeTarget}
           isAnime={activeTarget ? activeTargetIsAnime(activeTarget, library) : false}
+          isLive={isLivePlayback}
           time={time}
           duration={duration}
           paused={paused}

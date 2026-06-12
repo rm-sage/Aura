@@ -275,6 +275,20 @@ pub struct AppSettings {
     // serde ignores unknown fields by default — and the legacy values
     // are migrated forward once on first read via
     // `crash_reporting::migrate_from_legacy`.
+
+    // ── Live TV (IPTV) ─────────────────────────────────────────────────────
+    /// Configured Live TV playlist sources (M3U / Xtream / EPG). Round-trips
+    /// through `get_settings`/`update_settings` like every other field, so
+    /// playlists sync + back up with the rest of the user's settings. Xtream
+    /// passwords are NOT stored here — they live in the OS keyring keyed by
+    /// playlist id (see `iptv.rs`). Default empty.
+    #[serde(default)]
+    pub iptv_playlists: Vec<crate::iptv::IptvPlaylistSource>,
+    /// Id of the playlist Live TV should auto-select on open (instead of the
+    /// first one). None = no default → fall back to the first source. Syncs +
+    /// backs up with the rest of settings like `iptv_playlists`.
+    #[serde(default)]
+    pub iptv_default_playlist_id: Option<String>,
 }
 
 fn default_theme() -> String { "mica".into() }
@@ -380,6 +394,8 @@ impl Default for AppSettings {
             skip_recap_mode:             default_skip_recap_mode(),
             skip_treat_mixed_op_as_op:   true,
             gpu_acceleration:            true,
+            iptv_playlists:              Vec::new(),
+            iptv_default_playlist_id:    None,
         }
     }
 }

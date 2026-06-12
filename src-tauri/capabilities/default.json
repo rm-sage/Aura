@@ -27,6 +27,7 @@
     "deep-link:default",
     "allow-load-video",
     "allow-cast",
+    "allow-iptv",
     "allow-player-controls",
     "allow-fetch-catalog",
     "allow-addon-manifest",

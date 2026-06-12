@@ -999,6 +999,11 @@ interface Props {
    *  motion-interpolation toggle — interpolation is anime-only. */
   isAnime: boolean;
 
+  /** True for Live TV channels (synthetic `iptv:` target). Replaces the
+   *  seek scrubber with a LIVE indicator — an infinite live stream has no
+   *  duration to scrub, and resume/skip controls are meaningless. */
+  isLive?: boolean;
+
   // Playback state
   time: number;
   duration: number;
@@ -1219,6 +1224,7 @@ const SPEED_OPTIONS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4];
 export default function PlayerOverlay({
   activeTarget,
   isAnime,
+  isLive = false,
   time, duration, paused, volume, speed, buffering, bufferPct, firstFrameSeen,
   togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
   onExitPlayback,
@@ -1260,6 +1266,27 @@ export default function PlayerOverlay({
   const [scrubValue, setScrubValue] = useState<number | null>(null);
   const displayTime = scrubValue ?? time;
   const progress = duration > 0 ? (displayTime / duration) * 100 : 0;
+
+  // Live DVR — for Live TV, instead of hiding the scrubber entirely we let
+  // the user rewind through mpv's demuxer back-buffer (the 128 MiB the
+  // engine already keeps — RAM-only, freed on stop, nothing on the VPS).
+  // The estimator rides `time` + wallclock; no new mpv property reads, so
+  // none of the get_property-race landmines apply. See `useLiveDvr`. The
+  // target id keys the estimator so switching channels (isLive stays true,
+  // time resets to ~0) re-anchors to the new edge instead of showing the
+  // fresh channel as "behind live".
+  const dvr = useLiveDvr(isLive, time, activeTarget?.id ?? null);
+  // Go Live: jump a few seconds behind the live edge, but debounced + a no-op
+  // when already live, so spam-clicking can't seek-storm mpv (which stalled
+  // forward buffering until the clicking stopped).
+  const lastGoLiveRef = useRef(0);
+  const goLive = () => {
+    const t = Date.now();
+    if (t - lastGoLiveRef.current < 800) return;
+    lastGoLiveRef.current = t;
+    if (dvr.atLive) return;
+    seekAbsolute(Math.max(dvr.windowStart, dvr.edge - 3));
+  };
 
   // AniSkip OP/ED/recap windows for the current episode. Surfaced as
   // amber bands on the scrubber so the user can see where skip
@@ -1520,6 +1547,9 @@ export default function PlayerOverlay({
   const extSubFallbackRef = useRef(false);
   useEffect(() => {
     if (extSubFallbackRef.current) return;
+    // Live TV has no persistent subtitles — never auto-load one (the upstream
+    // external-sub fetch is already skipped for live, this is belt-and-braces).
+    if (isLive) return;
     // Need the initial fetch to have produced data so an empty embedded
     // list is a real "no subs" answer rather than "we haven't fetched yet".
     if (tracks.length === 0) return;
@@ -1543,7 +1573,7 @@ export default function PlayerOverlay({
     })
       .then(() => window.dispatchEvent(new Event("aura:tracks-refresh")))
       .catch(() => {});
-  }, [tracks.length, embeddedSubTracks.length, externalSubs, preferredSubLang]);
+  }, [tracks.length, embeddedSubTracks.length, externalSubs, preferredSubLang, isLive]);
 
   // ── Audio auto-select ─────────────────────────────────────────────
   // Replaces the old simple lang-prefix match with the full scoring
@@ -2043,30 +2073,44 @@ export default function PlayerOverlay({
           className="aura-glass-bar rounded-2xl px-4 pt-2 pb-3 w-full max-w-[1100px]
                      pointer-events-auto"
         >
-          {/* ── Scrubber (full-width row) ── */}
-          <div className="px-1.5 pt-0.5">
-            <Scrubber
-              value={displayTime}
-              max={duration || 1}
-              onScrubStart={() => setScrubValue(time)}
-              onScrub={(v) => setScrubValue(v)}
-              onScrubEnd={(v) => {
-                seekAbsolute(v);
-                setScrubValue(null);
-              }}
-              progressPct={progress}
-              segments={skipWindowsForScrub}
-              thumbnailAt={
-                streamUrl
-                  ? (sec) =>
-                      invoke<{ data_url: string; at: number } | null>("extract_thumbnail", {
-                        url: streamUrl,
-                        atSeconds: sec,
-                      }).catch(() => null)
-                  : undefined
-              }
+          {/* ── Scrubber (full-width row). VOD gets the full thumbnail
+              scrubber; Live TV gets the DVR scrubber (rewind within the
+              demuxer back-buffer, "Go Live" to snap back to the edge). ── */}
+          {!isLive && (
+            <div className="px-1.5 pt-0.5">
+              <Scrubber
+                value={displayTime}
+                max={duration || 1}
+                onScrubStart={() => setScrubValue(time)}
+                onScrub={(v) => setScrubValue(v)}
+                onScrubEnd={(v) => {
+                  seekAbsolute(v);
+                  setScrubValue(null);
+                }}
+                progressPct={progress}
+                segments={skipWindowsForScrub}
+                thumbnailAt={
+                  streamUrl
+                    ? (sec) =>
+                        invoke<{ data_url: string; at: number } | null>("extract_thumbnail", {
+                          url: streamUrl,
+                          atSeconds: sec,
+                        }).catch(() => null)
+                    : undefined
+                }
+              />
+            </div>
+          )}
+          {isLive && (
+            <LiveScrubber
+              windowStart={dvr.windowStart}
+              edge={dvr.edge}
+              position={dvr.position}
+              atLive={dvr.atLive}
+              onSeek={(t) => seekAbsolute(t)}
+              onGoLive={goLive}
             />
-          </div>
+          )}
 
           {/* ── Button row — order: Rewind ▶ Play/Pause ▶ Forward ── */}
           {/* gap-1.5 (6 px) keeps the row tight; pill buttons (Speed,
@@ -2074,6 +2118,10 @@ export default function PlayerOverlay({
               so they don't visually bloat against the round neighbours
               and the rhythm stays even across the bar. */}
           <div className="flex items-center gap-1.5 mt-1">
+            {/* Back-10 is available for Live TV too — it rewinds within the
+                demuxer back-buffer (the DVR window). Forward-10 only shows
+                when behind live (catching up toward the edge); at the live
+                edge there's nothing ahead to seek into. */}
             <IconButton
               onClick={() => seekRelative(-10)}
               label="Skip back 10 seconds"
@@ -2094,20 +2142,38 @@ export default function PlayerOverlay({
               </button>
             </Tooltip>
 
-            <IconButton
-              onClick={() => seekRelative(10)}
-              label="Skip forward 10 seconds"
-              tooltip="Forward 10 s"
-            >
-              <ForwardIcon />
-            </IconButton>
+            {(!isLive || !dvr.atLive) && (
+              <IconButton
+                onClick={() => seekRelative(10)}
+                label="Skip forward 10 seconds"
+                tooltip="Forward 10 s"
+              >
+                <ForwardIcon />
+              </IconButton>
+            )}
 
-            {/* Time display — current / total */}
-            <div className="ml-2 flex items-center gap-2 text-white/85 font-mono text-[12.5px] tabular-nums">
-              <span>{fmt(displayTime)}</span>
-              <span className="text-white/30">/</span>
-              <span className="text-white/55">{fmt(duration)}</span>
-            </div>
+            {/* Time display — current / total. For Live TV: a LIVE badge at
+                the edge, or how far behind live when rewound into the DVR
+                buffer. */}
+            {isLive ? (
+              dvr.atLive ? (
+                <div className="ml-2 flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-red-500" style={{ boxShadow: "0 0 8px rgba(239,68,68,0.7)" }} />
+                  <span className="text-red-300/90 font-semibold text-[12px] tracking-wide">LIVE</span>
+                </div>
+              ) : (
+                <div className="ml-2 flex items-center gap-1.5 text-white/70 font-mono text-[12px] tabular-nums">
+                  <span className="w-1.5 h-1.5 rounded-full bg-white/40" />
+                  <span>−{fmtBehind(Math.max(0, dvr.edge - dvr.position))} behind</span>
+                </div>
+              )
+            ) : (
+              <div className="ml-2 flex items-center gap-2 text-white/85 font-mono text-[12.5px] tabular-nums">
+                <span>{fmt(displayTime)}</span>
+                <span className="text-white/30">/</span>
+                <span className="text-white/55">{fmt(duration)}</span>
+              </div>
+            )}
 
             {/* Skip-window button — surfaces inline when playback is
                 currently inside a known OP/ED/Recap window, so the user
@@ -2115,12 +2181,14 @@ export default function PlayerOverlay({
                 Lua script's auto / prompt behaviour. When no windows
                 exist for the current stream, doubles as a "Detect"
                 affordance (silencedetect manual fallback). */}
-            <SkipWindowButton
-              time={time}
-              seekAbsolute={seekAbsolute}
-              streamUrl={streamUrl}
-              mediaType={activeTarget?.media_type}
-            />
+            {!isLive && (
+              <SkipWindowButton
+                time={time}
+                seekAbsolute={seekAbsolute}
+                streamUrl={streamUrl}
+                mediaType={activeTarget?.media_type}
+              />
+            )}
 
             {/* Spacer */}
             <div className="flex-1" />
@@ -2359,6 +2427,204 @@ export default function PlayerOverlay({
     </div>
     </MenuTrackerCtx.Provider>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Live DVR — rewind a live stream within mpv's demuxer back-buffer.
+//
+// We never read mpv's cache-state node property (that's the documented
+// get_property-race crash path). Instead we estimate the live edge purely
+// from the `time` the engine already streams plus wallclock: while we're
+// riding the edge, edge==time and advances 1 s/s; once the user rewinds,
+// `time` falls behind the estimate and the edge keeps growing on wallclock
+// alone. A large backward jump (channel switch / stream restart) re-anchors.
+//
+// The window is a conservative fixed span (the engine keeps 128 MiB of back-
+// buffer ≈ a few minutes; seeks past the real floor are clamped by mpv, so a
+// slightly-generous window is harmless). RAM-only, freed on stop — nothing is
+// persisted and nothing is stored server-side.
+// ---------------------------------------------------------------------------
+
+/** Conservative rewind window (s). The 128 MiB back-buffer holds ~2–5 min
+ *  depending on bitrate; mpv clamps over-seeks, so this only bounds the UI. */
+const DVR_WINDOW_S = 150;
+/** Within this many seconds of the estimated edge counts as "at live". */
+const DVR_EDGE_TOL_S = 6;
+
+interface LiveDvrState {
+  atLive: boolean;
+  /** Estimated live-edge position, in `time` units. */
+  edge: number;
+  /** Earliest seekable position shown in the UI. */
+  windowStart: number;
+  /** Current playback position clamped to the window. */
+  position: number;
+}
+
+function useLiveDvr(isLive: boolean, time: number, streamKey: string | null): LiveDvrState {
+  const anchor = useRef<{ t: number; wall: number; init: boolean; key: string | null }>({
+    t: 0, wall: 0, init: false, key: null,
+  });
+  const [state, setState] = useState<LiveDvrState>({ atLive: true, edge: 0, windowStart: 0, position: 0 });
+  const lastEmit = useRef<LiveDvrState | null>(null);
+
+  // mpv fires time-pos events many times per second; the DVR scrubber only
+  // moves sub-pixel between them, so committing a fresh state object each
+  // event re-rendered the whole PlayerOverlay an EXTRA time per tick (the
+  // live-lag cause). Dedupe to whole-second granularity — re-emit only when a
+  // visible value changes.
+  const commit = (next: LiveDvrState) => {
+    const prev = lastEmit.current;
+    if (
+      prev &&
+      prev.atLive === next.atLive &&
+      Math.round(prev.edge) === Math.round(next.edge) &&
+      Math.round(prev.windowStart) === Math.round(next.windowStart) &&
+      Math.round(prev.position) === Math.round(next.position)
+    ) {
+      return;
+    }
+    lastEmit.current = next;
+    setState(next);
+  };
+
+  useEffect(() => {
+    if (!isLive) {
+      anchor.current.init = false;
+      anchor.current.key = streamKey;
+      return;
+    }
+    const now = Date.now() / 1000;
+
+    // First sample, a CHANNEL SWITCH (streamKey changed — isLive stays true so
+    // the !isLive reset above never fires, and a fresh channel's `time` resets
+    // to ~0 which the est-relative test below can miss), or an in-channel
+    // stream restart where `time` drops well below the window floor → discard
+    // the prior anchor and re-anchor to the new live edge on this sample.
+    const est = anchor.current.t + (now - anchor.current.wall);
+    if (!anchor.current.init || anchor.current.key !== streamKey || time < est - DVR_WINDOW_S - 60) {
+      anchor.current = { t: time, wall: now, init: true, key: streamKey };
+      commit({
+        atLive: true,
+        edge: time,
+        windowStart: Math.max(0, time - DVR_WINDOW_S),
+        position: time,
+      });
+      return;
+    }
+
+    const atLive = time >= est - DVR_EDGE_TOL_S;
+    // Advance the edge anchor ONLY for a genuinely NEWER live frame (time
+    // beyond the wallclock estimate), never just because we're near the edge.
+    // Re-anchoring on "near" collapsed the estimate backward after a Go-Live
+    // seek to (edge − 3): that seeked position is within tolerance, so it used
+    // to reset edge = edge − 3, and each repeated click walked the edge (and
+    // the seek target) backward toward the start of the stream. Keeping the
+    // edge monotonic means Go Live always targets the true live frontier.
+    if (time > est) {
+      anchor.current = { t: time, wall: now, init: true, key: streamKey };
+    }
+    const edge = anchor.current.t + (now - anchor.current.wall);
+    commit({
+      atLive,
+      edge,
+      windowStart: Math.max(0, edge - DVR_WINDOW_S),
+      position: Math.min(Math.max(time, 0), edge),
+    });
+  }, [isLive, time, streamKey]);
+
+  return state;
+}
+
+/** Live DVR scrub bar: a red fill from the window start to the current
+ *  position, a draggable thumb, and a Live pill that snaps back to the edge.
+ *  Seeks are committed on pointer-up (no seek-storm). */
+function LiveScrubber({
+  windowStart,
+  edge,
+  position,
+  atLive,
+  onSeek,
+  onGoLive,
+}: {
+  windowStart: number;
+  edge: number;
+  position: number;
+  atLive: boolean;
+  onSeek: (t: number) => void;
+  onGoLive: () => void;
+}) {
+  const trackRef = useRef<HTMLDivElement>(null);
+  const [drag, setDrag] = useState<number | null>(null);
+  const span = Math.max(1, edge - windowStart);
+  const shown = drag ?? position;
+  const pct = Math.max(0, Math.min(100, ((shown - windowStart) / span) * 100));
+
+  const timeAt = (clientX: number): number => {
+    const el = trackRef.current;
+    if (!el) return position;
+    const r = el.getBoundingClientRect();
+    const f = Math.max(0, Math.min(1, (clientX - r.left) / r.width));
+    return windowStart + f * span;
+  };
+
+  return (
+    <div className="flex items-center gap-2.5 px-1.5 pt-0.5">
+      <div
+        ref={trackRef}
+        className="group relative flex-1 h-1.5 rounded-full bg-white/15 cursor-pointer"
+        onPointerDown={(e) => {
+          e.currentTarget.setPointerCapture(e.pointerId);
+          setDrag(timeAt(e.clientX));
+        }}
+        onPointerMove={(e) => {
+          if (drag != null) setDrag(timeAt(e.clientX));
+        }}
+        onPointerUp={(e) => {
+          const t = drag ?? timeAt(e.clientX);
+          setDrag(null);
+          onSeek(t);
+        }}
+      >
+        <span
+          className="absolute inset-y-0 left-0 rounded-full bg-red-500/80"
+          style={{ width: `${pct}%` }}
+        />
+        <span
+          className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-3 h-3 rounded-full
+                     bg-white shadow opacity-0 group-hover:opacity-100 transition-opacity"
+          style={{ left: `${pct}%` }}
+        />
+      </div>
+      <button
+        type="button"
+        onClick={onGoLive}
+        aria-label="Go to live edge"
+        title={atLive ? "Live" : "Go to live"}
+        className={[
+          "flex items-center gap-1.5 px-2.5 h-6 rounded-full text-[11px] font-semibold tracking-wide transition-colors flex-shrink-0",
+          atLive
+            ? "bg-red-500/15 text-red-300/90 cursor-default"
+            : "bg-white/8 text-white/70 hover:bg-white/15 hover:text-white",
+        ].join(" ")}
+      >
+        <span
+          className={["w-2 h-2 rounded-full", atLive ? "bg-red-500" : "bg-white/40"].join(" ")}
+          style={atLive ? { boxShadow: "0 0 8px rgba(239,68,68,0.7)" } : undefined}
+        />
+        {atLive ? "LIVE" : "GO LIVE"}
+      </button>
+    </div>
+  );
+}
+
+/** Compact "behind live" offset — "8s", "1:23", "12:05". */
+function fmtBehind(seconds: number): string {
+  const s = Math.floor(seconds);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${String(r).padStart(2, "0")}`;
 }
 
 // ---------------------------------------------------------------------------

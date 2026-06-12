@@ -51,6 +51,17 @@ interface CacheEntry {
  *  The chosen split: 4h for episodic, 7d for movies. */
 const TTL_EPISODIC_MS = 4 * 60 * 60 * 1000;
 const TTL_MOVIE_MS    = 7 * 24 * 60 * 60 * 1000;
+/** Null (a fetch that returned nothing usable) is cached only briefly.
+ *  The point of caching null at all is to stop a CW/hover row from
+ *  re-firing the same dead fetch on every render — a sub-second storm.
+ *  But a *transient* miss (addon slow, network blip, meta addon not yet
+ *  warmed) must not stick for the full media TTL: a 7-day movie null
+ *  meant "Wind River" showed "No extra details available" on hover for
+ *  days while its DetailView — which bypasses this cache — loaded fine.
+ *  90 s is long enough to absorb a render storm, short enough that the
+ *  next deliberate hover re-attempts. Null entries are also skipped at
+ *  persist time so a miss never survives a restart. */
+const TTL_NULL_MS     = 90 * 1000;
 function ttlFor(mediaType: string): number {
   const t = mediaType.toLowerCase();
   return (t === "series" || t === "anime") ? TTL_EPISODIC_MS : TTL_MOVIE_MS;
@@ -96,6 +107,10 @@ function noteYear(id: string, detail: MetaDetail | null, ts: number) {
       if (!Array.isArray(entry) || entry.length !== 2) continue;
       const [k, v] = entry;
       if (typeof k !== "string" || !v || typeof v.ts !== "number") continue;
+      // Skip cached nulls left by a previous build — they should never
+      // have been persisted, and rehydrating one re-sticks the empty
+      // hover state until its (formerly multi-day) TTL aged out.
+      if (!v.detail) continue;
       if (now - v.ts >= TTL_MAX_MS) continue;
       cache.set(k, v);
       const idPart = k.split("::")[2];
@@ -128,7 +143,12 @@ function persistNow() {
         if (idPart) noteYear(idPart, v.detail, v.ts);
       }
     }
-    localStorage.setItem(STORAGE_KEY, JSON.stringify([...cache.entries()]));
+    // Persist only entries with real detail. A cached null is a
+    // storm-suppression artifact with a 90 s in-memory life — it must
+    // never survive a restart, or a transient miss would re-stick the
+    // "No extra details available" state across sessions.
+    const persistable = [...cache.entries()].filter(([, v]) => v.detail);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistable));
   } catch {
     // Quota or serialization failure — non-fatal; the in-memory cache
     // continues to function for this session.
@@ -151,7 +171,10 @@ export async function getMetaDetail(
 ): Promise<MetaDetail | null> {
   const key = cacheKey(addon.url, mediaType, id);
   const hit = cache.get(key);
-  if (hit && Date.now() - hit.ts < ttlFor(mediaType)) return hit.detail;
+  if (hit) {
+    const ttl = hit.detail ? ttlFor(mediaType) : TTL_NULL_MS;
+    if (Date.now() - hit.ts < ttl) return hit.detail;
+  }
 
   const fetched = await dedupedInvoke(`meta:${key}`, () =>
     invoke<MetaDetail>("fetch_meta_detail", {

@@ -22,6 +22,10 @@ indexmap = { version = "2", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# gzip decompression for IPTV EPGs — many XMLTV guides are served as
+# `.xml.gz` FILES (body is gzip, not Content-Encoding), so reqwest's
+# transfer-decompression doesn't help; we detect the gzip magic + inflate.
+flate2 = "1"
 # Platform-native backends MUST be enabled explicitly — keyring v3
 # ships no default features, so a bare `keyring = "3"` resolves to the
 # in-memory mock backend that loses every value between app launches.
@@ -38,9 +42,10 @@ keyring = { version = "3", features = [
 ] }
 zeroize = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "macros", "process", "io-util", "time", "sync"] }
-# In-process streaming bridge (streaming.rs) — the loopback byte-range
-# proxy that used to live in the separate `aura-bridge` sidecar binary.
-# axum pinned to 0.7 (0.8 changed wildcard route syntax).
+# In-process streaming bridge (streaming.rs) — the loopback byte-range /
+# live proxy that used to live in the separate `aura-bridge` sidecar binary.
+# axum pinned to 0.7 (0.8 changed wildcard route syntax). futures-util also
+# enforces the IPTV fetch size-cap streaming.
 axum = "0.7"
 futures-util = "0.3"
 # Casting (src/cast/): mDNS `_googlecast._tcp` discovery + a hand-rolled

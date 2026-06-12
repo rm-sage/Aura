@@ -4694,7 +4694,7 @@ export default function SettingsView({ addons, session }: Props) {
                 description={
                   // Keep this short — the user reading this is debugging
                   // playback colour, not learning colour science.
-                  "Pick what to do with HDR sources. \"Tone-map for SDR\" is the safe default for laptop / desktop monitors. \"Passthrough\" is for HDR-capable TVs/monitors with HDR enabled in OS settings. \"Off\" disables all HDR processing."
+                  "Pick what to do with HDR sources. \"Tone-map for SDR\" is the safe default for laptop / desktop monitors. \"Passthrough\" outputs HDR (requires HDR enabled in Windows) with mpv tone-mapping to your panel's peak — set the nits below to your panel's real peak if highlights clip. Mode changes fully apply from the next playback. \"Off\" disables all HDR processing."
                 }
                 value={(() => {
                   const m = (backend.hdr_mode ?? "").trim().toLowerCase();

@@ -12,7 +12,7 @@
 
 **Key Architecture Notes:**
 - **libmpv Integration:** The app requires `libmpv-2.dll` and `libmpv-wrapper.dll` placed in the `src-tauri/lib/` directory to function. These are not included in the repository.
-- **Optional Companion Binary:** Aura can run alongside `aura-bridge`, a small companion binary that forwards plain-HTTP stream byte ranges. If placed next to the executable, it is spawned automatically.
+- **Streaming Bridge (in-process):** Aura runs a small loopback proxy on `127.0.0.1:11471` that forwards plain-HTTP stream byte ranges. It's in-process (`src-tauri/src/streaming.rs`, started at setup) — no sidecar binary. HTTPS and HLS bypass it entirely.
 - **Tauri Plugins Used:** Opener, clipboard-manager, shell, deep-link, window-state (for persistent bounds), updater (auto-updater).
 - **Split Licensing:** AGPL-3.0-or-later for code; CC-BY-NC-4.0 for branding/logos.
 

@@ -145,17 +145,14 @@ pnpm install
 pnpm tauri dev
 ```
 
-### Optional: aura-bridge runtime helper
+### Streaming bridge (built in)
 
-Aura runs alongside a small companion binary, `aura-bridge`, that
-forwards plain-HTTP stream byte ranges. It's distributed as a separate
-component and is **not required** for normal use — HTTPS streams bypass
-it entirely, and the vast majority of Stremio addons today serve over
-HTTPS. If a binary named `aura-bridge.exe` is found next to Aura's
-own executable (or anywhere on PATH at app launch), it'll be spawned
-automatically; if absent, plain-HTTP streams fail gracefully with a
-warning logged to the F12 DevConsole and the rest of the app continues
-to work.
+Aura runs a tiny loopback proxy on `127.0.0.1:11471` that forwards
+plain-HTTP stream byte ranges. It's **in-process** — part of the main
+executable, nothing to install or run separately. HTTPS streams and HLS
+manifests bypass it entirely and go straight to the player. If the port
+is already in use, the proxy is disabled gracefully (a warning is logged
+to the F12 DevConsole) and everything else keeps working.
 
 ## License
 

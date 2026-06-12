@@ -20,8 +20,12 @@
 //!     design.md`), an L-effort, HW-gated build;
 //!   * `--wid` + `vo=gpu-next` + d3d11 does correct HDR/Dolby-Vision
 //!     passthrough today (`target-colorspace-hint` is honoured by the
-//!     d3d11 GPU context), and mpv's own DXGI swapchain opts out of the
-//!     Win11 Independent-Flip/MPO promotion that plagued the WGL surface;
+//!     d3d11 GPU context). NOTE: the default hwnd swapchain IS eligible
+//!     for Win11 Independent-Flip/MPO promotion; when promoted, our PQ
+//!     signal is direct-scanned and this QD-OLED's True-Black HDR mode
+//!     lifts near-blacks (correct only while DWM composes). This is not
+//!     app-fixable — `d3d11-output-mode=composition` breaks `--wid` and an
+//!     in-app overlay can't defeat hardware MPO (see the init-opts note);
 //!   * dropping the render path also drops `tauri-plugin-libmpv` /
 //!     `libmpv-wrapper.dll` (the legacy plugin) entirely — one engine,
 //!     one DLL (`libmpv-2.dll`), one event channel.
@@ -142,6 +146,17 @@ enum EngineCommand {
     LoadFile {
         url: String,
         start_seconds: Option<f64>,
+        /// Optional forward proxy applied as a PER-FILE `http-proxy` loadfile
+        /// option (auto-scoped + reset when the file ends) — the per-playlist
+        /// Live TV proxy. Per-file is used over a global set_property because a
+        /// runtime global `http-proxy` change doesn't reliably apply to the
+        /// next loadfile's stream open.
+        http_proxy: Option<String>,
+        /// Stream-name HDR labelling (parsed frontend-side). Under the
+        /// "passthrough" HDR mode this routes the load to the PQ output
+        /// set (Some(true)) or the plain SDR set (anything else) BEFORE
+        /// the loadfile — per-content output without mid-playback writes.
+        hdr_hint: Option<bool>,
     },
     TogglePause,
     SetVolume(f64),
@@ -314,8 +329,13 @@ pub fn start(parent_hwnd: isize, emit: EngineEmit) {
 
 /// Submit a `LoadFile` command. Returns an error if the engine isn't
 /// running (master gate off or pre-startup) or the channel is closed.
-pub fn submit_load_file(url: String, start_seconds: Option<f64>) -> Result<(), String> {
-    submit(EngineCommand::LoadFile { url, start_seconds })
+pub fn submit_load_file(
+    url: String,
+    start_seconds: Option<f64>,
+    http_proxy: Option<String>,
+    hdr_hint: Option<bool>,
+) -> Result<(), String> {
+    submit(EngineCommand::LoadFile { url, start_seconds, http_proxy, hdr_hint })
 }
 
 /// Submit a `TogglePause` command.
@@ -571,6 +591,46 @@ unsafe extern "system" fn engine_wndproc(
         return LRESULT(0);
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// Write the HDR option set for `mode` (see `player::apply_hdr_options`)
+/// to the handle as string properties. Used at engine init AND per-load
+/// from the pump loop's LoadFile arm — the per-load path engages the PQ
+/// output only for HDR-labelled streams, applied BETWEEN files (before
+/// the loadfile command), never mid-playback.
+unsafe fn apply_hdr_mode_set(
+    lib: &Libmpv,
+    handle: *mut mpv_handle,
+    mode: &str,
+    peak_nits: u32,
+) {
+    let mut opts: indexmap::IndexMap<String, serde_json::Value> =
+        indexmap::IndexMap::new();
+    crate::player::apply_hdr_options(&mut opts, mode, peak_nits);
+    for (name, value) in opts.iter() {
+        let value_str = match value {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => {
+                if *b { "yes".to_string() } else { "no".to_string() }
+            }
+            // apply_hdr_options only ever emits scalars; skip anything
+            // else rather than send a wrong-format value.
+            _ => continue,
+        };
+        if let (Ok(name_c), Ok(value_c)) =
+            (CString::new(name.as_str()), CString::new(value_str.as_str()))
+        {
+            let r = (lib.set_property_string)(handle, name_c.as_ptr(), value_c.as_ptr());
+            if r < 0 {
+                crate::devlog!(
+                    warn, "mpv",
+                    "HDR option {name} = {value_str} failed: {}",
+                    err_str(lib, r),
+                );
+            }
+        }
+    }
 }
 
 /// `<null>`-safe NUL-terminated-C-string → owned `String`.
@@ -850,7 +910,15 @@ fn end_file_reason_to_str(reason: c_int) -> &'static str {
 /// Other events (start-file / file-loaded / seek / playback-restart, …)
 /// aren't consumed by the bridge today, so they're discarded silently —
 /// Phase 4 can extend this when a setter or observer needs them.
-unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineEmit) {
+/// Drain pending mpv events. Returns `true` if a `VIDEO_RECONFIG` was seen
+/// — mpv's VO (re)created/resized its `--wid` child window, which is the
+/// reliable signal that the geometry pump must re-run `resize_mpv_child_to_parent`
+/// (to size the child AND re-apply the windowed MPO-poison region on the new
+/// child). Without this, the region only landed on the next host-geometry
+/// change (e.g. a fullscreen toggle), so initial-playback windowed blacks
+/// stayed raised until the user toggled fullscreen.
+unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineEmit) -> bool {
+    let mut video_reconfig = false;
     loop {
         let ev = (lib.wait_event)(handle, 0.0);
         if ev.is_null() {
@@ -859,6 +927,10 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
         let id = (*ev).event_id;
         if id == mpv_event_id::NONE {
             break;
+        }
+        if id == mpv_event_id::VIDEO_RECONFIG {
+            video_reconfig = true;
+            continue;
         }
         if id == mpv_event_id::LOG_MESSAGE {
             let m = (*ev).data as *const mpv_event_log_message;
@@ -931,6 +1003,7 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
             break;
         }
     }
+    video_reconfig
 }
 
 /// Three-state visibility classification of the parent window, retained
@@ -1244,8 +1317,9 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         // always used, and the whole point of the consolidation: under a
         // real window (vs `vo=libmpv`) it drives the d3d11 GPU context,
         // which honours `target-colorspace-hint` for true HDR/DV
-        // passthrough and opts its swapchain out of Win11's
-        // Independent-Flip promotion.
+        // passthrough. (The d3d11 swapchain IS Independent-Flip/MPO-
+        // eligible; that promotion is the source of the QD-OLED scanout
+        // black-lift and is not app-fixable — see the INIT_OPTS note.)
         (lib.set_property_string)(
             handle,
             b"vo\0".as_ptr() as *const c_char,
@@ -1277,6 +1351,34 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             (b"hwdec\0", b"auto\0"),
             (b"keepaspect\0", b"yes\0"),
             (b"background\0", b"none\0"),
+            // Force a 10-bit DXGI swapchain. mpv creates the swapchain
+            // 10-bit (R10G10B10A2) on a >8bpc HDR output, but libplacebo
+            // re-picks the format when it wraps the swapchain, and the
+            // default 'auto' path was DOWNGRADING it to 8-bit R8G8B8A8
+            // (aura-mpv.log: "Attempting to reconfigure swap chain format:
+            // R10G10B10A2_UNORM -> R8G8B8A8_UNORM"). libplacebo only
+            // selects the PQ HDR10 colorspace (G2084) on a 10-bit format —
+            // an 8-bit surface falls back to G22_NONE_P2020 (SDR gamma in a
+            // BT.2020 container), which is exactly the blown-highlights
+            // failure. `rgb10_a2` pins color_bits=10/alpha_bits=2 so the
+            // HDR10 path stays eligible. The mpv child window is opaque
+            // (below the WebView2), so dropping to 2-bit alpha is a no-op
+            // for us; 10-bit also reduces banding in SDR dark gradients.
+            (b"d3d11-output-format\0", b"rgb10_a2\0"),
+            // NOTE — `d3d11-output-mode=composition` was tried here to stop
+            // Independent-Flip/MPO promotion (the source of the QD-OLED's
+            // raised-black-in-direct-scanout behaviour). It is INCOMPATIBLE
+            // with `--wid`: composition mode calls
+            // CreateSwapChainForComposition with window=NULL and needs the
+            // embedder to create/size a DirectComposition visual, which a
+            // bare child-window embed does not. mpv's d3d11 ctx then fails
+            // ("Failed to get height and width!") and falls back to the
+            // winvk (Vulkan) context with an 8-bit SDR sRGB swapchain — HDR
+            // breaks entirely. Do NOT re-add it without owning the DComp
+            // visual. The raised-black scanout behaviour is the panel's own
+            // near-black EOTF in its True-Black HDR mode (masked only when
+            // DWM composes) and is not app-fixable; see HANDOFF / the HDR
+            // memory for the full dead-end analysis.
             // 50% initial volume — comfortable headphone-safe default;
             // matches the PlaybackState bridge's assumed initial value
             // (mpv's own default of 100 is too loud for first play).
@@ -1414,49 +1516,27 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         }
 
         // -- HDR mode at init --
-        // Apply the user's persisted HDR mode (target-colorspace-hint /
-        // tone-mapping / target-prim/trc/peak / hdr-compute-peak) at
-        // instance creation so the first frame already honours the
-        // setting; the Settings toggle keeps routing live changes through
-        // `apply_hdr_settings` → `submit_set_property`.
+        // Apply the user's persisted HDR mode at instance creation so
+        // the first frame already honours the setting.
         //
-        // Under `--wid` + `vo=gpu-next` + the d3d11 GPU context,
-        // "passthrough" (`target-colorspace-hint=yes`) is REAL HDR
-        // passthrough — the d3d11 context honours the hint and flips the
-        // swapchain colour space. This is what the render-API engine
-        // could never do (`vo=libmpv` ignores the hint; its WGL surface
-        // was 8-bit SDR) and the reason the DXGI-interop design
-        // (2026-06-03 spec) is superseded by this consolidation.
+        // "passthrough" is PER-CONTENT: the PQ output path (forced PQ
+        // swapchain + mpv tone-mapping to the panel's real peak) only
+        // makes sense for HDR sources — SDR rendered into a PQ
+        // container sits at the 203-nit reference, visibly dimmer and
+        // flatter than the Windows SDR-brightness level every other
+        // window gets. So under passthrough the engine starts on the
+        // plain SDR output and flips per LOAD based on the stream's
+        // HDR labelling (see the LoadFile arm in the pump loop) — the
+        // switch happens BETWEEN files only, never mid-playback (the
+        // documented blow-out hazard).
         {
             let mode = crate::player::resolve_hdr_mode(&snap);
-            let mut hdr_opts: indexmap::IndexMap<String, serde_json::Value> =
-                indexmap::IndexMap::new();
-            crate::player::apply_hdr_options(&mut hdr_opts, mode, snap.hdr_target_peak_nits);
-            for (name, value) in hdr_opts.iter() {
-                let value_str = match value {
-                    serde_json::Value::String(s) => s.clone(),
-                    serde_json::Value::Number(n) => n.to_string(),
-                    serde_json::Value::Bool(b) => {
-                        if *b { "yes".to_string() } else { "no".to_string() }
-                    }
-                    // apply_hdr_options only ever emits scalars; skip anything
-                    // else rather than send a wrong-format value.
-                    _ => continue,
-                };
-                if let (Ok(name_c), Ok(value_c)) =
-                    (CString::new(name.as_str()), CString::new(value_str.as_str()))
-                {
-                    let r = (lib.set_property_string)(handle, name_c.as_ptr(), value_c.as_ptr());
-                    if r < 0 {
-                        crate::devlog!(
-                            warn, "mpv",
-                            "HDR init option {name} = {value_str} failed: {}",
-                            err_str(&lib, r),
-                        );
-                    }
-                }
-            }
-            crate::devlog!(info, "mpv", "HDR mode '{mode}' applied at engine init");
+            let effective = if mode == "passthrough" { "sdr" } else { mode };
+            apply_hdr_mode_set(&lib, handle, effective, snap.hdr_target_peak_nits);
+            crate::devlog!(
+                info, "mpv",
+                "HDR mode '{mode}' (initial output set: '{effective}') applied at engine init",
+            );
         }
 
         let ir = (lib.initialize)(handle);
@@ -1582,7 +1662,34 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         shutting_down = true;
                         break;
                     }
-                    Ok(EngineCommand::LoadFile { url, start_seconds }) => {
+                    Ok(EngineCommand::LoadFile { url, start_seconds, http_proxy, hdr_hint }) => {
+                        // Per-load HDR routing (passthrough mode only):
+                        // the PQ output set engages only for HDR-labelled
+                        // streams; everything else gets the plain SDR
+                        // output so it composites at the Windows SDR
+                        // brightness like every other window. Applied
+                        // HERE — between files, before the loadfile —
+                        // never mid-playback (the documented blow-out
+                        // hazard).
+                        {
+                            let snap = crate::settings::snapshot();
+                            let mode = crate::player::resolve_hdr_mode(&snap);
+                            if mode == "passthrough" {
+                                let effective = if hdr_hint == Some(true) {
+                                    "passthrough"
+                                } else {
+                                    "sdr"
+                                };
+                                apply_hdr_mode_set(
+                                    &lib, handle, effective,
+                                    snap.hdr_target_peak_nits,
+                                );
+                                crate::devlog!(
+                                    info, "mpv",
+                                    "per-load HDR output set: '{effective}' (hint={hdr_hint:?})",
+                                );
+                            }
+                        }
                         // Pre-loadfile pause clear: an inherited pause flag
                         // from a previous file would carry over otherwise
                         // and require a manual click to start playback.
@@ -1592,21 +1699,36 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                                 "set_pause(false) pre-loadfile failed: {e}",
                             );
                         }
-                        let start_opt = start_seconds
-                            .filter(|v| v.is_finite() && *v > 0.0)
-                            .map(|t| format!("start={:.3}", t.min(86_400.0 * 7.0)));
+                        // Per-file options (comma-joined): start + http-proxy.
+                        // NOTE: values must not contain a comma (the option-list
+                        // separator) — fine for `start=` and a normal proxy URL.
+                        let mut opts: Vec<String> = Vec::new();
+                        if let Some(t) = start_seconds.filter(|v| v.is_finite() && *v > 0.0) {
+                            opts.push(format!("start={:.3}", t.min(86_400.0 * 7.0)));
+                        }
+                        if let Some(px) = http_proxy.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            opts.push(format!("http-proxy={px}"));
+                        }
+                        let opts_str = opts.join(",");
                         let mut args_v: Vec<&str> = vec!["loadfile", &url, "replace"];
-                        if let Some(s) = start_opt.as_deref() {
+                        if !opts_str.is_empty() {
                             // Positional 3 ("0") is the file-index — required
                             // when supplying a 4th-positional options string.
                             args_v.push("0");
-                            args_v.push(s);
+                            args_v.push(&opts_str);
                         }
+                        // Redacted log — never print the proxy URL (it can
+                        // carry user:pass). Just note start + whether proxied.
+                        let proxied = opts.iter().any(|o| o.starts_with("http-proxy="));
+                        let start_log = start_seconds
+                            .filter(|v| v.is_finite() && *v > 0.0)
+                            .map(|t| format!(" start={:.1}", t))
+                            .unwrap_or_default();
                         match run_mpv_command(&lib, handle, &args_v) {
                             Ok(()) => crate::devlog!(
                                 info, "mpv",
-                                "loadfile accepted: {url}{}",
-                                start_opt.as_deref().map(|s| format!(" {s}")).unwrap_or_default(),
+                                "loadfile accepted: {url}{start_log}{}",
+                                if proxied { " [via proxy]" } else { "" },
                             ),
                             Err(e) => crate::devlog!(
                                 warn, "mpv", "loadfile failed: {e}",
@@ -1733,7 +1855,16 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 crate::win32::resize_mpv_child_to_parent(hwnd.0 as isize, 0);
             }
 
-            drain_mpv_events(&lib, handle, &emit);
+            // VIDEO_RECONFIG = mpv (re)created/resized its --wid child (first
+            // frame, resolution change, track switch). Force the next pump
+            // iteration to re-run the child resize so it (a) sizes the new
+            // child and (b) re-applies the windowed MPO-poison region onto
+            // it — without this the region only landed on a host-geometry
+            // change (e.g. a fullscreen toggle), leaving initial-playback
+            // windowed blacks raised. Sentinel guarantees target_geom differs.
+            if drain_mpv_events(&lib, handle, &emit) {
+                last_geom = (i32::MIN, i32::MIN, i32::MIN, i32::MIN);
+            }
 
             // Steady pump cadence — see TICK.
             let elapsed = tick_start.elapsed();
