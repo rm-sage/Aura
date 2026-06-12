@@ -12,7 +12,7 @@
 import { useEffect, useState } from "react";
 import { useWatchTogether } from "./watchTogether/useWatchTogether";
 import {
-  createRoom, joinRoom, leaveRoom, setWatchConfig, openRoomVideo,
+  createRoom, joinRoom, leaveRoom, setWatchConfig, openRoomVideo, clearPartyStream,
   getRelayUrl, getDisplayName, getAppToken,
 } from "./watchTogether/store";
 
@@ -125,6 +125,7 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
             onCopy={copyCode}
             onJoin={() => { openRoomVideo(); onClose(); }}
             onLeave={leaveRoom}
+            onClearStream={clearPartyStream}
           />
         )}
       </div>
@@ -224,13 +225,13 @@ function Lobby({
 
 function Room({
   code, status, members, selfId, roomVideoKey, roomTitle, roomStreamLabel, staging,
-  inSync, isLeader, copied, onCopy, onJoin, onLeave,
+  inSync, isLeader, copied, onCopy, onJoin, onLeave, onClearStream,
 }: {
   code: string | null; status: string; members: { id: string; name: string; videoKey: string | null }[];
   selfId: string | null; roomVideoKey: string | null; roomTitle: string | null;
   roomStreamLabel: string | null; staging: boolean;
   inSync: boolean; isLeader: boolean; copied: boolean;
-  onCopy: () => void; onJoin: () => void; onLeave: () => void;
+  onCopy: () => void; onJoin: () => void; onLeave: () => void; onClearStream: () => void;
 }) {
   const readyHere = roomVideoKey ? members.filter((m) => m.videoKey === roomVideoKey).length : 0;
   return (
@@ -255,7 +256,9 @@ function Room({
         </p>
       ) : !roomVideoKey ? (
         <p className="text-white/45 text-[12.5px]">
-          Waiting for someone to start playing. Whatever the first person plays becomes the party's title.
+          {isLeader
+            ? "You're the host — play something and it becomes the party's title."
+            : "Waiting for the host to start playing."}
         </p>
       ) : inSync ? (
         <div className="rounded-xl bg-emerald-400/[0.07] border border-emerald-400/20 px-3 py-2.5 space-y-0.5">
@@ -280,6 +283,19 @@ function Room({
             Join &amp; sync
           </button>
         </div>
+      )}
+
+      {/* Leader stream control — clear the party's selected stream so the next
+          stream the host plays re-establishes it. */}
+      {isLeader && roomVideoKey && (
+        <button
+          type="button"
+          onClick={onClearStream}
+          className="w-full h-8 rounded-xl text-[12px] font-medium text-white/65 border border-white/10
+                     hover:bg-white/[0.06] hover:text-white/90 transition-colors"
+        >
+          Clear party stream
+        </button>
       )}
 
       {/* Members */}

@@ -20,6 +20,7 @@
 import type {
   WatchMember, RoomState, ServerMsg, PlaybackBridge, VotePoll,
 } from "./types";
+import { showAppToast } from "../AppToast";
 
 const LS_URL = "aura.watch.relayUrl";
 const LS_NAME = "aura.watch.displayName";
@@ -114,6 +115,18 @@ let bridge: PlaybackBridge | null = null;
 let lastApplyAt = 0; // throttles applied remote seeks (APPLY_MIN_INTERVAL_MS)
 let localStaging = false; // are WE currently holding a stream for the party?
 let lastRoomState: RoomState | null = null; // for snap-to-room on becoming in-sync
+// Member ids from the last roster — diffed to fire join/leave toasts. Diffing by
+// id (stable across reconnects via the cid) avoids false join/leave on reconnect.
+let previousMemberIds = new Set<string>();
+// Deferred "left" toasts, keyed by member id. A member's transient reconnect
+// blip drops them from the roster then re-adds them; deferring the "left" toast
+// (and cancelling it if they return) stops bystanders seeing "X left" → "X
+// joined" for a wifi hiccup.
+const pendingLeaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+function clearPendingLeaves() {
+  for (const t of pendingLeaveTimers.values()) clearTimeout(t);
+  pendingLeaveTimers.clear();
+}
 
 // ── Pub/sub ────────────────────────────────────────────────────────────────
 const subs = new Set<() => void>();
@@ -207,6 +220,7 @@ export function leaveRoom(): void {
   ui.activeVotes = [];
   ui.wonVotes = [];
   ui.voteError = null;
+  previousMemberIds = new Set();
   emit();
 }
 
@@ -256,6 +270,15 @@ function connect(code: string): boolean {
   ws.onclose = () => {
     stopLeaderTimer();
     if (userLeft) return;
+    // Clear the SHARED staging/sync flags so the pause gate (wtStagedHold reads
+    // ui.staging && ui.inSync) lifts in lock-step with the banner hiding during
+    // the "connecting" window — otherwise the host sees the banner vanish (it's
+    // gated on status==="connected") while the gate stays stale-active, then it
+    // snaps back on reconnect. localStaging/amStaging are KEPT (the relay
+    // re-ingests staging on welcome; the leader's re-assert below reconciles it).
+    ui.staging = false;
+    ui.inSync = false;
+    emit();
     // Unexpected drop — try a few reconnects before giving up.
     if (reconnectAttempts < RECONNECT_MAX && ui.roomCode) {
       reconnectAttempts += 1;
@@ -293,6 +316,7 @@ function buildUrl(base: string, code: string): string {
 
 function teardown() {
   stopLeaderTimer();
+  clearPendingLeaves(); // stale deferred-leave toasts must not fire across a (re)connect
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   if (ws) {
     ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
@@ -318,21 +342,66 @@ function send(obj: unknown) {
 function handleMessage(data: string) {
   const msg = JSON.parse(data) as ServerMsg;
   switch (msg.t) {
-    case "welcome":
+    case "welcome": {
       reconnectAttempts = 0; // proven-healthy connection — re-arm the cap
       ui.selfId = msg.selfId;
       serverClockOffset = msg.serverNow - Date.now();
       ui.members = msg.members;
-      ingestRoomState(msg.state);
-      recomputeLeader();
+      previousMemberIds = new Set(msg.members.map((m) => m.id)); // seed (no join toasts on welcome)
+      recomputeLeader(); // needs members + selfId (both set) — before ingest so we know ownership
+      // A reconnecting LEADER already on the room's ESTABLISHED title re-asserts
+      // its CURRENT local playback over the relay's persisted state, which can be
+      // stale (e.g. we started playing during the drop — a control that never
+      // broadcast). For that case we ingest labels WITHOUT driving local playback
+      // (`drive=false`), so the leader isn't snapped to the relay's stale paused
+      // snapshot, then re-broadcast our true local state. Guarded on already
+      // owning the title, so a fresh room isn't auto-seeded with whatever we're
+      // watching. If we're now playing, staging is over — clear it.
+      const local = bridge?.getLocal();
+      const ownerReconnect =
+        ui.isLeader && local != null && local.videoKey != null && local.videoKey === msg.state.videoKey;
+      ingestRoomState(msg.state, !ownerReconnect);
+      if (ownerReconnect && local) {
+        if (!local.paused) { localStaging = false; ui.amStaging = false; }
+        broadcastControl(local.paused, local.position);
+      }
       emit();
       break;
-    case "members":
+    }
+    case "members": {
+      // Diff against the last roster (by stable id) to toast true joins/leaves —
+      // never for self, never on the initial welcome (seeded there).
+      const newIds = new Set(msg.members.map((m) => m.id));
+      // Joins — but a member RETURNING within the leave grace window is a
+      // reconnect blip, not a join: cancel the pending "left", emit nothing.
+      for (const m of msg.members) {
+        if (m.id === ui.selfId || previousMemberIds.has(m.id)) continue;
+        const pending = pendingLeaveTimers.get(m.id);
+        if (pending) {
+          clearTimeout(pending);
+          pendingLeaveTimers.delete(m.id);
+        } else {
+          showAppToast(`${m.name} joined the party`, { tone: "success" });
+        }
+      }
+      // Leaves — DEFERRED so a transient reconnect (the member reappears within
+      // the window) doesn't flash "left" then "joined" on every bystander.
+      for (const m of ui.members) {
+        if (m.id === ui.selfId || newIds.has(m.id) || pendingLeaveTimers.has(m.id)) continue;
+        const { id, name } = m;
+        const timer = setTimeout(() => {
+          pendingLeaveTimers.delete(id);
+          if (ui.status === "connected") showAppToast(`${name} left the party`, { tone: "default" });
+        }, 6000);
+        pendingLeaveTimers.set(id, timer);
+      }
+      previousMemberIds = newIds;
       ui.members = msg.members;
       recomputeLeader();
       recomputeSync();
       emit();
       break;
+    }
     case "control":
       ingestRoomState(msg);
       emit();
@@ -348,11 +417,10 @@ function handleMessage(data: string) {
       emit();
       break;
     case "vote-won": {
-      // Pin the winner (dedupe) and drop it from the active list immediately
-      // (the trailing `votes` frame confirms, but don't wait for it).
-      if (!ui.wonVotes.some((v) => v.id === msg.vote.id)) {
-        ui.wonVotes = [msg.vote, ...ui.wonVotes].slice(0, 6);
-      }
+      // Only ONE winner is pinned at a time — a new winner overwrites the old.
+      // Drop it from the active list immediately (the trailing `votes` frame
+      // confirms, but don't wait for it).
+      if (ui.wonVotes[0]?.id !== msg.vote.id) ui.wonVotes = [msg.vote];
       ui.activeVotes = ui.activeVotes.filter((v) => v.id !== msg.vote.id);
       emit();
       break;
@@ -366,8 +434,12 @@ function handleMessage(data: string) {
 }
 
 /** Adopt a new shared room state — update the "what we're watching" labels and,
- *  if we're on that title, snap local playback to it. */
-function ingestRoomState(state: RoomState) {
+ *  if we're on that title, snap local playback to it. `drive=false` updates the
+ *  labels but does NOT touch local playback — used when a reconnecting
+ *  owner-leader re-asserts (its own local state is authoritative; snapping it to
+ *  the relay's possibly-stale paused snapshot would pause a leader who started
+ *  playing during the drop). */
+function ingestRoomState(state: RoomState, drive = true) {
   lastRoomState = state;
   ui.roomVideoKey = state.videoKey;
   ui.roomMetaId = state.metaId ?? null;
@@ -378,7 +450,7 @@ function ingestRoomState(state: RoomState) {
   ui.roomPaused = state.paused;
   ui.staging = !!state.staging;
   recomputeSync();
-  if (!ui.inSync || !bridge) return;
+  if (!drive || !ui.inSync || !bridge) return;
   const target = expectedPosition(state);
   applyRemote(state.paused, target);
 }
@@ -471,6 +543,11 @@ function stopLeaderTimer() {
 export function notifyLocalControl(next?: { paused: boolean; position: number }): void {
   if (ui.status !== "connected" || !bridge) return;
   const local = bridge.getLocal();
+  // No syncable title locally (e.g. LIVE TV reports a null videoKey) — never
+  // broadcast. Critical for a LEADER on live: a null-identity control frame
+  // would otherwise hit the relay's `?? prev` fallback and RESURRECT the old
+  // VOD party stream, yanking every follower to the leader's live playhead.
+  if (local.videoKey == null) return;
   const matches = local.videoKey != null && local.videoKey === ui.roomVideoKey;
   // ONLY the party LEADER may establish or change the party stream. Followers
   // can still drive play/pause/seek, but ONLY when their local title already
@@ -486,6 +563,9 @@ export function notifyLocalControl(next?: { paused: boolean; position: number })
 function broadcastControl(paused: boolean, position: number) {
   if (!bridge) return;
   const local = bridge.getLocal();
+  // Belt-and-suspenders: an OWNER must never emit an identity-null control frame
+  // (live TV) — the relay would reconstitute the prior identity from `?? prev`.
+  if ((ui.isLeader || ui.roomVideoKey == null) && local.videoKey == null) return;
   // Stream/meta IDENTITY (which title + which stream pick + staging) belongs to
   // whoever established the party stream — the leader, or the very first control
   // when the room has no title yet. An in-sync FOLLOWER pausing/seeking only
@@ -525,6 +605,27 @@ export function startPartyStream(): void {
   if (ui.status !== "connected" || !bridge || !ui.isLeader) return;
   localStaging = true;
   broadcastControl(true, 0);
+}
+
+/** LEADER ONLY — clear the party's selected stream so the NEXT stream the
+ *  leader plays (re-)establishes it (even the same title). Resets the room to
+ *  blank (the relay's `clear-stream` handler writes the blank state explicitly,
+ *  bypassing its identity-preserving `?? prev` fallback). */
+export function clearPartyStream(): void {
+  if (ui.status !== "connected" || !ui.isLeader) return;
+  localStaging = false;
+  send({ t: "clear-stream" });
+  // We never receive our own frames — blank the local room state optimistically.
+  Object.assign(ui, BLANK_ROOM);
+  ui.amStaging = false;
+  recomputeSync();
+  emit();
+}
+
+/** Is there a party stream currently delegated? (drives the leader's "Clear
+ *  stream" affordance.) */
+export function hasPartyStream(): boolean {
+  return ui.roomVideoKey != null;
 }
 
 /** Whether WE are the one holding a staged stream (drives the host's

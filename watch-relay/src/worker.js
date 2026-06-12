@@ -180,6 +180,22 @@ export class Room {
           this.broadcast({ t: "tick", position: pos, paused: !!msg.paused, driverId: me.id }, ws);
           break;
         }
+        case "clear-stream": {
+          // Leader-only, server-enforced (a destructive room-wide reset). The
+          // leader is the lowest member id — the same rule the client uses.
+          if (!this.isLeader(me.id)) break;
+          // Leader resets the party stream to blank so the next leader play
+          // re-establishes it. Written EXPLICITLY (not via the control case,
+          // whose `?? prev` fallback would resurrect the old identity).
+          const blank = {
+            paused: true, position: 0, videoKey: null, metaId: null, mediaType: null,
+            title: null, streamLabel: null, streamKey: null, staging: false,
+            updatedAt: Date.now(), driverId: me.id ?? null,
+          };
+          await this.saveState(blank);
+          this.broadcast({ t: "control", ...blank }, ws);
+          break;
+        }
         case "video": {
           // A member switched what they're watching.
           me.videoKey = str(msg.videoKey, MAX_VIDEOKEY);
@@ -287,6 +303,18 @@ export class Room {
 
   broadcastMembers() {
     this.broadcast({ t: "members", members: this.roster() });
+  }
+
+  /** The room leader = the lowest member id among OPEN sockets (mirrors the
+   *  client's deterministic election). Null for an empty room. */
+  leaderId() {
+    const ids = this.roster().map((m) => m.id).filter((id) => typeof id === "string");
+    if (ids.length === 0) return null;
+    return ids.reduce((a, b) => (b < a ? b : a));
+  }
+
+  isLeader(id) {
+    return typeof id === "string" && id === this.leaderId();
   }
 
   /** @returns {Promise<RoomState>} */

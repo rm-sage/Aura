@@ -1192,16 +1192,23 @@ export default function App() {
   const reactiveParty = useWatchTogether();
   useEffect(() => {
     setPlaybackBridge({
-      getLocal: () => ({
-        paused: wtPausedRef.current,
-        position: wtTimeRef.current,
-        videoKey: wtTargetRef.current?.id ?? null,
-        metaId: wtTargetRef.current?.series_id ?? wtTargetRef.current?.id ?? null,
-        mediaType: wtTargetRef.current?.media_type ?? null,
-        title: wtTargetRef.current?.name ?? null,
-        streamLabel: wtStreamRef.current.label,
-        streamKey: wtStreamRef.current.key,
-      }),
+      getLocal: () => {
+        // Live TV NEVER participates in the party: report a null videoKey so
+        // the party can't sync/establish/stage on a live channel (sync is keyed
+        // on videoKey agreement, so a null key cascades through every gate).
+        const t = wtTargetRef.current;
+        const isLive = t != null && (t.media_type === "tv" || t.id.startsWith("iptv:"));
+        return {
+          paused: wtPausedRef.current,
+          position: wtTimeRef.current,
+          videoKey: isLive ? null : (t?.id ?? null),
+          metaId: isLive ? null : (t?.series_id ?? t?.id ?? null),
+          mediaType: isLive ? null : (t?.media_type ?? null),
+          title: isLive ? null : (t?.name ?? null),
+          streamLabel: isLive ? null : wtStreamRef.current.label,
+          streamKey: isLive ? null : wtStreamRef.current.key,
+        };
+      },
       apply: (remotePaused: boolean, position: number) => {
         if (Math.abs(wtTimeRef.current - position) > 0.4) wtSeekRef.current(position);
         if (wtIntendedPausedRef.current !== remotePaused) {
@@ -1438,8 +1445,10 @@ export default function App() {
         wtStreamRef.current = { label: streamLabel(stream), key: streamMatchKey(stream) };
         {
           const party = getWatchState();
+          // Live TV is excluded from the party entirely — never stage on it.
+          const isLive = target.media_type === "tv" || target.id.startsWith("iptv:");
           const establishingParty =
-            party.status === "connected" && party.isLeader && target.id !== party.roomVideoKey;
+            !isLive && party.status === "connected" && party.isLeader && target.id !== party.roomVideoKey;
           wtPendingStageRef.current = establishingParty;
         }
         // Live TV carve-out, computed from `target` (isLivePlayback derives
@@ -5799,8 +5808,10 @@ export default function App() {
       <NotificationsBell library={library} />
       <PartyButton />
       {/* "Vote to Watch" stack — active polls + won winners + cap errors.
-          Renders nothing unless in a party with something to show. */}
-      <PartyVotesOverlay />
+          Renders nothing unless in a party with something to show. Suppressed
+          on detail pages / during playback so it never overlaps the
+          stream/episode selector or the player chrome. */}
+      <PartyVotesOverlay suppressed={!!selectedMeta || isPlayerActive} />
 
       </div>
       )}

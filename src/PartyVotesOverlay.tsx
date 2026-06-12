@@ -18,7 +18,7 @@ import {
 } from "./watchTogether/store";
 import type { VotePoll } from "./watchTogether/types";
 
-export default function PartyVotesOverlay() {
+export default function PartyVotesOverlay({ suppressed = false }: { suppressed?: boolean }) {
   const w = useWatchTogether();
   const [, tick] = useReducer((n: number) => n + 1, 0);
 
@@ -26,20 +26,25 @@ export default function PartyVotesOverlay() {
   // can leave a dead poll in the list — hide any whose deadline has passed.
   const activeLive = w.activeVotes.filter((v) => voteRemainingMs(v) > 0);
 
-  // Drive the countdown rings — only while a poll is open (no idle churn).
+  // Drive the countdown rings — only while a poll is open AND visible (no idle
+  // or while-hidden churn).
   const hasActive = activeLive.length > 0;
   useEffect(() => {
-    if (!hasActive) return;
+    if (!hasActive || suppressed) return;
     const id = setInterval(tick, 250);
     return () => clearInterval(id);
-  }, [hasActive]);
+  }, [hasActive, suppressed]);
 
   if (w.status !== "connected") return null;
+  // Suppressed on detail pages / during playback so the stack never overlaps
+  // the stream/episode selector or the player chrome.
+  if (suppressed) return null;
   if (activeLive.length === 0 && w.wonVotes.length === 0 && !w.voteError) return null;
 
   return (
     <div
-      className="fixed right-3 top-20 z-[10000] flex flex-col items-end gap-3 w-[300px] max-w-[85vw]
+      // right-5 keeps the stack clear of the content scrollbar.
+      className="fixed right-5 top-20 z-[10000] flex flex-col items-end gap-3 w-[300px] max-w-[85vw]
                  pointer-events-none"
       aria-live="polite"
     >
