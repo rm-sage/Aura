@@ -35,8 +35,8 @@ const CHANGE_EVENT = "aura:iptv-changed";
 const PARSE_TTL_MS = 30 * 60 * 1000;
 
 /** Bundled, always-offered default playlist: iptv-org's free global index +
- *  a broad community XMLTV EPG (epgshare01 ALL_SOURCES — gzip, matched via the
- *  resolver's tvg-id + name fallback; won't cover every channel and is large).
+ *  the iptv-epg.org US XMLTV guide (gzip, matched via the resolver's tvg-id +
+ *  name fallback; US-focused so it won't cover every global channel).
  *  Seeded ONCE per install (see loadIptvSources) so a new user has something to
  *  try Live TV with; fully removable afterward. */
 const DEFAULT_PLAYLIST: IptvPlaylistSource = {
@@ -44,9 +44,14 @@ const DEFAULT_PLAYLIST: IptvPlaylistSource = {
   name: "iptv-org (Free)",
   url: "https://iptv-org.github.io/iptv/index.m3u",
   kind: "m3u",
-  epgUrl: "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.xml.gz",
+  epgUrl: "https://iptv-epg.org/files/epg-us.xml.gz",
 };
 const DEFAULT_SEEDED_KEY = "aura.iptv.defaultSeeded";
+/** The previous bundled-default EPG URL. Existing installs that were seeded
+ *  with it are migrated ONCE to the current `DEFAULT_PLAYLIST.epgUrl` (a user
+ *  who set their own EPG is untouched — only the exact old default matches). */
+const OLD_DEFAULT_EPG = "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.xml.gz";
+const EPG_MIGRATION_KEY = "aura.iptv.defaultEpgMigratedV2";
 
 interface IptvState {
   sources: IptvPlaylistSource[];
@@ -110,6 +115,28 @@ export async function loadIptvSources(): Promise<void> {
     _state.defaultId = s.iptv_default_playlist_id ?? null;
   } catch {
     sources = [];
+  }
+  // One-time EPG migration: the bundled default's EPG URL changed. Rewrite any
+  // source still on the OLD default EPG to the new one — a user who set a
+  // custom EPG is untouched (only the exact old default matches). Runs once.
+  try {
+    if (!localStorage.getItem(EPG_MIGRATION_KEY)) {
+      localStorage.setItem(EPG_MIGRATION_KEY, "1");
+      let migrated = false;
+      sources = sources.map((s) => {
+        if (s.epgUrl === OLD_DEFAULT_EPG) {
+          migrated = true;
+          return { ...s, epgUrl: DEFAULT_PLAYLIST.epgUrl };
+        }
+        return s;
+      });
+      if (migrated) {
+        _state.sources = sources;
+        await persistSources();
+      }
+    }
+  } catch {
+    /* localStorage unavailable — skip migration */
   }
   // Seed the bundled iptv-org playlist ONCE per install (so a new user has a
   // working Live TV starting point), then never force it again — the user can
