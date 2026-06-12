@@ -55,7 +55,11 @@ interface CachedStreams {
   ts: number;
 }
 const STREAM_CACHE_TTL_MS = 3 * 60 * 1000;
-const STREAM_CACHE_MAX = 32;
+// Soft cap on cached stream-fetch results. 12 covers rapid back-and-forth
+// between a handful of titles; the 3-min TTL reclaims the rest. (Lowered from
+// 32 — each entry holds a full stream list, so the smaller cap trims the
+// steady-state working set with no correctness impact, only eviction timing.)
+const STREAM_CACHE_MAX = 12;
 const streamCache = new Map<string, CachedStreams>();
 function streamCachePut(key: string, result: StreamFetchResult): void {
   // Soft cap: drop the oldest entry when full so we don't grow

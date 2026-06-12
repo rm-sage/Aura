@@ -58,6 +58,8 @@ fn client() -> &'static reqwest::Client {
             .https_only(true)
             .timeout(TIMEOUT)
             .tcp_nodelay(true)
+            .pool_max_idle_per_host(1)
+            .pool_idle_timeout(Duration::from_secs(30))
             .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " anilist"))
             .build()
             .expect("AniList HTTP client init failed")

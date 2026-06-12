@@ -67,17 +67,18 @@ struct FribbEntry {
 /// index per imdb-id. Multi-cour shows produce multiple of these
 /// under the same imdb-id key (Fribb's data shape).
 ///
-/// `kitsu_id` and `anidb_id` are populated but no lookup currently
-/// surfaces them — kept for symmetry with `anilist_id` and `mal_id`,
-/// and ready for the day a future caller needs the cour-specific
-/// kitsu / anidb id (e.g. to bypass the yuna.moe round-trip we
-/// currently use). Suppressing dead-code until then.
+/// Only the two ids any lookup actually surfaces (`anilist_id`,
+/// `mal_id`) are stored. Fribb's `kitsu_id` / `anidb_id` still gate
+/// inclusion in `build_index` (a row needs ≥1 anime id of any kind),
+/// but they're never read back, so keeping them here was dead weight —
+/// halving the per-row struct (4 → 2 `Option<u64>`, 32 → 16 bytes) across
+/// the ~10-15k resident rows. If a future caller needs the cour-specific
+/// kitsu / anidb id, re-add the fields here and the assignments in
+/// `build_index`.
 #[derive(Clone, Debug, Default)]
 pub struct AnimeIdRow {
     pub anilist_id: Option<u64>,
     pub mal_id:     Option<u64>,
-    #[allow(dead_code)] pub kitsu_id: Option<u64>,
-    #[allow(dead_code)] pub anidb_id: Option<u64>,
 }
 
 /// In-memory lookup. Populated by `warm_cache`; accessed by
@@ -118,15 +119,17 @@ fn build_index(entries: &[FribbEntry]) -> HashMap<String, Vec<AnimeIdRow>> {
         m.entry(imdb.clone()).or_default().push(AnimeIdRow {
             anilist_id: e.anilist_id,
             mal_id:     e.mal_id,
-            kitsu_id:   e.kitsu_id,
-            anidb_id:   e.anidb_id,
         });
     }
     m
 }
 
-fn install(entries: &[FribbEntry]) {
-    let next = build_index(entries);
+fn install(entries: Vec<FribbEntry>) {
+    // Build the resident index, then drop the parse Vec (~2-3 MB of full
+    // Fribb rows) BEFORE taking the map lock — so the transient overlap of
+    // {parse Vec + new index + old index under lock} is trimmed at startup.
+    let next = build_index(&entries);
+    drop(entries);
     let count = next.len();
     if let Ok(mut g) = map_slot().lock() {
         *g = next;
@@ -182,8 +185,10 @@ pub async fn warm_cache<R: Runtime>(app: AppHandle<R>) {
 
     if fresh_disk {
         if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Some(entries) = parse_entries(&text) {
-                install(&entries);
+            let parsed = parse_entries(&text);
+            drop(text); // free the ~1 MB JSON before building the index
+            if let Some(entries) = parsed {
+                install(entries);
                 return;
             }
             crate::devlog!(warn, "anime-id-map", "cached snapshot unparseable — refetching");
@@ -197,16 +202,20 @@ pub async fn warm_cache<R: Runtime>(app: AppHandle<R>) {
             if let Err(e) = std::fs::write(&path, &text) {
                 crate::devlog!(warn, "anime-id-map", "cache write failed: {e}");
             }
-            match parse_entries(&text) {
-                Some(entries) => install(&entries),
+            let parsed = parse_entries(&text);
+            drop(text); // free the ~1 MB JSON before building the index
+            match parsed {
+                Some(entries) => install(entries),
                 None => crate::devlog!(warn, "anime-id-map", "fresh snapshot unparseable"),
             }
         }
         Err(e) => {
             crate::devlog!(warn, "anime-id-map", "fetch failed ({e}) — falling back to stale cache");
             if let Ok(text) = std::fs::read_to_string(&path) {
-                if let Some(entries) = parse_entries(&text) {
-                    install(&entries);
+                let parsed = parse_entries(&text);
+                drop(text);
+                if let Some(entries) = parsed {
+                    install(entries);
                 }
             }
         }

@@ -99,6 +99,62 @@ for anime gating; dropping it from the *warm-start* copy could mis-gate anime un
 
 ---
 
+---
+
+## ✅ Applied 2026-06-12 (branch `feat/ram-backlog`) — the safe, gate-verifiable batch
+
+A 9-agent re-audit + 4-agent adversarial review of the backlog above. The items that
+could be implemented **and** fully verified with `cargo check` + `tsc` + `vite build`
+alone (no visual / playback smoke test) were applied; the visual / landmine-adjacent
+ones stay deferred (see "Still deferred" below).
+
+- **E1 — Sentry `maxBreadcrumbs: 30`** (`src/main.tsx`). Was unset → SDK default ~100
+  breadcrumbs retained per session; 30 keeps crash lead-up context without the
+  multi-hour bloat. Inside the existing consent gate. (~8–12 MB.)
+- **E3 — `anime_id_map.rs` row slim + parse-spike trim.** Dropped the never-read
+  `kitsu_id`/`anidb_id` from `AnimeIdRow` (4→2 `Option<u64>`, 32→16 B/row across
+  ~10–15k rows). The Fribb **inclusion filter is unchanged** (still gates on all four
+  ids via `FribbEntry`), so multi-season `entries[season-1]` Vec alignment is identical.
+  Plus `install()` now takes `Vec<FribbEntry>` by value + `drop(entries)` before the
+  lock and the callers `drop(text)` after parse — trims the ~3–4 MB startup overlap.
+- **E4 — DevConsole closed-buffer** (`src/DevConsole.tsx`). When F12 is closed the
+  component renders `null`, yet every log line was calling `setEntries` (a render on
+  nothing). Now logs accumulate in a **bounded** `closedBufferRef` while closed and
+  drain into `entries` on open (a `useLayoutEffect` syncs `openRef` synchronously both
+  directions; reopen-while-paused routes into the pause buffer to keep the view frozen).
+  **Closed is the outermost gate** so the paused+closed combo can't leak into the
+  unbounded pause buffer. (~15–20 MB of avoided render churn during playback.)
+- **E5 — `STREAM_CACHE_MAX` 32 → 12** (`src/views/DetailView.tsx`). TTL already
+  reclaims; smaller cap trims the steady-state working set, eviction-timing only.
+- **E2 (additive subset) — reqwest idle-pool tuning.** Added
+  `.pool_max_idle_per_host(1)` + `.pool_idle_timeout(30s)` to the rarely-used pooled
+  clients (stremio `CLIENT`/`ACCOUNT_CLIENT`, auth, aniskip, ratings, publicmetadb,
+  scrobble, scrobble_anilist, sync, subtitles). Caps **idle** retention, not in-flight
+  concurrency, so addon fan-out is unaffected. **Deliberately NOT done** (the part the
+  audit flagged unsafe-to-apply-blind): the transient-builder→shared-pool consolidation
+  (credential-isolation risk) and the long-lived streaming/iptv/cast clients. No
+  `https_only` client was merged or weakened.
+
+## ⏸ Still deferred (need a visual / playback / HW smoke test — do with the app running)
+
+- **A — HeroCarousel backdrop windowing** (~38 MB). The 2.4 s two-layer cross-fade
+  needs outgoing+incoming layers to coexist for the whole transition; a 3-layer window
+  is safe for auto-advance + wrap but **empirically breaks on mid-fade manual jumps**
+  (dot/arrow nav can jump arbitrarily). Needs visual verification of every transition.
+- **B — Window the 100-item grids** (~55–85 MB across Discover / CatalogPage /
+  CinemaRows popup). The proven `useLibraryRowWindow` ports, **but** all three cards
+  lack the fixed-height title container LibraryCard has, so row-stride measurement
+  drifts when titles wrap / filters change → scroll gaps. Fix card structure first,
+  then verify on 1080p + ultrawide.
+- **C — Unmount the browse tree during playback** (~5–8 MB). **Landmine #6** zone
+  (opaque flash over the MPV child). Safer partial = key-based HomeView/HeroCarousel
+  remount (~3 MB, proven `resetKey` path). Either way needs a windowed-playback smoke
+  test for cleanup-race stutter.
+- **D — Slim the warm-start library blob** (~8–12 MB). Dropping `state.genres` from
+  the warm-start copy risks mis-gating IMDb-id anime in the ~1–2 s window before the
+  fresh `library_get` re-seeds (`markAnimeId`). Verify the re-seed path under a startup
+  right-click smoke test before slimming.
+
 ## Standing rule
 See CLAUDE.md → "Performance & memory": every new feature ships with bounded caches, resized images,
 idle-native-resource teardown, listener/timer cleanup, and conscious buffer caps.

@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -728,6 +728,13 @@ export default function DevConsole() {
   const pendingRef     = useRef<LogEntry[]>([]);
   const pausedRef      = useRef(paused);
   useEffect(() => { pausedRef.current = paused; }, [paused]);
+  // While the console is CLOSED, `push` accumulates logs in this ref instead
+  // of React state — otherwise every log line during playback (F12 closed)
+  // re-renders a component that renders nothing (`if (!open) return null`).
+  // Drained into `entries` on open (effect below). `openRef` lets the stable
+  // `push` read the latest open state without being re-created.
+  const openRef         = useRef(open);
+  const closedBufferRef = useRef<LogEntry[]>([]);
 
   // ── Command prompt state ─────────────────────────────────────────────
   // `input`           — current text in the prompt
@@ -751,6 +758,17 @@ export default function DevConsole() {
   const push = useMemo(() => {
     return (e: Omit<LogEntry, "id">) => {
       const next: LogEntry = { ...e, id: ++idRef.current };
+      // Closed is the OUTERMOST gate: while the console renders nothing
+      // (`if (!open) return null`), pause is irrelevant, so buffer every log
+      // here — bounded — and never touch React state. (If pause were the outer
+      // gate, the paused+closed combo would route to the UNBOUNDED pendingRef
+      // and the resume-from-pause effect could setEntries on a null component.)
+      if (!openRef.current) {
+        const buf = closedBufferRef.current;
+        buf.push(next);
+        if (buf.length > MAX_ENTRIES) buf.splice(0, buf.length - MAX_ENTRIES);
+        return;
+      }
       if (pausedRef.current) {
         pendingRef.current.push(next);
         return;
@@ -853,6 +871,33 @@ export default function DevConsole() {
       return merged.length > MAX_ENTRIES ? merged.slice(-MAX_ENTRIES) : merged;
     });
   }, [paused]);
+
+  // Sync openRef + drain the closed-buffer when the console opens. Runs in a
+  // LAYOUT effect so openRef tracks `open` synchronously right after commit in
+  // BOTH directions — closing the window where a push during an open->close
+  // transition would wastefully setEntries on a component that just returned
+  // null. Updating openRef FIRST also means any push racing the close->open
+  // transition either still appended to the buffer we capture here, or (openRef
+  // now true) goes straight to the live path — no entry lost or double-counted.
+  useLayoutEffect(() => {
+    openRef.current = open;
+    if (!open) return;
+    const buffered = closedBufferRef.current;
+    if (buffered.length === 0) return;
+    closedBufferRef.current = [];
+    if (pausedRef.current) {
+      // Re-opened while paused — keep the view frozen; route the while-closed
+      // logs into the pause buffer so they surface on resume, not now.
+      pendingRef.current = pendingRef.current.length
+        ? pendingRef.current.concat(buffered)
+        : buffered;
+      return;
+    }
+    setEntries((prev) => {
+      const merged = prev.length ? [...prev, ...buffered] : buffered;
+      return merged.length > MAX_ENTRIES ? merged.slice(-MAX_ENTRIES) : merged;
+    });
+  }, [open]);
 
   // ── Command execution ────────────────────────────────────────────────
   // Builds the CommandContext fresh per call so each command sees the

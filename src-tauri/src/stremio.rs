@@ -332,6 +332,13 @@ fn client() -> &'static reqwest::Client {
             .timeout(TIMEOUT)
             .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(60))
+            // Reclaim idle TLS/socket buffers between bursts — this client
+            // fans out to many addon hosts, so the default (unbounded idle
+            // per host) is the biggest pool tenant. 1 kept-warm conn per host
+            // is enough for serial re-requests; concurrency is unaffected
+            // (this caps IDLE retention, not in-flight connections).
+            .pool_max_idle_per_host(1)
+            .pool_idle_timeout(Duration::from_secs(30))
             .user_agent("Aura/0.6.6")
             .build()
             .expect("HTTP client init failed")
@@ -346,6 +353,8 @@ fn account_client() -> &'static reqwest::Client {
             .timeout(Duration::from_secs(15))
             .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(60))
+            .pool_max_idle_per_host(1)
+            .pool_idle_timeout(Duration::from_secs(30))
             .user_agent("Aura/0.6.6")
             .build()
             .expect("Account HTTP client init failed")

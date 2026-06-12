@@ -82,6 +82,14 @@ async function bootstrapSentry() {
       // Security & Privacy.
       sendDefaultPii: false,
 
+      // ── Breadcrumb cap (RAM) ──────────────────────────────────────
+      // Default is ~100 breadcrumbs retained in memory per session.
+      // Aura is a multi-hour app whose console capture (warn/error) +
+      // fetch/navigation auto-instrumentation churn breadcrumbs steadily
+      // — 30 keeps enough lead-up context for a crash without the
+      // long-session bloat.
+      maxBreadcrumbs: 30,
+
       // ── Tracing (performance) ─────────────────────────────────────
       // 10 % of events get a transaction trace attached. Tauri's IPC
       // bridge makes most "spans" worth tracing local — set higher if
