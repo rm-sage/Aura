@@ -122,6 +122,11 @@ async fn load_video(
     // Optional forward proxy (per-playlist Live TV proxy) applied as a
     // per-file `http-proxy` loadfile option. None = direct.
     http_proxy: Option<String>,
+    // Stream-name HDR labelling (frontend parseStream). Under the
+    // "passthrough" HDR mode this routes the engine's per-load output
+    // selection (PQ set for HDR-labelled streams, plain SDR otherwise)
+    // — see the LoadFile arm in mpv::engine. None/false → SDR output.
+    content_hdr_hint: Option<bool>,
 ) -> Result<(), String> {
     let normalised = path.replace('\\', "/");
     // Defence in depth: only http(s) URLs, the localhost streaming
@@ -158,10 +163,10 @@ async fn load_video(
     // (thread-spawn or HWND-resolution failure) this returns a clear
     // "engine not running" error instead of crashing.
     #[cfg(target_os = "windows")]
-    return mpv::engine::submit_load_file(normalised, start_seconds, http_proxy);
+    return mpv::engine::submit_load_file(normalised, start_seconds, http_proxy, content_hdr_hint);
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (normalised, start_seconds, http_proxy);
+        let _ = (normalised, start_seconds, http_proxy, content_hdr_hint);
         Err("playback engine is Windows-only".into())
     }
 }
@@ -830,14 +835,16 @@ async fn apply_hdr_settings(app: tauri::AppHandle, mode: String) -> Result<(), S
         _ => "sdr".to_string(),
     };
 
-    // Persist so next MPV init picks it up. Also keep the legacy
-    // hdr_enabled boolean in lockstep so old code paths reading it
-    // (Discord RPC, telemetry, etc.) stay coherent: "off" → false,
-    // anything else → true.
+    // Persist so next MPV init picks it up — skipping the disk write when
+    // nothing changed. Keep the legacy hdr_enabled boolean in lockstep so
+    // old code paths reading it (Discord RPC, telemetry, etc.) stay
+    // coherent: "off" → false, anything else → true.
     let mut s = settings::snapshot();
-    s.hdr_mode = mode_norm.clone();
-    s.hdr_enabled = mode_norm != "off";
-    settings::save(&app, &s)?;
+    if s.hdr_mode != mode_norm || s.hdr_enabled != (mode_norm != "off") {
+        s.hdr_mode = mode_norm.clone();
+        s.hdr_enabled = mode_norm != "off";
+        settings::save(&app, &s)?;
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -847,6 +854,16 @@ async fn apply_hdr_settings(app: tauri::AppHandle, mode: String) -> Result<(), S
         // overwritten — no residual property drift between toggles.
         // Best-effort per property: anything mpv rejects is devlog'd
         // rather than aborting the rest of the block.
+        //
+        // NOTE: this full-set push is for explicit Settings changes
+        // ONLY — never call it per-load or mid-playback as routine.
+        // Rewriting colorspace plumbing on a live gpu-next d3d11
+        // pipeline forces a swapchain renegotiation that has been
+        // observed to leave the output blown out / mis-encoded. The HDR
+        // modes are designed to be fully static per mode (see
+        // player::apply_hdr_options) precisely so nothing needs to
+        // change per content. A mode change mid-playback may only take
+        // full effect (swapchain colorspace) on the next loadfile.
         let mut opts: indexmap::IndexMap<String, serde_json::Value> = indexmap::IndexMap::new();
         crate::player::apply_hdr_options(
             &mut opts,
@@ -864,6 +881,13 @@ async fn apply_hdr_settings(app: tauri::AppHandle, mode: String) -> Result<(), S
                     "apply_hdr {key}={value:?} → unsupported JSON shape for PropValue",
                 );
             }
+        }
+
+        // Re-evaluate the MPO poison: it's gated on hdr_mode=="passthrough",
+        // so toggling the mode here must apply (passthrough) or clear (other)
+        // the window region without waiting for a restart.
+        if let Some(hwnd) = app.get_webview_window("main").and_then(|w| w.hwnd().ok()) {
+            win32::apply_mpo_poison(hwnd.0 as isize);
         }
         Ok(())
     }
@@ -1468,6 +1492,13 @@ pub fn run() {
                 if let Ok(handle) = window.hwnd() {
                     let parent_hwnd = handle.0 as isize;
                     win32::recover_window_state(parent_hwnd);
+                    // MPO "poison pill": when hdr_mode==passthrough, give the
+                    // top-level window a non-rectangular region so Windows
+                    // can't promote the MPV child swapchain to direct scanout
+                    // (fixes the QD-OLED raised-black-in-HDR behaviour without
+                    // disabling MPO globally). No-op for SDR / off. Re-applied
+                    // on HDR-settings change + fullscreen transitions.
+                    win32::apply_mpo_poison(parent_hwnd);
                 }
             }
 

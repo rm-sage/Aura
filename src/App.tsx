@@ -57,6 +57,7 @@ import NextUpCta from "./NextUpCta";
 import EosSpotlight from "./EosSpotlight";
 import EpisodePanel from "./EpisodePanel";
 import SourceSwitcher, { streamKey } from "./SourceSwitcher";
+import { parseStream } from "./streamMeta";
 import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPreviousEpisode } from "./nextUp";
 import { getMetaDetailFallback, getRichestMetaDetail, peekCachedDetailById, peekRichestCachedDetailById, peekFreshestPostersByIds } from "./metaCache";
 import { PersistentCache } from "./persistentCache";
@@ -1090,6 +1091,13 @@ export default function App() {
 
   // ── Active scrobble / RPC / SMTC target ──
   const [activeTarget, setActiveTarget] = useState<ActiveScrobbleTarget | null>(null);
+  /** Whether the active stream's NAME labelled it as HDR/DV content.
+   *  Passed to `load_video` as `contentHdrHint` so the engine can pick
+   *  the per-load HDR output set (PQ for HDR content, plain SDR
+   *  otherwise) while hdr_mode=passthrough. Kept in a ref so the EOS
+   *  replay / stream-broken reload sites can re-send the same hint
+   *  without threading it through state. */
+  const lastHdrHintRef = useRef<boolean>(false);
   /** The DIRECT (un-proxied) URL of the playing stream, kept for the
    *  PlayerOverlay's Copy / Download / External-player utilities. Cleared
    *  when playback exits. */
@@ -1384,6 +1392,17 @@ export default function App() {
             });
         }
 
+        // HDR-content hint from the stream NAME (addon-supplied labels —
+        // "HDR", "DV", "DV+HDR"). Drives the engine's per-load output
+        // routing under hdr_mode=passthrough: only HDR-labelled content
+        // gets the PQ swapchain path; SDR streams render exactly as
+        // passthrough-off. parseStream never throws in practice but the
+        // guard keeps a malformed entry from killing playback.
+        const contentHdrHint = (() => {
+          try { return parseStream(stream).hdr != null; } catch { return false; }
+        })();
+        lastHdrHintRef.current = contentHdrHint;
+
         const t0load = Date.now();
         await invoke("load_video", {
           path:           resolved,
@@ -1392,6 +1411,7 @@ export default function App() {
           // a missing start_seconds as 0 (play from the beginning).
           startSeconds:   resumeAt ?? null,
           httpProxy:      opts?.proxyUrl ?? null,
+          contentHdrHint,
         });
         logLoadEvent("load_video returned (MPV accepted loadfile)", {
           dt: Date.now() - t0load,
@@ -4652,7 +4672,7 @@ export default function App() {
     setEosActive(false);
     notifyNewLoad();
     try {
-      await invoke("load_video", { path: activeStreamUrl, startSeconds: null });
+      await invoke("load_video", { path: activeStreamUrl, startSeconds: null, contentHdrHint: lastHdrHintRef.current });
     } catch (e) {
       console.error("[eos] replay failed", e);
     }
@@ -4952,6 +4972,14 @@ export default function App() {
     const timers = delays.map((d) => setTimeout(fire, d));
     return () => { timers.forEach(clearTimeout); };
   }, [durationReady]);
+
+  // (The per-content HDR target-peak probe that used to live here is
+  // deliberately GONE. Lesson from hardware: ANY runtime write into the
+  // HDR option set — even a single target-peak — destabilises the live
+  // gpu-next d3d11 pipeline into blown-out output. The HDR modes are
+  // now fully static per mode (player::apply_hdr_options): passthrough
+  // forces a PQ swapchain at init and lets MPV tone-map everything to
+  // the panel's real peak, so nothing needs to change per content.)
 
   useEffect(() => {
     const html = document.documentElement;
@@ -5639,6 +5667,7 @@ export default function App() {
                     await invoke("load_video", {
                       path: activeStreamUrl,
                       startSeconds: resumeAt,
+                      contentHdrHint: lastHdrHintRef.current,
                     });
                   } catch (e) {
                     console.error("Reload failed", e);
