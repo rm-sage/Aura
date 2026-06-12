@@ -561,6 +561,11 @@ function usePlayback(playerActive: boolean) {
   // contains a numeric value (NOT just non-zero ones, so a paused
   // file that's still receiving heartbeats counts as alive).
   const lastTimeUpdateAtRef = useRef<number>(0);
+  // Wall-clock of the last user seek. A seek (e.g. fast-forwarding a live
+  // stream toward the edge) makes mpv cache-pause while it refills, halting
+  // time-pos — that's a buffer, NOT a broken stream, so the stale-heartbeat
+  // detector gives a grace window after any seek before flagging a break.
+  const lastSeekAtRef = useRef<number>(0);
 
   useEffect(() => {
     // Previous tick's `payload.paused` for the keep-open EOS branch
@@ -809,6 +814,13 @@ function usePlayback(playerActive: boolean) {
       // the near-end EOS check above — moving it back up would re-
       // introduce the keep-open EOS regression.
       if (paused) return;
+      // Post-seek grace: a seek (e.g. fast-forwarding a live stream toward the
+      // edge) makes mpv cache-pause while it refills, halting time-pos. That's
+      // a buffer, not a break — don't flag broken for a while after a seek.
+      // (Live has no `duration`, so `nearEnd` can't disambiguate it as EOS;
+      // this grace is what keeps FF-to-the-edge from tripping the modal.)
+      const SEEK_GRACE_MS = 15000;
+      if (Date.now() - lastSeekAtRef.current < SEEK_GRACE_MS) return;
       if (staleFor >= BROKEN_STALE_MS) {
         if (nearEnd) {
           // Near-end stall → end-of-stream, not a break. App owns the
@@ -924,11 +936,17 @@ function usePlayback(playerActive: boolean) {
 
   const togglePause   = useCallback(() => invoke("toggle_pause").catch(() => {}), []);
   const seekRelative  = useCallback(
-    (s: number) => invoke("seek_relative", { seconds: s }).catch(() => {}),
+    (s: number) => {
+      lastSeekAtRef.current = Date.now();
+      return invoke("seek_relative", { seconds: s }).catch(() => {});
+    },
     [],
   );
   const seekAbsolute  = useCallback(
-    (t: number) => invoke("seek_absolute",  { time: t }).catch(() => {}),
+    (t: number) => {
+      lastSeekAtRef.current = Date.now();
+      return invoke("seek_absolute",  { time: t }).catch(() => {});
+    },
     [],
   );
   /** Optimistic volume — set local state immediately so the slider stays
