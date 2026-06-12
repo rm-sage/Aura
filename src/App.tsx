@@ -6,6 +6,7 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 
 import NavSidebar, { type NavView } from "./NavSidebar";
+import { loadSessionRoute, saveSessionRoute } from "./sessionRoute";
 import BootSplash from "./BootSplash";
 import ResizeHandles from "./ResizeHandles";
 import HomeView from "./views/HomeView";
@@ -1009,7 +1010,13 @@ function activeTargetIsAnime(
 
 export default function App() {
   // ── Nav state ──
-  const [activeView, setActiveView] = useState<NavView>("home");
+  // Restore the route from sessionStorage on a webview reload (Ctrl+R / F5)
+  // so the user lands back on the page they were viewing rather than Home.
+  // sessionStorage is cleared on app close, so a cold start still opens Home.
+  // The lazy initializer runs once on mount; selectedMeta's does the same.
+  const [activeView, setActiveView] = useState<NavView>(
+    () => loadSessionRoute()?.view ?? "home",
+  );
   const [homeResetKey, setHomeResetKey] = useState(0);
 
   // ── Auto-updater state ──
@@ -1135,8 +1142,18 @@ export default function App() {
   } = usePlayback(isPlayerActive);
 
   // ── Detail-view state (selected meta + click-rect for shared-element open) ──
-  const [selectedMeta, setSelectedMeta] = useState<MetaPreview | null>(null);
+  // Restored from the session route on reload (no rect → opens without the
+  // shared-element zoom, which is correct: there's no originating card).
+  const [selectedMeta, setSelectedMeta] = useState<MetaPreview | null>(
+    () => loadSessionRoute()?.detail ?? null,
+  );
   const [selectedRect, setSelectedRect] = useState<DOMRect | null>(null);
+
+  // Persist the browse route (active tab + open detail) on every change so a
+  // webview reload can restore it. Cheap — a small JSON write to sessionStorage.
+  useEffect(() => {
+    saveSessionRoute({ view: activeView, detail: selectedMeta });
+  }, [activeView, selectedMeta]);
 
   // ── Catalog deep-view state (clicking "View All" on Home) ──
   // Holdover from the old "View All → catalog deep view" navigation.
