@@ -151,6 +151,34 @@ ServerMsg frames. Store: `activeVotes` / `wonVotes` / `voteError` + `startVote` 
 `castVote` / `dismissWonVote` / `voteRemainingMs` / `haveVoted`. Client guards
 (cap/dup/render) ignore client-expired-but-unswept polls.
 
+## v4 — polish from user testing (2026-06-12)
+
+- **Single vote winner.** Only one won-vote card is pinned at a time; a new
+  winner overwrites the old (`vote-won` replaces `ui.wonVotes`).
+- **Vote overlay suppressed** on detail pages + during playback (`suppressed`
+  prop = `!!selectedMeta || isPlayerActive`) so it never overlaps the
+  stream/episode selector or the player; moved to `right-5` to clear the
+  scrollbar; the countdown tick pauses while hidden.
+- **Staging reconnect fix.** A long idle WebSocket drop set `status="connecting"`
+  (the banner is gated on `connected`, so it vanished) while the pause-gate read
+  the still-true `ui.staging`. `ws.onclose` now clears `ui.staging`+`inSync`; on
+  reconnect an owner-leader re-asserts its local state and `ingestRoomState`
+  runs with `drive=false`, so a host who started playing during the drop isn't
+  snapped back to the relay's stale paused snapshot (no leader-paused /
+  party-playing desync, no stale re-block).
+- **Live TV fully excluded.** `bridge.getLocal()` reports null identity for live
+  (`media_type === "tv"` / `id.startsWith("iptv:")`); `establishingParty` gated
+  on `!isLive`; and `notifyLocalControl`/`broadcastControl` short-circuit on a
+  null local `videoKey` — closing the leak where a leader on live would
+  resurrect the prior VOD party via the relay's `?? prev` fallback.
+- **Leader clear-stream.** `clearPartyStream()` (leader-only) → relay
+  `clear-stream` writes an explicit blank (bypassing `?? prev`), **server-
+  enforced leader-only** (lowest member id). "Clear party stream" button in the
+  panel. The next leader play re-establishes the stream.
+- **Join/leave toasts** (`showAppToast`, diffed by stable id, never self/welcome).
+  The "left" toast is DEFERRED 6 s and cancelled if the member returns, so a
+  reconnect blip doesn't flash "left" → "joined" on bystanders.
+
 ## Not hardware/multi-client tested at build time — needs the relay deployed +
-two clients to validate end-to-end. (v3: REDEPLOY the relay — `cd watch-relay;
-npx wrangler deploy` — for votes + the v2 stream-sharing to work.)
+two clients to validate end-to-end. (v3/v4: REDEPLOY the relay — `cd watch-relay;
+npx wrangler deploy` — for votes + stream-sharing + clear-stream to work.)
