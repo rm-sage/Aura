@@ -4,14 +4,18 @@
 //! Casting subsystem — Chromecast (CASTV2 via `rust_cast`) + DLNA
 //! (SSDP + SOAP/AVTransport). Ported per the 2026-06-09 casting spec.
 //!
-//! v1 scope: device discovery, in-process LAN media proxy, direct-play
+//! Scope: device discovery, in-process LAN media proxy, direct-play
 //! load/control on Chromecast's Default Media Receiver (`CC1AD845` —
 //! built into the Cast protocol, no Google registration) and on DLNA
-//! renderers. ffmpeg transmux (MKV → HLS) is the documented Phase-4
-//! follow-up: `cast_ffmpeg_present` reports tool availability so the UI
-//! can set expectations, but no transcode pipeline runs yet.
+//! renderers, plus Phase-4 ffmpeg HLS transmux (`transcode.rs` + `hls.rs`)
+//! for containers the receiver can't open directly (MKV/AVI/…). DLNA TVs
+//! mostly decode those natively, so transmux engages for Chromecast only.
+//! `cast_ffmpeg_present` gates it (ffmpeg+ffprobe must both be present).
 //!
-//! Roku / AirPlay are deliberately out of scope (spec §5).
+//! Roku / AirPlay are deferred indefinitely — low value for Aura: it is a
+//! Windows desktop app (AirPlay is legacy AP-1 only, which modern Apple
+//! devices reject), and Roku needs the user to side-load a channel + flip
+//! an ECP toggle. Chromecast + DLNA already cover the vast majority of TVs.
 //!
 //! ## Threading model (Chromecast)
 //!
@@ -34,7 +38,9 @@
 pub mod castv2;
 pub mod discovery;
 pub mod dlna;
+pub mod hls;
 pub mod media_server;
+pub mod transcode;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -76,7 +82,8 @@ pub struct CastStatus {
     pub duration_sec: Option<f64>,
     pub device_name: String,
     pub kind: String,
-    /// Reserved for the Phase-4 transmux path; always false today.
+    /// True while the active cast is being HLS-transmuxed by ffmpeg
+    /// (drives the "Transcoding" badge in the session bar).
     pub transcoding: bool,
 }
 
@@ -94,6 +101,10 @@ struct ChromecastSession {
     /// Receiver session id — needed to stop the app on cast_stop.
     app_session_id: String,
     media_session_id: Option<i64>,
+    /// Resume offset baked into the transmux: ffmpeg input-seeks here and the
+    /// device plays from currentTime=0, so real_time = device_time + this.
+    /// 0 for direct-play (the device's own time is already absolute).
+    tx_offset: f64,
     /// Signals the heartbeat thread to exit.
     stop: Arc<AtomicBool>,
 }
@@ -135,8 +146,9 @@ pub fn cast_ffmpeg_present() -> bool {
 
 /// Locate a bundled tool next to the exe (`lib/<name>` is the canonical
 /// spot — same arrangement as the git-ignored ffmpeg.exe), with a
-/// `CARGO_MANIFEST_DIR` fallback for `tauri dev`.
-fn locate_tool(name: &str) -> Option<std::path::PathBuf> {
+/// `CARGO_MANIFEST_DIR` fallback for `tauri dev`. Shared with the
+/// transcode/hls submodules.
+pub(super) fn locate_tool(name: &str) -> Option<std::path::PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             for cand in [dir.join("lib").join(name), dir.join(name)] {
@@ -155,12 +167,15 @@ fn locate_tool(name: &str) -> Option<std::path::PathBuf> {
 
 /// Start casting `url` to `device`, beginning at `start_seconds`.
 ///
-/// The upstream is re-served to the device through the in-process LAN
-/// proxy (`media_server`) — cast devices can't always do the TLS/range
-/// dance debrid hosts require, and several reject `application/
-/// octet-stream`. HLS upstreams are handed to the device DIRECTLY
-/// (proxying a playlist would break its relative segment URIs; the
-/// playlist-rewriting proxy is a Phase-4 follow-up).
+/// Routing:
+/// * HLS (`.m3u8`) upstreams → handed to the device DIRECTLY (proxying a
+///   playlist would break its relative segment URIs).
+/// * Direct-playable containers (MP4/WebM) → re-served through the
+///   in-process LAN proxy (`media_server`) — cast devices can't always do
+///   the TLS/range dance debrid hosts require, and several reject
+///   `application/octet-stream`.
+/// * Receiver-incompatible containers (MKV/AVI/…) on Chromecast → ffmpeg
+///   HLS transmux (`hls::register_transcode`), when ffmpeg+ffprobe exist.
 #[tauri::command]
 pub async fn cast_load(
     device: CastDeviceInfo,
@@ -176,17 +191,38 @@ pub async fn cast_load(
         crate::stremio::redact_sensitive_url(&url),
     );
 
-    // One session at a time — stop whatever is active first.
+    // One session at a time — stop whatever is active first, then drop any
+    // proxy / transcode sessions it left behind (a finished transcode's
+    // ffmpeg would otherwise linger until idle-eviction).
     stop_active_session().await;
+    media_server::clear_sessions();
+    hls::clear_all_async().await;
 
+    let resume = start_seconds.filter(|v| v.is_finite() && *v > 0.0).unwrap_or(0.0);
     let is_hls = url.split('?').next().unwrap_or("").to_ascii_lowercase().ends_with(".m3u8");
-    let media_url = if is_hls {
-        url.clone()
+    // Phase-4 transmux: containers the Default Media Receiver can't open
+    // directly (MKV/AVI/…) are re-segmented to HLS via ffmpeg — but only
+    // for Chromecast. Most DLNA TVs decode them natively, so DLNA always
+    // direct-plays (no needless transcode load). ffmpeg/ffprobe absent ⇒
+    // fall back to direct-play (the device may still cope, or report an
+    // error the user can act on).
+    let transmux = !is_hls
+        && device.kind == "chromecast"
+        && transcode::should_transmux(&url)
+        && cast_ffmpeg_present();
+    let (media_url, content_type): (String, &'static str) = if is_hls {
+        (url.clone(), guess_content_type(&url, true))
+    } else if transmux {
+        (hls::register_transcode(&url, &device.host, resume).await?, "application/x-mpegurl")
     } else {
-        media_server::register_cast(&url, &device.host).await?
+        (media_server::register_cast(&url, &device.host).await?, guess_content_type(&url, false))
     };
-    let content_type = guess_content_type(&url, is_hls);
-    let start = start_seconds.filter(|v| v.is_finite() && *v > 0.0).unwrap_or(0.0);
+    // A transmux input-seeks ffmpeg to `resume`, so its HLS timeline starts at
+    // 0; the device is told currentTime=0 and we add the offset back for
+    // status / seek / stop (so the receiver never seeks to an unproduced
+    // position). Direct-play / HLS seek the real file, so the device gets the
+    // real resume position and there's no offset.
+    let (device_start, tx_offset) = if transmux { (0.0, resume) } else { (resume, 0.0) };
 
     let result: Result<(), String> = match device.kind.as_str() {
         "chromecast" => {
@@ -194,12 +230,13 @@ pub async fn cast_load(
             let media_url2 = media_url.clone();
             let ct = content_type.to_string();
             match tauri::async_runtime::spawn_blocking(move || {
-                chromecast_load_blocking(&dev, &media_url2, &ct, title.as_deref(), poster.as_deref(), start)
+                chromecast_load_blocking(&dev, &media_url2, &ct, title.as_deref(), poster.as_deref(), device_start)
             })
             .await
             .map_err(|e| e.to_string())?
             {
-                Ok(session) => {
+                Ok(mut session) => {
+                    session.tx_offset = tx_offset;
                     *active_slot().lock().unwrap() = Some(ActiveSession::Chromecast(session));
                     Ok(())
                 }
@@ -213,10 +250,10 @@ pub async fn cast_load(
                     .clone()
                     .ok_or("DLNA device has no AVTransport control URL")?;
                 dlna::load(&control_url, &media_url, content_type, title.as_deref()).await?;
-                if start > 1.0 {
+                if device_start > 1.0 {
                     // Some renderers need a beat between Play and Seek.
                     tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-                    let _ = dlna::seek(&control_url, start).await;
+                    let _ = dlna::seek(&control_url, device_start).await;
                 }
                 *active_slot().lock().unwrap() = Some(ActiveSession::Dlna(DlnaSession {
                     device_name: device.name.clone(),
@@ -235,6 +272,7 @@ pub async fn cast_load(
     // other session can be live here; we stopped any active one above).
     if result.is_err() {
         media_server::clear_sessions();
+        hls::clear_all_async().await;
     }
     result
 }
@@ -242,7 +280,7 @@ pub async fn cast_load(
 #[tauri::command]
 pub async fn cast_play() -> Result<(), String> {
     match snapshot_session() {
-        Some(SessionSnapshot::Chromecast { host, port, transport_id, media_session_id }) => {
+        Some(SessionSnapshot::Chromecast { host, port, transport_id, media_session_id, .. }) => {
             tauri::async_runtime::spawn_blocking(move || {
                 chromecast_simple_command(&host, port, &transport_id, media_session_id, CcCommand::Play)
             })
@@ -258,7 +296,7 @@ pub async fn cast_play() -> Result<(), String> {
 #[tauri::command]
 pub async fn cast_pause() -> Result<(), String> {
     match snapshot_session() {
-        Some(SessionSnapshot::Chromecast { host, port, transport_id, media_session_id }) => {
+        Some(SessionSnapshot::Chromecast { host, port, transport_id, media_session_id, .. }) => {
             tauri::async_runtime::spawn_blocking(move || {
                 chromecast_simple_command(&host, port, &transport_id, media_session_id, CcCommand::Pause)
             })
@@ -274,11 +312,14 @@ pub async fn cast_pause() -> Result<(), String> {
 #[tauri::command]
 pub async fn cast_seek(position_sec: f64) -> Result<(), String> {
     match snapshot_session() {
-        Some(SessionSnapshot::Chromecast { host, port, transport_id, media_session_id }) => {
+        Some(SessionSnapshot::Chromecast { host, port, transport_id, media_session_id, tx_offset }) => {
+            // The UI seeks in real-media time; the transmux device timeline is
+            // offset-relative, so subtract the transcode offset (0 for direct).
+            let device_target = (position_sec - tx_offset).max(0.0);
             tauri::async_runtime::spawn_blocking(move || {
                 chromecast_simple_command(
                     &host, port, &transport_id, media_session_id,
-                    CcCommand::Seek(position_sec),
+                    CcCommand::Seek(device_target),
                 )
             })
             .await
@@ -302,6 +343,7 @@ pub async fn cast_stop() -> Result<f64, String> {
     };
     stop_active_session().await;
     media_server::clear_sessions();
+    hls::clear_all_async().await;
     Ok(last_pos)
 }
 
@@ -313,7 +355,7 @@ pub async fn cast_status() -> Result<CastStatus, String> {
 
 async fn current_status_inner() -> Result<CastStatus, String> {
     match snapshot_session() {
-        Some(SessionSnapshot::Chromecast { host, port, transport_id, media_session_id }) => {
+        Some(SessionSnapshot::Chromecast { host, port, transport_id, media_session_id, tx_offset }) => {
             let name = active_device_name().unwrap_or_default();
             let st = tauri::async_runtime::spawn_blocking(move || {
                 chromecast_status(&host, port, &transport_id, media_session_id)
@@ -321,13 +363,15 @@ async fn current_status_inner() -> Result<CastStatus, String> {
             .await
             .map_err(|e| e.to_string())?
             .map_err(humanize_cast_error)?;
+            // Add the transmux offset back so the UI sees real-media time
+            // (the device reports time relative to the input-seeked transcode).
             Ok(CastStatus {
                 player_state: st.0,
-                position_sec: st.1,
-                duration_sec: st.2,
+                position_sec: st.1 + tx_offset,
+                duration_sec: st.2.map(|d| d + tx_offset),
                 device_name: name,
                 kind: "chromecast".into(),
-                transcoding: false,
+                transcoding: hls::is_active(),
             })
         }
         Some(SessionSnapshot::Dlna { control_url, device_name }) => {
@@ -338,7 +382,7 @@ async fn current_status_inner() -> Result<CastStatus, String> {
                 duration_sec: dur,
                 device_name,
                 kind: "dlna".into(),
-                transcoding: false,
+                transcoding: hls::is_active(),
             })
         }
         None => Err("no active cast session".into()),
@@ -357,6 +401,7 @@ enum SessionSnapshot {
         port: u16,
         transport_id: String,
         media_session_id: Option<i64>,
+        tx_offset: f64,
     },
     Dlna {
         control_url: String,
@@ -372,12 +417,19 @@ fn snapshot_session() -> Option<SessionSnapshot> {
             port: s.port,
             transport_id: s.transport_id.clone(),
             media_session_id: s.media_session_id,
+            tx_offset: s.tx_offset,
         }),
         ActiveSession::Dlna(s) => Some(SessionSnapshot::Dlna {
             control_url: s.control_url.clone(),
             device_name: s.device_name.clone(),
         }),
     }
+}
+
+/// True while any cast session is active — the HLS evictor uses this so it
+/// never reaps the transcode of a live (even paused/buffering) cast.
+pub(super) fn has_active_session() -> bool {
+    active_slot().lock().map(|s| s.is_some()).unwrap_or(false)
 }
 
 fn active_device_name() -> Option<String> {
@@ -421,6 +473,8 @@ async fn stop_active_session() {
 /// best-effort. Stops the heartbeat thread and the receiver app so the
 /// TV doesn't sit on a dead "Default Media Receiver" splash.
 pub fn shutdown_blocking() {
+    // Kill any transcode ffmpeg + temp dirs first (orphan-proofing).
+    hls::shutdown();
     let taken = active_slot().lock().ok().and_then(|mut s| s.take());
     match taken {
         Some(ActiveSession::Chromecast(s)) => {
@@ -559,6 +613,7 @@ fn chromecast_load_blocking(
         transport_id,
         app_session_id,
         media_session_id,
+        tx_offset: 0.0, // set by cast_load for a transmux session
         stop,
     })
 }

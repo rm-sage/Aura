@@ -13,3 +13,11 @@ mpv-1.dll
 # ("lib/**/*") bundles it and silencedetect.rs::ffmpeg_bin prefers
 # it over PATH. Absent → falls back to PATH ffmpeg (no regression).
 ffmpeg.exe
+
+# Bundled ffprobe — the Phase-4 cast transmux prerequisite (cast/
+# transcode.rs probes the source's codecs to decide copy-vs-reencode).
+# Ships from the SAME ffmpeg build above (ffprobe.exe sits next to
+# ffmpeg.exe in those archives). Absent → casting falls back to
+# direct-play only (cast_ffmpeg_present() returns false; MKV won't
+# transmux for Chromecast). DLNA TVs decode MKV natively regardless.
+ffprobe.exe

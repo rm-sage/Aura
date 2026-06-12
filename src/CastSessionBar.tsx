@@ -42,8 +42,17 @@ export default function CastSessionBar({
     >
       <CastGlyph />
       <div className="min-w-0">
-        <p className="text-white/90 text-[13px] font-medium leading-tight truncate max-w-[220px]">
-          Casting to {deviceName}
+        <p className="text-white/90 text-[13px] font-medium leading-tight max-w-[240px] flex items-center gap-1.5">
+          <span className="truncate">Casting to {deviceName}</span>
+          {status?.transcoding && (
+            <span
+              title="This file is being converted on the fly so the device can play it"
+              className="flex-shrink-0 px-1.5 py-px rounded-full bg-amber-400/15 text-amber-300/90
+                         text-[9px] font-semibold uppercase tracking-wider leading-none"
+            >
+              Transcoding
+            </span>
+          )}
         </p>
         <p className="text-white/45 text-[11px] tabular-nums leading-tight">
           {buffering

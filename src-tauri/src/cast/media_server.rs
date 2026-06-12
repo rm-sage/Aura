@@ -94,7 +94,7 @@ pub fn clear_sessions() {
     }
 }
 
-async fn ensure_started() -> Result<u16, String> {
+pub(super) async fn ensure_started() -> Result<u16, String> {
     if let Some(p) = PORT.get() {
         return Ok(*p);
     }
@@ -109,7 +109,10 @@ async fn ensure_started() -> Result<u16, String> {
     }
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
-        .route("/s/:id", get(serve_session).head(serve_session_head));
+        .route("/s/:id", get(serve_session).head(serve_session_head))
+        // Phase-4 HLS transmux: one route covers the playlist + segments;
+        // the handler dispatches on the filename (see cast/hls.rs).
+        .route("/hls/:id/:file", get(serve_hls));
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
         .await
         .map_err(|e| format!("cast media server bind failed: {e}"))?;
@@ -141,6 +144,18 @@ async fn serve_session_head(
     forward(id, headers, true).await
 }
 
+/// HLS transmux route — dispatches the growing playlist vs a `.ts`
+/// segment by filename. Both live in cast/hls.rs.
+async fn serve_hls(AxumPath((id, file)): AxumPath<(String, String)>) -> Response {
+    if file == "index.m3u8" {
+        super::hls::serve_playlist(id).await
+    } else if file.ends_with(".ts") {
+        super::hls::serve_segment(id, file).await
+    } else {
+        (StatusCode::NOT_FOUND, "unknown hls resource").into_response()
+    }
+}
+
 /// Server-side-fetch the upstream and stream it back, preserving the
 /// byte-range contract and forcing a cast-friendly MIME.
 async fn forward(id: String, req_headers: HeaderMap, head_only: bool) -> Response {
@@ -161,8 +176,16 @@ async fn forward(id: String, req_headers: HeaderMap, head_only: bool) -> Respons
     let upstream_resp = match builder.send().await {
         Ok(r) => r,
         Err(e) => {
-            crate::devlog!(warn, "cast", "upstream fetch failed: {e}");
-            return (StatusCode::BAD_GATEWAY, format!("Upstream error: {e}")).into_response();
+            // reqwest's Display embeds the request URL, which carries the
+            // debrid token. Log the REDACTED upstream + the error WITHOUT its
+            // url, and never echo the raw error to the device (plain-HTTP LAN
+            // body the TV / a sniffer could capture).
+            crate::devlog!(
+                warn, "cast", "upstream fetch failed for {}: {}",
+                crate::stremio::redact_sensitive_url(&upstream),
+                e.without_url(),
+            );
+            return (StatusCode::BAD_GATEWAY, "upstream fetch failed").into_response();
         }
     };
 
@@ -233,7 +256,7 @@ fn guess_mime(url: &str) -> &'static str {
 /// The local IP the OS would use to reach `device_host` — a connected
 /// (no-traffic) UDP socket makes the kernel pick the right interface,
 /// which beats subnet guessing on multi-homed machines (VPN + LAN).
-fn reachable_ip_for(device_host: &str) -> Option<String> {
+pub(super) fn reachable_ip_for(device_host: &str) -> Option<String> {
     let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.connect((device_host, 9)).ok()?;
     let ip = sock.local_addr().ok()?.ip();
@@ -245,7 +268,7 @@ fn reachable_ip_for(device_host: &str) -> Option<String> {
 
 /// Generic default-route fallback (same trick against a public IP; no
 /// packet is actually sent).
-fn lan_ip_fallback() -> String {
+pub(super) fn lan_ip_fallback() -> String {
     std::net::UdpSocket::bind("0.0.0.0:0")
         .ok()
         .and_then(|s| {
