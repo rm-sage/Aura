@@ -1246,30 +1246,45 @@ export default function App() {
       resyncToRoom();
     }
   }, [firstFrameSeen]);
+  // While the party is staging AND we're on the staged title, normal
+  // play/pause/seek must NOT override the "Start now" hold — only wtStartParty
+  // (the host's "Start now" / the auto-start) releases it. A member off watching
+  // something else (not in sync) keeps full control. Reads live module state so
+  // it's always fresh (no stale-closure dep needed).
+  const wtStagedHold = useCallback(() => {
+    const w = getWatchState();
+    return w.staging && w.inSync;
+  }, []);
   const wtTogglePause = useCallback(() => {
+    if (wtStagedHold()) return;
     const next = !wtIntendedPausedRef.current;
     togglePause();
     wtIntendedPausedRef.current = next;
     notifyLocalControl({ paused: next, position: wtTimeRef.current });
-  }, [togglePause]);
+  }, [togglePause, wtStagedHold]);
   const wtSeekAbsolute = useCallback((t: number) => {
+    if (wtStagedHold()) return;
     seekAbsolute(t);
     notifyLocalControl({ paused: wtIntendedPausedRef.current, position: t });
-  }, [seekAbsolute]);
+  }, [seekAbsolute, wtStagedHold]);
   const wtSeekRelative = useCallback((d: number) => {
+    if (wtStagedHold()) return;
     seekRelative(d);
     notifyLocalControl({ paused: wtIntendedPausedRef.current, position: wtTimeRef.current + d });
-  }, [seekRelative]);
+  }, [seekRelative, wtStagedHold]);
   // Start the party (unpause + clear staging) — the leader's "Start now"
   // override, also called by the auto-start effect once everyone's ready.
+  // Bypasses the staging gate above (we're the one releasing it): clears
+  // localStaging first, then unpauses RAW + broadcasts play (broadcastControl
+  // recomputes staging=false now that localStaging is off).
   const wtStartParty = useCallback(() => {
     setLocalStaging(false);
     if (wtIntendedPausedRef.current) {
-      wtTogglePause(); // unpause + broadcast (staging now false)
-    } else {
-      notifyLocalControl({ paused: false, position: wtTimeRef.current });
+      togglePause();
+      wtIntendedPausedRef.current = false;
     }
-  }, [wtTogglePause]);
+    notifyLocalControl({ paused: false, position: wtTimeRef.current });
+  }, [togglePause]);
   // Auto-start once every member is on the party's stream.
   useEffect(() => {
     if (amStagingHost() && everyoneReady()) wtStartParty();
