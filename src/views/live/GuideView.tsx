@@ -35,10 +35,16 @@ interface Props {
   nowMs: number;
   hasEpg: boolean;
   epgLoading: boolean;
+  /** True when more channels exist beyond the rendered slice — drives the
+   *  scroll-to-load-more behaviour + the bottom sentinel. */
+  hasMore?: boolean;
+  /** Reveal the next page of channel rows (called once when the vertical
+   *  scroll nears the bottom and `hasMore` is true). */
+  onReachEnd?: () => void;
   onPlayChannel: (channel: IptvChannel) => void;
 }
 
-export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEpg, epgLoading, onPlayChannel }: Props) {
+export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEpg, epgLoading, hasMore, onReachEnd, onPlayChannel }: Props) {
   // Re-render the rows when favourites change so the stars stay in sync.
   const [, bumpFav] = useReducer((n: number) => n + 1, 0);
   useEffect(() => subscribeFavorites(bumpFav), []);
@@ -76,6 +82,27 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
     el?.addEventListener("scroll", clear, { passive: true });
     return () => el?.removeEventListener("scroll", clear);
   }, [hover]);
+
+  // Infinite scroll: reveal the next page when the user nears the bottom.
+  // `loadingMore` guards against a fast scroll firing several reveals before
+  // the new rows mount; it's cleared once the rendered count changes (a page
+  // landed), re-arming the next reveal. Only the vertical metric is read, so
+  // horizontal timeline scrolling never trips it.
+  const loadingMore = useRef(false);
+  useEffect(() => { loadingMore.current = false; }, [channels.length]);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !onReachEnd || !hasMore) return;
+    const onScroll = () => {
+      if (loadingMore.current) return;
+      if (el.scrollHeight - (el.scrollTop + el.clientHeight) < ROW_H * 4) {
+        loadingMore.current = true;
+        onReachEnd();
+      }
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [onReachEnd, hasMore]);
 
   // Hour tick marks across the ruler. Stop BEFORE windowEnd — a tick at the
   // very right edge (x === timelineW) renders its label outside the timeline
@@ -159,13 +186,16 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
           </div>
         </div>
 
-        {/* Now line — a thin red vertical line from the LIVE pill's base down
-            through the ruler + all rows. Just the 1px line crosses the ruler
-            (harmless); the pill itself is up in its own strip. */}
+        {/* Now line — a thin red vertical line descending through the rows.
+            z-10 keeps it ABOVE the programme blocks (z-auto) but BELOW the
+            sticky header (z-20): the content-anchored line otherwise scrolls
+            up behind the pinned header and, at a higher z, painted straight
+            over the LIVE pill. Now the header's opaque background masks the
+            line wherever they overlap, so the pill stays clean. */}
         {nowX >= 0 && nowX <= timelineW && (
           <span
             aria-hidden
-            className="absolute bottom-0 w-px bg-red-500/85 z-30 pointer-events-none"
+            className="absolute bottom-0 w-px bg-red-500/85 z-10 pointer-events-none"
             style={{
               left: CHANNEL_COL_W + nowX,
               top: LIVE_STRIP_H,
@@ -193,6 +223,18 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
             onBlockLeave={() => setHover(null)}
           />
         ))}
+
+        {/* Bottom sentinel — only while more channels remain. Reaching it (or
+            near it) triggers the next page via the scroll listener above. */}
+        {hasMore && (
+          <div
+            className="flex items-center justify-center gap-2 py-3 text-white/35 text-[11px] sticky left-0"
+            style={{ width: CHANNEL_COL_W }}
+          >
+            <span className="w-3.5 h-3.5 rounded-full border-2 border-white/15 border-t-ln-accent animate-spin" />
+            Loading more channels…
+          </div>
+        )}
       </div>
 
       <ProgramHoverCard hover={hover} />

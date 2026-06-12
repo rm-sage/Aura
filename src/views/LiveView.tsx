@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { memo, useEffect, useMemo, useReducer, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useReducer, useState } from "react";
 import ErrorBoundary from "../ErrorBoundary";
 import ImageLoader from "../ImageLoader";
 import {
@@ -37,9 +37,31 @@ import MultiView from "./live/MultiView";
 import { openChannelMenu } from "../iptv/channelMenu";
 
 /** Guide rows are heavier than grid cards (sticky cells + per-row timeline);
- *  cap them tighter than the grid so a huge category stays responsive. */
+ *  the guide starts at this many rows and grows by GUIDE_PAGE as the user
+ *  scrolls to the bottom — so a huge category stays responsive but is never
+ *  hard-capped. */
 const GUIDE_MAX_ROWS = 150;
+const GUIDE_PAGE = 50;
 type ViewMode = "grid" | "guide" | "multiview";
+
+// Session-sticky reveal counts for the guide's infinite scroll, keyed by
+// `${sourceId}::${group}`. Lets a user's scroll depth survive tab switches and
+// LiveView remounts within a run (their "cache until the app is restarted"); a
+// genuine restart starts every group fresh at GUIDE_MAX_ROWS. Bounded + LRU so
+// a provider with thousands of groups can't leak the map (CLAUDE.md cache rule).
+const guideRevealCache = new Map<string, number>();
+const GUIDE_REVEAL_CACHE_CAP = 256;
+function readGuideReveal(key: string): number {
+  return guideRevealCache.get(key) ?? GUIDE_MAX_ROWS;
+}
+function writeGuideReveal(key: string, n: number) {
+  guideRevealCache.delete(key); // re-insert as freshest for LRU eviction
+  guideRevealCache.set(key, n);
+  if (guideRevealCache.size > GUIDE_REVEAL_CACHE_CAP) {
+    const oldest = guideRevealCache.keys().next().value;
+    if (oldest !== undefined) guideRevealCache.delete(oldest);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // LiveView — Live TV (IPTV) browser. Source picker + group sidebar + search
@@ -188,6 +210,28 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
   }, [playlist, selectedGroup, query]);
 
   const visible = filtered.length > MAX_VISIBLE ? filtered.slice(0, MAX_VISIBLE) : filtered;
+
+  // ── Guide infinite scroll ────────────────────────────────────────────
+  // Reveal count is sticky per source+group (see guideRevealCache). It is NOT
+  // keyed on the search query: searching narrows `filtered`, the slice clamps,
+  // and clearing the search restores the group's depth.
+  const guideKey = `${selectedSourceId ?? ""}::${selectedGroup}`;
+  const [guideReveal, setGuideReveal] = useState(() => readGuideReveal(guideKey));
+  useEffect(() => {
+    setGuideReveal(readGuideReveal(guideKey));
+  }, [guideKey]);
+  const revealMoreGuide = useCallback(() => {
+    setGuideReveal((n) => {
+      const next = n + GUIDE_PAGE;
+      writeGuideReveal(guideKey, next);
+      return next;
+    });
+  }, [guideKey]);
+  const guideChannels = useMemo(
+    () => (filtered.length > guideReveal ? filtered.slice(0, guideReveal) : filtered),
+    [filtered, guideReveal],
+  );
+  const guideHasMore = filtered.length > guideChannels.length;
 
   // Resolve now/next for the visible cards ONCE per render (not per card) —
   // keyed on the visible set, source, the 30 s now-tick, and the EPG version
@@ -360,8 +404,8 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
                   {filtered.length.toLocaleString()} channel{filtered.length === 1 ? "" : "s"}
                   {viewMode === "grid" && filtered.length > MAX_VISIBLE &&
                     ` · showing first ${MAX_VISIBLE} (refine to see all)`}
-                  {viewMode === "guide" && filtered.length > GUIDE_MAX_ROWS &&
-                    ` · guide showing first ${GUIDE_MAX_ROWS} (refine to see all)`}
+                  {viewMode === "guide" && guideHasMore &&
+                    ` · showing ${guideChannels.length.toLocaleString()} — scroll for more`}
                 </span>
               ) : null}
               {!favoritesView && <ViewModeToggle mode={viewMode} onChange={setViewMode} />}
@@ -417,12 +461,14 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
               />
             ) : viewMode === "guide" ? (
               <GuideView
-                channels={filtered.slice(0, GUIDE_MAX_ROWS)}
+                channels={guideChannels}
                 sourceId={selectedSourceId ?? ""}
                 sourceName={playlist?.name ?? selectedSourceId ?? ""}
                 nowMs={nowMs}
                 hasEpg={epgReady}
                 epgLoading={epgLoading}
+                hasMore={guideHasMore}
+                onReachEnd={revealMoreGuide}
                 onPlayChannel={(ch) => playlist && onPlayChannel(ch, playlist)}
               />
             ) : (
