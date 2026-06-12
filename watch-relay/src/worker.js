@@ -135,11 +135,22 @@ export class Room {
           // (a garbage position would yank every viewer to 0).
           const pos = Number(msg.position);
           if (!Number.isFinite(pos)) break;
+          // The stream IDENTITY (which title + which stream pick) belongs to
+          // whoever established the party stream. The client already re-sends it
+          // verbatim from non-owners, but fall back to the stored state here too
+          // so a frame that omits identity (an old/minimal client) can't null
+          // out the party's stream pick for everyone.
+          const prev = await this.loadState();
           const next = {
             paused: !!msg.paused,
             position: pos,
-            videoKey: str(msg.videoKey, MAX_VIDEOKEY) ?? me.videoKey ?? null,
-            title: str(msg.title, MAX_TITLE),
+            videoKey: str(msg.videoKey, MAX_VIDEOKEY) ?? me.videoKey ?? prev.videoKey ?? null,
+            metaId: str(msg.metaId, MAX_VIDEOKEY) ?? prev.metaId ?? null,
+            mediaType: str(msg.mediaType, 32) ?? prev.mediaType ?? null,
+            title: str(msg.title, MAX_TITLE) ?? prev.title ?? null,
+            streamLabel: str(msg.streamLabel, MAX_TITLE) ?? prev.streamLabel ?? null,
+            streamKey: str(msg.streamKey, MAX_VIDEOKEY) ?? prev.streamKey ?? null,
+            staging: !!msg.staging,
             updatedAt: Date.now(),
             driverId: me.id ?? null,
           };
@@ -212,7 +223,11 @@ export class Room {
   /** @returns {Promise<RoomState>} */
   async loadState() {
     const s = await this.state.storage.get("state");
-    return s || { paused: true, position: 0, videoKey: null, title: null, updatedAt: Date.now(), driverId: null };
+    return s || {
+      paused: true, position: 0, videoKey: null, metaId: null, mediaType: null,
+      title: null, streamLabel: null, streamKey: null, staging: false,
+      updatedAt: Date.now(), driverId: null,
+    };
   }
 
   /** @param {RoomState} s */

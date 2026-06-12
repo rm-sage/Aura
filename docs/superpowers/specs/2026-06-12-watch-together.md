@@ -86,5 +86,36 @@ re-broadcast.
 - `APP_TOKEN` + room codes are the access control. Room members can drive each
   other's playback — that's the point of a watch party.
 
+## v2 — top-level party (2026-06-12)
+
+Promoted from a player-tucked panel to a first-class feature:
+
+- **Top-level access** — a floating `PartyButton` (app shell, next to the
+  account button, hidden during playback) shows party status (member count +
+  live dot) on every home/browse menu and opens the panel. The player More-menu
+  entry stays as the in-playback access (the top-level button is hidden then).
+- **In-player presence** — `PlayerPartyHud` renders a presence cluster
+  (top-right: member avatars + green/amber sync dots) + the staging banner.
+- **Stream sharing** — the host's chosen stream is broadcast: the `control`
+  frame / `RoomState` gained `metaId`, `mediaType`, `streamLabel`, `streamKey`
+  (`streamMatch.ts`: key = info_hash/filename, label = addon · filename).
+  Members get a one-tap **Join & sync** (`bridge.openVideo` → `setSelectedMeta`
+  + `setOpenInStreamsMode`) landing on the title's stream picker, where the
+  matching row is highlighted ("Party pick" — `DetailView` `partyStreamKey`
+  threaded `UnifiedPanel → StreamsPanel → StreamRow`).
+- **Wait-for-party staging** — when the host (the leader) starts a NEW party
+  stream, `handlePlayStream` arms `wtPendingStageRef`; on `firstFrameSeen` an
+  effect pauses the host + `startPartyStream()` (localStaging=true; broadcasts
+  staging + the stream id). Members who Join become "ready" on becoming in-sync
+  (snap to room state via `notifyLocalVideo`). It **auto-starts** once
+  `everyoneReady()`, or the host hits **Start now** (`wtStartParty` → clear
+  staging + unpause + broadcast play). Symmetric control is preserved; only the
+  leader establishes/stages.
+
+Store mechanics: `broadcastControl()` mirrors the sent state into the local
+`ui.room*` (we never receive our own frames). New helpers: `startPartyStream`,
+`amStagingHost`, `setLocalStaging`, `everyoneReady`, `readyCount`,
+`openRoomVideo`. Relay carries the new fields (length-capped).
+
 ## Not hardware/multi-client tested at build time — needs the relay deployed +
 two clients to validate end-to-end.

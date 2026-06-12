@@ -12,7 +12,7 @@
 import { useEffect, useState } from "react";
 import { useWatchTogether } from "./watchTogether/useWatchTogether";
 import {
-  createRoom, joinRoom, leaveRoom, setWatchConfig,
+  createRoom, joinRoom, leaveRoom, setWatchConfig, openRoomVideo,
   getRelayUrl, getDisplayName, getAppToken,
 } from "./watchTogether/store";
 
@@ -117,10 +117,13 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
             selfId={w.selfId}
             roomVideoKey={w.roomVideoKey}
             roomTitle={w.roomTitle}
+            roomStreamLabel={w.roomStreamLabel}
+            staging={w.staging}
             inSync={w.inSync}
             isLeader={w.isLeader}
             copied={copied}
             onCopy={copyCode}
+            onJoin={() => { openRoomVideo(); onClose(); }}
             onLeave={leaveRoom}
           />
         )}
@@ -220,14 +223,16 @@ function Lobby({
 }
 
 function Room({
-  code, status, members, selfId, roomVideoKey, roomTitle, inSync, isLeader,
-  copied, onCopy, onLeave,
+  code, status, members, selfId, roomVideoKey, roomTitle, roomStreamLabel, staging,
+  inSync, isLeader, copied, onCopy, onJoin, onLeave,
 }: {
   code: string | null; status: string; members: { id: string; name: string; videoKey: string | null }[];
   selfId: string | null; roomVideoKey: string | null; roomTitle: string | null;
+  roomStreamLabel: string | null; staging: boolean;
   inSync: boolean; isLeader: boolean; copied: boolean;
-  onCopy: () => void; onLeave: () => void;
+  onCopy: () => void; onJoin: () => void; onLeave: () => void;
 }) {
+  const readyHere = roomVideoKey ? members.filter((m) => m.videoKey === roomVideoKey).length : 0;
   return (
     <div className="space-y-4">
       {/* Room code */}
@@ -253,16 +258,27 @@ function Room({
           Waiting for someone to start playing. Whatever the first person plays becomes the party's title.
         </p>
       ) : inSync ? (
-        <p className="text-emerald-300/90 text-[12.5px] flex items-center gap-2">
-          <span className="w-2 h-2 rounded-full bg-emerald-400" />
-          In sync{isLeader ? " · you're the timing leader" : ""}
-        </p>
+        <div className="rounded-xl bg-emerald-400/[0.07] border border-emerald-400/20 px-3 py-2.5 space-y-0.5">
+          <p className="text-emerald-300/90 text-[12.5px] flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full bg-emerald-400" />
+            {staging ? `Waiting for the party · ${readyHere}/${members.length} here` : "In sync"}
+            {isLeader ? " · you're the host" : ""}
+          </p>
+          {roomTitle && (
+            <p className="text-white/55 text-[11.5px] truncate">
+              {roomTitle}{roomStreamLabel ? ` · ${roomStreamLabel}` : ""}
+            </p>
+          )}
+        </div>
       ) : (
         <div className="rounded-xl bg-amber-400/[0.08] border border-amber-400/20 px-3 py-2.5">
           <p className="text-amber-200/90 text-[12px] leading-snug">
-            The party is watching{roomTitle ? <> <span className="font-semibold">{roomTitle}</span></> : " a title"}.
-            Open it and pick a stream to fall into sync.
+            The party is watching{roomTitle ? <> <span className="font-semibold">{roomTitle}</span></> : " a title"}
+            {roomStreamLabel ? <span className="text-amber-200/60"> · {roomStreamLabel}</span> : null}.
           </p>
+          <button type="button" onClick={onJoin} disabled={!roomVideoKey} className={`${primaryBtn} mt-2`}>
+            Join &amp; sync
+          </button>
         </div>
       )}
 

@@ -58,20 +58,37 @@ export interface WatchUiState {
   members: WatchMember[];
   /** What the party is watching (from the shared playback state). */
   roomVideoKey: string | null;
+  roomMetaId: string | null;
+  roomMediaType: string | null;
   roomTitle: string | null;
+  roomStreamLabel: string | null;
+  roomStreamKey: string | null;
+  /** Current room play/pause (drives the waiting vs playing UI). */
+  roomPaused: boolean;
+  /** True while the host is holding playback, waiting for the party. */
+  staging: boolean;
+  /** True when WE are the member holding a staged stream (drives the host-only
+   *  "Start now" affordance — derived from local truth, not leader election, so
+   *  a leader crown flap mid-staging can't strand the control on the wrong peer). */
+  amStaging: boolean;
   /** True when local playback is on the room's title (sync is active). */
   inSync: boolean;
   isLeader: boolean;
   error: string | null;
 }
 
+const BLANK_ROOM = {
+  roomVideoKey: null, roomMetaId: null, roomMediaType: null, roomTitle: null,
+  roomStreamLabel: null, roomStreamKey: null, roomPaused: true, staging: false,
+};
+
 const ui: WatchUiState = {
   status: "idle",
   roomCode: null,
   selfId: null,
   members: [],
-  roomVideoKey: null,
-  roomTitle: null,
+  ...BLANK_ROOM,
+  amStaging: false,
   inSync: false,
   isLeader: false,
   error: null,
@@ -86,6 +103,8 @@ let reconnectAttempts = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let bridge: PlaybackBridge | null = null;
 let lastApplyAt = 0; // throttles applied remote seeks (APPLY_MIN_INTERVAL_MS)
+let localStaging = false; // are WE currently holding a stream for the party?
+let lastRoomState: RoomState | null = null; // for snap-to-room on becoming in-sync
 
 // ── Pub/sub ────────────────────────────────────────────────────────────────
 const subs = new Set<() => void>();
@@ -165,13 +184,14 @@ export function joinRoom(code: string): boolean {
 
 export function leaveRoom(): void {
   userLeft = true;
+  localStaging = false;
   teardown();
   ui.status = "idle";
   ui.roomCode = null;
   ui.selfId = null;
   ui.members = [];
-  ui.roomVideoKey = null;
-  ui.roomTitle = null;
+  Object.assign(ui, BLANK_ROOM);
+  ui.amStaging = false;
   ui.inSync = false;
   ui.isLeader = false;
   ui.error = null;
@@ -302,10 +322,7 @@ function handleMessage(data: string) {
       emit();
       break;
     case "control":
-      ingestRoomState({
-        paused: msg.paused, position: msg.position, videoKey: msg.videoKey,
-        title: msg.title, updatedAt: msg.updatedAt, driverId: msg.driverId,
-      });
+      ingestRoomState(msg);
       emit();
       break;
     case "tick":
@@ -322,8 +339,15 @@ function handleMessage(data: string) {
 /** Adopt a new shared room state — update the "what we're watching" labels and,
  *  if we're on that title, snap local playback to it. */
 function ingestRoomState(state: RoomState) {
+  lastRoomState = state;
   ui.roomVideoKey = state.videoKey;
+  ui.roomMetaId = state.metaId ?? null;
+  ui.roomMediaType = state.mediaType ?? null;
   ui.roomTitle = state.title;
+  ui.roomStreamLabel = state.streamLabel ?? null;
+  ui.roomStreamKey = state.streamKey ?? null;
+  ui.roomPaused = state.paused;
+  ui.staging = !!state.staging;
   recomputeSync();
   if (!ui.inSync || !bridge) return;
   const target = expectedPosition(state);
@@ -421,21 +445,113 @@ export function notifyLocalControl(next?: { paused: boolean; position: number })
   const establishing = ui.roomVideoKey == null;
   const matches = local.videoKey != null && local.videoKey === ui.roomVideoKey;
   if (!establishing && !matches) return;
+  broadcastControl(next?.paused ?? local.paused, next?.position ?? local.position);
+}
+
+/** Send a full control frame AND mirror it into the local room state — we
+ *  never receive our own frames, so without this our own inSync / room labels
+ *  would lag what we just told everyone else. */
+function broadcastControl(paused: boolean, position: number) {
+  if (!bridge) return;
+  const local = bridge.getLocal();
+  // Stream/meta IDENTITY (which title + which stream pick + staging) belongs to
+  // whoever established the party stream — the leader, or the very first control
+  // when the room has no title yet. An in-sync FOLLOWER pausing/seeking only
+  // moves the play-head; it must NOT overwrite the host's stream pick with its
+  // own per-user debrid resolution, nor clear the host's staging flag. So a
+  // non-owner preserves the room identity and re-sends it verbatim.
+  const owns = ui.isLeader || ui.roomVideoKey == null;
+  const videoKey = owns ? local.videoKey : ui.roomVideoKey;
+  const metaId = owns ? local.metaId : ui.roomMetaId;
+  const mediaType = owns ? local.mediaType : ui.roomMediaType;
+  const title = owns ? local.title : ui.roomTitle;
+  const streamLabel = owns ? local.streamLabel : ui.roomStreamLabel;
+  const streamKey = owns ? local.streamKey : ui.roomStreamKey;
+  const staging = owns ? localStaging : ui.staging;
+  ui.roomVideoKey = videoKey;
+  ui.roomMetaId = metaId;
+  ui.roomMediaType = mediaType;
+  ui.roomTitle = title;
+  ui.roomStreamLabel = streamLabel;
+  ui.roomStreamKey = streamKey;
+  ui.roomPaused = paused;
+  ui.staging = staging;
+  ui.amStaging = localStaging;
+  recomputeSync();
   send({
-    t: "control",
-    paused: next?.paused ?? local.paused,
-    position: next?.position ?? local.position,
-    videoKey: local.videoKey,
-    title: local.title,
+    t: "control", paused, position,
+    videoKey, metaId, mediaType, title, streamLabel, streamKey, staging,
+  });
+  emit();
+}
+
+/** Start (or switch) the party's stream and HOLD it (staging) for the party to
+ *  join. Bypasses the in-sync gate — this IS the new party content. Called by
+ *  the host right after their stream loads (paused). */
+export function startPartyStream(): void {
+  if (ui.status !== "connected" || !bridge) return;
+  localStaging = true;
+  broadcastControl(true, 0);
+}
+
+/** Whether WE are the one holding a staged stream (drives the host's
+ *  "waiting for party / Start now" UI + the auto-start effect). */
+export function amStagingHost(): boolean {
+  return localStaging && ui.status === "connected";
+}
+
+/** Clear our staging flag (host pressed "Start now" / auto-started). The
+ *  caller then unpauses local playback, whose broadcast carries staging=false. */
+export function setLocalStaging(v: boolean): void {
+  localStaging = v;
+  ui.amStaging = v;
+  emit();
+}
+
+/** Members (besides us) currently on the party's title — the "ready" count. */
+export function readyCount(): number {
+  if (!ui.roomVideoKey) return 0;
+  return ui.members.filter((m) => m.id !== ui.selfId && m.videoKey === ui.roomVideoKey).length;
+}
+
+/** True once every OTHER member is on the party's title — the auto-start
+ *  trigger. Excludes self (and reads self-readiness from local truth, not the
+ *  relay roster which lags) AND requires at least one other member, so a solo
+ *  host keeps waiting on the staging banner (with the Start-now override)
+ *  instead of blowing straight through it. */
+export function everyoneReady(): boolean {
+  if (!ui.roomVideoKey) return false;
+  const selfReady = (bridge?.getLocal().videoKey ?? null) === ui.roomVideoKey;
+  const others = ui.members.filter((m) => m.id !== ui.selfId);
+  return selfReady && others.length > 0 && others.every((m) => m.videoKey === ui.roomVideoKey);
+}
+
+/** Open the party's title locally, landing on the stream picker. */
+export function openRoomVideo(): void {
+  if (!bridge || !ui.roomMetaId) return;
+  bridge.openVideo({
+    metaId: ui.roomMetaId, mediaType: ui.roomMediaType, videoKey: ui.roomVideoKey,
+    title: ui.roomTitle, streamKey: ui.roomStreamKey,
   });
 }
 
 /** The local user switched what they're watching (active target changed).
- *  Updates presence + re-evaluates whether we're in sync with the party. */
+ *  Updates presence + the sync gate. The actual snap-to-room is DEFERRED to
+ *  resyncToRoom() on first decoded frame — seeking/pausing a stream that hasn't
+ *  loaded yet is a no-op on this libmpv build, so a member who Joins would land
+ *  un-synced (playing from 0 while the party is paused mid-film). */
 export function notifyLocalVideo(): void {
   if (ui.status !== "connected" || !bridge) return;
   const local = bridge.getLocal();
   send({ t: "video", videoKey: local.videoKey, title: local.title });
   recomputeSync();
   emit();
+}
+
+/** Snap local playback to the current room state — call once the local stream
+ *  has its first frame (so the seek/pause actually lands). Safe no-op unless we
+ *  are in sync on the room's title with a known room state. */
+export function resyncToRoom(): void {
+  if (!bridge || !ui.inSync || !lastRoomState) return;
+  applyRemote(lastRoomState.paused, expectedPosition(lastRoomState));
 }

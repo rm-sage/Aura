@@ -96,6 +96,7 @@ import { showFlyUpToast } from "../FlyUpToast";
 import ImageLoader from "../ImageLoader";
 import ErrorBoundary from "../ErrorBoundary";
 import { parseStream, chipStyleFor, type ChipKind } from "../streamMeta";
+import { streamMatchKey } from "../watchTogether/streamMatch";
 import Tooltip from "../Tooltip";
 import { BrandLogo, ratingDomain, groupRatingsByBrand } from "../logodev";
 import { hasUsableRating } from "../ratingValue";
@@ -141,6 +142,9 @@ interface Props {
       };
     },
   ) => void;
+  /** Watch-party: the leader's chosen stream match-key — highlights the
+   *  matching row so a member can one-tap the same stream. */
+  partyStreamKey?: string | null;
   /** Cast / crew name click handler. Wired by App to flip to Home + queue
    *  the name as the search query. DetailView calls this BEFORE onClose so
    *  the deep-link state is set before the unmount runs. */
@@ -282,7 +286,7 @@ export default function DetailView(props: Props) {
   );
 }
 
-function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
+function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
   const [detail, setDetail]                 = useState<MetaDetail | null>(null);
   const [streams, setStreams]               = useState<StreamEntry[]>([]);
   const [streamMeta, setStreamMeta]         = useState<StreamMetadata>({
@@ -1414,6 +1418,7 @@ function DetailViewBody({ meta, addons, fromRect, onClose, onPlayStream, onSearc
         >
           <UnifiedPanel
             mode={panelMode}
+            partyStreamKey={partyStreamKey}
             isEpisodic={isEpisodic}
             seriesId={meta.id}
             seriesMediaType={meta.media_type}
@@ -2193,6 +2198,7 @@ function SeasonAwareCastBlock({
 
 interface PanelProps {
   mode: PanelMode;
+  partyStreamKey?: string | null;
   isEpisodic: boolean;
   seriesId: string;
   /** "series" / "anime" — drives the meta-cache URL lookup that
@@ -2236,7 +2242,7 @@ interface PanelProps {
 }
 
 function UnifiedPanel({
-  mode, isEpisodic, seriesId, seriesMediaType, videos, activeVideo, streams, streamMeta, streamsLoading,
+  mode, partyStreamKey, isEpisodic, seriesId, seriesMediaType, videos, activeVideo, streams, streamMeta, streamsLoading,
   groupedStreams, metaLoading, onPickEpisode, onBackToEpisodes, onPlay, onCopy, onPlayExternal,
   scrollToVideoId, onScrollHandled, seasonHint, seasonNames, highlightVideoId, seriesArt,
 }: PanelProps) {
@@ -2293,6 +2299,7 @@ function UnifiedPanel({
               streamMeta={streamMeta}
               loading={streamsLoading}
               groups={groupedStreams}
+              partyStreamKey={partyStreamKey}
               onBack={isEpisodic ? onBackToEpisodes : undefined}
               onPlay={onPlay}
               onCopy={onCopy}
@@ -3440,7 +3447,7 @@ function StreamMessagesEmptyState({ metadata }: { metadata: StreamMetadata }) {
 }
 
 function StreamsPanel({
-  isEpisodic, activeVideo, streams, streamMeta, loading, groups, onBack, onPlay, onCopy, onPlayExternal,
+  isEpisodic, activeVideo, streams, streamMeta, loading, groups, partyStreamKey, onBack, onPlay, onCopy, onPlayExternal,
 }: {
   isEpisodic: boolean;
   activeVideo: VideoEntry | null;
@@ -3448,6 +3455,7 @@ function StreamsPanel({
   streamMeta: StreamMetadata;
   loading: boolean;
   groups: [string, StreamEntry[]][];
+  partyStreamKey?: string | null;
   onBack?: () => void;
   onPlay: (s: StreamEntry) => void;
   onCopy: (text: string) => void;
@@ -3554,6 +3562,7 @@ function StreamsPanel({
                     <StreamRow
                       key={`${s.url ?? s.info_hash ?? "x"}:${idx}`}
                       stream={s}
+                      partyMatch={!!partyStreamKey && streamMatchKey(s) === partyStreamKey}
                       onPlay={() => onPlay(s)}
                       onCopy={onCopy}
                       onPlayExternal={onPlayExternal}
@@ -3633,9 +3642,10 @@ function PanelHeader({
 // ---------------------------------------------------------------------------
 
 function StreamRow({
-  stream, onPlay, onCopy, onPlayExternal,
+  stream, partyMatch, onPlay, onCopy, onPlayExternal,
 }: {
   stream: StreamEntry;
+  partyMatch?: boolean;
   onPlay: () => void;
   onCopy: (text: string) => void;
   onPlayExternal: (url: string) => void;
@@ -3685,11 +3695,20 @@ function StreamRow({
         }>;
         openContextMenu(e.clientX, e.clientY, items);
       }}
-      className="relative hover-glow w-full text-left rounded-xl px-4 py-3
-                 bg-white/[0.04] border border-white/10
-                 hover:bg-white/[0.08] hover:border-white/18
-                 flex flex-col gap-2.5"
+      className={[
+        "relative hover-glow w-full text-left rounded-xl px-4 py-3",
+        "hover:bg-white/[0.08] hover:border-white/18 flex flex-col gap-2.5",
+        partyMatch
+          ? "bg-ln-accent/[0.10] border border-ln-accent/45 ring-1 ring-ln-accent/40"
+          : "bg-white/[0.04] border border-white/10",
+      ].join(" ")}
     >
+      {partyMatch && (
+        <span className="absolute -top-2 left-3 px-1.5 h-[15px] rounded-full bg-ln-accent text-black
+                         text-[9px] font-bold uppercase tracking-wider flex items-center leading-none">
+          Party pick
+        </span>
+      )}
       {/* TOP — quality summary on left, title/details on right. */}
       <div className="flex items-stretch gap-3">
         {/* Quality summary box. Three slots:

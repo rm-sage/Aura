@@ -62,7 +62,14 @@ import CastMenu from "./CastMenu";
 import CastSessionBar from "./CastSessionBar";
 import { useCastSession } from "./useCastSession";
 import WatchTogetherPanel from "./WatchTogetherPanel";
-import { setPlaybackBridge, notifyLocalControl, notifyLocalVideo } from "./watchTogether/store";
+import PartyButton from "./PartyButton";
+import PlayerPartyHud from "./PlayerPartyHud";
+import {
+  setPlaybackBridge, notifyLocalControl, notifyLocalVideo, resyncToRoom,
+  startPartyStream, setLocalStaging, amStagingHost, everyoneReady, getWatchState,
+} from "./watchTogether/store";
+import { useWatchTogether } from "./watchTogether/useWatchTogether";
+import { streamLabel, streamMatchKey } from "./watchTogether/streamMatch";
 import { parseStream } from "./streamMeta";
 import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPreviousEpisode } from "./nextUp";
 import { getMetaDetailFallback, getRichestMetaDetail, peekCachedDetailById, peekRichestCachedDetailById, peekFreshestPostersByIds } from "./metaCache";
@@ -1174,13 +1181,24 @@ export default function App() {
   // state when that actually changes.
   const wtIntendedPausedRef = useRef(paused);
   useEffect(() => { wtIntendedPausedRef.current = paused; }, [paused]);
+  // The leader's chosen stream (label + match key), stashed in handlePlayStream
+  // so the bridge can broadcast it to the party.
+  const wtStreamRef = useRef<{ label: string | null; key: string | null }>({ label: null, key: null });
+  // Set when the leader starts a party stream — staging is armed once the
+  // first frame lands (see the effect below).
+  const wtPendingStageRef = useRef(false);
+  const reactiveParty = useWatchTogether();
   useEffect(() => {
     setPlaybackBridge({
       getLocal: () => ({
         paused: wtPausedRef.current,
         position: wtTimeRef.current,
         videoKey: wtTargetRef.current?.id ?? null,
+        metaId: wtTargetRef.current?.series_id ?? wtTargetRef.current?.id ?? null,
+        mediaType: wtTargetRef.current?.media_type ?? null,
         title: wtTargetRef.current?.name ?? null,
+        streamLabel: wtStreamRef.current.label,
+        streamKey: wtStreamRef.current.key,
       }),
       apply: (remotePaused: boolean, position: number) => {
         if (Math.abs(wtTimeRef.current - position) > 0.4) wtSeekRef.current(position);
@@ -1189,9 +1207,45 @@ export default function App() {
           wtIntendedPausedRef.current = remotePaused;
         }
       },
+      openVideo: ({ metaId, mediaType, videoKey, title }) => {
+        // Land the member directly on the title's stream picker. Drop any
+        // active playback target first — DetailView only mounts when
+        // selectedMeta is set AND the player is inactive, so a member who's
+        // already watching something must leave that first or the Join no-ops.
+        setActiveTarget(null);
+        setSelectedRect(null);
+        setSelectedMeta({
+          id: metaId, name: title ?? "", media_type: mediaType ?? "movie",
+          poster: null, background: null, fanart: null, backdrop: null,
+          logo: null, release_info: null, description: null, imdb_rating: null, genres: [],
+        });
+        if (videoKey) setLastPlayedEpisodeId(videoKey);
+        setOpenInStreamsMode(true);
+        setWatchPanelOpen(false);
+      },
     });
     return () => setPlaybackBridge(null);
   }, []);
+  // Stage the leader's stream once it's actually showing (pause + tell the
+  // party). Pausing on the first frame rather than at load avoids racing the
+  // loadfile critical section.
+  useEffect(() => {
+    if (!firstFrameSeen) return;
+    if (wtPendingStageRef.current) {
+      // Leader establishing a NEW party stream — pause + stage it for the party.
+      wtPendingStageRef.current = false;
+      if (!wtIntendedPausedRef.current) {
+        togglePause();
+        wtIntendedPausedRef.current = true;
+      }
+      startPartyStream();
+    } else {
+      // A member who just joined the party's title — now that the stream has a
+      // decodable frame, snap to the room's live state (pause if staging, or
+      // seek to the current play-head). No-op unless we're in sync.
+      resyncToRoom();
+    }
+  }, [firstFrameSeen]);
   const wtTogglePause = useCallback(() => {
     const next = !wtIntendedPausedRef.current;
     togglePause();
@@ -1206,6 +1260,20 @@ export default function App() {
     seekRelative(d);
     notifyLocalControl({ paused: wtIntendedPausedRef.current, position: wtTimeRef.current + d });
   }, [seekRelative]);
+  // Start the party (unpause + clear staging) — the leader's "Start now"
+  // override, also called by the auto-start effect once everyone's ready.
+  const wtStartParty = useCallback(() => {
+    setLocalStaging(false);
+    if (wtIntendedPausedRef.current) {
+      wtTogglePause(); // unpause + broadcast (staging now false)
+    } else {
+      notifyLocalControl({ paused: false, position: wtTimeRef.current });
+    }
+  }, [wtTogglePause]);
+  // Auto-start once every member is on the party's stream.
+  useEffect(() => {
+    if (amStagingHost() && everyoneReady()) wtStartParty();
+  }, [reactiveParty.members, reactiveParty.roomVideoKey, reactiveParty.staging, wtStartParty]);
   // Tell the room what we're watching whenever the active title changes (so
   // presence + sync-gating stay current). Fires after the ref updates.
   useEffect(() => {
@@ -1347,6 +1415,16 @@ export default function App() {
     ) => {
       try {
         if (!stream.url && !stream.info_hash) return;
+        // ── Watch-Together: remember which stream this is (for broadcasting to
+        // the party), and if the leader is starting a NEW party stream, arm
+        // staging so it holds for the rest of the party once it's playing.
+        wtStreamRef.current = { label: streamLabel(stream), key: streamMatchKey(stream) };
+        {
+          const party = getWatchState();
+          const establishingParty =
+            party.status === "connected" && party.isLeader && target.id !== party.roomVideoKey;
+          wtPendingStageRef.current = establishingParty;
+        }
         // Live TV carve-out, computed from `target` (isLivePlayback derives
         // from activeTarget, which isn't set yet mid-load). A live channel has
         // no byte-range CDN edge to preheat and no useful scrubber thumbnails,
@@ -5675,6 +5753,7 @@ export default function App() {
           state continuous. The manual library-refresh control now
           lives inside this bell's popup header. */}
       <NotificationsBell library={library} />
+      <PartyButton />
 
       </div>
       )}
@@ -5873,6 +5952,12 @@ export default function App() {
         />
       )}
 
+      {/* Watch-party HUD — presence cluster + the "waiting for the party"
+          staging banner (host gets a Start-now override). */}
+      {isPlayerActive && (
+        <PlayerPartyHud onStart={wtStartParty} isFullscreen={isFullscreen} />
+      )}
+
       {/* In-player source switcher — sibling to PlayerOverlay; its own root is
           fixed + z-[10001] (above PlayerOverlay's z-[9999]). */}
       {activeTarget && (
@@ -6026,6 +6111,7 @@ export default function App() {
           meta={selectedMeta}
           addons={addons}
           fromRect={selectedRect}
+          partyStreamKey={reactiveParty.status === "connected" ? reactiveParty.roomStreamKey : null}
           onClose={closeDetail}
           onPlayStream={handlePlayStream}
           onSearchByName={(name) => {
