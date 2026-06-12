@@ -33,6 +33,12 @@ function bridgeUrl(url: string): string {
   return BRIDGE + encodeURIComponent(url);
 }
 
+const VOLUME_KEY = "aura.iptv.multiviewVolume";
+function loadVolume(): number {
+  const v = parseFloat(localStorage.getItem(VOLUME_KEY) ?? "");
+  return Number.isFinite(v) && v >= 0 && v <= 1 ? v : 0.5;
+}
+
 /** Is this an HLS manifest URL? hls.js only plays HLS — raw `.ts`/`.mp4`
  *  live URLs (Xtream `output=ts`, generic M3U) must not be handed to it. */
 function isHlsUrl(url: string): boolean {
@@ -84,6 +90,11 @@ export default function MultiView({ channels, onPlayChannel, suspended }: Props)
   const [tiles, setTiles] = useState<(IptvChannel | null)[]>(() => Array(4).fill(null));
   const [audioTile, setAudioTile] = useState(0);
   const [picking, setPicking] = useState<number | null>(null);
+  const [volume, setVolume] = useState(loadVolume);
+  const changeVolume = (v: number) => {
+    setVolume(v);
+    try { localStorage.setItem(VOLUME_KEY, String(v)); } catch { /* ignore */ }
+  };
 
   const slots = useMemo(() => tiles.slice(0, count), [tiles, count]);
 
@@ -135,6 +146,36 @@ export default function MultiView({ channels, onPlayChannel, suspended }: Props)
         >
           Clear all
         </button>
+
+        {/* Volume for the audio-focused tile (others stay muted). Persisted. */}
+        <div className="flex items-center gap-2 ml-auto">
+          <button
+            type="button"
+            onClick={() => changeVolume(volume > 0 ? 0 : 0.5)}
+            aria-label={volume > 0 ? "Mute" : "Unmute"}
+            className="w-8 h-8 rounded-lg flex items-center justify-center text-white/60 hover:text-white hover:bg-white/10"
+          >
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor">
+              {volume === 0 ? (
+                <path d="M3 10v4h4l5 5V5L7 10H3zm13.59 2 2.7-2.7-1.41-1.41L15.17 10.6 12.46 7.9 11.05 9.3 13.76 12l-2.71 2.7 1.41 1.41 2.71-2.7 2.71 2.7 1.41-1.41z" />
+              ) : volume < 0.5 ? (
+                <path d="M3 10v4h4l5 5V5L7 10H3zm13.5 2a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4z" />
+              ) : (
+                <path d="M3 10v4h4l5 5V5L7 10H3zm13.5 2a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4zM14 3.23v2.06a7 7 0 0 1 0 13.42v2.06a9 9 0 0 0 0-17.54z" />
+              )}
+            </svg>
+          </button>
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.02}
+            value={volume}
+            onChange={(e) => changeVolume(parseFloat(e.target.value))}
+            aria-label="Multiview volume"
+            className="w-28 accent-ln-accent cursor-pointer"
+          />
+        </div>
       </div>
 
       {/* Simultaneous-stream warning (kept per the user's request). */}
@@ -159,6 +200,7 @@ export default function MultiView({ channels, onPlayChannel, suspended }: Props)
               key={i}
               channel={ch}
               audio={i === audioTile}
+              volume={volume}
               suspended={!!suspended}
               onFocusAudio={() => setAudioTile(i)}
               onPick={() => setPicking(i)}
@@ -195,6 +237,7 @@ export default function MultiView({ channels, onPlayChannel, suspended }: Props)
 const Tile = memo(function Tile({
   channel,
   audio,
+  volume,
   suspended,
   onFocusAudio,
   onPick,
@@ -203,6 +246,7 @@ const Tile = memo(function Tile({
 }: {
   channel: IptvChannel | null;
   audio: boolean;
+  volume: number;
   suspended: boolean;
   onFocusAudio: () => void;
   onPick: () => void;
@@ -272,10 +316,13 @@ const Tile = memo(function Tile({
     };
   }, [channel, suspended]);
 
-  // Mute everything except the audio-focused tile.
+  // Mute everything except the audio-focused tile; apply the shared volume.
   useEffect(() => {
-    if (videoRef.current) videoRef.current.muted = !audio;
-  }, [audio, status]);
+    const v = videoRef.current;
+    if (!v) return;
+    v.muted = !audio;
+    v.volume = volume;
+  }, [audio, volume, status]);
 
   if (!channel) {
     return (
