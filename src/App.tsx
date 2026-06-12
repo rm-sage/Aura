@@ -4515,6 +4515,18 @@ export default function App() {
     // Picking the already-playing row is a no-op (the UI disables it too).
     if (stream.url && stream.url === activeStreamUrl) { setSwitcherOpen(false); return; }
     setSwitcherResolvingKey(streamKey(stream));
+    // The live position wins; but if the user switched within the first
+    // seconds (e.g. the original source failed to start), fall back to the
+    // library's saved offset for the SAME video so the swap doesn't lose
+    // the resume point. Mirrors handlePlayStream's same-episode rule.
+    const seriesKey = activeTarget.series_id ?? activeTarget.id;
+    const libRow = libraryRef.current.find((i) => i.id === seriesKey);
+    const st = (libRow?.state ?? {}) as { timeOffset?: number; video_id?: string };
+    const sameVideo = activeTarget.media_type === "movie"
+      || st.video_id == null
+      || st.video_id === activeTarget.id;
+    const savedOffset = sameVideo && typeof st.timeOffset === "number" ? st.timeOffset : 0;
+    const startAt = time > 5 ? time : Math.max(time, savedOffset);
     void handlePlayStream(stream, {
       id:            activeTarget.id,
       series_id:     activeTarget.series_id,
@@ -4532,7 +4544,7 @@ export default function App() {
         genres:               activeTarget.genres ?? undefined,
         country:              null,
       },
-    }, { forceStartSeconds: time > 1 ? time : 0 })
+    }, { forceStartSeconds: startAt })
       .catch(() => {
         window.dispatchEvent(new CustomEvent("aura:player-toast", {
           detail: { message: "Couldn't switch source" },
