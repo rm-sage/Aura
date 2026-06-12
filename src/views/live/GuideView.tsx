@@ -102,10 +102,15 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
               above the ruler, with the now-line descending from its base. */}
           <div className="relative" style={{ height: LIVE_STRIP_H }}>
             {nowX >= 0 && nowX <= timelineW && (
+              // Left-anchored at the now-line (a flag to its right) rather than
+              // centred — the now-line lives in the first hour (left edge), so
+              // a centred pill's left half slid under the sticky channel column
+              // right after an hour rollover and got clipped. A 2px left nudge
+              // tucks the line under the pill's edge.
               <span
-                className="absolute bottom-0 -translate-x-1/2 px-1.5 h-[16px] flex items-center rounded-full
+                className="absolute bottom-0 px-1.5 h-[16px] flex items-center rounded-full
                            bg-red-500 text-white text-[9px] font-bold tracking-wider leading-none"
-                style={{ left: CHANNEL_COL_W + nowX }}
+                style={{ left: CHANNEL_COL_W + nowX - 2 }}
               >
                 LIVE
               </span>

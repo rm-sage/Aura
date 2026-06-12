@@ -2455,6 +2455,27 @@ function useLiveDvr(isLive: boolean, time: number, streamKey: string | null): Li
     t: 0, wall: 0, init: false, key: null,
   });
   const [state, setState] = useState<LiveDvrState>({ atLive: true, edge: 0, windowStart: 0, position: 0 });
+  const lastEmit = useRef<LiveDvrState | null>(null);
+
+  // mpv fires time-pos events many times per second; the DVR scrubber only
+  // moves sub-pixel between them, so committing a fresh state object each
+  // event re-rendered the whole PlayerOverlay an EXTRA time per tick (the
+  // live-lag cause). Dedupe to whole-second granularity — re-emit only when a
+  // visible value changes.
+  const commit = (next: LiveDvrState) => {
+    const prev = lastEmit.current;
+    if (
+      prev &&
+      prev.atLive === next.atLive &&
+      Math.round(prev.edge) === Math.round(next.edge) &&
+      Math.round(prev.windowStart) === Math.round(next.windowStart) &&
+      Math.round(prev.position) === Math.round(next.position)
+    ) {
+      return;
+    }
+    lastEmit.current = next;
+    setState(next);
+  };
 
   useEffect(() => {
     if (!isLive) {
@@ -2472,7 +2493,7 @@ function useLiveDvr(isLive: boolean, time: number, streamKey: string | null): Li
     const est = anchor.current.t + (now - anchor.current.wall);
     if (!anchor.current.init || anchor.current.key !== streamKey || time < est - DVR_WINDOW_S - 60) {
       anchor.current = { t: time, wall: now, init: true, key: streamKey };
-      setState({
+      commit({
         atLive: true,
         edge: time,
         windowStart: Math.max(0, time - DVR_WINDOW_S),
@@ -2490,7 +2511,7 @@ function useLiveDvr(isLive: boolean, time: number, streamKey: string | null): Li
       atLive = false;
     }
     const edge = anchor.current.t + (Date.now() / 1000 - anchor.current.wall);
-    setState({
+    commit({
       atLive,
       edge,
       windowStart: Math.max(0, edge - DVR_WINDOW_S),

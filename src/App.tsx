@@ -4319,13 +4319,18 @@ export default function App() {
   }, [activeTarget, duration]);
 
   // ── SMTC: push playback state on every pause / time change at low rate ──
+  // Deduped to whole-second granularity: `time` ticks many times/sec, but the
+  // OS media flyout only needs second resolution, so we skip redundant IPC
+  // (this was firing an invoke per time-pos event — a chunk of the live-
+  // playback UI lag, where the position is meaningless anyway).
+  const lastSmtcRef = useRef<string>("");
   useEffect(() => {
     if (!activeTarget) return;
-    invoke("smtc_set_playback", {
-      playing: duration > 0,
-      paused,
-      position: time,
-    }).catch(() => {});
+    const payload = { playing: duration > 0, paused, position: Math.round(time) };
+    const sig = `${payload.playing}|${payload.paused}|${payload.position}`;
+    if (sig === lastSmtcRef.current) return;
+    lastSmtcRef.current = sig;
+    invoke("smtc_set_playback", payload).catch(() => {});
   }, [activeTarget, paused, duration, time]);
 
   // ── Global wheel-to-volume — only while the player overlay is up.
