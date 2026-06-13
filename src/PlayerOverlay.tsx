@@ -1022,6 +1022,13 @@ interface Props {
    *  about to see something. */
   firstFrameSeen: boolean;
 
+  /** True when we're a NON-leader synced to a watch party — the leader controls
+   *  playback, so the transport controls (play/pause / seek / skip / speed) are
+   *  disabled with a hint. Local-only controls (volume, subs, fullscreen) stay
+   *  live. The handlers are also no-ops in this state (gated in App), so this is
+   *  purely the visual/affordance half. */
+  partyFollower?: boolean;
+
   // Handlers
   togglePause: () => void;
   seekRelative: (s: number) => void;
@@ -1226,6 +1233,7 @@ export default function PlayerOverlay({
   isAnime,
   isLive = false,
   time, duration, paused, volume, speed, buffering, bufferPct, firstFrameSeen,
+  partyFollower = false,
   togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
   onExitPlayback,
   subsOpen, setSubsOpen,
@@ -2077,7 +2085,7 @@ export default function PlayerOverlay({
               scrubber; Live TV gets the DVR scrubber (rewind within the
               demuxer back-buffer, "Go Live" to snap back to the edge). ── */}
           {!isLive && (
-            <div className="px-1.5 pt-0.5">
+            <div className={`px-1.5 pt-0.5 ${partyFollower ? "pointer-events-none opacity-60" : ""}`}>
               <Scrubber
                 value={displayTime}
                 max={duration || 1}
@@ -2102,14 +2110,19 @@ export default function PlayerOverlay({
             </div>
           )}
           {isLive && (
-            <LiveScrubber
-              windowStart={dvr.windowStart}
-              edge={dvr.edge}
-              position={dvr.position}
-              atLive={dvr.atLive}
-              onSeek={(t) => seekAbsolute(t)}
-              onGoLive={goLive}
-            />
+            // Defensive: a party follower is never on Live TV (live reports a
+            // null videoKey ⇒ never in sync ⇒ partyFollower stays false), but
+            // disable the DVR scrubber under the flag anyway for consistency.
+            <div className={partyFollower ? "pointer-events-none opacity-60" : ""}>
+              <LiveScrubber
+                windowStart={dvr.windowStart}
+                edge={dvr.edge}
+                position={dvr.position}
+                atLive={dvr.atLive}
+                onSeek={(t) => seekAbsolute(t)}
+                onGoLive={goLive}
+              />
+            </div>
           )}
 
           {/* ── Button row — order: Rewind ▶ Play/Pause ▶ Forward ── */}
@@ -2122,34 +2135,47 @@ export default function PlayerOverlay({
                 demuxer back-buffer (the DVR window). Forward-10 only shows
                 when behind live (catching up toward the edge); at the live
                 edge there's nothing ahead to seek into. */}
-            <IconButton
-              onClick={() => seekRelative(-10)}
-              label="Skip back 10 seconds"
-              tooltip="Back 10 s"
-            >
-              <ReplayIcon />
-            </IconButton>
-
-            <Tooltip text={paused ? "Play (Space)" : "Pause (Space)"} pos="top">
-              <button
-                onClick={togglePause}
-                aria-label={paused ? "Play" : "Pause"}
-                className="flex items-center justify-center w-11 h-11 rounded-full
-                           bg-ln-accent/15 text-ln-accent hover:bg-ln-accent/25
-                           transition-colors flex-shrink-0"
-              >
-                {paused ? <PlayIcon /> : <PauseIcon />}
-              </button>
-            </Tooltip>
-
-            {(!isLive || !dvr.atLive) && (
+            <div className={`flex items-center gap-1.5 ${partyFollower ? "opacity-[0.45] pointer-events-none" : ""}`}>
               <IconButton
-                onClick={() => seekRelative(10)}
-                label="Skip forward 10 seconds"
-                tooltip="Forward 10 s"
+                onClick={() => seekRelative(-10)}
+                label="Skip back 10 seconds"
+                tooltip="Back 10 s"
               >
-                <ForwardIcon />
+                <ReplayIcon />
               </IconButton>
+
+              <Tooltip text={paused ? "Play (Space)" : "Pause (Space)"} pos="top">
+                <button
+                  onClick={togglePause}
+                  aria-label={paused ? "Play" : "Pause"}
+                  className="flex items-center justify-center w-11 h-11 rounded-full
+                             bg-ln-accent/15 text-ln-accent hover:bg-ln-accent/25
+                             transition-colors flex-shrink-0"
+                >
+                  {paused ? <PlayIcon /> : <PauseIcon />}
+                </button>
+              </Tooltip>
+
+              {(!isLive || !dvr.atLive) && (
+                <IconButton
+                  onClick={() => seekRelative(10)}
+                  label="Skip forward 10 seconds"
+                  tooltip="Forward 10 s"
+                >
+                  <ForwardIcon />
+                </IconButton>
+              )}
+            </div>
+
+            {partyFollower && (
+              <span className="ml-2 flex items-center gap-1 text-amber-200/85 text-[11.5px] whitespace-nowrap
+                               [text-shadow:_0_1px_3px_rgba(0,0,0,0.8)]">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                  <rect x="4" y="11" width="16" height="9" rx="2" /><path d="M8 11V8a4 4 0 0 1 8 0v3" />
+                </svg>
+                Leader controls playback
+              </span>
             )}
 
             {/* Time display — current / total. For Live TV: a LIVE badge at
@@ -2182,12 +2208,14 @@ export default function PlayerOverlay({
                 exist for the current stream, doubles as a "Detect"
                 affordance (silencedetect manual fallback). */}
             {!isLive && (
-              <SkipWindowButton
-                time={time}
-                seekAbsolute={seekAbsolute}
-                streamUrl={streamUrl}
-                mediaType={activeTarget?.media_type}
-              />
+              <div className={partyFollower ? "pointer-events-none opacity-[0.45]" : ""}>
+                <SkipWindowButton
+                  time={time}
+                  seekAbsolute={seekAbsolute}
+                  streamUrl={streamUrl}
+                  mediaType={activeTarget?.media_type}
+                />
+              </div>
             )}
 
             {/* Spacer */}
@@ -2202,8 +2230,11 @@ export default function PlayerOverlay({
               Icon={VolumeIconForLevel}
             />
 
-            {/* Speed */}
-            <SpeedMenu speed={speed} onChange={commitSpeed} />
+            {/* Speed — disabled for a party follower (rate isn't synced, so a
+                follower at a different speed would constantly drift + re-seek). */}
+            <div className={partyFollower ? "pointer-events-none opacity-[0.45]" : ""}>
+              <SpeedMenu speed={speed} onChange={commitSpeed} />
+            </div>
 
             {/* Audio tracks — always render the dropdown so the dedicated
                 voice-track button is present even before MPV resolves
@@ -2391,6 +2422,7 @@ export default function PlayerOverlay({
             <MoreMenu
               streamUrl={streamUrl}
               onRestart={() => seekAbsolute(0)}
+              partyFollower={partyFollower}
               activeTarget={activeTarget}
               isAnime={isAnime}
               time={time}
@@ -3399,10 +3431,12 @@ function TrackMenu({
 // ---------------------------------------------------------------------------
 
 function MoreMenu({
-  streamUrl, onRestart, activeTarget, isAnime, time, duration, skipWindows,
+  streamUrl, onRestart, partyFollower, activeTarget, isAnime, time, duration, skipWindows,
 }: {
   streamUrl: string | null;
   onRestart: () => void;
+  /** True for a non-leader synced to a party — Restart is a seek, so disable it. */
+  partyFollower: boolean;
   activeTarget: ActiveScrobbleTarget | null;
   isAnime: boolean;
   time: number;
@@ -3525,7 +3559,12 @@ function MoreMenu({
             onClick={() => { setAniskipOpen(true); setOpen(false); }}
           />
           <div className="my-1 mx-3 h-px bg-white/8" />
-          <MoreItem icon={<RestartIcon />}  label="Restart from beginning" onClick={() => { onRestart(); setOpen(false); }} />
+          <MoreItem
+            icon={<RestartIcon />}
+            label={partyFollower ? "Restart — leader controls playback" : "Restart from beginning"}
+            disabled={partyFollower}
+            onClick={() => { onRestart(); setOpen(false); }}
+          />
           <MoreItem
             icon={
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"

@@ -20,7 +20,7 @@
 import type {
   WatchMember, RoomState, ServerMsg, PlaybackBridge, VotePoll,
 } from "./types";
-import { showAppToast } from "../AppToast";
+import { showPartyToast } from "../PartyToast";
 
 const LS_URL = "aura.watch.relayUrl";
 const LS_NAME = "aura.watch.displayName";
@@ -50,13 +50,19 @@ const RECONNECT_MAX = 4;
  *  malicious peer) can't thrash the local playhead. */
 const APPLY_MIN_INTERVAL_MS = 300;
 
-export type WatchStatus = "idle" | "connecting" | "connected" | "error";
+export type WatchStatus = "idle" | "connecting" | "connected" | "error" | "not-found";
 
 export interface WatchUiState {
   status: WatchStatus;
   roomCode: string | null;
   selfId: string | null;
   members: WatchMember[];
+  /** The room's current leader (host) cid, as the relay reports it — drives the
+   *  crown, the transfer affordance, and the leader-only playback gate. */
+  leaderId: string | null;
+  /** The code that was just refused (status === "not-found") — drives the
+   *  Lobby's "no one is hosting X — create it?" affordance. */
+  pendingCode: string | null;
   /** What the party is watching (from the shared playback state). */
   roomVideoKey: string | null;
   roomMetaId: string | null;
@@ -94,6 +100,8 @@ const ui: WatchUiState = {
   roomCode: null,
   selfId: null,
   members: [],
+  leaderId: null,
+  pendingCode: null,
   ...BLANK_ROOM,
   amStaging: false,
   inSync: false,
@@ -109,6 +117,7 @@ let ws: WebSocket | null = null;
 let serverClockOffset = 0; // serverNow − Date.now() at welcome
 let leaderTimer: ReturnType<typeof setInterval> | null = null;
 let userLeft = false; // distinguishes a deliberate leave from a dropped socket
+let roomNotFound = false; // set on a `room-not-found` frame so onclose doesn't reconnect
 let reconnectAttempts = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let bridge: PlaybackBridge | null = null;
@@ -127,6 +136,12 @@ function clearPendingLeaves() {
   for (const t of pendingLeaveTimers.values()) clearTimeout(t);
   pendingLeaveTimers.clear();
 }
+// Member ids we've already announced as PRESENT (a join toast fired, or they
+// were in the roster at welcome). Makes join toasts idempotent — an unstable
+// peer flapping across the leave-grace window can't re-toast. An id is removed
+// only when its deferred "left" toast actually fires, so a genuine rejoin
+// re-toasts.
+let toastedMembers = new Set<string>();
 
 // ── Pub/sub ────────────────────────────────────────────────────────────────
 const subs = new Set<() => void>();
@@ -189,22 +204,47 @@ function genCode(): string {
   return out;
 }
 
-/** Create a new room (you become the first member / leader). Returns the code. */
+/** Normalize a user-typed code to the relay's accepted shape (A-Z0-9, 4-16).
+ *  Returns null + surfaces an error if it can't be made valid. */
+function normalizeCode(code: string): string | null {
+  const c = code.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (c.length < 4 || c.length > 16) {
+    setError("Room codes are 4–16 letters or numbers.");
+    return null;
+  }
+  return c;
+}
+
+/** Create a new room (you become the first member / host). Returns the code. */
 export function createRoom(): string | null {
   const code = genCode();
-  return connect(code) ? code : null;
+  return connect(code, "create") ? code : null;
+}
+
+/** Create a room with a SPECIFIC code (the "create it instead" affordance after
+ *  a join found no host). Returns the code, or null if the code is invalid. */
+export function createRoomWithCode(code: string): string | null {
+  const c = normalizeCode(code);
+  if (!c) return null;
+  return connect(c, "create") ? c : null;
 }
 
 export function joinRoom(code: string): boolean {
-  const c = code.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
-  if (!c) {
-    setError("Enter a room code.");
-    return false;
-  }
-  return connect(c);
+  const c = normalizeCode(code);
+  if (!c) return false;
+  return connect(c, "join");
 }
 
 export function leaveRoom(): void {
+  // Tell the relay we're leaving DELIBERATELY (before teardown closes the
+  // socket) so the leader crown hands off permanently to the next member and
+  // the room sees our departure promptly (vs. waiting for CF to reap the dead
+  // socket). Best-effort — only sendable when OPEN. If we're still CONNECTING
+  // (a reconnect in flight), bye is skipped, but the relay's webSocketClose
+  // still resolves the next effective leader; the only thing missed is the
+  // explicit permanent promotion, which is moot since a deliberate leaver sets
+  // userLeft and won't reconnect to reclaim.
+  if (ws && ws.readyState === WebSocket.OPEN) send({ t: "bye" });
   userLeft = true;
   localStaging = false;
   teardown();
@@ -212,6 +252,8 @@ export function leaveRoom(): void {
   ui.roomCode = null;
   ui.selfId = null;
   ui.members = [];
+  ui.leaderId = null;
+  ui.pendingCode = null;
   Object.assign(ui, BLANK_ROOM);
   ui.amStaging = false;
   ui.inSync = false;
@@ -221,10 +263,11 @@ export function leaveRoom(): void {
   ui.wonVotes = [];
   ui.voteError = null;
   previousMemberIds = new Set();
+  toastedMembers = new Set();
   emit();
 }
 
-function connect(code: string): boolean {
+function connect(code: string, intent: "join" | "create"): boolean {
   const base = getRelayUrl();
   if (!base) {
     setError("Set a relay URL in Settings → Watch Together first.");
@@ -232,14 +275,16 @@ function connect(code: string): boolean {
   }
   teardown();
   userLeft = false;
+  roomNotFound = false;
   ui.status = "connecting";
   ui.roomCode = code;
+  ui.pendingCode = null;
   ui.error = null;
   emit();
 
   let url: string;
   try {
-    url = buildUrl(base, code);
+    url = buildUrl(base, code, intent);
   } catch {
     setError("That relay URL doesn't look valid (use wss://… or ws://…).");
     return false;
@@ -267,9 +312,14 @@ function connect(code: string): boolean {
   ws.onerror = () => {
     // onclose follows; surface a hint there.
   };
-  ws.onclose = () => {
+  ws.onclose = (ev) => {
     stopLeaderTimer();
-    if (userLeft) return;
+    if (userLeft || roomNotFound) return;
+    // A join to a room nobody is hosting is closed by the relay with the app
+    // code 4404 — settle into not-found (don't reconnect, which would auto-
+    // create). This is the reliable signal even if the room-not-found frame
+    // didn't flush before the close.
+    if (ev.code === 4404) { enterNotFound(ui.roomCode); return; }
     // Clear the SHARED staging/sync flags so the pause gate (wtStagedHold reads
     // ui.staging && ui.inSync) lifts in lock-step with the banner hiding during
     // the "connecting" window — otherwise the host sees the banner vanish (it's
@@ -284,7 +334,7 @@ function connect(code: string): boolean {
       reconnectAttempts += 1;
       ui.status = "connecting";
       emit();
-      reconnectTimer = setTimeout(() => connect(ui.roomCode as string), 1500 * reconnectAttempts);
+      reconnectTimer = setTimeout(() => connect(ui.roomCode as string, "create"), 1500 * reconnectAttempts);
     } else {
       ui.status = "error";
       ui.error = ui.error ?? "Lost the watch-together connection.";
@@ -294,7 +344,7 @@ function connect(code: string): boolean {
   return true;
 }
 
-function buildUrl(base: string, code: string): string {
+function buildUrl(base: string, code: string, intent: "join" | "create"): string {
   let b = base.trim();
   // Tolerate http(s):// by upgrading to ws(s):// — a common copy-paste slip.
   if (b.startsWith("https://")) b = "wss://" + b.slice(8);
@@ -306,6 +356,9 @@ function buildUrl(base: string, code: string): string {
   const params = new URLSearchParams();
   params.set("name", getDisplayName());
   params.set("cid", getClientId());
+  // join → the relay refuses to auto-create if nobody's hosting (so we can
+  // offer "create it"). create/reconnect → auto-create / re-establish.
+  params.set("intent", intent);
   const v = bridge?.getLocal().videoKey ?? "";
   if (v) params.set("video", v);
   const token = getAppToken();
@@ -331,6 +384,23 @@ function setError(msg: string) {
   emit();
 }
 
+/** Settle into the "no one is hosting this code" state (the Lobby then offers
+ *  "create it instead"). Sets roomNotFound so onclose won't reconnect, tears the
+ *  socket down, and stashes the code for the create affordance. Driven by BOTH a
+ *  `room-not-found` frame and a 4404 close code (whichever arrives). */
+function enterNotFound(code: string | null) {
+  roomNotFound = true;
+  teardown();
+  ui.status = "not-found";
+  ui.pendingCode = code;
+  ui.roomCode = null;
+  ui.selfId = null;
+  ui.members = [];
+  ui.leaderId = null;
+  ui.error = null;
+  emit();
+}
+
 function send(obj: unknown) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     try { ws.send(JSON.stringify(obj)); } catch { /* dropped */ }
@@ -345,10 +415,12 @@ function handleMessage(data: string) {
     case "welcome": {
       reconnectAttempts = 0; // proven-healthy connection — re-arm the cap
       ui.selfId = msg.selfId;
+      ui.leaderId = msg.leaderId ?? null;
       serverClockOffset = msg.serverNow - Date.now();
       ui.members = msg.members;
       previousMemberIds = new Set(msg.members.map((m) => m.id)); // seed (no join toasts on welcome)
-      recomputeLeader(); // needs members + selfId (both set) — before ingest so we know ownership
+      toastedMembers = new Set(msg.members.map((m) => m.id)); // everyone present is already "announced"
+      recomputeLeader(); // needs members + selfId + leaderId — before ingest so we know ownership
       // A reconnecting LEADER already on the room's ESTABLISHED title re-asserts
       // its CURRENT local playback over the relay's persisted state, which can be
       // stale (e.g. we started playing during the drop — a control that never
@@ -369,19 +441,25 @@ function handleMessage(data: string) {
       break;
     }
     case "members": {
+      const prevLeader = ui.leaderId;
+      ui.leaderId = msg.leaderId ?? null;
       // Diff against the last roster (by stable id) to toast true joins/leaves —
       // never for self, never on the initial welcome (seeded there).
       const newIds = new Set(msg.members.map((m) => m.id));
       // Joins — but a member RETURNING within the leave grace window is a
       // reconnect blip, not a join: cancel the pending "left", emit nothing.
+      // toastedMembers makes the announcement idempotent (no re-toast on a
+      // flapping peer or a duplicate frame).
       for (const m of msg.members) {
         if (m.id === ui.selfId || previousMemberIds.has(m.id)) continue;
         const pending = pendingLeaveTimers.get(m.id);
         if (pending) {
           clearTimeout(pending);
           pendingLeaveTimers.delete(m.id);
-        } else {
-          showAppToast(`${m.name} joined the party`, { tone: "success" });
+          toastedMembers.add(m.id); // returned within grace — still present
+        } else if (!toastedMembers.has(m.id)) {
+          toastedMembers.add(m.id);
+          showPartyToast(`${m.name} joined the party`, { tone: "success" });
         }
       }
       // Leaves — DEFERRED so a transient reconnect (the member reappears within
@@ -391,12 +469,20 @@ function handleMessage(data: string) {
         const { id, name } = m;
         const timer = setTimeout(() => {
           pendingLeaveTimers.delete(id);
-          if (ui.status === "connected") showAppToast(`${name} left the party`, { tone: "default" });
+          toastedMembers.delete(id); // truly gone — a later rejoin re-toasts
+          if (ui.status === "connected") showPartyToast(`${name} left the party`, { tone: "default" });
         }, 6000);
         pendingLeaveTimers.set(id, timer);
       }
       previousMemberIds = newIds;
       ui.members = msg.members;
+      // Announce a leadership change (transfer or handoff) — but not the initial
+      // assignment (prevLeader null) or a no-op repeat.
+      if (ui.leaderId && prevLeader && ui.leaderId !== prevLeader) {
+        const ldr = msg.members.find((m) => m.id === ui.leaderId);
+        if (ui.leaderId === ui.selfId) showPartyToast("You're the host now", { tone: "leader" });
+        else if (ldr) showPartyToast(`${ldr.name} is the host now`, { tone: "leader" });
+      }
       recomputeLeader();
       recomputeSync();
       emit();
@@ -427,6 +513,11 @@ function handleMessage(data: string) {
     }
     case "vote-error":
       setVoteError(msg.reason);
+      break;
+    case "room-not-found":
+      // A join found no host — surface the "create it instead" affordance. (The
+      // 4404 close code in onclose is the fallback if this frame doesn't land.)
+      enterNotFound(msg.code || ui.roomCode);
       break;
     default:
       break;
@@ -461,7 +552,7 @@ function ingestRoomState(state: RoomState, drive = true) {
  *  during a membership change and a non-leader peer spamming forged ticks. */
 function applyTick(position: number, paused: boolean, driverId: string | null) {
   if (!ui.inSync || !bridge || paused) return;
-  if (!driverId || driverId !== leaderId()) return;
+  if (!driverId || driverId !== effectiveLeaderId()) return;
   const local = bridge.getLocal();
   if (local.paused) return;
   if (Math.abs(local.position - position) > DRIFT_THRESHOLD_S) {
@@ -494,10 +585,17 @@ function recomputeSync() {
   ui.inSync = ui.roomVideoKey != null && local != null && local === ui.roomVideoKey;
 }
 
-/** The current leader = lowest member id (deterministic across clients). */
+/** Fallback leader = lowest member id (deterministic across clients). Used only
+ *  before the first leader-bearing frame arrives, or against an un-redeployed
+ *  relay; normally the relay-provided ui.leaderId wins. */
 function leaderId(): string | null {
   if (ui.members.length === 0) return null;
   return ui.members.reduce((a, m) => (m.id < a ? m.id : a), ui.members[0].id);
+}
+
+/** The effective leader cid this client believes in (relay value, else fallback). */
+function effectiveLeaderId(): string | null {
+  return ui.leaderId ?? leaderId();
 }
 
 function recomputeLeader() {
@@ -506,7 +604,7 @@ function recomputeLeader() {
     stopLeaderTimer();
     return;
   }
-  const isLeader = ui.selfId === leaderId();
+  const isLeader = ui.selfId === effectiveLeaderId();
   ui.isLeader = isLeader;
   if (isLeader) startLeaderTimer();
   else stopLeaderTimer();
@@ -548,13 +646,19 @@ export function notifyLocalControl(next?: { paused: boolean; position: number })
   // would otherwise hit the relay's `?? prev` fallback and RESURRECT the old
   // VOD party stream, yanking every follower to the leader's live playhead.
   if (local.videoKey == null) return;
-  const matches = local.videoKey != null && local.videoKey === ui.roomVideoKey;
-  // ONLY the party LEADER may establish or change the party stream. Followers
-  // can still drive play/pause/seek, but ONLY when their local title already
-  // matches the room's (in sync) — a follower never delegates a stream, and a
-  // follower off watching something else can't broadcast at all.
-  if (!ui.isLeader && !matches) return;
+  // ONLY the party LEADER drives the party's playback (play/pause/seek) and the
+  // stream identity. A follower never broadcasts — the relay drops their control
+  // frames too, and the player UI disables their transport controls. (This
+  // supersedes the old "in-sync follower may also drive" behaviour.)
+  if (!ui.isLeader) return;
   broadcastControl(next?.paused ?? local.paused, next?.position ?? local.position);
+}
+
+/** LEADER ONLY — hand the host crown to another connected member. The relay
+ *  validates (current leader + target present) and broadcasts the new leaderId. */
+export function transferLeader(targetId: string): void {
+  if (ui.status !== "connected" || !ui.isLeader || !targetId || targetId === ui.selfId) return;
+  send({ t: "set-leader", target: targetId });
 }
 
 /** Send a full control frame AND mirror it into the local room state — we

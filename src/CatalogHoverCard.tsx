@@ -351,7 +351,7 @@ function HoverPanel({
       data-hover-panel="true"
       onMouseEnter={() => { notePanelPointer(true); cancelHoverClose(); }}
       onMouseLeave={() => { notePanelPointer(false); scheduleHoverClose(); }}
-      className="fixed z-[280] w-[360px] max-h-[80vh] overflow-y-auto
+      className="fixed z-[10000] w-[360px] max-h-[80vh] overflow-y-auto
                  rounded-xl border border-white/12 bg-black/85 backdrop-blur-2xl
                  shadow-[0_28px_64px_-20px_rgba(0,0,0,0.92)]
                  px-4 py-3.5 pointer-events-auto"

@@ -9,12 +9,15 @@
 // this panel only drives the room lifecycle + presence.
 // ---------------------------------------------------------------------------
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useWatchTogether } from "./watchTogether/useWatchTogether";
 import {
-  createRoom, joinRoom, leaveRoom, setWatchConfig, openRoomVideo, clearPartyStream,
-  getRelayUrl, getDisplayName, getAppToken,
+  createRoom, createRoomWithCode, joinRoom, leaveRoom, transferLeader, setWatchConfig,
+  openRoomVideo, clearPartyStream, getRelayUrl, getDisplayName, getAppToken,
 } from "./watchTogether/store";
+import { peekRichestCachedDetailById } from "./metaCache";
+import { scheduleHoverOpen, scheduleHoverClose, closeHoverNow } from "./catalogHoverStore";
+import type { MetaPreview } from "./types";
 
 interface Props {
   open: boolean;
@@ -38,6 +41,9 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
       setToken(getAppToken());
       setCopied(false);
       setEditingConfig(false);
+    } else {
+      // Closing the panel must dismiss any brief-meta hover card it spawned.
+      closeHoverNow();
     }
   }, [open]);
 
@@ -100,6 +106,7 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
           <Lobby
             name={name}
             joinCode={joinCode}
+            notFoundCode={w.status === "not-found" ? w.pendingCode : null}
             onName={setName}
             onJoinCode={setJoinCode}
             // Persist only the name here — the relay URL defaults to the baked-in
@@ -107,6 +114,7 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
             // pinning localStorage to the current default.
             onCreate={() => { setWatchConfig({ displayName: name }); createRoom(); }}
             onJoin={() => { setWatchConfig({ displayName: name }); joinRoom(joinCode); }}
+            onCreateWithCode={(c) => { setWatchConfig({ displayName: name }); createRoomWithCode(c); }}
             onEditRelay={() => setEditingConfig(true)}
           />
         ) : (
@@ -115,7 +123,10 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
             status={w.status}
             members={w.members}
             selfId={w.selfId}
+            leaderId={w.leaderId}
             roomVideoKey={w.roomVideoKey}
+            roomMetaId={w.roomMetaId}
+            roomMediaType={w.roomMediaType}
             roomTitle={w.roomTitle}
             roomStreamLabel={w.roomStreamLabel}
             staging={w.staging}
@@ -126,6 +137,7 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
             onJoin={() => { openRoomVideo(); onClose(); }}
             onLeave={leaveRoom}
             onClearStream={clearPartyStream}
+            onTransfer={transferLeader}
           />
         )}
       </div>
@@ -178,12 +190,17 @@ function ConfigNotice({
 }
 
 function Lobby({
-  name, joinCode, onName, onJoinCode, onCreate, onJoin, onEditRelay,
+  name, joinCode, notFoundCode, onName, onJoinCode, onCreate, onJoin, onCreateWithCode, onEditRelay,
 }: {
-  name: string; joinCode: string;
+  name: string; joinCode: string; notFoundCode: string | null;
   onName: (v: string) => void; onJoinCode: (v: string) => void;
-  onCreate: () => void; onJoin: () => void; onEditRelay: () => void;
+  onCreate: () => void; onJoin: () => void; onCreateWithCode: (code: string) => void;
+  onEditRelay: () => void;
 }) {
+  // A code is joinable only at 4–16 chars (the relay's accepted shape) — gate
+  // the Join button so a too-short code can't hang on "connecting".
+  const cleaned = joinCode.trim().replace(/[^A-Za-z0-9]/g, "");
+  const codeValid = cleaned.length >= 4 && cleaned.length <= 16;
   return (
     <div className="space-y-4">
       <Field label="Your name">
@@ -198,19 +215,33 @@ function Lobby({
         <span className="h-px flex-1 bg-white/10" /> or <span className="h-px flex-1 bg-white/10" />
       </div>
 
-      <div className="flex gap-2">
-        <input
-          value={joinCode}
-          onChange={(e) => onJoinCode(e.target.value.toUpperCase())}
-          onKeyDown={(e) => e.key === "Enter" && joinCode.trim() && onJoin()}
-          placeholder="Room code"
-          maxLength={8}
-          className={`${inputCls} flex-1 tracking-[0.2em] font-mono uppercase`}
-        />
-        <button type="button" onClick={onJoin} disabled={!joinCode.trim()} className={secondaryBtn}>
-          Join
-        </button>
+      <div className="space-y-1.5">
+        <div className="flex gap-2">
+          <input
+            value={joinCode}
+            onChange={(e) => onJoinCode(e.target.value.toUpperCase())}
+            onKeyDown={(e) => e.key === "Enter" && codeValid && onJoin()}
+            placeholder="Room code"
+            maxLength={16}
+            className={`${inputCls} flex-1 tracking-[0.2em] font-mono uppercase`}
+          />
+          <button type="button" onClick={onJoin} disabled={!codeValid} className={secondaryBtn}>
+            Join
+          </button>
+        </div>
+        <p className="text-white/30 text-[10.5px] leading-snug">4–16 letters or numbers.</p>
       </div>
+
+      {notFoundCode && (
+        <div className="rounded-xl bg-amber-400/[0.08] border border-amber-400/20 px-3 py-2.5 space-y-2">
+          <p className="text-amber-200/90 text-[12px] leading-snug">
+            No one is hosting room <span className="font-mono font-semibold tracking-[0.15em]">{notFoundCode}</span> right now.
+          </p>
+          <button type="button" onClick={() => onCreateWithCode(notFoundCode)} className={primaryBtn}>
+            Create room {notFoundCode}
+          </button>
+        </div>
+      )}
 
       <button
         type="button"
@@ -224,14 +255,17 @@ function Lobby({
 }
 
 function Room({
-  code, status, members, selfId, roomVideoKey, roomTitle, roomStreamLabel, staging,
-  inSync, isLeader, copied, onCopy, onJoin, onLeave, onClearStream,
+  code, status, members, selfId, leaderId, roomVideoKey, roomMetaId, roomMediaType,
+  roomTitle, roomStreamLabel, staging, inSync, isLeader, copied,
+  onCopy, onJoin, onLeave, onClearStream, onTransfer,
 }: {
   code: string | null; status: string; members: { id: string; name: string; videoKey: string | null }[];
-  selfId: string | null; roomVideoKey: string | null; roomTitle: string | null;
+  selfId: string | null; leaderId: string | null; roomVideoKey: string | null;
+  roomMetaId: string | null; roomMediaType: string | null; roomTitle: string | null;
   roomStreamLabel: string | null; staging: boolean;
   inSync: boolean; isLeader: boolean; copied: boolean;
   onCopy: () => void; onJoin: () => void; onLeave: () => void; onClearStream: () => void;
+  onTransfer: (id: string) => void;
 }) {
   const readyHere = roomVideoKey ? members.filter((m) => m.videoKey === roomVideoKey).length : 0;
   return (
@@ -261,25 +295,25 @@ function Room({
             : "Waiting for the host to start playing."}
         </p>
       ) : inSync ? (
-        <div className="rounded-xl bg-emerald-400/[0.07] border border-emerald-400/20 px-3 py-2.5 space-y-0.5">
+        <div className="rounded-xl bg-emerald-400/[0.07] border border-emerald-400/20 px-3 py-2.5 space-y-1">
           <p className="text-emerald-300/90 text-[12.5px] flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-emerald-400" />
             {staging ? `Waiting for the party · ${readyHere}/${members.length} here` : "In sync"}
             {isLeader ? " · you're the host" : ""}
           </p>
-          {roomTitle && (
-            <p className="text-white/55 text-[11.5px] truncate">
-              {roomTitle}{roomStreamLabel ? ` · ${roomStreamLabel}` : ""}
-            </p>
-          )}
+          <PartyMediaCard
+            metaId={roomMetaId} mediaType={roomMediaType} videoKey={roomVideoKey}
+            title={roomTitle} streamLabel={roomStreamLabel}
+          />
         </div>
       ) : (
         <div className="rounded-xl bg-amber-400/[0.08] border border-amber-400/20 px-3 py-2.5">
-          <p className="text-amber-200/90 text-[12px] leading-snug break-words">
-            The party is watching{roomTitle ? <> <span className="font-semibold">{roomTitle}</span></> : " a title"}
-            {roomStreamLabel ? <span className="text-amber-200/60"> · {roomStreamLabel}</span> : null}.
-          </p>
-          <button type="button" onClick={onJoin} disabled={!roomVideoKey} className={`${primaryBtn} mt-2`}>
+          <p className="text-amber-200/90 text-[12px] leading-snug">The party is watching:</p>
+          <PartyMediaCard
+            metaId={roomMetaId} mediaType={roomMediaType} videoKey={roomVideoKey}
+            title={roomTitle} streamLabel={roomStreamLabel}
+          />
+          <button type="button" onClick={onJoin} disabled={!roomVideoKey} className={`${primaryBtn} mt-2.5`}>
             Join &amp; sync
           </button>
         </div>
@@ -303,18 +337,38 @@ function Room({
         <p className="text-white/40 text-[10px] uppercase tracking-wider mb-1.5">
           In the room · {members.length}
         </p>
-        <ul className="space-y-1">
+        <ul className="space-y-0.5">
           {members.map((m) => {
             const onTitle = roomVideoKey != null && m.videoKey === roomVideoKey;
+            const isHost = m.id === leaderId;
+            const canTransfer = isLeader && !isHost && m.id !== selfId;
             return (
-              <li key={m.id} className="flex items-center gap-2 text-[13px]">
+              <li
+                key={m.id}
+                className="group flex items-center gap-2 text-[13px] rounded-lg px-1.5 py-1 -mx-1.5 hover:bg-white/[0.04]"
+              >
                 <span
                   className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${onTitle ? "bg-emerald-400" : "bg-amber-400/70"}`}
                   title={onTitle ? "Watching the party title" : "On a different title"}
                 />
-                <span className="text-white/85 truncate">
-                  {m.name}{m.id === selfId ? " (you)" : ""}
+                <span className="text-white/85 truncate flex items-center gap-1.5 min-w-0">
+                  <span className="truncate">{m.name}{m.id === selfId ? " (you)" : ""}</span>
+                  {isHost && (
+                    <span title="Host" aria-label="Host" className="text-amber-300 text-[12px] flex-shrink-0 leading-none">♛</span>
+                  )}
                 </span>
+                {canTransfer && (
+                  <button
+                    type="button"
+                    onClick={() => onTransfer(m.id)}
+                    title={`Make ${m.name} the host`}
+                    className="ml-auto flex-shrink-0 opacity-0 group-hover:opacity-100 focus:opacity-100
+                               transition-opacity text-[10.5px] px-1.5 py-0.5 rounded-md text-white/55
+                               hover:text-amber-200 hover:bg-white/[0.06] border border-white/10"
+                  >
+                    Make host
+                  </button>
+                )}
               </li>
             );
           })}
@@ -326,6 +380,68 @@ function Room({
       </button>
     </div>
   );
+}
+
+/** Brief meta for the party's selected title (poster + title + facts line),
+ *  with the full rich CatalogHoverCard on hover. Meta comes straight from the
+ *  shared 24 h cache (no addons needed here) — if it's not cached yet the poster
+ *  is a placeholder and the rich card fetches on hover. */
+function PartyMediaCard({
+  metaId, mediaType, videoKey, title, streamLabel,
+}: {
+  metaId: string | null; mediaType: string | null; videoKey: string | null;
+  title: string | null; streamLabel: string | null;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  if (!metaId && !title) return null;
+
+  const detail = metaId ? peekRichestCachedDetailById(metaId) : null;
+  const poster = detail?.poster ?? null;
+  const typeLabel = mediaType === "series" ? "Series" : mediaType === "movie" ? "Movie" : (mediaType ? cap(mediaType) : null);
+  const facts = [detail?.release_info ?? null, typeLabel, episodeLabel(videoKey, mediaType), streamLabel]
+    .filter(Boolean).join(" · ");
+  const preview: MetaPreview | null = metaId ? {
+    id: metaId, name: title ?? detail?.name ?? "", media_type: mediaType ?? "movie",
+    poster, background: detail?.background ?? null, fanart: null, backdrop: null,
+    logo: detail?.logo ?? null, release_info: detail?.release_info ?? null,
+    description: detail?.description ?? null, imdb_rating: detail?.imdb_rating ?? null,
+    genres: detail?.genres ?? [],
+  } : null;
+
+  return (
+    <div
+      ref={ref}
+      onMouseEnter={() => { if (preview && ref.current) scheduleHoverOpen(preview, ref.current); }}
+      onMouseLeave={() => scheduleHoverClose()}
+      className="flex items-center gap-2.5 cursor-default"
+    >
+      {poster ? (
+        <img src={poster} alt="" loading="lazy"
+             className="w-9 h-[54px] rounded-md object-cover flex-shrink-0 bg-white/5 border border-white/10" />
+      ) : (
+        <div className="w-9 h-[54px] rounded-md flex-shrink-0 bg-white/[0.06] border border-white/10" />
+      )}
+      <div className="min-w-0">
+        <p className="text-white/90 text-[12.5px] font-medium truncate">{title ?? detail?.name ?? "Untitled"}</p>
+        {facts && <p className="text-white/45 text-[11px] truncate">{facts}</p>}
+      </div>
+    </div>
+  );
+}
+
+function cap(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/** Parse "S{season}E{episode}" from a series videoKey like "tt0903747:1:5". */
+function episodeLabel(videoKey: string | null, mediaType: string | null): string | null {
+  if (!videoKey || mediaType === "movie") return null;
+  const parts = videoKey.split(":");
+  if (parts.length >= 3) {
+    const s = parts[parts.length - 2], e = parts[parts.length - 1];
+    if (/^\d+$/.test(s) && /^\d+$/.test(e)) return `S${s}E${e}`;
+  }
+  return null;
 }
 
 // ── Bits ─────────────────────────────────────────────────────────────────────

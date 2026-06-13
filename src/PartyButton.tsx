@@ -18,6 +18,7 @@ export default function PartyButton() {
   return (
     <button
       type="button"
+      data-party-anchor
       onClick={() => window.dispatchEvent(new CustomEvent("aura:open-watch-together"))}
       title={inParty ? `Watch party · ${count} ${count === 1 ? "person" : "people"}` : "Watch Together"}
       aria-label="Watch Together"

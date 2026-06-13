@@ -21,6 +21,10 @@
  *             title: string|null, updatedAt: number, driverId: string|null }} RoomState */
 
 const MAX_MEMBERS = 12; // a watch party, not a broadcast — keep rooms small
+// Cap the persisted join-order list so a high-churn room (many different cids
+// cycling through) can't grow storage unbounded. Pruned to currently-open
+// members + the explicit leader when exceeded.
+const MAX_ORDER = 64;
 
 /** Coerce + length-cap a peer-supplied string (defence against a member
  *  flooding the room state / attachment with a huge or non-string value). */
@@ -74,19 +78,45 @@ export class Room {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+    // Leader bookkeeping, lazily loaded from storage (survives hibernation).
+    //   order    — cids in join order (append-only); the auto-handoff fallback.
+    //   leaderId — the explicit current-leader cid (creator → transfer → bye-handoff).
+    /** @type {{ order: string[], leaderId: string|null } | null} */
+    this.meta = null;
   }
 
   /** @param {Request} request */
   async fetch(request) {
     const url = new URL(request.url);
-
-    if (this.state.getWebSockets().length >= MAX_MEMBERS) {
-      return new Response("room full", { status: 503 });
-    }
+    await this.ensureMeta();
 
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
+
+    // A `join`-intent connect to a room NObody is currently hosting must NOT
+    // auto-create — tell the client so it can offer "create it instead". Accept
+    // the socket transiently OUTSIDE the hibernation roster (server.accept, not
+    // state.acceptWebSocket) so there are zero side effects (no roster slot, no
+    // webSocketClose, no state/meta mutation), deliver the frame, and close.
+    // A missing intent (old client) keeps the legacy auto-create behaviour.
+    const openCount = this.state.getWebSockets().filter((s) => s.readyState === 1).length;
+    if (url.searchParams.get("intent") === "join" && openCount === 0) {
+      const codeMatch = url.pathname.match(/\/room\/([A-Za-z0-9]{4,16})/);
+      server.accept();
+      // Belt: send a frame for clients that read it. Suspenders: close with the
+      // app code 4404 — the frame might not flush before close, but the close
+      // CODE always reaches the browser's onclose (event.code), so the client
+      // reliably distinguishes "nobody hosting this code" from a transport drop
+      // (1006) without depending on frame delivery.
+      try { server.send(JSON.stringify({ t: "room-not-found", code: codeMatch ? codeMatch[1].toUpperCase() : "" })); } catch { /* closing */ }
+      try { server.close(4404, "room not found"); } catch { /* already closing */ }
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    if (this.state.getWebSockets().length >= MAX_MEMBERS) {
+      return new Response("room full", { status: 503 });
+    }
 
     // Stable per-install id (cid) so a reconnect reclaims the same roster slot
     // + leader-election ordering; fall back to a random id if absent.
@@ -101,6 +131,20 @@ export class Room {
 
     this.state.acceptWebSocket(server);
 
+    // Track join order (append-only) and seed the creator as the first leader.
+    if (!this.meta.order.includes(member.id)) {
+      this.meta.order.push(member.id);
+      // GC only ever needs ONE pass: the filtered set is (open members + the
+      // leader), and MAX_MEMBERS=12 caps concurrent open sockets — so the result
+      // is ≤13 entries, always well under MAX_ORDER. No re-check loop needed.
+      if (this.meta.order.length > MAX_ORDER) {
+        const open = new Set(this.roster().map((m) => m.id));
+        this.meta.order = this.meta.order.filter((c) => open.has(c) || c === this.meta.leaderId);
+      }
+    }
+    if (!this.meta.leaderId) this.meta.leaderId = member.id; // first member into an empty room = host
+    await this.saveMeta();
+
     // Hand the joiner the current playback state + roster, then tell the room.
     const stateNow = await this.loadState();
     server.send(JSON.stringify({
@@ -109,6 +153,7 @@ export class Room {
       serverNow: Date.now(),
       state: stateNow,
       members: this.roster(),
+      leaderId: this.effectiveLeader(),
     }));
     // Seed the joiner with any open votes — without this they can't see or cast,
     // and (since unanimity counts the whole roster) their silent presence would
@@ -131,6 +176,7 @@ export class Room {
       return; // ignore malformed frames
     }
     const me = ws.deserializeAttachment() || {};
+    await this.ensureMeta(); // leader gating + transfer need the meta loaded
 
     // All peer input is length-capped/coerced; a malformed or oversized frame
     // degrades to a no-op instead of bloating storage or throwing in this
@@ -146,6 +192,10 @@ export class Room {
           break;
         }
         case "control": {
+          // ONLY the leader drives the party's playback (play/pause/seek and
+          // the stream identity). A non-leader control frame is dropped — the
+          // server-authoritative half of "leader controls playback".
+          if (!this.isLeader(me.id)) break;
           // A user play/pause/seek. Drop frames with a non-finite position
           // (a garbage position would yank every viewer to 0).
           const pos = Number(msg.position);
@@ -174,6 +224,7 @@ export class Room {
           break;
         }
         case "tick": {
+          if (!this.isLeader(me.id)) break; // drift ticks come from the leader only
           const pos = Number(msg.position);
           if (!Number.isFinite(pos)) break;
           // Leader drift correction — relay only (no persistence needed).
@@ -194,6 +245,33 @@ export class Room {
           };
           await this.saveState(blank);
           this.broadcast({ t: "control", ...blank }, ws);
+          break;
+        }
+        case "set-leader": {
+          // Manual transfer — only the current leader may hand the crown to
+          // another CONNECTED member.
+          if (!this.isLeader(me.id)) break;
+          const target = (str(msg.target, 16) || "").replace(/[^A-Za-z0-9]/g, "");
+          const open = new Set(this.roster().map((m) => m.id));
+          if (!target || !open.has(target)) break;
+          this.meta.leaderId = target;
+          await this.saveMeta();
+          this.broadcastMembers(); // carries the new leaderId to everyone
+          break;
+        }
+        case "bye": {
+          // Graceful leave: if the leader is leaving, hand off PERMANENTLY to the
+          // longest-present remaining member before their socket drops (so a
+          // deliberate Leave is a one-way handoff, unlike a transient drop). The
+          // socket close follows and re-broadcasts the roster.
+          if (this.isLeader(me.id)) {
+            const open = this.roster().map((m) => m.id);
+            const next = this.meta.order.find((c) => c !== me.id && open.includes(c))
+              ?? open.find((c) => c !== me.id) ?? null;
+            this.meta.leaderId = next;
+            await this.saveMeta();
+            this.broadcastMembers();
+          }
           break;
         }
         case "video": {
@@ -262,7 +340,11 @@ export class Room {
   }
 
   async webSocketClose(ws) {
+    await this.ensureMeta();
     try { ws.close(); } catch { /* already closing */ }
+    // effectiveLeader() recomputes here: a departed leader (graceful bye already
+    // moved leaderId; an ungraceful drop falls through to the longest-present
+    // remaining member) is reflected in the leaderId this carries.
     this.broadcastMembers();
     // A departure can complete a pending vote (the lone hold-out left). Await it
     // so the read-modify-write finishes inside this event's input gate.
@@ -270,11 +352,13 @@ export class Room {
     // Last member out — drop the room's persisted blobs so an abandoned code
     // doesn't leave storage resident forever.
     if (this.roster().length === 0) {
-      try { await this.state.storage.delete(["state", "votes"]); } catch { /* ignore */ }
+      try { await this.state.storage.delete(["state", "votes", "meta"]); } catch { /* ignore */ }
+      this.meta = { order: [], leaderId: null };
     }
   }
 
   async webSocketError(ws) {
+    await this.ensureMeta();
     this.broadcastMembers();
   }
 
@@ -302,19 +386,38 @@ export class Room {
   }
 
   broadcastMembers() {
-    this.broadcast({ t: "members", members: this.roster() });
+    this.broadcast({ t: "members", members: this.roster(), leaderId: this.effectiveLeader() });
   }
 
-  /** The room leader = the lowest member id among OPEN sockets (mirrors the
-   *  client's deterministic election). Null for an empty room. */
-  leaderId() {
-    const ids = this.roster().map((m) => m.id).filter((id) => typeof id === "string");
-    if (ids.length === 0) return null;
-    return ids.reduce((a, b) => (b < a ? b : a));
+  /** Lazy-load the leader bookkeeping (survives hibernation; a fresh DO
+   *  instance after wake has this.meta === null until first touched). */
+  async ensureMeta() {
+    if (!this.meta) {
+      this.meta = (await this.state.storage.get("meta")) || { order: [], leaderId: null };
+    }
+    return this.meta;
+  }
+
+  async saveMeta() {
+    if (this.meta) await this.state.storage.put("meta", this.meta);
+  }
+
+  /** The room's current leader. The explicit leaderId (creator → manual
+   *  transfer → graceful-leave handoff) wins while that member is connected;
+   *  otherwise the longest-present remaining member (first open cid in join
+   *  order) — which preserves reconnect behaviour (a cid is stable, so a
+   *  blipped leader reclaims the crown on return). Assumes ensureMeta() ran. */
+  effectiveLeader() {
+    const meta = this.meta || { order: [], leaderId: null };
+    const open = new Set(this.roster().map((m) => m.id));
+    if (meta.leaderId && open.has(meta.leaderId)) return meta.leaderId;
+    for (const cid of meta.order) if (open.has(cid)) return cid;
+    const first = this.roster()[0];
+    return first ? first.id : null;
   }
 
   isLeader(id) {
-    return typeof id === "string" && id === this.leaderId();
+    return typeof id === "string" && id === this.effectiveLeader();
   }
 
   /** @returns {Promise<RoomState>} */

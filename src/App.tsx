@@ -32,6 +32,7 @@ import ContextMenuHost, { openContextMenu } from "./ContextMenu";
 import { CatalogHoverHost } from "./CatalogHoverCard";
 import AppToastHost, { showAppToast } from "./AppToast";
 import FlyUpToastHost, { showFlyUpToast } from "./FlyUpToast";
+import PartyToastHost from "./PartyToast";
 import SourcePopupHost from "./SourcePopup";
 import DevConsole from "./DevConsole";
 import UpdatePopup from "./UpdatePopup";
@@ -1268,23 +1269,33 @@ export default function App() {
     const w = getWatchState();
     return w.staging && w.inSync;
   }, []);
+  // A NON-leader in sync with the party is locked out of transport entirely —
+  // the leader controls playback. Suppress the LOCAL action too (not just the
+  // broadcast, which notifyLocalControl already drops) so a follower can't
+  // desync themselves via a button / keybinding / video click. A follower
+  // watching something else (not in sync) keeps full control of their own
+  // playback.
+  const wtFollowerLocked = useCallback(() => {
+    const w = getWatchState();
+    return w.status === "connected" && !w.isLeader && w.inSync;
+  }, []);
   const wtTogglePause = useCallback(() => {
-    if (wtStagedHold()) return;
+    if (wtStagedHold() || wtFollowerLocked()) return;
     const next = !wtIntendedPausedRef.current;
     togglePause();
     wtIntendedPausedRef.current = next;
     notifyLocalControl({ paused: next, position: wtTimeRef.current });
-  }, [togglePause, wtStagedHold]);
+  }, [togglePause, wtStagedHold, wtFollowerLocked]);
   const wtSeekAbsolute = useCallback((t: number) => {
-    if (wtStagedHold()) return;
+    if (wtStagedHold() || wtFollowerLocked()) return;
     seekAbsolute(t);
     notifyLocalControl({ paused: wtIntendedPausedRef.current, position: t });
-  }, [seekAbsolute, wtStagedHold]);
+  }, [seekAbsolute, wtStagedHold, wtFollowerLocked]);
   const wtSeekRelative = useCallback((d: number) => {
-    if (wtStagedHold()) return;
+    if (wtStagedHold() || wtFollowerLocked()) return;
     seekRelative(d);
     notifyLocalControl({ paused: wtIntendedPausedRef.current, position: wtTimeRef.current + d });
-  }, [seekRelative, wtStagedHold]);
+  }, [seekRelative, wtStagedHold, wtFollowerLocked]);
   // Start the party (unpause + clear staging) — the leader's "Start now"
   // override, also called by the auto-start effect once everyone's ready.
   // Bypasses the staging gate above (we're the one releasing it): clears
@@ -5970,6 +5981,10 @@ export default function App() {
           buffering={buffering}
           bufferPct={bufferPct}
           firstFrameSeen={firstFrameSeen}
+          // True when we're a non-leader synced to the party — the transport
+          // controls (play/pause/seek/skip/speed) disable with a "Leader
+          // controls playback" hint; local-only controls stay live.
+          partyFollower={reactiveParty.status === "connected" && !reactiveParty.isLeader && reactiveParty.inSync}
           togglePause={wtTogglePause}
           seekRelative={wtSeekRelative}
           seekAbsolute={wtSeekAbsolute}
@@ -6271,6 +6286,10 @@ export default function App() {
           Fed by showFlyUpToast(); used for library add/remove feedback
           so the action visibly originates from where the user clicked. */}
       <FlyUpToastHost />
+
+      {/* Party-activity toasts — spawn from the party icon's side and stack
+          downward. Fed by showPartyToast() (joins / leaves / host changes). */}
+      <PartyToastHost />
 
       {/* In-app source popup — renders a calendar-day-overlay-style
           modal containing a child Tauri Webview pointed at the URL.

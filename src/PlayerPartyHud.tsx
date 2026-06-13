@@ -43,6 +43,7 @@ export default function PlayerPartyHud({ onStart, isFullscreen }: Props) {
           the party panel. */}
       <button
         type="button"
+        data-party-anchor
         onClick={openPanel}
         title="Watch party — open"
         className="fixed right-4 z-[10000] pointer-events-auto flex items-center gap-1.5 px-2.5 h-9
@@ -56,19 +57,32 @@ export default function PlayerPartyHud({ onStart, isFullscreen }: Props) {
           <path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" />
         </svg>
         <div className="flex -space-x-1.5">
-          {w.members.slice(0, 5).map((m) => (
-            <span
-              key={m.id}
-              title={`${m.name}${m.id === w.selfId ? " (you)" : ""}${onTitle(m.videoKey) ? "" : " · different title"}`}
-              className={[
-                "w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-semibold uppercase",
-                "ring-2 ring-black/60",
-                onTitle(m.videoKey) ? "bg-emerald-500/40 text-emerald-50" : "bg-amber-500/40 text-amber-50",
-              ].join(" ")}
-            >
-              {(m.name || "?").slice(0, 2)}
-            </span>
-          ))}
+          {w.members.slice(0, 5).map((m) => {
+            const isLeader = m.id === w.leaderId;
+            return (
+              <span
+                key={m.id}
+                title={`${m.name}${m.id === w.selfId ? " (you)" : ""}${isLeader ? " · host" : ""}${onTitle(m.videoKey) ? "" : " · different title"}`}
+                className={[
+                  "relative w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-semibold uppercase",
+                  "ring-2 ring-black/60",
+                  isLeader ? "z-10" : "",
+                  onTitle(m.videoKey) ? "bg-emerald-500/40 text-emerald-50" : "bg-amber-500/40 text-amber-50",
+                ].join(" ")}
+              >
+                {(m.name || "?").slice(0, 2)}
+                {isLeader && (
+                  <span
+                    aria-hidden
+                    className="absolute -top-2 left-1/2 -translate-x-1/2 text-[9px] leading-none text-amber-300
+                               [text-shadow:_0_1px_2px_rgba(0,0,0,0.9)]"
+                  >
+                    ♛
+                  </span>
+                )}
+              </span>
+            );
+          })}
         </div>
         {total > 5 && <span className="text-white/75 text-[11px] tabular-nums">+{total - 5}</span>}
       </button>
@@ -80,7 +94,9 @@ export default function PlayerPartyHud({ onStart, isFullscreen }: Props) {
           className="fixed left-1/2 -translate-x-1/2 z-[10000] pointer-events-auto rounded-2xl
                      bg-black/80 backdrop-blur-xl border border-white/15
                      shadow-[0_8px_30px_rgba(0,0,0,0.65)] px-5 py-3 flex items-center gap-4"
-          style={{ bottom: isFullscreen ? 96 : 120 }}
+          // Raised to clear the player control bar (scrubber + buttons sit ~36px
+          // up from the bottom; fullscreen's bar sits a touch lower).
+          style={{ bottom: isFullscreen ? 124 : 156 }}
           role="status"
         >
           <div>

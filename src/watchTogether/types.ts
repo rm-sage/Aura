@@ -64,8 +64,8 @@ export interface VotePoll {
 
 /** Server → client frames. */
 export type ServerMsg =
-  | { t: "welcome"; selfId: string; serverNow: number; state: RoomState; members: WatchMember[] }
-  | { t: "members"; members: WatchMember[] }
+  | { t: "welcome"; selfId: string; serverNow: number; state: RoomState; members: WatchMember[]; leaderId: string | null }
+  | { t: "members"; members: WatchMember[]; leaderId: string | null }
   | ({ t: "control" } & RoomState)
   | { t: "tick"; position: number; paused: boolean; driverId: string | null }
   | { t: "video"; from: string; videoKey: string | null; title: string | null }
@@ -74,7 +74,10 @@ export type ServerMsg =
   /** A vote reached unanimous yes — clients persist it as a dismissable card. */
   | { t: "vote-won"; vote: VotePoll }
   /** Sent to the initiator only (3-vote cap reached, or duplicate). */
-  | { t: "vote-error"; reason: string };
+  | { t: "vote-error"; reason: string }
+  /** A `join`-intent connect to a room nobody is currently hosting — the relay
+   *  refuses to auto-create, so the client can offer "create it instead". */
+  | { t: "room-not-found"; code: string };
 
 /** A snapshot of LOCAL playback the store reads to broadcast / tick. */
 export interface LocalPlayback {
