@@ -917,8 +917,22 @@ fn end_file_reason_to_str(reason: c_int) -> &'static str {
 /// child). Without this, the region only landed on the next host-geometry
 /// change (e.g. a fullscreen toggle), so initial-playback windowed blacks
 /// stayed raised until the user toggled fullscreen.
-unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineEmit) -> bool {
-    let mut video_reconfig = false;
+/// Per-tick summary of the events drained, so the pump loop can gate the
+/// cache-state poll against load/seek critical sections (CLAUDE.md landmines
+/// #3/#4). SEEK / PLAYBACK_RESTART cover ALL seek sources — including AniSkip's
+/// Lua-issued seeks, the original `get_property`-during-seek crash trigger.
+#[derive(Default)]
+struct EventTick {
+    video_reconfig: bool,
+    started: bool,
+    loaded: bool,
+    seek: bool,
+    restart: bool,
+    ended: bool,
+}
+
+unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineEmit) -> EventTick {
+    let mut t = EventTick::default();
     loop {
         let ev = (lib.wait_event)(handle, 0.0);
         if ev.is_null() {
@@ -929,9 +943,15 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
             break;
         }
         if id == mpv_event_id::VIDEO_RECONFIG {
-            video_reconfig = true;
+            t.video_reconfig = true;
             continue;
         }
+        // Load/seek lifecycle — tracked (not emitted) purely to gate the
+        // cache-state poll below away from the loadfile/seek critical sections.
+        if id == mpv_event_id::START_FILE { t.started = true; continue; }
+        if id == mpv_event_id::FILE_LOADED { t.loaded = true; continue; }
+        if id == mpv_event_id::SEEK { t.seek = true; continue; }
+        if id == mpv_event_id::PLAYBACK_RESTART { t.restart = true; continue; }
         if id == mpv_event_id::LOG_MESSAGE {
             let m = (*ev).data as *const mpv_event_log_message;
             if !m.is_null() {
@@ -998,12 +1018,13 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
                 );
                 emit("end-file", serde_json::Value::Object(payload));
             }
+            t.ended = true;
         } else if id == mpv_event_id::SHUTDOWN {
             crate::devlog!(warn, "mpv", "mpv emitted SHUTDOWN");
             break;
         }
     }
-    video_reconfig
+    t
 }
 
 /// Three-state visibility classification of the parent window, retained
@@ -1618,6 +1639,20 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         // only call SetThreadExecutionState on an actual transition (not
         // every frame). Starts false = not inhibited.
         let mut display_awake_applied = false;
+        // -- Cache-state poll gating (CLAUDE.md landmines #3/#4) --
+        // A real buffering %/readahead read needs a get_property poll, which is
+        // SAFE only OUTSIDE the loadfile + seek critical sections. We never
+        // observe cache properties (landmine #4) and never poll during a
+        // transition (landmine #3): gate on file-loaded, no seek in flight, a
+        // settle window after the last transition, and a low cadence. SEEK /
+        // PLAYBACK_RESTART events (tracked in EventTick) cover every seek source
+        // including AniSkip's Lua seeks — the exact original crash trigger.
+        let mut playback_ready = false;
+        let mut seeking = false;
+        let mut last_transition = Instant::now();
+        let mut last_cache_poll = Instant::now();
+        const CACHE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+        const CACHE_SETTLE: Duration = Duration::from_millis(700);
         loop {
             let tick_start = Instant::now();
 
@@ -1663,6 +1698,11 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         break;
                     }
                     Ok(EngineCommand::LoadFile { url, start_seconds, http_proxy, hdr_hint }) => {
+                        // New file → not ready for cache polling until FILE_LOADED;
+                        // arm the settle window.
+                        playback_ready = false;
+                        seeking = false;
+                        last_transition = Instant::now();
                         // Per-load HDR routing (passthrough mode only):
                         // the PQ output set engages only for HDR-labelled
                         // streams; everything else gets the plain SDR
@@ -1754,6 +1794,13 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         }
                     }
                     Ok(EngineCommand::Command(args)) => {
+                        // A seek issued via the command channel arms the poll
+                        // gate immediately (the SEEK event also fires, but this
+                        // covers the window before the next drain).
+                        if args.first().map(|s| s.as_str()) == Some("seek") {
+                            seeking = true;
+                            last_transition = Instant::now();
+                        }
                         let borrowed: Vec<&str> =
                             args.iter().map(String::as_str).collect();
                         if let Err(e) = run_mpv_command(&lib, handle, &borrowed) {
@@ -1862,8 +1909,55 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             // it — without this the region only landed on a host-geometry
             // change (e.g. a fullscreen toggle), leaving initial-playback
             // windowed blacks raised. Sentinel guarantees target_geom differs.
-            if drain_mpv_events(&lib, handle, &emit) {
+            let tick = drain_mpv_events(&lib, handle, &emit);
+            if tick.video_reconfig {
                 last_geom = (i32::MIN, i32::MIN, i32::MIN, i32::MIN);
+            }
+            // Fold the load/seek lifecycle into the cache-poll gate.
+            if tick.started { playback_ready = false; seeking = false; last_transition = Instant::now(); }
+            if tick.loaded  { playback_ready = true;  last_transition = Instant::now(); }
+            if tick.seek    { seeking = true;  last_transition = Instant::now(); }
+            if tick.restart { seeking = false; last_transition = Instant::now(); }
+            // EOF resets ALL transition state together — a seek that ends in EOF
+            // never emits PLAYBACK_RESTART, so without clearing `seeking` here the
+            // poll gate would stay locked until the next load.
+            if tick.ended   { playback_ready = false; seeking = false; last_transition = Instant::now(); }
+
+            // -- Gated cache-state poll -- (see the gating-state comment above).
+            // Numeric formats ONLY (never NODE — landmine #4); never while a
+            // load/seek is in flight or within the settle window (landmine #3).
+            if playback_ready
+                && !seeking
+                && last_transition.elapsed() >= CACHE_SETTLE
+                && last_cache_poll.elapsed() >= CACHE_POLL_INTERVAL
+            {
+                last_cache_poll = Instant::now();
+                let paused_for_cache = get_property_generic(&lib, handle, "paused-for-cache", GetFormat::Flag)
+                    .ok().and_then(|v| v.as_bool()).unwrap_or(false);
+                // Readahead buffered ahead of the playhead, seconds. The "amount
+                // cached in the demuxer" surfaced to the loading overlay + party.
+                let cache_seconds = get_property_generic(&lib, handle, "demuxer-cache-duration", GetFormat::Double)
+                    .ok().and_then(|v| v.as_f64()).filter(|v| v.is_finite() && *v >= 0.0);
+                // The canonical mpv buffering % — only meaningful while stalled.
+                let cache_pct = if paused_for_cache {
+                    get_property_generic(&lib, handle, "cache-buffering-state", GetFormat::Double)
+                        .ok().and_then(|v| v.as_f64()).filter(|v| v.is_finite())
+                } else {
+                    None
+                };
+                let mut m = serde_json::Map::new();
+                m.insert("paused_for_cache".into(), serde_json::Value::Bool(paused_for_cache));
+                if let Some(s) = cache_seconds {
+                    if let Some(n) = serde_json::Number::from_f64(s) {
+                        m.insert("cache_seconds".into(), serde_json::Value::Number(n));
+                    }
+                }
+                if let Some(p) = cache_pct {
+                    if let Some(n) = serde_json::Number::from_f64(p.clamp(0.0, 100.0)) {
+                        m.insert("cache_pct".into(), serde_json::Value::Number(n));
+                    }
+                }
+                emit("cache-state", serde_json::Value::Object(m));
             }
 
             // Steady pump cadence — see TICK.

@@ -15,19 +15,40 @@
 // carry pointer-events so clicking them never falls through to play/pause.
 // ---------------------------------------------------------------------------
 
+import { useEffect, useRef, useState } from "react";
 import { useWatchTogether } from "./watchTogether/useWatchTogether";
 
 interface Props {
   /** Host override: start the party now (stop waiting). */
   onStart: () => void;
   isFullscreen: boolean;
+  /** Player chrome visibility — the pill fades in lockstep with it. */
+  controlsVisible: boolean;
 }
 
 // Drop-shadow on text so labels stay legible over bright video (clouds, snow).
 const TEXT_SHADOW = "[text-shadow:_0_1px_4px_rgba(0,0,0,0.85)]";
 
-export default function PlayerPartyHud({ onStart, isFullscreen }: Props) {
+export default function PlayerPartyHud({ onStart, isFullscreen, controlsVisible }: Props) {
   const w = useWatchTogether();
+  // Transient "wake": a party toast briefly reveals the pill even when the
+  // chrome is hidden, so a join/leave/host-change notification is seen, then it
+  // fades back with the chrome.
+  const [wake, setWake] = useState(false);
+  const wakeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    const onToast = () => {
+      setWake(true);
+      if (wakeTimer.current) clearTimeout(wakeTimer.current);
+      wakeTimer.current = setTimeout(() => setWake(false), 4200);
+    };
+    window.addEventListener("aura:party-toast", onToast);
+    return () => {
+      window.removeEventListener("aura:party-toast", onToast);
+      if (wakeTimer.current) clearTimeout(wakeTimer.current);
+    };
+  }, []);
+
   if (w.status !== "connected") return null;
 
   const onTitle = (vk: string | null) => w.roomVideoKey != null && vk === w.roomVideoKey;
@@ -35,21 +56,38 @@ export default function PlayerPartyHud({ onStart, isFullscreen }: Props) {
   const total = w.members.length;
   const openPanel = () => window.dispatchEvent(new CustomEvent("aura:open-watch-together"));
 
+  // A follower with a party stream they haven't joined yet → call attention to
+  // the pill (animate) and KEEP it visible until they join, regardless of the
+  // chrome auto-hide.
+  const needsAttention = !w.isLeader && w.roomVideoKey != null && !w.inSync;
+  // Visible when the chrome is up, during a transient notification, or while a
+  // stream is waiting to be joined.
+  const pillVisible = controlsVisible || wake || needsAttention;
+
   return (
     <>
       {/* Presence cluster — top right, dropped BELOW the overlay's top action
           bar (exit button + title span left-4→right-4) so it never covers a
           long title; above the overlay so it's never washed out; click to open
-          the party panel. */}
+          the party panel. Fades with the player chrome (Request B); pulses while
+          a stream is waiting to be joined (Request C). */}
       <button
         type="button"
         data-party-anchor
         onClick={openPanel}
-        title="Watch party — open"
-        className="fixed right-4 z-[10000] pointer-events-auto flex items-center gap-1.5 px-2.5 h-9
-                   rounded-full bg-black/70 backdrop-blur-xl border border-white/15
-                   shadow-[0_4px_16px_rgba(0,0,0,0.55)] hover:bg-black/80 transition-colors"
-        style={{ top: isFullscreen ? 60 : 96 }}
+        title={needsAttention ? "Stream selected — open to watch" : "Watch party — open"}
+        className={[
+          "fixed right-4 z-[10000] flex items-center gap-1.5 px-2.5 h-9",
+          "rounded-full bg-black/70 backdrop-blur-xl border border-white/15",
+          "shadow-[0_4px_16px_rgba(0,0,0,0.55)] hover:bg-black/80",
+          needsAttention ? "aura-party-attention" : "",
+        ].join(" ")}
+        style={{
+          top: isFullscreen ? 60 : 96,
+          opacity: pillVisible ? 1 : 0,
+          pointerEvents: pillVisible ? "auto" : "none",
+          transition: "opacity 320ms ease, background-color 150ms ease",
+        }}
       >
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
              strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-ln-accent" aria-hidden>
@@ -121,6 +159,22 @@ export default function PlayerPartyHud({ onStart, isFullscreen }: Props) {
           )}
         </div>
       )}
+
+      <style>{`
+        @keyframes aura-party-attention {
+          0%, 100% {
+            transform: scale(1);
+            box-shadow: 0 4px 16px rgba(0,0,0,0.55), 0 0 0 0 rgba(91,164,255,0);
+            border-color: rgba(91,164,255,0.65);
+          }
+          50% {
+            transform: scale(1.07);
+            box-shadow: 0 4px 16px rgba(0,0,0,0.55), 0 0 22px 3px rgba(91,164,255,0.6);
+            border-color: rgba(91,164,255,0.9);
+          }
+        }
+        .aura-party-attention { animation: aura-party-attention 1.4s ease-in-out infinite; }
+      `}</style>
     </>
   );
 }

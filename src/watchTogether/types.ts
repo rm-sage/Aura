@@ -62,6 +62,17 @@ export interface VotePoll {
   voters: string[];
 }
 
+/** A member's live buffer telemetry, broadcast over the relay (throttled) and
+ *  shown per-member in the party panel. `seconds` = demuxer readahead buffered
+ *  ahead of the playhead; `pct` = stall buffering % (only while stalled);
+ *  `stalled` = paused-for-cache. `ts` is the local receive time (freshness). */
+export interface MemberStat {
+  pct: number | null;
+  seconds: number | null;
+  stalled: boolean;
+  ts: number;
+}
+
 /** Server → client frames. */
 export type ServerMsg =
   | { t: "welcome"; selfId: string; serverNow: number; state: RoomState; members: WatchMember[]; leaderId: string | null }
@@ -77,7 +88,9 @@ export type ServerMsg =
   | { t: "vote-error"; reason: string }
   /** A `join`-intent connect to a room nobody is currently hosting — the relay
    *  refuses to auto-create, so the client can offer "create it instead". */
-  | { t: "room-not-found"; code: string };
+  | { t: "room-not-found"; code: string }
+  /** A peer's buffer telemetry, relayed (throttled) for the per-member readout. */
+  | { t: "stat"; from: string; pct: number | null; seconds: number | null; stalled: boolean };
 
 /** A snapshot of LOCAL playback the store reads to broadcast / tick. */
 export interface LocalPlayback {

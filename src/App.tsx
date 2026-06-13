@@ -68,8 +68,8 @@ import PlayerPartyHud from "./PlayerPartyHud";
 import PartyVotesOverlay from "./PartyVotesOverlay";
 import {
   setPlaybackBridge, notifyLocalControl, notifyLocalVideo, resyncToRoom,
-  startPartyStream, setLocalStaging, amStagingHost, everyoneReady, getWatchState,
-  startVote,
+  startPartyStream, setLocalStaging, getWatchState, getPartyStartPosition,
+  notifyLocalBuffer, startVote,
 } from "./watchTogether/store";
 import { useWatchTogether } from "./watchTogether/useWatchTogether";
 import { streamLabel, streamMatchKey } from "./watchTogether/streamMatch";
@@ -458,6 +458,10 @@ interface PlaybackPayload {
   speed: number;
   buffering: boolean;
   eof: boolean;
+  /** Buffering % (cache-buffering-state) — only present while stalled. */
+  cache_pct?: number;
+  /** Demuxer readahead buffered ahead of the playhead, seconds. */
+  cache_seconds?: number;
 }
 
 // Tail window (seconds before metadata duration) considered "near end"
@@ -498,17 +502,16 @@ function usePlayback(playerActive: boolean) {
   // though MPV was still filling its initial cache.
   const [buffering, setBuffering] = useState(true);
   const [eof, setEof]             = useState(false);
-  // Cache fill level reported by MPV during a buffering event. Null
-  // when not buffering or when the property isn't readable yet (early
-  // load window). Surfaced to the BufferingOverlay so long buffer hangs
-  // are visible to the user.
-  //
-  // Permanently null today: the only writer (the now-removed
-  // cache-buffering-state poll) was dropped because every JS-driven
-  // `get_property` rolled the dice against the libmpv-wrapper crash.
-  // Re-introduce via a Rust-side cache-state listener (event-driven, no
-  // polling) when adding the buffering UX back.
-  const [bufferPct] = useState<number | null>(null);
+  // Cache fill level (cache-buffering-state, 0-100) reported during a stall.
+  // Null when not stalled / not yet readable. Surfaced to the BufferingOverlay.
+  // Fed by the engine's gated, crash-safe cache poll (see mpv/engine.rs) via the
+  // `playback-update` channel — NOT the old JS get_property polling that raced
+  // the libmpv-wrapper (that wrapper is gone; the read now runs on the engine
+  // thread, gated against load/seek critical sections).
+  const [bufferPct, setBufferPct] = useState<number | null>(null);
+  // Demuxer readahead buffered ahead of the playhead, seconds ("amount cached
+  // in the demuxer"). Shown on the loading overlay + broadcast per-member.
+  const [cacheSeconds, setCacheSeconds] = useState<number | null>(null);
   // Once-per-playback latch: flips true the first time MPV reports
   // time-pos > 0 (i.e. real frames are flowing). The loading overlay
   // stays up until this flips, regardless of `duration` / `buffering`,
@@ -644,8 +647,22 @@ function usePlayback(playerActive: boolean) {
       if (typeof payload.paused === "boolean")  setPaused(payload.paused);
       if (typeof payload.volume === "number")   setVolume(payload.volume);
       if (typeof payload.speed === "number" && payload.speed > 0) setSpeed(payload.speed);
-      if (typeof payload.buffering === "boolean") setBuffering(payload.buffering);
+      if (typeof payload.buffering === "boolean") {
+        setBuffering(payload.buffering);
+        if (!payload.buffering) setBufferPct(null); // stall cleared → drop the %
+      }
       if (typeof payload.eof === "boolean")     setEof(payload.eof);
+      // Real cache telemetry from the engine's gated poll: drive the loading
+      // overlay's % + readahead, and broadcast our buffer to the party.
+      if (typeof payload.cache_pct === "number") setBufferPct(payload.cache_pct);
+      if (typeof payload.cache_seconds === "number") setCacheSeconds(payload.cache_seconds);
+      if (typeof payload.cache_pct === "number" || typeof payload.cache_seconds === "number") {
+        notifyLocalBuffer({
+          pct: typeof payload.cache_pct === "number" ? payload.cache_pct : null,
+          seconds: typeof payload.cache_seconds === "number" ? payload.cache_seconds : null,
+          stalled: payload.buffering === true,
+        });
+      }
 
       // EOS Spotlight — immediate-fire on the live tick. mpv's time-pos halts
       // within ~0.5 s of duration at true EOF on this libmpv build; without
@@ -987,7 +1004,7 @@ function usePlayback(playerActive: boolean) {
   }, []);
 
   return {
-    time, duration, paused, volume, speed, buffering, bufferPct, eof, firstFrameSeen,
+    time, duration, paused, volume, speed, buffering, bufferPct, cacheSeconds, eof, firstFrameSeen,
     streamBroken, setStreamBroken,
     togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
     notifyNewLoad, logLoadEvent,
@@ -1151,6 +1168,9 @@ export default function App() {
   } | null>(null);
 
   const isPlayerActive = activeTarget != null;
+  // Mirror of PlayerOverlay's auto-hide `controlsVisible` so the sibling
+  // PlayerPartyHud pill can fade in lockstep with the player chrome.
+  const [playerControlsVisible, setPlayerControlsVisible] = useState(true);
   /** True when the active stream is a Live TV channel (synthetic `iptv:`
    *  target / media_type "tv"). Drives the live carve-outs: no scrubber,
    *  no resume prompt, no scrobble, no history / Continue-Watching write
@@ -1162,7 +1182,7 @@ export default function App() {
   // ── Playback hook — gated on activeTarget so the polling fallback only
   //     runs while a stream is loaded.
   const {
-    time, duration, paused, volume, speed, buffering, bufferPct, firstFrameSeen,
+    time, duration, paused, volume, speed, buffering, bufferPct, cacheSeconds, firstFrameSeen,
     streamBroken, setStreamBroken,
     togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
     notifyNewLoad, logLoadEvent,
@@ -1309,10 +1329,9 @@ export default function App() {
     }
     notifyLocalControl({ paused: false, position: wtTimeRef.current });
   }, [togglePause]);
-  // Auto-start once every member is on the party's stream.
-  useEffect(() => {
-    if (amStagingHost() && everyoneReady()) wtStartParty();
-  }, [reactiveParty.members, reactiveParty.roomVideoKey, reactiveParty.staging, wtStartParty]);
+  // NB: NO auto-start. Even once every member is on the party's stream, playback
+  // stays staged (paused) until the HOST presses "Start now" (wtStartParty, the
+  // PlayerPartyHud onStart). This is deliberate — the leader controls the start.
   // Tell the room what we're watching whenever the active title changes (so
   // presence + sync-gating stay current). Fires after the ref updates.
   useEffect(() => {
@@ -1495,10 +1514,22 @@ export default function App() {
         let resumeSeconds: number | null = null;
         let resumeDuration: number | null = null;
         const libRow = library.find((i) => i.id === targetSeriesId);
-        // A source swap forces resume at the live position (below), so skip
-        // the resume-prompt computation entirely — leaving resumeSeconds null
-        // means the prompt never shows.
-        if (libRow && opts?.forceStartSeconds == null) {
+        // A non-host party member opening the party's own stream skips the
+        // "Resume where you left off" prompt entirely and lands at the party's
+        // synced position (resyncToRoom fine-tunes on the first decoded frame).
+        // It's treated exactly like a forced start, so the resume computation
+        // below is skipped. `getPartyStartPosition()` is the extrapolated room
+        // position; 0 if not known yet (resyncToRoom corrects post-load).
+        const wtState = getWatchState();
+        const isPartyFollowerJoin =
+          wtState.status === "connected" && !wtState.isLeader &&
+          wtState.roomVideoKey != null && wtState.roomVideoKey === target.id;
+        const forceStart: number | null =
+          opts?.forceStartSeconds ?? (isPartyFollowerJoin ? (getPartyStartPosition() ?? 0) : null);
+        // A source swap / party-follower-join forces resume at a specific
+        // position (below), so skip the resume-prompt computation entirely —
+        // leaving resumeSeconds null means the prompt never shows.
+        if (libRow && forceStart == null) {
           const st = libRow.state ?? {};
           const off = typeof st.timeOffset === "number" ? st.timeOffset : 0;
           const dur = typeof st.duration === "number" ? st.duration : 0;
@@ -1546,10 +1577,10 @@ export default function App() {
           }
         }
 
-        // In-player source swap: force resume at the live position (the
-        // resume-prompt computation was skipped above when this is set).
-        if (opts?.forceStartSeconds != null) {
-          resumeAt = opts.forceStartSeconds;
+        // In-player source swap OR party-follower-join: force resume at the
+        // chosen position (the resume-prompt computation was skipped above).
+        if (forceStart != null) {
+          resumeAt = forceStart;
         }
 
         const raw = stream.url ?? `magnet:?xt=urn:btih:${stream.info_hash}`;
@@ -5980,11 +6011,13 @@ export default function App() {
           speed={speed}
           buffering={buffering}
           bufferPct={bufferPct}
+          cacheSeconds={cacheSeconds}
           firstFrameSeen={firstFrameSeen}
           // True when we're a non-leader synced to the party — the transport
           // controls (play/pause/seek/skip/speed) disable with a "Leader
           // controls playback" hint; local-only controls stay live.
           partyFollower={reactiveParty.status === "connected" && !reactiveParty.isLeader && reactiveParty.inSync}
+          onControlsVisibleChange={setPlayerControlsVisible}
           togglePause={wtTogglePause}
           seekRelative={wtSeekRelative}
           seekAbsolute={wtSeekAbsolute}
@@ -6047,7 +6080,7 @@ export default function App() {
       {/* Watch-party HUD — presence cluster + the "waiting for the party"
           staging banner (host gets a Start-now override). */}
       {isPlayerActive && (
-        <PlayerPartyHud onStart={wtStartParty} isFullscreen={isFullscreen} />
+        <PlayerPartyHud onStart={wtStartParty} isFullscreen={isFullscreen} controlsVisible={playerControlsVisible} />
       )}
 
       {/* In-player source switcher — sibling to PlayerOverlay; its own root is

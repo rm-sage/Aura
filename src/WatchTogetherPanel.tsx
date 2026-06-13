@@ -18,6 +18,7 @@ import {
 import { peekRichestCachedDetailById } from "./metaCache";
 import { scheduleHoverOpen, scheduleHoverClose, closeHoverNow } from "./catalogHoverStore";
 import type { MetaPreview } from "./types";
+import type { MemberStat } from "./watchTogether/types";
 
 interface Props {
   open: boolean;
@@ -133,6 +134,7 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
             inSync={w.inSync}
             isLeader={w.isLeader}
             copied={copied}
+            memberStats={w.memberStats}
             onCopy={copyCode}
             onJoin={() => { openRoomVideo(); onClose(); }}
             onLeave={leaveRoom}
@@ -256,7 +258,7 @@ function Lobby({
 
 function Room({
   code, status, members, selfId, leaderId, roomVideoKey, roomMetaId, roomMediaType,
-  roomTitle, roomStreamLabel, staging, inSync, isLeader, copied,
+  roomTitle, roomStreamLabel, staging, inSync, isLeader, copied, memberStats,
   onCopy, onJoin, onLeave, onClearStream, onTransfer,
 }: {
   code: string | null; status: string; members: { id: string; name: string; videoKey: string | null }[];
@@ -264,6 +266,7 @@ function Room({
   roomMetaId: string | null; roomMediaType: string | null; roomTitle: string | null;
   roomStreamLabel: string | null; staging: boolean;
   inSync: boolean; isLeader: boolean; copied: boolean;
+  memberStats: Record<string, MemberStat>;
   onCopy: () => void; onJoin: () => void; onLeave: () => void; onClearStream: () => void;
   onTransfer: (id: string) => void;
 }) {
@@ -357,18 +360,21 @@ function Room({
                     <span title="Host" aria-label="Host" className="text-amber-300 text-[12px] flex-shrink-0 leading-none">♛</span>
                   )}
                 </span>
-                {canTransfer && (
-                  <button
-                    type="button"
-                    onClick={() => onTransfer(m.id)}
-                    title={`Make ${m.name} the host`}
-                    className="ml-auto flex-shrink-0 opacity-0 group-hover:opacity-100 focus:opacity-100
-                               transition-opacity text-[10.5px] px-1.5 py-0.5 rounded-md text-white/55
-                               hover:text-amber-200 hover:bg-white/[0.06] border border-white/10"
-                  >
-                    Make host
-                  </button>
-                )}
+                <div className="ml-auto flex items-center gap-2 flex-shrink-0">
+                  <MemberBuffer stat={memberStats[m.id]} />
+                  {canTransfer && (
+                    <button
+                      type="button"
+                      onClick={() => onTransfer(m.id)}
+                      title={`Make ${m.name} the host`}
+                      className="flex-shrink-0 opacity-0 group-hover:opacity-100 focus:opacity-100
+                                 transition-opacity text-[10.5px] px-1.5 py-0.5 rounded-md text-white/55
+                                 hover:text-amber-200 hover:bg-white/[0.06] border border-white/10"
+                    >
+                      Make host
+                    </button>
+                  )}
+                </div>
               </li>
             );
           })}
@@ -442,6 +448,37 @@ function episodeLabel(videoKey: string | null, mediaType: string | null): string
     if (/^\d+$/.test(s) && /^\d+$/.test(e)) return `S${s}E${e}`;
   }
   return null;
+}
+
+/** Per-member buffer readout: a stall pill while paused-for-cache, otherwise a
+ *  small readahead bar + seconds ("amount cached in the demuxer"). Driven by the
+ *  throttled per-member `stat` frames relayed through the party. */
+function MemberBuffer({ stat }: { stat: MemberStat | undefined }) {
+  if (!stat) return null;
+  if (stat.stalled) {
+    return (
+      <span
+        title="Buffering"
+        className="text-[10px] tabular-nums text-amber-300 flex-shrink-0 whitespace-nowrap"
+      >
+        buffering{stat.pct != null ? ` ${Math.round(stat.pct)}%` : "…"}
+      </span>
+    );
+  }
+  if (stat.seconds == null) return null;
+  // Health bar relative to a 30s readahead target — full ≈ a comfortable buffer.
+  const frac = Math.max(0.04, Math.min(1, stat.seconds / 30));
+  return (
+    <span
+      title={`${stat.seconds.toFixed(0)}s buffered ahead`}
+      className="flex items-center gap-1 flex-shrink-0"
+    >
+      <span className="w-8 h-1 rounded-full bg-white/12 overflow-hidden">
+        <span className="block h-full rounded-full bg-emerald-400/70" style={{ width: `${frac * 100}%` }} />
+      </span>
+      <span className="text-[10px] tabular-nums text-white/45">{stat.seconds.toFixed(0)}s</span>
+    </span>
+  );
 }
 
 // ── Bits ─────────────────────────────────────────────────────────────────────

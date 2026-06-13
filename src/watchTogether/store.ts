@@ -18,7 +18,7 @@
 // ---------------------------------------------------------------------------
 
 import type {
-  WatchMember, RoomState, ServerMsg, PlaybackBridge, VotePoll,
+  WatchMember, RoomState, ServerMsg, PlaybackBridge, VotePoll, MemberStat,
 } from "./types";
 import { showPartyToast } from "../PartyToast";
 
@@ -88,6 +88,10 @@ export interface WatchUiState {
   wonVotes: VotePoll[];
   /** Transient error (e.g. 3-vote cap reached); auto-clears. */
   voteError: string | null;
+  /** Per-member buffer telemetry (readahead seconds + stall %), keyed by member
+   *  id, broadcast over the relay (throttled). Drives the per-member buffer
+   *  readout in the party panel. Includes self. Pruned to the live roster. */
+  memberStats: Record<string, MemberStat>;
 }
 
 const BLANK_ROOM = {
@@ -110,6 +114,7 @@ const ui: WatchUiState = {
   activeVotes: [],
   wonVotes: [],
   voteError: null,
+  memberStats: {},
 };
 
 // ── Connection / runtime (not part of the emitted UI state) ────────────────
@@ -124,6 +129,21 @@ let bridge: PlaybackBridge | null = null;
 let lastApplyAt = 0; // throttles applied remote seeks (APPLY_MIN_INTERVAL_MS)
 let localStaging = false; // are WE currently holding a stream for the party?
 let lastRoomState: RoomState | null = null; // for snap-to-room on becoming in-sync
+// Buffer-broadcast throttle: we send our buffer stat at most every
+// BUFFER_SEND_INTERVAL_MS, plus immediately when the stall state flips so a
+// member buffering shows up promptly.
+const BUFFER_SEND_INTERVAL_MS = 2000;
+// A stall flip sends sooner than the interval — but never faster than this, so a
+// rapid stall/unstall hiccup can't spam the relay with a burst of stat frames.
+const BUFFER_FLIP_MIN_GAP_MS = 600;
+let lastBufferSentAt = 0;
+let lastBufferStalled = false;
+// Coalesce re-renders from inbound peer stats (≤ a few/sec across the party).
+let statEmitTimer: ReturnType<typeof setTimeout> | null = null;
+function emitStatsCoalesced() {
+  if (statEmitTimer) return;
+  statEmitTimer = setTimeout(() => { statEmitTimer = null; emit(); }, 400);
+}
 // Member ids from the last roster — diffed to fire join/leave toasts. Diffing by
 // id (stable across reconnects via the cid) avoids false join/leave on reconnect.
 let previousMemberIds = new Set<string>();
@@ -262,8 +282,11 @@ export function leaveRoom(): void {
   ui.activeVotes = [];
   ui.wonVotes = [];
   ui.voteError = null;
+  ui.memberStats = {};
   previousMemberIds = new Set();
   toastedMembers = new Set();
+  lastBufferSentAt = 0;
+  lastBufferStalled = false;
   emit();
 }
 
@@ -370,6 +393,8 @@ function buildUrl(base: string, code: string, intent: "join" | "create"): string
 function teardown() {
   stopLeaderTimer();
   clearPendingLeaves(); // stale deferred-leave toasts must not fire across a (re)connect
+  ui.memberStats = {}; // transient buffer stats don't survive a (re)connect — they repopulate
+  if (statEmitTimer) { clearTimeout(statEmitTimer); statEmitTimer = null; }
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   if (ws) {
     ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
@@ -470,12 +495,17 @@ function handleMessage(data: string) {
         const timer = setTimeout(() => {
           pendingLeaveTimers.delete(id);
           toastedMembers.delete(id); // truly gone — a later rejoin re-toasts
+          delete ui.memberStats[id]; // drop their buffer readout too
           if (ui.status === "connected") showPartyToast(`${name} left the party`, { tone: "default" });
         }, 6000);
         pendingLeaveTimers.set(id, timer);
       }
       previousMemberIds = newIds;
       ui.members = msg.members;
+      // Drop buffer stats for members who left.
+      for (const id of Object.keys(ui.memberStats)) {
+        if (!newIds.has(id)) delete ui.memberStats[id];
+      }
       // Announce a leadership change (transfer or handoff) — but not the initial
       // assignment (prevLeader null) or a no-op repeat.
       if (ui.leaderId && prevLeader && ui.leaderId !== prevLeader) {
@@ -488,16 +518,38 @@ function handleMessage(data: string) {
       emit();
       break;
     }
-    case "control":
+    case "control": {
+      const prevKey = ui.roomVideoKey;
       ingestRoomState(msg);
+      // The host just selected / changed the party stream — call attention to
+      // it for followers who aren't on it yet (a once-per-change toast; the pill
+      // also animates while roomVideoKey is set but we're not in sync).
+      if (!ui.isLeader && ui.roomVideoKey != null && ui.roomVideoKey !== prevKey && !ui.inSync) {
+        showPartyToast("Stream selected — tap to watch", { tone: "leader" });
+      }
       emit();
       break;
+    }
     case "tick":
       applyTick(msg.position, msg.paused, msg.driverId);
       break;
     case "video":
       // Presence-only; the following `members` frame carries the roster.
       break;
+    case "stat": {
+      // A peer's buffer telemetry — store it for the per-member readout. Never
+      // our own echo (we set self locally in notifyLocalBuffer).
+      if (msg.from && msg.from !== ui.selfId) {
+        ui.memberStats[msg.from] = {
+          pct: typeof msg.pct === "number" ? msg.pct : null,
+          seconds: typeof msg.seconds === "number" ? msg.seconds : null,
+          stalled: !!msg.stalled,
+          ts: Date.now(),
+        };
+        emitStatsCoalesced();
+      }
+      break;
+    }
     case "votes":
       ui.activeVotes = msg.votes;
       emit();
@@ -792,6 +844,33 @@ export function notifyLocalVideo(): void {
 export function resyncToRoom(): void {
   if (!bridge || !ui.inSync || !lastRoomState) return;
   applyRemote(lastRoomState.paused, expectedPosition(lastRoomState));
+}
+
+/** The party's current synced position (extrapolated from the last room state),
+ *  so a follower opening the party stream can BYPASS the resume prompt and land
+ *  in sync. Null when there's no established room stream yet (caller falls back
+ *  to 0; resyncToRoom fine-tunes on the first decoded frame). */
+export function getPartyStartPosition(): number | null {
+  if (ui.roomVideoKey == null || !lastRoomState) return null;
+  const p = expectedPosition(lastRoomState);
+  return Number.isFinite(p) ? Math.max(0, p) : null;
+}
+
+/** Feed local buffer telemetry (from the engine's cache poll) to the party.
+ *  Throttled: sent at most every BUFFER_SEND_INTERVAL_MS, plus immediately when
+ *  the stall state flips. Also stamps our own entry for the local readout. */
+export function notifyLocalBuffer(info: { pct: number | null; seconds: number | null; stalled: boolean }): void {
+  if (ui.status !== "connected" || ui.selfId == null) return;
+  const now = Date.now();
+  // Send every BUFFER_SEND_INTERVAL_MS, or sooner on a stall flip — but never
+  // faster than BUFFER_FLIP_MIN_GAP_MS, so a flapping stall can't burst-spam.
+  const minGap = info.stalled !== lastBufferStalled ? BUFFER_FLIP_MIN_GAP_MS : BUFFER_SEND_INTERVAL_MS;
+  if (now - lastBufferSentAt < minGap) return;
+  lastBufferSentAt = now;
+  lastBufferStalled = info.stalled;
+  ui.memberStats[ui.selfId] = { pct: info.pct, seconds: info.seconds, stalled: info.stalled, ts: now };
+  send({ t: "stat", pct: info.pct, seconds: info.seconds, stalled: info.stalled });
+  emit();
 }
 
 // ── Vote to Watch ────────────────────────────────────────────────────────────

@@ -1772,6 +1772,32 @@ pub fn run() {
                             handle.emit("playback-update", serde_json::Value::Object(update)).ok();
                         }
                     }
+                    "cache-state" => {
+                        // Engine's gated cache poll → real buffering state +
+                        // readahead. `paused_for_cache` drives the loading
+                        // overlay's mid-playback re-appearance; `cache_pct` is
+                        // the buffering % shown on it; `cache_seconds` is the
+                        // demuxer readahead (also broadcast per-member to the party).
+                        let Some(data) = ev.get("data") else { return; };
+                        let mut update = serde_json::Map::new();
+                        if let Some(b) = data.get("paused_for_cache").and_then(|v| v.as_bool()) {
+                            pb_ref.lock().unwrap().buffering = b;
+                            update.insert("buffering".into(), serde_json::Value::Bool(b));
+                        }
+                        if let Some(p) = data.get("cache_pct").and_then(|v| v.as_f64()) {
+                            if let Some(n) = serde_json::Number::from_f64(p) {
+                                update.insert("cache_pct".into(), serde_json::Value::Number(n));
+                            }
+                        }
+                        if let Some(s) = data.get("cache_seconds").and_then(|v| v.as_f64()) {
+                            if let Some(n) = serde_json::Number::from_f64(s) {
+                                update.insert("cache_seconds".into(), serde_json::Value::Number(n));
+                            }
+                        }
+                        if !update.is_empty() {
+                            handle.emit("playback-update", serde_json::Value::Object(update)).ok();
+                        }
+                    }
                     "end-file" => {
                         // libmpv fires this when a file finishes playing —
                         // either naturally (eof), via stop/quit, OR because

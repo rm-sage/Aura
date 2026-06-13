@@ -1015,6 +1015,9 @@ interface Props {
    *  Null when not buffering or not yet readable. Surfaced under the
    *  buffering overlay so the user knows whether MPV is making progress. */
   bufferPct: number | null;
+  /** Demuxer readahead buffered ahead of the playhead, seconds. Shown as a
+   *  secondary line on the loading overlay. */
+  cacheSeconds?: number | null;
   /** True once MPV has produced a first frame in the current playback
    *  session (time-pos > 0). Used to gate the loading overlay so it
    *  stays up across the gap between MPV's loadfile completing and
@@ -1028,6 +1031,10 @@ interface Props {
    *  live. The handlers are also no-ops in this state (gated in App), so this is
    *  purely the visual/affordance half. */
   partyFollower?: boolean;
+
+  /** Mirrors the overlay's auto-hide `controlsVisible` to the parent, so the
+   *  sibling PlayerPartyHud pill can fade in lockstep with the player chrome. */
+  onControlsVisibleChange?: (visible: boolean) => void;
 
   // Handlers
   togglePause: () => void;
@@ -1232,8 +1239,9 @@ export default function PlayerOverlay({
   activeTarget,
   isAnime,
   isLive = false,
-  time, duration, paused, volume, speed, buffering, bufferPct, firstFrameSeen,
+  time, duration, paused, volume, speed, buffering, bufferPct, cacheSeconds = null, firstFrameSeen,
   partyFollower = false,
+  onControlsVisibleChange,
   togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
   onExitPlayback,
   subsOpen, setSubsOpen,
@@ -1268,6 +1276,9 @@ export default function PlayerOverlay({
   // during active playback — a paused frame doesn't need its UI to
   // disappear; the user is likely about to re-engage.
   const controlsVisible = useAutoHide(3000, anyMenuOpen || paused, silentWakeCodes);
+  // Publish controls-visibility to the parent so the sibling PlayerPartyHud pill
+  // can fade with the chrome (it lives outside this overlay).
+  useEffect(() => { onControlsVisibleChange?.(controlsVisible); }, [controlsVisible, onControlsVisibleChange]);
 
   // Scrub state — `scrubValue` is set while the user drags the slider; we
   // commit on pointer-up so we don't seek-storm.
@@ -1961,6 +1972,7 @@ export default function PlayerOverlay({
         show={!firstFrameSeen || buffering}
         statusText={!firstFrameSeen ? "Loading" : "Buffering"}
         bufferPct={bufferPct}
+        cacheSeconds={cacheSeconds}
         title={titleForBuffer}
         logo={logoForBuffer}
       />
@@ -3595,21 +3607,8 @@ function MoreMenu({
               setOpen(false);
             }}
           />
-          <MoreItem
-            icon={
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                   strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
-                <circle cx="9" cy="7" r="4" />
-                <path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" />
-              </svg>
-            }
-            label="Watch Together"
-            onClick={() => {
-              window.dispatchEvent(new CustomEvent("aura:open-watch-together"));
-              setOpen(false);
-            }}
-          />
+          {/* Watch Together entry REMOVED — the in-player party pill (presence
+              cluster) is the sole entry point during playback. */}
           <div className="my-1 mx-3 h-px bg-white/8" />
           <MoreItem
             icon={<CopyIcon />}
@@ -3746,7 +3745,7 @@ function MoreItem({
 // ---------------------------------------------------------------------------
 
 function BufferingOverlay({
-  show, statusText, bufferPct, title, logo,
+  show, statusText, bufferPct, cacheSeconds = null, title, logo,
 }: {
   show: boolean;
   /** Replaces "Buffering" — caller decides ("Loading", "Buffering", …). */
@@ -3755,6 +3754,9 @@ function BufferingOverlay({
    *  when not applicable (initial load, manual pause, EOF). Rendered as
    *  a soft "Buffering… 47 %" suffix on the status line. */
   bufferPct: number | null;
+  /** Demuxer readahead buffered ahead of the playhead, seconds — shown as a
+   *  secondary "12s buffered" line so a slow fill is visible. */
+  cacheSeconds?: number | null;
   title: string;
   logo: string | null;
 }) {
@@ -3789,8 +3791,13 @@ function BufferingOverlay({
           </h2>
         )}
         <p className="text-white/55 text-[10px] font-mono uppercase tracking-[0.32em]">
-          {statusText}…{typeof bufferPct === "number" ? ` ${bufferPct}%` : ""}
+          {statusText}…{typeof bufferPct === "number" ? ` ${Math.round(bufferPct)}%` : ""}
         </p>
+        {typeof cacheSeconds === "number" && cacheSeconds > 0 && (
+          <p className="text-white/35 text-[10px] font-mono uppercase tracking-[0.32em] -mt-3">
+            {cacheSeconds.toFixed(1)}s buffered
+          </p>
+        )}
       </div>
     </div>
   );

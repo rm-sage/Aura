@@ -285,6 +285,18 @@ export class Room {
           this.broadcastMembers();
           break;
         }
+        case "stat": {
+          // A member's buffer telemetry — validated/capped then forwarded to the
+          // OTHER peers (no persistence, no roster rebuild) for the per-member
+          // buffer readout. Numeric caps guard against a garbage/malicious payload.
+          if (!me.id) break;
+          const pct = (typeof msg.pct === "number" && Number.isFinite(msg.pct))
+            ? Math.max(0, Math.min(100, msg.pct)) : null;
+          const seconds = (typeof msg.seconds === "number" && Number.isFinite(msg.seconds))
+            ? Math.max(0, Math.min(86_400, msg.seconds)) : null;
+          this.broadcast({ t: "stat", from: me.id, pct, seconds, stalled: !!msg.stalled }, ws);
+          break;
+        }
         case "vote-start": {
           // Any member proposes a title; the proposer auto-casts yes.
           if (!me.id) break; // no stable id ⇒ can't dedup a voter; reject
