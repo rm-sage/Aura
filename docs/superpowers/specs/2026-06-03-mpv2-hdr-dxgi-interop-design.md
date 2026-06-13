@@ -66,13 +66,16 @@ Consequences (all corrected myths):
    `SetHDRMetaData`).
 4. **An 8-bit FBO cannot carry HDR.** The FBO's backing texture must be
    `GL_RGBA16F` (FP16) or `GL_RGB10_A2` (10-bit). This is the root limitation.
-5. **`gpu-next` is (likely) mandatory.** `target-trc=scrgb`, `target-contrast`,
-   `target-gamut`, `hdr-reference-white` are `--vo=gpu-next` only. **OPEN
-   QUESTION (potential blocker) — see Risk #0:** whether the renderer used by
-   `vo_libmpv` (the render API) can be `gpu-next` at all, and how to select it.
-   The basic SDR tone-map options (`target-prim=bt.709`, `target-trc=bt.1886`,
-   `target-peak`, `tone-mapping=mobius`) work on `vo_gpu` too, which is why the
-   shipped SDR/off path already works under mpv2.
+5. **The render API uses `gl_video` (gpu), NOT `gpu-next` — RESOLVED, see Risk #0.**
+   `target-trc=scrgb`, `target-contrast`, `target-gamut`, `hdr-reference-white`
+   and the libplacebo tone-curves are `gpu-next`-only and therefore **unreachable**
+   here (the render API hardcodes `gl_video`; no knob). `gl_video` still supports
+   **PQ/HLG/BT.2020 HDR output + basic tone-mapping** — so HDR works, but the plan
+   pivots to the **PQ path, not scRGB**, and gpu-next-grade quality is only
+   available via the legacy `--wid`+`vo=gpu-next`+`gpu-context=d3d11` path. The
+   basic SDR options (`target-prim=bt.709`, `target-trc=bt.1886`, `target-peak`,
+   `tone-mapping=mobius`) work on `gl_video`, which is why the shipped SDR/off path
+   already works under mpv2.
 6. **The render API cannot un-HDR the display on idle** (it owns no swapchain).
    The host owns this lifecycle — tear down / reconfigure the HDR swapchain when
    playback stops, or the desktop stays stuck in HDR (cf. mpv #10196).
@@ -341,14 +344,36 @@ dependent — perf, not correctness; confirm with PresentMon.)
 
 ## 7. Open risks / must-verify-on-HW (ranked)
 
-0. **`gpu-next` under the render API (BLOCKER-CLASS, verify first).** `target-trc=
-   scrgb` and the advanced HDR options are gpu-next only. `vo=libmpv` historically
-   used the older `vo_gpu` renderer; whether gpu-next is reachable through the
-   render API on the shipped DLL — and how to select it — is unconfirmed. If it
-   is NOT reachable, scRGB is out and only the PQ path with basic options is
-   viable (still real HDR, narrower feature set). **Resolve before committing to
-   scRGB.** Check `mpv --vo=help`, the render-API renderer selection, and a probe
-   run reading mpv `stats`/log for the active renderer.
+0. **`gpu-next` under the render API — ✅ RESOLVED 2026-06-08 (probed): it is NOT
+   reachable. The render API hardcodes the legacy `gl_video` ("gpu") renderer.**
+   Confirmed two ways against the shipped build (mpv `v0.41.0-524-g5921fe50b`,
+   libplacebo 7.362): (a) the source — `video/out/gpu/libmpv_gpu.c`'s
+   `render_backend_gpu` calls `gl_video_init` / `gl_video_render_frame` and stores
+   a `struct gl_video *`, with zero libplacebo/`pl_renderer` usage; there is no
+   selection knob. (b) a headless option-surface probe of `libmpv-2.dll` — the
+   build *knows* `vo=gpu-next` and the parser *accepts* every HDR value incl.
+   `target-trc=scrgb` and the gpu-next-only options (`target-contrast`,
+   `corner-rounding`), but option acceptance is global and does NOT mean the
+   render-API renderer honors them.
+   **CONSEQUENCES (design pivots):**
+   - gpu-next quality (libplacebo tone-mapping: `spline`/`st2094-40` dynamic
+     metadata, `target-contrast`, scRGB, placebo dithering/peak-detect) is
+     **unreachable** via the render API. It is only available by letting mpv own
+     its own swapchain — i.e. the **legacy `--wid` + `vo=gpu-next` +
+     `--gpu-context=d3d11`** path, which is exactly why HDR worked pre-rewrite.
+   - `gl_video` IS mpv's original HDR renderer and supports **PQ/HLG/BT.2020
+     output + tone-mapping** (clip/mobius/reinhard/hable/bt.2390). So **HDR is NOT
+     blocked** — but **plan the PQ/R10A2 path as PRIMARY, not scRGB.** Under
+     `gl_video`, `scrgb` output is likely a no-op/unsupported (it's a
+     libplacebo/gpu-next output mode); confirm empirically in Phase 1, but do not
+     design around it.
+   - This makes the transparent-overlay-vs-PQ-no-alpha tension (§3) the central
+     design problem, since the overlay-friendly scRGB path is out.
+   - **Strategic note:** mpv2 HDR is inherently a notch below the legacy
+     gpu-next+d3d11 HDR (older renderer, PQ-only, more manual signalling). The
+     render-API rewrite traded gpu-next+mpv-owned-d3d11-HDR away for off-focus-drop
+     control + an Aura-owned swapchain. HDR is the one axis where legacy was
+     genuinely better — weigh that before committing to the multi-day DXGI build.
 1. **scRGB usability in the shipped libplacebo (HIGH).** mpv #17076 — scRGB clips
    negatives/`>1.0`. If present, default to PQ. Single biggest "plan A might fail."
 2. **Does `internal_format` drive libplacebo output depth in `vo_libmpv`? (HIGH).**
