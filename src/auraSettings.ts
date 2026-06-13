@@ -177,12 +177,15 @@ export interface AuraSettings {
    *  false, the desktop uses only the per-user addon probe path —
    *  same code as pre-Phase 9. See docs/release-search-spec.md. */
   releaseSearchEnabled: boolean;
-  /** When true, the mini-meta hover panel no longer opens on hover;
-   *  instead it opens when the configured mouse button is pressed on a
-   *  card (and the same press toggles it closed). Default false =
-   *  classic hover behaviour on every surface. */
-  metaPanelBindEnabled: boolean;
-  /** Mouse button that opens the meta panel when `metaPanelBindEnabled`.
+  /** How the mini-meta hover panel is triggered on a catalog card:
+   *   - "hover"  — opens on mouse-over (hover-intent). Default.
+   *   - "button" — hover never opens; the configured mouse button
+   *                (`metaPanelBindButton`) opens / toggles it.
+   *   - "hold"   — hover never opens; a press-and-hold (~0.4 s) on a card
+   *                opens it (a quick click still selects). Trackpad-friendly.
+   *  Migrated from the legacy boolean `metaPanelBindEnabled` (true → "button"). */
+  metaPanelActivation: "hover" | "button" | "hold";
+  /** Mouse button that opens the meta panel in "button" activation mode.
    *  DOM `MouseEvent.button`: 1 = middle (default), 3 = back, 4 =
    *  forward. 0 (left) and 2 (right) are intentionally not selectable —
    *  left is select/navigate, right is the card context menu. */
@@ -220,7 +223,7 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   interpolationTscale: "oversample",
   nextUpSkipFillerRecap: "none",
   releaseSearchEnabled: true,
-  metaPanelBindEnabled: false,
+  metaPanelActivation: "hover",
   metaPanelBindButton: 1,
   openLinksExternally: false,
   queueRemoveSeriesInProgress: true,
@@ -309,9 +312,11 @@ function readFromStorage(): AuraSettings {
       releaseSearchEnabled: typeof parsed.releaseSearchEnabled === "boolean"
         ? parsed.releaseSearchEnabled
         : true,
-      metaPanelBindEnabled: typeof parsed.metaPanelBindEnabled === "boolean"
-        ? parsed.metaPanelBindEnabled
-        : false,
+      metaPanelActivation:
+        parsed.metaPanelActivation === "button" || parsed.metaPanelActivation === "hold" || parsed.metaPanelActivation === "hover"
+          ? parsed.metaPanelActivation
+          // Migrate the legacy boolean: bind-enabled → "button", else "hover".
+          : ((parsed as Record<string, unknown>).metaPanelBindEnabled === true ? "button" : "hover"),
       // Only the three non-conflicting buttons are valid; anything else
       // (legacy / garbage / left / right) falls back to middle.
       metaPanelBindButton:

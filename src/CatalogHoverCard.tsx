@@ -529,15 +529,18 @@ export function CatalogHoverHost({
   onSelectMeta?: (m: MetaPreview) => void;
 }) {
   const target = useHoverTarget();
-  const [bindEnabled, setBindEnabled] = useState(
-    () => loadAuraSettings().metaPanelBindEnabled,
+  // True in the non-hover activation modes ("button" / "hold"), where the panel
+  // is opened explicitly and has no mouse-leave close — so it needs Esc +
+  // click-outside dismissal (added below).
+  const [explicitDismiss, setExplicitDismiss] = useState(
+    () => loadAuraSettings().metaPanelActivation !== "hover",
   );
 
   useEffect(() => {
     const sync = (e: Event) => {
       const keys = (e as CustomEvent<{ keys?: string[] }>).detail?.keys;
-      if (keys && !keys.includes("metaPanelBindEnabled")) return;
-      setBindEnabled(loadAuraSettings().metaPanelBindEnabled);
+      if (keys && !keys.includes("metaPanelActivation")) return;
+      setExplicitDismiss(loadAuraSettings().metaPanelActivation !== "hover");
     };
     window.addEventListener("aura:settings-changed", sync);
     return () => window.removeEventListener("aura:settings-changed", sync);
@@ -574,12 +577,12 @@ export function CatalogHoverHost({
     return () => window.clearInterval(id);
   }, [target]);
 
-  // Bind mode only: there is no mouse-leave close, so Esc and a click
-  // outside the panel + its anchoring card dismiss it. Hover mode is
-  // intentionally NOT given these (its leave/scroll behaviour is
-  // unchanged and shipped). target.el is the active card element.
+  // Button / hold modes only: there is no mouse-leave close, so Esc and a
+  // click outside the panel + its anchoring card dismiss it. Hover mode is
+  // intentionally NOT given these (its leave/scroll behaviour is unchanged
+  // and shipped). target.el is the active card element.
   useEffect(() => {
-    if (!target || !bindEnabled) return;
+    if (!target || !explicitDismiss) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") closeHoverNow();
     };
@@ -596,7 +599,7 @@ export function CatalogHoverHost({
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("mousedown", onDown, true);
     };
-  }, [target, bindEnabled]);
+  }, [target, explicitDismiss]);
 
   if (!target) return null;
   return <HoverPanel target={target} addons={addons} onSelectMeta={onSelectMeta} />;

@@ -4651,13 +4651,21 @@ export default function SettingsView({ addons, session }: Props) {
               mouse-button press instead — useful if hover-open feels
               twitchy or for click-only navigation. */}
           <Section id="sec-hover-panel" title="Hover Meta Panel">
-            <SettingToggle
-              label="Open with a mouse button instead of hover"
-              description="When on, the meta panel no longer opens on hover. Press the bound mouse button on any poster to open it; press again to dismiss. Esc or a click elsewhere also closes it."
-              value={aura.metaPanelBindEnabled}
-              onChange={(v) => setLocal({ metaPanelBindEnabled: v })}
+            <SettingDropdown
+              label="How the meta panel opens"
+              description="The mini-meta panel (poster, ratings, plot, cast) beside a catalog card. Hover opens it on mouse-over; Mouse button opens it on a bound button press; Press & hold opens it on a long-press of a poster — best for trackpads."
+              value={aura.metaPanelActivation}
+              required
+              options={[
+                { value: "hover", label: "Hover (default)" },
+                { value: "button", label: "Mouse button" },
+                { value: "hold", label: "Press & hold (trackpad-friendly)" },
+              ]}
+              onChange={(v) => {
+                if (v === "hover" || v === "button" || v === "hold") setLocal({ metaPanelActivation: v });
+              }}
             />
-            {aura.metaPanelBindEnabled && (
+            {aura.metaPanelActivation === "button" && (
               <>
                 <div className="h-px bg-white/6" />
                 <MouseBindRow
@@ -4666,6 +4674,16 @@ export default function SettingsView({ addons, session }: Props) {
                   button={aura.metaPanelBindButton}
                   onChange={(b) => setLocal({ metaPanelBindButton: b })}
                 />
+              </>
+            )}
+            {aura.metaPanelActivation === "hold" && (
+              <>
+                <div className="h-px bg-white/6" />
+                <p className="text-white/40 text-xs leading-relaxed px-0.5">
+                  Press and hold the left button (or tap-and-hold on a trackpad) on a poster
+                  for about 0.4&nbsp;s to open the panel. A quick click still selects. Esc or a
+                  click elsewhere closes it.
+                </p>
               </>
             )}
           </Section>
