@@ -639,27 +639,23 @@ function CWReleaseCountdown({ seriesId, episodes }: { seriesId: string; episodes
   const cloudMs = cloudIso ? Date.parse(cloudIso) : NaN;
   const targetMs = metaNextMs ?? cloudMs;
   if (!Number.isFinite(targetMs) || targetMs <= now) return null;
-  // Top-right of the tile (the only otherwise-empty corner — the remove-from-CW
-  // × also lives there but is hover-only, so the two cross-fade: countdown at
-  // rest, × on hover). Sized down for 1080p; `uw:` restores the current size on
-  // ultrawide. The icon scales with the text.
   return (
-    <span
-      title={`Next episode airs ${formatTargetDate(targetMs)}`}
-      className="absolute top-2 right-2 z-10 inline-flex items-center gap-1 uw:gap-1.5
-                 px-2 py-0.5 uw:px-2.5 rounded-full
-                 bg-black/72 backdrop-blur-sm border border-white/15
-                 text-white text-[11px] uw:text-[12.5px] font-semibold tabular-nums
-                 transition-opacity group-hover:opacity-0 group-hover:pointer-events-none"
-      style={{ textShadow: "0 1px 2px rgba(0,0,0,0.9)" }}
-    >
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"
-           className="w-[11px] h-[11px] uw:w-3 uw:h-3 text-ln-accent shrink-0" aria-hidden>
-        <circle cx="12" cy="12" r="9" />
-        <path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
-      </svg>
-      {formatCountdown(targetMs, now)}
-    </span>
+    <div className="absolute inset-x-0 bottom-[28px] flex justify-center pointer-events-none z-10">
+      <span
+        title={`Next episode airs ${formatTargetDate(targetMs)}`}
+        className="pointer-events-auto inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full
+                   bg-black/72 backdrop-blur-sm border border-white/15
+                   text-white text-[12.5px] font-semibold tabular-nums"
+        style={{ textShadow: "0 1px 2px rgba(0,0,0,0.9)" }}
+      >
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             strokeWidth="2.2" className="text-ln-accent" aria-hidden>
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+        {formatCountdown(targetMs, now)}
+      </span>
+    </div>
   );
 }
 
@@ -750,14 +746,15 @@ const ContinueWatchingCard = memo(function ContinueWatchingCard(
           ) : null}
 
           {/* SxxEyy badge — top-left, denotes the episode that will
-              actually be brought up when the card is clicked. Sized for
-              1080p; `uw:` bumps it to the larger sofa-distance size
-              (13 px) on ultrawide, matching the countdown pill opposite. */}
+              actually be brought up when the card is clicked. Same
+              style as the calendar but scaled +25 % (10.5 → 13 px font,
+              padding bumped proportionally) so the SxxEyy reads
+              cleanly at sofa distance. */}
           {badge && (
             <span
-              className="absolute top-1.5 left-1.5 px-1.5 py-0.5 uw:px-2 uw:py-1 rounded
+              className="absolute top-1.5 left-1.5 px-2 py-1 rounded
                          bg-black/75 backdrop-blur-sm border border-white/15
-                         text-white/90 text-[11px] uw:text-[13px] font-mono font-semibold
+                         text-white/90 text-[13px] font-mono font-semibold
                          tracking-wider tabular-nums"
               aria-label={`Resume at ${badge}`}
             >

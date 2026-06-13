@@ -10,14 +10,6 @@ export default {
       screen: "100vw",
     },
     extend: {
-      // Ultrawide breakpoint — separates 1080p-class viewports (≤1920w) from
-      // ultrawide / hi-res ones (≥2200w). Mobile-first: base styles target
-      // 1080p; `uw:` variants restore the larger sofa-distance sizing on
-      // ultrawide. (Default screens jump 1536 → nothing, so 1920 and 3440 would
-      // otherwise be indistinguishable.)
-      screens: {
-        uw: "2200px",
-      },
       // Tailwind's default opacity scale jumps in 5-point steps (..85/90/95/100)
       // — `bg-black/97` produced NO css at all so player overlay submenus
       // were rendering with a fully transparent background. Add the
