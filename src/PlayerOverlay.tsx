@@ -1274,11 +1274,16 @@ export default function PlayerOverlay({
   const anyMenuOpenRef = useRef(false);
   useEffect(() => { anyMenuOpenRef.current = anyMenuOpen; }, [anyMenuOpen]);
 
+  // While the pointer rests on the scrubber, hold the chrome visible — hover
+  // thumbnails can take a moment to load, and the 3 s idle auto-hide would
+  // otherwise pull the whole bar (and the preview) out from under the cursor.
+  const [scrubberHovered, setScrubberHovered] = useState(false);
+
   // Auto-hide is bypassed (controls + cursor stay visible) whenever a
-  // menu is open OR playback is paused. Fading should only happen
-  // during active playback — a paused frame doesn't need its UI to
-  // disappear; the user is likely about to re-engage.
-  const controlsVisible = useAutoHide(3000, anyMenuOpen || paused, silentWakeCodes);
+  // menu is open, playback is paused, OR the scrubber is hovered. Fading
+  // should only happen during active playback — a paused frame doesn't need
+  // its UI to disappear; the user is likely about to re-engage.
+  const controlsVisible = useAutoHide(3000, anyMenuOpen || paused || scrubberHovered, silentWakeCodes);
   // Publish controls-visibility to the parent so the sibling PlayerPartyHud pill
   // can fade with the chrome (it lives outside this overlay).
   useEffect(() => { onControlsVisibleChange?.(controlsVisible); }, [controlsVisible, onControlsVisibleChange]);
@@ -2100,7 +2105,11 @@ export default function PlayerOverlay({
               scrubber; Live TV gets the DVR scrubber (rewind within the
               demuxer back-buffer, "Go Live" to snap back to the edge). ── */}
           {!isLive && (
-            <div className={`px-1.5 pt-0.5 ${partyFollower ? "pointer-events-none opacity-60" : ""}`}>
+            <div
+              className={`px-1.5 pt-0.5 ${partyFollower ? "pointer-events-none opacity-60" : ""}`}
+              onMouseEnter={() => setScrubberHovered(true)}
+              onMouseLeave={() => setScrubberHovered(false)}
+            >
               <Scrubber
                 value={displayTime}
                 max={duration || 1}
@@ -2128,7 +2137,11 @@ export default function PlayerOverlay({
             // Defensive: a party follower is never on Live TV (live reports a
             // null videoKey ⇒ never in sync ⇒ partyFollower stays false), but
             // disable the DVR scrubber under the flag anyway for consistency.
-            <div className={partyFollower ? "pointer-events-none opacity-60" : ""}>
+            <div
+              className={partyFollower ? "pointer-events-none opacity-60" : ""}
+              onMouseEnter={() => setScrubberHovered(true)}
+              onMouseLeave={() => setScrubberHovered(false)}
+            >
               <LiveScrubber
                 windowStart={dvr.windowStart}
                 edge={dvr.edge}
