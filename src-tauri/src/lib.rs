@@ -1772,6 +1772,15 @@ pub fn run() {
                             handle.emit("playback-update", serde_json::Value::Object(update)).ok();
                         }
                     }
+                    "seek-state" => {
+                        // Seek lifecycle (SEEK → PLAYBACK_RESTART) → the frontend
+                        // shows the loading overlay during a slow/buffering seek.
+                        if let Some(s) = ev.get("data").and_then(|d| d.get("seeking")).and_then(|v| v.as_bool()) {
+                            let mut update = serde_json::Map::new();
+                            update.insert("seeking".into(), serde_json::Value::Bool(s));
+                            handle.emit("playback-update", serde_json::Value::Object(update)).ok();
+                        }
+                    }
                     "cache-state" => {
                         // Engine's gated cache poll → real buffering state +
                         // readahead. `paused_for_cache` drives the loading

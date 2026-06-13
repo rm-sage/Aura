@@ -462,6 +462,8 @@ interface PlaybackPayload {
   cache_pct?: number;
   /** Demuxer readahead buffered ahead of the playhead, seconds. */
   cache_seconds?: number;
+  /** Seek lifecycle (SEEK → PLAYBACK_RESTART) — drives the loading overlay on seeks. */
+  seeking?: boolean;
 }
 
 // Tail window (seconds before metadata duration) considered "near end"
@@ -520,6 +522,16 @@ function usePlayback(playerActive: boolean) {
   // every new load_video so per-episode swaps go back through the
   // loading state cleanly.
   const [firstFrameSeen, setFirstFrameSeen] = useState(false);
+  // Raw seek lifecycle from the engine (SEEK → PLAYBACK_RESTART). Debounced into
+  // `seekLoading` below so an instant seek doesn't flash the loading overlay, but
+  // a slow/buffering seek surfaces it (with the buffering stats) for transparency.
+  const [seeking, setSeeking] = useState(false);
+  const [seekLoading, setSeekLoading] = useState(false);
+  useEffect(() => {
+    if (!seeking) { setSeekLoading(false); return; }
+    const t = window.setTimeout(() => setSeekLoading(true), 250);
+    return () => window.clearTimeout(t);
+  }, [seeking]);
 
   // ── Buffering / EOF polling ──
   // `paused-for-cache`, `eof-reached`, and `cache-buffering-state` USED to be
@@ -652,6 +664,13 @@ function usePlayback(playerActive: boolean) {
         if (!payload.buffering) setBufferPct(null); // stall cleared → drop the %
       }
       if (typeof payload.eof === "boolean")     setEof(payload.eof);
+      if (typeof payload.seeking === "boolean") {
+        setSeeking(payload.seeking);
+        // On seek start, the pre-seek cache stats are stale for the new position —
+        // clear them so the overlay shows "Seeking…" until the post-seek poll
+        // reports fresh numbers for where we landed.
+        if (payload.seeking) { setBufferPct(null); setCacheSeconds(null); }
+      }
       // Real cache telemetry from the engine's gated poll: drive the loading
       // overlay's % + readahead, and broadcast our buffer to the party.
       if (typeof payload.cache_pct === "number") setBufferPct(payload.cache_pct);
@@ -1004,7 +1023,7 @@ function usePlayback(playerActive: boolean) {
   }, []);
 
   return {
-    time, duration, paused, volume, speed, buffering, bufferPct, cacheSeconds, eof, firstFrameSeen,
+    time, duration, paused, volume, speed, buffering, bufferPct, cacheSeconds, seekLoading, eof, firstFrameSeen,
     streamBroken, setStreamBroken,
     togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
     notifyNewLoad, logLoadEvent,
@@ -1182,7 +1201,7 @@ export default function App() {
   // ── Playback hook — gated on activeTarget so the polling fallback only
   //     runs while a stream is loaded.
   const {
-    time, duration, paused, volume, speed, buffering, bufferPct, cacheSeconds, firstFrameSeen,
+    time, duration, paused, volume, speed, buffering, bufferPct, cacheSeconds, seekLoading, firstFrameSeen,
     streamBroken, setStreamBroken,
     togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
     notifyNewLoad, logLoadEvent,
@@ -6012,6 +6031,7 @@ export default function App() {
           buffering={buffering}
           bufferPct={bufferPct}
           cacheSeconds={cacheSeconds}
+          seekLoading={seekLoading}
           firstFrameSeen={firstFrameSeen}
           // True when we're a non-leader synced to the party — the transport
           // controls (play/pause/seek/skip/speed) disable with a "Leader

@@ -1649,6 +1649,9 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         // including AniSkip's Lua seeks — the exact original crash trigger.
         let mut playback_ready = false;
         let mut seeking = false;
+        // Last `seeking` value pushed to the frontend, so the loading/buffering
+        // overlay can surface during a (slow) seek — emitted on transition only.
+        let mut seeking_emitted = false;
         let mut last_transition = Instant::now();
         let mut last_cache_poll = Instant::now();
         const CACHE_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -1922,6 +1925,16 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             // never emits PLAYBACK_RESTART, so without clearing `seeking` here the
             // poll gate would stay locked until the next load.
             if tick.ended   { playback_ready = false; seeking = false; last_transition = Instant::now(); }
+
+            // Surface seek lifecycle to the frontend (transition-only) so the
+            // loading overlay can show during a slow/buffering seek. The frontend
+            // debounces this so instant seeks don't flash the overlay.
+            if seeking != seeking_emitted {
+                seeking_emitted = seeking;
+                let mut sm = serde_json::Map::new();
+                sm.insert("seeking".into(), serde_json::Value::Bool(seeking));
+                emit("seek-state", serde_json::Value::Object(sm));
+            }
 
             // -- Gated cache-state poll -- (see the gating-state comment above).
             // Numeric formats ONLY (never NODE — landmine #4); never while a

@@ -1018,6 +1018,9 @@ interface Props {
   /** Demuxer readahead buffered ahead of the playhead, seconds. Shown as a
    *  secondary line on the loading overlay. */
   cacheSeconds?: number | null;
+  /** True during a slow/buffering seek (debounced) — surfaces the loading
+   *  overlay so the user sees WHY playback paused after a seek. */
+  seekLoading?: boolean;
   /** True once MPV has produced a first frame in the current playback
    *  session (time-pos > 0). Used to gate the loading overlay so it
    *  stays up across the gap between MPV's loadfile completing and
@@ -1239,7 +1242,7 @@ export default function PlayerOverlay({
   activeTarget,
   isAnime,
   isLive = false,
-  time, duration, paused, volume, speed, buffering, bufferPct, cacheSeconds = null, firstFrameSeen,
+  time, duration, paused, volume, speed, buffering, bufferPct, cacheSeconds = null, seekLoading = false, firstFrameSeen,
   partyFollower = false,
   onControlsVisibleChange,
   togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
@@ -1969,8 +1972,8 @@ export default function PlayerOverlay({
               Manual user pause is NOT covered (intentional pause shouldn't
               hide the frame the user is looking at). ── */}
       <BufferingOverlay
-        show={!firstFrameSeen || buffering}
-        statusText={!firstFrameSeen ? "Loading" : "Buffering"}
+        show={!firstFrameSeen || buffering || seekLoading}
+        statusText={!firstFrameSeen ? "Loading" : buffering ? "Buffering" : "Seeking"}
         bufferPct={bufferPct}
         cacheSeconds={cacheSeconds}
         title={titleForBuffer}
@@ -3790,11 +3793,11 @@ function BufferingOverlay({
             {title}
           </h2>
         )}
-        <p className="text-white/55 text-[10px] font-mono uppercase tracking-[0.32em]">
+        <p className="text-white/60 text-[12.5px] font-mono uppercase tracking-[0.3em]">
           {statusText}…{typeof bufferPct === "number" ? ` ${Math.round(bufferPct)}%` : ""}
         </p>
         {typeof cacheSeconds === "number" && cacheSeconds > 0 && (
-          <p className="text-white/35 text-[10px] font-mono uppercase tracking-[0.32em] -mt-3">
+          <p className="text-white/40 text-[12.5px] font-mono uppercase tracking-[0.3em] -mt-3">
             {cacheSeconds.toFixed(1)}s buffered
           </p>
         )}
