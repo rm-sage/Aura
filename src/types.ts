@@ -198,6 +198,13 @@ export interface MetaDetail {
    *  TVDB / IMDb / Kitsu / MAL meta. Used by the cast hover overlay
    *  for Main / Recurring / Guest tier classification. */
   aggregate_credits: AggregateCredits | null;
+  /** Series airing status from the addon meta's `status` field
+   *  (vocabulary varies by source): "Continuing" / "Returning Series" /
+   *  "Ended" / "Canceled" (Cinemeta / TMDB) or "current" / "finished" /
+   *  "finished_airing" / "releasing" / "upcoming" / "tba" (Kitsu / MAL /
+   *  AniList). Null when the addon omits it. Drives the EOS Spotlight
+   *  "Series finale" vs "Caught up" decision. */
+  status: string | null;
 }
 
 export interface VideoEntry {

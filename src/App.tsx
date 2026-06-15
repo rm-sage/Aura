@@ -51,7 +51,7 @@ import { libraryToggle, libraryRemoveAll, libraryWriteProgress, libraryClearProg
 import { libraryItemSeriesId } from "./libraryNormalize";
 import { sourcesForMeta, openInPopupBrowser } from "./externalSources";
 import { setManualWatchedScope, getManualWatchedState, setManualWatchedState, setManualWatchedMany, getPlannedQueue } from "./manualWatched";
-import { reconcileLibraryReleaseSignals, clearReleaseSignalStore } from "./releaseSignalStore";
+import { reconcileLibraryReleaseSignals, clearReleaseSignalStore, getReleaseSignal } from "./releaseSignalStore";
 import { syncPullAll, installSyncTriggers, startBackgroundPull, clearSyncEtags, setSyncActiveScope } from "./sync";
 import { setHistoryScope, addHistoryEntry } from "./historyStore";
 import { setAutoBackupScope, startAutoBackup } from "./userDataBackup";
@@ -2886,12 +2886,58 @@ export default function App() {
             loadAuraSettings().nextUpSkipFillerRecap)
         : null;
       const nextAirMs = detail ? (nextAiringEpisode(detail.videos)?.targetMs ?? null) : null;
+      // Series airing status (surfaced from the addon meta — Cinemeta/TMDB
+      // "Ended"/"Returning Series", Kitsu/MAL "finished"/"finished_airing"/
+      // "current", etc.). The video-list signals above (laterIgnoringAir /
+      // nextAirMs) only catch shows whose meta already LISTS a future episode;
+      // a still-airing show whose next episode hasn't been added to the meta
+      // yet (Wistoria after its last AIRED episode) has neither, so without a
+      // status check it wrongly reads as a finale. We flip to "caught up" only
+      // on POSITIVE evidence the series is NOT over — an explicit non-ended
+      // status, or (when the addon omits status) an open-ended release-info run
+      // like "2024–". A missing/unknown status alone stays on the finale path,
+      // so status-less addons don't suppress legitimate finale cards for shows
+      // that genuinely ended. The ended-match is a substring test so MAL's
+      // "finished_airing" is covered while every ongoing vocab term is not.
+      const statusRaw = (detail?.status ?? "").trim();
+      const endedStatus = statusRaw !== "" && /(ended|finished|cancell?ed|complete)/i.test(statusRaw);
+      const ongoingStatus = statusRaw !== "" && !endedStatus;
+      const openEndedRun =
+        statusRaw === "" && /^\d{4}\s*[-–—]\s*$/.test((detail?.release_info ?? "").trim());
+      // Cloud release signal (videos-independent; imdb-keyed). For tt-keyed
+      // series — which INCLUDES AIOMetadata anime mapped to imdb ids like
+      // Wistoria's tt31889371 — the cloud poller tracks the upstream schedule
+      // and knows the NEXT episode even when the addon meta lists none, emits
+      // no status, and carries an ambiguous closed releaseInfo ("2024-2026").
+      // A populated `next_aired` is hard proof the series is still going (a
+      // genuinely-ended show has next_aired=null), so it's both a reliable
+      // caught-up signal AND a real countdown target. Kitsu/anidb-keyed series
+      // aren't in the imdb-keyed store → getReleaseSignal returns
+      // undefined/null and we fall back to the addon-meta signals above.
+      const sig = getReleaseSignal(seriesId);
+      const cloudNextMs = sig?.next_aired?.aired_at ? Date.parse(sig.next_aired.aired_at) : NaN;
+      const cloudHasNext = sig?.next_aired != null;
+      const caughtUp =
+        !!laterIgnoringAir || ongoingStatus || nextAirMs != null || openEndedRun || cloudHasNext;
+      // Countdown target: prefer the meta's future-dated episode, else the
+      // cloud's next_aired when it's genuinely in the future. Null leaves the
+      // "next episode hasn't been scheduled yet" copy (correct when caught up
+      // via status/open-ended run with no known date).
+      const effectiveNextAirMs =
+        nextAirMs != null
+          ? nextAirMs
+          : Number.isFinite(cloudNextMs) && cloudNextMs > Date.now()
+            ? cloudNextMs
+            : null;
       console.info(
         `[eos] caught-up check seriesId=${seriesId} videos=${detail?.videos?.length ?? 0} ` +
-          `laterIgnoringAir=${laterIgnoringAir ? laterIgnoringAir.id : "none"} nextAirMs=${nextAirMs ?? "none"}`,
+          `laterIgnoringAir=${laterIgnoringAir ? laterIgnoringAir.id : "none"} ` +
+          `nextAirMs=${nextAirMs ?? "none"} status=${statusRaw || "none"} ended=${endedStatus} ` +
+          `cloudNext=${cloudHasNext ? (sig?.next_aired?.id ?? "yes") : "none"} ` +
+          `caughtUp=${caughtUp}`,
       );
-      setEosCaughtUpUnaired(!!laterIgnoringAir);
-      setEosNextAirMs(nextAirMs);
+      setEosCaughtUpUnaired(caughtUp);
+      setEosNextAirMs(effectiveNextAirMs);
       setEosResolve("none");
     })();
     return () => { cancelled = true; };
@@ -5924,7 +5970,17 @@ export default function App() {
         </div>
       )}
 
-      {streamBroken && isPlayerActive && !liveReconnecting && (
+      {/* `!switcherOpen`: the recovery modal's own "Switch source" button opens
+          the in-player source switcher WITHOUT issuing a new load_video, so the
+          original (dead) stream is still being watched by the stale-heartbeat
+          detector — which keeps re-flipping `streamBroken` true (its
+          lastTimeUpdateAtRef is already past BROKEN_STALE_MS). Without this gate
+          the z-[10500] modal re-renders over the open z-[10001] switcher within
+          ~1 s, which reads as "the switch-source menu closed itself". Suppress
+          the modal for as long as the switcher is up; picking a source clears
+          streamBroken via notifyNewLoad, and closing without a pick correctly
+          re-surfaces it (the stream genuinely is still broken). */}
+      {streamBroken && isPlayerActive && !liveReconnecting && !switcherOpen && (
         <div
           // z-[10500] sits above PlayerOverlay's z-[9999] click-capture
           // layer AND its z-[10000] submenu portals. Without this,

@@ -681,6 +681,15 @@ pub struct MetaDetail {
     /// crew member. TMDB-only. Powers the hover-overlay's
     /// Main/Recurring/Guest tier classification.
     pub aggregate_credits: Option<AggregateCredits>,
+    /// Series airing status straight from the addon meta's `status` field
+    /// (best-effort; the vocabulary varies by source). Cinemeta / TMDB-backed
+    /// addons emit "Continuing" / "Returning Series" / "Ended" / "Canceled";
+    /// anime addons (Kitsu / MAL / AniList) emit "current" / "finished" /
+    /// "finished_airing" / "releasing" / "upcoming" / "tba". `None` when the
+    /// addon omits it. Drives the EOS Spotlight's "Series finale" vs "Caught
+    /// up" decision — a non-ended status means more episodes are still coming
+    /// even when the meta's video list hasn't been extended with them yet.
+    pub status: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -2267,10 +2276,12 @@ pub async fn fetch_meta_detail(
     let cast_ct       = meta.get("cast").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
     let cast_extras_ct = meta.pointer("/app_extras/cast").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
     let rating_ct     = meta.get("ratings").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    let status_str    = meta.get("status").and_then(|v| v.as_str()).unwrap_or("-");
+    let relinfo_str   = meta.get("releaseInfo").and_then(|v| v.as_str()).unwrap_or("-");
     crate::devlog!(
         info, "meta",
-        "[{}] mapped {:?} type={} poster={} bg={} logo={} videos={} cast={}+{}(app_extras) ratings={}",
-        label, name_str, media_type, has_post, has_bg, has_logo, video_ct, cast_ct, cast_extras_ct, rating_ct,
+        "[{}] mapped {:?} type={} poster={} bg={} logo={} videos={} cast={}+{}(app_extras) ratings={} status={:?} releaseInfo={:?}",
+        label, name_str, media_type, has_post, has_bg, has_logo, video_ct, cast_ct, cast_extras_ct, rating_ct, status_str, relinfo_str,
     );
 
     let genres   = string_array(meta, "genres",   10, 32);
@@ -2554,6 +2565,7 @@ pub async fn fetch_meta_detail(
         tmdb_id,
         season_credits,
         aggregate_credits,
+        status:       json_str(meta, "status", 32),
     })
 }
 
