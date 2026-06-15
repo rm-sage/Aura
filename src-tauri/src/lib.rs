@@ -1201,6 +1201,45 @@ fn init_sentry_if_consented() -> Option<sentry::ClientInitGuard> {
     Some(guard)
 }
 
+/// Remove binaries that older Aura versions bundled but that are no longer
+/// used. Tauri's NSIS updater overlays the new fileset without deleting files
+/// the previous installer placed, so these linger in the install dir as dead
+/// weight after an update (e.g. the ~115 MB `mpv.dll`, a redundant duplicate of
+/// `libmpv-2.dll`, and the legacy `libmpv-wrapper.dll`). Best-effort: a failed
+/// delete (file in use / already gone / no permission) is logged and ignored.
+/// Mirrors the resolver search order (resource_dir/lib + exe_dir/lib). Extend
+/// `ORPHANS` as binaries move out of the bundle to on-demand download.
+///
+/// Release-only: in dev, `resource_dir`/`current_exe` can resolve into the
+/// source tree, and we must never delete the developer's git-ignored `lib/`.
+#[cfg(not(debug_assertions))]
+fn cleanup_orphaned_binaries<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    use tauri::Manager;
+    const ORPHANS: &[&str] = &["mpv.dll", "libmpv-wrapper.dll"];
+
+    let mut lib_dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(dir) = app.path().resource_dir() {
+        lib_dirs.push(dir.join("lib"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            lib_dirs.push(dir.join("lib"));
+        }
+    }
+
+    for dir in &lib_dirs {
+        for name in ORPHANS {
+            let path = dir.join(name);
+            if path.is_file() {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => crate::devlog!(info, "lib", "cleaned orphaned binary {}", path.display()),
+                    Err(e) => crate::devlog!(warn, "lib", "could not remove orphaned {}: {e}", path.display()),
+                }
+            }
+        }
+    }
+}
+
 pub fn run() {
     // ── Crash reporting (Sentry) — opt-in via first-run consent ───────────
     // Initialise BEFORE the panic hook below so that hook chains into
@@ -1413,6 +1452,13 @@ pub fn run() {
             // ── DevLog — install first so subsequent setup steps can log ──
             devlog::install(app.handle());
             crate::devlog!(info, "lib", "Aura setup begin");
+
+            // ── Orphaned-binary cleanup (release only) ─────────────────────
+            // Delete binaries older versions bundled that are now unused, so an
+            // update doesn't leave dead weight behind in the install dir. See
+            // cleanup_orphaned_binaries for the rationale and the orphan list.
+            #[cfg(not(debug_assertions))]
+            cleanup_orphaned_binaries(app.handle());
 
             // ── API key migration: settings.json → OS keyring ──
             // One-shot per launch. Moves the plaintext OpenSubtitles
