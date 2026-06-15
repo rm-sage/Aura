@@ -33,7 +33,12 @@
     "active": true,
     "targets": "all",
     "createUpdaterArtifacts": true,
-    "resources": ["lib/**/*", "shaders/**/*"],
+    "resources": [
+      "lib/libmpv-2.dll",
+      "lib/ffmpeg.exe",
+      "lib/ffprobe.exe",
+      "shaders/**/*"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
