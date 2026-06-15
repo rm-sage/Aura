@@ -6,6 +6,7 @@ import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { checkForUpdatePlugin, downloadAndInstallUpdatePlugin } from "../updaterPlugin";
 import StorageReport from "../StorageReport";
+import RuntimeComponentsSection from "../RuntimeComponentsSection";
 import {
   buildExportBlob,
   blobToBase64,
@@ -3260,6 +3261,7 @@ const TOC_GROUPS: TocGroup[] = [
     sections: [
       { id: "sec-performance", label: "Performance" },
       { id: "sec-storage",     label: "Storage" },
+      { id: "sec-optional-components", label: "Optional Components" },
     ],
   },
   {
@@ -5266,6 +5268,13 @@ export default function SettingsView({ addons, session }: Props) {
               etc.). */}
           <Section id="sec-storage" title="Storage">
             <StorageReport />
+          </Section>
+
+          {/* Optional Components — on-demand ffmpeg/ffprobe download. Not
+              bundled (keeps ~314 MB out of every update); fetched here when
+              the user wants silence detection / casting transmux. */}
+          <Section id="sec-optional-components" title="Optional Components">
+            <RuntimeComponentsSection />
           </Section>
 
           <GroupHeader label="Backup & Restore" />

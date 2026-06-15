@@ -149,6 +149,11 @@ pub fn cast_ffmpeg_present() -> bool {
 /// `CARGO_MANIFEST_DIR` fallback for `tauri dev`. Shared with the
 /// transcode/hls submodules.
 pub(super) fn locate_tool(name: &str) -> Option<std::path::PathBuf> {
+    // On-demand download dir (survives updates) takes precedence — a fetched,
+    // checksum-verified copy beats a stale bundled one.
+    if let Some(p) = crate::runtime_deps::resolved_path(name) {
+        return Some(p);
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             for cand in [dir.join("lib").join(name), dir.join(name)] {

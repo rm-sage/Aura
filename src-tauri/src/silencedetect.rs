@@ -59,6 +59,12 @@ fn ffmpeg_bin(app: &tauri::AppHandle) -> std::ffi::OsString {
             return pb.into_os_string();
         }
     }
+    // On-demand download dir (survives updates) — checked before the bundled
+    // candidates so a fetched copy wins, but after the explicit env override.
+    if let Some(p) = crate::runtime_deps::resolved_path(NAME) {
+        crate::devlog!(info, "silence", "using downloaded ffmpeg: {}", p.display());
+        return p.into_os_string();
+    }
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(dir) = app.path().resource_dir() {
         candidates.push(dir.join("lib").join(NAME));

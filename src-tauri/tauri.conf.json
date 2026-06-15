@@ -35,8 +35,6 @@
     "createUpdaterArtifacts": true,
     "resources": [
       "lib/libmpv-2.dll",
-      "lib/ffmpeg.exe",
-      "lib/ffprobe.exe",
       "shaders/**/*"
     ],
     "icon": [

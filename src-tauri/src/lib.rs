@@ -45,6 +45,7 @@ mod popup_nav;
 mod player;
 mod publicmetadb;
 mod ratings;
+mod runtime_deps;
 mod scrobble;
 mod scrobble_anilist;
 mod scrobble_auth;
@@ -1460,6 +1461,11 @@ pub fn run() {
             #[cfg(not(debug_assertions))]
             cleanup_orphaned_binaries(app.handle());
 
+            // ── On-demand runtime binaries ─────────────────────────────────
+            // Resolve <app_local_data>/runtime (survives updates) so the
+            // ffmpeg/ffprobe resolvers can find a previously-downloaded copy.
+            runtime_deps::init(app.handle());
+
             // ── API key migration: settings.json → OS keyring ──
             // One-shot per launch. Moves the plaintext OpenSubtitles
             // key from settings.json into the keyring (DPAPI / Keychain
@@ -1967,6 +1973,8 @@ pub fn run() {
             cast::cast_stop,
             cast::cast_status,
             cast::cast_ffmpeg_present,
+            runtime_deps::ensure_runtime_dep,
+            runtime_deps::runtime_dep_present,
             set_native_fullscreen,
             // ── Per-title persistence (volume / shader / audio / sub) ───────
             per_title::get_title_state,
