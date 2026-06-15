@@ -487,8 +487,8 @@ pub async fn sync_push<R: Runtime>(
         .header("Authorization", auth_header(&scope))
         .header("Content-Type", "application/json")
         .body(serialized);
-    if let Some(etag) = if_match {
-        req = req.header("If-Match", etag);
+    if let Some(etag) = if_match.as_ref() {
+        req = req.header("If-Match", etag.clone());
     }
 
     let resp = req.send().await.map_err(|e| format!("network: {e}"))?;
@@ -513,16 +513,42 @@ pub async fn sync_push<R: Runtime>(
     if !status.is_success() {
         return Err(format!("sync_push {namespace} http {}", status.as_u16()));
     }
-    let body: ServerPushResponse = resp.json().await.map_err(|e| format!("decode: {e}"))?;
-    crate::devlog!(
-        debug, "sync",
-        "pushed {namespace} ({} bytes, etag={})",
-        body.updated_at, body.etag,
-    );
-    Ok(PushOutcome::Ok(PushResult {
-        etag: body.etag,
-        updated_at: body.updated_at,
-    }))
+    // Read the body as text first so a 2xx response that ISN'T the documented
+    // `{etag, updated_at}` JSON — an intermediary/gateway answering 2xx with an
+    // empty or non-JSON body, the source of the "[sync] push … decode: error
+    // decoding response body" Sentry warnings on the settings/notifications
+    // namespaces — isn't reported as a failure. The status was a success, so the
+    // proxy accepted the write.
+    let raw = resp.text().await.map_err(|e| format!("read: {e}"))?;
+    match serde_json::from_str::<ServerPushResponse>(&raw) {
+        Ok(body) => {
+            crate::devlog!(
+                debug, "sync",
+                "pushed {namespace} ({} bytes, etag={})",
+                body.updated_at, body.etag,
+            );
+            Ok(PushOutcome::Ok(PushResult {
+                etag: body.etag,
+                updated_at: body.updated_at,
+            }))
+        }
+        Err(e) => {
+            // Write accepted but no usable etag came back. Echo the prior etag so
+            // the caller's bookkeeping stays stable: an unchanged-blob no-op then
+            // avoids a spurious 412, and a real change self-heals via the normal
+            // 412 → merge → retry path on the next push. Logged at debug (not the
+            // command-error path) so it stops surfacing in Sentry as a failure.
+            crate::devlog!(
+                debug, "sync",
+                "push {namespace}: http {} accepted but body not decodable ({} bytes): {e}",
+                status.as_u16(), raw.len(),
+            );
+            Ok(PushOutcome::Ok(PushResult {
+                etag: if_match.unwrap_or_default(),
+                updated_at: 0,
+            }))
+        }
+    }
 }
 
 /// Drop a single namespace from the proxy. Idempotent. Used by

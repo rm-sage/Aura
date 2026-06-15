@@ -915,7 +915,12 @@ function usePlayback(playerActive: boolean) {
       // "stop" and "quit" are user-initiated; "redirect" is internal to
       // MPV's playlist handling and never reaches the user.
       if (reason === "error") {
-        console.warn("[playback] end-file reason=error", payload);
+        // Interpolate the mpv error code into the message string — passing
+        // `payload` as a second arg made Sentry's console capture log a useless
+        // "[object Object]". The code distinguishes failure modes (e.g. loading
+        // failed vs. unsupported format); the stream URL is deliberately NOT
+        // logged (debrid URLs carry auth tokens).
+        console.warn(`[playback] end-file reason=error code=${payload?.error ?? "?"}`);
         setStreamBroken(true);
         return;
       }
