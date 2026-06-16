@@ -2935,7 +2935,9 @@ export default function App() {
             ? cloudNextMs
             : null;
       console.info(
-        `[eos] caught-up check seriesId=${seriesId} videos=${detail?.videos?.length ?? 0} ` +
+        `[eos] caught-up check seriesId=${seriesId} ` +
+          `(targetSeriesId=${activeTarget.series_id ?? "none"} targetId=${currentId}) ` +
+          `videos=${detail?.videos?.length ?? 0} ` +
           `laterIgnoringAir=${laterIgnoringAir ? laterIgnoringAir.id : "none"} ` +
           `nextAirMs=${nextAirMs ?? "none"} status=${statusRaw || "none"} ended=${endedStatus} ` +
           `cloudNext=${cloudHasNext ? (sig?.next_aired?.id ?? "yes") : "none"} ` +
