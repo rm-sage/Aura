@@ -46,6 +46,15 @@ const DEPS: &[Dep] = &[
         url: "https://github.com/rm-sage/Aura/releases/download/runtime-deps/ffprobe.exe",
         sha256: "0fde260f5abd35c9cafd96f594cc76365a780c1b73a90e35b6a3409ea1db1bf0",
     },
+    // The mpv core (Windows). Unlike ffmpeg/ffprobe this is REQUIRED for any
+    // playback — the first-run gate (PlaybackEngineGate) downloads it before the
+    // engine starts. Only fresh installs fetch it: an update keeps the prior
+    // version's libmpv-2.dll in the install dir, which the engine resolver finds.
+    Dep {
+        name: "libmpv-2.dll",
+        url: "https://github.com/rm-sage/Aura/releases/download/runtime-deps/libmpv-2.dll",
+        sha256: "9826b77fb42559752cd37a19191169a986aa4e929eb37705c3345d25a5f6d034",
+    },
 ];
 
 /// Resolved runtime directory, set once at startup by [`init`].

@@ -34,7 +34,6 @@
     "targets": "all",
     "createUpdaterArtifacts": true,
     "resources": [
-      "lib/libmpv-2.dll",
       "shaders/**/*"
     ],
     "icon": [

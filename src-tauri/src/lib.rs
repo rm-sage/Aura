@@ -1241,6 +1241,80 @@ fn cleanup_orphaned_binaries<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     }
 }
 
+/// Start the mpv playback engine if it isn't already running AND libmpv is
+/// resolvable (a copy left by a prior install, one downloaded on-demand, or a
+/// system one). Idempotent; returns whether the engine is running afterwards.
+/// On a fresh install with no libmpv yet it returns `false` WITHOUT aborting —
+/// the frontend first-run gate (PlaybackEngineGate) downloads libmpv and then
+/// calls `ensure_playback_engine` to retry. Mirrors the original setup wiring
+/// (parent HWND + the `mpv-event-main` emit channel).
+#[cfg(target_os = "windows")]
+fn try_start_playback_engine<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
+    use tauri::{Emitter, Manager};
+    if mpv::engine::is_running() {
+        return true;
+    }
+    if let Err(e) = player::check_mpv_dll() {
+        crate::devlog!(info, "player", "libmpv not resolvable yet ({e}) — engine not started");
+        return false;
+    }
+    if mpv::engine::legacy_env_requested() {
+        crate::devlog!(
+            warn, "player",
+            "AURA_MPV2 is set to an off value, but the legacy --wid plugin path \
+             it used to select was removed in the engine consolidation — ignored",
+        );
+    }
+    let parent_hwnd: isize = app
+        .get_webview_window("main")
+        .and_then(|w| w.hwnd().ok())
+        .map(|h| h.0 as isize)
+        .unwrap_or(0);
+    let emit_handle = app.clone();
+    mpv::engine::start(
+        parent_hwnd,
+        Box::new(move |name, payload| {
+            let mut wrapped = serde_json::Map::new();
+            wrapped.insert("name".into(), serde_json::Value::String(name.to_string()));
+            wrapped.insert("data".into(), payload);
+            let _ = emit_handle.emit("mpv-event-main", serde_json::Value::Object(wrapped));
+        }),
+    );
+    let running = mpv::engine::is_running();
+    if running {
+        crate::devlog!(info, "player", "mpv engine spawn requested");
+    }
+    running
+}
+
+#[cfg(not(target_os = "windows"))]
+fn try_start_playback_engine<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> bool {
+    false
+}
+
+/// True when the mpv playback engine is running (libmpv loaded). The frontend
+/// first-run gate polls this to decide whether to download libmpv. Non-Windows
+/// returns `true` — there is no Windows libmpv to fetch there, so the gate is
+/// skipped (the Linux engine, when present, sources libmpv from the system).
+#[tauri::command]
+fn playback_engine_ready() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        mpv::engine::is_running()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        true
+    }
+}
+
+/// (Re)start the playback engine after the first-run gate has downloaded libmpv.
+/// Returns whether the engine is running afterwards.
+#[tauri::command]
+fn ensure_playback_engine<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> bool {
+    try_start_playback_engine(&app)
+}
+
 pub fn run() {
     // ── Crash reporting (Sentry) — opt-in via first-run consent ───────────
     // Initialise BEFORE the panic hook below so that hook chains into
@@ -1522,12 +1596,6 @@ pub fn run() {
             scrobble_anilist::init_cache(app.handle());
 
 
-            // ── DLL pre-flight ─────────────────────────────────────────────
-            player::check_mpv_dll().map_err(|e| {
-                crate::devlog!(error, "player", "MPV DLL pre-flight failed: {e}");
-                std::io::Error::new(std::io::ErrorKind::NotFound, e)
-            })?;
-
             // ── Vibrancy ───────────────────────────────────────────────────
             let window = app.get_webview_window("main").unwrap();
 
@@ -1608,45 +1676,17 @@ pub fn run() {
             }
 
             // ── Playback engine (mpv — FFI --wid embedding) ──────────────
-            // The single playback path since the engine consolidation
-            // removed `tauri-plugin-libmpv`. mpv embeds via `wid` into an
-            // engine-owned host child window under main's HWND.
-            #[cfg(target_os = "windows")]
-            {
-                if mpv::engine::legacy_env_requested() {
-                    crate::devlog!(
-                        warn, "player",
-                        "AURA_MPV2 is set to an off value, but the legacy \
-                         --wid plugin path it used to select was removed in \
-                         the engine consolidation — the variable is ignored",
-                    );
-                }
-                let parent_hwnd: isize = app
-                    .get_webview_window("main")
-                    .and_then(|w| w.hwnd().ok())
-                    .map(|h| h.0 as isize)
-                    .unwrap_or(0);
-                // Engine event channel — the engine thread calls this on
-                // every mpv property change / end-of-file, which the
-                // observer bridge below consumes as `mpv-event-main` and
-                // folds into `playback-update` / `playback-end`.
-                let emit_handle = app.handle().clone();
-                mpv::engine::start(
-                    parent_hwnd,
-                    Box::new(move |name, payload| {
-                        let mut wrapped = serde_json::Map::new();
-                        wrapped.insert(
-                            "name".into(),
-                            serde_json::Value::String(name.to_string()),
-                        );
-                        wrapped.insert("data".into(), payload);
-                        let _ = emit_handle.emit(
-                            "mpv-event-main",
-                            serde_json::Value::Object(wrapped),
-                        );
-                    }),
+            // Started here when libmpv is resolvable: an update keeps the prior
+            // version's libmpv-2.dll in the install dir, so the engine starts
+            // immediately. On a FRESH install (libmpv no longer bundled) this is
+            // a no-op — the frontend first-run gate (PlaybackEngineGate)
+            // downloads libmpv then calls `ensure_playback_engine`. See
+            // try_start_playback_engine for the event-channel wiring.
+            if !try_start_playback_engine(app.handle()) {
+                crate::devlog!(
+                    info, "player",
+                    "playback engine deferred — libmpv not available yet (first-run download will fetch it)",
                 );
-                crate::devlog!(info, "player", "mpv engine spawn requested");
             }
 
             // ── Window lifecycle (pause-on-blur, pause-on-min, close-on-exit) ─
@@ -1975,6 +2015,8 @@ pub fn run() {
             cast::cast_ffmpeg_present,
             runtime_deps::ensure_runtime_dep,
             runtime_deps::runtime_dep_present,
+            playback_engine_ready,
+            ensure_playback_engine,
             set_native_fullscreen,
             // ── Per-title persistence (volume / shader / audio / sub) ───────
             per_title::get_title_state,

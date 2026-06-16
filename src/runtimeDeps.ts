@@ -16,7 +16,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-export type RuntimeDepName = "ffmpeg.exe" | "ffprobe.exe";
+export type RuntimeDepName = "ffmpeg.exe" | "ffprobe.exe" | "libmpv-2.dll";
 
 export interface RuntimeDepProgress {
   name: string;

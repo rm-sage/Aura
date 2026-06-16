@@ -201,6 +201,12 @@ pub fn check_mpv_dll() -> Result<(), String> {
             }
         }
 
+        // On-demand download dir (libmpv is no longer bundled — fetched at
+        // first run). Matches mpv::ffi::Libmpv::search_dirs.
+        if let Some(dir) = crate::runtime_deps::dir() {
+            search_dirs.push(dir);
+        }
+
         // Allow overriding the search path via the build-time env var that
         // the libmpv crate conventionally uses for its link directory.
         if let Ok(dir) = std::env::var("LIBMPV_LIB_DIR") {

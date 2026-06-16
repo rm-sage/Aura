@@ -54,8 +54,8 @@ commands.allow = [
 # ── On-demand runtime binaries (ffmpeg/ffprobe) ───────────────────────────────
 [[permission]]
 identifier = "allow-runtime-deps"
-description = "Allows the frontend to check for, and download + verify on demand, the optional runtime binaries (ffmpeg/ffprobe) used by silence detection and casting transmux"
-commands.allow = ["ensure_runtime_dep", "runtime_dep_present"]
+description = "Allows the frontend to check for + download/verify on-demand runtime binaries (ffmpeg/ffprobe for silence detection + casting; libmpv for the playback engine), and to (re)start the playback engine after the first-run libmpv download"
+commands.allow = ["ensure_runtime_dep", "runtime_dep_present", "playback_engine_ready", "ensure_playback_engine"]
 
 # ── Live TV (IPTV) ────────────────────────────────────────────────────────────
 [[permission]]

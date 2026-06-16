@@ -832,6 +832,12 @@ impl Libmpv {
                 dirs.push(dir.join("lib"));
             }
         }
+        // On-demand download dir: libmpv is no longer bundled, so a fresh
+        // install fetches it here via the first-run gate. (Updates still find
+        // the prior version's copy in exe/lib above.)
+        if let Some(dir) = crate::runtime_deps::dir() {
+            dirs.push(dir);
+        }
         if let Ok(dir) = std::env::var("LIBMPV_LIB_DIR") {
             dirs.push(PathBuf::from(dir));
         }

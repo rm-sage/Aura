@@ -59,6 +59,7 @@ import NextUpCta from "./NextUpCta";
 import EosSpotlight from "./EosSpotlight";
 import EpisodePanel from "./EpisodePanel";
 import SourceSwitcher, { streamKey, sameStreamSource } from "./SourceSwitcher";
+import PlaybackEngineGate from "./PlaybackEngineGate";
 import CastMenu from "./CastMenu";
 import CastSessionBar from "./CastSessionBar";
 import { useCastSession } from "./useCastSession";
@@ -6183,6 +6184,10 @@ export default function App() {
       {isPlayerActive && (
         <PlayerPartyHud onStart={wtStartParty} isFullscreen={isFullscreen} controlsVisible={playerControlsVisible} />
       )}
+
+      {/* First-run playback-engine (libmpv) download gate. Self-hides unless a
+          fresh install needs to fetch libmpv before the engine can start. */}
+      <PlaybackEngineGate />
 
       {/* In-player source switcher — sibling to PlayerOverlay; its own root is
           fixed + z-[10001] (above PlayerOverlay's z-[9999]). */}
