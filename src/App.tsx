@@ -2928,8 +2928,18 @@ export default function App() {
       // aren't in the imdb-keyed store → getReleaseSignal returns
       // undefined/null and we fall back to the addon-meta signals above.
       const sig = getReleaseSignal(seriesId);
-      const cloudNextMs = sig?.next_aired?.aired_at ? Date.parse(sig.next_aired.aired_at) : NaN;
-      const cloudHasNext = sig?.next_aired != null;
+      // IGNORE a season-0 next_aired: specials/OVAs (e.g. tt5626028:0:24) are
+      // NOT "the series is still airing" — a finished show whose only upcoming
+      // cloud entry is a special must still read as a finale. Prefer the
+      // `season` field; fall back to parsing the `:S:E` tail of a tt-style id
+      // when the field is absent.
+      const cloudNext = sig?.next_aired ?? null;
+      const cloudNextIsSpecial =
+        cloudNext != null &&
+        (cloudNext.season === 0 || /^tt\d+:0:\d+$/.test(cloudNext.id ?? ""));
+      const cloudHasNext = cloudNext != null && !cloudNextIsSpecial;
+      const cloudNextMs =
+        cloudHasNext && cloudNext?.aired_at ? Date.parse(cloudNext.aired_at) : NaN;
       const caughtUp =
         !!laterIgnoringAir || ongoingStatus || nextAirMs != null || openEndedRun || cloudHasNext;
       // Countdown target: prefer the meta's future-dated episode, else the
@@ -2948,7 +2958,7 @@ export default function App() {
           `videos=${detail?.videos?.length ?? 0} ` +
           `laterIgnoringAir=${laterIgnoringAir ? laterIgnoringAir.id : "none"} ` +
           `nextAirMs=${nextAirMs ?? "none"} status=${statusRaw || "none"} ended=${endedStatus} ` +
-          `cloudNext=${cloudHasNext ? (sig?.next_aired?.id ?? "yes") : "none"} ` +
+          `cloudNext=${cloudNext ? `${cloudNext.id ?? "yes"}${cloudNextIsSpecial ? "(S0,ignored)" : ""}` : "none"} ` +
           `caughtUp=${caughtUp}`,
       );
       setEosCaughtUpUnaired(caughtUp);
