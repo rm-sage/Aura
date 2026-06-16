@@ -931,7 +931,18 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     : "scale(0.96)";
 
   const targetForPlay = (video?: VideoEntry | null) => ({
-    id:         video?.id ?? meta.id,
+    // EPISODE id mirrors the streams-fetch `episodicId` resolution: when
+    // `video` hasn't resolved yet — a Watch-Together member joining the party's
+    // episode (openVideo → streams mode, before detail.videos load), or an EOS
+    // streams-mode open — fall back to the REQUESTED episode (resumeVideoId /
+    // openEpisodeSnapshot) BEFORE meta.id. Without this the target was keyed at
+    // the SERIES ROOT, so the played target didn't match the streams we fetched
+    // (for the episode) and a joining party member's videoKey was the root and
+    // never matched the leader's episode (party "stuck 1 of N", follower never
+    // in-sync).
+    id:         isEpisodic
+                  ? (video?.id ?? resumeVideoId ?? openEpisodeSnapshot ?? meta.id)
+                  : (video?.id ?? meta.id),
     // For series we ALWAYS want the library record keyed at the series
     // root, regardless of which episode is playing — that matches
     // Stremio's official client (state.video_id stores the episode).
