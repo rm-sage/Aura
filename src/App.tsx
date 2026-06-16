@@ -2846,6 +2846,14 @@ export default function App() {
     }
     const mt = (activeTarget.media_type ?? "").toLowerCase();
     const isSeriesLike = mt === "series" || mt === "anime";
+    // Entry trace — fires whenever the EOS resolver runs, so a "why is there no
+    // [eos] caught-up line / why finale" report shows which path it took: a
+    // non-series END-CARD, a pre-resolved NEXT-UP (no caught-up check), an
+    // already-settled resolve, or the caught-up walk (which logs its own line).
+    console.info(
+      `[eos] resolve enter id=${activeTarget.id} series_id=${activeTarget.series_id ?? "none"} ` +
+        `mt=${mt || "none"} seriesLike=${isSeriesLike} nextUp=${nextUpInfo ? "ready" : "none"} resolve=${eosResolve}`,
+    );
     if (!isSeriesLike) { setEosResolve("none"); return; }
     if (nextUpInfo) { setEosResolve("ready"); return; }
     if (eosResolve === "ready" || eosResolve === "none") return;
