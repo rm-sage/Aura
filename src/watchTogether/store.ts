@@ -502,6 +502,16 @@ function handleMessage(data: string) {
       }
       previousMemberIds = newIds;
       ui.members = msg.members;
+      // Diagnostic: the staging "X of Y ready" + the follower's sync gate both
+      // hinge on each member's videoKey matching the room's. A mismatch (e.g.
+      // the leader and a member resolve different episode-id schemes for the
+      // SAME episode) leaves the leader stuck "1 of N" and the follower never
+      // in-sync. Log the comparison so a 2-device test shows exactly which key
+      // diverges.
+      console.info(
+        `[watch] roster (${msg.members.length}) roomVideoKey=${ui.roomVideoKey ?? "none"} ` +
+          `members=[${msg.members.map((m) => `${m.name}=${m.videoKey ?? "none"}${m.videoKey === ui.roomVideoKey ? "✓" : "✗"}`).join(", ")}]`,
+      );
       // Drop buffer stats for members who left.
       for (const id of Object.keys(ui.memberStats)) {
         if (!newIds.has(id)) delete ui.memberStats[id];
@@ -525,7 +535,7 @@ function handleMessage(data: string) {
       // it for followers who aren't on it yet (a once-per-change toast; the pill
       // also animates while roomVideoKey is set but we're not in sync).
       if (!ui.isLeader && ui.roomVideoKey != null && ui.roomVideoKey !== prevKey && !ui.inSync) {
-        showPartyToast("Stream selected — tap to watch", { tone: "leader" });
+        showPartyToast("Stream selected", { tone: "leader" });
       }
       emit();
       break;
@@ -834,6 +844,9 @@ export function notifyLocalVideo(): void {
   if (ui.status !== "connected" || !bridge) return;
   const local = bridge.getLocal();
   send({ t: "video", videoKey: local.videoKey, title: local.title });
+  console.info(
+    `[watch] local video → videoKey=${local.videoKey ?? "none"} (roomVideoKey=${ui.roomVideoKey ?? "none"}, inSync=${ui.inSync})`,
+  );
   recomputeSync();
   emit();
 }

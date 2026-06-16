@@ -360,20 +360,25 @@ function Room({
                     <span title="Host" aria-label="Host" className="text-amber-300 text-[12px] flex-shrink-0 leading-none">♛</span>
                   )}
                 </span>
+                {/* Buffer is the LAST element so it's always flush-right and
+                    aligned across every row. "Make host" is `hidden` (zero
+                    layout) at rest — so an invisible button never shifts a
+                    member's buffer bar — and appears to the LEFT of the buffer
+                    on hover, leaving the buffer's right edge fixed. */}
                 <div className="ml-auto flex items-center gap-2 flex-shrink-0">
-                  <MemberBuffer stat={memberStats[m.id]} />
                   {canTransfer && (
                     <button
                       type="button"
                       onClick={() => onTransfer(m.id)}
                       title={`Make ${m.name} the host`}
-                      className="flex-shrink-0 opacity-0 group-hover:opacity-100 focus:opacity-100
-                                 transition-opacity text-[10.5px] px-1.5 py-0.5 rounded-md text-white/55
+                      className="flex-shrink-0 hidden group-hover:inline-flex focus:inline-flex
+                                 text-[10.5px] px-1.5 py-0.5 rounded-md text-white/55
                                  hover:text-amber-200 hover:bg-white/[0.06] border border-white/10"
                     >
                       Make host
                     </button>
                   )}
+                  <MemberBuffer stat={memberStats[m.id]} />
                 </div>
               </li>
             );
