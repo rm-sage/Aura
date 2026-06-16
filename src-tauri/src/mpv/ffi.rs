@@ -850,22 +850,32 @@ impl Libmpv {
     ///
     /// Not called from anywhere yet — Phase 2 wiring.
     pub fn load() -> Result<Self, String> {
+        // The libmpv dynamic-library file name differs by OS (the C ABI is
+        // identical, which is why the rest of this file is platform-neutral):
+        // libmpv-2.dll on Windows, libmpv.so.2 on Linux, libmpv.2.dylib on macOS.
+        #[cfg(target_os = "windows")]
+        const LIBMPV_NAME: &str = "libmpv-2.dll";
+        #[cfg(target_os = "macos")]
+        const LIBMPV_NAME: &str = "libmpv.2.dylib";
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        const LIBMPV_NAME: &str = "libmpv.so.2";
+
         for dir in Self::search_dirs() {
-            let candidate = dir.join("libmpv-2.dll");
+            let candidate = dir.join(LIBMPV_NAME);
             if candidate.is_file() {
-                // SAFETY: loading a DLL runs its entry point; libmpv-2.dll
-                // is a known-good library shipped with Aura.
+                // SAFETY: loading a shared library runs its initializers; libmpv
+                // is a known-good library shipped with / required by Aura.
                 if let Ok(lib) = unsafe { libloading::Library::new(&candidate) } {
                     return Self::from_library(lib);
                 }
             }
         }
-        // Fall back to the OS search (PATH / SxS / system directories).
+        // Fall back to the OS search (PATH / SxS / system / LD_LIBRARY_PATH).
         // SAFETY: see above.
-        match unsafe { libloading::Library::new("libmpv-2.dll") } {
+        match unsafe { libloading::Library::new(LIBMPV_NAME) } {
             Ok(lib) => Self::from_library(lib),
             Err(e) => Err(format!(
-                "libmpv-2.dll not found in the exe directory, its lib/ \
+                "{LIBMPV_NAME} not found in the exe directory, its lib/ \
                  subdirectory, $LIBMPV_LIB_DIR, or the system search path: {e}"
             )),
         }

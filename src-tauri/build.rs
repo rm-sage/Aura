@@ -62,9 +62,20 @@ fn main() {
     // d3d11 context refuses to configure the swapchain colorspace
     // (IsWindows10OrGreater() == false) — HDR output renders PQ-into-sRGB,
     // i.e. washed-out. See windows-app-manifest.xml for the full story.
-    println!("cargo:rerun-if-changed=windows-app-manifest.xml");
-    let windows = tauri_build::WindowsAttributes::new()
-        .app_manifest(include_str!("windows-app-manifest.xml"));
-    tauri_build::try_build(tauri_build::Attributes::new().windows_attributes(windows))
-        .expect("failed to run tauri-build");
+    //
+    // Windows-only: the manifest + WindowsAttributes are meaningless on Linux/
+    // macOS, where we run the plain tauri_build::build(). Keyed on the TARGET
+    // os (CARGO_CFG_TARGET_OS) rather than #[cfg(target_os)] (the build-script
+    // HOST os) so it's also correct under cross-compilation. The secret-baking
+    // above is OUTSIDE this gate — it must run on every target.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "windows" {
+        println!("cargo:rerun-if-changed=windows-app-manifest.xml");
+        let windows = tauri_build::WindowsAttributes::new()
+            .app_manifest(include_str!("windows-app-manifest.xml"));
+        tauri_build::try_build(tauri_build::Attributes::new().windows_attributes(windows))
+            .expect("failed to run tauri-build");
+    } else {
+        tauri_build::build();
+    }
 }
