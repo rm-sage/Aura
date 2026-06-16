@@ -44,7 +44,7 @@ const DEPS: &[Dep] = &[
     Dep {
         name: "ffprobe.exe",
         url: "https://github.com/rm-sage/Aura/releases/download/runtime-deps/ffprobe.exe",
-        sha256: "a6618e99bb58869ded3c6f37b53aa1a8d701c3591dbb7b5b317d47369c112be2",
+        sha256: "0fde260f5abd35c9cafd96f594cc76365a780c1b73a90e35b6a3409ea1db1bf0",
     },
 ];
 
