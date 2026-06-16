@@ -196,11 +196,6 @@ const ExternalIcon = () => (
     <path d="M14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7zM19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7z" />
   </svg>
 );
-const RestartIcon = () => (
-  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-    <path d="M17.65 6.35A7.958 7.958 0 0 0 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0 1 12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" />
-  </svg>
-);
 const LoudnormIcon = () => (
   // Compact audio-level bars — four vertical bars at varying heights
   // suggesting "evened out" levels. Visually distinct from VolumeIcon's
@@ -2444,13 +2439,11 @@ export default function PlayerOverlay({
               </button>
             </Tooltip>
 
-            {/* Three-dots / gear menu — Copy link, Download, External
-                player, Restart. Anchored to the far right so it reads as
-                the bar's catch-all "more" affordance. */}
+            {/* Three-dots / gear menu — AniSkip, Switch source, Copy link,
+                Download, External player. Anchored to the far right so it reads
+                as the bar's catch-all "more" affordance. */}
             <MoreMenu
               streamUrl={streamUrl}
-              onRestart={() => seekAbsolute(0)}
-              partyFollower={partyFollower}
               activeTarget={activeTarget}
               isAnime={isAnime}
               time={time}
@@ -3459,12 +3452,9 @@ function TrackMenu({
 // ---------------------------------------------------------------------------
 
 function MoreMenu({
-  streamUrl, onRestart, partyFollower, activeTarget, isAnime, time, duration, skipWindows,
+  streamUrl, activeTarget, isAnime, time, duration, skipWindows,
 }: {
   streamUrl: string | null;
-  onRestart: () => void;
-  /** True for a non-leader synced to a party — Restart is a seek, so disable it. */
-  partyFollower: boolean;
   activeTarget: ActiveScrobbleTarget | null;
   isAnime: boolean;
   time: number;
@@ -3587,12 +3577,6 @@ function MoreMenu({
             onClick={() => { setAniskipOpen(true); setOpen(false); }}
           />
           <div className="my-1 mx-3 h-px bg-white/8" />
-          <MoreItem
-            icon={<RestartIcon />}
-            label={partyFollower ? "Restart — leader controls playback" : "Restart from beginning"}
-            disabled={partyFollower}
-            onClick={() => { onRestart(); setOpen(false); }}
-          />
           <MoreItem
             icon={
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
