@@ -186,18 +186,37 @@ pub async fn set_shader_profile(app: tauri::AppHandle, profile: u8) -> Result<()
     // (`\\?\C:\…`); libmpv parses that as garbage in its option-list
     // grammar and rejects with "invalid parameter", so we strip the
     // prefix and forward-slash the result.
-    let resource_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
+    // Candidate base dirs for the bundled `shaders/` folder, first existing
+    // wins — mirrors silencedetect::ffmpeg_bin. Without the exe-dir +
+    // CARGO_MANIFEST_DIR fallbacks, `tauri dev` (where bundled resources are
+    // NOT copied into resource_dir) can't find the shaders, so the upscaler
+    // failed with "Shader file not found" / "Upscaler failed" on dev builds —
+    // which looked like a party-follower-only bug when one device ran dev.
+    let mut shader_dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(dir) = app.path().resource_dir() {
+        shader_dirs.push(dir.join("shaders"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            shader_dirs.push(dir.join("shaders"));
+        }
+    }
+    shader_dirs.push(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shaders"));
+
     let mut resolved_paths: Vec<String> = Vec::with_capacity(shader_files.len());
     for filename in shader_files.iter() {
-        let path = resource_dir.join("shaders").join(filename);
-        if !path.exists() {
-            return Err(format!(
-                "Shader file not found: {}\n\
-                 Place the file in src-tauri/shaders/ and rebuild.\n\
-                 See shaders/README.txt for download links.",
-                path.display()
-            ));
-        }
+        let path = shader_dirs
+            .iter()
+            .map(|d| d.join(filename))
+            .find(|p| p.exists())
+            .ok_or_else(|| {
+                format!(
+                    "Shader file not found: {} (looked in: {})\n\
+                     Place it in src-tauri/shaders/ and rebuild. See shaders/README.txt.",
+                    filename,
+                    shader_dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", "),
+                )
+            })?;
         let raw = path.to_string_lossy().into_owned();
         let cleaned = raw
             .strip_prefix(r"\\?\UNC\")

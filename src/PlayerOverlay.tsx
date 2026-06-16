@@ -473,7 +473,10 @@ function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | n
       }
     } catch (e) {
       console.error("Shader switch failed", e);
-      fireToast("Upscaler failed");
+      // Surface the actual reason (first line, capped) so a failure is
+      // actionable instead of a generic toast — e.g. "Shader file not found …".
+      const reason = String(e).replace(/^Error:\s*/i, "").split("\n")[0].trim().slice(0, 90);
+      fireToast(reason ? `Upscaler failed — ${reason}` : "Upscaler failed");
     }
     setOpen(false);
   }, [profiles, activeTarget]);
