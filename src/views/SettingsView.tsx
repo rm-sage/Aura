@@ -3371,7 +3371,11 @@ function SettingsToc({ scrollRoot, search }: SettingsTocProps) {
   }, [scrollRoot]);
 
   return (
-    <nav className="text-[13px] leading-snug select-none space-y-4">
+    <nav className="flex flex-col max-h-[calc(100vh-3rem)] text-[13px] leading-snug select-none">
+      {/* The contents list scrolls within the viewport-capped nav so a long TOC
+          (or a high display scale) can't push the pinned search footer below
+          the screen edge. */}
+      <div className="flex-1 min-h-0 overflow-y-auto aura-scroll space-y-4 pr-1">
       <p className="text-white/35 text-[10.5px] font-mono uppercase tracking-[0.2em]">
         Contents
       </p>
@@ -3424,8 +3428,10 @@ function SettingsToc({ scrollRoot, search }: SettingsTocProps) {
             • Because the aside itself is `sticky top-6`, the search
               stays in view as the user scrolls without needing a
               second sticky context. */}
+      </div>{/* /scroll region — search footer below stays pinned + visible */}
+
       {search && (
-        <div className="pt-3 border-t border-white/8 space-y-2">
+        <div className="pt-3 mt-4 border-t border-white/8 space-y-2 flex-shrink-0">
           <p className="text-white/35 text-[10.5px] font-mono uppercase tracking-[0.2em]">
             Search
           </p>
