@@ -16,9 +16,10 @@
 // ---------------------------------------------------------------------------
 
 import { iptvFetchText } from "./fetch";
-import { parseXmltv, indexProgramsByChannel, parseXmltvChannelNames } from "./xmltv";
+import { buildEpgIndex } from "./xmltv";
 import { resolveChannelEpg, findSharedTvgIds } from "./epgResolver";
 import { classifyIptvError } from "./store";
+import type { EpgParseRequest, EpgParseResponse } from "./epgWorker";
 import type { EpgIndex, EpgProgram, IptvChannel } from "./types";
 
 const CHANGE_EVENT = "aura:iptv-epg-changed";
@@ -109,21 +110,61 @@ export function loadEpg(
   return p;
 }
 
+/** Parse + index the EPG body OFF the main thread so a large guide doesn't
+ *  freeze the UI on entry to Live TV. Falls back to a synchronous main-thread
+ *  build (the same pure `buildEpgIndex`) if a Worker can't be created or it
+ *  errors — identical result, just blocking. The worker is one-shot:
+ *  terminated as soon as it answers so its copy of the body is freed. */
+function parseEpgInWorker(
+  body: string,
+  channels: IptvChannel[],
+): Promise<{ index: EpgIndex; rawHasPrograms: boolean }> {
+  return new Promise((resolve, reject) => {
+    let worker: Worker;
+    try {
+      worker = new Worker(new URL("./epgWorker.ts", import.meta.url), { type: "module" });
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    const settle = (fn: () => void) => {
+      try { worker.terminate(); } catch { /* already gone */ }
+      fn();
+    };
+    worker.onmessage = (e: MessageEvent<EpgParseResponse>) => {
+      const data = e.data;
+      if (data.ok) settle(() => resolve({ index: data.index, rawHasPrograms: data.rawHasPrograms }));
+      else settle(() => reject(new Error(data.error)));
+    };
+    worker.onerror = (e) => settle(() => reject(new Error(e.message || "EPG worker failed")));
+    const req: EpgParseRequest = {
+      body,
+      channels: channels.map((c) => ({ tvgId: c.tvgId, name: c.name })),
+    };
+    worker.postMessage(req);
+  });
+}
+
 async function doFetch(sourceId: string, epgUrl: string, channels: IptvChannel[]): Promise<void> {
   _loading.add(sourceId);
   _errors.delete(sourceId);
   emit();
   try {
     const body = await iptvFetchText(epgUrl);
-    const programs = parseXmltv(body);
-    if (programs.length === 0) {
+    let built: { index: EpgIndex; rawHasPrograms: boolean };
+    try {
+      built = await parseEpgInWorker(body, channels);
+    } catch (werr) {
+      console.warn("[iptv] EPG worker unavailable — parsing on main thread", werr);
+      built = buildEpgIndex(body, channels.map((c) => ({ tvgId: c.tvgId, name: c.name })));
+    }
+    const { index, rawHasPrograms } = built;
+    // Zero <programme> blocks at all → a broken feed, surface an error. HAD
+    // programmes but none matched this playlist → fine: store the empty index
+    // (no now/next, no wasted memory) rather than erroring.
+    if (index.byChannel.size === 0 && !rawHasPrograms) {
       throw new Error("The EPG loaded but contained no programmes.");
     }
-    // Build the name→id index too so the resolver can fall back to a
-    // display-name match when the playlist's tvg-ids don't line up with
-    // this EPG's channel ids.
-    const nameToId = parseXmltvChannelNames(body);
-    const index = indexProgramsByChannel(programs, nameToId);
     const shared = findSharedTvgIds(channels);
     _bySource.set(sourceId, { index, shared, url: epgUrl, lastUsed: Date.now() });
     enforceCap();

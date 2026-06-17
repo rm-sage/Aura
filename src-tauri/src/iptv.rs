@@ -191,14 +191,34 @@ pub async fn iptv_fetch_text(url: String) -> Result<String, String> {
     // <programme> blocks in. Inflate it here. MultiGzDecoder handles the
     // multi-member streams some providers concatenate. Best-effort: on
     // inflate failure fall back to the raw bytes rather than erroring.
+    //
+    // CRITICAL — the inflated output MUST be capped too. The MAX_BYTES gate
+    // above only bounds the COMPRESSED download; XMLTV is extremely
+    // compressible (repetitive markup), so a sub-cap `.gz` can inflate to
+    // MULTIPLE GB (the bundled iptv-org US EPG is ~55 MiB gzipped → ~465 MiB
+    // of XML, an 8.5x blowup). An uncapped inflate hands that giant string to
+    // the webview, where it (a) doubles to UTF-16 in the V8 heap and (b) is
+    // parsed synchronously on the main thread — spiking RAM to several GB and
+    // freezing the UI. Bound the inflated body to MAX_BYTES as well (read one
+    // extra byte to detect truncation). The XMLTV parser tolerates a cut tail:
+    // an unterminated final <programme>/<channel> block is simply skipped.
     if out.len() >= 2 && out[0] == 0x1f && out[1] == 0x8b {
         use std::io::Read;
-        let mut decoder = flate2::read::MultiGzDecoder::new(&out[..]);
-        let mut decoded = String::new();
-        match decoder.read_to_string(&mut decoded) {
-            Ok(n) => {
-                crate::devlog!(debug, "iptv", "gunzipped EPG → {} KiB", n / 1024);
-                return Ok(decoded);
+        let mut limited =
+            flate2::read::MultiGzDecoder::new(&out[..]).take(MAX_BYTES as u64 + 1);
+        let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024 * 1024);
+        match limited.read_to_end(&mut buf) {
+            Ok(_) => {
+                if buf.len() > MAX_BYTES {
+                    buf.truncate(MAX_BYTES);
+                    crate::devlog!(
+                        warn, "iptv",
+                        "EPG inflated past the {} MB cap — truncating (now/next may be partial)",
+                        MAX_BYTES / (1024 * 1024),
+                    );
+                }
+                crate::devlog!(debug, "iptv", "gunzipped EPG → {} KiB", buf.len() / 1024);
+                return Ok(String::from_utf8_lossy(&buf).into_owned());
             }
             Err(e) => {
                 crate::devlog!(

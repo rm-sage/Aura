@@ -30,8 +30,16 @@ export function parseXmltvTime(raw: string): number | null {
 }
 
 /** Parse every `<programme>` block. Tolerant: malformed blocks are
- *  skipped, not fatal. */
-export function parseXmltv(xml: string): EpgProgram[] {
+ *  skipped, not fatal.
+ *
+ *  When `relevant` is provided, programmes whose `channel` (EPG id) is not in
+ *  the set are skipped BEFORE the expensive title/desc extraction. The set is
+ *  the exact id space the resolver can ever resolve to (playlist tvg-ids plus
+ *  name-fallback ids), so this is a LOSSLESS memory cut: a global playlist
+ *  paired with a regional EPG would otherwise index hundreds of thousands of
+ *  programmes for channels the user can never watch. Pass `undefined` to keep
+ *  everything. */
+export function parseXmltv(xml: string, relevant?: Set<string>): EpgProgram[] {
   const out: EpgProgram[] = [];
   let from = 0;
   for (;;) {
@@ -44,12 +52,16 @@ export function parseXmltv(xml: string): EpgProgram[] {
     from = close + "</programme>".length;
 
     const tag = xml.slice(open, openEnd + 1);
-    const body = xml.slice(openEnd + 1, close);
 
     const start = attrValue(tag, "start").map(parseXmltvTime).find((v) => v != null) ?? null;
     const stop = attrValue(tag, "stop").map(parseXmltvTime).find((v) => v != null) ?? null;
     const channel = attrValue(tag, "channel")[0] ?? "";
     if (start == null || stop == null || !channel || stop <= start) continue;
+    // Skip channels this playlist can never resolve — before the slice +
+    // entity-decode work below, so filtering also saves parse CPU.
+    if (relevant && !relevant.has(channel)) continue;
+
+    const body = xml.slice(openEnd + 1, close);
 
     out.push({
       channelTvgId: channel,
@@ -81,6 +93,33 @@ export function indexProgramsByChannel(
     list.sort((a, b) => a.startMs - b.startMs);
   }
   return { byChannel, nameToId: nameToId ?? new Map(), fetchedAt: Date.now() };
+}
+
+/** Full EPG build: name index → relevant-id set → filtered programme index.
+ *  Pure (no DOM / Tauri), so it runs identically in the off-main-thread
+ *  worker (epgWorker.ts) and as the main-thread fallback. `channels` carries
+ *  just the join fields. `rawHasPrograms` lets the caller tell "the EPG body
+ *  had no <programme> at all" (a broken feed → surface an error) apart from
+ *  "had programmes but none matched this playlist" (fine → empty index, no
+ *  now/next). */
+export function buildEpgIndex(
+  body: string,
+  channels: ReadonlyArray<{ tvgId: string; name: string }>,
+): { index: EpgIndex; rawHasPrograms: boolean } {
+  const nameToId = parseXmltvChannelNames(body);
+  // The exact id space the resolver can resolve to: each channel's tvg-id
+  // plus, when its name maps to an EPG display-name, that mapped id.
+  const relevant = new Set<string>();
+  for (const ch of channels) {
+    const id = ch.tvgId.trim();
+    if (id) relevant.add(id);
+    const nk = normalizeChannelName(ch.name);
+    const mapped = nk ? nameToId.get(nk) : undefined;
+    if (mapped) relevant.add(mapped);
+  }
+  const rawHasPrograms = body.includes("<programme");
+  const programs = parseXmltv(body, relevant);
+  return { index: indexProgramsByChannel(programs, nameToId), rawHasPrograms };
 }
 
 /** Build a normalized-display-name → channel-id map from every `<channel>`
