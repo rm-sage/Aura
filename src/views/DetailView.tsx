@@ -3671,29 +3671,39 @@ function PanelHeader({
   action?: React.ReactNode;
 }) {
   return (
-    <div className="flex items-center gap-2 px-4 py-3 border-b border-white/10">
+    <div className="flex items-center gap-2.5 px-4 py-2.5 border-b border-white/10 bg-white/[0.015]">
+      {/* Left zone — back action as a defined chip, fenced off from the title. */}
       {onBack && (
-        <button
-          onClick={onBack}
-          className="flex items-center gap-1 px-2 py-1 rounded-md
-                     text-white/60 hover:text-white hover:bg-white/8
-                     text-[11px] font-mono tracking-[0.12em] uppercase transition-colors"
-        >
-          <ArrowBackSm />
-          <span>{backLabel}</span>
-        </button>
+        <>
+          <button
+            onClick={onBack}
+            className="flex items-center gap-1.5 pl-1.5 pr-2.5 h-7 rounded-lg shrink-0
+                       text-white/55 hover:text-white bg-white/[0.04] hover:bg-white/[0.09]
+                       border border-white/8 hover:border-white/15
+                       text-[11px] font-mono tracking-[0.1em] uppercase transition-colors"
+          >
+            <ArrowBackSm />
+            <span>{backLabel}</span>
+          </button>
+          <span className="w-px h-5 bg-white/10 shrink-0" aria-hidden />
+        </>
       )}
-      <span className="w-1 h-3.5 bg-ln-accent rounded-sm" aria-hidden />
-      <h3 className="text-white/95 text-[12.5px] font-mono font-semibold tracking-[0.22em] uppercase">
-        {title}
-      </h3>
+      {/* Title zone. */}
+      <div className="flex items-center gap-2 min-w-0">
+        <span className="w-1 h-4 bg-ln-accent rounded-full shadow-accent-glow shrink-0" aria-hidden />
+        <h3 className="text-white/95 text-[12.5px] font-mono font-semibold tracking-[0.22em] uppercase truncate">
+          {title}
+        </h3>
+      </div>
       <div className="flex-1" />
+      {/* Right zone — count badge + controls, grouped. */}
       {right && (
-        <span className="text-white/45 text-[11px] font-mono uppercase tracking-[0.15em]">
+        <span className="px-2 py-1 rounded-md shrink-0 bg-white/[0.05] border border-white/8
+                         text-white/50 text-[10px] font-mono uppercase tracking-[0.14em]">
           {right}
         </span>
       )}
-      {action}
+      {action && <div className="flex items-center gap-0.5 shrink-0">{action}</div>}
     </div>
   );
 }
