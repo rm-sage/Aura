@@ -19,7 +19,7 @@ import { isVideoAired } from "../types";
 import { computeReleaseCountdowns, formatCountdown, formatTargetDate, isInTheaters, nextAiringEpisode, useCountdownNow } from "../releaseCountdown";
 import { useMovieReleaseDates } from "../releaseDates";
 import EpisodeAirChip from "../EpisodeAirChip";
-import { loadAuraSettings } from "../auraSettings";
+import { loadAuraSettings, saveAuraSettings } from "../auraSettings";
 import { useReleaseSignal } from "../releaseSignalStore";
 import { fetchReleaseSignal } from "../releaseSearch";
 import { resolveDefaultMetaUrl } from "../addonDefaults";
@@ -99,7 +99,7 @@ import { getSortedEpisodes } from "../episodeSort";
 import { showFlyUpToast } from "../FlyUpToast";
 import ImageLoader from "../ImageLoader";
 import ErrorBoundary from "../ErrorBoundary";
-import { parseStream, chipStyleFor, type ChipKind } from "../streamMeta";
+import { parseStream, chipStyleFor, looksLikeTamTaro, type ChipKind } from "../streamMeta";
 import { streamMatchKey } from "../watchTogether/streamMatch";
 import Tooltip from "../Tooltip";
 import { BrandLogo, ratingDomain, groupRatingsByBrand } from "../logodev";
@@ -3477,6 +3477,10 @@ function StreamMessagesEmptyState({ metadata }: { metadata: StreamMetadata }) {
   );
 }
 
+/** localStorage flag — the non-TamTaro format hint shows once, then is
+ *  dismissed for good (the cog stays available for toggling either way). */
+const STREAM_FORMAT_HINT_KEY = "aura:stream-format-hint-dismissed";
+
 function StreamsPanel({
   isEpisodic, activeVideo, streams, streamMeta, loading, groups, partyStreamKey, onBack, onPlay, onCopy, onPlayExternal,
 }: {
@@ -3504,6 +3508,35 @@ function StreamsPanel({
     streamMeta.info.length +
     streamMeta.stats.length;
 
+  // Aura stream formatter toggle (live). When OFF, rows show the addon's raw
+  // title/description (like base Stremio) instead of parsed chips — the escape
+  // hatch for addons that don't emit the TamTaro format the parser expects.
+  const [formatterOn, setFormatterOn] = useState(() => loadAuraSettings().useAuraStreamFormatter);
+  useEffect(() => {
+    const sync = () => setFormatterOn(loadAuraSettings().useAuraStreamFormatter);
+    window.addEventListener("aura:settings-changed", sync);
+    return () => window.removeEventListener("aura:settings-changed", sync);
+  }, []);
+  const setFormatter = useCallback((v: boolean) => {
+    saveAuraSettings({ ...loadAuraSettings(), useAuraStreamFormatter: v });
+    setFormatterOn(v);
+  }, []);
+
+  // Auto-detect a non-TamTaro list (sample the first few rows). Drives the
+  // one-time hint banner; only meaningful while the parser is ON.
+  const nonTamTaro = useMemo(
+    () => streams.length > 0 && !streams.slice(0, 8).some(looksLikeTamTaro),
+    [streams],
+  );
+  const [hintDismissed, setHintDismissed] = useState(() => {
+    try { return localStorage.getItem(STREAM_FORMAT_HINT_KEY) === "1"; } catch { return false; }
+  });
+  const dismissHint = useCallback(() => {
+    setHintDismissed(true);
+    try { localStorage.setItem(STREAM_FORMAT_HINT_KEY, "1"); } catch { /* ignore */ }
+  }, []);
+  const showHint = formatterOn && nonTamTaro && !hintDismissed;
+
   return (
     <>
       <PanelHeader
@@ -3512,6 +3545,8 @@ function StreamsPanel({
         backLabel={onBack ? "Episodes" : undefined}
         onBack={onBack}
         action={(
+          <>
+          <StreamFormatCog on={formatterOn} onToggle={setFormatter} />
           <button
             type="button"
             onClick={() => window.dispatchEvent(new CustomEvent("aura:streams-refresh"))}
@@ -3530,6 +3565,7 @@ function StreamsPanel({
               <path d="M17.65 6.35A7.958 7.958 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A5.99 5.99 0 0 1 12 18a6 6 0 1 1 0-12c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" />
             </svg>
           </button>
+          </>
         )}
       />
       {subtitle && (
@@ -3567,6 +3603,12 @@ function StreamsPanel({
           )
         ) : (
           <div className="space-y-3">
+            {showHint && (
+              <StreamFormatHint
+                onTurnOff={() => { setFormatter(false); dismissHint(); }}
+                onDismiss={dismissHint}
+              />
+            )}
             {loading && (
               <div className="px-2 py-1">
                 <SpectralPulse
@@ -3589,16 +3631,20 @@ function StreamsPanel({
                   </span>
                 </div>
                 <div className="space-y-1">
-                  {list.map((s, idx) => (
-                    <StreamRow
-                      key={`${s.url ?? s.info_hash ?? "x"}:${idx}`}
-                      stream={s}
-                      partyMatch={!!partyStreamKey && streamMatchKey(s) === partyStreamKey}
-                      onPlay={() => onPlay(s)}
-                      onCopy={onCopy}
-                      onPlayExternal={onPlayExternal}
-                    />
-                  ))}
+                  {list.map((s, idx) => {
+                    const key = `${s.url ?? s.info_hash ?? "x"}:${idx}`;
+                    const partyMatch = !!partyStreamKey && streamMatchKey(s) === partyStreamKey;
+                    const rowProps = {
+                      stream: s,
+                      partyMatch,
+                      onPlay: () => onPlay(s),
+                      onCopy,
+                      onPlayExternal,
+                    };
+                    return formatterOn
+                      ? <StreamRow key={key} {...rowProps} />
+                      : <RawStreamRow key={key} {...rowProps} />;
+                  })}
                 </div>
               </div>
             ))}
@@ -3649,6 +3695,153 @@ function PanelHeader({
       )}
       {action}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Stream-formatter controls — the cog popover, the auto-detect hint banner,
+// and the raw (formatter-off) row.
+// ---------------------------------------------------------------------------
+
+/** Cog in the streams header → popover with the Aura stream-formatter toggle.
+ *  Also reachable from main Settings; both write the same AuraSettings flag. */
+function StreamFormatCog({ on, onToggle }: { on: boolean; onToggle: (v: boolean) => void }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-label="Stream formatting"
+        title="Stream formatting"
+        className="flex items-center justify-center w-7 h-7 -my-1 rounded-md
+                   text-white/55 hover:text-white hover:bg-white/8 transition-colors"
+      >
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+          <path d="M19.14 12.94c.04-.31.06-.62.06-.94s-.02-.63-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.62l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.03 7.03 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96a.5.5 0 0 0-.6.22L2.27 8.86a.5.5 0 0 0 .12.62l2.03 1.58c-.04.31-.06.62-.06.94s.02.63.06.94l-2.03 1.58a.5.5 0 0 0-.12.62l1.92 3.32c.14.24.42.32.66.22l2.39-.96c.49.38 1.03.7 1.62.94l.36 2.54c.04.24.25.42.5.42h3.84c.25 0 .46-.18.5-.42l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.24.1.52.02.66-.22l1.92-3.32a.5.5 0 0 0-.12-.62l-2.03-1.58zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z" />
+        </svg>
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+          <div className="absolute right-0 mt-1.5 w-[262px] z-50 rounded-xl border border-white/12
+                          bg-[rgba(14,14,18,0.97)] backdrop-blur-2xl shadow-glass-edge p-3 space-y-2">
+            <button
+              type="button"
+              onClick={() => onToggle(!on)}
+              className="w-full flex items-center justify-between gap-3"
+            >
+              <span className="text-[12.5px] text-white/90 font-medium font-sans normal-case tracking-normal">
+                Aura stream formatting
+              </span>
+              <span className={`relative w-9 h-5 rounded-full flex-shrink-0 transition-colors
+                                ${on ? "bg-ln-accent/80" : "bg-white/15"}`}>
+                <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all
+                                  ${on ? "left-[18px]" : "left-0.5"}`} />
+              </span>
+            </button>
+            <p className="text-[11px] text-white/45 leading-snug font-sans normal-case tracking-normal">
+              On: parse stream details into chips (built for AIOStreams' TamTaro format).
+              Off: show the addon's raw output, like Stremio.
+            </p>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** One-time banner above the stream list when the parser is on but the addon
+ *  isn't emitting the TamTaro format Aura parses. */
+function StreamFormatHint({ onTurnOff, onDismiss }: { onTurnOff: () => void; onDismiss: () => void }) {
+  return (
+    <div className="mx-1 rounded-lg border border-amber-400/25 bg-amber-500/[0.08] px-3 py-2.5">
+      <p className="text-[12px] text-amber-100/85 leading-snug">
+        These stream details aren't in Aura's expected format. Switch your AIOStreams output to
+        the <span className="font-semibold">TamTaro</span> formatter, or turn off Aura's stream
+        formatting to show the addon's raw text (also available under the cog above).
+      </p>
+      <div className="flex items-center gap-2 mt-2">
+        <button
+          type="button"
+          onClick={onTurnOff}
+          className="px-2.5 h-7 rounded-md text-[11.5px] font-medium
+                     bg-amber-400/15 text-amber-100 border border-amber-300/30 hover:bg-amber-400/25 transition-colors"
+        >
+          Turn off formatting
+        </button>
+        <button
+          type="button"
+          onClick={onDismiss}
+          className="px-2.5 h-7 rounded-md text-[11.5px] font-medium
+                     text-white/55 hover:text-white/85 hover:bg-white/8 transition-colors"
+        >
+          Dismiss
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Raw stream row — shown when the Aura formatter is OFF. Renders the addon's
+ *  title + description verbatim (line breaks preserved), like base Stremio, so
+ *  no detail is lost when the parser can't read the format. Play + right-click
+ *  actions mirror StreamRow. */
+function RawStreamRow({
+  stream, partyMatch, onPlay, onCopy, onPlayExternal,
+}: {
+  stream: StreamEntry;
+  partyMatch?: boolean;
+  onPlay: () => void;
+  onCopy: (text: string) => void;
+  onPlayExternal: (url: string) => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onPlay}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        const items = [
+          stream.url ? { label: "Copy stream link", onClick: () => onCopy(stream.url!) } : null,
+          stream.info_hash
+            ? { label: "Copy magnet link", onClick: () => onCopy(`magnet:?xt=urn:btih:${stream.info_hash}`) }
+            : null,
+          stream.url
+            ? { label: "Play externally", icon: <ExternalIcon />, onClick: () => onPlayExternal(stream.url!) }
+            : null,
+        ].filter(Boolean) as Array<{ label: string; icon?: React.ReactNode; onClick: () => void }>;
+        openContextMenu(e.clientX, e.clientY, items);
+      }}
+      title={stream.filename ?? undefined}
+      className={[
+        "relative hover-glow w-full text-left rounded-xl px-4 py-3 flex flex-col gap-1",
+        "hover:bg-white/[0.08] hover:border-white/18",
+        partyMatch
+          ? "bg-ln-accent/[0.10] border border-ln-accent/45 ring-1 ring-ln-accent/40"
+          : "bg-white/[0.04] border border-white/10",
+      ].join(" ")}
+    >
+      {partyMatch && (
+        <span className="absolute -top-2 left-3 px-1.5 h-[15px] rounded-full bg-ln-accent text-black
+                         text-[9px] font-bold uppercase tracking-wider flex items-center leading-none">
+          Party pick
+        </span>
+      )}
+      {stream.title && (
+        <p className="text-white/90 text-[13.5px] font-medium leading-snug break-words selectable whitespace-pre-wrap">
+          {stream.title}
+        </p>
+      )}
+      {stream.description && (
+        <p className="text-white/55 text-[12px] leading-snug break-words selectable whitespace-pre-wrap">
+          {stream.description}
+        </p>
+      )}
+      {!stream.title && !stream.description && (
+        <p className="text-white/40 text-[12px] italic">{stream.addon_name || "Stream"}</p>
+      )}
+    </button>
   );
 }
 

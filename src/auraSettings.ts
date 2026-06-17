@@ -202,6 +202,12 @@ export interface AuraSettings {
    *  a show out the moment you begin it. Flip false to keep in-progress
    *  shows pinned in the Queue. Surfaced as a toggle in the Queue page. */
   queueRemoveSeriesInProgress: boolean;
+  /** When true (default), Aura parses addon stream details into tidy chips —
+   *  built for AIOStreams' "TamTaro" glyph format. When false, the stream list
+   *  shows the addon's raw title/description text, like base Stremio. The
+   *  escape hatch for addons that emit a format Aura can't parse cleanly; the
+   *  stream panel auto-detects non-TamTaro output and offers to switch. */
+  useAuraStreamFormatter: boolean;
 }
 
 export const DEFAULT_AURA_SETTINGS: AuraSettings = {
@@ -227,6 +233,7 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   metaPanelBindButton: 1,
   openLinksExternally: false,
   queueRemoveSeriesInProgress: true,
+  useAuraStreamFormatter: true,
 };
 
 // Module-level memoization snapshot. loadAuraSettings is called many
@@ -328,6 +335,9 @@ function readFromStorage(): AuraSettings {
         : false,
       queueRemoveSeriesInProgress: typeof parsed.queueRemoveSeriesInProgress === "boolean"
         ? parsed.queueRemoveSeriesInProgress
+        : true,
+      useAuraStreamFormatter: typeof parsed.useAuraStreamFormatter === "boolean"
+        ? parsed.useAuraStreamFormatter
         : true,
       heroCatalog: parsed.heroCatalog
         && typeof parsed.heroCatalog === "object"

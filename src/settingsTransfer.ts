@@ -117,6 +117,7 @@ const PORTABLE_AURA_FIELDS = [
   "metaPanelBindButton",
   "openLinksExternally",
   "queueRemoveSeriesInProgress",
+  "useAuraStreamFormatter",
 ] as const;
 export type PortableAuraField = typeof PORTABLE_AURA_FIELDS[number];
 

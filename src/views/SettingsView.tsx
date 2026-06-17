@@ -4564,6 +4564,13 @@ export default function SettingsView({ addons, session }: Props) {
                   : "Drag to reorder. Only the listed addons are queried for streams; remove an entry to skip it on every lookup."
               }
             />
+            <div className="h-px bg-white/6" />
+            <SettingToggle
+              label="Aura stream formatting"
+              description="Parse addon stream details into tidy chips (built for AIOStreams' TamTaro format). Turn off to show the addon's raw output, like Stremio. Also toggleable from the cog in the stream list, where Aura flags non-TamTaro output automatically."
+              value={aura.useAuraStreamFormatter}
+              onChange={(v) => setLocal({ useAuraStreamFormatter: v })}
+            />
           </Section>
 
           {/* ── Search Providers ──────────────────────────────────────────

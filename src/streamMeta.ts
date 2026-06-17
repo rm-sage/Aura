@@ -209,6 +209,27 @@ const GLYPH_PROXY_OUT   = "⛉";   // ⛉
 const GLYPH_LANG        = "⛿";   // ⛿
 const GLYPH_PRIVATE     = "⚿";   // ⚿
 
+/** The line-leading glyphs unique to AIOStreams' "TamTaro" format that the
+ *  parser keys on. Used by `looksLikeTamTaro` for auto-detection. */
+const TAMTARO_SIGNATURE_GLYPHS = [
+  GLYPH_TITLE, GLYPH_LIBRARY, GLYPH_ENCODE, GLYPH_VISUAL_PRI, GLYPH_VISUAL_SEC,
+  GLYPH_AUDIO, GLYPH_CHANNELS, GLYPH_SIZE_PACK, GLYPH_SIZE_SINGLE, GLYPH_SEEDERS,
+  GLYPH_PROXY_FILL, GLYPH_PROXY_OUT, GLYPH_LANG, GLYPH_PRIVATE,
+];
+
+/** Heuristic: does this stream use the TamTaro glyph-tagged format the parser
+ *  is built for? Plain-label (Torrentio) and other emoji formats score 0, so
+ *  the UI can detect them and offer to fall back to raw output. Two distinct
+ *  signature glyphs is enough — a real TamTaro stream carries many. */
+export function looksLikeTamTaro(s: StreamEntry): boolean {
+  const body = `${s.title ?? ""}\n${s.description ?? ""}`;
+  let hits = 0;
+  for (const g of TAMTARO_SIGNATURE_GLYPHS) {
+    if (body.includes(g) && (hits += 1) >= 2) return true;
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Normalisation helpers.
 // ---------------------------------------------------------------------------
