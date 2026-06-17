@@ -4,8 +4,8 @@
 // ---------------------------------------------------------------------------
 // Live TV store — module-level singleton + CustomEvent pub/sub, mirroring
 // the shape of historyStore / releaseSignalStore. Holds:
-//   • `sources`   — configured playlists (persisted in Rust AppSettings
-//                   `iptv_playlists`, round-tripped via get/update_settings).
+//   • `sources`   — configured playlists (DEVICE-LOCAL: persisted in
+//                   localStorage, never synced — see the LS_SOURCES note below).
 //   • `playlists` — parsed channel lists keyed by source id, cached in
 //                   memory with a TTL so re-entering Live TV doesn't refetch.
 //   • `loading` / `errors` — per-source UI state.
@@ -34,24 +34,22 @@ const CHANGE_EVENT = "aura:iptv-changed";
  *  change" against a stale list after the provider adds channels. */
 const PARSE_TTL_MS = 30 * 60 * 1000;
 
-/** Bundled, always-offered default playlist: iptv-org's free global index +
- *  the iptv-epg.org US XMLTV guide (gzip, matched via the resolver's tvg-id +
- *  name fallback; US-focused so it won't cover every global channel).
- *  Seeded ONCE per install (see loadIptvSources) so a new user has something to
- *  try Live TV with; fully removable afterward. */
-const DEFAULT_PLAYLIST: IptvPlaylistSource = {
-  id: "iptv_org",
-  name: "iptv-org (Free)",
-  url: "https://iptv-org.github.io/iptv/index.m3u",
-  kind: "m3u",
-  epgUrl: "https://iptv-epg.org/files/epg-us.xml.gz",
-};
-const DEFAULT_SEEDED_KEY = "aura.iptv.defaultSeeded";
-/** The previous bundled-default EPG URL. Existing installs that were seeded
- *  with it are migrated ONCE to the current `DEFAULT_PLAYLIST.epgUrl` (a user
- *  who set their own EPG is untouched — only the exact old default matches). */
-const OLD_DEFAULT_EPG = "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.xml.gz";
-const EPG_MIGRATION_KEY = "aura.iptv.defaultEpgMigratedV2";
+// Playlists are DEVICE-LOCAL: stored in localStorage, never in Rust
+// AppSettings. The old design kept them in AppSettings, which is per-auth-
+// scope (scope_from_auth_key hashes the auth_key, which rotates per login)
+// AND part of the cloud-synced settings blob — so a new login (fresh scope
+// file) or a stale settings sync pull silently wiped a freshly-added playlist
+// (the "my playlists keep disappearing" bug). An M3U URL / Xtream login is
+// inherently per-device anyway (the Xtream password lives in THIS machine's
+// keyring), so there's nothing to gain from syncing them. No playlist is
+// seeded — the user adds their own.
+const LS_SOURCES = "aura.iptv.sources.v1";
+const LS_DEFAULT = "aura.iptv.defaultId.v1";
+/** Set once after the one-time import from the legacy AppSettings store. */
+const MIGRATED_KEY = "aura.iptv.migratedToLocalV1";
+/** Fixed id of the old bundled iptv-org seed — dropped during migration so
+ *  the global playlist + its heavy US EPG don't carry forward. */
+const LEGACY_SEED_ID = "iptv_org";
 
 interface IptvState {
   sources: IptvPlaylistSource[];
@@ -102,70 +100,66 @@ export function getIptvState(): Readonly<IptvState> {
 // Settings round-trip
 // ---------------------------------------------------------------------------
 
-/** Load configured sources from Rust AppSettings and kick off a passive
- *  refresh of each. Idempotent enough to call on every LiveView mount —
- *  cached playlists within the TTL are reused. */
+/** Load device-local sources (localStorage) and kick off a passive refresh of
+ *  each. Idempotent enough to call on every LiveView mount — cached playlists
+ *  within the TTL are reused. Performs a ONE-TIME import from the legacy
+ *  Rust-settings store so existing users keep their manually-added playlists. */
 export async function loadIptvSources(): Promise<void> {
   let sources: IptvPlaylistSource[] = [];
+  let defaultId: string | null = null;
+
   try {
-    const s = await invoke<{ iptv_playlists?: IptvPlaylistSource[]; iptv_default_playlist_id?: string | null }>(
-      "get_settings",
-    );
-    sources = Array.isArray(s.iptv_playlists) ? s.iptv_playlists : [];
-    _state.defaultId = s.iptv_default_playlist_id ?? null;
+    const raw = localStorage.getItem(LS_SOURCES);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) sources = parsed as IptvPlaylistSource[];
+    }
+    defaultId = localStorage.getItem(LS_DEFAULT) || null;
   } catch {
-    sources = [];
+    /* localStorage unreadable — start empty */
   }
-  // One-time EPG migration: the bundled default's EPG URL changed. Rewrite any
-  // source still on the OLD default EPG to the new one — a user who set a
-  // custom EPG is untouched (only the exact old default matches). Runs once.
+
+  // One-time migration off the legacy Rust AppSettings store. Runs only when
+  // local storage hasn't been populated yet; imports the user's manually-added
+  // playlists but DROPS the old bundled iptv-org seed (so its heavy US EPG
+  // doesn't carry forward).
   try {
-    if (!localStorage.getItem(EPG_MIGRATION_KEY)) {
-      localStorage.setItem(EPG_MIGRATION_KEY, "1");
-      let migrated = false;
-      sources = sources.map((s) => {
-        if (s.epgUrl === OLD_DEFAULT_EPG) {
-          migrated = true;
-          return { ...s, epgUrl: DEFAULT_PLAYLIST.epgUrl };
+    if (!localStorage.getItem(MIGRATED_KEY)) {
+      localStorage.setItem(MIGRATED_KEY, "1");
+      if (sources.length === 0) {
+        const s = await invoke<{
+          iptv_playlists?: IptvPlaylistSource[];
+          iptv_default_playlist_id?: string | null;
+        }>("get_settings");
+        const imported = (Array.isArray(s.iptv_playlists) ? s.iptv_playlists : []).filter(
+          (p) => p.id !== LEGACY_SEED_ID,
+        );
+        if (imported.length > 0) {
+          sources = imported;
+          const did = s.iptv_default_playlist_id ?? null;
+          defaultId = did && imported.some((p) => p.id === did) ? did : null;
         }
-        return s;
-      });
-      if (migrated) {
-        _state.sources = sources;
-        await persistSources();
       }
     }
   } catch {
-    /* localStorage unavailable — skip migration */
+    /* migration is best-effort */
   }
-  // Seed the bundled iptv-org playlist ONCE per install (so a new user has a
-  // working Live TV starting point), then never force it again — the user can
-  // remove it permanently. Deduped by URL so the current user's existing
-  // iptv-org entry isn't duplicated.
-  let seededNow = false;
-  try {
-    if (!localStorage.getItem(DEFAULT_SEEDED_KEY)) {
-      localStorage.setItem(DEFAULT_SEEDED_KEY, "1");
-      if (!sources.some((s) => s.url === DEFAULT_PLAYLIST.url)) {
-        sources = [DEFAULT_PLAYLIST, ...sources];
-        seededNow = true;
-      }
-    }
-  } catch {
-    /* localStorage unavailable — skip seeding */
-  }
+
   _state.sources = sources;
+  _state.defaultId = defaultId && sources.some((s) => s.id === defaultId) ? defaultId : null;
   _state.loaded = true;
-  if (seededNow) await persistSources();
+  persistLocal();
   emit();
   // Passive-refresh each source (TTL-gated; no-op if fresh).
   await Promise.all(sources.map((src) => refreshPlaylist(src.id).catch(() => {})));
 }
 
-/** Persist the current `sources` array to Rust settings. */
-async function persistSources(): Promise<void> {
+/** Persist the current sources + default id to DEVICE-LOCAL storage. */
+function persistLocal(): void {
   try {
-    await invoke("update_settings", { patch: { iptv_playlists: _state.sources } });
+    localStorage.setItem(LS_SOURCES, JSON.stringify(_state.sources));
+    if (_state.defaultId) localStorage.setItem(LS_DEFAULT, _state.defaultId);
+    else localStorage.removeItem(LS_DEFAULT);
   } catch (e) {
     console.warn("[iptv] persist sources failed", e);
   }
@@ -199,7 +193,7 @@ export async function addPlaylistSource(
 
   _state.sources = [..._state.sources.filter((s) => s.id !== id), source];
   emit();
-  await persistSources();
+  persistLocal();
   await refreshPlaylist(id, { force: true }).catch(() => {});
   return source;
 }
@@ -248,7 +242,7 @@ export async function updatePlaylistSource(
     dropEpg(id);
   }
   emit();
-  await persistSources();
+  persistLocal();
   await refreshPlaylist(id, { force: true }).catch(() => {});
 }
 
@@ -259,17 +253,9 @@ export async function removePlaylistSource(id: string): Promise<void> {
   _state.playlists.delete(id);
   _state.errors.delete(id);
   _state.loading.delete(id);
-  const wasDefault = _state.defaultId === id;
-  if (wasDefault) _state.defaultId = null;
+  if (_state.defaultId === id) _state.defaultId = null;
   emit();
-  await persistSources();
-  if (wasDefault) {
-    try {
-      await invoke("update_settings", { patch: { iptv_default_playlist_id: null } });
-    } catch (e) {
-      console.warn("[iptv] clear default failed", e);
-    }
-  }
+  persistLocal();
   try {
     await invoke("iptv_clear_xtream_password", { playlistId: id });
   } catch {
@@ -281,14 +267,9 @@ export async function removePlaylistSource(id: string): Promise<void> {
  *  on open. Persisted in AppSettings so it syncs + backs up. Passing the id
  *  that is already the default toggles it off. */
 export async function setDefaultPlaylist(id: string | null): Promise<void> {
-  const next = _state.defaultId === id ? null : id;
-  _state.defaultId = next;
+  _state.defaultId = _state.defaultId === id ? null : id;
   emit();
-  try {
-    await invoke("update_settings", { patch: { iptv_default_playlist_id: next } });
-  } catch (e) {
-    console.warn("[iptv] set default failed", e);
-  }
+  persistLocal();
 }
 
 // ---------------------------------------------------------------------------
