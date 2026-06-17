@@ -68,12 +68,6 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
     destructive: true,
   },
   {
-    prefix:      "aura:auto-bumped-series:v1",
-    label:       "Auto-bumped series tracker",
-    description: "Series the recheck-watched flow flagged so they don't re-enter Continue Watching after a watched-then-new-ep aired. Clearing re-allows them to appear in CW; safe.",
-    destructive: false,
-  },
-  {
     prefix:      "aura:notifications:v1",
     label:       "Notifications history",
     description: "Bell-panel notification list. Clearing wipes the history but doesn't affect future scans.",
@@ -83,18 +77,6 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
     prefix:      "aura:notifications:scanner-state",
     label:       "Episode scanner seen-ids",
     description: "Per-series record of episode ids the scanner has already seen. Clearing causes the next scan pass to re-seed from current addon state (a one-shot grace that fires no notifications), then resumes normal new-episode detection. Safe.",
-    destructive: false,
-  },
-  {
-    prefix:      "aura:recent-searches",
-    label:       "Recent searches",
-    description: "Search history surfaced under the search bar. Safe to clear.",
-    destructive: false,
-  },
-  {
-    prefix:      "aura:anime-id-cache:v1",
-    label:       "Anime ID cache",
-    description: "Local hint set used to classify IMDb-id'd anime correctly across surfaces (right-click menus, audio language defaults). Repopulates on detail-page visits. Safe to clear.",
     destructive: false,
   },
   {
