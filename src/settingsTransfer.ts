@@ -10,8 +10,9 @@
 //   Three buckets:
 //     1. backend  — addon-independent BackendSettings (theme, RPC, audio,
 //                   subtitles, keybindings, opensubtitles_api_key, …)
-//     2. aura     — addon-independent localStorage prefs (detail-page
-//                   toggles like hideCastSpoilers / blurUnwatchedThumbnails)
+//     2. aura     — addon-independent localStorage prefs (spoiler toggles,
+//                   auto-advance, motion/interpolation, meta-panel activation,
+//                   next-up skip, etc. — see PORTABLE_AURA_FIELDS)
 //     3. providers — addon-DEPENDENT prefs encoded by manifest_id INSTEAD
 //                    of URL. On import, each id is resolved against the
 //                    importing user's installed addons; ids that don't
@@ -88,16 +89,34 @@ const PORTABLE_BACKEND_FIELDS = [
   "skip_recap_mode",
   "skip_treat_mixed_op_as_op",
   "gpu_acceleration",
+  "scrobble_enabled",
 ] as const;
 
 export type PortableBackendField = typeof PORTABLE_BACKEND_FIELDS[number];
 
-/** Aura-side fields safe to round-trip across installs (all addon-URL-
- *  independent). hideCastSpoilers is a per-user preference, not tied to
- *  any addon, so it's appropriate for the portable blob. */
+/** Aura-side (localStorage) fields safe to round-trip across installs — every
+ *  addon-URL-INDEPENDENT user preference. The addon-DEPENDENT fields
+ *  (defaultHomeAddonUrl, streamAddonUrls, heroCatalog, …) are NOT here; they
+ *  ride the `providers` block keyed by manifest_id instead. Keep this list in
+ *  sync with AuraSettings: any new addon-independent preference belongs here so
+ *  export/import stays complete. The importer re-validates every value through
+ *  `readFromStorage`, so a malformed imported field can't corrupt state. */
 const PORTABLE_AURA_FIELDS = [
   "hideCastSpoilers",
   "blurUnwatchedThumbnails",
+  "blurEpisodeSynopsis",
+  "reduceMotion",
+  "autoAdvanceNextEpisode",
+  "autoAdvanceDelaySeconds",
+  "nextUpSkipFillerRecap",
+  "loudnessNormalization",
+  "motionInterpolation",
+  "interpolationTscale",
+  "releaseSearchEnabled",
+  "metaPanelActivation",
+  "metaPanelBindButton",
+  "openLinksExternally",
+  "queueRemoveSeriesInProgress",
 ] as const;
 export type PortableAuraField = typeof PORTABLE_AURA_FIELDS[number];
 

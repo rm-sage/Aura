@@ -1049,12 +1049,12 @@ function BackupRestoreSection({
       const current = loadAuraSettings();
       const next = { ...current };
       if (blob.aura) {
-        if (typeof blob.aura.hideCastSpoilers === "boolean") {
-          next.hideCastSpoilers = blob.aura.hideCastSpoilers;
-        }
-        if (typeof blob.aura.blurUnwatchedThumbnails === "boolean") {
-          next.blurUnwatchedThumbnails = blob.aura.blurUnwatchedThumbnails;
-        }
+        // blob.aura is already whitelisted to PORTABLE_AURA_FIELDS (and is
+        // addon-URL-independent), so merge every field present. Each value is
+        // re-validated + clamped by readFromStorage() on the next load, so a
+        // malformed imported field can't corrupt state. (Addon-dependent
+        // provider fields arrive separately via resolveProviders below.)
+        Object.assign(next, blob.aura);
       }
       const { aura: providerAura, unresolved } = resolveProviders(blob.providers, addons);
       // Each resolved provider field overlays the current Aura
