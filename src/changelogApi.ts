@@ -27,8 +27,17 @@ export interface ReleaseNote {
   notes: string;
 }
 
+export interface ReleasePage {
+  /** Real releases on this page (prereleases / drafts removed). */
+  items: ReleaseNote[];
+  /** True when GitHub returned a FULL raw page, so more pages may exist. Based
+   *  on the RAW count (not items.length), so a page that contained a
+   *  filtered-out prerelease doesn't falsely read as the last page. */
+  full: boolean;
+}
+
 /** Cache keyed by 1-based page index. */
-const _pageCache = new Map<number, ReleaseNote[]>();
+const _pageCache = new Map<number, ReleasePage>();
 
 interface GitHubRelease {
   tag_name: string;
@@ -40,10 +49,9 @@ interface GitHubRelease {
 }
 
 /** Fetch one page of releases (newest first), filtering out prereleases (the
- *  `runtime-deps` asset host) and drafts. Returns up to RELEASES_PAGE_SIZE
- *  real versions. Throws on network / HTTP / rate-limit failure so the caller
- *  can show a retry. Cached per page for the session. */
-export async function fetchReleasePage(page: number): Promise<ReleaseNote[]> {
+ *  `runtime-deps` asset host) and drafts. Throws on network / HTTP / rate-limit
+ *  failure so the caller can show a retry. Cached per page for the session. */
+export async function fetchReleasePage(page: number): Promise<ReleasePage> {
   const cached = _pageCache.get(page);
   if (cached) return cached;
 
@@ -57,7 +65,8 @@ export async function fetchReleasePage(page: number): Promise<ReleaseNote[]> {
     );
   }
   const raw = (await res.json()) as GitHubRelease[];
-  const out: ReleaseNote[] = (Array.isArray(raw) ? raw : [])
+  const arr = Array.isArray(raw) ? raw : [];
+  const items: ReleaseNote[] = arr
     .filter((r) => !r.prerelease && !r.draft)
     .map((r) => ({
       version: r.tag_name.replace(/^v/, ""),
@@ -65,8 +74,9 @@ export async function fetchReleasePage(page: number): Promise<ReleaseNote[]> {
       date: r.published_at ?? "",
       notes: r.body ?? "",
     }));
-  _pageCache.set(page, out);
-  return out;
+  const result: ReleasePage = { items, full: arr.length >= RELEASES_PAGE_SIZE };
+  _pageCache.set(page, result);
+  return result;
 }
 
 /** Format an ISO date as a short, locale-aware "Jun 17, 2026". Empty on no date. */

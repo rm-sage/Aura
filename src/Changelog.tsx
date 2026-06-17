@@ -35,9 +35,9 @@ export default function Changelog({
     const next = page + 1;
     try {
       const batch = await fetchReleasePage(next);
-      setReleases((prev) => [...prev, ...batch]);
+      setReleases((prev) => [...prev, ...batch.items]);
       setPage(next);
-      if (batch.length < RELEASES_PAGE_SIZE) setDone(true);
+      if (!batch.full) setDone(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

@@ -59,9 +59,9 @@ export default function UpdatePopup({
     try {
       const batch = await fetchReleasePage(next);
       // The target version's notes already show at top — drop it from the list.
-      setPrior((p) => [...p, ...batch.filter((r) => r.version !== release.version)]);
+      setPrior((p) => [...p, ...batch.items.filter((r) => r.version !== release.version)]);
       setPriorPage(next);
-      if (batch.length < RELEASES_PAGE_SIZE) setPriorDone(true);
+      if (!batch.full) setPriorDone(true);
       setShowPrior(true);
     } catch (e) {
       setPriorError(e instanceof Error ? e.message : String(e));
