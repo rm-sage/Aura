@@ -7,6 +7,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { checkForUpdatePlugin, downloadAndInstallUpdatePlugin } from "../updaterPlugin";
 import StorageReport from "../StorageReport";
 import RuntimeComponentsSection from "../RuntimeComponentsSection";
+import Changelog from "../Changelog";
 import {
   buildExportBlob,
   blobToBase64,
@@ -2789,6 +2790,7 @@ function fmtFps(n: number | null | undefined): string {
 function AboutSection({ addonCount }: { addonCount: number }) {
   const [stats, setStats] = useState<AuraStats | null>(null);
   const [debugOpen, setDebugOpen] = useState(false);
+  const [changelogOpen, setChangelogOpen] = useState(false);
   useEffect(() => {
     invoke<AuraStats>("get_stats").then(setStats).catch(() => {});
   }, []);
@@ -2806,14 +2808,25 @@ function AboutSection({ addonCount }: { addonCount: number }) {
         />
         <div className="flex-1 min-w-0">
           <p className="text-white/95 text-[15px] font-semibold leading-tight">Aura</p>
-          <p className="text-white/45 text-[12px] mt-0.5 font-mono">
-            v{APP_VERSION}
-            <span className="mx-2 text-white/15">·</span>
+          <div className="text-white/45 text-[12px] mt-1 font-mono flex items-center gap-2 flex-wrap">
+            <span>v{APP_VERSION}</span>
+            <button
+              type="button"
+              onClick={() => setChangelogOpen(true)}
+              className="px-1.5 py-0.5 rounded text-[10.5px] font-sans tracking-normal text-ln-accent/90
+                         border border-ln-accent/25 bg-ln-accent/10 hover:bg-ln-accent/20 transition-colors"
+            >
+              Changelog
+            </button>
+            <span className="text-white/15">·</span>
             <span>{addonCount} addon{addonCount === 1 ? "" : "s"}</span>
-          </p>
+          </div>
         </div>
         <CheckForUpdatesButton />
       </div>
+      {changelogOpen && (
+        <Changelog currentVersion={APP_VERSION} onClose={() => setChangelogOpen(false)} />
+      )}
 
       <div className="h-px bg-white/6" />
 

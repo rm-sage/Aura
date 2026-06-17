@@ -3,258 +3,36 @@
 
 // UpdatePopup.tsx ───────────────────────────────────────────────────────────
 //
-// Centered, screen-dimming "Update Available" modal. Surfaced from
-// App.tsx whenever `checkForUpdate()` returns a tag newer than the
-// running app version AND that tag has not already been dismissed to the
-// notifications bell.
+// Centered, screen-dimming "Update Available" modal. Surfaced from App.tsx
+// whenever checkForUpdate() returns a tag newer than the running app version
+// AND that tag has not already been dismissed to the notifications bell.
 //
-// The modal is intentionally NOT focus-trapped — Aura's UI is
-// tab-light and a strict trap would break the user's mental model of
-// "Esc/click-out to dismiss". We do still mount it with role="dialog"
-// + aria-modal="true" so screen readers identify it correctly.
+// The new version's notes render at top via the shared ReleaseNotesBody; a
+// "View earlier versions" control lazily loads prior releases from GitHub
+// (RELEASES_PAGE_SIZE at a time) so the popup doubles as a quick changelog.
 //
-// Two ways to dismiss: backdrop click and Esc.  Both call onDismiss,
-// which in App.tsx writes the tag to localStorage at the
-// "aura:update:dismissed-version" key and dispatches a CustomEvent for
-// the (separately-implemented) bell to consume. We do NOT close on the
-// "Update" button — the parent handles that after openUrl resolves.
-//
-// Animations live in App.css (.aura-update-backdrop / .aura-update-card)
-// rather than inline styles so we share the @layer-components scoping
-// and theme cross-fade behaviour with the rest of the app.
+// Two ways to dismiss: backdrop click and Esc (suppressed while installing).
+// We do NOT close on the "Install" button — the parent handles that after the
+// plugin relaunches.
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { UpdateInfo } from "./updaterPlugin";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { ReleaseNotesBody } from "./releaseNotesRender";
+import { fetchReleasePage, formatReleaseDate, RELEASES_PAGE_SIZE, type ReleaseNote } from "./changelogApi";
 
 interface Props {
   release:        UpdateInfo;
   currentVersion: string;
-  /** Primary action — kicks off the in-app signed download + install
-   *  via the tauri-plugin-updater. The popup manages its own busy
-   *  state during the call. Returns true on success (the app
-   *  relaunches automatically, so the success branch typically never
-   *  paints) and false on any failure; an error string is rendered
-   *  inline when false. */
+  /** Primary action — kicks off the in-app signed download + install via
+   *  tauri-plugin-updater. Returns true on success (the app relaunches, so
+   *  the success branch typically never paints) and false on any failure. */
   onUpdate:       () => Promise<boolean>;
   onDismiss:      () => void;
 }
 
-/** CP437 → byte map for the upper-half (0x80–0xEF) range — covers the
- *  characters that show up when UTF-8 box-drawing / accented Latin text
- *  is decoded as CP437 by mistake. Used by `recoverFromCp437Mojibake`
- *  to undo a known-bad encoding chain in pre-v0.6.22 latest.json
- *  manifests (the release script ran on a non-UTF-8 console and
- *  decoded `git`'s stdout as CP437 before encoding the result back
- *  into the manifest as UTF-8). */
-const CP437_TO_BYTE: Record<string, number> = {
-  "Ç":0x80,"ü":0x81,"é":0x82,"â":0x83,"ä":0x84,"à":0x85,"å":0x86,"ç":0x87,
-  "ê":0x88,"ë":0x89,"è":0x8A,"ï":0x8B,"î":0x8C,"ì":0x8D,"Ä":0x8E,"Å":0x8F,
-  "É":0x90,"æ":0x91,"Æ":0x92,"ô":0x93,"ö":0x94,"ò":0x95,"û":0x96,"ù":0x97,
-  "ÿ":0x98,"Ö":0x99,"Ü":0x9A,"¢":0x9B,"£":0x9C,"¥":0x9D,"₧":0x9E,"ƒ":0x9F,
-  "á":0xA0,"í":0xA1,"ó":0xA2,"ú":0xA3,"ñ":0xA4,"Ñ":0xA5,"ª":0xA6,"º":0xA7,
-  "¿":0xA8,"⌐":0xA9,"¬":0xAA,"½":0xAB,"¼":0xAC,"¡":0xAD,"«":0xAE,"»":0xAF,
-  "░":0xB0,"▒":0xB1,"▓":0xB2,"│":0xB3,"┤":0xB4,"╡":0xB5,"╢":0xB6,"╖":0xB7,
-  "╕":0xB8,"╣":0xB9,"║":0xBA,"╗":0xBB,"╝":0xBC,"╜":0xBD,"╛":0xBE,"┐":0xBF,
-  "└":0xC0,"┴":0xC1,"┬":0xC2,"├":0xC3,"─":0xC4,"┼":0xC5,"╞":0xC6,"╟":0xC7,
-  "╚":0xC8,"╔":0xC9,"╩":0xCA,"╦":0xCB,"╠":0xCC,"═":0xCD,"╬":0xCE,"╧":0xCF,
-  "╨":0xD0,"╤":0xD1,"╥":0xD2,"╙":0xD3,"╘":0xD4,"╒":0xD5,"╓":0xD6,"╫":0xD7,
-  "╪":0xD8,"┘":0xD9,"┌":0xDA,"█":0xDB,"▄":0xDC,"▌":0xDD,"▐":0xDE,"▀":0xDF,
-  "α":0xE0,"ß":0xE1,"Γ":0xE2,"π":0xE3,"Σ":0xE4,"σ":0xE5,"µ":0xE6,"τ":0xE7,
-  "Φ":0xE8,"Θ":0xE9,"Ω":0xEA,"δ":0xEB,"∞":0xEC,"φ":0xED,"ε":0xEE,"∩":0xEF,
-};
-
-/** Detect & reverse the CP437-mojibake chain that v0.6.21's release
- *  script applied to UTF-8 tag bodies. The trigger is the unmistakable
- *  `Γ<a><b>` triplet pattern — Γ = U+0393 (CP437 byte 0xE2, the leading
- *  byte of every UTF-8 box-drawing character) followed by two more
- *  high-CP437 chars. If we find that pattern, walk every char in the
- *  string, map each to its CP437 byte (ASCII fall-through for chars
- *  already in the 0x00–0x7F range), and decode the resulting byte
- *  array as UTF-8. Any mapping miss or decode failure aborts the
- *  recovery; the original string is returned untouched so we never
- *  destroy a legitimate non-mojibake release note. */
-function recoverFromCp437Mojibake(text: string): string {
-  if (!/Γ[-∀]{2}/.test(text)) return text;
-  const bytes: number[] = [];
-  for (const ch of text) {
-    const cp = ch.codePointAt(0)!;
-    if (cp < 0x80) {
-      bytes.push(cp);
-      continue;
-    }
-    const mapped = CP437_TO_BYTE[ch];
-    if (mapped === undefined) return text;
-    bytes.push(mapped);
-  }
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(bytes));
-  } catch {
-    return text;
-  }
-}
-
-/** Cap the rendered release notes at a generous limit so a runaway
- *  tag body can't make the popup scroll forever. 2200 chars covers a
- *  multi-section changelog with FIXED / ADDED / CHANGED blocks and
- *  still leaves the action row visible without the user having to
- *  scroll. Anything longer truncates with an ellipsis and a hint to
- *  view full notes on GitHub. */
+/** Cap the new-version note body so a runaway tag can't scroll forever. */
 const NOTES_MAX = 2200;
-function truncateNotes(body: string): string {
-  const trimmed = (body ?? "").trim();
-  if (trimmed.length <= NOTES_MAX) return trimmed;
-  const slice = trimmed.slice(0, NOTES_MAX);
-  const lastBreak = Math.max(
-    slice.lastIndexOf("\n\n"),
-    slice.lastIndexOf(". "),
-    slice.lastIndexOf(".\n"),
-  );
-  const cut = lastBreak > NOTES_MAX * 0.6 ? slice.slice(0, lastBreak + 1) : slice;
-  return cut.trimEnd() + "…";
-}
-
-/** Block-level structural parse of the lightweight changelog format
- *  Aura's release tags use:
- *
- *    ════════════════════════════════
- *    SECTION HEADER
- *    ════════════════════════════════
- *
- *      • bullet point one
- *      • bullet point two with
- *        continuation indent
- *
- *    paragraph text
- *
- *  Outputs structured blocks the renderer can layout — proper
- *  headings, bullet lists, and paragraph runs — so the popup reads
- *  like styled content instead of a wall of pre-wrapped monospace.
- *  Lines that don't fit a known pattern fall back to paragraph runs
- *  to preserve content. */
-type NoteBlock =
-  | { kind: "rule" }
-  | { kind: "heading"; text: string; level: 1 | 2 }
-  | { kind: "lead"; text: string }
-  | { kind: "bullets"; items: string[] }
-  | { kind: "paragraph"; text: string };
-
-const RULE_RE = /^[─━═\-_=]{6,}$/;
-// Markdown-ish heading: `# Title` (level 1) / `## Section` (level 2). Trailing
-// `#`s tolerated. The older `rule + UPPERCASE LINE + rule` form is still parsed
-// (old release tags) and folded to a level-2 heading.
-const HEADING_RE = /^(#{1,3})\s+(.+?)\s*#*$/;
-
-/** Render a line's inline emphasis: `**bold**` → a brighter strong span.
- *  Everything else passes through. Used in lead/bullet/paragraph text so
- *  feature names can stand out without a full markdown engine. */
-function renderInline(text: string): ReactNode[] {
-  return text.split(/(\*\*[^*]+?\*\*)/g).map((part, i) => {
-    const m = /^\*\*([^*]+?)\*\*$/.exec(part);
-    return m
-      ? <strong key={i} className="text-white font-semibold">{m[1]}</strong>
-      : <span key={i}>{part}</span>;
-  });
-}
-
-function parseNoteBlocks(notes: string): NoteBlock[] {
-  const lines = notes.split(/\r?\n/);
-  const blocks: NoteBlock[] = [];
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    const trimmed = line.trim();
-    if (!trimmed) {
-      i += 1;
-      continue;
-    }
-    // Markdown-ish heading line (`#`/`##`/`###`).
-    const h = HEADING_RE.exec(trimmed);
-    if (h) {
-      blocks.push({ kind: "heading", text: h[2].trim(), level: h[1].length <= 1 ? 1 : 2 });
-      i += 1;
-      continue;
-    }
-    if (RULE_RE.test(trimmed)) {
-      // Rule. If the next non-empty line is short + uppercase, treat
-      // the rule + that line as a heading (and skip the closing rule
-      // if it's there too). Otherwise emit a plain rule.
-      let j = i + 1;
-      while (j < lines.length && !lines[j].trim()) j += 1;
-      const candidate = j < lines.length ? lines[j].trim() : "";
-      const isHeading =
-        candidate.length > 0 &&
-        candidate.length <= 60 &&
-        candidate === candidate.toUpperCase() &&
-        !RULE_RE.test(candidate);
-      if (isHeading) {
-        blocks.push({ kind: "heading", text: candidate, level: 2 });
-        i = j + 1;
-        // Swallow a closing rule if it immediately follows.
-        while (i < lines.length && !lines[i].trim()) i += 1;
-        if (i < lines.length && RULE_RE.test(lines[i].trim())) i += 1;
-        continue;
-      }
-      blocks.push({ kind: "rule" });
-      i += 1;
-      continue;
-    }
-    // Bullet block — runs of lines whose first non-space token is a
-    // bullet glyph. Continuation lines (indented but no bullet) fold
-    // into the previous item.
-    if (/^\s*[•·●▪■▶►*-]\s+/.test(line)) {
-      const items: string[] = [];
-      while (i < lines.length) {
-        const cur = lines[i];
-        const curTrim = cur.trim();
-        if (!curTrim) {
-          i += 1;
-          // Blank line between bullets is fine — keep collecting.
-          if (i < lines.length && /^\s*[•·●▪■▶►*-]\s+/.test(lines[i])) {
-            continue;
-          }
-          break;
-        }
-        const bullet = cur.match(/^\s*[•·●▪■▶►*-]\s+(.*)$/);
-        if (bullet) {
-          items.push(bullet[1]);
-          i += 1;
-          continue;
-        }
-        // Continuation line — append to the previous item.
-        if (items.length > 0 && /^\s+/.test(cur)) {
-          items[items.length - 1] = items[items.length - 1] + " " + curTrim;
-          i += 1;
-          continue;
-        }
-        break;
-      }
-      blocks.push({ kind: "bullets", items });
-      continue;
-    }
-    // Paragraph — collect consecutive non-bullet, non-rule lines into
-    // one block; preserves intentional line-breaks via space-join so
-    // hard-wrapped tag prose reads like flowing text.
-    const para: string[] = [trimmed];
-    i += 1;
-    while (i < lines.length) {
-      const cur = lines[i];
-      const curTrim = cur.trim();
-      if (!curTrim) break;
-      if (RULE_RE.test(curTrim)) break;
-      if (/^\s*[•·●▪■▶►*-]\s+/.test(cur)) break;
-      para.push(curTrim);
-      i += 1;
-    }
-    // The opening paragraph reads as a lead/tagline — style it brighter.
-    blocks.push(
-      blocks.length === 0
-        ? { kind: "lead", text: para.join(" ") }
-        : { kind: "paragraph", text: para.join(" ") },
-    );
-  }
-  return blocks;
-}
 
 export default function UpdatePopup({
   release,
@@ -262,22 +40,37 @@ export default function UpdatePopup({
   onUpdate,
   onDismiss,
 }: Props) {
-  /** True while the plugin is downloading + verifying + installing.
-   *  Disables the action buttons and swaps the Install label for
-   *  "Installing…". Success branch typically never paints because
-   *  the plugin relaunches the app on completion. */
   const [installing, setInstalling] = useState(false);
-  /** Non-null when the download/install path failed (signature
-   *  mismatch, network outage, write permission, etc). Surfaced
-   *  inline above the action row so the user has a recovery hint
-   *  before falling back to the GitHub release page. */
   const [installError, setInstallError] = useState<string | null>(null);
 
-  // Esc handler — mounted only while this popup is up, so we don't have
-  // to coordinate with the global keybinding system in useKeybindings.
-  // While installing, Esc is suppressed so the user can't accidentally
-  // dismiss mid-download (the plugin holds open file handles that we'd
-  // rather see finish).
+  // Prior versions, lazily loaded from the GitHub releases API on demand.
+  const [prior, setPrior] = useState<ReleaseNote[]>([]);
+  const [priorPage, setPriorPage] = useState(0);
+  const [priorLoading, setPriorLoading] = useState(false);
+  const [priorError, setPriorError] = useState<string | null>(null);
+  const [priorDone, setPriorDone] = useState(false);
+  const [showPrior, setShowPrior] = useState(false);
+
+  const loadMorePrior = useCallback(async () => {
+    if (priorLoading || priorDone) return;
+    setPriorLoading(true);
+    setPriorError(null);
+    const next = priorPage + 1;
+    try {
+      const batch = await fetchReleasePage(next);
+      // The target version's notes already show at top — drop it from the list.
+      setPrior((p) => [...p, ...batch.filter((r) => r.version !== release.version)]);
+      setPriorPage(next);
+      if (batch.length < RELEASES_PAGE_SIZE) setPriorDone(true);
+      setShowPrior(true);
+    } catch (e) {
+      setPriorError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPriorLoading(false);
+    }
+  }, [priorLoading, priorDone, priorPage, release.version]);
+
+  // Esc dismiss — suppressed while installing (the plugin holds file handles).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -290,21 +83,9 @@ export default function UpdatePopup({
     return () => window.removeEventListener("keydown", onKey, true);
   }, [onDismiss, installing]);
 
-  // Run mojibake recovery BEFORE truncation so the heuristic gets the
-  // full string to work on — truncating first could split a 3-char
-  // mojibake triplet across the boundary and leave us unable to undo
-  // it. The recovery is no-op when the body is clean.
-  const noteBlocks = useMemo(() => {
-    const raw = release.body ?? "";
-    const recovered = recoverFromCp437Mojibake(raw);
-    const truncated = truncateNotes(recovered);
-    return parseNoteBlocks(truncated);
-  }, [release.body]);
-  // Plugin's UpdateInfo carries a bare version like "0.6.9"; surface
-  // it with the conventional "v" prefix to match the GitHub release
-  // page and the user's mental model of release tags.
   const targetTag = `v${release.version}`;
   const releasePageUrl = `https://github.com/rm-sage/Aura/releases/tag/${targetTag}`;
+  const hasNotes = (release.body ?? "").trim().length > 0;
 
   const handleInstall = async () => {
     if (installing) return;
@@ -356,80 +137,52 @@ export default function UpdatePopup({
           </p>
         </div>
 
-        {/* Release notes — block-parsed (headings / bullets / rules /
-            paragraphs) so a multi-section changelog reads as styled
-            content instead of monospace pre-wrapped text. Scrolls when
-            the body exceeds the height cap (~half-viewport). */}
-        {noteBlocks.length > 0 && (
-          <div
-            className="bg-white/[0.03] border border-white/[0.08] rounded-xl
-                       px-5 py-4 max-h-[50vh] overflow-y-auto"
-          >
-            <div className="text-white/75 text-[13px] leading-relaxed space-y-3">
-              {noteBlocks.map((block, idx) => {
-                switch (block.kind) {
-                  case "rule":
-                    return (
-                      <hr
-                        key={idx}
-                        className="border-0 border-t border-white/10 my-1"
-                      />
-                    );
-                  case "heading":
-                    return block.level === 1 ? (
-                      <h3
-                        key={idx}
-                        className="flex items-center gap-2.5 text-white text-[15px]
-                                   font-semibold tracking-tight pt-1"
-                      >
-                        <span className="w-1.5 h-1.5 rounded-full bg-ln-accent shadow-accent-glow" />
-                        {block.text}
-                      </h3>
-                    ) : (
-                      <h4 key={idx} className="flex items-center gap-2 pt-2">
-                        <span className="w-[3px] h-[13px] rounded-full bg-ln-accent/70 shrink-0" />
-                        <span className="text-[color:rgb(91,164,255)] text-[11px] font-bold tracking-[0.16em] uppercase">
-                          {block.text}
-                        </span>
-                      </h4>
-                    );
-                  case "lead":
-                    return (
-                      <p key={idx} className="text-white/90 text-[13.5px] leading-relaxed">
-                        {renderInline(block.text)}
-                      </p>
-                    );
-                  case "bullets":
-                    return (
-                      <ul key={idx} className="space-y-1.5 pl-1">
-                        {block.items.map((item, j) => (
-                          <li
-                            key={j}
-                            className="flex gap-2.5 text-white/75"
-                          >
-                            <span className="text-[color:rgb(91,164,255)]/70 mt-[2px] shrink-0">
-                              •
-                            </span>
-                            <span className="flex-1">{renderInline(item)}</span>
-                          </li>
-                        ))}
-                      </ul>
-                    );
-                  case "paragraph":
-                    return (
-                      <p key={idx} className="text-white/75">
-                        {renderInline(block.text)}
-                      </p>
-                    );
-                }
-              })}
-            </div>
-          </div>
-        )}
+        {/* Notes — the new version at top, then lazily-loaded prior versions. */}
+        <div
+          className="bg-white/[0.03] border border-white/[0.08] rounded-xl
+                     px-5 py-4 max-h-[50vh] overflow-y-auto space-y-5"
+        >
+          {hasNotes ? (
+            <ReleaseNotesBody notes={release.body ?? ""} max={NOTES_MAX} />
+          ) : (
+            <p className="text-white/45 text-[13px] italic">No notes for this release.</p>
+          )}
 
-        {/* Inline error — rendered between notes and actions so the
-            user sees the failure context before deciding whether to
-            retry or fall back to the browser. */}
+          {showPrior && prior.map((r) => (
+            <section key={r.tag} className="space-y-2 pt-4 border-t border-white/8">
+              <div className="flex items-baseline gap-2.5">
+                <h3 className="text-white text-[14px] font-semibold tracking-tight">Aura {r.version}</h3>
+                {formatReleaseDate(r.date) && (
+                  <span className="text-white/35 text-[10.5px] font-mono ml-auto">{formatReleaseDate(r.date)}</span>
+                )}
+              </div>
+              {r.notes.trim()
+                ? <ReleaseNotesBody notes={r.notes} max={Infinity} />
+                : <p className="text-white/40 text-[12px] italic">No notes for this release.</p>}
+            </section>
+          ))}
+
+          {/* Pager — reveals the changelog of earlier versions inline. */}
+          <div className="flex flex-col items-center gap-1.5 pt-1">
+            {priorLoading ? (
+              <span className="text-white/40 text-[11px]">Loading…</span>
+            ) : priorDone ? (
+              prior.length > 0 && <span className="text-white/30 text-[10.5px]">Showing all earlier versions.</span>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void loadMorePrior()}
+                className="px-3 py-1.5 rounded-lg text-[11.5px] font-medium text-white/75
+                           bg-white/[0.05] border border-white/10 hover:bg-white/10 transition-colors"
+              >
+                {priorError ? "Retry" : showPrior ? `View ${RELEASES_PAGE_SIZE} more` : "View earlier versions"}
+              </button>
+            )}
+            {priorError && <span className="text-red-200/80 text-[10.5px]">{priorError}</span>}
+          </div>
+        </div>
+
+        {/* Inline install error. */}
         {installError && (
           <div className="rounded-lg border border-red-400/30 bg-red-500/8 px-3 py-2">
             <p className="text-red-200/90 text-[11px] leading-snug">{installError}</p>
