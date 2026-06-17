@@ -312,13 +312,26 @@ function stripLeading(line: string, glyph: string): string {
   return line.slice(idx + glyph.length).trim();
 }
 
-/** Split a value on `·` / `•` separators (after NFKC). Returns trimmed
- *  non-empty tokens. */
+/** Whitespace AND zero-width / bidi-format characters that `String.trim()`
+ *  leaves behind. An addon that emits a stray U+200B (or similar) as a field
+ *  value would otherwise survive as a "blank but not empty" token and render
+ *  as an empty chip next to its category icon. */
+const INVISIBLE_RX = /[\s ​-‏‪-‮⁠﻿]+/gu;
+
+/** True when `s` has at least one VISIBLE character (not just whitespace /
+ *  zero-width / bidi marks). */
+function hasVisible(s: string): boolean {
+  return s.replace(INVISIBLE_RX, "").length > 0;
+}
+
+/** Split a value on `·` / `•` separators (after NFKC). Returns trimmed tokens
+ *  that contain at least one visible character (drops blank/zero-width-only
+ *  tokens so they never render as empty chips). */
 function splitOnDot(s: string): string[] {
   return s
     .split(/[·•]/)
     .map((t) => t.trim())
-    .filter((t) => t.length > 0);
+    .filter((t) => hasVisible(t));
 }
 
 function parseSeederValue(raw: string): { count: number | null; age: string | null } {
@@ -753,6 +766,12 @@ export function parseStream(s: StreamEntry): ParsedStream {
       if (sizeInfo.folderSize) out.folderSize = sizeInfo.folderSize;
       if (sizeInfo.bitrate) out.bitrate = sizeInfo.bitrate;
       out.seasonPack = out.seasonPack || isPack;
+      // Recognized size line but nothing matched the size/bitrate patterns →
+      // keep the raw value so it still surfaces (in the residue) rather than
+      // vanishing into a blank.
+      if (!sizeInfo.size && !sizeInfo.folderSize && !sizeInfo.bitrate && hasVisible(v)) {
+        remaining.push(rawLine);
+      }
       if (trailingFlags) handleMetadataFlags(trailingFlags, out);
       continue;
     }
@@ -764,6 +783,8 @@ export function parseStream(s: StreamEntry): ParsedStream {
       const r = parseSeederValue(cleaned);
       if (r.count != null) out.seeders = r.count;
       if (r.age) out.age = r.age;
+      // Neither a seeder count nor an age parsed → surface the raw value.
+      if (r.count == null && !r.age && hasVisible(cleaned)) remaining.push(rawLine);
       if (trailingFlags) handleMetadataFlags(trailingFlags, out);
       continue;
     }

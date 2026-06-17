@@ -4128,6 +4128,12 @@ function hasAnyChip(p: ReturnType<typeof parseStream>): boolean {
  *    wrapped two-line scraper chip is only as wide as it needs to be.
  *    Default chips use max-w-full so they never blow past their parent. */
 function ChipPill({ kind, label, tight }: { kind: ChipKind; label: string; tight?: boolean }) {
+  // Never render a blank chip: a label that's empty or only whitespace /
+  // zero-width / bidi characters would otherwise paint an empty box next to
+  // its category icon (the "blank spot" symptom).
+  if (!label || label.replace(/[\s ​-‏‪-‮⁠﻿]+/gu, "").length === 0) {
+    return null;
+  }
   const s = chipStyleFor(kind);
   const widthClass = tight ? "w-min max-w-full" : "max-w-full";
   return (
