@@ -1002,69 +1002,71 @@ pub fn shutdown_blocking<R: Runtime>(app: &AppHandle<R>) {
 
     let scope = sess.scope.clone();
 
-    // ── Trakt flush ────────────────────────────────────────────────
-    // Mirrors `trakt_sync_history` above but with a 2s timeout so a
-    // slow / unreachable Trakt API can't hold up app shutdown. We
-    // re-build the client locally rather than reusing the OnceLock
-    // singleton because reqwest's per-request timeout overrides the
-    // builder's, and we want a tighter ceiling than the 8s runtime
-    // default for the shutdown path specifically.
-    // Use the highest-priority candidate from trakt_targets so the
-    // VideoEntry's authoritative season/episode is preferred over the
-    // ID-parsed alternate / absolute fallback. Fire-and-forget; no
-    // retry on `not_found` here because the shutdown path can't wait
-    // on the response body parse + a second round-trip.
+    // ── Flush Trakt + AniList CONCURRENTLY ─────────────────────────
+    // Both are best-effort network writes each capped at 2 s. They used to run
+    // as two SEQUENTIAL `block_on`s — up to 4 s on an anime title linked to
+    // both services — serializing app shutdown (and a slow exit widens the
+    // Windows self-update file-lock window). Joining them in ONE runtime entry
+    // caps the pair at ~2 s. Each still no-ops when its service isn't linked.
+    //
+    // Trakt uses the highest-priority trakt_targets candidate (VideoEntry's
+    // authoritative season/episode over the ID-parsed / absolute fallback),
+    // fire-and-forget with no not_found retry — the shutdown path can't wait on
+    // a body parse + a second round-trip. AniList reuses save_progress (which
+    // self-no-ops for non-anime / no token). Clients are built locally with a
+    // 2 s timeout, tighter than the 8 s runtime default.
     let primary_target = trakt_targets(&sess).into_iter().next();
-    if let (Some(target), Some(token)) = (
-        primary_target,
-        scrobble_auth::read_token_for("trakt", &scope),
-    ) {
-        crate::devlog!(
-            info, "scrobble",
-            "shutdown_blocking flushing Trakt /sync/history for {} ({:.0}%)",
-            sess.imdb_id, progress_pct,
-        );
-        let body = build_history_body(&target);
-        let _ = tauri::async_runtime::block_on(async move {
-            let cli = reqwest::Client::builder()
+    let trakt_token = scrobble_auth::read_token_for("trakt", &scope);
+    let anilist_linked =
+        sess.is_anime && scrobble_auth::read_token_for("anilist", &scope).is_some();
+    let imdb_id = sess.imdb_id.clone();
+    let title = sess.title.clone();
+    let app = app.clone();
+
+    tauri::async_runtime::block_on(async move {
+        let trakt = async {
+            let (Some(target), Some(token)) = (primary_target, trakt_token) else {
+                return;
+            };
+            crate::devlog!(
+                info, "scrobble",
+                "shutdown_blocking flushing Trakt /sync/history for {} ({:.0}%)",
+                imdb_id, progress_pct,
+            );
+            let body = build_history_body(&target);
+            let Ok(cli) = reqwest::Client::builder()
                 .timeout(Duration::from_secs(2))
                 .https_only(true)
                 .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " scrobble"))
                 .build()
-                .ok()?;
-            cli.post(format!("{TRAKT_API}/sync/history"))
+            else {
+                return;
+            };
+            let _ = cli
+                .post(format!("{TRAKT_API}/sync/history"))
                 .header("Authorization", format!("Bearer {}", token.access_token))
                 .header("Content-Type", "application/json")
                 .header("trakt-api-version", "2")
                 .header("trakt-api-key", scrobble_auth::TRAKT_CLIENT_ID)
                 .json(&body)
                 .send()
-                .await
-                .ok()
-        });
-    }
-
-    // ── AniList flush ──────────────────────────────────────────────
-    // Best-effort, capped at 2 s. AniList is async + GraphQL so it's
-    // a different code path from Trakt's bare HTTP POST. We reuse
-    // save_progress (which internally no-ops for non-anime / no
-    // token) wrapped in a tokio timeout so the shutdown handler
-    // can't hang on a stuck network.
-    if sess.is_anime && scrobble_auth::read_token_for("anilist", &scope).is_some() {
-        crate::devlog!(
-            info, "scrobble",
-            "shutdown_blocking flushing AniList progress for \"{}\"",
-            sess.title,
-        );
-        let app_clone = app.clone();
-        let sess_clone = sess.clone();
-        let scope_clone = scope.clone();
-        let _ = tauri::async_runtime::block_on(async move {
-            tokio::time::timeout(
+                .await;
+        };
+        let anilist = async {
+            if !anilist_linked {
+                return;
+            }
+            crate::devlog!(
+                info, "scrobble",
+                "shutdown_blocking flushing AniList progress for \"{}\"",
+                title,
+            );
+            let _ = tokio::time::timeout(
                 Duration::from_secs(2),
-                crate::scrobble_anilist::save_progress(&app_clone, &scope_clone, &sess_clone),
+                crate::scrobble_anilist::save_progress(&app, &scope, &sess),
             )
-            .await
-        });
-    }
+            .await;
+        };
+        tokio::join!(trakt, anilist);
+    });
 }

@@ -408,46 +408,65 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     let _ = win.hide();
                 } else {
                     // Clean-shutdown path — tear down MPV synchronously so
-                    // libmpv releases its WASAPI device, then EXPLICITLY
-                    // exit the process. The tray icon (always installed)
-                    // would otherwise keep the app alive in a zombie state
-                    // where the window has closed AND MPV has been
-                    // destroyed — every subsequent load_video would error
-                    // out with "instance not found".
+                    // libmpv releases its WASAPI device, then EXPLICITLY exit
+                    // the process. The tray icon (always installed) would
+                    // otherwise keep the app alive in a zombie state where the
+                    // window has closed AND MPV has been destroyed — every
+                    // subsequent load_video would error "instance not found".
                     //
-                    // FLUSH SCROBBLE FIRST. If a scrobble session was open
-                    // (Trakt check-in / AniList in-progress mark), POST
-                    // the /end event before tearing MPV down so the
-                    // remote service sees a clean stop. Without this the
-                    // user's Trakt status was stuck on "Currently
-                    // watching" for hours after a hard window close
-                    // (the JS-side useScrobble cleanup never ran because
-                    // React doesn't get a teardown when the process
-                    // exits via app.exit). Capped at 2 s internally.
-                    crate::scrobble::shutdown_blocking(&handle);
-                    // Cast teardown — best-effort, bounded: stops the
-                    // Chromecast heartbeat thread + receiver app so the
-                    // TV doesn't sit on a dead receiver splash.
-                    crate::cast::shutdown_blocking();
-                    // Engine teardown — joins the engine thread, which runs
-                    // the synchronous mute → stop → mpv_terminate_destroy
-                    // sequence (the WASAPI-release discipline, landmine #9)
-                    // before app.exit() pulls the process out from under it.
+                    // The best-effort teardowns (scrobble flush, cast stop,
+                    // thumb worker) each block on the network / a join, so the
+                    // old strictly-sequential order could take ~7 s worst case.
+                    // Run them CONCURRENTLY on background threads so they
+                    // overlap each other AND the mandatory MPV teardown — they
+                    // touch only the network / a side mpv handle / Discord
+                    // (never Win32), so they're safe off the main thread — then
+                    // bound the wait. A fast, clean exit also narrows the
+                    // Windows self-update file-lock window (the NSIS updater
+                    // can't overwrite aura.exe until this process is gone).
+                    //
+                    // FLUSH SCROBBLE so Trakt / AniList see a clean stop on a
+                    // hard window-close (the JS useScrobble cleanup never runs
+                    // when the process exits via app.exit, which left Trakt
+                    // stuck "Currently watching" for hours). Capped 2 s.
+                    let sc = handle.clone();
+                    #[allow(unused_mut)]
+                    let mut bg = vec![
+                        std::thread::spawn(move || crate::scrobble::shutdown_blocking(&sc)),
+                        // Cast teardown stops the Chromecast heartbeat thread +
+                        // receiver app so the TV doesn't sit on a dead splash.
+                        std::thread::spawn(crate::cast::shutdown_blocking),
+                    ];
+                    // Headless thumbnail engine — no-op unless a thumbnail was
+                    // requested. audio=no, so it holds no WASAPI device; an
+                    // un-joined teardown leaks nothing the OS won't reclaim.
+                    #[cfg(target_os = "windows")]
+                    bg.push(std::thread::spawn(crate::mpv::thumb::shutdown));
+
+                    // MANDATORY + main-thread only: the engine join pumps Win32
+                    // messages (a child DestroyWindow posts WM_PARENTNOTIFY back
+                    // to this thread), so it must run here. This is the
+                    // WASAPI-release discipline (landmine #9) and always
+                    // completes before exit.
                     #[cfg(target_os = "windows")]
                     crate::mpv::engine::shutdown_if_running();
-                    // Headless thumbnail engine — no-op when no thumbnail was
-                    // ever requested (the worker is lazy). Otherwise sends
-                    // Shutdown and joins (bounded 2 s) so the thumb mpv handle
-                    // is destroyed before the process exits. audio=no, so it
-                    // holds no WASAPI device — this is tidiness, not a
-                    // correctness requirement.
-                    #[cfg(target_os = "windows")]
-                    crate::mpv::thumb::shutdown();
                     clear_presence_inner();
-                    // (The streaming bridge needs no shutdown step — it
-                    // runs in-process on the tokio runtime and dies with
-                    // the process; the loopback listener is released by
-                    // the OS immediately on exit.)
+
+                    // Join the best-effort threads, but never past a hard
+                    // deadline — a stuck network teardown must not hold the
+                    // process open. (The streaming bridge needs no step: it dies
+                    // with the process and the OS frees the loopback listener
+                    // immediately.)
+                    let deadline = std::time::Instant::now()
+                        + std::time::Duration::from_millis(2500);
+                    for t in bg {
+                        while !t.is_finished() && std::time::Instant::now() < deadline {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        if t.is_finished() {
+                            let _ = t.join();
+                        }
+                    }
                     handle.exit(0);
                 }
             }
