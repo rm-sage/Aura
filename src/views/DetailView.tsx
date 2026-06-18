@@ -2281,27 +2281,16 @@ function UnifiedPanel({
   // status icons (rendered with `absolute -top-3 -left-3`) anchor to its
   // top-left edge instead of escaping the entire detail view.
   return (
-    // Border replaced with a soft alpha-fade mask so the panel's outer
-    // edges blend into the page background rather than stamping a hard
-    // rectangle. Fades are kept small (1-1.5 %) so the header text and
-    // bottom chip row sit in the fully-opaque region — earlier 4 % top
-    // fade was clipping the EPISODES title underneath the blur. The
-    // shadow handles most of the elevation feel against bright backdrops.
+    // The panel reads as a defined card: a crisp 1px border (brighter along the
+    // top edge for a lit-from-above feel) plus the elevation shadow — replacing
+    // the old alpha-fade edge mask that left the outer edges undefined. overflow
+    // stays visible so floating status icons can anchor just outside the corner.
     <div
       className="relative flex flex-col h-full rounded-xl
                  bg-black/60 backdrop-blur-2xl
+                 border border-white/[0.09] border-t-white/[0.16]
                  shadow-[0_24px_48px_-18px_rgba(0,0,0,0.7)]
                  [overflow:visible]"
-      style={{
-        WebkitMaskImage:
-          "linear-gradient(to bottom, transparent 0%, black 1.5%, black 98.5%, transparent 100%), " +
-          "linear-gradient(to right, transparent 0%, black 1%, black 99%, transparent 100%)",
-        maskImage:
-          "linear-gradient(to bottom, transparent 0%, black 1.5%, black 98.5%, transparent 100%), " +
-          "linear-gradient(to right, transparent 0%, black 1%, black 99%, transparent 100%)",
-        WebkitMaskComposite: "source-in" as React.CSSProperties["WebkitMaskComposite"],
-        maskComposite: "intersect",
-      }}
     >
       {mode === "episodes" ? (
         <div className="flex flex-col h-full overflow-hidden rounded-xl">
