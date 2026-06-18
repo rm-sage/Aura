@@ -180,38 +180,18 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
 
   return (
     <div
-      className="relative mx-auto w-full overflow-hidden group gpu-layer cv-auto-hero cursor-pointer"
+      className="relative mx-auto w-full overflow-hidden rounded-xl
+                 border border-white/[0.09] border-t-white/[0.16]
+                 group gpu-layer cv-auto-hero cursor-pointer"
       style={{
-        // 21:9 box (cinematic). The blurred ambient-fill layers were
-        // removed (user feedback: didn't look great) — landscape art
-        // is now object-cover and crops slightly to fill the wider box,
-        // which is the lesser visual evil.
+        // 21:9 box (cinematic). Landscape art is object-cover and crops
+        // slightly to fill the wider box. A crisp 1px border (brighter along
+        // the top edge for a lit-from-above feel) now frames the hero —
+        // replacing the old alpha-fade edge mask that left the edges
+        // undefined — matching the streams/episodes panel treatment.
         aspectRatio: "21 / 9",
         maxHeight: HERO_MAX_HEIGHT,
         maxWidth: HERO_MAX_WIDTH,
-        // Narrow alpha-fade edges. Previously the bottom fade ran from
-        // black at 90 % to transparent at 100 % — a 10 % band that ate
-        // into the text region (the title + synopsis live in the bottom
-        // ~5 %), and on dark-natured artwork the soft fade read as a
-        // visible vertical band where the alpha dropped to ~50 %.
-        // Narrowed to 1.5–2 % bands on every side so:
-        //   1. The text sits inside the fully-opaque region (no fade-
-        //      over-text), making the existing text-shadow do all the
-        //      legibility lifting cleanly.
-        //   2. The seam where the mask meets the page background is
-        //      ~5× smaller — barely perceptible on dark images and
-        //      essentially invisible on bright ones.
-        // The 50 %-alpha midpoint is kept to avoid a hard line — just
-        // packed into a much tighter range.
-        WebkitMaskImage:
-          "linear-gradient(to bottom, transparent 0%, rgba(0,0,0,0.5) 1%, black 2%, black 98%, rgba(0,0,0,0.5) 99%, transparent 100%), " +
-          "linear-gradient(to right, transparent 0%, rgba(0,0,0,0.5) 0.5%, black 1.5%, black 98.5%, rgba(0,0,0,0.5) 99.5%, transparent 100%)",
-        maskImage:
-          "linear-gradient(to bottom, transparent 0%, rgba(0,0,0,0.5) 1%, black 2%, black 98%, rgba(0,0,0,0.5) 99%, transparent 100%), " +
-          "linear-gradient(to right, transparent 0%, rgba(0,0,0,0.5) 0.5%, black 1.5%, black 98.5%, rgba(0,0,0,0.5) 99.5%, transparent 100%)",
-        WebkitMaskComposite: "source-in" as React.CSSProperties["WebkitMaskComposite"],
-        // Standards property — newer Chromium / Safari support `intersect`.
-        maskComposite: "intersect",
       }}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
