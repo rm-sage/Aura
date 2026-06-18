@@ -27,7 +27,7 @@ interface DepUi {
 
 const DEPS: DepUi[] = [
   { name: "ffmpeg.exe",  label: "FFmpeg",  approxMb: 97,  purpose: "Silence detection — automatic OP/ED skip inference (Hybrid mode)." },
-  { name: "ffprobe.exe", label: "FFprobe", approxMb: 217, purpose: "Casting transmux — play files a Chromecast can't natively decode (e.g. some MKVs)." },
+  { name: "ffprobe.exe", label: "FFprobe", approxMb: 97,  purpose: "Casting transmux — play files a Chromecast can't natively decode (e.g. some MKVs)." },
 ];
 
 const fmtMb = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(0)} MB`;
