@@ -117,7 +117,7 @@ pub struct AppSettings {
     // ── Window behaviours ──────────────────────────────────────────────────
     #[serde(default = "default_true")]
     pub pause_on_minimize: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub pause_on_lost_focus: bool,
     /// When the user closes the window, exit cleanly (no tray persistence).
     #[serde(default = "default_true")]
@@ -239,8 +239,7 @@ pub struct AppSettings {
     pub next_up_lead_seconds: u32,
 
     // ── Anime OP/ED skip ───────────────────────────────────────────────────
-    /// "off" | "prompt" | "auto". Default "auto" — the user explicitly
-    /// asked for OP skipping, and the AniSkip data set is curated.
+    /// "off" | "prompt" | "auto". Default "prompt".
     #[serde(default = "default_skip_op_mode")]
     pub skip_op_mode: String,
     /// "off" | "prompt" | "auto". Default "prompt" — endings often
@@ -301,7 +300,7 @@ fn default_sub_border_size() -> u32 { 3 }
 fn default_sub_color() -> String { "#FFFFFFFF".into() }
 fn default_sub_back_color() -> String { "#00000000".into() }
 fn default_audio_priority() -> Vec<String> { vec!["original".into(), "en".into()] }
-fn default_skip_op_mode() -> String { "auto".into() }
+fn default_skip_op_mode() -> String { "prompt".into() }
 fn default_skip_ed_mode() -> String { "prompt".into() }
 fn default_skip_recap_mode() -> String { "prompt".into() }
 /// Default to active SDR tone-mapping. The pre-mode default ("on" with
@@ -366,7 +365,7 @@ impl Default for AppSettings {
             discord_rpc_blocked_titles:  Vec::new(),
             discord_rpc_browse_states:   true,
             pause_on_minimize:           true,
-            pause_on_lost_focus:         true,
+            pause_on_lost_focus:         false,
             close_on_exit:               true,
             minimize_to_tray_on_close:   false,
             scrobble_addon_url:          String::new(),

@@ -4991,7 +4991,7 @@ export default function SettingsView({ addons, session }: Props) {
               </p>
               <SkipModeRow
                 label="Openings (OP)"
-                description="Skip the OP. Most users want this on auto."
+                description="Skip the OP."
                 value={backend.skip_op_mode}
                 onChange={(v) => patchBackend({ skip_op_mode: v })}
               />
