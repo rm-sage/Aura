@@ -100,6 +100,7 @@ import { showFlyUpToast } from "../FlyUpToast";
 import ImageLoader from "../ImageLoader";
 import ErrorBoundary from "../ErrorBoundary";
 import { parseStream, chipStyleFor, looksLikeTamTaro, type ChipKind } from "../streamMeta";
+import NoProvidersWarning from "../NoProvidersWarning";
 import { streamMatchKey } from "../watchTogether/streamMatch";
 import Tooltip from "../Tooltip";
 import { BrandLogo, ratingDomain, groupRatingsByBrand } from "../logodev";
@@ -3526,6 +3527,14 @@ function StreamsPanel({
   }, []);
   const showHint = formatterOn && nonTamTaro && !hintDismissed;
 
+  // No active stream providers — the user removed all in Settings, so streams
+  // are fetched from zero addons. (Re-read each render; the formatter-state
+  // subscription above re-renders on aura:settings-changed.)
+  const streamProvidersEmpty = (() => {
+    const u = loadAuraSettings().streamAddonUrls;
+    return Array.isArray(u) && u.length === 0;
+  })();
+
   return (
     <>
       <PanelHeader
@@ -3579,11 +3588,17 @@ function StreamsPanel({
             />
           </div>
         ) : streams.length === 0 ? (
-          // Empty state — when AIOStreams (or any other addon) returned only
-          // errors/warnings/info we surface ALL of them here in place of the
-          // generic "no streams" message so the user can see why the list is
-          // empty. When there's nothing at all we keep the legacy fallback.
-          totalMessages > 0 ? (
+          // Empty state. No active stream providers gets a settings-link
+          // warning first; otherwise surface any addon errors/warnings/info,
+          // then the legacy "nothing found" fallback.
+          streamProvidersEmpty ? (
+            <div className="px-2 pt-4">
+              <NoProvidersWarning
+                section="sec-streams"
+                message="No stream providers are active, so no sources can be fetched."
+              />
+            </div>
+          ) : totalMessages > 0 ? (
             <StreamMessagesEmptyState metadata={streamMeta} />
           ) : (
             <p className="text-white/50 text-[13px] italic px-2 py-3">

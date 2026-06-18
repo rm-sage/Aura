@@ -7,6 +7,7 @@ import type { AddonEntry, MetaPreview, SearchGroup } from "../types";
 import { DiscoveryRow } from "../CinemaRows";
 import { withTypeSuffix } from "../aiometadata";
 import ErrorBoundary from "../ErrorBoundary";
+import NoProvidersWarning from "../NoProvidersWarning";
 
 // Module-level in-flight promise dedupe. React StrictMode (and any
 // other transient remount) was double-invoking the search effect, which
@@ -173,13 +174,24 @@ function SearchViewBody({ addons, query, onSelectMeta }: Props) {
             </div>
           )}
 
-          {/* Empty state — only when ALL addons settled AND every one
-              returned zero groups. Lets the user know the search
-              actually completed rather than is silently still going. */}
-          {slots && !stillSearching && orderedGroups.length === 0 && (
+          {/* No search providers active (the resolved set is empty — the
+              user disabled all in Settings, or no search-capable addon is
+              installed). Point them at Search Providers. */}
+          {slots && slots.length === 0 && (
+            <div className="px-6 pt-8">
+              <NoProvidersWarning
+                section="sec-search"
+                message="No search providers are active, so nothing can be searched."
+              />
+            </div>
+          )}
+
+          {/* Empty state — providers searched but every one returned zero
+              groups. Distinct from the no-providers case above. */}
+          {slots && slots.length > 0 && !stillSearching && orderedGroups.length === 0 && (
             <div className="mx-6 my-6 glass-panel rounded-2xl px-6 py-10 text-center">
               <p className="text-white/55 text-sm">
-                No results from any installed search-capable addon.
+                No results from any active search provider.
               </p>
             </div>
           )}

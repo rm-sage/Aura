@@ -11,6 +11,7 @@ import HeroCarousel, { HERO_MAX_WIDTH } from "../HeroCarousel";
 import { isManuallyWatched, onManualWatchedChange } from "../manualWatched";
 import { isAutoBumped, onAutoBumpedChange } from "../autoBumped";
 import { ContinueWatchingRow, DiscoveryRow, HOME_VISIBLE } from "../CinemaRows";
+import NoProvidersWarning from "../NoProvidersWarning";
 
 /** Per-row cap on the initial home payload. Matches the home grid's
  *  visible-cell count: at ultrawide we render 10 cells per row, at
@@ -686,6 +687,19 @@ export default function HomeView({
           {rows.length === 0 && addons.length > 0 && !bootstrapped && (
             <div className="px-6 pt-6">
               <div className="h-px bg-gradient-to-r from-transparent via-ln-accent/60 to-transparent animate-pulse" />
+            </div>
+          )}
+
+          {/* No catalog provider feeds Home — addons are installed but none
+              produce catalog rows. Point the user at Catalog Providers. (Rows
+              are created per-catalog before items load, so an empty rows list
+              after bootstrap means no catalog provider, not a slow fetch.) */}
+          {rows.length === 0 && addons.length > 0 && bootstrapped && (
+            <div className="px-6 pt-10">
+              <NoProvidersWarning
+                section="sec-catalog"
+                message="No catalog providers are active, so Home has nothing to show."
+              />
             </div>
           )}
         </div>
