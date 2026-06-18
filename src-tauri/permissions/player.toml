@@ -57,6 +57,12 @@ identifier = "allow-runtime-deps"
 description = "Allows the frontend to check for + download/verify on-demand runtime binaries (ffmpeg/ffprobe for silence detection + casting; libmpv for the playback engine), and to (re)start the playback engine after the first-run libmpv download"
 commands.allow = ["ensure_runtime_dep", "runtime_dep_present", "playback_engine_ready", "ensure_playback_engine"]
 
+# ── Trailer resolution (yt-dlp) ───────────────────────────────────────────────
+[[permission]]
+identifier = "allow-trailer"
+description = "Allows the frontend to resolve a YouTube trailer id to a direct CDN URL via yt-dlp for in-player trailer playback"
+commands.allow = ["resolve_trailer_url"]
+
 # ── Live TV (IPTV) ────────────────────────────────────────────────────────────
 [[permission]]
 identifier = "allow-iptv"

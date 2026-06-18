@@ -690,6 +690,12 @@ pub struct MetaDetail {
     /// up" decision — a non-ended status means more episodes are still coming
     /// even when the meta's video list hasn't been extended with them yet.
     pub status: Option<String>,
+    /// YouTube video id for the title's trailer, when the addon emits one.
+    /// Resolved from `trailerStreams[0].ytId` (Stremio v5 shape) or from
+    /// `trailers[0].source` (a bare id or a `youtube.com`/`youtu.be` URL).
+    /// `None` when neither is present. Drives the "Watch Trailer" button;
+    /// the frontend passes it to `resolve_trailer_url` (yt-dlp) for playback.
+    pub trailer_yt_id: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -2531,6 +2537,55 @@ pub async fn fetch_meta_detail(
         agg_cast_count,
     );
 
+    // ── Trailer YouTube id ─────────────────────────────────────────────
+    // Stremio v5 metas expose `trailerStreams: [{ytId, title}]`; the older
+    // Cinemeta shape uses `trailers: [{source, type}]` where `source` is a
+    // bare id or a YouTube URL. Take the first usable entry; a missing or
+    // non-YouTube source yields None and the "Watch Trailer" button is
+    // suppressed. MPV can't open a YouTube page directly — the frontend
+    // hands this id to `resolve_trailer_url` (yt-dlp) for a direct CDN URL.
+    fn extract_yt_id(raw: &str) -> Option<String> {
+        let s = raw.trim();
+        let is_id = |t: &str| {
+            t.len() == 11 && t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        };
+        if is_id(s) {
+            return Some(s.to_string());
+        }
+        // `watch?v=<id>` query form.
+        if let Some(idx) = s.find("v=") {
+            let cand: String = s[idx + 2..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if is_id(&cand) {
+                return Some(cand);
+            }
+        }
+        // Path forms: youtu.be/<id>, /embed/<id>, /shorts/<id>.
+        for marker in ["youtu.be/", "/embed/", "/shorts/"] {
+            if let Some(idx) = s.find(marker) {
+                let cand: String = s[idx + marker.len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                    .collect();
+                if is_id(&cand) {
+                    return Some(cand);
+                }
+            }
+        }
+        None
+    }
+    let trailer_yt_id: Option<String> = meta
+        .pointer("/trailerStreams/0/ytId")
+        .and_then(|v| v.as_str())
+        .and_then(extract_yt_id)
+        .or_else(|| {
+            meta.pointer("/trailers/0/source")
+                .and_then(|v| v.as_str())
+                .and_then(extract_yt_id)
+        });
+
     Ok(MetaDetail {
         id:           json_str(meta, "id", 256).unwrap_or_default(),
         name:         json_str(meta, "name", 200).unwrap_or_default(),
@@ -2566,6 +2621,7 @@ pub async fn fetch_meta_detail(
         season_credits,
         aggregate_credits,
         status:       json_str(meta, "status", 32),
+        trailer_yt_id,
     })
 }
 

@@ -451,10 +451,17 @@ export default function HomeView({
     () => loadAuraSettings().heroCatalog,
     [settingsTick],
   );
+  // Hero entirely disabled by the user (the "Disable" picker item). When true
+  // the banner is hidden AND none of its catalog / logo fetches run.
+  const heroDisabled = useMemo(
+    () => loadAuraSettings().heroDisabled,
+    [settingsTick],
+  );
   const [heroOverrideItems, setHeroOverrideItems] = useState<MetaPreview[] | null>(null);
   const [heroOverrideLabel, setHeroOverrideLabel] = useState<string | null>(null);
   useEffect(() => {
-    if (!heroCatalogPref) {
+    // Hero off, or no override catalog pinned → nothing to fetch.
+    if (heroDisabled || !heroCatalogPref) {
       setHeroOverrideItems(null);
       setHeroOverrideLabel(null);
       return;
@@ -480,16 +487,19 @@ export default function HomeView({
       })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [heroCatalogPref]);
+  }, [heroCatalogPref, heroDisabled]);
 
   // Source for the hero — override catalog when configured, otherwise
-  // the first browseable row's first ~5 art-bearing items.
+  // the first browseable row's first ~5 art-bearing items. Empty when the
+  // hero is disabled, which both hides the banner and skips the per-item
+  // logo fetches below.
   const heroItemsRaw: MetaPreview[] = useMemo(() => {
+    if (heroDisabled) return [];
     const source = heroOverrideItems ?? rows.find((r) => r.items.length > 0)?.items ?? [];
     return source
       .filter((it) => it.background ?? it.fanart ?? it.backdrop ?? it.poster)
       .slice(0, 10);
-  }, [heroOverrideItems, rows]);
+  }, [heroDisabled, heroOverrideItems, rows]);
 
   /** Display name of the catalog the hero is pulled from — surfaces
    *  as a subtle top-left chip on the hero card so the user knows

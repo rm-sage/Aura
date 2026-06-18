@@ -88,6 +88,7 @@ const PORTABLE_BACKEND_FIELDS = [
   "skip_ed_mode",
   "skip_recap_mode",
   "skip_treat_mixed_op_as_op",
+  "trailer_quality",
   "gpu_acceleration",
   "scrobble_enabled",
 ] as const;
@@ -118,6 +119,7 @@ const PORTABLE_AURA_FIELDS = [
   "openLinksExternally",
   "queueRemoveSeriesInProgress",
   "useAuraStreamFormatter",
+  "heroDisabled",
 ] as const;
 export type PortableAuraField = typeof PORTABLE_AURA_FIELDS[number];
 

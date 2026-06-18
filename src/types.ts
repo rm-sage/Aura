@@ -205,6 +205,10 @@ export interface MetaDetail {
    *  AniList). Null when the addon omits it. Drives the EOS Spotlight
    *  "Series finale" vs "Caught up" decision. */
   status: string | null;
+  /** YouTube video id for the title's trailer when the addon emits one
+   *  (`trailerStreams[0].ytId` / `trailers[0].source`). Null otherwise.
+   *  Drives the "Watch Trailer" button; passed to `resolve_trailer_url`. */
+  trailer_yt_id: string | null;
 }
 
 export interface VideoEntry {

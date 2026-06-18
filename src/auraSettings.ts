@@ -96,6 +96,10 @@ export interface AuraSettings {
    *  list (AIOMetadata's "AI Recommendations", a custom mdblist, etc.)
    *  in the hero band without cluttering the home grid below. */
   heroCatalog: { addonUrl: string; mediaType: string; catalogId: string } | null;
+  /** When true, the Home hero carousel is hidden entirely — no banner, and
+   *  none of its catalog / logo fetches run. Selected via the "Disable" item in
+   *  the Hero Carousel Source picker. Default false (hero shown). */
+  heroDisabled: boolean;
   /** Reduced-motion policy. `"auto"` (default) honours the OS-level
    *  `prefers-reduced-motion` media query — most users get exactly the
    *  experience they configured at the OS level. `"always"` forces
@@ -220,6 +224,7 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   hideCastSpoilers: false,
   blurUnwatchedThumbnails: false,
   heroCatalog: null,
+  heroDisabled: false,
   reduceMotion: "auto",
   autoAdvanceNextEpisode: false,
   autoAdvanceDelaySeconds: 10,
@@ -346,6 +351,7 @@ function readFromStorage(): AuraSettings {
         && typeof (parsed.heroCatalog as Record<string, unknown>).catalogId === "string"
         ? (parsed.heroCatalog as AuraSettings["heroCatalog"])
         : null,
+      heroDisabled: typeof parsed.heroDisabled === "boolean" ? parsed.heroDisabled : false,
     };
   } catch {
     return { ...DEFAULT_AURA_SETTINGS };
@@ -433,6 +439,7 @@ export const HOME_RELEVANT_SETTING_KEYS = new Set<keyof AuraSettings>([
   "additionalHomeAddonUrls",
   "streamAddonUrls",
   "heroCatalog",
+  "heroDisabled",
 ]);
 
 /** Helper: does a CHANGE_EVENT carry at least one key from the supplied

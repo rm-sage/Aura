@@ -216,9 +216,9 @@ pub async fn debug_load_test_pattern() -> Result<(), String> {
         let url =
             "av://lavfi:smptebars=size=1280x720:rate=24:duration=3600".to_string();
         crate::devlog!(info, "debug-panel", "loading lavfi test pattern: {url}");
-        // (start, http_proxy, hdr_hint) all None — the test pattern is a
-        // local lavfi source: no resume, no proxy, SDR output.
-        submit_load_file(url, None, None, None)
+        // (start, http_proxy, hdr_hint, audio_url) all None — the test pattern
+        // is a local lavfi source: no resume, no proxy, SDR output, no DASH audio.
+        submit_load_file(url, None, None, None, None)
     }
     #[cfg(not(target_os = "windows"))]
     {

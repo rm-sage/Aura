@@ -113,6 +113,8 @@ interface BackendSettings {
   skip_ed_mode: string;
   skip_recap_mode: string;
   skip_treat_mixed_op_as_op: boolean;
+  /** Preferred Watch-Trailer quality: "auto" | "720" | "1080" | "1440" | "2160". */
+  trailer_quality: string;
   gpu_acceleration: boolean;
 }
 
@@ -669,12 +671,21 @@ interface UnifiedHomePickerProps {
 // falls back to the first browseable row's items (the 0.6.x default).
 // ---------------------------------------------------------------------------
 
+/** Sentinel option value for "turn the hero off entirely". Distinct from the
+ *  empty-string Default option and from any real addon URL. */
+const HERO_DISABLE_OPT = "__hero_disabled__";
+
 function HeroCatalogPicker({
-  addons, value, onChange,
+  addons, value, disabled, onChange,
 }: {
   addons: AddonEntry[];
   value: { addonUrl: string; mediaType: string; catalogId: string } | null;
-  onChange: (next: { addonUrl: string; mediaType: string; catalogId: string } | null) => void;
+  /** True when the hero is fully disabled (the "Disable" item). */
+  disabled: boolean;
+  onChange: (next: {
+    disabled: boolean;
+    catalog: { addonUrl: string; mediaType: string; catalogId: string } | null;
+  }) => void;
 }) {
   const catalogAddons: AddonEntry[] = useMemo(
     () => addons.filter((a) => (a.resources ?? []).includes("catalog")),
@@ -707,20 +718,30 @@ function HeroCatalogPicker({
         catalogs are valid picks, useful for surfacing curated lists
         (AIOMetadata's AI Recommendations, mdblist, Trakt user lists)
         as the hero source without cluttering the grid below. Default
-        falls back to your first browseable row.
+        falls back to your first browseable row. Choose <span className="text-white/65">Disable</span> to
+        hide the hero entirely.
       </p>
       <div className="flex flex-wrap gap-2 items-center">
         <select
-          value={selectedUrl ?? ""}
+          value={disabled ? HERO_DISABLE_OPT : (selectedUrl ?? "")}
           onChange={(e) => {
-            const url = e.target.value || null;
+            const v = e.target.value;
+            if (v === HERO_DISABLE_OPT) {
+              setSelectedUrl(null);
+              onChange({ disabled: true, catalog: null });
+              return;
+            }
+            const url = v || null;
             setSelectedUrl(url);
-            if (!url) onChange(null);
+            // Switching addon (or back to Default) clears any pinned catalog
+            // until a new one is picked, and always re-enables the hero.
+            onChange({ disabled: false, catalog: null });
           }}
           className="bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-xs
                      outline-none focus:border-white/25 transition-colors min-w-[180px]"
           style={{ color: "var(--text-primary)" }}
         >
+          <option value={HERO_DISABLE_OPT}>Disable (no hero)</option>
           <option value="">Default (first row)</option>
           {catalogAddons.map((a) => (
             <option key={a.url} value={a.url}>{a.name}</option>
@@ -731,10 +752,10 @@ function HeroCatalogPicker({
             value={value && value.addonUrl === selectedUrl
               ? `${value.mediaType}:${value.catalogId}` : ""}
             onChange={(e) => {
-              if (!selectedUrl || !e.target.value) { onChange(null); return; }
+              if (!selectedUrl || !e.target.value) { onChange({ disabled: false, catalog: null }); return; }
               const [mediaType, catalogId] = e.target.value.split(":", 2);
               if (mediaType && catalogId) {
-                onChange({ addonUrl: selectedUrl, mediaType, catalogId });
+                onChange({ disabled: false, catalog: { addonUrl: selectedUrl, mediaType, catalogId } });
               }
             }}
             className="bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-xs
@@ -752,10 +773,10 @@ function HeroCatalogPicker({
             ))}
           </select>
         )}
-        {value && (
+        {(value || disabled) && (
           <button
             type="button"
-            onClick={() => { setSelectedUrl(null); onChange(null); }}
+            onClick={() => { setSelectedUrl(null); onChange({ disabled: false, catalog: null }); }}
             className="px-3 py-1.5 rounded-lg border border-white/15 bg-white/5
                        text-white/80 text-[11px] font-medium hover:bg-white/10
                        transition-colors"
@@ -4547,7 +4568,8 @@ export default function SettingsView({ addons, session }: Props) {
             <HeroCatalogPicker
               addons={addons}
               value={aura.heroCatalog}
-              onChange={(v) => setLocal({ heroCatalog: v })}
+              disabled={aura.heroDisabled}
+              onChange={(next) => setLocal({ heroCatalog: next.catalog, heroDisabled: next.disabled })}
             />
           </Section>
 
@@ -4825,6 +4847,21 @@ export default function SettingsView({ addons, session }: Props) {
                   setLocal({ loudnessNormalization: v });
                   invoke("set_audio_loudnorm", { enabled: v }).catch(() => {});
                 }}
+              />
+              <div className="h-px bg-white/6" />
+              <SettingDropdown
+                label="Trailer quality"
+                description="Preferred quality for the Watch Trailer player. 1080p and above stream video and audio separately (DASH, muxed by the player); 720p is a single file. Auto picks the best available. Falls back to the best the trailer offers, and you can change it per trailer from the player's quality menu."
+                required
+                value={backend.trailer_quality ?? "1080"}
+                options={[
+                  { value: "auto", label: "Auto (best available)" },
+                  { value: "2160", label: "4K (2160p)" },
+                  { value: "1440", label: "1440p" },
+                  { value: "1080", label: "1080p" },
+                  { value: "720",  label: "720p" },
+                ]}
+                onChange={(v) => patchBackend({ trailer_quality: v ?? "1080" })}
               />
               <div className="h-px bg-white/6" />
               <SettingToggle

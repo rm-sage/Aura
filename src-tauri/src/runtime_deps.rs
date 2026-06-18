@@ -55,6 +55,15 @@ const DEPS: &[Dep] = &[
         url: "https://github.com/rm-sage/Aura/releases/download/runtime-deps/libmpv-2.dll",
         sha256: "9826b77fb42559752cd37a19191169a986aa4e929eb37705c3345d25a5f6d034",
     },
+    // yt-dlp (Windows) — resolves a "Watch Trailer" YouTube id to a direct CDN
+    // URL for in-player playback. Optional: absent ⇒ the trailer button shows a
+    // one-time download prompt. SHA matches the binary uploaded to the
+    // runtime-deps prerelease; bump both to ship a newer yt-dlp.
+    Dep {
+        name: "yt-dlp.exe",
+        url: "https://github.com/rm-sage/Aura/releases/download/runtime-deps/yt-dlp.exe",
+        sha256: "3a48cb955d55c8821b60ccbdbbc6f61bc958f2f3d3b7ad5eaf3d83a543293a27",
+    },
 ];
 
 /// Resolved runtime directory, set once at startup by [`init`].

@@ -59,6 +59,7 @@ mod stremio;
 mod subtitles;
 mod sync;
 mod thumbs;
+mod trailer;
 mod tray;
 #[cfg(target_os = "windows")]
 mod win32;
@@ -131,6 +132,11 @@ async fn load_video(
     // selection (PQ set for HDR-labelled streams, plain SDR otherwise)
     // — see the LoadFile arm in mpv::engine. None/false → SDR output.
     content_hdr_hint: Option<bool>,
+    // Optional external audio URL for DASH trailers (1080p+ YouTube serves
+    // video-only + audio-only streams). Applied as the `audio-files` option
+    // before the loadfile; None for every normal stream (which clears any
+    // stale value). See the LoadFile arm in mpv::engine.
+    audio_url: Option<String>,
 ) -> Result<(), String> {
     let normalised = path.replace('\\', "/");
     // Defence in depth: only http(s) URLs, the localhost streaming
@@ -167,10 +173,10 @@ async fn load_video(
     // (thread-spawn or HWND-resolution failure) this returns a clear
     // "engine not running" error instead of crashing.
     #[cfg(target_os = "windows")]
-    return mpv::engine::submit_load_file(normalised, start_seconds, http_proxy, content_hdr_hint);
+    return mpv::engine::submit_load_file(normalised, start_seconds, http_proxy, content_hdr_hint, audio_url);
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (normalised, start_seconds, http_proxy, content_hdr_hint);
+        let _ = (normalised, start_seconds, http_proxy, content_hdr_hint, audio_url);
         Err("playback engine is Windows-only".into())
     }
 }
@@ -2015,6 +2021,7 @@ pub fn run() {
             cast::cast_ffmpeg_present,
             runtime_deps::ensure_runtime_dep,
             runtime_deps::runtime_dep_present,
+            trailer::resolve_trailer_url,
             playback_engine_ready,
             ensure_playback_engine,
             set_native_fullscreen,

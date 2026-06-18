@@ -157,6 +157,14 @@ enum EngineCommand {
         /// set (Some(true)) or the plain SDR set (anything else) BEFORE
         /// the loadfile — per-content output without mid-playback writes.
         hdr_hint: Option<bool>,
+        /// Optional external audio URL for DASH trailers (1080p+ YouTube ships
+        /// video-only + audio-only streams). Set as the `audio-files` option
+        /// (via FFI string property) BEFORE the loadfile so the new file picks
+        /// it up; cleared to empty for every normal load so a stale trailer
+        /// audio URL never bleeds into the next stream. NOT passed through the
+        /// comma-joined per-file options string — googlevideo URLs can contain
+        /// commas, which would corrupt that list.
+        audio_url: Option<String>,
     },
     TogglePause,
     SetVolume(f64),
@@ -334,8 +342,9 @@ pub fn submit_load_file(
     start_seconds: Option<f64>,
     http_proxy: Option<String>,
     hdr_hint: Option<bool>,
+    audio_url: Option<String>,
 ) -> Result<(), String> {
-    submit(EngineCommand::LoadFile { url, start_seconds, http_proxy, hdr_hint })
+    submit(EngineCommand::LoadFile { url, start_seconds, http_proxy, hdr_hint, audio_url })
 }
 
 /// Submit a `TogglePause` command.
@@ -1700,7 +1709,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         shutting_down = true;
                         break;
                     }
-                    Ok(EngineCommand::LoadFile { url, start_seconds, http_proxy, hdr_hint }) => {
+                    Ok(EngineCommand::LoadFile { url, start_seconds, http_proxy, hdr_hint, audio_url }) => {
                         // New file → not ready for cache polling until FILE_LOADED;
                         // arm the settle window.
                         playback_ready = false;
@@ -1731,6 +1740,29 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                                     info, "mpv",
                                     "per-load HDR output set: '{effective}' (hint={hdr_hint:?})",
                                 );
+                            }
+                        }
+                        // External audio (DASH trailers): mux the separate audio
+                        // stream BEFORE the loadfile so the new file picks it up
+                        // (what mpv's own ytdl_hook does for 1080p+ YouTube).
+                        // `audio-files` is a CLI-LIST option — libmpv rejects a
+                        // plain `set_property` on it with "invalid parameter",
+                        // exactly like `glsl-shaders` (see cinema.rs / landmine
+                        // #8). The protocol is `change-list <name> <op> <value>`:
+                        //   • clr    → always first, so a stale trailer audio URL
+                        //              never bleeds into the next (normal) load
+                        //   • append → add the single external URL as ONE item
+                        //              with NO separator-splitting or escaping —
+                        //              safe for a googlevideo URL full of special
+                        //              chars (commas, ';', etc.). `set` would
+                        //              split on the list separator; `append` won't.
+                        if let Err(e) = run_mpv_command(&lib, handle, &["change-list", "audio-files", "clr", ""]) {
+                            crate::devlog!(warn, "mpv", "clear audio-files failed: {e}");
+                        }
+                        if let Some(au) = audio_url.as_deref().filter(|s| !s.is_empty()) {
+                            match run_mpv_command(&lib, handle, &["change-list", "audio-files", "append", au]) {
+                                Ok(()) => crate::devlog!(info, "mpv", "external audio-files set for this load"),
+                                Err(e) => crate::devlog!(warn, "mpv", "append audio-files failed: {e}"),
                             }
                         }
                         // Pre-loadfile pause clear: an inherited pause flag

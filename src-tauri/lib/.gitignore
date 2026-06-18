@@ -21,3 +21,10 @@ ffmpeg.exe
 # direct-play only (cast_ffmpeg_present() returns false; MKV won't
 # transmux for Chromecast). DLNA TVs decode MKV natively regardless.
 ffprobe.exe
+
+# yt-dlp (~18 MB) — resolves a "Watch Trailer" YouTube id to a direct CDN URL
+# for in-player trailer playback (trailer.rs::resolve_trailer_url). On-demand
+# runtime dep: hosted on the runtime-deps prerelease + downloaded on first use,
+# so it's never bundled. Drop the matching build here for `tauri dev`; the SHA
+# in runtime_deps.rs must match the asset uploaded to the prerelease.
+yt-dlp.exe

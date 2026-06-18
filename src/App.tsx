@@ -32,6 +32,7 @@ import ContextMenuHost, { openContextMenu } from "./ContextMenu";
 import { CatalogHoverHost } from "./CatalogHoverCard";
 import AppToastHost, { showAppToast } from "./AppToast";
 import FlyUpToastHost, { showFlyUpToast } from "./FlyUpToast";
+import { runtimeDepPresent, ensureRuntimeDep } from "./runtimeDeps";
 import PartyToastHost from "./PartyToast";
 import SourcePopupHost from "./SourcePopup";
 import DevConsole from "./DevConsole";
@@ -480,6 +481,43 @@ const EOS_TAIL_SECONDS = 5;
 // skipping to the end never inflates summed watched time. Matches
 // useScrobble's TICK_DELTA_CAP_S.
 const HISTORY_TICK_DELTA_CAP_S = 5;
+
+/** Requested Watch-Trailer quality. "auto" = best available. */
+export type TrailerQuality = "auto" | "720" | "1080" | "1440" | "2160";
+
+/** Shape returned by the Rust `resolve_trailer_url` command. `audio_url` is
+ *  set only for DASH (1080p+); `quality_label` reflects the ACTUAL resolved
+ *  height (may be lower than requested when the title has no higher rendition). */
+interface TrailerResolution {
+  video_url: string;
+  audio_url: string | null;
+  height: number;
+  quality_label: string;
+  /** Highest rendition this title offers — gates the quality menu. */
+  max_height_available: number;
+}
+
+/** Map a requested quality to a max pixel height (0 = Auto/best). */
+function qualityToHeight(q: string): number {
+  switch (q) {
+    case "720":  return 720;
+    case "1080": return 1080;
+    case "1440": return 1440;
+    case "2160": return 2160;
+    default:     return 0; // "auto"
+  }
+}
+
+/** Map an ACTUAL resolved height to the menu rung that should be highlighted
+ *  (so the selector always shows the resolution that's really playing). Sub-720
+ *  heights have no rung, so "auto" is highlighted. */
+function heightToRung(height: number): string {
+  if (height >= 2160) return "2160";
+  if (height >= 1440) return "1440";
+  if (height >= 1080) return "1080";
+  if (height >= 720)  return "720";
+  return "auto";
+}
 
 function usePlayback(playerActive: boolean) {
   const [time, setTime]           = useState(0);
@@ -1204,6 +1242,38 @@ export default function App() {
     activeTarget != null &&
     (activeTarget.media_type === "tv" || activeTarget.id.startsWith("iptv:"));
 
+  /** A "Watch Trailer" playback session (synthetic `trailer:<ytId>` target).
+   *  Like live TV it has no library record, resume position, or completion —
+   *  so it shares every VOD carve-out (no scrobble / history / Continue-
+   *  Watching / resume prompt / source switcher). Kept separate from
+   *  `isLivePlayback` so the player chrome can show a TRAILER badge (not LIVE)
+   *  and the live-only reconnect loop never fires for it. */
+  const isTrailerPlayback =
+    activeTarget != null && activeTarget.id.startsWith("trailer:");
+
+  // ── Trailer quality state ──
+  // `trailerQuality` is the REQUESTED quality (drives the active menu row);
+  // `trailerQualityLabel` is what was actually RESOLVED (drives the menu button
+  // text — may be lower when the title has no higher rendition). The ytId of
+  // the playing trailer is kept in a ref so the in-player quality swap can
+  // re-resolve without a stale closure. `trailerResolvingRef` guards against
+  // overlapping re-resolves (the state is for the UI loading affordance).
+  const [trailerQuality, setTrailerQuality] = useState<string>("1080");
+  const [trailerQualityLabel, setTrailerQualityLabel] = useState<string>("");
+  // Highest rendition the current trailer offers — gates the quality menu so
+  // the user can't pick a resolution that isn't actually available.
+  const [trailerMaxHeight, setTrailerMaxHeight] = useState<number>(2160);
+  const [isTrailerResolving, setIsTrailerResolving] = useState(false);
+  const activeTrailerYtIdRef = useRef<string | null>(null);
+  const trailerResolvingRef = useRef(false);
+  // The height ACTUALLY playing — so a quality switch that resolves to the same
+  // height (e.g. 1440p requested but only 1080p exists) skips the pointless
+  // reload instead of stuttering back to the same picture.
+  const currentTrailerHeightRef = useRef<number>(0);
+  // Guards the "Watch Trailer" button against spam-clicks: the yt-dlp resolve
+  // takes 1-3 s, during which the DetailView button is still clickable.
+  const trailerLaunchingRef = useRef(false);
+
   // ── Playback hook — gated on activeTarget so the polling fallback only
   //     runs while a stream is loaded.
   const {
@@ -1243,11 +1313,14 @@ export default function App() {
   useEffect(() => {
     setPlaybackBridge({
       getLocal: () => {
-        // Live TV NEVER participates in the party: report a null videoKey so
-        // the party can't sync/establish/stage on a live channel (sync is keyed
-        // on videoKey agreement, so a null key cascades through every gate).
+        // Live TV / trailers NEVER participate in the party: report a null
+        // videoKey so the party can't sync/establish/stage on them (sync is
+        // keyed on videoKey agreement, so a null key cascades through every
+        // gate). A trailer is a private side-trip — it must not hijack the room.
         const t = wtTargetRef.current;
-        const isLive = t != null && (t.media_type === "tv" || t.id.startsWith("iptv:"));
+        const isLive =
+          t != null &&
+          (t.media_type === "tv" || t.id.startsWith("iptv:") || t.id.startsWith("trailer:"));
         return {
           paused: wtPausedRef.current,
           position: wtTimeRef.current,
@@ -1494,7 +1567,7 @@ export default function App() {
       // runs unchanged. See src/SourceSwitcher.tsx.
       // `proxyUrl`: per-playlist Live TV forward proxy (mpv http-proxy); null/
       // undefined plays direct (and clears any proxy left by a prior stream).
-      opts?: { forceStartSeconds?: number; proxyUrl?: string | null },
+      opts?: { forceStartSeconds?: number; proxyUrl?: string | null; audioFileUrl?: string | null },
     ) => {
       try {
         if (!stream.url && !stream.info_hash) return;
@@ -1504,19 +1577,29 @@ export default function App() {
         wtStreamRef.current = { label: streamLabel(stream), key: streamMatchKey(stream) };
         {
           const party = getWatchState();
-          // Live TV is excluded from the party entirely — never stage on it.
-          const isLive = target.media_type === "tv" || target.id.startsWith("iptv:");
+          // Live TV and trailers are excluded from the party entirely — never
+          // stage on them. A trailer is a private side-trip; it must not hijack
+          // the room (mirrors the null videoKey in the party bridge's getLocal).
+          const isLive =
+            target.media_type === "tv" ||
+            target.id.startsWith("iptv:") ||
+            target.id.startsWith("trailer:");
           const establishingParty =
             !isLive && party.status === "connected" && party.isLeader && target.id !== party.roomVideoKey;
           wtPendingStageRef.current = establishingParty;
         }
-        // Live TV carve-out, computed from `target` (isLivePlayback derives
-        // from activeTarget, which isn't set yet mid-load). A live channel has
-        // no byte-range CDN edge to preheat and no useful scrubber thumbnails,
-        // and both of those open an EXTRA upstream connection — wasteful, and
-        // costly against a provider's simultaneous-stream cap.
+        // Live TV (and trailer) carve-out, computed from `target`
+        // (isLivePlayback derives from activeTarget, which isn't set yet
+        // mid-load). A live channel has no byte-range CDN edge to preheat and
+        // no useful scrubber thumbnails, and both open an EXTRA upstream
+        // connection — wasteful, and costly against a provider's simultaneous-
+        // stream cap. A trailer is short and its scrubber is suppressed, so it
+        // needs neither preheat nor the thumbnail extractor (which can't
+        // range-probe a googlevideo CDN URL reliably).
         const isLiveTarget =
-          target.media_type === "tv" || target.id.startsWith("iptv:");
+          target.media_type === "tv" ||
+          target.id.startsWith("iptv:") ||
+          target.id.startsWith("trailer:");
         // User actually engaged with this series → clear the
         // auto-bumped CW-suppression flag (recheck-watched flow).
         // The series can now re-enter CW as normal once the player
@@ -1682,6 +1765,9 @@ export default function App() {
           startSeconds:   resumeAt ?? null,
           httpProxy:      opts?.proxyUrl ?? null,
           contentHdrHint,
+          // External DASH audio for 1080p+ trailers; null for every normal
+          // stream (which clears any stale `audio-files` value in the engine).
+          audioUrl:       opts?.audioFileUrl ?? null,
         });
         logLoadEvent("load_video returned (MPV accepted loadfile)", {
           dt: Date.now() - t0load,
@@ -1778,7 +1864,7 @@ export default function App() {
             // chapters; live-action via chapters / the positional
             // heuristic). Movies and live-TV have no OP/ED structure.
             const mtLower = (target.media_type ?? "").toLowerCase();
-            if (mtLower === "movie" || mtLower === "channel" || mtLower === "channels" || mtLower === "tv") {
+            if (mtLower === "movie" || mtLower === "channel" || mtLower === "channels" || mtLower === "tv" || mtLower === "trailer") {
               return;
             }
 
@@ -2266,10 +2352,11 @@ export default function App() {
   const subsFetchedFor = useRef<string | null>(null);
   useEffect(() => {
     if (!activeTarget) return;
-    // Live TV has no IMDb id / episode / Stremio meta to match — searching
-    // subtitle addons for `tv/iptv:<id>` just fans out junk lookups to every
-    // installed subtitle addon (incl. the user's VPS) per tune-in. Skip it.
-    if (isLivePlayback) {
+    // Live TV / trailers have no IMDb id / episode / Stremio meta to match —
+    // searching subtitle addons for `tv/iptv:<id>` (or `trailer:<id>`) just
+    // fans out junk lookups to every installed subtitle addon (incl. the
+    // user's VPS) per tune-in. Skip it.
+    if (isLivePlayback || isTrailerPlayback) {
       setActiveExternalSubs([]);
       return;
     }
@@ -2284,7 +2371,7 @@ export default function App() {
     })
       .then((subs) => setActiveExternalSubs(subs ?? []))
       .catch(() => setActiveExternalSubs([]));
-  }, [activeTarget, addons, isLivePlayback]);
+  }, [activeTarget, addons, isLivePlayback, isTrailerPlayback]);
 
   // ── Subtitle picker overlay ──
   const [subsOpen, setSubsOpen] = useState(false);
@@ -2536,6 +2623,10 @@ export default function App() {
 
   useEffect(() => {
     const onEos = () => {
+      // Trailers don't get an end-of-stream card — they're a short side-trip,
+      // not a watch session with a "what's next". Let playback sit on the last
+      // frame; the user exits back to the detail page when done.
+      if (isTrailerPlayback) return;
       setEosActive(true);
       // Pause mpv at the last frame. This silences the 1 Hz stale-
       // heartbeat detector's `if (paused) return` short-circuit, so no
@@ -2547,7 +2638,7 @@ export default function App() {
     };
     window.addEventListener("aura:eos-detected", onEos);
     return () => window.removeEventListener("aura:eos-detected", onEos);
-  }, [togglePause]);
+  }, [togglePause, isTrailerPlayback]);
 
   // Listen for ED-start updates from the AniSkip pipeline. The event
   // is dispatched from inside handlePlayStream's lookup IIFE.
@@ -2802,6 +2893,144 @@ export default function App() {
         logo:       channel.logo ?? undefined,
       };
       void handlePlayStream(stream, target, { proxyUrl: playlist.proxyUrl ?? null });
+    },
+    [handlePlayStream],
+  );
+
+  // ── Watch Trailer ───────────────────────────────────────────────────
+  // Plays a title's YouTube trailer in Aura's own MPV player (not a webview
+  // popup / the browser). MPV can't open a YouTube page, so the id is resolved
+  // to a direct CDN URL via yt-dlp (an on-demand binary fetched on first use)
+  // and that plain HTTPS URL is fed through the normal play path. The synthetic
+  // `trailer:<ytId>` target shape drives every VOD carve-out (no scrobble /
+  // history / Continue-Watching / resume) via `isTrailerPlayback`.
+  const handlePlayTrailer = useCallback(
+    async (ytId: string, title: string) => {
+      // Spam-click guard: the yt-dlp download + resolve takes a few seconds and
+      // the DetailView button stays clickable until the player opens over it.
+      if (trailerLaunchingRef.current) return;
+      trailerLaunchingRef.current = true;
+      try {
+      const center = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+      // First-use gate: download yt-dlp if it isn't already on disk. The toast
+      // covers the one-time fetch; the player's own loading overlay takes over
+      // once load_video starts. Subsequent trailer plays skip this entirely.
+      const present = await runtimeDepPresent("yt-dlp.exe").catch(() => false);
+      if (!present) {
+        showFlyUpToast("Preparing trailer playback…", center);
+        try {
+          await ensureRuntimeDep("yt-dlp.exe");
+        } catch (e) {
+          showFlyUpToast(`Couldn't set up trailer playback: ${String(e)}`, { ...center, tone: "danger" });
+          return;
+        }
+      }
+      // Default quality comes from the sharable `trailer_quality` setting;
+      // the in-player menu can override it per trailer afterward. 1080p+ is
+      // DASH (yt-dlp returns a separate audio URL the engine mux-pairs).
+      let quality = "1080";
+      try {
+        const s = await invoke<{ trailer_quality?: string }>("get_settings");
+        if (s?.trailer_quality) quality = s.trailer_quality;
+      } catch { /* fall back to 1080 */ }
+
+      let res: TrailerResolution;
+      try {
+        res = await invoke<TrailerResolution>("resolve_trailer_url", {
+          ytId, maxHeight: qualityToHeight(quality),
+        });
+      } catch (e) {
+        showFlyUpToast(`Trailer unavailable: ${String(e)}`, { ...center, tone: "danger" });
+        return;
+      }
+      activeTrailerYtIdRef.current = ytId;
+      currentTrailerHeightRef.current = res.height;
+      setTrailerMaxHeight(res.max_height_available);
+      // Highlight the rung that's ACTUALLY playing (not the requested one).
+      setTrailerQuality(heightToRung(res.height));
+      setTrailerQualityLabel(res.quality_label);
+
+      const stream: StreamEntry = {
+        title:       `${title} — Trailer`,
+        addon_name:  "YouTube",
+        url:         res.video_url,
+        info_hash:   null,
+        file_idx:    null,
+        description: null,
+        filename:    null,
+      };
+      const target = {
+        id:         `trailer:${ytId}`,
+        media_type: "trailer",
+        name:       title,
+      };
+      // forceStartSeconds: 0 forces a clean start (no resume prompt — a trailer
+      // has no library record / saved position anyway). audioFileUrl is the
+      // separate DASH audio stream (null for a muxed 720p single file).
+      void handlePlayStream(stream, target, {
+        forceStartSeconds: 0,
+        audioFileUrl: res.audio_url ?? undefined,
+      });
+      } finally {
+        trailerLaunchingRef.current = false;
+      }
+    },
+    [handlePlayStream],
+  );
+
+  // In-player trailer quality switch: re-resolve at the chosen height and
+  // swap in place at the current playhead (reuses handlePlayStream's
+  // forceStartSeconds path, exactly like the source switcher). Persists the
+  // choice as the new default. Guarded against overlapping re-resolves.
+  const handleSetTrailerQuality = useCallback(
+    async (quality: string) => {
+      const ytId = activeTrailerYtIdRef.current;
+      if (!ytId || trailerResolvingRef.current) return;
+      const t = writebackTarget.current;
+      if (!t || !t.id.startsWith("trailer:")) return;
+      const startAt = playbackRef.current.time;
+      const center = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+      trailerResolvingRef.current = true;
+      setIsTrailerResolving(true);
+      try {
+        const res = await invoke<TrailerResolution>("resolve_trailer_url", {
+          ytId, maxHeight: qualityToHeight(quality),
+        });
+        // Reflect what ACTUALLY resolved (label + highlighted rung), and keep
+        // the menu gated to what this title offers. Persist the user's REQUEST
+        // as the default so a future trailer that does offer it honours it.
+        setTrailerMaxHeight(res.max_height_available);
+        setTrailerQualityLabel(res.quality_label);
+        setTrailerQuality(heightToRung(res.height));
+        invoke("update_settings", { patch: { trailer_quality: quality } }).catch(() => {});
+        // Resolves to the SAME height already playing (e.g. re-selecting the
+        // current rung) — skip the reload so the picture doesn't stutter.
+        if (res.height === currentTrailerHeightRef.current) {
+          return;
+        }
+        currentTrailerHeightRef.current = res.height;
+        const stream: StreamEntry = {
+          title:       `${t.name} — Trailer`,
+          addon_name:  "YouTube",
+          url:         res.video_url,
+          info_hash:   null,
+          file_idx:    null,
+          description: null,
+          filename:    null,
+        };
+        const target = { id: `trailer:${ytId}`, media_type: "trailer", name: t.name };
+        await handlePlayStream(stream, target, {
+          forceStartSeconds: startAt,
+          audioFileUrl: res.audio_url ?? undefined,
+        });
+      } catch (e) {
+        // Resolve failed — the highlight never changed (it's set from the
+        // actual result only on success), so just surface the error.
+        showFlyUpToast(`Couldn't switch quality: ${String(e)}`, { ...center, tone: "danger" });
+      } finally {
+        trailerResolvingRef.current = false;
+        setIsTrailerResolving(false);
+      }
     },
     [handlePlayStream],
   );
@@ -3341,18 +3570,19 @@ export default function App() {
   //     home_view_secs counter is bumped from the Home view directly.
   const lastStatsTickRef = useRef<number | null>(null);
   useEffect(() => {
-    // Live TV isn't a VOD "stream played" and a 24/7 channel left on would
-    // pollute the watch-time stats — carve it out like scrobble/history do.
-    if (!activeTarget || isLivePlayback) {
+    // Live TV / trailers aren't a VOD "stream played" and a 24/7 channel left
+    // on would pollute the watch-time stats — carve them out like
+    // scrobble/history do.
+    if (!activeTarget || isLivePlayback || isTrailerPlayback) {
       lastStatsTickRef.current = null;
       return;
     }
     // First-time per session — count this as a stream played.
     invoke("bump_stat", { kind: "streams_played", delta: 1 }).catch(() => {});
     lastStatsTickRef.current = Date.now();
-  }, [activeTarget?.id, activeTarget?.media_type, isLivePlayback]);
+  }, [activeTarget?.id, activeTarget?.media_type, isLivePlayback, isTrailerPlayback]);
   useEffect(() => {
-    if (!activeTarget || paused || isLivePlayback) {
+    if (!activeTarget || paused || isLivePlayback || isTrailerPlayback) {
       lastStatsTickRef.current = null;
       return;
     }
@@ -3386,7 +3616,7 @@ export default function App() {
     }, 5000);
     lastStatsTickRef.current = Date.now();
     return () => clearInterval(id);
-  }, [activeTarget, paused, isLivePlayback]);
+  }, [activeTarget, paused, isLivePlayback, isTrailerPlayback]);
 
   // ── Keep the display awake during active playback ──
   // Belt-and-suspenders alongside mpv's own stop-screensaver: assert the
@@ -4301,9 +4531,10 @@ export default function App() {
   // it receives at scrobble_start time.
   const scrobbleScope = session?.auth_key ? session.auth_key.slice(0, 12) : "guest";
   useScrobble({
-    // Live TV channels never scrobble — there's no episode/completion to
-    // report. Passing null keeps the hook fully inert for `iptv:` targets.
-    active: isLivePlayback ? null : activeTarget,
+    // Live TV channels / trailers never scrobble — there's no episode or
+    // completion to report. Passing null keeps the hook fully inert for
+    // `iptv:` and `trailer:` targets.
+    active: isLivePlayback || isTrailerPlayback ? null : activeTarget,
     playback: { time, duration, paused },
     scope: scrobbleScope,
   });
@@ -4836,14 +5067,29 @@ export default function App() {
    *  stream rather than evaluating it.
    */
   const PROGRESS_WARMUP_S = 120;
+  // Continue-Watching is only written after this much GENUINE forward playback
+  // (2 minutes). watchedElapsedRef excludes seeks (only sub-cap forward deltas
+  // count), so scrubbing / skipping around — including a watch-together sync
+  // seek that lands a follower mid-show — never adds a title to Continue
+  // Watching without real viewing. The `time` (playhead) gate above stays so
+  // the saved resume position is still meaningful.
+  const MEANINGFUL_WATCH_S = 120;
   const flushProgress = useCallback(
     (sess: UserSession | null, target: ActiveScrobbleTarget | null) => {
       const { time, duration } = playbackRef.current;
       if (!sess?.auth_key || !target || duration <= 0) return;
-      // Live TV: no Continue-Watching / progress write — an `iptv:` target
-      // has no library record and no meaningful resume position.
-      if (target.media_type === "tv" || target.id.startsWith("iptv:")) return;
+      // Live TV / trailers: no Continue-Watching / progress write — an `iptv:`
+      // or `trailer:` target has no library record and no meaningful resume
+      // position (writing one would create a garbage Stremio library entry).
+      if (
+        target.media_type === "tv" ||
+        target.id.startsWith("iptv:") ||
+        target.id.startsWith("trailer:")
+      ) return;
       if (time < PROGRESS_WARMUP_S) return;
+      // Require real watching, not just a playhead parked past the warmup by a
+      // seek / party sync. Fixes "skipping around added a show to CW".
+      if (watchedElapsedRef.current < MEANINGFUL_WATCH_S) return;
       // Skip if we already wrote this exact second — prevents duplicate writes
       // when pause and unmount fire close together.
       if (Math.abs(time - lastWrittenTime.current) < 1) return;
@@ -4921,7 +5167,7 @@ export default function App() {
     // finished episode. Right-click "Mark as Watched" on a poster
     // happens OUTSIDE the player overlay, so handleExitPlayback
     // doesn't run for those flips at all and the gate isn't needed.
-    if (activeTarget && playedEpisodeId && !isLivePlayback) {
+    if (activeTarget && playedEpisodeId && !isLivePlayback && !isTrailerPlayback) {
       const watched = time;
       const dur     = duration;
       // Both conditions must hold: at least 80 % progress AND at least
@@ -5014,7 +5260,7 @@ export default function App() {
       // unrelated DetailView open doesn't inherit the hint.
       setLastPlayedEpisodeId(playedEpisodeId);
     }
-  }, [session, flushProgress, activeTarget, isLivePlayback, time, duration, library, selectedMeta]);
+  }, [session, flushProgress, activeTarget, isLivePlayback, isTrailerPlayback, time, duration, library, selectedMeta]);
 
   // ── Live channel auto-retry (leeway before the broken-stream modal) ──
   // IPTV channels hiccup constantly on the provider side (transient 5xx,
@@ -5480,6 +5726,14 @@ export default function App() {
       const logo = activeTarget.logo ?? null;
       largeImage = logo && logo.startsWith("https://") ? logo : null;
       largeText = activeTarget.name;
+    } else if (isTrailerPlayback && activeTarget) {
+      // Trailer — a short clip, not a watch session. Advertise it distinctly
+      // (and BEFORE the VOD branch) so it doesn't read as "watching the movie".
+      isPlayback = true;
+      title = activeTarget.name;
+      subtitle = paused ? "Trailer · Paused" : "Watching a trailer";
+      sceneKey = `trailer:${activeTarget.id}`;
+      useTimestamp = !paused;
     } else if (activeTarget && duration > 0) {
       isPlayback = true;
       title = activeTarget.name;
@@ -5577,7 +5831,7 @@ export default function App() {
     }, 400);
   }, [
     authChecked, session, landingDismissed,
-    activeTarget, duration, paused, isLivePlayback,
+    activeTarget, duration, paused, isLivePlayback, isTrailerPlayback,
     selectedMeta, activeCatalog,
     activeView, homeSearchActive,
   ]);
@@ -6042,9 +6296,10 @@ export default function App() {
                 Exit player
               </button>
               {/* "Switch source" is meaningless for a Live TV channel (one
-                  URL, no alternate-source list), so it's hidden for live —
-                  the user picks a different CHANNEL from the grid instead. */}
-              {!isLivePlayback && (
+                  URL, no alternate-source list) or a trailer (single yt-dlp
+                  URL), so it's hidden for both — the user picks a different
+                  CHANNEL from the grid / exits the trailer instead. */}
+              {!isLivePlayback && !isTrailerPlayback && (
                 <button
                   type="button"
                   onClick={() => {
@@ -6105,6 +6360,12 @@ export default function App() {
           activeTarget={activeTarget}
           isAnime={activeTarget ? activeTargetIsAnime(activeTarget, library) : false}
           isLive={isLivePlayback}
+          isTrailer={isTrailerPlayback}
+          trailerQuality={trailerQuality}
+          trailerQualityLabel={trailerQualityLabel}
+          trailerMaxHeight={trailerMaxHeight}
+          isTrailerResolving={isTrailerResolving}
+          onSetTrailerQuality={handleSetTrailerQuality}
           time={time}
           duration={duration}
           paused={paused}
@@ -6356,6 +6617,7 @@ export default function App() {
           }}
           inLibrary={library.some((i) => i.id === selectedMeta.id && !i.removed)}
           onLibraryToggle={(origin) => handleLibraryToggle(selectedMeta, origin)}
+          onPlayTrailer={handlePlayTrailer}
           openOnEpisodeId={lastPlayedEpisodeId}
           ignoreResumeHint={ignoreResumeOnNextOpen}
           onConsumeOpenHint={consumeLastPlayedEpisode}

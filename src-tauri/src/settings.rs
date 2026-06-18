@@ -255,6 +255,15 @@ pub struct AppSettings {
     #[serde(default = "default_true")]
     pub skip_treat_mixed_op_as_op: bool,
 
+    // ── Trailers ───────────────────────────────────────────────────────────
+    /// Preferred quality for the "Watch Trailer" player: "auto" (best
+    /// available), "720", "1080", "1440", or "2160". Default "1080". 1080p and
+    /// above are DASH (separate video + audio, muxed by mpv); 720p is a single
+    /// progressive file. Falls back to the best available rendition when the
+    /// requested height isn't offered. Also adjustable in-player per trailer.
+    #[serde(default = "default_trailer_quality")]
+    pub trailer_quality: String,
+
     // ── Rendering ──────────────────────────────────────────────────────────
     /// When false, WebView2 launches with `--disable-gpu` via the
     /// WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS env var (read at process
@@ -303,6 +312,7 @@ fn default_audio_priority() -> Vec<String> { vec!["original".into(), "en".into()
 fn default_skip_op_mode() -> String { "prompt".into() }
 fn default_skip_ed_mode() -> String { "prompt".into() }
 fn default_skip_recap_mode() -> String { "prompt".into() }
+fn default_trailer_quality() -> String { "1080".into() }
 /// Default to active SDR tone-mapping. The pre-mode default ("on" with
 /// target-colorspace-hint=yes + tone-mapping=auto) brightened HDR
 /// sources on SDR displays; "sdr" mode performs the same compute-peak
@@ -391,6 +401,7 @@ impl Default for AppSettings {
             skip_op_mode:                default_skip_op_mode(),
             skip_ed_mode:                default_skip_ed_mode(),
             skip_recap_mode:             default_skip_recap_mode(),
+            trailer_quality:             default_trailer_quality(),
             skip_treat_mixed_op_as_op:   true,
             gpu_acceleration:            true,
             iptv_playlists:              Vec::new(),

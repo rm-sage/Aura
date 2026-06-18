@@ -1001,6 +1001,25 @@ interface Props {
    *  seek scrubber with a LIVE indicator — an infinite live stream has no
    *  duration to scrub, and resume/skip controls are meaningless. */
   isLive?: boolean;
+  /** True for a "Watch Trailer" session (synthetic `trailer:<id>` target).
+   *  Keeps the VOD scrubber (a trailer is finite) but disables hover
+   *  thumbnails (the googlevideo CDN URL isn't reliably range-probeable) and
+   *  the OP/ED skip-window button, and shows a TRAILER badge instead of LIVE. */
+  isTrailer?: boolean;
+  /** Requested trailer quality ("auto"|"720"|"1080"|"1440"|"2160") — drives the
+   *  active row in the quality menu. */
+  trailerQuality?: string;
+  /** Actually-resolved trailer quality label (e.g. "1080p") — the menu button
+   *  text; may be lower than requested when the title has no higher rendition. */
+  trailerQualityLabel?: string;
+  /** Highest rendition the current trailer offers — gates the quality menu so
+   *  unavailable resolutions never appear. */
+  trailerMaxHeight?: number;
+  /** True while a trailer quality swap is re-resolving (yt-dlp). Disables the
+   *  quality menu + shows a loading affordance. */
+  isTrailerResolving?: boolean;
+  /** Change the trailer quality (re-resolves + swaps in place at the playhead). */
+  onSetTrailerQuality?: (quality: string) => void;
 
   // Playback state
   time: number;
@@ -1240,6 +1259,12 @@ export default function PlayerOverlay({
   activeTarget,
   isAnime,
   isLive = false,
+  isTrailer = false,
+  trailerQuality = "1080",
+  trailerQualityLabel = "",
+  trailerMaxHeight = 2160,
+  isTrailerResolving = false,
+  onSetTrailerQuality,
   time, duration, paused, volume, speed, buffering, bufferPct, cacheSeconds = null, seekLoading = false, firstFrameSeen,
   partyFollower = false,
   onControlsVisibleChange,
@@ -1572,9 +1597,10 @@ export default function PlayerOverlay({
   const extSubFallbackRef = useRef(false);
   useEffect(() => {
     if (extSubFallbackRef.current) return;
-    // Live TV has no persistent subtitles — never auto-load one (the upstream
-    // external-sub fetch is already skipped for live, this is belt-and-braces).
-    if (isLive) return;
+    // Live TV / trailers have no persistent subtitles — never auto-load one
+    // (the upstream external-sub fetch is already skipped for both; this is
+    // belt-and-braces).
+    if (isLive || isTrailer) return;
     // Need the initial fetch to have produced data so an empty embedded
     // list is a real "no subs" answer rather than "we haven't fetched yet".
     if (tracks.length === 0) return;
@@ -1598,7 +1624,7 @@ export default function PlayerOverlay({
     })
       .then(() => window.dispatchEvent(new Event("aura:tracks-refresh")))
       .catch(() => {});
-  }, [tracks.length, embeddedSubTracks.length, externalSubs, preferredSubLang, isLive]);
+  }, [tracks.length, embeddedSubTracks.length, externalSubs, preferredSubLang, isLive, isTrailer]);
 
   // ── Audio auto-select ─────────────────────────────────────────────
   // Replaces the old simple lang-prefix match with the full scoring
@@ -1975,8 +2001,8 @@ export default function PlayerOverlay({
               Manual user pause is NOT covered (intentional pause shouldn't
               hide the frame the user is looking at). ── */}
       <BufferingOverlay
-        show={!firstFrameSeen || buffering || seekLoading}
-        statusText={!firstFrameSeen ? "Loading" : buffering ? "Buffering" : "Seeking"}
+        show={!firstFrameSeen || buffering || seekLoading || isTrailerResolving}
+        statusText={isTrailerResolving ? "Switching quality" : !firstFrameSeen ? "Loading" : buffering ? "Buffering" : "Seeking"}
         bufferPct={bufferPct}
         cacheSeconds={cacheSeconds}
         title={titleForBuffer}
@@ -2120,7 +2146,9 @@ export default function PlayerOverlay({
                 progressPct={progress}
                 segments={skipWindowsForScrub}
                 thumbnailAt={
-                  streamUrl
+                  // Trailers play off a googlevideo CDN URL that ffmpeg can't
+                  // reliably seek/range-probe for hover frames — skip thumbs.
+                  streamUrl && !isTrailer
                     ? (sec) =>
                         invoke<{ data_url: string; at: number } | null>("extract_thumbnail", {
                           url: streamUrl,
@@ -2227,13 +2255,22 @@ export default function PlayerOverlay({
               </div>
             )}
 
+            {/* TRAILER badge — distinguishes a trailer session from a normal
+                watch (and from LIVE). Sits right after the time display. */}
+            {isTrailer && (
+              <div className="ml-2 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-violet-400" style={{ boxShadow: "0 0 8px rgba(167,139,250,0.7)" }} />
+                <span className="text-violet-200/90 font-semibold text-[12px] tracking-wide">TRAILER</span>
+              </div>
+            )}
+
             {/* Skip-window button — surfaces inline when playback is
                 currently inside a known OP/ED/Recap window, so the user
                 always has a one-click manual skip in addition to the
                 Lua script's auto / prompt behaviour. When no windows
                 exist for the current stream, doubles as a "Detect"
                 affordance (silencedetect manual fallback). */}
-            {!isLive && (
+            {!isLive && !isTrailer && (
               <div className={partyFollower ? "pointer-events-none opacity-[0.45]" : ""}>
                 <SkipWindowButton
                   time={time}
@@ -2441,6 +2478,18 @@ export default function PlayerOverlay({
                 {isFullscreen ? <ExitFullscreenIcon /> : <FullscreenIcon />}
               </button>
             </Tooltip>
+
+            {/* Trailer quality — only during trailer playback. Sits left of
+                the "more" menu, grouped with the other stream-shaping pills. */}
+            {isTrailer && onSetTrailerQuality && (
+              <TrailerQualityMenu
+                quality={trailerQuality}
+                label={trailerQualityLabel}
+                maxHeight={trailerMaxHeight}
+                resolving={isTrailerResolving}
+                onSelect={onSetTrailerQuality}
+              />
+            )}
 
             {/* Three-dots / gear menu — AniSkip, Switch source, Copy link,
                 Download, External player. Anchored to the far right so it reads
@@ -3215,6 +3264,102 @@ function SpeedMenu({
               custom: {speed}×
             </div>
           )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Sliders / "tune" glyph for the trailer quality pill.
+const QualityIcon = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+    <path d="M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z" />
+  </svg>
+);
+
+const TRAILER_QUALITY_OPTIONS: { value: string; label: string }[] = [
+  { value: "auto", label: "Auto" },
+  { value: "2160", label: "4K" },
+  { value: "1440", label: "1440p" },
+  { value: "1080", label: "1080p" },
+  { value: "720",  label: "720p" },
+];
+
+// ---------------------------------------------------------------------------
+// TrailerQualityMenu — pill (mirrors SpeedMenu) shown ONLY during trailer
+// playback. The button shows the resolved quality (e.g. "1080p"); picking a
+// rung re-resolves via yt-dlp and swaps in place at the current playhead.
+// ---------------------------------------------------------------------------
+function TrailerQualityMenu({
+  quality, label, maxHeight, resolving, onSelect,
+}: {
+  quality: string;
+  label: string;
+  maxHeight: number;
+  resolving: boolean;
+  onSelect: (q: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useMenuOpenSync(open);
+
+  // Only show rungs this title actually offers (+ Auto, which always maps to
+  // the best available) so the user can't pick a resolution that doesn't exist.
+  const options = TRAILER_QUALITY_OPTIONS.filter(
+    (o) => o.value === "auto" || Number(o.value) <= maxHeight,
+  );
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    window.addEventListener("mousedown", handler);
+    return () => window.removeEventListener("mousedown", handler);
+  }, [open]);
+
+  // Button text = the RESOLVED label ("1080p"); "…" while re-resolving. Accent
+  // when the menu is open or a non-default quality is active.
+  const btnText = resolving ? "…" : (label || "Quality");
+  const active = open || (quality !== "1080" && quality !== "auto");
+
+  return (
+    <div ref={ref} className="relative flex-shrink-0">
+      <Tooltip text="Trailer quality" pos="top">
+        <button
+          onClick={() => setOpen((v) => !v)}
+          aria-label="Trailer quality"
+          className={`flex items-center gap-1.5 px-2.5 h-10 rounded-full transition-colors
+                      ${active
+                        ? "bg-ln-accent/20 text-ln-accent"
+                        : "text-white/80 hover:text-white hover:bg-white/12"}`}
+        >
+          <QualityIcon />
+          <span className="font-mono text-[12px] tabular-nums tracking-wider">{btnText}</span>
+        </button>
+      </Tooltip>
+
+      {open && (
+        <div className={`absolute bottom-full mb-2 right-0 min-w-[130px]
+                         rounded-xl py-1.5 z-50 aura-glass-menu shadow-glass-edge
+                         ${resolving ? "opacity-50 pointer-events-none" : ""}`}>
+          <div className="px-4 pt-1.5 pb-1 text-white/40 text-[10px] font-mono font-semibold tracking-[0.18em] uppercase">
+            Quality
+          </div>
+          {options.map((o) => (
+            <button
+              key={o.value}
+              onClick={() => { onSelect(o.value); setOpen(false); }}
+              className={`w-full flex items-center justify-between px-4 py-1.5 text-[13px]
+                          transition-colors font-mono tabular-nums
+                          ${o.value === quality
+                            ? "text-ln-accent bg-ln-accent/10"
+                            : "text-white/75 hover:text-white hover:bg-white/[0.16]"}`}
+            >
+              <span>{o.label}</span>
+              {o.value === "auto" && <span className="text-[10px] text-white/35">best</span>}
+            </button>
+          ))}
         </div>
       )}
     </div>

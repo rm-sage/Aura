@@ -28,6 +28,7 @@ interface DepUi {
 const DEPS: DepUi[] = [
   { name: "ffmpeg.exe",  label: "FFmpeg",  approxMb: 97,  purpose: "Silence detection — automatic OP/ED skip inference (Hybrid mode)." },
   { name: "ffprobe.exe", label: "FFprobe", approxMb: 97,  purpose: "Casting transmux — play files a Chromecast can't natively decode (e.g. some MKVs)." },
+  { name: "yt-dlp.exe",  label: "yt-dlp",  approxMb: 18,  purpose: "Watch Trailer — resolves a title's YouTube trailer to a direct stream for Aura's player (downloaded automatically on first use)." },
 ];
 
 const fmtMb = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(0)} MB`;

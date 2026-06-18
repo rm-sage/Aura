@@ -162,6 +162,11 @@ interface Props {
    *  toast originating at `originPoint`, and re-fetches the library so
    *  this view's `inLibrary` flips. */
   onLibraryToggle?: (originPoint?: { x: number; y: number }) => void;
+  /** Play the title's trailer in Aura's MPV player. `ytId` comes from
+   *  `detail.trailer_yt_id`; `title` is the display name. App.tsx resolves the
+   *  id to a direct CDN URL via yt-dlp and plays it as a `trailer:<id>` target
+   *  (no scrobble / history / Continue-Watching). Absent ⇒ button hidden. */
+  onPlayTrailer?: (ytId: string, title: string) => void;
   /** When set, DetailView opens in episodes mode (instead of streams),
    *  selects the season containing this episode id, and scrolls the
    *  matching row to the top of the list. Used after exiting playback
@@ -291,7 +296,7 @@ export default function DetailView(props: Props) {
   );
 }
 
-function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
+function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, onPlayTrailer, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
   const [detail, setDetail]                 = useState<MetaDetail | null>(null);
   const [streams, setStreams]               = useState<StreamEntry[]>([]);
   const [streamMeta, setStreamMeta]         = useState<StreamMetadata>({
@@ -1271,11 +1276,12 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
               </div>
             )}
 
-            {/* Action row — currently just Library add/remove. Sits below
-                the meta strip so it never moves around when ratings or
-                runtime fields appear/disappear. */}
-            {onLibraryToggle && (
+            {/* Action row — Library add/remove + Watch Trailer (when the addon
+                emits one). Sits below the meta strip so it never moves around
+                when ratings or runtime fields appear/disappear. */}
+            {(onLibraryToggle || (detail?.trailer_yt_id && onPlayTrailer)) && (
               <div className="flex items-center gap-3 -mt-2">
+                {onLibraryToggle && (
                 <button
                   type="button"
                   onClick={(e) => onLibraryToggle({ x: e.clientX, y: e.clientY })}
@@ -1308,6 +1314,26 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                     </>
                   )}
                 </button>
+                )}
+                {/* Watch Trailer — plays the title's YouTube trailer in Aura's
+                    own MPV player (yt-dlp resolves a direct CDN URL). Sits to
+                    the RIGHT of the library button; only shown when the addon
+                    meta carried a trailer id. */}
+                {detail?.trailer_yt_id && onPlayTrailer && (
+                  <button
+                    type="button"
+                    onClick={() => onPlayTrailer(detail.trailer_yt_id!, detail?.name ?? meta.name)}
+                    className="flex items-center gap-2 px-4 py-2 rounded-full text-[13px] font-medium
+                               border transition-colors duration-150
+                               bg-white/8 text-white/85 border-white/15
+                               hover:bg-ln-accent/20 hover:text-ln-accent hover:border-ln-accent/40"
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                      <path d="M8 5v14l11-7z" />
+                    </svg>
+                    <span>Watch Trailer</span>
+                  </button>
+                )}
               </div>
             )}
 
