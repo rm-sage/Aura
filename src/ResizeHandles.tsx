@@ -12,7 +12,7 @@ type ResizeDirection =
   | "NorthEast" | "NorthWest" | "SouthEast" | "SouthWest";
 
 // ---------------------------------------------------------------------------
-// ResizeHandles — invisible 4-px edge regions that drive window resize on
+// ResizeHandles — invisible edge/corner regions that drive window resize on
 // borderless windows.
 //
 // `tauri.conf.json` sets `decorations: false`, so Windows doesn't render the
@@ -20,6 +20,13 @@ type ResizeDirection =
 // can't grab a window edge to resize at all. The eight regions (4 edges +
 // 4 corners) cover the perimeter and call into Tauri's
 // `startResizeDragging({direction})` API on pointer-down.
+//
+// Hit-area sizing: the original 4-px edges were too thin to reliably grab
+// (especially on high-DPI displays and with a mouse moving fast off the
+// window edge) — reported as "can't resize the window at all". Edges are now
+// 6 px and corners a generous 16-px square (corners are the most-used resize
+// grip and rarely overlap interactive content), which matches/exceeds the
+// effective hit area Windows gives a normal sizing border.
 //
 // Z-index 9000 puts them above page content (so they always intercept the
 // edge) but below the title bar (z-index 10000) so the title bar's drag
@@ -56,16 +63,16 @@ function Handle({ className, cursor, direction }: HandleProps) {
 export default function ResizeHandles() {
   return (
     <>
-      {/* Edges — 4 px deep along each side */}
-      <Handle className="top-0 left-2 right-2 h-1"        cursor="ns-resize" direction="North" />
-      <Handle className="bottom-0 left-2 right-2 h-1"     cursor="ns-resize" direction="South" />
-      <Handle className="top-2 bottom-2 left-0 w-1"       cursor="ew-resize" direction="West"  />
-      <Handle className="top-2 bottom-2 right-0 w-1"      cursor="ew-resize" direction="East"  />
-      {/* Corners — 8 px squares */}
-      <Handle className="top-0 left-0 w-2 h-2"     cursor="nwse-resize" direction="NorthWest" />
-      <Handle className="top-0 right-0 w-2 h-2"    cursor="nesw-resize" direction="NorthEast" />
-      <Handle className="bottom-0 left-0 w-2 h-2"  cursor="nesw-resize" direction="SouthWest" />
-      <Handle className="bottom-0 right-0 w-2 h-2" cursor="nwse-resize" direction="SouthEast" />
+      {/* Edges — 6 px deep along each side, inset to leave the 16 px corners */}
+      <Handle className="top-0 left-4 right-4 h-1.5"      cursor="ns-resize" direction="North" />
+      <Handle className="bottom-0 left-4 right-4 h-1.5"   cursor="ns-resize" direction="South" />
+      <Handle className="top-4 bottom-4 left-0 w-1.5"     cursor="ew-resize" direction="West"  />
+      <Handle className="top-4 bottom-4 right-0 w-1.5"    cursor="ew-resize" direction="East"  />
+      {/* Corners — 16 px squares (the primary resize grip) */}
+      <Handle className="top-0 left-0 w-4 h-4"     cursor="nwse-resize" direction="NorthWest" />
+      <Handle className="top-0 right-0 w-4 h-4"    cursor="nesw-resize" direction="NorthEast" />
+      <Handle className="bottom-0 left-0 w-4 h-4"  cursor="nesw-resize" direction="SouthWest" />
+      <Handle className="bottom-0 right-0 w-4 h-4" cursor="nwse-resize" direction="SouthEast" />
     </>
   );
 }
