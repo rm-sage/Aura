@@ -541,7 +541,7 @@ function handleMessage(data: string) {
       break;
     }
     case "tick":
-      applyTick(msg.position, msg.paused, msg.driverId);
+      applyTick(msg.position, msg.paused, msg.speed, msg.driverId);
       break;
     case "video":
       // Presence-only; the following `members` frame carries the roster.
@@ -605,20 +605,26 @@ function ingestRoomState(state: RoomState, drive = true) {
   recomputeSync();
   if (!drive || !ui.inSync || !bridge) return;
   const target = expectedPosition(state);
-  applyRemote(state.paused, target);
+  applyRemote(state.paused, target, state.speed ?? 1);
 }
 
 /** Drift correction from the leader's tick. Only nudge when we're in sync and
  *  the room is playing, and only past the threshold. Ticks are honored ONLY
  *  from the current leader — this rejects a stale ex-leader's in-flight tick
  *  during a membership change and a non-leader peer spamming forged ticks. */
-function applyTick(position: number, paused: boolean, driverId: string | null) {
+function applyTick(position: number, paused: boolean, speed: number | undefined, driverId: string | null) {
   if (!ui.inSync || !bridge || paused) return;
   if (!driverId || driverId !== effectiveLeaderId()) return;
   const local = bridge.getLocal();
   if (local.paused) return;
+  const spd = Number.isFinite(speed) && (speed as number) > 0 ? (speed as number) : local.speed;
   if (Math.abs(local.position - position) > DRIFT_THRESHOLD_S) {
-    applyRemote(false, position);
+    applyRemote(false, position, spd);
+  } else if (Math.abs(spd - local.speed) > 0.01) {
+    // Position is fine but the leader's speed drifted (e.g. a missed control
+    // frame) — match it WITHOUT a seek (position === local.position so apply's
+    // seek check is a no-op). Keeps followers locked to the leader's speed.
+    applyRemote(false, local.position, spd);
   }
 }
 
@@ -631,15 +637,19 @@ function expectedPosition(state: RoomState): number {
   return state.position + elapsed;
 }
 
-function applyRemote(paused: boolean, position: number) {
+function applyRemote(paused: boolean, position: number, speed = 1) {
   if (!bridge) return;
   if (!Number.isFinite(position)) return; // reject NaN/Inf — would yank to 0
   // Throttle a flood of applied seeks (a buggy/malicious peer), but NEVER drop
-  // a genuine pause-state change — those must always land.
+  // a genuine pause-state change OR a speed change — both must always land (a
+  // stale speed is exactly what makes a follower drift and re-seek forever).
+  const local = bridge.getLocal();
+  const spd = Number.isFinite(speed) && speed > 0 ? speed : local.speed;
+  const speedChanged = Math.abs(spd - local.speed) > 0.01;
   const now = Date.now();
-  if (paused === bridge.getLocal().paused && now - lastApplyAt < APPLY_MIN_INTERVAL_MS) return;
+  if (paused === local.paused && !speedChanged && now - lastApplyAt < APPLY_MIN_INTERVAL_MS) return;
   lastApplyAt = now;
-  bridge.apply(paused, position);
+  bridge.apply(paused, position, spd);
 }
 
 function recomputeSync() {
@@ -679,7 +689,7 @@ function startLeaderTimer() {
     const local = bridge.getLocal();
     // Only drive drift while WE are watching the room title and playing.
     if (local.paused || local.videoKey == null || local.videoKey !== ui.roomVideoKey) return;
-    send({ t: "tick", position: local.position, paused: false });
+    send({ t: "tick", position: local.position, paused: false, speed: local.speed });
   }, TICK_MS);
 }
 
@@ -700,7 +710,7 @@ function stopLeaderTimer() {
  *
  *  `next` carries the INTENDED post-action paused/position because React state
  *  (and the refs the bridge reads) haven't updated yet at the call site. */
-export function notifyLocalControl(next?: { paused: boolean; position: number }): void {
+export function notifyLocalControl(next?: { paused: boolean; position: number; speed?: number }): void {
   if (ui.status !== "connected" || !bridge) return;
   const local = bridge.getLocal();
   // No syncable title locally (e.g. LIVE TV reports a null videoKey) — never
@@ -713,7 +723,7 @@ export function notifyLocalControl(next?: { paused: boolean; position: number })
   // frames too, and the player UI disables their transport controls. (This
   // supersedes the old "in-sync follower may also drive" behaviour.)
   if (!ui.isLeader) return;
-  broadcastControl(next?.paused ?? local.paused, next?.position ?? local.position);
+  broadcastControl(next?.paused ?? local.paused, next?.position ?? local.position, next?.speed);
 }
 
 /** LEADER ONLY — hand the host crown to another connected member. The relay
@@ -726,9 +736,13 @@ export function transferLeader(targetId: string): void {
 /** Send a full control frame AND mirror it into the local room state — we
  *  never receive our own frames, so without this our own inSync / room labels
  *  would lag what we just told everyone else. */
-function broadcastControl(paused: boolean, position: number) {
+function broadcastControl(paused: boolean, position: number, speed?: number) {
   if (!bridge) return;
   const local = bridge.getLocal();
+  // Leader's playback speed — the explicit value when this broadcast IS the
+  // speed change, else the current local speed (so play/pause/seek frames carry
+  // the leader's current speed for late-applying followers).
+  const spd = Number.isFinite(speed) && (speed as number) > 0 ? (speed as number) : (local.speed ?? 1);
   // Belt-and-suspenders: an OWNER must never emit an identity-null control frame
   // (live TV) — the relay would reconstitute the prior identity from `?? prev`.
   if ((ui.isLeader || ui.roomVideoKey == null) && local.videoKey == null) return;
@@ -757,7 +771,7 @@ function broadcastControl(paused: boolean, position: number) {
   ui.amStaging = localStaging;
   recomputeSync();
   send({
-    t: "control", paused, position,
+    t: "control", paused, position, speed: spd,
     videoKey, metaId, mediaType, title, streamLabel, streamKey, staging,
   });
   emit();
@@ -856,7 +870,7 @@ export function notifyLocalVideo(): void {
  *  are in sync on the room's title with a known room state. */
 export function resyncToRoom(): void {
   if (!bridge || !ui.inSync || !lastRoomState) return;
-  applyRemote(lastRoomState.paused, expectedPosition(lastRoomState));
+  applyRemote(lastRoomState.paused, expectedPosition(lastRoomState), lastRoomState.speed ?? 1);
 }
 
 /** The party's current synced position (extrapolated from the last room state),

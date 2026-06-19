@@ -29,6 +29,13 @@ const MAX_ORDER = 64;
 /** Coerce + length-cap a peer-supplied string (defence against a member
  *  flooding the room state / attachment with a huge or non-string value). */
 const str = (v, max) => (typeof v === "string" ? v.slice(0, max) : null);
+/** Coerce a peer-supplied playback speed to a sane multiplier (0.25x–4x).
+ *  Falls back to `prev` (then 1) so a missing/garbage value never desyncs the
+ *  room or strands followers at the wrong speed. */
+const speedOf = (v, prev) => {
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0.25 && n <= 4 ? n : (typeof prev === "number" ? prev : 1);
+};
 const MAX_VIDEOKEY = 512;
 const MAX_TITLE = 300;
 const MAX_NAME = 40;
@@ -209,6 +216,7 @@ export class Room {
           const next = {
             paused: !!msg.paused,
             position: pos,
+            speed: speedOf(msg.speed, prev.speed),
             videoKey: str(msg.videoKey, MAX_VIDEOKEY) ?? me.videoKey ?? prev.videoKey ?? null,
             metaId: str(msg.metaId, MAX_VIDEOKEY) ?? prev.metaId ?? null,
             mediaType: str(msg.mediaType, 32) ?? prev.mediaType ?? null,
@@ -228,7 +236,7 @@ export class Room {
           const pos = Number(msg.position);
           if (!Number.isFinite(pos)) break;
           // Leader drift correction — relay only (no persistence needed).
-          this.broadcast({ t: "tick", position: pos, paused: !!msg.paused, driverId: me.id }, ws);
+          this.broadcast({ t: "tick", position: pos, paused: !!msg.paused, speed: speedOf(msg.speed, 1), driverId: me.id }, ws);
           break;
         }
         case "clear-stream": {
@@ -239,7 +247,7 @@ export class Room {
           // re-establishes it. Written EXPLICITLY (not via the control case,
           // whose `?? prev` fallback would resurrect the old identity).
           const blank = {
-            paused: true, position: 0, videoKey: null, metaId: null, mediaType: null,
+            paused: true, position: 0, speed: 1, videoKey: null, metaId: null, mediaType: null,
             title: null, streamLabel: null, streamKey: null, staging: false,
             updatedAt: Date.now(), driverId: me.id ?? null,
           };
@@ -436,7 +444,7 @@ export class Room {
   async loadState() {
     const s = await this.state.storage.get("state");
     return s || {
-      paused: true, position: 0, videoKey: null, metaId: null, mediaType: null,
+      paused: true, position: 0, speed: 1, videoKey: null, metaId: null, mediaType: null,
       title: null, streamLabel: null, streamKey: null, staging: false,
       updatedAt: Date.now(), driverId: null,
     };

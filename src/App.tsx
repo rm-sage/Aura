@@ -1292,9 +1292,13 @@ export default function App() {
   // on-screen controls + keybindings call (NOT programmatic/internal pauses).
   const wtTimeRef = useRef(time); wtTimeRef.current = time;
   const wtPausedRef = useRef(paused); wtPausedRef.current = paused;
+  const wtSpeedRef = useRef(speed); wtSpeedRef.current = speed;
   const wtTargetRef = useRef(activeTarget); wtTargetRef.current = activeTarget;
   const wtSeekRef = useRef(seekAbsolute); wtSeekRef.current = seekAbsolute;
   const wtTogglePauseRef = useRef(togglePause); wtTogglePauseRef.current = togglePause;
+  // RAW speed setter for the bridge's remote-apply path (sets the engine speed
+  // WITHOUT broadcasting — apply() is applying, not originating).
+  const wtCommitSpeedRef = useRef(commitSpeed); wtCommitSpeedRef.current = commitSpeed;
   // `togglePause` is a relative, fire-and-forget command and the observed
   // `paused`/`wtPausedRef` only update on the next MPV event — so a remote
   // apply that toggles against the lagging ref can desync when two control
@@ -1324,6 +1328,7 @@ export default function App() {
         return {
           paused: wtPausedRef.current,
           position: wtTimeRef.current,
+          speed: wtSpeedRef.current,
           videoKey: isLive ? null : (t?.id ?? null),
           metaId: isLive ? null : (t?.series_id ?? t?.id ?? null),
           mediaType: isLive ? null : (t?.media_type ?? null),
@@ -1332,11 +1337,18 @@ export default function App() {
           streamKey: isLive ? null : wtStreamRef.current.key,
         };
       },
-      apply: (remotePaused: boolean, position: number) => {
+      apply: (remotePaused: boolean, position: number, speed: number) => {
         if (Math.abs(wtTimeRef.current - position) > 0.4) wtSeekRef.current(position);
         if (wtIntendedPausedRef.current !== remotePaused) {
           wtTogglePauseRef.current();
           wtIntendedPausedRef.current = remotePaused;
+        }
+        // Match the leader's speed so we don't outpace/lag them and re-seek
+        // forever. RAW setter (no re-broadcast). Guard + epsilon avoid a
+        // redundant set_speed every drift tick.
+        if (Number.isFinite(speed) && speed > 0 && Math.abs(wtSpeedRef.current - speed) > 0.01) {
+          wtSpeedRef.current = speed;
+          wtCommitSpeedRef.current(speed);
         }
       },
       openVideo: ({ metaId, mediaType, videoKey, title }) => {
@@ -1414,6 +1426,15 @@ export default function App() {
     seekRelative(d);
     notifyLocalControl({ paused: wtIntendedPausedRef.current, position: wtTimeRef.current + d });
   }, [seekRelative, wtStagedHold, wtFollowerLocked]);
+  // Playback-speed change. A follower is locked out (the leader controls
+  // playback); the leader broadcasts the new speed so everyone matches it —
+  // otherwise followers stay at 1x and constantly re-seek to chase the host.
+  const wtCommitSpeed = useCallback((s: number) => {
+    if (wtFollowerLocked()) return;
+    commitSpeed(s);
+    wtSpeedRef.current = s;
+    notifyLocalControl({ paused: wtIntendedPausedRef.current, position: wtTimeRef.current, speed: s });
+  }, [commitSpeed, wtFollowerLocked]);
   // Start the party (unpause + clear staging) — the leader's "Start now"
   // override, also called by the auto-start effect once everyone's ready.
   // Bypasses the staging gate above (we're the one releasing it): clears
@@ -6385,7 +6406,7 @@ export default function App() {
           seekRelative={wtSeekRelative}
           seekAbsolute={wtSeekAbsolute}
           commitVolume={commitVolumeAndSave}
-          commitSpeed={commitSpeed}
+          commitSpeed={wtCommitSpeed}
           onExitPlayback={handleExitPlayback}
           subsOpen={subsOpen}
           setSubsOpen={setSubsOpen}

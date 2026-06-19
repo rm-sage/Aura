@@ -21,6 +21,10 @@ export interface RoomState {
   paused: boolean;
   /** Seconds into the title at `updatedAt`. */
   position: number;
+  /** Playback speed multiplier the leader is using (1 = normal). Followers
+   *  match it so they don't drift and re-seek to catch up — a leader at 1.5x
+   *  outpaces a 1x follower otherwise. Defaults to 1 on older relays/clients. */
+  speed: number;
   /** Episode id (series) / movie id — the sync key + the episode to open. */
   videoKey: string | null;
   /** Series-root id (or movie id) — what a member navigates to. */
@@ -78,7 +82,7 @@ export type ServerMsg =
   | { t: "welcome"; selfId: string; serverNow: number; state: RoomState; members: WatchMember[]; leaderId: string | null }
   | { t: "members"; members: WatchMember[]; leaderId: string | null }
   | ({ t: "control" } & RoomState)
-  | { t: "tick"; position: number; paused: boolean; driverId: string | null }
+  | { t: "tick"; position: number; paused: boolean; speed?: number; driverId: string | null }
   | { t: "video"; from: string; videoKey: string | null; title: string | null }
   /** Full active-vote list (broadcast on any change / expiry sweep). */
   | { t: "votes"; votes: VotePoll[] }
@@ -96,6 +100,8 @@ export type ServerMsg =
 export interface LocalPlayback {
   paused: boolean;
   position: number;
+  /** Current local playback speed (1 = normal). */
+  speed: number;
   videoKey: string | null;
   metaId: string | null;
   mediaType: string | null;
@@ -109,9 +115,9 @@ export interface LocalPlayback {
 export interface PlaybackBridge {
   /** Current local playback snapshot. */
   getLocal: () => LocalPlayback;
-  /** Apply a remote target: seek to `position` and match `paused`. MUST NOT
-   *  re-broadcast (it's applying, not originating). */
-  apply: (paused: boolean, position: number) => void;
+  /** Apply a remote target: seek to `position`, match `paused`, and match the
+   *  leader's `speed`. MUST NOT re-broadcast (it's applying, not originating). */
+  apply: (paused: boolean, position: number, speed: number) => void;
   /** Open the party's title locally, landing on the stream picker (and
    *  highlighting the leader's stream when `streamKey` matches). */
   openVideo: (target: {
