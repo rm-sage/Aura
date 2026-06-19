@@ -171,6 +171,22 @@ function airedAtMs(a: ReleaseAired | null | undefined): number {
   return Number.isFinite(t) ? t : Number.NEGATIVE_INFINITY;
 }
 
+/** Representation-independent dedup key for an episode: `e:<season>:<episode>`.
+ *  The cloud's `id` field can churn for the SAME episode — `last_aired.id` vs
+ *  `recent_aired[].id` can differ in format, and anime absolute↔season
+ *  numbering shifts the id as AIOMetadata resolves the season mapping. The
+ *  (season, episode) NUMBERS are semantic and stable, so keying dedup on them
+ *  (in addition to the raw id) stops the newest already-notified episode from
+ *  re-firing when only its id representation changed. Returns null when there's
+ *  no episode number (movies / number-less rows) — those fall back to the raw
+ *  id + timestamp guards, so there's no regression. The `e:` prefix can never
+ *  collide with a tt-style raw id. */
+function episodeKey(ep: ReleaseAired): string | null {
+  if (typeof ep.episode !== "number") return null;
+  const s = typeof ep.season === "number" ? ep.season : "";
+  return `e:${s}:${ep.episode}`;
+}
+
 /** Does the user's library record show they're at/past this
  *  episode? Used as a secondary "already seen" check so a fresh
  *  install (no prior scanner state) doesn't fire notifications for
@@ -365,6 +381,8 @@ export default function NotificationsScanner({ addons, library }: Props) {
               // > now → seeded as before.)
               if (ms > now) continue;
               seenSet.add(ep.id);
+              const k = episodeKey(ep);
+              if (k) seenSet.add(k); // representation-independent dedup
               if (ms > newestSeed) newestSeed = ms;
             }
             state[item.id] = {
@@ -374,6 +392,28 @@ export default function NotificationsScanner({ addons, library }: Props) {
             };
             stateDirty = true;
             continue;
+          }
+
+          // Pre-fix state stored only raw cloud ids. The NEWEST notified
+          // episode sits exactly AT the `<` timestamp watermark, so only its
+          // raw id protected it — and if the cloud has since churned that id
+          // (last_aired vs recent_aired format, or anime absolute↔season
+          // numbering) it re-fires. Seed its representation-independent key so
+          // it can't. Episodes strictly BELOW the watermark don't need this:
+          // the predate-watermark branch in the diff walk marks them seen
+          // (id + key) without firing regardless of id drift. We seed the
+          // at-watermark key ONLY when exactly one recent episode matches the
+          // watermark timestamp — with a same-timestamp batch drop we can't
+          // tell the notified episode from an un-notified sibling, so we
+          // defer to the diff walk (caveat #2: same-timestamp siblings still
+          // fire) and accept at most one extra notification. Idempotent: once
+          // the key is in seenVideoIds, this is a no-op.
+          if (lastNotifiedMs > 0) {
+            const atWatermark = candidates_aired.filter((ep) => airedAtMs(ep) === lastNotifiedMs);
+            if (atWatermark.length === 1) {
+              const wk = episodeKey(atWatermark[0]);
+              if (wk) seenSet.add(wk);
+            }
           }
 
           // Stacked diff: walk recent_aired ascending, fire for
@@ -386,8 +426,12 @@ export default function NotificationsScanner({ addons, library }: Props) {
               console.info(`[notif-scan] ${item.id}: skipping entry with no id`);
               continue;
             }
-            if (seenSet.has(ep.id)) {
-              console.info(`[notif-scan] ${item.id}/${ep.id}: already in seenSet — skip`);
+            const epKey = episodeKey(ep);
+            // Already notified — by raw id OR by representation-independent
+            // (season:episode) key. The key check is what survives a cloud
+            // episode-id churn that the raw-id check alone would miss.
+            if (seenSet.has(ep.id) || (epKey && seenSet.has(epKey))) {
+              console.info(`[notif-scan] ${item.id}/${ep.id}: already seen (id or s/e key) — skip`);
               continue;
             }
             const epMs = airedAtMs(ep);
@@ -423,6 +467,7 @@ export default function NotificationsScanner({ addons, library }: Props) {
               // set the watermark.
               console.info(`[notif-scan] ${item.id}/${ep.id}: aired_at ${ep.aired_at} predates watermark ${lastNotifiedMs} — mark seen without firing`);
               seenSet.add(ep.id);
+              if (epKey) seenSet.add(epKey);
               continue;
             }
             if (librarySaysSeen(item, ep)) {
@@ -430,12 +475,14 @@ export default function NotificationsScanner({ addons, library }: Props) {
               // their library — don't notify.
               console.info(`[notif-scan] ${item.id}/${ep.id}: librarySaysSeen=true (state.video_id=${item.state?.video_id ?? "(none)"}, timeOffset=${item.state?.timeOffset ?? 0}) — mark seen without firing`);
               seenSet.add(ep.id);
+              if (epKey) seenSet.add(epKey);
               if (epMs > highestFiredMs) highestFiredMs = epMs;
               continue;
             }
 
             // Fire the notification.
             seenSet.add(ep.id);
+            if (epKey) seenSet.add(epKey);
             if (epMs > highestFiredMs) highestFiredMs = epMs;
             firedCount++;
             console.info(`[notif-scan] ${item.id}/${ep.id}: FIRING notification (${isMovie ? "movie release" : "episode"})`);
@@ -452,7 +499,10 @@ export default function NotificationsScanner({ addons, library }: Props) {
               const titleParts: string[] = [item.name];
               if (epLabel) titleParts.push(epLabel);
               addNotification({
-                id: `episode:${item.id}:${ep.id}`,
+                // Representation-independent notification id (falls back to
+                // the raw cloud id only when there's no episode number) so the
+                // bell store's id-dedup also survives a churned cloud id.
+                id: `episode:${item.id}:${epKey ?? ep.id}`,
                 kind: "episode",
                 title: titleParts.join(" — "),
                 subtitle: undefined,

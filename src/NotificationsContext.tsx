@@ -237,6 +237,13 @@ function capItems(items: Notification[]): Notification[] {
 
 export function NotificationsProvider({ children }: { children: ReactNode }) {
   const [notifications, setNotifications] = useState<Notification[]>(() => loadFromStorage());
+  // Synchronous mirror of the live notification ids — lets addNotification
+  // detect a same-id re-add (a release-notification re-fire) without reading
+  // through React state. Kept in sync on every change below.
+  const liveIdsRef = useRef<Set<string>>(new Set(notifications.map((n) => n.id)));
+  useEffect(() => {
+    liveIdsRef.current = new Set(notifications.map((n) => n.id));
+  }, [notifications]);
   /** Transient pulse — flips true for NEW_PULSE_MS after every addNotification. */
   const [hasNew, setHasNew] = useState(false);
   const hasNewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -299,6 +306,18 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
 
   const addNotification = useCallback<NotificationsCtxValue["addNotification"]>((n) => {
     const id = n.id ?? `${n.kind}:${n.title}`;
+    // Re-fire guard for aired-content alerts: an `episode`/`release`
+    // notification whose id is ALREADY in the bell is a re-fire (a churned
+    // cloud episode-id slipping past the scanner's ledger, etc.). The scanner
+    // is the primary guard; this is defence-in-depth so a stray re-fire can't
+    // re-pulse the bell or re-float the popup for something the user already
+    // saw. Genuinely-new episodes always carry a new id, so a real new-episode
+    // alert is never suppressed. (Dismissed entries are removed from the list,
+    // so they're not matched here — the scanner's persisted ledger covers
+    // those.)
+    if ((n.kind === "episode" || n.kind === "release") && liveIdsRef.current.has(id)) {
+      return;
+    }
     setNotifications((prev) => {
       // Dedupe by id — if a notification with the same id already exists,
       // bring it back to "unread + non-dismissed" instead of duplicating.
