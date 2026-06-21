@@ -141,6 +141,21 @@ export function parseNoteBlocks(notes: string): NoteBlock[] {
       blocks.push({ kind: "bullets", items });
       continue;
     }
+    // Plain (non-markdown) section header: a short title that immediately
+    // precedes a bullet list and isn't prose. Lets notes authored as
+    // "Watch Trailer\n- …" get the SAME accent-bar heading treatment as the
+    // `## Section` and ALL-CAPS-with-rule forms — so plain-format release notes
+    // render consistently without re-authoring. Trailing sentence punctuation
+    // (`.`/`:` …) excludes a real lead-in sentence (e.g. the 1.0.6 lead).
+    if (trimmed.length <= 60 && !/[.:,;!?]$/.test(trimmed)) {
+      let j = i + 1;
+      while (j < lines.length && !lines[j].trim()) j += 1;
+      if (j < lines.length && /^\s*[•·●▪■▶►*-]\s+/.test(lines[j])) {
+        blocks.push({ kind: "heading", text: trimmed, level: 2 });
+        i += 1;
+        continue;
+      }
+    }
     const para: string[] = [trimmed];
     i += 1;
     while (i < lines.length) {
@@ -166,7 +181,13 @@ export function parseNoteBlocks(notes: string): NoteBlock[] {
 export function ReleaseNotesBody({ notes, max = 2200 }: { notes: string; max?: number }) {
   const blocks = useMemo(() => {
     const recovered = recoverFromCp437Mojibake(notes ?? "");
-    return parseNoteBlocks(truncateNotes(recovered, max));
+    // The GitHub release `.body` (from `gh release create --notes-from-tag`)
+    // begins with the tag's "Aura vX.Y.Z" subject line. The version is already
+    // shown as the entry header, so strip that leading duplicate before
+    // parsing. (latest.json notes use the tag BODY only and have no such line,
+    // so the regex is a no-op there — both surfaces stay correct.)
+    const deduped = recovered.replace(/^\s*Aura\s+v?\d+(?:\.\d+)*\s*(?:\r?\n|$)/, "");
+    return parseNoteBlocks(truncateNotes(deduped, max));
   }, [notes, max]);
 
   return (
