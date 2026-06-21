@@ -284,14 +284,18 @@ commands.allow = ["debug_engine_state", "debug_drop_test", "debug_load_test_patt
 # `location.reload()` / `location.assign(url)`. URL navigation re-
 # validates the scheme on the Rust side (http/https only) so a malicious
 # js:// or file:// can't be smuggled past the frontend guard.
+# `popup_webview_current_url` is a pure read of the webview's live URL
+# (WebView2 Source) that the chrome strip polls to keep the address bar
+# in sync as the user clicks through pages inside the popup.
 [[permission]]
 identifier = "allow-popup-nav"
-description = "Allows the SourcePopup chrome strip to drive back/forward/refresh/navigate against its own child webview"
+description = "Allows the SourcePopup chrome strip to drive back/forward/refresh/navigate against its own child webview, and to read its current URL for the address bar"
 commands.allow = [
   "popup_webview_back",
   "popup_webview_forward",
   "popup_webview_reload",
   "popup_webview_navigate",
+  "popup_webview_current_url",
 ]
 
 # ── Aura Proxy v2: per-account cloud sync ──────────────────────────────────

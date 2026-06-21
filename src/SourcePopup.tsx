@@ -39,6 +39,21 @@ const FIRST_POPUP_TOAST_KEY = "aura:popup-first-open-shown";
 const POPUP_FIRST_HINT_EVENT = "aura:popup-first-open-hint";
 const OPEN_EVENT = "aura:open-source-popup";
 
+// Cadence for polling the popup webview's live URL to keep the address
+// bar in sync with in-page navigation. 400ms reads snappy to the eye
+// without meaningful cost — each tick is a single WebView2 `Source` read
+// behind one IPC call, and only runs while a non-OAuth popup is visible.
+const URL_POLL_MS = 400;
+
+// Grace window after a user-typed Go/Enter navigation during which the
+// poll ignores a `Source` that still reports the page we're leaving.
+// Navigating goes through an eval'd `location.assign`, so there's a lag
+// where `Source` hasn't moved yet; without this the bar would flicker
+// back to the previous URL mid-load. The window self-ends as soon as
+// `Source` actually moves off the old page, so this is only a safety cap
+// for slow / failed loads.
+const SUBMIT_GRACE_MS = 2500;
+
 interface SourceState {
   url: string;
   title: string;
@@ -117,16 +132,23 @@ export default function SourcePopupHost() {
   // this null and the header just shows the static title.
   const [navHost, setNavHost] = useState<string | null>(null);
   // Address-bar state for the chrome strip. `urlInput` is what the user
-  // is typing; `currentUrl` is the last-known committed URL of the
-  // child webview (initial URL, or what the user just navigated to).
-  // We don't poll `location.href` from the child — Tauri's child-webview
-  // API doesn't expose a navigation event for the non-OAuth spawn path,
-  // and there's no safe way to read it back without a content script
-  // we'd have to inject (which we don't, since this is a sandboxed
-  // browsing context). In-page link clicks therefore leave the address
-  // bar showing the LAST committed URL until the user types a new one.
+  // is typing; `currentUrl` is the last-known committed URL of the child
+  // webview (initial URL, what the user typed + submitted, or — via the
+  // URL poll effect below — the page they clicked through to inside the
+  // webview). The JS `Webview` class exposes no navigation event, so we
+  // poll the Rust `popup_webview_current_url` command (a pure read of
+  // WebView2's live `Source`) on a short interval while the popup is
+  // open. That `Source` tracks in-page link clicks, form submits, AND
+  // SPA client-side route changes — history.pushState/replaceState to a
+  // new URL, e.g. AniList's Vue router moving from a title page to
+  // /home — so the bar stays honest like a real browser's. The
+  // `editingRef` below suppresses the auto-sync while the user is typing
+  // in the bar so a poll tick can't clobber their input mid-edit.
   const [urlInput, setUrlInput] = useState("");
   const [currentUrl, setCurrentUrl] = useState("");
+  // True while the address-bar input is focused (user is editing). Kept
+  // as a ref so toggling it doesn't restart the poll effect's interval.
+  const editingRef = useRef(false);
   // Minimized — collapses the backdrop+card to a floating pill at
   // bottom-right while keeping the child webview alive offscreen so
   // OAuth flow state (cookies, in-progress page, etc) doesn't reset
@@ -140,20 +162,40 @@ export default function SourcePopupHost() {
   // hide the next popup behind nothing.
   useEffect(() => { if (!active) setMinimized(false); }, [active]);
 
-  // Mirror active.url into the address-bar input + committed-URL state
-  // on every (re)open or external URL change. Keeps the chrome strip
-  // honest when openSourcePopup is called again with a different URL
-  // while the popup is already mounted.
+  // Mirror active.url into the address-bar input + committed-URL state on
+  // every (re)open. Keyed on the whole `active` object (not `active?.url`)
+  // so re-opening to the SAME url after the user has navigated inside the
+  // popup still resets the bar to the freshly-respawned page instead of
+  // leaving it showing wherever they'd browsed to. Also clears the
+  // post-submit grace stamp and seeds the live-URL tracker so a new
+  // session starts clean.
   useEffect(() => {
     if (!active) {
       setUrlInput("");
       setCurrentUrl("");
+      lastSubmitRef.current = { leaving: "", ts: 0 };
+      liveUrlRef.current = "";
       return;
     }
     setUrlInput(active.url);
     setCurrentUrl(active.url);
-  }, [active?.url]); // eslint-disable-line react-hooks/exhaustive-deps
+    lastSubmitRef.current = { leaving: "", ts: 0 };
+    liveUrlRef.current = active.url;
+  }, [active]);
   const placeholderRef = useRef<HTMLDivElement>(null);
+  // The address-bar <input>, so submitUrl can blur it (browser-omnibox
+  // behaviour: focus leaves the bar on navigate, which also lets the poll
+  // resume syncing the bar to the actual landing URL).
+  const inputRef = useRef<HTMLInputElement>(null);
+  // Tracks the most recently OBSERVED webview URL (every poll tick), even
+  // when we suppress repainting the bar. submitUrl reads this as the page
+  // we're "leaving" so the grace window below knows which stale value to
+  // ignore during the navigation lag.
+  const liveUrlRef = useRef("");
+  // Stamp set by submitUrl: the page we navigated away from + when. The
+  // poll ignores a polled URL equal to `leaving` until SUBMIT_GRACE_MS
+  // elapses or `Source` moves elsewhere, whichever comes first.
+  const lastSubmitRef = useRef<{ leaving: string; ts: number }>({ leaving: "", ts: 0 });
   const webviewRef = useRef<Webview | null>(null);
   const activeLabelRef = useRef<string | null>(null);
   // Each spawn gets a unique label so a quick re-open doesn't reuse a
@@ -396,6 +438,66 @@ export default function SourcePopupHost() {
     };
   }, [active, minimized]);
 
+  // Keep the address bar in sync with navigation that happens inside the
+  // webview. The child webview fires no JS-side navigation event, so we
+  // poll its live URL (WebView2 `Source`, surfaced by the Rust command)
+  // while the popup is open and visible. Excluded:
+  //   • OAuth popups — they deliberately expose only the host via the
+  //     navHost chip (the full start URL carries a device-flow / CSRF
+  //     state token we don't want echoed into a UI field), and have no
+  //     address bar to update.
+  //   • Minimized state — the bar isn't visible and the webview is
+  //     parked offscreen; nothing to repaint.
+  // We use a self-rescheduling timeout (not setInterval) so a slow IPC
+  // round-trip can never let ticks pile up on top of each other.
+  useEffect(() => {
+    if (!active || active.oauth || minimized) return;
+    const label = activeLabelRef.current;
+    if (!label) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const tick = async () => {
+      try {
+        const url = await invoke<string>("popup_webview_current_url", { label });
+        if (cancelled) return;
+        // Ignore transient about:blank / non-http states during load so a
+        // half-spawned webview can't blank out the bar.
+        if (url && /^https?:/i.test(url)) {
+          // During the grace window right after a user-typed navigate,
+          // the webview's Source can still report the page we left while
+          // the eval'd location.assign is in flight. Hold the bar on the
+          // user's target until Source actually moves off the old page
+          // (or the window expires) so it doesn't flicker backwards.
+          const g = lastSubmitRef.current;
+          const inGrace = g.ts !== 0 && Date.now() - g.ts < SUBMIT_GRACE_MS;
+          if (inGrace && url === g.leaving) {
+            liveUrlRef.current = url; // keep tracking what's loaded…
+            return;                   // …but don't repaint the bar yet.
+          }
+          // Navigation has moved (or the window expired): end the grace
+          // so subsequent ticks sync normally.
+          if (g.ts !== 0) lastSubmitRef.current = { leaving: "", ts: 0 };
+          liveUrlRef.current = url;
+          setCurrentUrl((prev) => (prev === url ? prev : url));
+          // Don't fight the user while they're editing the bar.
+          if (!editingRef.current) {
+            setUrlInput((prev) => (prev === url ? prev : url));
+          }
+        }
+      } catch {
+        // Popup not attached yet, or torn down mid-poll — retry next tick.
+      } finally {
+        if (!cancelled) timer = setTimeout(tick, URL_POLL_MS);
+      }
+    };
+    // Give the spawn layout-effect a beat to attach the webview first.
+    timer = setTimeout(tick, URL_POLL_MS);
+    return () => {
+      cancelled = true;
+      if (timer != null) clearTimeout(timer);
+    };
+  }, [active, minimized]);
+
   const close = useCallback(() => setActive(null), []);
   /** Minimize: collapse the modal to a floating pill, keep the
    *  webview alive offscreen. The sync useEffect re-runs on the
@@ -443,6 +545,15 @@ export default function SourcePopupHost() {
     const target = parsed.toString();
     setCurrentUrl(target);
     setUrlInput(target);
+    // Stamp the page we're leaving so the poll's grace window can ignore
+    // the stale Source during the navigation lag (see SUBMIT_GRACE_MS).
+    lastSubmitRef.current = { leaving: liveUrlRef.current, ts: Date.now() };
+    // Release the editing lock and drop focus — like a real browser's
+    // omnibox, focus leaves the bar on navigate, which also lets the poll
+    // resync the bar to wherever the page actually lands (redirects, SSO
+    // bounces, post-load SPA routing).
+    editingRef.current = false;
+    inputRef.current?.blur();
     invokePopupCmd("popup_webview_navigate", { url: target });
   }, [urlInput, invokePopupCmd]);
 
@@ -596,12 +707,15 @@ export default function SourcePopupHost() {
               </svg>
             </button>
             <input
+              ref={inputRef}
               type="text"
               value={urlInput}
               onChange={(e) => setUrlInput(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter") { e.preventDefault(); submitUrl(); }
               }}
+              onFocus={() => { editingRef.current = true; }}
+              onBlur={() => { editingRef.current = false; }}
               spellCheck={false}
               autoCorrect="off"
               autoCapitalize="off"

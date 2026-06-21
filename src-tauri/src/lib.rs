@@ -1998,6 +1998,7 @@ pub fn run() {
             popup_nav::popup_webview_forward,
             popup_nav::popup_webview_reload,
             popup_nav::popup_webview_navigate,
+            popup_nav::popup_webview_current_url,
             get_tracks,
             get_property,
             refresh_video,
