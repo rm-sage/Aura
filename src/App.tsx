@@ -2674,12 +2674,16 @@ export default function App() {
     return () => window.removeEventListener("aura:ed-start-time", onEdStart);
   }, []);
 
-  // Reset CTA state whenever the active target changes (new playback).
-  // This is also the canonical "new load" boundary for the EOS
-  // Spotlight: every load_video site (DetailView pick, NextUp/Spotlight
-  // Play-Next, Reload) routes through a setActiveTarget, so clearing
-  // eosActive here covers all of them without touching usePlayback's
-  // notifyNewLoad. handleExitPlayback also clears it explicitly.
+  // Reset CTA state whenever the active EPISODE changes (new playback).
+  // Keyed on `activeTarget?.id`, NOT the whole object: the
+  // absolute_episode_num enrichment below patches activeTarget in place
+  // (same id, new object) AFTER load — for season>=2 anime — and an
+  // in-player stream switch re-uses the same id too. Keying on the object
+  // would re-run this reset on those, wiping the just-dispatched ED-start
+  // (nextUpEdStartRef) and forcing a redundant next-up re-resolve, which
+  // made the Next-Up CTA fall back to the fixed lead-time instead of firing
+  // at the detected ED in anime. It's still the canonical "new load"
+  // boundary for the EOS Spotlight: every genuine new episode changes the id.
   useEffect(() => {
     setNextUpInfo(null);
     setNextUpVisible(false);
@@ -2698,7 +2702,8 @@ export default function App() {
     ) {
       nextUpDismissedFor.current = null;
     }
-  }, [activeTarget]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTarget?.id]);
 
   // PRE-RESOLVE effect — fires at 50 % progress (or sooner if the
   // episode is short / the lead is large). The actual fetch is
