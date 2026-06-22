@@ -1360,7 +1360,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
               return (
                 <p
                   className="text-white/95 text-[18px] leading-[1.55] font-normal tracking-[0.005em]
-                             max-w-prose selectable"
+                             max-w-[65ch] selectable"
                   style={{ textShadow: "0 1px 6px rgba(0,0,0,0.85)" }}
                 >
                   {shown}
@@ -1821,7 +1821,7 @@ function EpisodeSynopsisSection({
           </p>
         )}
       </div>
-      <div className="relative max-w-prose">
+      <div className="relative max-w-[65ch]">
         <p
           className={[
             "text-white/75 text-[15px] leading-relaxed transition-[filter] duration-200",

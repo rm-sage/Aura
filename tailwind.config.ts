@@ -10,11 +10,24 @@ export default {
       screen: "100vw",
     },
     extend: {
-      // Tailwind's default opacity scale jumps in 5-point steps (..85/90/95/100)
-      // — `bg-black/97` produced NO css at all so player overlay submenus
-      // were rendering with a fully transparent background. Add the
-      // intermediate values we actually use so the JIT compiler emits them.
+      // The default opacity scale only has 5-point steps (5/10/15/.../95/100),
+      // so any off-scale modifier like `bg-black/97` or `border-white/8` emits
+      // NO css and silently renders transparent (player-overlay submenus showed
+      // through; subtle glass borders fell back to the preflight gray hairline).
+      // Register every off-scale value the app actually uses so the JIT emits
+      // them. Keep this in sync when introducing a new off-scale opacity.
       opacity: {
+        2: "0.02",
+        3: "0.03",
+        4: "0.04",
+        6: "0.06",
+        8: "0.08",
+        12: "0.12",
+        14: "0.14",
+        16: "0.16",
+        18: "0.18",
+        72: "0.72",
+        82: "0.82",
         92: "0.92",
         93: "0.93",
         96: "0.96",

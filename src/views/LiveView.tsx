@@ -418,7 +418,7 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
                 style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
               >
                 {favorites.length === 0 ? (
-                  <p className="text-white/40 text-sm py-12 text-center max-w-md mx-auto">
+                  <p className="text-white/40 text-sm py-12 text-center max-w-[28rem] mx-auto">
                     {query
                       ? "No favorites match your search."
                       : "No favorites yet. Hover a channel and tap the ★ to add it here — favorites span every playlist."}
@@ -882,7 +882,7 @@ function EmptyState({ loaded, onAdd }: { loaded: boolean; onAdd: () => void }) {
       </div>
       <div>
         <p className="text-white/85 text-lg font-semibold">No playlists yet</p>
-        <p className="text-white/40 text-sm mt-1 max-w-sm">
+        <p className="text-white/40 text-sm mt-1 max-w-[24rem]">
           Add an M3U playlist or Xtream login to browse and watch live channels.
         </p>
       </div>
@@ -903,7 +903,7 @@ function EmptyState({ loaded, onAdd }: { loaded: boolean; onAdd: () => void }) {
 function ErrorState({ message, onRetry }: { message: string; onRetry: () => void }) {
   return (
     <div className="flex flex-col items-center justify-center text-center gap-3 py-16">
-      <p className="text-red-300/90 text-sm max-w-md">{message}</p>
+      <p className="text-red-300/90 text-sm max-w-[28rem]">{message}</p>
       <button
         type="button"
         onClick={onRetry}

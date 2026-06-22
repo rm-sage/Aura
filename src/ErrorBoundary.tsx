@@ -52,7 +52,7 @@ export default class ErrorBoundary extends Component<Props, State> {
     if (this.props.fallback) return this.props.fallback(error, this.reset);
     return (
       <div className="flex-1 flex items-center justify-center p-8">
-        <div className="glass-panel-elevated rounded-2xl px-6 py-5 max-w-md
+        <div className="glass-panel-elevated rounded-2xl px-6 py-5 max-w-[28rem]
                         border border-red-400/30">
           <p className="text-red-300/85 text-xs font-semibold tracking-[0.18em] uppercase mb-1.5">
             {this.props.scope ?? "Render error"}

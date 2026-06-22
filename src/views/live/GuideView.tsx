@@ -129,7 +129,7 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
             <p className="text-white/45 text-sm">Loading the TV guide…</p>
           </>
         ) : (
-          <p className="text-white/40 text-sm max-w-sm">
+          <p className="text-white/40 text-sm max-w-[24rem]">
             No EPG loaded for this playlist. Add an EPG (XMLTV) URL to the playlist,
             or use an Xtream login (its guide is fetched automatically).
           </p>

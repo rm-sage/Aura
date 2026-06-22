@@ -11,6 +11,7 @@ import { useRowWindow } from "../useRowWindow";
 import {
   FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState,
 } from "../FilterBar";
+import { PAGE_CONTENT_MAX_W } from "../pageLayout";
 
 // ---------------------------------------------------------------------------
 // CatalogPageView — the "/catalog/:id" deep view.
@@ -100,7 +101,7 @@ function CatalogPageBody({ target, onBack, onSelectMeta }: Props) {
         className="flex-1 overflow-y-auto"
         style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
       >
-        <div className="max-w-[1800px] mx-auto px-6 py-6 space-y-5">
+        <div className="mx-auto px-6 py-6 space-y-5" style={{ maxWidth: PAGE_CONTENT_MAX_W }}>
           {/* Header */}
           <div className="flex items-end justify-between gap-4 flex-wrap">
             <div className="flex items-center gap-3">

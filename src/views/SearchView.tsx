@@ -8,6 +8,7 @@ import { DiscoveryRow } from "../CinemaRows";
 import { withTypeSuffix } from "../aiometadata";
 import ErrorBoundary from "../ErrorBoundary";
 import NoProvidersWarning from "../NoProvidersWarning";
+import { PAGE_CONTENT_MAX_W } from "../pageLayout";
 
 // Module-level in-flight promise dedupe. React StrictMode (and any
 // other transient remount) was double-invoking the search effect, which
@@ -142,7 +143,7 @@ function SearchViewBody({ addons, query, onSelectMeta }: Props) {
         className="flex-1 overflow-y-auto"
         style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
       >
-        <div className="max-w-[1800px] mx-auto px-2 py-4 space-y-2">
+        <div className="mx-auto px-2 py-4 space-y-2" style={{ maxWidth: PAGE_CONTENT_MAX_W }}>
           {/* Header — query summary */}
           <div className="px-7 pb-2 flex items-baseline gap-3">
             <h1 className="aura-row-title text-2xl font-semibold tracking-tight">

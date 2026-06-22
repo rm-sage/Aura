@@ -21,7 +21,7 @@ export default function NoProvidersWarning({
       onClick={() =>
         window.dispatchEvent(new CustomEvent("aura:open-settings", { detail: { section } }))
       }
-      className="group w-full max-w-xl mx-auto flex items-center gap-3 px-4 py-3 rounded-xl text-left
+      className="group w-full max-w-[36rem] mx-auto flex items-center gap-3 px-4 py-3 rounded-xl text-left
                  border border-amber-400/30 bg-amber-500/[0.08] hover:bg-amber-500/[0.14]
                  transition-colors"
     >

@@ -296,7 +296,7 @@ export default function EosSpotlight({
                 </h2>
 
                 {synopsis && (
-                  <div className="relative mt-3 max-w-prose">
+                  <div className="relative mt-3 max-w-[65ch]">
                     <p
                       className={[
                         "text-white/70 text-[13.5px] leading-relaxed line-clamp-4 transition-[filter] duration-200",
