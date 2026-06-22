@@ -4353,18 +4353,40 @@ export default function SettingsView({ addons, session }: Props) {
   // SyncStatusChip) switched the view but never scrolled.
   useEffect(() => {
     if (!scrollEl) return;
+    let raf = 0;
+    const timers: number[] = [];
+    const clearPending = () => {
+      cancelAnimationFrame(raf);
+      timers.forEach((t) => clearTimeout(t));
+      timers.length = 0;
+    };
     const jump = () => {
       const id = window.location.hash.replace(/^#/, "");
       if (!id) return;
-      // rAF so backend-gated / conditionally-rendered sections have mounted.
-      requestAnimationFrame(() => {
+      // One-shot: drop the anchor from the URL immediately so a later PLAIN
+      // navigation to Settings (NavSidebar) doesn't re-scroll from a stale
+      // hash. replaceState fires no `hashchange` and leaves no bare `#`.
+      history.replaceState(null, "", window.location.pathname + window.location.search);
+      const scrollToTarget = () => {
         const el = scrollEl.querySelector<HTMLElement>(`#${window.CSS.escape(id)}`);
-        el?.scrollIntoView({ behavior: "smooth", block: "start" });
-      });
+        if (el) el.scrollIntoView({ behavior: "auto", block: "start" });
+      };
+      // The target can sit far down a long, partly-async page; sections above
+      // it mount / resize after the first frame and shift its final position.
+      // Re-run across a short settle window so we converge on the requested
+      // section instead of parking on an earlier one.
+      clearPending();
+      raf = requestAnimationFrame(scrollToTarget);
+      timers.push(window.setTimeout(scrollToTarget, 120));
+      timers.push(window.setTimeout(scrollToTarget, 300));
+      timers.push(window.setTimeout(scrollToTarget, 550));
     };
     jump();                                    // already-on-Settings case
     window.addEventListener("hashchange", jump);
-    return () => window.removeEventListener("hashchange", jump);
+    return () => {
+      clearPending();
+      window.removeEventListener("hashchange", jump);
+    };
   }, [scrollEl]);
 
   // ── Settings search ───────────────────────────────────────────────────
