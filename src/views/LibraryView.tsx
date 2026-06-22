@@ -15,6 +15,7 @@ import {
   type FilterState, type SortOption,
 } from "../FilterBar";
 import ListSearchInput, { looseMatch } from "../ListSearchInput";
+import { PAGE_CONTENT_MAX_W } from "../pageLayout";
 
 // ---------------------------------------------------------------------------
 // LibraryView — full grid of saved Stremio library items.
@@ -115,7 +116,7 @@ const LIB_MIN_CARD_W = 200;  // minmax(200px, 1fr) — bigger posters (was 180)
 // ultrawide lag. Capping to ~8 big posters roughly halves both the
 // mounted-card count and the painted poster area. Tunable — raise for
 // more columns.
-const LIB_MAX_GRID_W = 2000; // px — width cap for the centered grid (~8 cols)
+const LIB_MAX_GRID_W = PAGE_CONTENT_MAX_W; // px width cap for the centered grid (~8 cols); shared across pages
 const LIB_BUFFER_ROWS = 2;   // overscan rows above + below (trimmed from 3)
 const LIB_EST_ROW_STRIDE = 380; // pre-measure fallback: ~200px poster + h-14 title + gap
 

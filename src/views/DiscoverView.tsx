@@ -12,6 +12,7 @@ import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "../
 import { useHoverCardActivation } from "../useHoverCardActivation";
 import { closeHoverNow } from "../catalogHoverStore";
 import { useRowWindow } from "../useRowWindow";
+import { PAGE_CONTENT_MAX_W } from "../pageLayout";
 
 // ---------------------------------------------------------------------------
 // DiscoverView — browse any addon's catalogs, including ones the addon has
@@ -277,7 +278,7 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
         className="flex-1 overflow-y-auto"
         style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
       >
-        <div className="max-w-[1800px] mx-auto px-6 py-6 space-y-5">
+        <div className="mx-auto px-6 py-6 space-y-5" style={{ maxWidth: PAGE_CONTENT_MAX_W }}>
           {/* Header */}
           <div className="flex items-end justify-between gap-4 flex-wrap">
             <div>

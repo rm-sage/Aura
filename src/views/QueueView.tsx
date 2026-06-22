@@ -35,6 +35,7 @@ import { showAppToast } from "../AppToast";
 import { typeLabel } from "../aiometadata";
 import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "../FilterBar";
 import ListSearchInput, { looseMatch } from "../ListSearchInput";
+import { PAGE_CONTENT_MAX_W } from "../pageLayout";
 import { closeHoverNow } from "../catalogHoverStore";
 import { useHoverCardActivation } from "../useHoverCardActivation";
 import { loadAuraSettings, saveAuraSettings } from "../auraSettings";
@@ -217,7 +218,7 @@ function QueueViewBody({ library, onSelectMeta }: Props) {
         className="flex-1 overflow-y-auto"
         style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
       >
-        <div className="max-w-6xl mx-auto px-6 py-6 space-y-5">
+        <div className="mx-auto px-6 py-6 space-y-5" style={{ maxWidth: PAGE_CONTENT_MAX_W }}>
           <div className="flex items-end justify-between gap-4 flex-wrap">
             <div>
               <h1 className="aura-row-title text-3xl font-semibold tracking-tight">Queue</h1>
