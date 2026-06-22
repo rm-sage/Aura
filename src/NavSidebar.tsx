@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { StremioAccount } from "./LoginView";
 import AuraLogoA from "./AuraLogoA";
+import { anchorFromRect, type PartyAnchor } from "./partyAnchor";
 
 export type NavView = "home" | "library" | "queue" | "addons" | "discover" | "live" | "calendar" | "history" | "settings";
 
@@ -478,15 +479,25 @@ function NavRow({ label, icon, active, onClick }: RowProps) {
 }
 
 // ---------------------------------------------------------------------------
-// ProfilePopover — anchored to its parent's right edge (absolute
-// positioning, `top-2 left-full ml-3`). Exported so the floating
-// AccountButton (top-left of the app, below the title bar) can reuse
-// the same panel without forking the JSX.
+// ProfilePopover — hangs BELOW its trigger icon. It measures the trigger's
+// box (passed as `triggerRef`) through partyAnchor's `anchorFromRect` — the
+// same helper the Watch-Together panel/toasts use — so it seats itself a hair
+// under the button, flips to the icon's side, and clamps its height to the
+// viewport (overflow-y) rather than clipping off the top edge. Exported so the
+// floating AccountButton (top-left of the app, below the title bar) reuses the
+// same panel without forking the JSX.
 // ---------------------------------------------------------------------------
 
+// Exit-animation duration — the popover stays mounted this long after `open`
+// flips false so it can collapse back into its trigger before unmounting.
+// Keep in step with the transform/opacity transition below.
+const PROFILE_EXIT_MS = 200;
+
 export function ProfilePopover({
-  loggedIn, email, nickname, onClose, onLogin, onLogout,
+  open, triggerRef, loggedIn, email, nickname, onClose, onLogin, onLogout,
 }: {
+  open: boolean;
+  triggerRef: React.RefObject<HTMLButtonElement | null>;
   loggedIn: boolean;
   email?: string | null;
   nickname?: string | null;
@@ -494,19 +505,62 @@ export function ProfilePopover({
   onLogin: () => void;
   onLogout: () => void;
 }) {
-  // Read-only Stremio account snapshot, baked directly into this
-  // popover (the former separate "Account settings" panel was folded
-  // in here). The Rust command is cached 24h, so each popover open is
-  // a cache hit. Best-effort — failure just leaves the prop email.
+  // Mount + spawn/despawn lifecycle, mirrored from WatchTogetherPanel so the
+  // popover grows out of / collapses back into the account button with the
+  // SAME easing (the old CSS keyframe was a springy overshoot that read as
+  // "snappy"). `render` keeps the card alive through the exit animation;
+  // `visible` drives the enter/exit transition; `anchor` pins it under the
+  // trigger (measured via partyAnchor's anchorFromRect — top-LEFT default).
+  const [render, setRender] = useState(open);
+  const [visible, setVisible] = useState(false);
+  const [anchor, setAnchor] = useState<PartyAnchor>({ side: "left", top: 94, left: 12 });
+
+  // On open: snapshot the anchor, mount, then flip `visible` on the next
+  // frame so the transition runs from the collapsed state; re-pin on resize.
+  // On close: flip `visible` off and unmount once the exit finishes.
+  useEffect(() => {
+    if (open) {
+      const measure = () => {
+        const el = triggerRef.current;
+        if (el) setAnchor(anchorFromRect(el.getBoundingClientRect()));
+      };
+      measure();
+      setRender(true);
+      // Capture BOTH rAF handles: a close inside the ~16ms gap must not let
+      // the inner frame fire setVisible(true) after the exit already began.
+      let inner = 0;
+      const outer = requestAnimationFrame(() => {
+        inner = requestAnimationFrame(() => setVisible(true));
+      });
+      window.addEventListener("resize", measure);
+      return () => {
+        cancelAnimationFrame(outer);
+        cancelAnimationFrame(inner);
+        window.removeEventListener("resize", measure);
+      };
+    }
+    setVisible(false);
+    const t = setTimeout(() => setRender(false), PROFILE_EXIT_MS);
+    return () => clearTimeout(t);
+  }, [open, triggerRef]);
+
+  // Read-only Stremio account snapshot, baked directly into this popover (the
+  // former separate "Account settings" panel was folded in here). Fetched on
+  // open; the Rust command is cached 24h so each open is a cache hit.
+  // Best-effort — failure just leaves the prop email.
   const [acct, setAcct] = useState<StremioAccount | null>(null);
   useEffect(() => {
-    if (!loggedIn) { setAcct(null); return; }
+    if (!open || !loggedIn) return;
     let cancelled = false;
     invoke<StremioAccount>("fetch_stremio_account")
       .then((a) => { if (!cancelled) setAcct(a); })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [loggedIn]);
+  }, [open, loggedIn]);
+
+  if (!render) return null;
+
+  const reduced = document.documentElement.getAttribute("data-reduced-motion") === "true";
 
   const monthYear = (iso: string | null | undefined): string | null => {
     if (!iso) return null;
@@ -532,10 +586,24 @@ export function ProfilePopover({
       // popover. Bumped to /95 + an explicit solid backdrop layer so
       // the dialog reads cleanly at any z-stack depth without losing
       // the glass aesthetic.
-      className="absolute top-2 left-full ml-3 w-[300px] z-50
+      className="fixed w-[300px] z-[10045] overflow-y-auto
                  rounded-2xl border border-white/15 shadow-glass-edge
                  bg-[rgba(12,12,16,0.96)] backdrop-blur-2xl"
-      style={{ animation: "profile-pop-in 220ms cubic-bezier(0.34, 1.56, 0.64, 1)" }}
+      style={{
+        top: anchor.top,
+        ...(anchor.side === "left" ? { left: anchor.left } : { right: anchor.right }),
+        maxHeight: `calc(100vh - ${anchor.top + 16}px)`,
+        transformOrigin: anchor.side === "left" ? "top left" : "top right",
+        opacity: visible ? 1 : 0,
+        // Grow out of / collapse back into the account button corner — same
+        // easing as WatchTogetherPanel.
+        transform: visible
+          ? "translateY(0) scale(1)"
+          : reduced ? "none" : "translateY(-8px) scale(0.96)",
+        transition: reduced
+          ? "opacity 160ms ease"
+          : "opacity 200ms ease, transform 240ms cubic-bezier(0.16, 1, 0.3, 1)",
+      }}
     >
       {/* Top — logo + identity */}
       <div className="flex items-center gap-3 px-4 pt-4 pb-3 border-b border-white/8">
@@ -631,13 +699,6 @@ export function ProfilePopover({
       >
         ×
       </button>
-
-      <style>{`
-        @keyframes profile-pop-in {
-          from { opacity: 0; transform: translateX(-6px) scale(0.96); }
-          to   { opacity: 1; transform: translateX(0)     scale(1); }
-        }
-      `}</style>
     </div>
   );
 }

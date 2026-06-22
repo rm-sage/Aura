@@ -23,6 +23,9 @@ import type { ThemeId, AppSettings } from "./types";
 //   • amethyst — violet on indigo-black
 //   • ocean    — teal accent on midnight blue
 //   • solar    — golden sunburst on warm dark
+//   • crimson  — ruby-red accent on dark
+//   • contrast — high-contrast: pure black + vivid yellow accent
+//   • contrast-azure — high-contrast: pure black + vivid cyan accent
 // ---------------------------------------------------------------------------
 
 interface ThemeContext {
@@ -49,6 +52,9 @@ export const THEME_LABELS: Record<ThemeId, string> = {
   amethyst: "Amethyst · Violet Indigo",
   ocean:    "Ocean · Teal Midnight",
   solar:    "Solar · Sunburst Dark",
+  crimson:  "Crimson · Ruby Dark",
+  contrast: "High Contrast · Gold",
+  "contrast-azure": "High Contrast · Azure",
 };
 
 export const THEME_DESCRIPTIONS: Record<ThemeId, string> = {
@@ -61,11 +67,15 @@ export const THEME_DESCRIPTIONS: Record<ThemeId, string> = {
   amethyst: "Violet accent on indigo-black — moody and saturated.",
   ocean:    "Teal accent on midnight blue — cool and crisp.",
   solar:    "Golden sunburst accent on warm dark — bright accent, dim base.",
+  crimson:  "Ruby-red accent on a deep dark base — bold and warm.",
+  contrast: "Maximum legibility — pure black, white text, vivid gold accent.",
+  "contrast-azure": "Maximum legibility — pure black, white text, vivid cyan accent.",
 };
 
 const VALID_THEME_IDS: readonly ThemeId[] = [
   "mica", "glass", "midnight",
   "ember", "forest", "rose", "amethyst", "ocean", "solar",
+  "crimson", "contrast", "contrast-azure",
 ];
 
 function isValidThemeId(value: unknown): value is ThemeId {

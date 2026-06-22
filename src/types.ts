@@ -271,6 +271,17 @@ export interface StreamEntry {
    *  StreamRow surfaces it as a hover tooltip on the headline so users
    *  can verify the exact release without copying the link. */
   filename: string | null;
+  /** AIOStreams `streamData.episodePack` (flattened by the Rust sanitizer).
+   *  `true` → an unreliable multi-episode / season pack whose actually-played
+   *  episode can't be verified for a single-episode request (the file is
+   *  selected upstream, not by AIOStreams — so a request for E15 can silently
+   *  play a different episode in the pack). `false` → a verified single
+   *  episode, or a pack the upstream already resolved to the request. Omitted /
+   *  `null` → unknown (server didn't send `streamData` — it's gated behind
+   *  PROVIDE_STREAM_DATA — or an older build); treat unknown as NOT unreliable.
+   *  StreamRow swaps the star rating for a red "Unreliable" badge only when
+   *  this is exactly `true`. */
+  episode_pack?: boolean | null;
 }
 
 /** AIOStreams emits structured payloads alongside the canonical `streams`
@@ -359,7 +370,10 @@ export type ThemeId =
   | "rose"      // rose / pink accent on plum-grey
   | "amethyst"  // violet accent on indigo-black
   | "ocean"     // teal accent on midnight blue
-  | "solar";    // golden / sunburst on warm dark
+  | "solar"     // golden / sunburst on warm dark
+  | "crimson"   // ruby-red accent on dark
+  | "contrast"  // high-contrast: pure black + vivid yellow accent
+  | "contrast-azure"; // high-contrast: pure black + vivid cyan accent
 
 export interface AppSettings {
   theme: ThemeId;

@@ -3935,6 +3935,11 @@ function StreamRow({
   // Whether this row's badge slot is taken by Best/Alt Best — the stars
   // anchor below the badge in that case, otherwise to the top-right.
   const hasBadge = parsed.seadexBest || parsed.seadexAlt;
+  // AIOStreams flagged this as a multi-episode / season pack whose played
+  // episode can't be verified for a single-episode request. Exactly `true`
+  // only — `false`/undefined render the stars as normal. When set, a red
+  // "Unreliable" badge takes the stars' top-right slot for this row.
+  const unreliable = stream.episode_pack === true;
 
   return (
     <button
@@ -4287,15 +4292,33 @@ function StreamRow({
         </span>
       )}
 
-      {/* Stars — anchored to the top-right of the row. When a Best /
-          Alt Best badge is present in the same corner, the stars sit
-          directly below it (top-10 ≈ 40 px clears the badge's height).
-          When there's no badge, stars take the corner slot (top-2). */}
-      {parsed.stars > 0 && (
+      {/* Top-right rating slot. Normally the 5-star quality bar; for a
+          stream AIOStreams flagged as an unverifiable season pack the stars
+          are replaced by a red "Unreliable" badge occupying the same slot.
+          When a Best / Alt Best badge owns the top-2 corner, this sits
+          directly below it (top-10 ≈ 40 px clears the badge); otherwise it
+          takes the corner slot (top-2). */}
+      {unreliable ? (
+        <div className={`absolute right-2 ${hasBadge ? "top-10" : "top-2"}`}>
+          <Tooltip
+            text="Season pack — the played episode can't be verified and may not be the one you requested."
+            pos="left"
+          >
+            <span
+              className="text-[11px] font-semibold uppercase tracking-wider px-2 py-1 rounded
+                         bg-red-500/90 text-white border border-red-300/50
+                         shadow-[0_0_10px_rgba(239,68,68,0.45)]"
+              aria-label="Unreliable — season pack; the played episode can't be verified"
+            >
+              Unreliable
+            </span>
+          </Tooltip>
+        </div>
+      ) : parsed.stars > 0 ? (
         <div className={`absolute right-2 ${hasBadge ? "top-10" : "top-2"}`}>
           <Stars value={parsed.stars} />
         </div>
-      )}
+      ) : null}
 
       {/* Bottom-right cluster — release-group / indexer / private flag,
           then the seScore chip, then the VPS chip. Order left-to-right is:

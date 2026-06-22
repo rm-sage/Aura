@@ -762,6 +762,17 @@ pub struct StreamEntry {
     /// hover tooltip on the stream row's headline so users can verify
     /// the exact release without copying the link first.
     pub filename: Option<String>,
+    /// `streamData.episodePack` from AIOStreams. `Some(true)` marks an
+    /// unreliable multi-episode / season pack whose actually-played file
+    /// can't be verified for a single-episode request (the file is chosen
+    /// by the upstream addon, not by AIOStreams, so a request for E15 can
+    /// silently play a different episode inside the pack). `Some(false)` =
+    /// a verified single episode, or a pack the upstream already resolved
+    /// to the requested episode. `None` = the server didn't emit
+    /// `streamData` (it's gated behind PROVIDE_STREAM_DATA) or it's an
+    /// older build — treat as unknown and render normally. The UI swaps the
+    /// star rating for a red "Unreliable" badge only when this is `Some(true)`.
+    pub episode_pack: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3848,6 +3859,18 @@ fn sanitize_stream(s: &serde_json::Value, addon_name: &str) -> Option<StreamEntr
         .and_then(|v| v.as_str())
         .map(|s| cap(s.to_string(), 512));
 
+    // streamData.episodePack — AIOStreams (with PROVIDE_STREAM_DATA enabled)
+    // sets this on a multi-episode / season-pack result whose actually-played
+    // file can't be verified for a single-episode request. `None` when
+    // streamData is absent (gated off, non-AIOStreams addon, or older build).
+    // streamData is a sibling of the standard Stremio fields, NOT nested under
+    // behaviorHints. Pseudo-streams (streamData.type "statistic"/"error") never
+    // reach here — they're partitioned out before this sanitize loop runs.
+    let episode_pack = s
+        .get("streamData")
+        .and_then(|v| v.get("episodePack"))
+        .and_then(|v| v.as_bool());
+
     Some(StreamEntry {
         title,
         addon_name: cap(addon_name.to_string(), 64),
@@ -3859,6 +3882,7 @@ fn sanitize_stream(s: &serde_json::Value, addon_name: &str) -> Option<StreamEntr
             .and_then(|v| v.as_str())
             .map(|s| cap(s.to_string(), 1024)),
         filename,
+        episode_pack,
     })
 }
 

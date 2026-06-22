@@ -34,6 +34,7 @@ import WatchedBadge from "../WatchedBadge";
 import { showAppToast } from "../AppToast";
 import { typeLabel } from "../aiometadata";
 import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "../FilterBar";
+import ListSearchInput, { looseMatch } from "../ListSearchInput";
 import { closeHoverNow } from "../catalogHoverStore";
 import { useHoverCardActivation } from "../useHoverCardActivation";
 import { loadAuraSettings, saveAuraSettings } from "../auraSettings";
@@ -78,6 +79,8 @@ function QueueViewBody({ library, onSelectMeta }: Props) {
   // drag-reorder; switching to year/rating/name re-sorts inside the
   // filtered subset, which is fine since the filter is opt-in.
   const [filters, setFilters] = useState<FilterState>(DEFAULT_FILTERS);
+  // Always-visible name filter beside the queue's Filter & Sort controls.
+  const [search, setSearch] = useState("");
   // "Remove series from Queue once started" toggle, mirrored from
   // auraSettings + synced on settings change (the reconciliation effect in
   // App.tsx reads the same setting and prunes accordingly). Movies always
@@ -155,6 +158,13 @@ function QueueViewBody({ library, onSelectMeta }: Props) {
     return orderedIds.filter((id) => visible.has(id));
   }, [orderedIds, filterApplied, filters.sort]);
 
+  // Lenient name filter on top of the filter/sort pass (see looseMatch).
+  const searchedOrderedIds = useMemo(() => {
+    const q = search.trim();
+    if (!q) return filteredOrderedIds;
+    return filteredOrderedIds.filter((id) => looseMatch(q, libIndex.get(id)?.name ?? id));
+  }, [filteredOrderedIds, search, libIndex]);
+
   const sensors = useSensors(
     // 6 px activation distance — clicks under 6 px don't trigger a
     // drag, so tile clicks open the detail page reliably.
@@ -218,6 +228,15 @@ function QueueViewBody({ library, onSelectMeta }: Props) {
               </p>
             </div>
             <div className="flex items-center gap-3">
+              {orderedIds.length > 0 && (
+                <ListSearchInput
+                  value={search}
+                  onChange={setSearch}
+                  placeholder="Filter queue…"
+                  ariaLabel="Filter queue by name"
+                  className="w-48"
+                />
+              )}
               <button
                 type="button"
                 role="switch"
@@ -252,6 +271,14 @@ function QueueViewBody({ library, onSelectMeta }: Props) {
                 them. Drag a tile up or down to change its position.
               </p>
             </div>
+          ) : searchedOrderedIds.length === 0 ? (
+            <div className="glass-panel rounded-2xl px-6 py-10 text-center">
+              <p className="text-white/55 text-sm">
+                {search.trim()
+                  ? `No queued items match “${search.trim()}”.`
+                  : "No queued items match this filter."}
+              </p>
+            </div>
           ) : (
             <DndContext
               sensors={sensors}
@@ -259,12 +286,12 @@ function QueueViewBody({ library, onSelectMeta }: Props) {
               onDragStart={() => closeHoverNow()}
               onDragEnd={handleDragEnd}
             >
-              <SortableContext items={filteredOrderedIds} strategy={rectSortingStrategy}>
+              <SortableContext items={searchedOrderedIds} strategy={rectSortingStrategy}>
                 <div
                   className="grid gap-5 pb-6"
                   style={{ gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))" }}
                 >
-                  {filteredOrderedIds.map((id) => {
+                  {searchedOrderedIds.map((id) => {
                     const lib = libIndex.get(id);
                     return (
                       <QueueCard

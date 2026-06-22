@@ -38,6 +38,61 @@ function catalogKey(c: { media_type: string; id: string }): string {
   return `${c.media_type}:${c.id}`;
 }
 
+// ---------------------------------------------------------------------------
+// Catalog-item cache + last-selection memory (module-level → survives the
+// view unmount/remount you get from navigating away and back, and a refresh
+// that restores the Discover route; cleared on a full app restart). Without
+// it, leaving Discover and returning re-fired fetch_catalog_paginated every
+// time — Home's rows stay warm, so this brings Discover to parity.
+//
+// Bounded + TTL per the project's cache discipline (never an unbounded Map).
+// ---------------------------------------------------------------------------
+interface DiscoverCacheEntry { items: MetaPreview[]; ts: number; }
+const DISCOVER_TTL_MS = 30 * 60 * 1000;  // 30 min — Discover catalogs shift slowly
+const DISCOVER_MAX_ENTRIES = 32;          // ≤32 catalogs × ≤100 metas → a few-MB ceiling
+const discoverItemsCache = new Map<string, DiscoverCacheEntry>();
+
+function discoverCacheKey(addonUrl: string, type: string, id: string): string {
+  return `${addonUrl}::${type}::${id}`;
+}
+function getDiscoverItems(key: string): MetaPreview[] | null {
+  const hit = discoverItemsCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.ts >= DISCOVER_TTL_MS) { discoverItemsCache.delete(key); return null; }
+  return hit.items;
+}
+function putDiscoverItems(key: string, items: MetaPreview[]): void {
+  discoverItemsCache.set(key, { items, ts: Date.now() });
+  if (discoverItemsCache.size > DISCOVER_MAX_ENTRIES) {
+    // Evict oldest-by-ts down to the cap.
+    const ordered = [...discoverItemsCache.entries()].sort((a, b) => a[1].ts - b[1].ts);
+    for (const [k] of ordered.slice(0, discoverItemsCache.size - DISCOVER_MAX_ENTRIES)) {
+      discoverItemsCache.delete(k);
+    }
+  }
+}
+
+// Last (addon, catalog) the user viewed — restored on remount so Discover
+// reopens where they left off. sessionStorage so an in-app navigation OR a
+// route-restoring refresh both round-trip; cleared on app restart (matching
+// the in-memory item cache's lifetime).
+const DISCOVER_SEL_KEY = "aura:discover-selection:v1";
+function loadDiscoverSelection(): { addonUrl: string | null; catalogId: string | null } {
+  try {
+    const raw = sessionStorage.getItem(DISCOVER_SEL_KEY);
+    if (!raw) return { addonUrl: null, catalogId: null };
+    const p = JSON.parse(raw);
+    return {
+      addonUrl:  typeof p?.addonUrl  === "string" ? p.addonUrl  : null,
+      catalogId: typeof p?.catalogId === "string" ? p.catalogId : null,
+    };
+  } catch { return { addonUrl: null, catalogId: null }; }
+}
+function saveDiscoverSelection(addonUrl: string | null, catalogId: string | null): void {
+  try { sessionStorage.setItem(DISCOVER_SEL_KEY, JSON.stringify({ addonUrl, catalogId })); }
+  catch { /* sessionStorage unavailable / quota — selection memory is best-effort */ }
+}
+
 interface Props {
   addons: AddonEntry[];
   onSelectMeta?: (meta: MetaPreview) => void;
@@ -59,9 +114,17 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
     [addons],
   );
 
-  const [selectedAddonUrl, setSelectedAddonUrl] = useState<string | null>(
-    catalogAddons[0]?.url ?? null,
-  );
+  // Restore the last-viewed (addon, catalog). The snapshot is read ONCE via
+  // the lazy state initializer (no per-render sessionStorage cost); the
+  // catalog hint lives in a ref so it can be consumed after the first restore.
+  const [restored] = useState(loadDiscoverSelection);
+  const pendingCatalogId = useRef(restored.catalogId);
+
+  const [selectedAddonUrl, setSelectedAddonUrl] = useState<string | null>(() => {
+    const r = restored.addonUrl;
+    if (r && catalogAddons.some((a) => a.url === r)) return r;
+    return catalogAddons[0]?.url ?? null;
+  });
   const [manifest, setManifest] = useState<AddonManifest | null>(null);
   const [manifestErr, setManifestErr] = useState<string | null>(null);
   const [selectedCatalogId, setSelectedCatalogId] = useState<string | null>(null);
@@ -69,17 +132,14 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
   const [itemsErr, setItemsErr] = useState<string | null>(null);
   const [filters, setFilters] = useState<FilterState>(DEFAULT_FILTERS);
 
-  // Re-pick the first available addon if the previous selection got
-  // uninstalled, or if the user signs out and the catalog list shrinks.
+  // Re-pick when the current selection is empty or stale (uninstalled, signed
+  // out, or addons loaded after mount on a refresh that landed on Discover).
+  // Prefer the restored addon if it's now available, else the first one.
   useEffect(() => {
-    if (!selectedAddonUrl) {
-      setSelectedAddonUrl(catalogAddons[0]?.url ?? null);
-      return;
-    }
-    if (!catalogAddons.some((a) => a.url === selectedAddonUrl)) {
-      setSelectedAddonUrl(catalogAddons[0]?.url ?? null);
-    }
-  }, [catalogAddons, selectedAddonUrl]);
+    if (selectedAddonUrl && catalogAddons.some((a) => a.url === selectedAddonUrl)) return;
+    const restoredOk = restored.addonUrl && catalogAddons.some((a) => a.url === restored.addonUrl);
+    setSelectedAddonUrl(restoredOk ? restored.addonUrl : catalogAddons[0]?.url ?? null);
+  }, [catalogAddons, selectedAddonUrl, restored.addonUrl]);
 
   // Fetch the manifest whenever the addon changes. Cached on the Rust
   // side (5 min TTL via stremio.rs::MANIFEST_CACHE) so flipping back
@@ -97,12 +157,24 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
       .then((m) => {
         if (cancelled) return;
         setManifest(m);
-        // Auto-pick the first browseable catalog (excluding the
-        // is_search_only family — there's no point loading a row that
-        // requires a query). Hidden-from-home catalogs ARE valid here,
-        // which is the whole reason this view exists.
-        const firstCatalog = m.catalogs.find((c) => !c.is_search_only);
-        setSelectedCatalogId(firstCatalog ? catalogKey(firstCatalog) : null);
+        // Browseable = everything except the is_search_only family (no point
+        // loading a row that requires a query). Hidden-from-home catalogs ARE
+        // valid here — that's the whole reason this view exists.
+        const browseable = m.catalogs.filter((c) => !c.is_search_only);
+        // Restore the saved catalog ONLY when this manifest belongs to the
+        // addon it was saved against — a generic id like "movie:top" must not
+        // be applied to a different addon that happens to expose the same id
+        // (e.g. the saved addon was uninstalled and we fell back to another).
+        // Consume the hint after the first resolution either way, so a later
+        // addon switch auto-picks the first catalog.
+        const restoredCatalogId =
+          selectedAddonUrl === restored.addonUrl ? pendingCatalogId.current : null;
+        pendingCatalogId.current = null;
+        const restoredHit = restoredCatalogId
+          ? browseable.find((c) => catalogKey(c) === restoredCatalogId)
+          : undefined;
+        const pick = restoredHit ?? browseable[0] ?? null;
+        setSelectedCatalogId(pick ? catalogKey(pick) : null);
       })
       .catch((e) => {
         if (cancelled) return;
@@ -132,6 +204,19 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
       setItemsErr(null);
       return;
     }
+    const cacheKey = discoverCacheKey(
+      selectedAddon.url, selectedCatalog.media_type, selectedCatalog.id,
+    );
+    // Cache hit → render instantly, no skeleton, no refetch. This is the
+    // parity fix: leaving Discover and returning re-mounts the view, and the
+    // restored (addon, catalog) lands straight on its cached items.
+    const cached = getDiscoverItems(cacheKey);
+    if (cached) {
+      setItems(cached);
+      setItemsErr(null);
+      setFilters(DEFAULT_FILTERS);
+      return;
+    }
     let cancelled = false;
     setItems(null);
     setItemsErr(null);
@@ -147,7 +232,11 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
       catalogId:   selectedCatalog.id,
       target:      100,
     })
-      .then((r) => { if (!cancelled) setItems(r); })
+      .then((r) => {
+        if (cancelled) return;
+        setItems(r);
+        putDiscoverItems(cacheKey, r);
+      })
       .catch((e) => {
         if (cancelled) return;
         setItems([]);
@@ -155,6 +244,12 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
       });
     return () => { cancelled = true; };
   }, [selectedAddon, selectedCatalog]);
+
+  // Persist the selection on every change (including the auto-picked first
+  // catalog) so a later remount reopens exactly where the user left off.
+  useEffect(() => {
+    saveDiscoverSelection(selectedAddonUrl, selectedCatalogId);
+  }, [selectedAddonUrl, selectedCatalogId]);
 
   const filtered = useMemo(() => {
     if (!items) return [];

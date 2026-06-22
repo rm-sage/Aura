@@ -747,11 +747,22 @@ pub async fn get_settings<R: Runtime>(app: AppHandle<R>) -> AppSettings {
     load(&app)
 }
 
+/// Canonical theme ids the CSS can render — keep in sync with the frontend
+/// ThemeEngine `VALID_THEME_IDS`, `ThemeId` in types.ts, and the
+/// `:root[data-theme=...]` blocks in App.css. (Previously this list was just
+/// mica/glass/midnight, so the six tinted themes were silently rejected on
+/// write and never persisted across restarts.)
+const VALID_THEMES: &[&str] = &[
+    "mica", "glass", "midnight",
+    "ember", "forest", "rose", "amethyst", "ocean", "solar",
+    "crimson", "contrast", "contrast-azure",
+];
+
 /// Validates and persists the theme. Unknown themes are rejected so the
 /// frontend can't drift the stored value to something the CSS won't render.
 #[tauri::command]
 pub async fn set_theme<R: Runtime>(app: AppHandle<R>, theme: String) -> Result<(), String> {
-    if !matches!(theme.as_str(), "mica" | "glass" | "midnight") {
+    if !VALID_THEMES.contains(&theme.as_str()) {
         return Err(format!("Unknown theme: {theme}"));
     }
     let mut s = snapshot();
@@ -785,7 +796,7 @@ pub async fn update_settings<R: Runtime>(
     let next: AppSettings =
         serde_json::from_value(current).map_err(|e| format!("Invalid settings patch: {e}"))?;
 
-    if !matches!(next.theme.as_str(), "mica" | "glass" | "midnight") {
+    if !VALID_THEMES.contains(&next.theme.as_str()) {
         return Err(format!("Unknown theme: {}", next.theme));
     }
 

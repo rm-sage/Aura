@@ -14,6 +14,7 @@ import {
   FilterMenu, applyFilters, DEFAULT_FILTERS,
   type FilterState, type SortOption,
 } from "../FilterBar";
+import ListSearchInput, { looseMatch } from "../ListSearchInput";
 
 // ---------------------------------------------------------------------------
 // LibraryView — full grid of saved Stremio library items.
@@ -224,6 +225,10 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
   // every other browseable surface uses. `sort` drives the ordering;
   // this FilterState only carries the year / genre filter.
   const [extraFilters, setExtraFilters] = useState<FilterState>(DEFAULT_FILTERS);
+  // Always-visible name filter sitting next to the All/Movies/Series/Anime
+  // pills. Lenient match (see looseMatch) applied AFTER the pill + Filter &
+  // Sort pass, so it narrows whatever is currently displayed.
+  const [search, setSearch] = useState("");
 
   // Scroll-burst class toggle. While scroll events fire (and for 150 ms
   // after the last one) the grid carries `aura-scrolling`, which CSS uses
@@ -371,17 +376,24 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
     return arr;
   }, [filtered, sort, filteredMetaIds]);
 
+  // Final name-filter pass over the already sorted/filtered list.
+  const searched = useMemo(() => {
+    const q = search.trim();
+    if (!q) return sorted;
+    return sorted.filter((it) => looseMatch(q, it.name ?? ""));
+  }, [sorted, search]);
+
   // Windowing — only the cards in/near the viewport are mounted.
-  const win = useLibraryRowWindow(scrollContainerRef, gridWrapperRef, gridRef, sorted.length);
-  const visible = sorted.slice(win.start, win.end);
+  const win = useLibraryRowWindow(scrollContainerRef, gridWrapperRef, gridRef, searched.length);
+  const visible = searched.slice(win.start, win.end);
 
   // Reset scroll to the top when the visible set changes wholesale (filter
-  // pill / sort / year-genre filter). Without this a deep scroll position
-  // would survive into a now-shorter list and the window would compute an
-  // out-of-range slice (blank grid until the user scrolls back up).
+  // pill / sort / year-genre filter / search). Without this a deep scroll
+  // position would survive into a now-shorter list and the window would
+  // compute an out-of-range slice (blank grid until the user scrolls back up).
   useEffect(() => {
     scrollContainerRef.current?.scrollTo({ top: 0 });
-  }, [filter, sort, extraFilters]);
+  }, [filter, sort, extraFilters, search]);
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
@@ -448,6 +460,15 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
                 </button>
               );
             })}
+            {counts.all > 0 && (
+              <ListSearchInput
+                value={search}
+                onChange={setSearch}
+                placeholder="Filter library…"
+                ariaLabel="Filter library by name"
+                className="ml-auto w-56"
+              />
+            )}
           </div>
 
           {/* ── Data region ── */}
@@ -457,8 +478,12 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
             <EmptyCard message="Sign in to your Stremio account in the Addons tab to load your library." />
           ) : counts.all === 0 ? (
             <EmptyCard message='Your library is empty. Right-click any catalog poster and choose "Add to Library" to start curating.' />
-          ) : sorted.length === 0 ? (
-            <EmptyCard message="No items match this filter." />
+          ) : searched.length === 0 ? (
+            <EmptyCard
+              message={search.trim()
+                ? `No items match “${search.trim()}”.`
+                : "No items match this filter."}
+            />
           ) : (
             <div ref={gridWrapperRef} style={{ position: "relative", height: win.totalHeight }}>
               <div

@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ProfilePopover } from "./NavSidebar";
 import AuraLogoA from "./AuraLogoA";
 
@@ -13,9 +13,10 @@ import AuraLogoA from "./AuraLogoA";
 // stacked above the navigation rows.
 //
 // The popover JSX is shared with the sidebar variant (see
-// NavSidebar.ProfilePopover). Its built-in positioning (`absolute top-2
-// left-full ml-3`) means it slides out to the RIGHT of the trigger
-// button — consistent with the previous sidebar-anchored behavior.
+// NavSidebar.ProfilePopover). It hangs BELOW this trigger — anchored off
+// the button's measured box via partyAnchor's `anchorFromRect`, the same
+// helper the Watch-Together surfaces use — so it grows out of the icon and
+// stays viewport-clamped instead of clipping off the top edge.
 //
 // Outside-click + Escape close: mirrored from the sidebar's previous
 // effect so behavior is identical.
@@ -39,6 +40,8 @@ export default function AccountButton({
   loggedIn, email, nickname, onLoginRequest, onLogout,
 }: Props) {
   const [open, setOpen] = useState(false);
+  // Measured by ProfilePopover to seat itself just below this button.
+  const triggerRef = useRef<HTMLButtonElement>(null);
 
   // Outside-click + Esc to close — match the sidebar variant's behavior
   // exactly, including the same data-attribute guards so nested clicks
@@ -64,12 +67,27 @@ export default function AccountButton({
     ? `Signed in as ${nickname ?? email ?? "Stremio account"}`
     : "Guest. Click to sign in.";
 
+  // Two-letter monogram from the signed-in email (first upper, second lower
+  // — "rmsage95@gmail.com" → "Rm"). Derived from the local part so the "@"
+  // never leaks in. Falls back to the Aura "A" mark for guests or pre-sync
+  // sessions that have no email yet.
+  const local = (email ?? "").trim().split("@")[0] ?? "";
+  const initials =
+    loggedIn && local.length > 0
+      ? local
+          .slice(0, 2)
+          .split("")
+          .map((c, i) => (i === 0 ? c.toUpperCase() : c.toLowerCase()))
+          .join("")
+      : null;
+
   // Anchored just below the 36px title bar with an 8px gap. Same glass
   // recipe + ring-on-open accent the bell / refresh buttons use, so the
   // three floating affordances feel like a set.
   return (
     <div className="fixed top-[44px] left-3 z-30" style={{ pointerEvents: "auto" }}>
       <button
+        ref={triggerRef}
         data-profile-trigger
         type="button"
         onClick={() => setOpen((o) => !o)}
@@ -87,7 +105,13 @@ export default function AccountButton({
           open ? "ring-1 ring-ln-accent/50" : "",
         ].filter(Boolean).join(" ")}
       >
-        <AuraLogoA size={24} />
+        {initials ? (
+          <span className="text-[15px] font-semibold leading-none tracking-tight text-white/90 select-none">
+            {initials}
+          </span>
+        ) : (
+          <AuraLogoA size={24} />
+        )}
         {/* Tiny status dot — green when signed in, neutral when guest.
             Matches the marker pattern on the bell + popover for visual
             consistency. */}
@@ -100,16 +124,16 @@ export default function AccountButton({
           style={{ boxShadow: loggedIn ? "0 0 6px rgba(110,231,183,0.65)" : undefined }}
         />
       </button>
-      {open && (
-        <ProfilePopover
-          loggedIn={loggedIn}
-          email={email}
-          nickname={nickname}
-          onClose={() => setOpen(false)}
-          onLogin={() => { setOpen(false); onLoginRequest?.(); }}
-          onLogout={() => { setOpen(false); onLogout?.(); }}
-        />
-      )}
+      <ProfilePopover
+        open={open}
+        triggerRef={triggerRef}
+        loggedIn={loggedIn}
+        email={email}
+        nickname={nickname}
+        onClose={() => setOpen(false)}
+        onLogin={() => { setOpen(false); onLoginRequest?.(); }}
+        onLogout={() => { setOpen(false); onLogout?.(); }}
+      />
     </div>
   );
 }

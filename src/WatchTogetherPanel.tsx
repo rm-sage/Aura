@@ -11,6 +11,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useWatchTogether } from "./watchTogether/useWatchTogether";
+import { readPartyAnchor, type PartyAnchor } from "./partyAnchor";
 import {
   createRoom, createRoomWithCode, joinRoom, leaveRoom, transferLeader, setWatchConfig,
   openRoomVideo, clearPartyStream, getRelayUrl, getDisplayName, getAppToken,
@@ -25,6 +26,11 @@ interface Props {
   onClose: () => void;
 }
 
+// Exit-animation duration — the card stays mounted this long after `open`
+// flips false so it can fly back into its button before unmounting. Keep in
+// step with the `transform`/`opacity` transition below.
+const EXIT_MS = 200;
+
 export default function WatchTogetherPanel({ open, onClose }: Props) {
   const w = useWatchTogether();
   const [relayUrl, setRelayUrl] = useState(getRelayUrl());
@@ -33,6 +39,47 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
   const [joinCode, setJoinCode] = useState("");
   const [copied, setCopied] = useState(false);
   const [editingConfig, setEditingConfig] = useState(false);
+  // Mount + animation lifecycle. `render` keeps the card alive through the exit
+  // animation; `visible` drives the enter/exit transition; `anchor` pins the
+  // card next to whichever party button opened it (top-left PartyButton while
+  // browsing, top-right presence cluster during playback) so it grows out of
+  // that icon — same anchor the PartyToast stack spawns from.
+  const [render, setRender] = useState(open);
+  const [visible, setVisible] = useState(false);
+  const [anchor, setAnchor] = useState<PartyAnchor>({ side: "right", top: 70, right: 16 });
+
+  // Drive the spawn / despawn. On open: snapshot the anchor, mount, then flip
+  // `visible` on the next frame so the transition runs from the collapsed
+  // state. On close: flip `visible` off and unmount once the exit finishes.
+  useEffect(() => {
+    if (open) {
+      setAnchor(readPartyAnchor());
+      setRender(true);
+      // Capture BOTH rAF handles: if the panel is closed inside the ~16ms
+      // between the two frames, cancelling only the outer would leave the
+      // inner to fire setVisible(true) after the close already set it false
+      // — popping the card away with no exit animation.
+      let inner = 0;
+      const outer = requestAnimationFrame(() => {
+        inner = requestAnimationFrame(() => setVisible(true));
+      });
+      return () => {
+        cancelAnimationFrame(outer);
+        cancelAnimationFrame(inner);
+      };
+    }
+    setVisible(false);
+    const t = setTimeout(() => setRender(false), EXIT_MS);
+    return () => clearTimeout(t);
+  }, [open]);
+
+  // Re-pin to the button if the window resizes while the panel is open.
+  useEffect(() => {
+    if (!open) return;
+    const onResize = () => setAnchor(readPartyAnchor());
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [open]);
 
   // Keep the local fields in step if the panel re-opens.
   useEffect(() => {
@@ -48,7 +95,11 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
     }
   }, [open]);
 
-  if (!open) return null;
+  if (!render) return null;
+
+  const reduced = document.documentElement.getAttribute("data-reduced-motion") === "true";
+  const horizontal = anchor.side === "left" ? { left: anchor.left } : { right: anchor.right };
+  const transformOrigin = anchor.side === "left" ? "top left" : "top right";
 
   const configured = relayUrl.trim().length > 0;
   const inRoom = w.status === "connected" || w.status === "connecting";
@@ -66,11 +117,38 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
 
   return (
     <>
-      <div className="fixed inset-0 z-[9998]" onClick={onClose} />
+      {/* Click-catcher. Sits above the player chrome (z below) so an outside
+          click during playback closes the panel instead of pausing the video. */}
       <div
-        className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-[9999]
-                   w-[360px] max-w-[92vw] rounded-2xl border border-white/12
-                   bg-[rgba(16,16,20,0.98)] backdrop-blur-2xl shadow-glass-edge p-5"
+        className="fixed inset-0 z-[10040]"
+        onClick={onClose}
+        style={{
+          opacity: visible ? 1 : 0,
+          // opacity:0 still hit-tests — without this the catcher stays a
+          // full-screen click-trap through the 200ms exit, swallowing the
+          // next click (e.g. a play/pause toggle during playback). Only the
+          // active (visible) modal layer should capture.
+          pointerEvents: visible ? "auto" : "none",
+          transition: "opacity 180ms ease",
+        }}
+      />
+      <div
+        className="fixed z-[10041] w-[360px] max-w-[92vw] rounded-2xl border border-white/12
+                   bg-[rgba(16,16,20,0.98)] backdrop-blur-2xl shadow-glass-edge p-5 overflow-y-auto"
+        style={{
+          top: anchor.top,
+          ...horizontal,
+          maxHeight: `calc(100vh - ${anchor.top + 16}px)`,
+          transformOrigin,
+          opacity: visible ? 1 : 0,
+          // Grow out of / collapse back into the party button corner.
+          transform: visible
+            ? "translateY(0) scale(1)"
+            : reduced ? "none" : "translateY(-8px) scale(0.96)",
+          transition: reduced
+            ? "opacity 160ms ease"
+            : "opacity 200ms ease, transform 240ms cubic-bezier(0.16, 1, 0.3, 1)",
+        }}
         role="dialog"
         aria-label="Watch Together"
       >

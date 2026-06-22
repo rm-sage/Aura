@@ -30,7 +30,11 @@ export default {
           raised: "#0f0f0f",
           // CSS-var-backed glass tokens (see App.css) — referenced via arbitrary values.
           // e.g. bg-[var(--ln-glass-1)]
-          accent: "#5BA4FF",
+          // Accent is backed by the per-theme `--ln-accent-rgb` triplet so EVERY
+          // `ln-accent` utility (text/bg/border/ring/…/opacity) recolours with the
+          // active theme. The `<alpha-value>` placeholder lets `/opacity` suffixes
+          // (e.g. `bg-ln-accent/15`) keep working. See App.css `:root[data-theme]`.
+          accent: "rgb(var(--ln-accent-rgb) / <alpha-value>)",
           "accent-dim": "#3D7FCC",
           text: "#EAEAEA",
           "text-dim": "#8E8E8E",
@@ -50,7 +54,7 @@ export default {
         "glass-edge":
           "0 0 0 1px var(--ln-rim-luminous), 0 16px 48px rgba(0,0,0,0.8)",
         "accent-glow":
-          "0 0 24px rgba(91, 164, 255, 0.35), 0 0 8px rgba(91, 164, 255, 0.2)",
+          "0 0 24px rgb(var(--ln-accent-rgb) / 0.35), 0 0 8px rgb(var(--ln-accent-rgb) / 0.2)",
       },
       fontFamily: {
         sans: [

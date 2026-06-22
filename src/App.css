@@ -18,12 +18,15 @@
   --ln-rim-default:  rgba(255, 255, 255, 0.12);
   --ln-rim-luminous: rgba(255, 255, 255, 0.22);
 
-  /* Accent — invariant across themes (mirrors the Tailwind ln.accent token);
-     exposed as a CSS var so accent-driven effects (e.g. the vote burst) can
-     reference it. */
+  /* Accent — now PER-THEME. `--ln-accent` (hex) is for `var()` consumers
+     (e.g. the vote burst); `--ln-accent-rgb` (space-separated R G B triplet)
+     backs the Tailwind `ln-accent` token AND every accent-tinted rgba() in
+     this file via `rgb(var(--ln-accent-rgb) / <alpha>)`, so overriding the
+     triplet in a theme block recolours the whole accent system at once. */
   --ln-accent: #5ba4ff;
-  /* Accent glow */
-  --ln-accent-glow: rgba(91, 164, 255, 0.32);
+  --ln-accent-rgb: 91 164 255;
+  /* Accent glow — derived from the triplet so it always follows the theme. */
+  --ln-accent-glow: rgb(var(--ln-accent-rgb) / 0.4);
 
   --ln-bg:           transparent;       /* lets Mica show through */
   /* Boot-splash backdrop. Always opaque (alpha=1 — even 3 % bleed-
@@ -57,7 +60,8 @@
   --ln-rim-default:  rgba(255, 255, 255, 0.18);
   --ln-rim-luminous: rgba(255, 255, 255, 0.30);
 
-  --ln-accent-glow: rgba(91, 164, 255, 0.40);
+  --ln-accent: #4fc3f7;
+  --ln-accent-rgb: 79 195 247;
 
   --ln-bg:        rgba(10, 12, 18, 0.45);
   --aura-splash-bg: #0a0c12;
@@ -85,7 +89,8 @@
   --ln-rim-default:  rgba(255, 255, 255, 0.09);
   --ln-rim-luminous: rgba(255, 255, 255, 0.16);
 
-  --ln-accent-glow: rgba(91, 164, 255, 0.45);
+  --ln-accent: #3b9eff;
+  --ln-accent-rgb: 59 158 255;
 
   --ln-bg:        #000000;     /* pure black for OLED */
   --aura-splash-bg: #000000;
@@ -106,13 +111,11 @@
 }
 
 /* ----------------------------------------------------------------------
- * Tinted-dark themes. Each preserves the blue accent (the brand colour
- * stays the same across all themes) but tints the surface palette so
- * the app reads as a different overall mood. The Tailwind `ln-accent`
- * color stays hard-coded — themes ONLY override surface tokens. This
- * keeps every component that hard-codes the accent (progress bars,
- * focus rings, primary CTAs) consistent, while users still get a
- * meaningfully different look.
+ * Tinted-dark themes. Each tints the surface palette AND sets its own
+ * `--ln-accent` / `--ln-accent-rgb` (matching the theme's name) so the
+ * accent — and everything keyed to it (Tailwind `ln-accent` utilities,
+ * the sidebar pill, progress/scrubber fills, focus rings, hover halos,
+ * primary CTAs) — recolours with the theme.
  * ---------------------------------------------------------------------- */
 
 :root[data-theme="ember"] {
@@ -122,7 +125,8 @@
   --ln-rim-subtle:   rgba(255, 200, 140, 0.07);
   --ln-rim-default:  rgba(255, 200, 140, 0.13);
   --ln-rim-luminous: rgba(255, 200, 140, 0.22);
-  --ln-accent-glow: rgba(91, 164, 255, 0.40);
+  --ln-accent: #ff9f45;
+  --ln-accent-rgb: 255 159 69;
   --ln-bg:        #100c08;
   --aura-splash-bg: #100c08;
   --ln-blur:      32px;
@@ -143,7 +147,8 @@
   --ln-rim-subtle:   rgba(140, 220, 180, 0.07);
   --ln-rim-default:  rgba(140, 220, 180, 0.13);
   --ln-rim-luminous: rgba(140, 220, 180, 0.22);
-  --ln-accent-glow: rgba(91, 164, 255, 0.38);
+  --ln-accent: #34d399;
+  --ln-accent-rgb: 52 211 153;
   --ln-bg:        #0a1310;
   --aura-splash-bg: #0a1310;
   --ln-blur:      32px;
@@ -164,7 +169,8 @@
   --ln-rim-subtle:   rgba(230, 170, 200, 0.07);
   --ln-rim-default:  rgba(230, 170, 200, 0.13);
   --ln-rim-luminous: rgba(230, 170, 200, 0.22);
-  --ln-accent-glow: rgba(91, 164, 255, 0.40);
+  --ln-accent: #f472b6;
+  --ln-accent-rgb: 244 114 182;
   --ln-bg:        #110a0e;
   --aura-splash-bg: #110a0e;
   --ln-blur:      32px;
@@ -185,7 +191,8 @@
   --ln-rim-subtle:   rgba(190, 160, 240, 0.07);
   --ln-rim-default:  rgba(190, 160, 240, 0.13);
   --ln-rim-luminous: rgba(190, 160, 240, 0.22);
-  --ln-accent-glow: rgba(91, 164, 255, 0.42);
+  --ln-accent: #a78bfa;
+  --ln-accent-rgb: 167 139 250;
   --ln-bg:        #0c0a14;
   --aura-splash-bg: #0c0a14;
   --ln-blur:      32px;
@@ -206,7 +213,8 @@
   --ln-rim-subtle:   rgba(130, 220, 240, 0.07);
   --ln-rim-default:  rgba(130, 220, 240, 0.13);
   --ln-rim-luminous: rgba(130, 220, 240, 0.22);
-  --ln-accent-glow: rgba(91, 164, 255, 0.42);
+  --ln-accent: #22d3ee;
+  --ln-accent-rgb: 34 211 238;
   --ln-bg:        #08101a;
   --aura-splash-bg: #08101a;
   --ln-blur:      32px;
@@ -227,7 +235,8 @@
   --ln-rim-subtle:   rgba(255, 220, 140, 0.07);
   --ln-rim-default:  rgba(255, 220, 140, 0.13);
   --ln-rim-luminous: rgba(255, 220, 140, 0.22);
-  --ln-accent-glow: rgba(91, 164, 255, 0.42);
+  --ln-accent: #ffb020;
+  --ln-accent-rgb: 255 176 32;
   --ln-bg:        #120e08;
   --aura-splash-bg: #120e08;
   --ln-blur:      32px;
@@ -239,6 +248,85 @@
   --text-muted:    rgba(252, 244, 226, 0.58);
   --ln-skeleton-base:      rgba(255, 220, 140, 0.08);
   --ln-skeleton-highlight: rgba(255, 240, 175, 0.22);
+}
+
+:root[data-theme="crimson"] {
+  --ln-glass-1: rgba(255, 120, 130, 0.05);
+  --ln-glass-2: rgba(255, 120, 130, 0.09);
+  --ln-glass-3: rgba(255, 120, 130, 0.14);
+  --ln-rim-subtle:   rgba(255, 150, 160, 0.07);
+  --ln-rim-default:  rgba(255, 150, 160, 0.13);
+  --ln-rim-luminous: rgba(255, 150, 160, 0.22);
+  --ln-accent: #ff4d5e;
+  --ln-accent-rgb: 255 77 94;
+  --ln-bg:        #140809;
+  --aura-splash-bg: #140809;
+  --ln-blur:      32px;
+  --ln-blur-elev: 64px;
+  --ln-saturate:  1.7;
+  --glass-bg:      rgba(36, 20, 22, 0.94);
+  --glass-bg-soft: rgba(54, 32, 34, 0.94);
+  --text-primary:  rgba(252, 236, 238, 0.94);
+  --text-muted:    rgba(252, 236, 238, 0.58);
+  --ln-skeleton-base:      rgba(255, 150, 160, 0.08);
+  --ln-skeleton-highlight: rgba(255, 180, 188, 0.22);
+}
+
+/* ----------------------------------------------------------------------
+ * High-contrast themes. Pure-black base, near-white text, NO blur, and
+ * strong near-white rims so every surface edge is clearly delineated; a
+ * single vivid accent carries all interactive state. Built for legibility
+ * / accessibility, not vibrancy.
+ * ---------------------------------------------------------------------- */
+:root[data-theme="contrast"] {
+  --ln-glass-1: rgba(255, 255, 255, 0.06);
+  --ln-glass-2: rgba(255, 255, 255, 0.12);
+  --ln-glass-3: rgba(255, 255, 255, 0.20);
+  --ln-rim-subtle:   rgba(255, 255, 255, 0.35);
+  --ln-rim-default:  rgba(255, 255, 255, 0.55);
+  --ln-rim-luminous: rgba(255, 255, 255, 0.90);
+  --ln-accent: #ffe000;
+  --ln-accent-rgb: 255 224 0;
+  --ln-bg:        #000000;
+  --aura-splash-bg: #000000;
+  --ln-blur:      0px;
+  --ln-blur-elev: 0px;
+  --ln-saturate:  1;
+  --glass-bg:      #000000;
+  --glass-bg-soft: #0a0a0a;
+  --text-primary:  #ffffff;
+  --text-muted:    rgba(255, 255, 255, 0.80);
+  --ln-skeleton-base:      rgba(255, 255, 255, 0.12);
+  --ln-skeleton-highlight: rgba(255, 255, 255, 0.40);
+}
+
+:root[data-theme="contrast-azure"] {
+  --ln-glass-1: rgba(255, 255, 255, 0.06);
+  --ln-glass-2: rgba(255, 255, 255, 0.12);
+  --ln-glass-3: rgba(255, 255, 255, 0.20);
+  --ln-rim-subtle:   rgba(255, 255, 255, 0.35);
+  --ln-rim-default:  rgba(255, 255, 255, 0.55);
+  --ln-rim-luminous: rgba(255, 255, 255, 0.90);
+  --ln-accent: #22e0ff;
+  --ln-accent-rgb: 34 224 255;
+  --ln-bg:        #000000;
+  --aura-splash-bg: #000000;
+  --ln-blur:      0px;
+  --ln-blur-elev: 0px;
+  --ln-saturate:  1;
+  --glass-bg:      #000000;
+  --glass-bg-soft: #0a0a0a;
+  --text-primary:  #ffffff;
+  --text-muted:    rgba(255, 255, 255, 0.80);
+  --ln-skeleton-base:      rgba(255, 255, 255, 0.12);
+  --ln-skeleton-highlight: rgba(255, 255, 255, 0.40);
+}
+
+/* High-contrast themes drop the decorative animated backdrop entirely —
+   pure black with no spectral sweep is the whole point. */
+html[data-theme="contrast"] .aura-ambient,
+html[data-theme="contrast-azure"] .aura-ambient {
+  display: none;
 }
 
 /* Base reset — cinematic true-black, no background flicker on transparent window */
@@ -439,10 +527,10 @@ select,
   .aura-menu-row:hover {
     background-color: rgba(255, 255, 255, 0.16);
     color: #ffffff;
-    box-shadow: inset 0 0 0 1px rgba(91, 164, 255, 0.22);
+    box-shadow: inset 0 0 0 1px rgb(var(--ln-accent-rgb) /0.22);
   }
   .aura-menu-row.is-active {
-    background-color: rgba(91, 164, 255, 0.16);
+    background-color: rgb(var(--ln-accent-rgb) /0.16);
     color: var(--ln-accent, #5BA4FF);
   }
   .aura-menu-row.is-active::before {
@@ -454,7 +542,7 @@ select,
     width: 3px;
     border-radius: 2px;
     background: var(--ln-accent, #5BA4FF);
-    box-shadow: 0 0 8px rgba(91, 164, 255, 0.65);
+    box-shadow: 0 0 8px rgb(var(--ln-accent-rgb) /0.65);
   }
 
   /* ----------------------------------------------------------------
@@ -483,43 +571,43 @@ select,
   @keyframes hover-glow-rotate {
     0% {
       box-shadow:
-        0 0 0 1px rgba(91, 164, 255, 0.45),
-        0 -6px 14px 0 rgba(91, 164, 255, 0.55),
-         6px 0   14px 0 rgba(91, 164, 255, 0.18),
-         0 6px  14px 0 rgba(91, 164, 255, 0.10),
-        -6px 0   14px 0 rgba(91, 164, 255, 0.18);
+        0 0 0 1px rgb(var(--ln-accent-rgb) /0.45),
+        0 -6px 14px 0 rgb(var(--ln-accent-rgb) /0.55),
+         6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.18),
+         0 6px  14px 0 rgb(var(--ln-accent-rgb) /0.10),
+        -6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.18);
     }
     25% {
       box-shadow:
-        0 0 0 1px rgba(91, 164, 255, 0.45),
-         0 -6px 14px 0 rgba(91, 164, 255, 0.18),
-         6px 0   14px 0 rgba(91, 164, 255, 0.55),
-         0  6px 14px 0 rgba(91, 164, 255, 0.18),
-        -6px 0   14px 0 rgba(91, 164, 255, 0.10);
+        0 0 0 1px rgb(var(--ln-accent-rgb) /0.45),
+         0 -6px 14px 0 rgb(var(--ln-accent-rgb) /0.18),
+         6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.55),
+         0  6px 14px 0 rgb(var(--ln-accent-rgb) /0.18),
+        -6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.10);
     }
     50% {
       box-shadow:
-        0 0 0 1px rgba(91, 164, 255, 0.45),
-         0 -6px 14px 0 rgba(91, 164, 255, 0.10),
-         6px 0   14px 0 rgba(91, 164, 255, 0.18),
-         0  6px 14px 0 rgba(91, 164, 255, 0.55),
-        -6px 0   14px 0 rgba(91, 164, 255, 0.18);
+        0 0 0 1px rgb(var(--ln-accent-rgb) /0.45),
+         0 -6px 14px 0 rgb(var(--ln-accent-rgb) /0.10),
+         6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.18),
+         0  6px 14px 0 rgb(var(--ln-accent-rgb) /0.55),
+        -6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.18);
     }
     75% {
       box-shadow:
-        0 0 0 1px rgba(91, 164, 255, 0.45),
-         0 -6px 14px 0 rgba(91, 164, 255, 0.18),
-         6px 0   14px 0 rgba(91, 164, 255, 0.10),
-         0  6px 14px 0 rgba(91, 164, 255, 0.18),
-        -6px 0   14px 0 rgba(91, 164, 255, 0.55);
+        0 0 0 1px rgb(var(--ln-accent-rgb) /0.45),
+         0 -6px 14px 0 rgb(var(--ln-accent-rgb) /0.18),
+         6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.10),
+         0  6px 14px 0 rgb(var(--ln-accent-rgb) /0.18),
+        -6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.55);
     }
     100% {
       box-shadow:
-        0 0 0 1px rgba(91, 164, 255, 0.45),
-         0 -6px 14px 0 rgba(91, 164, 255, 0.55),
-         6px 0   14px 0 rgba(91, 164, 255, 0.18),
-         0  6px 14px 0 rgba(91, 164, 255, 0.10),
-        -6px 0   14px 0 rgba(91, 164, 255, 0.18);
+        0 0 0 1px rgb(var(--ln-accent-rgb) /0.45),
+         0 -6px 14px 0 rgb(var(--ln-accent-rgb) /0.55),
+         6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.18),
+         0  6px 14px 0 rgb(var(--ln-accent-rgb) /0.10),
+        -6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.18);
     }
   }
 
@@ -605,8 +693,27 @@ select,
     background-size: 200% 100%;
     background-repeat: repeat-x;
     animation: aura-sweep-anim 20s linear infinite;
-    mix-blend-mode: screen;
-    will-change: background-position;
+    mix-blend-mode: screen;  }
+
+  /* ---------------------------------------------------------------- */
+  /* Whole-app animated backdrop (the only painted full-window layer; */
+  /* the shell itself is transparent so MPV shows through).            */
+  /*                                                                   */
+  /* The sweep is animated with `transform: translateX` on an over-   */
+  /* wide ::before, NOT `background-position` on the element. Reason:  */
+  /* background-position is a PAINT property — it re-rasterises the    */
+  /* whole viewport every frame on the raster thread (the dominant    */
+  /* idle-GPU cost). A transform runs entirely on the compositor       */
+  /* thread (GPU), near-zero CPU. The layer is 3× viewport wide, tiled */
+  /* at one viewport per repeat; translating exactly one tile (-100vw) */
+  /* loops seamlessly because the mirrored 0%/100% stops make adjacent */
+  /* tiles identical. Gradient interpolated `in oklab` so the          */
+  /* perceptual colour change is spread evenly — shallower per-pixel   */
+  /* slope, so there is less banding for the dither to mask.           */
+  /* ---------------------------------------------------------------- */
+  @keyframes aura-sweep-x {
+    from { transform: translate3d(0, 0, 0); }
+    to   { transform: translate3d(-100vw, 0, 0); }
   }
 
   .aura-ambient {
@@ -614,18 +721,30 @@ select,
     inset: 0;
     pointer-events: none;
     z-index: -50;
+    overflow: hidden;  /* clip the over-wide ::before sweep */
+  }
+
+  .aura-ambient::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 300vw;
     background: linear-gradient(
-      90deg,
+      90deg in oklab,
       rgba(91,  164, 255, 0.06)  0%,
       rgba(180, 130, 255, 0.10) 25%,
       rgba(120, 220, 200, 0.08) 50%,
       rgba(180, 130, 255, 0.10) 75%,
       rgba(91,  164, 255, 0.06) 100%
     );
-    background-size: 200% 100%;
+    background-size: 100vw 100%;
     background-repeat: repeat-x;
-    animation: aura-sweep-anim 36s linear infinite;
-    will-change: background-position;
+    /* Compositor-thread sweep. Released automatically while the parent
+       is display:none during playback (the pseudo isn't rendered). */
+    will-change: transform;
+    animation: aura-sweep-x 36s linear infinite;
   }
 
   /* ---------------------------------------------------------------- */
@@ -633,40 +752,38 @@ select,
   /*                                                                   */
   /* WebView2 renders in SDR (8-bit). On OLED + HDR setups the per-   */
   /* pixel contrast amplifies each colour step in a wide gradient into */
-  /* a visible vertical line. The SVG feTurbulence noise breaks each   */
-  /* step into per-pixel variation that the panel can't render as a    */
-  /* hard edge.                                                        */
+  /* a visible vertical line. The SVG feTurbulence noise perturbs the  */
+  /* quantisation decision per-pixel so the panel can't render a hard  */
+  /* edge — true dithering, the only thing that beats 8-bit on a wide  */
+  /* ramp (extra stops / oklab help shape the ramp but can't defeat    */
+  /* the 256-code grid).                                               */
   /*                                                                   */
-  /* Uses fractalNoise (not turbulence) for softer grain, not crackle. */
-  /* mix-blend-mode: overlay makes the noise cancel out on uniform     */
-  /* areas while disrupting the transitions.                           */
+  /* Tuned to be effective but INVISIBLE: baseFrequency 0.8 + a 128px  */
+  /* tile read as fine dither (the old 0.95 aliased into visible       */
+  /* static on HiDPI); opacity 0.02 through `overlay` perturbs the     */
+  /* band edge while staying below the perceptual threshold. STATIC    */
+  /* (only the ::before gradient moves) so it composites once and is   */
+  /* cached rather than re-blended every frame.                        */
   /*                                                                   */
-  /* Applied to: .aura-sweep (title-bar gradient strip) and           */
-  /* .aura-ambient (full-viewport backdrop). Text-clipped gradients    */
-  /* (.aura-title, .aura-row-title etc.) are excluded — their gradient */
-  /* surface is masked to letterform shapes, no large flat region.     */
+  /* Applied ONLY to .aura-ambient (the full-viewport backdrop) — that */
+  /* wide, low-contrast sweep is the one that can actually band on     */
+  /* OLED. The .aura-sweep title-bar strip is deliberately EXCLUDED:   */
+  /* it's a 36 px-tall band where 8-bit stepping is imperceptible, so  */
+  /* the dither there added visible grain without mitigating any real  */
+  /* banding (LandingView / OnboardingView reuse .aura-sweep and are   */
+  /* equally short, so they lose the noise too). Text-clipped          */
+  /* gradients (.aura-title, .aura-row-title etc.) are excluded for    */
+  /* the same reason — masked to glyphs, no large flat region.         */
   /* ---------------------------------------------------------------- */
-  .aura-sweep::after,
   .aura-ambient::after {
     content: "";
     position: absolute;
     inset: 0;
     pointer-events: none;
-    /* Higher baseFrequency (0.9) + a smaller tile (110px) push the grain
-       toward per-pixel, which is what actually breaks an 8-bit band edge —
-       a coarse 200px tile leaves the band visible between grains. Amplitude
-       (opacity) bumped 0.04 → 0.09: the old value was below ~1 LSB of
-       effective perturbation through `overlay`, so it dithered almost
-       nothing and the wide low-contrast sweep gradients banded visibly
-       (the moving vertical lines). */
-    /* numOctaves=1 (was 2) drops the coarse, most-visible grain component and
-       keeps only the fine high-frequency noise that breaks band edges, so it
-       reads as much less "noisy". baseFrequency 0.95 keeps the grain ~per-
-       pixel; opacity eased 0.09 → 0.07 — still enough dither, less visible. */
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n' x='0' y='0'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.95' numOctaves='1' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n' x='0' y='0'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='1' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
     background-repeat: repeat;
-    background-size: 100px 100px;
-    opacity: 0.07;
+    background-size: 128px 128px;
+    opacity: 0.02;
     mix-blend-mode: overlay;
   }
 
@@ -708,14 +825,12 @@ select,
        though their fill is a moving translucent gradient. */
     -webkit-text-stroke: 0.4px rgba(255, 255, 255, 0.08);
     filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.35))
-            drop-shadow(0 0 6px rgba(91, 164, 255, 0.18));
+            drop-shadow(0 0 6px rgb(var(--ln-accent-rgb) /0.18));
 
     /* Same loop period as the sweep so the gradient under the letters
        progresses in lockstep with the bar; the visual is the bar's
        spectrum animated through a glyph window. */
-    animation: aura-sweep-anim 20s linear infinite;
-    will-change: background-position;
-    user-select: none;
+    animation: aura-sweep-anim 20s linear infinite;    user-select: none;
   }
 
   /* ---------------------------------------------------------------- */
@@ -762,10 +877,10 @@ select,
        ring is the primary signal; the outer glow adds the Aura spectral
        bloom. Paired with the filled accent day-number chip in CalendarView
        for an unmistakable "today" marker. */
-    background: rgba(91, 164, 255, 0.14);
+    background: rgb(var(--ln-accent-rgb) /0.14);
     box-shadow:
-      inset 0 0 0 2px rgba(91, 164, 255, 0.95),
-      0 0 16px 2px rgba(91, 164, 255, 0.45),
+      inset 0 0 0 2px rgb(var(--ln-accent-rgb) /0.95),
+      0 0 16px 2px rgb(var(--ln-accent-rgb) /0.45),
       0 0 30px 8px rgba(180, 130, 255, 0.22);
   }
 
@@ -808,7 +923,7 @@ select,
   /*      softens the colour blobs into ambient light.                 */
   /*   3. A slow drift keyframe (14 s, alternate) with per-blob offset */
   /*      timings so the surface shifts like ambient light, not a wipe.*/
-  /*   4. The same SVG fractalNoise dither used on .aura-sweep::after  */
+  /*   4. The same SVG fractalNoise dither used on .aura-ambient::after */
   /*      breaks the remaining quantised colour steps into per-pixel   */
   /*      noise so the panel's SDR renderer can't show hard edges.     */
   /* ---------------------------------------------------------------- */
@@ -821,7 +936,7 @@ select,
     position: absolute;
     inset: 0;
     background:
-      radial-gradient(circle at 20% 30%, rgb(91 164 255 / 0.20), transparent 55%),
+      radial-gradient(circle at 20% 30%, rgb(var(--ln-accent-rgb) /0.20), transparent 55%),
       radial-gradient(circle at 75% 65%, rgb(170 130 255 / 0.16), transparent 60%),
       radial-gradient(circle at 50% 90%, rgb(80 200 220 / 0.12), transparent 55%),
       rgb(8 10 14 / 1);
@@ -830,7 +945,7 @@ select,
     animation: detail-backdrop-drift 14s ease-in-out infinite alternate;
   }
 
-  /* Dither noise overlay — same SVG turbulence as .aura-sweep::after */
+  /* Dither noise overlay — same SVG turbulence as .aura-ambient::after */
   .detail-backdrop-skeleton::after {
     content: "";
     position: absolute;
@@ -862,11 +977,11 @@ select,
     width: 33%;
     background: linear-gradient(
       90deg,
-      rgba(91, 164, 255, 0)   0%,
-      rgba(91, 164, 255, 0.85) 30%,
+      rgb(var(--ln-accent-rgb) /0)   0%,
+      rgb(var(--ln-accent-rgb) /0.85) 30%,
       rgba(180, 130, 255, 0.95) 50%,
       rgba(120, 220, 200, 0.85) 70%,
-      rgba(91, 164, 255, 0)   100%
+      rgb(var(--ln-accent-rgb) /0)   100%
     );
     filter: drop-shadow(0 0 6px rgba(120, 180, 255, 0.55));
     animation: aura-search-progress 1.2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
@@ -882,8 +997,8 @@ select,
   }
 
   @keyframes boot-icon-pulse {
-    0%,  100% { filter: drop-shadow(0 4px 18px rgba(91, 164, 255, 0.45)); }
-    50%        { filter: drop-shadow(0 4px 28px rgba(91, 164, 255, 0.75)); }
+    0%,  100% { filter: drop-shadow(0 4px 18px rgb(var(--ln-accent-rgb) /0.45)); }
+    50%        { filter: drop-shadow(0 4px 28px rgb(var(--ln-accent-rgb) /0.75)); }
   }
 
   /* ---------------------------------------------------------------- */
@@ -909,14 +1024,14 @@ select,
     border-radius: 14px;
     background:
       linear-gradient(135deg,
-        rgb(91 164 255 / 0.22) 0%,
-        rgb(170 130 255 / 0.16) 60%,
-        rgb(80 200 220 / 0.10) 100%);
-    border: 1px solid rgb(91 164 255 / 0.35);
+        rgb(var(--ln-accent-rgb) / 0.22) 0%,
+        rgb(var(--ln-accent-rgb) / 0.14) 60%,
+        rgb(var(--ln-accent-rgb) / 0.07) 100%);
+    border: 1px solid rgb(var(--ln-accent-rgb) /0.35);
     box-shadow:
       inset 0 0 0 1px rgb(255 255 255 / 0.04),
-      0 0 22px rgb(91 164 255 / 0.28),
-      0 0 60px rgb(91 164 255 / 0.10);
+      0 0 22px rgb(var(--ln-accent-rgb) /0.28),
+      0 0 60px rgb(var(--ln-accent-rgb) /0.10);
     pointer-events: none;
     transition:
       transform 380ms cubic-bezier(0.34, 1.56, 0.64, 1),
@@ -928,12 +1043,12 @@ select,
   @keyframes aura-glow-pulse {
     from { box-shadow:
       inset 0 0 0 1px rgb(255 255 255 / 0.04),
-      0 0 18px rgb(91 164 255 / 0.22),
-      0 0 50px rgb(91 164 255 / 0.08); }
+      0 0 18px rgb(var(--ln-accent-rgb) /0.22),
+      0 0 50px rgb(var(--ln-accent-rgb) /0.08); }
     to   { box-shadow:
       inset 0 0 0 1px rgb(255 255 255 / 0.06),
-      0 0 26px rgb(91 164 255 / 0.32),
-      0 0 70px rgb(91 164 255 / 0.12); }
+      0 0 26px rgb(var(--ln-accent-rgb) /0.32),
+      0 0 70px rgb(var(--ln-accent-rgb) /0.12); }
   }
 
   /* ---------------------------------------------------------------- */
@@ -1091,7 +1206,7 @@ select,
     box-shadow:
       inset 0 0 0 1px rgba(255, 255, 255, 0.06),
       inset 0 1px 3px rgba(0, 0, 0, 0.55),
-      0 0 12px rgba(91, 164, 255, calc(var(--val-frac, 0.5) * 0.45));
+      0 0 12px rgb(var(--ln-accent-rgb) /calc(var(--val-frac, 0.5) * 0.45));
     animation: aura-slider-fill-anim 14s linear infinite;
   }
   @keyframes aura-slider-fill-anim {
@@ -1107,16 +1222,16 @@ select,
     border-radius: 50%;
     background: rgb(220, 232, 255);
     box-shadow:
-      0 0 0 2px rgba(91, 164, 255, 0.45),
-      0 0 10px rgba(91, 164, 255, 0.7),
+      0 0 0 2px rgb(var(--ln-accent-rgb) /0.45),
+      0 0 10px rgb(var(--ln-accent-rgb) /0.7),
       0 1px 2px rgba(0, 0, 0, 0.7);
     border: none;
     cursor: pointer;
   }
   .aura-slider:hover::-webkit-slider-thumb {
     box-shadow:
-      0 0 0 3px rgba(91, 164, 255, 0.55),
-      0 0 14px rgba(91, 164, 255, 0.85),
+      0 0 0 3px rgb(var(--ln-accent-rgb) /0.55),
+      0 0 14px rgb(var(--ln-accent-rgb) /0.85),
       0 1px 2px rgba(0, 0, 0, 0.7);
   }
 
@@ -1140,7 +1255,7 @@ select,
       rgba(91,  164, 255, 0.95) 100%);
     background-size: 200% 100%;
     background-repeat: repeat-x;
-    box-shadow: 0 0 10px rgba(91, 164, 255, 0.55);
+    box-shadow: 0 0 10px rgb(var(--ln-accent-rgb) /0.55);
     animation: aura-slider-fill-anim 14s linear infinite;
   }
   .aura-slider::-moz-range-thumb {
@@ -1149,8 +1264,8 @@ select,
     border-radius: 50%;
     background: rgb(220, 232, 255);
     box-shadow:
-      0 0 0 2px rgba(91, 164, 255, 0.45),
-      0 0 10px rgba(91, 164, 255, 0.7);
+      0 0 0 2px rgb(var(--ln-accent-rgb) /0.45),
+      0 0 10px rgb(var(--ln-accent-rgb) /0.7);
     border: none;
     cursor: pointer;
   }
@@ -1174,7 +1289,7 @@ select,
        The gradient is symmetric (start colour == end colour) so tiling
        joins seamlessly. */
     background-repeat: repeat-x;
-    box-shadow: 0 0 14px rgba(91, 164, 255, 0.55),
+    box-shadow: 0 0 14px rgb(var(--ln-accent-rgb) /0.55),
                 0 0 6px  rgba(180, 130, 255, 0.45);
     animation: aura-scrub-anim 6s linear infinite;
     will-change: background-position, width;
@@ -1208,11 +1323,9 @@ select,
 
     -webkit-text-stroke: 0.4px rgba(255, 255, 255, 0.10);
     filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.45))
-            drop-shadow(0 0 14px rgba(91, 164, 255, 0.20));
+            drop-shadow(0 0 14px rgb(var(--ln-accent-rgb) /0.20));
 
-    animation: aura-sweep-anim 18s linear infinite;
-    will-change: background-position;
-    user-select: none;
+    animation: aura-sweep-anim 18s linear infinite;    user-select: none;
   }
 
   /* ---------------------------------------------------------------- */
@@ -1221,7 +1334,7 @@ select,
   /* → Layer B hand-off is visually seamless.                         */
   /* ---------------------------------------------------------------- */
   .boot-splash-icon {
-    filter: drop-shadow(0 4px 18px rgba(91, 164, 255, 0.45));
+    filter: drop-shadow(0 4px 18px rgb(var(--ln-accent-rgb) /0.45));
     animation: boot-icon-pulse 1.6s ease-in-out infinite;
   }
 
@@ -1254,11 +1367,9 @@ select,
 
     -webkit-text-stroke: 0.5px rgba(255, 255, 255, 0.18);
     filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.45))
-            drop-shadow(0 0 10px rgba(91, 164, 255, 0.30));
+            drop-shadow(0 0 10px rgb(var(--ln-accent-rgb) /0.30));
 
-    animation: aura-sweep-anim 18s linear infinite;
-    will-change: background-position;
-  }
+    animation: aura-sweep-anim 18s linear infinite;  }
 
   /* ---------------------------------------------------------------- */
   /* aura-toast-pop — entry animation for the player's transient OSD  */
@@ -1346,10 +1457,10 @@ select,
      the bubble during the entrance to draw the eye. Decays before
      the breathe loop kicks in so the idle state stays calm. */
   @keyframes aura-popup-halo {
-    0%   { opacity: 0; box-shadow: 0 0 0 0 rgba(91, 164, 255, 0.55); }
-    20%  { opacity: 1; box-shadow: 0 0 0 6px rgba(91, 164, 255, 0.55); }
-    60%  { opacity: 0.45; box-shadow: 0 0 0 14px rgba(91, 164, 255, 0); }
-    100% { opacity: 0; box-shadow: 0 0 0 14px rgba(91, 164, 255, 0); }
+    0%   { opacity: 0; box-shadow: 0 0 0 0 rgb(var(--ln-accent-rgb) /0.55); }
+    20%  { opacity: 1; box-shadow: 0 0 0 6px rgb(var(--ln-accent-rgb) /0.55); }
+    60%  { opacity: 0.45; box-shadow: 0 0 0 14px rgb(var(--ln-accent-rgb) /0); }
+    100% { opacity: 0; box-shadow: 0 0 0 14px rgb(var(--ln-accent-rgb) /0); }
   }
   @keyframes aura-popup-tail-in {
     0%, 25%   { opacity: 0; transform: translate(8px, 8px) scale(0.15); }
@@ -1385,9 +1496,9 @@ select,
      than the breathe so the two don't beat against each other. */
   @keyframes aura-popup-glow {
     0%, 100% { box-shadow: 0 18px 48px -14px rgba(0, 0, 0, 0.85),
-                            0 0 0 0 rgba(91, 164, 255, 0); }
+                            0 0 0 0 rgb(var(--ln-accent-rgb) /0); }
     50%      { box-shadow: 0 18px 48px -14px rgba(0, 0, 0, 0.85),
-                            0 0 24px 2px rgba(91, 164, 255, 0.22); }
+                            0 0 24px 2px rgb(var(--ln-accent-rgb) /0.22); }
   }
   .aura-popup-enter {
     animation:
@@ -1538,7 +1649,7 @@ select,
     color: transparent;
     -webkit-text-fill-color: transparent;
     filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.65))
-            drop-shadow(0 0 16px rgba(91, 164, 255, 0.32));
+            drop-shadow(0 0 16px rgb(var(--ln-accent-rgb) /0.32));
     animation:
       aura-sweep-anim         16s linear infinite,
       aura-buffering-pulse     2.4s ease-in-out infinite;
@@ -1551,13 +1662,15 @@ select,
   /* lockstep with the sweep so the text feels alive when paused.      */
   /* ---------------------------------------------------------------- */
   .aura-row-title {
+    /* Accent-reactive shimmer: the catalog/section headers sweep between the
+       theme accent and white, so they recolour with the active theme. */
     background: linear-gradient(
       90deg,
-      rgba(180, 210, 255, 0.95)  0%,
-      rgba(220, 190, 255, 0.95) 25%,
-      rgba(190, 245, 230, 0.92) 50%,
-      rgba(220, 190, 255, 0.95) 75%,
-      rgba(180, 210, 255, 0.95) 100%
+      rgb(var(--ln-accent-rgb) / 0.95)  0%,
+      rgba(255, 255, 255, 0.95) 25%,
+      rgb(var(--ln-accent-rgb) / 0.92) 50%,
+      rgba(255, 255, 255, 0.95) 75%,
+      rgb(var(--ln-accent-rgb) / 0.95) 100%
     );
     background-size: 200% 100%;
     background-repeat: repeat-x;
@@ -1566,10 +1679,8 @@ select,
     color: transparent;
     -webkit-text-fill-color: transparent;
     filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.35))
-            drop-shadow(0 0 6px rgba(91, 164, 255, 0.16));
-    animation: aura-sweep-anim 20s linear infinite;
-    will-change: background-position;
-  }
+            drop-shadow(0 0 6px rgb(var(--ln-accent-rgb) /0.16));
+    animation: aura-sweep-anim 20s linear infinite;  }
 
   /* ---------------------------------------------------------------- */
   /* aura-update-* — entrance for the centered "Update Available"     */
@@ -1613,20 +1724,20 @@ select,
     0% {
       transform: scale(1);
       box-shadow:
-        0 0 0 0 rgba(91, 164, 255, 0.55),
-        0 0 0 0 rgba(91, 164, 255, 0.30);
+        0 0 0 0 rgb(var(--ln-accent-rgb) /0.55),
+        0 0 0 0 rgb(var(--ln-accent-rgb) /0.30);
     }
     50% {
       transform: scale(1.10);
       box-shadow:
-        0 0 14px 6px rgba(91, 164, 255, 0.45),
-        0 0 28px 14px rgba(91, 164, 255, 0.18);
+        0 0 14px 6px rgb(var(--ln-accent-rgb) /0.45),
+        0 0 28px 14px rgb(var(--ln-accent-rgb) /0.18);
     }
     100% {
       transform: scale(1);
       box-shadow:
-        0 0 0 0 rgba(91, 164, 255, 0),
-        0 0 0 0 rgba(91, 164, 255, 0);
+        0 0 0 0 rgb(var(--ln-accent-rgb) /0),
+        0 0 0 0 rgb(var(--ln-accent-rgb) /0);
     }
   }
   @keyframes aura-bell-badge-pop {
@@ -1748,7 +1859,7 @@ input[type="range"]::-moz-range-thumb {
   /* --progress is set inline as a percentage string */
   background: linear-gradient(
     to right,
-    rgba(91, 164, 255, 0.85) var(--progress, 0%),
+    rgb(var(--ln-accent-rgb) /0.85) var(--progress, 0%),
     rgba(255, 255, 255, 0.18) var(--progress, 0%)
   );
 }
@@ -1790,7 +1901,7 @@ input[type="range"]::-moz-range-thumb {
   border-radius: 999px;
   background: linear-gradient(
     to right,
-    rgba(91, 164, 255, 0.85) var(--filter-progress, 0%),
+    rgb(var(--ln-accent-rgb) /0.85) var(--filter-progress, 0%),
     rgba(255, 255, 255, 0.16) var(--filter-progress, 0%)
   );
 }
@@ -1802,7 +1913,7 @@ input[type="range"]::-moz-range-thumb {
 .aura-filter-slider::-moz-range-progress {
   height: 4px;
   border-radius: 999px;
-  background: rgba(91, 164, 255, 0.85);
+  background: rgb(var(--ln-accent-rgb) /0.85);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1835,7 +1946,7 @@ input[type="range"]::-moz-range-thumb {
 .aura-range-dual-fill {
   left: var(--range-min, 0%);
   right: calc(100% - var(--range-max, 100%));
-  background: rgba(91, 164, 255, 0.85);
+  background: rgb(var(--ln-accent-rgb) /0.85);
 }
 .aura-range-dual input[type="range"] {
   position: absolute;
@@ -1869,7 +1980,7 @@ input[type="range"]::-moz-range-thumb {
   margin-top: -5px; /* centre the 14px thumb on the 4px track */
   border-radius: 50%;
   background: #fff;
-  border: 2px solid rgba(91, 164, 255, 0.95);
+  border: 2px solid rgb(var(--ln-accent-rgb) /0.95);
   cursor: pointer;
 }
 .aura-range-dual input[type="range"]::-moz-range-thumb {
@@ -1878,7 +1989,7 @@ input[type="range"]::-moz-range-thumb {
   height: 14px;
   border-radius: 50%;
   background: #fff;
-  border: 2px solid rgba(91, 164, 255, 0.95);
+  border: 2px solid rgb(var(--ln-accent-rgb) /0.95);
   cursor: pointer;
 }
 
@@ -2022,10 +2133,10 @@ select option:hover {
   border-radius: 0.5rem;
   padding: 0.5rem 0.75rem;
   margin: -0.5rem -0.75rem;
-  background: rgba(91, 164, 255, 0.06);
-  box-shadow: inset 0 0 0 1px rgba(91, 164, 255, 0.42),
-              0 0 0 4px rgba(91, 164, 255, 0.10),
-              0 8px 22px -8px rgba(91, 164, 255, 0.30);
+  background: rgb(var(--ln-accent-rgb) /0.06);
+  box-shadow: inset 0 0 0 1px rgb(var(--ln-accent-rgb) /0.42),
+              0 0 0 4px rgb(var(--ln-accent-rgb) /0.10),
+              0 8px 22px -8px rgb(var(--ln-accent-rgb) /0.30);
   transition: background-color 180ms ease-out, box-shadow 180ms ease-out;
 }
 
@@ -2052,6 +2163,41 @@ html[data-reduced-motion="true"] .aura-bell-badge-bouncing,
 html[data-reduced-motion="true"] .aura-popup-breathe,
 html[data-reduced-motion="true"] .hover-glow:hover {
   animation: none !important;
+}
+
+/* ---------------------------------------------------------------- */
+/* Idle / unfocused decorative-animation suspend                    */
+/*                                                                  */
+/* Chromium only throttles CSS animations when the document is      */
+/* truly HIDDEN (minimized / tab-switched). A borderless,           */
+/* transparent window that's merely UNFOCUSED — e.g. sitting behind */
+/* another app — stays `visible`, so the always-on spectral sweeps  */
+/* keep re-rasterising `background-position` full-screen at 60fps in */
+/* the background, burning GPU for motion nobody is looking at (the  */
+/* ~11% idle GPU seen in Task Manager). App.tsx toggles             */
+/* `data-aura-idle` on <html> whenever the window loses focus or is  */
+/* hidden; we PAUSE (not `none`) the loops so each freezes in place  */
+/* and resumes EXACTLY where it left off on refocus — no seam jump   */
+/* (same rationale as AmbientAura's display:none-preserves-position).*/
+/*                                                                  */
+/* Kept SEPARATE from data-reduced-motion (an exported a11y setting) */
+/* so the two gates compose. Only purely decorative loops are listed */
+/* — work-in-progress indicators (buffering, search, skeleton) keep  */
+/* animating so a backgrounded download/scan still reads as live.    */
+/* ---------------------------------------------------------------- */
+html[data-aura-idle="true"] .aura-sweep,
+html[data-aura-idle="true"] .aura-sweep::after,
+html[data-aura-idle="true"] .aura-ambient,
+html[data-aura-idle="true"] .aura-ambient::before,
+html[data-aura-idle="true"] .aura-ambient::after,
+html[data-aura-idle="true"] .aura-title,
+html[data-aura-idle="true"] .aura-row-title,
+html[data-aura-idle="true"] .aura-logo-a,
+html[data-aura-idle="true"] .aura-hero-title,
+html[data-aura-idle="true"] .aura-glow,
+html[data-aura-idle="true"] .aura-bell-ringing,
+html[data-aura-idle="true"] .aura-bell-badge-bouncing {
+  animation-play-state: paused !important;
 }
 
 /* ---------------------------------------------------------------- */
@@ -2117,7 +2263,7 @@ html[data-reduced-motion="true"] [style*="addon-spinner-pulse"] {
   width: 130px;
   height: 130px;
   border-radius: 9999px;
-  background: radial-gradient(circle, var(--ln-accent, #5ba4ff) 0%, rgba(91, 164, 255, 0) 68%);
+  background: radial-gradient(circle, var(--ln-accent, #5ba4ff) 0%, rgb(var(--ln-accent-rgb) /0) 68%);
   animation: aura-vote-burst-flash 720ms ease-out forwards;
 }
 .aura-vote-burst .p {

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useRef, useState } from "react";
+import { readPartyAnchor } from "./partyAnchor";
 
 // ---------------------------------------------------------------------------
 // PartyToast — a SEPARATE toast surface for Watch-Together activity (joins,
@@ -55,30 +56,6 @@ export function showPartyToast(message: string, opts?: ShowOptions) {
   );
 }
 
-type Anchor =
-  | { side: "left"; top: number; left: number }
-  | { side: "right"; top: number; right: number };
-
-/** Locate the visible party affordance and derive where + which way to spawn.
- *  Multiple `[data-party-anchor]` nodes can exist (the PartyButton stays in the
- *  DOM but goes display:none during playback) — pick the first with a real box;
- *  fall back to the top-right corner if none is laid out yet. */
-function readAnchor(): Anchor {
-  const els = Array.from(document.querySelectorAll<HTMLElement>("[data-party-anchor]"));
-  for (const el of els) {
-    const r = el.getBoundingClientRect();
-    if (r.width > 0 && r.height > 0) {
-      const center = r.left + r.width / 2;
-      const top = Math.round(r.bottom + 10);
-      if (center < window.innerWidth / 2) {
-        return { side: "left", top, left: Math.round(r.left) };
-      }
-      return { side: "right", top, right: Math.round(window.innerWidth - r.right) };
-    }
-  }
-  return { side: "right", top: 70, right: 16 };
-}
-
 export default function PartyToastHost() {
   const [toasts, setToasts] = useState<ToastEntry[]>([]);
   const timers = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
@@ -108,7 +85,7 @@ export default function PartyToastHost() {
 
   if (toasts.length === 0) return null;
 
-  const anchor = readAnchor();
+  const anchor = readPartyAnchor();
   const positioning =
     anchor.side === "left"
       ? { top: anchor.top, left: anchor.left }

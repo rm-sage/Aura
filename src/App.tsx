@@ -2558,6 +2558,57 @@ export default function App() {
     };
   }, []);
 
+  // ── Idle / unfocused decorative-animation suspend ──
+  // The always-on spectral sweeps (AmbientAura full-viewport backdrop +
+  // TitleBar strip) animate `background-position` — a PAINT property — so
+  // they re-rasterise full-screen every frame. Chromium does NOT throttle
+  // CSS animations on a window that's merely unfocused (only on a truly
+  // hidden/minimized one), so a borderless Aura sitting behind another app
+  // keeps repainting that gradient in the background — the ~11% idle GPU
+  // users see in Task Manager. Toggle `data-aura-idle` whenever the window
+  // loses focus or is hidden; the CSS gate (App.css) pauses the decorative
+  // loops so they cost nothing while nobody's looking, then resume in place
+  // on refocus. Native window focus (Tauri onFocusChanged) is the reliable
+  // signal for a borderless WebView2 — DOM focus can stick when the OS
+  // window loses focus — with visibilitychange covering minimize/occlude.
+  useEffect(() => {
+    const root = document.documentElement;
+    const apply = (idle: boolean) => {
+      if (idle) root.setAttribute("data-aura-idle", "true");
+      else root.removeAttribute("data-aura-idle");
+    };
+    const syncFromDom = () => apply(document.hidden || !document.hasFocus());
+    syncFromDom();
+    const onVisibility = () => syncFromDom();
+    const onBlur = () => apply(true);
+    const onFocus = () => apply(document.hidden);
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("blur", onBlur);
+    window.addEventListener("focus", onFocus);
+
+    let unlistenFocus: (() => void) | null = null;
+    let disposed = false;
+    import("@tauri-apps/api/window")
+      .then(({ getCurrentWindow }) =>
+        getCurrentWindow().onFocusChanged(({ payload: focused }) =>
+          apply(!focused || document.hidden),
+        ),
+      )
+      .then((un) => {
+        if (disposed) un();
+        else unlistenFocus = un;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("blur", onBlur);
+      window.removeEventListener("focus", onFocus);
+      if (unlistenFocus) unlistenFocus();
+    };
+  }, []);
+
   // ── Per-title saved state (volume / shader / audio_lang / sub_lang) ──
   // Loaded once per activeTarget and applied. The audio/sub language values
   // override the global / anime lang defaults when present, so a user who
