@@ -189,11 +189,18 @@ function loadFromStorage(): Notification[] {
  *       them across `dismissAll`) so they need an explicit guard
  *       against eviction by the volume-cap path.
  */
-const ABSOLUTE_MAX = 1000;
+const ABSOLUTE_MAX = 300;
 
 function capItems(items: Notification[]): Notification[] {
+  // Drop already-dismissed notifications older than 30 days: they have been
+  // seen and only bloat the persisted blob. Undismissed (unseen) entries and
+  // updates are kept regardless of age.
+  const ageCutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const fresh = items.filter(
+    (n) => !n.dismissed || n.kind === "update" || n.createdAt >= ageCutoff,
+  );
   // Always serve in newest-first order downstream.
-  const sorted = [...items].sort((a, b) => b.createdAt - a.createdAt);
+  const sorted = [...fresh].sort((a, b) => b.createdAt - a.createdAt);
   if (sorted.length <= MAX_ITEMS) return sorted;
 
   const undismissed = sorted.filter((n) => !n.dismissed);

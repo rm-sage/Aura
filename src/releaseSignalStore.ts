@@ -155,6 +155,15 @@ export async function reconcileLibraryReleaseSignals(
         mutated = true;
       }
     }
+    // Prune signals for ids that have left the library so heavy curation does
+    // not accumulate stale entries forever.
+    const liveIds = new Set(items.map((i) => i.id));
+    for (const id of store.keys()) {
+      if (!liveIds.has(id)) {
+        store.delete(id);
+        mutated = true;
+      }
+    }
     if (mutated) bump();
   } catch (err) {
     console.warn(`[release-signals] reconcile failed: ${String(err)}`);
