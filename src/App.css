@@ -1811,6 +1811,21 @@ select,
     will-change: opacity, transform;
     pointer-events: none;
   }
+
+  /* Latest-aired marker on Continue Watching cards — a small green caret  */
+  /* that bobs gently to point at the newest aired episode.                */
+  @keyframes aura-latest-aired-bob {
+    0%, 100% { transform: translateY(0); }
+    50%      { transform: translateY(2.5px); }
+  }
+  .aura-latest-aired-caret {
+    animation: aura-latest-aired-bob 1.3s ease-in-out infinite;
+    transform-origin: center;
+    will-change: transform;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .aura-latest-aired-caret { animation: none; }
+  }
 }
 
 /* ------------------------------------------------------------------ */

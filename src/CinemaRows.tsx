@@ -98,6 +98,38 @@ interface ContinueWatchingCardProps {
 }
 
 // ---------------------------------------------------------------------------
+// LatestAiredCaret — the "newest aired episode" marker on CW progress bars.
+// A small green caret pointing DOWN at the latest-aired segment that bobs
+// gently (signalling "this is the latest"). Double-stroked (dark halo under
+// the green) plus a drop-shadow so it stays legible over bright or similarly
+// green backgrounds. aria-hidden + pointer-events-none so it never blocks the
+// bar's own hover tooltip.
+// ---------------------------------------------------------------------------
+function LatestAiredCaret({ leftPct }: { leftPct?: number }) {
+  return (
+    <span
+      aria-hidden
+      className="absolute -top-[8px] -translate-x-1/2 z-20 pointer-events-none"
+      style={{ left: leftPct != null ? `${leftPct}%` : "50%" }}
+    >
+      <svg
+        width="11"
+        height="7"
+        viewBox="0 0 11 7"
+        fill="none"
+        className="aura-latest-aired-caret block"
+        style={{ filter: "drop-shadow(0 1px 1.5px rgba(0,0,0,0.85))" }}
+      >
+        {/* dark halo underneath for contrast on any background */}
+        <path d="M1.3 1.4 L5.5 5.8 L9.7 1.4" stroke="#0a0a0a" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+        {/* green caret on top */}
+        <path d="M1.3 1.4 L5.5 5.8 L9.7 1.4" stroke="#3DF08A" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // SegmentedSeasonBar — for series / anime CW cards. Renders one segment
 // per episode in the resume episode's season; segments are colored:
 //   • emerald  — watched (manual mark OR position-implied)
@@ -186,10 +218,10 @@ function SegmentedSeasonBar({
   // The 8 px inset is enough to clear the curvature on a 5 px-tall
   // bar without leaving an obvious gap.
   //
-  // Airing marker: a glowing accent dot floats above the latest-aired
-  // segment, and aired-but-unwatched segments are tinted brighter than
+  // Airing marker: a green caret (LatestAiredCaret) bobs above the latest-
+  // aired segment, and aired-but-unwatched segments are tinted brighter than
   // not-yet-aired ones so "available to watch now" reads at a glance.
-  // overflow-visible lets the dot (and the Task-5 tooltip) sit above the bar.
+  // overflow-visible lets the caret (and the Task-5 tooltip) sit above the bar.
   const air = airingInfo(episodes);
   const latestAiredIdx = air.isAiring && air.latestAiredId
     ? episodes.findIndex((v) => v.id === air.latestAiredId)
@@ -240,16 +272,7 @@ function SegmentedSeasonBar({
         }
         return (
           <div key={ep.id} className={`relative flex-1 h-full ${cls}`}>
-            {i === latestAiredIdx && (
-              <span
-                aria-hidden
-                className="absolute -top-[7px] left-1/2 -translate-x-1/2 w-1.5 h-1.5 rounded-full z-20"
-                style={{
-                  background: "#5BA4FF",
-                  boxShadow: "0 0 6px 2px rgba(91,164,255,0.5), 0 0 0 1px rgba(0,0,0,0.55)",
-                }}
-              />
-            )}
+            {i === latestAiredIdx && <LatestAiredCaret />}
           </div>
         );
       })}
@@ -359,8 +382,8 @@ function ContinuousProgressBar({
         background: "rgb(52,211,153)",
       };
 
-  // Airing frontier line at the latest-aired position (Option A for the
-  // long-runner bar — the segmented bar uses the dot instead).
+  // Latest-aired caret at the airing frontier position. Same marker the
+  // segmented bar uses, placed at the latest-aired fraction along the bar.
   const air = airingInfo(episodes);
   const latestAiredIdx = air.isAiring && air.latestAiredId
     ? episodes.findIndex((v) => v.id === air.latestAiredId)
@@ -371,13 +394,7 @@ function ContinuousProgressBar({
       <div className="absolute inset-0 rounded-full overflow-hidden bg-white/15">
         <div aria-hidden className="h-full" style={fillStyle} />
       </div>
-      {frontierPct != null && (
-        <div
-          aria-hidden
-          className="absolute -top-[3px] -bottom-[3px] w-[2px] rounded-[2px] z-20"
-          style={{ left: `${frontierPct}%`, background: "#5BA4FF", boxShadow: "0 0 6px 1px rgba(91,164,255,0.5)" }}
-        />
-      )}
+      {frontierPct != null && <LatestAiredCaret leftPct={frontierPct} />}
     </div>
   );
 }
