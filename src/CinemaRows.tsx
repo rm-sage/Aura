@@ -1134,6 +1134,9 @@ export const DiscoveryRow = memo(function DiscoveryRow(
     if (cacheKey) {
       const cached = catalogPaginationCache.get(cacheKey);
       if (cached) {
+        // LRU touch so the actively-used catalogs survive the 16-entry cap.
+        catalogPaginationCache.delete(cacheKey);
+        catalogPaginationCache.set(cacheKey, cached);
         setOverflowItems(cached);
         return;
       }

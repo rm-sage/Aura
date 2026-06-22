@@ -56,11 +56,35 @@ export interface LandscapeArt {
 // without pulling 1920px masters into a ~320px box.
 export const LANDSCAPE_CARD_WIDTH = 640;
 
-// `undefined` = never fetched; a stored value (possibly null) = fetched, so
-// a miss isn't re-requested on every card remount / scroll.
-const cache = new Map<string, LandscapeArt | null>();
+// Bounded LRU + TTL. Art URLs are stable, but a long browse session would
+// otherwise accumulate one entry per (type, id, width) forever; cap the map and
+// expire entries so it can never grow without bound.
+const CACHE_MAX = 200;
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+interface CacheEntry { val: LandscapeArt | null; ts: number; }
+const cache = new Map<string, CacheEntry>();
 const keyFor = (mediaType: string, id: string, width?: number) =>
   `${mediaType}::${id}::${width ?? ""}`;
+
+/** Read with TTL expiry + LRU touch. `hit:false` means fetch (or re-fetch). */
+function cacheGet(k: string): { hit: boolean; val: LandscapeArt | null } {
+  const e = cache.get(k);
+  if (!e) return { hit: false, val: null };
+  if (Date.now() - e.ts > CACHE_TTL_MS) {
+    cache.delete(k);
+    return { hit: false, val: null };
+  }
+  cache.delete(k);
+  cache.set(k, e); // move to end (LRU)
+  return { hit: true, val: e.val };
+}
+function cacheSet(k: string, val: LandscapeArt | null): void {
+  cache.set(k, { val, ts: Date.now() });
+  if (cache.size > CACHE_MAX) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+}
 
 /** Fetch (and cache) resolved landscape art for one title. Best-effort:
  *  any failure resolves to null and the caller falls back to its own art. */
@@ -71,7 +95,8 @@ export async function getLandscapeArt(
   width?: number,
 ): Promise<LandscapeArt | null> {
   const k = keyFor(mediaType, id, width);
-  if (cache.has(k)) return cache.get(k) ?? null;
+  const cached = cacheGet(k);
+  if (cached.hit) return cached.val;
   const res = await dedupedInvoke(`art:${addon.url}::${k}`, () =>
     invoke<LandscapeArt>("fetch_landscape_art", {
       addonUrl: addon.url,
@@ -83,7 +108,7 @@ export async function getLandscapeArt(
   // Treat a result with no usable image as a miss so the card falls back.
   const val: LandscapeArt | null =
     res && (res.landscape || res.poster) ? res : null;
-  cache.set(k, val);
+  cacheSet(k, val);
   return val;
 }
 
@@ -101,16 +126,19 @@ export function useLandscapeArt(
 ): LandscapeArt | null {
   const wantFetch = !!item && !!aioAddon;
   const k = item ? keyFor(item.media_type, item.id, width) : "";
-  const [art, setArt] = useState<LandscapeArt | null>(
-    () => (wantFetch && cache.has(k) ? cache.get(k) ?? null : null),
-  );
+  const [art, setArt] = useState<LandscapeArt | null>(() => {
+    if (!wantFetch) return null;
+    const c = cacheGet(k);
+    return c.hit ? c.val : null;
+  });
   useEffect(() => {
     if (!wantFetch || !item || !aioAddon) {
       setArt(null);
       return;
     }
-    if (cache.has(k)) {
-      setArt(cache.get(k) ?? null);
+    const c = cacheGet(k);
+    if (c.hit) {
+      setArt(c.val);
       return;
     }
     let cancelled = false;
