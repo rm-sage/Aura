@@ -372,7 +372,7 @@ function Room({
       ) : !roomVideoKey ? (
         <p className="text-white/45 text-[12.5px]">
           {isLeader
-            ? "You're the host — play something and it becomes the party's title."
+            ? "You're the host. Play something and it becomes the party's title."
             : "Waiting for the host to start playing."}
         </p>
       ) : inSync ? (
