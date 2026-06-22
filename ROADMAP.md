@@ -489,7 +489,7 @@ A grab-bag of post-5.8 work that isn't gated to a single rendering / IPC milesto
 - [x] HTTPS enforcement on all reqwest pools: every long-lived client builds with `https_only(true)`; misconfigured `http://` URLs surface as a connection error rather than leaking the user/title/progress payload over plaintext
 - [x] Sanitized scrobble error logs: error category only (timeout / connect / status / send), never the full reqwest error string (which can include the request URL with embedded auth)
 - [x] Addon URL hardening: `validate_url` now also rejects empty / >2048-char inputs, embedded credentials (`user:pass@`), and path traversal (`/../`). Loopback intentionally allowed for self-hosted AIOMetadata / AIOStreams
-- [x] Power-user network tuning notes: `HANDOFF.md §9` documents Windows `netsh int tcp` autotuning + BBR2 + RSS, Linux sysctl bbr + rmem/wmem, and router-side SQM/cake recommendations for high-BDP debrid links
+- [x] Power-user network tuning notes: `CLAUDE.md` (Network tuning notes) documents Windows `netsh int tcp` autotuning + BBR2 + RSS, Linux sysctl bbr + rmem/wmem, and router-side SQM/cake recommendations for high-BDP debrid links
 
 ### 6.0.x Scrobble OAuth ✅
 

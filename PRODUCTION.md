@@ -161,7 +161,7 @@ Pre-release checklist:
 
 The user's stated goal: keep the source open enough for hobbyists to
 build / fork, but make commercial repurposing harder. See
-`HANDOFF.md` (or wherever the user prefers) for the full discussion;
+the notes below for the full discussion;
 short version:
 
 - The libmpv DLLs are NOT in the repo (`src-tauri/lib/*.dll`) and

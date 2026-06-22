@@ -145,7 +145,7 @@ export interface AuraSettings {
    *  false until the deferred `mpv_render_context` render-API rewrite
    *  is sorted** (with the current `--wid` child-HWND embedding,
    *  `display-resample` makes off-focus frame drops catastrophic —
-   *  ~20-60 fps vs ~6-8/s with audio-sync; see HANDOFF.md). Re-applies
+   *  ~20-60 fps vs ~6-8/s with audio-sync; see docs/research). Re-applies
    *  on every stream load AND on toggle; surfaced in both Settings and
    *  the in-player three-dots menu. Optional in the type only so
    *  incremental edits type-check; defaults + parse always populate it. */

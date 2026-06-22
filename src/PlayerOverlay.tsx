@@ -3962,7 +3962,7 @@ function BufferingOverlay({
 // Polling on a 250 ms interval is the source of truth for window-active
 // state. We deliberately don't observe `user-data/aura/skip-windows` as a
 // new MPV property — changing the observed-property set on this libmpv
-// build can break the entire event channel (HANDOFF landmine #4).
+// build can break the entire event channel (CLAUDE.md landmine #4).
 //
 // Components:
 //   • SkipWindowButton — inline pill in the bottom control bar; offers

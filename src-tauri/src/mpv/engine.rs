@@ -1407,7 +1407,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             // breaks entirely. Do NOT re-add it without owning the DComp
             // visual. The raised-black scanout behaviour is the panel's own
             // near-black EOTF in its True-Black HDR mode (masked only when
-            // DWM composes) and is not app-fixable; see HANDOFF / the HDR
+            // DWM composes) and is not app-fixable; see CLAUDE.md / the HDR
             // memory for the full dead-end analysis.
             // 50% initial volume — comfortable headphone-safe default;
             // matches the PlaybackState bridge's assumed initial value
