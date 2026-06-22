@@ -547,6 +547,11 @@ const FALLBACK_H: i32 = 460;
 /// `timeBeginPeriod(1)` for the process lifetime, so `thread::sleep`
 /// granularity here is ~1 ms.
 const TICK: Duration = Duration::from_millis(5);
+/// Coarse pump cadence while the window is hidden (minimized / tray). Playback
+/// is paused there (minimize pauses MPV, or a cast hands off to the device), so
+/// there is nothing to present and we only need to stay responsive to commands
+/// + mpv events. Drops idle wakeups from ~200/sec to ~7/sec.
+const HIDDEN_TICK: Duration = Duration::from_millis(150);
 
 /// Current [`PresentMode`] discriminant, published from the render thread
 /// on every mode transition. 255 = engine not running. Read by the debug
@@ -1974,6 +1979,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             // load/seek is in flight or within the settle window (landmine #3).
             if playback_ready
                 && !seeking
+                && mode != PresentMode::Hidden
                 && last_transition.elapsed() >= CACHE_SETTLE
                 && last_cache_poll.elapsed() >= CACHE_POLL_INTERVAL
             {
@@ -2006,10 +2012,15 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 emit("cache-state", serde_json::Value::Object(m));
             }
 
-            // Steady pump cadence — see TICK.
+            // Steady pump cadence. While hidden (minimized / tray) playback is
+            // paused and there is nothing to present, so drop to a coarse tick
+            // and stop waking the CPU 200x/sec. Commands + mpv events are still
+            // drained every iteration above, so restore / unpause stays
+            // responsive (latency only grows to the coarse tick while hidden).
+            let tick_target = if mode == PresentMode::Hidden { HIDDEN_TICK } else { TICK };
             let elapsed = tick_start.elapsed();
-            if elapsed < TICK {
-                thread::sleep(TICK - elapsed);
+            if elapsed < tick_target {
+                thread::sleep(tick_target - elapsed);
             }
         }
 
