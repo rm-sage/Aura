@@ -216,13 +216,40 @@ struct ThumbInstance {
     loaded_url: Option<String>,
 }
 
+/// Idle window after which a resident thumb mpv instance is destroyed to free
+/// its demuxer/codec RAM. The worker THREAD stays alive (cheap) and re-inits
+/// the instance lazily on the next hover (~450ms spin-up, paid once).
+const IDLE_TEARDOWN: Duration = Duration::from_secs(90);
+
 /// Worker entry point. Owns the mpv handle for the thread's lifetime;
 /// processes requests until `Shutdown` (or the channel closes), then tears
-/// the instance down.
+/// the instance down. A resident instance is also dropped after IDLE_TEARDOWN
+/// of inactivity so a one-off scrub doesn't keep a second libmpv resident.
 fn run_worker(rx: Receiver<ThumbControl>) {
     let mut instance: Option<ThumbInstance> = None;
 
-    while let Ok(ctl) = rx.recv() {
+    loop {
+        // Block for the next request. While an mpv instance is resident, only
+        // wait IDLE_TEARDOWN before freeing it (it holds demuxer/codec state);
+        // the thread stays and re-inits lazily on the next request.
+        let ctl = if instance.is_some() {
+            match rx.recv_timeout(IDLE_TEARDOWN) {
+                Ok(c) => c,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(inst) = instance.take() {
+                        unsafe { (inst.lib.terminate_destroy)(inst.handle) };
+                        crate::devlog!(info, "mpv", "thumb instance idle-destroyed (freed demuxer/codec RAM)");
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(c) => c,
+                Err(_) => break,
+            }
+        };
         match ctl {
             ThumbControl::Shutdown => break,
             ThumbControl::Extract(req) => {
