@@ -864,7 +864,14 @@ function usePlayback(playerActive: boolean) {
   // `aura:eos-detected` exactly once per stream. Reset per load inside
   // notifyNewLoad (alongside the other fresh-load state resets).
   const nearEndEosFiredRef = useRef(false);
+  // True while the window is minimized / in the tray. Shared across the
+  // playback-poll effects + the Discord presence effect so none of them do
+  // work nobody can see. Playback is paused while hidden (pause-on-minimize
+  // default), so these polls have nothing to do anyway; gating the EOS poll
+  // also stops the near-end stale-time check from false-firing on paused time.
+  const windowHidden = useWindowHidden();
   useEffect(() => {
+    if (windowHidden) return;
     const BROKEN_STALE_MS = 8000;
     // Fast path: when playback was already within the last few seconds
     // of the metadata duration, a stale heartbeat is end-of-stream, not
@@ -932,7 +939,7 @@ function usePlayback(playerActive: boolean) {
       }
     }, 1000);
     return () => window.clearInterval(id);
-  }, [paused, firstFrameSeen]);
+  }, [paused, firstFrameSeen, windowHidden]);
 
   // ── Load-failure detector ──
   // The stale-heartbeat detector above only catches mid-play stalls
@@ -987,7 +994,7 @@ function usePlayback(playerActive: boolean) {
   // window is long enough that slow CDNs handing over the first 4K
   // frame don't false-positive.
   useEffect(() => {
-    if (firstFrameSeen) return;
+    if (firstFrameSeen || windowHidden) return;
     const LOAD_TIMEOUT_MS = 45000;
     const id = window.setInterval(() => {
       const start = loadStartedAtRef.current;
@@ -1002,7 +1009,7 @@ function usePlayback(playerActive: boolean) {
       }
     }, 2000);
     return () => window.clearInterval(id);
-  }, [firstFrameSeen]);
+  }, [firstFrameSeen, windowHidden]);
 
   /** Reset playback state for a new load_video call. Called from the
    *  parent right before invoking load_video so every fresh playback
@@ -3622,6 +3629,7 @@ export default function App() {
   // ── Local stats: bump streams_played on every load_video, accumulate
   //     watched-time per media_type via a 5 s tick while playing. The
   //     home_view_secs counter is bumped from the Home view directly.
+  const windowHidden = useWindowHidden();
   const lastStatsTickRef = useRef<number | null>(null);
   useEffect(() => {
     // Live TV / trailers aren't a VOD "stream played" and a 24/7 channel left
@@ -3685,12 +3693,12 @@ export default function App() {
   // Home-view dwell time. The same 5 s cadence accumulates against
   // home_view_secs whenever activeView === "home" and the player isn't up.
   useEffect(() => {
-    if (activeView !== "home" || isPlayerActive) return;
+    if (activeView !== "home" || isPlayerActive || windowHidden) return;
     const id = setInterval(() => {
       invoke("bump_stat", { kind: "home_view_secs", delta: 5 }).catch(() => {});
     }, 5000);
     return () => clearInterval(id);
-  }, [activeView, isPlayerActive]);
+  }, [activeView, isPlayerActive, windowHidden]);
 
   // ── Auto-updater poll ──
   // Every time the user lands on Home, check the GitHub Releases API for
@@ -5741,7 +5749,6 @@ export default function App() {
   // threshold for Rich Presence.
   const rpcInvokeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastInvokedPresenceRef = useRef<string>("");
-  const windowHidden = useWindowHidden();
   useEffect(() => {
     // Don't broadcast presence while the user is on the landing/login screen
     // or before we've finished checking session — nothing meaningful to show
