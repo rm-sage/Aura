@@ -50,6 +50,7 @@ import { useScrobbleAuthAlerts } from "./useScrobbleAuthAlerts";
 import { useKeybindings } from "./useKeybindings";
 import { libraryToggle, libraryRemoveAll, libraryWriteProgress, libraryClearProgress } from "./libraryActions";
 import { libraryItemSeriesId } from "./libraryNormalize";
+import { isWindowHidden, isWindowFocused, subscribeWindowVisibility } from "./windowVisibility";
 import { sourcesForMeta, openInPopupBrowser } from "./externalSources";
 import { setManualWatchedScope, getManualWatchedState, setManualWatchedState, setManualWatchedMany, getPlannedQueue } from "./manualWatched";
 import { reconcileLibraryReleaseSignals, clearReleaseSignalStore, getReleaseSignal } from "./releaseSignalStore";
@@ -2571,42 +2572,18 @@ export default function App() {
   // on refocus. Native window focus (Tauri onFocusChanged) is the reliable
   // signal for a borderless WebView2 — DOM focus can stick when the OS
   // window loses focus — with visibilitychange covering minimize/occlude.
+  // Derived from the shared windowVisibility store (single listener set for
+  // the whole app). Idle = hidden (minimized) OR unfocused, since decorative
+  // animations need not run when nobody is looking at them either way.
   useEffect(() => {
     const root = document.documentElement;
-    const apply = (idle: boolean) => {
+    const apply = () => {
+      const idle = isWindowHidden() || !isWindowFocused();
       if (idle) root.setAttribute("data-aura-idle", "true");
       else root.removeAttribute("data-aura-idle");
     };
-    const syncFromDom = () => apply(document.hidden || !document.hasFocus());
-    syncFromDom();
-    const onVisibility = () => syncFromDom();
-    const onBlur = () => apply(true);
-    const onFocus = () => apply(document.hidden);
-    document.addEventListener("visibilitychange", onVisibility);
-    window.addEventListener("blur", onBlur);
-    window.addEventListener("focus", onFocus);
-
-    let unlistenFocus: (() => void) | null = null;
-    let disposed = false;
-    import("@tauri-apps/api/window")
-      .then(({ getCurrentWindow }) =>
-        getCurrentWindow().onFocusChanged(({ payload: focused }) =>
-          apply(!focused || document.hidden),
-        ),
-      )
-      .then((un) => {
-        if (disposed) un();
-        else unlistenFocus = un;
-      })
-      .catch(() => {});
-
-    return () => {
-      disposed = true;
-      document.removeEventListener("visibilitychange", onVisibility);
-      window.removeEventListener("blur", onBlur);
-      window.removeEventListener("focus", onFocus);
-      if (unlistenFocus) unlistenFocus();
-    };
+    apply();
+    return subscribeWindowVisibility(apply);
   }, []);
 
   // ── Per-title saved state (volume / shader / audio_lang / sub_lang) ──
