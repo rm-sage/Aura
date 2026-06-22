@@ -2213,8 +2213,19 @@ html[data-aura-idle="true"] .aura-logo-a,
 html[data-aura-idle="true"] .aura-hero-title,
 html[data-aura-idle="true"] .aura-glow,
 html[data-aura-idle="true"] .aura-bell-ringing,
-html[data-aura-idle="true"] .aura-bell-badge-bouncing {
+html[data-aura-idle="true"] .aura-bell-badge-bouncing,
+html[data-aura-idle="true"] .hover-glow:hover,
+html[data-aura-idle="true"] .detail-backdrop-skeleton::after,
+html[data-aura-idle="true"] .aura-popup-card-breathe,
+html[data-aura-idle="true"] .aura-popup-card-pulse,
+html[data-aura-idle="true"] .aura-latest-aired-caret {
   animation-play-state: paused !important;
+  /* Release the GPU compositor layers these decorative elements hold:
+     will-change ignores animation-play-state, so without this the layers stay
+     resident while idle/minimized. They re-promote on the next frame after
+     restore. (Progress indicators like SpectralPulse / spinners deliberately
+     keep animating so a backgrounded scan still reads as live.) */
+  will-change: auto !important;
 }
 
 /* ---------------------------------------------------------------- */
