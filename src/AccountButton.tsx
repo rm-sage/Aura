@@ -106,7 +106,7 @@ export default function AccountButton({
         ].filter(Boolean).join(" ")}
       >
         {initials ? (
-          <span className="text-[15px] font-semibold leading-none tracking-tight text-white/90 select-none">
+          <span className="aura-row-title text-[15px] font-semibold leading-none tracking-tight select-none">
             {initials}
           </span>
         ) : (
