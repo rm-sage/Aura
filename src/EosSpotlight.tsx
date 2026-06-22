@@ -31,6 +31,7 @@
 // ---------------------------------------------------------------------------
 
 import { useEffect, useRef, useState } from "react";
+import { useWindowHidden } from "./windowVisibility";
 import ImageLoader from "./ImageLoader";
 import type { LibraryItem, StreamEntry, VideoEntry } from "./types";
 import { formatEpisodeTag } from "./nextUp";
@@ -128,10 +129,14 @@ export default function EosSpotlight({
 
   const [remaining, setRemaining] = useState<number | null>(autoArmed ? initialSeconds : null);
   const cancelledRef = useRef(false);
+  const windowHidden = useWindowHidden();
 
   useEffect(() => {
     if (!autoArmed) return;
     if (cancelledRef.current) return;
+    // Freeze the auto-play countdown while the window is hidden so there is no
+    // surprise auto-advance while the user is in another app; resumes on show.
+    if (windowHidden) return;
     if (remaining === null) {
       setRemaining(initialSeconds);
       return;
@@ -142,7 +147,7 @@ export default function EosSpotlight({
     }
     const id = window.setTimeout(() => setRemaining((s) => (s === null ? null : s - 1)), 1000);
     return () => window.clearTimeout(id);
-  }, [autoArmed, remaining, initialSeconds, onPlayNext]);
+  }, [autoArmed, remaining, initialSeconds, onPlayNext, windowHidden]);
 
   useEffect(() => {
     if (remaining === null) return;

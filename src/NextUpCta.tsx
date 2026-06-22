@@ -24,6 +24,7 @@
 // ---------------------------------------------------------------------------
 
 import { useEffect, useRef, useState } from "react";
+import { useWindowHidden } from "./windowVisibility";
 import ImageLoader from "./ImageLoader";
 import type { VideoEntry } from "./types";
 import { formatEpisodeTag } from "./nextUp";
@@ -83,10 +84,14 @@ export default function NextUpCta({
   // (e.g. a `loading=true → false` cycle while the user was actively
   // moving the mouse). One cancel = no auto for this CTA instance.
   const cancelledRef = useRef(false);
+  const windowHidden = useWindowHidden();
 
   useEffect(() => {
     if (!autoArmed) return;
     if (cancelledRef.current) return;
+    // Freeze the auto-play countdown while the window is hidden so there is no
+    // surprise auto-advance while the user is in another app; resumes on show.
+    if (windowHidden) return;
     if (remaining === null) {
       setRemaining(initialSeconds);
       return;
@@ -97,7 +102,7 @@ export default function NextUpCta({
     }
     const id = window.setTimeout(() => setRemaining((s) => (s === null ? null : s - 1)), 1000);
     return () => window.clearTimeout(id);
-  }, [autoArmed, remaining, initialSeconds, onPlay]);
+  }, [autoArmed, remaining, initialSeconds, onPlay, windowHidden]);
 
   // Cancel signals: any pointer move on the document, any keydown,
   // hover into the CTA card itself (the user is reading / about to
