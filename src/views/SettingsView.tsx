@@ -82,8 +82,6 @@ interface BackendSettings {
   discord_rpc_show_titles: boolean;
   discord_rpc_blocked_titles: string[];
   discord_rpc_browse_states: boolean;
-  pause_on_minimize: boolean;
-  pause_on_lost_focus: boolean;
   close_on_exit: boolean;
   minimize_to_tray_on_close: boolean;
   scrobble_addon_url: string;
@@ -5165,20 +5163,6 @@ export default function SettingsView({ addons, session }: Props) {
           {/* Window & system behaviour */}
           {backend && (
             <Section id="sec-window" title="Window & System">
-              <SettingToggle
-                label="Pause on minimize"
-                description="Pause playback when the window is minimized."
-                value={backend.pause_on_minimize}
-                onChange={(v) => patchBackend({ pause_on_minimize: v })}
-              />
-              <div className="h-px bg-white/6" />
-              <SettingToggle
-                label="Pause on lost focus"
-                description="Pause playback when another window takes focus."
-                value={backend.pause_on_lost_focus}
-                onChange={(v) => patchBackend({ pause_on_lost_focus: v })}
-              />
-              <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Minimize to tray on close"
                 description="Hide Aura to a tray icon when you click the close button instead of exiting. Click the tray icon to bring the window back."

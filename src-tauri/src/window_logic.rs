@@ -315,10 +315,6 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
     window.clone().on_window_event(move |event| {
         let cfg = settings::snapshot();
         match event {
-            WindowEvent::Focused(false) if cfg.pause_on_lost_focus => {
-                crate::devlog!(info, "win", "lost focus → pause MPV");
-                pause_mpv(&handle);
-            }
             // Focus REGAIN backstop. After an alt-tab cycle (especially
             // following an enter/exit fullscreen sequence) libmpv's vo
             // child window has been observed to drift back to its default
@@ -371,7 +367,12 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                 // is safe.
                 let minimised = matches!(win.is_minimized(), Ok(true));
                 if minimised {
-                    if cfg.pause_on_minimize {
+                    // Pause on minimise is unconditional now, EXCEPT while
+                    // casting to a device: then video + audio keep rolling so
+                    // the cast session isn't interrupted by hiding the window.
+                    if crate::cast::has_active_session() {
+                        crate::devlog!(info, "win", "minimised while casting → keep playing");
+                    } else {
                         crate::devlog!(info, "win", "minimised → pause MPV");
                         pause_mpv(&handle);
                     }
@@ -392,9 +393,8 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     // do NOT stop MPV: hiding the window mid-playback should
                     // feel like a quick "hide, resume later" toggle.
                     //
-                    // Pause MPV unconditionally (regardless of
-                    // pause_on_lost_focus / pause_on_minimize) before
-                    // calling win.hide(). When the OS marks the window
+                    // Pause MPV before calling win.hide() (skipped while
+                    // casting). When the OS marks the window
                     // hidden, libmpv's vo keeps rendering frames into the
                     // off-screen child surface; on this build that's been
                     // observed to leave audio / video desynced or the vo
@@ -402,8 +402,11 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     // from the tray. Pausing first means MPV is in a
                     // known-quiet state across the hide/show cycle and
                     // the user-perceived "stream broke while minimised
-                    // to tray" symptom doesn't manifest.
-                    pause_mpv(&handle);
+                    // to tray" symptom doesn't manifest. While casting, keep
+                    // playback rolling so the cast isn't cut off.
+                    if !crate::cast::has_active_session() {
+                        pause_mpv(&handle);
+                    }
                     api.prevent_close();
                     let _ = win.hide();
                 } else {

@@ -72,8 +72,6 @@ const PORTABLE_BACKEND_FIELDS = [
   "discord_rpc_show_titles",
   "discord_rpc_blocked_titles",
   "discord_rpc_browse_states",
-  "pause_on_minimize",
-  "pause_on_lost_focus",
   "close_on_exit",
   "minimize_to_tray_on_close",
   "opensubtitles_api_key",

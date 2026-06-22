@@ -115,10 +115,6 @@ pub struct AppSettings {
     pub discord_rpc_browse_states: bool,
 
     // ── Window behaviours ──────────────────────────────────────────────────
-    #[serde(default = "default_true")]
-    pub pause_on_minimize: bool,
-    #[serde(default)]
-    pub pause_on_lost_focus: bool,
     /// When the user closes the window, exit cleanly (no tray persistence).
     #[serde(default = "default_true")]
     pub close_on_exit: bool,
@@ -374,8 +370,6 @@ impl Default for AppSettings {
             discord_rpc_show_titles:     true,
             discord_rpc_blocked_titles:  Vec::new(),
             discord_rpc_browse_states:   true,
-            pause_on_minimize:           true,
-            pause_on_lost_focus:         false,
             close_on_exit:               true,
             minimize_to_tray_on_close:   false,
             scrobble_addon_url:          String::new(),
