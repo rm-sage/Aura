@@ -134,7 +134,13 @@ export default function ImageLoader({
           }
         }
       },
-      { rootMargin: "1200px" },
+      // Preload ~0.75 of a viewport ahead instead of a flat 1200px: scales the
+      // off-screen decode/VRAM cost to the window size (a flat 1200px preloads
+      // many extra rows on a short window) while never exceeding the old value
+      // and never dropping below 600px, so normal scrolling still hits warm
+      // images. (Clamped conservatively; bump the 600 floor if fling-scroll on
+      // the widest grid shows skeleton pop-in.)
+      { rootMargin: `${Math.min(1200, Math.max(600, Math.round((typeof window !== "undefined" ? window.innerHeight : 1080) * 0.75)))}px` },
     );
     observer.observe(node);
     return () => observer.disconnect();
