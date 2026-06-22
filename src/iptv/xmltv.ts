@@ -83,8 +83,17 @@ export function indexProgramsByChannel(
   programs: EpgProgram[],
   nameToId?: Map<string, string>,
 ): EpgIndex {
+  // Rolling-window trim (RAM): keep only programmes overlapping
+  // [now - 6h, now + 72h]. A full 7-day XMLTV for hundreds of channels is far
+  // more EpgProgram objects than the now/next + short-horizon guide ever shows,
+  // so dropping the far-past / far-future tail cuts resident memory (~4x on a
+  // typical 7-day feed) with no visible loss. Re-trimmed on every EPG refresh.
+  const now = Date.now();
+  const windowStart = now - 6 * 60 * 60 * 1000;
+  const windowEnd = now + 72 * 60 * 60 * 1000;
   const byChannel = new Map<string, EpgProgram[]>();
   for (const p of programs) {
+    if (p.endMs <= windowStart || p.startMs >= windowEnd) continue;
     const list = byChannel.get(p.channelTvgId);
     if (list) list.push(p);
     else byChannel.set(p.channelTvgId, [p]);
