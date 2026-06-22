@@ -137,14 +137,20 @@ fn install(entries: Vec<FribbEntry>) {
     crate::devlog!(info, "anime-id-map", "installed {count} imdb→anime-ids entries");
 }
 
+static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+fn client() -> &'static reqwest::Client {
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .https_only(true)
+            .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " anime-id-map"))
+            .build()
+            .expect("anime-id-map HTTP client init failed")
+    })
+}
+
 async fn fetch_fresh() -> Result<String, String> {
-    let cli = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .https_only(true)
-        .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " anime-id-map"))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = cli.get(FRIBB_URL).send().await.map_err(|e| format!("fetch: {e}"))?;
+    let resp = client().get(FRIBB_URL).send().await.map_err(|e| format!("fetch: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
         return Err(format!("upstream returned HTTP {}", status.as_u16()));

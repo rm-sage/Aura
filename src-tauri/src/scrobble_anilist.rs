@@ -662,13 +662,9 @@ async fn resolve_anilist_id_for_anime_prefix(show_id: &str) -> Result<Option<u64
         anilist: Option<serde_json::Value>,
     }
     let url = format!("https://relations.yuna.moe/api/ids?source={api_source}&id={id}");
-    let cli = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .https_only(true)
-        .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " anilist-resolve"))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = match cli.get(&url).send().await {
+    // Reuse the module's pooled client (connection + TLS session reuse) rather
+    // than building a fresh one per lookup.
+    let resp = match client().get(&url).send().await {
         Ok(r) => r,
         Err(e) => {
             crate::devlog!(warn, "scrobble", "yuna.moe lookup failed for {source}={id}: {e}");
