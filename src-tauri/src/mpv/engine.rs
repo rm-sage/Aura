@@ -30,9 +30,10 @@
 //!     `libmpv-wrapper.dll` (the legacy plugin) entirely — one engine,
 //!     one DLL (`libmpv-2.dll`), one event channel.
 //!
-//! The known cost is the original off-focus DWM throttling of a `--wid`
-//! child's swapchain — accepted for now; the FFI foundation kept here is
-//! the basis for optimising that later.
+//! Off-focus frame drops were root-caused to the NVIDIA "Background
+//! Application Max Frame Rate" setting capping aura.exe when unfocused
+//! (a per-machine driver config, not a DWM/swapchain or render-path
+//! issue); with that disabled, off-focus playback holds full frame rate.
 //!
 //! ## Architecture
 //!
@@ -983,8 +984,9 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
                 // decoder drops (decoder-frame-drop-count) tells us
                 // WHERE in the pipeline the loss happens:
                 //   * VO drops without decoder drops → presentation
-                //     timing issue (DWM throttling, swap-interval
-                //     mismatch, render-loop pacing drift).
+                //     timing issue (NVIDIA "Background Application Max
+                //     Frame Rate" cap when unfocused, DWM throttling,
+                //     swap-interval mismatch, render-loop pacing drift).
                 //   * Decoder drops → CPU starvation / process power
                 //     throttling. Win11 EcoQoS is the canonical cause
                 //     post-2021; pin_process_scheduling now opts out.

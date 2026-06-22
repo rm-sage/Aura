@@ -141,11 +141,13 @@ export interface AuraSettings {
   loudnessNormalization: boolean;
   /** Motion interpolation — mpv's built-in GPU frame interpolation
    *  (`video-sync=display-resample` + `interpolation` + `tscale`).
-   *  GPU-cheap (Aura already uses `vo=gpu-next`), opt-in, **default
-   *  false until the deferred `mpv_render_context` render-API rewrite
-   *  is sorted** (with the current `--wid` child-HWND embedding,
-   *  `display-resample` makes off-focus frame drops catastrophic —
-   *  ~20-60 fps vs ~6-8/s with audio-sync; see docs/research). Re-applies
+   *  GPU-cheap (Aura already uses `vo=gpu-next`), opt-in and anime-gated
+   *  (it adds judder on live-action). Default false as a taste choice, not
+   *  a technical limitation: the off-focus frame drops once blamed on
+   *  `display-resample` were root-caused to the NVIDIA "Background
+   *  Application Max Frame Rate" driver setting capping aura.exe when
+   *  unfocused (a per-machine config, fixed in the NVIDIA profile), NOT to
+   *  the `--wid` embedding; interpolation no longer drops off-focus. Re-applies
    *  on every stream load AND on toggle; surfaced in both Settings and
    *  the in-player three-dots menu. Optional in the type only so
    *  incremental edits type-check; defaults + parse always populate it. */

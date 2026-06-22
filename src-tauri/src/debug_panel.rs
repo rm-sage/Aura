@@ -6,7 +6,10 @@
 //! Two Tauri commands that surface live engine + mpv + window state into
 //! the frontend, and a timed drop-rate test the user can run while moving
 //! Aura between foreground / visible-background / minimised to validate
-//! the off-focus-drop behaviour empirically.
+//! the off-focus-drop behaviour empirically. (Those drops were ultimately
+//! root-caused to the NVIDIA "Background Application Max Frame Rate" driver
+//! setting capping aura.exe when unfocused; this stays as a general
+//! drop-rate diagnostic.)
 //!
 //! All values come either from the [`crate::mpv::engine`] published
 //! atomics + `submit_get_property`, or from cheap Win32 / DWM queries

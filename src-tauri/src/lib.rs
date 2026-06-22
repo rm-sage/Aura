@@ -1654,13 +1654,15 @@ pub fn run() {
             settings::load(app.handle());
 
             // ── MPV engine ─────────────────────────────────────────────────
-            // Make the process immune to Windows background timer/priority
-            // throttling BEFORE MPV starts, so off-focus playback (alt-tab
-            // or a click on another monitor) keeps frame pacing. The
-            // throttle is catastrophic for interpolation's display-resample
-            // path (20-60 dropped fps) and noticeable even without it. See
-            // win32::pin_process_scheduling — touches no MPV property or
-            // window (clear of every MPV stability landmine).
+            // Opt the process out of Windows background timer/priority
+            // throttling BEFORE MPV starts, as defense-in-depth for off-focus
+            // playback. See win32::pin_process_scheduling: touches no MPV
+            // property or window (clear of every MPV stability landmine).
+            // NB: the severe off-focus drops once blamed on this throttle
+            // (the "20-60 dropped fps with interpolation" reports) were
+            // actually the NVIDIA "Background Application Max Frame Rate"
+            // driver setting capping aura.exe when unfocused (per-machine
+            // config), not this. This opt-out is kept but was not the fix.
             #[cfg(target_os = "windows")]
             {
                 win32::pin_process_scheduling();

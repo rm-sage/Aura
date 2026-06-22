@@ -2,7 +2,23 @@
 
 **Date:** 2026-06-22
 **Question:** Can Aura's off-focus frame drops be **completely eliminated** *without* sacrificing HDR / Dolby Vision / advanced video playback?
-**Status:** Research complete. Verdict below. No code changes made.
+**Status:** RESOLVED. Root cause found and it was external to Aura. See the resolution below; both analyses further down were WRONG and are kept only as a record of two confident misdiagnoses.
+
+---
+
+## RESOLVED - root cause was NVIDIA "Background Application Max Frame Rate"
+
+The off-focus frame drops, present since day one, were caused by the NVIDIA Control Panel setting **"Background Application Max Frame Rate"** misclassifying `aura.exe` as a background application and hard-capping its frame rate whenever Aura lost foreground focus. It was never a DWM composition throttle, never MPO / Independent-Flip demotion, never mpv's display-resample retiming, and never Windows EcoQoS / timer coarsening (the theories chased below and in the code comments at the time).
+
+Fix: set a per-application NVIDIA profile for `aura.exe` that disables "Background Application Max Frame Rate" (or turn the global setting off). With that done:
+
+- Off-focus playback holds full frame rate (alt-tab, click another monitor, etc.).
+- **Motion interpolation (`video-sync=display-resample`) no longer drops at all when enabled and Aura is out of focus.** The earlier "20-60 dropped fps with interpolation on" was the NVIDIA cap, not the architecture.
+- HDR / Dolby Vision passthrough is unaffected (it always was). The whole "HDR vs off-focus" tradeoff framing was a false dilemma born of the wrong premise.
+
+Because the cap is a per-machine driver setting, other users with "Background Application Max Frame Rate" enabled (it can be set globally) could see the same drops; it is a driver-config issue, not an Aura bug, and Aura needs no render-path rewrite to avoid it. The EcoQoS / timer-resolution / ABOVE_NORMAL opt-outs Aura applies (`win32::apply_playback_perf_opts`) and the `display-fps-override` pin for the resample clock remain as sound, independent measures, but they were never the fix for these drops.
+
+Everything below (the "later same day" CORRECTION and the original "Executive summary" onward) is SUPERSEDED and wrong; kept for the record.
 
 ---
 

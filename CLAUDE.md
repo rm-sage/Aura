@@ -302,6 +302,13 @@ monitor via `MonitorFromWindow`, `SetWindowPos` to its full `rcMonitor` (covers 
 - `apply_playback_perf_opts` clears Win11 EcoQoS execution-speed throttling for the process and sets
   `timeBeginPeriod(1)` for 1 ms timer granularity.
 
+Note: the historical "off-focus frame drops" (worse with motion interpolation on) were NOT a DWM or
+render-path limitation. They were root-caused to the NVIDIA Control Panel "Background Application Max
+Frame Rate" setting misclassifying `aura.exe` as a background app and capping its frame rate when it
+loses foreground. The fix is a per-app NVIDIA profile (or turning that global setting off); it is a
+per-machine driver config, not an Aura bug, and needs no render rewrite. The opt-outs above and the
+`display-fps-override` pin are sound but were never the fix for those drops.
+
 The taskbar bleed-through on an "always show taskbar" setting is a Windows compositor heuristic limit:
 auto-hide only triggers for users with "Automatically hide the taskbar" enabled. The `Shell_TrayWnd`
 `SW_HIDE` workaround was tried and reverted (broke secondary-monitor tray icons). True DXGI exclusive

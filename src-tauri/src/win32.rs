@@ -96,7 +96,7 @@ struct Rect {
 // media keeps full frame rate when the window loses focus.
 //
 // Windows throttles background apps three ways: DWM present-throttling of the
-// occluded window (the stubborn one), background timer coarsening, and Win11
+// occluded window, background timer coarsening, and Win11
 // EcoQoS / power throttling that slows the process outright. Browsers opt out
 // of the latter two for audible media. We do the same, process-wide + once:
 //   1. SetProcessInformation(ProcessPowerThrottling) with ExecutionSpeed in
@@ -104,8 +104,11 @@ struct Rect {
 //   2. timeBeginPeriod(1) → 1 ms timer resolution so a coarsened background
 //      timer can't stall the decode/present cadence.
 // Held for the process lifetime; the idle cost is negligible for a media app.
-// This does NOT defeat DWM present-throttling (that needs the render-path
-// rewrite) but removes the EcoQoS + timer halves, which is what browsers do.
+// These remove the EcoQoS + timer levers (what browsers do); they are sound
+// defense-in-depth but were NOT the fix for Aura's off-focus drops, which were
+// root-caused to the NVIDIA "Background Application Max Frame Rate" driver
+// setting capping aura.exe when unfocused (per-machine config). No render-path
+// rewrite is needed.
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "windows")]
 pub fn apply_playback_perf_opts() {
@@ -1177,9 +1180,11 @@ pub fn exit_native_fullscreen(parent_hwnd: isize) -> Result<(), String> {
 //      `video-sync=display-resample` path (interpolation ON) needs
 //      sub-millisecond wakeups to hit every display refresh; 15.6 ms
 //      scheduling granularity makes it miss refresh deadlines wholesale
-//      → the reported 20-60 dropped fps. With interpolation OFF
-//      (`video-sync=audio`) only whole frames jitter → the milder
-//      6-8/sec the user also saw. This asymmetry is the fingerprint.
+//      in theory. (In practice the severe "20-60 dropped fps with
+//      interpolation, milder 6-8/s without" reports were root-caused to
+//      the NVIDIA "Background Application Max Frame Rate" driver setting
+//      capping aura.exe when unfocused, NOT this timer coarsening; the
+//      opt-out below is kept as defense-in-depth, not the actual fix.)
 //   2. The foreground priority boost is gone, so the render/decode
 //      threads get preempted harder and longer.
 //
