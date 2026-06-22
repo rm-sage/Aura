@@ -213,7 +213,7 @@ dots (and a crown on the host), the party media card, and ideally a couple of me
 can stage two clients, showing the "Make host" control on hover is a bonus.
 -->
 <p align="center">
-  <img src="docs/screenshots/watch-together.png" alt="Watch Together party panel with member roster and room code" width="820">
+  <img src="docs/screenshots/watch-together.png" alt="Watch Together party panel with member roster and room code" width="344">
 </p>
 
 ## Stremio account and cloud sync
