@@ -50,7 +50,7 @@ import { useScrobbleAuthAlerts } from "./useScrobbleAuthAlerts";
 import { useKeybindings } from "./useKeybindings";
 import { libraryToggle, libraryRemoveAll, libraryWriteProgress, libraryClearProgress } from "./libraryActions";
 import { libraryItemSeriesId } from "./libraryNormalize";
-import { isWindowHidden, isWindowFocused, subscribeWindowVisibility } from "./windowVisibility";
+import { isWindowHidden, isWindowFocused, useWindowHidden, subscribeWindowVisibility } from "./windowVisibility";
 import { sourcesForMeta, openInPopupBrowser } from "./externalSources";
 import { setManualWatchedScope, getManualWatchedState, setManualWatchedState, setManualWatchedMany, getPlannedQueue } from "./manualWatched";
 import { reconcileLibraryReleaseSignals, clearReleaseSignalStore, getReleaseSignal } from "./releaseSignalStore";
@@ -5741,12 +5741,16 @@ export default function App() {
   // threshold for Rich Presence.
   const rpcInvokeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastInvokedPresenceRef = useRef<string>("");
+  const windowHidden = useWindowHidden();
   useEffect(() => {
     // Don't broadcast presence while the user is on the landing/login screen
     // or before we've finished checking session — nothing meaningful to show
     // and "Resuming Favorites" while the user is signing in is misleading.
     const onLanding = !session && !landingDismissed;
-    if (!authChecked || onLanding) {
+    // Suppress presence while the window is hidden (minimized / tray): nobody is
+    // looking at the app, so skip the RPC churn + reconnect attempts. The effect
+    // re-runs on restore (windowHidden is in the deps) and re-asserts presence.
+    if (!authChecked || onLanding || windowHidden) {
       lastSceneRef.current = "";
       presenceStartedAt.current = null;
       invoke("discord_clear_presence").catch(() => {});
@@ -5884,7 +5888,7 @@ export default function App() {
       invoke("discord_set_presence", { presence }).catch(() => {});
     }, 400);
   }, [
-    authChecked, session, landingDismissed,
+    authChecked, session, landingDismissed, windowHidden,
     activeTarget, duration, paused, isLivePlayback, isTrailerPlayback,
     selectedMeta, activeCatalog,
     activeView, homeSearchActive,
