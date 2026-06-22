@@ -23,7 +23,7 @@
 // than the dropdown for legibility over a bright paused frame.
 // ---------------------------------------------------------------------------
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import ImageLoader from "./ImageLoader";
 import SeasonSelect from "./SeasonSelect";
 import type { AddonEntry, LibraryItem, MetaDetail, VideoEntry } from "./types";
@@ -66,7 +66,7 @@ interface Props {
   onPlayEpisode: (video: VideoEntry) => void | Promise<void>;
 }
 
-export default function EpisodePanel({
+function EpisodePanel({
   open, onClose, seriesId, mediaType, addons,
   currentEpisodeId, nextEpisodeId, isFullscreen, libraryById,
   seriesArt: _seriesArt, onPlayEpisode,
@@ -392,3 +392,5 @@ export default function EpisodePanel({
     </>
   );
 }
+
+export default memo(EpisodePanel);

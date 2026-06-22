@@ -30,7 +30,7 @@
 // the History/scrobble fixes on those paths are reused unchanged.
 // ---------------------------------------------------------------------------
 
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { useWindowHidden } from "./windowVisibility";
 import ImageLoader from "./ImageLoader";
 import type { LibraryItem, StreamEntry, VideoEntry } from "./types";
@@ -110,7 +110,7 @@ function NextAirCountdown({ targetMs }: { targetMs: number }) {
   );
 }
 
-export default function EosSpotlight({
+function EosSpotlight({
   title, episode, stream, loading, isSeries, caughtUpUnaired, nextAirTargetMs,
   seriesArt, libraryById, onPlayNext, onReplay, onExit, onOpenEpisodes,
   onDismiss, episodesOpen,
@@ -467,3 +467,5 @@ export default function EosSpotlight({
     </div>
   );
 }
+
+export default memo(EosSpotlight);
