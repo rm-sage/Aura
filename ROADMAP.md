@@ -4,6 +4,13 @@ A snapshot of completed work and what remains. Each numbered phase shipped a
 coherent arc of features. Smaller tactical items live in the rolling Phase 6
 sections. New arcs land as numbered phases (Phase 7 onward).
 
+> HISTORICAL: this roadmap is frozen around Phase 5.8, and Phases 1 through 5.8
+> all shipped (the app is at v1.0.9). The work since then (live TV, casting,
+> watch together, EOS spotlight, HDR passthrough, the single-FFI engine, and the
+> polish batches) is indexed in `docs/ARCHIVE.md`. The current state of the code
+> is documented in `CLAUDE.md`, and shipped versions are on GitHub Releases.
+> Trust those over this file where they disagree.
+
 ## Status Legend
 
 - ✅ Shipped

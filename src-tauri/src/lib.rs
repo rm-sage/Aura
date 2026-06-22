@@ -25,7 +25,7 @@ mod aniskip;
 mod auth;
 mod backup;
 // Casting (Chromecast CASTV2 + DLNA SOAP) — discovery, LAN media proxy,
-// load/control. See cast/mod.rs + docs/superpowers/specs/2026-06-09-casting.md.
+// load/control. See cast/mod.rs.
 mod cast;
 mod cinema;
 mod crash_reporting;

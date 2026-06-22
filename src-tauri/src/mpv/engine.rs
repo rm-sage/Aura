@@ -15,9 +15,8 @@
 //!
 //!   * the render API on this libmpv build is hardcoded to `gl_video` —
 //!     `vo=gpu-next` (and with it scRGB/HDR passthrough) is unreachable;
-//!     real HDR needed a host DXGI flip swapchain + `WGL_NV_DX_interop2`
-//!     (see `docs/superpowers/specs/2026-06-03-mpv-hdr-dxgi-interop-
-//!     design.md`), an L-effort, HW-gated build;
+//!     real HDR needed a host DXGI flip swapchain + `WGL_NV_DX_interop2`,
+//!     an L-effort HW-gated path that was ultimately not pursued;
 //!   * `--wid` + `vo=gpu-next` + d3d11 does correct HDR/Dolby-Vision
 //!     passthrough today (`target-colorspace-hint` is honoured by the
 //!     d3d11 GPU context). NOTE: the default hwnd swapchain IS eligible
