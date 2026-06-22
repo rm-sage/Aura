@@ -109,7 +109,7 @@ function LatestAiredCaret({ leftPct }: { leftPct?: number }) {
   return (
     <span
       aria-hidden
-      className="absolute -top-[8px] -translate-x-1/2 z-20 pointer-events-none"
+      className="absolute -top-[9px] -translate-x-1/2 z-20 pointer-events-none"
       style={{ left: leftPct != null ? `${leftPct}%` : "50%" }}
     >
       <svg

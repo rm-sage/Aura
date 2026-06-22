@@ -1814,9 +1814,11 @@ select,
 
   /* Latest-aired marker on Continue Watching cards — a small green caret  */
   /* that bobs gently to point at the newest aired episode.                */
+  /* Bob LIFTS the caret up and back to its resting gap above the bar, so it
+     never dips into the episode line (its closest point is the resting pose). */
   @keyframes aura-latest-aired-bob {
     0%, 100% { transform: translateY(0); }
-    50%      { transform: translateY(2.5px); }
+    50%      { transform: translateY(-2px); }
   }
   .aura-latest-aired-caret {
     animation: aura-latest-aired-bob 1.3s ease-in-out infinite;
