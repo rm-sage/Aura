@@ -56,8 +56,6 @@ logs/
 
 # ─── AI assistants ─────────────────────────────────────────────────────────
 .claude/
-.gemini/
-.gemini_security/
 .cursor/
 
 # ─── Internal planning artifacts (not part of the shipped product) ─────────
