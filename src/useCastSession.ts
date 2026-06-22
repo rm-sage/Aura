@@ -24,6 +24,7 @@ import {
   discoverCastDevices,
   type CastDeviceInfo, type CastStatus,
 } from "./cast";
+import { isWindowHidden } from "./windowVisibility";
 
 interface UseCastSessionArgs {
   /** Raw URL of the currently-playing stream (null = nothing playing). */
@@ -165,6 +166,9 @@ export function useCastSession({
     if (!activeDevice) return;
     let failures = 0;
     const id = window.setInterval(() => {
+      // Skip the device-status IPC while minimized/tray; the cast keeps running
+      // on the device + Rust media server, and the UI catches up on restore.
+      if (isWindowHidden()) return;
       castStatus()
         .then((s) => {
           failures = 0;

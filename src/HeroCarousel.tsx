@@ -4,6 +4,7 @@
 import { useState, useEffect, useRef, useCallback, memo } from "react";
 import type { MetaPreview } from "./types";
 import ImageLoader from "./ImageLoader";
+import { useWindowHidden } from "./windowVisibility";
 
 // ---------------------------------------------------------------------------
 // HeroCarousel
@@ -141,14 +142,15 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
     if (index >= items.length) setIndex(0);
   }, [items.length, index]);
 
-  // Auto-advance
+  // Auto-advance (paused while the window is hidden / minimized).
+  const hidden = useWindowHidden();
   useEffect(() => {
-    if (items.length <= 1 || hovered) return;
+    if (items.length <= 1 || hovered || hidden) return;
     timer.current = setInterval(() => {
       setIndex((i) => (i + 1) % items.length);
     }, AUTO_ADVANCE_MS);
     return () => { if (timer.current) clearInterval(timer.current); };
-  }, [items.length, hovered]);
+  }, [items.length, hovered, hidden]);
 
   const goTo = useCallback((i: number) => {
     if (items.length === 0) return;

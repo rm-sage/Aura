@@ -4,6 +4,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import Tooltip from "./Tooltip";
+import { isWindowHidden } from "./windowVisibility";
 
 // ---------------------------------------------------------------------------
 // SyncStatusChip — tiny cloud icon in the title bar that reflects the live
@@ -70,8 +71,10 @@ export default function SyncStatusChip() {
       }
     };
     refresh();
-    const pollId = window.setInterval(refresh, POLL_INTERVAL_MS);
-    const tickId = window.setInterval(() => setTickNow(Date.now()), POLL_INTERVAL_MS);
+    // The chip lives in the title bar — invisible while minimized, so skip the
+    // status IPC + relative-time tick when hidden (resumes on restore).
+    const pollId = window.setInterval(() => { if (!isWindowHidden()) refresh(); }, POLL_INTERVAL_MS);
+    const tickId = window.setInterval(() => { if (!isWindowHidden()) setTickNow(Date.now()); }, POLL_INTERVAL_MS);
     // Refresh on settings change (theme, etc. — cheap) AND on session
     // transitions (sign-in / sign-out / account switch — the chip's
     // primary trigger for changing colour). Without the session

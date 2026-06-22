@@ -12,6 +12,7 @@ import {
 import { reconcileLibraryReleaseSignals } from "./releaseSignalStore";
 import type { ReleaseAired } from "./releaseSearch";
 import { formatEpLabel } from "./episodeLabel";
+import { useIdleGatedInterval } from "./useIdleGate";
 
 // ---------------------------------------------------------------------------
 // useNotificationsScanner — cloud-signal driven (v3).
@@ -65,6 +66,9 @@ const SCANNER_STATE_KEY = "aura:notifications:scanner-state";
 const SCANNER_VERSION_KEY = "aura:notifications:scanner-version";
 const CURRENT_SCANNER_VERSION = "3";
 const PERIODIC_REFRESH_MS = 5 * 60 * 1000;
+/** Slower cadence while the window is hidden/minimized: we keep catching new
+ *  releases so they are ready on restore, but poll less often to save power. */
+const HIDDEN_REFRESH_MS = 15 * 60 * 1000;
 
 interface ScannerItemState {
   lastChecked: number;
@@ -533,15 +537,18 @@ export default function NotificationsScanner({ addons, library }: Props) {
   // recommendation, 5–10 min. The cloud serves these from cache; the
   // §10.1 ETag short-circuit will reduce the bytes further once it
   // lands.
-  useEffect(() => {
-    const tick = () => {
-      const { library } = propsRef.current;
+  // The ONE poll we deliberately keep running while minimized/tray: the user
+  // wants new releases caught and ready on restore. It runs at a slower cadence
+  // while hidden (HIDDEN_REFRESH_MS) and fires an immediate catch-up the moment
+  // the window is restored.
+  useIdleGatedInterval(
+    () => {
       // Guest-mode + opt-out gated inside reconcileLibraryReleaseSignals.
-      void reconcileLibraryReleaseSignals(library, false);
-    };
-    const id = setInterval(tick, PERIODIC_REFRESH_MS);
-    return () => clearInterval(id);
-  }, []);
+      void reconcileLibraryReleaseSignals(propsRef.current.library, false);
+    },
+    PERIODIC_REFRESH_MS,
+    { keepWhileHidden: true, hiddenMs: HIDDEN_REFRESH_MS, runOnResume: true },
+  );
 
   return null;
 }

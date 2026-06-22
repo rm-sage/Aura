@@ -12,6 +12,7 @@
 // ---------------------------------------------------------------------------
 
 import { useEffect, useReducer } from "react";
+import { useWindowHidden } from "./windowVisibility";
 import { useWatchTogether } from "./watchTogether/useWatchTogether";
 import {
   castVote, dismissWonVote, haveVoted, voteRemainingMs, VOTE_TOTAL_MS,
@@ -29,11 +30,12 @@ export default function PartyVotesOverlay({ suppressed = false }: { suppressed?:
   // Drive the countdown rings — only while a poll is open AND visible (no idle
   // or while-hidden churn).
   const hasActive = activeLive.length > 0;
+  const hidden = useWindowHidden();
   useEffect(() => {
-    if (!hasActive || suppressed) return;
+    if (!hasActive || suppressed || hidden) return;
     const id = setInterval(tick, 250);
     return () => clearInterval(id);
-  }, [hasActive, suppressed]);
+  }, [hasActive, suppressed, hidden]);
 
   if (w.status !== "connected") return null;
   // Suppressed on detail pages / during playback so the stack never overlaps

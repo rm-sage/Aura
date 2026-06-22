@@ -4,6 +4,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { loadAuraSettings } from "./auraSettings";
+import { useWindowHidden } from "./windowVisibility";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -418,13 +419,14 @@ export default function CinemaSuite({ isFullscreen = false }: { isFullscreen?: b
     } catch {}
   }, []);
 
-  // Poll only while the OSD panel is visible — zero overhead otherwise.
+  // Poll only while the OSD panel is visible AND the window is not hidden.
+  const hidden = useWindowHidden();
   useEffect(() => {
-    if (!osdVisible) return;
+    if (!osdVisible || hidden) return;
     pollOsd();
     const id = setInterval(pollOsd, 2000);
     return () => clearInterval(id);
-  }, [osdVisible, pollOsd]);
+  }, [osdVisible, pollOsd, hidden]);
 
   // Toggle via the central keybindings system (App.tsx dispatches the event).
   useEffect(() => {
