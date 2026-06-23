@@ -5843,12 +5843,15 @@ export default function App() {
       sceneKey = "search";
     } else {
       switch (activeView) {
-        case "home":     title = "Resuming Favorites";       subtitle = "On Board";     sceneKey = "home";     break;
-        case "library":  title = "Revisiting Old Favorites"; subtitle = "In Library";   sceneKey = "library";  break;
-        case "queue":    title = "Lining Up What's Next";    subtitle = "In Queue";     sceneKey = "queue";    break;
-        case "calendar": title = "Planning My Next Binge";   subtitle = "On Calendar";  sceneKey = "calendar"; break;
-        case "addons":   title = "Exploring Add-ons";        subtitle = "In Add-ons";   sceneKey = "addons";   break;
-        case "settings": title = "Tuning Preferences";       subtitle = "In Settings";  sceneKey = "settings"; break;
+        case "home":     title = "Browsing the Home Screen";  subtitle = "On Home";      sceneKey = "home";     break;
+        case "discover": title = "Browsing Add-on Catalogs";  subtitle = "On Discover";  sceneKey = "discover"; break;
+        case "library":  title = "Revisiting Old Favorites";  subtitle = "In Library";   sceneKey = "library";  break;
+        case "queue":    title = "Lining Up What's Next";     subtitle = "In Queue";     sceneKey = "queue";    break;
+        case "live":     title = "Browsing Live TV";          subtitle = "On Live TV";   sceneKey = "live";     break;
+        case "calendar": title = "Planning My Next Binge";    subtitle = "On Calendar";  sceneKey = "calendar"; break;
+        case "history":  title = "Looking Through History";   subtitle = "In History";   sceneKey = "history";  break;
+        case "addons":   title = "Exploring Add-ons";         subtitle = "In Add-ons";   sceneKey = "addons";   break;
+        case "settings": title = "Tuning Preferences";        subtitle = "In Settings";  sceneKey = "settings"; break;
       }
     }
 
