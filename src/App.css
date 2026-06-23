@@ -1818,15 +1818,28 @@ select,
      never dips into the episode line (its closest point is the resting pose). */
   @keyframes aura-latest-aired-bob {
     0%, 100% { transform: translateY(0); }
-    50%      { transform: translateY(-2px); }
+    50%      { transform: translateY(-4px); }
   }
   .aura-latest-aired-caret {
-    animation: aura-latest-aired-bob 1.3s ease-in-out infinite;
+    animation: aura-latest-aired-bob 1.2s ease-in-out infinite;
     transform-origin: center;
     will-change: transform;
   }
+
+  /* Profile button highlight: a gentle accent glow that breathes between a soft
+     and a brighter level (recolours with the active theme accent). */
+  @keyframes aura-profile-glow-pulse {
+    0%, 100% { box-shadow: 0 0 0 1px rgb(var(--ln-accent-rgb) / 0.18), 0 0 8px 1px rgb(var(--ln-accent-rgb) / 0.22); }
+    50%      { box-shadow: 0 0 0 1px rgb(var(--ln-accent-rgb) / 0.50), 0 0 16px 3px rgb(var(--ln-accent-rgb) / 0.55); }
+  }
+  .aura-profile-glow {
+    animation: aura-profile-glow-pulse 2.6s ease-in-out infinite;
+    will-change: box-shadow;
+  }
+
   @media (prefers-reduced-motion: reduce) {
-    .aura-latest-aired-caret { animation: none; }
+    .aura-latest-aired-caret,
+    .aura-profile-glow { animation: none; }
   }
 }
 
@@ -2218,6 +2231,7 @@ html[data-aura-idle="true"] .hover-glow:hover,
 html[data-aura-idle="true"] .detail-backdrop-skeleton::after,
 html[data-aura-idle="true"] .aura-popup-card-breathe,
 html[data-aura-idle="true"] .aura-popup-card-pulse,
+html[data-aura-idle="true"] .aura-profile-glow,
 html[data-aura-idle="true"] .aura-latest-aired-caret {
   animation-play-state: paused !important;
   /* Release the GPU compositor layers these decorative elements hold:

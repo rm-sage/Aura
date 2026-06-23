@@ -102,11 +102,12 @@ export default function AccountButton({
           "backdrop-blur-xl shadow-lg",
           "transition-colors duration-150",
           "aura-bell-hover",
+          "aura-profile-glow",
           open ? "ring-1 ring-ln-accent/50" : "",
         ].filter(Boolean).join(" ")}
       >
         {initials ? (
-          <span className="aura-row-title text-[15px] font-semibold leading-none tracking-tight select-none">
+          <span className="text-[15px] font-semibold leading-none tracking-tight text-white/90 select-none">
             {initials}
           </span>
         ) : (
