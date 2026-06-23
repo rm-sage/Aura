@@ -152,10 +152,14 @@ function LatestAiredCaret({ leftPct }: { leftPct?: number }) {
 const SEGMENTED_BAR_EPISODE_CAP = 50;
 
 function SegmentedSeasonBar({
-  episodes, currentId,
+  episodes, currentId, resumeActive,
 }: {
   episodes: VideoEntry[];
   currentId: string | null;
+  /** Only paint the amber "you are here" marker when the item has a genuine
+   *  saved resume position (started, not finished, not advanced past). A
+   *  freshly-advanced next-up episode renders as "available" instead. */
+  resumeActive: boolean;
 }) {
   // Subscribe to manual-watched changes so the bar repaints
   // immediately when the user toggles a per-episode mark from the
@@ -183,7 +187,7 @@ function SegmentedSeasonBar({
   // a future-content roll-up.
   const airedCount = episodes.filter(isVideoAired).length;
   if (airedCount > SEGMENTED_BAR_EPISODE_CAP) {
-    return <ContinuousProgressBar episodes={episodes} currentId={currentId} />;
+    return <ContinuousProgressBar episodes={episodes} currentId={currentId} resumeActive={resumeActive} />;
   }
 
   const currentIdx = currentId
@@ -237,7 +241,7 @@ function SegmentedSeasonBar({
     const manual = getManualWatchedState(ep.id);
     let state: string;
     if (manual === "watched" || i < impliedThroughIdx) state = "Watched";
-    else if ((manual === "in-progress" || i === currentIdx) && i >= lastWatchedIdx) state = "In progress";
+    else if ((manual === "in-progress" || (i === currentIdx && resumeActive)) && i >= lastWatchedIdx) state = "In progress";
     else if (isVideoAired(ep)) state = "Available now";
     else state = "Not yet aired";
     return i === latestAiredIdx ? `${sxe} · ${state} · Latest aired` : `${sxe} · ${state}`;
@@ -259,9 +263,12 @@ function SegmentedSeasonBar({
         let cls: string;
         if (manual === "watched") {
           cls = "bg-emerald-400";
-        } else if ((manual === "in-progress" || i === currentIdx) && i >= lastWatchedIdx) {
-          // Genuine current position — no later episode has been watched
-          // past this one, so the amber "you are here" marker is meaningful.
+        } else if ((manual === "in-progress" || (i === currentIdx && resumeActive)) && i >= lastWatchedIdx) {
+          // Genuine current position — there IS a saved resume on this exact
+          // episode (resumeActive), and no later episode has been watched past
+          // it, so the amber "you are here" marker is meaningful. A next-up
+          // episode we advanced to but never started falls through to
+          // "available" below instead.
           cls = "bg-amber-400";
         } else if (i < impliedThroughIdx) {
           cls = "bg-emerald-400/85"; // implied-watched (earlier in season)
@@ -309,10 +316,13 @@ function SegmentedSeasonBar({
  *  when one exists — that's the "yellow at the end of the green bar"
  *  the user asked for. */
 function ContinuousProgressBar({
-  episodes, currentId,
+  episodes, currentId, resumeActive,
 }: {
   episodes: VideoEntry[];
   currentId: string | null;
+  /** Gate the amber "in-progress" gradient tip on a genuine saved resume
+   *  position (see SegmentedSeasonBar). */
+  resumeActive: boolean;
 }) {
   void useManualWatchedVersion();
   if (episodes.length === 0) return null;
@@ -368,7 +378,8 @@ function ContinuousProgressBar({
   // the rightmost watched episode — a mid-show in-progress with later
   // watched episodes is stale (the user moved past it) and shouldn't
   // paint the gradient's amber tip on an otherwise-completed run.
-  const hasInProgress = currentIdx >= 0
+  const hasInProgress =
+    (resumeActive && currentIdx >= 0)
     || episodes.some((ep, i) =>
       getManualWatchedState(ep.id) === "in-progress" && i >= lastWatchedIdx);
   const fillStyle: React.CSSProperties = hasInProgress
@@ -706,6 +717,19 @@ const ContinueWatchingCard = memo(function ContinueWatchingCard(
   const offset = typeof item.state?.timeOffset === "number" ? item.state.timeOffset : 0;
   const duration = typeof item.state?.duration === "number" ? item.state.duration : 0;
   const progress = duration > 0 ? Math.min(1, offset / duration) : 0;
+  // The amber "resume here" marker should only appear for a GENUINE saved
+  // resume: actually started (offset > 0), not yet finished (< 95%), and the
+  // saved episode is the one we're showing — NOT a finished episode we've
+  // advanced PAST to a not-yet-started next-up. Without the last check the bar
+  // painted amber on every in-progress series' next episode even though the
+  // user never started it.
+  const savedVideoId = (item.state ?? {}).video_id;
+  const resumeActive =
+    offset > 0 &&
+    progress < 0.95 &&
+    (typeof savedVideoId !== "string" ||
+      savedVideoId.length === 0 ||
+      getManualWatchedState(savedVideoId) !== "watched");
   const seasonEpisodes = useSeasonEpisodes(item, addons);
   // Effective resume episode — falls forward across manually-watched
   // entries so a freshly-marked episode causes the SxxEyy badge AND
@@ -802,6 +826,7 @@ const ContinueWatchingCard = memo(function ContinueWatchingCard(
             <SegmentedSeasonBar
               episodes={seasonEpisodes!}
               currentId={effectiveVideoId}
+              resumeActive={resumeActive}
             />
           ) : progress > 0 && (
             <div className="absolute inset-x-0 bottom-0 h-[5px] bg-white/15">
