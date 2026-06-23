@@ -1826,27 +1826,8 @@ select,
     will-change: transform;
   }
 
-  /* Profile monogram highlight: the initials are FILLED with the theme accent
-     and bloom, pulsing the fill brightness + a glow halo around the letters. */
-  @keyframes aura-profile-glow-pulse {
-    0%, 100% {
-      color: rgb(var(--ln-accent-rgb) / 0.85);
-      text-shadow: 0 0 5px rgb(var(--ln-accent-rgb) / 0.45), 0 0 11px rgb(var(--ln-accent-rgb) / 0.25);
-    }
-    50% {
-      color: rgb(var(--ln-accent-rgb));
-      text-shadow: 0 0 10px rgb(var(--ln-accent-rgb) / 0.95), 0 0 22px rgb(var(--ln-accent-rgb) / 0.65);
-    }
-  }
-  .aura-profile-glow {
-    color: rgb(var(--ln-accent-rgb));
-    animation: aura-profile-glow-pulse 2.6s ease-in-out infinite;
-    will-change: color, text-shadow;
-  }
-
   @media (prefers-reduced-motion: reduce) {
-    .aura-latest-aired-caret,
-    .aura-profile-glow { animation: none; }
+    .aura-latest-aired-caret { animation: none; }
   }
 }
 
@@ -2198,8 +2179,27 @@ html[data-reduced-motion="true"] .aura-glow,
 html[data-reduced-motion="true"] .aura-bell-ringing,
 html[data-reduced-motion="true"] .aura-bell-badge-bouncing,
 html[data-reduced-motion="true"] .aura-popup-breathe,
+html[data-reduced-motion="true"] .aura-title,
+html[data-reduced-motion="true"] .aura-row-title,
+html[data-reduced-motion="true"] .aura-hero-title,
+html[data-reduced-motion="true"] .aura-logo-a,
+html[data-reduced-motion="true"] .aura-latest-aired-caret,
 html[data-reduced-motion="true"] .hover-glow:hover {
   animation: none !important;
+}
+
+/* Reduced motion: collapse the animated accent gradient-text fills to ONE solid
+   accent colour. With the animation stopped they otherwise freeze TWO-TONE (the
+   accent plus the shimmer's white / spectral highlight); this keeps reduced
+   motion calm and uniformly on-theme. */
+html[data-reduced-motion="true"] .aura-title,
+html[data-reduced-motion="true"] .aura-row-title,
+html[data-reduced-motion="true"] .aura-hero-title,
+html[data-reduced-motion="true"] .aura-logo-a {
+  background: none !important;
+  -webkit-text-fill-color: rgb(var(--ln-accent-rgb)) !important;
+  color: rgb(var(--ln-accent-rgb)) !important;
+  -webkit-text-stroke: 0 !important;
 }
 
 /* ---------------------------------------------------------------- */
@@ -2238,7 +2238,6 @@ html[data-aura-idle="true"] .hover-glow:hover,
 html[data-aura-idle="true"] .detail-backdrop-skeleton::after,
 html[data-aura-idle="true"] .aura-popup-card-breathe,
 html[data-aura-idle="true"] .aura-popup-card-pulse,
-html[data-aura-idle="true"] .aura-profile-glow,
 html[data-aura-idle="true"] .aura-latest-aired-caret {
   animation-play-state: paused !important;
   /* Release the GPU compositor layers these decorative elements hold:
