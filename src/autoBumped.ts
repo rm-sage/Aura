@@ -89,6 +89,29 @@ export function clearAutoBumped(seriesId: string): void {
   window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
 }
 
+/** Clear any auto-bumped series that `id` belongs to. `id` may be the series
+ *  root itself OR one of its episode ids (e.g. "tt0903747:1:5" or
+ *  "kitsu:46474:5") - we match by exact id or `<seriesId>:` prefix, so no
+ *  id-shape parsing is needed and id-prefix collisions (tt0903747 vs
+ *  tt09037479) can't false-match. This is the MANUAL counterpart to the
+ *  play-time clear in onPlayStream: it fires when the user engages with a
+ *  series by marking it (or one of its episodes) watched / in-progress, so a
+ *  user who catches up WITHOUT playing doesn't leave the show stranded out of
+ *  CW. Idempotent. */
+export function clearAutoBumpedForVideo(id: string): void {
+  if (!id) return;
+  const set = load();
+  if (set.size === 0) return;
+  const toDelete: string[] = [];
+  for (const seriesId of set) {
+    if (id === seriesId || id.startsWith(seriesId + ":")) toDelete.push(seriesId);
+  }
+  if (toDelete.length === 0) return;
+  for (const seriesId of toDelete) set.delete(seriesId);
+  save();
+  window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
+}
+
 /** Subscribe to auto-bump changes. CW row uses this so the tile
  *  list refreshes the instant a series gets auto-bumped or cleared,
  *  without waiting on the next library re-fetch. */

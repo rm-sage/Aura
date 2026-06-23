@@ -42,7 +42,7 @@ import ResumePrompt, { type PendingResume } from "./ResumePrompt";
 import { isNewer } from "./updater";
 import { checkForUpdatePlugin, downloadAndInstallUpdatePlugin, type UpdateInfo } from "./updaterPlugin";
 import { advanceWatchedAfter } from "./autoAdvance";
-import { clearAutoBumped } from "./autoBumped";
+import { clearAutoBumped, clearAutoBumpedForVideo } from "./autoBumped";
 import { mirrorWatchedFromCloud, pushItemWatched } from "./watchedSync";
 import { onWatchedSync } from "./manualWatched";
 import { useScrobble, type ActiveScrobbleTarget } from "./useScrobble";
@@ -3625,6 +3625,26 @@ export default function App() {
       }
     });
   }, [session, library]);
+
+  // ── Clear the auto-bumped suppression when the user ENGAGES with a series by
+  //     marking any of its episodes (or the series root) watched / in-progress.
+  //     autoBumped previously only cleared on PLAY (onPlayStream pre-load hook),
+  //     so a user who caught up by marking watched WITHOUT playing left the
+  //     series stranded out of Continue Watching forever. Ungated (autoBumped is
+  //     a local overlay, independent of sign-in) and fires for every
+  //     watched-state transition; clearAutoBumpedForVideo prefix-matches an
+  //     episode id back to its series root. Marking null (un-watch) is NOT an
+  //     engagement, so recheckSeriesWatchedFlag's own seriesId->null write
+  //     can't clear the bump it sets immediately after.
+  useEffect(() => {
+    return onWatchedSync((diffs) => {
+      for (const d of diffs) {
+        if (d.newState === "watched" || d.newState === "in-progress") {
+          clearAutoBumpedForVideo(d.id);
+        }
+      }
+    });
+  }, []);
 
   // ── Local stats: bump streams_played on every load_video, accumulate
   //     watched-time per media_type via a 5 s tick while playing. The
