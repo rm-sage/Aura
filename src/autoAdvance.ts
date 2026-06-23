@@ -3,12 +3,20 @@
 
 // autoAdvance.ts ──────────────────────────────────────────────────────────
 //
-// "Watched an episode → mark the next one as in-progress" automation,
-// plus aired-only series-completion logic and a recheck path that
-// un-marks a "watched" series when new episodes air.
+// Aired-only series-completion logic plus a recheck path that un-marks a
+// "watched" series when new episodes air.
+//
+// NOTE: this module used to ALSO auto-promote the next episode to
+// "in-progress" after you watched one (and bump the first new aired episode of
+// a finished series). That painted a yellow Continue-Watching marker on
+// episodes that were never actually started, so the auto-promotion was removed.
+// The "in-progress" overlay is now reserved for episodes with a genuine saved
+// resume position, or set by hand via the episode right-click "Mark as In
+// Progress". CW membership and new-episode resurface do not depend on it: they
+// run off the Stremio library state.timeOffset and the series "watched" flag.
 //
 // Fires from two places:
-//   1. useScrobble — when playback crosses the 90 % completion threshold.
+//   1. useScrobble — when playback crosses the completion threshold.
 //   2. DetailView's right-click "Mark as Watched" handler — when the user
 //      manually flips an episode to watched.
 //
@@ -21,14 +29,9 @@
 //
 // Recheck path: when an addon adds a new aired episode to a show the
 // user already marked watched, `recheckSeriesWatchedFlag` flips the
-// series back to in-progress and bumps the first new aired ep to
-// "in-progress" so it surfaces in CW. Called by DetailView whenever a
+// series back out of "watched" so it returns to Continue Watching (via its
+// preserved state.timeOffset). Called by DetailView whenever a
 // freshly-fetched meta-detail comes in.
-//
-// Only ever PROMOTES the next episode's state (null → in-progress). If the
-// next episode is already watched (out-of-order viewing) or already
-// in-progress (user is part-way through the next ep already), we leave it
-// alone. Same for the series root: only set "watched" if it isn't already.
 // ---------------------------------------------------------------------------
 
 import type { AddonEntry, MetaDetail, VideoEntry } from "./types";
@@ -131,18 +134,13 @@ export async function advanceWatchedAfter(
     return;
   }
 
-  // Otherwise: promote the next AIRED episode to in-progress so it
-  // shows up in CW. Walking past unaired episodes is safe — the
-  // sorted list keeps them after the aired ones (future air dates
-  // sort highest by season/episode in the wire data).
-  for (let i = idx + 1; i < sorted.length; i += 1) {
-    const v = sorted[i];
-    if (!isEpisodeAired(v)) continue;
-    if (getManualWatchedState(v.id) == null) {
-      setManualWatchedState(v.id, "in-progress");
-    }
-    break;
-  }
+  // Not complete: we deliberately do NOT auto-promote the next episode to
+  // "in-progress" anymore. That painted a yellow Continue-Watching marker on an
+  // episode the user never actually started. The series stays in CW via its
+  // library state.timeOffset, and the amber resume marker is reserved for an
+  // episode with a genuine saved resume position (CinemaRows resumeActive).
+  // Manual right-click "Mark as In Progress" remains the only way to set that
+  // overlay by hand.
 }
 
 /** Re-check whether a series' "watched" flag is still valid given
@@ -187,15 +185,15 @@ export function recheckSeriesWatchedFlag(
   if (!firstUnwatchedAired) return;
 
   // New episode aired on a show that was previously fully watched.
-  // Unmark the series and bump the new episode into in-progress.
-  // Also tag the series as auto-bumped so the CW row doesn't
-  // suddenly add it (the library may still have a non-zero
-  // state.timeOffset from an earlier watch). The flag clears when
-  // the user actually engages with the show again — playing an
-  // episode, manually re-marking, or marking the new ep watched.
+  // Unmark the series so it returns to Continue Watching (its
+  // state.timeOffset from the last watch is intact). Also tag the series
+  // as auto-bumped so the CW row doesn't suddenly add it back the moment
+  // it un-marks; the flag clears when the user actually engages with the
+  // show again — playing an episode, manually re-marking, or marking the
+  // new ep watched. We no longer bump the new episode to "in-progress":
+  // that overlay is reserved for a genuine saved resume position. The
+  // `firstUnwatchedAired` lookup above is kept purely as the guard that
+  // decides whether a new aired episode exists at all.
   setManualWatchedState(seriesId, null);
   markAutoBumped(seriesId);
-  if (getManualWatchedState(firstUnwatchedAired.id) == null) {
-    setManualWatchedState(firstUnwatchedAired.id, "in-progress");
-  }
 }
