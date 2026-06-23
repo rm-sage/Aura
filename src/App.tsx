@@ -1843,7 +1843,7 @@ export default function App() {
           // during the loadfile critical section (landmine #3).
           invoke("set_motion_interpolation", {
             enabled: !!motionInterpolation && animeFlag,
-            tscale: interpolationTscale ?? "oversample",
+            tscale: interpolationTscale ?? "mitchell",
           }).catch(() => {});
           // Hover-thumbnail pre-warm. `extract_thumbnail` lazily spins
           // up a SEPARATE "thumb" libmpv instance (audio=false, vo=null,

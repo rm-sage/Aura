@@ -142,24 +142,24 @@ export interface AuraSettings {
   /** Motion interpolation — mpv's built-in GPU frame interpolation
    *  (`video-sync=display-resample` + `interpolation` + `tscale`).
    *  GPU-cheap (Aura already uses `vo=gpu-next`), opt-in and anime-gated
-   *  (it adds judder on live-action). Default false as a taste choice, not
-   *  a technical limitation: the off-focus frame drops once blamed on
-   *  `display-resample` were root-caused to the NVIDIA "Background
-   *  Application Max Frame Rate" driver setting capping aura.exe when
-   *  unfocused (a per-machine config, fixed in the NVIDIA profile), NOT to
-   *  the `--wid` embedding; interpolation no longer drops off-focus. Re-applies
-   *  on every stream load AND on toggle; surfaced in both Settings and
-   *  the in-player three-dots menu. Optional in the type only so
-   *  incremental edits type-check; defaults + parse always populate it. */
+   *  (it adds judder on live-action). Default TRUE: the off-focus frame drops
+   *  once blamed on `display-resample` were root-caused to the NVIDIA
+   *  "Background Application Max Frame Rate" driver setting capping aura.exe
+   *  when unfocused (a per-machine config, fixed in the NVIDIA profile), NOT to
+   *  the `--wid` embedding, so interpolation no longer drops off-focus and is on
+   *  by default again. Still anime-gated at apply time. Re-applies on every
+   *  stream load AND on toggle; surfaced in both Settings and the in-player
+   *  three-dots menu. Optional in the type only so incremental edits type-check;
+   *  defaults + parse always populate it. */
   motionInterpolation?: boolean;
   /** The `tscale` (temporal scaler) kernel mpv interpolation uses —
    *  THE quality dial. mpv lists kernels in increasing smoothness:
    *  `oversample` (sharpest — judder-fix only, synthesises NO
    *  intermediate motion) → `catmull_rom` → `mitchell` → `gaussian`
-   *  → `bicubic` (softest). Default `oversample` (low overhead, the
-   *  user's pick for the always-on default); switch to a blending
-   *  kernel for the SVP-like look. Whitelisted Rust-side. Optional in
-   *  the type only; defaults + parse always populate it. */
+   *  → `bicubic` (softest). Default `mitchell` (a balanced blending kernel -
+   *  visibly smoother motion without the heaviest softening); `oversample` is
+   *  judder-fix-only and the softer kernels push the SVP-like look. Whitelisted
+   *  Rust-side. Optional in the type only; defaults + parse always populate it. */
   interpolationTscale?: string;
   /** Next-Up CTA: skip filler / recap episodes when computing the
    *  next-up target. Source field: AIOMetadata's per-episode
@@ -232,8 +232,8 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   autoAdvanceDelaySeconds: 10,
   blurEpisodeSynopsis: false,
   loudnessNormalization: false,
-  motionInterpolation: false,
-  interpolationTscale: "oversample",
+  motionInterpolation: true,
+  interpolationTscale: "mitchell",
   nextUpSkipFillerRecap: "none",
   releaseSearchEnabled: true,
   metaPanelActivation: "hover",
@@ -310,13 +310,14 @@ function readFromStorage(): AuraSettings {
       // Default OFF until the deferred mpv_render_context rewrite is
       // sorted — under the current --wid child-HWND embedding,
       // display-resample makes off-focus frame drops catastrophic.
-      // An explicitly-stored `true` (user opted in) keeps it on.
+      // An explicitly-stored value (either way) is respected; absent falls back
+      // to the default-on value, so users who never touched it get it enabled.
       motionInterpolation: typeof parsed.motionInterpolation === "boolean"
         ? parsed.motionInterpolation
-        : false,
+        : true,
       interpolationTscale: typeof parsed.interpolationTscale === "string"
         ? parsed.interpolationTscale
-        : "oversample",
+        : "mitchell",
       nextUpSkipFillerRecap:
         parsed.nextUpSkipFillerRecap === "filler"
           || parsed.nextUpSkipFillerRecap === "recap"
