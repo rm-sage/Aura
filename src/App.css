@@ -2188,14 +2188,13 @@ html[data-reduced-motion="true"] .hover-glow:hover {
   animation: none !important;
 }
 
-/* Reduced motion: collapse the animated accent gradient-text fills to ONE solid
-   accent colour. With the animation stopped they otherwise freeze TWO-TONE (the
-   accent plus the shimmer's white / spectral highlight); this keeps reduced
-   motion calm and uniformly on-theme. */
-html[data-reduced-motion="true"] .aura-title,
+/* Reduced motion: collapse the accent-SHIMMER gradient-text fills (catalog row
+   headers + the home hero title) to ONE solid accent colour - they otherwise
+   freeze two-tone (accent + the white highlight). The title-bar branding
+   (.aura-title + .aura-logo-a) is deliberately EXCLUDED: it keeps its original
+   spectral gradient, simply frozen in place by the animation: none above. */
 html[data-reduced-motion="true"] .aura-row-title,
-html[data-reduced-motion="true"] .aura-hero-title,
-html[data-reduced-motion="true"] .aura-logo-a {
+html[data-reduced-motion="true"] .aura-hero-title {
   background: none !important;
   -webkit-text-fill-color: rgb(var(--ln-accent-rgb)) !important;
   color: rgb(var(--ln-accent-rgb)) !important;
