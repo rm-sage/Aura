@@ -42,19 +42,34 @@ export function useIdleGatedInterval(
     cbRef.current = callback;
   }, [callback]);
 
+  // Timestamp of the last actual run, so the resume catch-up can't be spammed
+  // by rapid minimize -> restore cycles.
+  const lastRunRef = useRef(0);
+  const run = () => {
+    lastRunRef.current = Date.now();
+    cbRef.current();
+  };
+
   useEffect(() => {
     // Fully paused while hidden unless we are told to keep going.
     if (hidden && !keepWhileHidden) return;
     const period = hidden ? (hiddenMs ?? ms) : ms;
-    const id = window.setInterval(() => cbRef.current(), period);
+    const id = window.setInterval(run, period);
     return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hidden, keepWhileHidden, hiddenMs, ms]);
 
-  // Catch-up fire on the hidden -> visible transition.
+  // Catch-up on the hidden -> visible transition, but ONLY if a normal interval
+  // would already be due. A quick minimize -> restore (well under `ms`) leaves
+  // lastRun recent, so it won't re-fire the poll — no request spam from
+  // flapping the window.
   const wasHiddenRef = useRef(hidden);
   useEffect(() => {
     const wasHidden = wasHiddenRef.current;
     wasHiddenRef.current = hidden;
-    if (wasHidden && !hidden && runOnResume) cbRef.current();
+    if (wasHidden && !hidden && runOnResume && Date.now() - lastRunRef.current >= ms) {
+      run();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hidden, runOnResume]);
 }
