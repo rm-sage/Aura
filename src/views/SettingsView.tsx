@@ -3305,6 +3305,46 @@ const TOC_GROUPS: TocGroup[] = [
   },
 ];
 
+/** Fast ease-out rAF scroll of `scrollRoot` so `el` is brought into view -
+ *  roughly 1.6x faster than native scrollIntoView({ behavior: "smooth" }),
+ *  whose duration the browser fixes and we can't speed up. `block: "start"`
+ *  parks the element `topInset`px below the container top (mirrors the
+ *  sections' scroll-mt-6); `block: "center"` vertically centers it. Jumps
+ *  instantly under reduced motion. Shared by every settings section-scroll
+ *  (the TOC + the search-match navigation) so they feel identical. */
+function fastScrollToSettingsEl(
+  scrollRoot: HTMLElement,
+  el: HTMLElement,
+  opts?: { block?: "start" | "center"; topInset?: number },
+): void {
+  const block = opts?.block ?? "start";
+  const topInset = opts?.topInset ?? 24;
+  const rootRect = scrollRoot.getBoundingClientRect();
+  const elRect = el.getBoundingClientRect();
+  const start = scrollRoot.scrollTop;
+  const rel = start + (elRect.top - rootRect.top);
+  const raw = block === "center"
+    ? rel - (scrollRoot.clientHeight - elRect.height) / 2
+    : rel - topInset;
+  const target = Math.max(0, Math.min(raw, scrollRoot.scrollHeight - scrollRoot.clientHeight));
+  const dist = Math.abs(target - start);
+  if (dist < 2) return;
+  // Reduced motion: jump instantly, no animated scroll.
+  if (document.documentElement.getAttribute("data-reduced-motion") === "true") {
+    scrollRoot.scrollTop = target;
+    return;
+  }
+  const duration = Math.min(280, Math.max(130, dist * 0.32));
+  const startTs = performance.now();
+  const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
+  const stepScroll = (now: number) => {
+    const t = Math.min(1, (now - startTs) / duration);
+    scrollRoot.scrollTop = start + (target - start) * easeOutCubic(t);
+    if (t < 1) requestAnimationFrame(stepScroll);
+  };
+  requestAnimationFrame(stepScroll);
+}
+
 interface SettingsTocProps {
   scrollRoot: HTMLDivElement | null;
   /** Search state — when present, the TOC renders the search input
@@ -3331,9 +3371,9 @@ function SettingsToc({ scrollRoot, search }: SettingsTocProps) {
     const el = scrollRoot.querySelector<HTMLElement>(`#${id}`);
     if (!el) return;
     setActiveId(id);
-    // scrollIntoView respects the scroll-mt-6 utility on the Section so
-    // the title isn't flush against the panel's top edge.
-    el.scrollIntoView({ behavior: "smooth", block: "start" });
+    // Snappy shared scroll instead of the browser-fixed native smooth
+    // scrollIntoView (see fastScrollToSettingsEl).
+    fastScrollToSettingsEl(scrollRoot, el, { block: "start" });
   };
 
   // Keep the active highlight in sync with whichever section the user
@@ -4466,10 +4506,11 @@ export default function SettingsView({ addons, session }: Props) {
     const idxStr = matchedIds[currentMatchIdx];
     if (!idxStr) return;
     const rowIdx = Number(idxStr);
-    const rows = scrollRef.current?.querySelectorAll<HTMLElement>("[data-settings-row]");
-    const el = rows?.[rowIdx];
-    if (!el) return;
-    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    const root = scrollRef.current;
+    const el = root?.querySelectorAll<HTMLElement>("[data-settings-row]")[rowIdx];
+    if (!root || !el) return;
+    // Same snappy shared scroll as the TOC, centered on the matched row.
+    fastScrollToSettingsEl(root, el, { block: "center" });
   }, [currentMatchIdx, matchedIds]);
 
   const stepMatch = useCallback((delta: 1 | -1) => {
