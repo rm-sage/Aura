@@ -660,12 +660,18 @@ function useEffectiveResumeVideoId(
 // season older than the one currently airing), keeps the CW countdown in lock-
 // step with the calendar for every show.
 function CWReleaseCountdown({ seriesId, episodes }: { seriesId: string; episodes: VideoEntry[] | null }) {
-  const now = useCountdownNow();
   useReleaseSignalsVersion(); // re-read getReleaseSignal when signals update
-  const metaNextMs = episodes ? (nextAiringEpisode(episodes, now)?.targetMs ?? null) : null;
+  // Resolve the target FIRST (a one-shot Date.now() is fine for picking the
+  // next future episode; the live `now` below still drives the display + aired
+  // guard) so the tick hook can coarsen its cadence to 30 s when the air date
+  // is far out. SOURCE PRIORITY unchanged: authoritative meta videos first, the
+  // cloud release signal only as a fallback (it can point at a later episode).
+  const probe = Date.now();
+  const metaNextMs = episodes ? (nextAiringEpisode(episodes, probe)?.targetMs ?? null) : null;
   const cloudIso = getReleaseSignal(seriesId)?.next_aired?.aired_at;
   const cloudMs = cloudIso ? Date.parse(cloudIso) : NaN;
   const targetMs = metaNextMs ?? cloudMs;
+  const now = useCountdownNow(Number.isFinite(targetMs) ? targetMs : undefined);
   if (!Number.isFinite(targetMs) || targetMs <= now) return null;
   return (
     <div className="absolute inset-x-0 bottom-[28px] flex justify-center pointer-events-none z-10">

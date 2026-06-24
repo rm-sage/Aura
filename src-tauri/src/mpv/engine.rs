@@ -552,6 +552,19 @@ const TICK: Duration = Duration::from_millis(5);
 /// there is nothing to present and we only need to stay responsive to commands
 /// + mpv events. Drops idle wakeups from ~200/sec to ~7/sec.
 const HIDDEN_TICK: Duration = Duration::from_millis(150);
+/// Pump cadence while the window is VISIBLE but nothing is loaded (sitting on a
+/// menu / Home screen — no file, so no presentation and no frame pacing to do).
+/// 33 ms (~30 Hz) keeps geometry tracking and click-to-Play command latency
+/// imperceptible while cutting idle wakeups from ~200/sec (TICK) to ~30/sec.
+/// Deliberately keyed off file-loaded, NOT pause state: a loaded-but-paused
+/// file (and background audio) stays on the fast TICK.
+const IDLE_TICK: Duration = Duration::from_millis(33);
+/// Minimum spacing between parent-visibility ([`PresentMode`]) detections. The
+/// detection issues a DWM round-trip (`DwmGetWindowAttribute`); at the 5 ms
+/// playback TICK that was ~190 calls/sec for a value that only changes on
+/// minimize / alt-tab. A <=120 ms lag on a transition is imperceptible (it only
+/// delays pump coarsening on minimize and un-coarsening on restore).
+const MODE_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
 /// Current [`PresentMode`] discriminant, published from the render thread
 /// on every mode transition. 255 = engine not running. Read by the debug
@@ -1654,6 +1667,17 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         // only call SetThreadExecutionState on an actual transition (not
         // every frame). Starts false = not inhibited.
         let mut display_awake_applied = false;
+        // Tracks whether we currently hold the 1 ms multimedia timer
+        // resolution. We assert it exactly while a file is loaded (the 5 ms
+        // TICK needs ~1 ms sleep granularity to pace mpv off-focus) and
+        // release it when nothing is loaded, so an idle Home / tray Aura
+        // returns to the OS-default ~15 ms timer and lets the CPU idle deeper.
+        // Starts false = not held (replaces the old process-lifetime hold).
+        let mut timer_res_applied = false;
+        // Throttles parent-visibility detection to MODE_POLL_INTERVAL (see the
+        // const) instead of once per tick. Initialised to "now" so the first
+        // iteration trusts the pre-loop `mode` value and doesn't re-poll.
+        let mut last_mode_poll = Instant::now();
         // -- Cache-state poll gating (CLAUDE.md landmines #3/#4) --
         // A real buffering %/readahead read needs a get_property poll, which is
         // SAFE only OUTSIDE the loadfile + seek critical sections. We never
@@ -1882,15 +1906,18 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             // switch; etc. Nothing is applied to mpv — this exists so
             // off-focus playback reports can be correlated with the
             // window state in DevConsole.
-            let now_mode = detect_present_mode(parent);
-            if now_mode != mode {
-                mode = now_mode;
-                CURRENT_MODE.store(mode.as_u8(), Ordering::Release);
-                crate::devlog!(
-                    info, "mpv",
-                    "parent visibility → {}",
-                    mode.label(),
-                );
+            if last_mode_poll.elapsed() >= MODE_POLL_INTERVAL {
+                last_mode_poll = Instant::now();
+                let now_mode = detect_present_mode(parent);
+                if now_mode != mode {
+                    mode = now_mode;
+                    CURRENT_MODE.store(mode.as_u8(), Ordering::Release);
+                    crate::devlog!(
+                        info, "mpv",
+                        "parent visibility → {}",
+                        mode.label(),
+                    );
+                }
             }
 
             // Geometry resync — poll the PARENT's client rect + fullscreen
@@ -1974,12 +2001,20 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 emit("seek-state", serde_json::Value::Object(sm));
             }
 
+            // An in-sync watch-party member keeps PLAYING while hidden (the
+            // window-event handler exempts it from pause-on-minimise), so for
+            // such a member "Hidden" is NOT idle: it must keep the fast tick, the
+            // 1 ms timer, and the cache poll so its control-apply latency and
+            // per-member buffer telemetry stay tight. Read once per tick.
+            let party_alive = crate::window_logic::party_keep_alive();
+
             // -- Gated cache-state poll -- (see the gating-state comment above).
             // Numeric formats ONLY (never NODE — landmine #4); never while a
             // load/seek is in flight or within the settle window (landmine #3).
+            // Runs while visible OR while a kept-alive party member plays hidden.
             if playback_ready
                 && !seeking
-                && mode != PresentMode::Hidden
+                && (mode != PresentMode::Hidden || party_alive)
                 && last_transition.elapsed() >= CACHE_SETTLE
                 && last_cache_poll.elapsed() >= CACHE_POLL_INTERVAL
             {
@@ -2012,12 +2047,46 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 emit("cache-state", serde_json::Value::Object(m));
             }
 
-            // Steady pump cadence. While hidden (minimized / tray) playback is
-            // paused and there is nothing to present, so drop to a coarse tick
-            // and stop waking the CPU 200x/sec. Commands + mpv events are still
-            // drained every iteration above, so restore / unpause stays
-            // responsive (latency only grows to the coarse tick while hidden).
-            let tick_target = if mode == PresentMode::Hidden { HIDDEN_TICK } else { TICK };
+            // Hold 1 ms multimedia timer resolution only while we are actively
+            // pacing a visible file (the 5 ms TICK below needs ~1 ms sleep
+            // granularity). Release it in every coarse-tick state and let the
+            // CPU reach deeper idle C-states:
+            //   * no file loaded (idle Home / menu): IDLE_TICK 33 ms — nothing
+            //     to pace.
+            //   * minimized / occluded (Hidden): HIDDEN_TICK 150 ms, and minimize
+            //     pauses local playback (the cast path uses a separate ffmpeg/HTTP
+            //     media server, not the multimedia timer), so nothing is pacing —
+            //     EXCEPT a kept-alive party member, which keeps decoding while
+            //     hidden and so keeps the 1 ms timer.
+            // Transition-only. `mode` lags up to MODE_POLL_INTERVAL, which only
+            // delays the release/re-assert by that much — imperceptible.
+            let want_timer_res = playback_ready && (mode != PresentMode::Hidden || party_alive);
+            if want_timer_res != timer_res_applied {
+                crate::win32::set_high_timer_resolution(want_timer_res);
+                timer_res_applied = want_timer_res;
+            }
+
+            // Steady pump cadence, three tiers:
+            //   * Hidden (minimized / tray): coarse HIDDEN_TICK — playback is
+            //     paused and nothing is presented, so don't wake 200x/sec.
+            //   * Visible but no file loaded (idle Home / menu): IDLE_TICK —
+            //     no presentation or frame pacing, just geometry + command
+            //     responsiveness, so ~30/sec is plenty.
+            //   * Visible with a file loaded (playing OR paused): the fast TICK
+            //     for invisible command/seek/event latency and frame pacing.
+            // Commands + mpv events are drained every iteration above, so
+            // restore / click-to-Play stays responsive (latency only grows to
+            // the active tier's tick).
+            // A kept-alive party member playing while hidden takes the fast TICK
+            // (not HIDDEN_TICK) so the leader's pause/seek/control frames apply
+            // with ~5 ms latency instead of up to 150 ms (tighter party sync).
+            let tick_target = if mode == PresentMode::Hidden && !party_alive {
+                HIDDEN_TICK
+            } else if !playback_ready {
+                IDLE_TICK
+            } else {
+                TICK
+            };
             let elapsed = tick_start.elapsed();
             if elapsed < tick_target {
                 thread::sleep(tick_target - elapsed);
@@ -2033,6 +2102,11 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         // thread, and the CloseRequested handler joins this thread before
         // `app.exit()`, so the audio device is guaranteed back with the
         // OS mixer before the process dies.
+        // Release the 1 ms timer resolution if we were still holding it (engine
+        // torn down mid-playback), so a balance isn't left outstanding.
+        if timer_res_applied {
+            crate::win32::set_high_timer_resolution(false);
+        }
         let _ = set_property_generic(&lib, handle, "mute", &PropValue::Flag(true));
         let _ = run_mpv_command(&lib, handle, &["stop"]);
         (lib.terminate_destroy)(handle);

@@ -422,7 +422,12 @@ function Room({
           {members.map((m) => {
             const onTitle = roomVideoKey != null && m.videoKey === roomVideoKey;
             const isHost = m.id === leaderId;
-            const canTransfer = isLeader && !isHost && m.id !== selfId;
+            // Only offer the crown to a member who is ON the party title (or when
+            // no party stream is established yet). Handing it to an off-title
+            // member lets their first play/pause overwrite the party's stream
+            // identity (broadcastControl owns=isLeader) and yank everyone to a
+            // title nobody picked — a one-click accidental party hijack.
+            const canTransfer = isLeader && !isHost && m.id !== selfId && (roomVideoKey == null || onTitle);
             return (
               <li
                 key={m.id}

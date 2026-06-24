@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { loadAuraSettings, saveAuraSettings, getSettingsUpdatedAt, setSettingsUpdatedAt, bumpSettingsUpdatedAt, type AuraSettings, DEFAULT_AURA_SETTINGS } from "./auraSettings";
 import { encryptForCloud, decryptFromCloud, isEncryptedBlob, type EncryptedBlob } from "./syncCrypto";
 import { getHistory, setAllHistory, type HistoryEntry } from "./historyStore";
+import { isWindowHidden, subscribeWindowVisibility } from "./windowVisibility";
 
 // ---------------------------------------------------------------------------
 // Aura Cloud sync orchestrator (frontend)
@@ -1106,8 +1107,13 @@ export function startBackgroundPull(): () => void {
   let timer: ReturnType<typeof setInterval> | null = null;
   let paused = false;
 
+  // Skip the 5-minute pull while a video is loaded (don't compete with playback
+  // for bandwidth) AND while the window is minimized / occluded (nothing is
+  // showing the synced state; a catch-up fires on restore below). This is the
+  // only ungated cloud call in the tray — the release/notification keep-alive
+  // is separate (NotificationsScanner) and intentionally stays running.
   const tick = () => {
-    if (paused) return;
+    if (paused || isWindowHidden()) return;
     void syncPullAll();
   };
 
@@ -1117,9 +1123,22 @@ export function startBackgroundPull(): () => void {
   window.addEventListener("aura:playback-started", onPlay);
   window.addEventListener("aura:playback-ended",   onStop);
 
+  // One catch-up pull the instant the window is restored from hidden, so a
+  // change made on another device while Aura sat in the tray lands promptly
+  // instead of waiting up to 5 minutes. syncPullAll's own PULL_MIN_INTERVAL_MS
+  // guard collapses this with any near-simultaneous interval tick, so a rapid
+  // minimize -> restore flap can't spam the proxy.
+  let wasHidden = isWindowHidden();
+  const unsubVisibility = subscribeWindowVisibility(() => {
+    const nowHidden = isWindowHidden();
+    if (wasHidden && !nowHidden && !paused) void syncPullAll();
+    wasHidden = nowHidden;
+  });
+
   timer = setInterval(tick, INTERVAL_MS);
   return () => {
     if (timer) clearInterval(timer);
+    unsubVisibility();
     window.removeEventListener("aura:playback-started", onPlay);
     window.removeEventListener("aura:playback-ended",   onStop);
   };

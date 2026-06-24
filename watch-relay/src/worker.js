@@ -90,6 +90,12 @@ export class Room {
     //   leaderId — the explicit current-leader cid (creator → transfer → bye-handoff).
     /** @type {{ order: string[], leaderId: string|null } | null} */
     this.meta = null;
+    // Per-socket frame rate limiter (token bucket per ws). Transient — lost when
+    // the DO hibernates, which is fine: a flood keeps the DO awake so the bucket
+    // persists for the flood's duration, and legit traffic (ticks ~0.25/s, stats
+    // ~0.5/s, controls on user action) never approaches the budget.
+    /** @type {Map<WebSocket, { tokens: number, last: number }>} */
+    this.rates = new Map();
   }
 
   /** @param {Request} request */
@@ -176,6 +182,10 @@ export class Room {
 
   /** @param {WebSocket} ws @param {string|ArrayBuffer} raw */
   async webSocketMessage(ws, raw) {
+    // Rate-limit BEFORE any work: a peer flooding control/tick/stat/vote frames
+    // would otherwise amplify N-fold to the whole room. Legit traffic never
+    // trips this; a flood degrades to silently-dropped frames.
+    if (!this.allow(ws)) return;
     let msg;
     try {
       msg = JSON.parse(typeof raw === "string" ? raw : new TextDecoder().decode(raw));
@@ -260,8 +270,16 @@ export class Room {
           // another CONNECTED member.
           if (!this.isLeader(me.id)) break;
           const target = (str(msg.target, 16) || "").replace(/[^A-Za-z0-9]/g, "");
-          const open = new Set(this.roster().map((m) => m.id));
-          if (!target || !open.has(target)) break;
+          const targetMember = this.roster().find((m) => m.id === target);
+          if (!target || !targetMember) break;
+          // Refuse to crown a member who isn't on the party title: their very
+          // first play/pause would run broadcastControl as owner and overwrite
+          // the party's stream IDENTITY with their own, yanking everyone to a
+          // title nobody picked (a one-click hijack). No established stream yet
+          // (videoKey null) ⇒ any target is fine. Mirrors the client's canTransfer
+          // gate, but enforced here so a crafted set-leader frame can't bypass it.
+          const stForXfer = await this.loadState();
+          if (stForXfer.videoKey != null && targetMember.videoKey !== stForXfer.videoKey) break;
           this.meta.leaderId = target;
           await this.saveMeta();
           this.broadcastMembers(); // carries the new leaderId to everyone
@@ -361,6 +379,7 @@ export class Room {
 
   async webSocketClose(ws) {
     await this.ensureMeta();
+    this.rates.delete(ws); // drop the leaver's rate-limit bucket
     try { ws.close(); } catch { /* already closing */ }
     // effectiveLeader() recomputes here: a departed leader (graceful bye already
     // moved leaderId; an ungraceful drop falls through to the longest-present
@@ -369,11 +388,31 @@ export class Room {
     // A departure can complete a pending vote (the lone hold-out left). Await it
     // so the read-modify-write finishes inside this event's input gate.
     try { await this.reevaluateVotes(); } catch { /* keep the room alive */ }
+    // Staging-strand recovery: if the member HOLDING a staged stream dropped
+    // (graceful or not) without clearing it, the persisted staging=true strands
+    // the room — the inherited leader has no local staging flag, so its "Start
+    // now" affordance never renders and every follower's transport stays blocked
+    // on "waiting for the host". When the staging driver is no longer connected,
+    // clear staging, reassign the driver to the new effective leader, and
+    // broadcast the corrected state so the new leader can drive and followers
+    // unblock. (Runs only while members remain; the empty-room cleanup is below.)
+    try {
+      const roster = this.roster();
+      if (roster.length > 0) {
+        const st = await this.loadState();
+        if (st.staging && (!st.driverId || !roster.some((m) => m.id === st.driverId))) {
+          const fixed = { ...st, staging: false, driverId: this.effectiveLeader(), updatedAt: Date.now() };
+          await this.saveState(fixed);
+          this.broadcast({ t: "control", ...fixed });
+        }
+      }
+    } catch { /* keep the room alive */ }
     // Last member out — drop the room's persisted blobs so an abandoned code
     // doesn't leave storage resident forever.
     if (this.roster().length === 0) {
       try { await this.state.storage.delete(["state", "votes", "meta"]); } catch { /* ignore */ }
       this.meta = { order: [], leaderId: null };
+      this.rates.clear();
     }
   }
 
@@ -383,6 +422,23 @@ export class Room {
   }
 
   // ── helpers ──────────────────────────────────────────────────────────────
+
+  /** Per-socket token-bucket rate limit. Returns false once the socket has
+   *  exhausted its frame budget (a flood). BURST tolerates a legit burst (a
+   *  scrubber drag, a reconnect catch-up); RATE is the sustained refill. Both
+   *  are far above any real client's frame rate, so this only ever drops abuse. */
+  allow(ws) {
+    const RATE = 30;   // sustained frames/sec refilled into the bucket
+    const BURST = 60;  // bucket capacity (max instantaneous burst)
+    const now = Date.now();
+    let r = this.rates.get(ws);
+    if (!r) { r = { tokens: BURST, last: now }; this.rates.set(ws, r); }
+    r.tokens = Math.min(BURST, r.tokens + ((now - r.last) / 1000) * RATE);
+    r.last = now;
+    if (r.tokens < 1) return false;
+    r.tokens -= 1;
+    return true;
+  }
 
   roster() {
     // getWebSockets() can still include a socket in the CLOSING state (even

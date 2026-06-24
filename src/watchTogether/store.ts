@@ -290,7 +290,7 @@ export function leaveRoom(): void {
   emit();
 }
 
-function connect(code: string, intent: "join" | "create"): boolean {
+function connect(code: string, intent: "join" | "create", isReconnect = false): boolean {
   const base = getRelayUrl();
   if (!base) {
     setError("Set a relay URL in Settings → Watch Together first.");
@@ -299,6 +299,11 @@ function connect(code: string, intent: "join" | "create"): boolean {
   teardown();
   userLeft = false;
   roomNotFound = false;
+  // A fresh user-initiated connect (create / join) re-arms the retry budget; the
+  // internal reconnect path passes isReconnect=true so it keeps counting down.
+  // Without this a NEW party inherits an exhausted counter from a prior failed
+  // session and gets zero reconnects on its first transient drop.
+  if (!isReconnect) reconnectAttempts = 0;
   ui.status = "connecting";
   ui.roomCode = code;
   ui.pendingCode = null;
@@ -357,7 +362,13 @@ function connect(code: string, intent: "join" | "create"): boolean {
       reconnectAttempts += 1;
       ui.status = "connecting";
       emit();
-      reconnectTimer = setTimeout(() => connect(ui.roomCode as string, "create"), 1500 * reconnectAttempts);
+      // Reconnect with the intent appropriate to OUR role: a former leader /
+      // creator re-establishes the room ("create"); a follower rejoins ("join")
+      // so that if the host has since closed the room the relay's 4404 fires and
+      // we settle into "no one is hosting" — instead of resurrecting a dead room
+      // with "create" and silently becoming its new (blank) leader.
+      const reIntent = ui.isLeader ? "create" : "join";
+      reconnectTimer = setTimeout(() => connect(ui.roomCode as string, reIntent, true), 1500 * reconnectAttempts);
     } else {
       ui.status = "error";
       ui.error = ui.error ?? "Lost the watch-together connection.";
@@ -396,6 +407,9 @@ function teardown() {
   ui.memberStats = {}; // transient buffer stats don't survive a (re)connect — they repopulate
   if (statEmitTimer) { clearTimeout(statEmitTimer); statEmitTimer = null; }
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  // A pending vote-error timeout would otherwise fire into a torn-down / re-
+  // connected room, emitting a stale error. Clear it with the rest.
+  if (voteErrorTimer) { clearTimeout(voteErrorTimer); voteErrorTimer = null; ui.voteError = null; }
   if (ws) {
     ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
     try { ws.close(); } catch { /* ignore */ }
@@ -565,10 +579,14 @@ function handleMessage(data: string) {
       emit();
       break;
     case "vote-won": {
-      // Only ONE winner is pinned at a time — a new winner overwrites the old.
+      // Pin EVERY distinct winner — two near-simultaneous wins must not clobber
+      // each other (an earlier agreed title would silently vanish). Newest first,
+      // deduped, capped so a long session can't grow the pinned list unbounded.
       // Drop it from the active list immediately (the trailing `votes` frame
       // confirms, but don't wait for it).
-      if (ui.wonVotes[0]?.id !== msg.vote.id) ui.wonVotes = [msg.vote];
+      if (!ui.wonVotes.some((v) => v.id === msg.vote.id)) {
+        ui.wonVotes = [msg.vote, ...ui.wonVotes].slice(0, 5);
+      }
       ui.activeVotes = ui.activeVotes.filter((v) => v.id !== msg.vote.id);
       emit();
       break;
@@ -616,8 +634,17 @@ function applyTick(position: number, paused: boolean, speed: number | undefined,
   if (!ui.inSync || !bridge || paused) return;
   if (!driverId || driverId !== effectiveLeaderId()) return;
   const local = bridge.getLocal();
-  if (local.paused) return;
   const spd = Number.isFinite(speed) && (speed as number) > 0 ? (speed as number) : local.speed;
+  // Self-heal a locally-paused follower while the room is PLAYING (we passed the
+  // `paused` guard above, and the leader only ticks when it is itself playing).
+  // A pause that did not come from a leader control frame (a minimize-edge, a
+  // buffering stall, a missed resume) is otherwise never corrected by ticks and
+  // sticks until the host next acts — a silent, sticky desync. The driverId
+  // guard above means a forged tick can't trigger this resume.
+  if (local.paused) {
+    applyRemote(false, position, spd);
+    return;
+  }
   if (Math.abs(local.position - position) > DRIFT_THRESHOLD_S) {
     applyRemote(false, position, spd);
   } else if (Math.abs(spd - local.speed) > 0.01) {
@@ -634,7 +661,11 @@ function expectedPosition(state: RoomState): number {
   if (state.paused) return state.position;
   const serverNow = Date.now() + serverClockOffset;
   const elapsed = Math.max(0, (serverNow - state.updatedAt) / 1000);
-  return state.position + elapsed;
+  // The room playhead advances at the leader's SPEED, so a non-1x leader moved
+  // `elapsed * speed` seconds since updatedAt. Extrapolating raw wall-seconds
+  // would land a joiner / resyncer `elapsed*(speed-1)` behind on the first snap.
+  const spd = state.speed && state.speed > 0 ? state.speed : 1;
+  return state.position + elapsed * spd;
 }
 
 function applyRemote(paused: boolean, position: number, speed = 1) {

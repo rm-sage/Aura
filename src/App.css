@@ -2217,9 +2217,14 @@ html[data-reduced-motion="true"] .aura-hero-title {
 /* (same rationale as AmbientAura's display:none-preserves-position).*/
 /*                                                                  */
 /* Kept SEPARATE from data-reduced-motion (an exported a11y setting) */
-/* so the two gates compose. Only purely decorative loops are listed */
-/* — work-in-progress indicators (buffering, search, skeleton) keep  */
-/* animating so a backgrounded download/scan still reads as live.    */
+/* so the two gates compose. Decorative loops + the player's own     */
+/* buffering / scrub paint bars are listed: when the window is hidden */
+/* or merely unfocused (e.g. background audio playing behind another  */
+/* app) nobody is watching playback, so freezing those paint loops is */
+/* free. True work-in-progress indicators (search, skeleton, scan)    */
+/* are NOT listed — they keep animating so a backgrounded scan still  */
+/* reads as live. The player bars also stay live under the FOCUSED    */
+/* user-idle tier below (a user can watch without moving the mouse).  */
 /* ---------------------------------------------------------------- */
 html[data-aura-idle="true"] .aura-sweep,
 html[data-aura-idle="true"] .aura-sweep::after,
@@ -2237,13 +2242,44 @@ html[data-aura-idle="true"] .hover-glow:hover,
 html[data-aura-idle="true"] .detail-backdrop-skeleton::after,
 html[data-aura-idle="true"] .aura-popup-card-breathe,
 html[data-aura-idle="true"] .aura-popup-card-pulse,
-html[data-aura-idle="true"] .aura-latest-aired-caret {
+html[data-aura-idle="true"] .aura-latest-aired-caret,
+html[data-aura-idle="true"] .aura-scrub-fill,
+html[data-aura-idle="true"] .aura-buffering-text,
+html[data-aura-idle="true"] .aura-buffering-pulse {
   animation-play-state: paused !important;
   /* Release the GPU compositor layers these decorative elements hold:
      will-change ignores animation-play-state, so without this the layers stay
      resident while idle/minimized. They re-promote on the next frame after
      restore. (Progress indicators like SpectralPulse / spinners deliberately
      keep animating so a backgrounded scan still reads as live.) */
+  will-change: auto !important;
+}
+
+/* ---------------------------------------------------------------- */
+/* Focused user-idle decorative suspend                             */
+/*                                                                  */
+/* App.tsx sets `data-aura-user-idle` when the window is FOCUSED    */
+/* but has had no pointer / key / scroll input for ~25 s — a user   */
+/* parked on a static Home. Freeze ONLY the always-on ambient       */
+/* shimmers (full-viewport `background-position` PAINT loops + the  */
+/* wordmark / row-title sweeps); they cost real GPU/CPU repainting  */
+/* something nobody is interacting with. Deliberately a SUBSET of   */
+/* the away list above — the player's buffering / scrub bars and    */
+/* the notification bell are NOT frozen here, because a focused     */
+/* user can watch (or await an alert) for minutes without moving    */
+/* the mouse. Resumes in place on the next input.                   */
+/* ---------------------------------------------------------------- */
+html[data-aura-user-idle="true"] .aura-sweep,
+html[data-aura-user-idle="true"] .aura-sweep::after,
+html[data-aura-user-idle="true"] .aura-ambient,
+html[data-aura-user-idle="true"] .aura-ambient::before,
+html[data-aura-user-idle="true"] .aura-ambient::after,
+html[data-aura-user-idle="true"] .aura-title,
+html[data-aura-user-idle="true"] .aura-row-title,
+html[data-aura-user-idle="true"] .aura-logo-a,
+html[data-aura-user-idle="true"] .aura-hero-title {
+  animation-play-state: paused !important;
+  /* Same compositor-layer release as the away tier. */
   will-change: auto !important;
 }
 

@@ -98,12 +98,16 @@ struct Rect {
 // Windows throttles background apps three ways: DWM present-throttling of the
 // occluded window, background timer coarsening, and Win11
 // EcoQoS / power throttling that slows the process outright. Browsers opt out
-// of the latter two for audible media. We do the same, process-wide + once:
+// of the latter two for audible media. We do the same:
 //   1. SetProcessInformation(ProcessPowerThrottling) with ExecutionSpeed in
 //      the control mask and the state bit CLEARED → "don't throttle me".
-//   2. timeBeginPeriod(1) → 1 ms timer resolution so a coarsened background
-//      timer can't stall the decode/present cadence.
-// Held for the process lifetime; the idle cost is negligible for a media app.
+//      Process-wide + once; the idle cost is negligible.
+//   2. 1 ms timer resolution so a coarsened background timer can't stall the
+//      decode/present cadence — but this is NO LONGER pinned for the process
+//      lifetime. It is asserted on demand by the engine pump only while a file
+//      is loaded (set_high_timer_resolution) and released when idle, so a
+//      menu-bound / minimized Aura returns to the OS-default timer and lets the
+//      CPU idle deeper instead of holding 1 ms resolution system-wide forever.
 // These remove the EcoQoS + timer levers (what browsers do); they are sound
 // defense-in-depth but were NOT the fix for Aura's off-focus drops, which were
 // root-caused to the NVIDIA "Background Application Max Frame Rate" driver
@@ -123,10 +127,6 @@ pub fn apply_playback_perf_opts() {
     // PROCESS_INFORMATION_CLASS::ProcessPowerThrottling
     const PROCESS_POWER_THROTTLING_CLASS: i32 = 4;
 
-    #[link(name = "winmm")]
-    extern "system" {
-        fn timeBeginPeriod(uperiod: u32) -> u32;
-    }
     #[link(name = "kernel32")]
     extern "system" {
         fn SetProcessInformation(h: *mut c_void, class: i32, info: *mut c_void, size: u32) -> i32;
@@ -150,9 +150,11 @@ pub fn apply_playback_perf_opts() {
         } else {
             crate::devlog!(info, "win32", "EcoQoS power-throttling disabled for full-rate background playback");
         }
-        // 1 ms timer resolution, held for the process lifetime.
-        timeBeginPeriod(1);
     }
+    // NB: 1 ms timer resolution is no longer pinned for the process lifetime
+    // here. It is now asserted on demand by the engine pump (only while a file
+    // is loaded) via set_high_timer_resolution, so an idle / tray Aura returns
+    // to the OS-default timer and idles deeper. See that helper below.
 }
 
 type GetClientRectFn = unsafe extern "system" fn(*mut c_void, *mut Rect) -> i32;
@@ -1188,19 +1190,24 @@ pub fn exit_native_fullscreen(parent_hwnd: isize) -> Result<(), String> {
 //   2. The foreground priority boost is gone, so the render/decode
 //      threads get preempted harder and longer.
 //
-// Fix: pin a 1 ms timer resolution for the ENTIRE process lifetime
-// (deliberately never paired with timeEndPeriod — the same lifetime
-// hold mpv.exe / VLC / browsers use for video) and nudge the process
-// priority class up one notch. Both are process-global and independent
-// of focus, so playback stays smooth off-focus. Touches NO MPV property
-// and NO window — clear of every MPV stability landmine in CLAUDE.md.
+// Fix, two parts:
+//   * Timer resolution: hold 1 ms while a file is loaded (demand-scoped, via
+//     set_high_timer_resolution, driven by the engine pump) and release it when
+//     idle. mpv.exe / VLC / browsers hold 1 ms only while playing too; pinning
+//     it for the whole process lifetime kept the system timer at 1 ms even on an
+//     idle Home / tray Aura, blocking deeper CPU idle states for no benefit.
+//   * Priority: nudge the process priority class up one notch (below). Process-
+//     global and focus-independent, so playback stays smooth off-focus.
+// Both touch NO MPV property and NO window — clear of every MPV stability
+// landmine in CLAUDE.md.
 //
-// Loaded via libloading to stay consistent with this module's stated
-// "no windows-sys dep" approach (see the module header). winmm is
-// intentionally leaked so the timeBeginPeriod request is never
-// implicitly dropped by the Library handle closing.
+// winmm is loaded via libloading (consistent with this module's stated "no
+// windows-sys dep" approach) and intentionally leaked once, so the cached
+// timeBeginPeriod / timeEndPeriod pointers stay valid for the process lifetime
+// even though the 1 ms request itself is now asserted and released on demand.
 
 type TimeBeginPeriodFn = unsafe extern "system" fn(u32) -> u32;
+type TimeEndPeriodFn = unsafe extern "system" fn(u32) -> u32;
 type GetCurrentProcessFn = unsafe extern "system" fn() -> *mut c_void;
 type SetPriorityClassFn = unsafe extern "system" fn(*mut c_void, u32) -> i32;
 type SetProcessInformationFn = unsafe extern "system" fn(
@@ -1238,37 +1245,15 @@ struct ProcessPowerThrottlingState {
     state_mask: u32,
 }
 
-/// Make the process immune to Windows background timer/priority
-/// throttling so the embedded MPV render loop keeps pace when Aura is
-/// not the foreground window. Call once, early, at startup. A second
-/// call is harmless (timeBeginPeriod ref-counts; we never balance it —
-/// intended) but unnecessary.
+/// Make the process immune to Windows background priority throttling so the
+/// embedded MPV render loop keeps pace when Aura is not the foreground window.
+/// Call once, early, at startup. A second call is harmless but unnecessary.
+///
+/// NB: this no longer pins 1 ms timer resolution. That is now demand-scoped to
+/// active playback by the engine pump (see [`set_high_timer_resolution`]), so
+/// an idle / tray Aura no longer holds the system timer at 1 ms forever.
 pub fn pin_process_scheduling() {
     unsafe {
-        // 1 ms timer resolution, held for the whole process lifetime.
-        match libloading::Library::new("winmm.dll") {
-            Ok(winmm) => {
-                match winmm.get::<TimeBeginPeriodFn>(b"timeBeginPeriod\0") {
-                    Ok(time_begin_period) => {
-                        let r = time_begin_period(1);
-                        crate::devlog!(info, "win32",
-                            "timeBeginPeriod(1) → {} (0 = TIMERR_NOERROR); \
-                             held for process lifetime", r);
-                    }
-                    Err(e) => crate::devlog!(warn, "win32",
-                        "winmm!timeBeginPeriod unavailable: {} — off-focus \
-                         frame pacing NOT hardened", e),
-                }
-                // Never unload winmm: dropping the Library closes our
-                // module handle. forget() keeps it resident so the timer
-                // request is unambiguously lifetime-scoped.
-                std::mem::forget(winmm);
-            }
-            Err(e) => crate::devlog!(warn, "win32",
-                "winmm.dll load failed: {} — off-focus frame pacing NOT \
-                 hardened", e),
-        }
-
         // Nudge the process priority class up one notch AND opt out of
         // Windows-11 EcoQoS background-execution throttling. The latter
         // is the documented cause of post-2021 "background apps drop
@@ -1340,5 +1325,87 @@ pub fn pin_process_scheduling() {
                  default", e),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Demand-scoped 1 ms multimedia timer resolution
+// ---------------------------------------------------------------------------
+//
+// Replaces the old process-lifetime `timeBeginPeriod(1)` hold (which was fired
+// twice at startup and never balanced). Raising the global timer resolution to
+// 1 ms blocks the CPU from reaching deeper idle C-states system-wide, which is
+// pure waste when Aura is idle on a menu / minimized to the tray with nothing
+// playing. The engine pump now asserts 1 ms only while a file is loaded (its
+// 5 ms TICK needs ~1 ms sleep granularity to pace mpv, including off-focus) and
+// releases it the moment playback stops.
+
+/// Whether we currently hold the 1 ms timer resolution. `timeBeginPeriod` /
+/// `timeEndPeriod` ref-count in the OS, so we keep ONE outstanding claim and
+/// only assert/release on a real transition — never letting the ref-count drift.
+static HIGH_TIMER_RES_HELD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Cached `timeBeginPeriod` / `timeEndPeriod` pointers, resolved once from
+/// winmm.dll (then leaked resident so the pointers stay valid). `None` if winmm
+/// or either symbol is unavailable, in which case timer management degrades to a
+/// no-op (the OS-default timer, identical to any non-multimedia app).
+struct TimerResFns {
+    begin: TimeBeginPeriodFn,
+    end: TimeEndPeriodFn,
+}
+// SAFETY: plain function pointers into winmm.dll, which is leaked resident for
+// the process lifetime, so the pointers are valid to call from any thread.
+unsafe impl Send for TimerResFns {}
+unsafe impl Sync for TimerResFns {}
+
+fn timer_res_fns() -> Option<&'static TimerResFns> {
+    static FNS: std::sync::OnceLock<Option<TimerResFns>> = std::sync::OnceLock::new();
+    FNS.get_or_init(|| unsafe {
+        match libloading::Library::new("winmm.dll") {
+            Ok(winmm) => {
+                let begin = winmm.get::<TimeBeginPeriodFn>(b"timeBeginPeriod\0").ok();
+                let end = winmm.get::<TimeEndPeriodFn>(b"timeEndPeriod\0").ok();
+                let resolved = match (begin, end) {
+                    (Some(b), Some(e)) => Some(TimerResFns { begin: *b, end: *e }),
+                    _ => {
+                        crate::devlog!(warn, "win32",
+                            "winmm timer-resolution symbols unavailable; 1 ms \
+                             timer not managed (off-focus pacing softer)");
+                        None
+                    }
+                };
+                // Keep winmm (and thus the cached pointers) resident forever.
+                std::mem::forget(winmm);
+                resolved
+            }
+            Err(e) => {
+                crate::devlog!(warn, "win32", "winmm.dll load failed: {}", e);
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// Assert (`on = true`) or release (`on = false`) 1 ms multimedia timer
+/// resolution. Idempotent: a call that matches the current state is a no-op, so
+/// the OS ref-count never drifts. Driven by the engine pump on the file-loaded
+/// transition (asserted while a file is loaded, released when playback stops).
+///
+/// MUST be called from a single thread (the engine pump + its teardown). The
+/// `AtomicBool` only guards memory visibility, not cross-thread races.
+pub fn set_high_timer_resolution(on: bool) {
+    use std::sync::atomic::Ordering;
+    if HIGH_TIMER_RES_HELD.load(Ordering::Acquire) == on {
+        return; // already in the requested state
+    }
+    let Some(fns) = timer_res_fns() else { return };
+    let r = unsafe {
+        if on { (fns.begin)(1) } else { (fns.end)(1) }
+    };
+    HIGH_TIMER_RES_HELD.store(on, Ordering::Release);
+    crate::devlog!(debug, "win32",
+        "{}(1) → {} (0 = OK)",
+        if on { "timeBeginPeriod" } else { "timeEndPeriod" }, r);
 }
 

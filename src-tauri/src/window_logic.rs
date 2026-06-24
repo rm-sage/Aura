@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -291,6 +291,41 @@ pub fn now_unix() -> i64 {
 //                     stop MPV cleanly and let the default close proceed
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Watch-party keep-alive
+//
+// Minimize / minimize-to-tray normally pauses MPV (see the window-event handler
+// below). An in-sync watch-party MEMBER — leader OR follower — is EXEMPT and
+// keeps playing while hidden, so the party stays in sync:
+//   * a FOLLOWER paused on minimize desyncs, and on this build is NOT un-paused
+//     by the leader's drift ticks (those bail when the follower is locally
+//     paused) — only an explicit control frame would, which may be many seconds
+//     away — so it sits frozen and behind until the leader next acts.
+//   * a LEADER paused on minimize would pause LOCALLY without telling the party,
+//     so it falls behind the still-playing room and snaps everyone back on
+//     restore (the leader also stops emitting drift ticks while paused). Keeping
+//     the leader playing keeps the party driven. (User-chosen policy.)
+//
+// The frontend sets this true while we are CONNECTED and IN-SYNC on the party
+// title (either role) and false otherwise (left party / off the party title).
+// Mirrors the casting exemption (cast::has_active_session) but for parties.
+static PARTY_KEEP_ALIVE: AtomicBool = AtomicBool::new(false);
+
+/// Frontend -> Rust: are we a connected, in-sync watch-party member (leader or
+/// follower) right now? Drives the pause-on-minimize / tray exemption below.
+#[tauri::command]
+pub fn set_party_keep_alive(active: bool) {
+    PARTY_KEEP_ALIVE.store(active, Ordering::Release);
+}
+
+/// Whether the minimize / tray pause should be SKIPPED to keep an in-sync party
+/// member in lock-step with the party. Read by the window-event handlers AND by
+/// the engine pump (so a kept-alive member that keeps PLAYING while hidden also
+/// keeps the fast tick + cache poll instead of powering down).
+pub fn party_keep_alive() -> bool {
+    PARTY_KEEP_ALIVE.load(Ordering::Acquire)
+}
+
 fn pause_mpv<R: Runtime>(app: &AppHandle<R>) {
     let _ = app;
     #[cfg(target_os = "windows")]
@@ -367,11 +402,17 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                 // is safe.
                 let minimised = matches!(win.is_minimized(), Ok(true));
                 if minimised {
-                    // Pause on minimise is unconditional now, EXCEPT while
-                    // casting to a device: then video + audio keep rolling so
-                    // the cast session isn't interrupted by hiding the window.
+                    // Pause on minimise is the default now, with TWO exemptions
+                    // that must keep video + audio rolling while hidden:
+                    //   * casting to a device — pausing would cut the cast off.
+                    //   * an in-sync watch-party member (leader OR follower) —
+                    //     pausing would desync the party (followers freeze with no
+                    //     drift-tick recovery; a paused leader falls behind and
+                    //     snaps everyone back on restore).
                     if crate::cast::has_active_session() {
                         crate::devlog!(info, "win", "minimised while casting → keep playing");
+                    } else if party_keep_alive() {
+                        crate::devlog!(info, "win", "minimised as in-sync party member → keep playing (stay in sync)");
                     } else {
                         crate::devlog!(info, "win", "minimised → pause MPV");
                         pause_mpv(&handle);
@@ -402,9 +443,11 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     // from the tray. Pausing first means MPV is in a
                     // known-quiet state across the hide/show cycle and
                     // the user-perceived "stream broke while minimised
-                    // to tray" symptom doesn't manifest. While casting, keep
-                    // playback rolling so the cast isn't cut off.
-                    if !crate::cast::has_active_session() {
+                    // to tray" symptom doesn't manifest. Two exemptions keep
+                    // playback rolling across the hide (same as the minimise
+                    // path above): while casting (don't cut the cast off) and
+                    // while an in-sync watch-party member (don't desync the party).
+                    if !crate::cast::has_active_session() && !party_keep_alive() {
                         pause_mpv(&handle);
                     }
                     api.prevent_close();

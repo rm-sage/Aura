@@ -8,6 +8,7 @@ import { checkForUpdatePlugin, downloadAndInstallUpdatePlugin } from "../updater
 import StorageReport from "../StorageReport";
 import RuntimeComponentsSection from "../RuntimeComponentsSection";
 import Changelog from "../Changelog";
+import { useIdleGatedInterval } from "../useIdleGate";
 import {
   buildExportBlob,
   blobToBase64,
@@ -2024,18 +2025,19 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
 
   useEffect(() => {
     void refresh();
-    const pollId = window.setInterval(() => { void refresh(); }, 30_000);
-    const tickId = window.setInterval(() => setTickNow(Date.now()), 30_000);
     const onSignal = () => { void refresh(); };
     window.addEventListener("aura:settings-changed", onSignal);
     window.addEventListener("aura:session-changed",  onSignal);
     return () => {
-      window.clearInterval(pollId);
-      window.clearInterval(tickId);
       window.removeEventListener("aura:settings-changed", onSignal);
       window.removeEventListener("aura:session-changed",  onSignal);
     };
   }, [refresh]);
+  // Status IPC + relative-time tick: paused while the window is minimized /
+  // occluded (the Settings page isn't visible there), with one refresh on
+  // restore so a stale "5 minutes ago" snaps current.
+  useIdleGatedInterval(() => { void refresh(); }, 30_000, { runOnResume: true });
+  useIdleGatedInterval(() => setTickNow(Date.now()), 30_000, { runOnResume: true });
 
   const handlePullNow = useCallback(async () => {
     if (busyAction) return;

@@ -35,6 +35,7 @@ import PlaylistForm from "./live/PlaylistForm";
 import GuideView from "./live/GuideView";
 import MultiView from "./live/MultiView";
 import { openChannelMenu } from "../iptv/channelMenu";
+import { useIdleGatedInterval } from "../useIdleGate";
 
 /** Guide rows are heavier than grid cards (sticky cells + per-row timeline);
  *  the guide starts at this many rows and grows by GUIDE_PAGE as the user
@@ -109,13 +110,12 @@ function useFavoritesVersion(): number {
 }
 
 /** Current wall-clock ms, refreshed on an interval so now/next + progress
- *  bars advance. 30 s granularity is plenty for programme boundaries. */
+ *  bars advance. 30 s granularity is plenty for programme boundaries. Idle-
+ *  gated: the EPG now/next re-scan pauses while the window is minimized /
+ *  occluded and snaps forward the moment it is restored. */
 function useNowTick(intervalMs = 30_000): number {
   const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), intervalMs);
-    return () => window.clearInterval(id);
-  }, [intervalMs]);
+  useIdleGatedInterval(() => setNow(Date.now()), intervalMs, { runOnResume: true });
   return now;
 }
 

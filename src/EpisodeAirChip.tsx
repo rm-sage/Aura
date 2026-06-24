@@ -18,7 +18,7 @@
 import { formatCountdown, useCountdownNow } from "./releaseCountdown";
 
 export default function EpisodeAirChip({ targetMs }: { targetMs: number }) {
-  const now = useCountdownNow();
+  const now = useCountdownNow(targetMs);
   if (targetMs <= now) return null; // aired since mount — drop the pill
   return (
     <div className="absolute inset-x-0 bottom-1.5 flex justify-center pointer-events-none z-10">

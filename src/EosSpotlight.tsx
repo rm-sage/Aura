@@ -38,6 +38,7 @@ import { formatEpisodeTag } from "./nextUp";
 import { loadAuraSettings } from "./auraSettings";
 import { isEpisodeWatched, shouldBlurSynopsis } from "./episodeSpoilers";
 import { formatCountdown, useCountdownNow } from "./releaseCountdown";
+import { getWatchState } from "./watchTogether/store";
 
 interface Props {
   /** Series / movie display name for the END-CARD heading. */
@@ -124,8 +125,17 @@ function EosSpotlight({
   // for the remote never gets surprise-advanced.
   const settings = loadAuraSettings();
   const initialSeconds = Math.max(5, Math.min(30, Math.round(settings.autoAdvanceDelaySeconds)));
+  // Never auto-advance an in-sync party FOLLOWER: independently advancing to the
+  // next episode would change our local videoKey, drop us off the party title
+  // (recomputeSync -> inSync=false), and leave us watching ahead of the party
+  // alone with no recovery. A follower's episode changes ONLY when the leader's
+  // control frame moves the room (openVideo / resyncToRoom). The leader (and
+  // solo viewers) auto-advance as normal.
+  const party = getWatchState();
+  const isPartyFollower =
+    party.status === "connected" && !party.isLeader && party.inSync;
   const autoArmed =
-    isNextUp && settings.autoAdvanceNextEpisode && !loading && stream != null;
+    isNextUp && settings.autoAdvanceNextEpisode && !loading && stream != null && !isPartyFollower;
 
   const [remaining, setRemaining] = useState<number | null>(autoArmed ? initialSeconds : null);
   const cancelledRef = useRef(false);

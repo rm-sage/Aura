@@ -2132,6 +2132,8 @@ pub fn run() {
             // ── Phase 3C: Discord RPC ─────────────────────────────────────────
             window_logic::discord_set_presence,
             window_logic::discord_clear_presence,
+            // Watch-party: exempt an in-sync member from pause-on-minimise.
+            window_logic::set_party_keep_alive,
             // ── Phase 4: OpenSubtitles ────────────────────────────────────────
             subtitles::search_subtitles,
             subtitles::download_subtitle,

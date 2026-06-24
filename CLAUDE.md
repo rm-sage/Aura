@@ -76,8 +76,13 @@ One engine, one DLL (`libmpv-2.dll`), one event channel. Driven by direct FFI in
   an `EngineCommand`: `LoadFile`, `TogglePause`, `SetVolume`, `Command(Vec<String>)`,
   `SetProperty{typed}`, `GetProperty{sync reply}`, `Shutdown`), the event drain
   (mpv events -> `mpv-event-main` -> the lib.rs observer bridge -> `playback-update` / `osd-update`),
-  and a ~5 ms geometry pump that tracks the parent client rect and resizes the host + mpv child
-  (36 px title-bar inset windowed, 0 in fullscreen).
+  and a geometry pump that tracks the parent client rect and resizes the host + mpv child
+  (36 px title-bar inset windowed, 0 in fullscreen). The pump cadence is three-tier: `TICK` 5 ms
+  while a file is loaded (playing OR paused), `IDLE_TICK` 33 ms when visible with no file loaded
+  (idle Home/menu), `HIDDEN_TICK` 150 ms while minimized/occluded. Keyed on file-loaded
+  (`playback_ready`), NOT pause state, so a paused file and background audio keep the fast tick.
+  Parent-visibility (`PresentMode`) is detected at most every `MODE_POLL_INTERVAL` (120 ms), not per
+  tick, to avoid a per-tick DWM round-trip.
 - **Observed properties (the only safe set on this libmpv build):** `pause`, `time-pos`, `duration`,
   `volume`, `speed`, `frame-drop-count`, `decoder-frame-drop-count`. Everything else is polled. See
   the landmines: extending this set carelessly kills the ENTIRE event channel.
@@ -299,8 +304,12 @@ monitor via `MonitorFromWindow`, `SetWindowPos` to its full `rcMonitor` (covers 
 - `parent_display_refresh_hz` reads the monitor's real refresh from `DEVMODEW.dmDisplayFrequency`;
   `set_motion_interpolation` uses it to pin mpv's `display-fps-override` (an embedded `--wid` mpv
   cannot estimate refresh on its own).
-- `apply_playback_perf_opts` clears Win11 EcoQoS execution-speed throttling for the process and sets
-  `timeBeginPeriod(1)` for 1 ms timer granularity.
+- `apply_playback_perf_opts` (and `pin_process_scheduling`) clear Win11 EcoQoS execution-speed
+  throttling + raise the process priority class. They NO LONGER pin `timeBeginPeriod(1)` for the
+  process lifetime: 1 ms timer resolution is now demand-scoped to active playback via
+  `win32::set_high_timer_resolution(bool)`, which the engine pump asserts while a file is loaded and
+  releases when idle (so a menu-bound / tray Aura returns to the OS-default ~15 ms timer and idles
+  deeper). It is ref-count-safe (one outstanding claim); do NOT re-pin `timeBeginPeriod(1)` at startup.
 
 Note: the historical "off-focus frame drops" (worse with motion interpolation on) were NOT a DWM or
 render-path limitation. They were root-caused to the NVIDIA Control Panel "Background Application Max

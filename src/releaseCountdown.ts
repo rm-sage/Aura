@@ -274,8 +274,7 @@ export function formatTargetDate(targetMs: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// React tick hook — re-renders the caller every `intervalMs` so countdowns
-// advance live. Defaults to 1 s now that formatCountdown shows seconds.
+// React tick hook — re-renders the caller so countdowns advance live.
 //
 // IMPORTANT: call this in the SMALLEST component that actually shows the
 // countdown text (a leaf display component), never in a heavy parent like
@@ -283,15 +282,34 @@ export function formatTargetDate(targetMs: number): string {
 // re-renders every second. The set of countdowns (computeReleaseCountdowns)
 // rarely changes, so compute that in the parent and let each leaf tick its
 // own value.
+//
+// CPU: two built-in economies, both invisible to the caller —
+//   * Adaptive cadence. Pass `targetMs` and the hook ticks every 30 s while the
+//     target is more than an hour out (formatCountdown shows no seconds that far
+//     away, so a 1 s tick is wasted re-renders) and switches to 1 s inside the
+//     final hour for smooth seconds. Omit `targetMs` to always tick at 1 s
+//     (callers that always show seconds, e.g. the end-of-stream countdown).
+//   * Hidden gate. While the window is minimized / occluded no countdown text is
+//     visible, so the interval is torn down entirely and `now` snaps forward the
+//     instant the window is restored. Universal across every caller.
 // ---------------------------------------------------------------------------
 
 import { useState, useEffect } from "react";
+import { useWindowHidden } from "./windowVisibility";
 
-export function useCountdownNow(intervalMs = 1000): number {
+export function useCountdownNow(targetMs?: number): number {
   const [now, setNow] = useState(() => Date.now());
+  const hidden = useWindowHidden();
+  // Coarse 30 s tick while the target is >1 h out (no seconds shown), 1 s in the
+  // final hour or when no target is supplied. Recomputed from `now`, so it flips
+  // to 1 s once exactly as the target crosses the one-hour mark.
+  const intervalMs =
+    targetMs != null && targetMs - now > 60 * 60 * 1000 ? 30_000 : 1_000;
   useEffect(() => {
+    if (hidden) return; // nothing visible to tick while minimized/occluded
+    setNow(Date.now()); // snap on (re)mount and on resume from hidden
     const id = window.setInterval(() => setNow(Date.now()), intervalMs);
     return () => window.clearInterval(id);
-  }, [intervalMs]);
+  }, [intervalMs, hidden]);
   return now;
 }

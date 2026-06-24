@@ -72,7 +72,7 @@ import PartyVotesOverlay from "./PartyVotesOverlay";
 import {
   setPlaybackBridge, notifyLocalControl, notifyLocalVideo, resyncToRoom,
   startPartyStream, setLocalStaging, getWatchState, getPartyStartPosition,
-  notifyLocalBuffer, startVote,
+  notifyLocalBuffer, startVote, leaveRoom,
 } from "./watchTogether/store";
 import { useWatchTogether } from "./watchTogether/useWatchTogether";
 import { streamLabel, streamMatchKey } from "./watchTogether/streamMatch";
@@ -871,7 +871,16 @@ function usePlayback(playerActive: boolean) {
   // also stops the near-end stale-time check from false-firing on paused time.
   const windowHidden = useWindowHidden();
   useEffect(() => {
-    if (windowHidden) return;
+    // A kept-alive party member (leader OR follower) keeps PLAYING while hidden
+    // (window_logic.rs exempts an in-sync member from pause-on-minimise), so the
+    // stream-broken detector must keep running for them — otherwise a minimized-
+    // but-playing member whose debrid stream breaks never surfaces recovery and
+    // sits frozen. Snapshot is fine: the effect re-arms on the windowHidden flip
+    // (the minimise transition), which is exactly when this matters.
+    const wParty = getWatchState();
+    const partyPlayingWhileHidden =
+      wParty.status === "connected" && wParty.inSync;
+    if (windowHidden && !partyPlayingWhileHidden) return;
     const BROKEN_STALE_MS = 8000;
     // Fast path: when playback was already within the last few seconds
     // of the metadata duration, a stale heartbeat is end-of-stream, not
@@ -1322,6 +1331,32 @@ export default function App() {
   // first frame lands (see the effect below).
   const wtPendingStageRef = useRef(false);
   const reactiveParty = useWatchTogether();
+  // Tell Rust whether we're an in-sync party MEMBER (leader OR follower), so the
+  // pause-on-minimise and minimize-to-tray paths SKIP the pause for us and we
+  // keep playing while hidden — staying in sync with the party. A paused follower
+  // desyncs (drift ticks can't resume it); a paused leader falls behind the
+  // still-playing room and snaps everyone back on restore (and stops ticking).
+  // User-chosen policy: both roles keep playing while minimized.
+  const partyKeepAlive =
+    reactiveParty.status === "connected" && reactiveParty.inSync;
+  useEffect(() => {
+    invoke("set_party_keep_alive", { active: partyKeepAlive }).catch(() => {});
+  }, [partyKeepAlive]);
+  // Leave any watch party when the signed-in identity CHANGES (sign-out or
+  // account switch). Otherwise the party WebSocket + our cid survive into the
+  // next account — leaking the old identity (and its leader crown) into a fresh
+  // session. Fires only on a real identity change (not initial login), and is a
+  // no-op when not in a party. Covers every logout path via the one `session`
+  // signal rather than patching each call site.
+  const prevAuthKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    const key = session?.auth_key ?? null;
+    const prev = prevAuthKeyRef.current;
+    prevAuthKeyRef.current = key;
+    if (prev !== null && prev !== key && getWatchState().status !== "idle") {
+      leaveRoom();
+    }
+  }, [session]);
   useEffect(() => {
     setPlaybackBridge({
       getLocal: () => {
@@ -2580,17 +2615,61 @@ export default function App() {
   // signal for a borderless WebView2 — DOM focus can stick when the OS
   // window loses focus — with visibilitychange covering minimize/occlude.
   // Derived from the shared windowVisibility store (single listener set for
-  // the whole app). Idle = hidden (minimized) OR unfocused, since decorative
-  // animations need not run when nobody is looking at them either way.
+  // the whole app). Two tiers, on two attributes:
+  //   * data-aura-idle — window is hidden (minimized) OR unfocused. Safe to
+  //     extend to the player's buffering/scrub paint loops (nobody's watching
+  //     the window), so the CSS pause list includes those.
+  //   * data-aura-user-idle — window is FOCUSED but has had no pointer/key/
+  //     scroll input for IDLE_AFTER_MS. Freezes only the always-on ambient Home
+  //     shimmers (full-viewport background-position PAINT loops), NOT the player
+  //     UI — a user can watch for minutes without moving the mouse, so the live
+  //     buffering/scrub bars must keep animating. Resumes on the next input.
   useEffect(() => {
     const root = document.documentElement;
+    const IDLE_AFTER_MS = 25_000;
+    let inputIdle = false;
+    let idleTimer: number | undefined;
+
     const apply = () => {
-      const idle = isWindowHidden() || !isWindowFocused();
-      if (idle) root.setAttribute("data-aura-idle", "true");
+      const away = isWindowHidden() || !isWindowFocused();
+      if (away) root.setAttribute("data-aura-idle", "true");
       else root.removeAttribute("data-aura-idle");
+      const userIdle = !away && inputIdle;
+      if (userIdle) root.setAttribute("data-aura-user-idle", "true");
+      else root.removeAttribute("data-aura-user-idle");
     };
+
+    const armIdleTimer = () => {
+      window.clearTimeout(idleTimer);
+      idleTimer = window.setTimeout(() => { inputIdle = true; apply(); }, IDLE_AFTER_MS);
+    };
+    const onActivity = () => {
+      if (inputIdle) { inputIdle = false; apply(); }
+      armIdleTimer();
+    };
+
+    // Passive listeners — they never preventDefault, so they don't add input
+    // latency. `scroll` is capture-phase to catch inner scroll containers too.
+    const passive: AddEventListenerOptions = { passive: true };
+    const passiveCapture: AddEventListenerOptions = { passive: true, capture: true };
+    window.addEventListener("pointermove", onActivity, passive);
+    window.addEventListener("pointerdown", onActivity, passive);
+    window.addEventListener("keydown", onActivity, passive);
+    window.addEventListener("wheel", onActivity, passive);
+    window.addEventListener("scroll", onActivity, passiveCapture);
+
     apply();
-    return subscribeWindowVisibility(apply);
+    armIdleTimer();
+    const unsub = subscribeWindowVisibility(apply);
+    return () => {
+      unsub();
+      window.clearTimeout(idleTimer);
+      window.removeEventListener("pointermove", onActivity, passive);
+      window.removeEventListener("pointerdown", onActivity, passive);
+      window.removeEventListener("keydown", onActivity, passive);
+      window.removeEventListener("wheel", onActivity, passive);
+      window.removeEventListener("scroll", onActivity, passiveCapture);
+    };
   }, []);
 
   // ── Per-title saved state (volume / shader / audio_lang / sub_lang) ──
@@ -4782,10 +4861,16 @@ export default function App() {
       // the home page).
       "frame-step-back":    () => {
         if (!isPlayerActive) return;
+        // Frame-step auto-pauses mpv, which would desync an in-sync follower
+        // (and applyTick can't resume a follower past a self-inflicted pause).
+        // The wrapped transport controls already gate on this; the keybinding
+        // path must too. Also blocked during a staged hold.
+        if (wtStagedHold() || wtFollowerLocked()) return;
         invoke("frame_step", { forward: false }).catch(() => {});
       },
       "frame-step-forward": () => {
         if (!isPlayerActive) return;
+        if (wtStagedHold() || wtFollowerLocked()) return;
         invoke("frame_step", { forward: true }).catch(() => {});
       },
       // Anime4K v4 chord shortcuts. Defaults Ctrl+1..6 + Ctrl+0;

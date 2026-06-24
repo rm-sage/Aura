@@ -8,7 +8,7 @@ commands.allow = ["load_video", "stop_video"]
 
 [[permission]]
 identifier = "allow-player-controls"
-description = "Allows the frontend to toggle pause, seek, set volume / speed, switch audio + subtitle tracks, query state, and apply language defaults"
+description = "Allows the frontend to toggle pause, seek, set volume / speed, switch audio + subtitle tracks, query state, apply language defaults, and flag an in-sync watch-party member so minimise does not pause it"
 commands.allow = [
   "toggle_pause",
   "set_keep_display_awake",
@@ -34,6 +34,7 @@ commands.allow = [
   "apply_subtitle_style",
   "set_subtitle_position_runtime",
   "set_native_fullscreen",
+  "set_party_keep_alive",
 ]
 
 # ── Casting (Chromecast + DLNA) ───────────────────────────────────────────────
