@@ -26,6 +26,7 @@ const LS_URL = "aura.watch.relayUrl";
 const LS_NAME = "aura.watch.displayName";
 const LS_TOKEN = "aura.watch.appToken";
 const LS_CLIENT_ID = "aura.watch.clientId";
+const LS_CLIENT_SECRET = "aura.watch.clientSecret";
 
 /** Stable per-install id sent as `cid`. The relay keys the member on it so a
  *  reconnect reclaims the same roster slot + leader-election ordering (instead
@@ -38,6 +39,25 @@ function getClientId(): string {
   const id = crypto.randomUUID().slice(0, 8);
   try { localStorage.setItem(LS_CLIENT_ID, id); } catch { /* ignore */ }
   return id;
+}
+
+/** Per-install secret that proves to the relay we own our cid, so nobody who
+ *  knows the room code can connect claiming our cid to steal our roster slot or
+ *  leader crown (the relay binds cid -> hash(secret) on first use and rejects a
+ *  mismatch). Auto-generated once, stored locally, NEVER shown to the user or
+ *  typed — zero friction, same UX as before (just a room code). */
+function getClientSecret(): string {
+  try {
+    const existing = localStorage.getItem(LS_CLIENT_SECRET);
+    if (existing) return existing;
+  } catch { /* ignore */ }
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  // base64url, no padding (~43 chars) — URL-safe for the connect query param.
+  const secret = btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  try { localStorage.setItem(LS_CLIENT_SECRET, secret); } catch { /* ignore */ }
+  return secret;
 }
 
 /** Re-seek a follower only when it has drifted more than this from the room
@@ -390,6 +410,7 @@ function buildUrl(base: string, code: string, intent: "join" | "create"): string
   const params = new URLSearchParams();
   params.set("name", getDisplayName());
   params.set("cid", getClientId());
+  params.set("cs", getClientSecret()); // per-install ownership proof (see relay auth.js)
   // join → the relay refuses to auto-create if nobody's hosting (so we can
   // offer "create it"). create/reconnect → auto-create / re-establish.
   params.set("intent", intent);

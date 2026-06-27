@@ -17,6 +17,8 @@
 // the primary gate — you need the code to address a room — but APP_TOKEN keeps
 // randoms who find the open Worker URL from opening rooms at all.
 
+import { authorizeCid } from "./auth.js";
+
 /** @typedef {{ paused: boolean, position: number, videoKey: string|null,
  *             title: string|null, updatedAt: number, driverId: string|null }} RoomState */
 
@@ -131,11 +133,29 @@ export class Room {
       return new Response("room full", { status: 503 });
     }
 
-    // Stable per-install id (cid) so a reconnect reclaims the same roster slot
-    // + leader-election ordering; fall back to a random id if absent.
-    const cid = (url.searchParams.get("cid") || "").replace(/[^A-Za-z0-9]/g, "").slice(0, 16);
+    // Stable per-install id (cid) so a reconnect reclaims the same roster slot +
+    // leader-election ordering. The cid is VERIFIED against a per-install secret
+    // (a seamless, password-free TOFU bearer capability — see auth.js): a cid
+    // presented WITHOUT the secret that originally bound it gets a FRESH random
+    // identity instead of inheriting the claimed one, so a peer who knows the
+    // room code can't connect as someone else's cid to steal their roster slot
+    // or leader crown. A legacy client (sends no `cs`) still works: its cid is
+    // granted but never bound, so it keeps reconnect identity without protection.
+    const rawCid = (url.searchParams.get("cid") || "").replace(/[^A-Za-z0-9]/g, "").slice(0, 16);
+    let memberId = rawCid || crypto.randomUUID().slice(0, 8);
+    if (rawCid) {
+      const { grant, hash } = await authorizeCid(
+        this.meta.secrets[rawCid] ?? null,
+        url.searchParams.get("cs") || "",
+      );
+      if (!grant) {
+        memberId = crypto.randomUUID().slice(0, 8); // failed proof of ownership → new identity
+      } else if (hash) {
+        this.meta.secrets[rawCid] = hash; // bind on first use (persisted by saveMeta below)
+      }
+    }
     const member = {
-      id: cid || crypto.randomUUID().slice(0, 8),
+      id: memberId,
       name: str(url.searchParams.get("name"), MAX_NAME) || "Guest",
       videoKey: str(url.searchParams.get("video"), MAX_VIDEOKEY),
     };
@@ -153,6 +173,11 @@ export class Room {
       if (this.meta.order.length > MAX_ORDER) {
         const open = new Set(this.roster().map((m) => m.id));
         this.meta.order = this.meta.order.filter((c) => open.has(c) || c === this.meta.leaderId);
+        // Prune bound secrets to the surviving cids so the map can't grow
+        // unbounded in a high-churn room. A pruned cid that returns simply
+        // re-binds (TOFU) on its next connect.
+        const keep = new Set(this.meta.order);
+        for (const c of Object.keys(this.meta.secrets)) if (!keep.has(c)) delete this.meta.secrets[c];
       }
     }
     if (!this.meta.leaderId) this.meta.leaderId = member.id; // first member into an empty room = host
@@ -411,7 +436,7 @@ export class Room {
     // doesn't leave storage resident forever.
     if (this.roster().length === 0) {
       try { await this.state.storage.delete(["state", "votes", "meta"]); } catch { /* ignore */ }
-      this.meta = { order: [], leaderId: null };
+      this.meta = { order: [], leaderId: null, secrets: {} };
       this.rates.clear();
     }
   }
@@ -469,7 +494,8 @@ export class Room {
    *  instance after wake has this.meta === null until first touched). */
   async ensureMeta() {
     if (!this.meta) {
-      this.meta = (await this.state.storage.get("meta")) || { order: [], leaderId: null };
+      this.meta = (await this.state.storage.get("meta")) || { order: [], leaderId: null, secrets: {} };
+      if (!this.meta.secrets) this.meta.secrets = {}; // backfill meta persisted before cid-binding
     }
     return this.meta;
   }
