@@ -66,7 +66,14 @@ interface Props {
   /** id→LibraryItem index (App builds from `library`) for the pure
    *  spoiler gate — identical rule to DetailView. */
   libraryById: Map<string, LibraryItem>;
-  onPlayNext: () => void;
+  /** Advance to the next episode. `auto` = true when fired by the auto-advance
+   *  countdown (counts toward the still-watching gate); false on a manual click
+   *  (resets the gate's streak). */
+  onPlayNext: (auto: boolean) => void;
+  /** Consecutive unattended auto-advances so far (App-tracked). At >=2, with the
+   *  stillWatchingGate setting on, the auto-advance countdown is suppressed and a
+   *  "Still watching?" confirm is shown instead, stopping an all-night chain. */
+  autoAdvanceStreak: number;
   onReplay: () => void;
   onExit: () => void;
   onOpenEpisodes: () => void;
@@ -113,7 +120,7 @@ function NextAirCountdown({ targetMs }: { targetMs: number }) {
 
 function EosSpotlight({
   title, episode, stream, loading, isSeries, caughtUpUnaired, nextAirTargetMs,
-  seriesArt, libraryById, onPlayNext, onReplay, onExit, onOpenEpisodes,
+  seriesArt, libraryById, onPlayNext, autoAdvanceStreak, onReplay, onExit, onOpenEpisodes,
   onDismiss, episodesOpen,
 }: Props) {
   const isNextUp = episode != null;
@@ -134,8 +141,15 @@ function EosSpotlight({
   const party = getWatchState();
   const isPartyFollower =
     party.status === "connected" && !party.isLeader && party.inSync;
+  // Still-watching binge gate: after 2 consecutive UNATTENDED auto-advances,
+  // suppress the auto-countdown and show a "Still watching?" confirm instead, so
+  // an all-night chain stops. The streak is App-tracked (reset on manual
+  // continue / exit). Opt-out via the stillWatchingGate setting (default on).
+  const gatedByStillWatching =
+    settings.stillWatchingGate !== false && isNextUp && autoAdvanceStreak >= 2;
   const autoArmed =
-    isNextUp && settings.autoAdvanceNextEpisode && !loading && stream != null && !isPartyFollower;
+    isNextUp && settings.autoAdvanceNextEpisode && !loading && stream != null
+    && !isPartyFollower && !gatedByStillWatching;
 
   const [remaining, setRemaining] = useState<number | null>(autoArmed ? initialSeconds : null);
   const cancelledRef = useRef(false);
@@ -152,7 +166,7 @@ function EosSpotlight({
       return;
     }
     if (remaining <= 0) {
-      onPlayNext();
+      onPlayNext(true);
       return;
     }
     const id = window.setTimeout(() => setRemaining((s) => (s === null ? null : s - 1)), 1000);
@@ -347,6 +361,16 @@ function EosSpotlight({
 
                 <div className="flex-1" />
 
+                {gatedByStillWatching && stream != null && (
+                  <p className="text-ln-accent text-[13px] font-semibold tracking-wide mb-1 flex items-center gap-2">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+                      <circle cx="12" cy="12" r="9" />
+                      <path d="M12 8v4M12 16h.01" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                    Still watching? Auto-play paused after a few episodes.
+                  </p>
+                )}
+
                 {/* ── Actions ── */}
                 <div className="flex flex-wrap items-center gap-2.5 mt-5">
                   {stream == null && !loading ? (
@@ -358,7 +382,7 @@ function EosSpotlight({
                     <button
                       type="button"
                       disabled={loading}
-                      onClick={onPlayNext}
+                      onClick={() => onPlayNext(false)}
                       className={`relative overflow-hidden ${btnBase}
                                   border border-ln-accent/45 bg-ln-accent/20 text-ln-accent
                                   hover:bg-ln-accent/30 disabled:opacity-55 disabled:cursor-progress
@@ -390,7 +414,7 @@ function EosSpotlight({
                           <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                             <path d="M8 5v14l11-7z" />
                           </svg>
-                          Play Next
+                          {gatedByStillWatching ? "Continue watching" : "Play Next"}
                         </span>
                       )}
                     </button>

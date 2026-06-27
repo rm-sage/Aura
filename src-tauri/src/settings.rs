@@ -98,6 +98,11 @@ pub struct AppSettings {
     /// Optional font family name. Empty = MPV's default sans.
     #[serde(default)]
     pub subtitle_font: String,
+    /// Subtitle glyph brightness, 0-100 (%). Scales the RGB of `subtitle_color`
+    /// (alpha preserved) so white subs don't sear at peak nits on HDR / OLED.
+    /// 100 = the chosen colour unchanged. Applied in `apply_subtitle_style`.
+    #[serde(default = "default_sub_brightness")]
+    pub subtitle_brightness: u32,
 
     // ── Discord Rich Presence ──────────────────────────────────────────────
     #[serde(default = "default_true")]
@@ -272,6 +277,27 @@ pub struct AppSettings {
     /// set BEFORE the WebView spawns.
     #[serde(default = "default_true")]
     pub gpu_acceleration: bool,
+
+    // ── Playback buffer tuning (power-user; applied by apply_buffer_settings) ─
+    /// Demuxer forward cache, seconds (mpv `cache-secs`). Larger = more buffered
+    /// ahead, smoother on bursty / high-BDP links, but more RAM. Default 180.
+    #[serde(default = "default_cache_secs")]
+    pub cache_secs: u32,
+    /// Demuxer readahead, seconds (mpv `demuxer-readahead-secs`). Usually the
+    /// binding constraint for "how far ahead". Default 120.
+    #[serde(default = "default_readahead_secs")]
+    pub demuxer_readahead_secs: u32,
+    /// Demuxer forward byte ceiling, MiB (mpv `demuxer-max-bytes`). The hard cap
+    /// on buffered-ahead memory; bigger helps 4K-remux underruns at a RAM cost.
+    /// Default 768.
+    #[serde(default = "default_demuxer_max_mib")]
+    pub demuxer_max_mib: u32,
+
+    /// Directory screenshots are saved to. Empty = the default
+    /// `app_data_dir()/screenshots`. A machine-local PATH, so it is NOT in the
+    /// portable / cloud-sync field lists (paths don't transfer across machines).
+    #[serde(default)]
+    pub screenshot_dir: String,
     // NOTE: crash_reporting_consent + crash_reporting_dsn used to live
     // here but moved to a scope-independent sidecar at
     // `<app_data_dir>/crash-reporting.json` (see crash_reporting.rs).
@@ -304,6 +330,10 @@ fn default_sub_position() -> u32 { 95 }
 fn default_sub_border_size() -> u32 { 3 }
 fn default_sub_color() -> String { "#FFFFFFFF".into() }
 fn default_sub_back_color() -> String { "#00000000".into() }
+fn default_sub_brightness() -> u32 { 100 }
+fn default_cache_secs() -> u32 { 180 }
+fn default_readahead_secs() -> u32 { 120 }
+fn default_demuxer_max_mib() -> u32 { 768 }
 fn default_audio_priority() -> Vec<String> { vec!["original".into(), "en".into()] }
 fn default_skip_op_mode() -> String { "prompt".into() }
 fn default_skip_ed_mode() -> String { "prompt".into() }
@@ -347,6 +377,9 @@ pub fn default_keybindings() -> HashMap<String, String> {
     // hit these constantly for sakuga inspection / sub-timing checks.
     m.insert("frame-step-back".into(),    "Comma".into());
     m.insert("frame-step-forward".into(), "Period".into());
+    // Screenshot — PrintScreen, the OS-conventional screenshot key. Some
+    // Win11 setups route PrtScn to the Snipping Tool; rebindable if so.
+    m.insert("screenshot".into(),         "PrintScreen".into());
     // Anime4K v4 chord defaults — match the Stremio Community v5
     // bindings the user is migrating from. Ctrl+0 disables upscaling
     // entirely (sets profile 0 / "None").
@@ -388,6 +421,7 @@ impl Default for AppSettings {
             subtitle_color:              default_sub_color(),
             subtitle_back_color:         default_sub_back_color(),
             subtitle_font:               String::new(),
+            subtitle_brightness:         default_sub_brightness(),
             audio_priority:              default_audio_priority(),
             avoid_dubs:                  false,
             user_region:                 String::new(),
@@ -398,6 +432,10 @@ impl Default for AppSettings {
             trailer_quality:             default_trailer_quality(),
             skip_treat_mixed_op_as_op:   true,
             gpu_acceleration:            true,
+            cache_secs:                  default_cache_secs(),
+            demuxer_readahead_secs:      default_readahead_secs(),
+            demuxer_max_mib:             default_demuxer_max_mib(),
+            screenshot_dir:              String::new(),
             iptv_playlists:              Vec::new(),
             iptv_default_playlist_id:    None,
         }

@@ -436,6 +436,109 @@ async fn set_volume(volume: f64) -> Result<(), String> {
     }
 }
 
+/// Save a screenshot of the CURRENT frame.
+///
+/// Saved to the user's configured `screenshot_dir` (Settings), or
+/// `app_data_dir()/screenshots` when that is empty. Uses mpv's `window` mode so
+/// the PNG is the gpu-next RENDERED output: HDR is tonemapped to SDR exactly as
+/// it appears on screen. (The `video` / `subtitles` modes dump a raw PQ frame
+/// that looks washed-out / wrong in a normal image viewer.) Whatever is
+/// currently rendered into the window is captured, so any visible subtitles are
+/// included. Returns the saved file path; the write happens just after the
+/// command is queued, so the caller should treat the path as "where it will
+/// land" rather than a guaranteed-existing file.
+#[tauri::command]
+async fn save_screenshot<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<String, String> {
+    use tauri::Manager;
+    // Configured directory wins; fall back to app_data_dir/screenshots. A bad
+    // custom dir (create_dir_all fails) falls back too, so a stale path can
+    // never silently swallow the screenshot.
+    let configured = settings::snapshot().screenshot_dir.trim().to_string();
+    let dir = if !configured.is_empty()
+        && std::fs::create_dir_all(&configured).is_ok()
+    {
+        std::path::PathBuf::from(configured)
+    } else {
+        let fallback = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| e.to_string())?
+            .join("screenshots");
+        std::fs::create_dir_all(&fallback).map_err(|e| e.to_string())?;
+        fallback
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path_str = dir.join(format!("aura-{stamp}.png")).to_string_lossy().to_string();
+    crate::devlog!(info, "player", "save_screenshot → {path_str}");
+    #[cfg(target_os = "windows")]
+    {
+        crate::mpv::engine::submit_command(vec![
+            "screenshot-to-file".into(),
+            path_str.clone(),
+            "window".into(),
+        ])?;
+        Ok(path_str)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path_str;
+        Err("playback engine is Windows-only".into())
+    }
+}
+
+/// Set one of mpv's video-equalizer properties (brightness / contrast /
+/// saturation / gamma / hue), each an integer -100..100 with 0 = neutral. These
+/// are display-space VO controls (independent of the HDR tonemap), used to
+/// rescue a washed-out or too-dark encode. Whitelisted so an arbitrary property
+/// name can never be written. NB: mpv keeps these for the SESSION (they don't
+/// reset per file), so the player UI offers a reset.
+#[tauri::command]
+async fn set_video_eq(prop: String, value: i64) -> Result<(), String> {
+    const ALLOWED: [&str; 5] = ["brightness", "contrast", "saturation", "gamma", "hue"];
+    if !ALLOWED.contains(&prop.as_str()) {
+        return Err(format!("unknown video-eq property: {prop}"));
+    }
+    let v = value.clamp(-100, 100);
+    crate::devlog!(info, "player", "set_video_eq({prop}={v})");
+    #[cfg(target_os = "windows")]
+    return crate::mpv::engine::submit_set_property(prop, crate::mpv::engine::PropValue::Int64(v));
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = v;
+        Err("playback engine is Windows-only".into())
+    }
+}
+
+/// Push the user's playback-buffer tuning (Settings) to the live mpv engine:
+/// cache-secs, demuxer-readahead-secs, and demuxer-max-bytes (from MiB). Called
+/// on app start AND whenever the user changes a buffer setting, so a change
+/// takes effect on the next stream load without an app restart. Values clamped
+/// to sane ranges; pushed as strings (mpv parses each to its property type, like
+/// the INIT_OPTS defaults). Best-effort per property.
+#[tauri::command]
+async fn apply_buffer_settings(cache_secs: u32, readahead_secs: u32, max_mib: u32) -> Result<(), String> {
+    let cs = cache_secs.clamp(10, 1800);
+    let ra = readahead_secs.clamp(5, 1800);
+    let mb = (max_mib.clamp(64, 4096) as u64) * 1024 * 1024;
+    crate::devlog!(info, "player", "apply_buffer_settings cache-secs={cs} readahead={ra} max-bytes={mb}");
+    #[cfg(target_os = "windows")]
+    {
+        use mpv::engine::PropValue;
+        let _ = mpv::engine::submit_set_property("cache-secs".into(), PropValue::String(cs.to_string()));
+        let _ = mpv::engine::submit_set_property("demuxer-readahead-secs".into(), PropValue::String(ra.to_string()));
+        let _ = mpv::engine::submit_set_property("demuxer-max-bytes".into(), PropValue::String(mb.to_string()));
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (cs, ra, mb);
+        Err("playback engine is Windows-only".into())
+    }
+}
+
 /// Generic property reader — used by the React side as a polling fallback
 /// when MPV's observe-property channel doesn't deliver a particular field.
 /// Returns the JSON-encoded property value.
@@ -1007,6 +1110,32 @@ async fn apply_lang_defaults(
 ///   • sub-color          → "#RRGGBB" or "#RRGGBBAA"
 ///   • sub-back-color     → "#RRGGBBAA"; A=00 → no background box
 ///   • sub-font           → string family name; empty falls back to MPV's default sans
+///
+/// `subtitle_brightness` (0-100) scales the glyph RGB so white subs don't sear
+/// at peak nits on HDR / OLED, alpha preserved.
+///
+/// Scale the RGB channels of an mpv `#RRGGBB` / `#RRGGBBAA` colour by
+/// `brightness`/100 (alpha kept). Returns the input unchanged at 100 / on a
+/// malformed value, so a bad setting can never blank the subtitles.
+fn dim_sub_color(color: &str, brightness: u32) -> String {
+    if brightness >= 100 {
+        return color.to_string();
+    }
+    let f = (brightness as f64 / 100.0).clamp(0.0, 1.0);
+    let hex = color.trim_start_matches('#');
+    if hex.len() != 6 && hex.len() != 8 {
+        return color.to_string();
+    }
+    let rgb = &hex[0..6];
+    let tail = &hex[6..]; // "" (RRGGBB) or alpha "AA" (RRGGBBAA)
+    let parse = |s: &str| u8::from_str_radix(s, 16).ok();
+    let (Some(r), Some(g), Some(b)) = (parse(&rgb[0..2]), parse(&rgb[2..4]), parse(&rgb[4..6])) else {
+        return color.to_string();
+    };
+    let scale = |c: u8| ((c as f64) * f).round() as u8;
+    format!("#{:02X}{:02X}{:02X}{}", scale(r), scale(g), scale(b), tail)
+}
+
 #[tauri::command]
 async fn apply_subtitle_style() -> Result<(), String> {
     let s = settings::snapshot();
@@ -1044,7 +1173,8 @@ async fn apply_subtitle_style() -> Result<(), String> {
             "sub-border-size".into(), PropValue::Int64(s.subtitle_border_size as i64),
         );
         let _ = mpv::engine::submit_set_property(
-            "sub-color".into(), PropValue::String(s.subtitle_color.clone()),
+            "sub-color".into(),
+            PropValue::String(dim_sub_color(&s.subtitle_color, s.subtitle_brightness)),
         );
         let _ = mpv::engine::submit_set_property(
             "sub-back-color".into(), PropValue::String(s.subtitle_back_color.clone()),
@@ -1697,6 +1827,19 @@ pub fn run() {
                 );
             }
 
+            // Apply the user's persisted playback-buffer tuning to the engine,
+            // overriding the INIT_OPTS defaults. Queued; the engine applies it
+            // after init. Mirrors the apply_buffer_settings command (which the
+            // Settings UI calls on a live change).
+            #[cfg(target_os = "windows")]
+            {
+                use mpv::engine::PropValue;
+                let s = settings::snapshot();
+                let _ = mpv::engine::submit_set_property("cache-secs".into(), PropValue::String(s.cache_secs.clamp(10, 1800).to_string()));
+                let _ = mpv::engine::submit_set_property("demuxer-readahead-secs".into(), PropValue::String(s.demuxer_readahead_secs.clamp(5, 1800).to_string()));
+                let _ = mpv::engine::submit_set_property("demuxer-max-bytes".into(), PropValue::String(((s.demuxer_max_mib.clamp(64, 4096) as u64) * 1024 * 1024).to_string()));
+            }
+
             // ── Window lifecycle (pause-on-blur, pause-on-min, close-on-exit) ─
             window_logic::install(app.handle());
 
@@ -1983,6 +2126,9 @@ pub fn run() {
             set_motion_interpolation,
             thumbs::extract_thumbnail,
             set_volume,
+            save_screenshot,
+            set_video_eq,
+            apply_buffer_settings,
             set_speed,
             seek_absolute,
             set_audio_track,
@@ -2125,6 +2271,7 @@ pub fn run() {
             auth::backfill_user_id,
             auth::fetch_stremio_account,
             log_export::save_text_with_dialog,
+            log_export::pick_folder,
             per_title::get_all_title_state,
             per_title::set_all_title_state,
             scrobble_anilist::get_anilist_id_map,

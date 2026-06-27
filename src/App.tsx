@@ -26,11 +26,12 @@ import LandingView from "./LandingView";
 import LoginView from "./LoginView";
 import OnboardingView from "./views/OnboardingView";
 import { isOnboardingComplete } from "./onboarding";
-import PlayerOverlay from "./PlayerOverlay";
+import PlayerOverlay, { VOLUME_MAX } from "./PlayerOverlay";
 import AmbientAura from "./AmbientAura";
 import ContextMenuHost, { openContextMenu } from "./ContextMenu";
 import { CatalogHoverHost } from "./CatalogHoverCard";
 import AppToastHost, { showAppToast } from "./AppToast";
+import { safeSetItem } from "./storageQuota";
 import FlyUpToastHost, { showFlyUpToast } from "./FlyUpToast";
 import { runtimeDepPresent, ensureRuntimeDep } from "./runtimeDeps";
 import PartyToastHost from "./PartyToast";
@@ -1984,18 +1985,37 @@ export default function App() {
                     detail: lastEdStart,
                   }));
                 }
-                // Hybrid-mode auto OP fallback. Every series path now
-                // passes `silenceUrl` (anime AND live-action) — that's
-                // the Hybrid opt-in: when NOTHING upstream produced an
-                // OP (no AniSkip data AND no titled/heuristic chapter
-                // OP), one bounded ffmpeg silencedetect pass infers the
-                // OP→dialogue boundary. Same one-shot command + heuristic
-                // as the manual "Detect Skip" button; just automatic.
-                // Prompt-mode (auto:false) — never auto-seek a guess.
-                // ffmpeg-on-PATH best-effort: a clean no-op without it.
+                // Hybrid-mode auto OP fallback. Every series path passes
+                // `silenceUrl` (anime AND live-action): when NOTHING upstream
+                // produced an OP (no AniSkip data AND no titled/heuristic
+                // chapter OP), one bounded ffmpeg silencedetect pass infers the
+                // OP->dialogue boundary. Prompt-mode (auto:false): never
+                // auto-seek a guess. ffmpeg is ensured just below.
                 const url = opts?.silenceUrl ?? null;
                 const hasOp = merged.some((w) => w.type === "op" || w.type === "mixed-op");
-                if (url && !hasOp && modeFor("op") !== "off") {
+                // Automatic skip detection (replaces the old manual "Detect Skip"
+                // button). When AniSkip + chapters miss the OP and/or the ED, a
+                // bounded ffmpeg silencedetect pass infers ONLY the missing
+                // segment (OP scan when no OP; ED tail-scan when no ED). ffmpeg is
+                // an on-demand dep, so ensure it ONCE (a one-time ~97 MB download
+                // with a toast) before either pass runs, otherwise the fallback
+                // silently no-ops for anyone who never fetched ffmpeg. Gated by
+                // the autoSkipDetect setting (default on).
+                const autoDetect = loadAuraSettings().autoSkipDetect !== false;
+                const willDetect = autoDetect && url != null
+                  && ((!hasOp && modeFor("op") !== "off")
+                    || (lastEdStart == null && modeFor("ed") !== "off"));
+                if (willDetect && !(await runtimeDepPresent("ffmpeg.exe").catch(() => false))) {
+                  window.dispatchEvent(new CustomEvent("aura:player-toast", {
+                    detail: { message: "Setting up automatic skip detection (one-time FFmpeg download)" },
+                  }));
+                  try {
+                    await ensureRuntimeDep("ffmpeg.exe");
+                  } catch {
+                    // Couldn't fetch it: the detect calls below no-op cleanly.
+                  }
+                }
+                if (autoDetect && url && !hasOp && modeFor("op") !== "off") {
                   try {
                     const sd = await invoke<{
                       available: boolean;
@@ -2063,7 +2083,7 @@ export default function App() {
                 // without the container duration) — we only hand the
                 // Next-Up CTA an ED-start so it fires on time for
                 // live-action / any series AniSkip + chapters miss.
-                if (url && lastEdStart == null && modeFor("ed") !== "off") {
+                if (autoDetect && url && lastEdStart == null && modeFor("ed") !== "off") {
                   try {
                     const ob = await invoke<{
                       available: boolean;
@@ -3405,10 +3425,14 @@ export default function App() {
     if (!sess?.auth_key) { setLibrary([]); setRawLibrary([]); setLibraryLoaded(true); return; }
     // Warm-start from the localStorage cache so the user sees their library
     // instantly on app launch — Stremio's `datastoreGet` round-trip can take
-    // a second or two on cold network. The cache is keyed by auth_key
-    // prefix so it doesn't bleed across accounts. Replaced as soon as the
-    // fresh fetch resolves below.
-    const cacheKey = `aura:library:${sess.auth_key.slice(0, 12)}`;
+    // a second or two on cold network. Keyed by the STABLE user_id when known:
+    // Stremio rotates auth_key on EVERY login, so an auth_key-prefixed key never
+    // hits across logins (defeating the warm-start it exists for) and orphans a
+    // blob each time. Fall back to the auth_key prefix for legacy sessions that
+    // predate user_id (backfilled next launch). Replaced by the fresh fetch.
+    const cacheKey = `aura:library:${
+      sess.user_id && sess.user_id.trim() ? `u:${sess.user_id}` : `k:${sess.auth_key.slice(0, 12)}`
+    }`;
     try {
       const raw = localStorage.getItem(cacheKey);
       if (raw) {
@@ -3489,13 +3513,20 @@ export default function App() {
         `[library] library_get raw=${raw.length} normalized=${items.length}` +
           (collapsed > 0 ? ` (collapsed ${collapsed} duplicate/episode rows)` : ""),
       );
+      // Drop any OTHER library warm-cache blobs (rotated-auth_key prefixes from
+      // prior logins, or a different account) so they don't leak quota forever.
       try {
-        // Persist the patched list so a relaunch immediately shows the
-        // fresh poster URLs without paying another full-library
-        // background warm. The Stremio cloud record itself is left
-        // untouched — this is purely a local UI cache.
-        localStorage.setItem(cacheKey, JSON.stringify(itemsWithFreshPosters));
-      } catch { /* quota exceeded — non-fatal */ }
+        const stale: string[] = [];
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (k && k.startsWith("aura:library:") && k !== cacheKey) stale.push(k);
+        }
+        for (const k of stale) localStorage.removeItem(k);
+      } catch { /* ignore */ }
+      // Persist the patched list (via safeSetItem so a full origin evicts a
+      // disposable cache rather than silently dropping the warm-start). Purely a
+      // local UI cache; the Stremio cloud record itself is left untouched.
+      safeSetItem(cacheKey, JSON.stringify(itemsWithFreshPosters));
     } catch (err) {
       if (String(err) === SESSION_EXPIRED) {
         await invoke("logout").catch(() => {});
@@ -4564,7 +4595,21 @@ export default function App() {
           loadLocalAddons();
         }
       })
-      .catch(() => loadLocalAddons())
+      .catch((e) => {
+        // A REJECTION here means the saved session could not be READ (the OS
+        // credential vault was momentarily locked / unavailable) — DISTINCT
+        // from "no saved session", which resolves null and is handled above.
+        // Silently booting to guest strands a logged-in user: they think they
+        // were signed out and re-login over a vault that will read fine next
+        // launch. Load local addons so the app works, but tell them WHY so the
+        // fix (restart, or unlock the vault) is obvious instead of a mystery.
+        console.warn(`[auth] could not read saved sign-in: ${String(e)}`);
+        loadLocalAddons();
+        showAppToast(
+          "Couldn't read your saved sign-in (your Windows credential vault may be locked). Restart Aura or sign in again.",
+          { tone: "danger", duration: 7000 },
+        );
+      })
       .finally(() => setAuthChecked(true));
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -4807,7 +4852,7 @@ export default function App() {
   // these codes, matching mousewheel behaviour. Step is 2 % (vs 5 % for
   // mousewheel) so keyboard users have finer-grained control.
   const bumpVolumeFromKey = useCallback((delta: number) => {
-    const next = Math.max(0, Math.min(100, volume + delta));
+    const next = Math.max(0, Math.min(VOLUME_MAX, volume + delta));
     commitVolumeAndSave(next);
     window.dispatchEvent(
       new CustomEvent("aura:player-toast", { detail: { message: `Volume · ${Math.round(next)}%` } }),
@@ -4872,6 +4917,18 @@ export default function App() {
         if (!isPlayerActive) return;
         if (wtStagedHold() || wtFollowerLocked()) return;
         invoke("frame_step", { forward: true }).catch(() => {});
+      },
+      "screenshot": () => {
+        if (!isPlayerActive) return;
+        // mpv `window` mode = the rendered (HDR-tonemapped) frame. Fire-and-
+        // forget; the file lands a moment after the command is queued. The
+        // toast names the directory it was saved to (configurable in Settings).
+        invoke<string>("save_screenshot")
+          .then((path) => {
+            const dir = path.replace(/[\\/][^\\/]*$/, "") || path;
+            window.dispatchEvent(new CustomEvent("aura:player-toast", { detail: { message: `Screenshot saved to ${dir}` } }));
+          })
+          .catch(() => window.dispatchEvent(new CustomEvent("aura:player-toast", { detail: { message: "Screenshot failed" } })));
       },
       // Anime4K v4 chord shortcuts. Defaults Ctrl+1..6 + Ctrl+0;
       // user-rebindable via Settings → Keybindings.
@@ -5166,43 +5223,12 @@ export default function App() {
     invoke("smtc_set_playback", payload).catch(() => {});
   }, [activeTarget, paused, duration, time]);
 
-  // ── Global wheel-to-volume — only while the player overlay is up.
-  // Listens on the player container (the whole app body); each wheel event
-  // adjusts MPV volume by ±5%. We do NOT preventDefault when scrolling lists
-  // — a wheel event over a scrollable element should still scroll that
-  // element. Detection: walk up the target chain; if any ancestor has
-  // overflow:auto/scroll AND there is something to scroll, defer to the
-  // browser. Otherwise, the wheel "belongs to" the player and we steal it.
-  // Gating on `isPlayerActive` (not just `duration > 0`) keeps the catalog
-  // / library / settings views scrollable normally — the engine can hold
-  // a stale duration from the previous playback while the user browses.
-  useEffect(() => {
-    if (!isPlayerActive || duration <= 0) return;
-
-    const isOverScrollable = (target: EventTarget | null): boolean => {
-      let el = target instanceof HTMLElement ? target : null;
-      while (el && el !== document.body) {
-        const cs = window.getComputedStyle(el);
-        const oy = cs.overflowY;
-        if ((oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight) {
-          return true;
-        }
-        el = el.parentElement;
-      }
-      return false;
-    };
-
-    const onWheel = (e: WheelEvent) => {
-      if (isOverScrollable(e.target)) return;
-      e.preventDefault();
-      const step = e.deltaY < 0 ? 5 : -5;
-      const next = Math.max(0, Math.min(100, volume + step));
-      commitVolumeAndSave(next);
-    };
-
-    window.addEventListener("wheel", onWheel, { passive: false });
-    return () => window.removeEventListener("wheel", onWheel);
-  }, [isPlayerActive, duration, volume, commitVolumeAndSave]);
+  // Wheel-to-volume lives in PlayerOverlay's own window wheel listener (it adds
+  // the on-screen toast and honors VOLUME_MAX = 150). A duplicate handler used
+  // to live here too and clamped to 100, so it fought the overlay's 150 ceiling
+  // (wheel visually stuck at ~100 while the toast read up to 105) and
+  // double-fired the set_volume IPC per tick. Removed; the overlay is the sole
+  // wheel-to-volume path and is mounted whenever the player is active.
 
   // ── Library writeback — on pause + on activeTarget change, send the
   //     current timeOffset/duration to the Stremio cloud datastore so the
@@ -5311,6 +5337,7 @@ export default function App() {
   // Flushes progress, stops MPV, clears the active target. Triggered by the
   // PlayerOverlay's "Exit playback" button (and keybinding if configured).
   const handleExitPlayback = useCallback(async () => {
+    autoAdvanceStreakRef.current = 0; // fresh start: reset the still-watching streak (#5)
     flushProgress(session, writebackTarget.current);
     // Capture which episode the user just played BEFORE we clear
     // activeTarget. If this was an episode of a series/anime, DetailView
@@ -5492,7 +5519,14 @@ export default function App() {
 
   // "Play Next" reuses onNextUpPlay (carries this pass's History/
   // scrobble append + target build + handlePlayStream swap unchanged).
-  const onEosPlayNext = useCallback(() => { void onNextUpPlay(); }, [onNextUpPlay]);
+  // `auto` distinguishes the EOS auto-advance countdown (counts toward the
+  // "Still watching?" gate, #5) from a manual click (resets the streak). The
+  // streak also resets on exit (handleExitPlayback).
+  const autoAdvanceStreakRef = useRef(0);
+  const onEosPlayNext = useCallback((auto: boolean) => {
+    autoAdvanceStreakRef.current = auto ? autoAdvanceStreakRef.current + 1 : 0;
+    void onNextUpPlay();
+  }, [onNextUpPlay]);
 
   const onEosExit = useCallback(() => {
     setEosActive(false);
@@ -6723,6 +6757,7 @@ export default function App() {
             seriesArt={seriesArt}
             libraryById={libraryById}
             onPlayNext={onEosPlayNext}
+            autoAdvanceStreak={autoAdvanceStreakRef.current}
             onReplay={onEosReplay}
             onExit={onEosExit}
             onDismiss={onEosDismiss}

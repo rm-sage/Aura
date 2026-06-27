@@ -27,6 +27,11 @@ import { loadAuraSettings, saveAuraSettings } from "./auraSettings";
 import AniSkipMenu from "./AniSkipMenu";
 import { copyTextToClipboard } from "./clipboard";
 
+// Max volume the slider / wheel / keys can reach. mpv's `volume-max` init option
+// (engine.rs) must match. >100 is a soft boost (~+3.5 dB at 150) for quiet
+// sources; the DEFAULT stays 50 so nothing is loud until the user opts in.
+export const VOLUME_MAX = 150;
+
 // ---------------------------------------------------------------------------
 // Menu-open tracker — child menus (TrackMenu, SpeedMenu, ShaderPicker,
 // MoreMenu) call `useMenuOpenSync(open)` so the overlay can:
@@ -1873,7 +1878,7 @@ export default function PlayerOverlay({
       }
       e.preventDefault();
       const step = e.deltaY < 0 ? 5 : -5;
-      const next = Math.max(0, Math.min(100, volume + step));
+      const next = Math.max(0, Math.min(VOLUME_MAX, volume + step));
       commitVolume(next);
       fireToast(`Volume · ${Math.round(next)}%`);
     };
@@ -2264,20 +2269,15 @@ export default function PlayerOverlay({
               </div>
             )}
 
-            {/* Skip-window button — surfaces inline when playback is
-                currently inside a known OP/ED/Recap window, so the user
-                always has a one-click manual skip in addition to the
-                Lua script's auto / prompt behaviour. When no windows
-                exist for the current stream, doubles as a "Detect"
-                affordance (silencedetect manual fallback). */}
+            {/* Skip-window button — surfaces inline ONLY when playback is
+                currently inside a known OP/ED/Recap window, giving the user a
+                one-click manual skip in addition to the Lua script's auto /
+                prompt behaviour. The old "Detect" affordance was removed: skip
+                detection is now fully automatic (App.tsx finishWithChapters runs
+                a silencedetect fallback for any missing OP/ED). */}
             {!isLive && !isTrailer && (
               <div className={partyFollower ? "pointer-events-none opacity-[0.45]" : ""}>
-                <SkipWindowButton
-                  time={time}
-                  seekAbsolute={seekAbsolute}
-                  streamUrl={streamUrl}
-                  mediaType={activeTarget?.media_type}
-                />
+                <SkipWindowButton time={time} seekAbsolute={seekAbsolute} />
               </div>
             )}
 
@@ -3162,23 +3162,29 @@ function VolumeControl({
             ref={trackRef}
             onPointerDown={(e) => {
               (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-              onChange(Math.round(pctFromEvent(e.clientX) * 100));
+              onChange(Math.round(pctFromEvent(e.clientX) * VOLUME_MAX));
             }}
             onPointerMove={(e) => {
-              if (e.buttons & 1) onChange(Math.round(pctFromEvent(e.clientX) * 100));
+              if (e.buttons & 1) onChange(Math.round(pctFromEvent(e.clientX) * VOLUME_MAX));
             }}
             className="relative h-5 flex items-center cursor-pointer w-32"
           >
             <div className="absolute inset-x-0 h-1 rounded-full bg-white/15" />
+            {/* Tick at the 100% (unity-gain) point so the boost zone is obvious. */}
             <div
               aria-hidden
-              className="absolute left-0 h-1 rounded-full bg-white/85"
-              style={{ width: `${volume}%` }}
+              className="absolute top-1/2 -translate-y-1/2 w-px h-2.5 bg-white/35"
+              style={{ left: `${(100 / VOLUME_MAX) * 100}%` }}
+            />
+            <div
+              aria-hidden
+              className={`absolute left-0 h-1 rounded-full ${volume > 100 ? "bg-ln-accent" : "bg-white/85"}`}
+              style={{ width: `${(volume / VOLUME_MAX) * 100}%` }}
             />
             <div
               aria-hidden
               className="absolute w-3 h-3 rounded-full bg-white shadow-[0_2px_4px_rgba(0,0,0,0.5)]"
-              style={{ left: `calc(${volume}% - 6px)` }}
+              style={{ left: `calc(${(volume / VOLUME_MAX) * 100}% - 6px)` }}
             />
           </div>
           <div className="text-center text-[10px] font-mono text-white/55 tabular-nums mt-1">
@@ -3631,6 +3637,25 @@ function MoreMenu({
     window.addEventListener("aura:settings-changed", sync);
     return () => window.removeEventListener("aura:settings-changed", sync);
   }, []);
+  // Video equalizer — display-space VO controls. Live + session-scoped (mpv
+  // keeps brightness/contrast/etc across files), with a Reset. Not persisted, so
+  // a per-title fix doesn't silently bleed into the next title beyond a reset.
+  const EQ_PROPS = [
+    ["brightness", "Brightness"], ["contrast", "Contrast"], ["saturation", "Saturation"],
+    ["gamma", "Gamma"], ["hue", "Hue"],
+  ] as const;
+  const [eqOpen, setEqOpen] = useState(false);
+  const [eq, setEq] = useState<Record<string, number>>(
+    { brightness: 0, contrast: 0, saturation: 0, gamma: 0, hue: 0 },
+  );
+  const setEqProp = (prop: string, value: number) => {
+    setEq((m) => ({ ...m, [prop]: value }));
+    invoke("set_video_eq", { prop, value }).catch(() => {});
+  };
+  const resetEq = () => {
+    setEq({ brightness: 0, contrast: 0, saturation: 0, gamma: 0, hue: 0 });
+    for (const [p] of EQ_PROPS) invoke("set_video_eq", { prop: p, value: 0 }).catch(() => {});
+  };
   const ref = useRef<HTMLDivElement>(null);
   useMenuOpenSync(open);
 
@@ -3845,6 +3870,52 @@ function MoreMenu({
               />
             </span>
           </button>
+          {/* Video equalizer — brightness / contrast / saturation / gamma / hue
+              (display-space VO controls, live, session-scoped). Collapsible. */}
+          <div className="my-1 mx-3 h-px bg-white/8" />
+          <button
+            type="button"
+            onClick={() => setEqOpen((v) => !v)}
+            aria-expanded={eqOpen}
+            className="w-full flex items-center gap-3 px-4 py-2 text-left text-[13px]
+                       text-white/85 hover:text-white hover:bg-white/[0.16] transition-colors"
+          >
+            <span className="text-white/55 flex-shrink-0">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   strokeWidth="2" strokeLinecap="round" aria-hidden>
+                <line x1="4" y1="21" x2="4" y2="14" /><line x1="4" y1="10" x2="4" y2="3" />
+                <line x1="12" y1="21" x2="12" y2="12" /><line x1="12" y1="8" x2="12" y2="3" />
+                <line x1="20" y1="21" x2="20" y2="16" /><line x1="20" y1="12" x2="20" y2="3" />
+                <line x1="1" y1="14" x2="7" y2="14" /><line x1="9" y1="8" x2="15" y2="8" /><line x1="17" y1="16" x2="23" y2="16" />
+              </svg>
+            </span>
+            <span className="flex-1">Video equalizer</span>
+            <span className="text-white/40 text-[11px]" aria-hidden>{eqOpen ? "▾" : "▸"}</span>
+          </button>
+          {eqOpen && (
+            <div className="px-4 pt-1 pb-2 space-y-1.5">
+              {EQ_PROPS.map(([prop, label]) => (
+                <div key={prop} className="flex items-center gap-2">
+                  <span className="text-white/55 text-[11px] w-[68px] flex-shrink-0">{label}</span>
+                  <input
+                    type="range" min={-100} max={100} step={1} value={eq[prop]}
+                    onChange={(e) => setEqProp(prop, Number(e.target.value))}
+                    className="flex-1 h-1 accent-ln-accent cursor-pointer"
+                    aria-label={label}
+                  />
+                  <span className="text-white/45 text-[10px] font-mono w-7 text-right tabular-nums">{eq[prop]}</span>
+                </div>
+              ))}
+              <button
+                type="button"
+                onClick={resetEq}
+                className="w-full mt-0.5 text-[11px] text-white/55 hover:text-white py-1
+                           rounded-md hover:bg-white/[0.08] transition-colors"
+              >
+                Reset to neutral
+              </button>
+            </div>
+          )}
           {flash && (
             <div className="px-4 py-1.5 text-[11px] font-mono text-ln-accent/85 border-t border-white/8 mt-1">
               {flash}
@@ -3966,8 +4037,9 @@ function BufferingOverlay({
 //
 // Components:
 //   • SkipWindowButton — inline pill in the bottom control bar; offers
-//     a one-click manual skip when inside a window, or a "Detect" probe
-//     (silencedetect) when no AniSkip / chapter data exists.
+//     a one-click manual skip ONLY while inside a known OP/ED/Recap window.
+//     (Skip detection is automatic now: App.tsx finishWithChapters runs a
+//     silencedetect fallback for any missing OP/ED, so there's no manual probe.)
 //   • SkipPromptToast — large top-left toast rendered when the active
 //     window is in `prompt` mode (auto: false). Shows kind + the hotkey.
 //   • SkipController — invisible component that owns the auto-skip
@@ -4218,21 +4290,12 @@ function SkipController({
 }
 
 function SkipWindowButton({
-  time, seekAbsolute, streamUrl, mediaType,
+  time, seekAbsolute,
 }: {
   time: number;
   seekAbsolute: (t: number) => void;
-  streamUrl: string | null;
-  mediaType?: string | null;
 }) {
   const windows = useSkipWindows();
-  const [detecting, setDetecting] = useState(false);
-  const [detectAttempted, setDetectAttempted] = useState(false);
-
-  // Reset the "attempted" latch whenever the stream URL changes so
-  // the Detect button is re-offered on the next episode.
-  useEffect(() => { setDetectAttempted(false); }, [streamUrl]);
-
   const active = windows.find((w) => time >= w.start && time < w.end);
 
   // Inside an active window → the "Skip OP/ED/Recap" jump button.
@@ -4257,87 +4320,6 @@ function SkipWindowButton({
         title={`${label} (${Math.round(active.end - time)} s remaining)`}
       >
         {label}
-      </button>
-    );
-  }
-
-  // No windows available for this stream → offer a manual "Detect"
-  // affordance backed by ffmpeg's silencedetect. Surfaces only:
-  //   • when the current stream has no AniSkip / chapter windows
-  //   • during the first 4 minutes (typical OP location)
-  //   • once per stream (the "attempted" latch suppresses re-offers
-  //     after a failed run, since silencedetect is slow and rarely
-  //     yields different results on retry)
-  // The Detect affordance is OP/ED-oriented (silencedetect looks for the
-  // intro→dialogue boundary), so it's only offered for series / anime —
-  // a movie has no intro window to skip.
-  const allowDetect = mediaType === "series" || mediaType === "anime";
-  if (windows.length === 0 && time < 240 && !detectAttempted && streamUrl && allowDetect) {
-    return (
-      <button
-        type="button"
-        disabled={detecting}
-        onClick={async () => {
-          setDetecting(true);
-          try {
-            const result = await invoke<{
-              available: boolean;
-              intervals: { start: number; end: number; duration: number }[];
-              note: string;
-            }>("detect_silence_intervals", { url: streamUrl, maxSecs: 180 });
-            if (!result.available) {
-              window.dispatchEvent(new CustomEvent("aura:player-toast", {
-                detail: { message: "Detect: ffmpeg not on PATH" },
-              }));
-              return;
-            }
-            // Heuristic: largest silence ≥1.5 s starting between 30 s
-            // and 180 s is most likely the OP→dialogue boundary. Pick
-            // it and stamp an OP window from 0 to its END. Window
-            // narrowed from 240 → 180 s — anime OPs are ~90 s, almost
-            // never extend past 150 s, and the longer scan was the
-            // single biggest contributor to detect-time on streams that
-            // serve at native rate (no fast pre-roll).
-            const candidate = result.intervals
-              .filter((iv) => iv.duration >= 1.5 && iv.start >= 30 && iv.start <= 180)
-              .sort((a, b) => b.duration - a.duration)[0];
-            if (!candidate) {
-              window.dispatchEvent(new CustomEvent("aura:player-toast", {
-                detail: { message: "Detect: no obvious OP boundary found" },
-              }));
-              return;
-            }
-            const window_ = {
-              type: "op",
-              start: 0,
-              end: candidate.end,
-              source: "silencedetect",
-              auto: false,
-            };
-            await invoke("set_skip_windows", { payload: { windows: [window_] } });
-            window.dispatchEvent(new CustomEvent("aura:player-toast", {
-              detail: { message: `Detect: OP window 0-${Math.round(candidate.end)} s` },
-            }));
-          } catch (err) {
-            console.warn(`[silence] detect failed: ${String(err)}`);
-            window.dispatchEvent(new CustomEvent("aura:player-toast", {
-              detail: { message: "Detect: failed" },
-            }));
-          } finally {
-            setDetecting(false);
-            setDetectAttempted(true);
-          }
-        }}
-        className="ml-3 px-3 py-1 rounded-full
-                   bg-white/10 text-white/75
-                   hover:bg-white/15 active:bg-white/20
-                   border border-white/20
-                   text-[12px] font-medium tracking-wide
-                   disabled:opacity-50 disabled:cursor-default
-                   transition-colors"
-        title="Probe audio for the opening's silence boundary (ffmpeg silencedetect)"
-      >
-        {detecting ? "Detecting…" : "Detect Skip"}
       </button>
     );
   }

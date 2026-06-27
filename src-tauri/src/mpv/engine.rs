@@ -1432,6 +1432,11 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             // matches the PlaybackState bridge's assumed initial value
             // (mpv's own default of 100 is too loud for first play).
             (b"volume\0", b"50\0"),
+            // Allow soft boost past 100% (up to 150%, ~+3.5 dB) for quiet
+            // sources. Default STAYS 50 (above), so nothing is loud until the
+            // user deliberately drags the slider over 100. mpv's own default
+            // volume-max is 100; 200 would clip hard, so 150 is the ceiling.
+            (b"volume-max\0", b"150\0"),
             // Subtitle styling baseline — `apply_subtitle_style`
             // re-asserts the user's persisted values on every
             // load_video; these are just sane first-paint defaults.

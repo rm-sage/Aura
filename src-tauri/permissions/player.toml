@@ -35,6 +35,9 @@ commands.allow = [
   "set_subtitle_position_runtime",
   "set_native_fullscreen",
   "set_party_keep_alive",
+  "save_screenshot",
+  "set_video_eq",
+  "apply_buffer_settings",
 ]
 
 # ── Casting (Chromecast + DLNA) ───────────────────────────────────────────────
@@ -335,5 +338,5 @@ commands.allow = ["get_crash_reporting", "set_crash_reporting"]
 # buffer to a user-chosen path. See src-tauri/src/log_export.rs.
 [[permission]]
 identifier = "allow-log-export"
-description = "Allows the DevConsole to open a native Save-As dialog and write the log buffer to disk"
-commands.allow = ["save_text_with_dialog"]
+description = "Allows the DevConsole to open a native Save-As dialog and write the log buffer to disk, and Settings to open a native folder picker"
+commands.allow = ["save_text_with_dialog", "pick_folder"]

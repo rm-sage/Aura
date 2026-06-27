@@ -13,6 +13,8 @@
 // window can react without a manual prop chain.
 // ---------------------------------------------------------------------------
 
+import { safeSetItem } from "./storageQuota";
+
 const SETTINGS_KEY = "aura:settings:v1";
 const CHANGE_EVENT = "aura:settings-changed";
 /** Persistent "this user last modified settings at" stamp.
@@ -41,12 +43,10 @@ export function getSettingsUpdatedAt(): number {
 }
 
 export function setSettingsUpdatedAt(unixSeconds: number): void {
-  try {
-    localStorage.setItem(SETTINGS_UPDATED_AT_KEY, String(Math.floor(unixSeconds)));
-  } catch {
-    // localStorage write failure is non-fatal — the next bump retries
-    // and the merger gracefully degrades to "treat local as 0".
-  }
+  // Via safeSetItem so a full origin evicts a disposable cache and retries: a
+  // dropped timestamp would let the cloud silently win the next settings merge.
+  // Still non-fatal if it ultimately fails (merger degrades to "treat local 0").
+  safeSetItem(SETTINGS_UPDATED_AT_KEY, String(Math.floor(unixSeconds)));
 }
 
 export function bumpSettingsUpdatedAt(): void {
@@ -121,6 +121,20 @@ export interface AuraSettings {
    *  `autoAdvanceNextEpisode === true`). Clamped to [5, 30] on load
    *  to guarantee the user always has a window to cancel. */
   autoAdvanceDelaySeconds: number;
+  /** "Still watching?" binge gate. After 2 CONSECUTIVE unattended auto-
+   *  advances (i.e. once the 3rd episode in a row finishes via auto-advance),
+   *  the next end-of-stream shows a confirm instead of auto-playing, and the
+   *  chain stops until the user continues. Counter resets on any manual
+   *  continue / exit. Default true (opt-out). Only meaningful when
+   *  autoAdvanceNextEpisode is on. */
+  stillWatchingGate: boolean;
+  /** Automatic skip detection (Hybrid). When AniSkip + chapters miss the OP
+   *  and/or ED for a series, run a bounded ffmpeg silencedetect fallback that
+   *  infers ONLY the missing segment. ffmpeg is fetched on demand (a one-time
+   *  ~97 MB download) the first time a series needs it. Default true; turn off
+   *  to avoid that download / the background scan. (Per-kind auto vs prompt vs
+   *  off is still governed by the Skip OP/ED/Recap mode settings.) */
+  autoSkipDetect: boolean;
   /** Blur the selected episode's per-episode synopsis on the detail
    *  page until the user clicks to reveal. Spoiler protection for
    *  per-episode overview text. Watched episodes are NEVER blurred
@@ -230,6 +244,8 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   reduceMotion: "auto",
   autoAdvanceNextEpisode: false,
   autoAdvanceDelaySeconds: 10,
+  stillWatchingGate: true,
+  autoSkipDetect: true,
   blurEpisodeSynopsis: false,
   loudnessNormalization: false,
   motionInterpolation: true,
@@ -301,6 +317,12 @@ function readFromStorage(): AuraSettings {
         && Number.isFinite(parsed.autoAdvanceDelaySeconds)
         ? Math.max(5, Math.min(30, Math.round(parsed.autoAdvanceDelaySeconds)))
         : 10,
+      stillWatchingGate: typeof parsed.stillWatchingGate === "boolean"
+        ? parsed.stillWatchingGate
+        : true,
+      autoSkipDetect: typeof parsed.autoSkipDetect === "boolean"
+        ? parsed.autoSkipDetect
+        : true,
       blurEpisodeSynopsis: typeof parsed.blurEpisodeSynopsis === "boolean"
         ? parsed.blurEpisodeSynopsis
         : false,
@@ -413,7 +435,10 @@ export function saveAuraSettings(s: AuraSettings, opts?: { fromCloud?: boolean }
   // and every HomeView mount would re-fetch the entire grid on every
   // unrelated setting flip (subtitle styling, loudness, motion, etc.).
   const prior = cached ?? readFromStorage();
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+  // Via safeSetItem: on a full origin, evict a disposable cache and retry so a
+  // user settings change is not silently dropped (and the bare setItem here used
+  // to THROW on quota, propagating up through every save call site).
+  safeSetItem(SETTINGS_KEY, JSON.stringify(s));
   cached = null; // bust cache before listeners run so they read fresh values
   const changed = diffSettings(prior, s);
   // Stamp the user-modified timestamp for cloud-sync last-writer-wins.

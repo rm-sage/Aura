@@ -10,7 +10,10 @@
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
 };
-use windows::Win32::UI::Shell::{FileSaveDialog, IFileSaveDialog, SIGDN_FILESYSPATH};
+use windows::Win32::UI::Shell::{
+    FileOpenDialog, FileSaveDialog, IFileOpenDialog, IFileSaveDialog, FOS_PICKFOLDERS,
+    SIGDN_FILESYSPATH,
+};
 
 /// Open a native Windows "Save As…" dialog seeded with `default_name`,
 /// then write `content` to the chosen path as UTF-8.
@@ -71,6 +74,59 @@ fn show_and_write(default_name: &str, content: &str) -> Result<Option<String>, S
                 // ERROR_CANCELLED (0x800704C7) — user clicked Cancel /
                 // closed the dialog. Surface as Ok(None) so the
                 // frontend can silently no-op.
+                const ERROR_CANCELLED: i32 = 0x800704C7u32 as i32;
+                if e.code().0 == ERROR_CANCELLED {
+                    Ok(None)
+                } else {
+                    Err(format!("dialog Show failed: {e}"))
+                }
+            }
+        }
+    }
+}
+
+/// Open a native Windows folder picker. Returns the chosen directory path,
+/// `Ok(None)` if the user cancels, `Err` on COM failure. Used by Settings to
+/// configure the screenshot output directory.
+#[tauri::command]
+pub async fn pick_folder() -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(show_folder_picker)
+        .await
+        .map_err(|e| format!("join error: {e}"))?
+}
+
+fn show_folder_picker() -> Result<Option<String>, String> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)
+                .map_err(|e| format!("CoCreateInstance(FileOpenDialog) failed: {e}"))?;
+
+        // Add FOS_PICKFOLDERS to the default options so the dialog selects a
+        // directory instead of a file.
+        let opts = dialog
+            .GetOptions()
+            .map_err(|e| format!("GetOptions failed: {e}"))?;
+        dialog
+            .SetOptions(opts | FOS_PICKFOLDERS)
+            .map_err(|e| format!("SetOptions failed: {e}"))?;
+
+        match dialog.Show(None) {
+            Ok(()) => {
+                let item = dialog
+                    .GetResult()
+                    .map_err(|e| format!("GetResult failed: {e}"))?;
+                let path_pwstr = item
+                    .GetDisplayName(SIGDN_FILESYSPATH)
+                    .map_err(|e| format!("GetDisplayName failed: {e}"))?;
+                let path = path_pwstr
+                    .to_string()
+                    .map_err(|e| format!("path conversion: {e}"))?;
+                windows::Win32::System::Com::CoTaskMemFree(Some(path_pwstr.0 as *const _));
+                Ok(Some(path))
+            }
+            Err(e) => {
                 const ERROR_CANCELLED: i32 = 0x800704C7u32 as i32;
                 if e.code().0 == ERROR_CANCELLED {
                     Ok(None)

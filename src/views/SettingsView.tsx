@@ -79,6 +79,7 @@ interface BackendSettings {
   subtitle_color: string;
   subtitle_back_color: string;
   subtitle_font: string;
+  subtitle_brightness: number;
   discord_rpc_enabled: boolean;
   discord_rpc_show_titles: boolean;
   discord_rpc_blocked_titles: string[];
@@ -107,6 +108,10 @@ interface BackendSettings {
    *  the set_audio_loudnorm command so the engine can install the
    *  @loudnorm filter at mpv init. Not edited directly from this view. */
   loudness_normalization: boolean;
+  cache_secs: number;
+  demuxer_readahead_secs: number;
+  demuxer_max_mib: number;
+  screenshot_dir: string;
   keybindings: Record<string, string>;
   skip_op_mode: string;
   skip_ed_mode: string;
@@ -4882,6 +4887,13 @@ export default function SettingsView({ addons, session }: Props) {
                     value={aura.autoAdvanceDelaySeconds}
                     onChange={(v) => setLocal({ autoAdvanceDelaySeconds: v })}
                   />
+                  <div className="h-px bg-white/6" />
+                  <SettingToggle
+                    label={'"Still watching?" check'}
+                    description="Once a few episodes have auto-played in a row with no input, pause and ask if you're still watching instead of starting the next one — so a binge chain doesn't run all night against your debrid quota. Resets the moment you continue or exit. Default on."
+                    value={aura.stillWatchingGate}
+                    onChange={(v) => setLocal({ stillWatchingGate: v })}
+                  />
                 </>
               )}
               <div className="h-px bg-white/6" />
@@ -4926,6 +4938,68 @@ export default function SettingsView({ addons, session }: Props) {
                 ]}
                 onChange={(v) => patchBackend({ trailer_quality: v ?? "1080" })}
               />
+              <div className="h-px bg-white/6" />
+              <SettingSlider
+                label="Forward buffer (seconds)"
+                description="How many seconds of video to buffer ahead (mpv cache + readahead). Higher = smoother on bursty / high-latency links, at the cost of RAM. Most people never need to touch this. Applies to the next stream you play."
+                value={backend.cache_secs ?? 180}
+                min={30}
+                max={600}
+                suffix=" s"
+                onChange={(v) => {
+                  const ra = Math.max(5, Math.round(v * 0.67));
+                  patchBackend({ cache_secs: v, demuxer_readahead_secs: ra });
+                  invoke("apply_buffer_settings", { cacheSecs: v, readaheadSecs: ra, maxMib: backend.demuxer_max_mib ?? 768 }).catch(() => {});
+                }}
+              />
+              <div className="h-px bg-white/6" />
+              <SettingSlider
+                label="Forward buffer memory cap"
+                description="Hard ceiling on buffered-ahead RAM (mpv demuxer-max-bytes). The seconds value above is usually the binding limit; raise this only if 4K remuxes underrun mid-playback. Each step is real memory. Applies to the next stream."
+                value={backend.demuxer_max_mib ?? 768}
+                min={128}
+                max={2048}
+                suffix=" MiB"
+                onChange={(v) => {
+                  patchBackend({ demuxer_max_mib: v });
+                  invoke("apply_buffer_settings", { cacheSecs: backend.cache_secs ?? 180, readaheadSecs: backend.demuxer_readahead_secs ?? 120, maxMib: v }).catch(() => {});
+                }}
+              />
+              <div className="h-px bg-white/6" />
+              <div className="px-1 py-3" data-settings-label="Screenshot folder">
+                <p className="text-white/75 text-sm font-medium">Screenshot folder</p>
+                <p className="text-white/45 text-[12.5px] leading-snug mt-0.5 mb-2">
+                  Where the Screenshot key (default Print Screen) saves PNGs. Leave blank for the default app-data screenshots folder.
+                </p>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={backend.screenshot_dir ?? ""}
+                    placeholder="Default: app-data screenshots folder"
+                    onChange={(e) => patchBackend({ screenshot_dir: e.target.value })}
+                    className="flex-1 min-w-0 bg-white/[0.06] border border-white/10 rounded-lg px-3 py-2 text-[13px] text-white/85 placeholder:text-white/30 focus:outline-none focus:border-ln-accent/50"
+                  />
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const picked = await invoke<string | null>("pick_folder").catch(() => null);
+                      if (picked) patchBackend({ screenshot_dir: picked });
+                    }}
+                    className="flex-shrink-0 px-3 py-2 rounded-lg text-[13px] text-white/85 bg-white/[0.08] hover:bg-white/[0.14] border border-white/10 transition-colors"
+                  >
+                    Browse
+                  </button>
+                  {(backend.screenshot_dir ?? "").trim() !== "" && (
+                    <button
+                      type="button"
+                      onClick={() => patchBackend({ screenshot_dir: "" })}
+                      className="flex-shrink-0 px-3 py-2 rounded-lg text-[13px] text-white/55 hover:text-white hover:bg-white/[0.08] transition-colors"
+                    >
+                      Reset
+                    </button>
+                  )}
+                </div>
+              </div>
               <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Motion interpolation"
@@ -5058,6 +5132,16 @@ export default function SettingsView({ addons, session }: Props) {
                 validationHint="Must be #RRGGBB or #RRGGBBAA."
               />
               <div className="h-px bg-white/6" />
+              <SettingSlider
+                label="Subtitle brightness"
+                description="Dims white subtitles so they don't sear at peak brightness on HDR / OLED. 100 = the glyph colour above unchanged; lower it if subs glow too hot on bright scenes."
+                value={backend.subtitle_brightness}
+                min={20}
+                max={100}
+                suffix=" %"
+                onChange={(v) => patchBackend({ subtitle_brightness: v })}
+              />
+              <div className="h-px bg-white/6" />
               <SettingText
                 label="Background colour"
                 description="Box behind the text. Final 2 hex digits are alpha; #00000000 means no background."
@@ -5115,6 +5199,13 @@ export default function SettingsView({ addons, session }: Props) {
                 description="AniSkip's `mixed-op` results bundle a recap into the opening. When on, they're handled with your OP mode; when off, they fall through (effectively unskipped)."
                 value={backend.skip_treat_mixed_op_as_op}
                 onChange={(v) => patchBackend({ skip_treat_mixed_op_as_op: v })}
+              />
+              <div className="h-px bg-white/6" />
+              <SettingToggle
+                label="Automatic skip detection"
+                description="When AniSkip and chapters don't cover a series, infer the missing opening / ending with a quick on-device audio scan (ffmpeg silencedetect). It only scans the part that wasn't already detected (opening if no opening, ending if no ending). ffmpeg downloads once (~97 MB) the first time a series needs it. Turn off to disable the scan and that download. Per-type auto / prompt / off is still set above."
+                value={aura.autoSkipDetect}
+                onChange={(v) => setLocal({ autoSkipDetect: v })}
               />
               <div className="h-px bg-white/6" />
               {/* Next-Up filler/recap skip — lives here because users

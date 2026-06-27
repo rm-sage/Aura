@@ -68,6 +68,7 @@ const PORTABLE_BACKEND_FIELDS = [
   "subtitle_color",
   "subtitle_back_color",
   "subtitle_font",
+  "subtitle_brightness",
   "discord_rpc_enabled",
   "discord_rpc_show_titles",
   "discord_rpc_blocked_titles",
@@ -88,6 +89,9 @@ const PORTABLE_BACKEND_FIELDS = [
   "skip_treat_mixed_op_as_op",
   "trailer_quality",
   "gpu_acceleration",
+  "cache_secs",
+  "demuxer_readahead_secs",
+  "demuxer_max_mib",
   "scrobble_enabled",
 ] as const;
 
@@ -107,6 +111,8 @@ const PORTABLE_AURA_FIELDS = [
   "reduceMotion",
   "autoAdvanceNextEpisode",
   "autoAdvanceDelaySeconds",
+  "stillWatchingGate",
+  "autoSkipDetect",
   "nextUpSkipFillerRecap",
   "loudnessNormalization",
   "motionInterpolation",
