@@ -452,6 +452,10 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     }
                     api.prevent_close();
                     let _ = win.hide();
+                    // Window is now hidden to the tray — surface the tray icon,
+                    // which is its only route back. Hidden again on restore
+                    // (tray::show_main_window).
+                    crate::tray::set_tray_visible(&handle, true);
                 } else {
                     // Clean-shutdown path — tear down MPV synchronously so
                     // libmpv releases its WASAPI device, then EXPLICITLY exit

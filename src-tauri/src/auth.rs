@@ -499,10 +499,13 @@ pub async fn fetch_stremio_account<R: Runtime>(
         .map(|s| s.to_string());
 
     // Self-heal: persist a recovered email so the ProfilePopover line
-    // stops showing "Email pending sync" on the next session read.
+    // stops showing "Email pending sync" on the next session read. Best-effort:
+    // the email/user_id/premium fields were already recovered for THIS call, so
+    // a keyring WRITE hiccup must not fail the whole account fetch with `?`
+    // (which left the popover blank). It just retries the heal next launch.
     if !email.is_empty() && session.email != email {
         session.email = email.clone();
-        store_session(&app, &session)?;
+        let _ = store_session(&app, &session);
     }
 
     let acct = StremioAccount { email, user_id, date_registered, premium_until };

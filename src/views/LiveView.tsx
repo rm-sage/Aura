@@ -18,6 +18,8 @@ import {
   resolveNowNext,
   hasEpg,
   isEpgLoading,
+  epgError,
+  epgTruncated,
   dropEpg,
   type NowNext,
 } from "../iptv/epgStore";
@@ -186,6 +188,18 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
   // useEpgVersion(), so these track load start/finish.
   const epgReady = selectedSourceId ? hasEpg(selectedSourceId) : false;
   const epgLoading = selectedSourceId ? isEpgLoading(selectedSourceId) : false;
+  // The EPG fetch/parse error (if any) for this source, and whether its body
+  // was truncated at the size cap — both surfaced in the guide so a failure
+  // isn't hidden behind the generic "no EPG loaded" copy.
+  const epgErr = selectedSourceId ? epgError(selectedSourceId) : null;
+  const epgIsTruncated = selectedSourceId ? epgTruncated(selectedSourceId) : false;
+
+  // Force-reload this source's EPG (wired to the guide's Retry button).
+  const retryEpg = useCallback(() => {
+    if (selectedSourceId && playlist) {
+      void loadEpg(selectedSourceId, playlist.epgUrl, playlist.channels, { force: true });
+    }
+  }, [selectedSourceId, playlist]);
 
   // Group counts for the sidebar (computed once per playlist).
   const groups = useMemo(() => {
@@ -467,6 +481,9 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
                 nowMs={nowMs}
                 hasEpg={epgReady}
                 epgLoading={epgLoading}
+                epgError={epgErr}
+                onRetryEpg={retryEpg}
+                truncated={epgIsTruncated}
                 hasMore={guideHasMore}
                 onReachEnd={revealMoreGuide}
                 onPlayChannel={(ch) => playlist && onPlayChannel(ch, playlist)}

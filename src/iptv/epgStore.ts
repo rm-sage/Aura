@@ -29,6 +29,10 @@ const CHANGE_EVENT = "aura:iptv-epg-changed";
 const PARSE_TTL_MS = 30 * 60 * 1000;
 /** Max source EPGs resident at once (RAM cap — see header). LRU by lastUsed. */
 const MAX_CACHED = 2;
+/** Sentinel the Rust fetch appends to a truncated EPG body (an ignored XML
+ *  comment) when an oversized inflated guide is cut at the byte cap. Detected
+ *  here to surface a small "partially truncated" chip. See iptv.rs. */
+const EPG_TRUNCATED_MARK = "<!--AURA_EPG_TRUNCATED-->";
 
 interface EpgEntry {
   index: EpgIndex;
@@ -42,6 +46,7 @@ interface EpgEntry {
 const _bySource = new Map<string, EpgEntry>();
 const _loading = new Set<string>();
 const _errors = new Map<string, string>();
+const _truncated = new Set<string>();
 const _inflight = new Map<string, Promise<void>>();
 
 function emit(): void {
@@ -59,6 +64,13 @@ export function isEpgLoading(sourceId: string): boolean {
 
 export function epgError(sourceId: string): string | null {
   return _errors.get(sourceId) ?? null;
+}
+
+/** True when this source's EPG body was truncated at the Rust size cap (a very
+ *  large guide). The guide still renders, but later channels may lack now/next,
+ *  so the UI shows a small "partially truncated" chip. */
+export function epgTruncated(sourceId: string): boolean {
+  return _truncated.has(sourceId);
 }
 
 export function hasEpg(sourceId: string): boolean {
@@ -148,9 +160,15 @@ function parseEpgInWorker(
 async function doFetch(sourceId: string, epgUrl: string, channels: IptvChannel[]): Promise<void> {
   _loading.add(sourceId);
   _errors.delete(sourceId);
+  _truncated.delete(sourceId);
   emit();
   try {
     const body = await iptvFetchText(epgUrl);
+    // The Rust fetch appends a sentinel (an ignored XML comment) at the very
+    // end when it had to truncate an oversized inflated EPG. Check only the
+    // tail so we don't rescan a 64 MiB string. The parser tolerates the cut
+    // tail (and the trailing comment) either way.
+    if (body.slice(-80).includes(EPG_TRUNCATED_MARK)) _truncated.add(sourceId);
     let built: { index: EpgIndex; rawHasPrograms: boolean };
     try {
       built = await parseEpgInWorker(body, channels);
@@ -179,6 +197,7 @@ async function doFetch(sourceId: string, epgUrl: string, channels: IptvChannel[]
 
 /** Drop a source's cached EPG (e.g. on playlist removal). */
 export function dropEpg(sourceId: string): void {
+  _truncated.delete(sourceId);
   if (_bySource.delete(sourceId) || _errors.delete(sourceId)) emit();
 }
 

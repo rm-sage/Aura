@@ -23,6 +23,8 @@
 // cache.
 // ---------------------------------------------------------------------------
 
+import { registerStorageReclaimer, isQuotaError } from "./storageQuota";
+
 interface Entry<V> {
   v: V;
   ts: number;
@@ -57,6 +59,10 @@ export class PersistentCache<V> {
     this.maxEntries = opts.maxEntries ?? 1000;
     this.debounceMs = opts.debounceMs ?? 250;
     this.hydrate();
+    // Disposable cache: when the shared localStorage origin hits quota during
+    // ANOTHER tenant's important write, yield room (drop our oldest half) rather
+    // than letting that write fail silently. The data re-fetches on next use.
+    registerStorageReclaimer(() => this.reclaimSpace());
   }
 
   private hydrate(): void {
@@ -91,7 +97,27 @@ export class PersistentCache<V> {
         for (const [k, v] of keep) this.map.set(k, v);
       }
       localStorage.setItem(this.storageKey, JSON.stringify([...this.map.entries()]));
-    } catch { /* quota / serialization failure — non-fatal */ }
+    } catch (e) {
+      // On a quota hit, drop our oldest half and rewrite a smaller blob. A
+      // serialization failure is just skipped (in-memory cache keeps working).
+      if (isQuotaError(e)) this.reclaimSpace();
+    }
+  }
+
+  /** Drop the oldest half of this cache and rewrite a smaller blob (or remove
+   *  the key if even that won't fit), freeing localStorage. Serves as both this
+   *  cache's own quota fallback AND the registered reclaimer other tenants run
+   *  when an important write hits the shared origin quota. */
+  private reclaimSpace(): void {
+    const sorted = [...this.map.entries()].sort((a, b) => b[1].ts - a[1].ts);
+    const keep = sorted.slice(0, Math.max(0, Math.floor(sorted.length / 2)));
+    this.map.clear();
+    for (const [k, v] of keep) this.map.set(k, v);
+    try {
+      localStorage.setItem(this.storageKey, JSON.stringify([...this.map.entries()]));
+    } catch {
+      try { localStorage.removeItem(this.storageKey); } catch { /* ignore */ }
+    }
   }
 
   /** Read; returns undefined for misses and expired entries (also

@@ -211,9 +211,16 @@ pub async fn iptv_fetch_text(url: String) -> Result<String, String> {
             Ok(_) => {
                 if buf.len() > MAX_BYTES {
                     buf.truncate(MAX_BYTES);
+                    // Append a sentinel the EPG store detects to show a small
+                    // "partially truncated" chip. It is an XML comment, so the
+                    // XMLTV parser ignores it (it already tolerates the cut
+                    // tail). Only this gzip-inflate path truncates-and-returns
+                    // Ok, and only gzip bodies (real EPGs) reach it, so the
+                    // marker never contaminates an M3U / Xtream body.
+                    buf.extend_from_slice(b"\n<!--AURA_EPG_TRUNCATED-->\n");
                     crate::devlog!(
                         warn, "iptv",
-                        "EPG inflated past the {} MB cap — truncating (now/next may be partial)",
+                        "EPG inflated past the {} MB cap, truncating (now/next may be partial)",
                         MAX_BYTES / (1024 * 1024),
                     );
                 }

@@ -3,6 +3,14 @@
 
 import type { LibraryItem } from "./types";
 
+// One-shot tripwire (see the in-progress resume pick below): fires once per
+// session if a series has multiple in-progress episodes but NONE carries a
+// usable `_mtime`, which makes the resume-episode choice arbitrary. That was the
+// symptom of the serde-rename bug that once blanked every `_mtime` (fixed in
+// stremio.rs via deserialize-only renames); the warn makes a regression visible
+// in the DevConsole instead of silently resuming the wrong episode.
+let mtimeTripwireFired = false;
+
 // ---------------------------------------------------------------------------
 // libraryNormalize — collapse the raw Stremio library_get response into a
 // clean view that Library / Calendar / Continue Watching can all consume.
@@ -92,14 +100,25 @@ export function normalizeLibrary(raw: LibraryItem[]): LibraryItem[] {
     // recent watched episode wins for resume.
     let stateSource: LibraryItem | null = null;
     let stateMtime = "";
+    let inProgressCount = 0;
     for (const i of list) {
       const s = (i.state ?? {}) as { timeOffset?: number };
       const off = typeof s.timeOffset === "number" ? s.timeOffset : 0;
       if (off <= 0) continue;
+      inProgressCount += 1;
       if ((i.mtime ?? "") > stateMtime) {
         stateSource = i;
         stateMtime = i.mtime ?? "";
       }
+    }
+    // Tripwire: 2+ in-progress episodes but no usable mtime among them means the
+    // resume pick fell back to arbitrary first-wins (the _mtime-regression
+    // symptom). Warn once so it surfaces instead of silently picking wrong.
+    if (inProgressCount >= 2 && stateMtime === "" && !mtimeTripwireFired) {
+      mtimeTripwireFired = true;
+      console.warn(
+        `[library-normalize] "${seriesId}" has ${inProgressCount} in-progress episodes but no usable _mtime; resume pick is arbitrary (possible _mtime regression).`,
+      );
     }
 
     // Build the merged record. State comes from stateSource if we found

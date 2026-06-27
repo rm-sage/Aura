@@ -35,6 +35,14 @@ interface Props {
   nowMs: number;
   hasEpg: boolean;
   epgLoading: boolean;
+  /** EPG fetch/parse error for this source (null when none). Shown with a
+   *  Retry when no guide loaded, instead of the generic "no EPG" copy. */
+  epgError?: string | null;
+  /** Force-reload the EPG — wired to the Retry button on an error. */
+  onRetryEpg?: () => void;
+  /** The EPG body was truncated at the size cap — show a small info chip
+   *  (the guide still renders, but later channels may lack now/next). */
+  truncated?: boolean;
   /** True when more channels exist beyond the rendered slice — drives the
    *  scroll-to-load-more behaviour + the bottom sentinel. */
   hasMore?: boolean;
@@ -44,7 +52,7 @@ interface Props {
   onPlayChannel: (channel: IptvChannel) => void;
 }
 
-export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEpg, epgLoading, hasMore, onReachEnd, onPlayChannel }: Props) {
+export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEpg, epgLoading, epgError, onRetryEpg, truncated, hasMore, onReachEnd, onPlayChannel }: Props) {
   // Re-render the rows when favourites change so the stars stay in sync.
   const [, bumpFav] = useReducer((n: number) => n + 1, 0);
   useEffect(() => subscribeFavorites(bumpFav), []);
@@ -128,6 +136,23 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
             <span className="w-7 h-7 rounded-full border-2 border-white/15 border-t-ln-accent animate-spin" />
             <p className="text-white/45 text-sm">Loading the TV guide…</p>
           </>
+        ) : epgError ? (
+          // The EPG was configured but the fetch/parse failed — show the real
+          // reason + a Retry, NOT the generic "add an EPG URL" copy (which
+          // tells the user to do the thing they already did).
+          <>
+            <p className="text-red-300/90 text-sm max-w-[28rem]">{epgError}</p>
+            {onRetryEpg && (
+              <button
+                type="button"
+                onClick={onRetryEpg}
+                className="px-3.5 h-9 rounded-xl text-[13px] font-medium bg-white/5 border border-white/10
+                           text-white/80 hover:bg-white/10"
+              >
+                Retry
+              </button>
+            )}
+          </>
         ) : (
           <p className="text-white/40 text-sm max-w-[24rem]">
             No EPG loaded for this playlist. Add an EPG (XMLTV) URL to the playlist,
@@ -139,12 +164,22 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
   }
 
   return (
-    <div
-      ref={scrollRef}
-      className="flex-1 overflow-auto relative"
-      style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
-    >
-      <div style={{ width: CHANNEL_COL_W + timelineW, position: "relative" }}>
+    <div className="flex-1 flex flex-col min-h-0 relative">
+      {truncated && (
+        <div
+          className="absolute top-2 right-3 z-[60] pointer-events-none px-2.5 h-7 flex items-center
+                     rounded-full bg-amber-400/15 border border-amber-300/30 text-amber-200/90
+                     text-[11px] font-medium shadow-glass-edge"
+        >
+          Guide data was large and partially truncated
+        </div>
+      )}
+      <div
+        ref={scrollRef}
+        className="flex-1 overflow-auto relative"
+        style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
+      >
+        <div style={{ width: CHANNEL_COL_W + timelineW, position: "relative" }}>
         {/* Sticky header: a LIVE-pill strip ABOVE the time ruler, so the pill
             never overlaps the hour labels or the top programme row. */}
         <div className="sticky top-0 z-20 bg-[rgba(12,12,16,0.96)] backdrop-blur-sm">
@@ -237,7 +272,8 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
         )}
       </div>
 
-      <ProgramHoverCard hover={hover} />
+        <ProgramHoverCard hover={hover} />
+      </div>
     </div>
   );
 }

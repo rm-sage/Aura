@@ -20,10 +20,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
-  castLoad, castPause, castPlay, castSeek, castStatus, castStop,
-  discoverCastDevices,
+  castFfmpegPresent, castLoad, castPause, castPlay, castSeek, castStatus,
+  castStop, discoverCastDevices, needsTransmux,
   type CastDeviceInfo, type CastStatus,
 } from "./cast";
+import { showAppToast } from "./AppToast";
 import { isWindowHidden } from "./windowVisibility";
 
 interface UseCastSessionArgs {
@@ -99,9 +100,9 @@ export function useCastSession({
     return () => window.removeEventListener("aura:open-cast-menu", onOpen);
   }, [rescan]);
 
-  const pickDevice = useCallback((device: CastDeviceInfo) => {
-    const url = urlRef.current;
-    if (!url) return;
+  // Actually begin a session. (pickDevice wraps this with the Chromecast
+  // FFmpeg pre-flight below.)
+  const startCast = useCallback((device: CastDeviceInfo, url: string) => {
     const gen = ++genRef.current;
     // Capture the pause state at INVOCATION time — castLoad can take a
     // second or two, and a user toggling local playback meanwhile must
@@ -133,6 +134,39 @@ export function useCastSession({
       });
   }, []);
 
+  const pickDevice = useCallback((device: CastDeviceInfo) => {
+    const url = urlRef.current;
+    if (!url) return;
+    // Pre-flight FFmpeg gate. A Chromecast Default Media Receiver cannot
+    // open MKV/AVI/... containers; Aura transmuxes them to HLS via the
+    // on-demand ffmpeg component (see cast/mod.rs cast_load). If ffmpeg is
+    // absent the Rust side silently direct-plays an undecodable container
+    // and the bar sits on "buffering" forever — so probe first and surface
+    // an actionable error, staying on local playback, instead of starting
+    // a doomed session. DLNA + HLS are unaffected.
+    if (device.kind === "chromecast" && needsTransmux(url)) {
+      setConnectingId(device.id);
+      setError(null);
+      castFfmpegPresent()
+        .then((present) => {
+          if (present) {
+            startCast(device, url);
+          } else {
+            setConnectingId(null);
+            setError(
+              "This file needs the FFmpeg component to cast to Chromecast. " +
+                "Install it in Settings > Components, or cast to a DLNA TV.",
+            );
+          }
+        })
+        // Probe itself failed: fall through and let the backend try (it may
+        // still cope, or report its own error).
+        .catch(() => startCast(device, url));
+      return;
+    }
+    startCast(device, url);
+  }, [startCast]);
+
   const stopCasting = useCallback(() => {
     genRef.current++;
     setActiveDevice(null);
@@ -160,30 +194,66 @@ export function useCastSession({
     castSeek(Math.max(0, pos)).catch((e) => setError(String(e)));
   }, [status?.position_sec]);
 
-  // 2 s device-status poll while a session is active. Consecutive
-  // failures end the session (device powered off / app dismissed).
+  // 2 s device-status poll while a session is active, with two auto-recovery
+  // guards. Both route through stopCasting() — which tears down the Rust
+  // session / heartbeat / media-server proxy AND resumes local playback where
+  // the device left off — then surface a transient toast. Without this a
+  // dropped or never-started device leaves the cast bar lingering while local
+  // MPV stays paused with no controls and native resources leak (recovery used
+  // to require an app restart).
   useEffect(() => {
     if (!activeDevice) return;
+    const device = activeDevice;
     let failures = 0;
+    let nonLivePolls = 0;
+    let becameLive = false;
+    let ended = false;
+
+    const recover = (msg: string) => {
+      if (ended) return;
+      ended = true;
+      stopCasting();
+      showAppToast(msg, { tone: "danger" });
+    };
+
     const id = window.setInterval(() => {
+      if (ended) return;
       // Skip the device-status IPC while minimized/tray; the cast keeps running
       // on the device + Rust media server, and the UI catches up on restore.
+      // Counting only polls we actually run also means a long minimize can't
+      // trip the never-started timeout below.
       if (isWindowHidden()) return;
       castStatus()
         .then((s) => {
           failures = 0;
           setStatus(s);
+          const live =
+            s.player_state === "playing" ||
+            s.player_state === "paused" ||
+            s.player_state === "buffering";
+          if (live) {
+            becameLive = true;
+          } else if (!becameLive) {
+            // A receiver-side media error answers cast_status SUCCESSFULLY (so
+            // `failures` never climbs) but the device never leaves idle/unknown.
+            // After ~18 s of live polling, give up and return to local rather
+            // than latching "connecting..." / a stale 0:00 forever.
+            nonLivePolls += 1;
+            if (nonLivePolls >= 9) {
+              recover(`${device.name} didn't start playing - resumed local playback`);
+            }
+          }
         })
         .catch(() => {
+          // Device powered off / dropped wifi: cast_status stops answering.
           failures += 1;
           if (failures >= 4) {
-            setActiveDevice(null);
-            setStatus(null);
+            recover(`Lost connection to ${device.name} - resumed local playback`);
           }
         });
     }, 2000);
     return () => window.clearInterval(id);
-  }, [activeDevice]);
+  }, [activeDevice, stopCasting]);
 
   return {
     menuOpen,

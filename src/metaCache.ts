@@ -5,6 +5,7 @@ import { useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { AddonEntry, MetaDetail } from "./types";
 import { dedupedInvoke } from "./invokeDedupe";
+import { registerStorageReclaimer, isQuotaError } from "./storageQuota";
 
 // ---------------------------------------------------------------------------
 // metaCache — shared module-level cache of MetaDetail responses keyed by
@@ -149,11 +150,40 @@ function persistNow() {
     // "No extra details available" state across sessions.
     const persistable = [...cache.entries()].filter(([, v]) => v.detail);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(persistable));
-  } catch {
-    // Quota or serialization failure — non-fatal; the in-memory cache
-    // continues to function for this session.
+  } catch (e) {
+    // On a quota hit, drop our oldest half and rewrite a smaller blob (the
+    // in-memory cache keeps working). A serialization failure is just skipped.
+    if (isQuotaError(e)) reclaimSpace();
   }
 }
+
+/** Drop the oldest half of the cache and rewrite a smaller blob, freeing
+ *  localStorage. Used BOTH as metaCache's own quota fallback AND, via
+ *  registerStorageReclaimer, when ANOTHER tenant's important write (settings,
+ *  history, a watched mark, a playlist) hits the shared origin quota — this is a
+ *  disposable cache, so it yields room rather than letting that write fail
+ *  silently. The data re-fetches on next use. */
+function reclaimSpace() {
+  const live = [...cache.entries()]
+    .filter(([, v]) => v.detail)
+    .sort((a, b) => b[1].ts - a[1].ts);
+  const keep = live.slice(0, Math.max(0, Math.floor(live.length / 2)));
+  cache.clear();
+  idYearIndex.clear();
+  for (const [k, v] of keep) {
+    cache.set(k, v);
+    const idPart = k.split("::")[2];
+    if (idPart) noteYear(idPart, v.detail, v.ts);
+  }
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify([...cache.entries()]));
+  } catch {
+    // Still over quota even halved — drop the on-disk cache entirely so the
+    // writer that triggered us gets the most room.
+    try { localStorage.removeItem(STORAGE_KEY); } catch { /* ignore */ }
+  }
+}
+registerStorageReclaimer(reclaimSpace);
 
 function cacheKey(addonUrl: string, mediaType: string, id: string): string {
   return `${addonUrl}::${mediaType}::${id}`;

@@ -20,6 +20,8 @@
 // ---------------------------------------------------------------------------
 
 import type { IptvChannel } from "./types";
+import { safeSetItem } from "../storageQuota";
+import { showAppToast } from "../AppToast";
 
 export interface FavoriteChannel {
   /** `${sourceId}::${channel.id}` — stable cross-playlist identity. */
@@ -66,11 +68,16 @@ function isValidFavorite(f: unknown): f is FavoriteChannel {
   );
 }
 
+/** One-shot guard so a wedged localStorage doesn't toast on every star toggle. */
+let _warnedPersistFail = false;
+
 function persist(): void {
-  try {
-    localStorage.setItem(STORE_KEY, JSON.stringify(_favorites));
-  } catch (e) {
-    console.warn("[iptv] favorites persist failed", e);
+  if (safeSetItem(STORE_KEY, JSON.stringify(_favorites))) return;
+  // localStorage is the only home for favourites — a failed write means the
+  // stars won't survive a restart. Keep it low-noise: one toast per session.
+  if (!_warnedPersistFail) {
+    _warnedPersistFail = true;
+    showAppToast("Couldn't save favorites: local storage may be full.", { tone: "danger" });
   }
 }
 

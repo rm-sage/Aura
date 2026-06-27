@@ -58,3 +58,24 @@ export const castSeek = (positionSec: number) =>
 export const castStop = () => invoke<number>("cast_stop");
 export const castStatus = () => invoke<CastStatus>("cast_status");
 export const castFfmpegPresent = () => invoke<boolean>("cast_ffmpeg_present");
+
+// Mirror of the Rust transmux gate (cast/transcode.rs TRANSMUX_EXT plus
+// cast/mod.rs is_hls): container extensions the Chromecast Default Media
+// Receiver cannot open directly, so Aura re-segments them to HLS via
+// ffmpeg. HLS (.m3u8) and direct-play containers (.mp4 / .m4v / .webm) are
+// deliberately NOT here. The picker uses this to pre-flight the on-demand
+// ffmpeg component before starting a doomed Chromecast session.
+const TRANSMUX_EXTENSIONS = new Set([
+  "mkv", "avi", "flv", "wmv", "m2ts", "mts", "ts", "vob", "mpg", "mpeg",
+  "ogv", "ogm", "divx", "rmvb", "rm", "asf", "3gp",
+]);
+
+/** True when `url` is a container that needs an ffmpeg transmux for a
+ *  Chromecast (non-HLS, extension in the transmux set). Matches the Rust
+ *  decision in `cast::cast_load`. */
+export function needsTransmux(url: string): boolean {
+  const path = (url.split("?")[0] ?? "").toLowerCase();
+  if (path.endsWith(".m3u8")) return false;
+  const ext = path.split(".").pop();
+  return ext ? TRANSMUX_EXTENSIONS.has(ext) : false;
+}

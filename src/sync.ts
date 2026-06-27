@@ -6,6 +6,7 @@ import { loadAuraSettings, saveAuraSettings, getSettingsUpdatedAt, setSettingsUp
 import { encryptForCloud, decryptFromCloud, isEncryptedBlob, type EncryptedBlob } from "./syncCrypto";
 import { getHistory, setAllHistory, type HistoryEntry } from "./historyStore";
 import { isWindowHidden, subscribeWindowVisibility } from "./windowVisibility";
+import { safeSetItem } from "./storageQuota";
 
 // ---------------------------------------------------------------------------
 // Aura Cloud sync orchestrator (frontend)
@@ -159,18 +160,16 @@ function loadEtagsForActiveScope(): void {
  *  wipe it on sign-in anyway, and a guest can still see 304 benefits
  *  within a single session. */
 function persistEtags(): void {
-  try {
-    const obj: Record<string, string> = {};
-    for (const [ns, etag] of lastEtag) obj[ns] = etag;
-    if (Object.keys(obj).length === 0) {
-      localStorage.removeItem(etagStorageKey());
-    } else {
-      localStorage.setItem(etagStorageKey(), JSON.stringify(obj));
-    }
-  } catch {
-    // Quota / serialization errors are non-fatal — the in-memory Map
-    // still works for the duration of this session.
+  const obj: Record<string, string> = {};
+  for (const [ns, etag] of lastEtag) obj[ns] = etag;
+  if (Object.keys(obj).length === 0) {
+    try { localStorage.removeItem(etagStorageKey()); } catch { /* ignore */ }
+    return;
   }
+  // Via safeSetItem so a full origin evicts a disposable cache and retries: a
+  // silently-dropped etag blob defeats the If-None-Match 304 short-circuit, so
+  // EVERY sync namespace re-pulls in full on the next launch (slow cold start).
+  safeSetItem(etagStorageKey(), JSON.stringify(obj));
 }
 
 export function clearSyncEtags(): void {

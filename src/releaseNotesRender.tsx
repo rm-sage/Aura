@@ -205,7 +205,7 @@ export function ReleaseNotesBody({ notes, max = 2200 }: { notes: string; max?: n
             ) : (
               <h4 key={idx} className="flex items-center gap-2 pt-2">
                 <span className="w-[3px] h-[13px] rounded-full bg-ln-accent/70 shrink-0" />
-                <span className="text-[color:rgb(91,164,255)] text-[11px] font-bold tracking-[0.16em] uppercase">
+                <span className="text-ln-accent text-[11px] font-bold tracking-[0.16em] uppercase">
                   {block.text}
                 </span>
               </h4>
@@ -217,7 +217,7 @@ export function ReleaseNotesBody({ notes, max = 2200 }: { notes: string; max?: n
               <ul key={idx} className="space-y-1.5 pl-1">
                 {block.items.map((item, j) => (
                   <li key={j} className="flex gap-2.5 text-white/75">
-                    <span className="text-[color:rgb(91,164,255)]/70 mt-[2px] shrink-0">•</span>
+                    <span className="text-ln-accent/70 mt-[2px] shrink-0">•</span>
                     <span className="flex-1">{renderInline(item)}</span>
                   </li>
                 ))}

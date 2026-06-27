@@ -1,6 +1,8 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { safeSetItem } from "./storageQuota";
+
 // ---------------------------------------------------------------------------
 // historyStore — local-only, per-account watch-history log.
 //
@@ -74,20 +76,16 @@ function loadFromStorage(scope: string): HistoryEntry[] {
 }
 
 function saveToStorage(scope: string, entries: HistoryEntry[]): void {
-  try {
-    localStorage.setItem(storageKey(scope), JSON.stringify(entries));
-  } catch {
-    // Quota — drop oldest half and retry once. localStorage quota
-    // varies (5-10 MB) but with poster/background URLs each entry is
-    // ~600 bytes; 1000 entries = ~600 KB, well within. If we still
-    // hit quota the user has bigger problems, log + give up.
-    try {
-      const trimmed = entries.slice(0, Math.floor(entries.length / 2));
-      localStorage.setItem(storageKey(scope), JSON.stringify(trimmed));
-    } catch {
-      console.warn("[history] localStorage quota exceeded — entries lost");
-    }
-  }
+  // safeSetItem first: on a full origin it evicts the DISPOSABLE caches
+  // (metaCache, ratings, etc.) and retries, so watch history (a genuine record)
+  // yields space LAST, not first. Only if it STILL won't fit do we drop the
+  // oldest half of history and try once more (the in-memory list stays intact
+  // this session; a dropped tail re-hydrates from the cloud merge if those rows
+  // still exist server-side). safeSetItem already emits a one-shot "storage
+  // full" warning, so a trim is not silent.
+  if (safeSetItem(storageKey(scope), JSON.stringify(entries))) return;
+  const trimmed = entries.slice(0, Math.floor(entries.length / 2));
+  safeSetItem(storageKey(scope), JSON.stringify(trimmed));
 }
 
 function ensureHydrated(): void {

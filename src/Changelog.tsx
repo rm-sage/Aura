@@ -68,13 +68,19 @@ export default function Changelog({
       <div
         className="aura-update-card glass-panel-elevated rounded-2xl w-full max-w-[680px] mx-4
                    shadow-glass-edge flex flex-col max-h-[82vh]"
+        // glass-panel-elevated's background is the per-theme ACCENT-tinted glass
+        // (--ln-glass-3), which made the whole changelog read as the accent
+        // colour. Override to a NEUTRAL frosted glass (the white-on-dark texture
+        // the neutral themes use) while keeping the blur + luminous rim, so the
+        // accent shows only in the headers, not the whole surface.
+        style={{ background: "rgba(255, 255, 255, 0.06)" }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
         <div className="flex items-center justify-between gap-3 px-7 pt-6 pb-4 border-b border-white/8">
           <div className="flex flex-col gap-0.5">
             <h2 className="text-[var(--text-primary)] text-xl font-medium tracking-wide">
-              <span className="text-[color:rgb(91,164,255)]">Changelog</span>
+              <span className="text-ln-accent">Changelog</span>
             </h2>
             <p className="text-white/45 text-xs tracking-wide">Currently on Aura {currentVersion}</p>
           </div>

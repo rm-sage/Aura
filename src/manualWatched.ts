@@ -1,6 +1,9 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { safeSetItem } from "./storageQuota";
+import { showAppToast } from "./AppToast";
+
 // ---------------------------------------------------------------------------
 // manualWatched — local-only, per-account "I've watched / I'm watching /
 // I'm planning to watch this" tracker.
@@ -101,17 +104,14 @@ function loadFromStorage(scope: string): Map<string, ManualWatchedState> {
   return next;
 }
 
-function saveToStorageDirect(scope: string, map: Map<string, ManualWatchedState>): void {
-  try {
-    // Persist as an array of [id, state] pairs to preserve insertion
-    // order — Queue tab depends on it. Object form (legacy) doesn't
-    // round-trip order reliably across all engines.
-    const arr: Array<[string, ManualWatchedState]> = [];
-    for (const [k, v] of map.entries()) arr.push([k, v]);
-    localStorage.setItem(storageKey(scope), JSON.stringify(arr));
-  } catch {
-    /* quota / disabled — non-fatal */
-  }
+/** Persist the map. Returns whether the write landed — via safeSetItem so a
+ *  full origin evicts a disposable cache and retries (so an explicit watched
+ *  mark is not silently lost on quota). Persists as an array of [id, state]
+ *  pairs to preserve insertion order — the Queue tab depends on it. */
+function saveToStorageDirect(scope: string, map: Map<string, ManualWatchedState>): boolean {
+  const arr: Array<[string, ManualWatchedState]> = [];
+  for (const [k, v] of map.entries()) arr.push([k, v]);
+  return safeSetItem(storageKey(scope), JSON.stringify(arr));
 }
 
 function ensureHydrated(): void {
@@ -199,7 +199,13 @@ export function setManualWatchedState(id: string, state: ManualWatchedState | nu
   if (current === state) return; // no-op
   if (state == null) _activeMap.delete(id);
   else _activeMap.set(id, state);
-  saveToStorageDirect(_activeScope, _activeMap);
+  if (!saveToStorageDirect(_activeScope, _activeMap)) {
+    // The in-memory map is updated, but the write didn't land even after a
+    // cache eviction + retry. Tell the user so an explicit mark that silently
+    // reverts on restart (and the stale value a sync push would then carry) is
+    // at least visible instead of a mystery.
+    showAppToast("Couldn't save your watched mark: local storage is full. It may not stick after a restart (clear space in Settings > Storage).", { duration: 5000 });
+  }
   window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
   emitSync([{ id, oldState: current, newState: state }]);
 }

@@ -26,6 +26,8 @@ import { iptvFetchText } from "./fetch";
 import { parseM3u, groupChannels } from "./m3u";
 import { fetchXtreamLiveChannels, buildXtreamUrls, type XtreamCreds } from "./xtream";
 import { dropEpg } from "./epgStore";
+import { safeSetItem } from "../storageQuota";
+import { showAppToast } from "../AppToast";
 import type { IptvPlaylist, IptvPlaylistSource } from "./types";
 
 const CHANGE_EVENT = "aura:iptv-changed";
@@ -154,15 +156,26 @@ export async function loadIptvSources(): Promise<void> {
   await Promise.all(sources.map((src) => refreshPlaylist(src.id).catch(() => {})));
 }
 
-/** Persist the current sources + default id to DEVICE-LOCAL storage. */
-function persistLocal(): void {
-  try {
-    localStorage.setItem(LS_SOURCES, JSON.stringify(_state.sources));
-    if (_state.defaultId) localStorage.setItem(LS_DEFAULT, _state.defaultId);
-    else localStorage.removeItem(LS_DEFAULT);
-  } catch (e) {
-    console.warn("[iptv] persist sources failed", e);
+/** Persist the current sources + default id to DEVICE-LOCAL storage. Routes
+ *  through safeSetItem (quota recovery + one-shot warn). Returns false when the
+ *  SOURCES write ultimately failed, so a user-action caller can surface a toast
+ *  — localStorage is the SOLE persistence path for playlists (no Rust fallback),
+ *  so a silent failure means added/edited playlists vanish on restart. */
+function persistLocal(): boolean {
+  const ok = safeSetItem(LS_SOURCES, JSON.stringify(_state.sources));
+  if (_state.defaultId) safeSetItem(LS_DEFAULT, _state.defaultId);
+  else {
+    try { localStorage.removeItem(LS_DEFAULT); } catch { /* best effort */ }
   }
+  return ok;
+}
+
+/** Toast shown when a playlist add/edit could not be persisted. */
+function warnPersistFailed(): void {
+  showAppToast(
+    "Couldn't save this playlist: local storage may be full, so it might not survive a restart.",
+    { tone: "danger" },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +206,7 @@ export async function addPlaylistSource(
 
   _state.sources = [..._state.sources.filter((s) => s.id !== id), source];
   emit();
-  persistLocal();
+  if (!persistLocal()) warnPersistFailed();
   await refreshPlaylist(id, { force: true }).catch(() => {});
   return source;
 }
@@ -242,7 +255,7 @@ export async function updatePlaylistSource(
     dropEpg(id);
   }
   emit();
-  persistLocal();
+  if (!persistLocal()) warnPersistFailed();
   await refreshPlaylist(id, { force: true }).catch(() => {});
 }
 
