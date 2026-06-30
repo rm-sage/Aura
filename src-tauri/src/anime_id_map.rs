@@ -59,8 +59,33 @@ struct FribbEntry {
     kitsu_id: Option<u64>,
     #[serde(default)]
     anidb_id: Option<u64>,
-    #[serde(default)]
+    // Fribb changed `imdb_id` from a plain string ("tt123") to an ARRAY of
+    // strings (["tt123"]) for multi-imdb entries (and many rows now omit it).
+    // Accept string OR [string] (first wins) OR null/absent — a bare
+    // `Option<String>` failed to deserialize the array rows, which made
+    // serde reject the WHOLE array and left the map empty ("snapshot
+    // unparseable").
+    #[serde(default, deserialize_with = "de_imdb_id")]
     imdb_id: Option<String>,
+}
+
+/// Deserialize Fribb's `imdb_id`: a string, an array of strings (first
+/// wins), or null / absent.
+fn de_imdb_id<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match Option::<StringOrVec>::deserialize(d)? {
+        Some(StringOrVec::One(s)) => Some(s),
+        Some(StringOrVec::Many(v)) => v.into_iter().next(),
+        None => None,
+    })
 }
 
 /// One row's worth of cross-anime ids — what we keep in the in-memory
@@ -99,7 +124,19 @@ fn cache_path<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
 }
 
 fn parse_entries(text: &str) -> Option<Vec<FribbEntry>> {
-    serde_json::from_str::<Vec<FribbEntry>>(text).ok()
+    // Fribb's reduced dataset is a top-level array. Parse the array
+    // structurally first, then deserialize each row INDEPENDENTLY so a
+    // single row whose shape drifted (Fribb periodically restructures —
+    // imdb_id became an array; themoviedb_id / tvdb_id became objects)
+    // skips just that row instead of failing the entire map. Combined with
+    // the string-or-array `imdb_id` handling above, the rows we actually
+    // want (those carrying an imdb_id) survive the current format.
+    let rows: Vec<serde_json::Value> = serde_json::from_str(text).ok()?;
+    Some(
+        rows.into_iter()
+            .filter_map(|v| serde_json::from_value::<FribbEntry>(v).ok())
+            .collect(),
+    )
 }
 
 fn build_index(entries: &[FribbEntry]) -> HashMap<String, Vec<AnimeIdRow>> {

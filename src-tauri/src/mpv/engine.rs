@@ -982,12 +982,27 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
         if id == mpv_event_id::LOG_MESSAGE {
             let m = (*ev).data as *const mpv_event_log_message;
             if !m.is_null() {
-                crate::devlog!(
-                    debug, "mpv",
-                    "mpv/{} {}",
-                    cstr((*m).prefix).trim(),
-                    cstr((*m).text).trim_end(),
-                );
+                let text = cstr((*m).text);
+                let body = text.trim_end();
+                // Drop a couple of ultra-high-frequency, zero-signal
+                // decoder/filter notes that otherwise flood the DevConsole
+                // (one per access unit on HDR / Dolby Vision content). Both
+                // are benign: a redundant DV RPU is simply skipped by the
+                // decoder, and `mpv_src_default_in` is mpv re-negotiating its
+                // filter graph on an on-the-fly frame-property change.
+                // Everything else still forwards at debug.
+                const MPV_LOG_NOISE: [&str; 2] = [
+                    "Multiple Dolby Vision RPUs found in one AU",
+                    "mpv_src_default_in:",
+                ];
+                if !MPV_LOG_NOISE.iter().any(|n| body.contains(n)) {
+                    crate::devlog!(
+                        debug, "mpv",
+                        "mpv/{} {}",
+                        cstr((*m).prefix).trim(),
+                        body,
+                    );
+                }
             }
         } else if id == mpv_event_id::PROPERTY_CHANGE {
             let p = (*ev).data as *const mpv_event_property;
@@ -1520,20 +1535,23 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         }
 
         // -- Loudness normalization at init (settings-gated) --
-        // Install the @loudnorm filter into the initial `af` option so it
-        // is part of the audio chain from the very first frame of the
-        // very first loadfile. The old flow (frontend re-adding it via
-        // `af add` ~1.5 s after each load) raced slow stream opens: the
-        // filter landed in the af property but the already-built audio
-        // chain didn't always pick it up until a seek forced a rebuild —
-        // the "volume is wrong until I seek once" symptom. Skipped under
-        // audio passthrough (bitstream bypasses the filter graph; the UI
-        // enforces the same exclusivity).
+        // Install the @loudnorm filter (a frame-local `dynaudnorm`, NOT the
+        // EBU R128 `loudnorm` — the latter resets its gating window on every
+        // seek and blasts a few seconds of unleveled audio after an OP/ED
+        // skip; see set_audio_loudnorm) into the initial `af` option so it is
+        // part of the audio chain from the very first frame of the very
+        // first loadfile. The old flow (frontend re-adding it via `af add`
+        // ~1.5 s after each load) raced slow stream opens: the filter landed
+        // in the af property but the already-built audio chain didn't always
+        // pick it up until a seek forced a rebuild — the "volume is wrong
+        // until I seek once" symptom. Skipped under audio passthrough
+        // (bitstream bypasses the filter graph; the UI enforces the same
+        // exclusivity). Keep this string in sync with set_audio_loudnorm.
         if snap.loudness_normalization && !snap.audio_passthrough {
             let r = (lib.set_property_string)(
                 handle,
                 b"af\0".as_ptr() as *const c_char,
-                b"@loudnorm:loudnorm=I=-23:LRA=7:TP=-2\0".as_ptr() as *const c_char,
+                b"@loudnorm:dynaudnorm=f=200:g=15\0".as_ptr() as *const c_char,
             );
             if r < 0 {
                 crate::devlog!(warn, "mpv", "init af=@loudnorm failed: {}", err_str(&lib, r));

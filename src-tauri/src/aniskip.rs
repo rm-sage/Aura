@@ -643,7 +643,7 @@ pub async fn set_skip_windows<R: Runtime>(
     // libmpv builds.
     let json = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
     crate::devlog!(
-        info, "aniskip",
+        info, "auraskip",
         "set_skip_windows ({} window(s))",
         payload.windows.len()
     );

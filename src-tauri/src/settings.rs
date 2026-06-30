@@ -377,9 +377,12 @@ pub fn default_keybindings() -> HashMap<String, String> {
     // hit these constantly for sakuga inspection / sub-timing checks.
     m.insert("frame-step-back".into(),    "Comma".into());
     m.insert("frame-step-forward".into(), "Period".into());
-    // Screenshot — PrintScreen, the OS-conventional screenshot key. Some
-    // Win11 setups route PrtScn to the Snipping Tool; rebindable if so.
-    m.insert("screenshot".into(),         "PrintScreen".into());
+    // Screenshot — 'c', the classic in-player screenshot key. PrintScreen
+    // was tried as the OS-conventional default but Windows intercepts it
+    // (Snipping Tool / clipboard capture) so it never reaches the WebView
+    // and the bind looked dead; 'c' reliably arrives. Rebindable in
+    // Settings -> Keybindings.
+    m.insert("screenshot".into(),         "KeyC".into());
     // Anime4K v4 chord defaults — match the Stremio Community v5
     // bindings the user is migrating from. Ctrl+0 disables upscaling
     // entirely (sets profile 0 / "None").
@@ -656,6 +659,19 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> AppSettings {
                     e.insert(default_spec);
                     merged_any = true;
                 }
+            }
+
+            // One-time keybinding fix: the screenshot action briefly
+            // defaulted to "PrintScreen", which Windows intercepts (Snipping
+            // Tool / clipboard) so it never reached the WebView — the bind
+            // looked dead. The merge loop above only ADDS missing defaults,
+            // so a stale "PrintScreen" an earlier launch already persisted
+            // would survive forever. Rewrite exactly that stale value to the
+            // new "KeyC" default; a user who deliberately picked another key
+            // is left untouched.
+            if parsed.keybindings.get("screenshot").map(|s| s.as_str()) == Some("PrintScreen") {
+                parsed.keybindings.insert("screenshot".into(), "KeyC".into());
+                merged_any = true;
             }
 
             // Scrobble enabled-flag migration: pre-existing settings.json

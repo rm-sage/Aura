@@ -552,7 +552,26 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     let cancelled = false;
     const ordered: AddonEntry[] = [
       metaAddon,
-      ...addons.filter((a) => a.url !== metaAddon.url),
+      // Only fall back to addons that can ACTUALLY serve meta for THIS id.
+      // Previously this sprayed /meta/<id> at every installed addon, so any
+      // id the primary source (AIOMetadata) returned empty for — e.g. a
+      // `kitsu:` id it doesn't resolve — triggered a burst of 404s against
+      // subtitle/stream-only addons (OpenSubtitles, SubDL, AIOStreams) that
+      // expose no /meta endpoint at all. Gate on the declared `meta`
+      // resource AND a matching id prefix, mirroring the backend stream
+      // gate (addon_entry_supports_stream_for in stremio.rs). The empty
+      // meta itself is upstream (AIOMetadata); this just stops Aura from
+      // 404-spamming addons that were never going to answer.
+      ...addons
+        .filter((a) => a.url !== metaAddon.url)
+        .filter((a) => {
+          if (!a.resources?.includes("meta")) return false;
+          const prefixes = a.id_prefixes;
+          if (prefixes && prefixes.length > 0) {
+            return prefixes.some((p) => meta.id.startsWith(p));
+          }
+          return true; // no declared idPrefixes → addon accepts any id
+        }),
     ];
     (async () => {
       let bestSoFar: MetaDetail | null = null;

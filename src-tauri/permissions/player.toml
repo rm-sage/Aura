@@ -141,10 +141,13 @@ identifier = "allow-settings"
 description = "Allows the frontend to read and update persistent app settings (theme, defaults, RPC, window, keybindings, subtitle keys)"
 commands.allow = ["get_settings", "set_theme", "update_settings", "reset_settings", "set_settings_scope"]
 
-# ── AniSkip (anime OP/ED skip-time fetcher) ─────────────────────────────────
+# ── AuraSkip (skip-window aggregate + AniSkip API + silence detection) ──────
+# Identifier kept as `allow-aniskip` for stability (renaming it would mean a
+# matching edit in capabilities/default.json and a silent-401 risk if missed);
+# the surface it gates is the whole AuraSkip umbrella, not just AniSkip.
 [[permission]]
 identifier = "allow-aniskip"
-description = "Allows the frontend to fetch op/ed/recap skip-time windows from the AniSkip API for anime titles"
+description = "Allows the frontend to drive AuraSkip: stamp/read the aggregate skip-time windows, fetch op/ed/recap windows from the AniSkip API, and run the silence/outro auto-detection used for anime and any series"
 commands.allow = ["fetch_skip_windows", "set_skip_windows", "get_skip_windows", "resolve_mal_id", "resolve_mal_id_by_title", "detect_silence_intervals", "detect_outro_boundary", "submit_skip_time", "vote_skip_time", "resolve_cour_mal_id", "resolve_cour_anilist_id", "resolve_anilist_to_mal", "resolve_mal_for_aniskip"]
 
 # ── publicmetadb (crowd-sourced OP/ED skip source) ──────────────────────────

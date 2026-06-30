@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -341,6 +341,11 @@ fn pause_mpv<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
+/// Last observed maximized show-state (-1 unknown, 0 restored, 1 maximized).
+/// Used to persist the window-state plugin's save ONLY on an actual
+/// maximize/restore transition (not every drag-resize tick).
+static LAST_MAXIMIZED: AtomicI8 = AtomicI8::new(-1);
+
 /// Install the window-event handler. Call from Tauri `setup`.
 pub fn install<R: Runtime>(app: &AppHandle<R>) {
     let Some(window) = app.get_webview_window("main") else { return };
@@ -421,12 +426,50 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                 }
                 // Non-minimise resizes need no backstop here — the
                 // engine's pump loop tracks the parent rect itself.
+                //
+                // Persist a maximize/restore TRANSITION immediately. The
+                // window-state plugin only captures the maximized flag on
+                // CloseRequested / app-exit, so a hard process-kill (Task
+                // Manager, crash, OS shutdown) — which fires neither — would
+                // restore a stale flag and the window would open un-maximized.
+                // Writing the truthful state the moment the user maximizes or
+                // restores means the choice survives a kill. Fires only on an
+                // actual state change (not every drag tick), and only while
+                // visible (the early return above handles minimized, where
+                // is_maximized() falsely reports false).
+                let maxi = matches!(win.is_maximized(), Ok(true)) as i8;
+                if LAST_MAXIMIZED.swap(maxi, Ordering::Relaxed) != maxi {
+                    use tauri_plugin_window_state::{AppHandleExt, StateFlags};
+                    let _ = handle.save_window_state(
+                        StateFlags::all() ^ StateFlags::FULLSCREEN,
+                    );
+                }
             }
             WindowEvent::CloseRequested { api, .. } => {
                 // Belt-and-suspenders — restore the Windows taskbar in
                 // case the user closes while still in fullscreen mode.
                 #[cfg(target_os = "windows")]
                 crate::win32::ensure_taskbar_visible();
+
+                // Preserve the maximize state across restart.
+                // tauri-plugin-window-state captures `is_maximized()` when it
+                // persists on CloseRequested AND on app exit — and a
+                // MINIMIZED window reports is_maximized() == false. So
+                // closing or quitting Aura while it sits minimized saved
+                // `maximized: false`, and the NEXT launch opened un-maximized
+                // at the last non-maximized size (which recover_window_state
+                // can't heal — that only fixes a full-monitor window). If we
+                // are minimized at close, un-minimize so the show-state is
+                // truthful, then force a corrected save. No-op on a normal
+                // visible close. Flags mirror the plugin registration in
+                // lib.rs (all bits except FULLSCREEN).
+                if matches!(win.is_minimized(), Ok(true)) {
+                    let _ = win.unminimize();
+                    use tauri_plugin_window_state::{AppHandleExt, StateFlags};
+                    let _ = handle.save_window_state(
+                        StateFlags::all() ^ StateFlags::FULLSCREEN,
+                    );
+                }
 
                 if cfg.minimize_to_tray_on_close {
                     // Tray-hide path — keep the process alive, let the user

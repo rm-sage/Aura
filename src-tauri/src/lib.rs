@@ -255,27 +255,28 @@ async fn frame_step(forward: bool) -> Result<(), String> {
     }
 }
 
-/// Toggle EBU R128 loudness normalization on the audio filter chain.
-/// When enabled, audio is levelled to −23 LUFS (broadcast standard)
-/// with a true-peak ceiling of −2 dBTP and a 7 LU loudness range —
-/// flattens the volume disparity between streams from different
-/// sources without crushing dynamics.
+/// Toggle loudness normalization on the audio filter chain — a single
+/// `dynaudnorm` pass labelled `@loudnorm` that levels the volume
+/// disparity between streams from different sources.
+///
+/// Why `dynaudnorm` and not `loudnorm` (EBU R128): the `loudnorm` filter
+/// keeps a gating / lookahead window and RESETS it on a timestamp
+/// discontinuity, so every seek — most visibly an OP/ED SKIP — replays a
+/// few seconds at near-unity gain (a loud blast) until it re-converges.
+/// That was the "loudness normalization breaks after a skip" report.
+/// `dynaudnorm` derives a Gaussian-smoothed per-frame gain with no
+/// cross-seek state, so it survives skips cleanly; it is the standard
+/// mpv realtime leveller for exactly this reason.
 ///
 /// Implementation notes (from a stream-silencing regression):
-///   • Use `change-list af toggle @loudnorm:loudnorm=…` instead of
-///     `set af "…"`. The latter REPLACES the entire filter graph
-///     in-place during playback, which on this libmpv build re-inits
-///     the audio output and frequently leaves it muted or with no
-///     track selected (the filter graph rebuilds before the aid
-///     dispatch can reattach). `change-list … toggle` does an
-///     incremental graph mutation that keeps the audio chain hot.
-///   • Drop `dynamic=true` — not a documented loudnorm parameter; the
-///     filter still initialises but the unknown option may push the
-///     graph into a degraded state where output samples don't reach
-///     the audio device. The base `I/LRA/TP` triple is sufficient.
-///   • The `@loudnorm` label prefix is the change-list selector — if
-///     it's already in the chain, toggle removes it; if it's absent,
-///     toggle adds it. Idempotent regardless of caller state.
+///   • Mutate the chain incrementally with `af add` / `af remove`, never
+///     `set af "…"`. The latter REPLACES the entire filter graph in-place
+///     during playback, which on this libmpv build re-inits the audio
+///     output and frequently leaves it muted or with no track selected
+///     (the graph rebuilds before the aid dispatch can reattach).
+///   • The `@loudnorm` label selects our filter for removal. `af remove`
+///     is a harmless no-op (mpv logs "label not found") when it isn't
+///     present, so remove-then-add stays idempotent regardless of state.
 ///
 /// Soft no-op when audio passthrough is on (bitstream output bypasses
 /// the filter graph entirely). The UI prevents this at the toggle
@@ -315,7 +316,7 @@ async fn set_audio_loudnorm(app: tauri::AppHandle, enabled: bool) -> Result<(), 
             return mpv::engine::submit_command(vec![
                 "af".into(),
                 "add".into(),
-                "@loudnorm:loudnorm=I=-23:LRA=7:TP=-2".into(),
+                "@loudnorm:dynaudnorm=f=200:g=15".into(),
             ]);
         }
         Ok(())
@@ -459,13 +460,28 @@ async fn save_screenshot<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<
     {
         std::path::PathBuf::from(configured)
     } else {
-        let fallback = app
+        // Default: the user's Pictures library under an "Aura" subfolder
+        // (Pictures/Aura), so screenshots land somewhere obvious instead of
+        // buried in AppData. Fall back to app_data_dir/screenshots only if
+        // the Pictures known-folder can't be resolved or created.
+        let pictures = app
             .path()
-            .app_data_dir()
-            .map_err(|e| e.to_string())?
-            .join("screenshots");
-        std::fs::create_dir_all(&fallback).map_err(|e| e.to_string())?;
-        fallback
+            .picture_dir()
+            .ok()
+            .map(|p| p.join("Aura"))
+            .filter(|p| std::fs::create_dir_all(p).is_ok());
+        match pictures {
+            Some(p) => p,
+            None => {
+                let fallback = app
+                    .path()
+                    .app_data_dir()
+                    .map_err(|e| e.to_string())?
+                    .join("screenshots");
+                std::fs::create_dir_all(&fallback).map_err(|e| e.to_string())?;
+                fallback
+            }
+        }
     };
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1154,9 +1170,10 @@ async fn apply_subtitle_style() -> Result<(), String> {
         let _ = mpv::engine::submit_set_property(
             "sub-ass-force-margins".into(), PropValue::String("yes".into()),
         );
-        let _ = mpv::engine::submit_set_property(
-            "ass-style-override".into(), PropValue::String("force".into()),
-        );
+        // `sub-ass-override` is the modern property name; the legacy
+        // `ass-style-override` alias was dropped — it doesn't exist on this
+        // libmpv build and only spammed a "-8 property not found" warning on
+        // every load (this line set it right before the working one below).
         let _ = mpv::engine::submit_set_property(
             "sub-ass-override".into(), PropValue::String("force".into()),
         );
@@ -2224,7 +2241,7 @@ pub fn run() {
             settings::update_settings,
             settings::reset_settings,
             settings::set_settings_scope,
-            // ── AniSkip (anime OP/ED skip-time fetcher) ──
+            // ── AuraSkip: skip-window aggregate (set/get) + AniSkip API (fetch/vote/submit/resolve) ──
             aniskip::fetch_skip_windows,
             aniskip::set_skip_windows,
             aniskip::submit_skip_time,

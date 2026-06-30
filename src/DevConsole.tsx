@@ -753,6 +753,15 @@ export default function DevConsole() {
   // the bottom — that gives us a snap-resume gesture without an
   // explicit "resume" button.
   const [autoScroll, setAutoScroll] = useState(true);
+  // Last observed scrollTop — lets the onScroll handler tell a genuine
+  // user scroll-UP (scrollTop DECREASES) apart from the programmatic
+  // scroll-to-tail and from content growth (both only ever INCREASE
+  // scrollTop or leave it put). Without this, a rapid burst of log lines
+  // grew scrollHeight faster than the async scroll event fired, so the old
+  // distance-only check mis-read "still pinned to the tail" as "user
+  // scrolled up" and stuck the Resume-autoscroll prompt on with nobody
+  // having touched the scrollbar.
+  const prevScrollTopRef = useRef(0);
 
   // Stable push function — buffers when paused so we can release later.
   const push = useMemo(() => {
@@ -1214,13 +1223,22 @@ export default function DevConsole() {
           onCopy={handleLogCopy}
           onScroll={(e) => {
             const el = e.currentTarget;
-            // 24 px hysteresis around the tail — prevents the auto-
-            // scroll re-arming from flickering when a fresh log line
-            // grows the scrollHeight by a couple of pixels right at
-            // the boundary.
-            const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-            const atBottom = distFromBottom <= 24;
-            setAutoScroll((prev) => (prev === atBottom ? prev : atBottom));
+            const prevTop = prevScrollTopRef.current;
+            const curTop = el.scrollTop;
+            prevScrollTopRef.current = curTop;
+            // Re-arm whenever we're at/near the tail (24 px hysteresis).
+            // Otherwise ONLY disarm on a real upward gesture — scrollTop
+            // actually DECREASING. Content growth and the programmatic
+            // scroll-to-tail only push scrollTop down the page (increase)
+            // or leave it put, so neither can be mistaken for the user
+            // scrolling up the way the old distance-only check was during
+            // fast log bursts.
+            const distFromBottom = el.scrollHeight - curTop - el.clientHeight;
+            if (distFromBottom <= 24) {
+              setAutoScroll((prev) => (prev ? prev : true));
+            } else if (curTop < prevTop - 2) {
+              setAutoScroll((prev) => (prev ? false : prev));
+            }
           }}
           className="absolute inset-0 overflow-y-auto px-3 py-2 text-[11.5px] leading-[1.5]"
           style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.10) transparent" }}

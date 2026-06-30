@@ -229,9 +229,14 @@ const OUTRO_FRACTION       = 0.20;
 const TARGET_OP_SECONDS    = 90;
 const OP_MIN_SECONDS       = 30;
 const OP_MAX_SECONDS       = 130;
-// Sanity caps so a mis-titled giant chapter ("Part 1") can't nuke real
-// content. ED can legitimately run long (a full credits roll).
-const TITLED_OP_MAX_SECONDS = 300;
+// Sanity caps so a mis-titled / coarse chapter can't nuke real content.
+// A real opening is ~90 s (OP_MAX_SECONDS is 130); a titled "Opening"
+// chapter much longer than that is a coarse marker that runs until the
+// NEXT marker (e.g. The Punisher S01E13 shipped an "Opening" chapter
+// spanning 4:53-9:37 = ~284 s, which skipped whole scenes). Reject those
+// here so silencedetect's precise window wins instead. ED can legitimately
+// run long (a full credits roll), so it keeps a generous cap.
+const TITLED_OP_MAX_SECONDS = 150;
 const ED_MAX_SECONDS        = 900;
 const MIN_WINDOW_SECONDS    = 2;
 
@@ -396,10 +401,10 @@ async function mergeChapterSkipWindows(
   try {
     await invoke("set_skip_windows", { payload: { windows: merged } });
     console.info(
-      `[aniskip] merged ${derived.length} chapter window(s) → total ${merged.length}`,
+      `[auraskip] merged ${derived.length} chapter window(s) → total ${merged.length}`,
     );
   } catch (err) {
-    console.warn(`[aniskip] chapter merge stamp failed: ${String(err)}`);
+    console.warn(`[auraskip] chapter merge stamp failed: ${String(err)}`);
   }
   return merged;
 }
@@ -1947,7 +1952,7 @@ export default function App() {
             const recapMode = normalizeMode(settings?.skip_recap_mode, "prompt");
             const treatMixed = settings?.skip_treat_mixed_op_as_op ?? true;
             if (opMode === "off" && edMode === "off" && recapMode === "off") {
-              console.info(`[aniskip] skip — all modes off`);
+              console.info(`[auraskip] skip — all modes off`);
               return;
             }
             const modeFor = (kind: string): "off" | "prompt" | "auto" =>
@@ -1969,7 +1974,7 @@ export default function App() {
               try {
                 if (prepared.length > 0) {
                   await invoke("set_skip_windows", { payload: { windows: prepared } });
-                  console.info(`[aniskip] stamped ${prepared.length} window(s)`);
+                  console.info(`[auraskip] stamped ${prepared.length} window(s)`);
                 }
                 const merged = await mergeChapterSkipWindows(prepared, modeFor);
                 // Latest ED window START → precisely-timed Next-Up CTA
@@ -2017,61 +2022,47 @@ export default function App() {
                 }
                 if (autoDetect && url && !hasOp && modeFor("op") !== "off") {
                   try {
+                    // Parallel, early-exit OP scan (Rust silencedetect).
+                    // Splits the first ~10 min into overlapping chunks, fans
+                    // out audio-only ffmpeg passes (bounded concurrency) and
+                    // returns the inferred OP / title-sequence window. This
+                    // replaces the old single 180 s pass + JS "dominant
+                    // silence in 30-180 s, OP-always-from-0" heuristic, which
+                    // could neither REACH nor REPRESENT a title card that
+                    // only lands 5-6 min in (e.g. The Punisher's cold-open-
+                    // then-credits structure). The window is stamped
+                    // auto:false (a detected guess never auto-seeks — Lua
+                    // shows an ignorable "Press X to skip" prompt instead),
+                    // so a wrong guess can't yank real content.
                     const sd = await invoke<{
                       available: boolean;
                       intervals: { start: number; end: number; duration: number }[];
+                      op_window: { start: number; end: number } | null;
                       note: string;
-                    }>("detect_silence_intervals", { url, maxSecs: 180 });
-                    if (sd.available) {
-                      // Largest silence ≥1.5 s starting 30–180 s ≈ the
-                      // OP→dialogue boundary (identical heuristic to
-                      // SkipWindowButton's manual path).
-                      const qualifying = sd.intervals
-                        .filter((iv) => iv.duration >= 1.5 && iv.start >= 30 && iv.start <= 180)
-                        .sort((a, b) => b.duration - a.duration);
-                      // Only treat the dominant silence as an OP boundary
-                      // if it's actually OP-shaped: it must END in the
-                      // 60–110 s band (a real OP→content cut after a
-                      // standard ~90 s opening) AND be clearly the single
-                      // dominant pause (no comparable-length silence else-
-                      // where in the first 3 min). Without these guards
-                      // ANY show with an ordinary ≥1.5 s dialogue gap in
-                      // 30–180 s got a bogus "OP 0-Ns" stamped — e.g.
-                      // Witch Hat Atelier (no OP at all) reported OP
-                      // 0-119s and then auto-skipped real content.
-                      const top = qualifying[0];
-                      const cand =
-                        top &&
-                        top.end >= 60 &&
-                        top.end <= 110 &&
-                        (qualifying.length < 2 ||
-                          qualifying[1].duration < top.duration * 0.6)
-                          ? top
-                          : undefined;
-                      if (cand) {
-                        const opWin: PreparedWindow = {
-                          type: "op",
-                          start: 0,
-                          end: cand.end,
-                          source: "silencedetect",
-                          auto: false,
-                        };
-                        // MERGE (not replace) so chapter ED windows
-                        // already stamped above survive.
-                        await invoke("set_skip_windows", {
-                          payload: { windows: [...merged, opWin] },
-                        });
-                        console.info(
-                          `[aniskip] silencedetect fallback → OP 0-${Math.round(cand.end)}s`,
-                        );
-                      } else {
-                        console.info(`[aniskip] silencedetect: no obvious OP boundary`);
-                      }
+                    }>("detect_silence_intervals", { url, maxSecs: 600 });
+                    if (sd.available && sd.op_window) {
+                      const opWin: PreparedWindow = {
+                        type: "op",
+                        start: Math.max(0, sd.op_window.start),
+                        end: sd.op_window.end,
+                        source: "silencedetect",
+                        auto: false,
+                      };
+                      // MERGE (not replace) so chapter ED windows already
+                      // stamped above survive.
+                      await invoke("set_skip_windows", {
+                        payload: { windows: [...merged, opWin] },
+                      });
+                      console.info(
+                        `[auraskip] silencedetect → OP ${Math.round(opWin.start)}-${Math.round(opWin.end)}s (${sd.note})`,
+                      );
+                    } else if (sd.available) {
+                      console.info(`[auraskip] silencedetect: no OP boundary (${sd.note})`);
                     } else {
-                      console.info(`[aniskip] silencedetect unavailable (ffmpeg not on PATH)`);
+                      console.info(`[auraskip] silencedetect unavailable (ffmpeg not on PATH)`);
                     }
                   } catch (e) {
-                    console.warn(`[aniskip] silencedetect fallback failed: ${String(e)}`);
+                    console.warn(`[auraskip] silencedetect scan failed: ${String(e)}`);
                   }
                 }
                 // Hybrid-mode ED fallback. When NOTHING upstream gave an
@@ -2089,23 +2080,23 @@ export default function App() {
                       available: boolean;
                       ed_start: number | null;
                       note: string;
-                    }>("detect_outro_boundary", { url, tailSecs: 330 });
+                    }>("detect_outro_boundary", { url, tailSecs: 420 });
                     if (ob.available && ob.ed_start != null && ob.ed_start > 0) {
                       window.dispatchEvent(new CustomEvent<number>("aura:ed-start-time", {
                         detail: ob.ed_start,
                       }));
                       console.info(
-                        `[aniskip] outro tail-scan → ED≈${Math.round(ob.ed_start)}s (next-up timing)`,
+                        `[auraskip] outro tail-scan → ED≈${Math.round(ob.ed_start)}s (next-up timing)`,
                       );
                     } else {
-                      console.info(`[aniskip] outro tail-scan: ${ob.note}`);
+                      console.info(`[auraskip] outro tail-scan: ${ob.note}`);
                     }
                   } catch (e) {
-                    console.warn(`[aniskip] outro tail-scan failed: ${String(e)}`);
+                    console.warn(`[auraskip] outro tail-scan failed: ${String(e)}`);
                   }
                 }
               } catch (err) {
-                console.warn(`[aniskip] finish/chapter merge failed: ${String(err)}`);
+                console.warn(`[auraskip] finish/chapter merge failed: ${String(err)}`);
               }
             };
 

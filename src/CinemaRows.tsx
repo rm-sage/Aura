@@ -6,8 +6,9 @@ import { createPortal } from "react-dom";
 import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "./FilterBar";
 import { useRowWindow } from "./useRowWindow";
 import { invoke } from "@tauri-apps/api/core";
-import type { MetaPreview, LibraryItem, AddonEntry, VideoEntry } from "./types";
+import type { MetaPreview, LibraryItem, AddonEntry, VideoEntry, MetaDetail } from "./types";
 import { isVideoAired } from "./types";
+import { findNextEpisode } from "./nextUp";
 import ImageLoader from "./ImageLoader";
 import { useLibraryProgress } from "./LibraryContext";
 import WatchedBadge, { useWatchedVariant, WatchedBadgeStatic } from "./WatchedBadge";
@@ -412,14 +413,21 @@ function ContinuousProgressBar({
 
 /** Pull the current season's episode list from the meta cache.
  *  Returns null while fetching, returns [] for non-episodic items. */
-function useSeasonEpisodes(item: LibraryItem, addons: AddonEntry[] | undefined): VideoEntry[] | null {
+function useSeasonEpisodes(
+  item: LibraryItem,
+  addons: AddonEntry[] | undefined,
+): { seasonEpisodes: VideoEntry[] | null; detail: MetaDetail | null } {
   const [eps, setEps] = useState<VideoEntry[] | null>(null);
+  // Full meta detail (all seasons) kept alongside the season slice so the
+  // CW badge can roll forward to the next-up episode ACROSS seasons.
+  const [detailState, setDetailState] = useState<MetaDetail | null>(null);
   const mediaType = (item.media_type ?? "").toLowerCase();
   const isEpisodic = mediaType === "series" || mediaType === "anime";
 
   useEffect(() => {
     if (!isEpisodic || !addons || addons.length === 0) {
       setEps([]);
+      setDetailState(null);
       return;
     }
     let cancelled = false;
@@ -444,6 +452,7 @@ function useSeasonEpisodes(item: LibraryItem, addons: AddonEntry[] | undefined):
       }
       if (!detail || !detail.videos || detail.videos.length === 0) {
         setEps([]);
+        setDetailState(null);
         return;
       }
       // Determine which season's episodes the bar should represent.
@@ -505,11 +514,12 @@ function useSeasonEpisodes(item: LibraryItem, addons: AddonEntry[] | undefined):
       seasonEps = seasonEps.filter((v) => (v.season ?? 0) !== 0);
       seasonEps.sort((a, b) => (a.episode ?? 0) - (b.episode ?? 0));
       setEps(seasonEps);
+      setDetailState(detail);
     })();
     return () => { cancelled = true; };
   }, [item.id, item.media_type, item.state?.video_id, isEpisodic, addons]);
 
-  return eps;
+  return { seasonEpisodes: eps, detail: detailState };
 }
 
 /** Inline title-suffix indicator for CW cards. Renders a small green
@@ -736,25 +746,41 @@ const ContinueWatchingCard = memo(function ContinueWatchingCard(
     (typeof savedVideoId !== "string" ||
       savedVideoId.length === 0 ||
       getManualWatchedState(savedVideoId) !== "watched");
-  const seasonEpisodes = useSeasonEpisodes(item, addons);
+  const { seasonEpisodes, detail: cwDetail } = useSeasonEpisodes(item, addons);
   // Effective resume episode — falls forward across manually-watched
   // entries so a freshly-marked episode causes the SxxEyy badge AND
   // the segmented bar's "current" amber to advance to the next
   // unwatched ep. Without this, the CW card stayed visually stuck on
   // the just-marked episode.
   const effectiveVideoId = useEffectiveResumeVideoId(item, seasonEpisodes);
-  // Prefer the VideoEntry's (season, episode) when the episode list has
-  // resolved — this gives a uniform `S01E06` badge regardless of whether
-  // the underlying id is IMDb-shape (`tt…:1:6`) or anime-prefix-shape
-  // (`kitsu:50023:6`, which doesn't encode the season in the id at all).
-  // Falls back to the id-string parse during the brief window before
-  // the meta detail fetch completes.
-  const currentEp = effectiveVideoId
-    ? seasonEpisodes?.find((v) => v.id === effectiveVideoId)
+  // Badge target = the episode the card will actually resume. When the saved
+  // (last-played) episode is FINISHED — >= 95 % watched, or manually marked —
+  // the card resumes the NEXT unwatched episode ACROSS seasons (the same roll
+  // openDetailFromCW / DetailView performs: finishing S01E13 → S02E01). The
+  // segmented bar keeps using effectiveVideoId so it still represents the
+  // just-finished season; only the badge rolls. Mid-watch (< 95 %, not marked)
+  // keeps the badge on the resume episode. findNextEpisode handles aired-
+  // gating, specials, and the cross-season hop.
+  const badgeVideoId = useMemo(() => {
+    const base = effectiveVideoId;
+    if (!base || !cwDetail?.videos || cwDetail.videos.length === 0) return base;
+    const finished =
+      getManualWatchedState(base) === "watched" ||
+      (base === savedVideoId && progress >= 0.95);
+    if (!finished) return base;
+    return findNextEpisode(cwDetail, base, Date.now(), "none")?.id ?? base;
+  }, [effectiveVideoId, cwDetail, savedVideoId, progress]);
+  // Prefer the VideoEntry's (season, episode) for a uniform `S01E06` badge
+  // regardless of whether the id is IMDb-shape (`tt…:1:6`) or anime-prefix-
+  // shape (`kitsu:50023:6`). badgeVideoId may live in a different season than
+  // the bar, so fall back to the full videos list before the id-string parse.
+  const currentEp = badgeVideoId
+    ? (seasonEpisodes?.find((v) => v.id === badgeVideoId)
+       ?? cwDetail?.videos?.find((v) => v.id === badgeVideoId))
     : null;
   const badge = (currentEp && currentEp.season != null && currentEp.episode != null)
     ? `S${String(currentEp.season).padStart(2, "0")}E${String(currentEp.episode).padStart(2, "0")}`
-    : badgeForVideoId(effectiveVideoId);
+    : badgeForVideoId(badgeVideoId);
   const useSegmented = seasonEpisodes != null && seasonEpisodes.length > 1;
 
   return (

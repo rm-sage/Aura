@@ -144,14 +144,16 @@ export interface AuraSettings {
    *  about spoilers flip this on. Mirrors the opt-in shape of
    *  `blurUnwatchedThumbnails`. */
   blurEpisodeSynopsis: boolean;
-  /** EBU R128 audio loudness normalization. When on, MPV's `af`
-   *  property holds `@loudnorm:loudnorm=I=-23:LRA=7:TP=-2:dynamic=true`
-   *  so streams from different sources level to a consistent
-   *  perceived volume. Auto-disabled (UI-side) when audio passthrough
-   *  is active — bitstream output bypasses the audio filter graph.
-   *  Default false (opt-in). Re-applies on every stream load AND on
-   *  toggle change; both the Settings panel and the in-player
-   *  three-dots menu surface the same setting. */
+  /** Audio loudness normalization. When on, MPV's `af` property holds
+   *  `@loudnorm:dynaudnorm=f=200:g=15` so streams from different sources
+   *  level to a consistent perceived volume. (dynaudnorm, not EBU R128
+   *  `loudnorm`: the latter resets its gating window on a seek and blasts
+   *  a few seconds of unleveled audio after an OP/ED skip — dynaudnorm is
+   *  frame-local and survives skips.) Auto-disabled (UI-side) when audio
+   *  passthrough is active — bitstream output bypasses the audio filter
+   *  graph. Default false (opt-in). Installed at engine init AND on toggle
+   *  change; both the Settings panel and the in-player three-dots menu
+   *  surface the same setting. */
   loudnessNormalization: boolean;
   /** Motion interpolation — mpv's built-in GPU frame interpolation
    *  (`video-sync=display-resample` + `interpolation` + `tscale`).

@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { AddonEntry, MetaDetail } from "./types";
 import { dedupedInvoke } from "./invokeDedupe";
 import { registerStorageReclaimer, isQuotaError } from "./storageQuota";
+import { findAIOMetadataAddon } from "./aiometadata";
 
 // ---------------------------------------------------------------------------
 // metaCache — shared module-level cache of MetaDetail responses keyed by
@@ -234,18 +235,44 @@ export async function getMetaDetailFallback(
   mediaType: string,
   id: string,
 ): Promise<MetaDetail | null> {
-  // Only query addons that actually expose the `meta` resource.
-  // Search/catalog-only addons (e.g. "AI Search") otherwise get a
-  // `/meta/...` round-trip on EVERY hover / CW / Calendar / detail
-  // lookup and just return an empty "?" stub — pure wasted latency
-  // since the loop then falls through to the real meta addon anyway.
-  // Back-compat: if NO addon advertises `meta` (old addons.json that
-  // predates the `resources` capture), fall back to the full list so
-  // we never regress to "no metadata at all".
+  // A real per-id meta source declares the `meta` resource AND — when it
+  // declares idPrefixes — those prefixes match this id. "AI Search" lists
+  // `meta` but only returns an empty "?" stub for foreign ids, so the bare
+  // resource check still let it eat a `/meta/...` round-trip on EVERY hover
+  // / CW / Calendar / detail lookup. Gate on the id prefix too (mirrors
+  // DetailView and the backend stream gate); an addon with NO declared
+  // idPrefixes is treated as universal so a prefix-less provider is kept.
+  const idMatches = (a: AddonEntry): boolean => {
+    const p = a.id_prefixes;
+    if (Array.isArray(p) && p.length > 0) return p.some((pre) => id.startsWith(pre));
+    return true;
+  };
+  // ALWAYS keep the resolved primary meta provider (AIOMetadata) even if its
+  // declared idPrefixes don't list this id's prefix — it's the universal
+  // source and may serve a prefix it under-declares. Mirrors DetailView,
+  // which prepends the meta addon unconditionally and only prefix-gates the
+  // fallbacks; without this carve-out a surviving stub could answer in
+  // AIOMetadata's place.
+  const forcedUrl = findAIOMetadataAddon(addons)?.url ?? null;
   const metaCapable = addons.filter((a) =>
     Array.isArray(a.resources) &&
-    a.resources.some((r) => r.toLowerCase() === "meta"),
+    a.resources.some((r) => r.toLowerCase() === "meta") &&
+    (a.url === forcedUrl || idMatches(a)),
   );
+  // Order: the primary provider first, then addons that EXPLICITLY declare a
+  // matching id prefix (real meta addons — Cinemeta), then prefix-less
+  // catch-alls (e.g. "AI Search"). So the real provider answers first and the
+  // fallthrough only reaches a stub for ids nothing else can resolve. Stable
+  // sort preserves the user's order within each tier.
+  const rank = (a: AddonEntry): number => {
+    if (a.url === forcedUrl) return 2;
+    const p = a.id_prefixes;
+    return Array.isArray(p) && p.length > 0 && p.some((pre) => id.startsWith(pre)) ? 1 : 0;
+  };
+  metaCapable.sort((a, b) => rank(b) - rank(a));
+  // Back-compat: if NO addon advertises `meta` (old addons.json predating
+  // the `resources` capture), fall back to the full list so we never
+  // regress to "no metadata at all".
   const candidates = metaCapable.length > 0 ? metaCapable : addons;
   for (const a of candidates) {
     const d = await getMetaDetail(a, mediaType, id);
