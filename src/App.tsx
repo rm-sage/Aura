@@ -483,6 +483,15 @@ interface PlaybackPayload {
 // user pause earlier in the file cannot satisfy it.
 const EOS_TAIL_SECONDS = 5;
 
+// Minimum forward jump in demuxer readahead (s) that counts as real buffer
+// progress — filters jitter so only a genuine fill resets the stall timers.
+const BUFFER_PROGRESS_MIN_S = 2;
+// How long the buffer may make NO progress before a stalled load / mid-play
+// cache wait is treated as wedged (and the recovery modal allowed). While the
+// buffer keeps filling within this window, the modal is suppressed so a slow-
+// but-alive source can finish buffering.
+const BUFFER_STALL_MS = 25000;
+
 // Per-tick forward-progress cap (s) for the History watched accumulator.
 // A `time` delta larger than this is a seek, not playback — discarded so
 // skipping to the end never inflates summed watched time. Matches
@@ -643,6 +652,12 @@ function usePlayback(playerActive: boolean) {
   // contains a numeric value (NOT just non-zero ones, so a paused
   // file that's still receiving heartbeats counts as alive).
   const lastTimeUpdateAtRef = useRef<number>(0);
+  // Buffer forward-progress tracker: last seen demuxer readahead (s) and the
+  // wall-clock of the last genuine +BUFFER_PROGRESS_MIN_S jump. The stall /
+  // load watchdogs use this to keep a slow-but-filling stream out of the
+  // recovery modal. Reset per load in notifyNewLoad.
+  const lastCacheSecondsRef = useRef<number>(0);
+  const lastBufferProgressAtRef = useRef<number>(0);
   // Wall-clock of the last user seek. A seek (e.g. fast-forwarding a live
   // stream toward the edge) makes mpv cache-pause while it refills, halting
   // time-pos — that's a buffer, NOT a broken stream, so the stale-heartbeat
@@ -720,7 +735,22 @@ function usePlayback(playerActive: boolean) {
       // Real cache telemetry from the engine's gated poll: drive the loading
       // overlay's % + readahead, and broadcast our buffer to the party.
       if (typeof payload.cache_pct === "number") setBufferPct(payload.cache_pct);
-      if (typeof payload.cache_seconds === "number") setCacheSeconds(payload.cache_seconds);
+      if (typeof payload.cache_seconds === "number") {
+        setCacheSeconds(payload.cache_seconds);
+        // Track buffer FORWARD progress so the stall / load watchdogs can tell
+        // a slow-but-alive fill from a wedged stream. A >= BUFFER_PROGRESS_MIN_S
+        // jump in demuxer readahead is real progress; a drop is playback
+        // consuming the buffer (or a seek), so re-baseline down without
+        // counting it as progress.
+        const cs = payload.cache_seconds;
+        const prev = lastCacheSecondsRef.current;
+        if (cs > prev + BUFFER_PROGRESS_MIN_S) {
+          lastBufferProgressAtRef.current = Date.now();
+          lastCacheSecondsRef.current = cs;
+        } else if (cs < prev) {
+          lastCacheSecondsRef.current = cs;
+        }
+      }
       if (typeof payload.cache_pct === "number" || typeof payload.cache_seconds === "number") {
         notifyLocalBuffer({
           pct: typeof payload.cache_pct === "number" ? payload.cache_pct : null,
@@ -950,6 +980,12 @@ function usePlayback(playerActive: boolean) {
           }
           return;
         }
+        // Buffer-aware: a cache stall legitimately halts time-pos. If the
+        // demuxer buffer is still FILLING (progress within BUFFER_STALL_MS),
+        // the stream is alive but slow — keep waiting so buffering can finish
+        // instead of yanking up the recovery modal mid-fill. Only a buffer
+        // that has made NO progress for BUFFER_STALL_MS is treated as wedged.
+        if (Date.now() - lastBufferProgressAtRef.current < BUFFER_STALL_MS) return;
         setStreamBroken(true);
       }
     }, 1000);
@@ -1015,6 +1051,10 @@ function usePlayback(playerActive: boolean) {
       const start = loadStartedAtRef.current;
       if (start === 0 || loadWatchdogFiredRef.current) return;
       if (Date.now() - start >= LOAD_TIMEOUT_MS) {
+        // Buffer-aware: if the initial cache is still FILLING (progress within
+        // BUFFER_STALL_MS), the source is just slow — don't declare the load
+        // wedged; keep waiting so the buffer can reach the play threshold.
+        if (Date.now() - lastBufferProgressAtRef.current < BUFFER_STALL_MS) return;
         // Fire ONCE per load — the guard (reset in notifyNewLoad) stops this
         // from re-warning + re-flipping streamBroken every 2 s indefinitely
         // when a load stays wedged.
@@ -1036,6 +1076,8 @@ function usePlayback(playerActive: boolean) {
     loadEventsSeenRef.current = new Set();
     lastTimeUpdateAtRef.current = 0;
     lastCacheBufferLogRef.current = null;
+    lastCacheSecondsRef.current = 0;
+    lastBufferProgressAtRef.current = 0;
     nearEndEosFiredRef.current = false;
     watchedElapsedRef.current = 0;
     watchedElapsedLastTimeRef.current = 0;
@@ -1300,7 +1342,7 @@ export default function App() {
   // ── Playback hook — gated on activeTarget so the polling fallback only
   //     runs while a stream is loaded.
   const {
-    time, duration, paused, volume, speed, buffering, bufferPct, cacheSeconds, seekLoading, firstFrameSeen,
+    time, duration, paused, volume, speed, buffering, bufferPct, seekLoading, firstFrameSeen,
     streamBroken, setStreamBroken,
     togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
     notifyNewLoad, logLoadEvent,
@@ -6571,7 +6613,6 @@ export default function App() {
           speed={speed}
           buffering={buffering}
           bufferPct={bufferPct}
-          cacheSeconds={cacheSeconds}
           seekLoading={seekLoading}
           firstFrameSeen={firstFrameSeen}
           // True when we're a non-leader synced to the party — the transport

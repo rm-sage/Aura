@@ -65,16 +65,23 @@ interface SourceSwitcherProps {
 function rowChips(s: StreamEntry): { kind: ChipKind; label: string }[] {
   const p = parseStream(s);
   const chips: { kind: ChipKind; label: string }[] = [];
+  // Debrid / service tile first ([TB]/[ND]/…) so the provider reads at a
+  // glance — mirrors the DetailView stream row's service pill.
+  if (p.serviceShort) chips.push({ kind: "service", label: `[${p.serviceShort}]` });
   if (p.resolution) chips.push({ kind: "resolution", label: p.resolution });
   const quality = p.quality ?? p.ripType;
   if (quality) chips.push({ kind: "quality", label: quality });
   if (p.hdr) chips.push({ kind: "hdr", label: p.hdr });
   const codec = p.codec ?? p.encode;
   if (codec) chips.push({ kind: "codec", label: codec });
+  if (p.cachedStatus === "cached") chips.push({ kind: "service", label: "⚡ cached" });
   if (p.size) chips.push({ kind: "size", label: p.size });
   if (p.seeders != null) chips.push({ kind: "seeders", label: `${p.seeders} seed` });
-  if (p.cachedStatus === "cached") chips.push({ kind: "service", label: "⚡ cached" });
-  return chips.slice(0, 6);
+  // Scraper (the addon that surfaced it) + release group — same fields and
+  // palette the DetailView row shows, so the switcher matches it.
+  if (p.addonName) chips.push({ kind: "addon", label: p.addonName });
+  if (p.releaseGroup) chips.push({ kind: "group", label: p.releaseGroup });
+  return chips.slice(0, 9);
 }
 
 export default function SourceSwitcher({
@@ -97,6 +104,20 @@ export default function SourceSwitcher({
     const m = new Map<string, { kind: ChipKind; label: string }[]>();
     for (const s of streams) m.set(streamKey(s), rowChips(s));
     return m;
+  }, [streams]);
+
+  // Match the DetailView stream list's visible order: it groups streams by
+  // addon (Map insertion order, order-preserving within a group). The raw
+  // fetch can interleave addons, so without this the switcher's flat order
+  // differs from the detail page. Group here so the two agree.
+  const orderedStreams = useMemo(() => {
+    const byAddon = new Map<string, StreamEntry[]>();
+    for (const s of streams) {
+      const list = byAddon.get(s.addon_name) ?? [];
+      list.push(s);
+      byAddon.set(s.addon_name, list);
+    }
+    return [...byAddon.values()].flat();
   }, [streams]);
 
   if (!open) return null;
@@ -136,7 +157,7 @@ export default function SourceSwitcher({
               No other sources available.
             </div>
           ) : (
-            streams.map((s) => {
+            orderedStreams.map((s) => {
               const key = streamKey(s);
               const isCurrent = sameStreamSource(s, currentStream);
               const resolving = resolvingKey === key;

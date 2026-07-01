@@ -82,8 +82,23 @@ function isValidThemeId(value: unknown): value is ThemeId {
   return typeof value === "string" && (VALID_THEME_IDS as readonly string[]).includes(value);
 }
 
+const THEME_LS_KEY = "aura:theme";
+const ACCENT_LS_KEY = "aura:accent-rgb";
+
 function applyTheme(theme: ThemeId) {
   document.documentElement.setAttribute("data-theme", theme);
+  // Persist for the next cold start's pre-paint inline script (index.html) so
+  // the app renders in the right theme from the first frame instead of
+  // flashing the default until get_settings resolves. Cache the resolved
+  // accent triplet too, so the boot splash glow matches the theme.
+  try {
+    localStorage.setItem(THEME_LS_KEY, theme);
+    const rgb = getComputedStyle(document.documentElement)
+      .getPropertyValue("--ln-accent-rgb").trim();
+    if (rgb) localStorage.setItem(ACCENT_LS_KEY, rgb);
+  } catch {
+    /* private mode / quota — non-fatal; the flash just returns next cold start */
+  }
 }
 
 interface Props {
@@ -94,8 +109,15 @@ export default function ThemeEngine({ children }: Props) {
   const [theme, setThemeState] = useState<ThemeId>("mica");
   const [ready, setReady] = useState(false);
 
-  // Initial load — pull from backend, fall back to default if unavailable
+  // Initial load — warm-start from the cached theme so there's no flash while
+  // get_settings (which waits on the Rust backend to spin up) is in flight,
+  // then reconcile with the authoritative backend value.
   useEffect(() => {
+    try {
+      const cached = localStorage.getItem(THEME_LS_KEY);
+      if (isValidThemeId(cached)) { setThemeState(cached); applyTheme(cached); }
+    } catch { /* ignore */ }
+
     invoke<AppSettings>("get_settings")
       .then((s) => {
         const t: ThemeId = isValidThemeId(s.theme) ? s.theme : "mica";

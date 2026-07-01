@@ -5,6 +5,22 @@
     <link rel="icon" type="image/png" href="/src/assets/aura-icon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Aura</title>
+    <script>
+      /* Apply the persisted theme + accent BEFORE the bundle so the app (and
+         this boot splash) paint in the selected theme from the first frame,
+         instead of flashing the default until ThemeEngine's get_settings
+         round-trip resolves a few seconds later. ThemeEngine writes both keys
+         on every theme change and reconciles with the authoritative backend
+         value on mount. */
+      (function () {
+        try {
+          var t = localStorage.getItem("aura:theme");
+          document.documentElement.setAttribute("data-theme", t || "mica");
+          var a = localStorage.getItem("aura:accent-rgb");
+          if (a) document.documentElement.style.setProperty("--boot-accent-rgb", a);
+        } catch (e) {}
+      })();
+    </script>
     <style>
       /* ── Boot splash — shown from first DOM paint until React mounts ── */
       #aura-boot-splash {
@@ -35,9 +51,11 @@
       #aura-boot-splash img {
         width: 96px;
         height: 96px;
-        /* Slow pulse on the glow — same drop-shadow recipe as LandingView */
+        /* Slow pulse on the glow — same drop-shadow recipe as LandingView.
+           Accent tracks the persisted theme via --boot-accent-rgb (set by the
+           pre-paint script above); falls back to the default blue. */
         animation: boot-icon-pulse 1.6s ease-in-out infinite;
-        filter: drop-shadow(0 4px 18px rgba(91, 164, 255, 0.45));
+        filter: drop-shadow(0 4px 18px rgb(var(--boot-accent-rgb, 91 164 255) / 0.45));
         -webkit-user-drag: none;
       }
 
@@ -65,14 +83,14 @@
         -webkit-text-fill-color: transparent;
         -webkit-text-stroke: 0.4px rgba(255, 255, 255, 0.08);
         filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.35))
-                drop-shadow(0 0 6px rgba(91, 164, 255, 0.18));
+                drop-shadow(0 0 6px rgb(var(--boot-accent-rgb, 91 164 255) / 0.18));
         animation: aura-sweep-anim 20s linear infinite;
         will-change: background-position;
       }
 
       @keyframes boot-icon-pulse {
-        0%,  100% { filter: drop-shadow(0 4px 18px rgba(91, 164, 255, 0.45)); }
-        50%        { filter: drop-shadow(0 4px 28px rgba(91, 164, 255, 0.75)); }
+        0%,  100% { filter: drop-shadow(0 4px 18px rgb(var(--boot-accent-rgb, 91 164 255) / 0.45)); }
+        50%        { filter: drop-shadow(0 4px 28px rgb(var(--boot-accent-rgb, 91 164 255) / 0.75)); }
       }
 
       @keyframes aura-sweep-anim {

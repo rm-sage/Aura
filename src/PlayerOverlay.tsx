@@ -1037,9 +1037,6 @@ interface Props {
    *  Null when not buffering or not yet readable. Surfaced under the
    *  buffering overlay so the user knows whether MPV is making progress. */
   bufferPct: number | null;
-  /** Demuxer readahead buffered ahead of the playhead, seconds. Shown as a
-   *  secondary line on the loading overlay. */
-  cacheSeconds?: number | null;
   /** True during a slow/buffering seek (debounced) — surfaces the loading
    *  overlay so the user sees WHY playback paused after a seek. */
   seekLoading?: boolean;
@@ -1270,7 +1267,7 @@ export default function PlayerOverlay({
   trailerMaxHeight = 2160,
   isTrailerResolving = false,
   onSetTrailerQuality,
-  time, duration, paused, volume, speed, buffering, bufferPct, cacheSeconds = null, seekLoading = false, firstFrameSeen,
+  time, duration, paused, volume, speed, buffering, bufferPct, seekLoading = false, firstFrameSeen,
   partyFollower = false,
   onControlsVisibleChange,
   togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
@@ -2009,7 +2006,6 @@ export default function PlayerOverlay({
         show={!firstFrameSeen || buffering || seekLoading || isTrailerResolving}
         statusText={isTrailerResolving ? "Switching quality" : !firstFrameSeen ? "Loading" : buffering ? "Buffering" : "Seeking"}
         bufferPct={bufferPct}
-        cacheSeconds={cacheSeconds}
         title={titleForBuffer}
         logo={logoForBuffer}
       />
@@ -3964,18 +3960,16 @@ function MoreItem({
 // ---------------------------------------------------------------------------
 
 function BufferingOverlay({
-  show, statusText, bufferPct, cacheSeconds = null, title, logo,
+  show, statusText, bufferPct, title, logo,
 }: {
   show: boolean;
   /** Replaces "Buffering" — caller decides ("Loading", "Buffering", …). */
   statusText: string;
-  /** MPV cache fill percent during a buffering event (0..100), or null
-   *  when not applicable (initial load, manual pause, EOF). Rendered as
-   *  a soft "Buffering… 47 %" suffix on the status line. */
+  /** MPV cache-buffering-state (0..100) — the REAL progress toward the
+   *  stream becoming playable (how full the cache is toward the point
+   *  playback (re)starts and this overlay drops). Rendered as the primary
+   *  progress readout + bar. Null when not in a cache wait. */
   bufferPct: number | null;
-  /** Demuxer readahead buffered ahead of the playhead, seconds — shown as a
-   *  secondary "12s buffered" line so a slow fill is visible. */
-  cacheSeconds?: number | null;
   title: string;
   logo: string | null;
 }) {
@@ -4010,12 +4004,25 @@ function BufferingOverlay({
           </h2>
         )}
         <p className="text-white/60 text-[12.5px] font-mono uppercase tracking-[0.3em]">
-          {statusText}…{typeof bufferPct === "number" ? ` ${Math.round(bufferPct)}%` : ""}
+          {statusText}…
         </p>
-        {typeof cacheSeconds === "number" && cacheSeconds > 0 && (
-          <p className="text-white/40 text-[12.5px] font-mono uppercase tracking-[0.3em] -mt-3">
-            {cacheSeconds.toFixed(1)}s buffered
-          </p>
+        {/* Progress toward playable: MPV's cache-buffering-state (%), i.e. how
+            full the cache is toward the point playback (re)starts and this
+            overlay drops. Replaces the old "Ns buffered" readahead — that was a
+            demuxer readahead figure, not load progress, and read as a false
+            "already buffered" number on a stalled load. */}
+        {typeof bufferPct === "number" && (
+          <div className="flex flex-col items-center gap-1.5 -mt-2 w-40">
+            <span className="text-white/55 text-[13px] font-mono tabular-nums tracking-[0.35em]">
+              {Math.round(bufferPct)}%
+            </span>
+            <span className="block h-[3px] w-full rounded-full bg-white/12 overflow-hidden">
+              <span
+                className="block h-full bg-ln-accent rounded-full transition-[width] duration-300"
+                style={{ width: `${Math.max(0, Math.min(100, bufferPct))}%` }}
+              />
+            </span>
+          </div>
         )}
       </div>
     </div>
