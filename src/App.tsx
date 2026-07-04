@@ -248,6 +248,57 @@ function windowOverlapFraction(
   return inter / Math.max(0.001, aEnd - aStart);
 }
 
+/** Collapse overlapping skip windows of the SAME kind across sources so a
+ *  region never gets two segments (e.g. an AniSkip OP + a chapter OP that
+ *  only partially overlap — the per-source guards in mergeChapterSkipWindows
+ *  let those slip through, which surfaced as the reported "chapter + no-source
+ *  overlap"). The higher-trust source wins the region; the loser is dropped
+ *  WHOLE, never merged into a union (a coarse chapter must not extend a precise
+ *  AniSkip window). `mixed-op` shares the OP group. */
+function dedupeSkipWindows(windows: PreparedWindow[]): PreparedWindow[] {
+  const group = (t: string) => (t === "mixed-op" ? "op" : t);
+  // Trust order. A release group's EXPLICIT titled chapter ("Opening") beats
+  // AniSkip: the chapter is a direct, encoder-set boundary (and the ≤150 s cap
+  // in mergeChapterSkipWindows already drops coarse markers), whereas AniSkip's
+  // crowd-sourced timings can be wrong for a given episode — observed on
+  // Dr. STONE S04E18, where the file's chapter OP was right and AniSkip's was
+  // off. Aura's own guesses (positional heuristic / silencedetect) rank lowest.
+  const PRIO: Record<string, number> = {
+    chapter: 5, aniskip: 4, publicmetadb: 3, "chapter-heuristic": 2, silencedetect: 1,
+  };
+  const prio = (src: string) => PRIO[src] ?? 0;
+  // Highest-priority source first (it survives a conflict), stable by start.
+  const ordered = [...windows].sort((a, b) => prio(b.source) - prio(a.source) || a.start - b.start);
+  const kept: PreparedWindow[] = [];
+  let opTaken = false;
+  for (const w of ordered) {
+    const g = group(w.type);
+    // An episode has exactly ONE opening. When two sources disagree on WHERE
+    // it is (e.g. AniSkip 2:34-4:04 vs a chapter "Opening" 0:55-2:24 on
+    // Dr. STONE — NON-overlapping, so the overlap test below can't catch
+    // them), keep only the single highest-priority OP and drop the rest.
+    // ED / recap are NOT collapsed this way: a real ED plus a next-episode
+    // "preview" are both legitimately skippable, so those get only the
+    // same-region overlap dedup below.
+    if (g === "op") {
+      if (opTaken) continue;
+      opTaken = true;
+      kept.push(w);
+      continue;
+    }
+    const wLen = Math.max(0.001, w.end - w.start);
+    const clashes = kept.some((k) => {
+      if (group(k.type) !== g) return false;
+      const inter = Math.max(0, Math.min(k.end, w.end) - Math.max(k.start, w.start));
+      const kLen = Math.max(0.001, k.end - k.start);
+      // Overlap past ~a quarter of the SHORTER window = the same region.
+      return inter / Math.min(wLen, kLen) > 0.25;
+    });
+    if (!clashes) kept.push(w);
+  }
+  return kept.sort((a, b) => a.start - b.start);
+}
+
 async function mergeChapterSkipWindows(
   existing: PreparedWindow[],
   modeFor: (kind: string) => "off" | "prompt" | "auto",
@@ -325,11 +376,11 @@ async function mergeChapterSkipWindows(
       kind === "ed" && isPreviewish && duration > 0 &&
       s.start < duration * (1 - OUTRO_FRACTION) - 1
     ) continue; // a stray EARLY "Preview" is not an outro
-    // Skip when AniSkip already covers this region (>80 % overlap).
-    const dup = existing.some(
-      (e) => windowOverlapFraction(s.start, s.end, e.start, e.end) > 0.8,
-    );
-    if (dup) continue;
+    // Always add the titled chapter — cross-source overlap (incl. vs AniSkip)
+    // is resolved centrally by dedupeSkipWindows, which now PREFERS the
+    // encoder-set chapter. The old "drop the chapter when AniSkip covers this
+    // region" guard here contradicted that (it kept the less-reliable AniSkip
+    // window), so it's gone.
     derived.push({
       type:   kind,
       start:  s.start,
@@ -397,7 +448,7 @@ async function mergeChapterSkipWindows(
 
   if (derived.length === 0) return existing;
 
-  const merged = [...existing, ...derived];
+  const merged = dedupeSkipWindows([...existing, ...derived]);
   try {
     await invoke("set_skip_windows", { payload: { windows: merged } });
     console.info(
@@ -2093,7 +2144,7 @@ export default function App() {
                       // MERGE (not replace) so chapter ED windows already
                       // stamped above survive.
                       await invoke("set_skip_windows", {
-                        payload: { windows: [...merged, opWin] },
+                        payload: { windows: dedupeSkipWindows([...merged, opWin]) },
                       });
                       console.info(
                         `[auraskip] silencedetect → OP ${Math.round(opWin.start)}-${Math.round(opWin.end)}s (${sd.note})`,

@@ -301,5 +301,14 @@ export function useEpisodesBehind(
     if (resumeId && v.id !== resumeId && episodeIsBeforeResume(v.id, resumeId)) watchedAired += 1;
   }
   const behind = Math.max(0, info.airedCount - watchedAired);
+  // "Behind" only means something when the user is actually WATCHING this
+  // series under THIS id — a resume position or at least one watched-aired
+  // episode. With zero progress here every aired episode reads as unwatched,
+  // so the badge would scream "48 behind" for a show you've finished. This
+  // fires on a duplicate per-season catalog entry (e.g. AIOMetadata's separate
+  // "... Season 3" listing) whose id differs from the one you watched under,
+  // so its library/resume state is empty. No progress = "not started", not
+  // "behind" — suppress it rather than alarm.
+  if (watchedAired === 0 && !resumeId) return null;
   return behind > 0 ? behind : null;
 }

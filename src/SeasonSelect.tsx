@@ -156,6 +156,14 @@ export default function SeasonSelect({
   const popoverStyle: React.CSSProperties = {
     maxHeight: `${SEASON_VISIBLE_CAP * 36 + 8}px`,
     minWidth: triggerRef.current?.offsetWidth ?? 160,
+    // Cap the width so a long cour title ("Season 3 · Mushoku Tensei: Jobless
+    // Reincarnation Season 3") can't blow the popover out. The options are
+    // `truncate` (white-space: nowrap), so their min-content width is the WHOLE
+    // string; with no cap the absolutely-positioned popover shrink-wraps far
+    // past the panel, overflows it, and adds a horizontal scroll that shoves
+    // the episode list sideways until the dropdown closes. max-width clamps it
+    // so the per-option truncate engages instead (full name stays in `title`).
+    maxWidth: "min(88vw, 360px)",
     ...(direction === "down" ? { top: "100%", marginTop: 4 } : { bottom: "100%", marginBottom: 4 }),
   };
 
