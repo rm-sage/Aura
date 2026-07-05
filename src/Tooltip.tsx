@@ -36,6 +36,10 @@ interface Props {
   shortcut?: string;
   /** Display delay in ms — default 120 ms (matches macOS/Windows feel). */
   delay?: number;
+  /** Extra classes merged into the wrapper span. The wrapper is `inline-flex`
+   *  (shrink-to-fit) by default; pass e.g. `w-full` when the trigger should
+   *  fill its container instead of collapsing to the child's content width. */
+  className?: string;
   children: ReactNode;
 }
 
@@ -104,7 +108,7 @@ function computePos(
   return { left: clamped.x, top: clamped.y };
 }
 
-export default function Tooltip({ text, pos = "right", shortcut, delay = 120, children }: Props) {
+export default function Tooltip({ text, pos = "right", shortcut, delay = 120, className, children }: Props) {
   const triggerRef = useRef<HTMLSpanElement>(null);
   const tipRef     = useRef<HTMLSpanElement>(null);
   const [open, setOpen]         = useState(false);
@@ -174,7 +178,7 @@ export default function Tooltip({ text, pos = "right", shortcut, delay = 120, ch
   return (
     <span
       ref={triggerRef}
-      className="relative inline-flex"
+      className={`relative inline-flex${className ? ` ${className}` : ""}`}
       onClick={handleClickLike}
       onContextMenu={handleClickLike}
       onMouseEnter={() => { setDismissed(false); scheduleShow(); }}

@@ -1318,6 +1318,17 @@ export default function App() {
 
   // ── Active scrobble / RPC / SMTC target ──
   const [activeTarget, setActiveTarget] = useState<ActiveScrobbleTarget | null>(null);
+  // Always-current mirror, read by the auto-remove effect (empty deps) so it
+  // can tell whether a just-"watched" id is the one CURRENTLY playing - that
+  // one's removal is deferred to handleExitPlayback (post-flush) to dodge the
+  // progress-write resurrection race.
+  const activeTargetRef = useRef(activeTarget);
+  activeTargetRef.current = activeTarget;
+  // Snapshot of whether the title was ALREADY watched when the current playback
+  // began. The auto-remove exit hook fires only on a genuine not-watched to
+  // watched TRANSITION, so replaying a title the user chose to KEEP (declined
+  // the enable-sweep) is never re-removed. Keyed by root id; { id, wasWatched }.
+  const watchedAtStartRef = useRef<{ id: string; wasWatched: boolean } | null>(null);
   /** Whether the active stream's NAME labelled it as HDR/DV content.
    *  Passed to `load_video` as `contentHdrHint` so the engine can pick
    *  the per-load HDR output set (PQ for HDR content, plain SDR
@@ -2497,6 +2508,23 @@ export default function App() {
           production_countries: target.scoring?.production_countries ?? null,
         });
         setActiveScoringMeta(target.scoring ?? null);
+        // Snapshot pre-play watched state so the auto-remove exit hook can fire
+        // only on a genuine not-watched to watched transition (see
+        // watchedAtStartRef). A movie counts by library ratio; a series by its
+        // persistent "watched" flag.
+        {
+          const rootId = target.series_id ?? target.id;
+          const mt = (target.media_type ?? "").toLowerCase();
+          const isSeriesLike = mt === "series" || mt === "anime";
+          let wasWatched = getManualWatchedState(rootId) === "watched";
+          if (!wasWatched && !isSeriesLike) {
+            const rec = library.find((i) => i.id === rootId);
+            const off = typeof rec?.state?.timeOffset === "number" ? rec.state.timeOffset : 0;
+            const dur = typeof rec?.state?.duration === "number" ? rec.state.duration : 0;
+            wasWatched = dur > 0 && off / dur >= 0.9;
+          }
+          watchedAtStartRef.current = { id: rootId, wasWatched };
+        }
         // Intentionally NOT closing the DetailView here. Keeping
         // `selectedMeta` populated means that when the user exits
         // playback (or hits Esc), they're returned to the stream /
@@ -4060,6 +4088,125 @@ export default function App() {
     return () => window.removeEventListener("aura:auto-advance-watched", onAdvance);
   }, [addons, activeTarget, library, selectedMeta]);
 
+  // ── Auto-remove watched (Library) ──
+  // Two opt-in toggles (Library page options popover, off by default) drop a
+  // title from the Library once it's fully watched. A movie counts when it
+  // reaches >=90% or is marked watched; a series counts only when its root
+  // "watched" flag flips (every AIRED episode watched, nothing further
+  // scheduled - advanceWatchedAfter), so an ongoing show is never removed.
+  //
+  // Removal is triggered at two RACE-SAFE points and always DEFERRED ~3 s +
+  // re-verified before it fires:
+  //   1. handleExitPlayback dispatches `aura:library-autoremove-check` for the
+  //      just-finished title AFTER its final progress flush, so the removeAll
+  //      tombstone lands with a later mtime than that write and Stremio's
+  //      last-writer-wins merge can't resurrect the row. This covers the title
+  //      you actually watched to the end.
+  //   2. onWatchedSync covers "watched" marks made OUTSIDE playback (right-click
+  //      Mark as Watched on a poster, or a completion of some other title). It
+  //      SKIPS the id that's currently playing - that one is handled at exit
+  //      (1) to avoid the resurrection race.
+  // The pre-existing watched backlog is NOT swept here - that's the one-time
+  // opt-in prompt on enable (handleAutoRemoveSweep). Settings are read fresh at
+  // fire time; empty deps + live refs mean a toggle flip never re-subscribes.
+  useEffect(() => {
+    const pending = new Map<string, ReturnType<typeof setTimeout>>();
+
+    // `trusted` = the caller already confirmed completion from an authoritative
+    // source (handleExitPlayback's final playhead), so the movie branch can
+    // skip the library-state ratio re-check - which is otherwise unreliable
+    // because library progress is written on pause / exit only, so a
+    // continuously-watched movie's stored timeOffset lags the true position and
+    // the post-exit refetch may not have landed within the defer window.
+    const scheduleRemoval = (id: string, trusted: boolean) => {
+      if (pending.has(id)) return; // already queued for this id
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        const auth = sessionRef.current?.auth_key;
+        if (!auth) return;
+        // Re-check active playback at FIRE time (not just schedule time): if the
+        // id became the currently-playing title during the 3s defer window,
+        // removing it now would race the ongoing progress writes and get the
+        // tombstone resurrected. Leave it to the exit path (which fires after
+        // the final flush) instead of removing mid-playback.
+        const at = activeTargetRef.current;
+        const activeId = at ? (at.series_id ?? at.id) : null;
+        if (activeId && id === activeId) return;
+        const item = libraryRef.current.find((i) => i.id === id && !i.removed);
+        if (!item) return;
+        const s = loadAuraSettings();
+        const mt = (item.media_type ?? "").toLowerCase();
+        const isSeriesLike = mt === "series" || mt === "anime";
+        // Re-verify eligibility + that the toggle is still on.
+        if (isSeriesLike) {
+          if (!s.libraryAutoRemoveWatchedSeries) return;
+          // Series completion is a persistent local flag either way, so this
+          // re-check is reliable regardless of `trusted`.
+          if (getManualWatchedState(item.id) !== "watched") return;
+        } else {
+          if (!s.libraryAutoRemoveWatchedMovies) return;
+          const off = typeof item.state?.timeOffset === "number" ? item.state.timeOffset : 0;
+          const dur = typeof item.state?.duration === "number" ? item.state.duration : 0;
+          const watched =
+            trusted || getManualWatchedState(item.id) === "watched" || (dur > 0 && off / dur >= 0.9);
+          if (!watched) return;
+        }
+        // Optimistic local removal + cloud tombstone - same path as the manual X.
+        setLibrary((prev) => prev.filter((i) => i.id !== item.id));
+        setRawLibrary((prev) => prev.filter((i) => libraryItemSeriesId(i.id) !== item.id));
+        if (getManualWatchedState(item.id) === "planned") setManualWatchedState(item.id, null);
+        void libraryRemoveAll(auth, item.id, rawLibraryRef.current)
+          .then((res) => {
+            if (res.removedCount > 0) {
+              showAppToast(`Auto-removed watched ${isSeriesLike ? "series" : "movie"} · ${item.name}`);
+            }
+          })
+          .catch((err) => console.warn(`[library] auto-remove failed id=${item.id} err=${String(err)}`));
+      }, 3000);
+      pending.set(id, timer);
+    };
+
+    // (1) The just-finished title, dispatched from handleExitPlayback post-flush.
+    // Trusted: the exit hook already confirmed completion from the final playhead.
+    const onExitCheck = (e: Event) => {
+      const id = (e as CustomEvent<{ id?: string }>).detail?.id;
+      if (typeof id === "string" && id) scheduleRemoval(id, true);
+    };
+    window.addEventListener("aura:library-autoremove-check", onExitCheck);
+
+    // (2) Marks made outside playback. Skip the currently-playing root - its
+    // removal is owned by the exit path so a final flush can't resurrect it.
+    const unsubSync = onWatchedSync((diffs) => {
+      const at = activeTargetRef.current;
+      const activeId = at ? (at.series_id ?? at.id) : null;
+      for (const diff of diffs) {
+        if (diff.newState !== "watched") continue;
+        if (activeId && diff.id === activeId) continue; // handled at exit
+        // diff.id may be an episode / movie / series-root id. Only a library
+        // record (movie or series root) resolves; episode-level marks find no
+        // record and are skipped. Re-checked at fire time in scheduleRemoval.
+        const item = libraryRef.current.find((i) => i.id === diff.id && !i.removed);
+        if (!item) continue;
+        const mt = (item.media_type ?? "").toLowerCase();
+        const isSeriesLike = mt === "series" || mt === "anime";
+        const s = loadAuraSettings();
+        if (isSeriesLike ? s.libraryAutoRemoveWatchedSeries : s.libraryAutoRemoveWatchedMovies) {
+          // Untrusted: re-verify from state. The diff means a "watched" mark was
+          // just set, so getManualWatchedState==="watched" passes; a movie whose
+          // mark got cleared in the defer window is correctly skipped.
+          scheduleRemoval(item.id, false);
+        }
+      }
+    });
+
+    return () => {
+      window.removeEventListener("aura:library-autoremove-check", onExitCheck);
+      unsubSync();
+      for (const t of pending.values()) clearTimeout(t);
+      pending.clear();
+    };
+  }, []);
+
   // ── Library toggle handler — exposed to right-click menus + DetailView.
   //
   // Optimistic: we mutate the local `library` / `rawLibrary` state BEFORE
@@ -4187,6 +4334,31 @@ export default function App() {
       window.dispatchEvent(new CustomEvent("aura:library-changed"));
     }
   }, [session, handleSessionExpired]);
+
+  // One-time backlog sweep when an auto-remove toggle is first enabled and the
+  // user confirms the Library prompt. Bulk version of handleLibraryRemove:
+  // optimistic drop of all victims at once, then parallel cloud tombstones
+  // against the pre-optimistic raw snapshot, then one summary toast.
+  const handleAutoRemoveSweep = useCallback((kind: "movie" | "series", victims: LibraryItem[]) => {
+    const auth = session?.auth_key;
+    if (!auth || victims.length === 0) return;
+    const ids = new Set(victims.map((v) => v.id));
+    const rawSnapshot = rawLibraryRef.current;
+    setLibrary((prev) => prev.filter((i) => !ids.has(i.id)));
+    setRawLibrary((prev) => prev.filter((i) => !ids.has(libraryItemSeriesId(i.id))));
+    for (const v of victims) {
+      if (getManualWatchedState(v.id) === "planned") setManualWatchedState(v.id, null);
+    }
+    void Promise.allSettled(
+      victims.map((v) => libraryRemoveAll(auth, v.id, rawSnapshot)),
+    ).then(() => {
+      const label =
+        kind === "movie"
+          ? (victims.length === 1 ? "movie" : "movies")
+          : "series";
+      showAppToast(`Removed ${victims.length} watched ${label} from your Library`);
+    });
+  }, [session]);
 
   // ── Card right-click — listens for "aura:card-context" events fired by
   //     CatalogCard / ContinueWatchingCard / PosterCard. App builds the menu
@@ -5508,6 +5680,55 @@ export default function App() {
       // logs a fresh row (addHistoryEntry keys on id+played_at).
       autoHistoryWrittenId.current = null;
     }
+
+    // ── Auto-remove-watched hook (the just-finished title) ──
+    // Fired AFTER flushProgress above so the removeAll tombstone (deferred in
+    // the auto-remove effect) out-mtimes the final progress write and can't be
+    // resurrected by Stremio's last-writer-wins merge. Movies count at >=90%
+    // (or a manual mark); series count only once advanceWatchedAfter has flipped
+    // the root "watched" flag (all aired watched, nothing upcoming, so an
+    // ongoing show is never removed). It fires ONLY on a not-watched to watched
+    // TRANSITION this session (via watchedAtStartRef), so replaying a title the
+    // user chose to keep is never re-removed. The effect re-verifies + gates on
+    // the toggle, so dispatching a hair eagerly here is harmless.
+    if (activeTarget && !isLivePlayback && !isTrailerPlayback) {
+      const settings = loadAuraSettings();
+      const rootId = activeTarget.series_id ?? activeTarget.id;
+      const mt = (activeTarget.media_type ?? "").toLowerCase();
+      const isSeriesLike = mt === "series" || mt === "anime";
+      let shouldRemove = false;
+      if (isSeriesLike) {
+        // Series carry a PERSISTENT completion flag (advanceWatchedAfter sets it
+        // only when every aired episode is watched and nothing is upcoming), so
+        // removal fires on the not-watched to watched TRANSITION this session:
+        // replaying an episode of an already-completed series (flag set at
+        // play-start) is not a transition, so it's never re-removed.
+        if (settings.libraryAutoRemoveWatchedSeries && getManualWatchedState(rootId) === "watched") {
+          const snap = watchedAtStartRef.current;
+          const wasWatched = snap && snap.id === rootId ? snap.wasWatched : false;
+          shouldRemove = !wasWatched;
+        }
+      } else {
+        // Movies have no persistent completion flag, so a ratio-based "was it
+        // watched at start" proxy is unreliable (a peek / another client can
+        // park the offset at >=90% without a real watch). Instead remove on a
+        // GENUINE completion THIS session: watched most of the runtime forward
+        // AND reached the end. watchedElapsedRef sums positive playback deltas
+        // and ignores seeks (per-play, reset on load), so seeking to ~95% to
+        // peek can't fake a finish, and a movie already parked at >=90% is still
+        // removed once genuinely finished. A manual "watched" mark is explicit
+        // intent. A full genuine rewatch legitimately removes it again.
+        if (settings.libraryAutoRemoveWatchedMovies) {
+          const genuineFinish =
+            duration > 0 && time / duration >= 0.9 && watchedElapsedRef.current >= 0.7 * duration;
+          shouldRemove = genuineFinish || getManualWatchedState(rootId) === "watched";
+        }
+      }
+      if (shouldRemove) {
+        window.dispatchEvent(new CustomEvent("aura:library-autoremove-check", { detail: { id: rootId } }));
+      }
+      watchedAtStartRef.current = null;
+    }
     // Always exit fullscreen on exit-playback — fullscreen is a
     // player-scoped concept; once the player is gone the rest of the
     // app shouldn't stay covering the monitor. Use the native Win32
@@ -6446,6 +6667,7 @@ export default function App() {
             session={session}
             onSelectMeta={openDetail}
             onRemoveItem={handleLibraryRemove}
+            onAutoRemoveSweep={handleAutoRemoveSweep}
           />
         )}
         {activeView === "addons" && (

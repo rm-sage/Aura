@@ -111,6 +111,13 @@ export interface SortOption {
   label: string;
 }
 
+/** A surface-specific status filter choice (Library only for now). Shares the
+ *  SortOption shape. When a caller passes `statusOptions` a "Status" section
+ *  renders at the top of the panel, driven by `statusValue` / `onStatusChange`
+ *  - the caller applies the actual filtering itself (status is derived from
+ *  library / manual-watched state a MetaPreview can't express). */
+export type StatusOption = SortOption;
+
 interface Props {
   /** Full unfiltered list — used to derive available genres + bound the
       year range slider so we never offer "1900–2026" when items are recent. */
@@ -122,6 +129,11 @@ interface Props {
   sortOptions?: SortOption[];
   sortValue?: string;
   onSortChange?: (value: string) => void;
+  /** Optional status filter (Library). First entry is treated as the
+   *  "no filter" default (value should be "all"). Omit on other surfaces. */
+  statusOptions?: StatusOption[];
+  statusValue?: string;
+  onStatusChange?: (value: string) => void;
 }
 
 const FilterIcon = () => (
@@ -145,7 +157,11 @@ const ChevronIcon = ({ open }: { open: boolean }) => (
 
 /** Derives genres + year bounds from the list and bundles the mutation
  *  helpers so both shells (sidebar bar, header menu) stay in lockstep. */
-function useFilterModel({ items, state, onChange, sortOptions, sortValue, onSortChange }: Props) {
+function useFilterModel({
+  items, state, onChange,
+  sortOptions, sortValue, onSortChange,
+  statusOptions, statusValue, onStatusChange,
+}: Props) {
   const genres = useMemo(() => collectGenres(items), [items]);
 
   // Bounds for the year slider — clamp to actual data when present
@@ -185,20 +201,29 @@ function useFilterModel({ items, state, onChange, sortOptions, sortValue, onSort
     else set({ sort: value as SortMode });
   };
 
+  // Status filter (Library). The first option is the "no filter" default.
+  const statusChoices = statusOptions ?? null;
+  const statusDefault = statusChoices?.[0]?.value ?? "all";
+  const activeStatus  = statusValue ?? statusDefault;
+  const setStatus = (value: string) => onStatusChange?.(value);
+
   const reset = () => {
     onChange({ ...DEFAULT_FILTERS, yearMin: yearBounds.min, yearMax: yearBounds.max });
     if (sortOptions) onSortChange?.(sortDefault);
+    if (statusChoices) onStatusChange?.(statusDefault);
   };
 
   const isDirty =
     state.yearMin !== yearBounds.min ||
     state.yearMax !== yearBounds.max ||
     state.genres.length > 0 ||
-    activeSort !== sortDefault;
+    activeSort !== sortDefault ||
+    (statusChoices ? activeStatus !== statusDefault : false);
 
   return {
     genres, yearBounds, set, toggleGenre, reset, isDirty,
     sortChoices, activeSort, setSort,
+    statusChoices, activeStatus, setStatus,
   };
 }
 
@@ -212,6 +237,7 @@ function FilterControls({ state, model }: { state: FilterState; model: FilterMod
   const {
     genres, yearBounds, set, toggleGenre, reset, isDirty,
     sortChoices, activeSort, setSort,
+    statusChoices, activeStatus, setStatus,
   } = model;
 
   // Highlighted span between the two thumbs, as track percentages. The
@@ -224,6 +250,34 @@ function FilterControls({ state, model }: { state: FilterState; model: FilterMod
 
   return (
     <div className="space-y-5">
+      {/* Status (Library only - omitted elsewhere). Sits at the top since
+          it's the coarsest cut of the list. */}
+      {statusChoices && statusChoices.length > 0 && (
+        <div className="space-y-1.5">
+          <label className="text-white/40 text-[10px] font-semibold tracking-wider uppercase">
+            Status
+          </label>
+          <div className="flex flex-wrap gap-1.5">
+            {statusChoices.map(({ value, label }) => {
+              const active = activeStatus === value;
+              return (
+                <button
+                  key={value}
+                  onClick={() => setStatus(value)}
+                  className={`px-2.5 py-1 rounded-full text-[11px] transition-colors
+                              ${active
+                                ? "bg-ln-accent/25 text-ln-accent border border-ln-accent/40"
+                                : "bg-white/5 text-white/55 border border-white/10 hover:bg-white/10"
+                              }`}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Sort */}
       <div className="space-y-1.5">
         <label className="text-white/40 text-[10px] font-semibold tracking-wider uppercase">

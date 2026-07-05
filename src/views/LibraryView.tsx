@@ -2,20 +2,26 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import type { LibraryItem, MetaPreview } from "../types";
 import type { UserSession } from "../LoginView";
 import ImageLoader from "../ImageLoader";
 import ErrorBoundary from "../ErrorBoundary";
+import Tooltip from "../Tooltip";
 import { isAnimeMeta, typeLabel } from "../aiometadata";
 import WatchedBadge from "../WatchedBadge";
 import { useHoverCardActivation } from "../useHoverCardActivation";
 import { closeHoverNow } from "../catalogHoverStore";
 import {
   FilterMenu, applyFilters, DEFAULT_FILTERS,
-  type FilterState, type SortOption,
+  type FilterState, type SortOption, type StatusOption,
 } from "../FilterBar";
 import ListSearchInput, { looseMatch } from "../ListSearchInput";
 import { PAGE_CONTENT_MAX_W } from "../pageLayout";
+import { getManualWatchedState, useManualWatchedVersion } from "../manualWatched";
+import { getReleaseSignal, useReleaseSignalsVersion } from "../releaseSignalStore";
+import { episodeIsBeforeResume } from "../LibraryContext";
+import { loadAuraSettings, saveAuraSettings } from "../auraSettings";
 
 // ---------------------------------------------------------------------------
 // LibraryView — full grid of saved Stremio library items.
@@ -45,6 +51,117 @@ const LIBRARY_SORT_OPTIONS: SortOption[] = [
   { value: "alpha-desc", label: "Z → A" },
 ];
 
+// Status filter - a coarse cut across the library by watch state, surfaced in
+// the Filter & Sort panel. "all" is the no-filter default (grid behaves exactly
+// as before). The other values narrow to a derived status; picking any of them
+// also pulls in auto-tracked (temp) Continue-Watching entries the grid normally
+// hides, so "In Progress" / "Watched" surface content the user never explicitly
+// added. See `filtered` below.
+type LibraryStatusFilter =
+  | "all" | "watched" | "unwatched" | "in-progress" | "in-queue" | "new-episodes";
+
+const LIBRARY_STATUS_OPTIONS: StatusOption[] = [
+  { value: "all",          label: "All" },
+  { value: "watched",      label: "Watched" },
+  { value: "unwatched",    label: "Unwatched" },
+  { value: "in-progress",  label: "In Progress" },
+  { value: "in-queue",     label: "In Queue" },
+  { value: "new-episodes", label: "New Episodes" },
+];
+
+/** The auto-remove-watched toggles are split by media kind. */
+type AutoRemoveKind = "movie" | "series";
+
+/** The mutually-exclusive watch status of a library item. Mirrors
+ *  WatchedBadge's `useWatchedVariant` precedence EXACTLY so the filter and the
+ *  on-poster badge never disagree: a manual mark wins; an auto-derived >=90%
+ *  signal is "watched" for movies but DEMOTED to "in-progress" for series/anime
+ *  (Stremio only stores the last-episode offset, not a series-level completion,
+ *  so a series is "watched" only when manually / auto-advance marked). */
+type ExclusiveStatus = "watched" | "unwatched" | "in-progress" | "in-queue";
+
+function libraryItemStatus(item: LibraryItem): ExclusiveStatus {
+  const manual = getManualWatchedState(item.id);
+  if (manual === "watched")     return "watched";
+  if (manual === "planned")     return "in-queue";
+  if (manual === "in-progress") return "in-progress";
+  const off = typeof item.state?.timeOffset === "number" ? item.state.timeOffset : 0;
+  const dur = typeof item.state?.duration   === "number" ? item.state.duration   : 0;
+  const ratio = dur > 0 ? Math.min(1, off / dur) : 0;
+  const mt = (item.media_type ?? "").toLowerCase();
+  const isSeriesLike = mt === "series" || mt === "anime";
+  if (ratio >= 0.9) return isSeriesLike ? "in-progress" : "watched";
+  if (ratio > 0)    return "in-progress";
+  return "unwatched";
+}
+
+/** Does this library item match the active media-type pill? Mirrors the
+ *  single-pass partition's bucket rules (anime detected via state.genres). */
+function itemMatchesTypeFilter(item: LibraryItem, filter: Filter): boolean {
+  if (filter === "all") return true;
+  const mt = (item.media_type ?? "").toLowerCase();
+  if (filter === "movie")  return mt === "movie";
+  if (filter === "series") return mt === "series";
+  // anime
+  const stateGenres = (item.state ?? {}).genres;
+  const genres = Array.isArray(stateGenres)
+    ? stateGenres.filter((g): g is string => typeof g === "string")
+    : [];
+  return isAnimeMeta({ media_type: item.media_type, id: item.id, genres });
+}
+
+/** True when a series in the library has an AIRED, unwatched episode past the
+ *  user's watch frontier - "you're following this and it dropped something new
+ *  you haven't seen." Requires engagement (a resume pointer or a watched aired
+ *  episode) so a never-started series isn't flagged, mirroring
+ *  `useEpisodesBehind`'s "not started" suppression. Backed by the cloud
+ *  release-signal store, so it's naturally empty for guests / opted-out users /
+ *  non-imdb ids (the filter just shows nothing for them). */
+function hasNewUnwatchedEpisode(item: LibraryItem): boolean {
+  const sig = getReleaseSignal(item.id);
+  if (!sig) return false;
+  const recent = Array.isArray(sig.recent_aired) ? sig.recent_aired : [];
+  if (recent.length === 0) return false;
+  const now = Date.now();
+  const resumeId =
+    typeof item.state?.video_id === "string" && item.state.video_id
+      ? item.state.video_id
+      : null;
+  let engaged = !!resumeId;
+  let hasNew = false;
+  for (const ep of recent) {
+    const t = Date.parse(ep.aired_at);
+    if (!Number.isFinite(t) || t > now) continue; // not yet aired
+    if (ep.season === 0) continue;                // specials air out-of-band
+    const epId = ep.id;
+    if (!epId) continue;
+    if (getManualWatchedState(epId) === "watched") { engaged = true; continue; }
+    if (resumeId) {
+      if (epId === resumeId) { engaged = true; continue; }
+      if (episodeIsBeforeResume(epId, resumeId)) { engaged = true; continue; }
+    }
+    hasNew = true; // aired, unwatched, at/after the frontier
+  }
+  return engaged && hasNew;
+}
+
+/** Watched items of a given media kind - the backlog an auto-remove toggle
+ *  offers to clear on enable. "series" covers series + anime; "movie" covers
+ *  movies (incl. anime movies). Uses libraryItemStatus so a "watched" series
+ *  means a genuine completion mark, not a lingering last-episode offset. */
+function watchedItemsOfKind(items: LibraryItem[], kind: AutoRemoveKind): LibraryItem[] {
+  const out: LibraryItem[] = [];
+  for (const i of items) {
+    if (!i || i.removed) continue;
+    const mt = (i.media_type ?? "").toLowerCase();
+    const isSeriesLike = mt === "series" || mt === "anime";
+    const kindMatch = kind === "movie" ? mt === "movie" : isSeriesLike;
+    if (!kindMatch) continue;
+    if (libraryItemStatus(i) === "watched") out.push(i);
+  }
+  return out;
+}
+
 interface Props {
   /** Undefined while the initial library_get is in flight. */
   library?: LibraryItem[];
@@ -55,6 +172,10 @@ interface Props {
    *  `originPoint` lets the implementer spawn a positional fly-up toast
    *  from the click. */
   onRemoveItem?: (item: LibraryItem, originPoint?: { x: number; y: number }) => void;
+  /** Bulk-remove the existing watched backlog when an auto-remove toggle is
+   *  first enabled and the user confirms the one-time sweep. The implementer
+   *  (App) owns the cloud write + optimistic state, same path as onRemoveItem. */
+  onAutoRemoveSweep?: (kind: AutoRemoveKind, items: LibraryItem[]) => void;
 }
 
 function libraryItemToMeta(item: LibraryItem): MetaPreview {
@@ -218,9 +339,36 @@ export default function LibraryView(props: Props) {
   );
 }
 
-function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props) {
+function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem, onAutoRemoveSweep }: Props) {
   const [sort, setSort]     = useState<SortMode>("added");
   const [filter, setFilter] = useState<Filter>("all");
+  // Coarse watch-status cut (All / Watched / Unwatched / In Progress / In Queue
+  // / New Episodes), surfaced in the Filter & Sort panel. Combines with the
+  // media-type pills + year/genre + name search below.
+  const [status, setStatus] = useState<LibraryStatusFilter>("all");
+  // Status is derived from manual-watched marks + release signals, neither of
+  // which is React state - subscribe to both so the grid re-filters the moment
+  // a mark flips or a new-episode signal lands.
+  const manualVersion  = useManualWatchedVersion();
+  const signalsVersion = useReleaseSignalsVersion();
+  // Auto-remove-watched toggles, mirrored from auraSettings + kept live on the
+  // settings-changed event. The going-forward removal runs in App (it owns the
+  // cloud writes); here we only drive the toggle UI and the one-time
+  // "clear existing backlog?" prompt.
+  const [autoRemove, setAutoRemove] = useState(() => {
+    const s = loadAuraSettings();
+    return { movie: s.libraryAutoRemoveWatchedMovies, series: s.libraryAutoRemoveWatchedSeries };
+  });
+  useEffect(() => {
+    const sync = () => {
+      const s = loadAuraSettings();
+      setAutoRemove({ movie: s.libraryAutoRemoveWatchedMovies, series: s.libraryAutoRemoveWatchedSeries });
+    };
+    window.addEventListener("aura:settings-changed", sync);
+    return () => window.removeEventListener("aura:settings-changed", sync);
+  }, []);
+  const [sweepPrompt, setSweepPrompt] = useState<{ kind: AutoRemoveKind; items: LibraryItem[] } | null>(null);
+  const [optionsOpen, setOptionsOpen] = useState(false);
   // Year / genre refinement plus the Sort By choice, both surfaced in
   // the header Filter & Sort panel (FilterMenu) — the same affordance
   // every other browseable surface uses. `sort` drives the ordering;
@@ -281,6 +429,22 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
   const items: LibraryItem[] = Array.isArray(library) ? library : [];
   const isLoading = library === undefined;
 
+  // Flip an auto-remove toggle. On enable (off -> on), offer to clear the
+  // existing watched backlog of that kind once; declining keeps it and only
+  // future completions are auto-removed. Nothing to clear -> no prompt.
+  const toggleAutoRemove = (kind: AutoRemoveKind) => {
+    const s = loadAuraSettings();
+    const key = kind === "movie"
+      ? "libraryAutoRemoveWatchedMovies" as const
+      : "libraryAutoRemoveWatchedSeries" as const;
+    const next = !s[key];
+    saveAuraSettings({ ...s, [key]: next });
+    if (next) {
+      const victims = watchedItemsOfKind(items, kind);
+      if (victims.length > 0) setSweepPrompt({ kind, items: victims });
+    }
+  };
+
   // Single-pass partition: classify every live (non-removed) item into
   // its media-type buckets in ONE iteration. Previously this code did
   // 7 passes over `items` (one filter for `live`, four for counts, plus
@@ -329,7 +493,28 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
     };
   }, [items]);
 
-  const filtered = buckets[filter];
+  // When no status filter is active the grid is exactly as before: the
+  // media-type bucket, which excludes auto-tracked (temp) entries. When a
+  // status IS chosen we rebuild from ALL live items (temp included) so
+  // "In Progress" / "Watched" surface Continue-Watching content the user never
+  // explicitly added - then narrow to the chosen status. `manualVersion` /
+  // `signalsVersion` are in the deps so the set re-derives when a mark flips or
+  // a release signal lands.
+  const filtered = useMemo(() => {
+    if (status === "all") return buckets[filter];
+    const out: LibraryItem[] = [];
+    for (const i of items) {
+      if (!i || i.removed) continue;
+      if (!itemMatchesTypeFilter(i, filter)) continue;
+      if (status === "new-episodes") {
+        if (hasNewUnwatchedEpisode(i)) out.push(i);
+      } else if (libraryItemStatus(i) === status) {
+        out.push(i);
+      }
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status, filter, buckets, items, manualVersion, signalsVersion]);
 
   // Project library items into MetaPreview shape so the panel's genre /
   // year filter can run uniformly across every browseable surface. The
@@ -394,7 +579,7 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
   // compute an out-of-range slice (blank grid until the user scrolls back up).
   useEffect(() => {
     scrollContainerRef.current?.scrollTo({ top: 0 });
-  }, [filter, sort, extraFilters, search]);
+  }, [filter, sort, extraFilters, search, status]);
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
@@ -423,14 +608,25 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
             </div>
 
             {aggregateMeta.length > 0 && (
-              <FilterMenu
-                items={aggregateMeta}
-                state={extraFilters}
-                onChange={setExtraFilters}
-                sortOptions={LIBRARY_SORT_OPTIONS}
-                sortValue={sort}
-                onSortChange={(v) => setSort(v as SortMode)}
-              />
+              <div className="flex items-center gap-2">
+                <LibraryOptionsMenu
+                  open={optionsOpen}
+                  onOpenChange={setOptionsOpen}
+                  autoRemove={autoRemove}
+                  onToggle={toggleAutoRemove}
+                />
+                <FilterMenu
+                  items={aggregateMeta}
+                  state={extraFilters}
+                  onChange={setExtraFilters}
+                  sortOptions={LIBRARY_SORT_OPTIONS}
+                  sortValue={sort}
+                  onSortChange={(v) => setSort(v as SortMode)}
+                  statusOptions={LIBRARY_STATUS_OPTIONS}
+                  statusValue={status}
+                  onStatusChange={(v) => setStatus(v as LibraryStatusFilter)}
+                />
+              </div>
             )}
           </div>
 
@@ -512,8 +708,205 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem }: Props
         </div>
       </div>
 
+      {sweepPrompt && (
+        <LibrarySweepConfirm
+          kind={sweepPrompt.kind}
+          count={sweepPrompt.items.length}
+          onConfirm={() => {
+            onAutoRemoveSweep?.(sweepPrompt.kind, sweepPrompt.items);
+            setSweepPrompt(null);
+          }}
+          onCancel={() => setSweepPrompt(null)}
+        />
+      )}
     </div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// LibraryOptionsMenu - gear popover holding the auto-remove-watched toggles.
+// Sits beside the Filter & Sort menu. Uses aura-glass-menu (hardcoded-dark,
+// theme-safe) so it stays legible on every theme. Each toggle carries a
+// hover Tooltip explaining exactly when a removal fires (crucially, that an
+// ongoing series is never touched).
+// ---------------------------------------------------------------------------
+
+function LibraryOptionsMenu({
+  open, onOpenChange, autoRemove, onToggle,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  autoRemove: { movie: boolean; series: boolean };
+  onToggle: (kind: AutoRemoveKind) => void;
+}) {
+  // Click-outside to close - the panel pins open on click (unlike FilterMenu's
+  // hover model) since it holds toggles the user interacts with.
+  const wrapRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: PointerEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) onOpenChange(false);
+    };
+    window.addEventListener("pointerdown", onDown);
+    return () => window.removeEventListener("pointerdown", onDown);
+  }, [open, onOpenChange]);
+
+  return (
+    <div className="relative" ref={wrapRef}>
+      <button
+        type="button"
+        onClick={() => onOpenChange(!open)}
+        aria-expanded={open}
+        aria-label="Library options"
+        title="Library options"
+        className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-semibold tracking-[0.1em] uppercase transition-colors
+                    ${open
+                      ? "bg-ln-accent/25 border-ln-accent/35 text-ln-accent"
+                      : "bg-white/5 border-white/8 text-white/75 hover:bg-white/10"
+                    }`}
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+          <path d="M19.14 12.94a7.9 7.9 0 000-1.88l2.03-1.58a.5.5 0 00.12-.64l-1.92-3.32a.5.5 0 00-.61-.22l-2.39.96a7.3 7.3 0 00-1.62-.94l-.36-2.54a.5.5 0 00-.5-.42h-3.84a.5.5 0 00-.5.42l-.36 2.54c-.58.24-1.12.56-1.62.94l-2.39-.96a.5.5 0 00-.61.22L2.68 8.84a.5.5 0 00.12.64l2.03 1.58a7.9 7.9 0 000 1.88l-2.03 1.58a.5.5 0 00-.12.64l1.92 3.32c.14.24.42.34.68.22l2.39-.96c.5.38 1.04.7 1.62.94l.36 2.54c.05.24.25.42.5.42h3.84c.25 0 .45-.18.5-.42l.36-2.54c.58-.24 1.12-.56 1.62-.94l2.39.96c.26.12.54.02.68-.22l1.92-3.32a.5.5 0 00-.12-.64l-2.03-1.58zM12 15.5A3.5 3.5 0 1112 8.5a3.5 3.5 0 010 7z" />
+        </svg>
+        Options
+      </button>
+
+      {open && (
+        <div className="absolute right-0 top-full z-50 pt-2">
+          <div className="w-72 aura-glass-menu rounded-2xl p-4 shadow-2xl space-y-3">
+            <div className="space-y-0.5">
+              <p className="text-white/85 text-[13px] font-semibold">Auto-remove watched</p>
+              <p className="text-white/45 text-[11px] leading-snug">
+                Drop finished titles from your Library automatically.
+              </p>
+            </div>
+            <AutoRemoveToggleRow
+              label="Watched movies"
+              tip="Removes a movie from your Library when you finish watching it (or mark it watched)."
+              on={autoRemove.movie}
+              onClick={() => onToggle("movie")}
+            />
+            <AutoRemoveToggleRow
+              label="Watched series"
+              tip="Removes a series from your Library once every aired episode is watched. Series still airing new episodes stay until they finish."
+              on={autoRemove.series}
+              onClick={() => onToggle("series")}
+            />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AutoRemoveToggleRow({
+  label, tip, on, onClick,
+}: {
+  label: string;
+  tip: string;
+  on: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <Tooltip text={tip} pos="left" className="w-full">
+      <button
+        type="button"
+        role="switch"
+        aria-checked={on}
+        onClick={onClick}
+        className="w-full flex items-center justify-between gap-3 px-2.5 py-2 rounded-lg
+                   border border-white/10 bg-white/5 text-white/75
+                   hover:text-white/95 hover:bg-white/10 transition-colors text-left"
+      >
+        <span className="text-[12px] font-medium">{label}</span>
+        <span
+          className={`relative flex-shrink-0 w-8 h-[18px] rounded-full transition-colors
+                      ${on ? "bg-ln-accent/70" : "bg-white/15"}`}
+        >
+          <span
+            className={`absolute top-0.5 w-[14px] h-[14px] rounded-full bg-white transition-all
+                        ${on ? "left-[18px]" : "left-0.5"}`}
+          />
+        </span>
+      </button>
+    </Tooltip>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// LibrarySweepConfirm - the one-time "clear the existing watched backlog?"
+// prompt shown when an auto-remove toggle is first enabled. Opaque zinc panel
+// (theme-independent) portal-rendered over a dim backdrop; Esc / click-outside
+// cancel. Declining keeps the backlog; either way future completions are
+// auto-removed.
+// ---------------------------------------------------------------------------
+
+function LibrarySweepConfirm({
+  kind, count, onConfirm, onCancel,
+}: {
+  kind: AutoRemoveKind;
+  count: number;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { e.preventDefault(); onCancel(); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onCancel]);
+
+  const noun = kind === "movie"
+    ? (count === 1 ? "movie" : "movies")
+    : (count === 1 ? "series" : "series");
+  const title = `Clear already-watched ${kind === "movie" ? "movies" : "series"}?`;
+
+  const node = (
+    <div
+      className="fixed inset-0 z-[10000] flex items-center justify-center p-6 bg-black/60 backdrop-blur-sm
+                 animate-[fade-in_120ms_ease-out]"
+      onClick={onCancel}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        onClick={(e) => e.stopPropagation()}
+        className="max-w-[400px] w-full rounded-2xl bg-zinc-900/95 border border-white/15 ring-1 ring-rose-400/40
+                   shadow-2xl p-6 space-y-4"
+      >
+        <div className="flex items-start gap-3">
+          <span className="flex-shrink-0 mt-0.5 text-2xl leading-none text-rose-300" aria-hidden>⚠</span>
+          <div className="flex-1 min-w-0 space-y-1.5">
+            <h3 className="text-white font-semibold text-[15px] leading-tight">{title}</h3>
+            <p className="text-white/70 text-[13px] leading-relaxed">
+              You have {count} watched {noun} already in your Library. Remove {count === 1 ? "it" : "them"} now?
+              New watched {kind === "movie" ? "movies" : "series"} are auto-removed going forward either way.
+            </p>
+          </div>
+        </div>
+        <div className="flex justify-end gap-2 pt-1">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="px-4 py-1.5 rounded-lg border border-white/15 bg-white/5
+                       text-white/80 text-[12px] font-medium hover:bg-white/10 transition-colors"
+          >
+            Keep them
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            className="px-4 py-1.5 rounded-lg border border-rose-300/60 bg-rose-500/30 text-rose-50
+                       text-[12px] font-medium hover:bg-rose-500/45 transition-colors"
+          >
+            Remove {count}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+  return createPortal(node, document.body);
 }
 
 // ---------------------------------------------------------------------------

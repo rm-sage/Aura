@@ -105,7 +105,7 @@ function parseEpisodePosition(id: string): { season: number; episode: number } |
  *  fixes both directions: if exactly ONE side is in S00, refuse to
  *  infer. Within-S00 ordering (S00E1 < S00E5) and within-main ordering
  *  still work normally. */
-function episodeIsBeforeResume(epId: string, resumeId: string): boolean {
+export function episodeIsBeforeResume(epId: string, resumeId: string): boolean {
   const a = parseEpisodePosition(epId);
   const b = parseEpisodePosition(resumeId);
   if (!a || !b) return false;

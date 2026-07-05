@@ -124,6 +124,8 @@ const PORTABLE_AURA_FIELDS = [
   "queueRemoveSeriesInProgress",
   "useAuraStreamFormatter",
   "heroDisabled",
+  "libraryAutoRemoveWatchedMovies",
+  "libraryAutoRemoveWatchedSeries",
 ] as const;
 export type PortableAuraField = typeof PORTABLE_AURA_FIELDS[number];
 

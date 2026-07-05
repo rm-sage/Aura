@@ -1439,7 +1439,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                 onClickName={onSearchByName ? (n) => { onSearchByName(n); onClose(); } : undefined}
               />
 
-              {detail?.voice_actors && detail.voice_actors.length > 0 &&
+              {detail?.voice_actors && detail.voice_actors.length > 0 && !voiceActorsDuplicateCast(detail) &&
                 <CreditRow label={detail.voice_actors.length > 1 ? "Voice Actors" : "Voice Actor"}
                   values={plainCredits(detail.voice_actors)}
                   onClickName={onSearchByName ? (n) => { onSearchByName(n); onClose(); } : undefined} />}
@@ -1900,6 +1900,77 @@ function plainCredits(values: string[]): CreditEntry[] {
     .map((name) => ({ name, character: null, photo: null }));
 }
 
+/** Collapse duplicate credit entries by (name, character). A voice actor
+ *  legitimately voicing two characters ("Name as A" / "Name as B") is kept
+ *  because the character differs; an exact repeat (a richer addon listing the
+ *  same person+role twice, seen on some AIOMetadata anime rosters) is dropped.
+ *  Applied inside CreditRow so every row (cast, voice actors, producers,
+ *  studios, ...) is deduped uniformly. */
+function dedupeCredits(entries: CreditEntry[]): CreditEntry[] {
+  const byKey = new Map<string, CreditEntry>();
+  const order: string[] = [];
+  for (const e of entries) {
+    const key = `${e.name.trim().toLowerCase()}|${(e.character ?? "").trim().toLowerCase()}`;
+    const existing = byKey.get(key);
+    if (!existing) { byKey.set(key, e); order.push(key); continue; }
+    // Same person+role listed twice: keep one, but backfill the richer fields
+    // (portrait, episode tier) from whichever copy has them so a null-photo
+    // first copy doesn't blank a headshot the second copy carried.
+    if ((!existing.photo && e.photo) || (existing.episode_count == null && e.episode_count != null)) {
+      byKey.set(key, {
+        ...existing,
+        photo: existing.photo ?? e.photo,
+        episode_count: existing.episode_count ?? e.episode_count,
+        total_show_episodes: existing.total_show_episodes ?? e.total_show_episodes,
+      });
+    }
+  }
+  return order.map((k) => byKey.get(k)!);
+}
+
+/** Every person name that the (season-aware) Cast row could show, across all
+ *  cast sources. Used to detect a redundant Voice Actors row. */
+function collectCastNames(detail: MetaDetail | null): Set<string> {
+  const set = new Set<string>();
+  if (!detail) return set;
+  const add = (n: unknown) => {
+    if (typeof n === "string") { const t = n.trim().toLowerCase(); if (t) set.add(t); }
+  };
+  for (const c of detail.cast_detailed ?? []) add(c.name);
+  for (const n of detail.cast ?? []) add(n);
+  for (const c of detail.aggregate_credits?.cast ?? []) add(c.name);
+  for (const roster of Object.values(detail.season_credits ?? {})) {
+    for (const c of roster?.cast ?? []) add(c.name);
+  }
+  return set;
+}
+
+/** Anime / animation report their voice ensemble twice: once as the richer
+ *  Cast (voice actor paired to character, with portraits) and again as a bare
+ *  Voice Actors name list. When the Voice Actors are substantially the same
+ *  people we already show as Cast, the row is pure duplication, so suppress it
+ *  and keep the richer Cast. Live-action + genuinely-separate dub casts overlap
+ *  little and are unaffected (the row stays). Threshold: >= 60% of the voice
+ *  actors already appear in the cast. */
+function voiceActorsDuplicateCast(detail: MetaDetail | null): boolean {
+  const rawVas = detail?.voice_actors ?? [];
+  if (rawVas.length === 0) return false;
+  const castNames = collectCastNames(detail);
+  if (castNames.size === 0) return false;
+  // Measure overlap on UNIQUE voice-actor names (the same list the row renders
+  // after dedupeCredits). Anime rosters sometimes repeat a name; dividing by the
+  // raw length would let those repeats inflate the ratio and hide a row that
+  // still carries unique voice actors.
+  const vaNames = new Set<string>();
+  for (const v of rawVas) {
+    if (typeof v === "string") { const t = v.trim().toLowerCase(); if (t) vaNames.add(t); }
+  }
+  if (vaNames.size === 0) return false;
+  let dup = 0;
+  for (const v of vaNames) if (castNames.has(v)) dup += 1;
+  return dup / vaNames.size >= 0.6;
+}
+
 /** Default visible-entry cap per credit row. Anything beyond this hides
  *  behind a "View all" toggle so dense TMDB / TVDB titles don't dump
  *  20+ names into a single row by default — keeps the page scannable
@@ -1920,7 +1991,7 @@ function CreditRow({
    *  Country row, which is not a person). */
   onClickName?: (name: string) => void;
 }) {
-  const cleaned = values.filter((v) => !!v.name && v.name.trim().length > 0);
+  const cleaned = dedupeCredits(values.filter((v) => !!v.name && v.name.trim().length > 0));
   const [expanded, setExpanded] = useState(false);
   if (cleaned.length === 0) return null;
 

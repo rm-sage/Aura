@@ -13,6 +13,17 @@
   --ln-glass-2: rgba(255, 255, 255, 0.08);
   --ln-glass-3: rgba(255, 255, 255, 0.14);
 
+  /* Legibility floor laid UNDER the translucent glass tint on elevated
+     popovers/tooltips (see .glass-panel-elevated). A DARK, still-translucent
+     base (not transparent): the blur alone can't save white text over a large
+     bright region (a blurred yellow poster stays yellow), so tooltips went
+     see-through over bright art. ~72% dark keeps the glass/blur look while
+     guaranteeing legible text on any backdrop, matching the .aura-glass-menu
+     player surfaces. The zero-blur themes below (midnight, contrast,
+     contrast-azure) override this to a fully OPAQUE surface colour since they
+     have no blur to lean on at all. */
+  --ln-panel-solid: rgba(8, 10, 14, 0.72);
+
   /* Luminous rims — 1px borders that catch ambient light */
   --ln-rim-subtle:   rgba(255, 255, 255, 0.06);
   --ln-rim-default:  rgba(255, 255, 255, 0.12);
@@ -84,6 +95,9 @@
   --ln-glass-1: rgba(255, 255, 255, 0.025);
   --ln-glass-2: rgba(255, 255, 255, 0.05);
   --ln-glass-3: rgba(255, 255, 255, 0.08);
+  /* Zero blur here (--ln-blur-elev: 0px), so elevated popovers need an opaque
+     base or they read as see-through over bright art. Matches --glass-bg. */
+  --ln-panel-solid: #0b0d12;
 
   --ln-rim-subtle:   rgba(255, 255, 255, 0.05);
   --ln-rim-default:  rgba(255, 255, 255, 0.09);
@@ -282,6 +296,9 @@
   --ln-glass-1: rgba(255, 255, 255, 0.06);
   --ln-glass-2: rgba(255, 255, 255, 0.12);
   --ln-glass-3: rgba(255, 255, 255, 0.20);
+  /* No blur in the contrast themes either - opaque base keeps elevated
+     popovers legible (the 20% white tint lifts pure black to a visible panel). */
+  --ln-panel-solid: #000000;
   --ln-rim-subtle:   rgba(255, 255, 255, 0.35);
   --ln-rim-default:  rgba(255, 255, 255, 0.55);
   --ln-rim-luminous: rgba(255, 255, 255, 0.90);
@@ -304,6 +321,7 @@
   --ln-glass-1: rgba(255, 255, 255, 0.06);
   --ln-glass-2: rgba(255, 255, 255, 0.12);
   --ln-glass-3: rgba(255, 255, 255, 0.20);
+  --ln-panel-solid: #000000;
   --ln-rim-subtle:   rgba(255, 255, 255, 0.35);
   --ln-rim-default:  rgba(255, 255, 255, 0.55);
   --ln-rim-luminous: rgba(255, 255, 255, 0.90);
@@ -424,7 +442,13 @@ select,
   }
 
   .glass-panel-elevated {
-    background: var(--ln-glass-3);
+    /* Translucent glass tint layered OVER an opaque legibility floor. On
+       frosted themes --ln-panel-solid is transparent, so this composites
+       identically to the old `background: var(--ln-glass-3)` and the backdrop
+       blur still shows through. On the zero-blur themes (midnight, contrast,
+       contrast-azure) --ln-panel-solid is opaque, so tooltips/popovers stay
+       readable over bright posters instead of turning see-through. */
+    background: linear-gradient(var(--ln-glass-3), var(--ln-glass-3)), var(--ln-panel-solid);
     border: 1px solid var(--ln-rim-luminous);
     backdrop-filter: blur(var(--ln-blur-elev)) saturate(calc(var(--ln-saturate) + 0.2));
     -webkit-backdrop-filter: blur(var(--ln-blur-elev)) saturate(calc(var(--ln-saturate) + 0.2));

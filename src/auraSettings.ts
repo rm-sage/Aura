@@ -230,6 +230,18 @@ export interface AuraSettings {
    *  escape hatch for addons that emit a format Aura can't parse cleanly; the
    *  stream panel auto-detects non-TamTaro output and offers to switch. */
   useAuraStreamFormatter: boolean;
+  /** Auto-remove a MOVIE from the Library once it's watched (played to
+   *  completion or manually marked watched). Off by default. Applies going
+   *  forward only; enabling prompts once about clearing the existing watched
+   *  backlog (declining keeps it). Surfaced as a toggle in the Library page's
+   *  options popover. Exported / sync-shared via PORTABLE_AURA_FIELDS. */
+  libraryAutoRemoveWatchedMovies: boolean;
+  /** Auto-remove a SERIES from the Library once every AIRED episode is watched
+   *  and nothing further is scheduled - the same gate that flips the
+   *  series-root "watched" flag (advanceWatchedAfter). A show still airing new
+   *  episodes is never removed. Off by default; enabling prompts once about
+   *  clearing the existing fully-watched backlog. */
+  libraryAutoRemoveWatchedSeries: boolean;
 }
 
 export const DEFAULT_AURA_SETTINGS: AuraSettings = {
@@ -259,6 +271,8 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   openLinksExternally: false,
   queueRemoveSeriesInProgress: true,
   useAuraStreamFormatter: true,
+  libraryAutoRemoveWatchedMovies: false,
+  libraryAutoRemoveWatchedSeries: false,
 };
 
 // Module-level memoization snapshot. loadAuraSettings is called many
@@ -371,6 +385,12 @@ function readFromStorage(): AuraSettings {
       useAuraStreamFormatter: typeof parsed.useAuraStreamFormatter === "boolean"
         ? parsed.useAuraStreamFormatter
         : true,
+      libraryAutoRemoveWatchedMovies: typeof parsed.libraryAutoRemoveWatchedMovies === "boolean"
+        ? parsed.libraryAutoRemoveWatchedMovies
+        : false,
+      libraryAutoRemoveWatchedSeries: typeof parsed.libraryAutoRemoveWatchedSeries === "boolean"
+        ? parsed.libraryAutoRemoveWatchedSeries
+        : false,
       heroCatalog: parsed.heroCatalog
         && typeof parsed.heroCatalog === "object"
         && typeof (parsed.heroCatalog as Record<string, unknown>).addonUrl === "string"

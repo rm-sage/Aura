@@ -782,6 +782,13 @@ const ContinueWatchingCard = memo(function ContinueWatchingCard(
     ? `S${String(currentEp.season).padStart(2, "0")}E${String(currentEp.episode).padStart(2, "0")}`
     : badgeForVideoId(badgeVideoId);
   const useSegmented = seasonEpisodes != null && seasonEpisodes.length > 1;
+  // Canonical release year - same helper the catalog cards use, so a series
+  // shows its full range ("2019-2021" / "2019-") and a movie a single year,
+  // resolved from the meta cache that useSeasonEpisodes above already warms.
+  // Falls back to the library record's own `year`, which is null for most
+  // auto-tracked CW entries (libraryWriteProgress never sets it) - that null
+  // is exactly why the raw `item.year` render was blank on so many tiles.
+  const displayYear = useCanonicalReleaseYear(item.id, item.year);
 
   return (
     <div
@@ -874,8 +881,8 @@ const ContinueWatchingCard = memo(function ContinueWatchingCard(
           {item.name}
           <CWTitleIndicator metaId={item.id} mediaType={item.media_type} />
         </p>
-        {item.year && (
-          <p className="text-white/35 text-[14px] mt-0.5 text-center font-mono">{item.year}</p>
+        {displayYear && (
+          <p className="text-white/35 text-[14px] mt-0.5 text-center font-mono">{displayYear}</p>
         )}
       </button>
 
