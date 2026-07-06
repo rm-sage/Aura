@@ -5,6 +5,7 @@ import { createContext, useContext, useEffect, useMemo, useState, type ReactNode
 import type { LibraryItem, VideoEntry } from "./types";
 import { getManualWatchedState, onManualWatchedChange, useManualWatchedVersion } from "./manualWatched";
 import { airingInfo } from "./releaseCountdown";
+import { libraryItemSeriesId } from "./libraryNormalize";
 
 // ---------------------------------------------------------------------------
 // LibraryContext — exposes a (id) → LibraryItem lookup for components that
@@ -283,7 +284,19 @@ export function useEpisodesBehind(
   seriesId: string | null | undefined,
 ): number | null {
   void useManualWatchedVersion();
-  const resumeId = useResumeVideoId(seriesId);
+  // Resolve the CANONICAL series id from the episode ids in `videos`, not the
+  // passed `seriesId`. A duplicate per-cour catalog entry (e.g. AIOMetadata's
+  // "... Season 3" listing) has its OWN id that your library / resume progress
+  // isn't keyed under, but its videos carry the canonical episode ids — so their
+  // root IS the id you actually watched under. Without this the resume lookup
+  // misses and the badge counts only manual marks (observed: "48 behind" on the
+  // Season 3 listing vs the correct "2 behind" on the series-root listing).
+  // No-ops for the DetailView / Library case where the videos' root already
+  // equals the passed id. Falls back to `seriesId` when there are no videos
+  // (the function returns null in that case anyway).
+  const canonicalSeriesId =
+    videos && videos.length > 0 ? libraryItemSeriesId(videos[0].id) : (seriesId ?? null);
+  const resumeId = useResumeVideoId(canonicalSeriesId);
   if (!videos || videos.length === 0) return null;
   const now = Date.now();
   const info = airingInfo(videos, now);

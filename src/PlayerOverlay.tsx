@@ -1516,8 +1516,21 @@ export default function PlayerOverlay({
   // delayed get_tracks reconcile (below) is authoritative. Reset per file so
   // a stale id can't match a different track after an episode change.
   const [selectedSubId, setSelectedSubId] = useState<number | null>(null);
+  // One-shot guards for the audio + subtitle auto-select effects further down.
+  // Declared here (above the reset effect) so they re-arm per file.
+  const subAutoSelectedRef = useRef(false);
+  const audioAutoSelectedRef = useRef(false);
+  // Reset per file: on episode change AND on a source switch (streamUrl change).
+  // A source switch swaps the stream WITHOUT unmounting PlayerOverlay, so
+  // without re-arming these one-shot pickers they keep the PREVIOUS source's
+  // tracks and never re-apply the language defaults to the new file — observed
+  // as switching sources selecting the file's default (e.g. Russian) audio
+  // instead of the preferred English. selectedSubId is cleared for the same
+  // reason (a stale id must not match a different track after the swap).
   useEffect(() => {
     setSelectedSubId(null);
+    subAutoSelectedRef.current = false;
+    audioAutoSelectedRef.current = false;
   }, [activeTarget?.id, streamUrl]);
 
   // Embedded MPV subtitle tracks (in-file + any sub-add'd via the
@@ -1534,9 +1547,9 @@ export default function PlayerOverlay({
   // a partial subtitle covering only on-screen text, NOT the dialogue.
   // Once tracks are populated for a session we walk them and switch
   // to the best match: matching `slang`, with a title that doesn't
-  // suggest a partial / forced / signs-only track. Runs at most once
-  // per playback session (the ref resets when PlayerOverlay unmounts).
-  const subAutoSelectedRef = useRef(false);
+  // suggest a partial / forced / signs-only track. Runs once per file
+  // (subAutoSelectedRef is declared + re-armed above on episode change /
+  // source switch / unmount).
   useEffect(() => {
     if (subAutoSelectedRef.current) return;
     // Persisted "off" — user previously disabled subs for this title.
@@ -1643,8 +1656,8 @@ export default function PlayerOverlay({
   // is folded into the audioPriority list so per-title overrides still
   // beat the priority tokens.
   //
-  // Runs at most once per playback session.
-  const audioAutoSelectedRef = useRef(false);
+  // Runs once per file (audioAutoSelectedRef is declared + re-armed above on
+  // episode change / source switch / unmount).
   useEffect(() => {
     if (audioAutoSelectedRef.current) return;
     if (audioTracks.length === 0) return;
