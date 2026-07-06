@@ -178,7 +178,7 @@ export default function SeasonSelect({
         className="bg-black/45 border border-white/16 rounded-lg px-5 py-2.5
                    text-[16px] font-mono tracking-wide outline-none
                    focus:border-ln-accent/45 transition-colors cursor-pointer
-                   appearance-none pr-10 inline-flex items-center max-w-[340px]"
+                   appearance-none pr-10 inline-flex items-center max-w-[340px] min-w-0"
         style={{
           color: "var(--text-primary)",
           backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='rgba(255,255,255,0.55)'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E")`,

@@ -12,77 +12,70 @@
 //   • Card geometry mirrors a Continue Watching tile: thumbnail on the
 //     left, episode tag + title stacked on the right, single primary
 //     CTA. Familiar shape for the user, no new visual vocabulary.
+//   • FILLER / RECAP: when the next episode is filler/recap AND a later
+//     canon episode exists, its rose/amber tag shows on the thumbnail and
+//     the PRIMARY action becomes "Skip to canon · SxxEyy" (jumps past all
+//     upcoming filler/recap); a small "Play this anyway" link plays the
+//     filler. Auto-advance then targets the skip, matching the primary.
 //   • Z-index sits ABOVE PlayerOverlay's auto-hide control bar so the
 //     CTA stays put even when the controls fade. Pointer events route
 //     through it so the user can dismiss / play without unhiding the
 //     bar.
-//   • DOES NOT auto-advance — explicit user click required. Some users
-//     legitimately want to sit on the credits / preview, and a silent
-//     auto-jump after N seconds is the kind of behaviour that earns
-//     bug reports rather than thanks. Auto-advance can come later as
-//     an opt-in setting if there's demand.
 // ---------------------------------------------------------------------------
 
 import { useEffect, useRef, useState } from "react";
 import { useWindowHidden } from "./windowVisibility";
 import ImageLoader from "./ImageLoader";
+import FillerRecapTags from "./FillerRecapTags";
 import type { VideoEntry } from "./types";
-import { formatEpisodeTag } from "./nextUp";
+import { formatEpisodeTag, episodeKindFlags } from "./nextUp";
 import { loadAuraSettings } from "./auraSettings";
 
 interface Props {
-  /** The next episode metadata. Provides the title + thumbnail. */
+  /** The next episode metadata. Provides the title + thumbnail + tag. */
   episode: VideoEntry;
-  /** True while the next episode's stream resolution is in flight.
-   *  The CTA still renders so the user can see the "Next Up: SxxEyy"
-   *  preview, but the play button is disabled with a small spinner
-   *  until a stream lands. */
+  /** True while the next episode's stream resolution is in flight. */
   loading: boolean;
-  /** When true, no playable stream resolved for the next episode (every
-   *  addon either errored or returned an empty array). The CTA renders
-   *  with a disabled-with-helper-text state instead of a play button. */
+  /** True when no playable stream resolved for the (literal) next episode. */
   noStream: boolean;
-  /** Click handler — App.tsx wires this to `handlePlayStream(stream,
-   *  target)` after the current playback's resume offset is flushed. */
+  /** When the next episode is filler/recap and a later canon episode was
+   *  pre-resolved (with a stream), its SxxEyy tag — presence flips the card
+   *  into "skip to canon primary" mode. null otherwise. */
+  skipTag?: string | null;
+  /** Skip past all upcoming filler/recap into the next canon episode. Wired
+   *  by App only when `skipTag` is set. */
+  onSkipToCanon?: () => void;
+  /** Play the (literal) next episode. In skip mode this is the "Play this
+   *  anyway" fallback; otherwise the primary action. */
   onPlay: () => void;
-  /** Hide the CTA for the rest of the current playback session. The
-   *  parent owns the dismiss state — this component just emits the
-   *  intent. */
+  /** Hide the CTA for the rest of the current playback session. */
   onDismiss: () => void;
 }
 
 export default function NextUpCta({
-  episode, loading, noStream, onPlay, onDismiss,
+  episode, loading, noStream, skipTag, onSkipToCanon, onPlay, onDismiss,
 }: Props) {
   const tag = formatEpisodeTag(episode);
   const title = (episode.title ?? "").trim() || "Untitled episode";
+  const { filler, recap } = episodeKindFlags(episode);
+  // Skip mode: the next episode is filler/recap and a canon target (with a
+  // stream) was pre-resolved. The skip is the primary action.
+  const skipMode = !!(skipTag && onSkipToCanon);
 
   // ── Opt-in auto-advance ─────────────────────────────────────────────
   // When the user has flipped `autoAdvanceNextEpisode` ON in Settings,
   // arm a countdown the moment the CTA mounts with a resolved playable
-  // stream (loading === false AND noStream === false). The countdown
-  // shows as a thin progress bar across the bottom of the card and the
-  // primary CTA button gains a "Playing in Ns…" label. Any cancel
-  // signal (mouse move in the viewport, key press, mouseenter on the
-  // card itself) clears the timer and the CTA reverts to its standard
-  // "Play next episode" state — the user can still click manually.
-  //
-  // Settings are read once at mount via the existing loadAuraSettings
-  // memoized snapshot; we deliberately don't subscribe to mid-session
-  // setting changes because the active countdown is tied to the
-  // moment-of-truth surfacing of the CTA, and reacting to a setting
-  // flip mid-countdown would either restart or abort in surprising
-  // ways. The user opts in at the level of "the next time NextUp
-  // surfaces, use auto-advance." Next surface honours the new value.
+  // primary action. In skip mode the countdown targets the skip (the canon
+  // stream is always resolved), so we don't gate it on the filler's
+  // `noStream`; otherwise it needs the literal next stream. Any cancel
+  // signal (mouse move, key, wheel, hover) clears the timer.
   const settings = loadAuraSettings();
   const initialSeconds = Math.max(5, Math.min(30, Math.round(settings.autoAdvanceDelaySeconds)));
-  const autoArmed = settings.autoAdvanceNextEpisode && !loading && !noStream;
+  const autoArmed = settings.autoAdvanceNextEpisode && !loading && (skipMode || !noStream);
 
   const [remaining, setRemaining] = useState<number | null>(autoArmed ? initialSeconds : null);
   // `cancelled` latches once the user has expressed any cancel intent
-  // so we don't restart the countdown if `autoArmed` flickers true again
-  // (e.g. a `loading=true → false` cycle while the user was actively
-  // moving the mouse). One cancel = no auto for this CTA instance.
+  // so we don't restart the countdown if `autoArmed` flickers true again.
   const cancelledRef = useRef(false);
   const windowHidden = useWindowHidden();
 
@@ -97,18 +90,18 @@ export default function NextUpCta({
       return;
     }
     if (remaining <= 0) {
-      onPlay();
+      // Fire whatever the primary button does: skip-to-canon in skip mode,
+      // otherwise play the literal next episode.
+      (skipMode ? onSkipToCanon! : onPlay)();
       return;
     }
     const id = window.setTimeout(() => setRemaining((s) => (s === null ? null : s - 1)), 1000);
     return () => window.clearTimeout(id);
-  }, [autoArmed, remaining, initialSeconds, onPlay, windowHidden]);
+  }, [autoArmed, remaining, initialSeconds, onPlay, onSkipToCanon, skipMode, windowHidden]);
 
-  // Cancel signals: any pointer move on the document, any keydown,
-  // hover into the CTA card itself (the user is reading / about to
-  // act), or the explicit dismiss button. Arrow / Escape / Tab all
-  // count — the user touched the keyboard. We listen at the window
-  // scope while the countdown is armed and detach when it isn't.
+  // Cancel signals: any pointer move on the document, any keydown, wheel, or
+  // the explicit dismiss button. We listen at window scope while the countdown
+  // is armed and detach when it isn't.
   useEffect(() => {
     if (remaining === null) return;
     const cancel = () => {
@@ -130,20 +123,21 @@ export default function NextUpCta({
     ? Math.max(0, Math.min(100, ((initialSeconds - remaining) / initialSeconds) * 100))
     : 0;
 
+  const PlayIcon = () => (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+      <path d="M8 5v14l11-7z" />
+    </svg>
+  );
+  const SkipIcon = () => (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+      <path d="M6 18l8.5-6L6 6v12zM16 6h2v12h-2z" />
+    </svg>
+  );
+
   return (
     <div
       // Z-INDEX 10001 (above PlayerOverlay's 9999) so the CTA paints
-      // and receives clicks ahead of the overlay's invisible
-      // "tap to play/pause" layer. `fixed` positioning anchors to the
-      // viewport directly — the CTA is rendered as a sibling of the
-      // overlay at App's root, NOT a child, so `absolute` would resolve
-      // against the document body and produce the same coordinates,
-      // but `fixed` is the explicit semantic: "stick to the viewport
-      // corner regardless of any ancestor's transform / overflow."
-      //
-      // pointer-events-auto + `onClick stopPropagation` on the wrapper
-      // is belt-and-braces against any ancestor click handler that
-      // might still be installed when this mounts.
+      // and receives clicks ahead of the overlay's invisible layer.
       className="fixed bottom-28 right-6 z-[10001] pointer-events-auto
                  bg-black/80 backdrop-blur-2xl border border-white/15
                  rounded-2xl shadow-[0_24px_64px_rgba(0,0,0,0.65)]
@@ -175,6 +169,9 @@ export default function NextUpCta({
             </svg>
           </div>
         )}
+        {/* Filler / recap tag — top-right of the thumbnail (mirrors the
+            episode list). Shows what's actually next even in skip mode. */}
+        <FillerRecapTags filler={filler} recap={recap} className="absolute top-1.5 right-1.5 z-10" />
       </div>
 
       {/* ── Body ── */}
@@ -201,7 +198,44 @@ export default function NextUpCta({
           </p>
         </div>
 
-        {noStream ? (
+        {skipMode ? (
+          // ── Skip-to-canon primary + "play this anyway" fallback ──
+          <div className="flex flex-col gap-1">
+            <button
+              type="button"
+              onClick={onSkipToCanon}
+              className="relative w-full px-3 py-1.5 rounded-lg overflow-hidden
+                         border border-ln-accent/45 bg-ln-accent/20
+                         text-ln-accent text-[12px] font-semibold tracking-wide
+                         hover:bg-ln-accent/30 transition-colors
+                         flex items-center justify-center gap-2"
+            >
+              {countdownActive && (
+                <span
+                  aria-hidden
+                  className="absolute inset-y-0 left-0 bg-ln-accent/25 transition-[width] duration-1000 ease-linear"
+                  style={{ width: `${fillPct}%` }}
+                />
+              )}
+              <span className="relative flex items-center gap-2">
+                <SkipIcon />
+                {countdownActive
+                  ? `Skipping to canon in ${remaining}s — move to cancel`
+                  : `Skip to canon · ${skipTag}`}
+              </span>
+            </button>
+            {!noStream && (
+              <button
+                type="button"
+                onClick={onPlay}
+                className="text-white/45 hover:text-white/85 text-[11px] tracking-wide
+                           transition-colors text-center py-0.5"
+              >
+                Play this anyway
+              </button>
+            )}
+          </div>
+        ) : noStream ? (
           <p className="text-amber-300/90 text-[11px] leading-snug">
             No streams found for this episode. Try opening it from the
             episode list.
@@ -218,10 +252,6 @@ export default function NextUpCta({
                        disabled:opacity-55 disabled:cursor-progress
                        flex items-center justify-center gap-2"
           >
-            {/* Auto-advance countdown fill — paints behind the button
-                label as a thin growing bar so the user sees the timer
-                at a glance without cluttering the layout. Linear 1s
-                steps, no easing, so it reads as a real clock. */}
             {countdownActive && (
               <span
                 aria-hidden
@@ -245,16 +275,12 @@ export default function NextUpCta({
               </>
             ) : countdownActive ? (
               <span className="relative flex items-center gap-2">
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                  <path d="M8 5v14l11-7z" />
-                </svg>
+                <PlayIcon />
                 Playing next in {remaining}s — move to cancel
               </span>
             ) : (
               <>
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                  <path d="M8 5v14l11-7z" />
-                </svg>
+                <PlayIcon />
                 Play next episode
               </>
             )}

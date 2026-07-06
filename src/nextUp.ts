@@ -67,6 +67,23 @@ function passesKindFilter(kind: string | null | undefined, mode: SkipFillerRecap
   return kind !== "filler" && kind !== "recap";
 }
 
+/** Filler / recap flags for an episode, read from its own AIOMetadata fields —
+ *  the SAME signal `findNextEpisode`'s skip walk uses, so the tag shown on a
+ *  next-up card always agrees with whether "skip to canon" would skip it. An
+ *  episode can be flagged both (release-search-spec §6.3). */
+export function episodeKindFlags(v: VideoEntry): { filler: boolean; recap: boolean } {
+  return {
+    filler: v.is_filler === true || v.episode_kind === "filler",
+    recap:  v.is_recap  === true || v.episode_kind === "recap",
+  };
+}
+
+/** True when an episode is filler or recap (skip-worthy for "skip to canon"). */
+export function isFillerOrRecap(v: VideoEntry): boolean {
+  const { filler, recap } = episodeKindFlags(v);
+  return filler || recap;
+}
+
 export function findNextEpisode(
   detail: MetaDetail,
   currentEpisodeId: string,
@@ -170,6 +187,33 @@ export async function resolveNextEpisode(
   const next = findNextEpisode(detail, currentEpisodeId, Date.now(), skipMode);
   if (!next) return null;
   return { detail, next };
+}
+
+/**
+ * When `nextEp` is filler/recap, resolve the NEXT CANON episode (walking past
+ * ALL upcoming filler AND recap via `findNextEpisode(..,"both")`) plus its
+ * first stream, so a next-up card can offer a one-tap "skip to canon".
+ *
+ * Returns null when: `nextEp` isn't filler/recap, no canon episode lies ahead
+ * (everything remaining is filler/recap, or `nextEp` is the last), or the
+ * canon episode has no playable stream — in every such case the card falls
+ * back to its normal single "play next" action, so the skip is only ever
+ * offered when it's actually actionable.
+ */
+export async function resolveCanonSkipTarget(
+  addons: AddonEntry[],
+  detail: MetaDetail,
+  mediaType: string,
+  currentEpisodeId: string,
+  nextEp: VideoEntry,
+  now: number = Date.now(),
+): Promise<{ episode: VideoEntry; stream: StreamEntry } | null> {
+  if (!isFillerOrRecap(nextEp)) return null;
+  const canon = findNextEpisode(detail, currentEpisodeId, now, "both");
+  if (!canon || canon.id === nextEp.id) return null;
+  const stream = await pickFirstStreamForEpisode(addons, mediaType, canon.id);
+  if (!stream) return null;
+  return { episode: canon, stream };
 }
 
 /** Format an SxxEyy / Sxx tag for the Next-Up button label. Falls back

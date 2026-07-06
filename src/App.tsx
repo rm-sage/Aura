@@ -78,7 +78,7 @@ import {
 import { useWatchTogether } from "./watchTogether/useWatchTogether";
 import { streamLabel, streamMatchKey } from "./watchTogether/streamMatch";
 import { parseStream } from "./streamMeta";
-import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPreviousEpisode } from "./nextUp";
+import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPreviousEpisode, resolveCanonSkipTarget, formatEpisodeTag } from "./nextUp";
 import { getMetaDetailFallback, getRichestMetaDetail, peekCachedDetailById, peekRichestCachedDetailById, peekFreshestPostersByIds } from "./metaCache";
 import { PersistentCache } from "./persistentCache";
 import { applyReducedMotionAttribute, loadAuraSettings } from "./auraSettings";
@@ -542,6 +542,14 @@ const BUFFER_PROGRESS_MIN_S = 2;
 // buffer keeps filling within this window, the modal is suppressed so a slow-
 // but-alive source can finish buffering.
 const BUFFER_STALL_MS = 25000;
+// Minimum buffering-% rate (cache-buffering-state, %/second) that still counts
+// as a healthily filling buffer. `cache_seconds` (readahead) fills the resume
+// threshold in sub-BUFFER_PROGRESS_MIN_S steps on high-bitrate sources, so the
+// cache-buffering PERCENTAGE — what the loading overlay shows — is the reliable
+// "still alive" signal. While the % climbs at least this fast the recovery modal
+// stays suppressed; only a % that's stopped or crawling slower than this (for
+// BUFFER_STALL_MS) is treated as wedged.
+const BUFFER_PCT_MIN_RATE = 2;
 
 // Per-tick forward-progress cap (s) for the History watched accumulator.
 // A `time` delta larger than this is a seek, not playback — discarded so
@@ -709,6 +717,13 @@ function usePlayback(playerActive: boolean) {
   // recovery modal. Reset per load in notifyNewLoad.
   const lastCacheSecondsRef = useRef<number>(0);
   const lastBufferProgressAtRef = useRef<number>(0);
+  // Buffering-% (cache-buffering-state) rate tracker — last seen % and its
+  // wall-clock. A climb of >= BUFFER_PCT_MIN_RATE %/s also refreshes
+  // lastBufferProgressAtRef, so a slow-but-filling source (readahead moving in
+  // sub-BUFFER_PROGRESS_MIN_S steps) is kept out of the recovery modal. Reset
+  // per load in notifyNewLoad.
+  const lastCachePctRef = useRef<number>(0);
+  const lastCachePctAtRef = useRef<number>(0);
   // Wall-clock of the last user seek. A seek (e.g. fast-forwarding a live
   // stream toward the edge) makes mpv cache-pause while it refills, halting
   // time-pos — that's a buffer, NOT a broken stream, so the stale-heartbeat
@@ -785,7 +800,27 @@ function usePlayback(playerActive: boolean) {
       }
       // Real cache telemetry from the engine's gated poll: drive the loading
       // overlay's % + readahead, and broadcast our buffer to the party.
-      if (typeof payload.cache_pct === "number") setBufferPct(payload.cache_pct);
+      if (typeof payload.cache_pct === "number") {
+        setBufferPct(payload.cache_pct);
+        // Buffering-% forward progress: a cache-buffering-state climbing at
+        // >= BUFFER_PCT_MIN_RATE %/s is a healthily filling buffer, so refresh
+        // the progress timestamp to keep the recovery modal deferred — the user
+        // sees the % climbing on the loading overlay and it must not be yanked
+        // up mid-fill. A DROP is a new fill cycle / cache consumed: re-baseline
+        // without counting it as progress.
+        const pct = payload.cache_pct;
+        const now = Date.now();
+        const prevPct = lastCachePctRef.current;
+        const prevAt = lastCachePctAtRef.current;
+        if (prevAt > 0 && pct >= prevPct) {
+          const dtSec = (now - prevAt) / 1000;
+          if (dtSec > 0 && (pct - prevPct) / dtSec >= BUFFER_PCT_MIN_RATE) {
+            lastBufferProgressAtRef.current = now;
+          }
+        }
+        lastCachePctRef.current = pct;
+        lastCachePctAtRef.current = now;
+      }
       if (typeof payload.cache_seconds === "number") {
         setCacheSeconds(payload.cache_seconds);
         // Track buffer FORWARD progress so the stall / load watchdogs can tell
@@ -1129,6 +1164,8 @@ function usePlayback(playerActive: boolean) {
     lastCacheBufferLogRef.current = null;
     lastCacheSecondsRef.current = 0;
     lastBufferProgressAtRef.current = 0;
+    lastCachePctRef.current = 0;
+    lastCachePctAtRef.current = 0;
     nearEndEosFiredRef.current = false;
     watchedElapsedRef.current = 0;
     watchedElapsedLastTimeRef.current = 0;
@@ -2850,6 +2887,10 @@ export default function App() {
   const [nextUpInfo, setNextUpInfo] = useState<{
     episode:  VideoEntry;
     stream:   StreamEntry | null;
+    /** When `episode` is filler/recap and a later canon episode was
+     *  pre-resolved (episode + first stream), drives the cards' "Skip to
+     *  canon" primary action. null/absent otherwise. */
+    canon?:   { episode: VideoEntry; stream: StreamEntry } | null;
   } | null>(null);
   /** Per-episode dismiss flag. Keyed by the CURRENT episode's id (not
    *  the next-up id) so dismissing while watching S01E05 only suppresses
@@ -2989,13 +3030,19 @@ export default function App() {
       }
       // Pre-fetch the first stream so the user's click feels instant.
       // If this returns null we still show the CTA but with a
-      // "no stream found" hint rather than a play button.
-      const stream = await pickFirstStreamForEpisode(addons, mediaType, next.next.id);
+      // "no stream found" hint rather than a play button. In parallel,
+      // if the next episode is filler/recap, pre-resolve the next CANON
+      // episode + its stream so the card can offer a one-tap "skip to
+      // canon" (null when next isn't filler/recap or no canon lies ahead).
+      const [stream, canon] = await Promise.all([
+        pickFirstStreamForEpisode(addons, mediaType, next.next.id),
+        resolveCanonSkipTarget(addons, next.detail, mediaType, currentId, next.next),
+      ]);
       // Guard against state changes during the await — only commit if
       // the active target hasn't moved on (user could have hit Next /
       // Back during the resolution).
       if (nextUpResolvedFor.current === currentId) {
-        setNextUpInfo({ episode: next.next, stream });
+        setNextUpInfo({ episode: next.next, stream, canon });
       }
     })();
   }, [activeTarget, time, duration, addons, nextUpLeadSeconds]);
@@ -3041,8 +3088,12 @@ export default function App() {
    *  the same handlePlayStream the DetailView uses. The episode tag
    *  ("S02E01" etc.) is reconstructed from the VideoEntry's parsed
    *  fields so the OSD / SMTC titles look right. */
-  const onNextUpPlay = useCallback(async () => {
-    if (!nextUpInfo || !activeTarget || !nextUpInfo.stream) return;
+  // Advance playback to a SPECIFIC next episode + pre-resolved stream,
+  // recording the CURRENT episode into History first (same gate as
+  // handleExitPlayback). Shared by "Play next episode" and "Skip to canon"
+  // so both carry the identical History/scrobble + target-build + swap path.
+  const advanceToEpisode = useCallback(async (ep: VideoEntry, stream: StreamEntry) => {
+    if (!activeTarget) return;
     const seriesId = activeTarget.series_id ?? activeTarget.id;
 
     // ── Record CURRENT episode into history before advancing ──
@@ -3109,7 +3160,6 @@ export default function App() {
       }
     }
 
-    const ep = nextUpInfo.episode;
     const tag =
       ep.season != null && ep.episode != null
         ? `S${String(ep.season).padStart(2, "0")}E${String(ep.episode).padStart(2, "0")}`
@@ -3125,10 +3175,22 @@ export default function App() {
       episode_num:   ep.episode ?? undefined,
     };
     setNextUpInfo(null);
-    await handlePlayStream(nextUpInfo.stream, target);
+    await handlePlayStream(stream, target);
     // Allow the new target's CTA to arm when its own end approaches.
     nextUpResolvedFor.current = null;
-  }, [nextUpInfo, activeTarget, library, selectedMeta]);
+  }, [activeTarget, library, selectedMeta]);
+
+  const onNextUpPlay = useCallback(async () => {
+    if (!nextUpInfo || !nextUpInfo.stream) return;
+    await advanceToEpisode(nextUpInfo.episode, nextUpInfo.stream);
+  }, [nextUpInfo, advanceToEpisode]);
+
+  // Skip past all upcoming filler/recap straight into the pre-resolved next
+  // canon episode. Only wired when `nextUpInfo.canon` is present.
+  const onNextUpSkip = useCallback(async () => {
+    if (!nextUpInfo?.canon) return;
+    await advanceToEpisode(nextUpInfo.canon.episode, nextUpInfo.canon.stream);
+  }, [nextUpInfo, advanceToEpisode]);
 
   const onNextUpDismiss = useCallback(() => {
     if (activeTarget) {
@@ -3376,9 +3438,12 @@ export default function App() {
       );
       if (cancelled) return;
       if (res) {
-        const stream = await pickFirstStreamForEpisode(addons, mediaType, res.next.id);
+        const [stream, canon] = await Promise.all([
+          pickFirstStreamForEpisode(addons, mediaType, res.next.id),
+          resolveCanonSkipTarget(addons, res.detail, mediaType, currentId, res.next),
+        ]);
         if (cancelled) return;
-        setNextUpInfo({ episode: res.next, stream });
+        setNextUpInfo({ episode: res.next, stream, canon });
         setEosResolve("ready");
         return;
       }
@@ -5833,6 +5898,13 @@ export default function App() {
     void onNextUpPlay();
   }, [onNextUpPlay]);
 
+  // "Skip to canon" from the Spotlight — same streak bookkeeping as Play Next,
+  // routes through onNextUpSkip (History append + swap unchanged).
+  const onEosSkipToCanon = useCallback((auto: boolean) => {
+    autoAdvanceStreakRef.current = auto ? autoAdvanceStreakRef.current + 1 : 0;
+    void onNextUpSkip();
+  }, [onNextUpSkip]);
+
   const onEosExit = useCallback(() => {
     setEosActive(false);
     handleExitPlayback();
@@ -7025,6 +7097,8 @@ export default function App() {
           episode={nextUpInfo.episode}
           loading={false}
           noStream={nextUpInfo.stream == null}
+          skipTag={nextUpInfo.canon ? formatEpisodeTag(nextUpInfo.canon.episode) : null}
+          onSkipToCanon={nextUpInfo.canon ? onNextUpSkip : undefined}
           onPlay={onNextUpPlay}
           onDismiss={onNextUpDismiss}
         />
@@ -7062,6 +7136,8 @@ export default function App() {
             seriesArt={seriesArt}
             libraryById={libraryById}
             onPlayNext={onEosPlayNext}
+            skipTag={nextEp && nextUpInfo?.canon ? formatEpisodeTag(nextUpInfo.canon.episode) : null}
+            onSkipToCanon={onEosSkipToCanon}
             autoAdvanceStreak={autoAdvanceStreakRef.current}
             onReplay={onEosReplay}
             onExit={onEosExit}

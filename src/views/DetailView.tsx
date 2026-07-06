@@ -27,6 +27,7 @@ import { findAIOMetadataAddon, isAnimeMeta, markAnimeId, typeLabel } from "../ai
 import { dedupedInvoke } from "../invokeDedupe";
 import { PersistentCache } from "../persistentCache";
 import SeasonSelect from "../SeasonSelect";
+import FillerRecapTags from "../FillerRecapTags";
 
 // 7-day cache for the aggregate ratings. RT/Metacritic values shift on
 // the order of weeks for theatrical releases and never for older
@@ -2761,28 +2762,12 @@ const EpisodeRow = ({
           const cloudRecap  = cloudForThis.some((k) => k.kind === "recap");
           const showFiller = cloudFiller || !!video.is_filler || video.episode_kind === "filler";
           const showRecap  = cloudRecap  || !!video.is_recap  || video.episode_kind === "recap";
-          if (!showFiller && !showRecap) return null;
           return (
-            <div className="absolute top-1.5 right-1.5 flex flex-col gap-1 items-end">
-              {showFiller && (
-                <span
-                  className="px-1.5 py-0.5 rounded text-[9px] font-semibold tracking-[0.14em] uppercase
-                             border bg-rose-500/85 text-white border-rose-300/30
-                             shadow-[0_2px_6px_rgba(244,63,94,0.4)]"
-                >
-                  filler
-                </span>
-              )}
-              {showRecap && (
-                <span
-                  className="px-1.5 py-0.5 rounded text-[9px] font-semibold tracking-[0.14em] uppercase
-                             border bg-amber-400/85 text-amber-950 border-amber-200/40
-                             shadow-[0_2px_6px_rgba(251,191,36,0.4)]"
-                >
-                  recap
-                </span>
-              )}
-            </div>
+            <FillerRecapTags
+              filler={showFiller}
+              recap={showRecap}
+              className="absolute top-1.5 right-1.5"
+            />
           );
         })()}
 
@@ -3074,21 +3059,24 @@ function EpisodesPanel({
           </p>
         ) : (
           <>
-            {/* Season dropdown — visually centred horizontally with the
-                episode count anchored to its right. The wrapper is a
-                relative-positioned row: the dropdown sits in the middle
-                via flex centring, the count is absolutely positioned to
-                the right edge so the dropdown stays optically centred
-                regardless of how many episodes the season has. */}
+            {/* Season dropdown + per-season episode count, centred as a
+                group with a clear gap between them. The count is a standout
+                accent chip (vs the dim white "N TOTAL" badge in the header)
+                so the selected season's length reads at a glance. The
+                dropdown truncates (min-w-0 in SeasonSelect) rather than
+                shoving the chip on a narrow panel. */}
             {seasons.length > 1 && (
-              <div className="relative flex items-center justify-center mb-4">
+              <div className="flex items-center justify-center gap-3.5 mb-4">
                 <SeasonSelect
                   seasons={seasons}
                   value={season}
                   onChange={setSeason}
                   names={seasonNames}
                 />
-                <span className="absolute right-1 text-white/45 text-[13px] font-mono tracking-wider">
+                <span className="shrink-0 inline-flex items-center rounded-md
+                                 bg-ln-accent/[0.12] border border-ln-accent/30
+                                 px-2.5 py-1 text-[11px] font-mono font-semibold uppercase
+                                 tracking-[0.14em] text-ln-accent tabular-nums">
                   {inSeason.length} {inSeason.length === 1 ? "ep" : "eps"}
                 </span>
               </div>

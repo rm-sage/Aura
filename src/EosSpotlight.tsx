@@ -33,8 +33,9 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { useWindowHidden } from "./windowVisibility";
 import ImageLoader from "./ImageLoader";
+import FillerRecapTags from "./FillerRecapTags";
 import type { LibraryItem, StreamEntry, VideoEntry } from "./types";
-import { formatEpisodeTag } from "./nextUp";
+import { formatEpisodeTag, episodeKindFlags } from "./nextUp";
 import { loadAuraSettings } from "./auraSettings";
 import { isEpisodeWatched, shouldBlurSynopsis } from "./episodeSpoilers";
 import { formatCountdown, useCountdownNow } from "./releaseCountdown";
@@ -70,6 +71,14 @@ interface Props {
    *  countdown (counts toward the still-watching gate); false on a manual click
    *  (resets the gate's streak). */
   onPlayNext: (auto: boolean) => void;
+  /** When the next episode is filler/recap and a canon target was pre-resolved
+   *  (with a stream), its SxxEyy tag — presence flips the primary action to
+   *  "Skip to canon · SxxEyy". null otherwise. */
+  skipTag?: string | null;
+  /** Skip past all upcoming filler/recap into the next canon episode. `auto`
+   *  mirrors onPlayNext (counts toward the still-watching gate). Wired by App
+   *  only when `skipTag` is set. */
+  onSkipToCanon?: (auto: boolean) => void;
   /** Consecutive unattended auto-advances so far (App-tracked). At >=2, with the
    *  stillWatchingGate setting on, the auto-advance countdown is suppressed and a
    *  "Still watching?" confirm is shown instead, stopping an all-night chain. */
@@ -120,10 +129,16 @@ function NextAirCountdown({ targetMs }: { targetMs: number }) {
 
 function EosSpotlight({
   title, episode, stream, loading, isSeries, caughtUpUnaired, nextAirTargetMs,
-  seriesArt, libraryById, onPlayNext, autoAdvanceStreak, onReplay, onExit, onOpenEpisodes,
-  onDismiss, episodesOpen,
+  seriesArt, libraryById, onPlayNext, skipTag, onSkipToCanon, autoAdvanceStreak,
+  onReplay, onExit, onOpenEpisodes, onDismiss, episodesOpen,
 }: Props) {
   const isNextUp = episode != null;
+  const { filler, recap } = episode
+    ? episodeKindFlags(episode)
+    : { filler: false, recap: false };
+  // Skip mode: the next episode is filler/recap and a canon target (with a
+  // stream) was pre-resolved. The skip becomes the primary action.
+  const skipMode = isNextUp && !!(skipTag && onSkipToCanon);
 
   // ── Countdown (NEXT-UP only) — mirrors NextUpCta's pattern exactly:
   // read autoAdvance settings once at mount, clamp delay to [5,30], arm
@@ -147,8 +162,11 @@ function EosSpotlight({
   // continue / exit). Opt-out via the stillWatchingGate setting (default on).
   const gatedByStillWatching =
     settings.stillWatchingGate !== false && isNextUp && autoAdvanceStreak >= 2;
+  // In skip mode the canon stream is always pre-resolved, so don't gate the
+  // countdown on the (filler) `stream`; otherwise the literal-next stream is
+  // required for "Play Next".
   const autoArmed =
-    isNextUp && settings.autoAdvanceNextEpisode && !loading && stream != null
+    isNextUp && settings.autoAdvanceNextEpisode && !loading && (skipMode || stream != null)
     && !isPartyFollower && !gatedByStillWatching;
 
   const [remaining, setRemaining] = useState<number | null>(autoArmed ? initialSeconds : null);
@@ -166,12 +184,14 @@ function EosSpotlight({
       return;
     }
     if (remaining <= 0) {
-      onPlayNext(true);
+      // Fire whatever the primary button does: skip-to-canon in skip mode,
+      // otherwise play the literal next episode.
+      (skipMode ? onSkipToCanon! : onPlayNext)(true);
       return;
     }
     const id = window.setTimeout(() => setRemaining((s) => (s === null ? null : s - 1)), 1000);
     return () => window.clearTimeout(id);
-  }, [autoArmed, remaining, initialSeconds, onPlayNext, windowHidden]);
+  }, [autoArmed, remaining, initialSeconds, onPlayNext, onSkipToCanon, skipMode, windowHidden]);
 
   useEffect(() => {
     if (remaining === null) return;
@@ -313,6 +333,9 @@ function EosSpotlight({
                     </svg>
                   </div>
                 )}
+                {/* Filler / recap tag — surfaces what's actually next even
+                    when the primary action is "Skip to canon". */}
+                <FillerRecapTags filler={filler} recap={recap} className="absolute top-2 right-2 z-10" />
               </div>
 
               {/* ── Body ── */}
@@ -361,7 +384,7 @@ function EosSpotlight({
 
                 <div className="flex-1" />
 
-                {gatedByStillWatching && stream != null && (
+                {gatedByStillWatching && (skipMode || stream != null) && (
                   <p className="text-ln-accent text-[13px] font-semibold tracking-wide mb-1 flex items-center gap-2">
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
                       <circle cx="12" cy="12" r="9" />
@@ -373,7 +396,40 @@ function EosSpotlight({
 
                 {/* ── Actions ── */}
                 <div className="flex flex-wrap items-center gap-2.5 mt-5">
-                  {stream == null && !loading ? (
+                  {skipMode ? (
+                    <>
+                      {/* Skip-to-canon primary (jumps past all upcoming
+                          filler/recap) + "play this anyway" fallback. */}
+                      <button
+                        type="button"
+                        onClick={() => onSkipToCanon!(false)}
+                        className={`relative overflow-hidden ${btnBase}
+                                    border border-ln-accent/45 bg-ln-accent/20 text-ln-accent
+                                    hover:bg-ln-accent/30 min-w-[170px]`}
+                      >
+                        {countdownActive && (
+                          <span
+                            aria-hidden
+                            className="absolute inset-y-0 left-0 bg-ln-accent/25 transition-[width] duration-1000 ease-linear"
+                            style={{ width: `${ringPct}%` }}
+                          />
+                        )}
+                        <span className="relative flex items-center gap-2">
+                          <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                            <path d="M6 18l8.5-6L6 6v12zM16 6h2v12h-2z" />
+                          </svg>
+                          {countdownActive
+                            ? `Skipping to canon in ${remaining}s — move to cancel`
+                            : `Skip to canon · ${skipTag}`}
+                        </span>
+                      </button>
+                      {stream != null && (
+                        <button type="button" onClick={() => onPlayNext(false)} className={`${btnBase} ${btnGhost}`}>
+                          Play this anyway
+                        </button>
+                      )}
+                    </>
+                  ) : stream == null && !loading ? (
                     <p className="text-amber-300/90 text-[12.5px] leading-snug flex-1 min-w-[200px]">
                       No streams found for this episode. Open the episode
                       list to pick a source.
