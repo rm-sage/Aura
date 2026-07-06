@@ -119,6 +119,11 @@ export default function UpdatePopup({
         className="aura-update-card glass-panel-elevated rounded-2xl
                    px-8 py-7 w-full max-w-[680px] mx-4 shadow-glass-edge
                    flex flex-col gap-5"
+        // glass-panel-elevated's background is the per-theme ACCENT-tinted glass
+        // (--ln-glass-3), which tinted the whole popup the accent colour. Override
+        // to a NEUTRAL frosted grey glass (matching Changelog.tsx) so the accent
+        // shows only in the title + section headers, not the whole surface.
+        style={{ background: "rgba(255, 255, 255, 0.06)" }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -128,7 +133,7 @@ export default function UpdatePopup({
             className="text-[var(--text-primary)] text-xl font-medium
                        tracking-wide flex items-center gap-2"
           >
-            <span className="text-[color:rgb(91,164,255)]">Update Available</span>
+            <span className="text-ln-accent">Update Available</span>
           </h2>
           <p className="text-white/55 text-xs tracking-wide">
             Aura {currentVersion}

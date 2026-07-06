@@ -4969,13 +4969,13 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="px-1 py-3" data-settings-label="Screenshot folder">
                 <p className="text-white/75 text-sm font-medium">Screenshot folder</p>
                 <p className="text-white/45 text-[12.5px] leading-snug mt-0.5 mb-2">
-                  Where the Screenshot key (default Print Screen) saves PNGs. Leave blank for the default app-data screenshots folder.
+                  Where the Screenshot key (default c) saves PNGs. Leave blank for the default Pictures\Aura folder.
                 </p>
                 <div className="flex items-center gap-2">
                   <input
                     type="text"
                     value={backend.screenshot_dir ?? ""}
-                    placeholder="Default: app-data screenshots folder"
+                    placeholder="Default: Pictures\Aura"
                     onChange={(e) => patchBackend({ screenshot_dir: e.target.value })}
                     className="flex-1 min-w-0 bg-white/[0.06] border border-white/10 rounded-lg px-3 py-2 text-[13px] text-white/85 placeholder:text-white/30 focus:outline-none focus:border-ln-accent/50"
                   />

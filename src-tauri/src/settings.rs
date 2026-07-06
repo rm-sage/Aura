@@ -293,9 +293,11 @@ pub struct AppSettings {
     #[serde(default = "default_demuxer_max_mib")]
     pub demuxer_max_mib: u32,
 
-    /// Directory screenshots are saved to. Empty = the default
-    /// `app_data_dir()/screenshots`. A machine-local PATH, so it is NOT in the
-    /// portable / cloud-sync field lists (paths don't transfer across machines).
+    /// Directory screenshots are saved to. Empty = the default `Pictures/Aura`
+    /// folder (with `app_data_dir()/screenshots` as the fallback when the
+    /// Pictures known-folder can't be resolved; see `save_screenshot` in lib.rs).
+    /// A machine-local PATH, so it is NOT in the portable / cloud-sync field
+    /// lists (paths don't transfer across machines).
     #[serde(default)]
     pub screenshot_dir: String,
     // NOTE: crash_reporting_consent + crash_reporting_dsn used to live
