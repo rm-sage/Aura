@@ -135,6 +135,15 @@ identifier = "allow-library-sync"
 description = "Allows the frontend to read and write the user's Stremio library (Continue Watching + Library)"
 commands.allow = ["library_get", "library_put"]
 
+# ── Platform probe (Win10 vs Win11 drag gating) ──────────────────────────────
+# Read once at startup by TitleBar.tsx to pick the window-drag strategy: Win10
+# uses a custom coalesced pointer-drag (the native caption-drag modal loop
+# stalls on Win10's DWM + weak GPUs), Win11 keeps native startDragging.
+[[permission]]
+identifier = "allow-platform"
+description = "Allows the frontend to query basic host platform facts (whether the OS is Windows 10 vs 11) to gate platform-specific UI behavior"
+commands.allow = ["is_windows_10"]
+
 # ── Phase 3B: app settings (theme, defaults) ─────────────────────────────────
 [[permission]]
 identifier = "allow-settings"

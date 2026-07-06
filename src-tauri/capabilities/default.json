@@ -42,6 +42,7 @@
     "allow-meta-detail",
     "allow-library-sync",
     "allow-settings",
+    "allow-platform",
     "allow-scrobble",
     "allow-scrobble-auth",
     "allow-discord-rpc",

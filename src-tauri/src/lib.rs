@@ -1033,6 +1033,23 @@ async fn apply_hdr_settings(app: tauri::AppHandle, mode: String) -> Result<(), S
 /// Windows recognise the window as fullscreen so the taskbar auto-hides.
 /// `set_native_fullscreen(false)` restores the saved pre-fullscreen
 /// bounds.
+/// Frontend probe: is this Windows 10 (build < 22000) rather than Windows 11?
+/// `TitleBar.tsx` reads this once at mount to decide the drag strategy — Win10
+/// gets the custom coalesced pointer-drag (the native caption-drag modal loop
+/// stalls on Win10's DWM + weak GPUs), Win11 keeps native `startDragging`
+/// (and Aero Snap). See `win32::is_windows_10`.
+#[tauri::command]
+fn is_windows_10() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        crate::win32::is_windows_10()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
 #[tauri::command]
 async fn set_native_fullscreen(
     app: tauri::AppHandle,
@@ -2191,6 +2208,7 @@ pub fn run() {
             playback_engine_ready,
             ensure_playback_engine,
             set_native_fullscreen,
+            is_windows_10,
             // ── Per-title persistence (volume / shader / audio / sub) ───────
             per_title::get_title_state,
             per_title::set_title_state,

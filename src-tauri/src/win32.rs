@@ -157,6 +157,62 @@ pub fn apply_playback_perf_opts() {
     // to the OS-default timer and idles deeper. See that helper below.
 }
 
+// ---------------------------------------------------------------------------
+// OS version probe (Windows 10 vs 11)
+// ---------------------------------------------------------------------------
+//
+// Windows 11 still reports major version 10 internally (it is NT 10.0), and the
+// WebView2 user-agent string is byte-identical on both ("Windows NT 10.0"), so
+// neither the frontend UA nor the GetVersionEx family can tell them apart. The
+// only reliable discriminator is the build number: Windows 11 is build >=
+// 22000. We read the TRUE version via ntdll `RtlGetVersion` (GetVersionEx is
+// subject to a manifest compatibility shim that caps the reported version;
+// RtlGetVersion is not shimmed). Resolved once and cached for the process
+// lifetime — mirrors the libloading pattern used elsewhere in this module.
+
+#[repr(C)]
+struct RtlOsVersionInfoW {
+    dw_os_version_info_size: u32,
+    dw_major_version: u32,
+    dw_minor_version: u32,
+    dw_build_number: u32,
+    dw_platform_id: u32,
+    sz_csd_version: [u16; 128],
+}
+
+type RtlGetVersionFn = unsafe extern "system" fn(*mut RtlOsVersionInfoW) -> i32;
+
+/// True when running on Windows 10 (major 10, build < 22000). Windows 11
+/// (build >= 22000) and every non-Windows target return false. Gates the
+/// custom windowed-drag path in `TitleBar.tsx`: the OS caption-drag modal loop
+/// (WM_NCLBUTTONDOWN / HTCAPTION posted by `startDragging`) recomposites Aura's
+/// transparent WebView2 + child-swapchain stack on every move step, which
+/// stalls on Win10's older DWM + weaker GPUs (the window crawls behind a
+/// captured cursor). Win11 keeps native dragging (and thus Aero Snap).
+pub fn is_windows_10() -> bool {
+    static IS_WIN10: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IS_WIN10.get_or_init(|| unsafe {
+        let ntdll = match libloading::Library::new("ntdll.dll") {
+            Ok(l) => l,
+            Err(_) => return false,
+        };
+        let rtl_get_version: libloading::Symbol<RtlGetVersionFn> =
+            match ntdll.get(b"RtlGetVersion\0") {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+        let mut info: RtlOsVersionInfoW = std::mem::zeroed();
+        info.dw_os_version_info_size =
+            std::mem::size_of::<RtlOsVersionInfoW>() as u32;
+        // RtlGetVersion returns STATUS_SUCCESS (0); treat anything else as
+        // "unknown" and fall back to the native drag (false).
+        if rtl_get_version(&mut info) != 0 {
+            return false;
+        }
+        info.dw_major_version == 10 && info.dw_build_number < 22000
+    })
+}
+
 type GetClientRectFn = unsafe extern "system" fn(*mut c_void, *mut Rect) -> i32;
 type SetWindowPosFn  = unsafe extern "system" fn(
     *mut c_void, *mut c_void, i32, i32, i32, i32, u32,

@@ -276,7 +276,14 @@ These are mistakes with specific, hard-to-diagnose symptoms.
    prop) in windowed; only unmount in true OS fullscreen. PlayerOverlay's top action bar must offset
    36 px in windowed mode to avoid overlapping it.
 7. **Do not use `data-tauri-drag-region` for the title bar.** It leaves the cursor stuck on simple
-   clicks. Use explicit `onPointerDown -> getCurrentWindow().startDragging()`.
+   clicks. Use explicit `onPointerDown`. The drag path forks by OS (`TitleBar.tsx`): Windows 11 (and
+   any non-Windows / maximized window) uses `getCurrentWindow().startDragging()` (native caption
+   drag, keeps Aero Snap); **Windows 10 uses a custom coalesced pointer-drag** (setPointerCapture +
+   one `setPosition` per rAF) because the native modal `SC_MOVE` loop recomposites the transparent
+   WebView2 + mpv d3d11 child on every move step and stalls on Win10's older DWM + weak GPUs (window
+   crawls behind a captured cursor). The gate is the `is_windows_10` command (`win32::is_windows_10`,
+   `RtlGetVersion` build < 22000 — the WebView2 UA can't tell Win10 from Win11). Do NOT collapse this
+   back to `startDragging` everywhere; the Win10 lag was the reason for the split.
 8. **Do not set `glsl-shaders` via `set_property`.** Use `change-list glsl-shaders set "<forward-slash-path>"`
    and strip `\\?\` UNC prefixes from the path first. Same class of bug applies to other option-list
    properties.
