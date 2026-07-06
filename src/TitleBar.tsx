@@ -113,9 +113,6 @@ export default function TitleBar({ subtitle, opaque }: Props) {
   // Transient state for the Win10 custom drag. A plain ref (never renders);
   // fully reset on every drag end.
   const dragRef = useRef<DragState>(freshDragState());
-  // Last non-drag click (Win10 path) for synthesizing double-click → maximize,
-  // since the native dblclick event is unreliable through pointer capture.
-  const lastClickRef = useRef<{ t: number; x: number; y: number } | null>(null);
   // Cancel any in-flight rAF if the bar unmounts mid-drag.
   useEffect(() => () => {
     const d = dragRef.current;
@@ -138,20 +135,18 @@ export default function TitleBar({ subtitle, opaque }: Props) {
   const close    = useCallback(() => { getCurrentWindow().close(); }, []);
 
   // Double-click on the drag region toggles maximize, matching standard OS
-  // behaviour. The dblclick fires only on the drag region itself — buttons
-  // intercept the event via stopPropagation in their own handlers.
+  // behaviour. Works on both platforms because the drag is deferred until the
+  // pointer actually moves (see handlePointerDown), so a plain double-click is
+  // never swallowed by the OS move loop and the native dblclick fires normally.
+  // Buttons opt out via [data-no-drag].
   const handleDoubleClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     if ((e.target as HTMLElement).closest("[data-no-drag]")) return;
-    // Win10 synthesizes double-click in handlePointerUp (the native dblclick
-    // event is unreliable through the custom pointer-capture drag); skip here
-    // so the window can't toggle twice.
-    if (isWin10Ref.current) return;
     getCurrentWindow().toggleMaximize();
   }, []);
 
-  // Coalesced window reposition, one per animation frame. Reading the latest
-  // cursor-derived target and issuing a single setPosition means moves can
-  // never queue faster than the compositor presents them.
+  // Coalesced window reposition (Win10 custom drag), one per animation frame.
+  // Issuing a single setPosition to the latest cursor-derived target means
+  // moves can never queue faster than the compositor presents them.
   const flushDragMove = useCallback(() => {
     const d = dragRef.current;
     d.raf = null;
@@ -161,7 +156,7 @@ export default function TitleBar({ subtitle, opaque }: Props) {
       .catch(() => {});
   }, []);
 
-  // Tear the drag fully down: cancel the pending frame, release capture, reset.
+  // Tear the gesture fully down: cancel the pending frame, release capture, reset.
   const endDrag = useCallback(() => {
     const d = dragRef.current;
     if (d.raf != null) { cancelAnimationFrame(d.raf); d.raf = null; }
@@ -171,37 +166,18 @@ export default function TitleBar({ subtitle, opaque }: Props) {
     dragRef.current = freshDragState();
   }, []);
 
-  // Pointer-down starts a drag gesture. On Windows 11 (and any non-Windows /
-  // unknown host, and whenever the window is maximized) we hand off to the OS
-  // caption drag via `startDragging()` — it is smooth there and preserves Aero
-  // Snap / snap-layouts / shake, and the maximized case restores-and-follows
-  // the cursor natively.
-  //
-  // On Windows 10 the native caption drag posts WM_NCLBUTTONDOWN(HTCAPTION),
-  // which enters DefWindowProc's modal SC_MOVE loop: it grabs mouse capture and
-  // recomposites Aura's transparent WebView2 + child (mpv d3d11) swapchain on
-  // every move step. On Win10's older DWM and weaker GPUs the loop can't keep
-  // up, so move messages back up and the window crawls behind the captured
-  // cursor (the reported "mouse locked, drags very slowly"). Instead we own the
-  // gesture: capture the pointer in the webview once real movement begins (so
-  // pointermove keeps flowing and pointerup / lostpointercapture give a
-  // deterministic end — no modal loop), and reposition the window ourselves,
-  // coalesced to one setPosition per frame. Capture is deferred until movement
-  // crosses DRAG_THRESHOLD_PX so a plain click / double-click never captures
-  // (double-click-to-maximize stays intact). Replaces the older
-  // `data-tauri-drag-region` path, which stuck the cursor on simple clicks.
+  // Pointer-down only ARMS a gesture — the actual drag is deferred to the first
+  // real movement (handlePointerMove). This is deliberate: calling
+  // `startDragging()` on pointer-down enters the OS modal SC_MOVE loop
+  // immediately and swallows the second click of a double-click, so
+  // double-click-to-maximize silently stops working. Deferring means a plain
+  // click / double-click never starts a drag and reaches the webview as
+  // ordinary click / dblclick events. (Replaces the old `data-tauri-drag-region`
+  // path, which stuck the cursor on simple clicks.)
   const handlePointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return; // primary button only
     if ((e.target as HTMLElement).closest("[data-no-drag]")) return;
 
-    const win = getCurrentWindow();
-    if (!isWin10Ref.current || maximized) {
-      win.startDragging().catch(() => {});
-      return;
-    }
-
-    // Arm the Win10 custom drag; don't capture or move until the pointer
-    // actually travels (handlePointerMove promotes armed → dragging).
     const prev = dragRef.current;
     if (prev.raf != null) cancelAnimationFrame(prev.raf);
     const gesture: DragState = {
@@ -214,31 +190,50 @@ export default function TitleBar({ subtitle, opaque }: Props) {
       dpr: window.devicePixelRatio || 1,
     };
     dragRef.current = gesture;
-    // Anchor the window's current physical top-left. Until this resolves (a
-    // few ms) pointermove no-ops, so the window never jumps at drag start.
-    // Identity-match `gesture` (not pointerId, which a mouse reuses) so a late
-    // resolve can't land on a subsequent drag.
-    win.outerPosition()
-      .then((p) => {
-        if (dragRef.current === gesture && gesture.phase !== "idle") {
-          gesture.startWinX = p.x;
-          gesture.startWinY = p.y;
-          gesture.ready = true;
-        }
-      })
-      .catch(() => {});
+    // The Win10 custom drag needs the window's current physical top-left.
+    // Prefetch it now (harmless if the gesture turns out to be a click or a
+    // native Win11 drag). Identity-match `gesture` (not pointerId, which a
+    // mouse reuses) so a late resolve can't land on a later gesture.
+    if (isWin10Ref.current && !maximized) {
+      getCurrentWindow().outerPosition()
+        .then((p) => {
+          if (dragRef.current === gesture && gesture.phase !== "idle") {
+            gesture.startWinX = p.x;
+            gesture.startWinY = p.y;
+            gesture.ready = true;
+          }
+        })
+        .catch(() => {});
+    }
   }, [maximized]);
 
+  // First movement past the threshold promotes the armed gesture to a real
+  // drag. Win11 (and any non-Windows / maximized window) hands off to the
+  // native OS caption drag via `startDragging()` — smooth there and it keeps
+  // Aero Snap / snap-layouts / shake, and restores-and-follows a maximized
+  // window. Windows 10 instead runs a custom coalesced drag: the native modal
+  // SC_MOVE loop recomposites Aura's transparent WebView2 + mpv d3d11 child on
+  // every step and stalls on Win10's older DWM + weak GPUs (window crawls behind
+  // a captured cursor), so we capture the pointer and reposition the window
+  // ourselves, one setPosition per frame.
   const handlePointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     const d = dragRef.current;
-    if (d.phase === "idle" || e.pointerId !== d.pointerId) return;
+    if (d.phase !== "armed" && d.phase !== "dragging") return;
+    if (e.pointerId !== d.pointerId) return;
     const dxCss = e.screenX - d.startScreenX;
     const dyCss = e.screenY - d.startScreenY;
     if (d.phase === "armed") {
       if (Math.abs(dxCss) < DRAG_THRESHOLD_PX && Math.abs(dyCss) < DRAG_THRESHOLD_PX) return;
+      if (!isWin10Ref.current || maximized) {
+        // Native OS drag from the current cursor position; the modal loop takes
+        // over from here, so we stop tracking this gesture.
+        getCurrentWindow().startDragging().catch(() => {});
+        dragRef.current = freshDragState();
+        return;
+      }
       d.phase = "dragging";
-      // Capturing now (still over the bar) keeps pointer events flowing even
-      // as the window slides out from under the cursor.
+      // Capture now (still over the bar) so pointer events keep flowing as the
+      // window slides out from under the cursor.
       try { d.el?.setPointerCapture(e.pointerId); } catch { /* capture unavailable */ }
     }
     if (!d.ready) return; // outerPosition() not back yet
@@ -247,40 +242,15 @@ export default function TitleBar({ subtitle, opaque }: Props) {
       y: Math.round(d.startWinY + dyCss * d.dpr),
     };
     if (d.raf == null) d.raf = requestAnimationFrame(flushDragMove);
-  }, [flushDragMove]);
+  }, [flushDragMove, maximized]);
 
-  const handlePointerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
-    const d = dragRef.current;
-    if (e.pointerId !== d.pointerId) return;
-    // A press that never crossed the drag threshold is a click, not a drag.
-    const wasClick = d.phase === "armed";
-    endDrag();
-    // Win10 synthesizes double-click → maximize from two threshold-close clicks
-    // within 400 ms (the native dblclick doesn't fire through the custom drag).
-    // Win11 keeps the native onDoubleClick path (handleDoubleClick).
-    if (!wasClick || !isWin10Ref.current) return;
-    const now = performance.now();
-    const last = lastClickRef.current;
-    if (
-      last &&
-      now - last.t < 400 &&
-      Math.abs(e.screenX - last.x) < DRAG_THRESHOLD_PX &&
-      Math.abs(e.screenY - last.y) < DRAG_THRESHOLD_PX
-    ) {
-      lastClickRef.current = null;
-      getCurrentWindow().toggleMaximize().catch(() => {});
-    } else {
-      lastClickRef.current = { t: now, x: e.screenX, y: e.screenY };
-    }
-  }, [endDrag]);
-
-  const handlePointerCancel = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+  const handlePointerEnd = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     if (e.pointerId !== dragRef.current.pointerId) return;
     endDrag();
   }, [endDrag]);
 
   // Safety net: if the OS revokes capture (focus loss, driver hiccup, Esc),
-  // tear the drag down so a missed pointerup can never wedge the gesture.
+  // tear the custom drag down so a missed pointerup can't wedge the gesture.
   const handleLostCapture = useCallback(() => { endDrag(); }, [endDrag]);
 
   return (
@@ -311,8 +281,8 @@ export default function TitleBar({ subtitle, opaque }: Props) {
       <div
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
-        onPointerCancel={handlePointerCancel}
+        onPointerUp={handlePointerEnd}
+        onPointerCancel={handlePointerEnd}
         onLostPointerCapture={handleLostCapture}
         onDoubleClick={handleDoubleClick}
         className="absolute inset-0 cursor-default"

@@ -275,15 +275,23 @@ These are mistakes with specific, hard-to-diagnose symptoms.
 6. **Do not unmount `<TitleBar>` during windowed playback.** It stays visible (with the `opaque`
    prop) in windowed; only unmount in true OS fullscreen. PlayerOverlay's top action bar must offset
    36 px in windowed mode to avoid overlapping it.
-7. **Do not use `data-tauri-drag-region` for the title bar.** It leaves the cursor stuck on simple
-   clicks. Use explicit `onPointerDown`. The drag path forks by OS (`TitleBar.tsx`): Windows 11 (and
-   any non-Windows / maximized window) uses `getCurrentWindow().startDragging()` (native caption
-   drag, keeps Aero Snap); **Windows 10 uses a custom coalesced pointer-drag** (setPointerCapture +
-   one `setPosition` per rAF) because the native modal `SC_MOVE` loop recomposites the transparent
-   WebView2 + mpv d3d11 child on every move step and stalls on Win10's older DWM + weak GPUs (window
-   crawls behind a captured cursor). The gate is the `is_windows_10` command (`win32::is_windows_10`,
-   `RtlGetVersion` build < 22000 — the WebView2 UA can't tell Win10 from Win11). Do NOT collapse this
-   back to `startDragging` everywhere; the Win10 lag was the reason for the split.
+7. **Do not use `data-tauri-drag-region` for the title bar, and do not start the drag on
+   `pointerdown`.** `data-tauri-drag-region` leaves the cursor stuck on simple clicks. Starting the
+   drag (either `startDragging()` OR the custom capture) on `pointerdown` enters the OS modal
+   `SC_MOVE` loop / captures the pointer immediately and **swallows the second click of a
+   double-click**, silently breaking double-click-to-maximize. So `TitleBar.tsx` only ARMS on
+   `onPointerDown` and **defers the real drag to the first `pointermove` past a 4px threshold** — a
+   plain click / double-click then never starts a drag and reaches the webview as ordinary
+   click / dblclick (native `onDoubleClick` -> `toggleMaximize`, no synthesis needed). Past that
+   threshold the path forks by OS: Windows 11 (and any non-Windows / maximized window) calls
+   `getCurrentWindow().startDragging()` (native caption drag, keeps Aero Snap); **Windows 10 uses a
+   custom coalesced pointer-drag** (`setPointerCapture` + one `setPosition` per rAF) because the
+   native modal loop recomposites the transparent WebView2 + mpv d3d11 child on every move step and
+   stalls on Win10's older DWM + weak GPUs (window crawls behind a captured cursor). The gate is the
+   `is_windows_10` command (`win32::is_windows_10`, `RtlGetVersion` build < 22000 — the WebView2 UA
+   can't tell Win10 from Win11). Do NOT move drag initiation back to `pointerdown` (re-breaks
+   double-click) and do NOT collapse the Win10 custom path back to `startDragging` (re-introduces the
+   Win10 lag).
 8. **Do not set `glsl-shaders` via `set_property`.** Use `change-list glsl-shaders set "<forward-slash-path>"`
    and strip `\\?\` UNC prefixes from the path first. Same class of bug applies to other option-list
    properties.
