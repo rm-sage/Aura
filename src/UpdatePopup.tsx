@@ -142,28 +142,52 @@ export default function UpdatePopup({
           </p>
         </div>
 
-        {/* Notes — the new version at top, then lazily-loaded prior versions. */}
-        <div
-          className="bg-white/[0.03] border border-white/[0.08] rounded-xl
-                     px-5 py-4 max-h-[50vh] overflow-y-auto space-y-5"
-        >
-          {hasNotes ? (
-            <ReleaseNotesBody notes={release.body ?? ""} max={NOTES_MAX} />
-          ) : (
-            <p className="text-white/45 text-[13px] italic">No notes for this release.</p>
-          )}
+        {/* Notes — the new version at top, then lazily-loaded prior versions.
+            Mirrors the Settings changelog (Changelog.tsx): each release is a
+            headed inner card floating on the neutral-glass panel, instead of
+            one flat bordered box with hairline dividers (the old style). The
+            scroll container itself is transparent so the cards read the same
+            in both surfaces. */}
+        <div className="max-h-[50vh] overflow-y-auto space-y-5">
+          {/* The version being offered. */}
+          <section className="space-y-2.5">
+            <div className="flex items-baseline gap-2.5">
+              <h3 className="text-white text-[15px] font-semibold tracking-tight">Aura {release.version}</h3>
+              <span className="px-1.5 py-px rounded text-[9px] font-bold uppercase tracking-wider
+                               bg-ln-accent/20 text-ln-accent border border-ln-accent/30">
+                New
+              </span>
+              {formatReleaseDate(release.date ?? "") && (
+                <span className="text-white/35 text-[11px] font-mono ml-auto">{formatReleaseDate(release.date ?? "")}</span>
+              )}
+            </div>
+            <div className="rounded-xl bg-white/[0.03] border border-white/[0.08] px-5 py-4">
+              {hasNotes
+                ? <ReleaseNotesBody notes={release.body ?? ""} max={NOTES_MAX} />
+                : <p className="text-white/40 text-[13px] italic">No notes for this release.</p>}
+            </div>
+          </section>
 
+          {/* Earlier versions, revealed by the pager below. */}
           {showPrior && prior.map((r) => (
-            <section key={r.tag} className="space-y-2 pt-4 border-t border-white/8">
+            <section key={r.tag} className="space-y-2.5">
               <div className="flex items-baseline gap-2.5">
-                <h3 className="text-white text-[14px] font-semibold tracking-tight">Aura {r.version}</h3>
+                <h3 className="text-white text-[15px] font-semibold tracking-tight">Aura {r.version}</h3>
+                {r.version === currentVersion && (
+                  <span className="px-1.5 py-px rounded text-[9px] font-bold uppercase tracking-wider
+                                   bg-ln-accent/20 text-ln-accent border border-ln-accent/30">
+                    Installed
+                  </span>
+                )}
                 {formatReleaseDate(r.date) && (
-                  <span className="text-white/35 text-[10.5px] font-mono ml-auto">{formatReleaseDate(r.date)}</span>
+                  <span className="text-white/35 text-[11px] font-mono ml-auto">{formatReleaseDate(r.date)}</span>
                 )}
               </div>
-              {r.notes.trim()
-                ? <ReleaseNotesBody notes={r.notes} max={Infinity} />
-                : <p className="text-white/40 text-[12px] italic">No notes for this release.</p>}
+              <div className="rounded-xl bg-white/[0.03] border border-white/[0.08] px-5 py-4">
+                {r.notes.trim()
+                  ? <ReleaseNotesBody notes={r.notes} max={Infinity} />
+                  : <p className="text-white/40 text-[13px] italic">No notes for this release.</p>}
+              </div>
             </section>
           ))}
 
