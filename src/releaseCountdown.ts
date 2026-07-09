@@ -186,9 +186,17 @@ export function isInTheaters(
 export function nextAiringEpisode(
   videos: VideoEntry[] | undefined,
   nowMs: number = Date.now(),
+  opts?: { mainRunOnly?: boolean },
 ): { id: string; targetMs: number } | null {
+  // `mainRunOnly` skips specials (season 0). Callers deciding "when does the
+  // SHOW air next" (CW countdown, Airing page) pass it so a lone upcoming
+  // special can't stand in for a real next episode; the episode-list "next to
+  // air" highlight leaves it off so it still flags whatever airs next in the
+  // full list.
+  const mainRunOnly = opts?.mainRunOnly === true;
   let best: { id: string; targetMs: number } | null = null;
   for (const v of videos ?? []) {
+    if (mainRunOnly && v.season === 0) continue;
     const t = parseMs(v.released);
     if (t == null || t <= nowMs) continue;
     if (best == null || t < best.targetMs) best = { id: v.id, targetMs: t };
@@ -202,7 +210,12 @@ export function nextAiringEpisode(
  *    episode (has content out, not finished).
  *  - latestAiredId / latestAiredEpisode: the highest-released episode with
  *    released <= now.
- *  - airedCount: episodes whose air date is in the past. */
+ *  - airedCount: episodes whose air date is in the past.
+ *
+ *  MAIN-RUN ONLY: specials (season 0) are excluded from every field. A finished
+ *  show with an upcoming special (My Hero Academia after its final season) must
+ *  NOT read as airing just because a season-0 episode is dated in the future;
+ *  specials are a separate track (see findNextEpisode / episodeIsBeforeResume).*/
 export function airingInfo(
   videos: VideoEntry[] | undefined,
   nowMs: number = Date.now(),
@@ -213,6 +226,7 @@ export function airingInfo(
   let latestAiredEpisode: number | null = null;
   let latestAiredMs = -Infinity;
   for (const v of videos ?? []) {
+    if (v.season === 0) continue; // specials never count as the show airing
     const t = parseMs(v.released);
     if (t == null) continue;
     if (t <= nowMs) {

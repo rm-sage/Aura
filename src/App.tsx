@@ -3466,7 +3466,7 @@ export default function App() {
         ? findNextEpisode(detail, currentId, Number.MAX_SAFE_INTEGER,
             loadAuraSettings().nextUpSkipFillerRecap)
         : null;
-      const nextAirMs = detail ? (nextAiringEpisode(detail.videos)?.targetMs ?? null) : null;
+      const nextAirMs = detail ? (nextAiringEpisode(detail.videos, undefined, { mainRunOnly: true })?.targetMs ?? null) : null;
       // Series airing status (surfaced from the addon meta — Cinemeta/TMDB
       // "Ended"/"Returning Series", Kitsu/MAL "finished"/"finished_airing"/
       // "current", etc.). The video-list signals above (laterIgnoringAir /

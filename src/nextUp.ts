@@ -89,6 +89,11 @@ export function findNextEpisode(
   currentEpisodeId: string,
   now: number = Date.now(),
   skipMode: SkipFillerRecapMode = "none",
+  /** When true, the future-air gate is dropped so the FIRST episode after the
+   *  current one in the same track is returned even if it hasn't aired yet. Used
+   *  by the caught-up CW/Airing badge to pre-empt the next episode (e.g. next
+   *  season's premiere) while still respecting the specials ↔ main-run split. */
+  includeUnaired: boolean = false,
 ): VideoEntry | null {
   if (!detail || !Array.isArray(detail.videos) || detail.videos.length === 0) {
     return null;
@@ -104,7 +109,7 @@ export function findNextEpisode(
     const candidateInSpecials = cs === 0;
     // Cross-track jump (specials ↔ main run) — skip.
     if (candidateInSpecials !== currentInSpecials) continue;
-    if (!isEpisodeAired(candidate, now)) continue;
+    if (!includeUnaired && !isEpisodeAired(candidate, now)) continue;
     // User-driven filler / recap skip. When the user has the toggle
     // off (skipMode === "none") the filter is a no-op; when on, we
     // walk forward until a non-skipped candidate appears, falling off

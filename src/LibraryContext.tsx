@@ -310,7 +310,7 @@ export function useEpisodesBehind(
   let airedMain = 0;
   let watchedAired = 0;
   for (const v of videos) {
-    if ((v.season ?? 0) === 0) continue; // specials are off the main-run "behind" axis
+    if (v.season === 0) continue; // specials are off the main-run "behind" axis
     // Count ONLY episodes with a parseable air date in the past, so watchedAired
     // and airedMain cover the SAME set. Using isVideoAired here would over-count:
     // it treats undated episodes as aired, breaking watchedAired <= airedMain.

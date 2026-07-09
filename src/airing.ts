@@ -40,33 +40,42 @@ function rootId(item: LibraryItem): string {
 export function isAiring(item: LibraryItem, detail?: MetaDetail | null): boolean {
   if (!isAiringSeriesLike(item)) return false;
   if (detail?.videos && airingInfo(detail.videos).isAiring) return true;
-  // Cloud "returning" signal — only when its next episode is genuinely in the
-  // FUTURE, so a stale / already-past next_aired can't keep an ended show airing.
-  const iso = getReleaseSignal(rootId(item))?.next_aired?.aired_at;
-  return iso != null && Date.parse(iso) > Date.now();
+  // Cloud "returning" signal, gated two ways: the next episode must be genuinely
+  // in the FUTURE (a stale/past next_aired can't keep an ended show airing) AND
+  // must be MAIN-RUN (season != 0). An upcoming SPECIAL doesn't make a finished
+  // show airing (My Hero Academia after its final season). airingInfo above is
+  // already main-run-only, so the meta path agrees.
+  const sig = getReleaseSignal(rootId(item))?.next_aired;
+  return sig != null && sig.season !== 0 && sig.aired_at != null && Date.parse(sig.aired_at) > Date.now();
 }
 
-/** Ms of the next upcoming episode (meta first, then cloud next_aired). */
+/** Ms of the next upcoming MAIN-RUN episode (meta first, then cloud next_aired).
+ *  Specials (season 0) are excluded so the Airing sort/countdown targets a real
+ *  next episode, not a lone upcoming special. */
 export function airingNextMs(item: LibraryItem, detail?: MetaDetail | null): number | null {
-  const metaMs = detail?.videos ? nextAiringEpisode(detail.videos)?.targetMs ?? null : null;
+  const metaMs = detail?.videos
+    ? nextAiringEpisode(detail.videos, undefined, { mainRunOnly: true })?.targetMs ?? null
+    : null;
   if (metaMs != null) return metaMs;
-  const iso = getReleaseSignal(rootId(item))?.next_aired?.aired_at;
-  const cloud = iso ? Date.parse(iso) : NaN;
+  const sig = getReleaseSignal(rootId(item))?.next_aired;
+  const cloud = sig && sig.season !== 0 && sig.aired_at ? Date.parse(sig.aired_at) : NaN;
   // "Next" is future by definition — never surface a stale/past cloud date.
   return Number.isFinite(cloud) && cloud > Date.now() ? cloud : null;
 }
 
-/** Ms of the most recently AIRED episode (meta first, then cloud last_aired). */
+/** Ms of the most recently AIRED MAIN-RUN episode (meta first, then cloud
+ *  last_aired). Specials (season 0) excluded to match the airing axis. */
 export function airingLastAiredMs(item: LibraryItem, detail?: MetaDetail | null): number | null {
   const now = Date.now();
   let best = -Infinity;
   for (const v of detail?.videos ?? []) {
+    if (v.season === 0) continue;
     const t = v.released ? Date.parse(v.released) : NaN;
     if (Number.isFinite(t) && t <= now && t > best) best = t;
   }
   if (best > -Infinity) return best;
-  const iso = getReleaseSignal(rootId(item))?.last_aired?.aired_at;
-  const cloud = iso ? Date.parse(iso) : NaN;
+  const sig = getReleaseSignal(rootId(item))?.last_aired;
+  const cloud = sig && sig.season !== 0 && sig.aired_at ? Date.parse(sig.aired_at) : NaN;
   return Number.isFinite(cloud) ? cloud : null;
 }
 
@@ -99,7 +108,7 @@ export function episodesBehind(
   let airedMain = 0;
   let watchedAired = 0;
   for (const v of videos) {
-    if ((v.season ?? 0) === 0) continue;
+    if (v.season === 0) continue;
     const t = v.released ? Date.parse(v.released) : NaN;
     if (!Number.isFinite(t) || t > now) continue;
     airedMain += 1;

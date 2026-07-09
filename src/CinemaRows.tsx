@@ -682,9 +682,13 @@ function CWReleaseCountdown({ seriesId, episodes }: { seriesId: string; episodes
   // is far out. SOURCE PRIORITY unchanged: authoritative meta videos first, the
   // cloud release signal only as a fallback (it can point at a later episode).
   const probe = Date.now();
-  const metaNextMs = episodes ? (nextAiringEpisode(episodes, probe)?.targetMs ?? null) : null;
-  const cloudIso = getReleaseSignal(seriesId)?.next_aired?.aired_at;
-  const cloudMs = cloudIso ? Date.parse(cloudIso) : NaN;
+  const metaNextMs = episodes ? (nextAiringEpisode(episodes, probe, { mainRunOnly: true })?.targetMs ?? null) : null;
+  // Cloud fallback ignores specials (season 0): a finished show with only an
+  // upcoming special must not show a "next episode" countdown.
+  const cloudNext = getReleaseSignal(seriesId)?.next_aired;
+  const cloudMs = cloudNext && cloudNext.season !== 0 && cloudNext.aired_at
+    ? Date.parse(cloudNext.aired_at)
+    : NaN;
   const targetMs = metaNextMs ?? cloudMs;
   const now = useCountdownNow(Number.isFinite(targetMs) ? targetMs : undefined);
   if (!Number.isFinite(targetMs) || targetMs <= now) return null;
@@ -783,17 +787,21 @@ export const ContinueWatchingCard = memo(function ContinueWatchingCard(
     if (nextAired) return nextAired.id;
     // Nothing aired left: the show is fully caught up and only has a FUTURE
     // episode coming (the one the countdown pill targets). Pre-empt it (e.g.
-    // S03E01) instead of falling back to the just-finished episode, which read
-    // as "next up S02E04" on a show the user had actually completed. Source
-    // priority mirrors CWReleaseCountdown: authoritative meta videos first,
-    // cloud next_aired as the fallback. When neither knows the upcoming
-    // episode, return null so the badge stays BLANK rather than mislabel the
-    // finished one.
-    const metaUpcoming = nextAiringEpisode(cwDetail.videos, nowMs)?.id;
+    // next season's premiere) instead of falling back to the just-finished
+    // episode, which read as "next up S02E04" on a show the user had actually
+    // completed. Anchor to `base` and walk to the next MAIN-RUN episode with the
+    // air gate off: that skips specials via the cross-track rule, so an upcoming
+    // SPECIAL (My Hero Academia S00E24 after a finished main run) never becomes
+    // the badge. Cloud next_aired is the fallback, likewise gated to non-special.
+    // When neither knows the upcoming episode, return null so the badge stays
+    // BLANK rather than mislabel the finished one.
+    const metaUpcoming = findNextEpisode(cwDetail, base, nowMs, "none", true)?.id;
     if (metaUpcoming) return metaUpcoming;
     const sigNext = getReleaseSignal(item.id)?.next_aired;
     const sigMs = sigNext?.aired_at ? Date.parse(sigNext.aired_at) : NaN;
-    if (sigNext && Number.isFinite(sigMs) && sigMs > nowMs) return sigNext.id ?? null;
+    if (sigNext && sigNext.season !== 0 && Number.isFinite(sigMs) && sigMs > nowMs) {
+      return sigNext.id ?? null;
+    }
     return null;
     // signalsVersion in deps so the badge fills in the instant cloud signals land.
   }, [effectiveVideoId, cwDetail, savedVideoId, progress, item.id, signalsVersion]);
