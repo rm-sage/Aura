@@ -3450,7 +3450,7 @@ function SettingsToc({ scrollRoot, search }: SettingsTocProps) {
   }, [scrollRoot]);
 
   return (
-    <nav className="flex flex-col max-h-[calc(100vh-3rem)] text-[13px] leading-snug select-none">
+    <nav className="flex flex-col max-h-[calc(100vh-6rem)] text-[13px] leading-snug select-none">
       {/* The contents list scrolls within the viewport-capped nav so a long TOC
           (or a high display scale) can't push the pinned search footer below
           the screen edge. */}
@@ -4558,14 +4558,16 @@ export default function SettingsView({ addons, session }: Props) {
               The search input now lives at the BOTTOM of this sidebar
               (instead of in a sticky page header) so the content
               column doesn't lose vertical real estate to a fixed bar.
-              `max-h: 100vh - 3rem` (24 px top sticky-offset + 24 px
-              bottom buffer) + `overflow-y-auto` bounds the aside to
-              the viewport so laptop / short-screen aspect ratios show
-              the full TOC with internal scrolling instead of forcing
-              the user to scroll the page itself to see lower entries. */}
+              `max-h: 100vh - 6rem` bounds the aside to the viewport:
+              36 px native title-bar inset (the sticky sits BELOW it) +
+              24 px top sticky-offset + ~36 px bottom buffer. The earlier
+              3 rem ignored the title bar, so on 1080p the aside spilled
+              ~48 px past the bottom edge and clipped the pinned search
+              footer. The nav's own internal scroll (below) still absorbs
+              any TOC growth, so this only has to clear the chrome. */}
           <aside
             className="sticky top-6 self-start overflow-y-auto"
-            style={{ maxHeight: "calc(100vh - 3rem)" }}
+            style={{ maxHeight: "calc(100vh - 6rem)" }}
           >
             <SettingsToc
               scrollRoot={scrollEl}
