@@ -4,6 +4,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
+import { bumpImageEpoch } from "./imageCacheBust";
 
 // ---------------------------------------------------------------------------
 // StorageReport — Settings → Storage panel.
@@ -160,8 +161,8 @@ function clearLocalStoragePrefix(prefix: string): void {
 }
 
 interface PendingClear {
-  kind: "disk" | "local";
-  /** disk: storage entry id. local: localStorage prefix. */
+  kind: "disk" | "local" | "images";
+  /** disk: storage entry id. local: localStorage prefix. images: unused. */
   target: string;
   label: string;
   destructive: boolean;
@@ -192,6 +193,13 @@ export default function StorageReport() {
 
   const performClear = useCallback(async (pending: PendingClear) => {
     setPendingClear(null);
+    if (pending.kind === "images") {
+      // Bump the image epoch → every ImageLoader refetches its src with a fresh
+      // cache key, pulling posters/backdrops/logos from source at the current
+      // size. Nothing on disk is deleted; the webview evicts the old entries.
+      bumpImageEpoch();
+      return;
+    }
     if (pending.kind === "disk") {
       setBusy(true);
       try {
@@ -307,6 +315,34 @@ export default function StorageReport() {
         </div>
       </div>
 
+      {/* ── Cached images (webview HTTP cache) ── */}
+      <div className="space-y-2">
+        <p className="text-white/85 text-sm font-semibold tracking-wide">Cached images</p>
+        <div className="divide-y divide-white/8 rounded-md border border-white/10 overflow-hidden">
+          <div className="flex items-start gap-3 px-3 py-2.5">
+            <div className="flex-1 min-w-0">
+              <p className="text-white/90 text-[13px] font-medium leading-tight">Cached posters &amp; images</p>
+              <p className="text-white/40 text-[11px] mt-0.5 leading-snug">
+                Posters, backdrops, and logos are cached on disk by the webview, keyed by URL — so if an
+                image's source or size changed on the server, the old one keeps showing for the same URL.
+                Reloading re-downloads every image from source at the current size. Uses bandwidth; nothing
+                is deleted.
+              </p>
+            </div>
+            <div className="flex flex-col items-end gap-1.5 flex-shrink-0">
+              <button
+                type="button"
+                onClick={() => setPendingClear({ kind: "images", target: "", label: "cached posters & images", destructive: false })}
+                className="text-[10px] px-2 py-1 rounded-md transition-colors
+                           text-white/60 hover:text-white hover:bg-white/8 border border-white/10"
+              >
+                Reload
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
       {pendingClear && (
         <ClearConfirmModal
           pending={pendingClear}
@@ -364,6 +400,7 @@ function ClearConfirmModal({
     return () => window.removeEventListener("keydown", onKey);
   }, [onCancel]);
 
+  const isImages = pending.kind === "images";
   const accent = pending.destructive
     ? { ring: "ring-rose-400/40", btn: "border-rose-300/60 bg-rose-500/30 text-rose-50 hover:bg-rose-500/45", icon: "text-rose-300" }
     : { ring: "ring-amber-400/40", btn: "border-amber-300/60 bg-amber-500/30 text-amber-50 hover:bg-amber-500/45", icon: "text-amber-300" };
@@ -386,12 +423,14 @@ function ClearConfirmModal({
           </span>
           <div className="flex-1 min-w-0 space-y-1.5">
             <h3 className="text-white font-semibold text-[15px] leading-tight">
-              {pending.destructive ? "Wipe user data?" : "Clear cache?"}
+              {pending.destructive ? "Wipe user data?" : isImages ? "Reload posters?" : "Clear cache?"}
             </h3>
             <p className="text-white/70 text-[13px] leading-relaxed">
               {pending.destructive
                 ? `This will permanently erase your ${pending.label.toLowerCase()}. The data is local-only and not recoverable from cloud sync.`
-                : `Clear ${pending.label.toLowerCase()}? Aura will rebuild it on next use; this only frees storage.`
+                : isImages
+                  ? "Aura will re-download every poster, backdrop, and logo from source at the current size. Uses bandwidth; nothing is deleted. Use this after a poster source or size change."
+                  : `Clear ${pending.label.toLowerCase()}? Aura will rebuild it on next use; this only frees storage.`
               }
             </p>
           </div>
@@ -411,7 +450,7 @@ function ClearConfirmModal({
             autoFocus
             className={`px-4 py-1.5 rounded-lg border text-[12px] font-medium transition-colors ${accent.btn}`}
           >
-            {pending.destructive ? "Yes, wipe" : "Clear"}
+            {pending.destructive ? "Yes, wipe" : isImages ? "Reload" : "Clear"}
           </button>
         </div>
       </div>

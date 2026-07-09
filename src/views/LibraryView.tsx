@@ -6,6 +6,7 @@ import { createPortal } from "react-dom";
 import type { LibraryItem, MetaPreview } from "../types";
 import type { UserSession } from "../LoginView";
 import ImageLoader from "../ImageLoader";
+import { shrinkPoster } from "../posterSize";
 import ErrorBoundary from "../ErrorBoundary";
 import Tooltip from "../Tooltip";
 import { isAnimeMeta, typeLabel } from "../aiometadata";
@@ -982,7 +983,13 @@ const LibraryCard = memo(function LibraryCard({
         >
           {item.poster ? (
             <ImageLoader
-              src={item.poster}
+              // Downsize oversized masters (TMDB original / metahub large) to
+              // card width: a 2000x3000 poster decoded into a ~180px tile is
+              // brutal for the compositor to re-raster on every scroll frame.
+              // 360 = 2x a 180px card for hi-DPI crispness. `perfLabel` logs any
+              // still-oversized poster to the DevConsole (filter `[lib-poster]`).
+              src={shrinkPoster(item.poster, 360)}
+              perfLabel={item.name ?? item.id}
               alt={item.name ?? ""}
               // Eager: the row-windowing already mounts only near-viewport
               // rows (+overscan), so ImageLoader's per-card

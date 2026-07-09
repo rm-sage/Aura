@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useRef, useState } from "react";
+import { useImageEpoch, withImageBust } from "./imageCacheBust";
 
 // ---------------------------------------------------------------------------
 // ImageLoader — global graceful fade-in for every poster / backdrop / logo.
@@ -36,6 +37,11 @@ export interface ImageLoaderProps {
   onLoad?: (img: HTMLImageElement) => void;
   /** Optional fallback content rendered when the image errors out. */
   fallback?: React.ReactNode;
+  /** Diagnostic: when set, warn to the DevConsole if the DECODED image is
+   *  pathologically large for a small tile (>1.5 MP). Surfaces a single
+   *  oversized poster that tanks scroll (compositor re-rasters the big texture
+   *  every frame). Label is the item name so the culprit is identifiable. */
+  perfLabel?: string;
 }
 
 /** Map an `api.ratingposterdb.com/.../imdb/poster-default/<tt…>.jpg` URL to
@@ -63,6 +69,7 @@ export default function ImageLoader({
   skeletonClassName,
   onLoad,
   fallback,
+  perfLabel,
 }: ImageLoaderProps) {
   const [loaded, setLoaded] = useState(false);
   const [errored, setErrored] = useState(false);
@@ -86,6 +93,9 @@ export default function ImageLoader({
   const [inView, setInView] = useState(loading === "eager");
   const wrapperRef = useRef<HTMLSpanElement>(null);
   const ref = useRef<HTMLImageElement>(null);
+  // Cache-bust epoch — appended to the loaded URL so "Reload cached posters"
+  // (Settings > Storage) forces a fresh fetch of every image. No-op at epoch 0.
+  const imgEpoch = useImageEpoch();
 
   // Reset state whenever the src changes so the new image fades in cleanly.
   useEffect(() => {
@@ -163,7 +173,7 @@ export default function ImageLoader({
       {src && !errored && inView && (
         <img
           ref={ref}
-          src={fallbackSrc ?? src}
+          src={withImageBust(fallbackSrc ?? src, imgEpoch)}
           alt={alt}
           draggable={draggable}
           decoding={decoding}
@@ -184,6 +194,14 @@ export default function ImageLoader({
             // builds), the catch path falls back to setLoaded(true)
             // immediately so rendering still happens.
             const finishLoad = () => {
+              // Diagnostic: flag a decoded poster that's far larger than a small
+              // tile needs (>1.5 MP, e.g. a 2000x3000 master). One such texture
+              // re-rastered every scroll frame is the "one row tanks" symptom.
+              if (perfLabel && img.naturalWidth * img.naturalHeight > 1_500_000) {
+                console.warn(
+                  `[lib-poster] oversized "${perfLabel}" ${img.naturalWidth}x${img.naturalHeight} src=${img.currentSrc}`,
+                );
+              }
               setLoaded(true);
               if (ref.current) onLoad?.(ref.current);
             };
