@@ -35,6 +35,10 @@ export interface FilterState {
   /** Selected genre names — match is OR (any selected must intersect item.genres). */
   genres: string[];
   sort: SortMode;
+  /** Currently-airing-only narrow. Meta/signal-aware, so applyFilters (which
+   *  only sees MetaPreview) can't evaluate it — the consuming view applies the
+   *  shared `isAiring` predicate to its library items when this is set. */
+  airingOnly?: boolean;
 }
 
 const YEAR_MIN_DEFAULT = 1900;
@@ -45,6 +49,7 @@ export const DEFAULT_FILTERS: FilterState = {
   yearMax: YEAR_MAX_DEFAULT,
   genres:  [],
   sort:    "default",
+  airingOnly: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -277,6 +282,29 @@ function FilterControls({ state, model }: { state: FilterState; model: FilterMod
           </div>
         </div>
       )}
+
+      {/* Airing-only toggle — meta/signal-aware, applied by the consuming view
+          (Library / Queue), not by applyFilters. */}
+      <div className="space-y-1.5">
+        <label className="text-white/40 text-[10px] font-semibold tracking-wider uppercase">
+          Airing
+        </label>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={state.airingOnly ?? false}
+          onClick={() => set({ airingOnly: !(state.airingOnly ?? false) })}
+          className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-[11px] transition-colors
+                      ${state.airingOnly
+                        ? "bg-ln-accent/25 text-ln-accent border border-ln-accent/40"
+                        : "bg-white/5 text-white/55 border border-white/10 hover:bg-white/10"}`}
+        >
+          <span>Currently airing only</span>
+          <span className={`relative w-8 h-4 rounded-full transition-colors ${state.airingOnly ? "bg-ln-accent/60" : "bg-white/15"}`}>
+            <span className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all ${state.airingOnly ? "left-4" : "left-0.5"}`} />
+          </span>
+        </button>
+      </div>
 
       {/* Sort */}
       <div className="space-y-1.5">

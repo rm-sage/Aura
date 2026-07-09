@@ -34,6 +34,8 @@ import WatchedBadge from "../WatchedBadge";
 import { showAppToast } from "../AppToast";
 import { typeLabel } from "../aiometadata";
 import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "../FilterBar";
+import { isAiring } from "../airing";
+import { useReleaseSignalsVersion } from "../releaseSignalStore";
 import ListSearchInput, { looseMatch } from "../ListSearchInput";
 import { PAGE_CONTENT_MAX_W } from "../pageLayout";
 import { closeHoverNow } from "../catalogHoverStore";
@@ -114,6 +116,9 @@ function QueueViewBody({ library, onSelectMeta }: Props) {
     return map;
   }, [library]);
 
+  // Re-derive the airing narrow when cloud release signals land.
+  const signalsVersion = useReleaseSignalsVersion();
+
   // Build the MetaPreview projection used by the FilterBar — same
   // shape every browseable view uses so the filter behaves identically
   // (year / rating / genre gates).
@@ -152,12 +157,21 @@ function QueueViewBody({ library, onSelectMeta }: Props) {
     [queuedAsMeta, filters],
   );
   const filteredOrderedIds = useMemo(() => {
+    void signalsVersion; // re-derive the airing narrow when signals land
+    let ids: string[];
     if (filters.sort !== "default") {
-      return filterApplied.map((m) => m.id);
+      ids = filterApplied.map((m) => m.id);
+    } else {
+      const visible = new Set(filterApplied.map((m) => m.id));
+      ids = orderedIds.filter((id) => visible.has(id));
     }
-    const visible = new Set(filterApplied.map((m) => m.id));
-    return orderedIds.filter((id) => visible.has(id));
-  }, [orderedIds, filterApplied, filters.sort]);
+    // Airing-only narrow (cheap: cloud next_aired via the shared predicate).
+    if (filters.airingOnly) {
+      ids = ids.filter((id) => { const it = libIndex.get(id); return it ? isAiring(it) : false; });
+    }
+    return ids;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orderedIds, filterApplied, filters.sort, filters.airingOnly, libIndex, signalsVersion]);
 
   // Lenient name filter on top of the filter/sort pass (see looseMatch).
   const searchedOrderedIds = useMemo(() => {

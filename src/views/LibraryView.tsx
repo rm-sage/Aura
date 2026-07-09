@@ -21,6 +21,7 @@ import ListSearchInput, { looseMatch } from "../ListSearchInput";
 import { PAGE_CONTENT_MAX_W } from "../pageLayout";
 import { getManualWatchedState, useManualWatchedVersion } from "../manualWatched";
 import { getReleaseSignal, useReleaseSignalsVersion } from "../releaseSignalStore";
+import { isAiring } from "../airing";
 import { episodeIsBeforeResume } from "../LibraryContext";
 import { loadAuraSettings, saveAuraSettings } from "../auraSettings";
 
@@ -101,14 +102,15 @@ function libraryItemStatus(item: LibraryItem): ExclusiveStatus {
 function itemMatchesTypeFilter(item: LibraryItem, filter: Filter): boolean {
   if (filter === "all") return true;
   const mt = (item.media_type ?? "").toLowerCase();
-  if (filter === "movie")  return mt === "movie";
-  if (filter === "series") return mt === "series";
-  // anime
+  if (filter === "movie") return mt === "movie";
   const stateGenres = (item.state ?? {}).genres;
   const genres = Array.isArray(stateGenres)
     ? stateGenres.filter((g): g is string => typeof g === "string")
     : [];
-  return isAnimeMeta({ media_type: item.media_type, id: item.id, genres });
+  const isAnime = isAnimeMeta({ media_type: item.media_type, id: item.id, genres });
+  // "Series" is LIVE-ACTION only — anime has its own pill.
+  if (filter === "series") return mt === "series" && !isAnime;
+  return isAnime; // anime
 }
 
 /** True when a series in the library has an AIRED, unwatched episode past the
@@ -478,15 +480,15 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem, onAutoR
       if (i.temp) continue;
       all.push(i);
       const mt = (i.media_type ?? "").toLowerCase();
-      if (mt === "movie")  movie.push(i);
-      if (mt === "series") series.push(i);
       const stateGenres = (i.state ?? {}).genres;
       const genres = Array.isArray(stateGenres)
         ? stateGenres.filter((g): g is string => typeof g === "string")
         : [];
-      if (isAnimeMeta({ media_type: i.media_type, id: i.id, genres })) {
-        anime.push(i);
-      }
+      const isAnime = isAnimeMeta({ media_type: i.media_type, id: i.id, genres });
+      if (mt === "movie") movie.push(i);
+      // "Series" bucket is LIVE-ACTION only — anime gets its own bucket + pill.
+      if (mt === "series" && !isAnime) series.push(i);
+      if (isAnime) anime.push(i);
     }
     return {
       buckets: { all, movie, series, anime } as Record<Filter, LibraryItem[]>,
@@ -502,20 +504,28 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem, onAutoR
   // `signalsVersion` are in the deps so the set re-derives when a mark flips or
   // a release signal lands.
   const filtered = useMemo(() => {
-    if (status === "all") return buckets[filter];
-    const out: LibraryItem[] = [];
-    for (const i of items) {
-      if (!i || i.removed) continue;
-      if (!itemMatchesTypeFilter(i, filter)) continue;
-      if (status === "new-episodes") {
-        if (hasNewUnwatchedEpisode(i)) out.push(i);
-      } else if (libraryItemStatus(i) === status) {
-        out.push(i);
+    let base: LibraryItem[];
+    if (status === "all") {
+      base = buckets[filter];
+    } else {
+      base = [];
+      for (const i of items) {
+        if (!i || i.removed) continue;
+        if (!itemMatchesTypeFilter(i, filter)) continue;
+        if (status === "new-episodes") {
+          if (hasNewUnwatchedEpisode(i)) base.push(i);
+        } else if (libraryItemStatus(i) === status) {
+          base.push(i);
+        }
       }
     }
-    return out;
+    // Airing-only narrow. Cheap path (cloud next_aired via the shared predicate,
+    // no per-item meta fetch on a filter toggle); naturally empty for guests /
+    // opted-out. The dedicated Airing page is the exhaustive surface.
+    if (extraFilters.airingOnly) base = base.filter((i) => isAiring(i));
+    return base;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status, filter, buckets, items, manualVersion, signalsVersion]);
+  }, [status, filter, buckets, items, manualVersion, signalsVersion, extraFilters.airingOnly]);
 
   // Project library items into MetaPreview shape so the panel's genre /
   // year filter can run uniformly across every browseable surface. The
