@@ -5025,6 +5025,11 @@ export default function App() {
   // re-render).
   useEffect(() => {
     if (!activeTarget) return;
+    // Live-TV channels and trailers carry no episode metadata or AniList ids —
+    // never enrich them (mirrors useScrobble's carve-out; without this the
+    // effect would fan out a futile getMetaDetailFallback to every meta addon
+    // on each channel change / trailer start).
+    if (isLivePlayback || isTrailerPlayback) return;
     const s = activeTarget.season;
     const e = activeTarget.episode_num;
     // Absolute episode: only needed for season > 1 (S1 cour-relative ==
@@ -5032,9 +5037,12 @@ export default function App() {
     const needAbsolute =
       activeTarget.absolute_episode_num == null && s != null && s > 1 && e != null;
     // Embedded AniList id/episode (AIOMetadata): stamp for ANY anime episode
-    // (incl. season 1 / single-cour), once. Absent for non-AIOMetadata sources,
-    // in which case the resolver falls back to the Fribb id-map / title search.
-    const needAnilist = activeTarget.anilist_id == null;
+    // (incl. season 1 / single-cour), once. Gated on an episode number so movies
+    // and non-episodic targets — which can never carry a per-video anilist_id —
+    // don't trigger a fetch here (they previously did none). Absent for
+    // non-AIOMetadata sources, where the resolver falls back to the Fribb id-map
+    // / SEQUEL-walk / title search.
+    const needAnilist = activeTarget.anilist_id == null && e != null;
     if (!needAbsolute && !needAnilist) return;
     const targetId = activeTarget.id;
     const mediaType = activeTarget.media_type;
