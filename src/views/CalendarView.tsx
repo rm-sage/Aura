@@ -10,6 +10,7 @@ import ImageLoader from "../ImageLoader";
 import { formatEpLabel } from "../episodeLabel";
 import { useHoverCardActivation } from "../useHoverCardActivation";
 import { closeHoverNow } from "../catalogHoverStore";
+import { getReleaseSignal } from "../releaseSignalStore";
 
 // ---------------------------------------------------------------------------
 // CalendarView — full-viewport month grid + day-click overlay
@@ -172,9 +173,19 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
     return addons[0] ?? null;
   }, [addons]);
 
-  // Fetch detail for every library item via the shared metaCache —
-  // hits from prior sessions / other views land instantly, misses
-  // fan out concurrently with concurrency 4.
+  // Fetch detail for every library item via the shared metaCache. Two things
+  // keep this responsive even on a cold-ish cache (episodic meta has a 4 h TTL,
+  // so the calendar re-fetches series meta a few times a day):
+  //
+  //   • PROGRESSIVE render — results flush to state in throttled batches as
+  //     they resolve, so cached items (which return instantly) paint right away
+  //     instead of being held hostage by the slowest network miss. The grid
+  //     fills in rather than staying blank for the whole 100+-item load.
+  //   • PRIORITISED order — items the release-signal store flags as airing /
+  //     recently aired (episodes near "now", i.e. the visible window) are
+  //     fetched FIRST, so the current month populates before older / ended
+  //     shows and movies stream in behind it. Falls back to library order when
+  //     no signal is present (release-search off, guest, or not yet reconciled).
   useEffect(() => {
     if (!metaAddon || library.length === 0) {
       setDetails(new Map());
@@ -183,29 +194,64 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
     let cancelled = false;
     setLoading(true);
 
+    // Fetch order: airing-soon / recently-aired first, then everything else in
+    // stable library order. Cheap — release signals are already in memory.
+    const NEAR_MS = 60 * DAYS_MS;
+    const now = Date.now();
+    const priority = (item: LibraryItem): number => {
+      const sig = getReleaseSignal(item.id);
+      if (!sig) return 0;
+      const next = sig.next_aired?.aired_at ? Date.parse(sig.next_aired.aired_at) : NaN;
+      const last = sig.last_aired?.aired_at ? Date.parse(sig.last_aired.aired_at) : NaN;
+      let score = 0;
+      if (Number.isFinite(next) && Math.abs(next - now) <= NEAR_MS) score += 2;
+      if (Number.isFinite(last) && now - last <= NEAR_MS) score += 1;
+      return score;
+    };
+    const order = library
+      .map((item, i) => ({ item, i, p: priority(item) }))
+      .sort((a, b) => (b.p - a.p) || (a.i - b.i))
+      .map((e) => e.item);
+
+    // Throttled flush so cached-item bursts and slow misses both paint
+    // progressively without one setState per item (~150 re-renders).
+    const acc = new Map<string, MetaDetail | null>();
+    let flushTimer: number | null = null;
+    const scheduleFlush = () => {
+      if (flushTimer != null) return;
+      flushTimer = window.setTimeout(() => {
+        flushTimer = null;
+        if (!cancelled) setDetails(new Map(acc));
+      }, 200);
+    };
+
     (async () => {
-      const next = new Map<string, MetaDetail | null>();
-      const concurrency = 4;
+      const concurrency = 8;
       let cursor = 0;
       const worker = async () => {
         while (!cancelled) {
           const i = cursor++;
-          if (i >= library.length) return;
-          const item = library[i];
+          if (i >= order.length) return;
+          const item = order[i];
           // getMetaDetail handles cache + dedupe + null-on-error.
           const d = await getMetaDetail(metaAddon, item.media_type, item.id)
             .catch(() => null);
-          next.set(item.id, d);
+          acc.set(item.id, d);
+          scheduleFlush();
         }
       };
       await Promise.all(Array.from({ length: concurrency }, worker));
       if (!cancelled) {
-        setDetails(next);
+        if (flushTimer != null) { window.clearTimeout(flushTimer); flushTimer = null; }
+        setDetails(new Map(acc));
         setLoading(false);
       }
     })();
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      if (flushTimer != null) window.clearTimeout(flushTimer);
+    };
   }, [library, metaAddon]);
 
   // Build a date-keyed bucket of entries across the entire library.
