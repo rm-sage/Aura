@@ -94,14 +94,19 @@ export function episodesBehind(
   if (!videos || videos.length === 0) return null;
   const info = airingInfo(videos, now);
   if (!info.isAiring) return null;
+  // Main-run only: specials (season 0) are off the "behind" axis, matching
+  // useEpisodesBehind (the per-tile badge) so the sort and the badge agree.
+  let airedMain = 0;
   let watchedAired = 0;
   for (const v of videos) {
+    if ((v.season ?? 0) === 0) continue;
     const t = v.released ? Date.parse(v.released) : NaN;
     if (!Number.isFinite(t) || t > now) continue;
+    airedMain += 1;
     if (getManualWatchedState(v.id) === "watched") { watchedAired += 1; continue; }
     if (resumeId && v.id !== resumeId && episodeIsBeforeResume(v.id, resumeId)) watchedAired += 1;
   }
-  const behind = Math.max(0, info.airedCount - watchedAired);
+  const behind = Math.max(0, airedMain - watchedAired);
   if (watchedAired === 0 && !resumeId) return null;
   return behind > 0 ? behind : null;
 }

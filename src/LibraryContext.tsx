@@ -301,19 +301,27 @@ export function useEpisodesBehind(
   const now = Date.now();
   const info = airingInfo(videos, now);
   if (!info.isAiring) return null;
+  // "Behind" counts MAIN-RUN aired episodes only. Specials (season 0) air on
+  // their own independent track (see episodeIsBeforeResume / findNextEpisode);
+  // finishing the main run must not read as "1 behind" just because an unwatched
+  // special exists (observed on Dark Matter). So count the aired total here over
+  // the SAME main-run set as watchedAired, instead of airingInfo.airedCount
+  // (which includes specials).
+  let airedMain = 0;
   let watchedAired = 0;
   for (const v of videos) {
-    // Count ONLY episodes airingInfo counts as aired (a parseable air date in
-    // the past), so watchedAired and airedCount cover the SAME set. Using
-    // isVideoAired here would over-count: it treats undated episodes as aired,
-    // but airingInfo's airedCount skips them — breaking watchedAired <= aired.
+    if ((v.season ?? 0) === 0) continue; // specials are off the main-run "behind" axis
+    // Count ONLY episodes with a parseable air date in the past, so watchedAired
+    // and airedMain cover the SAME set. Using isVideoAired here would over-count:
+    // it treats undated episodes as aired, breaking watchedAired <= airedMain.
     const t = v.released ? Date.parse(v.released) : NaN;
     if (!Number.isFinite(t) || t > now) continue;
+    airedMain += 1;
     const manual = getManualWatchedState(v.id);
     if (manual === "watched") { watchedAired += 1; continue; }
     if (resumeId && v.id !== resumeId && episodeIsBeforeResume(v.id, resumeId)) watchedAired += 1;
   }
-  const behind = Math.max(0, info.airedCount - watchedAired);
+  const behind = Math.max(0, airedMain - watchedAired);
   // "Behind" only means something when the user is actually WATCHING this
   // series under THIS id — a resume position or at least one watched-aired
   // episode. With zero progress here every aired episode reads as unwatched,

@@ -752,6 +752,9 @@ export const ContinueWatchingCard = memo(function ContinueWatchingCard(
       savedVideoId.length === 0 ||
       getManualWatchedState(savedVideoId) !== "watched");
   const { seasonEpisodes, detail: cwDetail } = useSeasonEpisodes(item, addons);
+  // Subscribe to release-signal changes so the badge's cloud next_aired
+  // fallback (below) re-derives the moment signals land for this series.
+  const signalsVersion = useReleaseSignalsVersion();
   // Effective resume episode — falls forward across manually-watched
   // entries so a freshly-marked episode causes the SxxEyy badge AND
   // the segmented bar's "current" amber to advance to the next
@@ -773,8 +776,27 @@ export const ContinueWatchingCard = memo(function ContinueWatchingCard(
       getManualWatchedState(base) === "watched" ||
       (base === savedVideoId && progress >= 0.95);
     if (!finished) return base;
-    return findNextEpisode(cwDetail, base, Date.now(), "none")?.id ?? base;
-  }, [effectiveVideoId, cwDetail, savedVideoId, progress]);
+    const nowMs = Date.now();
+    // Caught up on `base`: roll to the next UNWATCHED AIRED episode when one
+    // exists (something the user can play right now).
+    const nextAired = findNextEpisode(cwDetail, base, nowMs, "none");
+    if (nextAired) return nextAired.id;
+    // Nothing aired left: the show is fully caught up and only has a FUTURE
+    // episode coming (the one the countdown pill targets). Pre-empt it (e.g.
+    // S03E01) instead of falling back to the just-finished episode, which read
+    // as "next up S02E04" on a show the user had actually completed. Source
+    // priority mirrors CWReleaseCountdown: authoritative meta videos first,
+    // cloud next_aired as the fallback. When neither knows the upcoming
+    // episode, return null so the badge stays BLANK rather than mislabel the
+    // finished one.
+    const metaUpcoming = nextAiringEpisode(cwDetail.videos, nowMs)?.id;
+    if (metaUpcoming) return metaUpcoming;
+    const sigNext = getReleaseSignal(item.id)?.next_aired;
+    const sigMs = sigNext?.aired_at ? Date.parse(sigNext.aired_at) : NaN;
+    if (sigNext && Number.isFinite(sigMs) && sigMs > nowMs) return sigNext.id ?? null;
+    return null;
+    // signalsVersion in deps so the badge fills in the instant cloud signals land.
+  }, [effectiveVideoId, cwDetail, savedVideoId, progress, item.id, signalsVersion]);
   // Prefer the VideoEntry's (season, episode) for a uniform `S01E06` badge
   // regardless of whether the id is IMDb-shape (`tt…:1:6`) or anime-prefix-
   // shape (`kitsu:50023:6`). badgeVideoId may live in a different season than
