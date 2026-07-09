@@ -22,7 +22,7 @@ import { LANDSCAPE_CARD_WIDTH } from "../landscapeArt";
 import { ContinueWatchingCard } from "../CinemaRows";
 import { useEpisodesBehind } from "../LibraryContext";
 import { libraryItemSeriesId } from "../libraryNormalize";
-import { useReleaseSignalsVersion, hasAnyReleaseSignal } from "../releaseSignalStore";
+import { useReleaseSignalsVersion, hasAnyReleaseSignal, getReleaseSignal } from "../releaseSignalStore";
 import { useManualWatchedVersion } from "../manualWatched";
 import {
   isAiring, isAiringSeriesLike, isAnimeItem,
@@ -51,11 +51,6 @@ const SORT_OPTIONS: { id: SortMode; label: string }[] = [
   { id: "alpha",   label: "A - Z" },
 ];
 
-const resumeOf = (i: LibraryItem): string | null => {
-  const v = (i.state ?? {}).video_id;
-  return typeof v === "string" && v.length > 0 ? v : null;
-};
-
 export default function AiringView({ library, addons, onSelectMeta }: Props) {
   const [details, setDetails] = useState<Map<string, MetaDetail | null>>(new Map());
   const [loading, setLoading] = useState(false);
@@ -79,7 +74,17 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
   const candidates = useMemo(() => {
     void signalsVersion; // re-derive as signals land
     const seriesLike = library.filter(isAiringSeriesLike);
-    return hasAnyReleaseSignal() ? seriesLike.filter((i) => isAiring(i)) : seriesLike;
+    if (!hasAnyReleaseSignal()) return seriesLike; // no cloud → scan every series/anime
+    // Keep items the cloud says are returning (future next_aired via isAiring)
+    // OR that the cloud has NOT checked at all (undefined) — the latter is every
+    // non-tt anime (kitsu/mal/anidb ids never get a cloud signal), which must
+    // still be meta-fetched + confirmed via airingInfo below. Only items the
+    // cloud checked and found not-returning (a present signal, past/no next) are
+    // skipped, keeping the fetch to a subset.
+    return seriesLike.filter((i) => {
+      const sig = getReleaseSignal(libraryItemSeriesId(i.id) || i.id);
+      return sig === undefined || isAiring(i);
+    });
   }, [library, signalsVersion]);
 
   // Progressive, soonest-first meta fetch for the candidate subset (mirrors
@@ -132,24 +137,56 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
   );
 
   const now = Date.now();
-  const sorted = useMemo(() => {
+  const libById = useMemo(() => {
+    const m = new Map<string, LibraryItem>();
+    for (const i of library) m.set(i.id, i);
+    return m;
+  }, [library]);
+
+  // Precompute one sort key per item (next-air / last-aired / episodes-behind)
+  // so the comparator is O(1) rather than re-scanning every episode list on
+  // every comparison (which also re-runs on each ~200ms progressive-load flush).
+  // The behind key resolves the resume pointer the SAME way the tile badge does
+  // (canonical series root from the episode ids, not the item's raw
+  // state.video_id) so the sort and the badge agree for per-cour duplicates.
+  const sortKeys = useMemo(() => {
     void manualVersion; void signalsVersion;
+    const keys = new Map<string, { next: number; last: number; behind: number }>();
+    for (const item of airingItems) {
+      const detail = details.get(item.id);
+      const root = detail?.videos?.[0]?.id
+        ? libraryItemSeriesId(detail.videos[0].id)
+        : (libraryItemSeriesId(item.id) || item.id);
+      const rootItem = libById.get(root) ?? item;
+      const rv = (rootItem.state ?? {}).video_id;
+      const resume = typeof rv === "string" && rv.length > 0 ? rv : null;
+      keys.set(item.id, {
+        next:   airingNextMs(item, detail) ?? Infinity,
+        last:   airingLastAiredMs(item, detail) ?? -Infinity,
+        behind: episodesBehind(detail?.videos, resume, now) ?? 0,
+      });
+    }
+    return keys;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [airingItems, details, libById, manualVersion, signalsVersion]);
+
+  const sorted = useMemo(() => {
     const arr = [...airingItems];
+    const k = (id: string) => sortKeys.get(id) ?? { next: Infinity, last: -Infinity, behind: 0 };
     const cmp: Record<SortMode, (a: LibraryItem, b: LibraryItem) => number> = {
       alpha:   (a, b) => (a.name ?? "").localeCompare(b.name ?? ""),
-      soonest: (a, b) => (airingNextMs(a, details.get(a.id)) ?? Infinity) - (airingNextMs(b, details.get(b.id)) ?? Infinity),
-      behind:  (a, b) => (episodesBehind(details.get(b.id)?.videos, resumeOf(b), now) ?? 0) - (episodesBehind(details.get(a.id)?.videos, resumeOf(a), now) ?? 0),
-      recent:  (a, b) => (airingLastAiredMs(b, details.get(b.id)) ?? -Infinity) - (airingLastAiredMs(a, details.get(a.id)) ?? -Infinity),
+      soonest: (a, b) => k(a.id).next - k(b.id).next,
+      behind:  (a, b) => k(b.id).behind - k(a.id).behind,
+      recent:  (a, b) => k(b.id).last - k(a.id).last,
     };
     arr.sort(cmp[sort]);
     return arr;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [airingItems, sort, details, manualVersion, signalsVersion]);
+  }, [airingItems, sort, sortKeys]);
 
   const sections = useMemo(() => {
     if (groupBy === "type") {
       const series: LibraryItem[] = [], anime: LibraryItem[] = [];
-      for (const i of sorted) (isAnimeItem(i, details.get(i.id)) ? anime : series).push(i);
+      for (const i of sorted) (isAnimeItem(i) ? anime : series).push(i);
       return [
         { key: "series", label: "Series", items: series },
         { key: "anime",  label: "Anime",  items: anime },
@@ -232,8 +269,8 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
             <div className="glass-panel rounded-2xl px-6 py-10 text-center">
               <p className="text-white/65 text-sm">
                 {signalsOff
-                  ? "Sign in to your Stremio account (and keep the shared release feed on in Settings > Scrobbling) so Aura can tell which of your shows are currently airing."
-                  : "Nothing in your library is airing right now. Series with an upcoming or recently scheduled episode will show up here."}
+                  ? "Nothing in your library looks airing right now. Aura detects airing shows best from the shared release feed — sign in and keep it enabled (Settings > Scrobbling) to also catch returning and between-season shows."
+                  : "Nothing in your library is airing right now. Series with an upcoming or recently scheduled episode show up here."}
               </p>
             </div>
           ) : (

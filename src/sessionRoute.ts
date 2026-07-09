@@ -22,7 +22,7 @@ import type { NavView } from "./NavSidebar";
 const KEY = "aura:session-route:v1";
 
 const VALID_VIEWS: readonly NavView[] = [
-  "home", "library", "queue", "addons", "discover",
+  "home", "library", "queue", "airing", "addons", "discover",
   "live", "calendar", "history", "settings",
 ] as const;
 

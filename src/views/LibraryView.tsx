@@ -636,6 +636,7 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem, onAutoR
                   statusOptions={LIBRARY_STATUS_OPTIONS}
                   statusValue={status}
                   onStatusChange={(v) => setStatus(v as LibraryStatusFilter)}
+                  showAiringToggle
                 />
               </div>
             )}

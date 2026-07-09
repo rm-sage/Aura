@@ -891,28 +891,32 @@ export const ContinueWatchingCard = memo(function ContinueWatchingCard(
         )}
       </button>
 
-      {/* Clear-from-Continue-Watching button. Visible on hover only so it
-          doesn't compete with the poster art at rest. App.tsx handles the
-          cloud-side library write via the 'aura:cw-clear' event. */}
-      <button
-        type="button"
-        onClick={(e) => {
-          e.stopPropagation();
-          window.dispatchEvent(new CustomEvent("aura:cw-clear", { detail: { item } }));
-        }}
-        title="Remove from Continue Watching"
-        aria-label="Remove from Continue Watching"
-        className="absolute top-2 right-2 w-7 h-7 rounded-full
-                   bg-black/70 text-white/85 hover:bg-black/90 hover:text-white
-                   border border-white/20
-                   opacity-0 group-hover:opacity-100 transition-opacity
-                   flex items-center justify-center
-                   focus:outline-none focus-visible:opacity-100"
-      >
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-          <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
-        </svg>
-      </button>
+      {/* Clear-from-Continue-Watching button. Only on the CW row (contextSource
+          "cw") — it fires aura:cw-clear which zeroes the item's saved progress,
+          which is meaningless / destructive on the Airing page (contextSource
+          "library"), where tiles are selected by airing status, not progress.
+          Visible on hover only. */}
+      {contextSource === "cw" && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            window.dispatchEvent(new CustomEvent("aura:cw-clear", { detail: { item } }));
+          }}
+          title="Remove from Continue Watching"
+          aria-label="Remove from Continue Watching"
+          className="absolute top-2 right-2 w-7 h-7 rounded-full
+                     bg-black/70 text-white/85 hover:bg-black/90 hover:text-white
+                     border border-white/20
+                     opacity-0 group-hover:opacity-100 transition-opacity
+                     flex items-center justify-center
+                     focus:outline-none focus-visible:opacity-100"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+            <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
+          </svg>
+        </button>
+      )}
     </div>
   );
 });

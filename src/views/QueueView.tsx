@@ -274,7 +274,7 @@ function QueueViewBody({ library, onSelectMeta }: Props) {
                 Remove started series
               </button>
               {queuedAsMeta.length > 0 && (
-                <FilterMenu items={queuedAsMeta} state={filters} onChange={setFilters} />
+                <FilterMenu items={queuedAsMeta} state={filters} onChange={setFilters} showAiringToggle />
               )}
             </div>
           </div>

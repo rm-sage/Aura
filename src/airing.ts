@@ -40,7 +40,10 @@ function rootId(item: LibraryItem): string {
 export function isAiring(item: LibraryItem, detail?: MetaDetail | null): boolean {
   if (!isAiringSeriesLike(item)) return false;
   if (detail?.videos && airingInfo(detail.videos).isAiring) return true;
-  return getReleaseSignal(rootId(item))?.next_aired != null;
+  // Cloud "returning" signal — only when its next episode is genuinely in the
+  // FUTURE, so a stale / already-past next_aired can't keep an ended show airing.
+  const iso = getReleaseSignal(rootId(item))?.next_aired?.aired_at;
+  return iso != null && Date.parse(iso) > Date.now();
 }
 
 /** Ms of the next upcoming episode (meta first, then cloud next_aired). */
@@ -49,7 +52,8 @@ export function airingNextMs(item: LibraryItem, detail?: MetaDetail | null): num
   if (metaMs != null) return metaMs;
   const iso = getReleaseSignal(rootId(item))?.next_aired?.aired_at;
   const cloud = iso ? Date.parse(iso) : NaN;
-  return Number.isFinite(cloud) ? cloud : null;
+  // "Next" is future by definition — never surface a stale/past cloud date.
+  return Number.isFinite(cloud) && cloud > Date.now() ? cloud : null;
 }
 
 /** Ms of the most recently AIRED episode (meta first, then cloud last_aired). */
@@ -102,19 +106,15 @@ export function episodesBehind(
   return behind > 0 ? behind : null;
 }
 
-/** Anime vs live-action, using the item's stored genres plus any detail
- *  signals (original language / production countries) when a MetaDetail is on
- *  hand. Mirrors LibraryView's bucket check so the page + pills agree. */
-export function isAnimeItem(item: LibraryItem, detail?: MetaDetail | null): boolean {
+/** Anime vs live-action, using ONLY the item's stored genres (+ media_type /
+ *  id) — the exact inputs LibraryView's Series/Anime bucket + itemMatchesTypeFilter
+ *  use, so the Airing page's grouping and the Library pills classify a title the
+ *  same way. (Detail signals would classify more IMDb anime but would disagree
+ *  with the pills, which is worse.) */
+export function isAnimeItem(item: LibraryItem): boolean {
   const stateGenres = (item.state ?? {}).genres;
   const genres = Array.isArray(stateGenres)
     ? stateGenres.filter((g): g is string => typeof g === "string")
-    : (detail?.genres ?? null);
-  return isAnimeMeta({
-    media_type: item.media_type,
-    id: item.id,
-    genres,
-    original_language: detail?.original_language ?? null,
-    production_countries: detail?.production_countries ?? null,
-  });
+    : [];
+  return isAnimeMeta({ media_type: item.media_type, id: item.id, genres });
 }

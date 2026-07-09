@@ -139,6 +139,10 @@ interface Props {
   statusOptions?: StatusOption[];
   statusValue?: string;
   onStatusChange?: (value: string) => void;
+  /** Show the "Currently airing only" toggle. Only Library / Queue apply
+   *  `airingOnly`, so it stays hidden elsewhere (Discover / Search / Catalog /
+   *  View-all) where it would be an inert control. */
+  showAiringToggle?: boolean;
 }
 
 const FilterIcon = () => (
@@ -166,6 +170,7 @@ function useFilterModel({
   items, state, onChange,
   sortOptions, sortValue, onSortChange,
   statusOptions, statusValue, onStatusChange,
+  showAiringToggle = false,
 }: Props) {
   const genres = useMemo(() => collectGenres(items), [items]);
 
@@ -223,12 +228,14 @@ function useFilterModel({
     state.yearMax !== yearBounds.max ||
     state.genres.length > 0 ||
     activeSort !== sortDefault ||
+    (showAiringToggle && (state.airingOnly ?? false)) ||
     (statusChoices ? activeStatus !== statusDefault : false);
 
   return {
     genres, yearBounds, set, toggleGenre, reset, isDirty,
     sortChoices, activeSort, setSort,
     statusChoices, activeStatus, setStatus,
+    showAiringToggle,
   };
 }
 
@@ -243,6 +250,7 @@ function FilterControls({ state, model }: { state: FilterState; model: FilterMod
     genres, yearBounds, set, toggleGenre, reset, isDirty,
     sortChoices, activeSort, setSort,
     statusChoices, activeStatus, setStatus,
+    showAiringToggle,
   } = model;
 
   // Highlighted span between the two thumbs, as track percentages. The
@@ -284,7 +292,9 @@ function FilterControls({ state, model }: { state: FilterState; model: FilterMod
       )}
 
       {/* Airing-only toggle — meta/signal-aware, applied by the consuming view
-          (Library / Queue), not by applyFilters. */}
+          (Library / Queue), not by applyFilters. Hidden on surfaces that don't
+          honor it so it can't render as an inert control. */}
+      {showAiringToggle && (
       <div className="space-y-1.5">
         <label className="text-white/40 text-[10px] font-semibold tracking-wider uppercase">
           Airing
@@ -305,6 +315,7 @@ function FilterControls({ state, model }: { state: FilterState; model: FilterMod
           </span>
         </button>
       </div>
+      )}
 
       {/* Sort */}
       <div className="space-y-1.5">

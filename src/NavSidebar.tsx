@@ -250,12 +250,13 @@ export default function NavSidebar({
           if (item.id !== "library") return null;
           return (
             <>
-              {LIBRARY_SUBROWS.map((sub) => (
+              {LIBRARY_SUBROWS.map((sub, i) => (
                 <SubRow
                   key={sub.id}
                   label={sub.label}
                   icon={sub.icon}
                   active={active === sub.id}
+                  isLast={i === LIBRARY_SUBROWS.length - 1}
                   clickPulseId={subClickPulse[sub.id] ?? 0}
                   onClick={() => {
                     setSubClickPulse((p) => ({ ...p, [sub.id]: (p[sub.id] ?? 0) + 1 }));
@@ -414,11 +415,15 @@ interface RowProps {
 const QUEUE_TOP_GAP_PX = Math.max(0, Math.round(ROW_GAP_PX * 0.9));
 
 function SubRow({
-  label, icon, active, onClick, clickPulseId,
+  label, icon, active, isLast, onClick, clickPulseId,
 }: {
   label: string;
   icon: React.ReactNode;
   active: boolean;
+  /** Last child under Library — its connector is a rounded L that stops
+   *  at the icon. Earlier children draw a straight trunk that runs to the
+   *  container edge so the whole spine reads as one continuous line. */
+  isLast: boolean;
   onClick: () => void;
   /** Bumped on every click — drives the brief shrink-then-restore
    *  pulse on the Queue button. Re-keying the inner element via
@@ -437,22 +442,43 @@ function SubRow({
         className="relative"
         style={{ height: ROW_H_PX, marginTop: QUEUE_TOP_GAP_PX }}
       >
-        {/* L-shape connector — drawn from below the Library row's
-            icon (top of this container) down + right into the Queue
-            row's icon. Anchored absolutely so it doesn't shift the
-            button's content. The vertical leg sits at the same
-            horizontal centre as the parent's icon (≈ NavRow's
-            `px-3` + half of icon width). */}
-        <span
-          aria-hidden
-          className="absolute pointer-events-none border-l border-b border-white/20 rounded-bl-md"
-          style={{
-            left:   "1.05rem",
-            top:    -QUEUE_TOP_GAP_PX,
-            bottom: "50%",
-            width:  "0.7rem",
-          }}
-        />
+        {/* Tree connector into this child's icon. The vertical leg sits at
+            the same horizontal centre as the parent's icon (≈ NavRow's
+            `px-3` + half of icon width) and is anchored absolutely so it
+            doesn't shift the button's content.
+
+            The last child draws a single rounded L that stops at its icon
+            centre. Earlier children draw a straight trunk that runs past
+            the container edge (clipped by the outer `overflow: hidden`)
+            plus a horizontal tick into the icon — so the next child's
+            trunk, which starts at ITS container top, continues the same
+            line and the whole spine reads as one unbroken trunk with a
+            branch at each child instead of a stack of detached Ls. */}
+        {isLast ? (
+          <span
+            aria-hidden
+            className="absolute pointer-events-none border-l border-b border-white/20 rounded-bl-md"
+            style={{
+              left:   "1.05rem",
+              top:    -QUEUE_TOP_GAP_PX,
+              bottom: "50%",
+              width:  "0.7rem",
+            }}
+          />
+        ) : (
+          <>
+            <span
+              aria-hidden
+              className="absolute pointer-events-none border-l border-white/20"
+              style={{ left: "1.05rem", top: -QUEUE_TOP_GAP_PX, bottom: "-1rem" }}
+            />
+            <span
+              aria-hidden
+              className="absolute pointer-events-none border-t border-white/20"
+              style={{ left: "1.05rem", top: "50%", width: "0.7rem" }}
+            />
+          </>
+        )}
         {/* The button's own background tint is dropped now that the
             standard active-pill (.aura-glow) covers Queue when active.
             Click animation lives on a wrapper keyed by `clickPulseId`
