@@ -8,7 +8,7 @@ import type { StremioAccount } from "./LoginView";
 import AuraLogoA from "./AuraLogoA";
 import { anchorFromRect, type PartyAnchor } from "./partyAnchor";
 
-export type NavView = "home" | "library" | "queue" | "addons" | "discover" | "live" | "calendar" | "history" | "settings";
+export type NavView = "home" | "library" | "queue" | "airing" | "addons" | "discover" | "live" | "calendar" | "history" | "settings";
 
 interface Props {
   active: NavView;
@@ -76,6 +76,16 @@ const QueueIcon = () => (
     <path d="M17 3H7c-1.1 0-2 .9-2 2v16l7-3 7 3V5c0-1.1-.9-2-2-2z" />
   </svg>
 );
+const AiringIcon = () => (
+  // Broadcast / on-air signal — a centre dot with concentric arcs, reading as
+  // "currently airing". Stroke-drawn arcs (the sibling icons are filled; a
+  // filled broadcast glyph reads muddy at this size).
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+       strokeWidth="1.9" strokeLinecap="round" aria-hidden>
+    <circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none" />
+    <path d="M8.5 8.5a5 5 0 0 0 0 7M15.5 8.5a5 5 0 0 1 0 7M5.6 5.6a9 9 0 0 0 0 12.8M18.4 5.6a9 9 0 0 1 0 12.8" />
+  </svg>
+);
 const DiscoverIcon = () => (
   // Compass glyph — discover/explore convention. Distinct from the
   // Library "books" icon so the two browseable surfaces don't blur
@@ -130,6 +140,13 @@ const BOTTOM_ITEMS: ItemMeta[] = [
   { id: "settings", label: "Settings", icon: <SettingsIcon /> },
 ];
 
+// Sub-tabs nested under Library (indented, rendered directly below the Library
+// row, top to bottom). Each consumes one pill SLOT_PX below Library.
+const LIBRARY_SUBROWS: ItemMeta[] = [
+  { id: "queue",  label: "Queue",  icon: <QueueIcon /> },
+  { id: "airing", label: "Airing", icon: <AiringIcon /> },
+];
+
 // ---------------------------------------------------------------------------
 // NavSidebar
 //
@@ -165,14 +182,14 @@ export default function NavSidebar({
   // We transform `active` for index/highlight purposes only; the Queue
   // button itself still uses the raw active value to know it's the
   // selected sub-tab.
-  const navActive: NavView = active === "queue" ? "library" : active;
+  const navActive: NavView = (active === "queue" || active === "airing") ? "library" : active;
   const bottomIdx = BOTTOM_ITEMS.findIndex((i) => i.id === navActive);
 
   // Bumped each time Queue is clicked — drives a brief shrink-then-
   // restore animation on the Queue row's pill so the click reads as a
   // distinct event (Queue is visually smaller than the other rows, so
   // a regular pill slide-in alone reads as muted).
-  const [queueClickPulseId, setQueueClickPulseId] = useState(0);
+  const [subClickPulse, setSubClickPulse] = useState<Record<string, number>>({});
 
   // Queue is a permanent visual child of Library — always rendered
   // directly below the Library row. The L-shape connector + indented
@@ -185,7 +202,7 @@ export default function NavSidebar({
     const baseIdx = TOP_ITEMS.findIndex((i) => i.id === id);
     if (baseIdx < 0) return -1;
     if (baseIdx <= libraryFlatIdx) return baseIdx;
-    return baseIdx + 1;
+    return baseIdx + LIBRARY_SUBROWS.length;
   };
   const topIdx = flatIdxFor(navActive);
 
@@ -194,8 +211,11 @@ export default function NavSidebar({
   // (libraryY + ROW_H_PX + QUEUE_TOP_GAP_PX), which doesn't align with
   // the regular SLOT_PX stride — so we override the pill's translateY
   // with this absolute pixel value when Queue is active.
-  const queuePillY =
-    libraryFlatIdx * SLOT_PX + ROW_H_PX + QUEUE_TOP_GAP_PX;
+  // A sub-row's active pill sits below the Library row: Library top + one row +
+  // the tight top-gap, then one SLOT_PX per preceding sub-row.
+  const subRowPillY = (subIndex: number): number =>
+    libraryFlatIdx * SLOT_PX + ROW_H_PX + QUEUE_TOP_GAP_PX + subIndex * SLOT_PX;
+  const activeSubIndex = LIBRARY_SUBROWS.findIndex((s) => s.id === active);
 
   return (
     <aside
@@ -224,19 +244,26 @@ export default function NavSidebar({
         // so it sits on the Queue row instead of Library. Otherwise
         // null, and the pill follows the regular activeIdx*SLOT_PX
         // stride for whichever top item is active.
-        pillYOverride={active === "queue" ? queuePillY : null}
+        pillYOverride={activeSubIndex >= 0 ? subRowPillY(activeSubIndex) : null}
         onNavigate={onNavigate}
         renderSubAfter={(item) => {
           if (item.id !== "library") return null;
           return (
-            <QueueSubRow
-              active={active === "queue"}
-              clickPulseId={queueClickPulseId}
-              onClick={() => {
-                setQueueClickPulseId((n) => n + 1);
-                onNavigate("queue");
-              }}
-            />
+            <>
+              {LIBRARY_SUBROWS.map((sub) => (
+                <SubRow
+                  key={sub.id}
+                  label={sub.label}
+                  icon={sub.icon}
+                  active={active === sub.id}
+                  clickPulseId={subClickPulse[sub.id] ?? 0}
+                  onClick={() => {
+                    setSubClickPulse((p) => ({ ...p, [sub.id]: (p[sub.id] ?? 0) + 1 }));
+                    onNavigate(sub.id);
+                  }}
+                />
+              ))}
+            </>
           );
         }}
       />
@@ -386,9 +413,11 @@ interface RowProps {
 // parent/child relationship (about 10 % less vertical space).
 const QUEUE_TOP_GAP_PX = Math.max(0, Math.round(ROW_GAP_PX * 0.9));
 
-function QueueSubRow({
-  active, onClick, clickPulseId,
+function SubRow({
+  label, icon, active, onClick, clickPulseId,
 }: {
+  label: string;
+  icon: React.ReactNode;
   active: boolean;
   onClick: () => void;
   /** Bumped on every click — drives the brief shrink-then-restore
@@ -434,7 +463,7 @@ function QueueSubRow({
         >
           <button
             onClick={onClick}
-            aria-label="Queue"
+            aria-label={label}
             className={[
               "nav-tap relative w-full flex items-center gap-2.5 pl-8 pr-3 rounded-xl",
               "transition-colors duration-150",
@@ -444,8 +473,8 @@ function QueueSubRow({
             ].join(" ")}
             style={{ height: ROW_H_PX }}
           >
-            <span className="flex-shrink-0"><QueueIcon /></span>
-            <span className="text-[12.5px] font-medium tracking-wide">Queue</span>
+            <span className="flex-shrink-0">{icon}</span>
+            <span className="text-[12.5px] font-medium tracking-wide">{label}</span>
           </button>
         </div>
       </div>

@@ -242,6 +242,10 @@ export interface AuraSettings {
    *  episodes is never removed. Off by default; enabling prompts once about
    *  clearing the existing fully-watched backlog. */
   libraryAutoRemoveWatchedSeries: boolean;
+  /** Airing-page grouping + sort. Device-local view prefs — deliberately NOT in
+   *  PORTABLE_AURA_FIELDS / cloud sync (each device keeps its own view state). */
+  airingGroupBy: "type" | "airwindow" | "none";
+  airingSort: "recent" | "soonest" | "behind" | "alpha";
 }
 
 export const DEFAULT_AURA_SETTINGS: AuraSettings = {
@@ -273,6 +277,8 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   useAuraStreamFormatter: true,
   libraryAutoRemoveWatchedMovies: false,
   libraryAutoRemoveWatchedSeries: false,
+  airingGroupBy: "type",
+  airingSort: "recent",
 };
 
 // Module-level memoization snapshot. loadAuraSettings is called many

@@ -56,6 +56,13 @@ export function getReleaseSignal(imdbId: string): ReleaseSignal | null | undefin
   return store.has(imdbId) ? store.get(imdbId) ?? null : undefined;
 }
 
+/** True once the cloud has been consulted for at least one show (release-search
+ *  on + signed in + reconciled). When false, callers that would otherwise rely
+ *  on cloud signals should fall back to a local scan. */
+export function hasAnyReleaseSignal(): boolean {
+  return store.size > 0;
+}
+
 /** React hook — subscribes the calling component to release-signal
  *  changes AND returns the current signal for `imdbId`. Re-renders
  *  on any signal change (cheap; usually 0-1 per library reconcile).

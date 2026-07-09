@@ -89,13 +89,18 @@ function libraryItemToMeta(item: LibraryItem): MetaPreview {
   };
 }
 
-interface ContinueWatchingCardProps {
+export interface ContinueWatchingCardProps {
   item: LibraryItem;
   onSelect?: (meta: MetaPreview) => void;
   /** Required for the segmented per-season progress bar — CW card
    *  fetches its meta detail via the addon list to know how many
    *  episodes the current season has. */
   addons?: AddonEntry[];
+  /** Which context-menu the right-click fires (App reads `source`): "cw"
+   *  offers "Remove from Continue Watching" (the CW row default); "library"
+   *  falls through to the normal library menu. Reused by the Airing page,
+   *  whose items aren't necessarily CW entries. */
+  contextSource?: "cw" | "library";
 }
 
 // ---------------------------------------------------------------------------
@@ -703,8 +708,8 @@ function CWReleaseCountdown({ seriesId, episodes }: { seriesId: string; episodes
   );
 }
 
-const ContinueWatchingCard = memo(function ContinueWatchingCard(
-  { item, onSelect, addons }: ContinueWatchingCardProps
+export const ContinueWatchingCard = memo(function ContinueWatchingCard(
+  { item, onSelect, addons, contextSource = "cw" }: ContinueWatchingCardProps
 ) {
   // Landscape (16:9) art via AIOMeta (the art source-of-truth). We prefer
   // AIOMeta's resolved `landscape` over the item's own `background` because
@@ -806,7 +811,7 @@ const ContinueWatchingCard = memo(function ContinueWatchingCard(
           // from Library" since the user typically just wants to drop
           // the row from their CW lineup.
           window.dispatchEvent(new CustomEvent("aura:card-context", {
-            detail: { meta: libraryItemToMeta(item), x: e.clientX, y: e.clientY, source: "cw", item },
+            detail: { meta: libraryItemToMeta(item), x: e.clientX, y: e.clientY, source: contextSource, item },
           }));
         }}
         className="block w-full text-left rounded-xl focus:outline-none"

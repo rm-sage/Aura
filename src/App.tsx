@@ -18,6 +18,7 @@ import AddonsView from "./views/AddonsView";
 import CalendarView from "./views/CalendarView";
 import HistoryView from "./views/HistoryView";
 import QueueView from "./views/QueueView";
+import AiringView from "./views/AiringView";
 import SettingsView from "./views/SettingsView";
 import DetailView from "./views/DetailView";
 import ThemeEngine from "./ThemeEngine";
@@ -6397,6 +6398,7 @@ export default function App() {
         case "discover": title = "Browsing Add-on Catalogs";  subtitle = "On Discover";  sceneKey = "discover"; break;
         case "library":  title = "Revisiting Old Favorites";  subtitle = "In Library";   sceneKey = "library";  break;
         case "queue":    title = "Lining Up What's Next";     subtitle = "In Queue";     sceneKey = "queue";    break;
+        case "airing":   title = "Catching Up on Airing Shows"; subtitle = "On Airing";  sceneKey = "airing";   break;
         case "live":     title = "Browsing Live TV";          subtitle = "On Live TV";   sceneKey = "live";     break;
         case "calendar": title = "Planning My Next Binge";    subtitle = "On Calendar";  sceneKey = "calendar"; break;
         case "history":  title = "Looking Through History";   subtitle = "In History";   sceneKey = "history";  break;
@@ -6806,6 +6808,9 @@ export default function App() {
         )}
         {activeView === "queue" && (
           <QueueView library={library} onSelectMeta={openDetail} />
+        )}
+        {activeView === "airing" && (
+          <AiringView library={library} addons={addons} onSelectMeta={openDetail} />
         )}
         {activeView === "settings" && (
           <SettingsView addons={addons} session={session} />
