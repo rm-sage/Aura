@@ -825,6 +825,57 @@ async fn resolve_via_cache_or_search(
     }
 }
 
+/// Steps 3-6 of a scrobble save, shared by the heuristic resolver and the
+/// addon-embedded fast path: clamp the episode to the entry's total, skip when
+/// the user's tracked progress already leads, then write CURRENT / COMPLETED.
+/// `episode_num` is the episode LOCAL to `media` (the embedded fast path passes
+/// the addon's cour-local value; the heuristic path passes the user's absolute
+/// ep, which clamps to the entry total for split-cour anime). `label` is only
+/// used in the log line.
+async fn commit_progress(
+    access:      &str,
+    media:       &MediaInfo,
+    episode_num: u32,
+    label:       &str,
+) -> Result<(), AnilistError> {
+    // 3. Clamp the candidate to the entry's total. AniList rejects
+    //    `progress > episodes`, so clamping turns "user watched ep 34 of a
+    //    28-ep entry" into "save 28 + mark COMPLETED".
+    let to_save = match media.episodes {
+        Some(total) if episode_num > total => total,
+        _ => episode_num,
+    };
+    // 4. Don't clobber user-tracked progress that's ahead of us. Compare
+    //    against the clamped value so a user on ep 34 of a 28-ep entry with
+    //    list_progress=20 isn't skipped forever.
+    let existing = media
+        .media_list_entry
+        .as_ref()
+        .map(|e| e.progress)
+        .unwrap_or(0);
+    if existing >= to_save {
+        crate::devlog!(
+            info, "scrobble",
+            "AniList: progress already {existing} (>= clamped {to_save}, raw episode={episode_num}); skipping save for {label}",
+        );
+        return Ok(());
+    }
+    // 5. Status: COMPLETED if we know the total and we're at or past it.
+    let status = match media.episodes {
+        Some(total) if to_save >= total => "COMPLETED",
+        _ => "CURRENT",
+    };
+    // 6. Save.
+    save_media_list_entry(access, media.id, to_save, status).await?;
+    let total_str = media.episodes.map(|e| e.to_string()).unwrap_or_else(|| "?".into());
+    crate::devlog!(
+        info, "scrobble",
+        "AniList: saved {}/{} ({}) for {label} (anilist_id={}, raw episode={episode_num})",
+        to_save, total_str, status, media.id,
+    );
+    Ok(())
+}
+
 /// Save scrobble progress to AniList for the given session. No-op when:
 ///   * `sess.is_anime` is false
 ///   * No AniList token is stored for `scope`
@@ -845,6 +896,37 @@ pub async fn save_progress<R: Runtime>(
         return Ok(());
     };
     let access = token_obj.access_token;
+
+    // ── Fast path: addon-embedded AniList id + cour-local episode ──
+    // AIOMetadata attaches the exact AniList media id and the episode number
+    // LOCAL to that entry on each video (Aura<->AIOMetadata scrobble contract).
+    // When both are present we save straight to that entry and skip the whole
+    // Fribb id-map / title-search / sequel-walk / offset stack: the addon owns
+    // the numbering scheme, so this is both exact and immune to the Fribb
+    // dataset drift that periodically breaks the heuristic path. On a NotFound
+    // (bad/stale embedded id) we fall through to the heuristic resolver.
+    if let (Some(aid), Some(local_ep)) = (sess.anilist_id, sess.anilist_episode) {
+        if aid > 0 && local_ep > 0 {
+            crate::devlog!(
+                info, "scrobble",
+                "AniList embedded id (addon-provided): show=\"{}\" → anilist_id={aid} episode={local_ep}; skipping heuristic resolution",
+                sess.title,
+            );
+            match fetch_media(&access, aid).await {
+                Ok(media) => {
+                    return commit_progress(&access, &media, local_ep, &format!("\"{}\" (embedded)", sess.title)).await;
+                }
+                Err(AnilistError::NotFound) => {
+                    crate::devlog!(
+                        warn, "scrobble",
+                        "AniList embedded id {aid} returned NotFound — falling back to heuristic resolution for \"{}\"",
+                        sess.title,
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
 
     let Some(show_id) = parse_show_id(&sess.imdb_id) else {
         crate::devlog!(
@@ -1028,52 +1110,9 @@ pub async fn save_progress<R: Runtime>(
         }
     }
 
-    // 3. Clamp the candidate to the entry's total. The candidate
-    //    (`episode_num`) is the user's absolute ep number; for split-
-    //    cour anime the chosen anilist_id may only cover a slice of
-    //    the absolute range. AniList rejects `progress > episodes`, so
-    //    clamping turns "user watched ep 34 of a 28-ep entry" into
-    //    "save 28 + mark COMPLETED" — the right semantic for someone
-    //    who's finished what AniList tracks under this id.
-    let to_save = match media.episodes {
-        Some(total) if episode_num > total => total,
-        _ => episode_num,
-    };
-
-    // 4. Don't clobber user-tracked progress that's ahead of us.
-    //    Compare against the clamped value — otherwise a user on ep 34
-    //    of a 28-ep entry with list_progress=20 would get skipped
-    //    forever (34 > 20 passes, but the save would write 28 since
-    //    clamp also applies on write).
-    let existing = media
-        .media_list_entry
-        .as_ref()
-        .map(|e| e.progress)
-        .unwrap_or(0);
-    if existing >= to_save {
-        crate::devlog!(
-            info, "scrobble",
-            "AniList: progress already {existing} (>= clamped {to_save}, raw episode={episode_num}); skipping save",
-        );
-        return Ok(());
-    }
-
-    // 5. Status: COMPLETED if we know the total and we're at or past it.
-    let status = match media.episodes {
-        Some(total) if to_save >= total => "COMPLETED",
-        _ => "CURRENT",
-    };
-
-    // 6. Save.
-    save_media_list_entry(&access, media.id, to_save, status).await?;
-
-    let total_str = media.episodes.map(|e| e.to_string()).unwrap_or_else(|| "?".into());
-    crate::devlog!(
-        info, "scrobble",
-        "AniList: saved {}/{} ({}) for \"{}\" (anilist_id={}, raw episode={episode_num})",
-        to_save, total_str, status, sess.title, media.id,
-    );
-    Ok(())
+    // Steps 3-6 (clamp / skip-if-ahead / status / save) are shared with the
+    // addon-embedded fast path near the top of this function.
+    commit_progress(&access, &media, episode_num, &format!("\"{}\"", sess.title)).await
 }
 
 /// Run the search query and pick the best candidate. Prefers entries

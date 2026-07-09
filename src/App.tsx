@@ -5025,27 +5025,53 @@ export default function App() {
   // re-render).
   useEffect(() => {
     if (!activeTarget) return;
-    if (activeTarget.absolute_episode_num != null) return;
     const s = activeTarget.season;
     const e = activeTarget.episode_num;
-    if (s == null || s <= 1 || e == null) return;
-    const seriesId = activeTarget.series_id ?? activeTarget.id;
+    // Absolute episode: only needed for season > 1 (S1 cour-relative ==
+    // absolute) and only until stamped.
+    const needAbsolute =
+      activeTarget.absolute_episode_num == null && s != null && s > 1 && e != null;
+    // Embedded AniList id/episode (AIOMetadata): stamp for ANY anime episode
+    // (incl. season 1 / single-cour), once. Absent for non-AIOMetadata sources,
+    // in which case the resolver falls back to the Fribb id-map / title search.
+    const needAnilist = activeTarget.anilist_id == null;
+    if (!needAbsolute && !needAnilist) return;
+    const targetId = activeTarget.id;
+    const mediaType = activeTarget.media_type;
+    const seriesId = activeTarget.series_id ?? targetId;
     let cancelled = false;
     (async () => {
-      const detail = await getMetaDetailFallback(addons, activeTarget.media_type, seriesId)
+      const detail = await getMetaDetailFallback(addons, mediaType, seriesId)
         .catch(() => null);
       if (cancelled || !detail?.videos || detail.videos.length === 0) return;
-      const priorCourEps = detail.videos.filter(
-        (v) => (v.season ?? 0) > 0 && (v.season ?? 0) < s,
-      ).length;
-      const absoluteEp = priorCourEps + e;
-      // Patch via functional setState — if the user has already swapped
-      // to a different episode by the time the meta resolves, the id
-      // check refuses to overwrite the new target with stale data.
+      // Absolute episode = prior-cour episode counts + this cour-relative ep.
+      let absoluteEp: number | null = null;
+      if (needAbsolute && s != null && e != null) {
+        const priorCourEps = detail.videos.filter(
+          (v) => (v.season ?? 0) > 0 && (v.season ?? 0) < s,
+        ).length;
+        absoluteEp = priorCourEps + e;
+      }
+      // Embedded AniList pair from the VideoEntry the user is actually playing.
+      const vid = needAnilist ? detail.videos.find((v) => v.id === targetId) : undefined;
+      const aid = vid?.anilist_id ?? null;
+      const aep = vid?.anilist_episode ?? null;
+      // Patch via functional setState — if the user has already swapped to a
+      // different episode by the time the meta resolves, the id check refuses
+      // to overwrite the new target with stale data.
       setActiveTarget((prev) => {
-        if (!prev || prev.id !== activeTarget.id) return prev;
-        if (prev.absolute_episode_num === absoluteEp) return prev;
-        return { ...prev, absolute_episode_num: absoluteEp };
+        if (!prev || prev.id !== targetId) return prev;
+        let next = prev;
+        if (absoluteEp != null && prev.absolute_episode_num !== absoluteEp) {
+          next = { ...next, absolute_episode_num: absoluteEp };
+        }
+        if (
+          aid != null && aep != null &&
+          (prev.anilist_id !== aid || prev.anilist_episode !== aep)
+        ) {
+          next = { ...next, anilist_id: aid, anilist_episode: aep };
+        }
+        return next;
       });
     })();
     return () => { cancelled = true; };

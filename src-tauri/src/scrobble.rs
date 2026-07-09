@@ -163,6 +163,17 @@ pub struct ScrobbleSession {
     /// resolved).
     #[serde(default)]
     pub absolute_episode_num: Option<u32>,
+    /// AIOMetadata-embedded AniList media id for this episode's cour, threaded
+    /// from the VideoEntry (Aura<->AIOMetadata scrobble contract). When present
+    /// with `anilist_episode`, `scrobble_anilist::save_progress` saves straight
+    /// to this entry and bypasses the Fribb id-map / title-search / sequel-walk
+    /// / offset heuristics. AniList-only; Trakt still keys by IMDb + S/E.
+    #[serde(default)]
+    pub anilist_id: Option<u64>,
+    /// AIOMetadata-embedded episode number LOCAL to `anilist_id` (1-indexed).
+    /// Paired with `anilist_id`; ignored without it.
+    #[serde(default)]
+    pub anilist_episode: Option<u32>,
 }
 
 static SESSION: OnceLock<Mutex<Option<ScrobbleSession>>> = OnceLock::new();

@@ -116,6 +116,13 @@ export interface ActiveScrobbleTarget {
   genres?: string[] | null;
   original_language?: string | null;
   production_countries?: string[] | null;
+  /** AIOMetadata-embedded AniList media id for this episode's cour + the
+   *  episode local to it (1-indexed). Threaded to scrobble.rs so the AniList
+   *  fast-path saves directly to the exact entry, skipping all id-mapping
+   *  heuristics. Stamped by App's target-enrichment effect from the matching
+   *  VideoEntry; absent for non-AIOMetadata sources. */
+  anilist_id?: number | null;
+  anilist_episode?: number | null;
 }
 
 export function activeTargetFromMeta(
@@ -359,6 +366,11 @@ export function useScrobble({
           // returns not_found — covers shows Trakt indexes by absolute
           // numbering (Frieren et al.).
           absolute_episode_num: active.absolute_episode_num ?? null,
+          // Addon-embedded AniList entry + cour-local episode. When present,
+          // scrobble_anilist saves straight to this id and skips all mapping
+          // heuristics (Aura<->AIOMetadata contract).
+          anilist_id:      active.anilist_id ?? null,
+          anilist_episode: active.anilist_episode ?? null,
         },
         duration: playback.duration,
       }).catch(() => {});

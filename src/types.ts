@@ -236,6 +236,13 @@ export interface VideoEntry {
   is_filler?: boolean;
   /** Independent recap flag — see `is_filler`. */
   is_recap?: boolean;
+  /** AIOMetadata-embedded AniList media id for this episode's cour/season,
+   *  and the episode number LOCAL to it (1-indexed). When both are present,
+   *  the AniList scrobbler saves straight to that entry and bypasses the
+   *  Fribb id-map / title-search heuristics. `null`/absent for non-anime,
+   *  movies, and addons without the patch. */
+  anilist_id?: number | null;
+  anilist_episode?: number | null;
 }
 
 /** True when a video has aired (release date in the past) or its

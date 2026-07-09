@@ -734,6 +734,20 @@ pub struct VideoEntry {
     /// `is_filler` for the dual-flag rationale.
     #[serde(default)]
     pub is_recap: bool,
+    /// AIOMetadata-embedded AniList media id for THIS episode's cour/season
+    /// (per the Aura<->AIOMetadata scrobble contract). Paired with
+    /// `anilist_episode`. When both are present, the AniList scrobbler saves
+    /// straight to this entry and skips the Fribb id-map / title-search /
+    /// sequel-walk / offset heuristics entirely — the addon owns the
+    /// numbering scheme, so it's exact and immune to Fribb dataset drift.
+    /// `None` for non-anime, movies, and addons without the patch.
+    #[serde(default)]
+    pub anilist_id: Option<i64>,
+    /// AIOMetadata-embedded episode number LOCAL to `anilist_id` (1-indexed,
+    /// e.g. Science Future ep 4, NOT the display/absolute number). Only
+    /// meaningful alongside `anilist_id`.
+    #[serde(default)]
+    pub anilist_episode: Option<i64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -2874,6 +2888,19 @@ fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
                 else { None }
             });
 
+            // Embedded AniList pair (Aura<->AIOMetadata scrobble contract).
+            // Canonical wire key is camelCase (`anilistId` / `anilistEpisode`),
+            // matching the addon's `episodeKind` convention; snake_case aliases
+            // accepted for safety. Positive-only (a 0 / negative id is bogus).
+            let anilist_id = ["anilistId", "anilist_id"]
+                .iter()
+                .find_map(|k| v.get(*k).and_then(|x| x.as_i64()))
+                .filter(|&n| n > 0);
+            let anilist_episode = ["anilistEpisode", "anilist_episode"]
+                .iter()
+                .find_map(|k| v.get(*k).and_then(|x| x.as_i64()))
+                .filter(|&n| n > 0);
+
             Some(VideoEntry {
                 id,
                 title,
@@ -2885,6 +2912,8 @@ fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
                 episode_kind,
                 is_filler,
                 is_recap,
+                anilist_id,
+                anilist_episode,
             })
         })
         .collect();
