@@ -3733,6 +3733,23 @@ export default function App() {
   const warmedPosterIdsRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     if (library.length === 0 || addons.length === 0) return;
+    // Cheap synchronous anime seed from details ALREADY in the metaCache (warmed
+    // by Calendar / notifications / prior visits, which don't classify). The
+    // network warm below only covers un-cached ids, so this closes the gap for
+    // IMDb-id'd anime whose detail is cached but was never classified. markAnimeId
+    // is idempotent + only bumps the reactive version on a genuinely new id.
+    for (const it of library) {
+      const cached = peekCachedDetailById(it.id);
+      if (cached && isAnimeMeta({
+        media_type: cached.media_type ?? it.media_type,
+        id: it.id,
+        genres: cached.genres,
+        original_language: cached.original_language,
+        production_countries: cached.production_countries,
+      })) {
+        markAnimeId(it.id);
+      }
+    }
     const candidates = library.filter((it) =>
       !warmedPosterIdsRef.current.has(it.id) &&
       !peekCachedDetailById(it.id),
@@ -3753,6 +3770,22 @@ export default function App() {
             .catch(() => null);
           if (detail?.poster && detail.poster !== it.poster) {
             updates.set(it.id, detail.poster);
+          }
+          // Seed anime classification from the freshly-resolved detail. Library
+          // records synced from Stremio carry no genres, so IMDb-id'd anime
+          // (Bleach, Attack on Titan, Vinland Saga) fell into the Series bucket
+          // until the user opened their detail page. This warm covers every
+          // library id, so the Series/Anime split is correct after it settles.
+          // markAnimeId is idempotent + only bumps the reactive version on a
+          // genuinely new id, so LibraryView re-classifies without a poster diff.
+          if (detail && isAnimeMeta({
+            media_type: detail.media_type ?? it.media_type,
+            id: it.id,
+            genres: detail.genres,
+            original_language: detail.original_language,
+            production_countries: detail.production_countries,
+          })) {
+            markAnimeId(it.id);
           }
         }
       };

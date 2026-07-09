@@ -57,6 +57,11 @@ function rpdbToMetahubFallback(url: string): string | null {
   return m ? `https://images.metahub.space/poster/medium/${m[1]}/img` : null;
 }
 
+// Max automatic re-fetches after a transient image failure before we give up to
+// the placeholder. Two (with backoff) recovers a network blip / 429 / 503 / a
+// momentarily-unreachable CDN without looping forever on a genuine 404.
+const MAX_IMG_RETRIES = 2;
+
 export default function ImageLoader({
   src,
   alt = "",
@@ -81,6 +86,15 @@ export default function ImageLoader({
   // Ref-not-state so the onError closure always sees the latest value
   // without re-binding the listener through a render cycle.
   const triedFallbackRef = useRef(false);
+  // Bounded transient-failure retry. `retryNonce` is appended to the URL to
+  // force the <img> to re-fetch the SAME source; the count + timer are refs so
+  // the onError closure reads the latest without re-binding. Without this a
+  // single failed fetch stranded the tile on the placeholder until it remounted
+  // (scroll away + back) or a cache-bust: the "poster never loads, stays blank
+  // forever" symptom.
+  const [retryNonce, setRetryNonce] = useState(0);
+  const retryCountRef = useRef(0);
+  const retryTimerRef = useRef<number | null>(null);
   // `inView` controls whether we even set the <img>'s src. Native
   // `loading="lazy"` mis-fires on tiles inside horizontally-scrolling
   // rows: the initial IntersectionObserver check misses some entries,
@@ -103,6 +117,12 @@ export default function ImageLoader({
     setErrored(false);
     setFallbackSrc(null);
     triedFallbackRef.current = false;
+    retryCountRef.current = 0;
+    setRetryNonce(0);
+    if (retryTimerRef.current != null) {
+      window.clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
     // If the browser already had this URL cached, `onLoad` may not fire.
     // Detect that and short-circuit so we don't show an indefinite skeleton.
     const img = ref.current;
@@ -114,6 +134,11 @@ export default function ImageLoader({
     // function. Resetting on src change is what matters here.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [src]);
+
+  // Clear any pending retry timer on unmount so it can't fire into a dead card.
+  useEffect(() => () => {
+    if (retryTimerRef.current != null) window.clearTimeout(retryTimerRef.current);
+  }, []);
 
   // Custom IntersectionObserver-driven lazy-load. Only runs when
   // `loading="lazy"` (the default); `loading="eager"` short-circuits
@@ -173,7 +198,14 @@ export default function ImageLoader({
       {src && !errored && inView && (
         <img
           ref={ref}
-          src={withImageBust(fallbackSrc ?? src, imgEpoch)}
+          // Append the retry nonce (when > 0) so a re-fetch attempt after a
+          // transient failure bypasses the cached failed response.
+          src={(() => {
+            const busted = withImageBust(fallbackSrc ?? src, imgEpoch);
+            return retryNonce > 0
+              ? `${busted}${busted.includes("?") ? "&" : "?"}_r=${retryNonce}`
+              : busted;
+          })()}
           alt={alt}
           draggable={draggable}
           decoding={decoding}
@@ -225,6 +257,20 @@ export default function ImageLoader({
                 setFallbackSrc(swap);
                 return;
               }
+            }
+            // Bounded transient-failure retry: re-fetch the same URL a couple
+            // times with backoff (1.5s, 3s) before settling on the placeholder,
+            // so a network blip / rate-limit doesn't strand the tile blank until
+            // it remounts. A genuine 404 exhausts the retries and falls through.
+            if (retryCountRef.current < MAX_IMG_RETRIES) {
+              const attempt = retryCountRef.current + 1;
+              retryCountRef.current = attempt;
+              if (retryTimerRef.current != null) window.clearTimeout(retryTimerRef.current);
+              retryTimerRef.current = window.setTimeout(() => {
+                retryTimerRef.current = null;
+                setRetryNonce(attempt); // nonce bump → <img> re-fetches the source
+              }, attempt * 1500);
+              return;
             }
             setErrored(true);
           }}

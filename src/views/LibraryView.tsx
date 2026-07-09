@@ -9,7 +9,7 @@ import ImageLoader from "../ImageLoader";
 import { shrinkPoster } from "../posterSize";
 import ErrorBoundary from "../ErrorBoundary";
 import Tooltip from "../Tooltip";
-import { isAnimeMeta, typeLabel } from "../aiometadata";
+import { isAnimeMeta, typeLabel, useAnimeCacheVersion } from "../aiometadata";
 import WatchedBadge from "../WatchedBadge";
 import { useHoverCardActivation } from "../useHoverCardActivation";
 import { closeHoverNow } from "../catalogHoverStore";
@@ -354,6 +354,9 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem, onAutoR
   // a mark flips or a new-episode signal lands.
   const manualVersion  = useManualWatchedVersion();
   const signalsVersion = useReleaseSignalsVersion();
+  // Re-classify the Series/Anime split when the background meta warm marks a
+  // newly-resolved IMDb-id'd anime (App.tsx poster-warm effect).
+  const animeCacheVersion = useAnimeCacheVersion();
   // Auto-remove-watched toggles, mirrored from auraSettings + kept live on the
   // settings-changed event. The going-forward removal runs in App (it owns the
   // cloud writes); here we only drive the toggle UI and the one-time
@@ -494,7 +497,8 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem, onAutoR
       buckets: { all, movie, series, anime } as Record<Filter, LibraryItem[]>,
       counts:  { all: all.length, movie: movie.length, series: series.length, anime: anime.length } as Record<Filter, number>,
     };
-  }, [items]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [items, animeCacheVersion]);
 
   // When no status filter is active the grid is exactly as before: the
   // media-type bucket, which excludes auto-tracked (temp) entries. When a
@@ -525,7 +529,7 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem, onAutoR
     if (extraFilters.airingOnly) base = base.filter((i) => isAiring(i));
     return base;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status, filter, buckets, items, manualVersion, signalsVersion, extraFilters.airingOnly]);
+  }, [status, filter, buckets, items, manualVersion, signalsVersion, animeCacheVersion, extraFilters.airingOnly]);
 
   // Project library items into MetaPreview shape so the panel's genre /
   // year filter can run uniformly across every browseable surface. The

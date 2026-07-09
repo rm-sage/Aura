@@ -1,6 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { useSyncExternalStore } from "react";
 import type { AddonEntry, MetaPreview, LibraryItem } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -104,6 +105,25 @@ function saveAnimeCache(): void {
   } catch { /* quota exceeded — non-fatal */ }
 }
 
+// Reactive version so views classifying by the anime cache (Library's
+// Series/Anime split) re-render when a background meta warm marks NEW ids.
+// Mirrors manualWatched.ts's subscribe/version pattern.
+let animeCacheVersion = 0;
+const animeCacheListeners = new Set<() => void>();
+function bumpAnimeCache(): void {
+  animeCacheVersion += 1;
+  for (const fn of animeCacheListeners) fn();
+}
+function subscribeAnimeCache(cb: () => void): () => void {
+  animeCacheListeners.add(cb);
+  return () => { animeCacheListeners.delete(cb); };
+}
+/** Subscribe a component to anime-cache mutations. Re-renders when a new id is
+ *  marked anime (e.g. the Library background warm resolving IMDb-id'd anime). */
+export function useAnimeCacheVersion(): number {
+  return useSyncExternalStore(subscribeAnimeCache, () => animeCacheVersion);
+}
+
 /** Stamp an id as anime in the persistent cache. Called by DetailView /
  *  Calendar / anywhere meta detail resolves with the Anime genre, so
  *  the next time a CW card or library entry references this id we can
@@ -114,6 +134,7 @@ export function markAnimeId(id: string): void {
   if (cache.has(id)) return;
   cache.add(id);
   saveAnimeCache();
+  bumpAnimeCache();
 }
 
 /** Inverse: stamp as definitively NOT anime so we don't keep checking
