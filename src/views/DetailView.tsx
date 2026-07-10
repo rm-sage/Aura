@@ -99,6 +99,7 @@ import { recheckSeriesWatchedFlag } from "../autoAdvance";
 import { getSortedEpisodes } from "../episodeSort";
 import { showFlyUpToast } from "../FlyUpToast";
 import ImageLoader from "../ImageLoader";
+import { shrinkPoster, screenWidthHint } from "../posterSize";
 import ErrorBoundary from "../ErrorBoundary";
 import { parseStream, chipStyleFor, looksLikeTamTaro, type ChipKind } from "../streamMeta";
 import NoProvidersWarning from "../NoProvidersWarning";
@@ -1032,7 +1033,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
       {/* Full-bleed backdrop */}
       {heroArt && (
         <ImageLoader
-          src={heroArt}
+          src={shrinkPoster(heroArt, screenWidthHint())}
           alt=""
           decoding="async"
           draggable={false}
@@ -2707,7 +2708,7 @@ const EpisodeRow = ({
           />
         ) : video.thumbnail ? (
           <ImageLoader
-            src={video.thumbnail}
+            src={shrinkPoster(video.thumbnail, 360)}
             alt=""
             className="absolute inset-0 w-full h-full"
             imgClassName={`w-full h-full object-cover transition-[filter] duration-300

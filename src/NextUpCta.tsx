@@ -26,6 +26,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useWindowHidden } from "./windowVisibility";
 import ImageLoader from "./ImageLoader";
+import { shrinkPoster } from "./posterSize";
 import FillerRecapTags from "./FillerRecapTags";
 import type { VideoEntry } from "./types";
 import { formatEpisodeTag, episodeKindFlags } from "./nextUp";
@@ -157,7 +158,7 @@ export default function NextUpCta({
       >
         {episode.thumbnail ? (
           <ImageLoader
-            src={episode.thumbnail}
+            src={shrinkPoster(episode.thumbnail, 480)}
             alt=""
             className="absolute inset-0 w-full h-full"
             imgClassName="w-full h-full object-cover"

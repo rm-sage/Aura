@@ -4,6 +4,7 @@
 import { useState, useEffect, useRef, useCallback, memo } from "react";
 import type { MetaPreview } from "./types";
 import ImageLoader from "./ImageLoader";
+import { shrinkPoster, screenWidthHint } from "./posterSize";
 import { useWindowHidden } from "./windowVisibility";
 
 // ---------------------------------------------------------------------------
@@ -430,6 +431,9 @@ function HeroBackdrop({
   onDualLayer: () => void;
 }) {
   const { src, isPortraitFallback } = pickHeroArt(item);
+  // Full-bleed backdrop: resize to the display's physical width (never upscaled,
+  // so a low-res source stays low-res and the detection below still fires).
+  const proxiedSrc = shrinkPoster(src, screenWidthHint());
   const [lowRes, setLowRes] = useState(false);
 
   // Reset measurement when src changes
@@ -463,7 +467,7 @@ function HeroBackdrop({
           // previous implementation since portrait sources have nothing
           // landscape to crop into.
           <ImageLoader
-            src={src}
+            src={proxiedSrc}
             alt=""
             decoding="async"
             loading="lazy"
@@ -491,7 +495,7 @@ function HeroBackdrop({
           // that to the blurred ambient-fill copies that previously
           // flanked an object-contain inset.
           <ImageLoader
-            src={src}
+            src={proxiedSrc}
             alt={item.name}
             decoding="async"
             loading="lazy"

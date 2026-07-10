@@ -30,17 +30,14 @@
 const IMG_PROXY_BASE = "http://127.0.0.1:11471/img";
 
 /** Apply a host-specific size hint so the first fetch is smaller. Unknown hosts
- *  pass through unchanged. Never upsizes. */
+ *  pass through unchanged. Never upsizes.
+ *
+ *  NOTE: no AIOMetadata `/poster?...&w=` hint. That was dropped: no server
+ *  producer emits it, the handler ignores it, and post its ETag fix the param
+ *  forks the validator (a distinct cache entry for byte-identical content) and
+ *  misses the nginx poster-cache's warmed no-`w` entries. The on-device resize
+ *  proxy handles the `/poster` bytes regardless, so the hint was pure cost. */
 function applyCdnSizeHint(url: string, targetW: number): string {
-  // AIOMetadata poster proxy: /poster/{type}/{id}?fallback=<url>&lang=&key=.
-  // Kept as a belt-and-suspenders hint (the resize proxy handles the bytes
-  // regardless): if the addon honours `w` the first fetch is already small.
-  // Host-agnostic (self-hosted allowed): matched by the /poster/{type}/ path +
-  // a `fallback=` param. `&w=` because the proxy URL always carries `?fallback=`.
-  if (/\/poster\/(?:movie|series)\//.test(url) && /[?&]fallback=/.test(url)) {
-    return /[?&]w=\d+/.test(url) ? url : `${url}&w=${targetW}`;
-  }
-
   // metahub (Cinemeta CDN): path-based sizes small | medium | large.
   const mh = url.match(/^(https?:\/\/images\.metahub\.space\/poster\/)(small|medium|large)(\/.*)$/i);
   if (mh) {
@@ -93,8 +90,23 @@ function proxyImage(url: string, targetW: number): string {
   if (!/^https?:\/\//i.test(url)) return url;
   // Don't double-wrap or point the proxy at the bridge itself.
   if (/\/\/(?:127\.0\.0\.1|localhost):11471\b/.test(url)) return url;
+  // Already server-resized by the addon (e.g. AIOMetadata's
+  // /api/image/banner-to-background for AniList art): re-proxying would just
+  // re-fetch + re-encode an image that's already sized.
+  if (url.includes("/api/image/")) return url;
   if (isPrivateHost(url)) return url;
   return `${IMG_PROXY_BASE}?w=${targetW}&url=${encodeURIComponent(url)}`;
+}
+
+/** Physical horizontal resolution of the display, for FULL-BLEED art (hero /
+ *  detail backdrops) so it stays sharp on a 4K / ultrawide panel while a 1080p
+ *  screen only pulls ~1920px. Clamped so a tiny window still gets a decent
+ *  backdrop and the proxy's 4096 ceiling is respected. */
+export function screenWidthHint(): number {
+  if (typeof window === "undefined") return 1920;
+  const w = window.screen?.width || window.innerWidth || 1920;
+  const dpr = window.devicePixelRatio || 1;
+  return Math.min(4096, Math.max(1280, Math.round(w * dpr)));
 }
 
 /** Downsize a poster URL to roughly `targetW` CSS px (callers fold in hi-DPI,

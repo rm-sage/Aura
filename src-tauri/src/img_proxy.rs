@@ -60,8 +60,12 @@ const MAX_FETCH_BYTES: usize = 24 * 1024 * 1024;
 const MAX_DECODE_PIXELS: u64 = 40 * 1_000_000;
 
 /// Requested widths are clamped into this range; hi-DPI callers pass ~2x CSS px.
+/// The ceiling is 4K-wide so a full-bleed backdrop can be delivered sharp on a
+/// 4K / ultrawide display (callers pass the physical screen width). Output size
+/// scales with `w`, but the INPUT is still bounded by the byte + pixel caps, so a
+/// large `w` can't be turned into a decode bomb.
 const MIN_TARGET_W: u32 = 64;
-const MAX_TARGET_W: u32 = 1024;
+const MAX_TARGET_W: u32 = 4096;
 const DEFAULT_TARGET_W: u32 = 360;
 
 /// JPEG quality for the re-encoded output. 82 is visually clean for poster art
@@ -222,6 +226,13 @@ fn img_client() -> &'static reqwest::Client {
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 if attempt.previous().len() >= 5 {
                     return attempt.error("too many redirects".to_string());
+                }
+                // Fail fast on a self-referential loop instead of walking to the
+                // hop cap. A 302 with an EMPTY Location resolves back to the same
+                // URL (the AIOMetadata /poster artwork-less path emits exactly
+                // this), which would otherwise self-redirect five times.
+                if attempt.previous().iter().any(|u| u == attempt.url()) {
+                    return attempt.error("redirect loop".to_string());
                 }
                 if host_is_public(attempt.url()) {
                     attempt.follow()

@@ -25,6 +25,7 @@
 
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import ImageLoader from "./ImageLoader";
+import { shrinkPoster } from "./posterSize";
 import SeasonSelect from "./SeasonSelect";
 import type { AddonEntry, LibraryItem, MetaDetail, VideoEntry } from "./types";
 import { getMetaDetailFallback, peekCachedDetailById } from "./metaCache";
@@ -293,7 +294,7 @@ function EpisodePanel({
                   >
                     {v.thumbnail ? (
                       <ImageLoader
-                        src={v.thumbnail}
+                        src={shrinkPoster(v.thumbnail, 360)}
                         alt=""
                         className="absolute inset-0 w-full h-full"
                         imgClassName={`w-full h-full object-cover transition-[filter] duration-300
