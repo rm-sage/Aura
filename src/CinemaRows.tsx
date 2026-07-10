@@ -19,6 +19,7 @@ import { getReleaseSignal, useReleaseSignalsVersion } from "./releaseSignalStore
 import { formatCountdown, formatTargetDate, airingInfo, nextAiringEpisode, useCountdownNow } from "./releaseCountdown";
 import { useLandscapeArt, LANDSCAPE_CARD_WIDTH } from "./landscapeArt";
 import { findAIOMetadataAddon } from "./aiometadata";
+import { shrinkPoster } from "./posterSize";
 
 /** Per-catalog cache for the View-all popup. Keyed by
  *  `${addonUrl}|${type}|${id}`. Persists across DiscoveryRow remounts
@@ -1015,7 +1016,7 @@ export const CatalogCard = memo(function CatalogCard({ meta, onSelect, fixedTitl
       >
         {meta.poster ? (
           <ImageLoader
-            src={meta.poster}
+            src={shrinkPoster(meta.poster)}
             alt={meta.name}
             draggable={false}
             className="absolute inset-0 w-full h-full"

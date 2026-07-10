@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { AddonEntry, MetaPreview } from "../types";
 import type { CatalogInfo } from "../CatalogPicker";
 import ImageLoader from "../ImageLoader";
+import { shrinkPoster } from "../posterSize";
 import ErrorBoundary from "../ErrorBoundary";
 import WatchedBadge from "../WatchedBadge";
 import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "../FilterBar";
@@ -550,7 +551,7 @@ const DiscoverPosterCard = memo(function DiscoverPosterCard({
            style={{ aspectRatio: "2 / 3" }}>
         {meta.poster ? (
           <ImageLoader
-            src={meta.poster}
+            src={shrinkPoster(meta.poster)}
             alt={meta.name}
             className="w-full h-full object-cover"
           />

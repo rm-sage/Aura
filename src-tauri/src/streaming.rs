@@ -196,7 +196,9 @@ pub fn start_in_process() {
         let app = Router::new()
             .route("/health", get(health))
             .route("/proxy/*encoded", get(proxy_stream).options(proxy_preflight))
-            .route("/magnet/*encoded", get(magnet_stream));
+            .route("/magnet/*encoded", get(magnet_stream))
+            // On-device poster resize-and-cache proxy (img_proxy.rs).
+            .route("/img", get(crate::img_proxy::handle));
 
         let addr = SocketAddr::from(([127, 0, 0, 1], BRIDGE_PORT));
         let listener = match tokio::net::TcpListener::bind(addr).await {

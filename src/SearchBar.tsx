@@ -5,6 +5,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { AddonEntry, MetaPreview } from "./types";
 import ImageLoader from "./ImageLoader";
+import { shrinkPoster } from "./posterSize";
 
 // ---------------------------------------------------------------------------
 // SearchBar
@@ -339,7 +340,7 @@ export default function SearchBar({
                       <div className="flex-shrink-0 relative w-8 h-12 rounded overflow-hidden bg-white/5">
                         {meta.poster ? (
                           <ImageLoader
-                            src={meta.poster}
+                            src={shrinkPoster(meta.poster, 120)}
                             alt=""
                             className="absolute inset-0 w-full h-full"
                             imgClassName="w-full h-full object-cover"

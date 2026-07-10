@@ -38,6 +38,7 @@ mod media_controls;
 // thumbnail instance). Replaced `tauri-plugin-libmpv` entirely; see
 // mpv/mod.rs for the consolidation history.
 mod debug_panel;
+mod img_proxy;
 // IPTV (Live TV) network hop — see src/iptv/ for the TS parsers.
 mod iptv;
 mod mpv;
@@ -1898,6 +1899,12 @@ pub fn run() {
             // swallowed inside start_in_process (only plain-HTTP streams
             // need the proxy; HTTPS bypasses the bridge entirely per
             // resolve_stream's routing rules).
+            // Poster resize-and-cache proxy: capture its on-device cache dir
+            // (the bridge task has no AppHandle) before the bridge starts, then
+            // it serves GET /img?url=&w= on the same loopback listener.
+            if let Ok(dir) = app.handle().path().app_data_dir() {
+                img_proxy::init(dir.join("img-cache"));
+            }
             streaming::start_in_process();
 
             // ── Deep-link handler ─────────────────────────────────────────

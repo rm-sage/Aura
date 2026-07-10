@@ -4,6 +4,7 @@
 import { useState, useEffect, memo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { MetaPreview } from "./types";
+import { shrinkPoster } from "./posterSize";
 
 export type { MetaPreview };
 
@@ -29,7 +30,7 @@ const PosterCard = memo(function PosterCard({ meta }: { meta: MetaPreview }) {
       >
         {showImage ? (
           <img
-            src={meta.poster!}
+            src={shrinkPoster(meta.poster)!}
             alt={meta.name}
             loading="lazy"
             decoding="async"

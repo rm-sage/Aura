@@ -5,6 +5,7 @@ import { useState, useMemo, memo } from "react";
 import type { MetaPreview } from "./CatalogGrid";
 import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "./FilterBar";
 import ImageLoader from "./ImageLoader";
+import { shrinkPoster } from "./posterSize";
 
 const PosterCard = memo(function PosterCard({
   meta, onSelect,
@@ -32,7 +33,7 @@ const PosterCard = memo(function PosterCard({
       >
         {meta.poster ? (
           <ImageLoader
-            src={meta.poster}
+            src={shrinkPoster(meta.poster)}
             alt={meta.name}
             className="absolute inset-0 w-full h-full"
             imgClassName="w-full h-full object-cover transition-transform duration-300 group-hover:scale-105"

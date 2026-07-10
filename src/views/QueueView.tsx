@@ -29,6 +29,7 @@ import {
   onManualWatchedChange,
 } from "../manualWatched";
 import ImageLoader from "../ImageLoader";
+import { shrinkPoster } from "../posterSize";
 import ErrorBoundary from "../ErrorBoundary";
 import WatchedBadge from "../WatchedBadge";
 import { showAppToast } from "../AppToast";
@@ -407,7 +408,7 @@ function QueueCard({
         >
           {meta.poster ? (
             <ImageLoader
-              src={meta.poster}
+              src={shrinkPoster(meta.poster)}
               alt={meta.name ?? ""}
               className="absolute inset-0 w-full h-full"
               imgClassName="w-full h-full object-cover"

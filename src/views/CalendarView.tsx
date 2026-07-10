@@ -7,6 +7,7 @@ import { loadAuraSettings } from "../auraSettings";
 import { resolveDefaultMetaUrl } from "../addonDefaults";
 import { getMetaDetail } from "../metaCache";
 import ImageLoader from "../ImageLoader";
+import { shrinkPoster } from "../posterSize";
 import { formatEpLabel } from "../episodeLabel";
 import { useHoverCardActivation } from "../useHoverCardActivation";
 import { closeHoverNow } from "../catalogHoverStore";
@@ -810,7 +811,7 @@ function CalendarCard({
       >
         {poster ? (
           <ImageLoader
-            src={poster}
+            src={shrinkPoster(poster)}
             alt=""
             draggable={false}
             className="absolute inset-0 w-full h-full"

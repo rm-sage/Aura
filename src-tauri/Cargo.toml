@@ -48,6 +48,12 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "macros", "
 # enforces the IPTV fetch size-cap streaming.
 axum = "0.7"
 futures-util = "0.3"
+# On-device poster resize-and-cache proxy (img_proxy.rs). Native decode of
+# poster bytes so the WebView2 layer only ever textures card-sized images
+# (the raw kitsu/anilist covers are 3+ MP). default-features off keeps the
+# decoder set lean: posters are jpeg/png/webp; anything else fails the decode
+# and the proxy degrades to a redirect to the original.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 # Casting (src/cast/): mDNS `_googlecast._tcp` discovery + a hand-rolled
 # CASTV2 client (cast/castv2.rs — length-prefixed protobuf frames with
 # JSON payloads; no protocol surface beyond what Aura uses). native-tls

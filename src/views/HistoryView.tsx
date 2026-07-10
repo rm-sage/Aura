@@ -11,6 +11,7 @@ import {
   type HistoryEntry,
 } from "../historyStore";
 import ImageLoader from "../ImageLoader";
+import { shrinkPoster } from "../posterSize";
 import ErrorBoundary from "../ErrorBoundary";
 import { showAppToast } from "../AppToast";
 import { typeLabel } from "../aiometadata";
@@ -215,7 +216,7 @@ function HistoryCard({
         >
           {entry.poster ? (
             <ImageLoader
-              src={entry.poster}
+              src={shrinkPoster(entry.poster)}
               alt={entry.name}
               className="absolute inset-0 w-full h-full"
               imgClassName="w-full h-full object-cover"
