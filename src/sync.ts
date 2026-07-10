@@ -621,7 +621,22 @@ async function writeSettingsBlob(blob: Partial<SettingsSyncBlob>): Promise<void>
     // fromCloud: true suppresses the bumpSettingsUpdatedAt() inside
     // saveAuraSettings — we want the local stamp to inherit the
     // server's updated_at below, not re-stamp to "right now".
-    saveAuraSettings({ ...DEFAULT_AURA_SETTINGS, ...blob.frontend }, { fromCloud: true });
+    //
+    // Device-local view preferences are preserved across the pull instead of
+    // being reset to the cloud blob's value: a stale/older server blob (or one
+    // written before the field existed) would otherwise clobber the user's last
+    // choice on this device, which read as "the grouping never remembers".
+    // These are per-device UI prefs, not account data, so the local value wins.
+    const local = loadAuraSettings();
+    saveAuraSettings(
+      {
+        ...DEFAULT_AURA_SETTINGS,
+        ...blob.frontend,
+        airingGroupBy: local.airingGroupBy,
+        airingSort: local.airingSort,
+      },
+      { fromCloud: true },
+    );
   }
   if (blob.backend) {
     await applyBackendSettings(blob.backend);
