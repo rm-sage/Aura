@@ -246,6 +246,11 @@ export interface AuraSettings {
    *  PORTABLE_AURA_FIELDS / cloud sync (each device keeps its own view state). */
   airingGroupBy: "type" | "airwindow" | "none";
   airingSort: "recent" | "soonest" | "behind" | "alpha";
+  /** Airing-page tile size. Unlike the grouping/sort above this DOES cloud-sync
+   *  + is portable (a display-scale preference the user wants to carry across
+   *  devices). "small" is the compact scaling; "medium" (default) is 50% larger;
+   *  "large" is 100% larger. */
+  airingTileSize: "small" | "medium" | "large";
 }
 
 export const DEFAULT_AURA_SETTINGS: AuraSettings = {
@@ -279,6 +284,7 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   libraryAutoRemoveWatchedSeries: false,
   airingGroupBy: "type",
   airingSort: "recent",
+  airingTileSize: "medium",
 };
 
 // Module-level memoization snapshot. loadAuraSettings is called many

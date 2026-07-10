@@ -37,14 +37,25 @@ interface Props {
 
 type GroupBy = "type" | "airwindow" | "none";
 type SortMode = "recent" | "soonest" | "behind" | "alpha";
+type TileSize = "small" | "medium" | "large";
 
-// Responsive min-width for the landscape tile grid. Deliberately DECOUPLED from
-// LANDSCAPE_CARD_WIDTH (640), which is the image-resolution hint: using that as
-// the grid floor forced ~640px tiles (only ~3 per row, and a single full-width
-// tile on a narrow window). This clamps the DISPLAY width so tiles pack several
-// per row at a sensible size and shrink on smaller viewports instead of eating
-// the whole screen on 1080p.
-const AIRING_TILE_MIN_W = "clamp(220px, 24vw, 300px)";
+// Responsive tile min-widths for the landscape grid, per size choice. Deliberately
+// DECOUPLED from LANDSCAPE_CARD_WIDTH (640), which is the image-resolution hint:
+// using that as the grid floor forced ~640px tiles (only ~3 per row, and a single
+// full-width tile on a narrow window). Each entry clamps the DISPLAY width so tiles
+// pack several per row and shrink on smaller viewports instead of eating the whole
+// screen. "small" is the compact scaling; "medium" is 50% larger; "large" is 100%
+// larger (roughly the original oversized tiles).
+const TILE_SIZES: Record<TileSize, string> = {
+  small:  "clamp(220px, 24vw, 300px)",
+  medium: "clamp(330px, 36vw, 450px)",
+  large:  "clamp(440px, 48vw, 600px)",
+};
+const TILE_SIZE_OPTIONS: { id: TileSize; label: string }[] = [
+  { id: "small",  label: "Small" },
+  { id: "medium", label: "Medium" },
+  { id: "large",  label: "Large" },
+];
 
 const GROUP_OPTIONS: { id: GroupBy; label: string }[] = [
   { id: "type",      label: "Series / Anime" },
@@ -63,6 +74,7 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
   const [loading, setLoading] = useState(false);
   const [groupBy, setGroupBy] = useState<GroupBy>(() => loadAuraSettings().airingGroupBy);
   const [sort, setSort] = useState<SortMode>(() => loadAuraSettings().airingSort);
+  const [tileSize, setTileSize] = useState<TileSize>(() => loadAuraSettings().airingTileSize);
   const signalsVersion = useReleaseSignalsVersion();
   const manualVersion = useManualWatchedVersion();
 
@@ -215,6 +227,7 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
 
   const setGroup = (g: GroupBy) => { setGroupBy(g); saveAuraSettings({ ...loadAuraSettings(), airingGroupBy: g }); };
   const setSortMode = (m: SortMode) => { setSort(m); saveAuraSettings({ ...loadAuraSettings(), airingSort: m }); };
+  const setTileSizeMode = (t: TileSize) => { setTileSize(t); saveAuraSettings({ ...loadAuraSettings(), airingTileSize: t }); };
 
   const total = airingItems.length;
   const signalsOff = !hasAnyReleaseSignal();
@@ -260,6 +273,25 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
                     <option key={o.id} value={o.id} className="bg-zinc-900">{o.label}</option>
                   ))}
                 </select>
+                {/* Tile-size segmented control */}
+                <div
+                  className="flex items-center rounded-full bg-white/5 border border-white/10 p-0.5"
+                  role="group"
+                  aria-label="Tile size"
+                >
+                  {TILE_SIZE_OPTIONS.map((t) => (
+                    <button
+                      key={t.id}
+                      onClick={() => setTileSizeMode(t.id)}
+                      aria-pressed={tileSize === t.id}
+                      title={`${t.label} tiles`}
+                      className={`px-3 py-1 rounded-full text-xs font-medium transition-colors
+                                  ${tileSize === t.id ? "bg-ln-accent/20 text-ln-accent" : "text-white/55 hover:text-white/85"}`}
+                    >
+                      {t.label}
+                    </button>
+                  ))}
+                </div>
               </div>
             )}
           </div>
@@ -292,7 +324,7 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
                   )}
                   <div
                     className="grid gap-4"
-                    style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${AIRING_TILE_MIN_W}, 1fr))` }}
+                    style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${TILE_SIZES[tileSize]}, 1fr))` }}
                   >
                     {section.items.map((item) => (
                       <AiringTile

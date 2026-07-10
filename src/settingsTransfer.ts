@@ -126,6 +126,7 @@ const PORTABLE_AURA_FIELDS = [
   "heroDisabled",
   "libraryAutoRemoveWatchedMovies",
   "libraryAutoRemoveWatchedSeries",
+  "airingTileSize",
 ] as const;
 export type PortableAuraField = typeof PORTABLE_AURA_FIELDS[number];
 
