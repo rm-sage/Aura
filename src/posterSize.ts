@@ -46,14 +46,22 @@ function applyCdnSizeHint(url: string, targetW: number): string {
     return rank[mh[2].toLowerCase()] > rank[want] ? `${mh[1]}${want}${mh[3]}` : url;
   }
 
-  // TMDB image CDN: /t/p/original or /t/p/wNNN.
+  // TMDB image CDN: /t/p/original or /t/p/wNNN. Pick the rung at least as wide
+  // as the target and rewrite to it. The ladder MUST scale past poster width:
+  // backdrops pass a full display-width target (1280..4096), and the old
+  // w500 cap downsized a full-bleed backdrop to 500px, tripping the hero's
+  // low-res detector into the blurred portrait fallback. TMDB serves any rung
+  // from the master, so a large target legitimately fetches `original` and lets
+  // the on-device proxy resize it to exact width.
   const tmdb = url.match(/^(https?:\/\/image\.tmdb\.org\/t\/p\/)(original|w\d+)(\/.*)$/i);
   if (tmdb) {
-    const rung = targetW <= 200 ? "w185" : targetW <= 400 ? "w342" : "w500";
-    const cur = tmdb[2].toLowerCase();
-    const curW = cur === "original" ? Infinity : parseInt(cur.slice(1), 10);
-    const rungW = parseInt(rung.slice(1), 10);
-    return curW > rungW ? `${tmdb[1]}${rung}${tmdb[3]}` : url;
+    const rung = targetW <= 200 ? "w185"
+               : targetW <= 400 ? "w342"
+               : targetW <= 600 ? "w500"
+               : targetW <= 900 ? "w780"
+               : targetW <= 1400 ? "w1280"
+               : "original";
+    return tmdb[2].toLowerCase() === rung ? url : `${tmdb[1]}${rung}${tmdb[3]}`;
   }
 
   return url;
