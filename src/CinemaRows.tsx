@@ -8,9 +8,8 @@ import { useRowWindow } from "./useRowWindow";
 import { invoke } from "@tauri-apps/api/core";
 import type { MetaPreview, LibraryItem, AddonEntry, VideoEntry, MetaDetail } from "./types";
 import { isVideoAired } from "./types";
-import { findNextEpisode } from "./nextUp";
 import ImageLoader from "./ImageLoader";
-import { useLibraryProgress } from "./LibraryContext";
+import { useLibraryProgress, episodeIsBeforeResume } from "./LibraryContext";
 import WatchedBadge, { useWatchedVariant, WatchedBadgeStatic } from "./WatchedBadge";
 import { getManualWatchedState, useManualWatchedVersion } from "./manualWatched";
 import { getMetaDetailFallback, useCanonicalReleaseYear } from "./metaCache";
@@ -418,34 +417,29 @@ function ContinuousProgressBar({
 
 /** Pull the current season's episode list from the meta cache.
  *  Returns null while fetching, returns [] for non-episodic items. */
-function useSeasonEpisodes(
+/** Fetch the FULL meta detail (all seasons) for a CW/Airing card. The season
+ *  slice + next-up are derived reactively in the component via resolveCwProgress
+ *  so they follow manual watched marks, not just the resume pointer. */
+function useCwDetail(
   item: LibraryItem,
   addons: AddonEntry[] | undefined,
-): { seasonEpisodes: VideoEntry[] | null; detail: MetaDetail | null } {
-  const [eps, setEps] = useState<VideoEntry[] | null>(null);
-  // Full meta detail (all seasons) kept alongside the season slice so the
-  // CW badge can roll forward to the next-up episode ACROSS seasons.
+): MetaDetail | null {
   const [detailState, setDetailState] = useState<MetaDetail | null>(null);
   const mediaType = (item.media_type ?? "").toLowerCase();
   const isEpisodic = mediaType === "series" || mediaType === "anime";
 
   useEffect(() => {
     if (!isEpisodic || !addons || addons.length === 0) {
-      setEps([]);
       setDetailState(null);
       return;
     }
     let cancelled = false;
     (async () => {
-      // Some library items get added under one media_type but only
-      // resolve their episode list under the other (the dual-indexed
-      // anime case: an IMDb-id'd anime saved under media_type=series
-      // via Cinemeta, but its episode list lives on a Kitsu/AniList
-      // addon that only responds to type=anime). The first attempt
-      // uses the stored type; if that returns no videos, retry with
-      // the alternate. Without this, the CW card silently falls
-      // through to the thin progress-bar render path because the
-      // segmented bar requires a video list to draw the segments.
+      // Some library items get added under one media_type but only resolve their
+      // episode list under the other (the dual-indexed anime case: an IMDb-id'd
+      // anime saved under media_type=series via Cinemeta, but its episode list
+      // lives on a Kitsu/AniList addon that only answers to type=anime). Try the
+      // stored type first; if it returns no videos, retry with the alternate.
       let detail = await getMetaDetailFallback(addons, item.media_type, item.id);
       if (cancelled) return;
       const altType = mediaType === "series" ? "anime"
@@ -455,76 +449,12 @@ function useSeasonEpisodes(
         detail = await getMetaDetailFallback(addons, altType, item.id);
         if (cancelled) return;
       }
-      if (!detail || !detail.videos || detail.videos.length === 0) {
-        setEps([]);
-        setDetailState(null);
-        return;
-      }
-      // Determine which season's episodes the bar should represent.
-      // Resolution order:
-      //   1. VideoEntry-authoritative: find the video in detail.videos
-      //      whose id matches state.video_id. Works uniformly for both
-      //      tt-style ids (`tt22248376:2:9`) and anime-prefix ids
-      //      (`kitsu:49240:9`) — the latter carries the kitsu show id
-      //      in its middle slot, not a season number, so id-parsing
-      //      would mis-read it as season 49240.
-      //   2. (season, episode) tuple match for legacy library entries
-      //      whose state.video_id shape no longer matches videos[].id.
-      //   3. Id-string parse fallback (tt-only) when neither matches —
-      //      covers in-flight meta where videos[] hasn't loaded yet.
-      // Cour-aggregated anime: AIOMetadata now emits one season per
-      // cour, so v.season carries the cour position (1, 2, 3, …) and
-      // the bar correctly represents the user's current cour.
-      const videoId = (item.state ?? {}).video_id;
-      let season: number | null = null;
-      if (typeof videoId === "string" && videoId.length > 0) {
-        const directMatch = detail.videos.find((v) => v.id === videoId);
-        if (directMatch?.season != null) {
-          season = directMatch.season;
-        } else {
-          // Tuple-match fallback for ids that don't equal any current
-          // video id (legacy shape after addon-side renaming, e.g.
-          // tt22248376:1:5 against new kitsu:46474:5 videos).
-          const parts = videoId.split(":");
-          if (parts.length >= 3 && videoId.startsWith("tt")) {
-            const s = Number(parts[parts.length - 2]);
-            const e = Number(parts[parts.length - 1]);
-            if (Number.isFinite(s) && Number.isFinite(e)) {
-              const tupleMatch = detail.videos.find(
-                (v) => (v.season ?? 0) === s && (v.episode ?? 0) === e,
-              );
-              if (tupleMatch?.season != null) season = tupleMatch.season;
-            }
-          }
-        }
-      }
-      // Filter to the resolved season. When season is null (initial
-      // load / unrecognised id / single-season show), fall through to
-      // the full list so the bar still draws — the strip-specials
-      // filter below collapses it to a sensible single-bar render for
-      // flat shows.
-      let seasonEps = season != null
-        ? detail.videos.filter((v) => v.season === season)
-        : detail.videos;
-      if (seasonEps.length === 0 && detail.videos.length > 0) {
-        seasonEps = detail.videos;
-      }
-      // Always strip season 0 (specials / OVAs / extras). The CW
-      // segmented bar represents the user's main watch arc — specials
-      // air out-of-band and inflating the segment count with them
-      // makes the bar misrepresent main-run progress (e.g. Frieren's
-      // 28 main-run episodes balloon to 38 when 10 specials are
-      // included). The detail page's EpisodesPanel still shows the
-      // specials season explicitly via the dropdown.
-      seasonEps = seasonEps.filter((v) => (v.season ?? 0) !== 0);
-      seasonEps.sort((a, b) => (a.episode ?? 0) - (b.episode ?? 0));
-      setEps(seasonEps);
-      setDetailState(detail);
+      setDetailState(detail && detail.videos && detail.videos.length > 0 ? detail : null);
     })();
     return () => { cancelled = true; };
-  }, [item.id, item.media_type, item.state?.video_id, isEpisodic, addons]);
+  }, [item.id, item.media_type, isEpisodic, addons]);
 
-  return { seasonEpisodes: eps, detail: detailState };
+  return detailState;
 }
 
 /** Inline title-suffix indicator for CW cards. Renders a small green
@@ -629,35 +559,75 @@ function resolveCurrentEpisode(
   return episodes.find((v) => (v.episode ?? 0) === pair.last) ?? null;
 }
 
-function useEffectiveResumeVideoId(
+/** Resolve the season the CW bar should show AND the next episode to watch,
+ *  from the FULL episode list + the item's watched state. Crucially this works
+ *  off MANUAL watched marks as well as the resume pointer (state.video_id): a
+ *  series the user marks episode-by-episode (no in-app playback, so no resume
+ *  pointer) still advances the bar + badge to the right season, and it reacts
+ *  to mark/unmark. Main-run only (specials are a separate track).
+ *
+ *  - In-progress resume (saved episode started, < 95%, not marked watched): that
+ *    IS the current episode; show its season and badge it.
+ *  - Otherwise: the next-up is the first UNWATCHED episode after the rightmost
+ *    watched one, across seasons. Its season is the current season. Once a
+ *    season is fully watched this naturally rolls onto the next season (Silo:
+ *    S01+S02 watched -> bar + badge move to S03E01).
+ *  - Everything watched: caught up; show the last season and leave next-up null
+ *    so the caller's cloud fallback can pre-empt the upcoming premiere. */
+function resolveCwProgress(
+  detail: MetaDetail | null,
   item: LibraryItem,
-  episodes: VideoEntry[] | null,
-): string | null {
-  void useManualWatchedVersion();
-  const baseId = (item.state ?? {}).video_id;
-  if (typeof baseId !== "string" || baseId.length === 0) return null;
-  if (getManualWatchedState(baseId) !== "watched") {
-    // Even when the user isn't manually-watched here, the baseId may
-    // not directly match the current videos[] shape (post AIOMetadata
-    // IMDb-anime patch transition). Resolve to the current-shape id
-    // via the tuple fallback so the badge + bar paint correctly.
-    if (!episodes || episodes.length === 0) return baseId;
-    const resolved = resolveCurrentEpisode(baseId, episodes);
-    return resolved?.id ?? baseId;
+): { currentSeason: number | null; nextUpId: string | null } {
+  const mains = (detail?.videos ?? []).filter((v) => v.season != null && v.season !== 0);
+  if (mains.length === 0) return { currentSeason: null, nextUpId: null };
+  const sorted = [...mains].sort(
+    (a, b) => (a.season! - b.season!) || ((a.episode ?? 0) - (b.episode ?? 0)),
+  );
+  const rawResume = (item.state ?? {}).video_id;
+  const resumeId = typeof rawResume === "string" && rawResume.length > 0 ? rawResume : null;
+  const offset = typeof item.state?.timeOffset === "number" ? item.state.timeOffset : 0;
+  const duration = typeof item.state?.duration === "number" ? item.state.duration : 0;
+  const resumeProgress = duration > 0 ? offset / duration : 0;
+  const resumeFinished =
+    resumeId != null &&
+    (getManualWatchedState(resumeId) === "watched" || resumeProgress >= 0.95);
+
+  const isWatched = (ep: VideoEntry): boolean => {
+    if (getManualWatchedState(ep.id) === "watched") return true;
+    if (resumeId) {
+      if (ep.id === resumeId) return resumeFinished;
+      if (episodeIsBeforeResume(ep.id, resumeId)) return true;
+    }
+    return false;
+  };
+
+  // In-progress resume wins: the saved episode isn't finished, so that's where
+  // the user continues. resolveCurrentEpisode absorbs legacy id-shape drift.
+  // BUT only when it isn't stale: if a LATER episode has been manually marked
+  // watched, the user moved past this paused episode, so fall through to the
+  // frontier walk (mirrors the segmented bar's stale-in-progress heuristic).
+  if (resumeId && !resumeFinished) {
+    const cur = resolveCurrentEpisode(resumeId, sorted);
+    if (cur?.season != null) {
+      const curIdx = sorted.findIndex((v) => v.id === cur.id);
+      const laterWatched = sorted
+        .slice(curIdx + 1)
+        .some((v) => getManualWatchedState(v.id) === "watched");
+      if (!laterWatched) return { currentSeason: cur.season, nextUpId: cur.id };
+    }
   }
-  // Resume ep is manually-watched. Walk the season to find the next
-  // non-watched episode — that's where the user would resume.
-  if (!episodes || episodes.length === 0) return baseId;
-  const startEp = resolveCurrentEpisode(baseId, episodes);
-  if (!startEp) return baseId;
-  const idx = episodes.findIndex((v) => v.id === startEp.id);
-  if (idx < 0) return startEp.id;
-  for (let i = idx + 1; i < episodes.length; i += 1) {
-    const ep = episodes[i];
-    if (getManualWatchedState(ep.id) === "watched") continue;
-    return ep.id;
+
+  // First unwatched episode after the rightmost watched one.
+  let frontierIdx = -1;
+  for (let i = 0; i < sorted.length; i += 1) {
+    if (isWatched(sorted[i])) frontierIdx = i;
   }
-  return startEp.id;
+  const nextUp = sorted[frontierIdx + 1] ?? null;
+  if (nextUp?.season != null) return { currentSeason: nextUp.season, nextUpId: nextUp.id };
+
+  // Everything in the meta is watched.
+  const last = sorted[sorted.length - 1];
+  return { currentSeason: last.season ?? null, nextUpId: null };
 }
 
 // Centered "next episode" countdown pill, overlaid on the CW tile art just
@@ -742,69 +712,65 @@ export const ContinueWatchingCard = memo(function ContinueWatchingCard(
   const offset = typeof item.state?.timeOffset === "number" ? item.state.timeOffset : 0;
   const duration = typeof item.state?.duration === "number" ? item.state.duration : 0;
   const progress = duration > 0 ? Math.min(1, offset / duration) : 0;
-  // The amber "resume here" marker should only appear for a GENUINE saved
-  // resume: actually started (offset > 0), not yet finished (< 95%), and the
-  // saved episode is the one we're showing — NOT a finished episode we've
-  // advanced PAST to a not-yet-started next-up. Without the last check the bar
-  // painted amber on every in-progress series' next episode even though the
-  // user never started it.
   const savedVideoId = (item.state ?? {}).video_id;
+
+  const cwDetail = useCwDetail(item, addons);
+  // Subscribe to release-signal + manual-watched changes so the season slice,
+  // badge, and bar all re-derive when a signal lands OR the user marks/unmarks
+  // an episode. The old resume-pointer-only resolution never reacted to manual
+  // marks, so the badge stayed stuck until an automatic progress write.
+  const signalsVersion = useReleaseSignalsVersion();
+  const manualVersion = useManualWatchedVersion();
+
+  // The season the bar should show + the next episode to watch, resolved from
+  // the watched state (manual marks OR the resume pointer) across ALL seasons.
+  // This is what makes a manually-tracked show (no resume pointer) advance the
+  // bar + badge onto the right season instead of dumping every season on one bar.
+  const { currentSeason, nextUpId } = useMemo(
+    () => resolveCwProgress(cwDetail, item),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [cwDetail, item.state?.video_id, item.state?.timeOffset, item.state?.duration, manualVersion],
+  );
+
+  // Main-run episodes of the resolved current season, sorted by episode. Specials
+  // (season 0) are always stripped: they air out-of-band and would misrepresent
+  // the main watch arc (the detail page still lists them via its dropdown).
+  const seasonEpisodes = useMemo(() => {
+    const vids = cwDetail?.videos;
+    if (!vids || vids.length === 0) return null;
+    const eps = vids
+      .filter((v) => (v.season ?? 0) !== 0 && (currentSeason == null || v.season === currentSeason))
+      .sort((a, b) => (a.episode ?? 0) - (b.episode ?? 0));
+    return eps.length > 0 ? eps : null;
+  }, [cwDetail, currentSeason]);
+
+  // The amber "resume here" marker only when the next-up IS a genuine in-progress
+  // saved resume (started, < 95%, not finished). A freshly-advanced next-up the
+  // user never started renders as "available" instead.
   const resumeActive =
     offset > 0 &&
     progress < 0.95 &&
-    (typeof savedVideoId !== "string" ||
-      savedVideoId.length === 0 ||
-      getManualWatchedState(savedVideoId) !== "watched");
-  const { seasonEpisodes, detail: cwDetail } = useSeasonEpisodes(item, addons);
-  // Subscribe to release-signal changes so the badge's cloud next_aired
-  // fallback (below) re-derives the moment signals land for this series.
-  const signalsVersion = useReleaseSignalsVersion();
-  // Effective resume episode — falls forward across manually-watched
-  // entries so a freshly-marked episode causes the SxxEyy badge AND
-  // the segmented bar's "current" amber to advance to the next
-  // unwatched ep. Without this, the CW card stayed visually stuck on
-  // the just-marked episode.
-  const effectiveVideoId = useEffectiveResumeVideoId(item, seasonEpisodes);
-  // Badge target = the episode the card will actually resume. When the saved
-  // (last-played) episode is FINISHED — >= 95 % watched, or manually marked —
-  // the card resumes the NEXT unwatched episode ACROSS seasons (the same roll
-  // openDetailFromCW / DetailView performs: finishing S01E13 → S02E01). The
-  // segmented bar keeps using effectiveVideoId so it still represents the
-  // just-finished season; only the badge rolls. Mid-watch (< 95 %, not marked)
-  // keeps the badge on the resume episode. findNextEpisode handles aired-
-  // gating, specials, and the cross-season hop.
+    typeof savedVideoId === "string" &&
+    savedVideoId.length > 0 &&
+    savedVideoId === nextUpId;
+
+  // Badge = the next episode to watch. resolveCwProgress already rolled across
+  // seasons off the watched frontier, so nextUpId is it (the next aired episode,
+  // or a pre-empted next-season premiere the meta lists). When every listed
+  // episode is watched (nextUpId null), pre-empt the upcoming episode from the
+  // cloud signal (main-run only); otherwise leave the badge blank rather than
+  // mislabel a finished episode.
   const badgeVideoId = useMemo(() => {
-    const base = effectiveVideoId;
-    if (!base || !cwDetail?.videos || cwDetail.videos.length === 0) return base;
-    const finished =
-      getManualWatchedState(base) === "watched" ||
-      (base === savedVideoId && progress >= 0.95);
-    if (!finished) return base;
-    const nowMs = Date.now();
-    // Caught up on `base`: roll to the next UNWATCHED AIRED episode when one
-    // exists (something the user can play right now).
-    const nextAired = findNextEpisode(cwDetail, base, nowMs, "none");
-    if (nextAired) return nextAired.id;
-    // Nothing aired left: the show is fully caught up and only has a FUTURE
-    // episode coming (the one the countdown pill targets). Pre-empt it (e.g.
-    // next season's premiere) instead of falling back to the just-finished
-    // episode, which read as "next up S02E04" on a show the user had actually
-    // completed. Anchor to `base` and walk to the next MAIN-RUN episode with the
-    // air gate off: that skips specials via the cross-track rule, so an upcoming
-    // SPECIAL (My Hero Academia S00E24 after a finished main run) never becomes
-    // the badge. Cloud next_aired is the fallback, likewise gated to non-special.
-    // When neither knows the upcoming episode, return null so the badge stays
-    // BLANK rather than mislabel the finished one.
-    const metaUpcoming = findNextEpisode(cwDetail, base, nowMs, "none", true)?.id;
-    if (metaUpcoming) return metaUpcoming;
+    if (nextUpId) return nextUpId;
     const sigNext = getReleaseSignal(item.id)?.next_aired;
     const sigMs = sigNext?.aired_at ? Date.parse(sigNext.aired_at) : NaN;
-    if (sigNext && sigNext.season !== 0 && Number.isFinite(sigMs) && sigMs > nowMs) {
+    if (sigNext && sigNext.season !== 0 && Number.isFinite(sigMs) && sigMs > Date.now()) {
       return sigNext.id ?? null;
     }
     return null;
     // signalsVersion in deps so the badge fills in the instant cloud signals land.
-  }, [effectiveVideoId, cwDetail, savedVideoId, progress, item.id, signalsVersion]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nextUpId, item.id, signalsVersion]);
   // Prefer the VideoEntry's (season, episode) for a uniform `S01E06` badge
   // regardless of whether the id is IMDb-shape (`tt…:1:6`) or anime-prefix-
   // shape (`kitsu:50023:6`). badgeVideoId may live in a different season than
@@ -899,7 +865,7 @@ export const ContinueWatchingCard = memo(function ContinueWatchingCard(
             // hasn't resolved yet (lazy fetch via metaCache).
             <SegmentedSeasonBar
               episodes={seasonEpisodes!}
-              currentId={effectiveVideoId}
+              currentId={nextUpId}
               resumeActive={resumeActive}
             />
           ) : progress > 0 && (
