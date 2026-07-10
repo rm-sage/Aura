@@ -18,7 +18,6 @@ import { loadAuraSettings, saveAuraSettings } from "../auraSettings";
 import { resolveDefaultMetaUrl } from "../addonDefaults";
 import { getMetaDetail } from "../metaCache";
 import { PAGE_CONTENT_MAX_W } from "../pageLayout";
-import { LANDSCAPE_CARD_WIDTH } from "../landscapeArt";
 import { ContinueWatchingCard } from "../CinemaRows";
 import { useEpisodesBehind } from "../LibraryContext";
 import { libraryItemSeriesId } from "../libraryNormalize";
@@ -38,6 +37,14 @@ interface Props {
 
 type GroupBy = "type" | "airwindow" | "none";
 type SortMode = "recent" | "soonest" | "behind" | "alpha";
+
+// Responsive min-width for the landscape tile grid. Deliberately DECOUPLED from
+// LANDSCAPE_CARD_WIDTH (640), which is the image-resolution hint: using that as
+// the grid floor forced ~640px tiles (only ~3 per row, and a single full-width
+// tile on a narrow window). This clamps the DISPLAY width so tiles pack several
+// per row at a sensible size and shrink on smaller viewports instead of eating
+// the whole screen on 1080p.
+const AIRING_TILE_MIN_W = "clamp(220px, 24vw, 300px)";
 
 const GROUP_OPTIONS: { id: GroupBy; label: string }[] = [
   { id: "type",      label: "Series / Anime" },
@@ -285,7 +292,7 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
                   )}
                   <div
                     className="grid gap-4"
-                    style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${LANDSCAPE_CARD_WIDTH}px, 1fr))` }}
+                    style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${AIRING_TILE_MIN_W}, 1fr))` }}
                   >
                     {section.items.map((item) => (
                       <AiringTile
