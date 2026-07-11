@@ -31,6 +31,9 @@ export type TooltipPos = "right" | "left" | "top" | "bottom";
 
 interface Props {
   text: string;
+  /** Optional rich content rendered INSTEAD of `text` (e.g. coloured count
+   *  spans). `text` is still required as the plain fallback / measurement key. */
+  content?: ReactNode;
   pos?: TooltipPos;
   /** Show keyboard hint after the label (e.g. "Sign in · S"). */
   shortcut?: string;
@@ -108,7 +111,7 @@ function computePos(
   return { left: clamped.x, top: clamped.y };
 }
 
-export default function Tooltip({ text, pos = "right", shortcut, delay = 120, className, children }: Props) {
+export default function Tooltip({ text, content, pos = "right", shortcut, delay = 120, className, children }: Props) {
   const triggerRef = useRef<HTMLSpanElement>(null);
   const tipRef     = useRef<HTMLSpanElement>(null);
   const [open, setOpen]         = useState(false);
@@ -153,7 +156,7 @@ export default function Tooltip({ text, pos = "right", shortcut, delay = 120, cl
     const a = trigger.getBoundingClientRect();
     const { left, top } = computePos(pos, a, r.width, r.height);
     setCoords({ left, top, ready: true });
-  }, [open, dismissed, pos, text, shortcut]);
+  }, [open, dismissed, pos, text, content, shortcut]);
 
   // Keep position correct on resize / scroll while open.
   useEffect(() => {
@@ -203,7 +206,7 @@ export default function Tooltip({ text, pos = "right", shortcut, delay = 120, cl
             opacity: coords.ready ? 1 : 0,
           }}
         >
-          {text}
+          {content ?? text}
           {shortcut && (
             <span className="ml-2 opacity-60 font-mono">{shortcut}</span>
           )}

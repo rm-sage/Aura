@@ -2819,6 +2819,28 @@ const EpisodeRow = ({
 // EpisodesPanel — season dropdown + scrollable episode list.
 // ---------------------------------------------------------------------------
 
+/** Count filler / recap episodes in a video list, using the SAME priority each
+ *  EpisodeRow uses for its tags: cloud `episode_kinds` for this id, then the
+ *  VideoEntry `is_filler`/`is_recap` booleans, then the legacy `episode_kind`
+ *  string. Keeping this in lockstep is why the header + per-season counts always
+ *  match the badges rendered on the rows. */
+function countFillerRecap(
+  list: VideoEntry[],
+  kinds: { id: string; kind: string }[],
+): { filler: number; recap: number } {
+  let filler = 0;
+  let recap = 0;
+  for (const v of list) {
+    const isFiller = kinds.some((k) => k.id === v.id && k.kind === "filler")
+      || !!v.is_filler || v.episode_kind === "filler";
+    const isRecap = kinds.some((k) => k.id === v.id && k.kind === "recap")
+      || !!v.is_recap || v.episode_kind === "recap";
+    if (isFiller) filler += 1;
+    if (isRecap) recap += 1;
+  }
+  return { filler, recap };
+}
+
 function EpisodesPanel({
   seriesId, seriesMediaType, videos, activeVideo, onPick, scrollToVideoId, onScrollHandled,
   metaLoading, seasonHint, seasonNames, highlightVideoId, seriesArt,
@@ -2851,25 +2873,14 @@ function EpisodesPanel({
   }, [videos]);
 
   // Filler / recap totals across the whole show, computed the SAME way each
-  // EpisodeRow derives its tags (cloud signal `episode_kinds` > VideoEntry
-  // is_filler/is_recap > legacy `episode_kind`) so the header counts always
-  // match the per-row badges. Zero for shows with none (the chips just don't
-  // render), so live-action series show only the plain total.
+  // EpisodeRow derives its tags (see countFillerRecap) so the header counts
+  // always match the per-row badges. Zero for shows with none (the chips just
+  // don't render), so live-action series show only the plain total.
   const cloudSignal = useReleaseSignal(seriesId);
-  const { fillerCount, recapCount } = useMemo(() => {
-    const kinds = cloudSignal?.episode_kinds ?? [];
-    let filler = 0;
-    let recap = 0;
-    for (const v of videos) {
-      const isFiller = kinds.some((k) => k.id === v.id && k.kind === "filler")
-        || !!v.is_filler || v.episode_kind === "filler";
-      const isRecap = kinds.some((k) => k.id === v.id && k.kind === "recap")
-        || !!v.is_recap || v.episode_kind === "recap";
-      if (isFiller) filler += 1;
-      if (isRecap) recap += 1;
-    }
-    return { fillerCount: filler, recapCount: recap };
-  }, [videos, cloudSignal]);
+  const { filler: fillerCount, recap: recapCount } = useMemo(
+    () => countFillerRecap(videos, cloudSignal?.episode_kinds ?? []),
+    [videos, cloudSignal],
+  );
 
   // When the parent hands us a `scrollToVideoId`, prefer the season of
   // THAT video over the default "first non-special season" pick — the
@@ -2972,6 +2983,24 @@ function EpisodesPanel({
     list.sort((a, b) => (a.episode ?? 0) - (b.episode ?? 0));
     return list;
   }, [videos, season, seasons.length]);
+
+  // Filler / recap counts for the SELECTED season only (shown on hover of the
+  // season episode-count chip), same source as the show-wide header totals.
+  const { filler: seasonFiller, recap: seasonRecap } = useMemo(
+    () => countFillerRecap(inSeason, cloudSignal?.episode_kinds ?? []),
+    [inSeason, cloudSignal],
+  );
+  // Only anime with any filler/recap get the hover breakdown; live-action shows
+  // (zero of both show-wide) render the plain chip with no tooltip.
+  const showHasFillerRecap = fillerCount > 0 || recapCount > 0;
+  const seasonCountChip = (
+    <span className="shrink-0 inline-flex items-center rounded-md
+                     bg-ln-accent/[0.12] border border-ln-accent/30
+                     px-2.5 py-1 text-[11px] font-mono font-semibold uppercase
+                     tracking-[0.14em] text-ln-accent tabular-nums">
+      {inSeason.length} {inSeason.length === 1 ? "ep" : "eps"}
+    </span>
+  );
 
   // The single next-to-air episode across ALL seasons (not just the one
   // displayed) — its row gets the live countdown chip. Recomputed only
@@ -3124,12 +3153,30 @@ function EpisodesPanel({
                   onChange={setSeason}
                   names={seasonNames}
                 />
-                <span className="shrink-0 inline-flex items-center rounded-md
-                                 bg-ln-accent/[0.12] border border-ln-accent/30
-                                 px-2.5 py-1 text-[11px] font-mono font-semibold uppercase
-                                 tracking-[0.14em] text-ln-accent tabular-nums">
-                  {inSeason.length} {inSeason.length === 1 ? "ep" : "eps"}
-                </span>
+                {showHasFillerRecap ? (
+                  <Tooltip
+                    pos="bottom"
+                    className="shrink-0"
+                    text={seasonFiller > 0 || seasonRecap > 0
+                      ? `${seasonFiller} filler, ${seasonRecap} recap this season`
+                      : "No filler or recap this season"}
+                    content={seasonFiller > 0 || seasonRecap > 0 ? (
+                      <span className="inline-flex items-center gap-2">
+                        {seasonFiller > 0 && (
+                          <span className="text-rose-300 font-semibold">{seasonFiller} filler</span>
+                        )}
+                        {seasonRecap > 0 && (
+                          <span className="text-amber-300 font-semibold">{seasonRecap} recap</span>
+                        )}
+                        <span className="text-white/45">this season</span>
+                      </span>
+                    ) : undefined}
+                  >
+                    {seasonCountChip}
+                  </Tooltip>
+                ) : (
+                  seasonCountChip
+                )}
               </div>
             )}
 
