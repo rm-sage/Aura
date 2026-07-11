@@ -211,10 +211,11 @@ if (-not (Test-Path $bundleDir)) {
 #      neither a tag nor a prior tag to compute a delta against.
 #
 # The full annotated tag body (Co-Authored-By trailers stripped, capped
-# at 2000 chars) ships in `notes`. The popup renders it with markdown-
-# ish formatting (bullets, section headers, horizontal rules) instead
-# of the prior "first paragraph only" truncation that buried the
-# changelog body behind the header banner.
+# at 8000 chars) ships in `notes`. The popup renders it with markdown-
+# ish formatting (bullets, section headers, horizontal rules) inside a
+# scrollable container, so the WHOLE changelog is visible without a trip
+# to GitHub. 8000 comfortably fits a multi-section release; the cap only
+# guards a runaway tag body from bloating the manifest the updater polls.
 # ---------------------------------------------------------------------------
 
 function Get-ReleaseNotes {
@@ -234,11 +235,10 @@ function Get-ReleaseNotes {
         # Drop trailing Co-Authored-By trailers — these are git
         # bookkeeping, not release notes.
         $body = ($body -split "\r?\nCo-Authored-By:", 2)[0].TrimEnd()
-        # Cap so the in-app updater dialog stays readable. 2000 chars
-        # fits a multi-section changelog comfortably; longer notes are
-        # one click away on the GitHub release page anyway.
-        if ($body.Length -gt 2000) {
-            $body = $body.Substring(0, 1997) + "..."
+        # Generous cap so the whole changelog shows in the scrollable
+        # updater dialog. Only a pathologically long tag body is trimmed.
+        if ($body.Length -gt 8000) {
+            $body = $body.Substring(0, 7997) + "..."
         }
         if ($body.Length -ge 30) {
             Write-Host "[release] notes: using v$Version annotated tag body ($($body.Length) chars)" -ForegroundColor DarkGray

@@ -31,8 +31,12 @@ interface Props {
   onDismiss:      () => void;
 }
 
-/** Cap the new-version note body so a runaway tag can't scroll forever. */
-const NOTES_MAX = 2200;
+/** No frontend cap on the new-version notes: the notes are already bounded
+ *  server-side (release.ps1 caps the latest.json body at 8000), and the popup's
+ *  notes region scrolls (max-h-[50vh] overflow-y-auto), so the whole changelog
+ *  shows without a trip to GitHub. Matches the prior-versions list + the
+ *  Settings changelog, both of which render at Infinity. */
+const NOTES_MAX = Infinity;
 
 export default function UpdatePopup({
   release,
