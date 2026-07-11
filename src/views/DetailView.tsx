@@ -2850,6 +2850,27 @@ function EpisodesPanel({
     return [...set].sort((a, b) => a - b);
   }, [videos]);
 
+  // Filler / recap totals across the whole show, computed the SAME way each
+  // EpisodeRow derives its tags (cloud signal `episode_kinds` > VideoEntry
+  // is_filler/is_recap > legacy `episode_kind`) so the header counts always
+  // match the per-row badges. Zero for shows with none (the chips just don't
+  // render), so live-action series show only the plain total.
+  const cloudSignal = useReleaseSignal(seriesId);
+  const { fillerCount, recapCount } = useMemo(() => {
+    const kinds = cloudSignal?.episode_kinds ?? [];
+    let filler = 0;
+    let recap = 0;
+    for (const v of videos) {
+      const isFiller = kinds.some((k) => k.id === v.id && k.kind === "filler")
+        || !!v.is_filler || v.episode_kind === "filler";
+      const isRecap = kinds.some((k) => k.id === v.id && k.kind === "recap")
+        || !!v.is_recap || v.episode_kind === "recap";
+      if (isFiller) filler += 1;
+      if (isRecap) recap += 1;
+    }
+    return { fillerCount: filler, recapCount: recap };
+  }, [videos, cloudSignal]);
+
   // When the parent hands us a `scrollToVideoId`, prefer the season of
   // THAT video over the default "first non-special season" pick — the
   // user just exited playback on it; landing on a different season
@@ -3016,7 +3037,36 @@ function EpisodesPanel({
     <>
       <PanelHeader
         title="Episodes"
-        right={`${videos.length} total`}
+        right={(
+          <div className="flex items-center gap-1.5 shrink-0">
+            {/* Absolute total: now a standout accent chip (was dim white) so
+                it reads as prominently as the per-season count below. */}
+            <span className="inline-flex items-center rounded-md shrink-0
+                             bg-ln-accent/[0.12] border border-ln-accent/30
+                             px-2 py-1 text-[10px] font-mono font-semibold uppercase
+                             tracking-[0.14em] text-ln-accent tabular-nums">
+              {videos.length} total
+            </span>
+            {/* Filler / recap totals, coloured to match their episode tags
+                (filler = rose, recap = amber). Only for shows that have them. */}
+            {fillerCount > 0 && (
+              <span className="inline-flex items-center rounded-md shrink-0
+                               bg-rose-500/[0.12] border border-rose-400/30
+                               px-2 py-1 text-[10px] font-mono font-semibold uppercase
+                               tracking-[0.14em] text-rose-300 tabular-nums">
+                {fillerCount} filler
+              </span>
+            )}
+            {recapCount > 0 && (
+              <span className="inline-flex items-center rounded-md shrink-0
+                               bg-amber-400/[0.12] border border-amber-300/30
+                               px-2 py-1 text-[10px] font-mono font-semibold uppercase
+                               tracking-[0.14em] text-amber-300 tabular-nums">
+                {recapCount} recap
+              </span>
+            )}
+          </div>
+        )}
       />
       <div className="pl-5 pr-4 py-3 flex-1 min-h-0 flex flex-col">
         {videos.length === 0 && metaLoading ? (
@@ -3062,7 +3112,7 @@ function EpisodesPanel({
           <>
             {/* Season dropdown + per-season episode count, centred as a
                 group with a clear gap between them. The count is a standout
-                accent chip (vs the dim white "N TOTAL" badge in the header)
+                accent chip (matching the absolute-total chip in the header)
                 so the selected season's length reads at a glance. The
                 dropdown truncates (min-w-0 in SeasonSelect) rather than
                 shoving the chip on a narrow panel. */}
@@ -3772,7 +3822,10 @@ function PanelHeader({
   title, right, backLabel, onBack, action,
 }: {
   title: string;
-  right?: string | null;
+  /** Right-aligned status. A plain string renders inside the dim count badge
+   *  (streams "N found"); a ReactNode renders raw so the caller can supply its
+   *  own styled chips (the episodes total + filler/recap counts). */
+  right?: React.ReactNode;
   backLabel?: string;
   onBack?: () => void;
   /** Optional trailing control (e.g. the Streams "Refresh" button),
@@ -3807,10 +3860,14 @@ function PanelHeader({
       <div className="flex-1" />
       {/* Right zone — count badge + controls, grouped. */}
       {right && (
-        <span className="px-2 py-1 rounded-md shrink-0 bg-white/[0.05] border border-white/8
-                         text-white/50 text-[10px] font-mono uppercase tracking-[0.14em]">
-          {right}
-        </span>
+        typeof right === "string" ? (
+          <span className="px-2 py-1 rounded-md shrink-0 bg-white/[0.05] border border-white/8
+                           text-white/50 text-[10px] font-mono uppercase tracking-[0.14em]">
+            {right}
+          </span>
+        ) : (
+          right
+        )
       )}
       {action && <div className="flex items-center gap-0.5 shrink-0">{action}</div>}
     </div>
