@@ -2994,11 +2994,20 @@ function EpisodesPanel({
   // (zero of both show-wide) render the plain chip with no tooltip.
   const showHasFillerRecap = fillerCount > 0 || recapCount > 0;
   const seasonCountChip = (
-    <span className="shrink-0 inline-flex items-center rounded-md
+    <span className="shrink-0 inline-flex items-center gap-1.5 rounded-md
                      bg-ln-accent/[0.12] border border-ln-accent/30
                      px-2.5 py-1 text-[11px] font-mono font-semibold uppercase
                      tracking-[0.14em] text-ln-accent tabular-nums">
-      {inSeason.length} {inSeason.length === 1 ? "ep" : "eps"}
+      <span>{inSeason.length} {inSeason.length === 1 ? "ep" : "eps"}</span>
+      {/* Presence dots for THIS season, colour-matched to the filler/recap
+          tags. They preview that there's a breakdown to reveal, making the
+          hover discoverable (paired with the cursor-help below). */}
+      {(seasonFiller > 0 || seasonRecap > 0) && (
+        <span className="inline-flex items-center gap-1" aria-hidden>
+          {seasonFiller > 0 && <span className="w-1.5 h-1.5 rounded-full bg-rose-400" />}
+          {seasonRecap > 0 && <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />}
+        </span>
+      )}
     </span>
   );
 
@@ -3156,7 +3165,7 @@ function EpisodesPanel({
                 {showHasFillerRecap ? (
                   <Tooltip
                     pos="bottom"
-                    className="shrink-0"
+                    className="shrink-0 cursor-help"
                     text={seasonFiller > 0 || seasonRecap > 0
                       ? `${seasonFiller} filler, ${seasonRecap} recap this season`
                       : "No filler or recap this season"}
