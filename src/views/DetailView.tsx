@@ -2819,17 +2819,22 @@ const EpisodeRow = ({
 // EpisodesPanel — season dropdown + scrollable episode list.
 // ---------------------------------------------------------------------------
 
-/** Count filler / recap episodes in a video list, using the SAME priority each
- *  EpisodeRow uses for its tags: cloud `episode_kinds` for this id, then the
- *  VideoEntry `is_filler`/`is_recap` booleans, then the legacy `episode_kind`
- *  string. Keeping this in lockstep is why the header + per-season counts always
- *  match the badges rendered on the rows. */
+/** Count filler / recap / canon episodes in a video list, using the SAME
+ *  priority each EpisodeRow uses for its tags: cloud `episode_kinds` for this
+ *  id, then the VideoEntry `is_filler`/`is_recap` booleans, then the legacy
+ *  `episode_kind` string. Keeping this in lockstep is why the header +
+ *  per-season counts always match the badges rendered on the rows.
+ *
+ *  `canon` = episodes that are NEITHER filler nor recap. Counted directly (not
+ *  `total - filler - recap`) so an episode flagged as BOTH filler and recap is
+ *  removed from canon exactly once, not twice. */
 function countFillerRecap(
   list: VideoEntry[],
   kinds: { id: string; kind: string }[],
-): { filler: number; recap: number } {
+): { filler: number; recap: number; canon: number } {
   let filler = 0;
   let recap = 0;
+  let canon = 0;
   for (const v of list) {
     const isFiller = kinds.some((k) => k.id === v.id && k.kind === "filler")
       || !!v.is_filler || v.episode_kind === "filler";
@@ -2837,8 +2842,66 @@ function countFillerRecap(
       || !!v.is_recap || v.episode_kind === "recap";
     if (isFiller) filler += 1;
     if (isRecap) recap += 1;
+    if (!isFiller && !isRecap) canon += 1;
   }
-  return { filler, recap };
+  return { filler, recap, canon };
+}
+
+/** Accent episode-count chip with a hover breakdown. Shared by the header
+ *  (absolute total) and the per-season chip so both behave identically: the
+ *  count reads prominently; when the show has filler/recap, colour-matched
+ *  presence dots (rose = filler, amber = recap) + a help cursor hint at a
+ *  breakdown, and hovering reveals the canon / filler / recap counts (canon
+ *  green, filler rose, recap amber). No filler/recap anywhere → plain chip. */
+function EpisodeCountChip({
+  label, showBreakdown, canon, filler, recap, scope,
+}: {
+  label: string;
+  /** Wrap in the hover breakdown (true when the SHOW has any filler/recap). */
+  showBreakdown: boolean;
+  canon: number;
+  filler: number;
+  recap: number;
+  /** Tooltip suffix, e.g. "this season". */
+  scope?: string;
+}) {
+  const chip = (
+    <span className="shrink-0 inline-flex items-center gap-1.5 rounded-md
+                     bg-ln-accent/[0.12] border border-ln-accent/30
+                     px-2.5 py-1 text-[11px] font-mono font-semibold uppercase
+                     tracking-[0.14em] text-ln-accent tabular-nums">
+      <span>{label}</span>
+      {(filler > 0 || recap > 0) && (
+        <span className="inline-flex items-center gap-1" aria-hidden>
+          {filler > 0 && <span className="w-1.5 h-1.5 rounded-full bg-rose-400" />}
+          {recap > 0 && <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />}
+        </span>
+      )}
+    </span>
+  );
+  if (!showBreakdown) return chip;
+
+  const suffix = scope ? ` ${scope}` : "";
+  const plain = [`${canon} canon`];
+  if (filler > 0) plain.push(`${filler} filler`);
+  if (recap > 0) plain.push(`${recap} recap`);
+  return (
+    <Tooltip
+      pos="bottom"
+      className="shrink-0 cursor-help"
+      text={plain.join(", ") + suffix}
+      content={(
+        <span className="inline-flex items-center gap-2">
+          <span className="text-emerald-300 font-semibold">{canon} canon</span>
+          {filler > 0 && <span className="text-rose-300 font-semibold">{filler} filler</span>}
+          {recap > 0 && <span className="text-amber-300 font-semibold">{recap} recap</span>}
+          {scope && <span className="text-white/45">{scope}</span>}
+        </span>
+      )}
+    >
+      {chip}
+    </Tooltip>
+  );
 }
 
 function EpisodesPanel({
@@ -2877,7 +2940,7 @@ function EpisodesPanel({
   // always match the per-row badges. Zero for shows with none (the chips just
   // don't render), so live-action series show only the plain total.
   const cloudSignal = useReleaseSignal(seriesId);
-  const { filler: fillerCount, recap: recapCount } = useMemo(
+  const { filler: fillerCount, recap: recapCount, canon: canonCount } = useMemo(
     () => countFillerRecap(videos, cloudSignal?.episode_kinds ?? []),
     [videos, cloudSignal],
   );
@@ -2986,30 +3049,13 @@ function EpisodesPanel({
 
   // Filler / recap counts for the SELECTED season only (shown on hover of the
   // season episode-count chip), same source as the show-wide header totals.
-  const { filler: seasonFiller, recap: seasonRecap } = useMemo(
+  const { filler: seasonFiller, recap: seasonRecap, canon: seasonCanon } = useMemo(
     () => countFillerRecap(inSeason, cloudSignal?.episode_kinds ?? []),
     [inSeason, cloudSignal],
   );
   // Only anime with any filler/recap get the hover breakdown; live-action shows
   // (zero of both show-wide) render the plain chip with no tooltip.
   const showHasFillerRecap = fillerCount > 0 || recapCount > 0;
-  const seasonCountChip = (
-    <span className="shrink-0 inline-flex items-center gap-1.5 rounded-md
-                     bg-ln-accent/[0.12] border border-ln-accent/30
-                     px-2.5 py-1 text-[11px] font-mono font-semibold uppercase
-                     tracking-[0.14em] text-ln-accent tabular-nums">
-      <span>{inSeason.length} {inSeason.length === 1 ? "ep" : "eps"}</span>
-      {/* Presence dots for THIS season, colour-matched to the filler/recap
-          tags. They preview that there's a breakdown to reveal, making the
-          hover discoverable (paired with the cursor-help below). */}
-      {(seasonFiller > 0 || seasonRecap > 0) && (
-        <span className="inline-flex items-center gap-1" aria-hidden>
-          {seasonFiller > 0 && <span className="w-1.5 h-1.5 rounded-full bg-rose-400" />}
-          {seasonRecap > 0 && <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />}
-        </span>
-      )}
-    </span>
-  );
 
   // The single next-to-air episode across ALL seasons (not just the one
   // displayed) — its row gets the live countdown chip. Recomputed only
@@ -3076,34 +3122,13 @@ function EpisodesPanel({
       <PanelHeader
         title="Episodes"
         right={(
-          <div className="flex items-center gap-1.5 shrink-0">
-            {/* Absolute total: now a standout accent chip (was dim white) so
-                it reads as prominently as the per-season count below. */}
-            <span className="inline-flex items-center rounded-md shrink-0
-                             bg-ln-accent/[0.12] border border-ln-accent/30
-                             px-2 py-1 text-[10px] font-mono font-semibold uppercase
-                             tracking-[0.14em] text-ln-accent tabular-nums">
-              {videos.length} total
-            </span>
-            {/* Filler / recap totals, coloured to match their episode tags
-                (filler = rose, recap = amber). Only for shows that have them. */}
-            {fillerCount > 0 && (
-              <span className="inline-flex items-center rounded-md shrink-0
-                               bg-rose-500/[0.12] border border-rose-400/30
-                               px-2 py-1 text-[10px] font-mono font-semibold uppercase
-                               tracking-[0.14em] text-rose-300 tabular-nums">
-                {fillerCount} filler
-              </span>
-            )}
-            {recapCount > 0 && (
-              <span className="inline-flex items-center rounded-md shrink-0
-                               bg-amber-400/[0.12] border border-amber-300/30
-                               px-2 py-1 text-[10px] font-mono font-semibold uppercase
-                               tracking-[0.14em] text-amber-300 tabular-nums">
-                {recapCount} recap
-              </span>
-            )}
-          </div>
+          <EpisodeCountChip
+            label={`${videos.length} total`}
+            showBreakdown={showHasFillerRecap}
+            canon={canonCount}
+            filler={fillerCount}
+            recap={recapCount}
+          />
         )}
       />
       <div className="pl-5 pr-4 py-3 flex-1 min-h-0 flex flex-col">
@@ -3162,30 +3187,14 @@ function EpisodesPanel({
                   onChange={setSeason}
                   names={seasonNames}
                 />
-                {showHasFillerRecap ? (
-                  <Tooltip
-                    pos="bottom"
-                    className="shrink-0 cursor-help"
-                    text={seasonFiller > 0 || seasonRecap > 0
-                      ? `${seasonFiller} filler, ${seasonRecap} recap this season`
-                      : "No filler or recap this season"}
-                    content={seasonFiller > 0 || seasonRecap > 0 ? (
-                      <span className="inline-flex items-center gap-2">
-                        {seasonFiller > 0 && (
-                          <span className="text-rose-300 font-semibold">{seasonFiller} filler</span>
-                        )}
-                        {seasonRecap > 0 && (
-                          <span className="text-amber-300 font-semibold">{seasonRecap} recap</span>
-                        )}
-                        <span className="text-white/45">this season</span>
-                      </span>
-                    ) : undefined}
-                  >
-                    {seasonCountChip}
-                  </Tooltip>
-                ) : (
-                  seasonCountChip
-                )}
+                <EpisodeCountChip
+                  label={`${inSeason.length} ${inSeason.length === 1 ? "ep" : "eps"}`}
+                  showBreakdown={showHasFillerRecap}
+                  canon={seasonCanon}
+                  filler={seasonFiller}
+                  recap={seasonRecap}
+                  scope="this season"
+                />
               </div>
             )}
 
