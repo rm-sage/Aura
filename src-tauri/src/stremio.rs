@@ -1729,85 +1729,8 @@ pub async fn fetch_catalog_paginated(
 }
 
 // ---------------------------------------------------------------------------
-// Commands — global search (Task 2.3)
+// Commands: grouped search
 // ---------------------------------------------------------------------------
-
-/// Query all search-enabled addons concurrently via JoinSet and return a
-/// deduplicated, sanitized result set.
-///
-/// Security: all returned poster URLs are validated (http/https only, ≤ 2048
-/// chars); all text fields are capped to prevent memory inflation from a
-/// malicious community addon.
-#[tauri::command]
-pub async fn global_search(
-    addons: Vec<AddonEntry>,
-    query: String,
-) -> Result<Vec<MetaPreview>, String> {
-    let query = query.trim().to_string();
-    if query.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let search_addons: Vec<AddonEntry> = addons.into_iter().filter(|a| a.has_search).collect();
-    if search_addons.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let encoded = encode_query(&query);
-    let mut set: tokio::task::JoinSet<Vec<MetaPreview>> = tokio::task::JoinSet::new();
-
-    for addon in search_addons {
-        let encoded = encoded.clone();
-        set.spawn(async move {
-            let base = addon.url.trim_end_matches('/').to_string();
-            let Ok((wire, _)) = fetch_manifest(&base).await else {
-                return vec![];
-            };
-
-            // Collect search-capable catalog descriptors before any await so there
-            // are no borrows of `wire` across await points.
-            let search_cats: Vec<(String, String)> = wire
-                .catalogs
-                .iter()
-                .filter(|c| {
-                    c.extra.iter().any(|ex| {
-                        ex.get("name").and_then(|v| v.as_str()) == Some("search")
-                    })
-                })
-                .map(|c| (c.media_type.clone(), c.id.clone()))
-                .collect();
-
-            let mut results = Vec::new();
-            for (media_type, id) in search_cats {
-                let url =
-                    format!("{base}/catalog/{media_type}/{id}/search={encoded}.json");
-                if let Ok(resp) = client().get(&url).send().await {
-                    if let Ok(resp) = resp.error_for_status() {
-                        if let Ok(cr) = resp.json::<CatalogResponse>().await {
-                            let (metas, _, _) = parse_meta_array(cr.metas);
-                            results.extend(metas.into_iter().map(sanitize_meta));
-                        }
-                    }
-                }
-            }
-            results
-        });
-    }
-
-    let mut all: Vec<MetaPreview> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    while let Some(task_result) = set.join_next().await {
-        if let Ok(items) = task_result {
-            for item in items {
-                if seen.insert(item.id.clone()) {
-                    all.push(item);
-                }
-            }
-        }
-    }
-
-    Ok(all)
-}
 
 /// Per-addon-catalog search results. Each entry maps to a `<DiscoveryRow>`
 /// in the search view — the frontend renders one section per group and
@@ -1966,9 +1889,10 @@ pub async fn fetch_search_catalog_expanded(
     Ok(items)
 }
 
-/// Like `global_search`, but returns results grouped by addon + catalog so
-/// the search view can render Stremio-style discrete sections. Iterates
-/// addons in install order; per addon, iterates catalogs in manifest order.
+/// Concurrent search across all search-enabled addons, returning results
+/// grouped by addon + catalog so the search view can render Stremio-style
+/// discrete sections. Iterates addons in install order; per addon, iterates
+/// catalogs in manifest order.
 #[tauri::command]
 pub async fn global_search_grouped(
     addons: Vec<AddonEntry>,

@@ -62,14 +62,6 @@ export const DEFAULT_SEARCH_ORDER: readonly string[] = [
   CINEMETA_MANIFEST_ID,
 ] as const;
 
-/** Default LIVE-suggestion providers — AI search omitted because the
- *  per-keystroke cost is what the user explicitly wanted to avoid in
- *  the suggestions dropdown. */
-export const DEFAULT_SUGGESTION_ORDER: readonly string[] = [
-  AIOMETADATA_MANIFEST_ID,
-  CINEMETA_MANIFEST_ID,
-] as const;
-
 /** Default stream providers — empty means "all installed stream addons
  *  are queried" (the existing null-default semantics). We don't bake
  *  preferred stream addons into the default since the user's preferred

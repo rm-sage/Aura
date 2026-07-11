@@ -2239,7 +2239,6 @@ pub fn run() {
             stremio::list_addons,
             stremio::reorder_addons,
             // ── Global search & cloud sync (2.3) ────────────────────────────
-            stremio::global_search,
             stremio::global_search_grouped,
             stremio::search_addon_grouped,
             stremio::fetch_search_catalog_expanded,

@@ -36,7 +36,6 @@
 //       defaultMetadataAddonId:    string | null,
 //       streamAddonIds:            string[] | null,
 //       searchAddonIds:            string[] | null,
-//       searchSuggestionAddonIds:  string[] | null,
 //       heroCatalog: { addonId, mediaType, catalogId } | null
 //     }
 //   }
@@ -142,7 +141,6 @@ export interface PortableProvidersBlob {
   defaultMetadataAddonId:    string | null;
   streamAddonIds:            string[] | null;
   searchAddonIds:            string[] | null;
-  searchSuggestionAddonIds:  string[] | null;
   heroCatalog:               { addonId: string; mediaType: string; catalogId: string } | null;
 }
 
@@ -206,7 +204,6 @@ function buildProvidersBlob(
     defaultMetadataAddonId:   urlToId(aura.defaultMetadataAddonUrl as string | null, addons),
     streamAddonIds:           ids(aura.streamAddonUrls),
     searchAddonIds:           ids(aura.searchAddonUrls),
-    searchSuggestionAddonIds: ids(aura.searchSuggestionAddonUrls),
     heroCatalog,
   };
 }
@@ -294,9 +291,6 @@ export function resolveProviders(
   }
   if (providers.searchAddonIds !== undefined) {
     aura.searchAddonUrls = resolveList(providers.searchAddonIds);
-  }
-  if (providers.searchSuggestionAddonIds !== undefined) {
-    aura.searchSuggestionAddonUrls = resolveList(providers.searchSuggestionAddonIds);
   }
   if (providers.heroCatalog) {
     const url = idToUrl(providers.heroCatalog.addonId, addons);
@@ -415,7 +409,6 @@ export function parseImportInput(raw: string): SettingsBlob | null {
       defaultMetadataAddonId:   stringOrNull(provRaw.defaultMetadataAddonId),
       streamAddonIds:           stringArrOrNull(provRaw.streamAddonIds),
       searchAddonIds:           stringArrOrNull(provRaw.searchAddonIds),
-      searchSuggestionAddonIds: stringArrOrNull(provRaw.searchSuggestionAddonIds),
       heroCatalog,
     };
   }

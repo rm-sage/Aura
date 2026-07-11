@@ -4377,12 +4377,9 @@ export default function SettingsView({ addons, session }: Props) {
   const effectiveStreamUrls = aura.streamAddonUrls
     ?? addons.filter(isStreamProvider).map((a) => a.url);
 
-  // Same pattern for the Search Providers + Search Suggestion Providers
-  // pickers. `null` (default) means "every search-capable addon"; the
-  // first edit commits a concrete array to the relevant key.
+  // Same pattern for the Search Providers picker. `null` (default) means
+  // "every search-capable addon"; the first edit commits a concrete array.
   const effectiveSearchUrls = aura.searchAddonUrls
-    ?? addons.filter(isSearchProvider).map((a) => a.url);
-  const effectiveSearchSuggestionUrls = aura.searchSuggestionAddonUrls
     ?? addons.filter(isSearchProvider).map((a) => a.url);
 
   // The scroll container the TOC observes for active-section highlighting
@@ -4679,18 +4676,10 @@ export default function SettingsView({ addons, session }: Props) {
           </Section>
 
           {/* ── Search Providers ──────────────────────────────────────────
-              Two separate lists for the two distinct search code paths:
-
-                • "Search Providers" — addons hit on a deliberate Enter
-                  search (the SearchView grouped results). Cost-tolerant:
-                  expensive AI providers belong here.
-                • "Suggestion Providers" — addons hit on every debounced
-                  keystroke pause for the live dropdown. Latency / cost
-                  sensitive: drop AI / slow providers from this list to
-                  keep typing snappy without losing them on submit.
-
-              Defaults to "all search-capable installed addons" for both
-              lists; the first user edit commits a concrete array. */}
+              Addons hit on a deliberate Enter search (the SearchView grouped
+              results). Cost-tolerant: expensive AI providers belong here.
+              Defaults to "all search-capable installed addons"; the first
+              user edit commits a concrete array. */}
           <Section id="sec-search" title="Search Providers">
             <UnifiedHomeSourcesPicker
               addons={addons}
@@ -4709,26 +4698,6 @@ export default function SettingsView({ addons, session }: Props) {
                 aura.searchAddonUrls === null
                   ? "All installed search-capable addons are queried when you press Enter (default). Drag to reorder once you make any edit."
                   : "Drag to reorder. Only the listed addons run on submit; remove an entry to skip it for full-search results."
-              }
-            />
-            <div className="h-px bg-white/6" />
-            <UnifiedHomeSourcesPicker
-              addons={addons}
-              filter={isSearchProvider}
-              primaryUrl={effectiveSearchSuggestionUrls[0] ?? null}
-              additionalUrls={effectiveSearchSuggestionUrls.slice(1)}
-              onChange={(primary, additional) => {
-                const urls = [
-                  ...(primary ? [primary] : []),
-                  ...additional,
-                ];
-                setLocal({ searchSuggestionAddonUrls: urls });
-              }}
-              title="Live Suggestions (while typing)"
-              description={
-                aura.searchSuggestionAddonUrls === null
-                  ? "All installed search-capable addons feed the typing-suggestions dropdown (default). Remove expensive ones (e.g. AI search) to keep typing snappy without losing them on submit."
-                  : "Drag to reorder. Only the listed addons feed the typing-suggestions dropdown; submit-search providers are configured above."
               }
             />
           </Section>

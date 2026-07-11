@@ -73,12 +73,6 @@ export interface AuraSettings {
    *  it on a deliberate Enter-search. User-managed via the Search
    *  Providers section in Settings. */
   searchAddonUrls: string[] | null;
-  /** Search providers used for LIVE SUGGESTIONS while typing. Same
-   *  shape + semantics as `searchAddonUrls` but queried on the
-   *  debounced suggestion path instead of submit. Common pattern:
-   *  exclude expensive/AI addons here while keeping them in
-   *  searchAddonUrls. `null` = query all search-capable addons. */
-  searchSuggestionAddonUrls: string[] | null;
   /** Hide the cast-card hover overlay that surfaces episode counts +
    *  Main/Recurring/Guest tier. Some shows lean on regular vs. guest
    *  billing as a plot beat (deaths, returns, cameos), so the count
@@ -259,7 +253,6 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   additionalHomeAddonUrls: [],
   streamAddonUrls: null,
   searchAddonUrls: null,
-  searchSuggestionAddonUrls: null,
   hideCastSpoilers: false,
   blurUnwatchedThumbnails: false,
   heroCatalog: null,
@@ -324,9 +317,6 @@ function readFromStorage(): AuraSettings {
         : null,
       searchAddonUrls: Array.isArray(parsed.searchAddonUrls)
         ? parsed.searchAddonUrls.filter((u): u is string => typeof u === "string")
-        : null,
-      searchSuggestionAddonUrls: Array.isArray(parsed.searchSuggestionAddonUrls)
-        ? parsed.searchSuggestionAddonUrls.filter((u): u is string => typeof u === "string")
         : null,
       hideCastSpoilers: typeof parsed.hideCastSpoilers === "boolean"
         ? parsed.hideCastSpoilers

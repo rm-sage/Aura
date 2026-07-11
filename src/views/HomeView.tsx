@@ -49,7 +49,6 @@ import {
   resolveDefaultUrls,
   DEFAULT_HOME_ORDER,
   DEFAULT_SEARCH_ORDER,
-  DEFAULT_SUGGESTION_ORDER,
 } from "../addonDefaults";
 // FilterBar moved to per-view sidebars (CatalogPageView, LibraryView,
 // QueueView, DiscoverView) — Home now only emits the unfiltered row list.
@@ -433,14 +432,6 @@ export default function HomeView({
     ),
     [addons, settingsTick],
   );
-  const suggestionSearchAddons = useMemo(
-    () => resolveSearchAddons(
-      addons,
-      loadAuraSettings().searchSuggestionAddonUrls,
-      DEFAULT_SUGGESTION_ORDER,
-    ),
-    [addons, settingsTick],
-  );
 
   // User-chosen hero catalog override. When set, the hero band fetches
   // its OWN copy of the catalog (independent of the home grid's row
@@ -618,7 +609,6 @@ export default function HomeView({
       <div className="flex-shrink-0 pt-4 pb-2 px-6 relative z-30">
         <div className="mx-auto relative w-full" style={{ maxWidth: HERO_MAX_WIDTH }}>
           <SearchBar
-            addons={suggestionSearchAddons}
             committedQuery={activeQuery}
             onSubmit={handleSubmitSearch}
             onClear={handleClearSearch}
