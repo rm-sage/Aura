@@ -36,7 +36,7 @@ import { episodeIsBeforeResume, useResumeVideoId } from "./LibraryContext";
 import { getManualWatchedState, useManualWatchedVersion } from "./manualWatched";
 import { shrinkPoster } from "./posterSize";
 import {
-  arcEpisodeRange, arcYearRange, orderGroupings, showIsMultiSeason,
+  arcEpisodeRange, arcYearRange, orderGroupings, absoluteEpisodeMap,
   type ArcGrouping, type ArcResult, type StoryArc, groupingDisplayName,} from "./storyArcs";
 import type { VideoEntry } from "./types";
 
@@ -91,15 +91,13 @@ function tileGeometry(perRow: 1 | 2): { aspect: string; artWidth: number } {
 function ArcCard({
   arc,
   perRow,
-  videosById,
-  multiSeason,
+  absoluteById,
   resumeId,
   onSelect,
 }: {
   arc: StoryArc;
   perRow: 1 | 2;
-  videosById: Map<string, VideoEntry>;
-  multiSeason: boolean;
+  absoluteById: Map<string, number>;
   resumeId: string | null;
   onSelect: (arc: StoryArc) => void;
 }) {
@@ -108,7 +106,7 @@ function ArcCard({
   const ratio = total > 0 ? watched / total : 0;
   const complete = total > 0 && watched === total;
   const years = arcYearRange(arc);
-  const range = arcEpisodeRange(arc, videosById, multiSeason);
+  const range = arcEpisodeRange(arc, absoluteById);
   const { aspect, artWidth } = tileGeometry(perRow);
 
   // Server-resize hint sized to the tile, never a full-size master pulled into
@@ -317,12 +315,9 @@ export default function ArcGrid({
     [result.arcs],
   );
 
-  const videosById = useMemo(
-    () => new Map(videos.map((v) => [v.id, v])),
-    [videos],
-  );
-  // Decided once for the whole show so every arc's range reads the same way.
-  const multiSeason = useMemo(() => showIsMultiSeason(videos), [videos]);
+  // Absolute episode numbers, computed once, so every arc range reads as a plain
+  // unambiguous E20-E67 no matter how the addon seasons the show.
+  const absoluteById = useMemo(() => absoluteEpisodeMap(videos), [videos]);
 
   const active = activeGroupingId ?? result.grouping_id;
   // Tile density follows the grouping the user asked for, so a switch to a
@@ -358,8 +353,7 @@ export default function ArcGrid({
               key={arc.id}
               arc={arc}
               perRow={perRow}
-              videosById={videosById}
-              multiSeason={multiSeason}
+              absoluteById={absoluteById}
               resumeId={resumeId}
               onSelect={onSelect}
             />

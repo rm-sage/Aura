@@ -343,51 +343,36 @@ export function preferredGroupingId(groupings: ArcGrouping[]): string | undefine
 // Episode-number range
 // ---------------------------------------------------------------------------
 
-function epLabel(v: VideoEntry, withSeason: boolean): string {
-  const ep = v.episode != null ? `E${v.episode}` : "";
-  if (!withSeason || v.season == null) return ep;
-  return `S${String(v.season).padStart(2, "0")}${ep}`;
+/** Absolute (whole-series) episode number for every main-run video id, 1-based
+ *  in broadcast order. This is what lets arc ranges read as a plain, unambiguous
+ *  `E20-E67` regardless of how the addon splits the show into seasons: an addon
+ *  that numbers Naruto per-season (S04E1 = the 160th episode) would otherwise
+ *  make a range read "E1-E6" for a mid-series arc. Specials (season 0) are
+ *  excluded so they do not shift the main-run count. */
+export function absoluteEpisodeMap(videos: VideoEntry[]): Map<string, number> {
+  const main = videos
+    .filter((v) => (v.season ?? 0) >= 1 && v.episode != null)
+    .sort((a, b) => (a.season! - b.season!) || (a.episode! - b.episode!));
+  const m = new Map<string, number>();
+  main.forEach((v, i) => m.set(v.id, i + 1));
+  return m;
 }
 
-/** True when the show's episodes span more than one season. Decides the episode-
- *  label format ONCE for the whole show, so every arc reads the same way instead
- *  of some showing `E13-E26` and others `S02E05-E12`. */
-export function showIsMultiSeason(videos: VideoEntry[]): boolean {
-  let seen: number | null = null;
-  for (const v of videos) {
-    if (v.season == null) continue;
-    if (seen == null) seen = v.season;
-    else if (v.season !== seen) return true;
-  }
-  return false;
-}
-
-/** Human episode range for an arc. Consistent across the whole show, driven by
- *  `multiSeason`: a multi-season show always prefixes the season
- *  (`S20E13-S21E194`, `S02E05-S02E12`); a single-season / absolute-numbered show
- *  never does (`E890-E1085`). Empty string when NONE of the arc's episode ids
- *  resolve against the addon's video list.
- *
- *  `videosById` is the caller's id -> VideoEntry map. Unresolvable ids inside the
- *  arc are skipped, so the range is always drawn from real episodes. */
+/** Human episode range for an arc, always as absolute `Eyy` (no season prefix),
+ *  e.g. `E20-E67` or the single `E135`. Empty string when NONE of the arc's
+ *  episode ids resolve. `absoluteById` comes from `absoluteEpisodeMap`. */
 export function arcEpisodeRange(
   arc: StoryArc,
-  videosById: Map<string, VideoEntry>,
-  multiSeason: boolean,
+  absoluteById: Map<string, number>,
 ): string {
-  let first: VideoEntry | null = null;
-  let last: VideoEntry | null = null;
+  let first: number | null = null;
+  let last: number | null = null;
   for (const id of arc.episode_ids) {
-    const v = videosById.get(id);
-    if (!v) continue;
-    if (!first) first = v;
-    last = v;
+    const abs = absoluteById.get(id);
+    if (abs == null) continue;
+    if (first == null) first = abs;
+    last = abs;
   }
-  if (!first || !last) return "";
-
-  const a = epLabel(first, multiSeason);
-  const b = epLabel(last, multiSeason);
-  if (!a && !b) return "";
-  if (first.id === last.id || a === b) return a || b;
-  return `${a}-${b}`;
+  if (first == null || last == null) return "";
+  return first === last ? `E${first}` : `E${first}-E${last}`;
 }

@@ -747,27 +747,37 @@ async fn fetch_story_arcs_inner<R: Runtime>(
         alignment.min_confidence(),
         alignment.min_score()
     );
-    // When episodes go unmatched, the FIRST few unmatched TMDB keys say WHERE the
-    // alignment fell off (an early break leaves a contiguous tail unmatched,
-    // which shows up as arcs rendering from the start then stopping). Cheap, and
-    // it is the one thing needed to diagnose a bad join against a user's addon.
-    if !alignment.left_only.is_empty() {
-        let sample: Vec<&str> = alignment.left_only.iter().take(8).map(|s| s.as_str()).collect();
-        crate::devlog!(
-            warn, "arcs",
-            "tmdb {tv_id}: {} TMDB episodes did not map; first unmatched: {:?}",
-            alignment.left_only.len(), sample
-        );
-    }
-
     // Fast lookup of the Aura video behind a mapped id, for year ranges and
     // the still fallback.
     let by_id: HashMap<&str, &ArcVideoRef> =
         aura.iter().map(|v| (v.id.as_str(), *v)).collect();
+
+    // When episodes go unmatched, dump BOTH sides of the break: the TMDB
+    // episodes with their dates+titles, and the Aura episodes with theirs, so a
+    // bad join against a user's addon is diagnosable without the addon's config.
+    // This is the one thing that says WHY the tail did not align (missing dates,
+    // a different calendar, or a genuinely different title).
     let tmdb_by_key: HashMap<String, &GroupEpisode> = tmdb_sorted
         .iter()
         .map(|((s, e), ep)| (format!("{s}:{e}"), ep))
         .collect();
+
+    if !alignment.left_only.is_empty() {
+        let tmdb_sample: Vec<String> = alignment.left_only.iter().take(6).map(|k| {
+            let e = tmdb_by_key.get(k);
+            format!("{k}[{} {:?}]",
+                e.and_then(|e| e.air_date.clone()).unwrap_or_default(),
+                e.and_then(|e| e.name.clone()).unwrap_or_default())
+        }).collect();
+        let aura_sample: Vec<String> = alignment.right_only.iter().take(6).map(|id| {
+            let v = by_id.get(id.as_str());
+            format!("{id}[{} {:?}]",
+                v.and_then(|v| v.released.clone()).unwrap_or_default(),
+                v.and_then(|v| v.title.clone()).unwrap_or_default())
+        }).collect();
+        crate::devlog!(warn, "arcs", "tmdb {tv_id}: {} unmatched TMDB: {:?}", alignment.left_only.len(), tmdb_sample);
+        crate::devlog!(warn, "arcs", "tmdb {tv_id}: {} unmatched ADDON: {:?}", alignment.right_only.len(), aura_sample);
+    }
 
     // 5. Arc art. Best-effort and never fatal: a failed wiki fetch just means
     //    the cards fall back to episode stills.
