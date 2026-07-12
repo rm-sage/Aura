@@ -92,6 +92,10 @@ interface Props {
    *  so the user is left looking at the paused final frame. Wired to
    *  the × button and Escape. */
   onDismiss: () => void;
+  /** Set only when the episode just finished was the LAST of its story arc.
+   *  Renders an arc-boundary line on the next-up state. Informational: it does
+   *  not gate or delay auto-advance. `next` is null on the final arc. */
+  arcNote?: { ending: string; next: string | null } | null;
   /** True when the EpisodePanel drawer (opened via Spotlight's
    *  "Episodes" button) is on top of the Spotlight. Esc cascade
    *  contract: panel closes FIRST (its own listener), then Spotlight
@@ -130,7 +134,7 @@ function NextAirCountdown({ targetMs }: { targetMs: number }) {
 function EosSpotlight({
   title, episode, stream, loading, isSeries, caughtUpUnaired, nextAirTargetMs,
   seriesArt, libraryById, onPlayNext, skipTag, onSkipToCanon, autoAdvanceStreak,
-  onReplay, onExit, onOpenEpisodes, onDismiss, episodesOpen,
+  onReplay, onExit, onOpenEpisodes, onDismiss, episodesOpen, arcNote,
 }: Props) {
   const isNextUp = episode != null;
   const { filler, recap } = episode
@@ -346,6 +350,17 @@ function EosSpotlight({
                 <h2 className="text-white text-[22px] font-semibold leading-tight mt-1 line-clamp-2">
                   {epTitle}
                 </h2>
+
+                {/* Arc boundary. The episode you just finished ended a story
+                    arc, so say which one, and which is next. Informational
+                    only: the auto-advance countdown still runs. */}
+                {arcNote && (
+                  <p className="text-ln-accent/85 text-[12.5px] leading-tight mt-1.5">
+                    {arcNote.next
+                      ? `${arcNote.ending} complete · next arc: ${arcNote.next}`
+                      : `${arcNote.ending} complete · final arc`}
+                  </p>
+                )}
 
                 {synopsis && (
                   <div className="relative mt-3 max-w-[65ch]">

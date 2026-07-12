@@ -992,7 +992,7 @@ function BackupRestoreSection({
   // sites await the blob.
   const hydrateBackendWithKeyringKeys = useCallback(async (): Promise<Record<string, unknown>> => {
     const merged: Record<string, unknown> = { ...(backend as unknown as Record<string, unknown>) };
-    for (const name of ["opensubtitles"] as const) {
+    for (const name of ["opensubtitles", "tmdb"] as const) {
       try {
         const v = await invoke<string>("get_api_key", { name });
         if (v && v.trim()) {
@@ -1048,9 +1048,17 @@ function BackupRestoreSection({
       // into the OS keyring. We mutate a copy of blob.backend so the
       // backend patch sent to onApply has the key fields stripped.
       const backendPatch = { ...(blob.backend as Record<string, unknown>) };
-      const opensubKey = typeof backendPatch.opensubtitles_api_key === "string"
-        ? backendPatch.opensubtitles_api_key as string : "";
-      delete backendPatch.opensubtitles_api_key;
+      const importedKeys: [string, string][] = [];
+      for (const name of ["opensubtitles", "tmdb"] as const) {
+        const field = `${name}_api_key`;
+        const value = typeof backendPatch[field] === "string"
+          ? backendPatch[field] as string : "";
+        // Strip unconditionally, even when empty: `tmdb_api_key` is not a
+        // BackendSettings field at all, and an unknown key must not ride along
+        // into the settings.json patch.
+        delete backendPatch[field];
+        if (value.trim()) importedKeys.push([name, value.trim()]);
+      }
 
       await onApply(backendPatch as Partial<BackendSettings>);
 
@@ -1059,12 +1067,10 @@ function BackupRestoreSection({
       // is left in settings.json either (the user can re-paste the
       // key manually). Skip empty values so we don't overwrite an
       // existing keyring entry with nothing.
-      let apiKeysTouched = false;
-      if (opensubKey.trim()) {
-        await invoke("set_api_key", { name: "opensubtitles", value: opensubKey.trim() }).catch(() => {});
-        apiKeysTouched = true;
+      for (const [name, value] of importedKeys) {
+        await invoke("set_api_key", { name, value }).catch(() => {});
       }
-      if (apiKeysTouched) {
+      if (importedKeys.length > 0) {
         window.dispatchEvent(new CustomEvent("aura:api-keys-changed"));
       }
       // Aura-side portable subset. Import is additive: any field
@@ -1859,7 +1865,7 @@ function AutoAdvanceDelayRow({
 function KeyringApiKeyInput({
   name, label, description, placeholder,
 }: {
-  name: "opensubtitles";
+  name: "opensubtitles" | "tmdb";
   label: string;
   description: string;
   placeholder?: string;
@@ -5388,6 +5394,12 @@ export default function SettingsView({ addons, session }: Props) {
                 label="OpenSubtitles API key"
                 description="Unlocks the in-player subtitle picker that queries OpenSubtitles' REST API. Register a free account at opensubtitles.com (the .com REST API, not the legacy .org XML-RPC) and find your key under Profile → Consumer. Leave empty to disable; addon-supplied subtitles still work without it. Stored securely in the OS keyring."
                 placeholder="e.g. 1a2b3c4dXyZ…"
+              />
+              <KeyringApiKeyInput
+                name="tmdb"
+                label="TMDB API key (optional)"
+                description="Powers the Seasons / Arcs toggle on anime that have story arcs (One Piece, Naruto, Bleach, and roughly thirty others). Aura ships with its own key, so you only need this if you would rather spend your own quota. Get a free one at themoviedb.org under Settings → API. Stored securely in the OS keyring."
+                placeholder="e.g. 8a1b2c3d4e5f…"
               />
             </Section>
           )}

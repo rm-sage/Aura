@@ -104,6 +104,18 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
     description: "Per-episode opening, ending, and recap skip windows fetched from the AniSkip API. 30-day TTL; windows for an aired episode are immutable once committed. Safe to clear.",
     destructive: false,
   },
+  {
+    prefix:      "aura:story-arcs:v1",
+    label:       "Story arc cache",
+    description: "Per-series story arcs (TMDB episode groups, already mapped onto your addon's episode ids). 24-hour TTL because an ongoing show gains an episode every week. Re-fetches on the next detail open. Safe to clear.",
+    destructive: false,
+  },
+  {
+    prefix:      "aura:arc-mode:v1",
+    label:       "Seasons / Arcs choice",
+    description: "Remembers, per series, whether you last browsed it by season or by story arc, and which arc grouping you picked. Clearing just sends every show back to the Seasons default. Safe to clear.",
+    destructive: false,
+  },
 ];
 
 function formatBytes(n: number): string {

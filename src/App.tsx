@@ -80,6 +80,7 @@ import { useWatchTogether } from "./watchTogether/useWatchTogether";
 import { streamLabel, streamMatchKey } from "./watchTogether/streamMatch";
 import { parseStream } from "./streamMeta";
 import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPreviousEpisode, resolveCanonSkipTarget, formatEpisodeTag } from "./nextUp";
+import { arcPositionOf, fetchStoryArcs, loadArcMode } from "./storyArcs";
 import { getMetaDetailFallback, getRichestMetaDetail, peekCachedDetailById, peekRichestCachedDetailById, peekFreshestPostersByIds } from "./metaCache";
 import { PersistentCache } from "./persistentCache";
 import { applyReducedMotionAttribute, loadAuraSettings } from "./auraSettings";
@@ -2898,6 +2899,40 @@ export default function App() {
    *  the suggestion for THIS playback; opening S01E06 fresh produces a
    *  new CTA when its own end approaches. */
   const nextUpDismissedFor = useRef<string | null>(null);
+
+  /** Arc context for the episode currently playing, but ONLY when finishing it
+   *  crosses a story-arc boundary. The Next-Up card and the EOS Spotlight then
+   *  say so ("Alabasta complete - next arc: Sky Island") instead of silently
+   *  rolling into a new arc.
+   *
+   *  Decoration, never a gate: auto-advance behaviour is unchanged, and every
+   *  failure path here (no arcs, no TMDB key, meta not cached yet) simply
+   *  leaves this null. It must never delay playback, which is why it reads the
+   *  CACHED meta rather than fetching one. */
+  const [arcNote, setArcNote] = useState<{ ending: string; next: string | null } | null>(null);
+
+  useEffect(() => {
+    const seriesId = activeTarget?.series_id ?? activeTarget?.id ?? null;
+    const episodeId = activeTarget?.id ?? null;
+    const mt = activeTarget?.media_type ?? "";
+    if (!seriesId || !episodeId || seriesId === episodeId || !(mt === "series" || mt === "anime")) {
+      setArcNote(null);
+      return;
+    }
+    const detail = peekRichestCachedDetailById(seriesId);
+    if (!detail) {
+      setArcNote(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const result = await fetchStoryArcs(detail, seriesId, loadArcMode(seriesId).groupingId);
+      if (cancelled) return;
+      const pos = arcPositionOf(result, episodeId);
+      setArcNote(pos?.isLast ? { ending: pos.arc.name, next: pos.next?.name ?? null } : null);
+    })();
+    return () => { cancelled = true; };
+  }, [activeTarget?.id, activeTarget?.series_id, activeTarget?.media_type]);
   /** Sticky resolution flag — when we've already resolved a candidate
    *  (or determined there isn't one) for the active target, don't keep
    *  poking the addons every tick. Reset on activeTarget change. */
@@ -7173,6 +7208,7 @@ export default function App() {
           onSkipToCanon={nextUpInfo.canon ? onNextUpSkip : undefined}
           onPlay={onNextUpPlay}
           onDismiss={onNextUpDismiss}
+          arcNote={arcNote}
         />
       )}
 
@@ -7210,6 +7246,7 @@ export default function App() {
             onPlayNext={onEosPlayNext}
             skipTag={nextEp && nextUpInfo?.canon ? formatEpisodeTag(nextUpInfo.canon.episode) : null}
             onSkipToCanon={onEosSkipToCanon}
+            arcNote={arcNote}
             autoAdvanceStreak={autoAdvanceStreakRef.current}
             onReplay={onEosReplay}
             onExit={onEosExit}

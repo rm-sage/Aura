@@ -51,10 +51,14 @@ interface Props {
   onPlay: () => void;
   /** Hide the CTA for the rest of the current playback session. */
   onDismiss: () => void;
+  /** Set only when the episode just finished was the LAST of its story arc, so
+   *  playing the next one crosses an arc boundary. Purely informational: the
+   *  countdown still rolls into the next arc. `next` is null on the final arc. */
+  arcNote?: { ending: string; next: string | null } | null;
 }
 
 export default function NextUpCta({
-  episode, loading, noStream, skipTag, onSkipToCanon, onPlay, onDismiss,
+  episode, loading, noStream, skipTag, onSkipToCanon, onPlay, onDismiss, arcNote,
 }: Props) {
   const tag = formatEpisodeTag(episode);
   const title = (episode.title ?? "").trim() || "Untitled episode";
@@ -197,6 +201,15 @@ export default function NextUpCta({
           <p className="text-white/95 text-sm font-medium leading-tight mt-0.5 line-clamp-2">
             {title}
           </p>
+          {/* Arc boundary. Additive to the SxxEyy tag above, not a replacement:
+              the user still needs to know which episode is queued. */}
+          {arcNote && (
+            <p className="text-ln-accent/85 text-[11px] leading-tight mt-1 line-clamp-2">
+              {arcNote.next
+                ? `${arcNote.ending} complete · next arc: ${arcNote.next}`
+                : `${arcNote.ending} complete · final arc`}
+            </p>
+          )}
         </div>
 
         {skipMode ? (

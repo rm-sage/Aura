@@ -520,11 +520,15 @@ interface SettingsSyncBlob {
  *  `src-tauri/src/api_keyring.rs`. If you add a key on the Rust side,
  *  list it here too — the encryption layer just sees the JSON shape
  *  but the read/write paths use this list explicitly. */
-const SYNCED_API_KEYS = ["opensubtitles"] as const;
+const SYNCED_API_KEYS = ["opensubtitles", "tmdb"] as const;
 type SyncedApiKeyName = typeof SYNCED_API_KEYS[number];
 
 interface ApiKeysPlaintext {
   opensubtitles?: string;
+  /** Optional TMDB key backing the story-arc grouping. Aura bakes its own key,
+   *  so this is only set when the user chose to spend their own quota; syncing
+   *  it means they set it once, not once per device. */
+  tmdb?: string;
 }
 
 /** Pull the user_id off the keyring-resident session. Returns null
