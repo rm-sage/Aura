@@ -91,7 +91,9 @@ optional but nice.
 - **Mini meta hover panel** (Kai style) that surfaces synopsis, ratings, cast, runtime, genres, and
   release countdowns when you hover a poster, with hover, button, and press and hold activation modes.
 - **Continue Watching** with per season segmented progress bars, plus a **Calendar** of upcoming and
-  recent releases, a drag to reorder **Queue**, and a day grouped **History** view.
+  recent releases, a drag to reorder **Queue**, a day grouped **History** view, and an **Airing** page
+  that gathers the shows you follow that are currently putting out episodes, with an episodes behind
+  badge and grouping by air window.
 - **Filter and sort** controls (year, genre, rating, sort order) across Library, Queue, and Discover,
   and manual marks for watched, in progress, and planned.
 - **Spoiler controls** that blur unwatched episode thumbnails, episode synopses, and cast photos.
@@ -130,6 +132,23 @@ whichever reads as the richest single image of Aura's discovery layer.
 - **PublicMetaDB** skip windows for live action series, and **filler and recap** skipping in Next Up
   driven by AIOMetadata flags.
 - Cour aware MyAnimeList resolution so multi season anime map to the correct entry.
+- **Story Arcs** for long running anime: a Seasons and Arcs toggle on the Detail page that regroups
+  the episode list into narrative arcs, with a switcher for broader sagas or combined cuts where a
+  show defines them. Each arc is a tile with Fandom key art, its episode and year range, and your
+  watch progress, and the current arc carries onto the Next Up card and the End of Season Spotlight.
+  Arcs come from TMDB episode groups aligned to your addon's real episodes (by sequence, not by
+  episode number), so they appear only for the shows that have them. The feature needs a TMDB key
+  (baked in, or your own under Settings > API Keys) and is inert without one.
+
+<!--
+SCREENSHOT NEEDED: docs/screenshots/story-arcs.png - the Detail page in Arcs mode, with the
+Seasons/Arcs toggle and the grouping switcher (Sagas / Story Arcs) visible, and a grid of arc tiles
+showing key art, episode ranges, and progress. One Piece is the showcase title. Section: "Anime and
+skip tooling".
+-->
+<p align="center">
+  <img src="docs/screenshots/story-arcs.png" alt="Story Arcs view on the Detail page with arc tiles" width="920">
+</p>
 
 ## Subtitles
 
@@ -139,6 +158,20 @@ whichever reads as the richest single image of Aura's discovery layer.
   installed Stremio subtitle addons merged alongside embedded tracks.
 - Preferred language selection with smart auto pick, an optional language allowlist, live delay, and
   the in player styling described above.
+- **Live Subtitle Sync** in the player: pick the line you just heard from a scrollable cue list and
+  Aura computes and applies the delay for you, no counting seconds by hand. It works on embedded
+  container tracks as well as external files (Stremio's own sync only handles external tracks), and a
+  two point mode takes a second anchor further into the episode to correct framerate drift through
+  mpv's subtitle speed, with a one click undo if a correction is not what you wanted.
+
+<!--
+SCREENSHOT NEEDED: docs/screenshots/subtitle-sync.png - the Live Subtitle Sync panel open bottom-right
+in the player, showing the delay readout at the top and the scrollable list of subtitle lines with the
+anchor line highlighted. A paused subtitled frame behind it reads best. Section: "Subtitles".
+-->
+<p align="center">
+  <img src="docs/screenshots/subtitle-sync.png" alt="Live Subtitle Sync panel with a cue list in the player" width="560">
+</p>
 
 ## Notifications and end of season
 
@@ -167,6 +200,10 @@ ring if you can trigger auto-advance). The dark scrim over a paused frame looks 
 - Cour aware anime mapping with absolute episode fallbacks, completion gates (80 percent plus real
   elapsed time) to avoid false marks, proactive token refresh, expiry alerts, and a master on and off
   toggle.
+- **Manual scrobble from History**: every History row has a Scrobble to Trakt button (and a Scrobble
+  to AniList button for anime) that pushes the play backdated to when you actually watched it, so a
+  session where scrobbling was off, or a title one service missed, can still be recorded after the
+  fact (Trakt to the exact watch time, AniList to the day).
 
 ## Casting
 

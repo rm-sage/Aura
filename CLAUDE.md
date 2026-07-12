@@ -212,7 +212,10 @@ frontend ~40k LOC over ~70 files + ~13 views).
   `publicmetadb.rs` (OP/ED skip source + TMDB id resolution), `anime_id_map.rs`, `silencedetect.rs`
   (outro boundary via ffmpeg), `trailer.rs` (YouTube trailer resolve).
 - **Skip / scrobble**: `aniskip.rs` (OP/ED timing, vote/submit, id resolution), `scrobble.rs` +
-  `scrobble_auth.rs` + `scrobble_anilist.rs` (Trakt + AniList OAuth, heartbeat).
+  `scrobble_auth.rs` + `scrobble_anilist.rs` (Trakt + AniList OAuth, heartbeat). `scrobble.rs` also
+  exposes the manual `scrobble_history_trakt` / `scrobble_history_anilist` commands (the per-row
+  buttons on the History tab in `src/views/HistoryView.tsx`), which backdate the mark to the original
+  watch time: Trakt exact via `watched_at`, AniList day-precision via `completedAt`.
 - **Subtitles + media**: `subtitles.rs` (OpenSubtitles v1: search incl. moviehash, download,
   add-to-mpv), `subsync.rs` (Live Sync cue lists: SRT / WebVTT / ASS parsing for external tracks,
   WINDOWED ffmpeg extraction for embedded ones), `media_controls.rs` (SMTC via souvlaki),
@@ -310,7 +313,7 @@ These are mistakes with specific, hard-to-diagnose symptoms.
    drag (either `startDragging()` OR the custom capture) on `pointerdown` enters the OS modal
    `SC_MOVE` loop / captures the pointer immediately and **swallows the second click of a
    double-click**, silently breaking double-click-to-maximize. So `TitleBar.tsx` only ARMS on
-   `onPointerDown` and **defers the real drag to the first `pointermove` past a 4px threshold** — a
+   `onPointerDown` and **defers the real drag to the first `pointermove` past a 4px threshold** - a
    plain click / double-click then never starts a drag and reaches the webview as ordinary
    click / dblclick (native `onDoubleClick` -> `toggleMaximize`, no synthesis needed). Past that
    threshold the path forks by OS: Windows 11 (and any non-Windows / maximized window) calls
@@ -318,7 +321,7 @@ These are mistakes with specific, hard-to-diagnose symptoms.
    custom coalesced pointer-drag** (`setPointerCapture` + one `setPosition` per rAF) because the
    native modal loop recomposites the transparent WebView2 + mpv d3d11 child on every move step and
    stalls on Win10's older DWM + weak GPUs (window crawls behind a captured cursor). The gate is the
-   `is_windows_10` command (`win32::is_windows_10`, `RtlGetVersion` build < 22000 — the WebView2 UA
+   `is_windows_10` command (`win32::is_windows_10`, `RtlGetVersion` build < 22000, the WebView2 UA
    can't tell Win10 from Win11). Do NOT move drag initiation back to `pointerdown` (re-breaks
    double-click) and do NOT collapse the Win10 custom path back to `startDragging` (re-introduces the
    Win10 lag).
