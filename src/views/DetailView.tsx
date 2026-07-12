@@ -107,9 +107,9 @@ import { streamMatchKey } from "../watchTogether/streamMatch";
 import Tooltip from "../Tooltip";
 import { BrandLogo, ratingDomain, groupRatingsByBrand } from "../logodev";
 import { hasUsableRating } from "../ratingValue";
-import ArcGrid from "../ArcGrid";
+import ArcGrid, { ArcGridSkeleton } from "../ArcGrid";
 import {
-  arcPositionOf, arcYearRange, loadArcMode, saveArcMode, useStoryArcs,
+  arcPositionOf, arcYearRange, loadArcMode, preferredGroupingId, saveArcMode, useStoryArcs,
   type EpisodeGrouping,
 } from "../storyArcs";
 
@@ -3097,13 +3097,36 @@ function EpisodesPanel({
     () => loadArcMode(seriesId).groupingId,
   );
   const [openArcId, setOpenArcId] = useState<string | null>(null);
-  const { arcs: arcResult } = useStoryArcs(detail ?? null, seriesId, groupingId);
+  const { arcs: arcResult, loading: arcsLoading } = useStoryArcs(detail ?? null, seriesId, groupingId);
+
+  // A remembered grouping always wins. Captured once at mount so the auto-default
+  // below cannot fight a choice the user made in this same session.
+  const storedGroupingIdRef = useRef(loadArcMode(seriesId).groupingId);
+
+  // Default the grouping to Sagas (the first in display order) rather than to
+  // whatever the backend scored highest. Only when the user has no remembered
+  // choice, and only once they are actually in Arcs mode: a seasons-mode visitor
+  // should not pay for a second TMDB round-trip they will never look at. The
+  // refetch is skeletoned like any other grouping switch, and it settles after
+  // one pass (the refetched result's grouping_id IS the preferred one).
+  useEffect(() => {
+    if (grouping !== "arcs") return;
+    if (storedGroupingIdRef.current) return;
+    if (!arcResult || arcResult.groupings.length < 2) return;
+    const preferred = preferredGroupingId(arcResult.groupings);
+    if (!preferred || preferred === arcResult.grouping_id) return;
+    setGroupingId(preferred);
+  }, [grouping, arcResult]);
 
   const arcAvailable = !!arcResult && arcResult.arcs.length > 0;
   // Guard every render path on availability, not just on the toggle: a user who
   // last left One Piece in Arcs mode must not get an empty panel when the TMDB
   // fetch fails or the key is missing.
   const arcMode = grouping === "arcs" && arcAvailable;
+  // First open (or a remembered Arcs mode) with nothing resolved yet: the TMDB
+  // join is genuinely slow, so the panel owes the user a skeleton instead of
+  // silently showing the season list.
+  const arcPending = grouping === "arcs" && !arcAvailable && arcsLoading;
   const openArc = useMemo(
     () => (arcMode ? arcResult!.arcs.find((a) => a.id === openArcId) ?? null : null),
     [arcMode, arcResult, openArcId],
@@ -3128,6 +3151,10 @@ function EpisodesPanel({
       setGroupingId(id);
       setOpenArcId(null);
       saveArcMode(seriesId, "arcs", id);
+      // An explicit pick becomes the remembered choice immediately, so the
+      // Sagas-default effect above stops considering this series (it must not
+      // yank the user back off a grouping they just chose).
+      storedGroupingIdRef.current = id;
     },
     [seriesId],
   );
@@ -3263,7 +3290,7 @@ function EpisodesPanel({
           <div className="flex items-center gap-2.5">
             {/* Only offered when the show genuinely has arcs. Most of the
                 library will never see this control. */}
-            {arcAvailable && (
+            {(arcAvailable || arcPending) && (
               <GroupingToggle mode={grouping} onChange={switchGrouping} />
             )}
             <EpisodeCountChip
@@ -3316,9 +3343,20 @@ function EpisodesPanel({
           <p className="text-white/50 text-[13px] italic">
             No episode list returned by the addon.
           </p>
+        ) : arcPending ? (
+          // Arcs asked for, none resolved yet. The TMDB episode-group fetch plus
+          // the sequence-alignment join takes a visible beat on a 1000-episode
+          // show, and an empty panel read as "nothing happened".
+          <div className="flex-1 min-h-0 overflow-y-auto px-1 pt-1 pb-4 space-y-3">
+            <div className="h-px bg-gradient-to-r from-transparent via-ln-accent/55 to-transparent animate-pulse" />
+            <p className="text-white/55 text-[12px] italic">Loading story arcs…</p>
+            <ArcGridSkeleton />
+          </div>
         ) : arcMode && !openArc ? (
           // Arc picker. Scrolls on its own so a 55-arc show (One Piece) behaves
-          // like the episode list does.
+          // like the episode list does. `loading` covers a grouping SWITCH: the
+          // grid keeps its header (so the newly selected segment lights up at
+          // once) and swaps its tiles for skeletons while the refetch runs.
           <div
             className="flex-1 min-h-0 overflow-y-auto px-1 pt-1 pb-4"
             style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
@@ -3326,6 +3364,9 @@ function EpisodesPanel({
             <ArcGrid
               result={arcResult!}
               seriesId={seriesId}
+              videos={videos}
+              loading={arcsLoading}
+              activeGroupingId={groupingId ?? arcResult!.grouping_id}
               onSelect={(arc) => setOpenArcId(arc.id)}
               onGroupingChange={switchArcGrouping}
             />

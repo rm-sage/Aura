@@ -252,3 +252,90 @@ export function arcYearRange(arc: StoryArc): string {
   if (arc.year_end == null || arc.year_end === arc.year_start) return String(arc.year_start);
   return `${arc.year_start}-${arc.year_end}`;
 }
+
+// ---------------------------------------------------------------------------
+// Grouping display order + default
+//
+// The backend returns groupings sorted by an internal score, which puts
+// whatever it liked best first. The UI wants a STABLE, meaningful order that a
+// user can build a habit around: the broad view first, the fine-grained view
+// next, the mashups last. That is a general rule keyed on the grouping NAME, not
+// a One Piece special case: any show whose TMDB episode groups are named
+// "... Sagas" gets the coarse view first, anything named "combo"/"combined"
+// sinks to the end, and everything else keeps the backend's relative order in
+// the middle. A show with no saga-ish grouping simply starts at its first
+// grouping, which is what happens today.
+// ---------------------------------------------------------------------------
+
+function groupingRank(name: string): number {
+  const n = name.toLowerCase();
+  // COMBO IS TESTED FIRST, AND THAT ORDER IS LOAD-BEARING. One Piece's combo
+  // grouping is literally named "Season, Arc & Saga Combos", so a "saga" check
+  // that ran first would match it, sort it leftmost, AND make it the default
+  // (the default is just the first in display order) - the exact opposite of
+  // what we want.
+  if (n.includes("combo") || n.includes("combined")) return 2;
+  if (n.includes("saga")) return 0;
+  return 1;
+}
+
+/** Sagas first, story arcs next, combos last. Stable within a rank, so the
+ *  backend's own ordering still breaks ties. Never mutates the input. */
+export function orderGroupings(groupings: ArcGrouping[]): ArcGrouping[] {
+  return groupings
+    .map((g, i) => ({ g, i }))
+    .sort((a, b) => groupingRank(a.g.name) - groupingRank(b.g.name) || a.i - b.i)
+    .map((e) => e.g);
+}
+
+/** The grouping to open on by default: the first one in display order, i.e. the
+ *  Sagas grouping when the show has one. `undefined` for a show with no
+ *  groupings (the caller then leaves the backend's own pick alone). */
+export function preferredGroupingId(groupings: ArcGrouping[]): string | undefined {
+  return orderGroupings(groupings)[0]?.id;
+}
+
+// ---------------------------------------------------------------------------
+// Episode-number range
+// ---------------------------------------------------------------------------
+
+function epLabel(v: VideoEntry, withSeason: boolean): string {
+  const ep = v.episode != null ? `E${v.episode}` : "";
+  if (!withSeason || v.season == null) return ep;
+  return `S${String(v.season).padStart(2, "0")}${ep}`;
+}
+
+/** Human episode range for an arc, e.g. `E890-E1085`, `S20E13-S21E194`, or the
+ *  single-episode `S02E05`. Empty string when NONE of the arc's episode ids
+ *  resolve against the addon's video list (an arc whose ids the addon no longer
+ *  lists is rendered without a range rather than with a wrong one).
+ *
+ *  `videosById` is the caller's id -> VideoEntry map (the episodes panel already
+ *  has the list in scope). Unresolvable ids inside the arc are skipped, so the
+ *  range is always drawn from real episodes.
+ *
+ *  Season prefixing rule: shown when the arc crosses a season boundary, or when
+ *  it sits in a season other than 1. A single-season-1 show (the long-runner
+ *  case: One Piece is one 1000+ episode season) reads as a plain `E890-E1085`. */
+export function arcEpisodeRange(arc: StoryArc, videosById: Map<string, VideoEntry>): string {
+  let first: VideoEntry | null = null;
+  let last: VideoEntry | null = null;
+  for (const id of arc.episode_ids) {
+    const v = videosById.get(id);
+    if (!v) continue;
+    if (!first) first = v;
+    last = v;
+  }
+  if (!first || !last) return "";
+
+  const crossesSeason = first.season != null && last.season != null && first.season !== last.season;
+  const withSeason = crossesSeason || (first.season != null && first.season !== 1);
+
+  const a = epLabel(first, withSeason);
+  const b = epLabel(last, withSeason);
+  if (!a && !b) return "";
+  if (first.id === last.id || a === b) return a || b;
+  // Same season: only the left side carries the Sxx prefix (`S02E05-E12`), so a
+  // within-season range does not read as a cross-season one.
+  return `${a}-${crossesSeason ? b : epLabel(last, false) || b}`;
+}
