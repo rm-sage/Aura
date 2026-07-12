@@ -66,15 +66,13 @@ export interface ArcResult {
 /** Keyed `${seriesId}::${groupingId ?? "default"}`. 24 h because an ongoing
  *  show gains an episode weekly, and a stale arc would be missing it.
  *
- *  The `:v2` bump discards every `:v1` entry: those were produced by the
- *  earlier raw-score confidence gate, which dropped legitimate arcs (Naruto's
- *  filler arcs, where a TMDB/Cinemeta date or title diverges, collapsed the
- *  grouping to a single surviving arc) and predate the "Seasons" grouping
- *  reject. A cached bad result would otherwise hide those fixes for 24 h. Bump
- *  this whenever the arc-building logic changes in a way that invalidates
- *  previously cached results. */
+ *  The version suffix discards every older cached entry. Bump it whenever the
+ *  arc-building or alignment logic changes in a way that invalidates previously
+ *  cached results, because a stale result would otherwise hide the fix for 24 h.
+ *  History: v2 dropped the raw-score gate's over-rejected arcs; v3 the widened
+ *  band; v4 the residual pass that recovers a reordered tail block. */
 const arcCache = new PersistentCache<ArcResult | null>({
-  storageKey: "aura:story-arcs:v3",
+  storageKey: "aura:story-arcs:v4",
   ttlMs: 24 * 60 * 60 * 1000,
   maxEntries: 60,
 });
@@ -84,6 +82,7 @@ const arcCache = new PersistentCache<ArcResult | null>({
 try {
   localStorage.removeItem("aura:story-arcs:v1");
   localStorage.removeItem("aura:story-arcs:v2");
+  localStorage.removeItem("aura:story-arcs:v3");
 } catch { /* localStorage unavailable; nothing to clean */ }
 
 /** The user's Seasons-vs-Arcs choice, and chosen grouping, per series. Bounded
@@ -350,19 +349,32 @@ function epLabel(v: VideoEntry, withSeason: boolean): string {
   return `S${String(v.season).padStart(2, "0")}${ep}`;
 }
 
-/** Human episode range for an arc, e.g. `E890-E1085`, `S20E13-S21E194`, or the
- *  single-episode `S02E05`. Empty string when NONE of the arc's episode ids
- *  resolve against the addon's video list (an arc whose ids the addon no longer
- *  lists is rendered without a range rather than with a wrong one).
+/** True when the show's episodes span more than one season. Decides the episode-
+ *  label format ONCE for the whole show, so every arc reads the same way instead
+ *  of some showing `E13-E26` and others `S02E05-E12`. */
+export function showIsMultiSeason(videos: VideoEntry[]): boolean {
+  let seen: number | null = null;
+  for (const v of videos) {
+    if (v.season == null) continue;
+    if (seen == null) seen = v.season;
+    else if (v.season !== seen) return true;
+  }
+  return false;
+}
+
+/** Human episode range for an arc. Consistent across the whole show, driven by
+ *  `multiSeason`: a multi-season show always prefixes the season
+ *  (`S20E13-S21E194`, `S02E05-S02E12`); a single-season / absolute-numbered show
+ *  never does (`E890-E1085`). Empty string when NONE of the arc's episode ids
+ *  resolve against the addon's video list.
  *
- *  `videosById` is the caller's id -> VideoEntry map (the episodes panel already
- *  has the list in scope). Unresolvable ids inside the arc are skipped, so the
- *  range is always drawn from real episodes.
- *
- *  Season prefixing rule: shown when the arc crosses a season boundary, or when
- *  it sits in a season other than 1. A single-season-1 show (the long-runner
- *  case: One Piece is one 1000+ episode season) reads as a plain `E890-E1085`. */
-export function arcEpisodeRange(arc: StoryArc, videosById: Map<string, VideoEntry>): string {
+ *  `videosById` is the caller's id -> VideoEntry map. Unresolvable ids inside the
+ *  arc are skipped, so the range is always drawn from real episodes. */
+export function arcEpisodeRange(
+  arc: StoryArc,
+  videosById: Map<string, VideoEntry>,
+  multiSeason: boolean,
+): string {
   let first: VideoEntry | null = null;
   let last: VideoEntry | null = null;
   for (const id of arc.episode_ids) {
@@ -373,14 +385,9 @@ export function arcEpisodeRange(arc: StoryArc, videosById: Map<string, VideoEntr
   }
   if (!first || !last) return "";
 
-  const crossesSeason = first.season != null && last.season != null && first.season !== last.season;
-  const withSeason = crossesSeason || (first.season != null && first.season !== 1);
-
-  const a = epLabel(first, withSeason);
-  const b = epLabel(last, withSeason);
+  const a = epLabel(first, multiSeason);
+  const b = epLabel(last, multiSeason);
   if (!a && !b) return "";
   if (first.id === last.id || a === b) return a || b;
-  // Same season: only the left side carries the Sxx prefix (`S02E05-E12`), so a
-  // within-season range does not read as a cross-season one.
-  return `${a}-${crossesSeason ? b : epLabel(last, false) || b}`;
+  return `${a}-${b}`;
 }

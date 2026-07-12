@@ -36,7 +36,7 @@ import { episodeIsBeforeResume, useResumeVideoId } from "./LibraryContext";
 import { getManualWatchedState, useManualWatchedVersion } from "./manualWatched";
 import { shrinkPoster } from "./posterSize";
 import {
-  arcEpisodeRange, arcYearRange, orderGroupings,
+  arcEpisodeRange, arcYearRange, orderGroupings, showIsMultiSeason,
   type ArcGrouping, type ArcResult, type StoryArc, groupingDisplayName,} from "./storyArcs";
 import type { VideoEntry } from "./types";
 
@@ -92,12 +92,14 @@ function ArcCard({
   arc,
   perRow,
   videosById,
+  multiSeason,
   resumeId,
   onSelect,
 }: {
   arc: StoryArc;
   perRow: 1 | 2;
   videosById: Map<string, VideoEntry>;
+  multiSeason: boolean;
   resumeId: string | null;
   onSelect: (arc: StoryArc) => void;
 }) {
@@ -106,7 +108,7 @@ function ArcCard({
   const ratio = total > 0 ? watched / total : 0;
   const complete = total > 0 && watched === total;
   const years = arcYearRange(arc);
-  const range = arcEpisodeRange(arc, videosById);
+  const range = arcEpisodeRange(arc, videosById, multiSeason);
   const { aspect, artWidth } = tileGeometry(perRow);
 
   // Server-resize hint sized to the tile, never a full-size master pulled into
@@ -319,6 +321,8 @@ export default function ArcGrid({
     () => new Map(videos.map((v) => [v.id, v])),
     [videos],
   );
+  // Decided once for the whole show so every arc's range reads the same way.
+  const multiSeason = useMemo(() => showIsMultiSeason(videos), [videos]);
 
   const active = activeGroupingId ?? result.grouping_id;
   // Tile density follows the grouping the user asked for, so a switch to a
@@ -355,6 +359,7 @@ export default function ArcGrid({
               arc={arc}
               perRow={perRow}
               videosById={videosById}
+              multiSeason={multiSeason}
               resumeId={resumeId}
               onSelect={onSelect}
             />

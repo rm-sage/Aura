@@ -319,53 +319,138 @@ pub fn align(left: &[AlignEpisode], right: &[AlignEpisode]) -> Alignment {
         }
     }
 
-    // Traceback from (n, m). The band guarantees that cell is reachable.
-    let mut pairs: Vec<AlignPair> = Vec::new();
-    let mut left_only: Vec<String> = Vec::new();
-    let mut right_only: Vec<String> = Vec::new();
+    // Traceback from (n, m). The band guarantees that cell is reachable. Work in
+    // INDICES so the residual pass can reach each episode's Prepped comparison
+    // terms; keys are built at the very end.
+    let mut matched: Vec<(usize, usize)> = Vec::new(); // (left idx, right idx)
+    let mut left_unmatched: Vec<usize> = Vec::new();
+    let mut right_unmatched: Vec<usize> = Vec::new();
 
     let mut i = n;
     let mut j = m;
     while i > 0 || j > 0 {
         match back[at(i, j)] {
             DIR_DIAG if i > 0 && j > 0 => {
-                let a = &lefts[i - 1];
-                let b = &rights[j - 1];
-                let score = pair_score(a, b);
-                pairs.push(AlignPair {
-                    left_key: a.key.clone(),
-                    right_key: b.key.clone(),
-                    score,
-                    confidence: pair_confidence(score, attainable(a, b)),
-                });
+                matched.push((i - 1, j - 1));
                 i -= 1;
                 j -= 1;
             }
             DIR_UP if i > 0 => {
-                left_only.push(lefts[i - 1].key.clone());
+                left_unmatched.push(i - 1);
                 i -= 1;
             }
             DIR_LEFT if j > 0 => {
-                right_only.push(rights[j - 1].key.clone());
+                right_unmatched.push(j - 1);
                 j -= 1;
             }
             _ => {
                 // Unreachable with a well formed band. Fail loudly in the result rather than
                 // silently truncating: everything still unconsumed becomes unmatched.
-                for e in lefts[..i].iter() {
-                    left_only.push(e.key.clone());
+                for k in (0..i).rev() {
+                    left_unmatched.push(k);
                 }
-                for e in rights[..j].iter() {
-                    right_only.push(e.key.clone());
+                for k in (0..j).rev() {
+                    right_unmatched.push(k);
                 }
                 break;
             }
         }
     }
+    matched.reverse();
+    left_unmatched.reverse();
+    right_unmatched.reverse();
 
-    pairs.reverse();
-    left_only.reverse();
-    right_only.reverse();
+    let mut pairs: Vec<AlignPair> = matched
+        .into_iter()
+        .map(|(li, ri)| {
+            let score = pair_score(&lefts[li], &rights[ri]);
+            AlignPair {
+                left_key: lefts[li].key.clone(),
+                right_key: rights[ri].key.clone(),
+                score,
+                confidence: pair_confidence(score, attainable(&lefts[li], &rights[ri])),
+            }
+        })
+        .collect();
+
+    // Residual pass, over the episodes the monotone DP left UNMATCHED on both
+    // sides. Where the two sources ORDER a block differently (a shuffle or a
+    // re-sorted run) the positional DP cannot pair it and gaps the block on both
+    // sides. Real addons do this to the tail filler of long anime (Naruto's last
+    // ~17 episodes came back reordered relative to TMDB, with the SAME air
+    // dates). We recover those order-independently by matching on a NEAR-EXACT
+    // air date.
+    //
+    // The near-exact date gate (`RESIDUAL_MAX_DELTA` days) is what keeps this
+    // safe. Weekly episodic content is only 7 days apart, so accepting a looser
+    // date would let a 1-week reorder pair adjacent-but-different episodes, which
+    // is exactly the off-by-one this whole module exists to prevent. A same-date
+    // shuffle is unambiguous; a one-week reorder is not, so we only take the
+    // former. The One Piece crossover (unmatched on ONE side only) has no
+    // counterpart and stays a clean gap. Bounded so a total misalignment does not
+    // become O(n^2) work.
+    const RESIDUAL_MAX: usize = 512;
+    const RESIDUAL_MAX_DELTA: i64 = 3;
+    let mut left_consumed = vec![false; left_unmatched.len()];
+    let mut right_consumed = vec![false; right_unmatched.len()];
+    if !left_unmatched.is_empty()
+        && !right_unmatched.is_empty()
+        && left_unmatched.len() <= RESIDUAL_MAX
+        && right_unmatched.len() <= RESIDUAL_MAX
+    {
+        for (lk, &li) in left_unmatched.iter().enumerate() {
+            let Some(lday) = lefts[li].day else { continue };
+            let mut best_rk: Option<usize> = None;
+            let mut best_delta = i64::MAX;
+            let mut best_dice = -1.0;
+            for (rk, &ri) in right_unmatched.iter().enumerate() {
+                if right_consumed[rk] {
+                    continue;
+                }
+                let Some(rday) = rights[ri].day else { continue };
+                let delta = (lday - rday).abs();
+                if delta > RESIDUAL_MAX_DELTA {
+                    continue;
+                }
+                // Among near-exact-date candidates, prefer the closest date, then
+                // the best title, so a run of same-date episodes still resolves.
+                let dice = dice_from_counts(
+                    &lefts[li].norm, &lefts[li].bigrams, lefts[li].bigram_total,
+                    &rights[ri].norm, &rights[ri].bigrams, rights[ri].bigram_total,
+                );
+                if delta < best_delta || (delta == best_delta && dice > best_dice) {
+                    best_delta = delta;
+                    best_dice = dice;
+                    best_rk = Some(rk);
+                }
+            }
+            if let Some(rk) = best_rk {
+                let ri = right_unmatched[rk];
+                let score = pair_score(&lefts[li], &rights[ri]);
+                right_consumed[rk] = true;
+                left_consumed[lk] = true;
+                pairs.push(AlignPair {
+                    left_key: lefts[li].key.clone(),
+                    right_key: rights[ri].key.clone(),
+                    score,
+                    confidence: pair_confidence(score, attainable(&lefts[li], &rights[ri])),
+                });
+            }
+        }
+    }
+
+    let left_only: Vec<String> = left_unmatched
+        .iter()
+        .enumerate()
+        .filter(|(lk, _)| !left_consumed[*lk])
+        .map(|(_, &li)| lefts[li].key.clone())
+        .collect();
+    let right_only: Vec<String> = right_unmatched
+        .iter()
+        .enumerate()
+        .filter(|(rk, _)| !right_consumed[*rk])
+        .map(|(_, &ri)| rights[ri].key.clone())
+        .collect();
 
     Alignment {
         pairs,
@@ -440,14 +525,18 @@ fn date_proximity(a: Option<i64>, b: Option<i64>) -> f64 {
         0.4
     } else if delta <= 35 {
         0.1
+        // A month-plus apart is almost never the same episode, and this must lose
+        // to a gap no matter what the title does, so the monotone DP always GAPS a
+        // far-date pair rather than forcing it. That matters because a shared word
+        // ("...Mission", "...Arc") gives filler episodes a moderate title score;
+        // at a gentler floor the DP would force a wrong far-date match instead of
+        // gapping cleanly, and the residual pass (which only recovers gapped
+        // episodes) could never fix it. W_DATE * -2.0 = -1.1, so even a perfect
+        // title (+0.45) lands at -0.65, well under the -0.35 gap. A genuinely
+        // mis-dated real match is then left for the residual pass, or simply
+        // dropped from its arc: absent beats wrong.
     } else {
-        // A month-plus apart is almost never the same episode. This must score
-        // low enough that the whole pair (W_DATE * -1.0 = -0.55) loses to a gap
-        // (-0.35) when the title does not also match, so with the wide band the
-        // DP gaps a clear mismatch instead of reaching across to force it. A
-        // strong title can still rescue a genuinely mis-dated match
-        // (W_DATE*-1.0 + W_TITLE*1.0 = -0.1 > gap).
-        -1.0
+        -2.0
     }
 }
 
@@ -1005,18 +1094,31 @@ mod tests {
 
     #[test]
     fn confidence_still_punishes_disagreement_it_only_forgives_absence() {
-        // Both sides carry dates AND titles, and both DISAGREE. Evidence was
-        // available and it was bad, so confidence must stay low. (Guards against
-        // "fixing" the dateless case by making confidence trivially 1.0.)
-        let left = vec![ep("L0", "totally different words here", Some(0))];
-        let right = vec![ep("R0", "nothing alike whatsoever", Some(400))];
+        // A pair whose date is CLOSE-ISH (in monotone range) but whose title
+        // disagrees is kept, and its confidence must stay low so the arc gate can
+        // drop its arc. (Guards against "fixing" the dateless case by making
+        // confidence trivially 1.0.) Dates 20 days apart -> still matched
+        // positionally; disjoint titles -> low confidence.
+        let base = parse_day("2013-04-07").unwrap();
+        let left = vec![ep("L0", "totally different words here", Some(base))];
+        let right = vec![ep("R0", "nothing alike whatsoever", Some(base + 20))];
         let a = align(&left, &right);
         assert_eq!(a.pairs.len(), 1);
         assert!(
             a.min_confidence() < 0.5,
-            "a pair whose available signals both disagree must not clear the gate, got {}",
+            "a close-date but title-disagreeing pair must not clear the gate, got {}",
             a.min_confidence(),
         );
+
+        // But a pair whose signals BOTH disagree hard (a month-plus apart AND no
+        // shared title) is not the same episode: the monotone gaps it rather than
+        // forcing a bad pair, and the near-exact-date residual leaves it alone.
+        let left = vec![ep("L0", "totally different words here", Some(base))];
+        let right = vec![ep("R0", "nothing alike whatsoever", Some(base + 400))];
+        let a = align(&left, &right);
+        assert!(a.pairs.is_empty(), "a hard-disagreeing pair must not be forced");
+        assert_eq!(a.left_only, vec!["L0".to_string()]);
+        assert_eq!(a.right_only, vec!["R0".to_string()]);
     }
 
     #[test]
@@ -1048,6 +1150,98 @@ mod tests {
             "a filler run (date off 5d, divergent titles) must clear the arc gate, got {}",
             a.min_confidence(),
         );
+    }
+
+    #[test]
+    fn reordered_tail_block_is_recovered_by_the_residual_pass() {
+        // The Naruto tail case: the first stretch aligns 1:1, then a block that
+        // both sources contain but SHUFFLE far apart (identical air dates, but
+        // scattered positions so the monotone DP gaps the whole block on both
+        // sides). The residual pass must recover it by same-date matching. Dates
+        // in the tail are spaced a YEAR apart so the shuffle is unambiguous (no
+        // two are within the near-exact-date gate), which is the safe case the
+        // residual is limited to.
+        const HEAD: usize = 15;
+        let base = parse_day("2006-09-13").unwrap();
+        let tail_days: [i64; 6] = [
+            parse_day("2010-01-01").unwrap(),
+            parse_day("2011-01-01").unwrap(),
+            parse_day("2012-01-01").unwrap(),
+            parse_day("2013-01-01").unwrap(),
+            parse_day("2014-01-01").unwrap(),
+            parse_day("2015-01-01").unwrap(),
+        ];
+        let mut left: Vec<AlignEpisode> = Vec::new();
+        let mut right: Vec<AlignEpisode> = Vec::new();
+        for i in 0..HEAD {
+            let day = Some(base + 7 * i as i64);
+            left.push(ep(&format!("L{i}"), &title_of(i), day));
+            right.push(ep(&format!("R{i}"), &title_of(i), day));
+        }
+        // Left tail in order, right tail shuffled (indices 3,0,5,1,4,2).
+        for i in 0..6 {
+            left.push(ep(&format!("LT{i}"), &format!("tail {}", WORDS[i % 40]), Some(tail_days[i])));
+        }
+        for &i in &[3usize, 0, 5, 1, 4, 2] {
+            right.push(ep(&format!("RT{i}"), &format!("tail {}", WORDS[i % 40]), Some(tail_days[i])));
+        }
+
+        let a = align(&left, &right);
+        assert!(a.left_only.is_empty(), "residual must map every tail ep, left_only={:?}", a.left_only);
+        assert!(a.right_only.is_empty(), "right_only={:?}", a.right_only);
+        for i in 0..6 {
+            assert_eq!(a.map(&format!("LT{i}")), Some(format!("RT{i}").as_str()), "tail ep {i}");
+        }
+    }
+
+    #[test]
+    fn residual_will_not_pair_beyond_the_near_exact_date_gate() {
+        // The residual only recovers a SAME-date shuffle. A gapped left and gapped
+        // right that are 7 days apart (a weekly reorder, ambiguous by nature) must
+        // be refused: a one-week residual match is the off-by-one this module
+        // exists to prevent. Build an aligned head, then a scattered tail (years
+        // apart, so the monotone gaps it) in which exactly one cross-side pair is
+        // 7 days off; that pair must stay unmatched while the same-date ones
+        // recover.
+        let base = parse_day("2006-09-13").unwrap();
+        let mut left: Vec<AlignEpisode> = Vec::new();
+        let mut right: Vec<AlignEpisode> = Vec::new();
+        for i in 0..12 {
+            let day = Some(base + 7 * i as i64);
+            left.push(ep(&format!("L{i}"), &title_of(i), day));
+            right.push(ep(&format!("R{i}"), &title_of(i), day));
+        }
+        // Tail, years apart so the monotone gaps the whole block:
+        let d_a = parse_day("2011-01-01").unwrap();
+        let d_b = parse_day("2013-01-01").unwrap();
+        // Left tail in order; right tail REVERSED so the monotone gaps the whole
+        // block (positional partners are years apart) and hands it to the
+        // residual. Right's B is 7 days off from left's B.
+        left.push(ep("LA", "orphan alpha", Some(d_a)));
+        left.push(ep("LB", "orphan bravo", Some(d_b)));
+        right.push(ep("RB", "orphan bravo", Some(d_b + 7)));
+        right.push(ep("RA", "orphan alpha", Some(d_a)));
+
+        let a = align(&left, &right);
+        // The exact-date pair recovers.
+        assert_eq!(a.map("LA"), Some("RA"), "same-date tail ep must recover");
+        // The 7-day pair must NOT: both stay unmatched.
+        assert!(a.map("LB").is_none(), "a 7-day residual pair is forbidden");
+        assert!(a.left_only.contains(&"LB".to_string()));
+        assert!(a.right_only.contains(&"RB".to_string()));
+    }
+
+    #[test]
+    fn residual_pass_leaves_a_one_sided_gap_alone() {
+        // The One Piece crossover: one TMDB-only episode, nothing unmatched on the
+        // Aura side. The residual pass has no counterpart to pair it with, so it
+        // must stay a single left_only gap (never mis-paired).
+        let mut left = weekly_run("L", 20);
+        left.insert(10, ep("CROSS", "one off crossover special", Some(parse_day("2013-06-01").unwrap())));
+        let right = weekly_run("R", 20);
+        let a = align(&left, &right);
+        assert_eq!(a.left_only, vec!["CROSS".to_string()]);
+        assert!(a.right_only.is_empty());
     }
 
     #[test]
@@ -1097,17 +1291,16 @@ mod tests {
         assert!((a.score_of("L0").unwrap() - 1.0).abs() < 1e-9);
         assert!(a.left_only.is_empty() && a.right_only.is_empty());
 
-        // One on each side, but nothing in common: still a match (a single gap pair costs more
-        // than the worst possible match), and min_score is what tells the caller not to trust it.
+        // One on each side, nothing in common (a month-plus apart, disjoint
+        // titles): NOT the same episode. Gapping both costs less than forcing the
+        // match, so the aligner leaves them unmatched rather than reporting a
+        // bogus pair.
         let left = vec![ep("L0", "zebra quartz", Some(base))];
         let right = vec![ep("R0", "wisp xenon", Some(base + 400))];
         let a = align(&left, &right);
-        assert_eq!(a.pairs.len(), 1);
-        assert!(
-            a.min_score() < 0.0,
-            "a garbage pair must report a bad score, got {}",
-            a.min_score()
-        );
+        assert!(a.pairs.is_empty(), "a garbage pair must not be forced");
+        assert_eq!(a.left_only, vec!["L0".to_string()]);
+        assert_eq!(a.right_only, vec!["R0".to_string()]);
     }
 
     #[test]
