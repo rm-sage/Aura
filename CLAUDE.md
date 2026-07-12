@@ -159,12 +159,38 @@ writes `_id = series_id ?? id` and stamps `state.video_id = id` when they differ
 `libraryClearProgress` is Stremio's "Rewind": only zeroes `state.timeOffset`, preserving `video_id`
 and everything else.
 
+### Story arcs: NEVER join TMDB arcs to episodes by number
+
+Arcs come from TMDB episode groups (`type == 5`), which define an arc as a set of TMDB
+`(season, episode)` pairs. Aura's episode ids come from Stremio meta addons (Cinemeta / TVDB
+numbering). **The two numbering systems disagree, and not by a constant.** Do not "fix" this with a
+season join, an absolute-episode join, or a hardcoded offset. All three are wrong:
+
+- TMDB's season boundaries are not Cinemeta's (One Piece: TMDB S1 = 61 episodes, Cinemeta S1 = 8).
+- TMDB promotes a Toriko crossover special into One Piece's MAIN RUN at absolute 590; Cinemeta files
+  it as special S0E39. So TMDB abs N == Cinemeta abs N up to 589 and N-1 from 591 on. A naive
+  absolute-index join misplaces **579 of 1168 episodes (49.6%)**: every arc from Punk Hazard onward
+  starts and ends one episode late, and it *looks correct*. That offset is one TMDB editorial
+  decision, not a constant, and it grows over time.
+- Air date alone is not a key (weekly anime repeat dates: 40 of Naruto Shippuden's air dates carry
+  two episodes). Title alone is not a key (TVDB and TMDB use different English translations of the
+  same episode; some true pairs score 0.00 on bigram similarity).
+
+`arc_align.rs` is the answer: a banded Needleman-Wunsch alignment over air date + title with
+broadcast order as a hard constraint, which absorbs a promotion/demotion as a single gap. Measured
+100% correct on One Piece (1168/1168) and Naruto Shippuden (500/500). It has real `#[cfg(test)]`
+tests, including a regression test for exactly the off-by-one above; keep them. Any arc containing a
+sub-0.5-confidence pair is DROPPED and logged rather than rendered. Fail visible, never fail
+off-by-one. Season 0 is excluded on both sides (the two databases' specials do not correspond).
+
 ### Build-time secrets
 
-`build.rs` parses `../.env.local` (git-ignored) or real environment variables and bakes two keys via
-`cargo:rustc-env`: `AURA_MDBLIST_KEY` (used by `ratings.rs`) and `AURA_PUBLICMETADB_KEY` (used by
-`publicmetadb.rs`). An empty/missing key makes that feature cleanly no-op (no error, just empty
-ratings or skip windows). Per-account cloud sync scopes by a SHA-256 hash of the Stremio `auth_key`
+`build.rs` parses `../.env.local` (git-ignored) or real environment variables and bakes three keys
+via `cargo:rustc-env`: `AURA_MDBLIST_KEY` (used by `ratings.rs`), `AURA_PUBLICMETADB_KEY` (used by
+`publicmetadb.rs`), and `AURA_TMDB_KEY` (used by `arcs.rs`). An empty/missing key makes that feature
+cleanly no-op (no error, just empty ratings, no skip windows, or no Arcs toggle). A user-supplied key
+in the OS keyring overrides the baked one where supported (`api_keyring::SUPPORTED_KEYS` is
+`opensubtitles` + `tmdb`). Per-account cloud sync scopes by a SHA-256 hash of the Stremio `auth_key`
 (`sync.rs`); each account's blob is isolated.
 
 ## Codebase map
@@ -188,8 +214,12 @@ frontend ~40k LOC over ~70 files + ~13 views).
 - **Skip / scrobble**: `aniskip.rs` (OP/ED timing, vote/submit, id resolution), `scrobble.rs` +
   `scrobble_auth.rs` + `scrobble_anilist.rs` (Trakt + AniList OAuth, heartbeat).
 - **Subtitles + media**: `subtitles.rs` (OpenSubtitles v1: search incl. moviehash, download,
-  add-to-mpv), `media_controls.rs` (SMTC via souvlaki), `per_title.rs` (per-id volume / shader /
-  track memory).
+  add-to-mpv), `subsync.rs` (Live Sync cue lists: SRT / WebVTT / ASS parsing for external tracks,
+  WINDOWED ffmpeg extraction for embedded ones), `media_controls.rs` (SMTC via souvlaki),
+  `per_title.rs` (per-id volume / shader / track memory).
+- **Story arcs**: `arcs.rs` (TMDB episode groups -> arcs, grouping selection, the command),
+  `arc_align.rs` (the join; see the landmine below), `arc_art.rs` (Fandom arc key art, curated
+  TMDB-id -> wiki table). Devlog label `[arcs]`.
 - **Casting + live TV**: `cast/mod.rs` + `cast/castv2.rs` + `cast/dlna.rs` + `cast/hls.rs` +
   `cast/media_server.rs` (Chromecast via hand-rolled CASTV2 + DLNA + on-the-fly HLS transcode),
   `iptv.rs` (EPG fetch + Xtream password keyring).
@@ -355,6 +385,11 @@ Bound every cache (see Performance & memory).
   the page you were on; cleared on app close (cold start opens Home).
 - **Notifications** (`aura:notifications:v1`): ring buffer capped at 200 entries.
 - **EPG** (`src/iptv/epgStore.ts`): localStorage, ~4-week retention, parsed off-thread in a worker.
+- **Story arcs**: `aura:story-arcs:v1` (24 h TTL, cap 60) holds the joined arcs per series; the TTL is
+  short deliberately because an ongoing show gains an episode weekly and a stale arc would be missing
+  it. `aura:arc-mode:v1` (cap 200) remembers the Seasons/Arcs choice per series. Rust side:
+  `arcs-cache-v1.json` (TMDB payloads, 24 h, cap 40) and `arc-art-v1.json` (Fandom art, 30 d, cap 60;
+  an empty map is a cached MISS and is honoured, so a show with no art does not re-probe every visit).
 - **Addon manifest fields**: `AddonEntry.stream_types`, `id_prefixes`, `stream_id_prefixes` are
   populated at install/sync time; `fetch_streams` reads them directly and never re-fetches manifests
   per stream request (a transient failure during that re-probe used to kill all stream lookups).
@@ -398,6 +433,17 @@ creep degrades the experience. When adding ANY feature:
   non-empty `AURA_MDBLIST_KEY` (baked from `.env.local`); the MAL/AniList branch needs a resolvable
   anime id. Non-tt non-anime ids get only addon-supplied `detail.ratings`. OMDb is fully removed.
 - "Skip windows missing" -> `aniskip.rs` / `publicmetadb.rs`; `AURA_PUBLICMETADB_KEY` must be baked.
+- "No Seasons/Arcs toggle on an anime" -> `arcs.rs`. In order: `AURA_TMDB_KEY` baked (or a user key in
+  the keyring), a resolvable TMDB id (`MetaDetail.tmdb_id`, else the `/find` by IMDb id), and a TMDB
+  episode group of `type == 5` that clears the coverage bar. Most shows have no arcs at all: arcs are
+  a property of long-running manga, so the toggle is *supposed* to be absent nearly everywhere.
+  DevConsole `[arcs]` logs the grouping choice and the alignment score.
+- "Arc shows the wrong episodes" / "arc is off by one" -> read the story-arcs section above. This is
+  the failure the aligner exists to prevent; check the `[arcs]` min-score log before touching
+  anything else.
+- "Live Sync cue list is empty / will not scroll" -> `subsync.rs` for the cue source (bitmap PGS /
+  VobSub tracks can never yield text and are a deliberate disabled state), and the non-passive wheel
+  handler in the panel: the overlay's volume-wheel handler steals wheel events without it.
 - "Subtitle download fails / path rejected" -> `subtitles.rs`; downloads must land in
   `app_data_dir()/subtitles` and `add_subtitle_to_mpv` enforces containment.
 - "A Tailwind class has no effect" -> check the theme-scale gotchas; confirm against
@@ -411,7 +457,7 @@ creep degrades the experience. When adding ANY feature:
 - Rust log labels to grep in the DevConsole or `aura-mpv.log`: `[bridge]`, `[player]`, `[streams]`,
   `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[ratings]`, `[rpc]`, `[win32]`, `[smtc]`,
   `[scrobble]`, `[publicmetadb]`, `[mpv]` (the playback engine), `[cast]`, `[iptv]`, `[sync]`,
-  `[aniskip]`.
+  `[aniskip]`, `[arcs]`, `[subsync]`.
 - libmpv writes its own verbose log to `%USERPROFILE%\aura-mpv.log` (truncated each MPV init, rotated
   to `.old` past 50 MB). The last few lines usually pinpoint a STATUS_ACCESS_VIOLATION.
 - Discord RPC uses application ID `1499651271357890610` (`window_logic.rs`). Browse states are gated
