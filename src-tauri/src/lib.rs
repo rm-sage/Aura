@@ -2361,6 +2361,8 @@ pub fn run() {
             scrobble_auth::scrobble_oauth_device_poll,
             scrobble_auth::open_oauth_popup_webview,
             scrobble::scrobble_test_fire,
+            scrobble::scrobble_history_trakt,
+            scrobble::scrobble_history_anilist,
             // ── API keys (OS keyring) ─────────────────────────────────────────
             api_keyring::get_api_key,
             api_keyring::set_api_key,

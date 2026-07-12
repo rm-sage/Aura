@@ -362,20 +362,36 @@ fn trakt_targets(sess: &ScrobbleSession) -> Vec<TraktTarget> {
 /// for episodes we use the nested `shows[].seasons[].episodes[]` shape
 /// which lets us key the show by IMDB id and the episode by S/E
 /// numbers without needing the Trakt-internal episode id.
-fn build_history_body(target: &TraktTarget) -> serde_json::Value {
+///
+/// `watched_at` (ISO 8601 UTC, e.g. `2026-07-12T21:04:00.000Z`) backdates
+/// the history row to the original watch time. Trakt accepts it on the
+/// movie object and on the episode object; when `None`, Trakt stamps the
+/// row with "now" (the automatic scrobble path's behavior). Only the
+/// manual "scrobble a History item" path supplies it.
+fn build_history_body(target: &TraktTarget, watched_at: Option<&str>) -> serde_json::Value {
     match target {
-        TraktTarget::Movie { imdb } => serde_json::json!({
-            "movies": [{ "ids": { "imdb": imdb } }],
-        }),
-        TraktTarget::Episode { show_imdb, season, number } => serde_json::json!({
-            "shows": [{
-                "ids":     { "imdb": show_imdb },
-                "seasons": [{
-                    "number":   season,
-                    "episodes": [{ "number": number }],
+        TraktTarget::Movie { imdb } => {
+            let mut movie = serde_json::json!({ "ids": { "imdb": imdb } });
+            if let Some(ts) = watched_at {
+                movie["watched_at"] = serde_json::Value::String(ts.to_string());
+            }
+            serde_json::json!({ "movies": [movie] })
+        }
+        TraktTarget::Episode { show_imdb, season, number } => {
+            let mut episode = serde_json::json!({ "number": number });
+            if let Some(ts) = watched_at {
+                episode["watched_at"] = serde_json::Value::String(ts.to_string());
+            }
+            serde_json::json!({
+                "shows": [{
+                    "ids":     { "imdb": show_imdb },
+                    "seasons": [{
+                        "number":   season,
+                        "episodes": [episode],
+                    }],
                 }],
-            }],
-        }),
+            })
+        }
     }
 }
 
@@ -445,8 +461,9 @@ struct TraktSyncResponseBody {
 /// fallback target (dual-numbering) or surface the result as final.
 async fn trakt_sync_history_once(
     token_bearer: &str, target: &TraktTarget, sess: &ScrobbleSession, progress_pct: f64,
+    watched_at: Option<&str>,
 ) -> TraktSyncOutcome {
-    let body = build_history_body(target);
+    let body = build_history_body(target, watched_at);
     let res = client()
         .post(format!("{TRAKT_API}/sync/history"))
         .header("Authorization", format!("Bearer {token_bearer}"))
@@ -549,7 +566,9 @@ async fn trakt_sync_history_once(
     }
 }
 
-async fn trakt_sync_history(scope: &str, sess: &ScrobbleSession, time: f64, duration: f64) -> TraktSyncResult {
+async fn trakt_sync_history(
+    scope: &str, sess: &ScrobbleSession, time: f64, duration: f64, watched_at: Option<&str>,
+) -> TraktSyncResult {
     let Some(mut token) = scrobble_auth::read_token_for("trakt", scope) else {
         crate::devlog!(
             info, "scrobble",
@@ -649,7 +668,7 @@ async fn trakt_sync_history(scope: &str, sess: &ScrobbleSession, time: f64, dura
             );
         }
         let mut outcome = trakt_sync_history_once(
-            &token.access_token, target, sess, progress_pct,
+            &token.access_token, target, sess, progress_pct, watched_at,
         ).await;
 
         // ── Reactive refresh on 401 ────────────────────────────────
@@ -673,7 +692,7 @@ async fn trakt_sync_history(scope: &str, sess: &ScrobbleSession, time: f64, dura
                         token.access_token = refreshed.access_token.clone();
                     }
                     outcome = trakt_sync_history_once(
-                        &token.access_token, target, sess, progress_pct,
+                        &token.access_token, target, sess, progress_pct, watched_at,
                     ).await;
                     if let TraktSyncOutcome::Unauthorized = outcome {
                         // Refreshed token still 401s — give up, clear,
@@ -798,15 +817,15 @@ pub async fn scrobble_end<R: Runtime>(
         sess.imdb_id, progress, sess.is_anime, scope,
     );
     // Trakt: covers movies + IMDB-id'd series (most of the catalogue).
-    trakt_sync_history(&scope, &sess, time, duration).await;
+    trakt_sync_history(&scope, &sess, time, duration, None).await;
     // AniList: separate provider, separate keyring entry, separate
     // failure mode. Internally no-ops when sess.is_anime is false or
     // no AniList token is stored, so calling it unconditionally is
     // cheap. We treat its outcome as best-effort the same way Trakt
     // does — a 401 clears the keyring entry so Settings reflects
     // "expired, reconnect" on next refresh.
-    match crate::scrobble_anilist::save_progress(&app, &scope, &sess).await {
-        Ok(()) => {}
+    match crate::scrobble_anilist::save_progress(&app, &scope, &sess, None).await {
+        Ok(_) => {}
         Err(crate::scrobble_anilist::AnilistError::Unauthorized) => {
             crate::devlog!(
                 warn, "scrobble",
@@ -933,8 +952,8 @@ pub async fn scrobble_test_fire<R: Runtime>(
         sess.season, sess.episode_num,
     );
 
-    let trakt_result = trakt_sync_history(&scope, &sess, test_time, test_duration).await;
-    let anilist_outcome = crate::scrobble_anilist::save_progress(&app, &scope, &sess).await;
+    let trakt_result = trakt_sync_history(&scope, &sess, test_time, test_duration, None).await;
+    let anilist_outcome = crate::scrobble_anilist::save_progress(&app, &scope, &sess, None).await;
     if let Err(crate::scrobble_anilist::AnilistError::Unauthorized) = anilist_outcome {
         crate::devlog!(
             warn, "scrobble",
@@ -951,7 +970,7 @@ pub async fn scrobble_test_fire<R: Runtime>(
     };
     let anilist_msg = if anilist_will_fire {
         match &anilist_outcome {
-            Ok(()) => "fired".to_string(),
+            Ok(_) => "fired".to_string(),
             Err(crate::scrobble_anilist::AnilistError::NotFound)
                 => "skipped (not on AniList)".to_string(),
             Err(e) => format!("failed: {e}"),
@@ -976,6 +995,156 @@ pub async fn scrobble_test_fire<R: Runtime>(
         anilist_fired: anilist_will_fire && anilist_outcome.is_ok(),
         message,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Manual "scrobble a History item" commands
+//
+// The History tab lets the user push a past watch to Trakt / AniList on
+// demand, backdated to the ORIGINAL watch time (`played_at`). These go
+// through the SAME target resolution + POST/retry machinery as the
+// automatic scrobble path (trakt_targets / trakt_sync_history for Trakt,
+// save_progress for AniList); they only differ in (a) supplying the
+// backdate and (b) returning a human-readable outcome string (or an Err
+// with a legible reason) so the UI can toast it. Nothing here fails
+// silently.
+// ---------------------------------------------------------------------------
+
+/// Assemble a `ScrobbleSession` from the fields a History row carries.
+/// `episode` (the trailing S/E number) is threaded as `episode_num` and
+/// the season as `season`, mirroring what the live scrobble path passes
+/// from the VideoEntry the user clicked; `parent_id` becomes the
+/// series-root IMDb anchor. `imdb_id`/`title` reuse the existing session
+/// field names.
+#[allow(clippy::too_many_arguments)]
+fn session_from_history(
+    id:         String,
+    parent_id:  Option<String>,
+    media_type: String,
+    season:     Option<u32>,
+    episode:    Option<u32>,
+    name:       String,
+    is_anime:   bool,
+    scope:      String,
+) -> ScrobbleSession {
+    ScrobbleSession {
+        imdb_id: id,
+        media_type,
+        episode: None,
+        title: name,
+        is_anime,
+        scope,
+        season,
+        episode_num: episode,
+        series_imdb_id: parent_id,
+        absolute_episode_num: None,
+        anilist_id: None,
+        anilist_episode: None,
+    }
+}
+
+/// Push a History item to Trakt's /sync/history, backdated to `played_at`
+/// (ISO 8601 UTC). Returns a short outcome string on success, or an Err
+/// with a legible reason (not connected / unsupported id / catalog miss /
+/// network failure).
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn scrobble_history_trakt<R: Runtime>(
+    _app:       AppHandle<R>,
+    id:         String,
+    parent_id:  Option<String>,
+    media_type: String,
+    season:     Option<u32>,
+    episode:    Option<u32>,
+    name:       String,
+    scope:      String,
+    played_at:  String,
+) -> Result<String, String> {
+    if scrobble_auth::read_token_for("trakt", &scope).is_none() {
+        return Err("Trakt is not connected. Connect it in Settings > Scrobbling.".into());
+    }
+    let sess = session_from_history(id, parent_id, media_type, season, episode, name, false, scope.clone());
+    let trimmed = played_at.trim();
+    let watched_at = if trimmed.is_empty() { None } else { Some(trimmed) };
+    crate::devlog!(
+        info, "scrobble",
+        "scrobble_history_trakt: id={} scope={} watched_at={:?}",
+        sess.imdb_id, scope, watched_at,
+    );
+    // time/duration only feed a progress-% log line on this path; pass a
+    // synthetic completion pair.
+    match trakt_sync_history(&scope, &sess, 100.0, 100.0, watched_at).await {
+        TraktSyncResult::Fired    => Ok("Added to Trakt history".into()),
+        TraktSyncResult::NotFound => {
+            Err("Trakt has no catalog match for this title under its numbering.".into())
+        }
+        TraktSyncResult::Skipped  => {
+            Err("This item has no IMDb id Trakt can use.".into())
+        }
+        TraktSyncResult::Failed   => {
+            Err("Trakt request failed (network error or token rejected). Try again.".into())
+        }
+    }
+}
+
+/// Push a History item to AniList, backdating the completion date to
+/// `played_at` when the write completes the entry (AniList's
+/// `completedAt` is day-precision, no time of day). Anime-only; the
+/// frontend only offers this for anime rows. Returns a short outcome
+/// string on success or an Err with a legible reason.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn scrobble_history_anilist<R: Runtime>(
+    app:        AppHandle<R>,
+    id:         String,
+    parent_id:  Option<String>,
+    media_type: String,
+    season:     Option<u32>,
+    episode:    Option<u32>,
+    name:       String,
+    scope:      String,
+    played_at:  String,
+) -> Result<String, String> {
+    if scrobble_auth::read_token_for("anilist", &scope).is_none() {
+        return Err("AniList is not connected. Connect it in Settings > Scrobbling.".into());
+    }
+    // is_anime = true so save_progress runs its resolver; the frontend
+    // gates this command to anime rows already.
+    let sess = session_from_history(id, parent_id, media_type, season, episode, name, true, scope.clone());
+    let completed_at = crate::scrobble_anilist::parse_fuzzy_date(&played_at);
+    crate::devlog!(
+        info, "scrobble",
+        "scrobble_history_anilist: id={} scope={} completed_at={:?}",
+        sess.imdb_id, scope, completed_at,
+    );
+    use crate::scrobble_anilist::{AnilistError, SaveOutcome};
+    match crate::scrobble_anilist::save_progress(&app, &scope, &sess, completed_at).await {
+        Ok(SaveOutcome::Saved { progress, total, completed }) => {
+            if completed {
+                let total_str = total.map(|t| t.to_string()).unwrap_or_else(|| progress.to_string());
+                Ok(format!("AniList marked complete ({progress}/{total_str})"))
+            } else {
+                Ok(format!("AniList progress set to {progress}"))
+            }
+        }
+        Ok(SaveOutcome::AlreadyAhead { progress }) => {
+            Ok(format!("AniList already at episode {progress} or beyond"))
+        }
+        Ok(SaveOutcome::NotApplicable) => {
+            Err("AniList scrobbling is not available for this item.".into())
+        }
+        Ok(SaveOutcome::Unresolvable) => {
+            Err("Could not resolve this title to an AniList entry.".into())
+        }
+        Err(AnilistError::Unauthorized) => {
+            scrobble_auth::clear_token_for("anilist", &scope);
+            Err("AniList sign-in expired. Reconnect it in Settings > Scrobbling.".into())
+        }
+        Err(AnilistError::NotFound) => {
+            Err("Could not find this anime on AniList.".into())
+        }
+        Err(e) => Err(format!("AniList request failed: {e}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1044,7 +1213,7 @@ pub fn shutdown_blocking<R: Runtime>(app: &AppHandle<R>) {
                 "shutdown_blocking flushing Trakt /sync/history for {} ({:.0}%)",
                 imdb_id, progress_pct,
             );
-            let body = build_history_body(&target);
+            let body = build_history_body(&target, None);
             let Ok(cli) = reqwest::Client::builder()
                 .timeout(Duration::from_secs(2))
                 .https_only(true)
@@ -1074,7 +1243,7 @@ pub fn shutdown_blocking<R: Runtime>(app: &AppHandle<R>) {
             );
             let _ = tokio::time::timeout(
                 Duration::from_secs(2),
-                crate::scrobble_anilist::save_progress(&app, &scope, &sess),
+                crate::scrobble_anilist::save_progress(&app, &scope, &sess, None),
             )
             .await;
         };

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import type { MetaPreview } from "../types";
 import {
   getHistory,
@@ -14,7 +15,19 @@ import ImageLoader from "../ImageLoader";
 import { shrinkPoster } from "../posterSize";
 import ErrorBoundary from "../ErrorBoundary";
 import { showAppToast } from "../AppToast";
-import { typeLabel } from "../aiometadata";
+import { typeLabel, isAnimeMeta } from "../aiometadata";
+
+// Which scrobble services are connected for the active account. Drives
+// whether each History row offers the "Scrobble to Trakt / AniList"
+// actions. We never render an action for a service the user hasn't
+// linked. Sourced from the same `get_scrobble_auth_status` command the
+// Settings + notification surfaces use, so there is one source of truth
+// for "connected".
+interface ScrobbleConnState {
+  scope: string;
+  trakt: boolean;
+  anilist: boolean;
+}
 
 // ---------------------------------------------------------------------------
 // HistoryView — Trakt-style detailed feed of recent automatic plays.
@@ -43,10 +56,48 @@ export default function HistoryView(props: Props) {
 
 function HistoryViewBody({ onSelectMeta }: Props) {
   const [entries, setEntries] = useState<HistoryEntry[]>(() => getHistory());
+  const [conn, setConn] = useState<ScrobbleConnState>({
+    scope: "guest", trakt: false, anilist: false,
+  });
 
   useEffect(() => {
     const sync = () => setEntries(getHistory());
     return onHistoryChange(sync);
+  }, []);
+
+  // Resolve the active scope + which scrobble services are connected.
+  // Re-runs when the account changes (aura:session-changed) or a token
+  // is (dis)connected in Settings (aura:scrobble-auth-changed) so the
+  // per-row actions appear / disappear without a manual refresh.
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      let scope = "guest";
+      try {
+        const sess = await invoke<{ auth_key?: string } | null>("get_session");
+        scope = sess?.auth_key ? sess.auth_key.slice(0, 12) : "guest";
+      } catch {
+        scope = "guest";
+      }
+      if (cancelled) return;
+      try {
+        const status = await invoke<{ trakt: unknown | null; anilist: unknown | null }>(
+          "get_scrobble_auth_status", { scope },
+        );
+        if (cancelled) return;
+        setConn({ scope, trakt: status.trakt != null, anilist: status.anilist != null });
+      } catch {
+        if (!cancelled) setConn({ scope, trakt: false, anilist: false });
+      }
+    };
+    void load();
+    window.addEventListener("aura:session-changed", load);
+    window.addEventListener("aura:scrobble-auth-changed", load);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("aura:session-changed", load);
+      window.removeEventListener("aura:scrobble-auth-changed", load);
+    };
   }, []);
 
   // Group entries by calendar day in the user's local timezone. Entry
@@ -113,6 +164,7 @@ function HistoryViewBody({ onSelectMeta }: Props) {
                 dateKey={key}
                 entries={dayEntries}
                 onSelectMeta={onSelectMeta}
+                conn={conn}
               />
             ))
           )}
@@ -127,11 +179,12 @@ function HistoryViewBody({ onSelectMeta }: Props) {
 // ---------------------------------------------------------------------------
 
 function DayGroup({
-  dateKey, entries, onSelectMeta,
+  dateKey, entries, onSelectMeta, conn,
 }: {
   dateKey: string;
   entries: HistoryEntry[];
   onSelectMeta?: (meta: MetaPreview) => void;
+  conn: ScrobbleConnState;
 }) {
   const totalSecs = useMemo(
     () => entries.reduce((s, e) => s + (e.watched_seconds ?? 0), 0),
@@ -163,6 +216,7 @@ function DayGroup({
             key={`${entry.id}::${entry.played_at}`}
             entry={entry}
             onSelectMeta={onSelectMeta}
+            conn={conn}
           />
         ))}
       </div>
@@ -175,11 +229,57 @@ function DayGroup({
 // ---------------------------------------------------------------------------
 
 function HistoryCard({
-  entry, onSelectMeta,
+  entry, onSelectMeta, conn,
 }: {
   entry: HistoryEntry;
   onSelectMeta?: (meta: MetaPreview) => void;
+  conn: ScrobbleConnState;
 }) {
+  // null = idle; otherwise the service whose push is in flight. Blocks
+  // both buttons while either is running so a double-click can't fire two
+  // overlapping writes for the same row.
+  const [busy, setBusy] = useState<"trakt" | "anilist" | null>(null);
+
+  // AniList is anime-only. isAnimeMeta reads id-prefix + the localStorage
+  // anime cache (populated by DetailView) + media_type: the same detector
+  // the rest of the app uses; we do not invent a new signal here. Use the
+  // series root id when present so an episode id resolves against the show.
+  const isAnime = isAnimeMeta({
+    media_type: entry.media_type,
+    id: entry.parent_id ?? entry.id,
+    genres: [],
+  });
+
+  const scrobble = async (service: "trakt" | "anilist") => {
+    if (busy) return;
+    setBusy(service);
+    try {
+      const command = service === "trakt"
+        ? "scrobble_history_trakt"
+        : "scrobble_history_anilist";
+      // Tauri maps these camelCase keys onto the Rust command's
+      // snake_case params (parent_id, media_type, played_at, ...).
+      const message = await invoke<string>(command, {
+        id:        entry.id,
+        parentId:  entry.parent_id ?? null,
+        mediaType: entry.media_type,
+        season:    entry.season ?? null,
+        episode:   entry.episode ?? null,
+        name:      entry.name,
+        scope:     conn.scope,
+        playedAt:  entry.played_at,
+      });
+      showAppToast(message, { tone: "success" });
+    } catch (err) {
+      showAppToast(String(err), { tone: "danger", duration: 6000 });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const showTrakt = conn.trakt;
+  const showAnilist = conn.anilist && isAnime;
+
   const epLabel = entry.season != null && entry.episode != null
     ? `S${String(entry.season).padStart(2, "0")}E${String(entry.episode).padStart(2, "0")}`
     : entry.episode != null
@@ -240,6 +340,36 @@ function HistoryCard({
         </div>
       </div>
 
+      {/* Hover-revealed scrobble actions. Each service is only offered
+          when the account has it connected (AniList additionally gated to
+          anime). Explicit click only; nothing fires on hover. */}
+      {(showTrakt || showAnilist) && (
+        <div
+          className="absolute bottom-0 inset-x-0 flex items-center justify-end gap-1.5
+                     px-2 py-1.5 bg-gradient-to-t from-black/80 to-transparent
+                     opacity-0 group-hover:opacity-100 focus-within:opacity-100
+                     transition-opacity duration-150 z-10"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {showTrakt && (
+            <ScrobbleButton
+              label="Trakt"
+              busy={busy === "trakt"}
+              disabled={busy !== null}
+              onClick={() => scrobble("trakt")}
+            />
+          )}
+          {showAnilist && (
+            <ScrobbleButton
+              label="AniList"
+              busy={busy === "anilist"}
+              disabled={busy !== null}
+              onClick={() => scrobble("anilist")}
+            />
+          )}
+        </div>
+      )}
+
       {/* Hover X — removes ONLY this entry (id, played_at). */}
       <button
         type="button"
@@ -264,6 +394,52 @@ function HistoryCard({
         </svg>
       </button>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Scrobble action pill, shared by the Trakt / AniList buttons on a card.
+// Shows a spinner while its push is in flight; disabled while EITHER
+// service on the row is running.
+// ---------------------------------------------------------------------------
+
+function ScrobbleButton({
+  label, busy, disabled, onClick,
+}: {
+  label: string;
+  busy: boolean;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      title={`Scrobble to ${label}`}
+      aria-label={`Scrobble to ${label}`}
+      disabled={disabled}
+      onClick={(e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        onClick();
+      }}
+      className="inline-flex items-center gap-1 px-2 py-1 rounded-full
+                 text-[10.5px] font-medium leading-none
+                 bg-white/10 text-white/85 border border-white/20
+                 hover:bg-ln-accent/25 hover:text-white hover:border-ln-accent/50
+                 disabled:opacity-50 disabled:cursor-default
+                 backdrop-blur-md transition-colors"
+    >
+      {busy && (
+        <svg
+          width="10" height="10" viewBox="0 0 24 24"
+          className="animate-spin" aria-hidden
+        >
+          <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor"
+                  strokeWidth="3" strokeLinecap="round" strokeDasharray="42 14" opacity="0.9" />
+        </svg>
+      )}
+      {label}
+    </button>
   );
 }
 

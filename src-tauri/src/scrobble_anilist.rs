@@ -385,6 +385,72 @@ mutation ($mediaId: Int, $progress: Int, $status: MediaListStatus) {
 }
 ";
 
+/// Same as `SAVE_MUTATION` but carries a `completedAt` FuzzyDate. Used
+/// only by the manual "scrobble a History item" path, which backdates
+/// the completion to the original watch date. A SEPARATE mutation
+/// string (rather than always passing `completedAt`) is deliberate:
+/// AniList treats an explicit `completedAt: null` as "clear the date",
+/// so sending null on the automatic path would wipe any date the user
+/// already had. Day precision only: SaveMediaListEntry has no time-of-
+/// day field, so the wall-clock time from `played_at` is not preserved.
+const SAVE_MUTATION_WITH_DATE: &str = "
+mutation ($mediaId: Int, $progress: Int, $status: MediaListStatus, $completedAt: FuzzyDateInput) {
+  SaveMediaListEntry(mediaId: $mediaId, progress: $progress, status: $status, completedAt: $completedAt) {
+    id progress status
+  }
+}
+";
+
+/// Day-precision completion date threaded from a History item's
+/// `played_at`. AniList's `FuzzyDateInput` is `{ year, month, day }`
+/// with no time component, so this is the finest granularity the API
+/// accepts for backdating a completion.
+#[derive(Clone, Copy, Debug)]
+pub struct FuzzyDate {
+    pub year:  i32,
+    pub month: u32,
+    pub day:   u32,
+}
+
+/// Parse the leading `YYYY-MM-DD` out of an ISO 8601 timestamp (what a
+/// History item's `played_at` carries, e.g. `2026-07-12T21:04:00.000Z`).
+/// String-sliced rather than pulled through a date crate to avoid adding
+/// a `chrono` dependency for one field. The date is the UTC calendar
+/// date; near local midnight this can differ by a day from the date the
+/// user sees in their History grouping, which is an acceptable
+/// limitation for AniList's day-precision `completedAt`.
+pub fn parse_fuzzy_date(iso: &str) -> Option<FuzzyDate> {
+    let date = iso.get(0..10)?;
+    let mut parts = date.split('-');
+    let year:  i32 = parts.next()?.parse().ok()?;
+    let month: u32 = parts.next()?.parse().ok()?;
+    let day:   u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() { return None; }
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(FuzzyDate { year, month, day })
+}
+
+/// What `save_progress` actually did, so the manual-scrobble command
+/// can build a legible toast ("AniList progress set to 12") instead of
+/// a bare Ok. The automatic scrobble callers ignore the payload.
+#[derive(Clone, Debug)]
+pub enum SaveOutcome {
+    /// A write went out. `completed` reflects whether we marked the
+    /// entry COMPLETED (progress reached the entry total).
+    Saved { progress: u32, total: Option<u32>, completed: bool },
+    /// The user's tracked progress was already at/ahead of ours, so we
+    /// left it untouched. Still a success from the caller's view.
+    AlreadyAhead { progress: u32 },
+    /// Not applicable: session not flagged anime, or no AniList token.
+    /// The automatic path treats this as a silent no-op.
+    NotApplicable,
+    /// The session id could not be resolved to an AniList media id
+    /// (non-IMDB, non-anime-prefix shape, or no episode number).
+    Unresolvable,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 #[allow(dead_code)] // id_mal kept for future MAL cross-mapping work
 pub struct MediaInfo {
@@ -573,17 +639,29 @@ async fn save_media_list_entry(
     media_id: u64,
     progress: u32,
     status:   &str,
+    completed_at: Option<FuzzyDate>,
 ) -> Result<(), AnilistError> {
-    let _: SaveResponse = graphql_post(
-        token,
-        SAVE_MUTATION,
-        serde_json::json!({
-            "mediaId":  media_id as i64,
-            "progress": progress as i64,
-            "status":   status,
-        }),
-    )
-    .await?;
+    let mut variables = serde_json::json!({
+        "mediaId":  media_id as i64,
+        "progress": progress as i64,
+        "status":   status,
+    });
+    // Only reach for the completedAt-carrying mutation when we actually
+    // have a date AND we're completing the entry. Sending completedAt
+    // on a CURRENT save (or as null) would either be semantically wrong
+    // or clobber an existing date.
+    let mutation = match completed_at {
+        Some(d) if status == "COMPLETED" => {
+            variables["completedAt"] = serde_json::json!({
+                "year":  d.year,
+                "month": d.month,
+                "day":   d.day,
+            });
+            SAVE_MUTATION_WITH_DATE
+        }
+        _ => SAVE_MUTATION,
+    };
+    let _: SaveResponse = graphql_post(token, mutation, variables).await?;
     Ok(())
 }
 
@@ -833,11 +911,12 @@ async fn resolve_via_cache_or_search(
 /// ep, which clamps to the entry total for split-cour anime). `label` is only
 /// used in the log line.
 async fn commit_progress(
-    access:      &str,
-    media:       &MediaInfo,
-    episode_num: u32,
-    label:       &str,
-) -> Result<(), AnilistError> {
+    access:       &str,
+    media:        &MediaInfo,
+    episode_num:  u32,
+    label:        &str,
+    completed_at: Option<FuzzyDate>,
+) -> Result<SaveOutcome, AnilistError> {
     // 3. Clamp the candidate to the entry's total. AniList rejects
     //    `progress > episodes`, so clamping turns "user watched ep 34 of a
     //    28-ep entry" into "save 28 + mark COMPLETED".
@@ -858,22 +937,23 @@ async fn commit_progress(
             info, "scrobble",
             "AniList: progress already {existing} (>= clamped {to_save}, raw episode={episode_num}); skipping save for {label}",
         );
-        return Ok(());
+        return Ok(SaveOutcome::AlreadyAhead { progress: existing });
     }
     // 5. Status: COMPLETED if we know the total and we're at or past it.
-    let status = match media.episodes {
-        Some(total) if to_save >= total => "COMPLETED",
-        _ => "CURRENT",
-    };
-    // 6. Save.
-    save_media_list_entry(access, media.id, to_save, status).await?;
+    let completed = matches!(media.episodes, Some(total) if to_save >= total);
+    let status = if completed { "COMPLETED" } else { "CURRENT" };
+    // 6. Save. completed_at is only honored by save_media_list_entry
+    //    when we're marking COMPLETED (backdating a completion date to
+    //    the original watch date for the manual History path).
+    save_media_list_entry(access, media.id, to_save, status, completed_at).await?;
     let total_str = media.episodes.map(|e| e.to_string()).unwrap_or_else(|| "?".into());
     crate::devlog!(
         info, "scrobble",
-        "AniList: saved {}/{} ({}) for {label} (anilist_id={}, raw episode={episode_num})",
+        "AniList: saved {}/{} ({}) for {label} (anilist_id={}, raw episode={episode_num}, completedAt={})",
         to_save, total_str, status, media.id,
+        completed_at.filter(|_| completed).map(|d| format!("{:04}-{:02}-{:02}", d.year, d.month, d.day)).unwrap_or_else(|| "none".into()),
     );
-    Ok(())
+    Ok(SaveOutcome::Saved { progress: to_save, total: media.episodes, completed })
 }
 
 /// Save scrobble progress to AniList for the given session. No-op when:
@@ -885,15 +965,16 @@ async fn commit_progress(
 /// Best-effort. Errors are returned so the caller can clear tokens on
 /// Unauthorized; everything else is a "log and move on" outcome.
 pub async fn save_progress<R: Runtime>(
-    app:   &AppHandle<R>,
-    scope: &str,
-    sess:  &ScrobbleSession,
-) -> Result<(), AnilistError> {
+    app:          &AppHandle<R>,
+    scope:        &str,
+    sess:         &ScrobbleSession,
+    completed_at: Option<FuzzyDate>,
+) -> Result<SaveOutcome, AnilistError> {
     if !sess.is_anime {
-        return Ok(());
+        return Ok(SaveOutcome::NotApplicable);
     }
     let Some(token_obj) = scrobble_auth::read_token_for("anilist", scope) else {
-        return Ok(());
+        return Ok(SaveOutcome::NotApplicable);
     };
     let access = token_obj.access_token;
 
@@ -914,7 +995,7 @@ pub async fn save_progress<R: Runtime>(
             );
             match fetch_media(&access, aid).await {
                 Ok(media) => {
-                    return commit_progress(&access, &media, local_ep, &format!("\"{}\" (embedded)", sess.title)).await;
+                    return commit_progress(&access, &media, local_ep, &format!("\"{}\" (embedded)", sess.title), completed_at).await;
                 }
                 Err(AnilistError::NotFound) => {
                     crate::devlog!(
@@ -934,10 +1015,10 @@ pub async fn save_progress<R: Runtime>(
             "AniList: skipping non-IMDB session id ({})",
             sess.imdb_id,
         );
-        return Ok(());
+        return Ok(SaveOutcome::Unresolvable);
     };
     let Some(parsed_episode) = parse_episode_num(&sess.imdb_id, &sess.media_type) else {
-        return Ok(());
+        return Ok(SaveOutcome::Unresolvable);
     };
     // Prefer the VideoEntry-authoritative absolute episode number (set
     // by App.tsx from active.episode_num) over the id-string's trailing
@@ -1112,7 +1193,7 @@ pub async fn save_progress<R: Runtime>(
 
     // Steps 3-6 (clamp / skip-if-ahead / status / save) are shared with the
     // addon-embedded fast path near the top of this function.
-    commit_progress(&access, &media, episode_num, &format!("\"{}\"", sess.title)).await
+    commit_progress(&access, &media, episode_num, &format!("\"{}\"", sess.title), completed_at).await
 }
 
 /// Run the search query and pick the best candidate. Prefers entries
