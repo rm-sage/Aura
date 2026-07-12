@@ -661,34 +661,38 @@ export default function SubtitleSyncPanel({
   const canOfferDrift = firstAnchor !== null && !twoPointArmed && status === "ready";
 
   return (
-    <div className="absolute inset-0 z-40 flex items-end justify-center p-6 pointer-events-none">
+    // Anchored bottom-right, above the control bar, so it reads as a continuation
+    // of the subtitle menu it was opened from rather than a separate dialog.
+    <div className="absolute inset-0 z-40 flex items-end justify-end p-6 pointer-events-none">
       <div
-        className="glass-panel-elevated rounded-2xl shadow-glass-edge w-full max-w-[42rem]
+        className="aura-glass-menu rounded-xl shadow-glass-edge w-full max-w-[34rem]
                    pointer-events-auto flex flex-col max-h-[70vh] overflow-hidden"
       >
-        {/* Header */}
-        <div className="flex items-center justify-between px-5 py-3 border-b border-white/8 flex-shrink-0">
-          <div className="flex items-center gap-2 min-w-0">
-            <span className="text-white/55"><SyncIcon /></span>
-            <h2 className="text-white/85 text-sm font-semibold tracking-wide whitespace-nowrap">
-              Live Subtitle Sync
-            </h2>
-            <span className="text-white/30 text-xs whitespace-nowrap">
-              · click the line you just heard
+        {/* Header. Same mono / uppercase / tracked section-label treatment the
+            track menus use, so this panel belongs to the same family instead of
+            reading as a modal dialog dropped on top of the player. */}
+        <div className="flex items-center justify-between px-4 pt-2.5 pb-1.5 flex-shrink-0">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <span className="text-white/40"><SyncIcon /></span>
+            <span className="text-white/40 text-[10px] font-mono font-semibold tracking-[0.18em] uppercase whitespace-nowrap">
+              Subtitles Live Sync
             </span>
           </div>
           <button
             onClick={onClose}
             aria-label="Close"
-            className="w-7 h-7 rounded-full text-white/50 hover:text-white hover:bg-white/8
+            className="w-6 h-6 rounded-full text-white/45 hover:text-white hover:bg-white/12
                        flex items-center justify-center transition-colors flex-shrink-0"
           >
             <CloseIcon />
           </button>
         </div>
+        <p className="px-4 pb-2 text-white/35 text-[11px] leading-snug flex-shrink-0">
+          Choose the line you just heard to sync the subtitle delay.
+        </p>
 
         {/* Delay readout + manual nudge */}
-        <div className="flex items-center gap-2 px-5 py-2.5 border-b border-white/6 flex-shrink-0">
+        <div className="flex items-center gap-2 px-4 py-2 border-t border-white/8 flex-shrink-0">
           <span className="text-white/45 text-[10px] font-mono font-semibold uppercase tracking-[0.18em]">
             Delay
           </span>
@@ -754,7 +758,7 @@ export default function SubtitleSyncPanel({
 
         {/* Search */}
         {status === "ready" && (
-          <div className="px-5 py-2.5 border-b border-white/6 flex-shrink-0">
+          <div className="px-4 py-2 border-t border-white/8 flex-shrink-0">
             <input
               type="search"
               value={query}
@@ -772,7 +776,7 @@ export default function SubtitleSyncPanel({
 
         {/* Two-point / drift affordance */}
         {canOfferDrift && (
-          <div className="px-5 py-2.5 border-b border-white/6 flex-shrink-0 flex items-start gap-3">
+          <div className="px-4 py-2.5 border-t border-white/8 flex-shrink-0 flex items-start gap-3">
             <div className="min-w-0 flex-1">
               <p className="text-white/75 text-xs font-medium">Still drifting?</p>
               <p className="text-white/40 text-[11px] leading-snug mt-0.5">
@@ -794,7 +798,7 @@ export default function SubtitleSyncPanel({
           </div>
         )}
         {twoPointArmed && (
-          <div className="px-5 py-2 border-b border-white/6 flex-shrink-0 flex items-center gap-3">
+          <div className="px-4 py-2 border-t border-white/8 flex-shrink-0 flex items-center gap-3">
             <p className="text-ln-accent text-[11.5px] flex-1 min-w-0">
               Two-point mode: pick the line you just heard. It has to be at least{" "}
               {MIN_ANCHOR_GAP_SECS}s away from your first pick.
@@ -813,7 +817,7 @@ export default function SubtitleSyncPanel({
 
         {/* Note / error */}
         {(note || error) && (
-          <div className="px-5 py-2 flex-shrink-0 text-[11.5px] leading-snug">
+          <div className="px-4 py-2 flex-shrink-0 text-[11.5px] leading-snug">
             {error
               ? <span className="text-red-400/85 break-words">{error}</span>
               : <span className="text-white/55">{note}</span>}
@@ -887,15 +891,18 @@ export default function SubtitleSyncPanel({
                   else rowRefs.current.delete(idx);
                 }}
                 onClick={() => { void onPickCue(idx); }}
-                className={`w-full text-left px-3 py-2 rounded-lg text-[13px] leading-snug
-                            transition-colors border
+                // Same row idiom as the track menus: full-bleed px-4 py-2 rows at
+                // 13px, accent tint for the active one, white/[0.16] on hover. No
+                // per-row borders or rounding, which is what made this list read
+                // as a list of cards rather than a menu.
+                className={`w-full text-left px-4 py-2 text-[13px] leading-snug transition-colors
                             ${isFlash
-                              ? "bg-ln-accent/25 text-white border-ln-accent/60"
+                              ? "bg-ln-accent/20 text-ln-accent"
                               : isAnchor
-                                ? "bg-ln-accent/10 text-white border-ln-accent/35"
+                                ? "bg-ln-accent/10 text-ln-accent"
                                 : isMatch
-                                  ? "bg-white/12 text-white border-white/20"
-                                  : "text-white/80 border-transparent hover:bg-white/8 hover:text-white"}`}
+                                  ? "bg-white/12 text-white"
+                                  : "text-white/70 hover:bg-white/[0.16] hover:text-white"}`}
               >
                 {/* Cue text only - Rust already stripped every SRT / VTT / ASS
                     markup form, so this is safe to render verbatim. */}

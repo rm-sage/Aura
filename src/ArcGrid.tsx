@@ -37,8 +37,7 @@ import { getManualWatchedState, useManualWatchedVersion } from "./manualWatched"
 import { shrinkPoster } from "./posterSize";
 import {
   arcEpisodeRange, arcYearRange, orderGroupings,
-  type ArcGrouping, type ArcResult, type StoryArc,
-} from "./storyArcs";
+  type ArcGrouping, type ArcResult, type StoryArc, groupingDisplayName,} from "./storyArcs";
 import type { VideoEntry } from "./types";
 
 /** Above this arc count a grouping is "dense" and switches to two tiles per
@@ -257,7 +256,7 @@ function GroupingSelect({
                   : "text-white/55 hover:text-white/90 hover:bg-white/6",
               ].join(" ")}
             >
-              <span className="truncate max-w-[12rem]">{g.name}</span>
+              <span className="truncate max-w-[12rem]">{groupingDisplayName(g.name)}</span>
               <span
                 className={[
                   "px-1.5 py-px rounded-full text-[10px] font-mono tabular-nums",

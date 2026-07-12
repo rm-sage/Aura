@@ -279,6 +279,13 @@ function groupingRank(name: string): number {
   return 1;
 }
 
+/** Display name for a grouping. TMDB's own label for the fine-grained grouping
+ *  is the singular "Story Arc", which reads wrong on a tab that contains 55 of
+ *  them. Everything else is shown as the source names it. */
+export function groupingDisplayName(name: string): string {
+  return name.trim().toLowerCase() === "story arc" ? "Story Arcs" : name;
+}
+
 /** Sagas first, story arcs next, combos last. Stable within a rank, so the
  *  backend's own ordering still breaks ties. Never mutates the input. */
 export function orderGroupings(groupings: ArcGrouping[]): ArcGrouping[] {
