@@ -476,8 +476,18 @@ creep degrades the experience. When adding ANY feature:
 - `src-tauri/lib/` is git-ignored (>100 MB). `libmpv-2.dll` is REQUIRED there for dev (download from
   `github.com/zhongfly/mpv-winbuild`). `libmpv-wrapper.dll` is no longer used and is actively cleaned
   up as an orphan.
-- `ffmpeg` (silencedetect + cast HLS transcode), `ffprobe` (cast), and `yt-dlp` (trailers) are
-  NOT bundled. They are fetched on demand from a GitHub `runtime-deps` prerelease, SHA-verified
+**ffmpeg landmine: with `-copyts`, NEVER bound the slice with `-t`.** `-t` is documented as a
+duration, but under `-copyts` ffmpeg measures it against the COPIED (absolute) timestamps, so it
+silently behaves like `-to`. `-ss 330 -copyts -t 300` therefore means "stop once the timestamp
+reaches 300", which is already in the past at the seek point: ffmpeg writes ZERO bytes and the
+feature fails silently. Use `-to (start + window)`. This was measured against the bundled
+`ffmpeg.exe`, and it had silently broken TWO features: `subsync.rs` (Live Sync on embedded tracks was
+dead for any playhead past ~7m30s) and `silencedetect.rs` (every chunk past the first decoded
+nothing, so only the head of a file was ever scanned, and the `-sseof` outro scan decoded nothing at
+all on a real episode). `-sseof` already bounds a read to the tail, so it needs no output limit.
+
+- `ffmpeg` (silencedetect + subsync + cast HLS transcode), `ffprobe` (subsync + cast), and `yt-dlp`
+  (trailers) are NOT bundled. They are fetched on demand from a GitHub `runtime-deps` prerelease, SHA-verified
   (`runtime_deps.rs`). Absent -> the dependent feature ships inert rather than crashing.
 
 ## Network tuning notes for power users (host-level, cannot ship from inside the app)
