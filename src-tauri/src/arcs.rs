@@ -737,14 +737,28 @@ async fn fetch_story_arcs_inner<R: Runtime>(
     // between the two means the data was thin, not that the join was bad.
     crate::devlog!(
         info, "arcs",
-        "tmdb {tv_id} grouping '{}': aligned {} pairs ({} tmdb-only, {} aura-only), min confidence {:.2} (raw score {:.2})",
+        "tmdb {tv_id} grouping '{}': {} tmdb eps vs {} aura eps -> aligned {} pairs ({} tmdb-only, {} aura-only), min confidence {:.2} (raw score {:.2})",
         chosen.name,
+        left.len(),
+        right.len(),
         alignment.pairs.len(),
         alignment.left_only.len(),
         alignment.right_only.len(),
         alignment.min_confidence(),
         alignment.min_score()
     );
+    // When episodes go unmatched, the FIRST few unmatched TMDB keys say WHERE the
+    // alignment fell off (an early break leaves a contiguous tail unmatched,
+    // which shows up as arcs rendering from the start then stopping). Cheap, and
+    // it is the one thing needed to diagnose a bad join against a user's addon.
+    if !alignment.left_only.is_empty() {
+        let sample: Vec<&str> = alignment.left_only.iter().take(8).map(|s| s.as_str()).collect();
+        crate::devlog!(
+            warn, "arcs",
+            "tmdb {tv_id}: {} TMDB episodes did not map; first unmatched: {:?}",
+            alignment.left_only.len(), sample
+        );
+    }
 
     // Fast lookup of the Aura video behind a mapped id, for year ranges and
     // the still fallback.

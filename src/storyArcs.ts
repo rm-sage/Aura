@@ -74,15 +74,16 @@ export interface ArcResult {
  *  this whenever the arc-building logic changes in a way that invalidates
  *  previously cached results. */
 const arcCache = new PersistentCache<ArcResult | null>({
-  storageKey: "aura:story-arcs:v2",
+  storageKey: "aura:story-arcs:v3",
   ttlMs: 24 * 60 * 60 * 1000,
   maxEntries: 60,
 });
 
-// One-shot cleanup of the orphaned v1 blob so the version bump does not just
-// leave dead bytes in localStorage.
+// One-shot cleanup of orphaned older blobs so a version bump does not leave dead
+// bytes in localStorage.
 try {
   localStorage.removeItem("aura:story-arcs:v1");
+  localStorage.removeItem("aura:story-arcs:v2");
 } catch { /* localStorage unavailable; nothing to clean */ }
 
 /** The user's Seasons-vs-Arcs choice, and chosen grouping, per series. Bounded

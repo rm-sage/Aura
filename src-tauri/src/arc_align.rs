@@ -65,9 +65,18 @@ const W_DATE: f64 = 0.55;
 const W_TITLE: f64 = 0.45;
 /// Cost of leaving one episode unmatched on either side.
 const GAP: f64 = -0.35;
-/// Base half-width of the alignment band. Widened when the two lists differ in length by more
-/// than this, so that a complete path from (0, 0) to (n, m) always exists.
-const BAND: i64 = 12;
+/// Base half-width of the alignment band. This bounds how far apart in position two episodes may
+/// be and still match, which is what keeps the DP O(n * band) and forbids absurd re-orderings.
+///
+/// It has to be wider than the LONGEST run of consecutive gaps the two sources can force. Real
+/// addon metadata (AIOMetadata) and TMDB routinely disagree on where filler episodes sit and how
+/// they are dated, so a whole filler block can need gapping on one side; a band of 12 could not
+/// span that and the alignment fell off-band and left every later episode unmatched (Naruto showed
+/// only its first arc or two). 64 spans any realistic block while staying cheap even for One Piece
+/// (~1168 * 129 cells). The far-date floor below is what keeps a wide band SAFE: a clearly-wrong
+/// pair scores worse than a gap, so the DP gaps a mismatch rather than reaching across the band to
+/// force a bad match.
+const BAND: i64 = 64;
 /// Refuse to align lists longer than this (a real series never comes close). Over the cap the
 /// aligner returns an empty [`Alignment`] rather than allocating an enormous DP table.
 const MAX_EPISODES: usize = 4000;
@@ -432,7 +441,13 @@ fn date_proximity(a: Option<i64>, b: Option<i64>) -> f64 {
     } else if delta <= 35 {
         0.1
     } else {
-        -0.5
+        // A month-plus apart is almost never the same episode. This must score
+        // low enough that the whole pair (W_DATE * -1.0 = -0.55) loses to a gap
+        // (-0.35) when the title does not also match, so with the wide band the
+        // DP gaps a clear mismatch instead of reaching across to force it. A
+        // strong title can still rescue a genuinely mis-dated match
+        // (W_DATE*-1.0 + W_TITLE*1.0 = -0.1 > gap).
+        -1.0
     }
 }
 
