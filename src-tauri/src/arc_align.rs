@@ -1005,6 +1005,37 @@ mod tests {
     }
 
     #[test]
+    fn naruto_filler_run_stays_above_the_arc_gate() {
+        // The reported regression: original Naruto's arc grouping collapsed to a
+        // single surviving arc. Filler episodes are the stress case: TMDB and
+        // Cinemeta often disagree on the exact air date by a few days AND give
+        // the episode different English titles. This builds such a run (dates
+        // offset by 5 days, deliberately dissimilar titles) and asserts every
+        // pair still clears the 0.5 confidence gate that arcs.rs uses, so an arc
+        // made of these episodes is KEPT rather than dropped.
+        const N: usize = 20;
+        let base = parse_day("2005-01-04").unwrap();
+        let left: Vec<AlignEpisode> = (0..N)
+            .map(|i| ep(&format!("L{i}"), &format!("{} mission", WORDS[i % 40]), Some(base + 7 * i as i64)))
+            .collect();
+        // Aura side: 5 days late, and a different title wording for the same ep.
+        let right: Vec<AlignEpisode> = (0..N)
+            .map(|i| ep(&format!("R{i}"), &format!("the {} quest", WORDS[i % 40]), Some(base + 7 * i as i64 + 5)))
+            .collect();
+
+        let a = align(&left, &right);
+        assert_eq!(a.pairs.len(), N, "every episode must map");
+        for i in 0..N {
+            assert_eq!(a.map(&format!("L{i}")), Some(format!("R{i}").as_str()), "ep {i} maps 1:1");
+        }
+        assert!(
+            a.min_confidence() >= 0.5,
+            "a filler run (date off 5d, divergent titles) must clear the arc gate, got {}",
+            a.min_confidence(),
+        );
+    }
+
+    #[test]
     fn confidence_is_zero_when_there_is_no_evidence_at_all() {
         // No date, no title. We know nothing; that must not read as certainty.
         let left = vec![ep("L0", "", None)];
