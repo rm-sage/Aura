@@ -28,6 +28,21 @@ use crate::addons::AddonEntry;
 pub const SESSION_EXPIRED: &str = "SESSION_EXPIRED";
 
 const STREMIO_API: &str = "https://api.strem.io/api";
+
+/// Stremio's device-link API (the same one Stremio's own TV / console
+/// clients use). A third-party desktop client cannot mint a Facebook or
+/// Apple token that Stremio's `authWithFacebook` / `authWithApple`
+/// endpoints would accept (those tokens are bound to Stremio's own app
+/// IDs), so the sanctioned way to offer "Sign in with Facebook / Apple"
+/// is to hand the user a short code, let them authenticate on Stremio's
+/// OWN hosted login page (in their real browser, where their Facebook /
+/// Apple sessions already live), and poll here for the resulting
+/// `authKey`. Aura never sees a password or a provider token, only the
+/// final session key.
+///
+/// The `v2` path segment mirrors stremio-core's `LinkRequest::VERSION`.
+/// Reuses the same `https_only` `auth_client()` as `/login`.
+const STREMIO_LINK_API: &str = "https://link.stremio.com/api/v2";
 const KEYRING_SERVICE: &str = "aura";
 const KEYRING_USER: &str = "stremio-session";
 
@@ -269,6 +284,213 @@ pub async fn login<R: Runtime>(
     let session = UserSession { email, auth_key, user_id };
     store_session(&app, &session)?;
     clear_account_cache();
+    Ok(session)
+}
+
+// ---------------------------------------------------------------------------
+// Device-link login (Facebook / Apple / email via Stremio's hosted page)
+//
+// Aura is a third-party client and cannot produce a Facebook access token
+// or an Apple identity token whose audience is Stremio's own app IDs, so
+// `authWithFacebook` / `authWithApple` are not directly callable from
+// here. Instead we use Stremio's device-link code flow: Aura asks
+// `link.stremio.com` for a short code + a URL, the user opens that URL in
+// their real browser (or scans the QR on their phone) and signs in with
+// WHATEVER provider Stremio's page offers - today that is Facebook, Apple
+// and email - and Aura polls until the code is exchanged for an `authKey`.
+//
+// Wire shapes (verified against the live endpoint):
+//   GET {STREMIO_LINK_API}/create?type=Create
+//     -> { "result": { "success": true, "code": "B91D",
+//                       "link": "https://link.stremio.com/B91D",
+//                       "qrcode": "https://link.stremio.com/qr?data=..." } }
+//   GET {STREMIO_LINK_API}/read?type=Read&code=<code>
+//     -> before the user finishes: { "error": { "code": 101,
+//            "message": "Invalid or expired token" } }   (still pending)
+//     -> after:  { "result": { "authKey": "<session key>" } }
+//
+// Note the ambiguity: a not-yet-consumed code and a genuinely expired /
+// invalid code BOTH return error 101, so `stremio_link_poll` treats the
+// absence of `authKey` as "keep polling" and leaves the give-up decision
+// to the frontend's own timeout. The resulting `authKey` is an ordinary
+// Stremio session key (usable for getUser / addonCollectionGet /
+// datastoreGet), so `finalize_link_session` reuses the exact same
+// persistence + `/getUser` backfill path as `login`.
+// ---------------------------------------------------------------------------
+
+/// The device-link challenge surfaced to the user. Field names match the
+/// Stremio wire format AND the TS `LinkCode` interface, so no serde
+/// rename is needed (Tauri sends the Rust field names outward).
+#[derive(Debug, Clone, Serialize)]
+pub struct LinkCode {
+    /// Short human-typable code (e.g. "B91D"). Shown prominently and
+    /// also encoded into `qrcode`.
+    pub code: String,
+    /// The URL the user opens to sign in. Redirects to Stremio's login
+    /// page with the code pre-filled and the provider buttons shown.
+    pub link: String,
+    /// Hosted PNG URL encoding `link` (NOT a data URI) - safe to drop
+    /// straight into an `<img src>`.
+    pub qrcode: String,
+}
+
+/// Begin a device-link login attempt: ask Stremio for a fresh code +
+/// link + QR. No auth, no keyring write - a code that is never used just
+/// expires server-side.
+#[tauri::command]
+pub async fn stremio_link_create() -> Result<LinkCode, String> {
+    let raw = auth_client()
+        .get(format!("{STREMIO_LINK_API}/create"))
+        .query(&[("type", "Create")])
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("HTTP {}: {}", e.status().map(|s| s.as_u16()).unwrap_or(0), e))?
+        .text()
+        .await
+        .map_err(|e| format!("Response read error: {e}"))?;
+
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("JSON parse error: {e}\nRaw response: {raw}"))?;
+
+    if let Some(err) = json
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return Err(err.to_string());
+    }
+
+    let code = json
+        .pointer("/result/code")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("code missing in response: {raw}"))?
+        .to_string();
+    let link = json
+        .pointer("/result/link")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("link missing in response: {raw}"))?
+        .to_string();
+    let qrcode = json
+        .pointer("/result/qrcode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    crate::devlog!(info, "auth", "device-link code issued (code={code})");
+    Ok(LinkCode { code, link, qrcode })
+}
+
+/// Poll a device-link code once. Returns:
+///   - `Ok(Some(session))` when the user has finished signing in (the
+///     session is already persisted to the keyring).
+///   - `Ok(None)` when the code has not been consumed yet (pending); the
+///     frontend keeps polling until its own timeout.
+///   - `Err(..)` only on a hard network / transport failure; the
+///     frontend may retry on the next tick.
+///
+/// A pending read comes back as `{ "error": { "code": 101 } }`, which is
+/// indistinguishable from an expired code, so it maps to `Ok(None)` and
+/// the frontend's timeout owns the give-up decision.
+#[tauri::command]
+pub async fn stremio_link_poll<R: Runtime>(
+    app: AppHandle<R>,
+    code: String,
+) -> Result<Option<UserSession>, String> {
+    // reqwest's `.query()` percent-encodes the code, so a future format
+    // change can't break the query string.
+    let raw = auth_client()
+        .get(format!("{STREMIO_LINK_API}/read"))
+        .query(&[("type", "Read"), ("code", code.as_str())])
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("Response read error: {e}"))?;
+
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("JSON parse error: {e}\nRaw response: {raw}"))?;
+
+    // Success shape: { result: { authKey } }. Anything else (including the
+    // pending `error.code 101`) means "not ready yet" - keep polling.
+    match json
+        .pointer("/result/authKey")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        Some(auth_key) => {
+            let session = finalize_link_session(&app, auth_key.to_string()).await?;
+            Ok(Some(session))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Turn a raw device-link `authKey` into a persisted `UserSession`.
+/// Best-effort `/getUser` enrichment mirrors the self-heal pattern in
+/// `fetch_stremio_account`: the hard-won `authKey` is persisted even if
+/// the enrichment call fails, and `email` / `user_id` are then filled in
+/// on the next launch by `backfill_user_id` / `fetch_stremio_account`.
+///
+/// Populating `user_id` here when we can matters for cloud sync:
+/// `sync.rs` prefers the stable Stremio `_id` for the per-account scope
+/// hash and only falls back to hashing the `auth_key` (which is not
+/// cross-device-consistent) when it is missing.
+async fn finalize_link_session<R: Runtime>(
+    app: &AppHandle<R>,
+    auth_key: String,
+) -> Result<UserSession, String> {
+    let mut email = String::new();
+    let mut user_id: Option<String> = None;
+
+    let body = serde_json::json!({ "authKey": auth_key });
+    match auth_client()
+        .post(format!("{STREMIO_API}/getUser"))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            if let Ok(text) = resp.text().await {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                    email = json
+                        .pointer("/result/email")
+                        .or_else(|| json.pointer("/result/user/email"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    user_id = json
+                        .pointer("/result/_id")
+                        .or_else(|| json.pointer("/result/user/_id"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string());
+                }
+            }
+        }
+        Err(e) => {
+            // Non-fatal: keep the session, enrich later. The authKey is
+            // the load-bearing part and we already have it.
+            crate::devlog!(
+                warn, "auth",
+                "device-link finalize: /getUser failed ({e}); persisting session without email/user_id",
+            );
+        }
+    }
+
+    let session = UserSession { email, auth_key, user_id };
+    store_session(app, &session)?;
+    clear_account_cache();
+    crate::devlog!(
+        info, "auth",
+        "device-link session stored (email_len={}, user_id={})",
+        session.email.len(),
+        session.user_id.is_some(),
+    );
     Ok(session)
 }
 

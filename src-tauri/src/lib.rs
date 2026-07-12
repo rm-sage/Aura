@@ -2250,6 +2250,8 @@ pub fn run() {
             auth::logout,
             auth::get_session,
             auth::get_synced_addons,
+            auth::stremio_link_create,
+            auth::stremio_link_poll,
             // ── Streaming bridge (2.4) ───────────────────────────────────────
             streaming::resolve_stream,
             // ── Cinema Suite (2.6) ──────────────────────────────────────────
