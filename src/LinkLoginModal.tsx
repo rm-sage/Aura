@@ -223,7 +223,7 @@ export default function LinkLoginModal({ provider, onSuccess, onCancel }: Props)
               ) : null}
               <div className="flex flex-col gap-1.5 min-w-0">
                 <span className="text-white/40 text-xs">
-                  Or go to stremio.com/link and enter:
+                  Or go to link.stremio.com and enter:
                 </span>
                 <button
                   onClick={copyCode}
