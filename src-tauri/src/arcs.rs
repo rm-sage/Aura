@@ -583,14 +583,29 @@ async fn fetch_story_arcs_inner<R: Runtime>(
         },
     };
 
-    // Aura's main run, in broadcast order. Specials (season 0) are excluded on
-    // both sides: the two databases disagree wildly about them (One Piece:
+    // Aura's main run, in TRUE BROADCAST ORDER. Specials (season 0) are excluded
+    // on both sides: the two databases disagree wildly about them (One Piece:
     // Cinemeta 63 specials vs TMDB 39) and no arc is defined over them.
+    //
+    // Sort by AIR DATE, not (season, episode). An addon's season split is not
+    // guaranteed to sort into broadcast order: AIOMetadata labels Naruto's
+    // "Jiraiya Returns" (aired 2003) as season 2 episode 1, so a (season,
+    // episode) sort drops it near the END of the list, 150+ positions from where
+    // it aired, and the alignment (which assumes both lists are in broadcast
+    // order) cannot reconcile the resulting multi-year date gap. Air date is
+    // broadcast order by definition. Undated episodes fall back to (season,
+    // episode) and sort last; the main run is essentially always dated.
     let mut aura: Vec<&ArcVideoRef> = videos
         .iter()
         .filter(|v| v.season.unwrap_or(0) >= 1 && v.episode.is_some())
         .collect();
-    aura.sort_by_key(|v| (v.season.unwrap_or(0), v.episode.unwrap_or(0)));
+    aura.sort_by_key(|v| {
+        (
+            v.released.as_deref().and_then(arc_align::parse_day).unwrap_or(i64::MAX),
+            v.season.unwrap_or(0),
+            v.episode.unwrap_or(0),
+        )
+    });
     if aura.len() < 2 {
         return Ok(None);
     }
@@ -709,9 +724,20 @@ async fn fetch_story_arcs_inner<R: Runtime>(
         }
     }
 
+    // Same broadcast-order sort as the aura side: air date first, then
+    // (season, episode) as the tiebreak / undated fallback. TMDB's own
+    // episode_number is usually already absolute, so this rarely reorders it, but
+    // sorting BOTH sides the same way is what guarantees the two lists are in the
+    // same order for the alignment.
     let mut tmdb_sorted: Vec<((i64, i64), GroupEpisode)> =
         tmdb_eps.iter().map(|(k, v)| (*k, v.clone())).collect();
-    tmdb_sorted.sort_by_key(|((s, e), _)| (*s, *e));
+    tmdb_sorted.sort_by_key(|((s, e), ep)| {
+        (
+            ep.air_date.as_deref().and_then(arc_align::parse_day).unwrap_or(i64::MAX),
+            *s,
+            *e,
+        )
+    });
 
     // 4. Align.
     let left: Vec<AlignEpisode> = tmdb_sorted

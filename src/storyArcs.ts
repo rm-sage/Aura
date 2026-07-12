@@ -70,9 +70,9 @@ export interface ArcResult {
  *  arc-building or alignment logic changes in a way that invalidates previously
  *  cached results, because a stale result would otherwise hide the fix for 24 h.
  *  History: v2 dropped the raw-score gate's over-rejected arcs; v3 the widened
- *  band; v4 the residual pass that recovers a reordered tail block. */
+ *  band; v4 the residual pass; v5 broadcast-order (air-date) sorting. */
 const arcCache = new PersistentCache<ArcResult | null>({
-  storageKey: "aura:story-arcs:v4",
+  storageKey: "aura:story-arcs:v5",
   ttlMs: 24 * 60 * 60 * 1000,
   maxEntries: 60,
 });
@@ -83,6 +83,7 @@ try {
   localStorage.removeItem("aura:story-arcs:v1");
   localStorage.removeItem("aura:story-arcs:v2");
   localStorage.removeItem("aura:story-arcs:v3");
+  localStorage.removeItem("aura:story-arcs:v4");
 } catch { /* localStorage unavailable; nothing to clean */ }
 
 /** The user's Seasons-vs-Arcs choice, and chosen grouping, per series. Bounded
@@ -350,9 +351,25 @@ export function preferredGroupingId(groupings: ArcGrouping[]): string | undefine
  *  make a range read "E1-E6" for a mid-series arc. Specials (season 0) are
  *  excluded so they do not shift the main-run count. */
 export function absoluteEpisodeMap(videos: VideoEntry[]): Map<string, number> {
+  // BROADCAST order (air date), the same order the Rust join uses, so the
+  // absolute number reflects when an episode actually aired. An addon whose
+  // season split is not chronological (AIOMetadata labels Naruto's 2003 Jiraiya
+  // episode as season 2 episode 1) would otherwise number it as if it were near
+  // the end of the show. Undated episodes fall back to (season, episode) and
+  // sort last.
+  const dayOf = (v: VideoEntry): number => {
+    if (!v.released) return Number.MAX_SAFE_INTEGER;
+    const t = Date.parse(v.released);
+    return Number.isFinite(t) ? t : Number.MAX_SAFE_INTEGER;
+  };
   const main = videos
     .filter((v) => (v.season ?? 0) >= 1 && v.episode != null)
-    .sort((a, b) => (a.season! - b.season!) || (a.episode! - b.episode!));
+    .sort(
+      (a, b) =>
+        dayOf(a) - dayOf(b) ||
+        (a.season! - b.season!) ||
+        (a.episode! - b.episode!),
+    );
   const m = new Map<string, number>();
   main.forEach((v, i) => m.set(v.id, i + 1));
   return m;
