@@ -76,8 +76,14 @@ const MAX_WINDOW_SECS: f64 = 900.0;
 /// Subprocess wall-clock ceilings. ffmpeg has to open the remote container and
 /// demux the window, so it gets more room than ffprobe's metadata-only read.
 /// Neither is ever allowed to hang the app: on timeout the child is killed.
-const FFMPEG_TIMEOUT: Duration = Duration::from_secs(25);
-const FFPROBE_TIMEOUT: Duration = Duration::from_secs(15);
+// Generous, because the input is a REMOTE debrid mkv that the player is already
+// streaming on the same link. Before ffmpeg can seek at all it has to open the
+// URL, negotiate TLS, and fetch the Matroska Cues index, which for a large file
+// lives at the END: that is a second range request against a host that may well
+// be throttling us because mpv holds a connection too. 25 s was not enough for a
+// real remux and users just saw "ffmpeg timed out".
+const FFMPEG_TIMEOUT: Duration = Duration::from_secs(90);
+const FFPROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Ceiling on the subtitle streams reported by a single probe. A sane container
 /// has a handful; the cap keeps a pathological file from producing a huge list.
@@ -885,6 +891,14 @@ pub async fn extract_embedded_cues<R: Runtime>(
         // guard that keeps `-i` off local-file / concat: / subfile: reads.
         .arg("-protocol_whitelist")
         .arg("http,https,tcp,tls,crypto")
+        // Cap the OPENING probe. By default ffmpeg will read and analyse a large
+        // prefix of the input before it does anything, which over HTTP is a real
+        // download against a link the player is already saturating. We only need
+        // the stream layout, and the container header carries that.
+        .arg("-probesize")
+        .arg("5M")
+        .arg("-analyzeduration")
+        .arg("5M")
         .arg("-ss")
         .arg(format!("{start:.3}"))
         .arg("-copyts")
@@ -894,6 +908,9 @@ pub async fn extract_embedded_cues<R: Runtime>(
         .arg(format!("{end:.3}"))
         .arg("-map")
         .arg(format!("0:s:{sub_index}"))
+        // Subtitles only: never let ffmpeg touch the video or audio streams.
+        .arg("-vn")
+        .arg("-an")
         .arg("-f")
         .arg("srt")
         .arg("-")
@@ -901,6 +918,15 @@ pub async fn extract_embedded_cues<R: Runtime>(
         .stderr(Stdio::null())
         .stdin(Stdio::null())
         .kill_on_drop(true);
+
+    // Log the exact slice we are asking for. When a remote extraction is slow or
+    // empty, the first question is always "what did we actually run", and the
+    // answer needs to be in the DevConsole, not reconstructed from memory.
+    crate::devlog!(
+        info, "subsync",
+        "embedded: ffmpeg -ss {start:.3} -copyts -to {end:.3} -map 0:s:{sub_index} (window {window:.0}s)"
+    );
+    let started = std::time::Instant::now();
 
     let mut child = cmd
         .spawn()
@@ -935,9 +961,16 @@ pub async fn extract_embedded_cues<R: Runtime>(
 
     match timed {
         Err(_) => {
-            crate::devlog!(warn, "subsync", "embedded: ffmpeg timed out after {FFMPEG_TIMEOUT:?}");
+            crate::devlog!(
+                warn, "subsync",
+                "embedded: ffmpeg timed out after {}s (read {} bytes). The source is remote and the \
+                 player is streaming the same link; an external subtitle is the reliable path here.",
+                FFMPEG_TIMEOUT.as_secs(), buf.len()
+            );
             return Err(format!(
-                "ffmpeg timed out after {} s extracting the subtitle window",
+                "Could not read this track in time ({} s). The file is being streamed remotely, and \
+                 pulling subtitles out of the container competes with playback for the same link. \
+                 Loading an external subtitle instead will work.",
                 FFMPEG_TIMEOUT.as_secs()
             ));
         }
@@ -951,12 +984,13 @@ pub async fn extract_embedded_cues<R: Runtime>(
     let cues = parse_cues(&text);
     crate::devlog!(
         info, "subsync",
-        "embedded: {} cue(s) from 0:s:{} window {:.0}-{:.0}s ({} bytes)",
+        "embedded: {} cue(s) from 0:s:{} window {:.0}-{:.0}s ({} bytes) in {:.1}s",
         cues.len(),
         sub_index,
         start,
         start + window,
         buf.len(),
+        started.elapsed().as_secs_f64(),
     );
     if cues.is_empty() {
         return Err(

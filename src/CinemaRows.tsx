@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "./FilterBar";
 import { useRowWindow } from "./useRowWindow";
@@ -101,6 +101,11 @@ export interface ContinueWatchingCardProps {
    *  falls through to the normal library menu. Reused by the Airing page,
    *  whose items aren't necessarily CW entries. */
   contextSource?: "cw" | "library";
+  /** Extra badge pinned to the card's top-right, INSIDE the scaling element so
+   *  it grows with the card on hover exactly like the SxxEyy badge does. The
+   *  Airing page's "N behind" pill used to be a sibling of the card, which left
+   *  it sitting still while the artwork lifted underneath it. */
+  overlayBadge?: ReactNode;
 }
 
 // ---------------------------------------------------------------------------
@@ -684,7 +689,7 @@ function CWReleaseCountdown({ seriesId, episodes }: { seriesId: string; episodes
 }
 
 export const ContinueWatchingCard = memo(function ContinueWatchingCard(
-  { item, onSelect, addons, contextSource = "cw" }: ContinueWatchingCardProps
+  { item, onSelect, addons, contextSource = "cw", overlayBadge }: ContinueWatchingCardProps
 ) {
   // Landscape (16:9) art via AIOMeta (the art source-of-truth). We prefer
   // AIOMeta's resolved `landscape` over the item's own `background` because
@@ -843,6 +848,11 @@ export const ContinueWatchingCard = memo(function ContinueWatchingCard(
               {badge}
             </span>
           )}
+
+          {/* Caller-supplied badge (the Airing page's "N behind"). Rendered HERE,
+              inside the scaling element, so it lifts with the card on hover
+              instead of hanging motionless over it. */}
+          {overlayBadge}
 
           <div className="absolute inset-x-0 bottom-0 h-1/3 bg-gradient-to-t from-black/70 to-transparent" />
           {/* On-art logo (hasBakedTitle=false). Bottom-left, above the

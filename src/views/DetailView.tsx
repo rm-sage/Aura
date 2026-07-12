@@ -2638,7 +2638,7 @@ const EpisodeRow = ({
         if (allSet.length > 1 && allSet.some((v) => getManualWatchedState(v.id) !== "watched")) {
           bulkItems.push({
             kind: "action",
-            label: "Mark all as watched",
+            label: `Mark all in this ${groupLabel} as watched`,
             tone: "success",
             icon: checkIcon,
             onClick: bulkAction(allSet, "watched", `all in ${groupLabel}`),
@@ -2647,7 +2647,7 @@ const EpisodeRow = ({
         if (allSet.length > 1 && allSet.some((v) => getManualWatchedState(v.id) === "watched")) {
           bulkItems.push({
             kind: "action",
-            label: "Unmark all as watched",
+            label: `Unmark all in this ${groupLabel} as watched`,
             icon: checkIcon,
             onClick: bulkAction(allSet, null, `all in ${groupLabel}`),
           });

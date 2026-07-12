@@ -360,17 +360,24 @@ function AiringTile({
   const behind = useEpisodesBehind(detail?.videos, root);
   return (
     <div className="relative">
-      <ContinueWatchingCard item={item} onSelect={onSelect} addons={addons} contextSource="library" />
-      {behind != null && behind > 0 && (
-        <span
-          className="absolute top-1.5 right-1.5 z-10 px-1.5 py-0.5 rounded-md text-[10px] font-bold
-                     bg-rose-600/90 text-white border border-rose-300/30 shadow-[0_2px_8px_rgba(0,0,0,0.5)]
-                     pointer-events-none"
-          title={`${behind} aired episode${behind === 1 ? "" : "s"} unwatched`}
-        >
-          {behind} behind
-        </span>
-      )}
+      <ContinueWatchingCard
+        item={item}
+        onSelect={onSelect}
+        addons={addons}
+        contextSource="library"
+        // Passed INTO the card rather than layered over it, so the badge scales
+        // with the artwork on hover like the SxxEyy badge does.
+        overlayBadge={behind != null && behind > 0 ? (
+          <span
+            className="absolute top-1.5 right-1.5 z-10 px-1.5 py-0.5 rounded-md text-[10px] font-bold
+                       bg-rose-600/90 text-white border border-rose-300/30 shadow-[0_2px_8px_rgba(0,0,0,0.5)]
+                       pointer-events-none"
+            title={`${behind} aired episode${behind === 1 ? "" : "s"} unwatched`}
+          >
+            {behind} behind
+          </span>
+        ) : undefined}
+      />
     </div>
   );
 }
