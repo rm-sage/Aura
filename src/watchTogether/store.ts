@@ -235,12 +235,16 @@ export function setPlaybackBridge(b: PlaybackBridge | null): void {
 // ── Room lifecycle ─────────────────────────────────────────────────────────
 
 function genCode(): string {
-  // Ambiguity-free alphabet (no O/0/I/1) — easy to read aloud / type.
+  // Ambiguity-free alphabet (no O/0/I/1) — easy to read aloud / type. Exactly 32
+  // symbols, so `byte % 32` is unbiased (256 is a multiple of 32); no rejection
+  // sampling needed. 8 chars = 40 bits of entropy, well past casual enumeration
+  // of live rooms (the relay leaks only a roster + title even to a lucky guess).
   const alpha = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const LEN = 8;
   let out = "";
-  const buf = new Uint8Array(6);
+  const buf = new Uint8Array(LEN);
   crypto.getRandomValues(buf);
-  for (let i = 0; i < 6; i++) out += alpha[buf[i] % alpha.length];
+  for (let i = 0; i < LEN; i++) out += alpha[buf[i] % alpha.length];
   return out;
 }
 

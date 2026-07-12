@@ -3,7 +3,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openExternalUrl } from "../externalUrl";
 import {
   loadOnboardingProgress,
   markOnboardingComplete,
@@ -681,7 +681,7 @@ function AddonsStep({
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => openUrl(entry.configureUrl).catch(() => {})}
+                    onClick={() => openExternalUrl(entry.configureUrl)}
                     className="px-2.5 py-1 rounded-md text-[11px] font-medium
                                bg-white/5 text-white/75 border border-white/10
                                hover:bg-white/10 transition-colors"

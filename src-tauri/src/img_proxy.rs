@@ -177,7 +177,7 @@ fn is_public_ip(ip: &IpAddr) -> bool {
 /// consulting the custom DNS resolver (`SsrfGuardResolver` only runs for
 /// hostnames). A hostname returns true and is guarded by the resolver at connect
 /// time. A missing/unparseable host is rejected.
-fn host_is_public(url: &reqwest::Url) -> bool {
+pub(crate) fn host_is_public(url: &reqwest::Url) -> bool {
     let Some(host) = url.host_str() else { return false };
     // host_str brackets an IPv6 literal ("[::1]"); strip before parsing.
     let h = host
@@ -190,7 +190,7 @@ fn host_is_public(url: &reqwest::Url) -> bool {
     }
 }
 
-struct SsrfGuardResolver;
+pub(crate) struct SsrfGuardResolver;
 
 impl reqwest::dns::Resolve for SsrfGuardResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {

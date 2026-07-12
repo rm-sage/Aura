@@ -4,7 +4,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openExternalUrl } from "../externalUrl";
 import type {
   AddonEntry,
   MetaPreview,
@@ -1561,7 +1561,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
             }}
             onPlay={(s) => onPlayStream(s, targetForPlay(activeVideo))}
             onCopy={(text) => navigator.clipboard.writeText(text).catch(() => {})}
-            onPlayExternal={(url) => openUrl(url).catch(() => {})}
+            onPlayExternal={(url) => openExternalUrl(url)}
             scrollToVideoId={scrollOnceTo}
             highlightVideoId={ringEpisodeId}
             seriesArt={episodeFallbackArt}

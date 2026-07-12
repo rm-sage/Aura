@@ -59,6 +59,13 @@ fn proxy_client() -> &'static reqwest::Client {
             .read_timeout(Duration::from_secs(30))
             .user_agent(concat!("aura-bridge/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::limited(5))
+            // SSRF guard on the CONNECT hop: a hostname that resolves only to a
+            // private / loopback / link-local / cloud-metadata address is
+            // refused, and every connection re-resolves so a DNS-rebind is caught
+            // on the exploiting hop. IP-literal hosts are checked up front in
+            // `proxy_stream` (the resolver only runs for hostnames). Shared with
+            // img_proxy so both fetchers enforce the same policy.
+            .dns_resolver(std::sync::Arc::new(crate::img_proxy::SsrfGuardResolver))
             .build()
             .expect("Proxy HTTP client init failed")
     })
@@ -83,6 +90,20 @@ async fn proxy_stream(
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return (StatusCode::BAD_REQUEST, "Only http/https stream URLs are supported")
             .into_response();
+    }
+
+    // SSRF guard. Without it, a web page in the user's browser could
+    // `fetch("http://127.0.0.1:11471/proxy/http://192.168.1.1/...")` while Aura
+    // is running and use the bridge as a same-machine port scanner / internal
+    // service reader that bypasses the browser's same-origin policy. An
+    // IP-LITERAL host is validated HERE (the connect-time resolver only runs for
+    // hostnames); a hostname passes here and is enforced on connect by the
+    // SsrfGuardResolver above.
+    match reqwest::Url::parse(&url) {
+        Ok(parsed) if crate::img_proxy::host_is_public(&parsed) => {}
+        _ => {
+            return (StatusCode::FORBIDDEN, "blocked: non-public host").into_response();
+        }
     }
 
     let mut builder = proxy_client().get(&url);
@@ -127,11 +148,13 @@ async fn proxy_stream(
                 }
             }
         }
-        // CORS — so hls.js running in the WebView (origin tauri.localhost) can
-        // fetch IPTV segments through the bridge for the Multiview grid. The
-        // bridge is loopback-only; `*` is safe here. Harmless for the MPV path
-        // (MPV ignores CORS). Expose the range headers so hls.js can read them.
-        add_cors(headers);
+        // CORS — so hls.js running in the WebView can fetch IPTV segments
+        // through the bridge for the Multiview grid. Reflect ONLY the WebView's
+        // own origin, never `*`: loopback binding does not stop a browser page
+        // the user visits from calling the bridge, and `*` would let that page
+        // READ the response cross-origin (an egress proxy attributable to the
+        // victim's IP). MPV ignores CORS, so the native path is unaffected.
+        add_cors(headers, req_headers.get("origin"));
     }
 
     resp.body(body)
@@ -139,11 +162,11 @@ async fn proxy_stream(
 }
 
 /// CORS preflight for the proxy route — hls.js's Range-bearing segment GETs
-/// trigger an OPTIONS preflight. Answer it with permissive loopback CORS.
-async fn proxy_preflight() -> Response {
+/// trigger an OPTIONS preflight. Reflects only the WebView origin.
+async fn proxy_preflight(req_headers: axum::http::HeaderMap) -> Response {
     let mut resp = Response::builder().status(StatusCode::NO_CONTENT);
     if let Some(headers) = resp.headers_mut() {
-        add_cors(headers);
+        add_cors(headers, req_headers.get("origin"));
         headers.insert(
             HeaderName::from_static("access-control-allow-methods"),
             HeaderValue::from_static("GET, OPTIONS"),
@@ -157,18 +180,45 @@ async fn proxy_preflight() -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-fn add_cors(headers: &mut axum::http::HeaderMap) {
+/// The origins the WebView UI is served from. hls.js runs here; a page in the
+/// user's normal browser does not, so it never gets a reflected ACAO and cannot
+/// read a proxied response cross-origin. `tauri.localhost` is the packaged
+/// WebView2 origin; `localhost:1420` is the Vite dev server.
+fn is_webview_origin(origin: &str) -> bool {
+    matches!(
+        origin,
+        "http://tauri.localhost"
+            | "https://tauri.localhost"
+            | "http://localhost:1420"
+            | "https://localhost:1420"
+    )
+}
+
+fn add_cors(headers: &mut axum::http::HeaderMap, origin: Option<&HeaderValue>) {
+    // Reflect the request Origin only when it is the WebView's own. No match ->
+    // no ACAO header at all, so a cross-origin read fails. `*` is never sent.
+    let allowed = origin
+        .and_then(|v| v.to_str().ok())
+        .filter(|o| is_webview_origin(o))
+        .and_then(|o| HeaderValue::from_str(o).ok());
+    let Some(origin_val) = allowed else { return };
     headers.insert(
         HeaderName::from_static("access-control-allow-origin"),
-        HeaderValue::from_static("*"),
+        origin_val,
+    );
+    // Vary on Origin so a cache never serves one origin's reflected value to
+    // another.
+    headers.insert(
+        HeaderName::from_static("vary"),
+        HeaderValue::from_static("Origin"),
     );
     headers.insert(
         HeaderName::from_static("access-control-allow-headers"),
-        HeaderValue::from_static("*"),
+        HeaderValue::from_static("range, content-type"),
     );
     headers.insert(
         HeaderName::from_static("access-control-expose-headers"),
-        HeaderValue::from_static("*"),
+        HeaderValue::from_static("content-length, content-range, accept-ranges"),
     );
 }
 

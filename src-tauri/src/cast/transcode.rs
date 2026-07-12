@@ -85,7 +85,11 @@ pub(super) fn probe(url: &str) -> Codecs {
             // Bound every protocol read/write at 15 s so a stalled upstream
             // can't wedge the probe (microseconds).
             "-rw_timeout", "15000000",
-            "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+            // No `file`: the probe only READS its input and writes nothing, so
+            // permitting `file` here would be a pure arbitrary-local-read
+            // primitive (a `file://` input) for no benefit. The caller already
+            // http(s)-gates the url, so this is defense in depth.
+            "-protocol_whitelist", "http,https,tcp,tls,crypto",
             "-print_format", "json",
             "-show_streams",
             url,

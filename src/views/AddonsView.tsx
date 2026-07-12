@@ -20,7 +20,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { invoke } from "@tauri-apps/api/core";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openExternalUrl } from "../externalUrl";
 import type { AddonEntry } from "../types";
 import type { UserSession } from "../LoginView";
 import LoginView from "../LoginView";
@@ -373,7 +373,7 @@ function AddonRow({
   // manually clicks Refresh. The focus-listener is one-shot per
   // configure click so it can't accumulate across rapid re-clicks.
   const handleConfigure = () => {
-    openUrl(configureUrl).catch(() => {});
+    openExternalUrl(configureUrl);
     let fired = false;
     const cleanup = () => {
       window.removeEventListener("focus", onFocus);
@@ -419,7 +419,7 @@ function AddonRow({
           },
           {
             label: "Open manifest URL",
-            onClick: () => openUrl(manifestUrl).catch(() => {}),
+            onClick: () => openExternalUrl(manifestUrl),
           },
           {
             label: "Copy manifest URL",

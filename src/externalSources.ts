@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { isSafeExternalUrl } from "./externalUrl";
 import type { MetaPreview } from "./types";
 import { isAnimeMeta } from "./aiometadata";
 import { loadAuraSettings } from "./auraSettings";
@@ -166,8 +167,13 @@ export function openInPopupBrowser(url: string, title: string): void {
       new CustomEvent(OPEN_EVENT, { detail: { url, title } }),
     );
   if (loadAuraSettings().openLinksExternally) {
-    openUrl(url).catch(popup);
-    return;
+    // Only hand http(s) to the shell opener; a non-web URL (an addon could
+    // supply `file:` or a protocol handler) falls back to the sandboxed in-app
+    // popup instead of ShellExecute.
+    if (isSafeExternalUrl(url)) {
+      openUrl(url).catch(popup);
+      return;
+    }
   }
   popup();
 }

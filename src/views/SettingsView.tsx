@@ -944,6 +944,8 @@ function BackupRestoreSection({
 }) {
   const [exportText, setExportText] = useState<string>("");
   const [importText, setImportText] = useState<string>("");
+  // Off by default: keys are keyring credentials and the export is shareable.
+  const [includeApiKeys, setIncludeApiKeys] = useState(false);
   const [status, setStatus] = useState<{
     kind: "idle" | "ok" | "error";
     message: string;
@@ -990,8 +992,19 @@ function BackupRestoreSection({
   // export gets the user's keys round-trippable to a fresh device).
   // Stays async since `get_api_key` is a Tauri command; calling
   // sites await the blob.
-  const hydrateBackendWithKeyringKeys = useCallback(async (): Promise<Record<string, unknown>> => {
+  const hydrateBackendWithKeyringKeys = useCallback(async (includeKeys: boolean): Promise<Record<string, unknown>> => {
     const merged: Record<string, unknown> = { ...(backend as unknown as Record<string, unknown>) };
+    // API keys are OS-keyring CREDENTIALS. The export string is designed to be
+    // shared (it pastes into a messenger), so by default we do NOT bake them in:
+    // a user swapping configs with a friend would otherwise hand over their
+    // OpenSubtitles + TMDB keys. Only include them when the user explicitly opts
+    // in (moving to their own second machine).
+    if (!includeKeys) {
+      for (const name of ["opensubtitles", "tmdb"] as const) {
+        delete merged[`${name}_api_key`];
+      }
+      return merged;
+    }
     for (const name of ["opensubtitles", "tmdb"] as const) {
       try {
         const v = await invoke<string>("get_api_key", { name });
@@ -1008,18 +1021,23 @@ function BackupRestoreSection({
   }, [backend]);
 
   const buildAndShow = useCallback(async () => {
-    const hydratedBackend = await hydrateBackendWithKeyringKeys();
+    const hydratedBackend = await hydrateBackendWithKeyringKeys(includeApiKeys);
     const blob = buildExportBlob(
       hydratedBackend,
       loadAuraSettings() as unknown as Record<string, unknown>,
       addons,
     );
     setExportText(blobToBase64(blob));
-    setStatus({ kind: "ok", message: "Export string ready. Copy or download." });
-  }, [hydrateBackendWithKeyringKeys, addons]);
+    setStatus({
+      kind: "ok",
+      message: includeApiKeys
+        ? "Export ready. It contains your API keys, so do not share it."
+        : "Export string ready. Copy or download.",
+    });
+  }, [hydrateBackendWithKeyringKeys, addons, includeApiKeys]);
 
   const downloadFile = useCallback(async () => {
-    const hydratedBackend = await hydrateBackendWithKeyringKeys();
+    const hydratedBackend = await hydrateBackendWithKeyringKeys(includeApiKeys);
     const blob = buildExportBlob(
       hydratedBackend,
       loadAuraSettings() as unknown as Record<string, unknown>,
@@ -1034,7 +1052,7 @@ function BackupRestoreSection({
     } catch (e) {
       setStatus({ kind: "error", message: `Save failed: ${String(e)}` });
     }
-  }, [hydrateBackendWithKeyringKeys, addons]);
+  }, [hydrateBackendWithKeyringKeys, addons, includeApiKeys]);
 
   const applyText = useCallback(async (raw: string) => {
     const blob = parseImportInput(raw);
@@ -1134,6 +1152,19 @@ function BackupRestoreSection({
       {/* ── Export ── */}
       <div className="space-y-2">
         <p className="text-white/75 text-sm font-medium">Export</p>
+        <label className="flex items-start gap-2 text-white/60 text-[11.5px] leading-snug cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={includeApiKeys}
+            onChange={(e) => { setIncludeApiKeys(e.target.checked); setExportText(""); }}
+            className="mt-0.5 accent-ln-accent"
+          />
+          <span>
+            Include my API keys (OpenSubtitles, TMDB). Off by default because the
+            export is shareable: only turn this on to move settings to another of
+            your OWN devices, and do not paste that export anywhere public.
+          </span>
+        </label>
         <div className="flex gap-2">
           <button
             type="button"
