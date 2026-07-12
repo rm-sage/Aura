@@ -164,18 +164,33 @@ fn cache_path<R: Runtime>(app: &AppHandle<R>) -> Option<std::path::PathBuf> {
     Some(dir.join("arc-art-v1.json"))
 }
 
-fn load_cache<R: Runtime>(app: &AppHandle<R>) {
+/// Hydrated once per process; see arcs.rs for the same reasoning (blocking
+/// full-file read + parse off the runtime, and not on every call).
+static CACHE_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+async fn ensure_cache_loaded<R: Runtime>(app: &AppHandle<R>) {
+    use std::sync::atomic::Ordering;
+    if CACHE_LOADED.swap(true, Ordering::AcqRel) {
+        return;
+    }
     let Some(path) = cache_path(app) else { return };
-    let Ok(text) = std::fs::read_to_string(&path) else { return };
-    let Ok(map) = serde_json::from_str::<ArtCache>(&text) else { return };
-    if let Ok(mut lock) = cache().lock() {
-        if lock.is_empty() {
-            *lock = map;
+    let loaded = tokio::task::spawn_blocking(move || {
+        let text = std::fs::read_to_string(&path).ok()?;
+        serde_json::from_str::<ArtCache>(&text).ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some(map) = loaded {
+        if let Ok(mut lock) = cache().lock() {
+            if lock.is_empty() {
+                *lock = map;
+            }
         }
     }
 }
 
-fn save_cache<R: Runtime>(app: &AppHandle<R>) {
+async fn persist_cache<R: Runtime>(app: &AppHandle<R>) {
     let Some(path) = cache_path(app) else { return };
     let snapshot = {
         let Ok(mut lock) = cache().lock() else { return };
@@ -190,9 +205,12 @@ fn save_cache<R: Runtime>(app: &AppHandle<R>) {
         }
         lock.clone()
     };
-    if let Ok(text) = serde_json::to_string(&snapshot) {
-        let _ = std::fs::write(path, text);
-    }
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(text) = serde_json::to_string(&snapshot) {
+            let _ = std::fs::write(path, text);
+        }
+    })
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -332,7 +350,7 @@ pub async fn resolve_arc_art<R: Runtime>(
     }
 
     let key = format!("art:{tmdb_id}");
-    load_cache(app);
+    ensure_cache_loaded(app).await;
     if let Ok(lock) = cache().lock() {
         if let Some(entry) = lock.get(&key) {
             let ttl = if entry.art.is_empty() { NEGATIVE_TTL } else { TTL };
@@ -397,6 +415,8 @@ pub async fn resolve_arc_art<R: Runtime>(
     if let Ok(mut lock) = cache().lock() {
         lock.insert(key, ArtEntry { fetched_at: now_secs(), art: art.clone() });
     }
-    save_cache(app);
+    // We only reach here on a cache MISS (a hit returned above), so a write is
+    // always warranted; persist once, off the runtime.
+    persist_cache(app).await;
     art
 }

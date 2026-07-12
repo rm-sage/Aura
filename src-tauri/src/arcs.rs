@@ -186,24 +186,46 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Set once the disk file has been hydrated into `CACHE`, so we read it from
+/// disk exactly once per process instead of on every `cached_get`.
+static CACHE_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn cache_path<R: Runtime>(app: &AppHandle<R>) -> Option<std::path::PathBuf> {
     let dir = app.path().app_data_dir().ok()?;
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("arcs-cache-v1.json"))
 }
 
-fn load_cache<R: Runtime>(app: &AppHandle<R>) {
+/// Hydrate the in-memory cache from disk ONCE. The full-file read + JSON parse
+/// (a One Piece payload is 1000+ episodes) runs on a blocking thread so it never
+/// stalls a tokio worker, and the CACHE_LOADED flag stops the ~20 `cached_get`
+/// calls of a single One Piece arc open from each re-reading and re-parsing the
+/// whole file only to throw the result away.
+async fn ensure_cache_loaded<R: Runtime>(app: &AppHandle<R>) {
+    use std::sync::atomic::Ordering;
+    if CACHE_LOADED.swap(true, Ordering::AcqRel) {
+        return;
+    }
     let Some(path) = cache_path(app) else { return };
-    let Ok(text) = std::fs::read_to_string(&path) else { return };
-    let Ok(map) = serde_json::from_str::<CacheMap>(&text) else { return };
-    if let Ok(mut lock) = cache().lock() {
-        if lock.is_empty() {
-            *lock = map;
+    let loaded = tokio::task::spawn_blocking(move || {
+        let text = std::fs::read_to_string(&path).ok()?;
+        serde_json::from_str::<CacheMap>(&text).ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some(map) = loaded {
+        if let Ok(mut lock) = cache().lock() {
+            if lock.is_empty() {
+                *lock = map;
+            }
         }
     }
 }
 
-fn save_cache<R: Runtime>(app: &AppHandle<R>) {
+/// Snapshot the (bounded) cache and write it once, off the runtime. Call at the
+/// END of a fetch, not per sub-request.
+async fn persist_cache<R: Runtime>(app: &AppHandle<R>) {
     let Some(path) = cache_path(app) else { return };
     let snapshot = {
         let Ok(mut lock) = cache().lock() else { return };
@@ -219,19 +241,25 @@ fn save_cache<R: Runtime>(app: &AppHandle<R>) {
         }
         lock.clone()
     };
-    if let Ok(text) = serde_json::to_string(&snapshot) {
-        let _ = std::fs::write(path, text);
-    }
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(text) = serde_json::to_string(&snapshot) {
+            let _ = std::fs::write(path, text);
+        }
+    })
+    .await;
 }
 
-/// Fetch through the cache. `key` is the cache key, `path` the TMDB path.
+/// Fetch through the in-memory cache. Does NO disk I/O of its own: the caller
+/// hydrates once via `ensure_cache_loaded` up front and persists once via
+/// `persist_cache` at the end. Returns whether a NEW body was fetched, so the
+/// caller knows whether a persist is worth doing.
 async fn cached_get<R: Runtime>(
     app: &AppHandle<R>,
     cache_key: &str,
     path: &str,
     api_key: &str,
 ) -> Result<String, String> {
-    load_cache(app);
+    let _ = app;
     if let Ok(lock) = cache().lock() {
         if let Some(entry) = lock.get(cache_key) {
             if now_secs().saturating_sub(entry.fetched_at) < TTL.as_secs() {
@@ -245,10 +273,14 @@ async fn cached_get<R: Runtime>(
             cache_key.to_string(),
             CacheEntry { fetched_at: now_secs(), body: body.clone() },
         );
+        CACHE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
     }
-    save_cache(app);
     Ok(body)
 }
+
+/// Set whenever `cached_get` inserts a new body, so the caller can skip the
+/// persist (and its serialize + write) entirely on an all-cache-hit open.
+static CACHE_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // TMDB wire shapes
@@ -504,6 +536,26 @@ pub async fn fetch_story_arcs<R: Runtime>(
     videos: Vec<ArcVideoRef>,
     grouping_id: Option<String>,
 ) -> Result<Option<ArcResult>, String> {
+    // Hydrate the disk cache once, up front, off the runtime. Then run the
+    // fetch (which touches only the in-memory cache), and persist ONCE at the
+    // end, and only if a new body was actually fetched. This wrapper is what
+    // guarantees the single load / single conditional write no matter which of
+    // the many early-return paths inside the inner fn is taken.
+    ensure_cache_loaded(&app).await;
+    let out = fetch_story_arcs_inner(&app, tmdb_id, imdb_id, videos, grouping_id).await;
+    if CACHE_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        persist_cache(&app).await;
+    }
+    out
+}
+
+async fn fetch_story_arcs_inner<R: Runtime>(
+    app: &AppHandle<R>,
+    tmdb_id: Option<i64>,
+    imdb_id: Option<String>,
+    videos: Vec<ArcVideoRef>,
+    grouping_id: Option<String>,
+) -> Result<Option<ArcResult>, String> {
     let Some(key) = tmdb_key() else {
         // No key baked and none supplied: the feature is simply off. This is
         // the same clean no-op MDBList ratings and PublicMetaDB skips take.
@@ -516,7 +568,7 @@ pub async fn fetch_story_arcs<R: Runtime>(
             // A propagated Err here is deliberate: the frontend caches a
             // successful `null` for 24 h, so laundering a 429 / offline blip
             // into "this show has no arcs" would hide the toggle for a day.
-            Some(imdb) if imdb.starts_with("tt") => match find_tmdb_by_imdb(&app, imdb, &key).await? {
+            Some(imdb) if imdb.starts_with("tt") => match find_tmdb_by_imdb(app, imdb, &key).await? {
                 Some(id) => id,
                 None => {
                     crate::devlog!(info, "arcs", "no TMDB id for {imdb}; arcs unavailable");
@@ -540,7 +592,7 @@ pub async fn fetch_story_arcs<R: Runtime>(
     }
 
     // 1. List the groups and pick one.
-    let list_body = cached_get(&app, &format!("groups:{tv_id}"), &format!("/tv/{tv_id}/episode_groups"), &key).await?;
+    let list_body = cached_get(app, &format!("groups:{tv_id}"), &format!("/tv/{tv_id}/episode_groups"), &key).await?;
     let list: GroupsList = serde_json::from_str(&list_body)
         .map_err(|e| format!("TMDB episode_groups parse failed: {e}"))?;
 
@@ -702,11 +754,21 @@ pub async fn fetch_story_arcs<R: Runtime>(
     // 5. Arc art. Best-effort and never fatal: a failed wiki fetch just means
     //    the cards fall back to episode stills.
     let arc_names: Vec<String> = detail.groups.iter().map(|b| b.name.clone()).collect();
-    let art = crate::arc_art::resolve_arc_art(&app, tv_id, &arc_names).await;
+    let art = crate::arc_art::resolve_arc_art(app, tv_id, &arc_names).await;
 
     // 6. Build the arcs.
     let mut buckets: Vec<&GroupBucket> = detail.groups.iter().collect();
     buckets.sort_by_key(|b| b.order);
+
+    // Index the alignment once: `Alignment::map` / `confidence_of` are each a
+    // linear scan over ~1168 pairs, and the loop below calls both per episode,
+    // so using them directly is O(episodes * pairs) (~1.3M string compares on
+    // One Piece). One HashMap turns the inner lookups into O(1).
+    let aligned: HashMap<&str, (&str, f64)> = alignment
+        .pairs
+        .iter()
+        .map(|p| (p.left_key.as_str(), (p.right_key.as_str(), p.confidence)))
+        .collect();
 
     let mut arcs: Vec<StoryArc> = Vec::new();
     let mut rejected = 0usize;
@@ -729,19 +791,16 @@ pub async fn fetch_story_arcs<R: Runtime>(
                 continue;
             }
             let tkey = format!("{s}:{n}");
-            match alignment.map(&tkey) {
-                Some(aura_id) => {
-                    // `confidence_of`, NOT `score_of`. The raw score is not
+            match aligned.get(tkey.as_str()) {
+                Some(&(aura_id, confidence)) => {
+                    // `confidence`, NOT the raw score. The raw score is not
                     // comparable across pairs: an episode missing an air date on
                     // either side can never exceed the title weight (0.45), so
                     // gating the raw score against 0.5 would reject a perfectly
                     // aligned arc for having ONE dateless episode, which is
                     // routine on ongoing shows and on TMDB's newest entries.
-                    // Confidence renormalises against the evidence that was
-                    // actually available.
-                    if let Some(sc) = alignment.confidence_of(&tkey) {
-                        worst = worst.min(sc);
-                    }
+                    // Confidence renormalises against the evidence available.
+                    worst = worst.min(confidence);
                     if still.is_none() {
                         still = tmdb_by_key
                             .get(&tkey)

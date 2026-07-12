@@ -130,7 +130,10 @@ pub struct Alignment {
 }
 
 impl Alignment {
-    /// Map a TMDB key to an Aura key. None when unmatched.
+    /// Map a TMDB key to an Aura key. None when unmatched. `arcs.rs` builds its
+    /// own HashMap for the hot per-episode loop; this stays as the type's
+    /// single-lookup API and is exercised by the tests.
+    #[allow(dead_code)]
     pub fn map(&self, left_key: &str) -> Option<&str> {
         self.pairs
             .iter()
@@ -166,7 +169,9 @@ impl Alignment {
     }
 
     /// Evidence-normalised confidence of a specific pair, by TMDB key. THIS is
-    /// what a trust threshold should compare against.
+    /// what a trust threshold should compare against. (arcs.rs reads confidence
+    /// straight off the indexed pairs; kept as the by-key accessor.)
+    #[allow(dead_code)]
     pub fn confidence_of(&self, left_key: &str) -> Option<f64> {
         self.pairs
             .iter()
