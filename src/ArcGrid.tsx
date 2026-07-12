@@ -239,7 +239,11 @@ function GroupingSelect({
     <div
       role="group"
       aria-label="Arc grouping"
-      className="flex items-center gap-1 p-1 rounded-xl bg-black/30 border border-white/10"
+      // WRAP, and never exceed the container. A show can have three or four
+      // groupings with long names ("Story Arcs with Filler"); a single
+      // non-wrapping row slipped off both edges of the panel. `flex-wrap` +
+      // `max-w-full` keeps every tab on screen, growing to a second line instead.
+      className="flex flex-wrap items-center gap-1 p-1 rounded-xl bg-black/30 border border-white/10 max-w-full"
     >
       {ordered.map((g) => {
         const on = g.id === active;
@@ -256,7 +260,7 @@ function GroupingSelect({
                   : "text-white/55 hover:text-white/90 hover:bg-white/6",
               ].join(" ")}
             >
-              <span className="truncate max-w-[12rem]">{groupingDisplayName(g.name)}</span>
+              <span className="truncate max-w-[11rem]">{groupingDisplayName(g.name)}</span>
               <span
                 className={[
                   "px-1.5 py-px rounded-full text-[10px] font-mono tabular-nums",

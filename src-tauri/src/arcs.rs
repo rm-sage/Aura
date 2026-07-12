@@ -457,16 +457,19 @@ pub struct ArcVideoRef {
 
 /// Names that are really air-order / season splits which an uploader typed as
 /// "Story Arc". Naruto Shippuden alone has a "TVDB Order" and a "Wikipedia
-/// Order" both carrying type 5. Picking one of those produces a fake "arc"
-/// view that is just the season list with different labels.
-fn looks_like_air_order(name: &str) -> bool {
-    let n = name.to_lowercase();
-    n.contains("order")
+/// Order" both carrying type 5, and Naruto has one literally named "Seasons".
+/// These are NOT arcs (they are the season list relabelled), so they are
+/// rejected outright rather than merely deprioritised: a "Seasons" tab sitting
+/// in the Arcs view is worse than not offering it, and it was slipping onto the
+/// grouping switcher on real shows.
+fn is_not_an_arc_grouping(name: &str) -> bool {
+    let n = name.trim().to_lowercase();
+    n == "seasons"
+        || n == "season"
+        || n.contains("order")     // "TVDB Order", "Wikipedia Order", "Absolute Order", ...
+        || n.contains("air date")
         || n.contains("tvdb")
         || n.contains("wikipedia")
-        || n.contains("air date")
-        || n.trim() == "seasons"
-        || n.trim() == "season"
 }
 
 /// Score a candidate grouping. Higher is better; `None` rejects it outright.
@@ -476,6 +479,10 @@ fn score_grouping(g: &GroupSummary, main_run_total: i64) -> Option<f64> {
     }
     // A single bucket is not a partition, it is the whole show.
     if g.group_count <= 1 {
+        return None;
+    }
+    // Air-order / season splits are not arcs. Drop them entirely.
+    if is_not_an_arc_grouping(&g.name) {
         return None;
     }
     // Coverage against the show's real main run. A grouping that only covers
@@ -490,9 +497,6 @@ fn score_grouping(g: &GroupSummary, main_run_total: i64) -> Option<f64> {
     }
 
     let mut score = coverage.min(1.15) * 100.0;
-    if looks_like_air_order(&g.name) {
-        score -= 60.0;
-    }
     // Prefer finer arcs, but only as a tiebreak: a show with 55 real arcs is
     // more useful than the same show cut into 12 broad sagas, and the user can
     // switch.
@@ -885,3 +889,55 @@ async fn fetch_story_arcs_inner<R: Runtime>(
 
 // Re-export so `arcs::arc_art` reads naturally at the one call site above.
 use crate::arc_art;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grp(name: &str, kind: i64, count: i64, eps: i64) -> GroupSummary {
+        GroupSummary {
+            id: "x".into(),
+            name: name.into(),
+            description: String::new(),
+            kind,
+            group_count: count,
+            episode_count: eps,
+        }
+    }
+
+    #[test]
+    fn air_order_and_season_groupings_are_rejected_outright() {
+        // These carry TMDB type 5 ("Story Arc") on real shows but are the season
+        // list relabelled, not arcs. Naruto's "Seasons" was slipping onto the
+        // grouping switcher; it must score None.
+        for bad in ["Seasons", "season", "TVDB Order", "Wikipedia Order", "Absolute Order"] {
+            assert!(is_not_an_arc_grouping(bad), "{bad} should be rejected");
+            assert!(
+                score_grouping(&grp(bad, GROUP_TYPE_STORY_ARC, 20, 220), 220).is_none(),
+                "{bad} must not score",
+            );
+        }
+    }
+
+    #[test]
+    fn real_arc_groupings_score() {
+        // Naruto's genuine arc groupings must survive.
+        for good in ["Story Arcs with Filler", "Official Story Arcs", "Italian Sagas", "Sagas"] {
+            assert!(!is_not_an_arc_grouping(good), "{good} should NOT be rejected");
+            assert!(
+                score_grouping(&grp(good, GROUP_TYPE_STORY_ARC, 10, 220), 220).is_some(),
+                "{good} must score",
+            );
+        }
+    }
+
+    #[test]
+    fn low_coverage_and_single_bucket_are_rejected() {
+        // "Manga Story Arcs" (129 of 220) leaves a third of the show in no arc.
+        assert!(score_grouping(&grp("Manga Story Arcs", GROUP_TYPE_STORY_ARC, 5, 129), 220).is_none());
+        // A single bucket is the whole show, not a partition.
+        assert!(score_grouping(&grp("Everything", GROUP_TYPE_STORY_ARC, 1, 220), 220).is_none());
+        // Wrong type is never an arc grouping.
+        assert!(score_grouping(&grp("Absolute", 2, 2, 220), 220).is_none());
+    }
+}

@@ -267,14 +267,37 @@ export function arcYearRange(arc: StoryArc): string {
 // grouping, which is what happens today.
 // ---------------------------------------------------------------------------
 
+/** A grouping name in a language other than the app's English UI. TMDB carries
+ *  localized cuts like Naruto's "Italian Sagas" and Chinese-named groupings, and
+ *  one of those must never become the DEFAULT just because it contains the word
+ *  "saga". Detected by a leading language word or any non-ASCII character. */
+function isLocalizedGroupingName(name: string): boolean {
+  // Any non-ASCII char (CJK names, accented locale titles).
+  for (let i = 0; i < name.length; i++) {
+    if (name.charCodeAt(i) > 127) return true;
+  }
+  const first = name.trim().toLowerCase().split(/\s+/)[0] ?? "";
+  return [
+    "italian", "german", "french", "spanish", "portuguese", "brazilian",
+    "japanese", "korean", "chinese", "russian", "polish", "dutch", "turkish",
+    "latin", "castilian", "mexican",
+  ].includes(first);
+}
+
+/** Display-order rank. Lower sorts left and (since the default is the leftmost)
+ *  is preferred. Order: an ENGLISH saga grouping, then arc groupings, then any
+ *  localized grouping, then combos. */
 function groupingRank(name: string): number {
   const n = name.toLowerCase();
   // COMBO IS TESTED FIRST, AND THAT ORDER IS LOAD-BEARING. One Piece's combo
   // grouping is literally named "Season, Arc & Saga Combos", so a "saga" check
-  // that ran first would match it, sort it leftmost, AND make it the default
-  // (the default is just the first in display order) - the exact opposite of
-  // what we want.
-  if (n.includes("combo") || n.includes("combined")) return 2;
+  // that ran first would match it, sort it leftmost, AND make it the default -
+  // the exact opposite of what we want.
+  if (n.includes("combo") || n.includes("combined")) return 3;
+  // A localized grouping ("Italian Sagas") is demoted below every English arc
+  // grouping so it is never the default, but still offered.
+  if (isLocalizedGroupingName(name)) return 2;
+  // Only an ENGLISH "Sagas" leads (One Piece). "Italian Sagas" was caught above.
   if (n.includes("saga")) return 0;
   return 1;
 }
