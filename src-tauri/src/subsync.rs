@@ -30,7 +30,10 @@
 //! just heard", which needs a couple of minutes of cues, not the episode.
 //! `-ss` before `-i` makes it a fast input seek, and `-copyts` is what keeps
 //! the emitted timestamps ABSOLUTE (without it every cue comes back relative to
-//! the window start and every computed delay is silently wrong).
+//! the window start and every computed delay is silently wrong). The slice is
+//! bounded with `-to` (an absolute end time), NOT `-t`: under `-copyts` ffmpeg
+//! measures a `-t` duration against the copied absolute timestamps, so `-t`
+//! silently means `-to` and any window starting past it emits nothing at all.
 //!
 //! `probe_subtitle_streams` (ffprobe) is the bridge between the two: it maps
 //! mpv's track ids onto ffmpeg's subtitle-relative index (the N in `-map
@@ -282,16 +285,38 @@ fn ensure_within_cap(len: usize, what: &str) -> Result<(), String> {
 
 /// Drop `<i>`, `<b>`, `<font color="#fff">`, `<v Roger>`, `<c.yellow>` and the
 /// inline `<00:01:02.000>` karaoke timestamps that WebVTT allows.
+///
+/// A `<` only opens a tag if it actually CLOSES. Subtitle dialogue genuinely
+/// contains bare angle brackets ("if x < 5", "<<sigh>>", a stray "<" from a bad
+/// OCR), and the previous depth-counting version treated the first unbalanced
+/// `<` as an unterminated tag and silently ate the entire rest of the line.
 fn strip_angle_tags(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
-    let mut depth: usize = 0;
-    for c in s.chars() {
-        match c {
-            '<' => depth += 1,
-            '>' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => out.push(c),
-            _ => {}
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '<' {
+            // A tag only OPENS when a tag-name character follows: a letter or
+            // digit (`<i>`, `<font ...>`, `<00:01:02.000>`), or a slash (`</i>`).
+            // "if x < 5" has a space after the bracket, so it is arithmetic, not
+            // markup. Requiring this is what stops "5 < 6 and 7 > 2" from being
+            // read as one big tag and eaten.
+            let opens_tag = chars
+                .get(i + 1)
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '/');
+            if opens_tag {
+                if let Some(close) = chars[i + 1..].iter().position(|&c| c == '>') {
+                    i += close + 2; // skip the whole `<...>` span
+                    continue;
+                }
+            }
+            // Not a tag (or never closed): literal text.
+            out.push('<');
+            i += 1;
+            continue;
         }
+        out.push(chars[i]);
+        i += 1;
     }
     out
 }
@@ -841,9 +866,17 @@ pub async fn extract_embedded_cues<R: Runtime>(
     // index / byte range instead of decoding from zero). `-copyts` keeps the
     // input timestamps, so the emitted SRT carries ABSOLUTE cue times; without
     // it every cue would come back relative to the window start and every delay
-    // the user computes would be silently wrong. `-t` then bounds the slice to
-    // `window` seconds of output (same `-ss -copyts -t` shape silencedetect.rs
-    // already relies on).
+    // the user computes would be silently wrong.
+    //
+    // BOUND THE SLICE WITH `-to`, NOT `-t`. Under `-copyts` ffmpeg measures the
+    // recording limit against the ABSOLUTE (copied) timestamps, so `-t` behaves
+    // exactly like `-to`: `-ss 330 -copyts -t 300` asks for "stop once the
+    // timestamp reaches 300", which is already in the past at the seek point, so
+    // ffmpeg writes ZERO bytes. Measured against the real ffmpeg.exe: `-ss 330
+    // -copyts -t 300` -> 0 bytes; `-ss 330 -copyts -to 630` -> the correct
+    // window. With `-t` this whole feature was dead for any playhead past
+    // roughly 7m30s.
+    let end = start + window;
     let mut cmd = tool_command(&app, "ffmpeg.exe", "AURA_FFMPEG");
     cmd.arg("-hide_banner")
         .arg("-nostdin")
@@ -857,8 +890,8 @@ pub async fn extract_embedded_cues<R: Runtime>(
         .arg("-copyts")
         .arg("-i")
         .arg(&url)
-        .arg("-t")
-        .arg(format!("{window:.3}"))
+        .arg("-to")
+        .arg(format!("{end:.3}"))
         .arg("-map")
         .arg(format!("0:s:{sub_index}"))
         .arg("-f")
@@ -1172,6 +1205,11 @@ mod tests {
         assert_eq!(clean_timed_text("<00:00:01.000><c>Word</c> up"), "Word up");
         // A lone backslash that is not an ASS escape survives.
         assert_eq!(clean_ass_text("path C:\\temp"), "path C:\\temp");
+        // An UNBALANCED `<` is literal dialogue, not an unterminated tag. The
+        // depth-counting stripper used to swallow everything after it, which
+        // silently truncated the line the user is trying to click on.
+        assert_eq!(clean_timed_text("if x < 5 then run"), "if x < 5 then run");
+        assert_eq!(clean_timed_text("<i>tilt</i> 5 < 6 and 7 > 2"), "tilt 5 < 6 and 7 > 2");
         assert!(ass_is_drawing("{\\p1}m 0 0 l 5 5"));
         assert!(!ass_is_drawing("{\\pos(10,20)}Real dialogue"));
         assert!(!ass_is_drawing("{\\p0}Drawing mode off"));

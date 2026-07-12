@@ -94,13 +94,24 @@ export function saveArcMode(seriesId: string, mode: EpisodeGrouping, groupingId?
 // ---------------------------------------------------------------------------
 
 /** Cheap gate: false when no TMDB key is baked or stored, so the Detail page
- *  never even asks for arcs. Resolved once per session. */
+ *  never even asks for arcs. Memoised per session, but INVALIDATED when the user
+ *  changes an API key: without that, pasting a TMDB key into Settings would do
+ *  nothing at all until the next app launch (the memo would keep answering
+ *  "false"), and even then nothing for 24 hours (the arc cache would keep
+ *  serving the `null` recorded while the key was missing). */
 let availablePromise: Promise<boolean> | null = null;
 export function storyArcsAvailable(): Promise<boolean> {
   if (!availablePromise) {
     availablePromise = invoke<boolean>("story_arcs_available").catch(() => false);
   }
   return availablePromise;
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("aura:api-keys-changed", () => {
+    availablePromise = null;
+    arcCache.clear();
+  });
 }
 
 /** The series-root IMDb id, when the show has one. Episode ids look like

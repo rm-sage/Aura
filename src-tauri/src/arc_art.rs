@@ -38,6 +38,13 @@ use crate::arc_align::dice_bigram;
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// Arc key art is static. A month is conservative.
 const TTL: Duration = Duration::from_secs(30 * 24 * 3600);
+/// A MISS (empty art map) gets a much shorter TTL than a hit. An empty map is
+/// ambiguous: it means "this wiki has no arc category and no name matched" but
+/// it ALSO means "Fandom was down / the network was out when we asked". Honouring
+/// a network blip for 30 days would permanently strip a show of its arc art. One
+/// day is long enough to stop re-probing on every detail open, short enough to
+/// self-heal.
+const NEGATIVE_TTL: Duration = Duration::from_secs(24 * 3600);
 const CACHE_CAP: usize = 60;
 /// Below this the names are not the same arc. "Alabasta" vs "Arabasta Arc"
 /// scores well above it; "Alabasta" vs "Skypiea" does not.
@@ -328,7 +335,8 @@ pub async fn resolve_arc_art<R: Runtime>(
     load_cache(app);
     if let Ok(lock) = cache().lock() {
         if let Some(entry) = lock.get(&key) {
-            if now_secs().saturating_sub(entry.fetched_at) < TTL.as_secs() {
+            let ttl = if entry.art.is_empty() { NEGATIVE_TTL } else { TTL };
+            if now_secs().saturating_sub(entry.fetched_at) < ttl.as_secs() {
                 return entry.art.clone();
             }
         }

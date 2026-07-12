@@ -236,9 +236,18 @@ fn infer_op_window(intervals: &[SilenceInterval], min_score: Option<f64>) -> Opt
 /// silence intervals, returning ABSOLUTE-timestamp intervals. `-ss` seeks
 /// to the slice start and `-copyts` keeps the input PTS so the parsed
 /// silence_start/end stay absolute (NOT slice-relative) — the OP
-/// inference places windows on the real timeline. `-t` then bounds the
-/// slice to `len_secs` of OUTPUT (proven by `detect_outro_boundary`'s
-/// `-sseof -copyts -t` tail scan, which reports true absolute PTS).
+/// inference places windows on the real timeline.
+///
+/// THE SLICE IS BOUNDED WITH `-to`, NOT `-t`. Under `-copyts` ffmpeg measures a
+/// `-t` duration against the COPIED (absolute) timestamps, so `-t` silently
+/// means `-to`: a chunk seeking to 600 s with `-t 300` asks ffmpeg to "stop once
+/// the timestamp reaches 300", which is already in the past, so it decodes NOTHING
+/// and the chunk returns zero intervals. That was this function's behaviour for
+/// every chunk past the first, i.e. only the head of the file was ever scanned.
+/// Measured against the bundled ffmpeg.exe: `-ss 600 -copyts -t 300` decodes 0 s;
+/// `-ss 600 -copyts -to 900` decodes the expected 300 s. Chunk 0 passes no
+/// `-copyts`, so `-t` and `-to` are equivalent there and one shape covers both.
+///
 /// Audio-only (`-vn`), so a fan-out of these is light on CPU — the
 /// per-chunk cost is mostly the byte-range download. ffmpeg is killed on
 /// drop, so an aborted task (early-exit) tears its process down at once.
@@ -257,10 +266,11 @@ async fn scan_silence_chunk(
     if start_secs > 0.0 {
         cmd.arg("-ss").arg(format!("{start_secs:.3}")).arg("-copyts");
     }
+    let end_secs = start_secs + len_secs;
     cmd.arg("-i").arg(url)
         .arg("-vn")
         .arg("-af").arg("silencedetect=n=-30dB:d=0.5")
-        .arg("-t").arg(format!("{len_secs:.3}"))
+        .arg("-to").arg(format!("{end_secs:.3}"))
         .arg("-f").arg("null")
         .arg("-")
         .stdout(Stdio::null())
@@ -564,8 +574,16 @@ pub async fn detect_outro_boundary(
     // "ED≈46 s" (~1090 s too early), which made the Next-Up card fire at
     // the episode midpoint. `-copyts` keeps input timestamps intact so
     // `ed_start` is a true absolute container timestamp. Downscale before
-    // blackdetect so the tail video decode is cheap; `-t` bounds the
-    // worst case.
+    // blackdetect so the tail video decode is cheap.
+    //
+    // NO `-t` HERE. It used to pass `-t (tail + 30)`, which under `-copyts` is
+    // measured against the ABSOLUTE timestamps: in the tail those are around
+    // (duration - tail), which exceeds `tail + 30` on any real episode, so
+    // ffmpeg stopped immediately and decoded NOTHING. This scan has therefore
+    // been silently returning no intervals. `-sseof` already bounds the read to
+    // the tail (it runs to EOF), so no output limit is needed at all. Measured
+    // against the bundled ffmpeg.exe: `-sseof -120 -copyts -t 150` decodes 0 s;
+    // dropping `-t` decodes the expected ~120 s.
     let mut cmd = ffmpeg_command(&app);
     cmd.arg("-hide_banner")
         .arg("-nostdin")
@@ -575,7 +593,6 @@ pub async fn detect_outro_boundary(
         .arg("-i").arg(&url)
         .arg("-vf").arg("scale=160:-2,blackdetect=d=0.30:pic_th=0.98")
         .arg("-af").arg("silencedetect=n=-30dB:d=0.5")
-        .arg("-t").arg((tail + 30).to_string())
         .arg("-f").arg("null")
         .arg("-")
         .stdout(Stdio::null())

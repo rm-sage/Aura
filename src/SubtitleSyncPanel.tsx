@@ -277,6 +277,17 @@ export default function SubtitleSyncPanel({
   useEffect(() => { togglePauseRef.current = togglePause; }, [togglePause]);
   useEffect(() => { currentTimeRef.current = currentTime; }, [currentTime]);
 
+  /** Serialises cue fetches so at most one ffprobe/ffmpeg runs at a time. */
+  const fetchChainRef = useRef<Promise<unknown>>(Promise.resolve());
+
+  /** True while WE are the reason playback is paused. The moment playback runs
+   *  again for any reason, we stop owning the pause: if the user then pauses on
+   *  their own, closing the panel must NOT resume for them. */
+  const weOwnThePauseRef = useRef(false);
+  useEffect(() => {
+    if (!paused) weOwnThePauseRef.current = false;
+  }, [paused]);
+
   useEffect(() => () => {
     if (flashTimer.current) clearTimeout(flashTimer.current);
   }, []);
@@ -300,13 +311,22 @@ export default function SubtitleSyncPanel({
 
     // Only pause if we are actually playing; closing must not resume a stream
     // the user had deliberately paused BEFORE opening the panel.
-    const resumeOnClose = !pausedRef.current;
-    if (resumeOnClose) togglePauseRef.current();
+    if (!pausedRef.current) {
+      togglePauseRef.current();
+      weOwnThePauseRef.current = true;
+    }
 
     return () => {
-      // The user may have resumed by hand while the panel was up - only toggle
-      // when we are still the reason it is paused.
-      if (resumeOnClose && pausedRef.current) togglePauseRef.current();
+      // Resume ONLY if we still own the pause. Tracking a plain
+      // "was playing when I opened" boolean was not enough: if the user resumed
+      // by hand while the panel was up and then paused again on purpose, that
+      // boolean was still true and closing would have yanked their deliberate
+      // pause back into playback. `weOwnThePause` is cleared the instant
+      // playback runs again, so that sequence leaves it false.
+      if (weOwnThePauseRef.current && pausedRef.current) {
+        togglePauseRef.current();
+      }
+      weOwnThePauseRef.current = false;
       setAnchor(null);
       setCues([]);
       setStatus("idle");
@@ -328,6 +348,15 @@ export default function SubtitleSyncPanel({
     ? `${activeSub.id}|${activeSub.external_filename ?? ""}`
     : "";
 
+  // Read the CURRENT correction without making the fetch depend on it. Picking a
+  // line writes a new delay, and re-running the whole ffmpeg extraction every
+  // time the user nudges +/-0.25s would be absurd. The correction cannot change
+  // between the panel opening and this fetch resolving, so a ref is exact here.
+  const subDelayRef = useRef(subDelay);
+  const subSpeedRef = useRef(subSpeed);
+  subDelayRef.current = subDelay;
+  subSpeedRef.current = subSpeed;
+
   // ── Cue fetch ────────────────────────────────────────────────────────
   useEffect(() => {
     if (!open || anchor == null) return;
@@ -336,6 +365,12 @@ export default function SubtitleSyncPanel({
       setStatus("no-track");
       return;
     }
+
+    // The anchor mapped back into the subtitle file's OWN timeline. The playhead
+    // is display time; a cue's `start`/`end` are raw file times, and with a
+    // correction already applied (speed != 1 or delay != 0) those two spaces do
+    // not coincide. Everything that selects cues must work in raw space.
+    const rawAnchor = (anchor - subDelayRef.current) / (subSpeedRef.current || 1);
     // Fast path: mpv already told us the codec, so a bitmap track never even
     // reaches ffprobe.
     if (isBitmapCodec(activeSub.codec)) {
@@ -348,7 +383,14 @@ export default function SubtitleSyncPanel({
     setError(null);
     setCues([]);
 
-    (async () => {
+    // SERIALISE the fetches. `cancelled` stops a stale RESULT from landing, but
+    // it cannot un-spawn a subprocess: the Rust command keeps running to
+    // completion, so open/close/open/close on an embedded track would pile up
+    // concurrent ffprobe + ffmpeg processes all pulling byte ranges from the
+    // same debrid link the player is already streaming. Chaining means at most
+    // one extraction is ever in flight.
+    fetchChainRef.current = fetchChainRef.current.catch(() => {}).then(async () => {
+      if (cancelled) return;
       try {
         let raw: SubCue[];
         const source = activeSub.external_filename ?? null;
@@ -382,15 +424,20 @@ export default function SubtitleSyncPanel({
           raw = await invoke<SubCue[]>("extract_embedded_cues", {
             url: streamUrl,
             subIndex: chosen.sub_index,
-            aroundSeconds: anchor,
+            // RAW-space anchor, not the playhead. Cue times (both the ones
+            // ffmpeg emits and the ones we compare against) live in the file's
+            // own timeline; the playhead lives in DISPLAY time. With a
+            // correction already applied those two are not the same point, so
+            // seeking to the playhead would pull the wrong stretch of cues.
+            aroundSeconds: rawAnchor,
             windowSeconds: EXTRACT_WINDOW_SECS,
           });
         }
         if (cancelled) return;
 
         // The cue list is windowed + capped the moment it lands: a whole-episode
-        // array is never retained.
-        const windowed = windowCues(raw, anchor);
+        // array is never retained. Windowed in RAW space, for the same reason.
+        const windowed = windowCues(raw, rawAnchor);
         setCues(windowed);
         setStatus(windowed.length > 0 ? "ready" : "empty");
       } catch (e) {
@@ -398,7 +445,7 @@ export default function SubtitleSyncPanel({
         setError(String(e));
         setStatus("error");
       }
-    })();
+    });
 
     return () => { cancelled = true; };
     // `activeSub` / `embeddedSubs` are read from the closure on purpose: they
@@ -421,7 +468,9 @@ export default function SubtitleSyncPanel({
     for (let i = cues.length - 1; i >= 0; i--) {
       if (cues[i].end <= raw) return i;
     }
-    return 0;
+    // No cue at or before the anchor. Return -1 rather than 0: highlighting the
+    // first row would confidently point at a line the user did NOT just hear.
+    return -1;
   }, [cues, anchor, subDelay, subSpeed]);
 
   // ── Search ───────────────────────────────────────────────────────────

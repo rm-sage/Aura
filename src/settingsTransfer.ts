@@ -75,6 +75,11 @@ const PORTABLE_BACKEND_FIELDS = [
   "close_on_exit",
   "minimize_to_tray_on_close",
   "opensubtitles_api_key",
+  // Not a settings.json field: it lives in the OS keyring, and SettingsView
+  // hydrates it into the export blob (and strips it back out on import) exactly
+  // like the OpenSubtitles key. It has to be listed here anyway, because the
+  // exporter FILTERS the blob down to this list and would otherwise drop it.
+  "tmdb_api_key",
   "hdr_enabled",
   "hdr_mode",
   "hdr_target_peak_nits",

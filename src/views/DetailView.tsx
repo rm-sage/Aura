@@ -2473,7 +2473,7 @@ function UnifiedPanel({
 // ---------------------------------------------------------------------------
 
 const EpisodeRow = ({
-  video, seriesId, seriesMediaType, isActive, onPick, seasonVideos, isNextAiring, isDeepLinked, seriesArt,
+  video, seriesId, seriesMediaType, isActive, onPick, seasonVideos, isNextAiring, isDeepLinked, seriesArt, groupLabel = "season",
 }: {
   video: VideoEntry;
   seriesId: string;
@@ -2485,6 +2485,10 @@ const EpisodeRow = ({
   /** All episodes in the currently-displayed season, in episode order.
    *  Drives the "this & above / below / all" right-click bulk options. */
   seasonVideos: VideoEntry[];
+  /** What `seasonVideos` actually IS, for the confirmation toast. In Arcs mode
+   *  the visible list is a story arc, not a season, and "Marked watched · all in
+   *  season" would be a lie about what the user just did. */
+  groupLabel?: string;
   /** True for the single earliest-future-dated episode across the series
    *  (computed once by the panel). Drives the live "Airs in …" chip. */
   isNextAiring?: boolean;
@@ -2637,7 +2641,7 @@ const EpisodeRow = ({
             label: "Mark all as watched",
             tone: "success",
             icon: checkIcon,
-            onClick: bulkAction(allSet, "watched", "all in season"),
+            onClick: bulkAction(allSet, "watched", `all in ${groupLabel}`),
           });
         }
         if (allSet.length > 1 && allSet.some((v) => getManualWatchedState(v.id) === "watched")) {
@@ -2645,7 +2649,7 @@ const EpisodeRow = ({
             kind: "action",
             label: "Unmark all as watched",
             icon: checkIcon,
-            onClick: bulkAction(allSet, null, "all in season"),
+            onClick: bulkAction(allSet, null, `all in ${groupLabel}`),
           });
         }
 
@@ -3128,6 +3132,25 @@ function EpisodesPanel({
     [seriesId],
   );
 
+  // Seasons mode auto-selects the season holding the resume / deep-linked
+  // episode. Arcs mode has to do the same, or a user whose remembered mode is
+  // Arcs lands on the arc GRID and their resume row is nowhere on screen (the
+  // scroll-to-episode effect below then hunts a row that is not rendered, and
+  // a notification deep-link silently goes nowhere).
+  //
+  // Consume-once, like the season hint: it must not yank the user back to the
+  // resume arc every time they navigate back out to the arc list.
+  const hasAppliedArcAnchorRef = useRef(false);
+  useEffect(() => {
+    if (!arcMode || !arcResult || hasAppliedArcAnchorRef.current) return;
+    const anchorId = highlightVideoId ?? resolvedScrollId ?? activeVideo?.id ?? null;
+    if (!anchorId) return;
+    const pos = arcPositionOf(arcResult, anchorId);
+    if (!pos) return;
+    hasAppliedArcAnchorRef.current = true;
+    setOpenArcId(pos.arc.id);
+  }, [arcMode, arcResult, highlightVideoId, resolvedScrollId, activeVideo?.id]);
+
   const inSeason = useMemo(() => {
     const list = seasons.length === 0
       ? [...videos]
@@ -3227,7 +3250,10 @@ function EpisodesPanel({
       clearInterval(interval);
       clearTimeout(stop);
     };
-  }, [scrollToVideoId, resolvedScrollId, season, inSeason.length, onScrollHandled]);
+    // `visibleEpisodes.length` + `openArcId`, not `inSeason.length`: in Arcs mode
+    // the rendered list is the open arc, so the retry has to re-arm when the arc
+    // changes or the row it is hunting is never in the DOM.
+  }, [scrollToVideoId, resolvedScrollId, season, openArcId, visibleEpisodes.length, onScrollHandled]);
 
   return (
     <>
@@ -3377,6 +3403,7 @@ function EpisodesPanel({
                     isActive={activeVideo?.id === v.id}
                     onPick={onPick}
                     seasonVideos={visibleEpisodes}
+                    groupLabel={arcMode ? "arc" : "season"}
                     isNextAiring={v.id === nextAiringId}
                     isDeepLinked={v.id === highlightId}
                     seriesArt={seriesArt}

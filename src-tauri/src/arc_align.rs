@@ -104,8 +104,19 @@ pub struct AlignPair {
     pub left_key: String,
     /// Aura side.
     pub right_key: String,
-    /// The pair score, roughly -0.5 ..= 1.0.
+    /// The RAW pair score, roughly -0.5 ..= 1.0. This is what the DP maximises.
+    /// It is NOT a confidence: a pair with no air date on one side can never
+    /// exceed `W_TITLE` (0.45) no matter how perfectly its title matches, so
+    /// comparing it against an absolute threshold punishes missing data rather
+    /// than bad data. Use `confidence` for that.
     pub score: f64,
+    /// The pair score renormalised against the evidence that was actually
+    /// AVAILABLE for this pair: `score / (W_DATE if both have a date) + (W_TITLE
+    /// if both have a title)`. So a title-perfect pair with no date scores 0.45
+    /// raw but 1.0 confidence, while a pair whose available signals DISAGREE
+    /// still scores low. 0.0 when neither side offers any signal at all (no
+    /// evidence is not the same as good evidence).
+    pub confidence: f64,
 }
 
 /// The result of aligning a TMDB list (left) against an Aura list (right).
@@ -143,12 +154,35 @@ impl Alignment {
         }
     }
 
-    /// Confidence of a specific pair, by TMDB key.
+    /// RAW score of a specific pair, by TMDB key. For diagnostics and tests.
+    /// Gate on `confidence_of` instead: this value is not comparable across
+    /// pairs that carry different signals.
+    #[allow(dead_code)]
     pub fn score_of(&self, left_key: &str) -> Option<f64> {
         self.pairs
             .iter()
             .find(|p| p.left_key == left_key)
             .map(|p| p.score)
+    }
+
+    /// Evidence-normalised confidence of a specific pair, by TMDB key. THIS is
+    /// what a trust threshold should compare against.
+    pub fn confidence_of(&self, left_key: &str) -> Option<f64> {
+        self.pairs
+            .iter()
+            .find(|p| p.left_key == left_key)
+            .map(|p| p.confidence)
+    }
+
+    /// The lowest pair confidence in the alignment (1.0 when there are no pairs).
+    pub fn min_confidence(&self) -> f64 {
+        let mut min = f64::INFINITY;
+        for p in &self.pairs {
+            if p.confidence < min {
+                min = p.confidence;
+            }
+        }
+        if min.is_finite() { min } else { 1.0 }
     }
 }
 
@@ -283,10 +317,12 @@ pub fn align(left: &[AlignEpisode], right: &[AlignEpisode]) -> Alignment {
             DIR_DIAG if i > 0 && j > 0 => {
                 let a = &lefts[i - 1];
                 let b = &rights[j - 1];
+                let score = pair_score(a, b);
                 pairs.push(AlignPair {
                     left_key: a.key.clone(),
                     right_key: b.key.clone(),
-                    score: pair_score(a, b),
+                    score,
+                    confidence: pair_confidence(score, attainable(a, b)),
                 });
                 i -= 1;
                 j -= 1;
@@ -330,6 +366,32 @@ fn unaligned(left: &[AlignEpisode], right: &[AlignEpisode]) -> Alignment {
         pairs: Vec::new(),
         left_only: left.iter().map(|e| e.key.clone()).collect(),
         right_only: right.iter().map(|e| e.key.clone()).collect(),
+    }
+}
+
+/// The maximum score this pair COULD have reached, given which signals both
+/// sides actually carry. A pair with no date on one side can only ever earn the
+/// title weight, so that is its ceiling.
+fn attainable(a: &Prepped, b: &Prepped) -> f64 {
+    let mut max = 0.0;
+    if a.day.is_some() && b.day.is_some() {
+        max += W_DATE;
+    }
+    if !a.norm.is_empty() && !b.norm.is_empty() {
+        max += W_TITLE;
+    }
+    max
+}
+
+/// Renormalise a raw score against the evidence that was available. Returns 0.0
+/// when there was NO evidence on either axis: an episode with neither a date nor
+/// a title tells us nothing, and "no evidence" must not read as "high
+/// confidence".
+fn pair_confidence(score: f64, attainable: f64) -> f64 {
+    if attainable <= 0.0 {
+        0.0
+    } else {
+        score / attainable
     }
 }
 
@@ -904,8 +966,49 @@ mod tests {
         for i in 0..N {
             assert_eq!(a.map(&format!("L{i}")), Some(format!("R{i}").as_str()));
         }
-        // Title-only confidence: 0.45 * 1.0, with the date term contributing nothing.
+        // Title-only RAW score: 0.45 * 1.0, with the date term contributing nothing.
         assert!((a.min_score() - W_TITLE).abs() < 1e-9, "{}", a.min_score());
+
+        // ...but the CONFIDENCE is 1.0, because the title was the only evidence
+        // available and it matched perfectly. This is the distinction that
+        // matters in production: `arcs.rs` gates arcs on confidence >= 0.5, and
+        // gating the raw score instead would reject this perfectly-aligned arc
+        // outright (0.45 < 0.5) purely for having no air dates. An ongoing show
+        // whose newest episodes lack a date on one side hits this constantly.
+        assert!(
+            (a.min_confidence() - 1.0).abs() < 1e-9,
+            "dateless-but-title-perfect must survive the production gate, got {}",
+            a.min_confidence(),
+        );
+        assert!(a.min_confidence() >= 0.5, "must clear arcs.rs MIN_PAIR_CONFIDENCE");
+    }
+
+    #[test]
+    fn confidence_still_punishes_disagreement_it_only_forgives_absence() {
+        // Both sides carry dates AND titles, and both DISAGREE. Evidence was
+        // available and it was bad, so confidence must stay low. (Guards against
+        // "fixing" the dateless case by making confidence trivially 1.0.)
+        let left = vec![ep("L0", "totally different words here", Some(0))];
+        let right = vec![ep("R0", "nothing alike whatsoever", Some(400))];
+        let a = align(&left, &right);
+        assert_eq!(a.pairs.len(), 1);
+        assert!(
+            a.min_confidence() < 0.5,
+            "a pair whose available signals both disagree must not clear the gate, got {}",
+            a.min_confidence(),
+        );
+    }
+
+    #[test]
+    fn confidence_is_zero_when_there_is_no_evidence_at_all() {
+        // No date, no title. We know nothing; that must not read as certainty.
+        let left = vec![ep("L0", "", None)];
+        let right = vec![ep("R0", "", None)];
+        let a = align(&left, &right);
+        if !a.pairs.is_empty() {
+            assert_eq!(a.pairs[0].confidence, 0.0);
+            assert!(a.min_confidence() < 0.5);
+        }
     }
 
     // ------------------------------------------------------------- edge cases

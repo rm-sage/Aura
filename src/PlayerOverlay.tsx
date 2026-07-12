@@ -1346,10 +1346,15 @@ export default function PlayerOverlay({
 
   // ── A/V sync nudges ──
   // Lifted into PlayerOverlay scope so both the audio and sub track
-  // menus can host their respective delay row inline. MPV resets these
-  // properties on each `loadfile`, so a stream change naturally zeroes
-  // the underlying state too — we just need to mirror that in React so
-  // the displayed value matches.
+  // menus can host their respective delay row inline.
+  //
+  // `sub-delay`, `audio-delay` and `sub-speed` are all mpv OPTIONS, and a
+  // runtime change to an option PERSISTS across `loadfile`. mpv does not zero
+  // them for us. Resetting only the React state (which is what this used to do)
+  // left the UI reading 0.00s while mpv was still applying the previous
+  // episode's correction: a 30s Live Sync fix silently poisoned the next
+  // episode, and the user had no value on screen to explain it. Every reset
+  // below therefore has to be WRITTEN THROUGH to mpv, not just to React.
   const [audioDelay, setAudioDelay] = useState(0);
   const [subDelay,   setSubDelay]   = useState(0);
   // ── Live Subtitle Sync ──
@@ -1367,15 +1372,18 @@ export default function PlayerOverlay({
     setSubSpeed(1);
     setSyncFirstAnchor(null);
     setSyncOpen(false);
-    // mpv zeroes sub-delay / audio-delay itself on loadfile, but `sub-speed` is
-    // an OPTION: a runtime change to it persists across files, so a drift
-    // correction solved for one release would silently follow the user into the
-    // next episode. Clear it explicitly. Nothing is persisted to disk either
-    // way: a sub delay belongs to the RELEASE, not the title, so persisting it
-    // would re-apply a wrong correction after a source switch (same reasoning
-    // as playback speed and the video EQ, which are also session-only).
+    // Write every reset THROUGH to mpv. These are options, not per-file state:
+    // mpv carries them across `loadfile`, so React-only resets would leave the
+    // engine applying the last episode's correction behind a UI reading 0.00s.
+    invoke("set_subtitle_delay", { seconds: 0 }).catch(() => {});
+    invoke("set_audio_delay", { seconds: 0 }).catch(() => {});
     invoke("set_subtitle_speed", { speed: 1 }).catch(() => {});
-  }, [activeTarget?.id]);
+    // Keyed on the STREAM as well as the target. A source switch keeps the same
+    // activeTarget.id but is a different release, and a subtitle correction
+    // belongs to the release: carrying it over would silently mistime the new
+    // source. Nothing is persisted to disk for the same reason (same reasoning
+    // as playback speed and the video EQ, which are also session-only).
+  }, [activeTarget?.id, streamUrl]);
   const nudgeAudioDelay = useCallback((delta: number) => {
     setAudioDelay((prev) => {
       const next = Math.max(-10, Math.min(10, +(prev + delta).toFixed(3)));

@@ -68,6 +68,12 @@ const CACHE_CAP: usize = 40;
 /// Below this, we do not believe the alignment and refuse to render the arc.
 /// Measured on real data, One Piece and Naruto Shippuden produce ZERO pairs
 /// under this threshold, so tripping it means something genuinely drifted.
+///
+/// Compared against `AlignPair::confidence` (evidence-normalised), never against
+/// the raw score. Against the raw score this threshold would be UNREACHABLE for
+/// any episode missing an air date on either side (their ceiling is the title
+/// weight, 0.45), so a single dateless episode would silently reject its whole
+/// arc even when the alignment is perfect.
 const MIN_PAIR_CONFIDENCE: f64 = 0.5;
 
 // ---------------------------------------------------------------------------
@@ -469,21 +475,25 @@ fn score_grouping(g: &GroupSummary, main_run_total: i64) -> Option<f64> {
 /// Resolve a TMDB tv id from an IMDb id. Only used when the addon meta did not
 /// stamp one (`MetaDetail.tmdb_id`) and the caller could not resolve one via
 /// the existing kitsu/anidb/anilist path in `publicmetadb::resolve_anime_tmdb_id`.
+/// `Ok(None)` means TMDB genuinely has no TV match for this IMDb id (a real,
+/// cacheable "no arcs"). An `Err` means we could not ASK (429, 5xx, offline) and
+/// must propagate so the caller does not cache a transient failure as a
+/// permanent verdict for 24 hours.
 async fn find_tmdb_by_imdb<R: Runtime>(
     app: &AppHandle<R>,
     imdb_id: &str,
     key: &str,
-) -> Option<i64> {
+) -> Result<Option<i64>, String> {
     let body = cached_get(
         app,
         &format!("find:{imdb_id}"),
         &format!("/find/{imdb_id}?external_source=imdb_id"),
         key,
     )
-    .await
-    .ok()?;
-    let parsed: FindResult = serde_json::from_str(&body).ok()?;
-    parsed.tv_results.first().and_then(|t| t.id)
+    .await?;
+    let parsed: FindResult = serde_json::from_str(&body)
+        .map_err(|e| format!("TMDB /find parse failed: {e}"))?;
+    Ok(parsed.tv_results.first().and_then(|t| t.id))
 }
 
 #[tauri::command]
@@ -503,7 +513,10 @@ pub async fn fetch_story_arcs<R: Runtime>(
     let tv_id = match tmdb_id {
         Some(id) if id > 0 => id,
         _ => match imdb_id.as_deref() {
-            Some(imdb) if imdb.starts_with("tt") => match find_tmdb_by_imdb(&app, imdb, &key).await {
+            // A propagated Err here is deliberate: the frontend caches a
+            // successful `null` for 24 h, so laundering a 429 / offline blip
+            // into "this show has no arcs" would hide the toggle for a day.
+            Some(imdb) if imdb.starts_with("tt") => match find_tmdb_by_imdb(&app, imdb, &key).await? {
                 Some(id) => id,
                 None => {
                     crate::devlog!(info, "arcs", "no TMDB id for {imdb}; arcs unavailable");
@@ -663,13 +676,17 @@ pub async fn fetch_story_arcs<R: Runtime>(
         .collect();
 
     let alignment = arc_align::align(&left, &right);
+    // min_confidence is the number that matters (it is what the arc gate below
+    // compares against); min_score is logged alongside it because a big gap
+    // between the two means the data was thin, not that the join was bad.
     crate::devlog!(
         info, "arcs",
-        "tmdb {tv_id} grouping '{}': aligned {} pairs ({} tmdb-only, {} aura-only), min score {:.2}",
+        "tmdb {tv_id} grouping '{}': aligned {} pairs ({} tmdb-only, {} aura-only), min confidence {:.2} (raw score {:.2})",
         chosen.name,
         alignment.pairs.len(),
         alignment.left_only.len(),
         alignment.right_only.len(),
+        alignment.min_confidence(),
         alignment.min_score()
     );
 
@@ -714,7 +731,15 @@ pub async fn fetch_story_arcs<R: Runtime>(
             let tkey = format!("{s}:{n}");
             match alignment.map(&tkey) {
                 Some(aura_id) => {
-                    if let Some(sc) = alignment.score_of(&tkey) {
+                    // `confidence_of`, NOT `score_of`. The raw score is not
+                    // comparable across pairs: an episode missing an air date on
+                    // either side can never exceed the title weight (0.45), so
+                    // gating the raw score against 0.5 would reject a perfectly
+                    // aligned arc for having ONE dateless episode, which is
+                    // routine on ongoing shows and on TMDB's newest entries.
+                    // Confidence renormalises against the evidence that was
+                    // actually available.
+                    if let Some(sc) = alignment.confidence_of(&tkey) {
                         worst = worst.min(sc);
                     }
                     if still.is_none() {
