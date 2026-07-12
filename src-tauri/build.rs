@@ -50,12 +50,18 @@ fn main() {
 
     let mdblist_key      = resolve_secret(&env_file, "AURA_MDBLIST_KEY");
     let publicmetadb_key = resolve_secret(&env_file, "AURA_PUBLICMETADB_KEY");
+    // TMDB v3 key, read by arcs.rs for the story-arc episode groups. Empty ->
+    // the Arcs toggle never renders and no request is made. A user-supplied
+    // key in the OS keyring overrides this one at runtime.
+    let tmdb_key         = resolve_secret(&env_file, "AURA_TMDB_KEY");
 
     println!("cargo:rustc-env=AURA_MDBLIST_KEY={mdblist_key}");
     println!("cargo:rustc-env=AURA_PUBLICMETADB_KEY={publicmetadb_key}");
+    println!("cargo:rustc-env=AURA_TMDB_KEY={tmdb_key}");
     println!("cargo:rerun-if-changed=../.env.local");
     println!("cargo:rerun-if-env-changed=AURA_MDBLIST_KEY");
     println!("cargo:rerun-if-env-changed=AURA_PUBLICMETADB_KEY");
+    println!("cargo:rerun-if-env-changed=AURA_TMDB_KEY");
 
     // Custom Windows manifest: tauri-build's default has NO <compatibility>
     // section, so Windows version-lies 6.2 to the process and libmpv's

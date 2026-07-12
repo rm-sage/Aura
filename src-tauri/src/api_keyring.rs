@@ -28,7 +28,11 @@ const KEYRING_SERVICE: &str = "aura-api-keys";
 /// Canonical name of every API key Aura stores. Centralised here so
 /// the migration, reads, and settings-export paths all reference the
 /// same set.
-pub const SUPPORTED_KEYS: &[&str] = &["opensubtitles"];
+/// `tmdb` is optional: `arcs.rs` falls back to the build-time baked
+/// `AURA_TMDB_KEY` when the keyring has no entry, so a user only needs to set
+/// one to override the shared app key (or to make arcs work in a build that
+/// was compiled without a baked key).
+pub const SUPPORTED_KEYS: &[&str] = &["opensubtitles", "tmdb"];
 
 fn entry(name: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEYRING_SERVICE, name).map_err(|e| e.to_string())

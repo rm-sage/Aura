@@ -107,6 +107,11 @@ import { streamMatchKey } from "../watchTogether/streamMatch";
 import Tooltip from "../Tooltip";
 import { BrandLogo, ratingDomain, groupRatingsByBrand } from "../logodev";
 import { hasUsableRating } from "../ratingValue";
+import ArcGrid from "../ArcGrid";
+import {
+  arcPositionOf, arcYearRange, loadArcMode, saveArcMode, useStoryArcs,
+  type EpisodeGrouping,
+} from "../storyArcs";
 
 // ---------------------------------------------------------------------------
 // DetailView — full-bleed cinematic detail page with a "Command Center" feel.
@@ -1501,6 +1506,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
             isEpisodic={isEpisodic}
             seriesId={meta.id}
             seriesMediaType={meta.media_type}
+            detail={detail}
             videos={detail?.videos ?? []}
             activeVideo={activeVideo}
             streams={streams}
@@ -2354,6 +2360,9 @@ interface PanelProps {
   /** "series" / "anime" — drives the meta-cache URL lookup that
    *  EpisodeRow's auto-advance uses to find the next episode. */
   seriesMediaType: string;
+  /** Full meta. Only the episodes panel uses it, to resolve story arcs (which
+   *  need the anime signals + the TMDB id, not just the video list). */
+  detail?: MetaDetail | null;
   videos: VideoEntry[];
   activeVideo: VideoEntry | null;
   streams: StreamEntry[];
@@ -2394,7 +2403,7 @@ interface PanelProps {
 function UnifiedPanel({
   mode, partyStreamKey, isEpisodic, seriesId, seriesMediaType, videos, activeVideo, streams, streamMeta, streamsLoading,
   groupedStreams, metaLoading, onPickEpisode, onBackToEpisodes, onPlay, onCopy, onPlayExternal,
-  scrollToVideoId, onScrollHandled, seasonHint, seasonNames, highlightVideoId, seriesArt,
+  scrollToVideoId, onScrollHandled, seasonHint, seasonNames, highlightVideoId, seriesArt, detail,
 }: PanelProps) {
   // The streams panel needs `position: relative` so the floating AIOStreams
   // status icons (rendered with `absolute -top-3 -left-3`) anchor to its
@@ -2426,6 +2435,7 @@ function UnifiedPanel({
             seasonNames={seasonNames}
             highlightVideoId={highlightVideoId}
             seriesArt={seriesArt}
+            detail={detail}
           />
         </div>
       ) : (
@@ -2904,9 +2914,40 @@ function EpisodeCountChip({
   );
 }
 
+/** Seasons | Arcs. Mirrors LiveView's ViewModeToggle so the two segmented
+ *  controls in the app look like the same control. */
+function GroupingToggle({
+  mode,
+  onChange,
+}: {
+  mode: EpisodeGrouping;
+  onChange: (m: EpisodeGrouping) => void;
+}) {
+  return (
+    <div className="flex gap-1 p-0.5 rounded-lg bg-white/6 border border-white/8" role="group" aria-label="Episode grouping">
+      {(["seasons", "arcs"] as const).map((m) => (
+        <button
+          key={m}
+          type="button"
+          onClick={() => onChange(m)}
+          aria-pressed={mode === m}
+          className={[
+            "px-2.5 h-6 rounded-md text-[11px] font-medium capitalize transition-colors",
+            mode === m
+              ? "bg-ln-accent/20 text-ln-accent"
+              : "text-white/50 hover:text-white/85",
+          ].join(" ")}
+        >
+          {m}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function EpisodesPanel({
   seriesId, seriesMediaType, videos, activeVideo, onPick, scrollToVideoId, onScrollHandled,
-  metaLoading, seasonHint, seasonNames, highlightVideoId, seriesArt,
+  metaLoading, seasonHint, seasonNames, highlightVideoId, seriesArt, detail,
 }: {
   seriesId: string;
   seriesMediaType: string;
@@ -2916,6 +2957,10 @@ function EpisodesPanel({
   onPick: (v: VideoEntry) => void;
   scrollToVideoId?: string | null;
   onScrollHandled?: () => void;
+  /** The full meta, needed to resolve story arcs (anime detection + the TMDB
+   *  id). Arcs are a progressive enhancement: no meta, no key, or no arc
+   *  grouping simply means the Seasons/Arcs toggle never renders. */
+  detail?: MetaDetail | null;
   /** Season parsed from the catalog entry's title (e.g. "Dorohedoro
    *  Season 2" → 2). Selected on open when that season actually exists
    *  in the cour-aggregated videos, UNLESS a resume / just-played
@@ -3039,6 +3084,50 @@ function EpisodesPanel({
     }));
   }, [season]);
 
+  // ── Story arcs ────────────────────────────────────────────────────────────
+  // An orthogonal axis to `season`: the panel shows EITHER the season list OR
+  // the arc list. Arcs resolve async and are absent for most shows, so nothing
+  // below may assume they exist.
+  const [grouping, setGrouping] = useState<EpisodeGrouping>(() => loadArcMode(seriesId).mode);
+  const [groupingId, setGroupingId] = useState<string | undefined>(
+    () => loadArcMode(seriesId).groupingId,
+  );
+  const [openArcId, setOpenArcId] = useState<string | null>(null);
+  const { arcs: arcResult } = useStoryArcs(detail ?? null, seriesId, groupingId);
+
+  const arcAvailable = !!arcResult && arcResult.arcs.length > 0;
+  // Guard every render path on availability, not just on the toggle: a user who
+  // last left One Piece in Arcs mode must not get an empty panel when the TMDB
+  // fetch fails or the key is missing.
+  const arcMode = grouping === "arcs" && arcAvailable;
+  const openArc = useMemo(
+    () => (arcMode ? arcResult!.arcs.find((a) => a.id === openArcId) ?? null : null),
+    [arcMode, arcResult, openArcId],
+  );
+
+  const switchGrouping = useCallback(
+    (next: EpisodeGrouping) => {
+      setGrouping(next);
+      saveArcMode(seriesId, next, groupingId);
+      // Entering Arcs mode: land the user on the arc holding the episode they
+      // were about to resume, rather than dumping them at arc 1 of 55.
+      if (next === "arcs" && arcResult) {
+        const anchor = resolvedScrollId ?? activeVideo?.id ?? null;
+        setOpenArcId(anchor ? arcPositionOf(arcResult, anchor)?.arc.id ?? null : null);
+      }
+    },
+    [seriesId, groupingId, arcResult, resolvedScrollId, activeVideo?.id],
+  );
+
+  const switchArcGrouping = useCallback(
+    (id: string) => {
+      setGroupingId(id);
+      setOpenArcId(null);
+      saveArcMode(seriesId, "arcs", id);
+    },
+    [seriesId],
+  );
+
   const inSeason = useMemo(() => {
     const list = seasons.length === 0
       ? [...videos]
@@ -3047,11 +3136,34 @@ function EpisodesPanel({
     return list;
   }, [videos, season, seasons.length]);
 
+  /** The episodes of the open arc, in ARC order (not season order): a
+   *  cross-season arc renders as one flat list and the season boundary is
+   *  invisible. Ids the addon no longer lists are dropped rather than rendered
+   *  as holes. */
+  const inArc = useMemo(() => {
+    if (!openArc) return [];
+    const byId = new Map(videos.map((v) => [v.id, v]));
+    return openArc.episode_ids
+      .map((id) => byId.get(id))
+      .filter((v): v is VideoEntry => !!v);
+  }, [openArc, videos]);
+
+  /** Whichever list is actually on screen. Used for the row context menu's
+   *  bulk "mark this and above/below" actions, which operate on the visible
+   *  list. */
+  const visibleEpisodes = arcMode ? (openArc ? inArc : []) : inSeason;
+
   // Filler / recap counts for the SELECTED season only (shown on hover of the
   // season episode-count chip), same source as the show-wide header totals.
   const { filler: seasonFiller, recap: seasonRecap, canon: seasonCanon } = useMemo(
     () => countFillerRecap(inSeason, cloudSignal?.episode_kinds ?? []),
     [inSeason, cloudSignal],
+  );
+  // Same breakdown, scoped to the open arc. Routed through the SAME helper so
+  // the arc chip can never disagree with the badges on its own rows.
+  const { filler: arcFiller, recap: arcRecap, canon: arcCanon } = useMemo(
+    () => countFillerRecap(inArc, cloudSignal?.episode_kinds ?? []),
+    [inArc, cloudSignal],
   );
   // Only anime with any filler/recap get the hover breakdown; live-action shows
   // (zero of both show-wide) render the plain chip with no tooltip.
@@ -3122,13 +3234,20 @@ function EpisodesPanel({
       <PanelHeader
         title="Episodes"
         right={(
-          <EpisodeCountChip
-            label={`${videos.length} total`}
-            showBreakdown={showHasFillerRecap}
-            canon={canonCount}
-            filler={fillerCount}
-            recap={recapCount}
-          />
+          <div className="flex items-center gap-2.5">
+            {/* Only offered when the show genuinely has arcs. Most of the
+                library will never see this control. */}
+            {arcAvailable && (
+              <GroupingToggle mode={grouping} onChange={switchGrouping} />
+            )}
+            <EpisodeCountChip
+              label={`${videos.length} total`}
+              showBreakdown={showHasFillerRecap}
+              canon={canonCount}
+              filler={fillerCount}
+              recap={recapCount}
+            />
+          </div>
         )}
       />
       <div className="pl-5 pr-4 py-3 flex-1 min-h-0 flex flex-col">
@@ -3171,15 +3290,56 @@ function EpisodesPanel({
           <p className="text-white/50 text-[13px] italic">
             No episode list returned by the addon.
           </p>
+        ) : arcMode && !openArc ? (
+          // Arc picker. Scrolls on its own so a 55-arc show (One Piece) behaves
+          // like the episode list does.
+          <div
+            className="flex-1 min-h-0 overflow-y-auto px-1 pt-1 pb-4"
+            style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
+          >
+            <ArcGrid
+              result={arcResult!}
+              seriesId={seriesId}
+              onSelect={(arc) => setOpenArcId(arc.id)}
+              onGroupingChange={switchArcGrouping}
+            />
+          </div>
         ) : (
           <>
+            {/* Arc breadcrumb, replacing the season dropdown while an arc is
+                open. Same vertical rhythm so the list below does not shift. */}
+            {arcMode && openArc && (
+              <div className="flex items-center justify-center gap-3.5 mb-4">
+                <button
+                  type="button"
+                  onClick={() => setOpenArcId(null)}
+                  className="flex items-center gap-1.5 px-3 h-7 rounded-lg text-[12px] font-medium
+                             text-white/70 hover:text-white bg-white/6 hover:bg-white/12 transition-colors"
+                >
+                  <span aria-hidden>&larr;</span>
+                  <span className="truncate max-w-[22rem]">{openArc.name}</span>
+                </button>
+                <EpisodeCountChip
+                  label={`${inArc.length} ${inArc.length === 1 ? "ep" : "eps"}`}
+                  showBreakdown={showHasFillerRecap}
+                  canon={arcCanon}
+                  filler={arcFiller}
+                  recap={arcRecap}
+                  scope="this arc"
+                />
+                {arcYearRange(openArc) && (
+                  <span className="text-[12px] text-white/40">{arcYearRange(openArc)}</span>
+                )}
+              </div>
+            )}
+
             {/* Season dropdown + per-season episode count, centred as a
                 group with a clear gap between them. The count is a standout
                 accent chip (matching the absolute-total chip in the header)
                 so the selected season's length reads at a glance. The
                 dropdown truncates (min-w-0 in SeasonSelect) rather than
                 shoving the chip on a narrow panel. */}
-            {seasons.length > 1 && (
+            {!arcMode && seasons.length > 1 && (
               <div className="flex items-center justify-center gap-3.5 mb-4">
                 <SeasonSelect
                   seasons={seasons}
@@ -3208,7 +3368,7 @@ function EpisodesPanel({
               className="flex-1 min-h-0 overflow-y-auto px-3 pt-3 pb-4 space-y-1.5"
               style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
             >
-              {inSeason.map((v) => (
+              {visibleEpisodes.map((v) => (
                 <div key={v.id} data-episode-id={v.id}>
                   <EpisodeRow
                     video={v}
@@ -3216,7 +3376,7 @@ function EpisodesPanel({
                     seriesMediaType={seriesMediaType}
                     isActive={activeVideo?.id === v.id}
                     onPick={onPick}
-                    seasonVideos={inSeason}
+                    seasonVideos={visibleEpisodes}
                     isNextAiring={v.id === nextAiringId}
                     isDeepLinked={v.id === highlightId}
                     seriesArt={seriesArt}

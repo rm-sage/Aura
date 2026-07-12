@@ -22,6 +22,9 @@
 
 mod addons;
 mod aniskip;
+mod arc_align;
+mod arc_art;
+mod arcs;
 mod auth;
 mod backup;
 // Casting (Chromecast CASTV2 + DLNA SOAP) — discovery, LAN media proxy,
@@ -57,6 +60,7 @@ mod stats;
 mod storage;
 mod streaming;
 mod stremio;
+mod subsync;
 mod subtitles;
 mod sync;
 mod thumbs;
@@ -757,14 +761,48 @@ async fn set_audio_delay(seconds: f64) -> Result<(), String> {
 
 /// Nudge subtitle sync forward or backward. Wraps MPV's `sub-delay`
 /// property (seconds, f64). Positive = subs appear later; negative =
-/// subs appear earlier. Same ±10 s clamp as `set_audio_delay`.
+/// subs appear earlier.
+///
+/// The clamp is ±120 s, deliberately far wider than `set_audio_delay`'s ±10 s.
+/// An audio delay past 10 s means the user has a worse problem than mistiming,
+/// but a SUBTITLE file grabbed for a different release routinely sits tens of
+/// seconds out (a different intro cut, a broadcast-vs-web master), and Live
+/// Sync exists precisely to fix those. The old ±10 s clamp silently truncated
+/// exactly the corrections the feature was built to apply.
 #[tauri::command]
 async fn set_subtitle_delay(seconds: f64) -> Result<(), String> {
-    let clamped = seconds.clamp(-10.0, 10.0);
+    let clamped = seconds.clamp(-120.0, 120.0);
     crate::devlog!(info, "player", "set_subtitle_delay({clamped:.3})");
     #[cfg(target_os = "windows")]
     return mpv::engine::submit_set_property(
         "sub-delay".into(),
+        mpv::engine::PropValue::Double(clamped),
+    );
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = clamped;
+        Err("playback engine is Windows-only".into())
+    }
+}
+
+/// Scale subtitle timestamps. Wraps MPV's `sub-speed` (a multiplier applied to
+/// every cue time, text subs only).
+///
+/// This is what a constant `sub-delay` cannot fix: subtitles authored against a
+/// different framerate are correct at the start and progressively wrong by the
+/// end. Live Sync's two-point mode solves for delay AND speed from two anchor
+/// lines and writes both.
+///
+/// Clamped to 0.5..2.0. Real framerate mismatches live in a narrow band around
+/// 1.0 (25 / 23.976 = 1.043, its inverse = 0.959); anything outside this range
+/// is a solve gone wrong, not a real correction, and would scramble the track.
+#[tauri::command]
+async fn set_subtitle_speed(speed: f64) -> Result<(), String> {
+    let clamped = if speed.is_finite() { speed.clamp(0.5, 2.0) } else { 1.0 };
+    crate::devlog!(info, "player", "set_subtitle_speed({clamped:.5})");
+    #[cfg(target_os = "windows")]
+    return mpv::engine::submit_set_property(
+        "sub-speed".into(),
         mpv::engine::PropValue::Double(clamped),
     );
     #[cfg(not(target_os = "windows"))]
@@ -876,6 +914,16 @@ struct TrackEntry {
     /// True for tracks injected via `sub-add` (external `.srt`/`.vtt`).
     external: bool,
     codec: Option<String>,
+    /// The file path or URL backing an external track (mpv's
+    /// `track-list/N/external-filename`). `None` for container-embedded tracks.
+    ///
+    /// Without this, `external: true` tells you a track came from `sub-add` but
+    /// NOT what it came from: an OpenSubtitles download's local path is thrown
+    /// away by the picker after `add_subtitle_to_mpv`, and an addon sub's URL is
+    /// only recoverable by title-matching back into the addon list. Live Sync
+    /// needs the actual source to read the cue text, so we read the one
+    /// subproperty that answers it.
+    external_filename: Option<String>,
 }
 
 /// Snapshot the current MPV track-list. Returns one entry per video / audio /
@@ -934,8 +982,16 @@ async fn get_tracks() -> Result<Vec<TrackEntry>, String> {
                 let codec = mpv::engine::submit_get_property(
                     format!("track-list/{}/codec", i), GetFormat::String,
                 ).ok().and_then(|v| v.as_str().map(String::from));
+                // Same typed-String path as title / lang / codec above, so this
+                // carries no new crash surface (the node-format read is the one
+                // that faults, and we never do that).
+                let external_filename = mpv::engine::submit_get_property(
+                    format!("track-list/{}/external-filename", i), GetFormat::String,
+                ).ok().and_then(|v| v.as_str().map(String::from))
+                 .filter(|s| !s.is_empty());
                 out.push(TrackEntry {
                     id, track_type, title, lang, selected, external, codec,
+                    external_filename,
                 });
             }
             Ok::<Vec<TrackEntry>, String>(out)
@@ -2176,8 +2232,16 @@ pub fn run() {
             set_audio_delay,
             set_subtitle_track,
             set_subtitle_delay,
+            set_subtitle_speed,
             set_subtitle_visibility,
             set_panscan,
+            // ── Live subtitle sync ──────────────────────────────────────────
+            subsync::parse_subtitle_cues,
+            subsync::extract_embedded_cues,
+            subsync::probe_subtitle_streams,
+            // ── Story arcs ──────────────────────────────────────────────────
+            arcs::fetch_story_arcs,
+            arcs::story_arcs_available,
             dev_force_panic,
             debug_panel::debug_engine_state,
             debug_panel::debug_drop_test,

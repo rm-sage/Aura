@@ -24,7 +24,18 @@ commands.allow = [
   "set_audio_delay",
   "set_subtitle_track",
   "set_subtitle_delay",
+  "set_subtitle_speed",
   "set_subtitle_visibility",
+  # Live subtitle sync: read the cue list of the active subtitle track so the
+  # user can click the line they just heard. External tracks parse straight
+  # from the .srt/.vtt/.ass we already have; embedded tracks come out of a
+  # windowed ffmpeg extraction.
+  "parse_subtitle_cues",
+  "extract_embedded_cues",
+  "probe_subtitle_streams",
+  # Story arcs: TMDB episode groups, joined to the addon's episode ids.
+  "fetch_story_arcs",
+  "story_arcs_available",
   "set_panscan",
   "get_tracks",
   "get_property",
