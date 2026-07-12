@@ -98,6 +98,10 @@ export interface TrackEntry {
   selected: boolean;
   external: boolean;
   codec: string | null;
+  /** File path or URL backing an EXTERNAL track (mpv `track-list/N/external-filename`).
+   *  null for container-embedded tracks. This is what makes a track's cue text
+   *  reachable at all. */
+  external_filename?: string | null;
 }
 
 /** Per-addon-catalog search results — drives the Search view's per-addon

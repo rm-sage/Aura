@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import {
-  createContext,
   useCallback,
-  useContext,
   useEffect,
   useMemo,
   useRef,
@@ -25,6 +23,8 @@ import { pickDefaultAudio, type ScoringMeta } from "./audioScoring";
 import { prettyBinding } from "./useKeybindings";
 import { loadAuraSettings, saveAuraSettings } from "./auraSettings";
 import AniSkipMenu from "./AniSkipMenu";
+import SubtitleSyncPanel, { type SyncAnchorPair } from "./SubtitleSyncPanel";
+import { MenuTrackerCtx, useMenuOpenSync, type MenuTracker } from "./menuTracker";
 import { copyTextToClipboard } from "./clipboard";
 
 // Max volume the slider / wheel / keys can reach. mpv's `volume-max` init option
@@ -40,22 +40,9 @@ export const VOLUME_MAX = 150;
 //     menu (so the user doesn't accidentally toggle pause on dismissal).
 // ---------------------------------------------------------------------------
 
-interface MenuTracker {
-  notify: (delta: 1 | -1) => void;
-}
-
-const MenuTrackerCtx = createContext<MenuTracker | null>(null);
-
-/** Increments/decrements the parent's open-menu counter as `open` flips. */
-function useMenuOpenSync(open: boolean) {
-  const tracker = useContext(MenuTrackerCtx);
-  useEffect(() => {
-    if (!tracker) return;
-    if (!open) return;
-    tracker.notify(1);
-    return () => tracker.notify(-1);
-  }, [open, tracker]);
-}
+// The open-menu counter (MenuTrackerCtx + useMenuOpenSync) lives in
+// ./menuTracker so sibling panels rendered outside this module can join the
+// same coordination without importing back into PlayerOverlay.
 
 /** openUrl wrapper — wrapped in try/catch so a missing permission can
  *  never crash the app. (Clipboard copy: ./clipboard#copyTextToClipboard.) */
@@ -1365,9 +1352,29 @@ export default function PlayerOverlay({
   // the displayed value matches.
   const [audioDelay, setAudioDelay] = useState(0);
   const [subDelay,   setSubDelay]   = useState(0);
+  // ── Live Subtitle Sync ──
+  // `subSpeed` is mpv's `sub-speed` (the framerate-drift multiplier a two-point
+  // solve produces). `syncFirstAnchor` is the first (playback clock, cue end)
+  // pair of that solve: it lives HERE, not in the panel, because the two-point
+  // flow is "pick a line, close, play on, reopen, pick a second line" and the
+  // panel unmounts in between.
+  const [subSpeed, setSubSpeed] = useState(1);
+  const [syncFirstAnchor, setSyncFirstAnchor] = useState<SyncAnchorPair | null>(null);
+  const [syncOpen, setSyncOpen] = useState(false);
   useEffect(() => {
     setAudioDelay(0);
     setSubDelay(0);
+    setSubSpeed(1);
+    setSyncFirstAnchor(null);
+    setSyncOpen(false);
+    // mpv zeroes sub-delay / audio-delay itself on loadfile, but `sub-speed` is
+    // an OPTION: a runtime change to it persists across files, so a drift
+    // correction solved for one release would silently follow the user into the
+    // next episode. Clear it explicitly. Nothing is persisted to disk either
+    // way: a sub delay belongs to the RELEASE, not the title, so persisting it
+    // would re-apply a wrong correction after a source switch (same reasoning
+    // as playback speed and the video EQ, which are also session-only).
+    invoke("set_subtitle_speed", { speed: 1 }).catch(() => {});
   }, [activeTarget?.id]);
   const nudgeAudioDelay = useCallback((delta: number) => {
     setAudioDelay((prev) => {
@@ -1376,9 +1383,13 @@ export default function PlayerOverlay({
       return next;
     });
   }, []);
+  // Clamped to mpv's own +/-120 s range (lib.rs `set_subtitle_delay`), NOT the
+  // old +/-10: Live Sync can legitimately land a 30 s correction on a
+  // badly-muxed release, and a ±10 clamp here would snap it back the moment the
+  // user tapped +0.1.
   const nudgeSubDelay = useCallback((delta: number) => {
     setSubDelay((prev) => {
-      const next = Math.max(-10, Math.min(10, +(prev + delta).toFixed(3)));
+      const next = Math.max(-120, Math.min(120, +(prev + delta).toFixed(3)));
       invoke("set_subtitle_delay", { seconds: next }).catch(() => {});
       return next;
     });
@@ -1387,9 +1398,15 @@ export default function PlayerOverlay({
     setAudioDelay(0);
     invoke("set_audio_delay", { seconds: 0 }).catch(() => {});
   }, []);
+  // Full reset of the subtitle timing: delay AND the drift multiplier. Zeroing
+  // the delay while leaving a 1.043x speed applied would leave the track just as
+  // wrong, in a way the user has no visible control for from this row.
   const resetSubDelay = useCallback(() => {
     setSubDelay(0);
+    setSubSpeed(1);
+    setSyncFirstAnchor(null);
     invoke("set_subtitle_delay", { seconds: 0 }).catch(() => {});
+    invoke("set_subtitle_speed", { speed: 1 }).catch(() => {});
   }, []);
 
   // ── Toast (transient feedback over the player) ──
@@ -2459,6 +2476,7 @@ export default function PlayerOverlay({
                 onMinus: () => nudgeSubDelay(-0.1),
                 onPlus:  () => nudgeSubDelay(+0.1),
                 onReset: resetSubDelay,
+                onLiveSync: () => setSyncOpen(true),
               }}
             />
 
@@ -2534,6 +2552,27 @@ export default function PlayerOverlay({
         }
         streamUrl={streamUrl}
         onClose={() => setSubsOpen(false)}
+      />
+
+      {/* Live Subtitle Sync: cue picker. Sibling of SubtitlePicker, inside
+          MenuTrackerCtx so its own `useMenuOpenSync(open)` freezes the
+          control-bar auto-hide while it is up. Owns nothing: the delay, the
+          drift multiplier and the first two-point anchor all live in this
+          component's state so they survive the panel closing and reopening. */}
+      <SubtitleSyncPanel
+        open={syncOpen}
+        onClose={() => setSyncOpen(false)}
+        currentTime={time}
+        paused={paused}
+        togglePause={togglePause}
+        tracks={tracks}
+        streamUrl={streamUrl}
+        subDelay={subDelay}
+        setSubDelay={setSubDelay}
+        subSpeed={subSpeed}
+        setSubSpeed={setSubSpeed}
+        firstAnchor={syncFirstAnchor}
+        setFirstAnchor={setSyncFirstAnchor}
       />
 
       {/* Performance OSD */}
@@ -3419,6 +3458,10 @@ function TrackMenu({
     onMinus: () => void;
     onPlus:  () => void;
     onReset: () => void;
+    /** When set, adds a "Live sync" button to the delay row. This is the row a
+     *  user already comes to when the subtitles are off, so it is where the
+     *  cue-picker panel belongs. Clicking closes this menu and opens the panel. */
+    onLiveSync?: () => void;
   };
 }) {
   const [open, setOpen] = useState(false);
@@ -3601,6 +3644,17 @@ function TrackMenu({
                     Reset
                   </button>
                 </div>
+                {delay.onLiveSync && (
+                  <button
+                    type="button"
+                    onClick={() => { setOpen(false); delay.onLiveSync?.(); }}
+                    className="w-full px-1.5 py-1 rounded-md text-[11px] font-medium tracking-wide
+                               bg-ln-accent/15 text-ln-accent border border-ln-accent/35
+                               hover:bg-ln-accent/25 active:scale-95 transition-all"
+                  >
+                    Live sync · pick the line you heard
+                  </button>
+                )}
               </div>
             </>
           )}
