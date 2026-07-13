@@ -391,6 +391,10 @@ pub fn align(left: &[AlignEpisode], right: &[AlignEpisode]) -> Alignment {
     // become O(n^2) work.
     const RESIDUAL_MAX: usize = 512;
     const RESIDUAL_MAX_DELTA: i64 = 3;
+    // Sub-pass 2 (below) only fires when the two dates are at least this far
+    // apart, so it never touches the near-date regime the off-by-one protection
+    // guards.
+    const STRONG_TITLE_FAR_DELTA: i64 = 35;
     let mut left_consumed = vec![false; left_unmatched.len()];
     let mut right_consumed = vec![false; right_unmatched.len()];
     if !left_unmatched.is_empty()
@@ -436,6 +440,74 @@ pub fn align(left: &[AlignEpisode], right: &[AlignEpisode]) -> Alignment {
                     confidence: pair_confidence(score, attainable(&lefts[li], &rights[ri])),
                 });
             }
+        }
+
+        // Sub-pass 2: STRONG-TITLE recovery, for the case where an addon has the
+        // right titles but WRONG dates for a block. AIOMetadata dates Naruto's
+        // "Jiraiya Returns" four months early (2003-06 vs the real 2003-10), so
+        // neither the monotone DP nor sub-pass 1 can place it, yet its title is
+        // byte-identical to TMDB's. We pair such leftovers on EXACT normalized
+        // title, under three guards that keep it as safe as the date path:
+        //   1. Exact normalized-title equality, NOT a dice threshold. dice("...
+        //      part 1", "... part 2") is 0.95, so a threshold would cross
+        //      formulaic titles; exact string equality keeps "part 1" and
+        //      "part 2" distinct and un-crossable.
+        //   2. The title must be UNIQUE among the still-unmatched pool on BOTH
+        //      sides. A genuinely duplicated title ("Assault!" twice) stays a gap
+        //      rather than risk pairing the wrong instance.
+        //   3. FAR dates only (or a side dateless). This confines the branch to
+        //      gross mis-dating and leaves the near-date off-by-one protection
+        //      (a 7-day reorder is still refused) completely untouched.
+        // Confidence is scored on the TITLE axis alone, so a recovered exact-title
+        // pair reads as confidence 1.0 (its raw date-poisoned score would be
+        // negative and would otherwise make arcs.rs drop the whole arc).
+        let mut left_norm_count: HashMap<&str, u32> = HashMap::new();
+        let mut right_norm_count: HashMap<&str, u32> = HashMap::new();
+        for (lk, &li) in left_unmatched.iter().enumerate() {
+            if !left_consumed[lk] && !lefts[li].norm.is_empty() {
+                *left_norm_count.entry(lefts[li].norm.as_str()).or_insert(0) += 1;
+            }
+        }
+        for (rk, &ri) in right_unmatched.iter().enumerate() {
+            if !right_consumed[rk] && !rights[ri].norm.is_empty() {
+                *right_norm_count.entry(rights[ri].norm.as_str()).or_insert(0) += 1;
+            }
+        }
+        for (lk, &li) in left_unmatched.iter().enumerate() {
+            if left_consumed[lk] || lefts[li].norm.is_empty() {
+                continue;
+            }
+            let norm = lefts[li].norm.as_str();
+            if left_norm_count.get(norm) != Some(&1) || right_norm_count.get(norm) != Some(&1) {
+                continue; // guard 1 + 2: unique exact title on both sides
+            }
+            let Some((rk, &ri)) = right_unmatched
+                .iter()
+                .enumerate()
+                .find(|&(rk, &ri)| !right_consumed[rk] && rights[ri].norm == lefts[li].norm)
+            else {
+                continue;
+            };
+            let far = match (lefts[li].day, rights[ri].day) {
+                (Some(a), Some(b)) => (a - b).abs() > STRONG_TITLE_FAR_DELTA,
+                _ => true,
+            };
+            if !far {
+                continue; // guard 3: near-date pairs belong to sub-pass 1 / the DP
+            }
+            let dice = dice_from_counts(
+                &lefts[li].norm, &lefts[li].bigrams, lefts[li].bigram_total,
+                &rights[ri].norm, &rights[ri].bigrams, rights[ri].bigram_total,
+            );
+            let score = W_TITLE * dice;
+            right_consumed[rk] = true;
+            left_consumed[lk] = true;
+            pairs.push(AlignPair {
+                left_key: lefts[li].key.clone(),
+                right_key: rights[ri].key.clone(),
+                score,
+                confidence: pair_confidence(score, W_TITLE),
+            });
         }
     }
 
@@ -527,16 +599,17 @@ fn date_proximity(a: Option<i64>, b: Option<i64>) -> f64 {
         0.1
         // A month-plus apart is almost never the same episode, and this must lose
         // to a gap no matter what the title does, so the monotone DP always GAPS a
-        // far-date pair rather than forcing it. That matters because a shared word
-        // ("...Mission", "...Arc") gives filler episodes a moderate title score;
-        // at a gentler floor the DP would force a wrong far-date match instead of
-        // gapping cleanly, and the residual pass (which only recovers gapped
-        // episodes) could never fix it. W_DATE * -2.0 = -1.1, so even a perfect
-        // title (+0.45) lands at -0.65, well under the -0.35 gap. A genuinely
-        // mis-dated real match is then left for the residual pass, or simply
-        // dropped from its arc: absent beats wrong.
+        // far-date pair rather than forcing it. It has to lose even to gapping
+        // BOTH sides (2 * GAP = -0.70): a far-date pair with a PERFECT title
+        // (W_TITLE = 0.45) must still land below that, or the DP would quietly
+        // match a wrong-dated-but-identical-title episode in place and the
+        // strong-title residual (which only recovers GAPPED episodes) could never
+        // reach it. W_DATE * -2.5 = -1.375, so even +0.45 for a perfect title
+        // lands at -0.925, under -0.70. A genuinely mis-dated real match is then
+        // left for the residual (recovered by exact title if unique) or dropped
+        // from its arc: absent beats wrong.
     } else {
-        -2.0
+        -2.5
     }
 }
 
@@ -716,6 +789,13 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// Sort a list into broadcast (air-date) order, mirroring what arcs.rs does
+    /// before it calls `align`. Undated episodes sort last.
+    fn by_date(mut v: Vec<AlignEpisode>) -> Vec<AlignEpisode> {
+        v.sort_by_key(|e| (e.day.unwrap_or(i64::MAX), e.key.clone()));
+        v
     }
 
     // ---------------------------------------------------------------- parse_day
@@ -1242,6 +1322,95 @@ mod tests {
         let a = align(&left, &right);
         assert_eq!(a.left_only, vec!["CROSS".to_string()]);
         assert!(a.right_only.is_empty());
+    }
+
+    #[test]
+    fn strong_title_recovers_a_wrong_dated_but_identical_title_block() {
+        // The Naruto case: an addon has the right titles but WRONG dates for a
+        // block (Jiraiya Returns dated 4 months early). The block gaps on both
+        // sides (dates far off), and strong-title recovery must pair it by exact
+        // title. Distinctive titles, dates 126 days (18 weeks) apart.
+        const HEAD: usize = 12;
+        let base = parse_day("2003-01-01").unwrap();
+        let mut left: Vec<AlignEpisode> = Vec::new();
+        let mut right: Vec<AlignEpisode> = Vec::new();
+        for i in 0..HEAD {
+            let day = Some(base + 7 * i as i64);
+            left.push(ep(&format!("L{i}"), &title_of(i), day));
+            right.push(ep(&format!("R{i}"), &title_of(i), day));
+        }
+        // A block with distinctive, identical titles. Left dates are correct;
+        // right (addon) dates are 126 days early, so the monotone gaps them.
+        let block: [&str; 4] = [
+            "long time no see jiraiya returns",
+            "the summoning jutsu wisdom of the toad sage",
+            "a feeling of yearning a flower full of hope",
+            "hospital besieged the evil hand revealed",
+        ];
+        for (k, title) in block.iter().enumerate() {
+            let real = base + 7 * (HEAD + k) as i64;
+            left.push(ep(&format!("LB{k}"), title, Some(real)));
+            right.push(ep(&format!("RB{k}"), title, Some(real - 126)));
+        }
+
+        let a = align(&left, &right);
+        for k in 0..4 {
+            assert_eq!(
+                a.map(&format!("LB{k}")),
+                Some(format!("RB{k}").as_str()),
+                "block ep {k} must recover by exact title",
+            );
+        }
+        // Recovered pairs are title-confident (1.0), so an arc built from them
+        // clears the confidence gate.
+        for k in 0..4 {
+            assert!(
+                a.confidence_of(&format!("LB{k}")).unwrap() >= 0.5,
+                "recovered pair must be confident",
+            );
+        }
+    }
+
+    #[test]
+    fn strong_title_will_not_cross_formulaic_part_titles() {
+        // "The Chunin Exam, Part 1..4", wrong-dated and reversed so both sides gap
+        // them. Exact-title equality (not dice) keeps Part N distinct, so none
+        // cross-pair.
+        let base = parse_day("2003-01-01").unwrap();
+        let mut left = weekly_run("L", 10);
+        let mut right = weekly_run("R", 10);
+        let parts = ["the chunin exam part 1", "the chunin exam part 2", "the chunin exam part 3", "the chunin exam part 4"];
+        for (k, t) in parts.iter().enumerate() {
+            left.push(ep(&format!("LP{k}"), t, Some(base + 7 * (20 + k) as i64)));
+        }
+        // right block reversed AND far-dated
+        for k in (0..4).rev() {
+            right.push(ep(&format!("RP{k}"), parts[k], Some(base + 7 * (20 + k) as i64 - 200)));
+        }
+        let a = align(&left, &right);
+        // Each Part N pairs only with its exact-title counterpart, never a neighbour.
+        for k in 0..4 {
+            if let Some(m) = a.map(&format!("LP{k}")) {
+                assert_eq!(m, format!("RP{k}"), "Part {k} must not cross to another Part");
+            }
+        }
+    }
+
+    #[test]
+    fn strong_title_refuses_a_duplicated_title() {
+        // Two DIFFERENT episodes both titled "assault" gap on each side. The
+        // uniqueness guard must refuse them (a duplicated title cannot be
+        // disambiguated by title alone).
+        let base = parse_day("2003-01-01").unwrap();
+        let mut left = weekly_run("L", 8);
+        let mut right = weekly_run("R", 8);
+        left.push(ep("LA0", "assault", Some(base + 7 * 20)));
+        left.push(ep("LA1", "assault", Some(base + 7 * 21)));
+        right.push(ep("RA0", "assault", Some(base + 7 * 20 - 300)));
+        right.push(ep("RA1", "assault", Some(base + 7 * 21 - 300)));
+        let a = align(&left, &right);
+        assert!(a.map("LA0").is_none(), "a duplicated title must not be strong-title paired");
+        assert!(a.map("LA1").is_none());
     }
 
     #[test]

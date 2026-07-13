@@ -105,7 +105,7 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
     destructive: false,
   },
   {
-    prefix:      "aura:story-arcs:v6",
+    prefix:      "aura:story-arcs:v7",
     label:       "Story arc cache",
     description: "Per-series story arcs (TMDB episode groups, already mapped onto your addon's episode ids). 24-hour TTL because an ongoing show gains an episode every week. Re-fetches on the next detail open. Safe to clear.",
     destructive: false,

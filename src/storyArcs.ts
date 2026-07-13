@@ -70,9 +70,9 @@ export interface ArcResult {
  *  arc-building or alignment logic changes in a way that invalidates previously
  *  cached results, because a stale result would otherwise hide the fix for 24 h.
  *  History: v2 dropped the raw-score gate's over-rejected arcs; v3 the widened
- *  band; v4 the residual pass; v5 air-date sorting; v6 majority confidence gate. */
+ *  band; v4 the residual pass; v5 air-date sorting; v6 majority gate; v7 strong-title recovery. */
 const arcCache = new PersistentCache<ArcResult | null>({
-  storageKey: "aura:story-arcs:v6",
+  storageKey: "aura:story-arcs:v7",
   ttlMs: 24 * 60 * 60 * 1000,
   maxEntries: 60,
 });
@@ -85,6 +85,7 @@ try {
   localStorage.removeItem("aura:story-arcs:v3");
   localStorage.removeItem("aura:story-arcs:v4");
   localStorage.removeItem("aura:story-arcs:v5");
+  localStorage.removeItem("aura:story-arcs:v6");
 } catch { /* localStorage unavailable; nothing to clean */ }
 
 /** The user's Seasons-vs-Arcs choice, and chosen grouping, per series. Bounded
