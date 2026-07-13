@@ -284,9 +284,9 @@ export function arcYearRange(arc: StoryArc): string {
 // ---------------------------------------------------------------------------
 
 /** A grouping name in a language other than the app's English UI. TMDB carries
- *  localized cuts like Naruto's "Italian Sagas" and Chinese-named groupings, and
- *  one of those must never become the DEFAULT just because it contains the word
- *  "saga". Detected by a leading language word or any non-ASCII character. */
+ *  localized cuts (Naruto's "Italian Sagas", CJK-named groupings). These are
+ *  hidden from the switcher entirely (see orderGroupings). Detected by a leading
+ *  language word or any non-ASCII character. */
 function isLocalizedGroupingName(name: string): boolean {
   // Any non-ASCII char (CJK names, accented locale titles).
   for (let i = 0; i < name.length; i++) {
@@ -301,19 +301,17 @@ function isLocalizedGroupingName(name: string): boolean {
 }
 
 /** Display-order rank. Lower sorts left and (since the default is the leftmost)
- *  is preferred. Order: an ENGLISH saga grouping, then arc groupings, then any
- *  localized grouping, then combos. */
+ *  is preferred. Order: an ENGLISH saga grouping, then arc groupings, then
+ *  combos. Localized groupings are FILTERED OUT before ranking, so they never
+ *  reach this. */
 function groupingRank(name: string): number {
   const n = name.toLowerCase();
   // COMBO IS TESTED FIRST, AND THAT ORDER IS LOAD-BEARING. One Piece's combo
   // grouping is literally named "Season, Arc & Saga Combos", so a "saga" check
   // that ran first would match it, sort it leftmost, AND make it the default -
   // the exact opposite of what we want.
-  if (n.includes("combo") || n.includes("combined")) return 3;
-  // A localized grouping ("Italian Sagas") is demoted below every English arc
-  // grouping so it is never the default, but still offered.
-  if (isLocalizedGroupingName(name)) return 2;
-  // Only an ENGLISH "Sagas" leads (One Piece). "Italian Sagas" was caught above.
+  if (n.includes("combo") || n.includes("combined")) return 2;
+  // Only an ENGLISH "Sagas" leads (One Piece).
   if (n.includes("saga")) return 0;
   return 1;
 }
@@ -325,10 +323,17 @@ export function groupingDisplayName(name: string): string {
   return name.trim().toLowerCase() === "story arc" ? "Story Arcs" : name;
 }
 
-/** Sagas first, story arcs next, combos last. Stable within a rank, so the
- *  backend's own ordering still breaks ties. Never mutates the input. */
+/** English-only groupings, Sagas first, story arcs next, combos last. Stable
+ *  within a rank, so the backend's own ordering breaks ties. Localized
+ *  groupings (Italian Sagas, CJK-named cuts) are HIDDEN entirely: they read as
+ *  clutter in an English UI, and a whole show of them (all groupings localized)
+ *  is vanishingly rare. If filtering would leave nothing, we keep the localized
+ *  ones so the user is never stranded with an empty switcher. Never mutates
+ *  the input. */
 export function orderGroupings(groupings: ArcGrouping[]): ArcGrouping[] {
-  return groupings
+  const english = groupings.filter((g) => !isLocalizedGroupingName(g.name));
+  const usable = english.length > 0 ? english : groupings;
+  return usable
     .map((g, i) => ({ g, i }))
     .sort((a, b) => groupingRank(a.g.name) - groupingRank(b.g.name) || a.i - b.i)
     .map((e) => e.g);
