@@ -830,6 +830,7 @@ async fn fetch_story_arcs_inner<R: Runtime>(
     for bucket in buckets {
         let mut episode_ids: Vec<String> = Vec::new();
         let mut dropped = 0usize;
+        let mut low_conf = 0usize;
         let mut worst = 1.0f64;
         let mut still: Option<String> = None;
 
@@ -847,14 +848,10 @@ async fn fetch_story_arcs_inner<R: Runtime>(
             let tkey = format!("{s}:{n}");
             match aligned.get(tkey.as_str()) {
                 Some(&(aura_id, confidence)) => {
-                    // `confidence`, NOT the raw score. The raw score is not
-                    // comparable across pairs: an episode missing an air date on
-                    // either side can never exceed the title weight (0.45), so
-                    // gating the raw score against 0.5 would reject a perfectly
-                    // aligned arc for having ONE dateless episode, which is
-                    // routine on ongoing shows and on TMDB's newest entries.
-                    // Confidence renormalises against the evidence available.
                     worst = worst.min(confidence);
+                    if confidence < MIN_PAIR_CONFIDENCE {
+                        low_conf += 1;
+                    }
                     if still.is_none() {
                         still = tmdb_by_key
                             .get(&tkey)
@@ -868,16 +865,25 @@ async fn fetch_story_arcs_inner<R: Runtime>(
         }
 
         if episode_ids.is_empty() {
-            continue;
-        }
-        // Fail visible, never fail off-by-one. An arc we are not confident
-        // about is an arc that silently starts and ends on the wrong episode,
-        // which is exactly the failure this whole module exists to prevent.
-        if worst < MIN_PAIR_CONFIDENCE {
             crate::devlog!(
                 warn, "arcs",
-                "dropping arc '{}': low alignment confidence {:.2}",
-                bucket.name, worst
+                "arc '{}' empty: 0 of {} episodes mapped (dropped {})",
+                bucket.name, bucket.episodes.len(), dropped
+            );
+            continue;
+        }
+        // Confidence gate, but a MAJORITY-based one. A single episode whose title
+        // is a divergent translation (or whose date is a few days off) scores low
+        // but is still the right episode; dropping the whole arc for one such
+        // outlier was killing legitimate tail arcs. A genuinely mis-aligned arc,
+        // by contrast, has MOST of its pairs wrong. So drop only when at least
+        // half the mapped episodes are low-confidence: off-by-one protection
+        // intact, single outliers tolerated.
+        if low_conf * 2 >= episode_ids.len() {
+            crate::devlog!(
+                warn, "arcs",
+                "dropping arc '{}': {}/{} episodes low-confidence (worst {:.2})",
+                bucket.name, low_conf, episode_ids.len(), worst
             );
             rejected += 1;
             continue;
