@@ -140,12 +140,6 @@ whichever reads as the richest single image of Aura's discovery layer.
   episode number), so they appear only for the shows that have them. The feature needs a TMDB key
   (baked in, or your own under Settings > API Keys) and is inert without one.
 
-<!--
-SCREENSHOT NEEDED: docs/screenshots/story-arcs.png - the Detail page in Arcs mode, with the
-Seasons/Arcs toggle and the grouping switcher (Sagas / Story Arcs) visible, and a grid of arc tiles
-showing key art, episode ranges, and progress. One Piece is the showcase title. Section: "Anime and
-skip tooling".
--->
 <p align="center">
   <img src="docs/screenshots/story-arcs.png" alt="Story Arcs view on the Detail page with arc tiles" width="920">
 </p>
@@ -164,11 +158,6 @@ skip tooling".
   two point mode takes a second anchor further into the episode to correct framerate drift through
   mpv's subtitle speed, with a one click undo if a correction is not what you wanted.
 
-<!--
-SCREENSHOT NEEDED: docs/screenshots/subtitle-sync.png - the Live Subtitle Sync panel open bottom-right
-in the player, showing the delay readout at the top and the scrollable list of subtitle lines with the
-anchor line highlighted. A paused subtitled frame behind it reads best. Section: "Subtitles".
--->
 <p align="center">
   <img src="docs/screenshots/subtitle-sync.png" alt="Live Subtitle Sync panel with a cue list in the player" width="560">
 </p>
@@ -198,12 +187,22 @@ ring if you can trigger auto-advance). The dark scrim over a paused frame looks 
 - **Trakt** (OAuth device flow) and **AniList** (GraphQL) scrobbling, both authorized through an in
   app popup.
 - Cour aware anime mapping with absolute episode fallbacks, completion gates (80 percent plus real
-  elapsed time) to avoid false marks, proactive token refresh, expiry alerts, and a master on and off
-  toggle.
-- **Manual scrobble from History**: every History row has a Scrobble to Trakt button (and a Scrobble
-  to AniList button for anime) that pushes the play backdated to when you actually watched it, so a
-  session where scrobbling was off, or a title one service missed, can still be recorded after the
-  fact (Trakt to the exact watch time, AniList to the day).
+  elapsed time) to avoid false marks, proactive token refresh, and expiry alerts.
+- **Automatic scrobbling on by default**, with a separate toggle to turn it off if you would rather
+  decide what gets recorded yourself, plus a master switch that silences all scrobble traffic.
+- **Manual scrobble from History**: every row has a Scrobble to Trakt button (and a Scrobble to
+  AniList button for anime) that pushes the play backdated to when you actually watched it, so a
+  session where automatic scrobbling was off, or a title one service missed, can still be recorded
+  after the fact (Trakt to the exact watch time, AniList to the day).
+- **Scrobble All and bulk scrobbling**: send your entire history at once, or select individual rows
+  (or every play on a given date) and scrobble or remove them together. Runs are paced with backoff
+  so a large history does not trip a service rate limit, keep going if you leave the History page, and
+  ask before you close Aura mid run. Items a service has already refused are retired rather than
+  retried, and anything already recorded is skipped.
+
+<p align="center">
+  <img src="docs/screenshots/history-scrobble.png" alt="History page with multi-select and the Scrobble All action" width="920">
+</p>
 
 ## Casting
 
