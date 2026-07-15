@@ -446,6 +446,29 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                 }
             }
             WindowEvent::CloseRequested { api, .. } => {
+                // A bulk History scrobble is mid-flight and this close would END THE
+                // PROCESS. Tearing down now would abandon the run partway, leaving
+                // Trakt/AniList half-updated with nothing to say where it stopped —
+                // so hand the decision to the user rather than guessing. The
+                // frontend answers by finishing the run, cancelling it, or
+                // dismissing; each path clears the flag and re-issues the close, and
+                // we then fall through to the normal teardown below.
+                //
+                // Gated on `!minimize_to_tray_on_close`: in tray mode the X button
+                // does not exit at all, it just hides the window, and the run would
+                // carry on perfectly happily in the background. Prompting there
+                // would be asking the user to approve something that isn't
+                // happening.
+                //
+                // Runs FIRST, before any shutdown housekeeping, so a prevented close
+                // leaves no side effects behind.
+                if !cfg.minimize_to_tray_on_close && crate::scrobble::scrobble_run_active() {
+                    api.prevent_close();
+                    use tauri::Emitter;
+                    let _ = handle.emit("aura:scrobble-close-request", ());
+                    return;
+                }
+
                 // Belt-and-suspenders — restore the Windows taskbar in
                 // case the user closes while still in fullscreen mode.
                 #[cfg(target_os = "windows")]

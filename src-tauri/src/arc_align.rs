@@ -43,14 +43,41 @@
 //! ```text
 //!   score(a, b) = 0.55 * date_proximity + 0.45 * dice_bigram(norm(a.title), norm(b.title))
 //!   date_proximity by |delta days|:  <=1 -> 1.0, <=3 -> 0.9, <=7 -> 0.75,
-//!                                    <=14 -> 0.4, <=35 -> 0.1, else -0.5
+//!                                    <=14 -> 0.4, <=35 -> 0.1, else -2.5
 //!                                    (either side dateless -> 0.0, neutral, never negative)
+//!   strong-exact-far: EXACT normalized-title equality + a FAR date (> 35 days) scores a fixed
+//!                     0.70, above a date-perfect mismatch (0.55), so a mis-dated block stays on
+//!                     its title diagonal instead of sliding onto the one its wrong dates fit
 //!   gap penalty: -0.35 per unmatched episode, on either side
-//!   band: only cells with |i - j| <= 12 are considered (O(n * band), forbids absurd reorderings)
+//!   band: only cells with |i - j| <= 64 are considered (O(n * band), forbids absurd reorderings)
 //! ```
 //!
 //! Two soft terms, each of which is individually unreliable, plus a hard monotonic constraint.
 //! Measured 100 percent correct on One Piece (1168/1168) and Naruto Shippuden (500/500).
+//!
+//! # The AIOMetadata date-shift case (why strong-exact-far + interior-fill exist)
+//!
+//! A meta addon can carry the RIGHT title but a badly WRONG date for a whole block. AIOMetadata
+//! dates original Naruto's "Jiraiya Returns" block (17 episodes) ~18 weeks early, with titles
+//! byte-identical to TMDB's. Those wrong dates line up perfectly with a DIFFERENT positional
+//! diagonal, so a plain date+title DP slides the entire middle of the show over by 17 and strands
+//! two DISJOINT unmatched tails (TMDB's finale vs the addon's Jiraiya block) that share no titles,
+//! so no residual can bridge them: only 20 of 23 arcs survived. Two additions fix it without
+//! disturbing the general weights (which keep date-carried filler runs above the arc-confidence
+//! gate):
+//!
+//! * **strong-exact-far** (in `pair_score`): pins an exact-title far-date pair in place, so the DP
+//!   cannot take the mis-dated diagonal. This recovers the exactly-equal titles (16 of the block's
+//!   17), holding the correct diagonal.
+//! * **interior-bracket-fill** (a residual): between two matched anchors, if the two sides have the
+//!   SAME number of leftover episodes, pair them positionally. This recovers the near-exact titles
+//!   (e.g. "Byakugan vs. Shadow Clone" vs "...Shadow Clone Jutsu!") that the exact gate skips,
+//!   bracketed and made safe by the pins around them.
+//!
+//! With both, original Naruto aligns 220/220 (all 23 arcs), One Piece and Shippuden unchanged.
+//! Requires the caller to sort both lists by (season, episode), NOT air date: the addon's numbering
+//! is its reliable broadcast order, and sorting by its corrupted dates re-scatters the very block
+//! this fixes (see `arcs.rs`).
 //!
 //! Both input lists must already be sorted in broadcast order and filtered to the main run
 //! (season >= 1). Specials on either side are the thing this module exists to survive, not to
@@ -65,6 +92,20 @@ const W_DATE: f64 = 0.55;
 const W_TITLE: f64 = 0.45;
 /// Cost of leaving one episode unmatched on either side.
 const GAP: f64 = -0.35;
+/// A |delta days| past this is "far": almost never the same episode by date alone. Used by both
+/// the date-proximity floor and the strong-exact-far override below.
+const FAR_DELTA: i64 = 35;
+/// Score awarded to a pair whose normalized titles are EXACTLY equal but whose dates are FAR apart
+/// (the [`FAR_DELTA`] regime). This is the AIOMetadata date-shift case: an addon carries the right
+/// title but a badly wrong date (Naruto's "Jiraiya Returns" is dated ~18 weeks early), and those
+/// wrong dates line up perfectly with a different positional diagonal. A date-led DP would slide
+/// the whole block onto that diagonal; pinning exact-title pairs at a score ABOVE a date-perfect
+/// mismatch (`W_DATE * 1.0 = 0.55`, plus a little for any incidental title overlap it carries)
+/// keeps the DP on the correct title diagonal. 0.70 clears that with margin while staying below a
+/// genuine near-date exact match (which scores up to ~0.95), so it never out-competes a real match.
+/// Gated on EXACT equality (not a dice threshold) so it can never cross formulaic "Part 1"/"Part 2"
+/// titles, which are 0.95 similar but distinct.
+const STRONG_EXACT_FAR_SCORE: f64 = 0.70;
 /// Base half-width of the alignment band. This bounds how far apart in position two episodes may
 /// be and still match, which is what keeps the DP O(n * band) and forbids absurd re-orderings.
 ///
@@ -361,8 +402,8 @@ pub fn align(left: &[AlignEpisode], right: &[AlignEpisode]) -> Alignment {
     right_unmatched.reverse();
 
     let mut pairs: Vec<AlignPair> = matched
-        .into_iter()
-        .map(|(li, ri)| {
+        .iter()
+        .map(|&(li, ri)| {
             let score = pair_score(&lefts[li], &rights[ri]);
             AlignPair {
                 left_key: lefts[li].key.clone(),
@@ -372,6 +413,9 @@ pub fn align(left: &[AlignEpisode], right: &[AlignEpisode]) -> Alignment {
             }
         })
         .collect();
+    // `matched` is kept alive past this point: the residual passes append their
+    // (left, right) index pairs to it so the interior-bracket-fill below sees the
+    // FULL set of anchors, DP and residual alike.
 
     // Residual pass, over the episodes the monotone DP left UNMATCHED on both
     // sides. Where the two sources ORDER a block differently (a shuffle or a
@@ -391,10 +435,9 @@ pub fn align(left: &[AlignEpisode], right: &[AlignEpisode]) -> Alignment {
     // become O(n^2) work.
     const RESIDUAL_MAX: usize = 512;
     const RESIDUAL_MAX_DELTA: i64 = 3;
-    // Sub-pass 2 (below) only fires when the two dates are at least this far
+    // Sub-pass 2 (below) only fires when the two dates are at least `FAR_DELTA`
     // apart, so it never touches the near-date regime the off-by-one protection
     // guards.
-    const STRONG_TITLE_FAR_DELTA: i64 = 35;
     let mut left_consumed = vec![false; left_unmatched.len()];
     let mut right_consumed = vec![false; right_unmatched.len()];
     if !left_unmatched.is_empty()
@@ -433,6 +476,7 @@ pub fn align(left: &[AlignEpisode], right: &[AlignEpisode]) -> Alignment {
                 let score = pair_score(&lefts[li], &rights[ri]);
                 right_consumed[rk] = true;
                 left_consumed[lk] = true;
+                matched.push((li, ri));
                 pairs.push(AlignPair {
                     left_key: lefts[li].key.clone(),
                     right_key: rights[ri].key.clone(),
@@ -489,7 +533,7 @@ pub fn align(left: &[AlignEpisode], right: &[AlignEpisode]) -> Alignment {
                 continue;
             };
             let far = match (lefts[li].day, rights[ri].day) {
-                (Some(a), Some(b)) => (a - b).abs() > STRONG_TITLE_FAR_DELTA,
+                (Some(a), Some(b)) => (a - b).abs() > FAR_DELTA,
                 _ => true,
             };
             if !far {
@@ -502,6 +546,7 @@ pub fn align(left: &[AlignEpisode], right: &[AlignEpisode]) -> Alignment {
             let score = W_TITLE * dice;
             right_consumed[rk] = true;
             left_consumed[lk] = true;
+            matched.push((li, ri));
             pairs.push(AlignPair {
                 left_key: lefts[li].key.clone(),
                 right_key: rights[ri].key.clone(),
@@ -511,17 +556,75 @@ pub fn align(left: &[AlignEpisode], right: &[AlignEpisode]) -> Alignment {
         }
     }
 
-    let left_only: Vec<String> = left_unmatched
-        .iter()
-        .enumerate()
-        .filter(|(lk, _)| !left_consumed[*lk])
-        .map(|(_, &li)| lefts[li].key.clone())
+    // What is STILL unmatched after both residual passes, as per-index open flags
+    // (a whole-length bool is cheaper to probe than scanning the unmatched vecs,
+    // and the interior-fill below needs O(1) "is index k open?" lookups).
+    let mut left_open = vec![false; n];
+    for (lk, &li) in left_unmatched.iter().enumerate() {
+        if !left_consumed[lk] {
+            left_open[li] = true;
+        }
+    }
+    let mut right_open = vec![false; m];
+    for (rk, &ri) in right_unmatched.iter().enumerate() {
+        if !right_consumed[rk] {
+            right_open[ri] = true;
+        }
+    }
+
+    // Sub-pass 3: INTERIOR-BRACKET-FILL. Some episodes remain gapped BETWEEN two
+    // matched anchors. The Naruto date-shift block is pinned at its exactly-equal
+    // titles by pair_score's strong-exact-far override, but the NEAR-exact ones in
+    // between ("Byakugan vs. Shadow Clone" vs "...Shadow Clone Jutsu!") are neither
+    // exact (sub-pass 2 skips them) nor same-date (sub-pass 1 skips them). Between
+    // two correct anchors, if the two sides have the SAME number of leftover
+    // episodes, their broadcast order is unambiguous, so pair them positionally.
+    //
+    // The equal-count guard is the whole safety story: a one-sided gap (the One
+    // Piece crossover -- a TMDB episode the addon never lists) makes the counts
+    // UNEQUAL and is left strictly alone, so this can never manufacture a partner
+    // for a genuinely-absent episode. Confidence is scored on the TITLE axis, so a
+    // genuinely-different interior filler reads low and the arc gate can still drop
+    // its arc; a real but near-exact title reads high. Anchors = DP + both residual
+    // passes, so a residual-recovered pair also brackets a fill.
+    if left_unmatched.len() <= RESIDUAL_MAX && right_unmatched.len() <= RESIDUAL_MAX {
+        matched.sort_unstable();
+        for w in matched.windows(2) {
+            let (lp, rp) = w[0];
+            let (ln, rn) = w[1];
+            let l_gap: Vec<usize> = (lp + 1..ln).filter(|&li| left_open[li]).collect();
+            if l_gap.is_empty() {
+                continue;
+            }
+            let r_gap: Vec<usize> = (rp + 1..rn).filter(|&ri| right_open[ri]).collect();
+            if l_gap.len() != r_gap.len() {
+                continue; // a one-sided gap: leave it, never invent a partner
+            }
+            for (li, ri) in l_gap.into_iter().zip(r_gap) {
+                left_open[li] = false;
+                right_open[ri] = false;
+                let dice = dice_from_counts(
+                    &lefts[li].norm, &lefts[li].bigrams, lefts[li].bigram_total,
+                    &rights[ri].norm, &rights[ri].bigrams, rights[ri].bigram_total,
+                );
+                let score = W_TITLE * dice;
+                pairs.push(AlignPair {
+                    left_key: lefts[li].key.clone(),
+                    right_key: rights[ri].key.clone(),
+                    score,
+                    confidence: pair_confidence(score, W_TITLE),
+                });
+            }
+        }
+    }
+
+    let left_only: Vec<String> = (0..n)
+        .filter(|&li| left_open[li])
+        .map(|li| lefts[li].key.clone())
         .collect();
-    let right_only: Vec<String> = right_unmatched
-        .iter()
-        .enumerate()
-        .filter(|(rk, _)| !right_consumed[*rk])
-        .map(|(_, &ri)| rights[ri].key.clone())
+    let right_only: Vec<String> = (0..m)
+        .filter(|&ri| right_open[ri])
+        .map(|ri| rights[ri].key.clone())
         .collect();
 
     Alignment {
@@ -567,6 +670,18 @@ fn pair_confidence(score: f64, attainable: f64) -> f64 {
 }
 
 fn pair_score(a: &Prepped, b: &Prepped) -> f64 {
+    // Strong-exact-far override: an EXACT normalized-title match whose dates are FAR apart is the
+    // AIOMetadata date-shift case (see STRONG_EXACT_FAR_SCORE). Trust the title and pin it in place
+    // with a score above a date-perfect mismatch, so the DP cannot slide the block onto the diagonal
+    // its wrong dates happen to line up with. Gated on EXACT equality so formulaic "Part 1"/"Part 2"
+    // titles (0.95 dice, distinct) are never crossed; they fall through to the normal score, are
+    // gapped by the far-date floor, and recovered order-independently by the strong-title residual.
+    if !a.norm.is_empty()
+        && a.norm == b.norm
+        && matches!((a.day, b.day), (Some(x), Some(y)) if (x - y).abs() > FAR_DELTA)
+    {
+        return STRONG_EXACT_FAR_SCORE;
+    }
     let date = date_proximity(a.day, b.day);
     let title = dice_from_counts(
         &a.norm,
@@ -607,7 +722,10 @@ fn date_proximity(a: Option<i64>, b: Option<i64>) -> f64 {
         // reach it. W_DATE * -2.5 = -1.375, so even +0.45 for a perfect title
         // lands at -0.925, under -0.70. A genuinely mis-dated real match is then
         // left for the residual (recovered by exact title if unique) or dropped
-        // from its arc: absent beats wrong.
+        // from its arc: absent beats wrong. The ONE exception is an EXACTLY-equal
+        // title, which pair_score's strong-exact-far override pins in place BEFORE
+        // reaching this floor (a whole SHIFTED exact-title block otherwise produces
+        // disjoint unmatched pools the residual cannot bridge; see that override).
     } else {
         -2.5
     }
@@ -1155,7 +1273,7 @@ mod tests {
         for i in 0..N {
             assert_eq!(a.map(&format!("L{i}")), Some(format!("R{i}").as_str()));
         }
-        // Title-only RAW score: 0.45 * 1.0, with the date term contributing nothing.
+        // Title-only RAW score: W_TITLE * 1.0, with the date term contributing nothing.
         assert!((a.min_score() - W_TITLE).abs() < 1e-9, "{}", a.min_score());
 
         // ...but the CONFIDENCE is 1.0, because the title was the only evidence
@@ -1397,10 +1515,15 @@ mod tests {
     }
 
     #[test]
-    fn strong_title_refuses_a_duplicated_title() {
-        // Two DIFFERENT episodes both titled "assault" gap on each side. The
-        // uniqueness guard must refuse them (a duplicated title cannot be
-        // disambiguated by title alone).
+    fn duplicated_title_pairs_only_in_monotonic_order() {
+        // Two episodes both titled "assault", wrong-dated (300 days off). The
+        // strong-exact-far override pins exact titles, so these DO pair now -- but
+        // the DP's MONOTONICITY is what disambiguates a duplicated title: LA0
+        // (before LA1) can only pair at or before LA1's partner, so the result is
+        // LA0->RA0, LA1->RA1, in order, and it can NEVER cross. (An earlier build
+        // gapped duplicated titles outright via a residual uniqueness guard;
+        // pairing them in order is strictly better -- it keeps them in their arc --
+        // and just as safe, because a monotone path cannot cross.)
         let base = parse_day("2003-01-01").unwrap();
         let mut left = weekly_run("L", 8);
         let mut right = weekly_run("R", 8);
@@ -1409,8 +1532,80 @@ mod tests {
         right.push(ep("RA0", "assault", Some(base + 7 * 20 - 300)));
         right.push(ep("RA1", "assault", Some(base + 7 * 21 - 300)));
         let a = align(&left, &right);
-        assert!(a.map("LA0").is_none(), "a duplicated title must not be strong-title paired");
-        assert!(a.map("LA1").is_none());
+        // Paired in order, never crossed.
+        assert_eq!(a.map("LA0"), Some("RA0"), "duplicated titles pair in order (no cross)");
+        assert_eq!(a.map("LA1"), Some("RA1"));
+    }
+
+    #[test]
+    fn far_date_shift_with_identical_titles_holds_the_diagonal() {
+        // The AIOMetadata date-shift reproduction. Every episode carries its EXACT
+        // TMDB title but a date shifted 8 weeks EARLIER, so the wrong dates line up
+        // perfectly with the diagonal 8 positions over (right[i].date ==
+        // left[i-8].date). A plain date+title DP takes that date-perfect diagonal
+        // (0.55/pair) over the correct-but-far-dated one (-0.925/pair) and slides
+        // the whole show over, stranding two disjoint tails. strong-exact-far pins
+        // each exact-title pair at 0.70, so the correct diagonal wins outright.
+        const N: usize = 25;
+        const SHIFT: i64 = 7 * 8; // 56 days: comfortably past FAR_DELTA
+        let base = parse_day("2003-01-01").unwrap();
+        let left: Vec<AlignEpisode> = (0..N)
+            .map(|i| ep(&format!("L{i}"), &title_of(i), Some(base + 7 * i as i64)))
+            .collect();
+        let right: Vec<AlignEpisode> = (0..N)
+            .map(|i| ep(&format!("R{i}"), &title_of(i), Some(base + 7 * i as i64 - SHIFT)))
+            .collect();
+        let a = align(&left, &right);
+        for i in 0..N {
+            assert_eq!(
+                a.map(&format!("L{i}")),
+                Some(format!("R{i}").as_str()),
+                "ep {i}: exact title must hold the diagonal against a far-date shift",
+            );
+        }
+        assert!(a.left_only.is_empty() && a.right_only.is_empty());
+    }
+
+    #[test]
+    fn interior_bracket_fill_recovers_a_near_exact_gap() {
+        // A far-date block with EXACT titles is pinned by strong-exact-far, but one
+        // interior episode has a NEAR-exact title ("... extended") that is neither
+        // exact (so the strong-title residual skips it) nor same-date (so the
+        // near-date residual skips it). Bracketed by the two exact-title anchors
+        // around it with a balanced 1:1 leftover count, interior-fill pairs it
+        // positionally. Without that pass it would be left_only/right_only.
+        const N: usize = 15;
+        const GAP_AT: usize = 7;
+        let base = parse_day("2003-01-01").unwrap();
+        let mut left: Vec<AlignEpisode> = Vec::new();
+        let mut right: Vec<AlignEpisode> = Vec::new();
+        for i in 0..N {
+            let real = base + 7 * i as i64;
+            left.push(ep(&format!("L{i}"), &title_of(i), Some(real)));
+            let title = if i == GAP_AT { format!("{} extended", title_of(i)) } else { title_of(i) };
+            right.push(ep(&format!("R{i}"), &title, Some(real - 7 * 8))); // all far-dated
+        }
+        let a = align(&left, &right);
+        assert_eq!(
+            a.map(&format!("L{GAP_AT}")),
+            Some(format!("R{GAP_AT}").as_str()),
+            "near-exact interior episode must be recovered by bracket-fill",
+        );
+        assert!(a.left_only.is_empty() && a.right_only.is_empty(), "every episode mapped");
+    }
+
+    #[test]
+    fn interior_fill_leaves_a_one_sided_gap_alone() {
+        // The One Piece crossover guard for interior-fill: a TMDB-only episode
+        // between two anchors makes the leftover counts UNEQUAL (1 left, 0 right),
+        // so interior-fill must not manufacture a partner for it.
+        let mut left = weekly_run("L", 20);
+        // One extra TMDB episode the addon does not have, mid-run.
+        left.insert(10, ep("CROSS", "one off crossover special", Some(parse_day("2013-06-01").unwrap())));
+        let right = weekly_run("R", 20);
+        let a = align(&left, &right);
+        assert_eq!(a.left_only, vec!["CROSS".to_string()], "the one-sided gap stays a gap");
+        assert!(a.right_only.is_empty());
     }
 
     #[test]

@@ -108,8 +108,9 @@ import Tooltip from "../Tooltip";
 import { BrandLogo, ratingDomain, groupRatingsByBrand } from "../logodev";
 import { hasUsableRating } from "../ratingValue";
 import ArcGrid, { ArcGridSkeleton } from "../ArcGrid";
+import GroupingToggle from "../EpisodeGroupingToggle";
 import {
-  arcPositionOf, arcYearRange, loadArcMode, preferredGroupingId, saveArcMode, useStoryArcs,
+  absoluteEpisodeMap, arcPositionOf, arcsLikelyAvailable, arcYearRange, formatAbsoluteEpisode, loadArcMode, preferredGroupingId, saveArcMode, useStoryArcs,
   type EpisodeGrouping,
 } from "../storyArcs";
 
@@ -2405,6 +2406,15 @@ function UnifiedPanel({
   groupedStreams, metaLoading, onPickEpisode, onBackToEpisodes, onPlay, onCopy, onPlayExternal,
   scrollToVideoId, onScrollHandled, seasonHint, seasonNames, highlightVideoId, seriesArt, detail,
 }: PanelProps) {
+  // Absolute-episode annotation for the streams header (e.g. "(E88)" next to
+  // S04E30 on a saga show). Memoised on the episode list so a One-Piece-sized
+  // list is not re-walked on every stream-panel re-render.
+  const streamAbsoluteTag = useMemo(() => {
+    if (!activeVideo) return "";
+    const abs = absoluteEpisodeMap(videos).get(activeVideo.id);
+    return formatAbsoluteEpisode(seriesId, activeVideo.episode, abs);
+  }, [videos, activeVideo, seriesId]);
+
   // The streams panel needs `position: relative` so the floating AIOStreams
   // status icons (rendered with `absolute -top-3 -left-3`) anchor to its
   // top-left edge instead of escaping the entire detail view.
@@ -2453,6 +2463,7 @@ function UnifiedPanel({
               onPlay={onPlay}
               onCopy={onCopy}
               onPlayExternal={onPlayExternal}
+              absoluteTag={streamAbsoluteTag}
             />
           </div>
           {/* Notice badges have moved OUT of UnifiedPanel — they're
@@ -2473,7 +2484,7 @@ function UnifiedPanel({
 // ---------------------------------------------------------------------------
 
 const EpisodeRow = ({
-  video, seriesId, seriesMediaType, isActive, onPick, seasonVideos, isNextAiring, isDeepLinked, seriesArt, groupLabel = "season",
+  video, seriesId, seriesMediaType, isActive, onPick, seasonVideos, isNextAiring, isDeepLinked, seriesArt, groupLabel = "season", absoluteNumber = null, absoluteTag = "",
 }: {
   video: VideoEntry;
   seriesId: string;
@@ -2485,6 +2496,16 @@ const EpisodeRow = ({
   /** All episodes in the currently-displayed season, in episode order.
    *  Drives the "this & above / below / all" right-click bulk options. */
   seasonVideos: VideoEntry[];
+  /** Whole-series absolute episode number, shown INSTEAD of the addon's
+   *  per-season `video.episode` when in Arcs mode. A cross-season arc otherwise
+   *  labels its rows with per-season numbers that jump around (E49, E03, ...) and
+   *  contradict the arc card's absolute `E101-E208` range. Null in season mode,
+   *  where the per-season number is the right thing to show. */
+  absoluteNumber?: number | null;
+  /** Absolute-episode annotation ("(E88)") shown AFTER the per-season number in
+   *  season mode on a saga show; empty otherwise. In arc mode the row already
+   *  shows the absolute number itself, so this is ignored there. */
+  absoluteTag?: string;
   /** What `seasonVideos` actually IS, for the confirmation toast. In Arcs mode
    *  the visible list is a story arc, not a season, and "Marked watched · all in
    *  season" would be a lie about what the user just did. */
@@ -2805,10 +2826,18 @@ const EpisodeRow = ({
       <div className="flex-1 min-w-0 flex flex-col py-1 justify-center gap-1.5">
         <p className="flex items-baseline gap-3 font-mono text-[14px] tracking-[0.16em] uppercase">
           <span className={isActive ? "text-ln-accent" : "text-white/65"}>
-            {video.episode != null
+            {absoluteNumber != null
+              ? `E${String(absoluteNumber).padStart(2, "0")}`
+              : video.episode != null
               ? `E${String(video.episode).padStart(2, "0")}`
               : "EP"}
           </span>
+          {/* Absolute-episode annotation in season mode (arc mode already shows
+              the absolute number itself). Empty for non-saga / already-absolute
+              shows. */}
+          {absoluteNumber == null && absoluteTag && (
+            <span className="text-white/35 tracking-wide">{absoluteTag}</span>
+          )}
           {unaired && airMs != null ? (
             <span className="text-white/45 tracking-wide whitespace-nowrap">
               Airs {new Date(airMs).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}
@@ -2915,37 +2944,6 @@ function EpisodeCountChip({
     >
       {chip}
     </Tooltip>
-  );
-}
-
-/** Seasons | Arcs. Mirrors LiveView's ViewModeToggle so the two segmented
- *  controls in the app look like the same control. */
-function GroupingToggle({
-  mode,
-  onChange,
-}: {
-  mode: EpisodeGrouping;
-  onChange: (m: EpisodeGrouping) => void;
-}) {
-  return (
-    <div className="flex gap-1 p-0.5 rounded-lg bg-white/6 border border-white/8" role="group" aria-label="Episode grouping">
-      {(["seasons", "arcs"] as const).map((m) => (
-        <button
-          key={m}
-          type="button"
-          onClick={() => onChange(m)}
-          aria-pressed={mode === m}
-          className={[
-            "px-2.5 h-6 rounded-md text-[11px] font-medium capitalize transition-colors",
-            mode === m
-              ? "bg-ln-accent/20 text-ln-accent"
-              : "text-white/50 hover:text-white/85",
-          ].join(" ")}
-        >
-          {m}
-        </button>
-      ))}
-    </div>
   );
 }
 
@@ -3123,6 +3121,12 @@ function EpisodesPanel({
   // last left One Piece in Arcs mode must not get an empty panel when the TMDB
   // fetch fails or the key is missing.
   const arcMode = grouping === "arcs" && arcAvailable;
+  // A revisit in SEASONS mode where a prior fetch knew this show has arcs, but
+  // the 24 h result cache has since expired. Show the toggle right away in a
+  // loading state so a long show like One Piece does not pop it in a few seconds
+  // later. Distinct from `arcPending`, which only covers a remembered Arcs mode.
+  const arcsLikelyPending =
+    grouping === "seasons" && !arcAvailable && arcsLoading && arcsLikelyAvailable(seriesId);
   // First open (or a remembered Arcs mode) with nothing resolved yet: the TMDB
   // join is genuinely slow, so the panel owes the user a skeleton instead of
   // silently showing the season list.
@@ -3197,6 +3201,12 @@ function EpisodesPanel({
       .map((id) => byId.get(id))
       .filter((v): v is VideoEntry => !!v);
   }, [openArc, videos]);
+
+  /** Whole-series absolute episode numbers, so an arc's rows label with the same
+   *  absolute count as the arc card's `E101-E208` range (a cross-season arc's
+   *  per-season numbers would otherwise jump around and contradict it). Only used
+   *  in arc mode; cheap enough to always compute. */
+  const absoluteById = useMemo(() => absoluteEpisodeMap(videos), [videos]);
 
   /** Whichever list is actually on screen. Used for the row context menu's
    *  bulk "mark this and above/below" actions, which operate on the visible
@@ -3289,9 +3299,15 @@ function EpisodesPanel({
         right={(
           <div className="flex items-center gap-2.5">
             {/* Only offered when the show genuinely has arcs. Most of the
-                library will never see this control. */}
-            {(arcAvailable || arcPending) && (
-              <GroupingToggle mode={grouping} onChange={switchGrouping} />
+                library will never see this control. While arcs are still
+                resolving (a remembered Arcs mode, or a known-arcs revisit whose
+                cache expired) it shows in a loading state rather than popping in. */}
+            {(arcAvailable || arcPending || arcsLikelyPending) && (
+              <GroupingToggle
+                mode={grouping}
+                onChange={switchGrouping}
+                loading={!arcAvailable}
+              />
             )}
             <EpisodeCountChip
               label={`${videos.length} total`}
@@ -3445,6 +3461,8 @@ function EpisodesPanel({
                     onPick={onPick}
                     seasonVideos={visibleEpisodes}
                     groupLabel={arcMode ? "arc" : "season"}
+                    absoluteNumber={arcMode ? absoluteById.get(v.id) ?? null : null}
+                    absoluteTag={arcMode ? "" : formatAbsoluteEpisode(seriesId, v.episode, absoluteById.get(v.id))}
                     isNextAiring={v.id === nextAiringId}
                     isDeepLinked={v.id === highlightId}
                     seriesArt={seriesArt}
@@ -3920,7 +3938,7 @@ function StreamMessagesEmptyState({ metadata }: { metadata: StreamMetadata }) {
 const STREAM_FORMAT_HINT_KEY = "aura:stream-format-hint-dismissed";
 
 function StreamsPanel({
-  isEpisodic, activeVideo, streams, streamMeta, loading, groups, partyStreamKey, onBack, onPlay, onCopy, onPlayExternal,
+  isEpisodic, activeVideo, streams, streamMeta, loading, groups, partyStreamKey, onBack, onPlay, onCopy, onPlayExternal, absoluteTag,
 }: {
   isEpisodic: boolean;
   activeVideo: VideoEntry | null;
@@ -3933,10 +3951,15 @@ function StreamsPanel({
   onPlay: (s: StreamEntry) => void;
   onCopy: (text: string) => void;
   onPlayExternal: (url: string) => void;
+  /** Absolute-episode annotation ("(E88)") when this show uses per-season
+   *  numbering but has arcs; empty otherwise. Computed by the parent, which has
+   *  the full episode list. Sits between the SxxEyy tag and the title so the
+   *  saga-relative number is easy to follow. */
+  absoluteTag?: string;
 }) {
   const subtitle = isEpisodic && activeVideo
     ? (activeVideo.season != null && activeVideo.episode != null
-        ? `S${String(activeVideo.season).padStart(2, "0")} · E${String(activeVideo.episode).padStart(2, "0")} · ${activeVideo.title}`
+        ? `S${String(activeVideo.season).padStart(2, "0")} · E${String(activeVideo.episode).padStart(2, "0")}${absoluteTag ? ` ${absoluteTag}` : ""} · ${activeVideo.title}`
         : activeVideo.title)
     : null;
 

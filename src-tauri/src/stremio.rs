@@ -214,17 +214,56 @@ fn save_manifest_cache_to_disk() {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    // Atomic write: temp file + rename. Prevents a half-written cache
-    // file from breaking the next launch's parse.
-    let tmp = path.with_extension("json.tmp");
+
+    // Atomic write: temp file + rename, so a half-written file can never break the
+    // next launch's parse.
+    //
+    // TWO CONCURRENCY BUGS LIVED HERE, and both fired constantly on startup, where
+    // every installed addon's manifest resolves at once and each one calls this:
+    //
+    //   1. Every writer used the SAME temp path. Writer A renamed tmp -> path,
+    //      consuming it; writer B then renamed a tmp that no longer existed and got
+    //      "The system cannot find the file specified. (os error 2)". A unique temp
+    //      name per write fixes that.
+    //   2. Even with distinct temps, two renames landing on the same destination
+    //      race on Windows, where MoveFileEx fails with "Access is denied.
+    //      (os error 5)" if another handle holds the target. The mutex below
+    //      serialises the rename so only one writer touches the destination at a
+    //      time, and the short retry rides out a transient share violation from an
+    //      unrelated reader (AV scanner, a concurrent load).
+    //
+    // The data is not lost either way — the cache is a rebuildable snapshot — but
+    // it meant the file was usually NOT being refreshed, and it spammed warnings.
+    static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.tmp.{}.{seq}", std::process::id()));
     if let Err(e) = std::fs::write(&tmp, &json) {
         crate::devlog!(warn, "catalog", "manifest cache: tmp write failed: {e}");
+        let _ = std::fs::remove_file(&tmp);
         return;
     }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        crate::devlog!(warn, "catalog", "manifest cache: rename failed: {e}");
-        let _ = std::fs::remove_file(&tmp);
+
+    // Poisoning is irrelevant here (the guard protects a filesystem rename, not
+    // in-memory state), so recover rather than give up on the write.
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut last_err = None;
+    for attempt in 0..3 {
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => return,
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < 2 {
+                    std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
+                }
+            }
+        }
     }
+    if let Some(e) = last_err {
+        crate::devlog!(warn, "catalog", "manifest cache: rename failed after 3 tries: {e}");
+    }
+    let _ = std::fs::remove_file(&tmp);
 }
 
 // Per-CATALOG soft-fail cache.

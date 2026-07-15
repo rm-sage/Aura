@@ -18,6 +18,7 @@ import ImageLoader from "./ImageLoader";
 import type { ActiveScrobbleTarget } from "./useScrobble";
 import type { AddonEntry, ExternalSubtitle, LibraryItem, TrackEntry, VideoEntry } from "./types";
 import EpisodePanel from "./EpisodePanel";
+import { formatAbsoluteEpisode } from "./storyArcs";
 import { setTitleState } from "./titleState";
 import { pickDefaultAudio, type ScoringMeta } from "./audioScoring";
 import { prettyBinding } from "./useKeybindings";
@@ -1525,14 +1526,46 @@ export default function PlayerOverlay({
     };
   }, [tracksReady]);
 
+  // The sub-pos value the lift last computed. Held in a ref so the re-assert
+  // effect below can re-apply the CURRENT target without re-subscribing.
+  const liftTargetRef = useRef(subBaseline);
   useEffect(() => {
     if (!tracksReady) return;
     const LIFT_AMOUNT = 12;
     const target = controlsVisible
       ? Math.max(0, subBaseline - LIFT_AMOUNT)
       : subBaseline;
+    liftTargetRef.current = target;
     invoke("set_subtitle_position_runtime", { percent: target }).catch(() => {});
   }, [controlsVisible, tracksReady, subBaseline]);
+
+  // Re-assert the lift after events that silently clobber the runtime sub-pos:
+  //   • a SEEK — mpv re-renders subtitles at the new position and the ASS
+  //     force-margins path drops the runtime sub-pos, so the lifted dialogue
+  //     snaps back down behind the control bar. The main lift effect does NOT
+  //     re-run (controlsVisible has not changed), so nothing restores it. Two
+  //     delayed re-asserts: one once mpv has processed a cached seek, one a beat
+  //     later to cover a debrid re-buffer that renders the new frame late.
+  //   • apply_subtitle_style at load — it re-applies the saved sub-pos baseline,
+  //     undoing a lift that fired first. Re-assert immediately.
+  useEffect(() => {
+    if (!tracksReady) return;
+    const reassert = () =>
+      invoke("set_subtitle_position_runtime", { percent: liftTargetRef.current }).catch(() => {});
+    const timers = new Set<number>();
+    const later = (ms: number) => {
+      const id = window.setTimeout(() => { timers.delete(id); reassert(); }, ms);
+      timers.add(id);
+    };
+    const onSeek = () => { later(140); later(700); };
+    window.addEventListener("aura:player-seek", onSeek);
+    window.addEventListener("aura:subtitle-style-applied", reassert);
+    return () => {
+      window.removeEventListener("aura:player-seek", onSeek);
+      window.removeEventListener("aura:subtitle-style-applied", reassert);
+      timers.forEach((id) => clearTimeout(id));
+    };
+  }, [tracksReady]);
 
   const audioTracks = useMemo(() => tracks.filter((t) => t.type === "audio"), [tracks]);
   // Optimistic subtitle selection. mpv's track-list `selected` flag lags a
@@ -2133,6 +2166,17 @@ export default function PlayerOverlay({
                 {activeTarget.episode && (
                   <span className="font-mono text-ln-accent/90 mr-2">
                     {activeTarget.episode}
+                    {/* Absolute-episode annotation on a saga show that uses
+                        per-season numbering (empty otherwise). absolute_episode_num
+                        is stamped by App's target enrichment for season > 1. */}
+                    {(() => {
+                      const tag = formatAbsoluteEpisode(
+                        activeTarget.series_id ?? activeTarget.id,
+                        activeTarget.episode_num,
+                        activeTarget.absolute_episode_num,
+                      );
+                      return tag ? <span className="text-white/45 ml-1.5">{tag}</span> : null;
+                    })()}
                   </span>
                 )}
                 {activeTarget.episode_title && (

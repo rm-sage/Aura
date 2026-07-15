@@ -105,15 +105,33 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
     destructive: false,
   },
   {
-    prefix:      "aura:story-arcs:v7",
+    prefix:      "aura:story-arcs:v8",
     label:       "Story arc cache",
     description: "Per-series story arcs (TMDB episode groups, already mapped onto your addon's episode ids). 24-hour TTL because an ongoing show gains an episode every week. Re-fetches on the next detail open. Safe to clear.",
+    destructive: false,
+  },
+  {
+    prefix:      "aura:arc-available:v1",
+    label:       "Story-arc availability hint",
+    description: "Remembers, per series, whether it has story arcs at all, so the Detail page can show the Seasons/Arcs toggle immediately on a revisit instead of popping it in after the arc data reloads. Just a smoothing hint; clearing it only means the toggle appears a beat later next time. Safe to clear.",
     destructive: false,
   },
   {
     prefix:      "aura:arc-mode:v1",
     label:       "Seasons / Arcs choice",
     description: "Remembers, per series, whether you last browsed it by season or by story arc, and which arc grouping you picked. Clearing just sends every show back to the Seasons default. Safe to clear.",
+    destructive: false,
+  },
+  {
+    prefix:      "aura:scrobble-ineligible:",
+    label:       "Refused-scrobble record",
+    description: "History items Trakt or AniList has definitively refused (no catalog match for the episode under this numbering, or an unresolvable title), so bulk runs stop re-sending them and re-reporting the same failure. Expires after 30 days in case the catalog gains the entry. Clearing it just means those items get retried once more.",
+    destructive: false,
+  },
+  {
+    prefix:      "aura:scrobbled:",
+    label:       "Scrobbled-history record",
+    description: "Which History rows you have already pushed to Trakt / AniList, so a bulk 'Scrobble All' can skip them instead of re-sending. Not the duplicate guard itself: Trakt ignores a repeat of the same watched_at and AniList won't move progress backwards, so clearing this only costs a few redundant calls on the next bulk run. Safe to clear.",
     destructive: false,
   },
 ];

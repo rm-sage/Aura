@@ -142,6 +142,22 @@ pub struct AppSettings {
     #[serde(default)]
     pub scrobble_enabled: bool,
 
+    /// Whether Aura scrobbles AUTOMATICALLY as you finish things.
+    ///
+    /// Distinct from `scrobble_enabled`, which is the master switch over ALL
+    /// scrobble traffic. This one governs only the playback-driven path (the
+    /// completion push at end-of-file, and the shutdown flush). Turning it off
+    /// leaves the History page's manual and bulk scrobbling fully working, for
+    /// people who would rather decide what gets recorded than have it happen for
+    /// them.
+    ///
+    /// `default_true`, NOT `#[serde(default)]`: automatic scrobbling is the
+    /// shipped experience, and a plain bool default would deserialize every
+    /// existing settings.json (which has no such key) to `false` and silently
+    /// switch it off for everyone who already had it working.
+    #[serde(default = "default_true")]
+    pub auto_scrobble_enabled: bool,
+
     // ── OpenSubtitles ──────────────────────────────────────────────────────
     /// Required for api.opensubtitles.com searches & downloads. Free tier
     /// allows 20 downloads/day. Empty string = subtitle picker disabled.
@@ -412,6 +428,7 @@ impl Default for AppSettings {
             minimize_to_tray_on_close:   false,
             scrobble_addon_url:          String::new(),
             scrobble_enabled:            false,
+            auto_scrobble_enabled:       true,
             opensubtitles_api_key:       String::new(),
             hdr_enabled:                 true,
             hdr_mode:                    default_hdr_mode(),

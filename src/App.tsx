@@ -32,6 +32,8 @@ import AmbientAura from "./AmbientAura";
 import ContextMenuHost, { openContextMenu } from "./ContextMenu";
 import { CatalogHoverHost } from "./CatalogHoverCard";
 import AppToastHost, { showAppToast } from "./AppToast";
+import ScrobbleRunBar from "./ScrobbleRunBar";
+import ScrobbleClosePrompt from "./ScrobbleClosePrompt";
 import { safeSetItem } from "./storageQuota";
 import FlyUpToastHost, { showFlyUpToast } from "./FlyUpToast";
 import { runtimeDepPresent, ensureRuntimeDep } from "./runtimeDeps";
@@ -1196,19 +1198,30 @@ function usePlayback(playerActive: boolean) {
   }, []);
 
   const togglePause   = useCallback(() => invoke("toggle_pause").catch(() => {}), []);
+  // Fired on every seek so surfaces that MUST survive a seek can re-assert.
+  // Right now it drives the subtitle control-bar lift: mpv drops the runtime
+  // `sub-pos` override when it re-renders subtitles at the new position, so the
+  // lifted dialogue snaps back behind the control bar (most visible while the
+  // Live Sync panel holds the bar open). PlayerOverlay re-applies the lift on
+  // this event. A plain window event avoids threading a nonce through the tree.
+  const signalSeek = useCallback(() => {
+    window.dispatchEvent(new Event("aura:player-seek"));
+  }, []);
   const seekRelative  = useCallback(
     (s: number) => {
       lastSeekAtRef.current = Date.now();
+      signalSeek();
       return invoke("seek_relative", { seconds: s }).catch(() => {});
     },
-    [],
+    [signalSeek],
   );
   const seekAbsolute  = useCallback(
     (t: number) => {
       lastSeekAtRef.current = Date.now();
+      signalSeek();
       return invoke("seek_absolute",  { time: t }).catch(() => {});
     },
-    [],
+    [signalSeek],
   );
   /** Optimistic volume — set local state immediately so the slider stays
    *  responsive; the polling reconciles within ≤ 250 ms. */
@@ -1397,6 +1410,9 @@ export default function App() {
   } | null>(null);
 
   const isPlayerActive = activeTarget != null;
+  /** True while the "you're closing mid-scrobble" prompt owns the screen — it
+   *  renders its own progress, so the floating bar stands down. */
+  const [scrobbleClosePromptOpen, setScrobbleClosePromptOpen] = useState(false);
   // Mirror of PlayerOverlay's auto-hide `controlsVisible` so the sibling
   // PlayerPartyHud pill can fade in lockstep with the player chrome.
   const [playerControlsVisible, setPlayerControlsVisible] = useState(true);
@@ -2009,8 +2025,13 @@ export default function App() {
         setTimeout(() => {
           invoke("apply_lang_defaults", { isAnime: animeFlag }).catch(() => {});
           // Re-push the user's subtitle styling so a freshly-loaded
-          // file inherits the saved size / colour / position / etc.
-          invoke("apply_subtitle_style").catch(() => {});
+          // file inherits the saved size / colour / position / etc. This
+          // re-applies the SAVED sub-pos baseline, which clobbers any
+          // control-bar lift PlayerOverlay applied first; the event lets the
+          // overlay re-assert the lift right after.
+          invoke("apply_subtitle_style")
+            .catch(() => {})
+            .finally(() => window.dispatchEvent(new Event("aura:subtitle-style-applied")));
           // Loudness normalization is NOT re-applied per load anymore:
           // the `af` property persists across loadfiles, the engine
           // installs the filter at mpv init from the persisted setting,
@@ -3189,6 +3210,12 @@ export default function App() {
           played_at:     new Date().toISOString(),
           duration:      dur || undefined,
           watched_seconds: watched,
+          // Capture the addon's AniList mapping NOW, while we still have the
+          // VideoEntry. A History row scrobbled later has no way to recover it,
+          // and without it AniList mis-resolves split-cour anime — see the field
+          // docs in historyStore.ts.
+          anilist_id:      activeTarget.anilist_id ?? null,
+          anilist_episode: activeTarget.anilist_episode ?? null,
         });
         // Claim the guard so handleExitPlayback (and a same-play onAdvance)
         // won't re-log this episode. Reset per-load in notifyNewLoad.
@@ -4213,6 +4240,8 @@ export default function App() {
           played_at:     new Date().toISOString(),
           duration:      dur || undefined,
           watched_seconds: watched || undefined,
+          anilist_id:      at.anilist_id ?? null,
+          anilist_episode: at.anilist_episode ?? null,
         });
         autoHistoryWrittenId.current = detail.episodeId;
       }
@@ -5841,6 +5870,8 @@ export default function App() {
           played_at:     new Date().toISOString(),
           duration:      dur || undefined,
           watched_seconds: watched,
+          anilist_id:      activeTarget.anilist_id ?? null,
+          anilist_episode: activeTarget.anilist_episode ?? null,
         });
       }
       // Reset the per-play guard now the History decision for this play
@@ -7380,6 +7411,19 @@ export default function App() {
 
       {/* Global toast surface — visible on every tab, fed by showAppToast(). */}
       <AppToastHost />
+
+      {/* Bulk-scrobble progress. Mounted HERE, not in HistoryView: the job is a
+          module-level singleton that outlives the page, so a bar owned by the
+          view would vanish on navigation while the run kept firing requests
+          invisibly. Renders nothing when no run is in flight.
+
+          Suppressed (hidden, never stopped) while a stream or trailer is playing,
+          where it would sit on top of the video, and while the close prompt is up,
+          which renders its own copy of the progress. */}
+      <ScrobbleRunBar suppressed={isPlayerActive || scrobbleClosePromptOpen} />
+
+      {/* Answers Rust's refusal to close the window mid-scrobble. */}
+      <ScrobbleClosePrompt onOpenChange={setScrobbleClosePromptOpen} />
 
       {/* Fly-up toast — spawns at the click point and floats upward.
           Fed by showFlyUpToast(); used for library add/remove feedback

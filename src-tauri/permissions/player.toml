@@ -240,7 +240,7 @@ commands.allow = ["fetch_external_subtitles"]
 [[permission]]
 identifier = "allow-scrobble"
 description = "Allows the frontend to fire scrobble Start/Heartbeat/End events to the configured AIOMetadata addon, plus a DevConsole-only manual test trigger that re-fires the same provider dispatch against the active session without consuming it."
-commands.allow = ["scrobble_start", "scrobble_heartbeat", "scrobble_end", "scrobble_test_fire", "scrobble_history_trakt", "scrobble_history_anilist"]
+commands.allow = ["scrobble_start", "scrobble_heartbeat", "scrobble_end", "scrobble_test_fire", "scrobble_history_trakt", "scrobble_history_anilist", "set_scrobble_run_active"]
 
 # ── Trakt + AniList direct-scrobble OAuth (replaces AIOMetadata) ─────────────
 [[permission]]

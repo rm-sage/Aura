@@ -85,6 +85,12 @@ fn client() -> &'static reqwest::Client {
 ///     re-resolved on next watch.
 const CURRENT_CACHE_VERSION: u32 = 1;
 
+/// How long a "we searched, and nothing on AniList covers episode numbers this
+/// high" verdict stands before we are willing to spend the search again. It must
+/// EXPIRE: an ongoing show gains a cour eventually, and a permanent verdict would
+/// pin it to the wrong entry forever.
+const NO_BETTER_TARGET_TTL: u64 = 7 * 24 * 3600;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CachedMedia {
     anilist_id: u64,
@@ -95,6 +101,27 @@ struct CachedMedia {
     /// then invalidates them for multi-cour keys.
     #[serde(default)]
     resolver_version: u32,
+    /// NEGATIVE RESULT. Set when a full title-search + SEQUEL-walk concluded that
+    /// no AniList entry exists with enough episodes for the requested episode
+    /// number, and we fell back to this (under-covering) id.
+    ///
+    /// Without it, a show whose addon numbering runs past its AniList entry
+    /// re-ran the entire search on EVERY episode: Dr. STONE season 4 is numbered
+    /// cumulatively (S04E29) while AniList splits it into ~11-episode cours, so
+    /// every one of episodes 25..37 spent a search + a sequel walk (3-4 GraphQL
+    /// calls) only to land back on the same 24-episode base entry and clamp the
+    /// save away. During a bulk history scrobble that is what exhausts AniList's
+    /// rate limit. Remembering the verdict turns those 4 calls into 1.
+    #[serde(default)]
+    no_better_target_at: Option<u64>,
+}
+
+/// Is this row's negative result still within its TTL?
+fn no_better_target_fresh(c: &CachedMedia) -> bool {
+    match c.no_better_target_at {
+        Some(at) => now_secs().saturating_sub(at) < NO_BETTER_TARGET_TTL,
+        None => false,
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -884,6 +911,22 @@ async fn resolve_via_cache_or_search(
                 Err(e) => Err(e),
             }
         }
+        // The cached entry does NOT cover this episode number, but we have already
+        // searched for a better one and found none. Reuse it rather than paying
+        // for the same fruitless search + SEQUEL-walk on every single episode.
+        // `is_plausible_target` is deliberately NOT applied: we know it is
+        // implausible by episode count, and are accepting it anyway because it is
+        // the best AniList has. commit_progress clamps to its episode total, which
+        // is the same outcome the search was reaching by a much longer road.
+        Some(c) if no_better_target_fresh(c) => {
+            crate::devlog!(
+                info, "scrobble",
+                "AniList: cached id={} has only {:?} episodes (< requested ep {}), but a prior \
+                 search found no better entry for show={} — reusing it without re-searching",
+                c.anilist_id, c.episodes, episode_num, show_id,
+            );
+            fetch_media(access, c.anilist_id).await
+        }
         Some(c) => {
             crate::devlog!(
                 info, "scrobble",
@@ -1175,8 +1218,18 @@ pub async fn save_progress<R: Runtime>(
     // 2. Persist mapping (write-through cache). Use the same composite
     // key as the read above so multi-cour shows store one entry per
     // cour.
-    let needs_persist = cached.as_ref().map(|c| c.anilist_id) != Some(media.id);
-    if needs_persist {
+    //
+    // `short_of_request` records the NEGATIVE result: we resolved, and the winner
+    // still has fewer episodes than the one we were asked for. That is the
+    // "searched and found nothing better" verdict, and it MUST be persisted --
+    // otherwise the id-comparison below sees the search returned the same id it
+    // already had, decides nothing changed, writes nothing, and the very next
+    // episode of the same show re-runs the identical search. That is exactly the
+    // loop that burned AniList's rate limit on Dr. STONE.
+    let short_of_request = media.episodes.map(|e| e < episode_num).unwrap_or(false);
+    let id_changed = cached.as_ref().map(|c| c.anilist_id) != Some(media.id);
+    let verdict_changed = short_of_request != cached.as_ref().map(no_better_target_fresh).unwrap_or(false);
+    if id_changed || verdict_changed {
         if let Ok(mut g) = cache_lock().lock() {
             g.by_show.insert(
                 cache_key.clone(),
@@ -1185,9 +1238,20 @@ pub async fn save_progress<R: Runtime>(
                     episodes:         media.episodes,
                     fetched_at:       now_secs(),
                     resolver_version: CURRENT_CACHE_VERSION,
+                    // Only stamp it when the shortfall is real; a normal
+                    // resolution clears any stale verdict.
+                    no_better_target_at: if short_of_request { Some(now_secs()) } else { None },
                 },
             );
             save_cache(app, &g);
+        }
+        if short_of_request {
+            crate::devlog!(
+                info, "scrobble",
+                "AniList: recorded 'no better target' for {cache_key} (best id={} has {:?} \
+                 episodes, needed {episode_num}) — later episodes will skip the search",
+                media.id, media.episodes,
+            );
         }
     }
 

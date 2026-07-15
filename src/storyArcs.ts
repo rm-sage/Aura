@@ -70,9 +70,11 @@ export interface ArcResult {
  *  arc-building or alignment logic changes in a way that invalidates previously
  *  cached results, because a stale result would otherwise hide the fix for 24 h.
  *  History: v2 dropped the raw-score gate's over-rejected arcs; v3 the widened
- *  band; v4 the residual pass; v5 air-date sorting; v6 majority gate; v7 strong-title recovery. */
+ *  band; v4 the residual pass; v5 air-date sorting; v6 majority gate; v7 strong-title recovery;
+ *  v8 reverted to (season, episode) sort + strong-exact-far + interior-bracket-fill (fixes the
+ *  AIOMetadata date-shift that stranded 3 of Naruto's 23 arcs). */
 const arcCache = new PersistentCache<ArcResult | null>({
-  storageKey: "aura:story-arcs:v7",
+  storageKey: "aura:story-arcs:v8",
   ttlMs: 24 * 60 * 60 * 1000,
   maxEntries: 60,
 });
@@ -80,12 +82,7 @@ const arcCache = new PersistentCache<ArcResult | null>({
 // One-shot cleanup of orphaned older blobs so a version bump does not leave dead
 // bytes in localStorage.
 try {
-  localStorage.removeItem("aura:story-arcs:v1");
-  localStorage.removeItem("aura:story-arcs:v2");
-  localStorage.removeItem("aura:story-arcs:v3");
-  localStorage.removeItem("aura:story-arcs:v4");
-  localStorage.removeItem("aura:story-arcs:v5");
-  localStorage.removeItem("aura:story-arcs:v6");
+  for (let v = 1; v <= 7; v++) localStorage.removeItem(`aura:story-arcs:v${v}`);
 } catch { /* localStorage unavailable; nothing to clean */ }
 
 /** The user's Seasons-vs-Arcs choice, and chosen grouping, per series. Bounded
@@ -95,6 +92,53 @@ const arcModeCache = new PersistentCache<{ mode: EpisodeGrouping; groupingId?: s
   ttlMs: 365 * 24 * 60 * 60 * 1000,
   maxEntries: 200,
 });
+
+/** Per-series memory of whether the last successful fetch found any arcs.
+ *
+ *  The full arc RESULT (`arcCache`) lives 24 h and is what actually populates the
+ *  view. But whether a show HAS arcs is a stable property that barely changes, so
+ *  it is remembered far longer here. On a revisit whose result cache has expired,
+ *  this lets the Detail page show the Seasons/Arcs toggle IMMEDIATELY (in a
+ *  loading state) instead of popping it in a few seconds later once the cold TMDB
+ *  fetch + alignment resolves. A long-running show like One Piece felt broken
+ *  otherwise: the toggle just was not there for the first few seconds. */
+const arcAvailabilityCache = new PersistentCache<boolean>({
+  storageKey: "aura:arc-available:v1",
+  ttlMs: 90 * 24 * 60 * 60 * 1000,
+  maxEntries: 400,
+});
+
+/** True when a prior fetch found arcs for this series. Drives the toggle's
+ *  loading state so it never pops in on a revisit. */
+export function arcsLikelyAvailable(seriesId: string | null): boolean {
+  return !!seriesId && arcAvailabilityCache.get(seriesId) === true;
+}
+
+/** The parenthesised absolute-episode annotation to show next to a per-season
+ *  `SxxEyy` label, e.g. `"(E88)"`. Empty string when it would be redundant or
+ *  noise, so callers can drop it in unconditionally:
+ *
+ *   - the show has NO arcs — absolute numbering is only worth following on shows
+ *     with Sagas/arcs, so a plain multi-season drama does not get annotated;
+ *   - the addon ALREADY numbers absolutely (a single-season run like Bleach where
+ *     `S01E168` IS the absolute number) — the per-season number equals the
+ *     absolute, so there is nothing to add and no meaningful inverse to show;
+ *   - no absolute number is known for this episode.
+ *
+ *  Each surface computes the absolute number however it can (the position-based
+ *  `absoluteEpisodeMap`, or the target's pre-computed `absolute_episode_num` —
+ *  both are prior-season episode counts plus the per-season number, so they
+ *  agree) and passes it in here for the single gating decision. */
+export function formatAbsoluteEpisode(
+  seriesId: string | null,
+  perSeasonEpisode: number | null | undefined,
+  absoluteEpisode: number | null | undefined,
+): string {
+  if (!arcsLikelyAvailable(seriesId)) return "";
+  if (absoluteEpisode == null) return "";
+  if (perSeasonEpisode != null && perSeasonEpisode === absoluteEpisode) return "";
+  return `(E${absoluteEpisode})`;
+}
 
 export type EpisodeGrouping = "seasons" | "arcs";
 
@@ -167,6 +211,11 @@ export async function fetchStoryArcs(
       groupingId: groupingId ?? null,
     });
     arcCache.set(key, result ?? null);
+    // Remember availability on the series root (independent of the grouping) so a
+    // future visit can pre-show the toggle. Only a definitive answer updates it: a
+    // null result is a transient miss (see the catch below) and must not erase a
+    // known-good verdict.
+    if (result) arcAvailabilityCache.set(seriesId, result.arcs.length > 0);
     return result ?? null;
   } catch (e) {
     // A TMDB hiccup must never break the episode list. Do NOT cache the miss:
@@ -358,25 +407,17 @@ export function preferredGroupingId(groupings: ArcGrouping[]): string | undefine
  *  make a range read "E1-E6" for a mid-series arc. Specials (season 0) are
  *  excluded so they do not shift the main-run count. */
 export function absoluteEpisodeMap(videos: VideoEntry[]): Map<string, number> {
-  // BROADCAST order (air date), the same order the Rust join uses, so the
-  // absolute number reflects when an episode actually aired. An addon whose
-  // season split is not chronological (AIOMetadata labels Naruto's 2003 Jiraiya
-  // episode as season 2 episode 1) would otherwise number it as if it were near
-  // the end of the show. Undated episodes fall back to (season, episode) and
-  // sort last.
-  const dayOf = (v: VideoEntry): number => {
-    if (!v.released) return Number.MAX_SAFE_INTEGER;
-    const t = Date.parse(v.released);
-    return Number.isFinite(t) ? t : Number.MAX_SAFE_INTEGER;
-  };
+  // BROADCAST order, by (season, episode) -- the SAME order the Rust join uses
+  // (see arcs.rs). The addon's own numbering is its reliable broadcast order; its
+  // air dates are the field providers most often corrupt. AIOMetadata dates
+  // Naruto's "Jiraiya Returns" block ~18 weeks early, so an air-date sort scatters
+  // those episodes and hands every one of them the WRONG absolute number (the arc
+  // range then read a nonsensical jumble). Sorting by (season, episode) numbers
+  // "Gotta See!" (addon S2E49) as episode 101, which is exactly right, so the row
+  // labels and the arc's `E101-E208` range agree. Undated episodes are unaffected.
   const main = videos
     .filter((v) => (v.season ?? 0) >= 1 && v.episode != null)
-    .sort(
-      (a, b) =>
-        dayOf(a) - dayOf(b) ||
-        (a.season! - b.season!) ||
-        (a.episode! - b.episode!),
-    );
+    .sort((a, b) => (a.season! - b.season!) || (a.episode! - b.episode!));
   const m = new Map<string, number>();
   main.forEach((v, i) => m.set(v.id, i + 1));
   return m;

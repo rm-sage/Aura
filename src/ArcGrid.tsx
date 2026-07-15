@@ -243,7 +243,9 @@ function GroupingSelect({
       // groupings with long names ("Story Arcs with Filler"); a single
       // non-wrapping row slipped off both edges of the panel. `flex-wrap` +
       // `max-w-full` keeps every tab on screen, growing to a second line instead.
-      className="flex flex-wrap items-center gap-1 p-1 rounded-xl bg-black/30 border border-white/10 max-w-full"
+      // `justify-center` so a wrapped last line (e.g. a lone "Season, Arc & Saga
+      // Combos") sits centred rather than stranded left with dead space beside it.
+      className="flex flex-wrap items-center justify-center gap-1 p-1 rounded-xl bg-black/30 border border-white/10 max-w-full"
     >
       {ordered.map((g) => {
         const on = g.id === active;

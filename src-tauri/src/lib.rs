@@ -2363,6 +2363,7 @@ pub fn run() {
             scrobble::scrobble_test_fire,
             scrobble::scrobble_history_trakt,
             scrobble::scrobble_history_anilist,
+            scrobble::set_scrobble_run_active,
             // ── API keys (OS keyring) ─────────────────────────────────────────
             api_keyring::get_api_key,
             api_keyring::set_api_key,

@@ -97,6 +97,7 @@ const PORTABLE_BACKEND_FIELDS = [
   "demuxer_readahead_secs",
   "demuxer_max_mib",
   "scrobble_enabled",
+  "auto_scrobble_enabled",
 ] as const;
 
 export type PortableBackendField = typeof PORTABLE_BACKEND_FIELDS[number];

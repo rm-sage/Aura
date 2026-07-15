@@ -566,6 +566,76 @@ async fn trakt_sync_history_once(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bulk-run flag, mirrored from the frontend.
+//
+// The bulk History scrobble runs in the WEBVIEW (see scrobbleRun.ts), but the
+// window-close decision is made in Rust. This flag is how the close handler
+// learns that a job is in flight so it can ask the user instead of silently
+// killing a half-finished run and leaving Trakt/AniList partially updated with
+// no record of where it stopped.
+// ---------------------------------------------------------------------------
+
+static SCROBBLE_RUN_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Marker prefix on an error a RETRY CAN NEVER FIX.
+///
+/// Trakt simply does not have Frieren S02E10 under this numbering; AniList cannot
+/// resolve some titles at all. Those verdicts are stable, so the bulk runner marks
+/// the row permanently ineligible instead of re-attempting it (and re-reporting it
+/// as a failure) on every single run.
+///
+/// The frontend keys on this exact prefix and strips it before showing the message
+/// (`scrobbleRun.ts` / `HistoryView.tsx`). Kept as a machine-readable marker rather
+/// than having the frontend pattern-match English prose, which would silently break
+/// the moment anyone reworded an error.
+pub const PERMANENT_PREFIX: &str = "[permanent] ";
+
+/// True while a bulk History scrobble is running. Read by window_logic's
+/// CloseRequested handler.
+pub fn scrobble_run_active() -> bool {
+    SCROBBLE_RUN_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Mirror the frontend's bulk-run state into Rust. The frontend MUST clear this
+/// (in a `finally`) or the window could never be closed again.
+#[tauri::command]
+pub fn set_scrobble_run_active(active: bool) {
+    SCROBBLE_RUN_ACTIVE.store(active, std::sync::atomic::Ordering::Release);
+}
+
+/// Last time a PROACTIVE Trakt refresh was attempted, per scope.
+static LAST_PROACTIVE_REFRESH: OnceLock<Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+    OnceLock::new();
+
+/// Rate-limit the proactive refresh path to at most one attempt per scope per
+/// `REFRESH_COOLDOWN`.
+///
+/// The window check alone is not enough. Once a token IS genuinely inside the
+/// window, every subsequent call would try to refresh until one succeeds -- and
+/// if the refresh endpoint is the thing that's failing (429), that is a retry
+/// storm that makes the 429 worse. This caps proactive attempts regardless, so a
+/// bulk run degrades to "use the current token, let the reactive 401 path sort it
+/// out" instead of hammering. Returns true when a refresh may be attempted, and
+/// stamps the attempt.
+///
+/// The reactive (401) refresh is deliberately NOT gated by this: that one only
+/// fires when the server has already rejected the token, so it is self-limiting.
+fn proactive_refresh_allowed(scope: &str) -> bool {
+    const REFRESH_COOLDOWN: Duration = Duration::from_secs(60);
+    let map = LAST_PROACTIVE_REFRESH.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let Ok(mut guard) = map.lock() else { return true };
+    let now = std::time::Instant::now();
+    if let Some(prev) = guard.get(scope) {
+        if now.duration_since(*prev) < REFRESH_COOLDOWN {
+            return false;
+        }
+    }
+    guard.insert(scope.to_string(), now);
+    true
+}
+
 async fn trakt_sync_history(
     scope: &str, sess: &ScrobbleSession, time: f64, duration: f64, watched_at: Option<&str>,
 ) -> TraktSyncResult {
@@ -578,19 +648,28 @@ async fn trakt_sync_history(
     };
 
     // ── Proactive refresh ──────────────────────────────────────────
-    // Trakt access tokens are 90-day-lived. If this one is within ~7
-    // days of expiry, refresh BEFORE dispatching so the request goes
-    // out with a fresh token rather than relying on the reactive 401
-    // backstop. `expires_at == None` means the proxy didn't stamp an
-    // expiry (older token) — skip the proactive check and let the
-    // reactive path handle it.
+    // Refresh BEFORE dispatching when the access token is close to expiry, so
+    // the request goes out fresh rather than leaning on the reactive 401
+    // backstop. `expires_at == None` means the proxy didn't stamp an expiry
+    // (older token) — skip the proactive check entirely.
+    //
+    // THE WINDOW MUST STAY WELL UNDER THE TOKEN LIFETIME. This was 7 DAYS, on
+    // the assumption (in a comment) that Trakt tokens live 90 days. The proxy
+    // actually issues SEVEN-DAY tokens, so `exp - now` was ~604800 against a
+    // 604800 window: every call one second past the last refresh fell inside the
+    // window and minted ANOTHER token. A bulk history scrobble therefore hit
+    // /trakt/refresh once per push and rate-limited itself (429) within a couple
+    // of minutes -- the /sync/history calls themselves were fine. Keep this small
+    // enough that a normal token is nowhere near it; the reactive 401 path is the
+    // real safety net, and REFRESH_COOLDOWN below is a hard backstop against ever
+    // re-entering that storm.
     if let Some(exp) = token.expires_at {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        const PROACTIVE_WINDOW: u64 = 7 * 24 * 3600;
-        if exp.saturating_sub(now) < PROACTIVE_WINDOW {
+        const PROACTIVE_WINDOW: u64 = 30 * 60;
+        if exp.saturating_sub(now) < PROACTIVE_WINDOW && proactive_refresh_allowed(scope) {
             match scrobble_auth::refresh_trakt_token(scope, Some(&token.access_token)).await {
                 Ok(_) => {
                     // Re-read so the dispatch below uses the rotated token.
@@ -808,6 +887,18 @@ pub async fn scrobble_end<R: Runtime>(
         // disconnecting their accounts.
         return Ok(());
     }
+    if !s.auto_scrobble_enabled {
+        // Automatic scrobbling is off. This is the END-OF-PLAYBACK push, i.e. the
+        // automatic path — so it stands down. The History page's manual and bulk
+        // scrobbling deliberately does NOT consult this flag: the whole point of
+        // turning automatic off is to choose what gets recorded by hand instead.
+        crate::devlog!(
+            info, "scrobble",
+            "scrobble_end: automatic scrobbling is off — skipping the completion push \
+             (History-page scrobbling still works)",
+        );
+        return Ok(());
+    }
 
     let scope = sess.scope.clone();
     let progress = if duration > 0.0 { (time / duration * 100.0).clamp(0.0, 100.0) } else { 0.0 };
@@ -1017,15 +1108,18 @@ pub async fn scrobble_test_fire<R: Runtime>(
 /// series-root IMDb anchor. `imdb_id`/`title` reuse the existing session
 /// field names.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn session_from_history(
-    id:         String,
-    parent_id:  Option<String>,
-    media_type: String,
-    season:     Option<u32>,
-    episode:    Option<u32>,
-    name:       String,
-    is_anime:   bool,
-    scope:      String,
+    id:              String,
+    parent_id:       Option<String>,
+    media_type:      String,
+    season:          Option<u32>,
+    episode:         Option<u32>,
+    name:            String,
+    is_anime:        bool,
+    scope:           String,
+    anilist_id:      Option<u64>,
+    anilist_episode: Option<u32>,
 ) -> ScrobbleSession {
     ScrobbleSession {
         imdb_id: id,
@@ -1038,8 +1132,15 @@ fn session_from_history(
         episode_num: episode,
         series_imdb_id: parent_id,
         absolute_episode_num: None,
-        anilist_id: None,
-        anilist_episode: None,
+        // The addon's per-video AniList mapping, carried on the History row. These
+        // used to be hardcoded None, which quietly disabled the AIOMetadata
+        // fast-path for EVERY manual/bulk history scrobble: the resolver fell back
+        // to title-search + SEQUEL-walk, which cannot place a split-cour show
+        // (Dr. STONE S04E29 has no AniList entry with >= 29 episodes, so it landed
+        // on the 24-episode base and clamped the save away). Live playback always
+        // passed these; history simply never stored them.
+        anilist_id,
+        anilist_episode,
     }
 }
 
@@ -1050,20 +1151,25 @@ fn session_from_history(
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn scrobble_history_trakt<R: Runtime>(
-    _app:       AppHandle<R>,
-    id:         String,
-    parent_id:  Option<String>,
-    media_type: String,
-    season:     Option<u32>,
-    episode:    Option<u32>,
-    name:       String,
-    scope:      String,
-    played_at:  String,
+    _app:            AppHandle<R>,
+    id:              String,
+    parent_id:       Option<String>,
+    media_type:      String,
+    season:          Option<u32>,
+    episode:         Option<u32>,
+    name:            String,
+    scope:           String,
+    played_at:       String,
+    anilist_id:      Option<u64>,
+    anilist_episode: Option<u32>,
 ) -> Result<String, String> {
+    // Trakt never reads the AniList fields; accepted only so both history
+    // commands take the identical payload from the frontend.
+    let _ = (anilist_id, anilist_episode);
     if scrobble_auth::read_token_for("trakt", &scope).is_none() {
         return Err("Trakt is not connected. Connect it in Settings > Scrobbling.".into());
     }
-    let sess = session_from_history(id, parent_id, media_type, season, episode, name, false, scope.clone());
+    let sess = session_from_history(id, parent_id, media_type, season, episode, name, false, scope.clone(), None, None);
     let trimmed = played_at.trim();
     let watched_at = if trimmed.is_empty() { None } else { Some(trimmed) };
     crate::devlog!(
@@ -1075,12 +1181,18 @@ pub async fn scrobble_history_trakt<R: Runtime>(
     // synthetic completion pair.
     match trakt_sync_history(&scope, &sess, 100.0, 100.0, watched_at).await {
         TraktSyncResult::Fired    => Ok("Added to Trakt history".into()),
+        // Both of these are verdicts about the ITEM, not about this attempt: Trakt's
+        // catalog does not contain it under this numbering, or there is no IMDb id to
+        // key on. Retrying changes nothing, so they carry PERMANENT_PREFIX and the
+        // caller retires the row instead of failing it again on every run.
         TraktSyncResult::NotFound => {
-            Err("Trakt has no catalog match for this title under its numbering.".into())
+            Err(format!("{PERMANENT_PREFIX}Trakt has no catalog match for this title under its numbering."))
         }
         TraktSyncResult::Skipped  => {
-            Err("This item has no IMDb id Trakt can use.".into())
+            Err(format!("{PERMANENT_PREFIX}This item has no IMDb id Trakt can use."))
         }
+        // Transient: network blip or a token that needs refreshing. Retry is exactly
+        // the right response, so this one is deliberately NOT marked permanent.
         TraktSyncResult::Failed   => {
             Err("Trakt request failed (network error or token rejected). Try again.".into())
         }
@@ -1095,27 +1207,35 @@ pub async fn scrobble_history_trakt<R: Runtime>(
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn scrobble_history_anilist<R: Runtime>(
-    app:        AppHandle<R>,
-    id:         String,
-    parent_id:  Option<String>,
-    media_type: String,
-    season:     Option<u32>,
-    episode:    Option<u32>,
-    name:       String,
-    scope:      String,
-    played_at:  String,
+    app:             AppHandle<R>,
+    id:              String,
+    parent_id:       Option<String>,
+    media_type:      String,
+    season:          Option<u32>,
+    episode:         Option<u32>,
+    name:            String,
+    scope:           String,
+    played_at:       String,
+    anilist_id:      Option<u64>,
+    anilist_episode: Option<u32>,
 ) -> Result<String, String> {
     if scrobble_auth::read_token_for("anilist", &scope).is_none() {
         return Err("AniList is not connected. Connect it in Settings > Scrobbling.".into());
     }
     // is_anime = true so save_progress runs its resolver; the frontend
-    // gates this command to anime rows already.
-    let sess = session_from_history(id, parent_id, media_type, season, episode, name, true, scope.clone());
+    // gates this command to anime rows already. The anilist_* pair (when the
+    // History row carries it) takes save_progress's embedded fast path and skips
+    // the title-search + SEQUEL-walk entirely -- the only way to get split-cour
+    // shows right.
+    let sess = session_from_history(
+        id, parent_id, media_type, season, episode, name, true, scope.clone(),
+        anilist_id, anilist_episode,
+    );
     let completed_at = crate::scrobble_anilist::parse_fuzzy_date(&played_at);
     crate::devlog!(
         info, "scrobble",
-        "scrobble_history_anilist: id={} scope={} completed_at={:?}",
-        sess.imdb_id, scope, completed_at,
+        "scrobble_history_anilist: id={} scope={} completed_at={:?} embedded=({:?},{:?})",
+        sess.imdb_id, scope, completed_at, anilist_id, anilist_episode,
     );
     use crate::scrobble_anilist::{AnilistError, SaveOutcome};
     match crate::scrobble_anilist::save_progress(&app, &scope, &sess, completed_at).await {
@@ -1130,19 +1250,24 @@ pub async fn scrobble_history_anilist<R: Runtime>(
         Ok(SaveOutcome::AlreadyAhead { progress }) => {
             Ok(format!("AniList already at episode {progress} or beyond"))
         }
+        // Verdicts about the item itself — AniList has nothing this can map onto, and
+        // a retry re-derives the identical answer. Retire the row (PERMANENT_PREFIX)
+        // instead of re-failing it every run.
         Ok(SaveOutcome::NotApplicable) => {
-            Err("AniList scrobbling is not available for this item.".into())
+            Err(format!("{PERMANENT_PREFIX}AniList scrobbling is not available for this item."))
         }
         Ok(SaveOutcome::Unresolvable) => {
-            Err("Could not resolve this title to an AniList entry.".into())
+            Err(format!("{PERMANENT_PREFIX}Could not resolve this title to an AniList entry."))
         }
         Err(AnilistError::Unauthorized) => {
             scrobble_auth::clear_token_for("anilist", &scope);
             Err("AniList sign-in expired. Reconnect it in Settings > Scrobbling.".into())
         }
         Err(AnilistError::NotFound) => {
-            Err("Could not find this anime on AniList.".into())
+            Err(format!("{PERMANENT_PREFIX}Could not find this anime on AniList."))
         }
+        // Everything left (429 after its own retries, 5xx, network, decode) is
+        // transient. NOT marked permanent: the runner should back off and retry.
         Err(e) => Err(format!("AniList request failed: {e}")),
     }
 }
@@ -1168,7 +1293,9 @@ pub fn shutdown_blocking<R: Runtime>(app: &AppHandle<R>) {
     let Some(sess) = taken else { return; };
 
     let s = settings::snapshot();
-    if !s.scrobble_enabled { return; }
+    // Same pair of gates as scrobble_end: this shutdown flush IS the automatic
+    // path, just fired from the close handler instead of end-of-file.
+    if !s.scrobble_enabled || !s.auto_scrobble_enabled { return; }
 
     let (time, duration) = last_playback_slot()
         .lock()

@@ -341,6 +341,12 @@ export default function SubtitleSyncPanel({
   // ffmpeg subtitle-relative index is an ordinal into; sub-added externals must
   // not shift it.
   const embeddedSubs = useMemo(() => subTracks.filter((t) => !t.external), [subTracks]);
+  // Is the ACTIVE track embedded? External tracks (OpenSubtitles downloads,
+  // addon .srt/.vtt) are already text and parse in milliseconds. An embedded
+  // track has to be located with ffprobe and pulled out with a windowed ffmpeg
+  // extract over the network, which is much slower — worth warning about so the
+  // wait does not read as a hang.
+  const activeIsEmbedded = activeSub != null && !activeSub.external;
 
   // Stable key: the track list object identity churns on every `get_tracks`
   // refresh, but the cue fetch must only re-run when the TRACK actually changes.
@@ -835,8 +841,14 @@ export default function SubtitleSyncPanel({
           }}
         >
           {status === "loading" && (
-            <div className="text-white/40 text-xs px-3 py-8 text-center">
+            <div className="text-white/40 text-xs px-3 py-8 text-center leading-relaxed">
               Reading the subtitle track…
+              {activeIsEmbedded && (
+                <span className="block mt-2 text-white/30">
+                  This is an embedded track, which has to be extracted from the video
+                  file, so it can take noticeably longer than an external subtitle.
+                </span>
+              )}
             </div>
           )}
 

@@ -202,13 +202,16 @@ export default function NextUpCta({
             {title}
           </p>
           {/* Arc boundary. Additive to the SxxEyy tag above, not a replacement:
-              the user still needs to know which episode is queued. */}
+              the user still needs to know which episode is queued. The next-arc
+              name sits on its own line so the two facts (arc ended / arc next)
+              read as two lines rather than one long run-on. */}
           {arcNote && (
-            <p className="text-ln-accent/85 text-[11px] leading-tight mt-1 line-clamp-2">
+            <div className="text-ln-accent/85 text-[11px] leading-tight mt-1">
+              <p className="line-clamp-1">{arcNote.ending} complete</p>
               {arcNote.next
-                ? `${arcNote.ending} complete · next arc: ${arcNote.next}`
-                : `${arcNote.ending} complete · final arc`}
-            </p>
+                ? <p className="line-clamp-1">Next arc: {arcNote.next}</p>
+                : <p>Final arc</p>}
+            </div>
           )}
         </div>
 

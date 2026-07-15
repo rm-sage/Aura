@@ -23,7 +23,7 @@
 // than the dropdown for legibility over a bright paused frame.
 // ---------------------------------------------------------------------------
 
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ImageLoader from "./ImageLoader";
 import { shrinkPoster } from "./posterSize";
 import SeasonSelect from "./SeasonSelect";
@@ -36,6 +36,13 @@ import { formatEpisodeTag } from "./nextUp";
 import { isVideoAired } from "./types";
 import { nextAiringEpisode, formatTargetDate } from "./releaseCountdown";
 import EpisodeAirChip from "./EpisodeAirChip";
+import ArcGrid, { ArcGridSkeleton } from "./ArcGrid";
+import GroupingToggle from "./EpisodeGroupingToggle";
+import {
+  useStoryArcs, loadArcMode, saveArcMode, preferredGroupingId,
+  arcPositionOf, absoluteEpisodeMap, arcsLikelyAvailable, formatAbsoluteEpisode,
+  type EpisodeGrouping, type StoryArc,
+} from "./storyArcs";
 
 interface Props {
   open: boolean;
@@ -127,6 +134,97 @@ function EpisodePanel({
     [sorted, season],
   );
 
+  // ── Story arcs (parity with DetailView) ──────────────────────────────
+  // The in-player panel offers the same Seasons/Arcs split as the Detail page:
+  // for a long-running anime, browse by arc instead of by season. All the arc
+  // logic mirrors DetailView's EpisodesPanel; only the chrome differs (a narrow
+  // player drawer vs. the full page).
+  const [grouping, setGrouping] = useState<EpisodeGrouping>("seasons");
+  const [groupingId, setGroupingId] = useState<string | undefined>(undefined);
+  const [openArcId, setOpenArcId] = useState<string | null>(null);
+  const { arcs: arcResult, loading: arcsLoading } = useStoryArcs(detail, seriesId, groupingId);
+
+  // Restore the remembered Seasons/Arcs choice + grouping whenever the panel
+  // (re)opens or the series changes.
+  useEffect(() => {
+    if (!open) return;
+    const saved = loadArcMode(seriesId);
+    setGrouping(saved.mode);
+    setGroupingId(saved.groupingId);
+    setOpenArcId(null);
+  }, [open, seriesId]);
+
+  // Adopt the finest sensible grouping once arcs resolve, unless the user has
+  // one pinned (same precedence as DetailView).
+  useEffect(() => {
+    if (groupingId || !arcResult || arcResult.groupings.length < 2) return;
+    const preferred = preferredGroupingId(arcResult.groupings);
+    if (preferred && preferred !== arcResult.grouping_id) setGroupingId(preferred);
+  }, [groupingId, arcResult]);
+
+  const arcAvailable = !!arcResult && arcResult.arcs.length > 0;
+  const arcMode = grouping === "arcs" && arcAvailable;
+  // Remembered Arcs mode, arcs not resolved yet: show the arc skeleton rather
+  // than flashing the season list before switching.
+  const arcPending = grouping === "arcs" && !arcAvailable && arcsLoading;
+  // Seasons mode, but a prior visit knew this show has arcs and the result cache
+  // has since expired: pre-show the toggle (loading) so it does not pop in.
+  const arcsLikelyPending =
+    grouping === "seasons" && !arcAvailable && arcsLoading && arcsLikelyAvailable(seriesId);
+  const showToggle = arcAvailable || arcPending || arcsLikelyPending;
+
+  const openArc = useMemo<StoryArc | null>(
+    () => (arcMode ? arcResult!.arcs.find((a) => a.id === openArcId) ?? null : null),
+    [arcMode, arcResult, openArcId],
+  );
+
+  // Absolute episode numbers, so an arc's rows read E101, E158, ... instead of
+  // the addon's per-season numbers (which reset each season and would jump
+  // around in a cross-season arc). Same map DetailView + the arc cards use.
+  const absoluteById = useMemo(() => absoluteEpisodeMap(sorted), [sorted]);
+
+  // The arc's episodes, in arc (broadcast) order; ids the addon no longer lists
+  // are dropped rather than rendered as gaps.
+  const inArc = useMemo(() => {
+    if (!openArc) return [];
+    const byId = new Map(sorted.map((v) => [v.id, v]));
+    return openArc.episode_ids.map((id) => byId.get(id)).filter((v): v is VideoEntry => !!v);
+  }, [openArc, sorted]);
+
+  // Whichever list is actually on screen: a season, or an open arc.
+  const visibleEpisodes = arcMode ? (openArc ? inArc : []) : inSeason;
+
+  const switchGrouping = useCallback((next: EpisodeGrouping) => {
+    setGrouping(next);
+    saveArcMode(seriesId, next, groupingId);
+    // Entering Arcs: open the arc that holds the episode currently playing, so
+    // the user lands where they are rather than at the top of the arc list.
+    if (next === "arcs" && arcResult) {
+      const anchor = currentEpisodeId;
+      setOpenArcId(anchor ? arcPositionOf(arcResult, anchor)?.arc.id ?? null : null);
+    }
+  }, [seriesId, groupingId, arcResult, currentEpisodeId]);
+
+  const switchGroupingId = useCallback((id: string) => {
+    setGroupingId(id);
+    setOpenArcId(null);
+    saveArcMode(seriesId, "arcs", id);
+  }, [seriesId]);
+
+  // On first entry into Arcs mode (or when arcs resolve while already in Arcs
+  // mode) with nothing open, anchor to the playing episode's arc.
+  const arcAnchoredRef = useRef(false);
+  useEffect(() => { arcAnchoredRef.current = false; }, [open, seriesId]);
+  useEffect(() => {
+    if (!arcMode || !arcResult || arcAnchoredRef.current) return;
+    if (openArcId) { arcAnchoredRef.current = true; return; }
+    if (!currentEpisodeId) return;
+    const pos = arcPositionOf(arcResult, currentEpisodeId);
+    if (!pos) return;
+    arcAnchoredRef.current = true;
+    setOpenArcId(pos.arc.id);
+  }, [arcMode, arcResult, openArcId, currentEpisodeId]);
+
   // Next-to-air episode across ALL seasons — its row shows the live
   // countdown chip. No per-second tick here; the chip owns its own.
   const nextAiringId = useMemo(
@@ -136,7 +234,9 @@ function EpisodePanel({
 
   const blurThumbs = loadAuraSettings().blurUnwatchedThumbnails;
 
-  // Auto-scroll the playing episode into view on open.
+  // Auto-scroll the playing episode into view on open. Re-runs when the visible
+  // list changes (season pick, or the open arc), so the current row is centred
+  // in whichever grouping is showing.
   const listRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!open || !currentEpisodeId) return;
@@ -147,7 +247,7 @@ function EpisodePanel({
       el?.scrollIntoView({ block: "center" });
     }, 60);
     return () => window.clearTimeout(id);
-  }, [open, currentEpisodeId, season]);
+  }, [open, currentEpisodeId, season, openArcId, arcMode]);
 
   // Escape closes (matches the other player submenus).
   useEffect(() => {
@@ -219,19 +319,40 @@ function EpisodePanel({
       >
         {/* Header */}
         <div className="flex items-center justify-between gap-3 px-5 pt-5 pb-3 flex-shrink-0">
-          <div className="flex items-center gap-3 min-w-0">
-            {seasons.length > 1 ? (
+          <div className="flex items-center gap-2.5 min-w-0">
+            {arcMode && openArc ? (
+              // An arc is open: a back affordance to the arc list, labelled with
+              // the arc name (mirrors DetailView's "← Various Filler").
+              <button
+                type="button"
+                onClick={() => setOpenArcId(null)}
+                className="flex items-center gap-1.5 min-w-0 text-white/80 hover:text-white
+                           text-[13px] font-medium transition-colors"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden className="flex-shrink-0">
+                  <path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z" />
+                </svg>
+                <span className="truncate">{openArc.name}</span>
+              </button>
+            ) : arcMode ? (
+              <span className="text-[15px] font-mono tracking-wide text-white/80">Arcs</span>
+            ) : seasons.length > 1 ? (
               <SeasonSelect seasons={seasons} value={season} onChange={setSeason} />
             ) : (
-              <span className="text-[15px] font-mono tracking-wide text-white/80">
-                Episodes
-              </span>
+              <span className="text-[15px] font-mono tracking-wide text-white/80">Episodes</span>
             )}
           </div>
-          <div className="flex items-center gap-3 flex-shrink-0">
-            <span className="text-white/45 text-[12px] font-mono tracking-wider">
-              {inSeason.length} {inSeason.length === 1 ? "ep" : "eps"}
-            </span>
+          <div className="flex items-center gap-2.5 flex-shrink-0">
+            {showToggle && (
+              <GroupingToggle mode={grouping} onChange={switchGrouping} loading={!arcAvailable} />
+            )}
+            {/* Count reflects the visible list; hidden on the arc GRID (its own
+                cards carry per-arc counts) and while arcs are still resolving. */}
+            {!(arcMode && !openArc) && !arcPending && !arcsLikelyPending && (
+              <span className="text-white/45 text-[12px] font-mono tracking-wider whitespace-nowrap">
+                {visibleEpisodes.length} {visibleEpisodes.length === 1 ? "ep" : "eps"}
+              </span>
+            )}
             <button
               type="button"
               onClick={onClose}
@@ -252,21 +373,43 @@ function EpisodePanel({
           className="flex-1 min-h-0 overflow-y-auto px-3 pb-4 space-y-1.5"
           style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.10) transparent" }}
         >
-          {loading && inSeason.length === 0 ? (
+          {arcMode && !openArc ? (
+            // Arc GRID: pick an arc to drill into its episodes. ArcGrid owns the
+            // grouping switcher (Sagas / Story Arcs), the tiles, and the loading
+            // skeleton — the same component the Detail page uses.
+            arcResult && (
+              <ArcGrid
+                result={arcResult}
+                seriesId={seriesId}
+                videos={sorted}
+                loading={arcsLoading}
+                activeGroupingId={groupingId}
+                onSelect={(arc) => setOpenArcId(arc.id)}
+                onGroupingChange={switchGroupingId}
+              />
+            )
+          ) : arcPending || arcsLikelyPending ? (
+            // Arcs requested (or known to exist) but not resolved yet: show the
+            // grid skeleton so the panel does not flash the season list first.
+            <ArcGridSkeleton perRow={1} />
+          ) : loading && visibleEpisodes.length === 0 ? (
             Array.from({ length: 6 }).map((_, i) => (
               <div key={i} className="h-[84px] rounded-xl bg-white/[0.04] animate-pulse" />
             ))
-          ) : inSeason.length === 0 ? (
+          ) : visibleEpisodes.length === 0 ? (
             <p className="text-white/45 text-[13px] italic px-3 py-6 text-center">
               No episode list available.
             </p>
           ) : (
-            inSeason.map((v) => {
+            visibleEpisodes.map((v) => {
               const isCurrent = v.id === currentEpisodeId;
               const isNext = v.id === nextEpisodeId;
               const watched = isEpisodeWatched(libraryById, v.id);
               const blurThumb = shouldBlurThumbnail(libraryById, v.id, blurThumbs);
               const isPending = pendingPlayId === v.id;
+              // Season-mode absolute annotation ("(E88)") on a saga show; empty
+              // otherwise. Arc mode shows the absolute number itself, so skip.
+              const absTag = arcMode ? "" : formatAbsoluteEpisode(seriesId, v.episode, absoluteById.get(v.id));
               // Unaired = parseable FUTURE air date (undated specials count
               // as aired). The next-to-air row gets the live chip; later
               // unaired rows a static date. Both dim the thumbnail.
@@ -342,7 +485,13 @@ function EpisodePanel({
                   <div className="flex-1 min-w-0 py-0.5">
                     <div className="flex items-center gap-2">
                       <span className="text-white/45 text-[10.5px] font-mono uppercase tracking-[0.14em]">
-                        {formatEpisodeTag(v)}
+                        {/* Arc mode: absolute whole-series number, so a
+                            cross-season arc's rows agree with the arc's range.
+                            Season mode: the addon's per-season tag, plus the
+                            absolute number in parens on a saga show. */}
+                        {arcMode
+                          ? `E${String(absoluteById.get(v.id) ?? "").padStart(2, "0")}`
+                          : `${formatEpisodeTag(v)}${absTag ? ` ${absTag}` : ""}`}
                       </span>
                       {isCurrent && (
                         <span className="text-ln-accent text-[9.5px] font-semibold uppercase tracking-wider">

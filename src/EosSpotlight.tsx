@@ -353,13 +353,15 @@ function EosSpotlight({
 
                 {/* Arc boundary. The episode you just finished ended a story
                     arc, so say which one, and which is next. Informational
-                    only: the auto-advance countdown still runs. */}
+                    only: the auto-advance countdown still runs. The next-arc
+                    name gets its own line so it does not run on. */}
                 {arcNote && (
-                  <p className="text-ln-accent/85 text-[12.5px] leading-tight mt-1.5">
+                  <div className="text-ln-accent/85 text-[12.5px] leading-tight mt-1.5 space-y-0.5">
+                    <p>{arcNote.ending} complete</p>
                     {arcNote.next
-                      ? `${arcNote.ending} complete · next arc: ${arcNote.next}`
-                      : `${arcNote.ending} complete · final arc`}
-                  </p>
+                      ? <p>Next arc: {arcNote.next}</p>
+                      : <p>Final arc</p>}
+                  </div>
                 )}
 
                 {synopsis && (

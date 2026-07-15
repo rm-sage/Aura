@@ -88,6 +88,7 @@ interface BackendSettings {
   minimize_to_tray_on_close: boolean;
   scrobble_addon_url: string;
   scrobble_enabled: boolean;
+  auto_scrobble_enabled: boolean;
   opensubtitles_api_key: string;
   /** Legacy HDR toggle. Kept on the wire so older settings survive the
    *  migration, but the new UI talks to `hdr_mode` directly. */
@@ -219,12 +220,15 @@ interface ToggleProps {
   description: string;
   value: boolean;
   onChange: (v: boolean) => void;
+  /** Greys the row out and refuses input — for a toggle whose parent switch is
+   *  off, where flipping it would mean nothing. */
+  disabled?: boolean;
 }
 
-function SettingToggle({ label, description, value, onChange }: ToggleProps) {
+function SettingToggle({ label, description, value, onChange, disabled = false }: ToggleProps) {
   return (
     <div
-      className="flex items-center justify-between gap-4"
+      className={`flex items-center justify-between gap-4 ${disabled ? "opacity-40" : ""}`}
       data-settings-row=""
       data-settings-label={label}
       data-settings-description={description}
@@ -234,10 +238,12 @@ function SettingToggle({ label, description, value, onChange }: ToggleProps) {
         <p className="text-white/35 text-xs mt-0.5">{description}</p>
       </div>
       <button
-        onClick={() => onChange(!value)}
+        onClick={() => { if (!disabled) onChange(!value); }}
+        disabled={disabled}
         role="switch"
         aria-checked={value}
         className={`relative w-10 h-6 rounded-full transition-colors duration-150 flex-shrink-0
+                    disabled:cursor-default
                     ${value ? "bg-ln-accent/80" : "bg-white/15"}`}
       >
         <span
@@ -5382,6 +5388,13 @@ export default function SettingsView({ addons, session }: Props) {
                 description="Master switch. When off, Aura sends no scrobble traffic to either provider, useful for pausing without disconnecting your accounts."
                 value={backend.scrobble_enabled}
                 onChange={(v) => patchBackend({ scrobble_enabled: v })}
+              />
+              <SettingToggle
+                label="Scrobble automatically"
+                description="On by default: Aura records what you watch as you finish it. Turn this off to decide what gets recorded yourself — the History page's per-item and bulk scrobbling keeps working either way."
+                value={backend.auto_scrobble_enabled}
+                onChange={(v) => patchBackend({ auto_scrobble_enabled: v })}
+                disabled={!backend.scrobble_enabled}
               />
             </Section>
           )}

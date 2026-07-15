@@ -51,6 +51,23 @@ export interface HistoryEntry {
   /** How far into the file the user was at the time of write. Same
    *  semantics as state.timeOffset. */
   watched_seconds?: number;
+  /** AIOMetadata's per-video AniList mapping, captured AT PLAY TIME from the
+   *  VideoEntry (via ActiveScrobbleTarget).
+   *
+   *  These are what make AniList scrobbling correct for split-cour franchises.
+   *  AniList models each cour as its own entry (Dr. STONE: 24 + 11 + 11 + ...),
+   *  while the addon numbers season 4 cumulatively (S04E29). Without the
+   *  embedded id, the resolver has to guess: it title-searches, walks SEQUEL
+   *  relations looking for a cour with >= 29 episodes, finds none (each is ~11),
+   *  and falls back to the base entry -- where 29 clamps to 24 and the save is
+   *  skipped. The live-playback path already avoids all that by passing these
+   *  through, but HISTORY rows never stored them, so the manual / bulk scrobble
+   *  rebuilt a session without them and took the broken guessing path.
+   *
+   *  Absent on rows written before this field existed, and on non-anime; the
+   *  resolver's title-search fallback still covers those. */
+  anilist_id?: number | null;
+  anilist_episode?: number | null;
 }
 
 let _activeScope: string = "guest";
@@ -176,6 +193,24 @@ export function removeHistoryEntry(id: string, playedAt: string): void {
   ensureHydrated();
   const before = _entries.length;
   _entries = _entries.filter((e) => !(e.id === id && e.played_at === playedAt));
+  if (_entries.length === before) return;
+  saveToStorage(_activeScope, _entries);
+  window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
+}
+
+/** Remove MANY entries in one write and one change event. The single-entry
+ *  path above persists and dispatches per call, so clearing a 200-row
+ *  multi-selection through it would hit localStorage 200 times and re-render
+ *  the History view 200 times. Keys are (id, played_at) pairs, the same
+ *  primary key `removeHistoryEntry` uses. */
+export function removeHistoryEntries(
+  keys: Array<{ id: string; playedAt: string }>,
+): void {
+  ensureHydrated();
+  if (keys.length === 0) return;
+  const drop = new Set(keys.map((k) => `${k.id}::${k.playedAt}`));
+  const before = _entries.length;
+  _entries = _entries.filter((e) => !drop.has(`${e.id}::${e.played_at}`));
   if (_entries.length === before) return;
   saveToStorage(_activeScope, _entries);
   window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
