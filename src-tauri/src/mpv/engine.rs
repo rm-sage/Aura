@@ -1885,7 +1885,21 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         // A seek issued via the command channel arms the poll
                         // gate immediately (the SEEK event also fires, but this
                         // covers the window before the next drain).
-                        if args.first().map(|s| s.as_str()) == Some("seek") {
+                        // `frame-back-step` is a real backward seek and `stop`
+                        // tears the file down, but neither is named "seek", so
+                        // the old literal match left them exposed for one pump
+                        // tick: the SEEK / END_FILE events also arm the gate,
+                        // but only from the next drain, and the core may not
+                        // have queued them when mpv_command returns. A cache
+                        // poll landing in that window reads a property inside
+                        // libmpv's seek critical section (landmine 3b).
+                        // Forward `frame-step` is deliberately NOT listed: it
+                        // does not seek, and since only restart/ended/started
+                        // clear this flag, arming on it risks pinning the gate.
+                        if matches!(
+                            args.first().map(|s| s.as_str()),
+                            Some("seek") | Some("revert-seek") | Some("frame-back-step") | Some("stop")
+                        ) {
                             seeking = true;
                             last_transition = Instant::now();
                         }

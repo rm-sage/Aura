@@ -244,10 +244,31 @@ pub async fn search_subtitles(
         params.push(("year", y.to_string()));
     }
     if let Some(id) = imdb_id.as_ref().filter(|s| !s.is_empty()) {
+        // Stremio ids for series episodes are COMPOSITE ("tt0903747:1:5"):
+        // base imdb id, season, episode. Sending the whole string produced
+        // `imdb_id=903747:1:5`, which is not an integer, so the search either
+        // 400'd or silently ignored the id and collapsed to the free-text
+        // query. Split it: base id becomes parent_imdb_id and the suffix
+        // becomes season_number / episode_number, which is how the
+        // OpenSubtitles v1 search models an episode. A bare id (movies)
+        // stays on imdb_id.
+        let mut parts = id.split(':');
+        let base = parts.next().unwrap_or("");
+        let season = parts.next().and_then(|s| s.parse::<u32>().ok());
+        let episode = parts.next().and_then(|s| s.parse::<u32>().ok());
         // OpenSubtitles wants the numeric portion of "tt1234567"
-        let numeric = id.trim_start_matches("tt").trim_start_matches('0');
-        if !numeric.is_empty() {
-            params.push(("imdb_id", numeric.to_string()));
+        let numeric = base.trim_start_matches("tt").trim_start_matches('0');
+        // Fail CLOSED on a non-numeric id (kitsu:, mal: and friends): sending
+        // no id at all is strictly better than sending a malformed one.
+        if !numeric.is_empty() && numeric.chars().all(|c| c.is_ascii_digit()) {
+            match (season, episode) {
+                (Some(s), Some(e)) => {
+                    params.push(("parent_imdb_id", numeric.to_string()));
+                    params.push(("season_number", s.to_string()));
+                    params.push(("episode_number", e.to_string()));
+                }
+                _ => params.push(("imdb_id", numeric.to_string())),
+            }
         }
     }
     let langs = languages.unwrap_or_else(|| "en".to_string());
@@ -484,6 +505,11 @@ pub async fn add_subtitle_to_mpv(
     }
     let normalised = path.replace('\\', "/");
     let mode = flag.unwrap_or_else(|| "select".into());
+    // `mode` is moved into the command args below; keep a copy for the
+    // "cached" carve-out (that mode means "add only if not already loaded",
+    // so an unchanged track count there is success, not failure).
+    #[cfg(target_os = "windows")]
+    let mode_for_verify = mode.clone();
     #[cfg(target_os = "windows")]
     {
         // `sub-add <file> <flags> <title> <lang>` — positional. We must
@@ -500,7 +526,42 @@ pub async fn add_subtitle_to_mpv(
                 args.push(lang_str);
             }
         }
-        crate::mpv::engine::submit_command(args)
+        // `submit_command` reports only that the command was QUEUED, never
+        // that mpv ran it. A sub-add that failed (404 URL, unreadable file,
+        // codec mpv refuses) therefore surfaced to the user as a cheerful
+        // "Subtitles loaded" toast with no subtitles and only a `[mpv]` warn
+        // line to explain it. Bracket the add with mpv's own track count to
+        // turn that into a real error. `track-list/count` as int64 is the one
+        // read form proven safe on this libmpv build (same as get_tracks in
+        // lib.rs); the reads are FIFO-ordered behind the command on the engine
+        // thread, and spawn_blocking keeps the channel waits off the main
+        // thread as the engine module's contract requires.
+        let verify = mode_for_verify != "cached";
+        return tauri::async_runtime::spawn_blocking(move || {
+            use crate::mpv::engine::{submit_command, submit_get_property, GetFormat};
+            let before = if verify {
+                submit_get_property("track-list/count".into(), GetFormat::Int64)
+                    .ok()
+                    .and_then(|v| v.as_i64())
+            } else {
+                None
+            };
+            submit_command(args)?;
+            if let Some(before) = before {
+                let after = submit_get_property("track-list/count".into(), GetFormat::Int64)
+                    .ok()
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(before);
+                if after <= before {
+                    return Err(
+                        "mpv could not load that subtitle file".to_string(),
+                    );
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("add_subtitle_to_mpv join error: {e}"))?;
     }
     #[cfg(not(target_os = "windows"))]
     {

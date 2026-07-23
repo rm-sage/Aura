@@ -123,7 +123,7 @@ import { NotificationsProvider, useNotifications } from "./NotificationsContext"
 import NotificationsBell from "./NotificationsBell";
 import AccountButton from "./AccountButton";
 import NotificationsScanner, { clearScannerState } from "./NotificationsScanner";
-import { getTitleState } from "./titleState";
+import { getTitleState, titleStateKey } from "./titleState";
 import { isAnimeMeta, markAnimeId } from "./aiometadata";
 import type {
   AddonEntry,
@@ -306,6 +306,11 @@ function dedupeSkipWindows(windows: PreparedWindow[]): PreparedWindow[] {
 async function mergeChapterSkipWindows(
   existing: PreparedWindow[],
   modeFor: (kind: string) => "off" | "prompt" | "auto",
+  /** Per-load token check from handlePlayStream. The poll below runs up to
+   *  ~6 s, which is long enough for the file to have been replaced. Without
+   *  it the chapters read belong to the NEW file, get merged with the OLD
+   *  file's windows, and the result is stamped over the new file's own. */
+  isStale?: () => boolean,
 ): Promise<PreparedWindow[]> {
   // Wait for chapter-list to land. Demuxer parse can be slightly behind
   // duration; bail early once we see chapters or after ~6 s of attempts.
@@ -322,6 +327,7 @@ async function mergeChapterSkipWindows(
   let duration = 0;
   for (let i = 0; i < 10; i += 1) {
     await new Promise((r) => setTimeout(r, 600));
+    if (isStale?.()) return existing;
     try {
       duration = (await invoke<number | null>("get_property", { name: "duration", format: "double" })) ?? 0;
     } catch {}
@@ -453,6 +459,7 @@ async function mergeChapterSkipWindows(
   if (derived.length === 0) return existing;
 
   const merged = dedupeSkipWindows([...existing, ...derived]);
+  if (isStale?.()) return existing;
   try {
     await invoke("set_skip_windows", { payload: { windows: merged } });
     console.info(
@@ -1388,6 +1395,22 @@ export default function App() {
    *  replay / stream-broken reload sites can re-send the same hint
    *  without threading it through state. */
   const lastHdrHintRef = useRef<boolean>(false);
+  /** The active load's per-playlist Live TV forward proxy (mpv `http-proxy`),
+   *  null for every normal stream. `http-proxy` is a PER-FILE loadfile option,
+   *  so every in-place reload (live auto-retry, recovery-modal Reload, EOS
+   *  Replay) has to re-send it or the reload connects direct and a proxy-gated
+   *  provider rejects it, leaving the channel unrecoverable without exiting to
+   *  the Live grid. Same ref pattern as lastHdrHintRef. */
+  const lastProxyUrlRef = useRef<string | null>(null);
+  /** Per-load token for the OP/ED skip-window resolution chain. That chain is
+   *  fire-and-forget and LONG (a 6 s chapter poll, then a possible ffmpeg
+   *  fetch, then silence scans over up to 600 s of audio), while
+   *  `set_skip_windows` is global state with no file association. Without a
+   *  token, the outgoing episode's chain stamps its OP/ED onto whatever is
+   *  playing by the time it finally resolves: the next episode auto-seeks at
+   *  the previous one's timings. Claimed synchronously before the first await
+   *  and re-checked before every stamp. */
+  const skipChainSeqRef = useRef(0);
   /** The DIRECT (un-proxied) URL of the playing stream, kept for the
    *  PlayerOverlay's Copy / Download / External-player utilities. Cleared
    *  when playback exits. */
@@ -1800,23 +1823,6 @@ export default function App() {
     ) => {
       try {
         if (!stream.url && !stream.info_hash) return;
-        // ── Watch-Together: remember which stream this is (for broadcasting to
-        // the party), and if the leader is starting a NEW party stream, arm
-        // staging so it holds for the rest of the party once it's playing.
-        wtStreamRef.current = { label: streamLabel(stream), key: streamMatchKey(stream) };
-        {
-          const party = getWatchState();
-          // Live TV and trailers are excluded from the party entirely — never
-          // stage on them. A trailer is a private side-trip; it must not hijack
-          // the room (mirrors the null videoKey in the party bridge's getLocal).
-          const isLive =
-            target.media_type === "tv" ||
-            target.id.startsWith("iptv:") ||
-            target.id.startsWith("trailer:");
-          const establishingParty =
-            !isLive && party.status === "connected" && party.isLeader && target.id !== party.roomVideoKey;
-          wtPendingStageRef.current = establishingParty;
-        }
         // Live TV (and trailer) carve-out, computed from `target`
         // (isLivePlayback derives from activeTarget, which isn't set yet
         // mid-load). A live channel has no byte-range CDN edge to preheat and
@@ -1920,6 +1926,32 @@ export default function App() {
           resumeAt = forceStart;
         }
 
+        // ── Watch-Together: remember which stream this is (for broadcasting to
+        // the party), and if the leader is starting a NEW party stream, arm
+        // staging so it holds for the rest of the party once it's playing.
+        //
+        // Deliberately AFTER the resume-prompt abort above. Arming before it
+        // left the flag (and the stream label) set for a stream that was never
+        // loaded, so the next reload that bypasses handlePlayStream (EOS
+        // Replay, live auto-retry) consumed the stale arming on its first frame
+        // and re-staged the entire party at position 0 on the wrong stream.
+        // Re-reading the room state here is also strictly more correct: the
+        // room may have moved while the prompt was up.
+        wtStreamRef.current = { label: streamLabel(stream), key: streamMatchKey(stream) };
+        {
+          const party = getWatchState();
+          // Live TV and trailers are excluded from the party entirely: never
+          // stage on them. A trailer is a private side-trip; it must not hijack
+          // the room (mirrors the null videoKey in the party bridge's getLocal).
+          const isLive =
+            target.media_type === "tv" ||
+            target.id.startsWith("iptv:") ||
+            target.id.startsWith("trailer:");
+          const establishingParty =
+            !isLive && party.status === "connected" && party.isLeader && target.id !== party.roomVideoKey;
+          wtPendingStageRef.current = establishingParty;
+        }
+
         const raw = stream.url ?? `magnet:?xt=urn:btih:${stream.info_hash}`;
         // Reset playback state BEFORE load_video so the loading overlay
         // covers the entire window between user click and first frame.
@@ -1984,6 +2016,7 @@ export default function App() {
           try { return parseStream(stream).hdr != null; } catch { return false; }
         })();
         lastHdrHintRef.current = contentHdrHint;
+        lastProxyUrlRef.current = opts?.proxyUrl ?? null;
 
         const t0load = Date.now();
         await invoke("load_video", {
@@ -2089,6 +2122,13 @@ export default function App() {
         // beyond the meta-detail cache hit.
         // Episode number is parsed from target.id's last segment.
         {
+          // Claim this load's token BEFORE the first await. Every stamp below
+          // is gated on still owning it, so a chain whose file has already
+          // been replaced resolves into a no-op instead of writing the
+          // previous episode's OP/ED windows onto the current one.
+          skipChainSeqRef.current += 1;
+          const skipSeq = skipChainSeqRef.current;
+          const stale = () => skipChainSeqRef.current !== skipSeq;
           (async () => {
             // Reset first so non-anime / no-data cases don't leave
             // stale windows from the previous load.
@@ -2140,7 +2180,8 @@ export default function App() {
                   await invoke("set_skip_windows", { payload: { windows: prepared } });
                   console.info(`[auraskip] stamped ${prepared.length} window(s)`);
                 }
-                const merged = await mergeChapterSkipWindows(prepared, modeFor);
+                const merged = await mergeChapterSkipWindows(prepared, modeFor, stale);
+                if (stale()) return;
                 // Latest ED window START → precisely-timed Next-Up CTA
                 // (last ED wins for double-ED / sponsor-bumper cases).
                 const lastEdStart = merged
@@ -2204,6 +2245,7 @@ export default function App() {
                       op_window: { start: number; end: number } | null;
                       note: string;
                     }>("detect_silence_intervals", { url, maxSecs: 600 });
+                    if (stale()) return;
                     if (sd.available && sd.op_window) {
                       const opWin: PreparedWindow = {
                         type: "op",
@@ -2245,6 +2287,7 @@ export default function App() {
                       ed_start: number | null;
                       note: string;
                     }>("detect_outro_boundary", { url, tailSecs: 420 });
+                    if (stale()) return;
                     if (ob.available && ob.ed_start != null && ob.ed_start > 0) {
                       window.dispatchEvent(new CustomEvent<number>("aura:ed-start-time", {
                         detail: ob.ed_start,
@@ -2533,10 +2576,15 @@ export default function App() {
         // Look up the logo for the buffering overlay. Try the selected meta
         // (the exact card the user clicked) first, falling back to the
         // selected library item.
+        //
+        // The library lookup keys on the SERIES ROOT, not `target.id`.
+        // libraryNormalize collapses every per-episode row into one
+        // series-rooted record, so an episode id (`tt123:1:5`) can never match
+        // a library row and this fallback silently never fired for series.
         const logo =
           target.logo ??
           selectedMeta?.logo ??
-          library.find((i) => i.id === target.id)?.logo ??
+          library.find((i) => i.id === (target.series_id ?? target.id))?.logo ??
           null;
         // absolute_episode_num is patched in by the async effect
         // below — computing it inline would require awaiting the meta
@@ -2593,6 +2641,18 @@ export default function App() {
         // paint behind the player — see the conditional render below.
       } catch (e) {
         console.error("Stream load failed", e);
+        // Never leave party staging armed for a load that failed.
+        wtPendingStageRef.current = false;
+        // setActiveTarget is the LAST statement of the try, so a resolve_stream
+        // or load_video failure leaves isPlayerActive false: PlayerOverlay never
+        // mounts, and with it neither the `aura:player-toast` host nor the
+        // recovery modal (both gated on isPlayerActive). The click was being
+        // swallowed in total silence. showAppToast's host lives outside the
+        // block hidden during playback, so it covers both the "player never
+        // opened" case and a failed in-player source swap.
+        showAppToast("Couldn't start playback. The source may be dead - try another.", {
+          tone: "danger",
+        });
       }
     },
     [closeDetail, selectedMeta, library]
@@ -2619,14 +2679,27 @@ export default function App() {
     const key = `${activeTarget.media_type}:${activeTarget.id}`;
     if (subsFetchedFor.current === key) return;
     subsFetchedFor.current = key;
+    // Drop the OUTGOING episode's list before the new one lands. These are
+    // per-episode subtitle files, and PlayerOverlay's external-sub fallback
+    // auto-adds the first entry as soon as the new file's track list shows no
+    // embedded subs. That read can win the race against this fetch, in which
+    // case the fallback would sub-add the PREVIOUS episode's .srt onto the
+    // current one: right language, wrong timings, and nothing on screen says
+    // so. Clearing first makes the worst case "no external sub yet" instead.
+    setActiveExternalSubs([]);
 
+    // Ignore a response that arrives after the target moved on again (a fast
+    // double-advance): without this the loser of that race overwrites the
+    // winner and the menu lists an episode the user is no longer watching.
+    let cancelled = false;
     invoke<ExternalSubtitle[]>("fetch_external_subtitles", {
       addons,
       mediaType: activeTarget.media_type,
       id:        activeTarget.id,
     })
-      .then((subs) => setActiveExternalSubs(subs ?? []))
-      .catch(() => setActiveExternalSubs([]));
+      .then((subs) => { if (!cancelled) setActiveExternalSubs(subs ?? []); })
+      .catch(() => { if (!cancelled) setActiveExternalSubs([]); });
+    return () => { cancelled = true; };
   }, [activeTarget, addons, isLivePlayback, isTrailerPlayback]);
 
   // ── Subtitle picker overlay ──
@@ -2875,7 +2948,7 @@ export default function App() {
   useEffect(() => {
     if (!activeTarget) { setTitleOverrides(null); return; }
     let cancelled = false;
-    getTitleState(activeTarget.media_type, activeTarget.id).then((st) => {
+    getTitleState(activeTarget.media_type, titleStateKey(activeTarget)).then((st) => {
       if (cancelled || !st) { setTitleOverrides(null); return; }
       setTitleOverrides({ audio_lang: st.audio_lang, sub_lang: st.sub_lang });
     }).catch(() => {});
@@ -2992,6 +3065,13 @@ export default function App() {
       // not a watch session with a "what's next". Let playback sit on the last
       // frame; the user exits back to the detail page when done.
       if (isTrailerPlayback) return;
+      // Live TV has no end of stream: a channel reporting EOF has DROPPED
+      // (provider ended the segment list), so it belongs on the reconnect
+      // path, not an end card offering "Replay". Pausing here would also wedge
+      // recovery outright, because the stale-heartbeat detector early-returns
+      // while paused, so streamBroken could never flip afterwards and the
+      // auto-retry effect would never run.
+      if (isLivePlayback) { setStreamBroken(true); return; }
       setEosActive(true);
       // Pause mpv at the last frame. This silences the 1 Hz stale-
       // heartbeat detector's `if (paused) return` short-circuit, so no
@@ -3003,7 +3083,7 @@ export default function App() {
     };
     window.addEventListener("aura:eos-detected", onEos);
     return () => window.removeEventListener("aura:eos-detected", onEos);
-  }, [togglePause, isTrailerPlayback]);
+  }, [togglePause, isTrailerPlayback, isLivePlayback, setStreamBroken]);
 
   // Listen for ED-start updates from the AniSkip pipeline. The event
   // is dispatched from inside handlePlayStream's lookup IIFE.
@@ -3236,12 +3316,43 @@ export default function App() {
       episode_title: ep.title ?? undefined,
       season:        ep.season ?? undefined,
       episode_num:   ep.episode ?? undefined,
+      // Carry the OUTGOING episode's scoring signals into the next one.
+      // Same series means same original language / production countries /
+      // genres, so re-nesting them is exact, not a guess.
+      //
+      // Without this the advance handed handlePlayStream a target with no
+      // `scoring`, which nulled activeScoringMeta AND the anime-detection
+      // fields on activeTarget. The audio scorer then could not resolve the
+      // "original" token in the priority list, silently dropped it, and
+      // auto-selected the English dub on a Japanese-original show from the
+      // second episode of a binge onward. Same class of loss the
+      // useScrobble is_anime comment describes for AniList.
+      //
+      // activeScoringMeta is preferred over the flattened activeTarget
+      // fields because it also carries `country`, which ActiveScrobbleTarget
+      // has no slot for and which is the scorer's last-resort tier.
+      // handlePlayStream does not clear it until later in this same call, so
+      // it still holds the outgoing episode's values here. Mirrors the
+      // re-nest in onPickSource.
+      scoring: activeScoringMeta ?? {
+        original_language:    activeTarget.original_language ?? null,
+        production_countries: activeTarget.production_countries ?? [],
+        genres:               activeTarget.genres ?? undefined,
+        country:              null,
+      },
     };
+    // Tear the end screen down BEFORE clearing nextUpInfo. The Spotlight
+    // derives its mode from `episode`, so a still-mounted eosActive with a null
+    // nextUpInfo renders the "You've finished <title>" END-CARD for the whole
+    // load, which is seconds, not a flash. The id-keyed reset effect clears
+    // eosActive too, but not until setActiveTarget lands at the very end of
+    // handlePlayStream.
+    setEosActive(false);
     setNextUpInfo(null);
     await handlePlayStream(stream, target);
     // Allow the new target's CTA to arm when its own end approaches.
     nextUpResolvedFor.current = null;
-  }, [activeTarget, library, selectedMeta]);
+  }, [activeTarget, activeScoringMeta, library, selectedMeta]);
 
   const onNextUpPlay = useCallback(async () => {
     if (!nextUpInfo || !nextUpInfo.stream) return;
@@ -3484,9 +3595,13 @@ export default function App() {
     if (!isSeriesLike) { setEosResolve("none"); return; }
     if (nextUpInfo) { setEosResolve("ready"); return; }
     if (eosResolve === "ready" || eosResolve === "none") return;
-    // Once per current episode: the setEosResolve("resolving") below
-    // re-runs this effect, but the started-for ref keeps us from
-    // firing a second addon fan-out.
+    // Once per current episode. `eosResolve` is deliberately NOT a dep of this
+    // effect: while it was, the setEosResolve("resolving") below re-ran the
+    // effect, and the re-run's cleanup flipped `cancelled` on the lookup that
+    // had only just started. The resolve then sat on "resolving" forever,
+    // which the Spotlight renders as a permanent spinner, so the finale and
+    // caught-up end cards never appeared at all. The started-for ref is the
+    // only re-entry guard needed here.
     if (eosResolveStartedFor.current === activeTarget.id) return;
     eosResolveStartedFor.current = activeTarget.id;
     setEosResolve("resolving");
@@ -3596,7 +3711,7 @@ export default function App() {
       setEosResolve("none");
     })();
     return () => { cancelled = true; };
-  }, [eosActive, activeTarget, addons, nextUpInfo, eosResolve]);
+  }, [eosActive, activeTarget, addons, nextUpInfo]);
   // (EOS action handlers are defined just below handleExitPlayback —
   // they depend on it, which is declared later in this component.)
 
@@ -3604,6 +3719,13 @@ export default function App() {
   // Volume is a property of the user's environment (headphones loud, TV
   // quiet) — NOT a property of the content. Save on user-initiated
   // changes (via commitVolumeAndSave) and re-apply on every stream load.
+  // Keyed on the target ID, not the object: the absolute_episode_num / anilist
+  // enrichment patches activeTarget in place (same id, new object identity)
+  // seconds after load, and an object-keyed dep re-read the PERSISTED
+  // last_volume at that moment. Landing inside the 600 ms save debounce, that
+  // reverted a volume the user had just set (settings ended up correct, mpv did
+  // not). mpv keeps `volume` across loadfile, so a same-id source swap needs no
+  // re-apply.
   useEffect(() => {
     if (!activeTarget) return;
     invoke<{ last_volume?: number }>("get_settings")
@@ -3613,7 +3735,8 @@ export default function App() {
         }
       })
       .catch(() => {});
-  }, [activeTarget]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTarget?.id]);
 
   // Wrap commitVolume so user-driven changes also persist (debounced).
   // CRITICAL: save only fires for USER-initiated commits, not for the
@@ -4002,7 +4125,13 @@ export default function App() {
         if (wasWatched === isWatched) continue;
         const item = library.find((i) => i.id === d.id);
         if (!item) continue;
-        pushItemWatched(authKey, item, isWatched).catch((err) => {
+        // Raw record supplies the state block verbatim so the push never
+        // rewrites Stremio's millisecond progress in seconds (see the raw-item
+        // note in pushItemWatched). Series roots carry the last episode's
+        // position there, so this is a real cross-client resume fix, not just
+        // cosmetic.
+        const rawItem = rawLibraryRef.current.find((i) => i.id === d.id) ?? null;
+        pushItemWatched(authKey, item, isWatched, rawItem).catch((err) => {
           console.warn(`[watched-sync] push fail id=${d.id} err=${String(err)}`);
         });
       }
@@ -4176,10 +4305,19 @@ export default function App() {
         // Mark the write so the focus-based sync skips the
         // immediately-after-clear refetch (which would round-trip
         // the old state back from Stremio's eventual-consistency window).
+        // Mirror the zero into the RAW snapshot for every contributing record
+        // (legacy per-episode rows included). Without this, rawLibraryRef keeps
+        // reporting the pre-rewind offset and a later raw-sourced write
+        // (libraryRemoveAll, libraryToggle) would echo it back to the cloud.
+        setRawLibrary((curr) => curr.map((i) =>
+          libraryItemSeriesId(i.id) === detail.item.id
+            ? { ...i, state: { ...i.state, timeOffset: 0 } }
+            : i
+        ));
         window.dispatchEvent(new CustomEvent("aura:library-write"));
         // Then push to the cloud — fire-and-forget so a slow network
         // doesn't keep the row visible.
-        await libraryClearProgress(sess.auth_key, detail.item);
+        await libraryClearProgress(sess.auth_key, detail.item, rawLibraryRef.current);
       } catch (err) {
         console.warn("[cw-clear] failed", err);
       }
@@ -4439,7 +4577,7 @@ export default function App() {
     }
 
     try {
-      await libraryToggle(session.auth_key, meta, library);
+      await libraryToggle(session.auth_key, meta, library, rawLibraryRef.current);
     } catch (err) {
       if (String(err) === SESSION_EXPIRED) await handleSessionExpired();
       // On any error, the impending `aura:library-changed` re-fetch
@@ -5442,6 +5580,17 @@ export default function App() {
         episode_title: firstEp?.title ?? undefined,
         season:        firstEp?.season ?? undefined,
         episode_num:   firstEp?.episode ?? undefined,
+        // A queue hop is a DIFFERENT show, so the outgoing episode's scoring
+        // must not be inherited here. The freshly fetched `detail` carries
+        // all four fields; same shape DetailView's targetForPlay builds.
+        // Without this the queued title opens its first episode with the
+        // "original" priority token unresolvable, i.e. on the English dub.
+        scoring: {
+          original_language:    detail.original_language ?? null,
+          production_countries: detail.production_countries ?? [],
+          genres:               detail.genres ?? [],
+          country:              detail.country ?? null,
+        },
       });
       return true;
     }
@@ -5451,6 +5600,10 @@ export default function App() {
   const stepEpisode = useCallback(async (direction: 1 | -1) => {
     const target = activeTarget;
     if (!target) return;
+    // A party follower must not move its own episode: changing our videoKey
+    // drops us off the room title with no recovery path. Nobody steps while
+    // the room is staged either. Same gate wtTogglePause uses.
+    if (wtStagedHold() || wtFollowerLocked()) return;
     const isSeries = target.media_type === "series" || target.media_type === "anime";
     if (!isSeries) {
       // Movies / non-episodic: there's no "previous episode" semantic,
@@ -5495,11 +5648,6 @@ export default function App() {
         return;
       }
       const ep = candidate.title || `Episode ${candidate.episode ?? "?"}`;
-      // Scoring metadata isn't carried on ActiveScrobbleTarget — handlePlayStream
-      // accepts it as optional and falls back to the addon-supplied stream
-      // metadata for default-track selection. The OS Next/Prev path is rare
-      // enough that the small loss in audio-track scoring fidelity isn't
-      // worth threading the original scoring values through React state.
       await handlePlayStream(stream, {
         id:           candidate.id,
         series_id:    seriesId,
@@ -5509,11 +5657,25 @@ export default function App() {
         episode_title: candidate.title ?? undefined,
         season:        candidate.season ?? undefined,
         episode_num:   candidate.episode ?? undefined,
+        // Same-series step, so the outgoing episode's scoring carries over
+        // verbatim. Omitting it nulled activeScoringMeta and made the audio
+        // scorer drop the "original" priority token, auto-selecting the dub
+        // (see the matching re-nest in advanceToEpisode). The older comment
+        // here claimed handlePlayStream falls back to addon stream metadata
+        // for default-track selection; it does not, it just passes
+        // `target.scoring` straight through.
+        scoring: activeScoringMeta ?? {
+          original_language:    target.original_language ?? null,
+          production_countries: target.production_countries ?? [],
+          genres:               target.genres ?? undefined,
+          country:              null,
+        },
       });
     } catch (err) {
       console.warn("[smtc] step episode failed:", err);
     }
-  }, [addons, activeTarget, handlePlayStream, advanceToQueueNext]);
+  }, [addons, activeTarget, activeScoringMeta, handlePlayStream, advanceToQueueNext,
+      wtStagedHold, wtFollowerLocked]);
 
   // ── In-player source switcher ──────────────────────────────────────────
   // Swap the stream SOURCE for the currently-playing item without leaving the
@@ -5630,11 +5792,17 @@ export default function App() {
         case "play":
         case "pause":
         case "toggle":
-          togglePause();
+          // Wrapped control, NOT the raw one: an OS media key is a user
+          // transport action exactly like the on-screen button, so it has to
+          // honour the party staging hold and the follower lockout, and it has
+          // to broadcast the leader's play/pause to the room. Using the raw
+          // control meant a leader pausing with a media key stopped locally
+          // while every follower played on, with no control frame sent.
+          wtTogglePause();
           break;
         case "stop":
           // No explicit stop binding; pause as the closest analogue.
-          if (!paused) togglePause();
+          if (!paused) wtTogglePause();
           break;
         case "next":
           void stepEpisode(1);
@@ -5645,7 +5813,7 @@ export default function App() {
       }
     });
     return () => { p.then((fn) => fn()); };
-  }, [togglePause, paused, stepEpisode]);
+  }, [wtTogglePause, paused, stepEpisode]);
 
   // ── SMTC: push now-playing metadata when activeTarget / duration changes ──
   useEffect(() => {
@@ -5691,7 +5859,41 @@ export default function App() {
   const writebackTarget = useRef<ActiveScrobbleTarget | null>(null);
   const writebackTimer  = useRef<ReturnType<typeof setTimeout> | null>(null);
   const playbackRef     = useRef({ time: 0, duration: 0 });
-  useEffect(() => { playbackRef.current = { time, duration }; }, [time, duration]);
+  /** Last position seen while a file was GENUINELY loaded, stamped with the
+   *  target it belonged to.
+   *
+   *  handlePlayStream calls notifyNewLoad() (which zeroes time, duration and
+   *  watchedElapsedRef) hundreds of lines BEFORE setActiveTarget, with an
+   *  awaited resolve_stream + load_video in between, so they land in different
+   *  commits. By the time the activeTarget-change cleanup flushes the OUTGOING
+   *  target, the live refs already describe the INCOMING load and every gate in
+   *  flushProgress rejects: watch 35 minutes, switch source, and those 35
+   *  minutes were never written.
+   *
+   *  Two guards, both load-bearing:
+   *    - only updated while a file is really loaded (duration > 0 AND time > 0),
+   *      so a fresh-load reset or a stop_video reporting time 0 cannot poison
+   *      it with zeroes.
+   *    - stamped with the target id, so a snapshot left over from a PREVIOUS
+   *      title can never be written into a different title's record. Without
+   *      it: play A for 35 min, exit, open B, B never produces a duration
+   *      (dead source), exit, and A's 35 minutes land on B's cloud record. */
+  const lastLoadedRef   = useRef<{
+    time: number; duration: number; watched: number; targetId: string | null;
+  }>({ time: 0, duration: 0, watched: 0, targetId: null });
+  useEffect(() => {
+    playbackRef.current = { time, duration };
+    if (duration > 0 && time > 0) {
+      lastLoadedRef.current = {
+        time,
+        duration,
+        watched:  watchedElapsedRef.current,
+        // activeTargetRef is a render-time mirror, so this is the committed
+        // target for the file these ticks belong to.
+        targetId: activeTargetRef.current?.id ?? null,
+      };
+    }
+  }, [time, duration, watchedElapsedRef]);
   /** Episode id whose History row was already written by the 80 %
    *  auto-complete path (onAdvance) for the CURRENT play. Lets
    *  handleExitPlayback skip its duplicate append (addHistoryEntry
@@ -5721,8 +5923,17 @@ export default function App() {
   // the saved resume position is still meaningful.
   const MEANINGFUL_WATCH_S = 120;
   const flushProgress = useCallback(
-    (sess: UserSession | null, target: ActiveScrobbleTarget | null) => {
-      const { time, duration } = playbackRef.current;
+    (
+      sess: UserSession | null,
+      target: ActiveScrobbleTarget | null,
+      /** Optional frozen position to write INSTEAD of live state. Passed only
+       *  by the activeTarget-change cleanup, whose live state already belongs
+       *  to the incoming load (see lastLoadedRef). Every other call site is
+       *  flushing a file that is still loaded, so it reads live state. */
+      snap?: { time: number; duration: number; watched: number },
+    ) => {
+      const { time, duration } = snap ?? playbackRef.current;
+      const watched = snap ? snap.watched : watchedElapsedRef.current;
       if (!sess?.auth_key || !target || duration <= 0) return;
       // Live TV / trailers: no Continue-Watching / progress write — an `iptv:`
       // or `trailer:` target has no library record and no meaningful resume
@@ -5735,14 +5946,93 @@ export default function App() {
       if (time < PROGRESS_WARMUP_S) return;
       // Require real watching, not just a playhead parked past the warmup by a
       // seek / party sync. Fixes "skipping around added a show to CW".
-      if (watchedElapsedRef.current < MEANINGFUL_WATCH_S) return;
+      if (watched < MEANINGFUL_WATCH_S) return;
       // Skip if we already wrote this exact second — prevents duplicate writes
       // when pause and unmount fire close together.
       if (Math.abs(time - lastWrittenTime.current) < 1) return;
       lastWrittenTime.current = time;
-      libraryWriteProgress(sess.auth_key, target, library, time, duration).catch(() => {});
+      // libraryRef (not the `library` state) so this callback stays stable:
+      // taking a `library` dep would recreate it on every optimistic patch
+      // below, which re-runs the pause-debounce effect on a loop.
+      libraryWriteProgress(sess.auth_key, target, libraryRef.current, time, duration)
+        .then(() => {
+          // Optimistically patch the in-memory library so the resume prompt and
+          // Continue Watching see this position WITHOUT a refetch. The only
+          // refetch paths are the `aura:library-changed` event and a window
+          // `focus` handler, and a single-window desktop app never blurs
+          // between play, exit and play again: without this the next resume
+          // prompt reads a record that predates the whole session, and a
+          // first-time movie (no row at all) never offers Resume.
+          //
+          // SECONDS here, deliberately. `library` holds normalizeLibrary's
+          // output, whose canonical unit is seconds, and the resume prompt
+          // reads it as seconds. libraryWriteProgress writes MILLISECONDS to
+          // the cloud (Stremio's protocol unit) and the read side converts.
+          const recordId  = target.series_id ?? target.id;
+          const isEpisode = target.series_id != null && target.series_id !== target.id;
+          const stamp     = new Date().toISOString();
+          setLibrary((prev) => {
+            const idx = prev.findIndex((i) => i.id === recordId);
+            if (idx < 0) {
+              // Mirror of the auto-tracked row the server just created.
+              // `temp: true` matches libraryWriteProgress and keeps it out of
+              // the Library grid and the notifications scanner (both skip
+              // temp), while Continue Watching (timeOffset > 0) picks it up.
+              const row: LibraryItem = {
+                id:         recordId,
+                media_type: target.media_type,
+                name:       target.name,
+                poster:     null,
+                background: null,
+                logo:       target.logo ?? null,
+                year:       null,
+                removed:    false,
+                temp:       true,
+                ctime:      stamp,
+                mtime:      stamp,
+                state: {
+                  timeOffset: time,
+                  duration,
+                  ...(isEpisode ? { video_id: target.id } : {}),
+                },
+              };
+              return [row, ...prev];
+            }
+            const curr = prev[idx];
+            const out  = prev.slice();
+            out[idx] = {
+              ...curr,
+              mtime: stamp,
+              state: {
+                ...curr.state,
+                timeOffset: time,
+                duration,
+                ...(isEpisode ? { video_id: target.id } : {}),
+              },
+            };
+            return out;
+          });
+          // Suppress the focus refetch for 5 minutes. Stremio's datastore is
+          // eventually consistent on `_mtime`, so a pull right after our write
+          // round-trips the OLD state back over the patch above (same reason
+          // libraryClearProgress deliberately skips aura:library-changed).
+          window.dispatchEvent(new CustomEvent("aura:library-write"));
+        })
+        .catch((err) => {
+          // Never silent: this was the only library_put caller that swallowed
+          // everything, including SESSION_EXPIRED, so an expired key meant every
+          // resume position for the rest of the session was lost with no trace
+          // to grep. Deliberately does NOT call handleSessionExpired: that would
+          // log the user out from a background playback timer, mid-episode.
+          console.warn(
+            `[library] progress write FAILED id=${target.series_id ?? target.id} err=${String(err)}`,
+          );
+        });
     },
-    [library],
+    // Intentionally empty: reads `library` through libraryRef so the callback
+    // identity is stable, which keeps the optimistic setLibrary above from
+    // re-creating it and re-running the pause-debounce effect in a loop.
+    [],
   );
 
   // Track the latest active target in a ref so unmount cleanup can flush even
@@ -5761,7 +6051,15 @@ export default function App() {
   // Active target changed (or cleared) → flush the *previous* target's progress.
   useEffect(() => {
     return () => {
-      flushProgress(session, writebackTarget.current);
+      // Flush the OUTGOING target from the frozen snapshot, not live state: on
+      // an in-player advance or source switch the live refs already belong to
+      // the incoming load (see lastLoadedRef). Only honour the snapshot when it
+      // was captured for THIS target, so a snapshot left over from a previous
+      // title can never be written into this one's record.
+      const outgoing = writebackTarget.current;
+      const snap     = lastLoadedRef.current;
+      const useSnap  = outgoing != null && snap.targetId === outgoing.id && snap.duration > 0;
+      flushProgress(session, outgoing, useSnap ? snap : undefined);
       // Reset the dedup guard for the NEXT target. `flushProgress` skips a
       // write when `time` is within 1 s of `lastWrittenTime` (to coalesce a
       // pause-write and an unmount-write on the same second). Left un-reset
@@ -5945,6 +6243,11 @@ export default function App() {
     setActiveStreamUrl(null);
     setCurrentStream(null);
     setActiveExternalSubs([]);
+    // Re-arm the fetch memo alongside the list it guards. Leaving it stamped
+    // while the list is cleared meant replaying the SAME title later in the
+    // session hit the `subsFetchedFor.current === key` early-return, so the
+    // subtitle menu stayed permanently empty of addon tracks until restart.
+    subsFetchedFor.current = null;
     setActiveScoringMeta(null);
     // EOS Spotlight: ensure the end screen is torn down the instant the
     // player exits, independent of the activeTarget-reset effect's
@@ -5993,7 +6296,16 @@ export default function App() {
     setLiveReconnecting(true);
     const t = window.setTimeout(() => {
       notifyNewLoad();
-      invoke("load_video", { path: activeStreamUrl, startSeconds: null }).catch((e) => {
+      // In-place reload: re-arm PlayerOverlay's per-file one-shots (the URL and
+      // the target are unchanged, but mpv has re-run loadfile).
+      window.dispatchEvent(new Event("aura:player-reloaded"));
+      invoke("load_video", {
+        path: activeStreamUrl,
+        startSeconds: null,
+        // Per-file option: without it the retry connects direct and a
+        // proxy-gated provider rejects it (see lastProxyUrlRef).
+        httpProxy: lastProxyUrlRef.current,
+      }).catch((e) => {
         console.error("[live] auto-retry reload failed", e);
       });
     }, 2500);
@@ -6001,6 +6313,20 @@ export default function App() {
     // notifyNewLoad is stable from usePlayback.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [streamBroken, isLivePlayback, activeStreamUrl]);
+
+  // Restore the retry budget once a reconnect HOLDS. Without this the budget
+  // is per tune-in, so a channel left on all evening spends its two retries on
+  // unrelated hiccups hours apart and then goes modal-first on the third. The
+  // hold window (not the first frame alone) is what stops a flapping channel
+  // retrying forever: frame-drop-frame-drop never reaches 30 s of stable
+  // playback, so it still exhausts and surfaces the modal.
+  const LIVE_RETRY_RESET_MS = 30000;
+  useEffect(() => {
+    if (!isLivePlayback || !firstFrameSeen || streamBroken) return;
+    if (liveRetryRef.current === 0) return;
+    const t = window.setTimeout(() => { liveRetryRef.current = 0; }, LIVE_RETRY_RESET_MS);
+    return () => window.clearTimeout(t);
+  }, [isLivePlayback, firstFrameSeen, streamBroken]);
 
   // ── EOS Spotlight action handlers ───────────────────────────────────
   // Defined here (not next to the resolution effect above) because they
@@ -6013,9 +6339,19 @@ export default function App() {
   const onEosReplay = useCallback(async () => {
     if (!activeStreamUrl) { setEosActive(false); handleExitPlayback(); return; }
     setEosActive(false);
+    // Drop the Next-Up card along with the end screen. activeTarget.id does not
+    // change on a replay, so nextUpVisible would otherwise stay true and the
+    // card would re-mount at t=0 of the replay with a freshly armed countdown,
+    // yanking the user into the next episode seconds after they asked to watch
+    // this one again. The normal ED / lead-time trigger re-arms it legitimately
+    // when the replay reaches its own end.
+    setNextUpVisible(false);
     notifyNewLoad();
+    // In-place reload: activeTarget.id and activeStreamUrl are both unchanged,
+    // so PlayerOverlay's per-file one-shots need an explicit re-arm signal.
+    window.dispatchEvent(new Event("aura:player-reloaded"));
     try {
-      await invoke("load_video", { path: activeStreamUrl, startSeconds: null, contentHdrHint: lastHdrHintRef.current });
+      await invoke("load_video", { path: activeStreamUrl, startSeconds: null, contentHdrHint: lastHdrHintRef.current, httpProxy: lastProxyUrlRef.current });
     } catch (e) {
       console.error("[eos] replay failed", e);
     }
@@ -6050,7 +6386,17 @@ export default function App() {
   // decoded frame, so the user is left on the paused final frame. No
   // mpv pause/set_property here — flip-model retention handles the
   // visual (CLAUDE.md landmine #1: never mpv.command set_property).
-  const onEosDismiss = useCallback(() => setEosActive(false), []);
+  const onEosDismiss = useCallback(() => {
+    // Dismissing the end screen must not hand the decision back to the small
+    // Next-Up card. That card is a fresh mount when the Spotlight goes away, so
+    // its "user cancelled the countdown" latch is empty and a countdown the
+    // user already declined re-arms on the frozen final frame. Latch the
+    // dismiss for this episode instead. Escape is the worst case: the keydown
+    // lands before the card mounts, so no cancel listener would ever see it.
+    if (activeTarget) nextUpDismissedFor.current = activeTarget.id;
+    setNextUpVisible(false);
+    setEosActive(false);
+  }, [activeTarget]);
 
   // EpisodePanel play path (Spotlight "Episodes" button + Phase 4 hover
   // edge). Same target shape as onNextUpPlay; routes through
@@ -7056,11 +7402,14 @@ export default function App() {
                   const resumeAt = time > 1 ? time : null;
                   setStreamBroken(false);
                   notifyNewLoad();
+                  // In-place reload: re-arm PlayerOverlay's per-file one-shots.
+                  window.dispatchEvent(new Event("aura:player-reloaded"));
                   try {
                     await invoke("load_video", {
                       path: activeStreamUrl,
                       startSeconds: resumeAt,
                       contentHdrHint: lastHdrHintRef.current,
+                      httpProxy: lastProxyUrlRef.current,
                     });
                   } catch (e) {
                     console.error("Reload failed", e);
@@ -7236,9 +7585,17 @@ export default function App() {
           loading={false}
           noStream={nextUpInfo.stream == null}
           skipTag={nextUpInfo.canon ? formatEpisodeTag(nextUpInfo.canon.episode) : null}
-          onSkipToCanon={nextUpInfo.canon ? onNextUpSkip : undefined}
-          onPlay={onNextUpPlay}
+          // Routed through the EOS handlers, not the raw onNextUp* ones, so the
+          // still-watching streak has a writer on the path that actually fires
+          // during a binge. This card triggers a lead-time before the end of
+          // the file, so an unattended chain never reaches EOF and the
+          // Spotlight (previously the only surface that incremented the
+          // streak) never got a turn: the gate was dead code in exactly the
+          // scenario it exists for.
+          onSkipToCanon={nextUpInfo.canon ? onEosSkipToCanon : undefined}
+          onPlay={onEosPlayNext}
           onDismiss={onNextUpDismiss}
+          autoAdvanceStreak={autoAdvanceStreakRef.current}
           arcNote={arcNote}
         />
       )}

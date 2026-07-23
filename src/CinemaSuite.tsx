@@ -257,7 +257,16 @@ function OsdOverlay({ stats, topPx }: { stats: OsdStats; topPx: number }) {
 // safe fallback.
 // ---------------------------------------------------------------------------
 
-export default function CinemaSuite({ isFullscreen = false }: { isFullscreen?: boolean }) {
+export default function CinemaSuite({
+  isFullscreen = false,
+  pollGate,
+}: {
+  isFullscreen?: boolean;
+  /** Playback is settled: duration known, first frame seen, not buffering or
+   *  seeking. REQUIRED (not optional-defaulting) on purpose, so a future mount
+   *  that forgets it fails to compile rather than silently freezing the OSD. */
+  pollGate: boolean;
+}) {
   const [osdVisible, setOsdVisible] = useState(false);
   const [osdStats, setOsdStats] = useState<OsdStats>({
     frame_drops: 0,
@@ -421,12 +430,21 @@ export default function CinemaSuite({ isFullscreen = false }: { isFullscreen?: b
 
   // Poll only while the OSD panel is visible AND the window is not hidden.
   const hidden = useWindowHidden();
+  // `pollGate` is duration > 0 + first frame seen + not buffering / seeking.
+  // This burst is 29 concurrent get_property reads every 2 s, and the OSD is a
+  // sticky toggle, so without the gate it polled straight through every
+  // loadfile and every AniSkip seek: landmine 3 says a read landing in
+  // libmpv's seek critical section crashes the wrapper, and 29 at a time makes
+  // the collision window that much wider. The interval tears down while the
+  // gate is false and re-fires immediately when it flips back, so the panel
+  // refreshes right after a load or seek instead of going stale. Stats during
+  // a load are meaningless anyway (mpv has not resolved video params yet).
   useEffect(() => {
-    if (!osdVisible || hidden) return;
+    if (!osdVisible || hidden || !pollGate) return;
     pollOsd();
     const id = setInterval(pollOsd, 2000);
     return () => clearInterval(id);
-  }, [osdVisible, pollOsd, hidden]);
+  }, [osdVisible, pollOsd, hidden, pollGate]);
 
   // Toggle via the central keybindings system (App.tsx dispatches the event).
   useEffect(() => {

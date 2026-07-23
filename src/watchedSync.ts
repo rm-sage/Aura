@@ -57,10 +57,19 @@ export async function pushItemWatched(
   authKey: string,
   item: LibraryItem,
   watched: boolean,
+  /** Un-normalized `library_get` record for this id, when available. Its state
+   *  is the source of truth for timeOffset / duration: normalizeLibrary
+   *  rescales those from Stremio's MILLISECONDS down to seconds for the UI, so
+   *  spreading a normalized `item.state` back to the wire rewrites the record
+   *  in seconds. For a movie mark that is cosmetic (ratio stays 1.0), but for a
+   *  series root the untouched timeOffset carries the LAST EPISODE's position,
+   *  and downscaling it makes other Stremio clients resume that episode ~1.2 s
+   *  in. Sourcing from raw is exact and needs no unit heuristic. */
+  rawItem: LibraryItem | null,
 ): Promise<void> {
   if (!authKey || !item) return;
   const mtime = nowIso();
-  const prevState = (item.state ?? {}) as Record<string, unknown>;
+  const prevState = ((rawItem ?? item).state ?? {}) as Record<string, unknown>;
   const nextState: Record<string, unknown> = { ...prevState };
 
   if (watched) {

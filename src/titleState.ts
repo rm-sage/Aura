@@ -21,6 +21,19 @@ export interface TitleState {
   sub_lang?:   string | null;  // 2-letter ISO, or "off" to mean "subs disabled"
 }
 
+/** Per-title state is a property of the SHOW, not of one episode: an audio
+ *  or subtitle language picked on S01E01 has to apply to S01E02. For series,
+ *  `activeTarget.id` is the EPISODE id, so keying on it saved a preference
+ *  that could only ever match the episode the user had just finished, and
+ *  grew the store by one record per episode watched. Every call site resolves
+ *  the key through here instead. Movies are unaffected: their `series_id` is
+ *  absent or equal to `id`. */
+export function titleStateKey(
+  target: { id: string; series_id?: string | null },
+): string {
+  return target.series_id ?? target.id;
+}
+
 /** Look up saved state for `{media_type}:{id}`. Returns null if nothing
  *  is stored yet (caller should fall back to the global defaults). */
 export async function getTitleState(

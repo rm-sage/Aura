@@ -869,6 +869,12 @@ pub async fn scrobble_heartbeat<R: Runtime>(
     Ok(())
 }
 
+/// Minimum watched fraction (percent of runtime) for an AUTOMATIC end-of-
+/// playback push to count as "watched". Kept in step with the frontend's
+/// completion threshold in src/useScrobble.ts. Manual History-page scrobbling
+/// deliberately bypasses this: there the user is asserting the fact directly.
+const AUTO_COMPLETE_MIN_PCT: f64 = 80.0;
+
 #[tauri::command]
 pub async fn scrobble_end<R: Runtime>(
     app: AppHandle<R>,
@@ -902,6 +908,23 @@ pub async fn scrobble_end<R: Runtime>(
 
     let scope = sess.scope.clone();
     let progress = if duration > 0.0 { (time / duration * 100.0).clamp(0.0, 100.0) } else { 0.0 };
+    // Completion floor. `scrobble_end` is invoked from EVERY frontend teardown
+    // path (exit playback, episode switch, unmount, beforeunload), not only
+    // from the >= 80% completion branch, and /sync/history is an unconditional
+    // "mark watched" with no progress semantics. Without this, quitting two
+    // minutes into an episode marked it watched on Trakt and advanced AniList.
+    // `duration <= 0` means we never learned the runtime, so the ratio is not
+    // meaningful: keep the old behaviour there rather than silently dropping a
+    // real completion.
+    if duration > 0.0 && progress < AUTO_COMPLETE_MIN_PCT {
+        crate::devlog!(
+            info, "scrobble",
+            "scrobble_end: id={} progress={:.0}% is under the {:.0}% bar - closing the session \
+             without marking watched (teardown, not a completion)",
+            sess.imdb_id, progress, AUTO_COMPLETE_MIN_PCT,
+        );
+        return Ok(());
+    }
     crate::devlog!(
         info, "scrobble",
         "scrobble_end: id={} progress={:.0}% anime={} scope={} - dispatching to providers",
@@ -1306,6 +1329,16 @@ pub fn shutdown_blocking<R: Runtime>(app: &AppHandle<R>) {
     } else {
         0.0
     };
+    // Same completion floor as scrobble_end: closing the window part-way
+    // through an episode is not a completion and must not mark it watched.
+    if duration > 0.0 && progress_pct < AUTO_COMPLETE_MIN_PCT {
+        crate::devlog!(
+            info, "scrobble",
+            "shutdown flush: id={} progress={:.0}% is under the {:.0}% bar - not marking watched",
+            sess.imdb_id, progress_pct, AUTO_COMPLETE_MIN_PCT,
+        );
+        return;
+    }
 
     let scope = sess.scope.clone();
 

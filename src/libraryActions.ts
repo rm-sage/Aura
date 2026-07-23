@@ -35,10 +35,35 @@ function buildChange(
   meta: MetaPreview,
   existing: LibraryItem | null,
   removed: boolean,
+  rawExisting: LibraryItem | null,
 ): Record<string, unknown> {
   const ctime = existing?.ctime ?? nowIso();
   const mtime = nowIso();
-  const baseState = (existing?.state ?? {}) as Record<string, unknown>;
+  // Progress fields come from the RAW cloud record, never the normalized one.
+  // normalizeLibrary rescales timeOffset / duration from MILLISECONDS (the
+  // Stremio protocol unit) down to seconds for the UI whenever duration
+  // crosses 24 h. Spreading that back onto the wire rewrites the record in
+  // seconds: the RATIO still looks right, so progress bars are fine, but
+  // official Stremio clients seek to timeOffset milliseconds and resume a
+  // 41-minute episode 1.2 seconds in. Toggling library membership must not
+  // touch progress at all, so echo the server's own bytes back.
+  //
+  // Deliberately NOT a magnitude heuristic: "scale up anything under 86400"
+  // would turn a genuinely short item (under 86.4 s, already in ms) into
+  // hours. Sourcing from raw is exact and needs no threshold.
+  //
+  // When there is no raw record with this exact id (a legacy library holding
+  // only per-episode rows), drop the two progress fields rather than write
+  // rescaled ones: the episode rows still carry the real progress and the
+  // normalizer keeps hoisting it for Aura's own UI.
+  let baseState: Record<string, unknown>;
+  if (rawExisting) {
+    baseState = { ...((rawExisting.state ?? {}) as Record<string, unknown>) };
+  } else {
+    baseState = { ...((existing?.state ?? {}) as Record<string, unknown>) };
+    delete baseState.timeOffset;
+    delete baseState.duration;
+  }
   const nextState: Record<string, unknown> = { ...baseState };
   if (Array.isArray(meta.genres) && meta.genres.length > 0) {
     nextState.genres = meta.genres;
@@ -79,11 +104,18 @@ export async function libraryToggle(
   authKey: string,
   meta: MetaPreview,
   library: LibraryItem[],
+  /** Un-normalized `library_get` snapshot. Supplies the record's state block
+   *  verbatim so a toggle never rewrites Stremio's millisecond progress in
+   *  seconds (see buildChange). */
+  rawLibrary: LibraryItem[],
 ): Promise<LibraryToggleResult> {
   const existing = library.find((i) => i.id === meta.id) ?? null;
+  // Membership detection stays on the NORMALIZED row (that is what the UI
+  // shows). Only the opaque state block is sourced from the raw record.
+  const rawExisting = rawLibrary.find((i) => i.id === meta.id) ?? null;
   // If it currently exists AND is not flagged removed → we're removing.
   const isCurrentlyIn = !!existing && !existing.removed;
-  const change = buildChange(meta, existing, /* removed */ isCurrentlyIn);
+  const change = buildChange(meta, existing, /* removed */ isCurrentlyIn, rawExisting);
 
   console.info(
     `[library] toggle ${isCurrentlyIn ? "REMOVE" : "ADD"} id=${meta.id} ` +
@@ -217,9 +249,64 @@ export async function libraryWriteProgress(
 export async function libraryClearProgress(
   authKey: string,
   item: LibraryItem,
+  rawLibrary: LibraryItem[],
 ): Promise<void> {
   if (!authKey) return;
   const mtime = nowIso();
+
+  // Fan out over every RAW record that contributes to this normalized row,
+  // exactly like libraryRemoveAll does. Legacy Aura builds wrote per-episode
+  // records ("tt0903747:1:5"), and normalizeLibrary hoists a non-zero
+  // timeOffset from ANY contributing row, so zeroing only the series root left
+  // the episode row in progress and the CW card came back the moment App's
+  // 5-minute recentlyCleared overlay expired.
+  //
+  // Each record's state is copied VERBATIM from the raw row, never from the
+  // normalized item, so the milliseconds Stremio's protocol uses survive the
+  // rewind untouched. Only timeOffset is mutated.
+  const group = rawLibrary.filter(
+    (i) => i && i.id && libraryItemSeriesId(i.id) === item.id,
+  );
+  if (group.length > 0) {
+    // Touch the series root (when it genuinely exists) plus any row still
+    // carrying progress. Rows already at zero are skipped so we do not bump
+    // their _mtime for nothing, and a root that does NOT exist is never
+    // created: writing one would invent a cloud record that every other
+    // Stremio client would then see.
+    const targets = group.filter((rec) => {
+      if (rec.id === item.id) return true;
+      const s = (rec.state ?? {}) as { timeOffset?: number };
+      return typeof s.timeOffset === "number" && s.timeOffset > 0;
+    });
+    if (targets.length === 0) {
+      console.info("[libraryClearProgress] rewind no-op (already cleared)", { id: item.id });
+      return;
+    }
+    const changes = targets.map((rec) => ({
+      _id:        rec.id,
+      type:       rec.media_type,
+      name:       rec.name,
+      poster:     rec.poster ?? null,
+      background: rec.background ?? null,
+      logo:       rec.logo ?? null,
+      year:       rec.year ?? null,
+      removed:    rec.removed ?? false,
+      temp:       rec.temp ?? false,
+      _ctime:     rec.ctime ?? mtime,
+      _mtime:     mtime,
+      state:      { ...((rec.state ?? {}) as Record<string, unknown>), timeOffset: 0 },
+    }));
+    console.info("[libraryClearProgress] rewind", {
+      id: item.id,
+      mtime,
+      records: targets.map((t) => t.id).join(", "),
+    });
+    await invoke("library_put", { authKey, changes });
+    return;
+  }
+
+  // Fallback: no raw snapshot for this id (empty or stale raw array). Behave
+  // exactly as before and rewind the single normalized record.
   const prevState = (item.state ?? {}) as Record<string, unknown>;
   const nextState = {
     ...prevState,
@@ -239,7 +326,7 @@ export async function libraryClearProgress(
     _mtime:     mtime,
     state:      nextState,
   };
-  console.info("[libraryClearProgress] rewind", { id: item.id, mtime });
+  console.info("[libraryClearProgress] rewind (no raw match)", { id: item.id, mtime });
   await invoke("library_put", { authKey, changes: [change] });
   // Intentionally NOT dispatching `aura:library-changed` here — the
   // App's clear handler does the optimistic local update, and triggering

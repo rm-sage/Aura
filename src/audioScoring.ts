@@ -184,6 +184,24 @@ function normalizeLang(raw: string | null | undefined): { lang2: string | null; 
   return { lang2: LANG_NAME_TO_1[trimmed] ?? null, region: null };
 }
 
+/** Public normalizer for stored or user-supplied language tags: maps a raw
+ *  mpv `lang` value ("jpn"), a BCP-47 tag ("pt-BR") or a language name
+ *  ("Japanese") to a 2-letter 639-1 code. Unrecognised tags fall back to the
+ *  trimmed lowercase input so they still round-trip instead of vanishing.
+ *
+ *  Exported because the SAME normalization has to happen on both sides of
+ *  every language comparison. Track tags were already normalized here while
+ *  saved per-title preferences and priority tokens were not, so a per-title
+ *  pick stored as "jpn" could never match a track scored as "ja" and the
+ *  user's explicit choice silently did nothing. */
+export function toLang2(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const { lang2 } = normalizeLang(raw);
+  if (lang2) return lang2;
+  const trimmed = raw.trim().toLowerCase();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 function isExcluded(t: TrackEntry): boolean {
   const blob = `${t.title ?? ""} ${t.codec ?? ""}`;
   return COMMENTARY_RE.test(blob) || DESCRIPTION_RE.test(blob) || KARAOKE_RE.test(blob);
@@ -199,12 +217,16 @@ function expandPriority(audioPriority: string[], originalLanguage: string | null
     if (!t) continue;
     if (t === "original") {
       if (originalLanguage) {
-        const norm = originalLanguage.toLowerCase();
+        const norm = toLang2(originalLanguage) ?? originalLanguage.toLowerCase();
         if (!out.includes(norm)) out.push(norm);
       }
       continue;
     }
-    if (!out.includes(t)) out.push(t);
+    // Tokens are matched against tracks whose tags went through
+    // normalizeLang, so they have to be normalized too. A per-title override
+    // arrives here as the raw mpv tag ("jpn") and would otherwise never match.
+    const norm = toLang2(t) ?? t;
+    if (!out.includes(norm)) out.push(norm);
   }
   if (!out.includes("en")) out.push("en");
   return out;

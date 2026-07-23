@@ -44,11 +44,19 @@ interface Props {
    *  into "skip to canon primary" mode. null otherwise. */
   skipTag?: string | null;
   /** Skip past all upcoming filler/recap into the next canon episode. Wired
-   *  by App only when `skipTag` is set. */
-  onSkipToCanon?: () => void;
+   *  by App only when `skipTag` is set. `auto` is true when the countdown
+   *  fired it unattended, false on a click. Mirrors EosSpotlight's contract. */
+  onSkipToCanon?: (auto: boolean) => void;
   /** Play the (literal) next episode. In skip mode this is the "Play this
-   *  anyway" fallback; otherwise the primary action. */
-  onPlay: () => void;
+   *  anyway" fallback; otherwise the primary action. `auto` as above. */
+  onPlay: (auto: boolean) => void;
+  /** Consecutive unattended auto-advances so far. At 2 or more (with the
+   *  stillWatchingGate setting on) the countdown stands down and the user has
+   *  to click, which is what stops an all-night chain. This card needs the
+   *  same gate EosSpotlight has, because this is the surface that actually
+   *  fires during a binge: it appears a lead-time BEFORE the end of the file,
+   *  so the end-of-stream Spotlight never gets a turn. */
+  autoAdvanceStreak: number;
   /** Hide the CTA for the rest of the current playback session. */
   onDismiss: () => void;
   /** Set only when the episode just finished was the LAST of its story arc, so
@@ -59,6 +67,7 @@ interface Props {
 
 export default function NextUpCta({
   episode, loading, noStream, skipTag, onSkipToCanon, onPlay, onDismiss, arcNote,
+  autoAdvanceStreak,
 }: Props) {
   const tag = formatEpisodeTag(episode);
   const title = (episode.title ?? "").trim() || "Untitled episode";
@@ -76,7 +85,14 @@ export default function NextUpCta({
   // signal (mouse move, key, wheel, hover) clears the timer.
   const settings = loadAuraSettings();
   const initialSeconds = Math.max(5, Math.min(30, Math.round(settings.autoAdvanceDelaySeconds)));
-  const autoArmed = settings.autoAdvanceNextEpisode && !loading && (skipMode || !noStream);
+  // Still-watching binge gate, mirroring EosSpotlight: after 2 consecutive
+  // unattended auto-advances the countdown stands down and the user has to
+  // click through. Opt out via the stillWatchingGate setting (default on).
+  const gatedByStillWatching =
+    settings.stillWatchingGate !== false && autoAdvanceStreak >= 2;
+  const autoArmed =
+    settings.autoAdvanceNextEpisode && !loading && (skipMode || !noStream)
+    && !gatedByStillWatching;
 
   const [remaining, setRemaining] = useState<number | null>(autoArmed ? initialSeconds : null);
   // `cancelled` latches once the user has expressed any cancel intent
@@ -97,7 +113,7 @@ export default function NextUpCta({
     if (remaining <= 0) {
       // Fire whatever the primary button does: skip-to-canon in skip mode,
       // otherwise play the literal next episode.
-      (skipMode ? onSkipToCanon! : onPlay)();
+      (skipMode ? onSkipToCanon! : onPlay)(true);
       return;
     }
     const id = window.setTimeout(() => setRemaining((s) => (s === null ? null : s - 1)), 1000);
@@ -220,7 +236,7 @@ export default function NextUpCta({
           <div className="flex flex-col gap-1">
             <button
               type="button"
-              onClick={onSkipToCanon}
+              onClick={() => onSkipToCanon!(false)}
               className="relative w-full px-3 py-1.5 rounded-lg overflow-hidden
                          border border-ln-accent/45 bg-ln-accent/20
                          text-ln-accent text-[12px] font-semibold tracking-wide
@@ -244,7 +260,7 @@ export default function NextUpCta({
             {!noStream && (
               <button
                 type="button"
-                onClick={onPlay}
+                onClick={() => onPlay(false)}
                 className="text-white/45 hover:text-white/85 text-[11px] tracking-wide
                            transition-colors text-center py-0.5"
               >
@@ -261,7 +277,7 @@ export default function NextUpCta({
           <button
             type="button"
             disabled={loading}
-            onClick={onPlay}
+            onClick={() => onPlay(false)}
             className="relative w-full px-3 py-1.5 rounded-lg overflow-hidden
                        border border-ln-accent/45 bg-ln-accent/20
                        text-ln-accent text-[12px] font-semibold tracking-wide

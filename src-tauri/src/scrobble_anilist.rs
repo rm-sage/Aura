@@ -1000,7 +1000,7 @@ async fn commit_progress(
 }
 
 /// Save scrobble progress to AniList for the given session. No-op when:
-///   * `sess.is_anime` is false
+///   * `sess.is_anime` is false AND no addon-embedded AniList id was supplied
 ///   * No AniList token is stored for `scope`
 ///   * Session id can't be parsed (non-IMDB shape)
 ///   * Existing progress on AniList is already >= our episode
@@ -1013,7 +1013,18 @@ pub async fn save_progress<R: Runtime>(
     sess:         &ScrobbleSession,
     completed_at: Option<FuzzyDate>,
 ) -> Result<SaveOutcome, AnilistError> {
-    if !sess.is_anime {
+    // An addon that attached an explicit AniList media id + episode has told us
+    // outright that this is an AniList-tracked title. That is direct evidence,
+    // so it outranks `is_anime`, which is a heuristic over genres / original
+    // language / id prefixes and returns false for plenty of real anime (an
+    // IMDB-id'd series whose meta carries neither an Anime genre nor a resolved
+    // MAL id). Without this the embedded fast path 20 lines below was
+    // unreachable precisely when it was most valuable.
+    let has_embedded_id = matches!(
+        (sess.anilist_id, sess.anilist_episode),
+        (Some(aid), Some(ep)) if aid > 0 && ep > 0
+    );
+    if !sess.is_anime && !has_embedded_id {
         return Ok(SaveOutcome::NotApplicable);
     }
     let Some(token_obj) = scrobble_auth::read_token_for("anilist", scope) else {
@@ -1050,6 +1061,20 @@ pub async fn save_progress<R: Runtime>(
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    // Everything below is heuristic resolution (Fribb id-map, title search,
+    // sequel walk). That is only defensible for a title our own detector agrees
+    // is anime. When the sole reason we got past the gate was an addon-supplied
+    // id, and that id failed to resolve, stop here: title-searching AniList for
+    // a show it may not track at all risks writing progress to the wrong entry.
+    if !sess.is_anime {
+        crate::devlog!(
+            info, "scrobble",
+            "AniList: embedded id did not resolve and is_anime=false for \"{}\"; not falling back to heuristics",
+            sess.title,
+        );
+        return Ok(SaveOutcome::Unresolvable);
     }
 
     let Some(show_id) = parse_show_id(&sess.imdb_id) else {

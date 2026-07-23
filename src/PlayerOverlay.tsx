@@ -19,8 +19,8 @@ import type { ActiveScrobbleTarget } from "./useScrobble";
 import type { AddonEntry, ExternalSubtitle, LibraryItem, TrackEntry, VideoEntry } from "./types";
 import EpisodePanel from "./EpisodePanel";
 import { formatAbsoluteEpisode } from "./storyArcs";
-import { setTitleState } from "./titleState";
-import { pickDefaultAudio, type ScoringMeta } from "./audioScoring";
+import { setTitleState, titleStateKey } from "./titleState";
+import { pickDefaultAudio, toLang2, type ScoringMeta } from "./audioScoring";
 import { prettyBinding } from "./useKeybindings";
 import { loadAuraSettings, saveAuraSettings } from "./auraSettings";
 import AniSkipMenu from "./AniSkipMenu";
@@ -32,6 +32,30 @@ import { copyTextToClipboard } from "./clipboard";
 // (engine.rs) must match. >100 is a soft boost (~+3.5 dB at 150) for quiet
 // sources; the DEFAULT stays 50 so nothing is loud until the user opts in.
 export const VOLUME_MAX = 150;
+
+// Stable empty track list. Shared identity matters: it is what the track-list
+// state falls back to while the current file's list has not been read yet, and
+// a fresh [] each render would re-fire every useMemo / effect keyed on it.
+const EMPTY_TRACKS: TrackEntry[] = [];
+
+/** Does a subtitle track's language tag satisfy the preferred language?
+ *
+ *  Both sides are normalized to a 2-letter code first, because the two ends
+ *  disagree on shape in practice: embedded mpv tracks tag themselves 639-2
+ *  ("eng"), addon-supplied externals are almost always 2-letter ("en"), and a
+ *  saved per-title pick stores whichever the user happened to click. A bare
+ *  prefix test matched "eng" against "en" but NOT "en" against "eng", so a
+ *  per-title choice made on an embedded track silently stopped matching the
+ *  external list. The prefix test is kept as a fallback so a 3-letter code
+ *  missing from the ISO table behaves exactly as it did before. */
+function subLangMatches(lang: string | null | undefined, pref: string): boolean {
+  if (!pref) return false;
+  const raw = (lang ?? "").toLowerCase();
+  const prefNorm = toLang2(pref) ?? pref;
+  const langNorm = toLang2(raw);
+  if (langNorm && langNorm === prefNorm) return true;
+  return raw.startsWith(pref);
+}
 
 // ---------------------------------------------------------------------------
 // Menu-open tracker — child menus (TrackMenu, SpeedMenu, ShaderPicker,
@@ -417,10 +441,27 @@ function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | n
     if (!activeTarget || profiles.length === 0) return;
     let cancelled = false;
     import("./titleState").then(({ getTitleState }) => {
-      getTitleState(activeTarget.media_type, activeTarget.id).then((st) => {
-        if (cancelled || !st?.shader) return;
-        const match = profiles.find((p) => p.name === st.shader);
-        if (!match) return;
+      getTitleState(activeTarget.media_type, titleStateKey(activeTarget)).then((st) => {
+        if (cancelled) return;
+        const match = st?.shader ? profiles.find((p) => p.name === st.shader) : null;
+        if (!match) {
+          // No saved profile for this title: clear whatever the PREVIOUS title
+          // left applied. `glsl-shaders` is a global mpv option and survives
+          // loadfile, and this effect only ever applied, never un-applied, so
+          // an Anime4K chain picked on an anime stayed active on the next
+          // live-action film. Profile 0 is the empty chain, so this resolves
+          // to a `change-list glsl-shaders clr` and never hands a path to
+          // set_property (landmine 8).
+          invoke<number>("get_shader_profile")
+            .then((cur) => {
+              if (cancelled || cur === 0) return;
+              invoke("set_shader_profile", { profile: 0 })
+                .then(() => setActive(0))
+                .catch(() => {});
+            })
+            .catch(() => {});
+          return;
+        }
         invoke("set_shader_profile", { profile: match.id })
           .then(() => setActive(match.id))
           .catch(() => {});
@@ -462,7 +503,7 @@ function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | n
       const name = profiles.find((p) => p.id === id)?.name ?? "None";
       fireToast(id === 0 ? "Upscaler off" : `Upscaler · ${name}`);
       if (activeTarget && name) {
-        setTitleState(activeTarget.media_type, activeTarget.id, { shader: name });
+        setTitleState(activeTarget.media_type, titleStateKey(activeTarget), { shader: name });
       }
     } catch (e) {
       console.error("Shader switch failed", e);
@@ -1335,12 +1376,42 @@ export default function PlayerOverlay({
   // truth, no duplicate fetch.
   const skipWindowsForScrub = useSkipWindows();
 
-  // Track lists — polled every 500 ms because we trimmed `track-list /
-  // aid / sid` out of the property-observer set in Phase 6.0.2 (those
-  // formats broke the entire observation channel on this libmpv build).
-  // Polling is cheap enough at 2 Hz and reflects MPV's true selection
-  // state so the dropdown doesn't visually snap back.
-  const [tracks, setTracks] = useState<TrackEntry[]>([]);
+  // Track lists: read on demand because we trimmed `track-list / aid / sid`
+  // out of the property-observer set in Phase 6.0.2 (those formats broke the
+  // entire observation channel on this libmpv build). The 500 ms poll this
+  // comment used to describe is GONE and must not come back: it raced the
+  // AniSkip seek and crashed the FFI. See the read-once + `aura:tracks-refresh`
+  // pattern in the effect below.
+  //
+  // The list is KEYED to the file it was read from. An episode advance or a
+  // source switch swaps the file without unmounting PlayerOverlay, and the
+  // one-shot auto-selects below re-arm the instant `activeTarget.id` /
+  // `streamUrl` changes, which is in the SAME commit, ~10 ms after
+  // `loadfile`, long before the new file's track list has been read. Holding
+  // the list in plain state let those effects run against the PREVIOUS
+  // file's tracks and burn their one-shot guard on a stale answer (observed
+  // as the audio auto-select firing 12 ms after loadfile). Deriving `tracks`
+  // from a load key during RENDER, rather than clearing it from the reset
+  // effect, is what makes the staleness visible synchronously: a state
+  // update scheduled inside the reset effect would not be serviced until
+  // after every other passive effect in the same commit had already run.
+  // In-place reloads (recovery-modal "Reload stream", EOS "Replay", live
+  // auto-reconnect) re-issue load_video with the SAME activeTarget.id and the
+  // SAME streamUrl, so neither half of this key changes even though mpv has
+  // re-run loadfile and reverted aid / sid to the file's defaults. App.tsx
+  // fires `aura:player-reloaded` on those three paths; folding the nonce into
+  // the key makes them re-arm exactly like any other load.
+  const [reloadNonce, setReloadNonce] = useState(0);
+  useEffect(() => {
+    const onReloaded = () => setReloadNonce((n) => n + 1);
+    window.addEventListener("aura:player-reloaded", onReloaded);
+    return () => window.removeEventListener("aura:player-reloaded", onReloaded);
+  }, []);
+  const loadKey = `${activeTarget?.id ?? ""}::${streamUrl ?? ""}::${reloadNonce}`;
+  const [trackList, setTrackList] = useState<{ key: string; list: TrackEntry[] }>(
+    { key: "", list: EMPTY_TRACKS },
+  );
+  const tracks = trackList.key === loadKey ? trackList.list : EMPTY_TRACKS;
   /** Local "subtitles muted" flag tracked separately because MPV's
    *  `sub-visibility=no` doesn't surface as a track-list change. */
   const [subsMuted, setSubsMuted] = useState(false);
@@ -1379,6 +1450,16 @@ export default function PlayerOverlay({
     invoke("set_subtitle_delay", { seconds: 0 }).catch(() => {});
     invoke("set_audio_delay", { seconds: 0 }).catch(() => {});
     invoke("set_subtitle_speed", { speed: 1 }).catch(() => {});
+    // `sub-visibility` is in the same family: an option, so it survives
+    // loadfile, and React's mirror (`subsMuted`) does NOT survive an unmount.
+    // Turning subs off on one title therefore left mpv hiding them on the NEXT
+    // title played, while a freshly-mounted overlay showed subsMuted=false and
+    // the menu showed a track selected. Symptom: "subtitles just stopped
+    // working" with nothing in the UI to explain it. Re-enable per file; the
+    // persisted per-title "off" preference re-applies it a moment later in the
+    // subtitle auto-select effect below, which runs after this one.
+    setSubsMuted(false);
+    invoke("set_subtitle_visibility", { visible: true }).catch(() => {});
     // Keyed on the STREAM as well as the target. A source switch keeps the same
     // activeTarget.id but is a different release, and a subtitle correction
     // belongs to the release: carrying it over would silently mistime the new
@@ -1467,9 +1548,9 @@ export default function PlayerOverlay({
     const refresh = async () => {
       try {
         const t = await invoke<TrackEntry[]>("get_tracks");
-        if (!cancelled) setTracks(t);
+        if (!cancelled) setTrackList({ key: loadKey, list: t });
       } catch {
-        if (!cancelled) setTracks([]);
+        if (!cancelled) setTrackList({ key: loadKey, list: EMPTY_TRACKS });
       }
     };
     const startTimer = setTimeout(() => {
@@ -1488,7 +1569,10 @@ export default function PlayerOverlay({
       clearTimeout(startTimer);
       window.removeEventListener("aura:tracks-refresh", onRefresh);
     };
-  }, [tracksReady]);
+    // `loadKey` is a dep so the read (and the refresh listener) re-arm for
+    // the new file even in the case where `duration` never dips back to 0
+    // between two loads.
+  }, [tracksReady, loadKey]);
 
   // ── Subtitle dynamic lift while controls are visible ──────────────────
   //
@@ -1578,6 +1662,11 @@ export default function PlayerOverlay({
   // Declared here (above the reset effect) so they re-arm per file.
   const subAutoSelectedRef = useRef(false);
   const audioAutoSelectedRef = useRef(false);
+  // Same for the external-sub fallback. An mpv `sub-add` does NOT survive a
+  // loadfile, so a guard that armed once per MOUNT meant only the first
+  // sub-less episode of a binge got an external subtitle: every later one
+  // played bare while the menu still listed the addon's tracks as available.
+  const extSubFallbackRef = useRef(false);
   // Reset per file: on episode change AND on a source switch (streamUrl change).
   // A source switch swaps the stream WITHOUT unmounting PlayerOverlay, so
   // without re-arming these one-shot pickers they keep the PREVIOUS source's
@@ -1589,7 +1678,15 @@ export default function PlayerOverlay({
     setSelectedSubId(null);
     subAutoSelectedRef.current = false;
     audioAutoSelectedRef.current = false;
-  }, [activeTarget?.id, streamUrl]);
+    extSubFallbackRef.current = false;
+    // `reloadNonce`: an in-place reload re-runs loadfile, which drops the
+    // sub-add'd external track and reverts aid / sid to the file's defaults.
+    // These guards have to re-arm for it too, or the user's language picks are
+    // silently lost for the rest of the episode. Note the delay / sub-speed
+    // reset effect above deliberately does NOT take this dep: those are mpv
+    // options that survive loadfile, and a Live Sync correction made for THIS
+    // release should survive a reload of the same release.
+  }, [activeTarget?.id, streamUrl, reloadNonce]);
 
   // Embedded MPV subtitle tracks (in-file + any sub-add'd via the
   // OpenSubtitles picker). The external addon list is merged in below.
@@ -1629,7 +1726,7 @@ export default function PlayerOverlay({
 
     const scored = embeddedSubTracks.map((t) => {
       let score = 0;
-      if ((t.lang ?? "").toLowerCase().startsWith(pref)) score += 100;
+      if (subLangMatches(t.lang, pref)) score += 100;
       if (!isPartialTitle(t.title)) score += 10;
       // Tiebreaker: keep MPV's natural ordering (lower id = earlier track).
       score -= t.id * 0.001;
@@ -1665,9 +1762,8 @@ export default function PlayerOverlay({
   //
   // Trigger: only after the initial track-list fetch has produced a
   // result (`tracks.length > 0` — any video has at least one track) AND
-  // there are zero embedded sub rows. Runs once per session
-  // (`extSubFallbackRef`).
-  const extSubFallbackRef = useRef(false);
+  // there are zero embedded sub rows. Runs once per FILE
+  // (`extSubFallbackRef`, re-armed by the per-file reset effect above).
   useEffect(() => {
     if (extSubFallbackRef.current) return;
     // Live TV / trailers have no persistent subtitles — never auto-load one
@@ -1682,7 +1778,7 @@ export default function PlayerOverlay({
 
     const pref = (preferredSubLang ?? "").toLowerCase();
     const match = pref
-      ? externalSubs.find((s) => (s.lang ?? "").toLowerCase().startsWith(pref))
+      ? externalSubs.find((s) => subLangMatches(s.lang, pref))
       : null;
     const target = match ?? externalSubs[0];
     if (!target) return;
@@ -2111,6 +2207,7 @@ export default function PlayerOverlay({
         isFullscreen={isFullscreen}
         streamUrl={streamUrl}
         controlsVisible={controlsVisible}
+        ready={tracksReady}
       />
 
       {/* ── Top scrim — gradient fade from black to transparent so the
@@ -2397,7 +2494,7 @@ export default function PlayerOverlay({
                   // ids change between releases) so a sibling episode
                   // or a re-watch picks the same language automatically.
                   if (activeTarget && t?.lang) {
-                    setTitleState(activeTarget.media_type, activeTarget.id, {
+                    setTitleState(activeTarget.media_type, titleStateKey(activeTarget), {
                       audio_lang: t.lang.toLowerCase(),
                     });
                   }
@@ -2431,7 +2528,7 @@ export default function PlayerOverlay({
                   setSelectedSubId(null);
                   fireToast("Subtitles off");
                   if (activeTarget) {
-                    setTitleState(activeTarget.media_type, activeTarget.id, {
+                    setTitleState(activeTarget.media_type, titleStateKey(activeTarget), {
                       sub_lang: "off",
                     });
                   }
@@ -2476,7 +2573,7 @@ export default function PlayerOverlay({
                         `Subtitles · ${matching.title ?? matching.lang?.toUpperCase() ?? `#${matching.id}`}`,
                       );
                       if (activeTarget && matching.lang) {
-                        setTitleState(activeTarget.media_type, activeTarget.id, {
+                        setTitleState(activeTarget.media_type, titleStateKey(activeTarget), {
                           sub_lang: matching.lang.toLowerCase(),
                         });
                       }
@@ -2499,7 +2596,7 @@ export default function PlayerOverlay({
                     window.dispatchEvent(new Event("aura:tracks-refresh"));
                     fireToast(`Subtitles · ${ext?.lang?.toUpperCase() ?? "external"}`);
                     if (activeTarget && ext?.lang) {
-                      setTitleState(activeTarget.media_type, activeTarget.id, {
+                      setTitleState(activeTarget.media_type, titleStateKey(activeTarget), {
                         sub_lang: ext.lang.toLowerCase(),
                       });
                     }
@@ -2515,7 +2612,7 @@ export default function PlayerOverlay({
                   const t = subDropdownItems.find((x) => x.id === id);
                   fireToast(`Subtitles · ${t?.title ?? t?.lang?.toUpperCase() ?? `#${id}`}`);
                   if (activeTarget && t?.lang) {
-                    setTitleState(activeTarget.media_type, activeTarget.id, {
+                    setTitleState(activeTarget.media_type, titleStateKey(activeTarget), {
                       sub_lang: t.lang.toLowerCase(),
                     });
                   }
@@ -2628,7 +2725,10 @@ export default function PlayerOverlay({
       />
 
       {/* Performance OSD */}
-      <CinemaSuite isFullscreen={isFullscreen} />
+      <CinemaSuite
+        isFullscreen={isFullscreen}
+        pollGate={duration > 0 && firstFrameSeen && !buffering && !seekLoading}
+      />
     </div>
     </MenuTrackerCtx.Provider>
   );
@@ -4291,17 +4391,30 @@ function SkipPromptToast({
  *  top of PlayerOverlay so its `keydown` listeners stay alive even
  *  when the bottom control bar is hidden by the auto-fade timer. */
 function SkipController({
-  time, seekAbsolute, isFullscreen, streamUrl, controlsVisible,
+  time, seekAbsolute, isFullscreen, streamUrl, controlsVisible, ready,
 }: {
   time: number;
   seekAbsolute: (t: number) => void;
   isFullscreen: boolean;
   streamUrl: string | null;
   controlsVisible: boolean;
+  /** The file is genuinely loaded (duration > 0). Everything below is gated
+   *  on it: skip windows for the NEW episode get stamped within ~1 s of
+   *  `loadfile`, seconds before libmpv finishes parsing headers, while
+   *  `time` is still 0 (or a leftover tick from the file being replaced).
+   *  Ungated, a window starting at ~0 matched instantly and fired its seek
+   *  into libmpv's loadfile critical section: on a cold open mpv rejected it
+   *  (`seek ... failed: -12`) and the window was burned unskipped, and on an
+   *  episode advance (previous file still loaded) it landed, which is the
+   *  "opening skipped the moment it started" symptom. Gating the match
+   *  itself also suppresses the premature toast and prompt. Deliberately
+   *  NOT keyed on first-frame-seen: that flag is set by the cross-boundary
+   *  tick this guard exists to ignore. */
+  ready: boolean;
 }) {
   const windows = useSkipWindows();
-  const active   = windows.find((w) => time >= w.start && time < w.end) ?? null;
-  const upcoming = windows.find((w) => w.start > time && (w.start - time) <= 30) ?? null;
+  const active   = ready ? (windows.find((w) => time >= w.start && time < w.end) ?? null) : null;
+  const upcoming = ready ? (windows.find((w) => w.start > time && (w.start - time) <= 30) ?? null) : null;
 
   // Per-window "we already handled this one" set, scoped to the
   // current stream. A backwards seek out of the window then back in

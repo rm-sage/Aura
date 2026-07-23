@@ -148,8 +148,13 @@ fn read_window_state(_parent_hwnd: isize) -> Value {
 }
 
 /// One-shot live snapshot. Frontend polls this every second.
+/// `async` + `spawn_blocking`: `read_mpv_snapshot` makes ~22 blocking engine
+/// round-trips and `submit_get_property` has no reply timeout, so running it
+/// on the Tauri main thread stalled the whole UI once per poll (and would hang
+/// it outright if the engine thread were wedged in a slow loadfile). Same
+/// discipline as `get_tracks` in lib.rs.
 #[tauri::command]
-pub fn debug_engine_state(app: AppHandle) -> Value {
+pub async fn debug_engine_state(app: AppHandle) -> Value {
     // Always true since the engine consolidation — the mpv engine is the
     // only playback path. Kept in the payload so the frontend panel's
     // shape doesn't change.
