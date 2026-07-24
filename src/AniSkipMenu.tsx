@@ -334,12 +334,12 @@ export default function AniSkipMenu({
           rest of the player's submenus. */}
       <div className="relative px-4 pt-3 pb-2 border-b border-white/8">
         <h3 className="text-white/85 text-[11.5px] font-semibold uppercase tracking-[0.18em] text-center">
-          AniSkip
+          AuraSkip
         </h3>
         <button
           type="button"
           onClick={onClose}
-          aria-label="Close AniSkip menu"
+          aria-label="Close AuraSkip menu"
           className="absolute top-2.5 right-2.5 w-6 h-6 rounded text-white/55 hover:text-white hover:bg-white/12
                      flex items-center justify-center transition-colors"
         >
@@ -542,21 +542,29 @@ export default function AniSkipMenu({
             label="Opening"
             value={opMode}
             disabled={modesLoading}
-            onChange={(v) => { setOpMode(v); patchMode("skip_op_mode", v); }}
+            onChange={(v) => { setOpMode(v); patchMode("skip_op_mode", v); showFlash(`Opening skip: ${v}`); }}
           />
           <ModeRow
             label="Ending"
             value={edMode}
             disabled={modesLoading}
-            onChange={(v) => { setEdMode(v); patchMode("skip_ed_mode", v); }}
+            onChange={(v) => { setEdMode(v); patchMode("skip_ed_mode", v); showFlash(`Ending skip: ${v}`); }}
           />
           <ModeRow
             label="Recap"
             value={recapMode}
             disabled={modesLoading}
-            onChange={(v) => { setRecapMode(v); patchMode("skip_recap_mode", v); }}
+            onChange={(v) => { setRecapMode(v); patchMode("skip_recap_mode", v); showFlash(`Recap skip: ${v}`); }}
           />
         </div>
+        {/* Live-apply feedback. auto<->prompt re-stamps the CURRENT episode's
+            windows instantly (App.tsx listens for aura:settings-changed); the
+            one case that can't apply live is re-enabling a segment turned fully
+            off, because its window was dropped from the active payload. */}
+        <p className="text-white/40 text-[10px] leading-snug mt-2 text-center px-2">
+          Applies to the current episode instantly. Turning a segment fully off
+          then back on takes effect from the next stream load.
+        </p>
       </div>
 
       {flash && (

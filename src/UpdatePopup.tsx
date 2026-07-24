@@ -151,8 +151,13 @@ export default function UpdatePopup({
             headed inner card floating on the neutral-glass panel, instead of
             one flat bordered box with hairline dividers (the old style). The
             scroll container itself is transparent so the cards read the same
-            in both surfaces. */}
-        <div className="max-h-[50vh] overflow-y-auto space-y-5">
+            in both surfaces. Thin translucent scrollbar matches the app-wide
+            convention (and the Settings changelog) instead of the default chunky
+            WebView2 bar. */}
+        <div
+          className="max-h-[50vh] overflow-y-auto space-y-5"
+          style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
+        >
           {/* The version being offered. */}
           <section className="space-y-2.5">
             <div className="flex items-baseline gap-2.5">

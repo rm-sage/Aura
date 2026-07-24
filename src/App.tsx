@@ -562,6 +562,16 @@ const BUFFER_STALL_MS = 25000;
 // BUFFER_STALL_MS) is treated as wedged.
 const BUFFER_PCT_MIN_RATE = 2;
 
+// Grace after an `end-file reason=error` before the recovery modal is allowed.
+// mpv's own reconnect gives up on a transient range-request failure and fires
+// this while the NEXT episode is still opening; the old code flipped the modal
+// instantly (0 s), surfacing it "too soon" on streams that then played fine.
+// 20 s is long enough for mpv to re-open / the source to recover; if playback
+// comes alive in that window (a time-pos update lands after the error) or a new
+// load supersedes it, the modal never shows. Only a genuinely dead stream (no
+// life for the full grace) surfaces recovery, ~20 s later instead of instantly.
+const STREAM_ERROR_GRACE_MS = 20000;
+
 // Per-tick forward-progress cap (s) for the History watched accumulator.
 // A `time` delta larger than this is a seek, not playback — discarded so
 // skipping to the end never inflates summed watched time. Matches
@@ -697,6 +707,15 @@ function usePlayback(playerActive: boolean) {
    *  re-warning + re-flipping streamBroken every 2 s forever. Reset on each
    *  fresh load (notifyNewLoad). */
   const loadWatchdogFiredRef = useRef(false);
+  /** Wall-clock of an unrecovered `end-file reason=error`. mpv fires that when
+   *  its own reconnect (reconnect_on_network_error=1) gives up on a range
+   *  request; on a flaky debrid stream that happens TRANSIENTLY while the next
+   *  episode is still opening. Rather than flip the recovery modal instantly
+   *  (the old zero-grace behaviour that surfaced it "too soon" on streams that
+   *  then loaded fine), we stamp this and let the error-grace watchdog wait
+   *  STREAM_ERROR_GRACE_MS — cleared if playback comes alive or a new load
+   *  supersedes it. 0 = no pending error. Reset per load (notifyNewLoad). */
+  const loadErrorAtRef = useRef<number>(0);
   /** Set of load-event names already emitted for the current
    *  load. Stops the same milestone from spamming the log on
    *  every poll tick (e.g. "duration appeared"). */
@@ -1115,8 +1134,16 @@ function usePlayback(playerActive: boolean) {
         // "[object Object]". The code distinguishes failure modes (e.g. loading
         // failed vs. unsupported format); the stream URL is deliberately NOT
         // logged (debrid URLs carry auth tokens).
-        console.warn(`[playback] end-file reason=error code=${payload?.error ?? "?"}`);
-        setStreamBroken(true);
+        console.warn(`[playback] end-file reason=error code=${payload?.error ?? "?"} — arming ${STREAM_ERROR_GRACE_MS / 1000}s recovery grace`);
+        // Do NOT flip streamBroken here. This was the ONLY recovery path with
+        // zero grace, and on a flaky debrid stream a transient error at the
+        // START of the next episode (mpv's reconnect gave up on the first range
+        // request, then a retry / the source recovers) surfaced the modal "too
+        // soon" on streams that then played fine. Stamp the error; the
+        // error-grace watchdog below waits STREAM_ERROR_GRACE_MS and only flags
+        // broken if playback never comes alive (no time-pos update after the
+        // error) and no new load supersedes it.
+        loadErrorAtRef.current = Date.now();
         return;
       }
       // "eof" = the file played to completion. This is the clean
@@ -1163,6 +1190,34 @@ function usePlayback(playerActive: boolean) {
     return () => window.clearInterval(id);
   }, [firstFrameSeen, windowHidden]);
 
+  // ── Error-grace watchdog ──
+  // Deferred companion to the immediate `end-file reason=error` flip that used
+  // to be here. When mpv reports a load/playback error we stamp loadErrorAtRef
+  // (in the playback-end listener) rather than flag broken; this poll decides
+  // the outcome once the grace elapses. It's the "more accurate" half: if a
+  // time-pos update lands AFTER the error the stream came alive (mpv re-opened
+  // it / the transient cleared) and we clear the pending error silently; a new
+  // load resets loadErrorAtRef via notifyNewLoad, so an error from the previous
+  // episode never leaks onto the next one. Only an error that stays dead for the
+  // whole grace surfaces the recovery modal.
+  useEffect(() => {
+    if (windowHidden) return;
+    const id = window.setInterval(() => {
+      const errAt = loadErrorAtRef.current;
+      if (errAt === 0) return;
+      // Came alive after the error → recovered, no modal. (notifyNewLoad zeroes
+      // lastTimeUpdateAtRef on a new load, so this can't false-clear across
+      // loads; a stale pending error is cleared by notifyNewLoad directly.)
+      if (lastTimeUpdateAtRef.current > errAt) { loadErrorAtRef.current = 0; return; }
+      if (Date.now() - errAt >= STREAM_ERROR_GRACE_MS) {
+        loadErrorAtRef.current = 0;
+        console.warn(`[playback] end-file error unrecovered after ${STREAM_ERROR_GRACE_MS / 1000}s — surfacing recovery`);
+        setStreamBroken(true);
+      }
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [windowHidden]);
+
   /** Reset playback state for a new load_video call. Called from the
    *  parent right before invoking load_video so every fresh playback
    *  session — first or Nth — starts in the "loading" state and the
@@ -1170,6 +1225,10 @@ function usePlayback(playerActive: boolean) {
   const notifyNewLoad = useCallback(() => {
     loadStartedAtRef.current = Date.now();
     loadWatchdogFiredRef.current = false;
+    // A fresh load supersedes any pending error grace from the previous file,
+    // so an error stamped just before the episode advance can't flag the NEW
+    // stream broken 20 s in.
+    loadErrorAtRef.current = 0;
     loadEventsSeenRef.current = new Set();
     lastTimeUpdateAtRef.current = 0;
     lastCacheBufferLogRef.current = null;
@@ -2367,6 +2426,41 @@ export default function App() {
                 }
               }
             }
+            // Step 1.5 — SEASON-AWARE resolver for IMDb-keyed multi-season
+            // anime. `detail.mal_id` (Step 2) is the SERIES-ROOT entry, which
+            // MAL treats as season 1: for a season-2 IMDb id (tt…:2:E) it would
+            // pair season 1's MAL id with a season-local episode and fetch
+            // season 1's OP/ED — applied to season 2 those land mid-content and
+            // (with OP on auto) yank the playhead partway through the episode.
+            // `resolve_mal_for_aniskip` keys Fribb by (imdb, season) and returns
+            // the SEASON-specific entry — the exact resolver the in-player
+            // AniSkip menu already uses, which is why the menu showed the correct
+            // mal=55825 for Hell's Paradise S2 while this auto-stamp used 46569
+            // (S1). Gated to tt-style ids with season > 1: season 1 and anime-
+            // prefix ids (Step 1) already resolve correctly. On failure it falls
+            // through to Step 2, so this can only improve resolution.
+            if (!malId && target.id.startsWith("tt")
+                && Number.isFinite(target.season as number) && (target.season as number) > 1) {
+              const seriesImdb = target.series_id?.startsWith("tt")
+                ? target.series_id
+                : target.id.split(":")[0];
+              try {
+                malId = await invoke<number | null>("resolve_mal_for_aniskip", {
+                  targetId:   target.id,
+                  seriesImdb,
+                  season:     target.season ?? null,
+                  title:      detail?.name ?? null,
+                });
+                if (malId) {
+                  console.info(
+                    `[aniskip] season-aware resolve (s${target.season}) → mal=${malId} ` +
+                    `(overrides series-root detail.mal_id=${detail?.mal_id ?? "none"})`,
+                  );
+                }
+              } catch (e) {
+                console.warn(`[aniskip] season-aware resolve threw: ${String(e)} — falling back to detail.mal_id`);
+              }
+            }
             // Step 2 — meta-detail anime ids. Only hit when step 1
             // didn't resolve (legacy tt-style ids or unrecognised
             // prefix).
@@ -2758,6 +2852,66 @@ export default function App() {
       window.removeEventListener("aura:keybindings-changed", onChange);
       window.removeEventListener("aura:settings-changed", onChange);
     };
+  }, []);
+
+  // ── Live re-stamp of AniSkip windows when skip modes change mid-play ──
+  // Each window's `auto` flag is BAKED at stamp time (from the mode read
+  // then), and BOTH the MPV-side Lua script AND the in-player SkipController
+  // key the actual skip on that per-window flag. So flipping OP auto→prompt
+  // in the in-player AniSkip menu (or Settings) was silently ignored until
+  // the NEXT episode load: the OP kept auto-skipping. On any settings change
+  // during playback, re-read the per-kind modes and re-map every currently
+  // stamped window's `auto` by kind (dropping kinds turned off), then re-push
+  // via set_skip_windows — which rewrites the Lua user-data AND emits
+  // `aura:skip-windows` for the SkipController, so the change takes effect
+  // live. Guarded to a real change so unrelated settings (theme, etc.) don't
+  // churn the payload. NOTE: turning a kind OFF drops its window from the
+  // cache, so toggling it back ON mid-episode won't restore it until the next
+  // load — the common auto<->prompt flip (the reported bug) is fully live.
+  useEffect(() => {
+    const restampSkipModes = async () => {
+      try {
+        const cur = await invoke<{ windows?: Array<PreparedWindow & { skip_id?: string | null }> } | null>(
+          "get_skip_windows",
+        );
+        const windows = Array.isArray(cur?.windows) ? cur!.windows! : [];
+        if (windows.length === 0) return; // nothing loaded / no windows to re-stamp
+        let settings: BackendSettingsLite | null = null;
+        try { settings = await invoke<BackendSettingsLite>("get_settings"); } catch { return; }
+        const mode = (raw: string | undefined, fb: "off" | "prompt" | "auto"): "off" | "prompt" | "auto" =>
+          raw === "off" || raw === "prompt" || raw === "auto" ? raw : fb;
+        const opMode    = mode(settings?.skip_op_mode,    "auto");
+        const edMode    = mode(settings?.skip_ed_mode,    "prompt");
+        const recapMode = mode(settings?.skip_recap_mode, "prompt");
+        const modeForKind = (kind: string): "off" | "prompt" | "auto" | null =>
+          kind === "op" || kind === "mixed-op" ? opMode
+          : kind === "ed"    ? edMode
+          : kind === "recap" ? recapMode
+          : null; // unknown kind — leave untouched
+        const remapped = windows
+          .map((w) => {
+            const m = modeForKind(w.type);
+            if (m == null) return w;        // unknown kind: preserve as-is
+            if (m === "off") return null;   // kind disabled: drop the window
+            return { ...w, auto: m === "auto" };
+          })
+          .filter((w): w is PreparedWindow & { skip_id?: string | null } => w != null);
+        // Only re-push when the flags/count actually changed, so a theme or
+        // unrelated settings change during playback doesn't rewrite the payload.
+        const changed = remapped.length !== windows.length
+          || remapped.some((w) => {
+               const prev = windows.find(
+                 (c) => c.type === w.type && c.start === w.start && c.end === w.end,
+               );
+               return !prev || prev.auto !== w.auto;
+             });
+        if (!changed) return;
+        await invoke("set_skip_windows", { payload: { windows: remapped } });
+        console.info(`[auraskip] re-stamped ${remapped.length} window(s) after skip-mode change`);
+      } catch { /* best-effort — the next episode stamps fresh from settings anyway */ }
+    };
+    window.addEventListener("aura:settings-changed", restampSkipModes);
+    return () => window.removeEventListener("aura:settings-changed", restampSkipModes);
   }, []);
 
   // ── Show-login event listener ──
@@ -6089,6 +6243,7 @@ export default function App() {
   // PlayerOverlay's "Exit playback" button (and keybinding if configured).
   const handleExitPlayback = useCallback(async () => {
     autoAdvanceStreakRef.current = 0; // fresh start: reset the still-watching streak (#5)
+
     flushProgress(session, writebackTarget.current);
     // Capture which episode the user just played BEFORE we clear
     // activeTarget. If this was an episode of a series/anime, DetailView

@@ -3022,6 +3022,13 @@ function Scrubber({
   const [thumbUrlSec, setThumbUrlSec] = useState<number | null>(null);
   const [thumbBusy, setThumbBusy] = useState(false);
   const thumbReqRef = useRef(0);
+  // Escalating loader copy. A cold extraction can take several seconds — the
+  // warm FFI engine burns its seek/restart timeouts BEFORE the ffmpeg-per-hover
+  // fallback even starts — so a bare spinner reads as frozen. Staged off the
+  // same hoverIntSec lifecycle as the fetch: 0 = spinner only (fast hovers stay
+  // clean), then a label steps up as the wait grows so the user sees it's still
+  // working rather than stuck.
+  const [thumbLoaderStage, setThumbLoaderStage] = useState(0);
 
   useEffect(() => {
     // Bump reqId FIRST so any in-flight `.then` from a prior effect run sees a
@@ -3060,6 +3067,17 @@ function Scrubber({
         });
     }, 220);
     return () => clearTimeout(timer);
+  }, [hoverIntSec]);
+
+  // Drive the escalating loader copy off the same per-second lifecycle as the
+  // fetch: reset on each new hovered second, then step the label up as the wait
+  // grows (2.5 s → "Generating preview", 9 s → "Slow stream, still working").
+  useEffect(() => {
+    setThumbLoaderStage(0);
+    if (hoverIntSec == null) return;
+    const t1 = window.setTimeout(() => setThumbLoaderStage(1), 2500);
+    const t2 = window.setTimeout(() => setThumbLoaderStage(2), 9000);
+    return () => { window.clearTimeout(t1); window.clearTimeout(t2); };
   }, [hoverIntSec]);
 
   // Leaving the track: invalidate any in-flight request and clear.
@@ -3265,7 +3283,7 @@ function Scrubber({
                   className="absolute inset-0 w-full h-full object-cover"
                 />
               ) : (
-                <div className="absolute inset-0 flex items-center justify-center">
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5">
                   <div className="absolute inset-0 bg-white/5 animate-pulse" />
                   <svg
                     className="relative w-5 h-5 animate-spin text-white/70"
@@ -3274,6 +3292,11 @@ function Scrubber({
                     <circle cx="12" cy="12" r="9" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
                     <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
                   </svg>
+                  {thumbLoaderStage > 0 && (
+                    <span className="relative text-white/60 text-[9px] leading-tight tracking-wide px-2 text-center">
+                      {thumbLoaderStage === 1 ? "Generating preview…" : "Slow stream, still working…"}
+                    </span>
+                  )}
                 </div>
               )}
             </div>
@@ -3961,7 +3984,7 @@ function MoreMenu({
                         shadow-glass-edge">
           <MoreItem
             icon={<MoreIcon />}
-            label="AniSkip segments"
+            label="AuraSkip"
             onClick={() => { setAniskipOpen(true); setOpen(false); }}
           />
           <div className="my-1 mx-3 h-px bg-white/8" />

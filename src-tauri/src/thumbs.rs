@@ -29,10 +29,14 @@ use std::time::Duration;
 use tauri::AppHandle;
 use tokio::sync::Semaphore;
 
-/// Per-extraction timeout. A cold TLS/DNS + open + keyframe seek on a remote
-/// debrid stream can take a couple seconds; 12 s is generous headroom before we
-/// give up and let the overlay fall back to the plain timestamp tooltip.
-const THUMB_TIMEOUT: Duration = Duration::from_secs(12);
+/// Per-extraction timeout for the cold ffmpeg fallback. A cold TLS/DNS + open +
+/// keyframe seek on a remote debrid stream is NOT "a couple seconds": measured
+/// against a torbox host it blew past 12 s (the old value) on the very streams
+/// the FFI engine had already given up on, so the fallback timed out too and the
+/// scrubber showed the loader then nothing. 20 s matches the FFI demuxer-open
+/// budget and gives the cold ffmpeg a real chance before we fall back to the
+/// plain timestamp tooltip. Still bounded so a dead URL can't wedge a decoder.
+const THUMB_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Unique temp-file counter so concurrent extractions never clobber each
 /// other's output (the old code serialised on a mutex; we allow a little
@@ -103,14 +107,25 @@ pub async fn extract_thumbnail(
     // round-trip, so it must run on a blocking thread, never the async runtime.
     #[cfg(target_os = "windows")]
     {
+        use crate::mpv::thumb::ThumbOutcome;
         let u = url.clone();
         match tokio::task::spawn_blocking(move || crate::mpv::thumb::extract(u, at_seconds)).await {
-            Ok(Ok(Some(r))) => return Ok(Some(r)),
-            // No frame OR a coalesced (superseded) rapid-hover request — return
-            // None directly. NOT a fallback case: the next hover retries, and
-            // falling back to ffmpeg here would spawn a cold ffmpeg per skipped
-            // hover. ffmpeg is only for a HARD FFI failure (Err) below.
-            Ok(Ok(None)) => return Ok(None),
+            Ok(Ok(ThumbOutcome::Frame(r))) => return Ok(Some(r)),
+            // A newer hover coalesced this request away before it ran; that
+            // newer request produces the frame. Return None directly — spawning
+            // a cold ffmpeg for a superseded hover would be pure waste.
+            Ok(Ok(ThumbOutcome::Superseded)) => return Ok(None),
+            // The FFI engine ran its real attempts and produced no frame (a
+            // software-decode seek that couldn't confirm within the event
+            // timeouts on a slow/flaky remote stream, most often). THIS is the
+            // case the ffmpeg-per-hover fallback exists for: it re-opens the
+            // stream cold with a fast input seek and a generous 12 s budget, so
+            // it lands frames the warm FFI engine gives up on. Previously this
+            // fell straight through to Ok(None) and the scrubber showed the
+            // loader then nothing — the "hover thumbnails stopped working" bug
+            // on HEVC/debrid streams.
+            Ok(Ok(ThumbOutcome::NoFrame)) =>
+                crate::devlog!(debug, "thumbs", "ffi thumb produced no frame, ffmpeg fallback"),
             Ok(Err(e)) => crate::devlog!(debug, "thumbs", "ffi thumb error, ffmpeg fallback: {e}"),
             Err(e) => crate::devlog!(debug, "thumbs", "ffi thumb join error, ffmpeg fallback: {e}"),
         }

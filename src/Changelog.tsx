@@ -97,8 +97,13 @@ export default function Changelog({
           </button>
         </div>
 
-        {/* Scrollable body */}
-        <div className="flex-1 min-h-0 overflow-y-auto px-7 py-5 space-y-5">
+        {/* Scrollable body. Thin translucent scrollbar (the app-wide convention)
+            so it reads as part of the frosted glass instead of the default chunky
+            WebView2 bar that crowded the release cards. */}
+        <div
+          className="flex-1 min-h-0 overflow-y-auto px-7 py-5 space-y-5"
+          style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
+        >
           {releases.map((r) => (
             <section key={r.tag} className="space-y-2.5">
               <div className="flex items-baseline gap-2.5">

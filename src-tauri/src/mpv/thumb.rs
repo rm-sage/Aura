@@ -61,13 +61,32 @@ use crate::thumbs::ThumbResult;
 // Public API
 // ===========================================================================
 
+/// Outcome of a single thumbnail request. Splitting a genuine no-frame from
+/// a superseded request is what lets [`crate::thumbs::extract_thumbnail`]
+/// decide whether to try the ffmpeg-per-hover fallback: a real [`NoFrame`]
+/// (extraction ran, nothing came out) SHOULD fall back; a [`Superseded`]
+/// request (coalesced away by a newer hover) should NOT, because the newer
+/// hover already produces the frame and a cold ffmpeg per skipped hover is
+/// pure waste. Before this split, both collapsed to `Ok(None)` and the
+/// no-frame case never reached ffmpeg — the "hover thumbnails stopped
+/// working" bug on slow/flaky remote streams.
+pub enum ThumbOutcome {
+    /// A frame was captured.
+    Frame(ThumbResult),
+    /// Extraction ran and produced nothing (loadfile / seek / playback-restart
+    /// timed out, or the screenshot came back empty). Fall back to ffmpeg.
+    NoFrame,
+    /// A newer request coalesced this one away before it was processed.
+    Superseded,
+}
+
 /// A single thumbnail request and its one-shot reply channel.
 struct ThumbRequest {
     url: String,
     at_seconds: f64,
-    /// `Ok(Some(_))` with the frame, `Ok(None)` when no frame could be
-    /// produced (graceful), `Err` on a hard failure the JS side swallows.
-    reply: Sender<Result<Option<ThumbResult>, String>>,
+    /// `Ok(Frame)` with the frame; `Ok(NoFrame)` / `Ok(Superseded)` for the
+    /// graceful no-image cases; `Err` on a hard failure the JS side swallows.
+    reply: Sender<Result<ThumbOutcome, String>>,
 }
 
 /// Control message to the worker thread.
@@ -97,7 +116,7 @@ fn worker_slot() -> &'static Mutex<Option<ThumbWorker>> {
 /// `playback-time` the captured frame landed at (see [`ThumbResult::at`]),
 /// which can differ from the requested seek target after the post-seek
 /// frame-step.
-pub fn extract(url: String, at_seconds: f64) -> Result<Option<ThumbResult>, String> {
+pub fn extract(url: String, at_seconds: f64) -> Result<ThumbOutcome, String> {
     // Try once with the current (or freshly spawned) worker. If the send
     // fails the worker thread is gone — its `Receiver` was dropped (channel
     // closed) — so discard the dead handle, respawn, and try once more. This
@@ -263,7 +282,7 @@ fn run_worker(rx: Receiver<ThumbControl>) {
                 loop {
                     match rx.try_recv() {
                         Ok(ThumbControl::Extract(newer)) => {
-                            let _ = req.reply.send(Ok(None));
+                            let _ = req.reply.send(Ok(ThumbOutcome::Superseded));
                             req = newer;
                         }
                         Ok(ThumbControl::Shutdown) => {
@@ -399,7 +418,7 @@ unsafe fn process(
     inst: &mut ThumbInstance,
     url: &str,
     at_seconds: f64,
-) -> Result<Option<ThumbResult>, String> {
+) -> Result<ThumbOutcome, String> {
     let lib = &inst.lib;
     let handle = inst.handle;
 
@@ -416,9 +435,23 @@ unsafe fn process(
         // quickly; correct when it's slow). Bounded so a dead URL can't hang
         // the worker. On failure, drop the cached URL so the next request
         // re-loads cleanly.
-        if !wait_for_event(lib, handle, mpv_event_id::FILE_LOADED, 6000) {
+        //
+        // 20 s, NOT 6 s. Measured: on a slow debrid host (torbox via
+        // meteorfortheweebs) the SECOND connection this instance opens for the
+        // same file took >6 s just to parse headers — the MAIN player needed
+        // ~7.5 s — so 6 s timed out on every hover AND on the background prewarm,
+        // leaving the instance permanently cold (the prewarm's whole purpose is
+        // to open the demuxer once so warm hovers skip this loadfile). 20 s lets
+        // the demuxer actually open on a cold debrid stream while still bounding
+        // a genuinely dead URL. A miss still hands off to the ffmpeg fallback.
+        if !wait_for_event(lib, handle, mpv_event_id::FILE_LOADED, 20000) {
             inst.loaded_url = None;
-            return Ok(None);
+            crate::devlog!(
+                warn, "mpv",
+                "thumb: demuxer open (FILE_LOADED) timed out for {}",
+                url.chars().take(64).collect::<String>(),
+            );
+            return Ok(ThumbOutcome::NoFrame);
         }
     }
 
@@ -430,7 +463,11 @@ unsafe fn process(
 
     // Up to 3 attempts: right after a fresh loadfile the cold decode pipeline
     // occasionally needs a second seek before it emits playback-restart /
-    // produces a frame. Warm hovers succeed on attempt 0.
+    // produces a frame. Warm hovers succeed on attempt 0. `last_stage` records
+    // which sub-step lost the race so the no-frame log below can point at it
+    // (loadfile OK but seek/restart timing out on a slow debrid range request
+    // is the common flaky-stream case that now hands off to the ffmpeg path).
+    let mut last_stage = "seek not attempted";
     for attempt in 0..3u32 {
         // Clear any pending events so the waits below only see THIS seek's.
         drain_events(lib, handle);
@@ -446,11 +483,13 @@ unsafe fn process(
         // mpv emits SEEK at seek initiation and PLAYBACK_RESTART at completion,
         // so a restart observed AFTER our SEEK is guaranteed to be ours.
         if !wait_for_event(lib, handle, mpv_event_id::SEEK, timeout_ms) {
+            last_stage = "seek-start event timed out";
             continue;
         }
         // The anti-stale gate proper: seek done + first frame at the new
         // position decoded. Warm seeks fire it in tens of ms.
         if !wait_for_event(lib, handle, mpv_event_id::PLAYBACK_RESTART, timeout_ms) {
+            last_stage = "playback-restart timed out";
             continue; // seek didn't confirm in time — retry
         }
 
@@ -460,6 +499,7 @@ unsafe fn process(
         // wrong frame (belt-and-suspenders behind the SEEK barrier).
         let actual_at = get_double(lib, handle, b"playback-time\0").unwrap_or(at_seconds);
         if (actual_at - at_seconds).abs() > 1.0 {
+            last_stage = "seek landed off-target";
             continue;
         }
 
@@ -473,7 +513,7 @@ unsafe fn process(
             if let Ok(bytes) = std::fs::read(&path) {
                 if !bytes.is_empty() {
                     let _ = std::fs::remove_file(&path);
-                    return Ok(Some(ThumbResult {
+                    return Ok(ThumbOutcome::Frame(ThumbResult {
                         data_url: format!("data:image/jpeg;base64,{}", b64_encode(&bytes)),
                         at: actual_at,
                     }));
@@ -481,12 +521,20 @@ unsafe fn process(
             }
             thread::sleep(Duration::from_millis(20));
         }
+        last_stage = "screenshot produced no bytes";
     }
 
-    // Nothing after the retries — graceful: scrubber stays on the
-    // timestamp-only tooltip (or the ffmpeg fallback in thumbs.rs).
+    // Nothing after the retries — graceful. `NoFrame` (not `Superseded`) tells
+    // thumbs.rs this is a genuine miss worth handing to the ffmpeg-per-hover
+    // fallback rather than dropping the hover silently.
     let _ = std::fs::remove_file(&path);
-    Ok(None)
+    crate::devlog!(
+        debug, "mpv",
+        "thumb: no frame at {:.1}s ({}) for {}",
+        at_seconds, last_stage,
+        url.chars().take(64).collect::<String>(),
+    );
+    Ok(ThumbOutcome::NoFrame)
 }
 
 /// Block-drain mpv's event queue until `target` fires or `timeout_ms` elapses,
