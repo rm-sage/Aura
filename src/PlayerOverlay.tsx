@@ -2203,9 +2203,10 @@ export default function PlayerOverlay({
               control bar fades out. ── */}
       <SkipController
         time={time}
+        duration={duration}
         seekAbsolute={seekAbsolute}
         isFullscreen={isFullscreen}
-        streamUrl={streamUrl}
+        loadKey={loadKey}
         controlsVisible={controlsVisible}
         ready={tracksReady}
       />
@@ -2452,7 +2453,7 @@ export default function PlayerOverlay({
                 a silencedetect fallback for any missing OP/ED). */}
             {!isLive && !isTrailer && (
               <div className={partyFollower ? "pointer-events-none opacity-[0.45]" : ""}>
-                <SkipWindowButton time={time} seekAbsolute={seekAbsolute} />
+                <SkipWindowButton time={time} duration={duration} seekAbsolute={seekAbsolute} />
               </div>
             )}
 
@@ -4348,6 +4349,41 @@ function useSkipWindows(): AuraSkipWindow[] {
   return windows;
 }
 
+/** Seconds of headroom kept between a skip target and the end of the file. */
+const SKIP_EOS_MARGIN_SECONDS = 1;
+/** Where a skip actually seeks to. A window that ends AT the duration seeks
+ *  onto the last frame, which lands inside the end-of-stream tail and hands
+ *  the episode straight to auto-advance instead of skipping. AniSkip's ED
+ *  rows routinely do this (ed 1376-1465 against a 1465.1 s file), so land
+ *  just short and let playback finish on its own. */
+function skipSeekTarget(w: AuraSkipWindow, duration: number): number {
+  if (!(duration > 0)) return w.end;
+  return Math.min(w.end, duration - SKIP_EOS_MARGIN_SECONDS);
+}
+
+/** Run a user-initiated skip, or decline it when the clamped target is at or
+ *  behind the playhead (a window that runs to EOF, entered inside the margin -
+ *  seeking there would go BACKWARDS). Returns whether it actually seeked so
+ *  the caller only reports what happened: a "Skipped Ending" toast over a
+ *  playhead that did not move is worse than no feedback. */
+function performSkip(
+  w: AuraSkipWindow,
+  duration: number,
+  time: number,
+  seek: (t: number) => void,
+): boolean {
+  const target = skipSeekTarget(w, duration);
+  if (target <= time) {
+    console.info(
+      `[auraskip] skip declined, nothing left to skip: ${w.type} `
+      + `${Math.round(w.start)}-${Math.round(w.end)}s at ${time.toFixed(1)}s`,
+    );
+    return false;
+  }
+  seek(target);
+  return true;
+}
+
 function skipKindLabel(kind: string): string {
   switch (kind) {
     case "op":       return "Opening";
@@ -4414,12 +4450,20 @@ function SkipPromptToast({
  *  top of PlayerOverlay so its `keydown` listeners stay alive even
  *  when the bottom control bar is hidden by the auto-fade timer. */
 function SkipController({
-  time, seekAbsolute, isFullscreen, streamUrl, controlsVisible, ready,
+  time, duration, seekAbsolute, isFullscreen, loadKey, controlsVisible, ready,
 }: {
   time: number;
+  /** Only used to keep a skip from seeking onto the last frame - see
+   *  `skipSeekTarget`. 0 while the file is still loading. */
+  duration: number;
   seekAbsolute: (t: number) => void;
   isFullscreen: boolean;
-  streamUrl: string | null;
+  /** `${target.id}::${streamUrl}::${reloadNonce}` - the same key the rest of
+   *  the overlay re-arms on. NOT the bare stream url: EOS "Replay", the
+   *  recovery-modal reload and the live auto-retry all re-run `loadfile` on
+   *  the SAME url and restart at 0, so keying the fired set on the url left
+   *  the opening marked as already-skipped and it never fired again. */
+  loadKey: string;
   controlsVisible: boolean;
   /** The file is genuinely loaded (duration > 0). Everything below is gated
    *  on it: skip windows for the NEW episode get stamped within ~1 s of
@@ -4439,12 +4483,19 @@ function SkipController({
   const active   = ready ? (windows.find((w) => time >= w.start && time < w.end) ?? null) : null;
   const upcoming = ready ? (windows.find((w) => w.start > time && (w.start - time) <= 30) ?? null) : null;
 
-  // Per-window "we already handled this one" set, scoped to the
-  // current stream. A backwards seek out of the window then back in
-  // should re-trigger the prompt; that's why we key by start+end +
-  // reset on stream change.
+  // Per-window "we already handled this one" set, scoped to the current LOAD.
+  // A backwards seek out of the window then back in should re-trigger the
+  // prompt; that's why we key by start+end and reset per load.
   const firedRef = useRef<Set<string>>(new Set());
-  useEffect(() => { firedRef.current = new Set(); }, [streamUrl]);
+  const firedKeyRef = useRef<string>("");
+  useEffect(() => {
+    // Guarded rather than reset-on-every-run so React StrictMode's double
+    // effect invocation cannot wipe a window this mount has already fired
+    // (which would seek a second time).
+    if (firedKeyRef.current === loadKey) return;
+    firedKeyRef.current = loadKey;
+    firedRef.current = new Set();
+  }, [loadKey]);
 
   // Refs that the always-on Shift+X listener reads. The listener is
   // installed once and never re-bound — capturing `active` / `upcoming`
@@ -4453,10 +4504,12 @@ function SkipController({
   const upcomingRef  = useRef(upcoming);
   const seekRef      = useRef(seekAbsolute);
   const timeRef      = useRef(time);
+  const durationRef  = useRef(duration);
   useEffect(() => { activeRef.current   = active; },   [active]);
   useEffect(() => { upcomingRef.current = upcoming; }, [upcoming]);
   useEffect(() => { seekRef.current     = seekAbsolute; }, [seekAbsolute]);
   useEffect(() => { timeRef.current     = time; },     [time]);
+  useEffect(() => { durationRef.current = duration; }, [duration]);
 
   // Auto-skip: when entering a window with auto=true, fire seek to end.
   // Midpoint grace mirrors the Lua script — if the user resumed past
@@ -4467,19 +4520,34 @@ function SkipController({
     const key = `${active.start}-${active.end}`;
     if (firedRef.current.has(key)) return;
     const span = active.end - active.start;
+    // One line per decision: the auto-skip used to leave no trace anywhere
+    // but a transient toast, so a wrong seek could only be reconstructed
+    // from surrounding timestamps.
+    const desc = `${active.type} ${Math.round(active.start)}-${Math.round(active.end)}s `
+               + `(source: ${active.source}) at ${time.toFixed(1)}s`;
     if (time - active.start > span * 0.5) {
       // Don't yank, but mark fired so we don't re-evaluate every tick.
       firedRef.current.add(key);
+      console.info(`[auraskip] auto-skip declined, entered past midpoint: ${desc}`);
       return;
     }
     firedRef.current.add(key);
-    seekAbsolute(active.end);
+    const target = skipSeekTarget(active, duration);
+    if (target <= time) {
+      // The window runs to the end of the file and we are already inside the
+      // end-of-stream margin. Seeking would go backwards; let it play out.
+      console.info(`[auraskip] auto-skip declined, nothing left to skip: ${desc}`);
+      return;
+    }
+    console.info(`[auraskip] auto-skip ${desc} → ${target.toFixed(1)}s`);
+    seekAbsolute(target);
     fireToast(`Skipped ${skipKindLabel(active.type)}`);
     // Only the start/end+auto matter for the gate; `time` is
     // intentionally excluded so a single firing isn't re-evaluated on
     // every poll tick. The midpoint check above runs once per entry.
+    // `duration` is settled before `ready` opens the gate above.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active?.start, active?.end, active?.auto, streamUrl]);
+  }, [active?.start, active?.end, active?.auto, loadKey]);
 
   // Prompt-mode key 'x' — only bound while in a prompt window.
   useEffect(() => {
@@ -4494,11 +4562,17 @@ function SkipController({
       e.preventDefault();
       e.stopPropagation();
       firedRef.current.add(key);
-      seekAbsolute(active.end);
-      fireToast(`Skipped ${skipKindLabel(active.type)}`);
+      // timeRef / durationRef, not the captured values: this handler outlives
+      // the render it was installed in (`time` is deliberately not a dep).
+      if (performSkip(active, durationRef.current, timeRef.current, seekAbsolute)) {
+        fireToast(`Skipped ${skipKindLabel(active.type)}`);
+      }
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
+    // `duration` / `time` are read through refs inside the handler, so they
+    // are deliberately not dependencies: re-installing a capture-phase
+    // keydown listener on every time tick would be absurd.
   }, [active?.start, active?.end, active?.auto, seekAbsolute]);
 
   // Force-skip Shift+X — always active, anywhere in playback. Inside a
@@ -4516,12 +4590,14 @@ function SkipController({
       const u = upcomingRef.current;
       if (a) {
         firedRef.current.add(`${a.start}-${a.end}`);
-        seekRef.current(a.end);
-        fireToast(`Skipped ${skipKindLabel(a.type)}`);
+        if (performSkip(a, durationRef.current, timeRef.current, seekRef.current)) {
+          fireToast(`Skipped ${skipKindLabel(a.type)}`);
+        }
       } else if (u) {
         firedRef.current.add(`${u.start}-${u.end}`);
-        seekRef.current(u.end);
-        fireToast(`Skipped upcoming ${skipKindLabel(u.type)}`);
+        if (performSkip(u, durationRef.current, timeRef.current, seekRef.current)) {
+          fireToast(`Skipped upcoming ${skipKindLabel(u.type)}`);
+        }
       } else {
         fireToast("No skip window nearby");
       }
@@ -4552,9 +4628,10 @@ function SkipController({
 }
 
 function SkipWindowButton({
-  time, seekAbsolute,
+  time, duration, seekAbsolute,
 }: {
   time: number;
+  duration: number;
   seekAbsolute: (t: number) => void;
 }) {
   const windows = useSkipWindows();
@@ -4569,10 +4646,15 @@ function SkipWindowButton({
       "mixed-op": "Skip OP",
     };
     const label = labelByKind[active.type] ?? "Skip";
+    // Don't offer a control that cannot act: inside the end-of-stream margin
+    // of a window that runs to EOF there is nothing left to seek to, and an
+    // enabled-looking pill that does nothing on click is worse than no pill.
+    const target = skipSeekTarget(active, duration);
+    if (!(target > time)) return null;
     return (
       <button
         type="button"
-        onClick={() => seekAbsolute(active.end)}
+        onClick={() => seekAbsolute(target)}
         className="ml-3 px-3 py-1 rounded-full
                    bg-ln-accent/20 text-ln-accent
                    hover:bg-ln-accent/30 active:bg-ln-accent/40

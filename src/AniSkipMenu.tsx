@@ -248,6 +248,12 @@ export default function AniSkipMenu({
       if (result.success) {
         setStartInput("");
         setEndInput("");
+        // Drop the locally cached windows for this episode so the next load
+        // picks the submission up. Rust invalidates its own entry inside the
+        // command; this covers the 3-day frontend cache.
+        window.dispatchEvent(new CustomEvent("aura:aniskip-invalidate", {
+          detail: { malId, episode: courEpisode },
+        }));
       }
     } catch (err) {
       showFlash(String(err) || "Submit error");
@@ -291,8 +297,17 @@ export default function AniSkipMenu({
       [skipId]: { last: voteType, cooldownUntil: now + VOTE_COOLDOWN_MS },
     }));
     try {
-      await invoke<boolean>("vote_skip_time", { skipId, voteType });
+      // mal/episode are passed so the backend can drop its cached copy of
+      // this episode's windows: a downvote that keeps being served from
+      // cache for 3 days is indistinguishable from a downvote that did
+      // nothing.
+      await invoke<boolean>("vote_skip_time", {
+        skipId, voteType, malId, episode: courEpisode,
+      });
       showFlash(voteType === "upvote" ? "Upvoted" : "Downvoted");
+      window.dispatchEvent(new CustomEvent("aura:aniskip-invalidate", {
+        detail: { malId, episode: courEpisode },
+      }));
     } catch (err) {
       showFlash(String(err) || "Vote failed");
       // On failure roll back the optimistic lock so the user can
@@ -304,7 +319,7 @@ export default function AniSkipMenu({
         return next;
       });
     }
-  }, [voteState]);
+  }, [voteState, malId, courEpisode]);
 
   if (!open) return null;
 

@@ -4,9 +4,14 @@
 // ---------------------------------------------------------------------------
 // NextUpCta — floating "Next Up" card rendered over the player's bottom-
 // right corner. Appears in the final stretch of an episode (configurable
-// lead time, or right after an anime ED chapter ends, whichever comes
-// first) and offers a one-click jump to the next episode's first
-// available stream.
+// lead time, or the moment the ending BEGINS when Aura knows where that is,
+// whichever comes first) and offers a one-click jump to the next episode's
+// first available stream.
+//
+// The ED trigger is the ED window's START, not its end: the card is meant to
+// appear as the credits roll, which is the same instant the "Skip ending?
+// Press X" prompt does. Waiting for the ED to END would put it in the last few
+// seconds of the file, by which point the plain lead time has already fired.
 //
 // Design notes:
 //   • Card geometry mirrors a Continue Watching tile: thumbnail on the
@@ -31,6 +36,7 @@ import FillerRecapTags from "./FillerRecapTags";
 import type { VideoEntry } from "./types";
 import { formatEpisodeTag, episodeKindFlags } from "./nextUp";
 import { loadAuraSettings } from "./auraSettings";
+import { getWatchState } from "./watchTogether/store";
 
 interface Props {
   /** The next episode metadata. Provides the title + thumbnail + tag. */
@@ -59,6 +65,13 @@ interface Props {
   autoAdvanceStreak: number;
   /** Hide the CTA for the rest of the current playback session. */
   onDismiss: () => void;
+  /** True when the user has EXPLICITLY refused an auto-advance for this episode
+   *  (they dismissed this card). Owned by App so the refusal survives this card
+   *  being replaced by the end-of-stream Spotlight, which would otherwise arm a
+   *  fresh countdown and advance anyway. Ambient activity - a mouse move, a
+   *  keypress - only cancels the countdown LOCALLY: it is attention, not a
+   *  decision, and the end card is a new decision point. */
+  autoAdvanceCancelled: boolean;
   /** Set only when the episode just finished was the LAST of its story arc, so
    *  playing the next one crosses an arc boundary. Purely informational: the
    *  countdown still rolls into the next arc. `next` is null on the final arc. */
@@ -67,7 +80,7 @@ interface Props {
 
 export default function NextUpCta({
   episode, loading, noStream, skipTag, onSkipToCanon, onPlay, onDismiss, arcNote,
-  autoAdvanceStreak,
+  autoAdvanceStreak, autoAdvanceCancelled,
 }: Props) {
   const tag = formatEpisodeTag(episode);
   const title = (episode.title ?? "").trim() || "Untitled episode";
@@ -90,14 +103,26 @@ export default function NextUpCta({
   // click through. Opt out via the stillWatchingGate setting (default on).
   const gatedByStillWatching =
     settings.stillWatchingGate !== false && autoAdvanceStreak >= 2;
+  // Never auto-advance an in-sync party FOLLOWER. Same rule (and the same
+  // reasoning) as EosSpotlight: advancing independently changes our local
+  // videoKey, drops us off the party title, and leaves us watching ahead of the
+  // room alone with no way back. This card is the surface that actually fires
+  // during a binge - it appears a lead time BEFORE the end of the file, so the
+  // Spotlight, which HAD the guard, never gets a turn.
+  const party = getWatchState();
+  const isPartyFollower =
+    party.status === "connected" && !party.isLeader && party.inSync;
   const autoArmed =
     settings.autoAdvanceNextEpisode && !loading && (skipMode || !noStream)
-    && !gatedByStillWatching;
+    && !isPartyFollower && !gatedByStillWatching;
 
-  const [remaining, setRemaining] = useState<number | null>(autoArmed ? initialSeconds : null);
+  const [remaining, setRemaining] = useState<number | null>(
+    autoArmed && !autoAdvanceCancelled ? initialSeconds : null,
+  );
   // `cancelled` latches once the user has expressed any cancel intent
   // so we don't restart the countdown if `autoArmed` flickers true again.
-  const cancelledRef = useRef(false);
+  // Seeded from App so a refusal made on an earlier surface still holds.
+  const cancelledRef = useRef(autoAdvanceCancelled);
   const windowHidden = useWindowHidden();
 
   useEffect(() => {
@@ -121,23 +146,36 @@ export default function NextUpCta({
   }, [autoArmed, remaining, initialSeconds, onPlay, onSkipToCanon, skipMode, windowHidden]);
 
   // Cancel signals: any pointer move on the document, any keydown, wheel, or
-  // the explicit dismiss button. We listen at window scope while the countdown
-  // is armed and detach when it isn't.
+  // the explicit dismiss button. Local only - see `autoAdvanceCancelled`.
+  //
+  // Bound for the WHOLE lifetime, not just while a countdown is ticking. The
+  // card mounts with the countdown disarmed while the next stream resolves, and
+  // binding on `remaining !== null` meant every bit of activity during that
+  // phase was discarded - the countdown then armed underneath a user who had
+  // already been moving the mouse.
+  //
+  // CAPTURE phase, because SkipController's x / Shift+X handlers are themselves
+  // window-capture listeners that call stopPropagation(). That stops the event
+  // dead at the capture step, so a bubble-phase listener on window never runs
+  // and pressing the skip key - unambiguous attention - could not cancel an
+  // auto-advance. Same-node, same-phase listeners all still fire, so capture
+  // sidesteps it without changing the skip handlers.
   useEffect(() => {
-    if (remaining === null) return;
     const cancel = () => {
+      if (cancelledRef.current) return;
       cancelledRef.current = true;
       setRemaining(null);
     };
-    window.addEventListener("pointermove", cancel, { passive: true });
-    window.addEventListener("keydown", cancel);
-    window.addEventListener("wheel", cancel, { passive: true });
+    const opts = { capture: true, passive: true } as const;
+    window.addEventListener("pointermove", cancel, opts);
+    window.addEventListener("keydown", cancel, { capture: true });
+    window.addEventListener("wheel", cancel, opts);
     return () => {
-      window.removeEventListener("pointermove", cancel);
-      window.removeEventListener("keydown", cancel);
-      window.removeEventListener("wheel", cancel);
+      window.removeEventListener("pointermove", cancel, opts);
+      window.removeEventListener("keydown", cancel, { capture: true });
+      window.removeEventListener("wheel", cancel, opts);
     };
-  }, [remaining]);
+  }, []);
 
   const countdownActive = remaining !== null && remaining > 0;
   const fillPct = countdownActive

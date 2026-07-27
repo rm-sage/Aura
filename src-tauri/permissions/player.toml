@@ -168,7 +168,7 @@ commands.allow = ["get_settings", "set_theme", "update_settings", "reset_setting
 [[permission]]
 identifier = "allow-aniskip"
 description = "Allows the frontend to drive AuraSkip: stamp/read the aggregate skip-time windows, fetch op/ed/recap windows from the AniSkip API, and run the silence/outro auto-detection used for anime and any series"
-commands.allow = ["fetch_skip_windows", "set_skip_windows", "get_skip_windows", "resolve_mal_id", "resolve_mal_id_by_title", "detect_silence_intervals", "detect_outro_boundary", "submit_skip_time", "vote_skip_time", "resolve_cour_mal_id", "resolve_cour_anilist_id", "resolve_anilist_to_mal", "resolve_mal_for_aniskip"]
+commands.allow = ["fetch_skip_windows", "fetch_neighbour_skip_profile", "set_skip_windows", "get_skip_windows", "resolve_mal_id", "resolve_mal_id_by_title", "detect_silence_intervals", "detect_outro_boundary", "submit_skip_time", "vote_skip_time", "resolve_cour_mal_id", "resolve_cour_anilist_id", "resolve_anilist_to_mal", "resolve_mal_for_aniskip"]
 
 # ── publicmetadb (crowd-sourced OP/ED skip source) ──────────────────────────
 [[permission]]

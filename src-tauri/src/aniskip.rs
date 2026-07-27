@@ -47,10 +47,11 @@ struct ApiResult {
     /// "op" | "ed" | "mixed-op" | "recap"
     #[serde(rename = "skipType")]
     skip_type: String,
-    /// Total episode length AniSkip received from the submitter; we
-    /// don't currently use it but it's useful for diagnostics.
+    /// Total episode length AniSkip received from the submitter. This is the
+    /// gate the neighbour profile below is built on: a row recorded against a
+    /// different runtime describes a different edit and its timings do not
+    /// transfer.
     #[serde(rename = "episodeLength", default)]
-    #[allow(dead_code)]
     episode_length: f64,
     /// AniSkip's per-row identifier. Required for the vote endpoint
     /// (`POST /v2/skip-times/vote/{skip_id}`). Optional in the parse
@@ -113,12 +114,55 @@ struct CacheEntry {
 
 static CACHE: OnceLock<Mutex<HashMap<String, CacheEntry>>> = OnceLock::new();
 
+/// Positive entries never expire, so without a cap this map only ever grows
+/// for the life of the process - one entry per episode watched, plus one per
+/// episode the neighbour profile probes. Bounded like every other cache in the
+/// app; the oldest quarter goes on overflow.
+const CACHE_CAP: usize = 400;
+
 fn cache() -> &'static Mutex<HashMap<String, CacheEntry>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn cache_key(mal_id: u32, episode: u32) -> String {
-    format!("{}:{}", mal_id, episode)
+/// Insert with the cap applied. Eviction is by insertion time, which for this
+/// cache is also least-recently-fetched (entries are never refreshed on read).
+fn cache_insert(key: String, payload: SkipWindows) {
+    let mut lock = cache().lock().unwrap();
+    if lock.len() >= CACHE_CAP {
+        let mut ages: Vec<(String, Instant)> =
+            lock.iter().map(|(k, e)| (k.clone(), e.cached_at)).collect();
+        ages.sort_by_key(|(_, at)| *at);
+        for (k, _) in ages.into_iter().take(CACHE_CAP / 4) {
+            lock.remove(&k);
+        }
+    }
+    lock.insert(key, CacheEntry { payload, cached_at: Instant::now() });
+}
+
+/// `treat_mixed_op_as_op` is part of the key because the cached payload is
+/// stored POST-mapping (a "mixed-op" row is rewritten to "op" before it is
+/// cached). Keying without it served the previous mapping to everyone who
+/// toggled the setting mid-session, and positive entries never expire.
+fn cache_key(mal_id: u32, episode: u32, treat_mixed_op_as_op: bool) -> String {
+    format!("{}:{}:{}", mal_id, episode, u8::from(treat_mixed_op_as_op))
+}
+
+/// Drop every cached payload for one (anime, episode) across both
+/// `treat_mixed_op_as_op` variants. Called after a vote or a submit: the user
+/// has just told AniSkip its data is wrong, and positive entries otherwise
+/// live for the whole process lifetime.
+fn invalidate_cache(mal_id: u32, episode: u32) {
+    let prefix = format!("{}:{}:", mal_id, episode);
+    let mut lock = cache().lock().unwrap();
+    let before = lock.len();
+    lock.retain(|k, _| !k.starts_with(&prefix));
+    let dropped = before - lock.len();
+    if dropped > 0 {
+        crate::devlog!(
+            info, "aniskip",
+            "cache invalidated for mal={mal_id} ep={episode} ({dropped} entr(ies))"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -147,7 +191,10 @@ fn client() -> &'static reqwest::Client {
             // full reconnect (TCP + TLS handshake) per host.
             .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(60))
-            .pool_max_idle_per_host(1)
+            // 4, not 1: the neighbour profile fires up to 2 * PROFILE_SPAN
+            // probes at once against this same host, and a 1-connection idle
+            // pool made every one of them pay a fresh TLS handshake.
+            .pool_max_idle_per_host(4)
             .pool_idle_timeout(Duration::from_secs(30))
             .user_agent("Aura/0.6.6")
             .build()
@@ -171,7 +218,7 @@ pub async fn fetch_skip_windows(
     episode_length: f64,
     treat_mixed_op_as_op: bool,
 ) -> Result<SkipWindows, String> {
-    let key = cache_key(mal_id, episode);
+    let key = cache_key(mal_id, episode, treat_mixed_op_as_op);
 
     // Cache hit? Positive results never expire; negative results
     // expire after 24 h.
@@ -223,10 +270,7 @@ pub async fn fetch_skip_windows(
         );
         if status == reqwest::StatusCode::NOT_FOUND {
             let payload = SkipWindows { found: false, windows: vec![] };
-            cache().lock().unwrap().insert(key, CacheEntry {
-                payload: payload.clone(),
-                cached_at: Instant::now(),
-            });
+            cache_insert(key, payload.clone());
             return Ok(payload);
         }
         return Err(format!("AniSkip HTTP {}", status.as_u16()));
@@ -262,10 +306,7 @@ pub async fn fetch_skip_windows(
         SkipWindows { found: true, windows }
     };
 
-    cache().lock().unwrap().insert(key.clone(), CacheEntry {
-        payload: payload.clone(),
-        cached_at: Instant::now(),
-    });
+    cache_insert(key, payload.clone());
 
     crate::devlog!(
         info, "aniskip",
@@ -273,6 +314,443 @@ pub async fn fetch_skip_windows(
         payload.found, payload.windows.len()
     );
     Ok(payload)
+}
+
+// ---------------------------------------------------------------------------
+// Neighbour profile: infer a MISSING episode's OP/ED from the episodes
+// either side of it.
+//
+// AniSkip's coverage is per-episode and patchy. Hell's Paradise S02 (mal 55825)
+// carries an ED on episodes 1, 2, 5, 6, 7 and 12 and NOTHING on 3, 4, 8-11 and
+// 13. The ending of a TV anime does not wander between episodes of one cour,
+// though: every one of those six rows starts within 13 s of 1376 against a
+// 1465.1 s runtime. So for the gaps the neighbours ARE the answer, and a much
+// better one than the ffmpeg tail-scan that used to be the only fallback (a
+// ~97 MB on-demand dependency and a multi-minute decode, for a worse number -
+// it is what put the Next-Up card a minute early on S02E11).
+//
+// Rails, because this is inference and not data:
+//   * only neighbours whose reported `episodeLength` matches the file actually
+//     playing. A different release or a double-length premiere has a different
+//     ED offset: mal 52991 (Frieren) puts its ED at 1417 on the 1560 s opener
+//     and at 1370 on every 1470 s episode, so an ungated average would land
+//     between two correct answers and be wrong for both.
+//   * at least PROFILE_MIN_SAMPLES agreeing rows, so one bad submission cannot
+//     carry a window on its own.
+//   * the MEDIAN, not the mean - an outlier shifts nothing.
+//   * source "aniskip-neighbour", which the front-end classifies as a GUESS:
+//     prompt-only, never an auto-seek, and drawn on the scrubber like every
+//     other window so the user can see what it inferred.
+//
+// Recap is deliberately NOT inferred: "previously on" segments are per-episode
+// content whose length changes week to week, so a neighbour tells us nothing.
+// ---------------------------------------------------------------------------
+
+/// Episodes either side of the target that get probed.
+const PROFILE_SPAN: u32 = 4;
+/// Agreeing rows required before an ED is inferred at all.
+const PROFILE_MIN_SAMPLES: usize = 2;
+/// The OP asks for more, and for tighter agreement, because an opening is a far
+/// less stable target than an ending. An ending is anchored to the end of a
+/// fixed broadcast slot - every ED row for mal 55825 lands within 13 s of 1376,
+/// and mal 52991's within 1 s of 1370. An opening floats with whatever cold
+/// open precedes it: the SAME six episodes of 55825 start their OP at 0, 76.5,
+/// 97, 107 and 116 s. Borrowing that would also suppress the file-specific
+/// silencedetect OP scan (which outranks nothing here but does get skipped once
+/// `hasOp` is true), and that scan reads THIS file rather than its neighbours.
+/// So the OP is inferred only for shows whose openings genuinely do not move.
+const PROFILE_OP_MIN_SAMPLES: usize = 3;
+/// How far a neighbour's reported `episodeLength` may differ from the file
+/// actually playing and still describe the same edit.
+const PROFILE_LENGTH_TOLERANCE: f64 = 6.0;
+/// How far a sample's start may sit from the median and still count as agreeing.
+const PROFILE_AGREE_TOLERANCE: f64 = 20.0;
+const PROFILE_OP_AGREE_TOLERANCE: f64 = 10.0;
+/// Shortest window worth inferring.
+const PROFILE_MIN_WINDOW: f64 = 10.0;
+const PROFILE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Bounded like every other cache in the app: one entry per (series, runtime,
+/// mixed-op mapping). Oldest third is dropped on overflow.
+const PROFILE_CACHE_CAP: usize = 64;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SeriesSkipProfile {
+    pub found: bool,
+    /// Inferred windows. `source` is "aniskip-neighbour" and `skip_id` is
+    /// always None: there is no server-side row for THIS episode to vote on.
+    pub windows: Vec<SkipWindow>,
+    /// Human-readable summary for the DevConsole (`[aniskip]`).
+    pub note: String,
+}
+
+static PROFILE_CACHE: OnceLock<Mutex<HashMap<String, (Instant, SeriesSkipProfile)>>> =
+    OnceLock::new();
+
+fn profile_cache() -> &'static Mutex<HashMap<String, (Instant, SeriesSkipProfile)>> {
+    PROFILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// One raw AniSkip row, kept with the runtime the submitter recorded it against.
+#[derive(Debug, Clone)]
+struct ProfileRow {
+    kind: String,
+    start: f64,
+    end: f64,
+    episode_length: f64,
+}
+
+/// Outcome of one neighbour probe. A 404 ("this episode has no data") and a
+/// network failure both mean "no vote", but they are NOT the same thing: if
+/// most of the neighbourhood errored, the profile that comes back is built on a
+/// fraction of the evidence and the note has to say so, otherwise "nothing
+/// usable" reads as "this series has no data" when it was a dead connection.
+struct ProbeOutcome {
+    rows: Vec<ProfileRow>,
+    failed: bool,
+}
+
+/// Raw single-episode probe. Deliberately NOT routed through
+/// `fetch_skip_windows`: that drops `episodeLength` (the whole basis of the
+/// length gate) and would fill the per-episode cache with rows for episodes the
+/// user is not watching.
+async fn probe_episode(mal_id: u32, episode: u32) -> ProbeOutcome {
+    let none = |failed| ProbeOutcome { rows: vec![], failed };
+    let url = format!(
+        "{ANISKIP_BASE}/skip-times/{mal_id}/{episode}\
+         ?types[]=op&types[]=ed&types[]=mixed-op&episodeLength=0"
+    );
+    let Ok(resp) = client().get(&url).send().await else { return none(true) };
+    let status = resp.status();
+    if !status.is_success() {
+        // 404 is the API's "no rows for this episode" and is an answer.
+        return none(status != reqwest::StatusCode::NOT_FOUND);
+    }
+    let Ok(raw) = resp.text().await else { return none(true) };
+    let Ok(parsed) = serde_json::from_str::<ApiResponse>(&raw) else { return none(true) };
+    if !parsed.found { return none(false) }
+    ProbeOutcome {
+        rows: parsed.results.into_iter().map(|r| ProfileRow {
+            kind: r.skip_type,
+            start: r.interval.start_time,
+            end: r.interval.end_time,
+            episode_length: r.episode_length,
+        }).collect(),
+        failed: false,
+    }
+}
+
+/// Lower median. Callers only reach it with at least PROFILE_MIN_SAMPLES
+/// entries, but it returns NaN rather than indexing an empty slice so a future
+/// caller gets a value that fails every downstream comparison instead of a panic.
+fn median(mut v: Vec<f64>) -> f64 {
+    if v.is_empty() { return f64::NAN }
+    // total_cmp, not partial_cmp+unwrap_or: a NaN in the input makes the latter
+    // an inconsistent comparator, and sort_by's output order is then undefined.
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+/// Reduce raw neighbour rows to at most one OP and one ED window. Pure, so the
+/// rails (runtime gate, sample floor, agreement, median) are testable without
+/// touching the network.
+fn infer_profile_windows(
+    rows: &[ProfileRow], duration: f64, treat_mixed_op_as_op: bool,
+) -> Vec<SkipWindow> {
+    // Runtime gate first: a row recorded against a different edit describes a
+    // different timeline and must not vote at all.
+    let matched: Vec<&ProfileRow> = rows.iter()
+        .filter(|r| (r.episode_length - duration).abs() <= PROFILE_LENGTH_TOLERANCE)
+        .collect();
+
+    let mut windows: Vec<SkipWindow> = Vec::new();
+    for want in ["op", "ed"] {
+        let samples: Vec<&ProfileRow> = matched.iter().copied()
+            .filter(|r| {
+                let mapped = if r.kind == "mixed-op" && treat_mixed_op_as_op {
+                    "op"
+                } else {
+                    r.kind.as_str()
+                };
+                mapped == want
+            })
+            .collect();
+        let (floor, slack) = if want == "op" {
+            (PROFILE_OP_MIN_SAMPLES, PROFILE_OP_AGREE_TOLERANCE)
+        } else {
+            (PROFILE_MIN_SAMPLES, PROFILE_AGREE_TOLERANCE)
+        };
+        if samples.len() < floor { continue }
+        // Median as the centre, then keep only what agrees with it, then take
+        // the median of THOSE - one wild submission neither carries the window
+        // nor drags it. A show whose openings do not cluster tightly enough
+        // fails the floor on the second pass and is simply not inferred.
+        let centre = median(samples.iter().map(|r| r.start).collect());
+        let agreeing: Vec<&ProfileRow> = samples.iter().copied()
+            .filter(|r| (r.start - centre).abs() <= slack)
+            .collect();
+        if agreeing.len() < floor { continue }
+        let start = median(agreeing.iter().map(|r| r.start).collect());
+        let end = median(agreeing.iter().map(|r| r.end).collect()).min(duration);
+        if !(end > start + PROFILE_MIN_WINDOW) { continue }
+        windows.push(SkipWindow {
+            kind: want.to_string(),
+            start,
+            end,
+            source: "aniskip-neighbour".into(),
+            skip_id: None,
+        });
+    }
+    windows
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    fn row(kind: &str, start: f64, end: f64, len: f64) -> ProfileRow {
+        ProfileRow { kind: kind.into(), start, end, episode_length: len }
+    }
+
+    /// Real AniSkip data for mal 55825 (Hell's Paradise S02), which is the case
+    /// that produced the bug report: episode 11 returns 404 while 1, 2, 5, 6, 7
+    /// and 12 all carry an ED.
+    fn hells_paradise_neighbours() -> Vec<ProfileRow> {
+        vec![
+            row("ed", 1375.0, 1465.0, 1465.0),
+            row("ed", 1376.0, 1465.0, 1465.132),
+            row("ed", 1388.0, 1465.0, 1465.048),   // the outlier
+            row("ed", 1376.0, 1465.0, 1465.132),
+            row("ed", 1377.0, 1465.0, 1465.09),
+            row("ed", 1376.0, 1461.9, 1464.97),
+        ]
+    }
+
+    #[test]
+    fn hells_paradise_ed_is_recovered_from_its_neighbours() {
+        let w = infer_profile_windows(&hells_paradise_neighbours(), 1465.1, true);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].kind, "ed");
+        assert_eq!(w[0].source, "aniskip-neighbour");
+        assert!(w[0].skip_id.is_none());
+        // The 1388 outlier must not drag the answer.
+        assert!((w[0].start - 1376.0).abs() < 1.0, "start was {}", w[0].start);
+        assert!(w[0].end <= 1465.1);
+    }
+
+    #[test]
+    fn a_different_runtime_never_votes() {
+        // Frieren (mal 52991) is the reason this gate exists: its double-length
+        // opener (1559.9 s) starts its ED at 1417, every 1470 s episode at 1370.
+        // Averaging the two lands between two correct answers and is wrong for
+        // both.
+        let rows = vec![
+            row("ed", 1417.135, 1507.135, 1559.949),
+            row("ed", 1370.0, 1460.0, 1469.968),
+            row("ed", 1370.0, 1460.0, 1470.032),
+            row("ed", 1371.0, 1460.0, 1470.148),
+        ];
+        let w = infer_profile_windows(&rows, 1470.078, true);
+        assert_eq!(w.len(), 1);
+        assert!((w[0].start - 1370.0).abs() < 1.0, "start was {}", w[0].start);
+    }
+
+    #[test]
+    fn one_lone_sample_is_not_enough() {
+        // Frieren episode 4 (1559.857 s) has exactly one runtime-matching
+        // neighbour. One crowd submission does not get to move the UI.
+        let rows = vec![
+            row("ed", 1417.135, 1507.135, 1559.949),
+            row("ed", 1370.0, 1460.0, 1470.032),
+        ];
+        assert!(infer_profile_windows(&rows, 1559.857, true).is_empty());
+    }
+
+    #[test]
+    fn disagreeing_samples_produce_nothing() {
+        let rows = vec![
+            row("ed", 1100.0, 1200.0, 1465.0),
+            row("ed", 1376.0, 1465.0, 1465.0),
+        ];
+        // Neither half reaches PROFILE_MIN_SAMPLES once the outlier filter runs.
+        assert!(infer_profile_windows(&rows, 1465.1, true).is_empty());
+    }
+
+    #[test]
+    fn mixed_op_folds_into_op_only_when_asked() {
+        let rows = vec![
+            row("mixed-op", 100.0, 190.0, 1465.0),
+            row("mixed-op", 101.0, 191.0, 1465.0),
+            row("mixed-op", 102.0, 192.0, 1465.0),
+        ];
+        let folded = infer_profile_windows(&rows, 1465.1, true);
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0].kind, "op");
+        assert!(infer_profile_windows(&rows, 1465.1, false).is_empty());
+    }
+
+    #[test]
+    fn a_show_whose_opening_moves_gets_no_inferred_op() {
+        // Real AniSkip OP starts for mal 55825 episodes 7-12: the cold open
+        // before the opening is a different length every week, so the neighbours
+        // do not agree and the file-specific silencedetect scan should keep the
+        // job. The ED on the same episodes is rock steady, so it still lands.
+        let rows = vec![
+            row("op", 116.0, 204.0, 1465.09),
+            row("op", 76.5, 106.0, 1465.133),
+            row("op", 0.0, 108.0, 1465.048),
+            row("op", 97.0, 185.0, 1465.132),
+            row("op", 107.338, 197.018, 1464.97),
+            row("ed", 1377.0, 1465.0, 1465.09),
+            row("ed", 1376.0, 1461.9, 1464.97),
+        ];
+        let w = infer_profile_windows(&rows, 1465.1, true);
+        assert_eq!(w.len(), 1, "expected ED only, got {w:?}");
+        assert_eq!(w[0].kind, "ed");
+        assert!((w[0].start - 1377.0).abs() < 1.5, "start was {}", w[0].start);
+    }
+
+    #[test]
+    fn a_show_whose_opening_is_fixed_does_get_one() {
+        let rows = vec![
+            row("op", 118.0, 208.0, 1440.0),
+            row("op", 119.0, 209.0, 1440.0),
+            row("op", 118.5, 208.5, 1440.0),
+        ];
+        let w = infer_profile_windows(&rows, 1440.0, true);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].kind, "op");
+        assert!((w[0].start - 118.5).abs() < 1.0, "start was {}", w[0].start);
+    }
+
+    #[test]
+    fn recap_is_never_inferred() {
+        // Per-episode content: the neighbours say nothing useful about it.
+        let rows = vec![
+            row("recap", 0.0, 60.0, 1465.0),
+            row("recap", 0.0, 62.0, 1465.0),
+            row("recap", 0.0, 61.0, 1465.0),
+        ];
+        assert!(infer_profile_windows(&rows, 1465.1, true).is_empty());
+    }
+
+    #[test]
+    fn a_degenerate_window_is_dropped() {
+        let rows = vec![
+            row("ed", 1400.0, 1403.0, 1465.0),
+            row("ed", 1400.0, 1404.0, 1465.0),
+        ];
+        assert!(infer_profile_windows(&rows, 1465.1, true).is_empty());
+    }
+
+    #[test]
+    fn both_kinds_can_be_filled_at_once() {
+        let rows = vec![
+            row("op", 100.0, 190.0, 1465.0),
+            row("op", 101.0, 191.0, 1465.0),
+            row("op", 102.0, 192.0, 1465.0),
+            row("ed", 1376.0, 1465.0, 1465.0),
+            row("ed", 1377.0, 1465.0, 1465.0),
+        ];
+        let w = infer_profile_windows(&rows, 1465.1, true);
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0].kind, "op");
+        assert_eq!(w[1].kind, "ed");
+    }
+}
+
+/// Infer OP / ED windows for `episode` from its neighbours. `duration` is the
+/// container runtime of the file being played and is REQUIRED: without it the
+/// length gate cannot run and the whole thing degrades into averaging unrelated
+/// edits together.
+#[tauri::command]
+pub async fn fetch_neighbour_skip_profile(
+    mal_id: u32,
+    episode: u32,
+    duration: f64,
+    treat_mixed_op_as_op: bool,
+) -> Result<SeriesSkipProfile, String> {
+    if !(duration > 0.0) {
+        return Ok(SeriesSkipProfile {
+            found: false, windows: vec![],
+            note: "no container duration - neighbour inference needs one".into(),
+        });
+    }
+    // Keyed by EPISODE, not just by series: each episode has its own
+    // neighbourhood, and a long-running show can change its opening or ending
+    // between cours. A series-wide key served episode 5's answer to episode 40.
+    // The runtime is bucketed so a re-open of the same episode (or the same
+    // episode at a fractionally different reported duration) still hits.
+    let key = format!(
+        "{mal_id}:{episode}:{}:{}",
+        (duration / 5.0).round() as i64,
+        u8::from(treat_mixed_op_as_op),
+    );
+    {
+        let lock = profile_cache().lock().unwrap();
+        if let Some((at, profile)) = lock.get(&key) {
+            if at.elapsed() < PROFILE_TTL {
+                crate::devlog!(
+                    info, "aniskip",
+                    "neighbour profile cache hit mal={mal_id} ({} window(s))",
+                    profile.windows.len()
+                );
+                return Ok(profile.clone());
+            }
+        }
+    }
+
+    let lo = episode.saturating_sub(PROFILE_SPAN).max(1);
+    let hi = episode.saturating_add(PROFILE_SPAN);
+    let mut set: tokio::task::JoinSet<ProbeOutcome> = tokio::task::JoinSet::new();
+    let mut probed = 0usize;
+    for ep in lo..=hi {
+        if ep == episode { continue }
+        probed += 1;
+        set.spawn(async move { probe_episode(mal_id, ep).await });
+    }
+    let mut rows: Vec<ProfileRow> = Vec::new();
+    let mut failed = 0usize;
+    while let Some(res) = set.join_next().await {
+        match res {
+            Ok(mut out) => { failed += usize::from(out.failed); rows.append(&mut out.rows) }
+            Err(_) => failed += 1,
+        }
+    }
+    if failed > 0 {
+        crate::devlog!(
+            warn, "aniskip",
+            "neighbour profile mal={mal_id} ep={episode}: {failed}/{probed} probe(s) failed"
+        );
+    }
+
+    let matched = rows.iter()
+        .filter(|r| (r.episode_length - duration).abs() <= PROFILE_LENGTH_TOLERANCE)
+        .count();
+    let windows = infer_profile_windows(&rows, duration, treat_mixed_op_as_op);
+
+    let note = format!(
+        "neighbour profile mal={mal_id} ep={episode}: probed {probed} ({failed} failed), \
+         {matched} row(s) matched runtime {duration:.1}s -> {} window(s)",
+        windows.len(),
+    );
+    crate::devlog!(info, "aniskip", "{note}");
+
+    let profile = SeriesSkipProfile { found: !windows.is_empty(), windows, note };
+    {
+        let mut lock = profile_cache().lock().unwrap();
+        if lock.len() >= PROFILE_CACHE_CAP {
+            // Drop the oldest third rather than clearing: a full wipe would
+            // re-probe every open series at once on the next episode load.
+            let mut ages: Vec<(String, Instant)> =
+                lock.iter().map(|(k, (at, _))| (k.clone(), *at)).collect();
+            ages.sort_by_key(|(_, at)| *at);
+            for (k, _) in ages.into_iter().take(PROFILE_CACHE_CAP / 3) {
+                lock.remove(&k);
+            }
+        }
+        lock.insert(key, (Instant::now(), profile.clone()));
+    }
+    Ok(profile)
 }
 
 // ---------------------------------------------------------------------------
@@ -800,7 +1278,7 @@ pub async fn submit_skip_time<R: Runtime>(
     // Invalidate the cached query so the next fetch picks up the
     // freshly-submitted window without waiting for AniSkip's
     // server-side cache to expire.
-    cache().lock().unwrap().remove(&cache_key(mal_id, episode));
+    invalidate_cache(mal_id, episode);
     Ok(SubmitSkipResult { success, skip_id, message })
 }
 
@@ -1021,7 +1499,15 @@ pub async fn resolve_anilist_to_mal(anilist_id: u64) -> Option<u64> {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub async fn vote_skip_time(skip_id: String, vote_type: String) -> Result<bool, String> {
+// `mal_id` / `episode` are optional and are used only to invalidate this
+// episode's cached windows once the vote lands; a caller that omits them just
+// skips that step.
+pub async fn vote_skip_time(
+    skip_id: String,
+    vote_type: String,
+    mal_id: Option<u32>,
+    episode: Option<u32>,
+) -> Result<bool, String> {
     if !matches!(vote_type.as_str(), "upvote" | "downvote") {
         return Err(format!("invalid vote_type: {vote_type}"));
     }
@@ -1039,6 +1525,12 @@ pub async fn vote_skip_time(skip_id: String, vote_type: String) -> Result<bool, 
             status.as_u16(), raw.chars().take(400).collect::<String>(),
         );
         return Err(format!("AniSkip HTTP {}", status.as_u16()));
+    }
+    // The vote itself does not change what AniSkip returns today (votes
+    // accumulate server-side), but the user has flagged this episode's data,
+    // so stop serving them the local copy of it.
+    if let (Some(mal), Some(ep)) = (mal_id, episode) {
+        invalidate_cache(mal, ep);
     }
     Ok(true)
 }

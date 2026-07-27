@@ -519,30 +519,68 @@ pub struct OutroBoundaryResult {
     pub note:      String,
 }
 
+/// Closest a returned boundary may sit to the end of the file. The whole point
+/// of an inferred ED start is to beat the Next-Up card's fixed lead time, so a
+/// boundary inside the last 45 s buys nothing and is far more likely to be the
+/// fade-out at EOF than the start of the credits.
+const OUTRO_MIN_TAIL_SECS: f64 = 45.0;
+/// How close a silence boundary has to be to a black boundary for the two to
+/// count as ONE transition. A cut into the credits normally drops both the
+/// picture and the audio bed within a beat of each other.
+const OUTRO_COINCIDENCE_SLACK_SECS: f64 = 3.0;
+/// Shortest black run that counts as a transition. A cut between shots is a
+/// frame or two; a transition into credits holds black for around a second.
+const BLACK_MIN_RUN_SECS: f64 = 0.5;
+/// Shortest audio gap that counts. Deliberately left at the threshold this
+/// scan has always effectively used: with the LATEST-wins rule above, extra
+/// candidates can only move the answer later (and everything in the window is
+/// already a plausible credits position), so tightening recall here would lose
+/// files that have one weak boundary and nothing else, for no accuracy gain.
+const SILENCE_MIN_RUN_SECS: f64 = 1.5;
+
 /// Hybrid-mode ED detection (the bounded, low-risk slice — NO 90× scan).
 ///
 /// Scans only the LAST `tail_secs` of the stream with a SINGLE ffmpeg
 /// pass running `blackdetect` (downscaled, cheap) + `silencedetect`
 /// together. Credits/ED almost always begin with a hard scene→black
-/// cut and/or a music/dialogue→silence transition; the EARLIEST such
-/// significant boundary inside the tail (excluding the seek-in artifact
-/// and the final fade-to-black at EOF) is the ED start.
+/// cut and/or a music/dialogue→silence transition.
 ///
-/// This does NOT stamp a skip window (no reliable end without the
-/// container duration) — its job is to hand the desktop an ED-start so
-/// the Next-Up CTA fires at the right moment for live-action / any
-/// series AniSkip + chapters don't cover. ffmpeg-on-PATH best-effort,
-/// same graceful `available=false` contract as `detect_silence_intervals`.
+/// SELECTION IS BIASED LATE, ON PURPOSE. This used to take the EARLIEST
+/// qualifying boundary in a 420 s tail, which is wrong in a specific and
+/// user-visible way: a 24-minute episode's tail starts around 17:25, and every
+/// fade-to-black act break between there and the real credits is a candidate.
+/// Reported on Hell's Paradise S02E11 (AniSkip has NO data for that episode, so
+/// this scan was the only ED source): the Next-Up card appeared a minute or two
+/// before the ending. The credits are the LAST major A/V discontinuity in the
+/// file, so the latest qualifying boundary that still leaves `OUTRO_MIN_TAIL_SECS`
+/// of runtime is the one to take. Being late costs nothing (the Next-Up card's
+/// fixed lead time still fires); being early yanks a card over the climax.
+///
+/// Confidence order, all within the same window:
+///   1. a black boundary with a silence boundary within a few seconds of it
+///      (a real cut into the credits drops picture and audio bed together),
+///   2. a black boundary alone,
+///   3. a long silence alone.
+///
+/// `duration` (container seconds, 0 when unknown) anchors the window. Without
+/// it the scan can only guess the end from the timestamps it happened to
+/// observe, which is exactly how a bad answer used to look plausible.
+///
+/// The caller stamps the returned boundary as a PROMPT-ONLY `ed` window so the
+/// inference is visible on the scrubber rather than silently timing a card.
+/// ffmpeg-on-PATH best-effort, same graceful `available=false` contract as
+/// `detect_silence_intervals`.
 #[tauri::command]
 pub async fn detect_outro_boundary(
     app: tauri::AppHandle,
     url: String,
     tail_secs: u32,
+    duration: f64,
 ) -> Result<OutroBoundaryResult, String> {
     let tail = if tail_secs == 0 { 300 } else { tail_secs.min(900) };
     crate::devlog!(
         info, "silence",
-        "detect_outro_boundary tail={tail}s url={}",
+        "detect_outro_boundary tail={tail}s duration={duration:.1} url={}",
         url.chars().take(80).collect::<String>(),
     );
 
@@ -591,8 +629,10 @@ pub async fn detect_outro_boundary(
         .arg("-sseof").arg(format!("-{tail}"))
         .arg("-copyts")
         .arg("-i").arg(&url)
-        .arg("-vf").arg("scale=160:-2,blackdetect=d=0.30:pic_th=0.98")
-        .arg("-af").arg("silencedetect=n=-30dB:d=0.5")
+        // Filter thresholds match the post-filters below so ffmpeg does not
+        // emit runs the parser will only discard.
+        .arg("-vf").arg("scale=160:-2,blackdetect=d=0.50:pic_th=0.98")
+        .arg("-af").arg("silencedetect=n=-30dB:d=1.5")
         .arg("-f").arg("null")
         .arg("-")
         .stdout(Stdio::null())
@@ -618,51 +658,54 @@ pub async fn detect_outro_boundary(
     };
     let mut reader = BufReader::new(stderr).lines();
 
-    // (start, kind) — kind: true=black, false=long-silence. We also
-    // track the scanned PTS range to drop the seek-in artifact and the
-    // final EOF fade without needing the container duration.
-    let mut blacks: Vec<f64> = Vec::new();   // black_start where black_duration ≥ 0.30
-    let mut sils:   Vec<f64> = Vec::new();   // silence_start where silence ≥ 1.5 s
+    let mut blacks: Vec<f64> = Vec::new();   // black_start of a run ≥ BLACK_MIN_RUN_SECS
+    let mut sils:   Vec<f64> = Vec::new();   // silence_start of a gap ≥ SILENCE_MIN_RUN_SECS
     let mut sil_start: Option<f64> = None;
-    let mut black_start: Option<f64> = None;
     let mut ts_min = f64::INFINITY;
     let mut ts_max = f64::NEG_INFINITY;
 
+    /// Number that follows `tag` on a line, if any.
+    fn field(line: &str, tag: &str) -> Option<f64> {
+        line.split(tag).nth(1)?.split_whitespace().next()?.parse::<f64>().ok()
+    }
+
     let parse = async {
         while let Ok(Some(line)) = reader.next_line().await {
-            if let Some(rest) = line.split("black_start:").nth(1) {
-                if let Some(tok) = rest.split_whitespace().next() {
-                    if let Ok(s) = tok.parse::<f64>() {
-                        black_start = Some(s);
-                        ts_min = ts_min.min(s);
-                        ts_max = ts_max.max(s);
-                    }
+            // blackdetect emits ONE line per run carrying all three fields:
+            //   [blackdetect @ ...] black_start:1376.2 black_end:1378.1 black_duration:1.9
+            // The previous parser was an if/else-if chain that tested
+            // `black_start:` first, so the `black_end:` arm could never be
+            // reached on that same line and NOTHING was ever pushed to
+            // `blacks`. Every ED this scan has ever reported came from the
+            // silence list alone, which is also why the "a hard black cut is a
+            // stronger credits signal, so prefer it" comment described
+            // behaviour that did not exist.
+            if line.contains("black_start:") {
+                let start = field(&line, "black_start:");
+                let end   = field(&line, "black_end:");
+                let run   = field(&line, "black_duration:")
+                    .or_else(|| match (start, end) { (Some(s), Some(e)) => Some(e - s), _ => None });
+                if let Some(s) = start {
+                    ts_min = ts_min.min(s);
+                    ts_max = ts_max.max(end.unwrap_or(s));
+                    if run.unwrap_or(0.0) >= BLACK_MIN_RUN_SECS { blacks.push(s) }
                 }
-            } else if let Some(rest) = line.split("black_end:").nth(1) {
-                if let Some(tok) = rest.split_whitespace().next() {
-                    if let Ok(e) = tok.parse::<f64>() {
-                        ts_max = ts_max.max(e);
-                        if let Some(bs) = black_start.take() {
-                            if e - bs >= 0.30 { blacks.push(bs); }
-                        }
-                    }
-                }
-            } else if let Some(rest) = line.split("silence_start:").nth(1) {
-                if let Some(tok) = rest.split_whitespace().next() {
-                    if let Ok(s) = tok.parse::<f64>() {
-                        sil_start = Some(s);
-                        ts_min = ts_min.min(s);
-                        ts_max = ts_max.max(s);
-                    }
-                }
-            } else if let Some(rest) = line.split("silence_end:").nth(1) {
-                if let Some(tok) = rest.split_whitespace().next() {
-                    if let Ok(e) = tok.parse::<f64>() {
-                        ts_max = ts_max.max(e);
-                        if let Some(ss) = sil_start.take() {
-                            if e - ss >= 1.5 { sils.push(ss); }
-                        }
-                    }
+                continue;
+            }
+            // silencedetect DOES split across lines: `silence_start: X`, then
+            // `silence_end: Y | silence_duration: Z`.
+            if let Some(s) = field(&line, "silence_start:") {
+                sil_start = Some(s);
+                ts_min = ts_min.min(s);
+                ts_max = ts_max.max(s);
+                continue;
+            }
+            if let Some(e) = field(&line, "silence_end:") {
+                ts_max = ts_max.max(e);
+                let run = field(&line, "silence_duration:")
+                    .or_else(|| sil_start.map(|s| e - s));
+                if let Some(s) = sil_start.take() {
+                    if run.unwrap_or(0.0) >= SILENCE_MIN_RUN_SECS { sils.push(s) }
                 }
             }
         }
@@ -672,43 +715,217 @@ pub async fn detect_outro_boundary(
     if timed.is_err() {
         crate::devlog!(warn, "silence", "outro ffmpeg readline timed out — killing");
         let _ = child.kill().await;
+        let _ = child.wait().await;
+        // A truncated scan is NOT a partial answer. Selection below takes the
+        // LATEST qualifying boundary, and a scan cut short is missing exactly
+        // the late ones, so continuing would hand back a systematically early
+        // guess wearing a clean `available: true`.
+        return Ok(OutroBoundaryResult {
+            available: false,
+            ed_start:  None,
+            note:      format!(
+                "outro scan timed out after 300s (tail {tail}s, partial: {} black + {} silence)",
+                blacks.len(), sils.len(),
+            ),
+        });
     }
-    let _ = child.wait().await;
+    let exit_ok = matches!(child.wait().await, Ok(s) if s.success());
+    if !exit_ok {
+        // Same reasoning: an ffmpeg that died mid-stream (dropped debrid link,
+        // decode error) has an incomplete tail, and its last boundary is not
+        // the file's last boundary.
+        crate::devlog!(warn, "silence", "outro ffmpeg exited non-zero, discarding scan");
+        return Ok(OutroBoundaryResult {
+            available: false,
+            ed_start:  None,
+            note:      format!(
+                "ffmpeg exited non-zero (tail {tail}s, partial: {} black + {} silence)",
+                blacks.len(), sils.len(),
+            ),
+        });
+    }
 
-    // Exclude the seek-in artifact (first ~2 s of the scan) and the
-    // final fade-to-black at the very end (~last 8 s). The ED begins at
-    // the EARLIEST qualifying boundary in between; a hard black cut is
-    // a stronger credits signal than silence, so prefer it.
-    let lo = if ts_min.is_finite() { ts_min + 2.0 } else { 0.0 };
-    let hi = if ts_max.is_finite() { ts_max - 8.0 } else { f64::INFINITY };
-    let in_window = |t: f64| t >= lo && t <= hi;
-
-    let earliest_black = blacks.iter().copied().filter(|&t| in_window(t))
-        .fold(f64::INFINITY, f64::min);
-    let earliest_sil = sils.iter().copied().filter(|&t| in_window(t))
-        .fold(f64::INFINITY, f64::min);
-
-    let ed_start = if earliest_black.is_finite() {
-        Some(earliest_black)
-    } else if earliest_sil.is_finite() {
-        Some(earliest_sil)
+    // Anchor the window on the CONTAINER duration when the caller knows it;
+    // fall back to the largest observed timestamp only when it doesn't (the old
+    // behaviour, kept so a duration-less caller still gets an answer rather
+    // than nothing). `ts_max` is the last timestamp any detector reported, NOT
+    // the end of the file: on a stream whose final minute has neither a black
+    // frame nor a silence it under-reads the end by however long that quiet
+    // stretch is, and every offset derived from it shifts with it.
+    let end_ref = if duration > 0.0 {
+        duration
+    } else if ts_max.is_finite() {
+        ts_max
     } else {
-        None
+        f64::NAN
     };
+    // Low edge excludes the seek-in artifact; high edge excludes both the
+    // fade-out at EOF and anything too close to the end to be worth reporting.
+    //
+    // The floor comes from the SCAN ORIGIN (`-sseof -tail` starts the read at
+    // end_ref - tail), never from ts_min. ts_min is just the first timestamp a
+    // detector happened to report, so folding it in would push the floor past
+    // the only boundary in a file that has exactly one - the clean case. It is
+    // used only when the caller could not supply a duration and there is
+    // nothing else to anchor to.
+    let (lo, hi) = outro_window(end_ref, tail, ts_min);
+
+    let (ed_start, how, coincident) = pick_outro_boundary(&blacks, &sils, lo, hi);
 
     let note = match ed_start {
         Some(t) => format!(
-            "tail {tail}s: {} black + {} silence boundary(s) → ED≈{:.1}s",
-            blacks.len(), sils.len(), t,
+            "tail {tail}s window {lo:.1}-{hi:.1}s: {} black + {} silence \
+             ({coincident} coincident) → ED≈{t:.1}s via {how}",
+            blacks.len(), sils.len(),
         ),
         None => format!(
-            "tail {tail}s: {} black + {} silence boundary(s), none qualified",
+            "tail {tail}s window {lo:.1}-{hi:.1}s: {} black + {} silence boundary(s), \
+             none qualified",
             blacks.len(), sils.len(),
         ),
     };
     crate::devlog!(info, "silence", "{note}");
 
     Ok(OutroBoundaryResult { available: true, ed_start, note })
+}
+
+/// Acceptance window for a credits boundary, in absolute stream seconds.
+///
+/// Anchored on the SCAN ORIGIN. `-sseof -tail` starts the read at
+/// `end_ref - tail`, so that plus a couple of seconds is the seek-in artifact
+/// floor. The floor must NOT be folded together with `ts_min`: that is only the
+/// first timestamp some detector happened to report, so on a file whose tail
+/// contains exactly one boundary (the clean case) `ts_min + 2` lands PAST it and
+/// the answer is thrown away. `ts_min` is the fallback only when the caller
+/// could not supply a duration and there is nothing else to anchor to.
+fn outro_window(end_ref: f64, tail: u32, ts_min: f64) -> (f64, f64) {
+    if end_ref.is_finite() {
+        (end_ref - tail as f64 + 2.0, end_ref - OUTRO_MIN_TAIL_SECS)
+    } else if ts_min.is_finite() {
+        (ts_min + 2.0, f64::INFINITY)
+    } else {
+        (0.0, f64::INFINITY)
+    }
+}
+
+/// Choose the credits boundary out of the scan's two boundary lists. Pure, so
+/// the selection rule is testable without ffmpeg or a network stream.
+///
+/// LATEST qualifying boundary, not earliest: the credits are the last major A/V
+/// discontinuity in a file, and every act break before them is a candidate an
+/// earliest-wins rule prefers - which is precisely how the Next-Up card ended up
+/// a minute early. Everything inside [lo, hi] is already a plausible credits
+/// position by construction, so taking the last one is uniformly the
+/// conservative choice: worst case the card fires a few seconds into the credits
+/// instead of at their first frame.
+///
+/// The two lists are a UNION, not a priority ladder. Tiering them (coincident,
+/// then black, then silence) re-created the original bug in miniature: an act
+/// break that happened to drop both picture and audio outranked a later, real
+/// credits cut that only showed up in one list. Coincidence is still computed,
+/// but only to describe how well corroborated the answer is.
+///
+/// Returns (boundary, how well corroborated, how many coincident candidates).
+fn pick_outro_boundary(
+    blacks: &[f64], sils: &[f64], lo: f64, hi: f64,
+) -> (Option<f64>, &'static str, usize) {
+    let in_window = |t: f64| t >= lo && t <= hi;
+    let coincident: Vec<f64> = blacks.iter().copied()
+        .filter(|&b| in_window(b))
+        .filter(|&b| sils.iter().any(|&s| (s - b).abs() <= OUTRO_COINCIDENCE_SLACK_SECS))
+        .collect();
+    let best = blacks.iter().chain(sils.iter()).copied()
+        .filter(|&t| in_window(t))
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !best.is_finite() { return (None, "none", coincident.len()) }
+    let how = if coincident.iter().any(|&c| (c - best).abs() < f64::EPSILON) {
+        "black+silence"
+    } else if blacks.contains(&best) {
+        "black"
+    } else {
+        "silence"
+    };
+    (Some(best), how, coincident.len())
+}
+
+#[cfg(test)]
+mod outro_tests {
+    use super::*;
+
+    // Hell's Paradise S02: 1465.1 s runtime, credits at 1376 (AniSkip rows for
+    // episodes 1/2/5/6/7/12 all land within 13 s of it). The scan window for a
+    // 240 s tail is [1227.1, 1420.1].
+    const LO: f64 = 1227.1;
+    const HI: f64 = 1420.1;
+
+    #[test]
+    fn latest_boundary_wins_over_an_earlier_act_break() {
+        // The reported failure: an act break at 1246 and the real credits at
+        // 1376. Earliest-wins returned 1246 and put the Next-Up card 130 s early.
+        let (t, how, _) = pick_outro_boundary(&[1246.0, 1376.0], &[], LO, HI);
+        assert_eq!(t, Some(1376.0));
+        assert_eq!(how, "black");
+    }
+
+    #[test]
+    fn corroboration_does_not_promote_an_earlier_candidate() {
+        // A coincident act break at 1300 must NOT beat a later lone black at
+        // 1390: tiering the two lists re-created the reported bug in miniature.
+        let (t, how, n) = pick_outro_boundary(&[1300.0, 1390.0], &[1301.5], LO, HI);
+        assert_eq!(t, Some(1390.0));
+        assert_eq!(how, "black");
+        assert_eq!(n, 1, "the 1300 coincidence is still counted, just not preferred");
+    }
+
+    #[test]
+    fn a_silence_only_file_still_gets_an_answer() {
+        let (t, how, _) = pick_outro_boundary(&[], &[1290.0, 1376.0], LO, HI);
+        assert_eq!(t, Some(1376.0));
+        assert_eq!(how, "silence");
+    }
+
+    #[test]
+    fn boundaries_outside_the_window_never_qualify() {
+        // 1170 is in the final act but before the window; 1450 is inside the
+        // last OUTRO_MIN_TAIL_SECS and would be the fade-out at EOF.
+        let (t, how, _) = pick_outro_boundary(&[1170.0, 1450.0], &[1170.5], LO, HI);
+        assert_eq!(t, None);
+        assert_eq!(how, "none");
+    }
+
+    #[test]
+    fn empty_input_is_not_an_answer() {
+        assert_eq!(pick_outro_boundary(&[], &[], LO, HI).0, None);
+    }
+
+    #[test]
+    fn a_single_clean_credits_transition_is_found() {
+        // Drives the REAL window computation, not hardcoded bounds: the old
+        // event-derived trim (lo = ts_min + 2, hi = ts_max - 8) inverted on
+        // exactly this input - one black at 1376, one silence at 1374.5 - and
+        // threw the perfectly-detected answer away.
+        let (lo, hi) = outro_window(1465.1, 240, 1374.5);
+        let (t, how, _) = pick_outro_boundary(&[1376.0], &[1374.5], lo, hi);
+        assert_eq!(t, Some(1376.0));
+        assert_eq!(how, "black+silence");
+    }
+
+    #[test]
+    fn the_window_is_anchored_on_the_scan_origin_not_on_the_events() {
+        let (lo, hi) = outro_window(1465.1, 240, 1374.5);
+        assert!((lo - 1227.1).abs() < 0.001, "lo was {lo}");
+        assert!((hi - (1465.1 - OUTRO_MIN_TAIL_SECS)).abs() < 0.001, "hi was {hi}");
+        // The first observed event must still be inside the window.
+        assert!(1374.5 >= lo && 1374.5 <= hi);
+    }
+
+    #[test]
+    fn without_a_duration_the_window_degrades_rather_than_inverting() {
+        let (lo, hi) = outro_window(f64::NAN, 240, 1300.0);
+        assert_eq!(lo, 1302.0);
+        assert_eq!(hi, f64::INFINITY);
+        assert!(lo < hi, "the window must never invert");
+    }
 }
 
 async fn ffmpeg_is_available(app: &tauri::AppHandle) -> bool {

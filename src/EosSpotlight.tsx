@@ -83,6 +83,12 @@ interface Props {
    *  stillWatchingGate setting on, the auto-advance countdown is suppressed and a
    *  "Still watching?" confirm is shown instead, stopping an all-night chain. */
   autoAdvanceStreak: number;
+  /** True when the user EXPLICITLY refused an auto-advance for this episode -
+   *  they dismissed the small NextUpCta, which this screen replaces. Without it
+   *  the refusal died with that component and this one armed a fresh countdown
+   *  and advanced anyway. Ambient activity does not set it: a mouse move a
+   *  minute ago is attention, not a decision, and the end card is a new one. */
+  autoAdvanceCancelled: boolean;
   onReplay: () => void;
   onExit: () => void;
   onOpenEpisodes: () => void;
@@ -134,6 +140,7 @@ function NextAirCountdown({ targetMs }: { targetMs: number }) {
 function EosSpotlight({
   title, episode, stream, loading, isSeries, caughtUpUnaired, nextAirTargetMs,
   seriesArt, libraryById, onPlayNext, skipTag, onSkipToCanon, autoAdvanceStreak,
+  autoAdvanceCancelled,
   onReplay, onExit, onOpenEpisodes, onDismiss, episodesOpen, arcNote,
 }: Props) {
   const isNextUp = episode != null;
@@ -173,8 +180,12 @@ function EosSpotlight({
     isNextUp && settings.autoAdvanceNextEpisode && !loading && (skipMode || stream != null)
     && !isPartyFollower && !gatedByStillWatching;
 
-  const [remaining, setRemaining] = useState<number | null>(autoArmed ? initialSeconds : null);
-  const cancelledRef = useRef(false);
+  const [remaining, setRemaining] = useState<number | null>(
+    autoArmed && !autoAdvanceCancelled ? initialSeconds : null,
+  );
+  // Seeded from App: a refusal expressed on the NextUpCta this screen replaced
+  // still holds here.
+  const cancelledRef = useRef(autoAdvanceCancelled);
   const windowHidden = useWindowHidden();
 
   useEffect(() => {
@@ -197,26 +208,32 @@ function EosSpotlight({
     return () => window.clearTimeout(id);
   }, [autoArmed, remaining, initialSeconds, onPlayNext, onSkipToCanon, skipMode, windowHidden]);
 
+  // Bound for the whole lifetime and in the CAPTURE phase - see the matching
+  // comment in NextUpCta. Binding on `remaining !== null` threw away every
+  // cancel signal during the "Resolving stream..." phase, and a bubble-phase
+  // listener never saw x / Shift+X at all because SkipController's own
+  // window-capture handlers stop the event there.
   useEffect(() => {
-    if (remaining === null) return;
     const cancel = () => {
+      if (cancelledRef.current) return;
       cancelledRef.current = true;
       setRemaining(null);
     };
-    window.addEventListener("pointermove", cancel, { passive: true });
-    window.addEventListener("keydown", cancel);
-    window.addEventListener("wheel", cancel, { passive: true });
+    const opts = { capture: true, passive: true } as const;
+    window.addEventListener("pointermove", cancel, opts);
+    window.addEventListener("keydown", cancel, { capture: true });
+    window.addEventListener("wheel", cancel, opts);
     return () => {
-      window.removeEventListener("pointermove", cancel);
-      window.removeEventListener("keydown", cancel);
-      window.removeEventListener("wheel", cancel);
+      window.removeEventListener("pointermove", cancel, opts);
+      window.removeEventListener("keydown", cancel, { capture: true });
+      window.removeEventListener("wheel", cancel, opts);
     };
-  }, [remaining]);
+  }, []);
 
   // Escape dismisses the Spotlight (stay paused on the last frame).
-  // Independent of the countdown-cancel listener above: that one only
-  // exists while a countdown is armed and merely cancels auto-advance;
-  // this one always exists and actually hides the screen. stopPropagation
+  // Independent of the countdown-cancel listener above: that one is bound for
+  // the whole lifetime but only cancels auto-advance; this one actually hides
+  // the screen. stopPropagation
   // so the keypress doesn't also reach PlayerOverlay's own Esc handler.
   //
   // Esc cascade (2026-05-20): when EpisodePanel is OPEN on top of the

@@ -140,6 +140,13 @@ export class PersistentCache<V> {
 
   has(key: string): boolean { return this.get(key) !== undefined; }
 
+  /** Drop one entry (no-op when absent). For caches whose upstream can be
+   *  corrected by the user - e.g. an AniSkip window they just downvoted -
+   *  so the next read refetches instead of serving the stale copy. */
+  delete(key: string): void {
+    if (this.map.delete(key)) this.schedulePersist();
+  }
+
   clear(): void {
     this.map.clear();
     try { localStorage.removeItem(this.storageKey); } catch { /* ignore */ }

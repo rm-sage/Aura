@@ -2333,6 +2333,7 @@ pub fn run() {
             settings::set_settings_scope,
             // ── AuraSkip: skip-window aggregate (set/get) + AniSkip API (fetch/vote/submit/resolve) ──
             aniskip::fetch_skip_windows,
+            aniskip::fetch_neighbour_skip_profile,
             aniskip::set_skip_windows,
             aniskip::submit_skip_time,
             aniskip::vote_skip_time,
