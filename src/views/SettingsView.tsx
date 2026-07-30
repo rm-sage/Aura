@@ -37,6 +37,8 @@ import {
   type AuraSettings,
 } from "../auraSettings";
 import { showAppToast } from "../AppToast";
+import { openExternalUrl } from "../externalUrl";
+import { encodeQr } from "../qrCode";
 import {
   DndContext,
   closestCenter,
@@ -3950,24 +3952,88 @@ function ScrobbleAuthRow({
     };
   }, [deviceFlow, service, scope, label]);
 
+  // AniList has no device flow, so nothing polls on its behalf: if the
+  // user closes the browser tab without authorizing, the row would sit on
+  // "Connecting…" forever. Two minutes, then reset. Shared by the browser
+  // and in-app paths so both behave identically.
+  const armAniListTimeout = useCallback(() => {
+    if (timeoutRef.current !== null) window.clearTimeout(timeoutRef.current);
+    timeoutRef.current = window.setTimeout(() => {
+      timeoutRef.current = null;
+      setPending(false);
+      sessionStorage.removeItem(`aura:oauth:pending:${service}`);
+      showAppToast(
+        `${label} authorization didn't complete. Try again.`,
+        { duration: 6000 },
+      );
+    }, 120_000);
+  }, [service, label]);
+
+  // ── Fallback: sign in inside Aura ────────────────────────────────────
+  // The in-app popup webview, which was the default before the browser
+  // handoff. It still works when the browser path can't run at all: no
+  // default browser registered, `openUrl` refused, or port 11471 squatted
+  // by an orphaned process so the loopback callback has nowhere to land.
+  // The tradeoff is that its cookie jar drops session cookies at app exit,
+  // so the user usually has to type their password again — which is the
+  // whole reason it is no longer the default.
+  const connectInApp = useCallback(async () => {
+    try {
+      const { openOAuthPopup } = await import("../SourcePopup");
+      if (useDeviceFlow) {
+        // Device flow is already in progress; the popup is just another
+        // surface for entering the code. Polling is unaffected by where
+        // the user types it, so there is nothing else to re-arm.
+        if (!deviceFlow) return;
+        openOAuthPopup(deviceFlow.verification_url, `Connect to ${label}`, {
+          userCode: deviceFlow.user_code,
+        });
+        return;
+      }
+      sessionStorage.setItem(`aura:oauth:pending:${service}`, scope);
+      // `loopback: false` keeps the legacy terminal hop at
+      // `aura://oauth/<svc>`, which the popup's own on_navigation
+      // interceptor catches and re-emits as a `deep-link`. Requesting the
+      // loopback URL here would work too, but routing it through the
+      // interceptor keeps the popup's trust check (prior host must be the
+      // proxy) on the path it was written for.
+      const url = await invoke<string>("scrobble_oauth_authorize_url", {
+        service, loopback: false,
+      });
+      openOAuthPopup(url, `Connect to ${label}`, {
+        interceptPrefix: `aura://oauth/${service}`,
+      });
+      setPending(true);
+      armAniListTimeout();
+    } catch (e) {
+      sessionStorage.removeItem(`aura:oauth:pending:${service}`);
+      showAppToast(`Couldn't start ${label} auth: ${String(e)}`, { duration: 5000 });
+    }
+  }, [useDeviceFlow, deviceFlow, service, scope, label, armAniListTimeout]);
+
   const connect = useCallback(async () => {
     if (busy || pending || deviceFlow) return;
     setBusy(true);
     try {
-      // Both providers route their auth UI through the in-app
-      // SourcePopup (a child Tauri Webview) instead of the system
-      // browser. This sidesteps a class of browser bugs around
-      // automatic redirects to non-HTTP custom schemes (Firefox
-      // silently dropping `aura://` 302s, etc.) and keeps the entire
-      // flow inside Aura's process. AniList additionally registers a
-      // navigation interceptor on the popup so the proxy's terminal
-      // `aura://oauth/anilist?...` redirect is caught and re-emitted
-      // as a `deep-link` event — the existing App.tsx handler then
-      // persists the token through the same code path the OS scheme
-      // handler would have taken. Trakt doesn't need the interceptor
-      // because device-flow polling drives auth detection.
-      const { openOAuthPopup } = await import("../SourcePopup");
-
+      // Both providers now start in the user's DEFAULT BROWSER, which is
+      // what RFC 8252 ("OAuth 2.0 for Native Apps") recommends for native
+      // clients — not for purity, but because the system browser already
+      // holds the user's Trakt / AniList session. Re-authorizing becomes
+      // one click on "Authorize" instead of retyping a password into a
+      // webview whose cookie jar drops session cookies when Aura exits.
+      //
+      // The reason this wasn't always the case: browsers refuse to
+      // AUTO-redirect into a foreign protocol handler, so the proxy's old
+      // terminal `aura://oauth/<svc>` hop died silently (Firefox being the
+      // canonical case). Two different mechanisms avoid that hop now:
+      //   • Trakt   — device flow (RFC 8628). No redirect at all; the Rust
+      //               poll loop detects authorization on its own, from
+      //               whichever device the user approved on.
+      //   • AniList — loopback redirect (RFC 8252 §7.3). The proxy lands on
+      //               http://127.0.0.1:11471/oauth/callback, which is plain
+      //               HTTP and so is never blocked; oauth_callback.rs
+      //               nonce-checks it and re-emits the usual `deep-link`.
+      // `connectInApp` below is the fallback when either path can't run.
       if (useDeviceFlow) {
         // Trakt: device-flow path. No deep-link involvement; we poll.
         const begin = await invoke<{
@@ -3984,41 +4050,41 @@ function ScrobbleAuthRow({
           expires_at:       Date.now() + begin.expires_in * 1000,
           interval_ms:      Math.max(2000, begin.interval * 1000),
         });
-        // Open the activation page so the user can paste/type the code
-        // immediately. The popup self-closes when the device-flow poll
-        // returns Authorized (via the aura:scrobble-auth-changed event
-        // SourcePopup listens for in OAuth mode).
-        //
-        // Surface the user_code as a chip in the popup header (and on
-        // the floating minimize pill) so it's always visible alongside
-        // trakt.tv/activate — no need to dismiss or minimize the
-        // popup just to read the code.
-        openOAuthPopup(begin.verification_url, `Connect to ${label}`, {
-          userCode: begin.user_code,
-        });
+        // Hand the activation page to the user's browser, where they are
+        // most likely already signed in to Trakt. The panel below keeps
+        // the code (and a QR for approving on a phone) on screen, and the
+        // Rust poll loop clears it the moment Trakt reports Authorized —
+        // regardless of which device did the approving.
+        openExternalUrl(begin.verification_url);
       } else {
-        // AniList: authorize-URL + deep-link path, but the deep-link
-        // is intercepted inside the popup webview rather than handed
-        // off to the OS scheme handler via the system browser.
+        // AniList: authorization-code flow finishing at the loopback
+        // listener. The scope stash is what App.tsx's `deep-link` handler
+        // reads back to know which Stremio account to write the token
+        // under, so it must be set BEFORE the browser can come back.
         sessionStorage.setItem(`aura:oauth:pending:${service}`, scope);
-        const url = await invoke<string>("scrobble_oauth_authorize_url", { service });
-        openOAuthPopup(url, `Connect to ${label}`, {
-          interceptPrefix: `aura://oauth/${service}`,
-        });
-        setPending(true);
-        // Safety timer — if the user closes the popup without
-        // authorizing (or the proxy never redirects to the intercept
-        // prefix), we still want the row's "Connecting…" state to
-        // clear. Keeps the existing 2-minute window.
-        timeoutRef.current = window.setTimeout(() => {
-          timeoutRef.current = null;
-          setPending(false);
-          sessionStorage.removeItem(`aura:oauth:pending:${service}`);
+        // `loopback: true` makes the Rust side mint a single-use nonce and
+        // point the proxy at 127.0.0.1. It errors (rather than silently
+        // downgrading) if the bridge never bound its port, because opening
+        // a browser tab that has nowhere to return to is exactly the kind
+        // of silent dead end the silent-failure audit set out to remove —
+        // so fall back to the in-app popup and tell the user why.
+        let url: string;
+        try {
+          url = await invoke<string>("scrobble_oauth_authorize_url", {
+            service, loopback: true,
+          });
+        } catch (loopbackErr) {
+          console.warn("[scrobble-auth] loopback unavailable:", loopbackErr);
           showAppToast(
-            `${label} authorization didn't complete. Try again.`,
-            { duration: 6000 },
+            "Opening sign-in inside Aura (the local callback port is unavailable).",
+            { duration: 5000 },
           );
-        }, 120_000);
+          await connectInApp();
+          return;
+        }
+        openExternalUrl(url);
+        setPending(true);
+        armAniListTimeout();
       }
     } catch (e) {
       sessionStorage.removeItem(`aura:oauth:pending:${service}`);
@@ -4026,12 +4092,30 @@ function ScrobbleAuthRow({
     } finally {
       setBusy(false);
     }
-  }, [busy, pending, deviceFlow, service, scope, useDeviceFlow, label]);
+  }, [
+    busy, pending, deviceFlow, service, scope, useDeviceFlow, label,
+    connectInApp, armAniListTimeout,
+  ]);
 
   const cancelPending = useCallback(() => {
     clearWaiting();
     setDeviceFlow(null);
   }, [clearWaiting]);
+
+  // QR for the Trakt activation page, so the code can be approved on a
+  // phone that is already signed in to Trakt. Memoised on the URL string
+  // (not the object) so the 60s expiry tick and poll-driven re-renders
+  // don't re-run the encoder.
+  //
+  // NOTE: this encodes the plain verification_url, so the code still has
+  // to be typed on the phone. RFC 8628 §3.2 defines an optional
+  // `verification_uri_complete` that embeds the code and would turn the
+  // scan into one-tap approval; Trakt does not return one today. If the
+  // proxy ever starts forwarding it, prefer it here.
+  const deviceQr = useMemo(
+    () => (deviceFlow ? encodeQr(deviceFlow.verification_url) : null),
+    [deviceFlow?.verification_url],
+  );
 
   const copyUserCode = useCallback(async () => {
     if (!deviceFlow) return;
@@ -4044,22 +4128,15 @@ function ScrobbleAuthRow({
     }
   }, [deviceFlow]);
 
-  const reopenVerification = useCallback(async () => {
+  // Re-open the activation page in the user's browser, for when they closed
+  // the tab. Polling in the background is indifferent to where (or on which
+  // device) the code is finally entered, so there is no state to re-arm.
+  // `openExternalUrl` reports its own failures via toast and never throws,
+  // so there is deliberately no try/catch here.
+  const reopenVerification = useCallback(() => {
     if (!deviceFlow) return;
-    try {
-      // Reopen the activation page in the same in-app popup the
-      // initial Connect click used. The device-flow poll in the
-      // background continues polling regardless of which popup is
-      // visible; we just need to make the activation URL accessible
-      // again if the user dismissed the first popup.
-      const { openOAuthPopup } = await import("../SourcePopup");
-      openOAuthPopup(deviceFlow.verification_url, `Connect to ${label}`, {
-        userCode: deviceFlow.user_code,
-      });
-    } catch (e) {
-      showAppToast(`Couldn't open ${deviceFlow.verification_url}: ${String(e)}`, { duration: 5000 });
-    }
-  }, [deviceFlow, label]);
+    openExternalUrl(deviceFlow.verification_url);
+  }, [deviceFlow]);
 
   const disconnect = useCallback(async () => {
     if (busy) return;
@@ -4224,8 +4301,9 @@ function ScrobbleAuthRow({
                         p-3 flex flex-col sm:flex-row sm:items-center gap-3">
           <div className="flex-1 min-w-0">
             <p className="text-white/70 text-[11px] leading-snug mb-1">
-              Open Trakt and enter this code to authorize Aura. Aura will
-              connect automatically once you click Allow.
+              Trakt has opened in your browser — enter this code there to
+              authorize Aura, or scan the QR to approve from your phone.
+              Aura connects itself once you click Allow.
             </p>
             <div className="flex items-center gap-2">
               <code className="font-mono tracking-[0.25em] text-[15px]
@@ -4249,13 +4327,64 @@ function ScrobbleAuthRow({
                            text-white/75 text-[10.5px] font-medium tracking-wide
                            hover:bg-white/10 hover:text-white transition-colors"
               >
-                Open Trakt
+                Reopen in browser
               </button>
             </div>
             <p className="text-white/40 text-[10.5px] mt-1.5 truncate">
               {deviceFlow.verification_url}
             </p>
+            {/* Escape hatch. Only worth surfacing while a flow is actually
+                in progress — as a permanent control it would invite users
+                into the worse path (the popup's cookie jar drops session
+                cookies at app exit, so it asks for a password every time). */}
+            <button
+              type="button"
+              onClick={connectInApp}
+              className="mt-1.5 text-white/40 hover:text-white/70 text-[10.5px]
+                         underline underline-offset-2 transition-colors"
+            >
+              Browser didn't open? Sign in inside Aura instead
+            </button>
           </div>
+          {/* White plate regardless of theme — scanners need the quiet zone
+              and the light/dark polarity to be right. */}
+          {deviceQr && (
+            <div className="shrink-0 self-center rounded-md bg-white p-1.5">
+              <svg
+                viewBox={`0 0 ${deviceQr.size} ${deviceQr.size}`}
+                width={104}
+                height={104}
+                role="img"
+                aria-label={`QR code for ${deviceFlow.verification_url}`}
+                shapeRendering="crispEdges"
+              >
+                <path d={deviceQr.path} fill="#000" />
+              </svg>
+              <p className="text-black/55 text-[9px] text-center mt-1 leading-none">
+                Scan to approve
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+      {/* AniList waiting state. Device flow gives Trakt a code to display;
+          AniList's authorization-code flow has nothing to show, so without
+          this the row just sat on a disabled button with no explanation of
+          what the user was supposed to do next in the browser. */}
+      {pending && !deviceFlow && (
+        <div className="mt-2 rounded-lg border border-ln-accent/25 bg-ln-accent/[0.06] p-3">
+          <p className="text-white/70 text-[11px] leading-snug">
+            Finish signing in to {label} in your browser. Aura will connect
+            itself the moment you approve — you can leave this page open.
+          </p>
+          <button
+            type="button"
+            onClick={connectInApp}
+            className="mt-1.5 text-white/40 hover:text-white/70 text-[10.5px]
+                       underline underline-offset-2 transition-colors"
+          >
+            Browser didn't open? Sign in inside Aura instead
+          </button>
         </div>
       )}
       {status?.expired && !pending && !deviceFlow && (
@@ -4955,7 +5084,7 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SettingSlider
                 label="Forward buffer (seconds)"
-                description="How many seconds of video to buffer ahead (mpv cache + readahead). Higher = smoother on bursty / high-latency links, at the cost of RAM. Most people never need to touch this. Applies to the next stream you play."
+                description="How many seconds of video to buffer ahead (mpv cache + readahead). Higher = smoother on bursty / high-latency links, at the cost of RAM. Most people never need to touch this. Applies immediately, including to a stream that is already playing."
                 value={backend.cache_secs ?? 180}
                 min={30}
                 max={600}
@@ -4969,7 +5098,7 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SettingSlider
                 label="Forward buffer memory cap"
-                description="Hard ceiling on buffered-ahead RAM (mpv demuxer-max-bytes). The seconds value above is usually the binding limit; raise this only if 4K remuxes underrun mid-playback. Each step is real memory. Applies to the next stream."
+                description="Hard ceiling on buffered-ahead RAM (mpv demuxer-max-bytes). The seconds value above is usually the binding limit; raise this only if 4K remuxes underrun mid-playback. Each step is real memory. Applies immediately."
                 value={backend.demuxer_max_mib ?? 768}
                 min={128}
                 max={2048}
@@ -5189,7 +5318,7 @@ export default function SettingsView({ addons, session }: Props) {
               </p>
               <SkipModeRow
                 label="Openings (OP)"
-                description="Skip the OP."
+                description="The opening theme. Prompt by default."
                 value={backend.skip_op_mode}
                 onChange={(v) => patchBackend({ skip_op_mode: v })}
               />
@@ -5374,7 +5503,7 @@ export default function SettingsView({ addons, session }: Props) {
               <ScrobbleAuthRow
                 service="trakt"
                 authKey={session?.auth_key ?? null}
-                description="Trakt receives playback progress for movies and series. Aura logs in directly via OAuth, no addon required. Scrobble events fire at start (after 120 s of real playback) and end (80 % progress with at least 5 min watched)."
+                description="Trakt receives playback progress for movies and series. Aura logs in directly via OAuth, no addon required. Nothing is sent while you watch: Aura adds the item to your Trakt history once, on completion (80 % progress with at least 5 min watched). The first 120 s of playback are a local preview window, so a stream you back out of never reaches your history."
               />
               <div className="h-px bg-white/6" />
               <ScrobbleAuthRow
@@ -5458,7 +5587,7 @@ export default function SettingsView({ addons, session }: Props) {
             <Section id="sec-crash-reporting" title="Crash Reporting">
               <SettingToggle
                 label="Send crash reports"
-                description="When enabled, Aura sends anonymised crash reports (error message, stack trace, OS / app version) to the developer's Sentry endpoint. No PII: usernames, IP addresses, file paths, and stream URLs are never included. Reports help fix bugs that would otherwise vanish silently on the user's machine. Takes effect on next app restart."
+                description="When enabled, Aura sends anonymised crash reports (error message, stack trace, OS / app version) to the developer's Sentry endpoint. Before an event leaves your machine Aura clears the Sentry user record (username, email, account id), pins the IP to 0.0.0.0, and drops the geolocation and request blocks. The crash text itself is not rewritten, so it can still contain whatever the failing code was handling. Reports help fix bugs that would otherwise vanish silently on the user's machine. Takes effect on next app restart."
                 value={crashConfig.consent === true}
                 onChange={(v) => patchCrashConfig({ consent: v })}
               />

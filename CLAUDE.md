@@ -207,7 +207,11 @@ frontend ~40k LOC over ~70 files + ~13 views).
   subtitle styling defaults), `cinema.rs` (GLSL shader profiles).
 - **Stremio + streaming**: `stremio.rs` (catalog / search / library / meta / stream aggregation /
   external subs; the biggest module), `streaming.rs` (axum bridge), `auth.rs` (Stremio login /
-  session), `sync.rs` (cloud library sync + release-signal polling), `addons.rs`.
+  session), `sync.rs` (cloud library sync + release-signal polling), `addons.rs`,
+  `oauth_callback.rs` (RFC 8252 §7.3 loopback landing pad for system-browser OAuth, served as
+  `GET /oauth/callback` on the same bridge listener; nonce-guarded, re-emits the existing
+  `deep-link` event so `App.tsx` persists tokens through one code path. Proxy-side contract in
+  `docs/oauth-loopback-contract.md`).
 - **Metadata + ratings**: `ratings.rs` (MDBList + Jikan + AniList aggregator, anime-aware weights),
   `publicmetadb.rs` (OP/ED skip source + TMDB id resolution), `anime_id_map.rs`, `silencedetect.rs`
   (outro boundary via ffmpeg), `trailer.rs` (YouTube trailer resolve).

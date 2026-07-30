@@ -10,6 +10,7 @@ import {
   type NotificationKind,
 } from "./NotificationsContext";
 import Tooltip from "./Tooltip";
+import { openExternalUrl } from "./externalUrl";
 
 // ---------------------------------------------------------------------------
 // NotificationsPanel — anchored ABOVE the bell (bottom-12 left-3 in absolute
@@ -298,18 +299,39 @@ function NotificationRow({ notification, onActivate, onDismiss }: RowProps) {
     setReconnecting(true);
     try {
       // Mirrors the SettingsView → ScrobbleAuthRow → AniList branch:
-      // stash the scope so the deep-link handler can route the token
-      // to the right keyring slot, fetch the authorize URL, open the
-      // OAuth popup with the redirect interceptor. Success closes the
-      // popup and dispatches `aura:scrobble-auth-changed`; the
-      // useScrobbleAuthAlerts watcher then removes this notification
+      // stash the scope so the deep-link handler can route the token to
+      // the right keyring slot, then hand the flow to the user's own
+      // browser, where they are most likely still signed in to AniList.
+      // The proxy finishes at the loopback callback, which re-emits the
+      // usual `deep-link`; that dispatches `aura:scrobble-auth-changed`
+      // and the useScrobbleAuthAlerts watcher removes this notification
       // automatically since the token is no longer expired.
+      //
+      // Reconnecting is the ONE thing this notification exists to make
+      // easy, so a loopback failure falls back to the in-app popup
+      // rather than leaving the button inert.
       sessionStorage.setItem(`aura:oauth:pending:anilist`, expiredScope);
-      const url = await invoke<string>("scrobble_oauth_authorize_url", { service: "anilist" });
-      const { openOAuthPopup } = await import("./SourcePopup");
-      openOAuthPopup(url, "Reconnect AniList", {
-        interceptPrefix: `aura://oauth/anilist`,
-      });
+      let url: string;
+      let loopback = true;
+      try {
+        url = await invoke<string>("scrobble_oauth_authorize_url", {
+          service: "anilist", loopback: true,
+        });
+      } catch (loopbackErr) {
+        console.warn("[notifications] loopback unavailable:", loopbackErr);
+        loopback = false;
+        url = await invoke<string>("scrobble_oauth_authorize_url", {
+          service: "anilist", loopback: false,
+        });
+      }
+      if (loopback) {
+        openExternalUrl(url);
+      } else {
+        const { openOAuthPopup } = await import("./SourcePopup");
+        openOAuthPopup(url, "Reconnect AniList", {
+          interceptPrefix: `aura://oauth/anilist`,
+        });
+      }
     } catch (err) {
       console.warn("[notifications] AniList reconnect failed:", err);
     } finally {

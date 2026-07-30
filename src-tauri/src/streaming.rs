@@ -22,6 +22,7 @@
 //! the routing rules on the command).
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -36,6 +37,18 @@ use axum::{
 use futures_util::StreamExt;
 
 pub const BRIDGE_PORT: u16 = 11471;
+
+/// True once the listener has actually bound. Bind failure is survivable for
+/// stream proxying (HTTPS / HLS bypass the bridge anyway) but NOT for the
+/// loopback OAuth callback, which has nowhere to land without it. Callers
+/// that need the callback check this and fall back to the in-app popup
+/// rather than opening a browser tab that can never come back.
+static BRIDGE_UP: AtomicBool = AtomicBool::new(false);
+
+/// Whether the loopback listener is accepting connections.
+pub fn is_running() -> bool {
+    BRIDGE_UP.load(Ordering::Relaxed)
+}
 
 // ---------------------------------------------------------------------------
 // In-process server
@@ -248,7 +261,14 @@ pub fn start_in_process() {
             .route("/proxy/*encoded", get(proxy_stream).options(proxy_preflight))
             .route("/magnet/*encoded", get(magnet_stream))
             // On-device poster resize-and-cache proxy (img_proxy.rs).
-            .route("/img", get(crate::img_proxy::handle));
+            .route("/img", get(crate::img_proxy::handle))
+            // RFC 8252 §7.3 loopback redirect target for system-browser
+            // OAuth. Nonce-guarded in oauth_callback.rs — see its trust
+            // model comment before touching this route.
+            .route(
+                crate::oauth_callback::CALLBACK_PATH,
+                get(crate::oauth_callback::handle),
+            );
 
         let addr = SocketAddr::from(([127, 0, 0, 1], BRIDGE_PORT));
         let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -264,9 +284,13 @@ pub fn start_in_process() {
             }
         };
         crate::devlog!(info, "bridge", "in-process bridge listening on http://{addr}");
+        BRIDGE_UP.store(true, Ordering::Relaxed);
         if let Err(e) = axum::serve(listener, app).await {
             crate::devlog!(warn, "bridge", "bridge server error: {e}");
         }
+        // Serve only returns when the listener dies; the OAuth callback has
+        // nowhere to land from here on.
+        BRIDGE_UP.store(false, Ordering::Relaxed);
     });
 }
 

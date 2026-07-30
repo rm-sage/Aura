@@ -45,6 +45,7 @@ mod img_proxy;
 // IPTV (Live TV) network hop — see src/iptv/ for the TS parsers.
 mod iptv;
 mod mpv;
+mod oauth_callback;
 mod popup_nav;
 mod player;
 mod publicmetadb;
@@ -1961,6 +1962,11 @@ pub fn run() {
             if let Ok(dir) = app.handle().path().app_data_dir() {
                 img_proxy::init(dir.join("img-cache"));
             }
+            // Same reason: the loopback OAuth callback route needs an
+            // AppHandle to re-emit the `deep-link` event and focus the
+            // window, and the bridge task has none. Must precede the
+            // listener so no callback can race an uninitialised handle.
+            oauth_callback::init(app.handle());
             streaming::start_in_process();
 
             // ── Deep-link handler ─────────────────────────────────────────

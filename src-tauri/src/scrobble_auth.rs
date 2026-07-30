@@ -339,12 +339,53 @@ fn parsed_host_of(raw: &str) -> Option<String> {
 /// is structured for (`startTrakt` / `startAnilist` in main.go), and
 /// it keeps Aura ignorant of the per-provider URL shapes — adding a
 /// third provider becomes a proxy-only change.
+/// `loopback` selects how the proxy should finish the flow:
+///
+///   * `Some(true)`  — the caller is about to open the user's DEFAULT
+///     BROWSER, so the proxy must land on
+///     `http://127.0.0.1:<port>/oauth/callback` (RFC 8252 §7.3). Plain
+///     HTTP to loopback, so no browser blocks it and no OS scheme handler
+///     is involved. A single-use nonce is minted and travels with the
+///     request; `oauth_callback::handle` refuses any callback without it.
+///   * `None` / `Some(false)` — the caller is about to open the IN-APP
+///     popup webview, which intercepts the terminal `aura://oauth/<svc>`
+///     navigation itself. Keeps the legacy contract intact for the popup
+///     fallback path and for `NotificationsPanel`'s reconnect button.
+///
+/// Requesting loopback while the bridge is down is an error rather than a
+/// silent downgrade: the caller needs to know to use the popup instead,
+/// otherwise it would open a browser tab that can never come back.
 #[tauri::command]
-pub fn scrobble_oauth_authorize_url(service: String) -> Result<String, String> {
+pub fn scrobble_oauth_authorize_url(
+    service:  String,
+    loopback: Option<bool>,
+) -> Result<String, String> {
     if !["trakt", "anilist"].contains(&service.as_str()) {
         return Err(format!("unknown scrobble service: {service}"));
     }
-    Ok(format!("{REDIRECT_BASE}/{service}/start"))
+    let base = format!("{REDIRECT_BASE}/{service}/start");
+    if loopback != Some(true) {
+        return Ok(base);
+    }
+    if !crate::streaming::is_running() {
+        return Err(
+            "the local callback listener is not running (port 11471 is in use \
+             by another process); sign in inside Aura instead"
+                .to_string(),
+        );
+    }
+    let port  = crate::streaming::BRIDGE_PORT.to_string();
+    let nonce = crate::oauth_callback::issue_nonce(&service);
+    let url = Url::parse_with_params(
+        &base,
+        &[("redirect", "loopback"), ("port", port.as_str()), ("nonce", nonce.as_str())],
+    )
+    .map_err(|e| format!("failed to build authorize url: {e}"))?;
+    crate::devlog!(
+        info, "scrobble",
+        "oauth start ({service}) → system browser, loopback callback on port {port}",
+    );
+    Ok(url.to_string())
 }
 
 // ---------------------------------------------------------------------------
