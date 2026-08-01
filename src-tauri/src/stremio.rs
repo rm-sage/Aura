@@ -469,6 +469,31 @@ struct CatalogResponse {
     metas: Vec<serde_json::Value>,
 }
 
+/// Deserialise a field the Stremio spec types as a STRING but that real addons
+/// sometimes emit as a JSON number.
+///
+/// AIOMetadata sends `releaseInfo: 2027` (integer, not `"2027"`) for
+/// not-yet-released titles, and `imdbRating` is routinely a float upstream.
+/// Strict `Option<String>` rejected those, and because `parse_meta_array` drops
+/// the WHOLE meta on ANY field error, one wrong-typed year silently removed the
+/// entire entry from the catalog - Frieren S3 disappeared from Upcoming Anime on
+/// every launch, logged only as a `warn` nobody reads.
+///
+/// Numbers render back to their compact JSON form (`2027` -> `"2027"`,
+/// `8.5` -> `"8.5"`). Anything else (bool / array / object) is genuinely
+/// malformed for these fields, so it degrades to `None` rather than being
+/// stringified into `"[object]"` in the UI.
+fn de_lenient_string<'de, D>(de: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(de)? {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    })
+}
+
 #[derive(Deserialize)]
 struct WireMeta {
     /// Required. The Stremio addon spec mandates an id on every meta;
@@ -492,10 +517,14 @@ struct WireMeta {
     /// Community/AIOMetadata field for alt landscape art.
     backdrop: Option<String>,
     logo: Option<String>,
-    #[serde(rename = "releaseInfo")]
+    /// Year or year range ("2024", "2020-2024"). Lenient: addons emit a bare
+    /// integer for upcoming titles. See `de_lenient_string`.
+    #[serde(rename = "releaseInfo", default, deserialize_with = "de_lenient_string")]
     release_info: Option<String>,
     description: Option<String>,
-    #[serde(rename = "imdbRating")]
+    /// Lenient for the same reason - upstream sends this as a float as often
+    /// as a string.
+    #[serde(rename = "imdbRating", default, deserialize_with = "de_lenient_string")]
     imdb_rating: Option<String>,
     /// Optional genre list — drives the FilterBar genre chips.
     #[serde(default)]
@@ -4169,5 +4198,66 @@ fn title_case(s: &str) -> String {
     match c.next() {
         None => String::new(),
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: AIOMetadata emits `releaseInfo` as a bare INTEGER for
+    /// not-yet-released titles. `WireMeta` typed it as a strict
+    /// `Option<String>`, so serde failed the whole struct - and because
+    /// `parse_meta_array` drops the entire meta on any field error, the row
+    /// vanished from the catalog. Observed live as Frieren S3 disappearing
+    /// from `series/mal.upcoming_anime` on every launch, with only a
+    /// `skipped malformed meta: invalid type: integer 2027, expected a string`
+    /// warning to show for it.
+    #[test]
+    fn integer_release_info_does_not_drop_the_meta() {
+        let raw = serde_json::json!({
+            "id": "mal:63816",
+            "type": "series",
+            "name": "Sousou no Frieren 3rd Season",
+            "releaseInfo": 2027,
+        });
+        let (metas, dropped, errors) = parse_meta_array(vec![raw]);
+        assert!(errors.is_empty(), "unexpected parse errors: {errors:?}");
+        assert_eq!(dropped, 0, "meta was dropped instead of coerced");
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].release_info.as_deref(), Some("2027"));
+    }
+
+    /// The same coercion has to hold for `imdbRating`, which upstream sends as
+    /// a float at least as often as a string.
+    #[test]
+    fn float_imdb_rating_does_not_drop_the_meta() {
+        let raw = serde_json::json!({
+            "id": "tt0903747", "type": "series", "name": "Breaking Bad",
+            "imdbRating": 9.5, "releaseInfo": "2008-2013",
+        });
+        let (metas, dropped, _) = parse_meta_array(vec![raw]);
+        assert_eq!(dropped, 0);
+        assert_eq!(metas[0].imdb_rating.as_deref(), Some("9.5"));
+        assert_eq!(metas[0].release_info.as_deref(), Some("2008-2013"));
+    }
+
+    /// String values must still pass through untouched, and a genuinely
+    /// malformed shape (object / array / bool) degrades to None rather than
+    /// stringifying into the UI or killing the row.
+    #[test]
+    fn strings_pass_through_and_junk_degrades_to_none() {
+        let raw = serde_json::json!({
+            "id": "tt1", "type": "movie", "name": "A",
+            "releaseInfo": "2024", "imdbRating": { "value": 8 },
+        });
+        let (metas, dropped, _) = parse_meta_array(vec![raw]);
+        assert_eq!(dropped, 0);
+        assert_eq!(metas[0].release_info.as_deref(), Some("2024"));
+        assert_eq!(metas[0].imdb_rating, None);
     }
 }
