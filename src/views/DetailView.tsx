@@ -4505,10 +4505,18 @@ function StreamRow({
           {/* TITLE LINE — display title + library badge + episode. pr-24
               reserves horizontal clearance so the Best / Alt Best badge
               and the stars at top-right don't overlap a long title. */}
-          {(headline || parsed.episode || parsed.year || parsed.library) && (
+          {(headline || parsed.episode || parsed.year || parsed.date ||
+            parsed.library || parsed.preloading) && (
             <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 pr-24">
               {parsed.library && (
-                <span className="text-cyan-300/85 text-[12px] leading-none" aria-label="from library">☁</span>
+                <Tooltip text="Already in your debrid library" pos="top">
+                  <span className="text-cyan-300/85 text-[12px] leading-none" aria-label="already in your debrid library">☁</span>
+                </Tooltip>
+              )}
+              {parsed.preloading && (
+                <Tooltip text="Being preloaded to your debrid service" pos="top">
+                  <span className="text-amber-300/85 text-[12px] leading-none" aria-label="preloading to debrid">➤</span>
+                </Tooltip>
               )}
               {headline && (
                 <p
@@ -4518,9 +4526,15 @@ function StreamRow({
                   {headline}
                 </p>
               )}
-              {parsed.year && (
-                <span className="text-white/55 text-[12px] font-mono">({parsed.year})</span>
-              )}
+              {/* Newer AIOStreams sends a full air date in place of the bare
+                  year, so prefer it: for an episode row the date is the more
+                  useful of the two. Falls back to the year for addons (and
+                  older formats) that only send that. */}
+              {parsed.date
+                ? <span className="text-white/55 text-[12px] font-mono">{parsed.date}</span>
+                : parsed.year && (
+                    <span className="text-white/55 text-[12px] font-mono">({parsed.year})</span>
+                  )}
               {parsed.episode && (
                 <span className="text-emerald-300/90 text-[11px] font-mono font-semibold tracking-wider">
                   {parsed.episode}
@@ -4573,10 +4587,15 @@ function StreamRow({
                 </div>
               )}
 
-              {/* ♬ Audio codec */}
-              {(parsed.audioTags.length > 0 || parsed.audio) && (
+              {/* ♬ Audio codec + ♯ channels - ONE row. A channel layout is a
+                  single short chip and never justified a line of its own; the
+                  distinct orange fill already separates it from the codecs.
+                  Rail shows ♯ when there are channels but no codec to label. */}
+              {(parsed.audioTags.length > 0 || parsed.audio || parsed.audioChannels.length > 0) && (
                 <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-white/35 text-[11px] font-mono w-4 shrink-0" aria-hidden>♬</span>
+                  <span className="text-white/35 text-[11px] font-mono w-4 shrink-0" aria-hidden>
+                    {parsed.audioTags.length > 0 || parsed.audio ? "♬" : "♯"}
+                  </span>
                   {parsed.audioTags.length > 0
                     ? parsed.audioTags.map((t, i) => (
                         <Tooltip key={`a-${i}`} text="Audio codec" pos="top">
@@ -4589,13 +4608,6 @@ function StreamRow({
                         </Tooltip>
                       )
                   }
-                </div>
-              )}
-
-              {/* ♯ Audio channels */}
-              {parsed.audioChannels.length > 0 && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-white/35 text-[11px] font-mono w-4 shrink-0" aria-hidden>♯</span>
                   {parsed.audioChannels.map((c, i) => (
                     <Tooltip key={`ch-${i}`} text="Audio channels" pos="top">
                       <ChipPill kind="channels" label={c} />
@@ -4703,6 +4715,23 @@ function StreamRow({
                 </div>
               )}
 
+              {/* Release tags the addon sends after its ` » ` separator that
+                  aren't seadex / NZB / score: release-scoring matches, and the
+                  newer network + edition fields. Shown verbatim rather than
+                  dropped, so an upstream addition surfaces instead of vanishing. */}
+              {parsed.releaseFlags.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {/* » is the separator AIOStreams itself puts in front of
+                      these, so it reads as the same rail vocabulary as ▣ / ♬. */}
+                  <span className="text-white/35 text-[11px] font-mono w-4 shrink-0" aria-hidden>»</span>
+                  {parsed.releaseFlags.map((f, i) => (
+                    <Tooltip key={`rf-${i}`} text="Release tags from the addon" pos="top">
+                      <ChipPill kind="default" label={f} />
+                    </Tooltip>
+                  ))}
+                </div>
+              )}
+
             </div>
           )}
 
@@ -4796,6 +4825,11 @@ function StreamRow({
               <ChipPill kind="proxy" label="⛊" />
             </Tooltip>
           )}
+          {parsed.proxyState === "self" && (
+            <Tooltip text="Served by the addon host itself (AIOStreams' built-in usenet engine), so the connection stays on its IP. Not proxied." pos="top">
+              <ChipPill kind="proxy-self" label="⛊" />
+            </Tooltip>
+          )}
           {parsed.proxyState === "off" && (
             <Tooltip text="Direct delivery; addon's proxy is off for this stream" pos="top">
               <ChipPill kind="proxy-off" label="⛉" />
@@ -4819,7 +4853,7 @@ function hasAnyChip(p: ReturnType<typeof parseStream>): boolean {
     p.size || p.folderSize || p.bitrate ||
     p.seeders != null || p.age ||
     p.language || p.languages.length > 0 || p.subbed || p.subtitles.length > 0 ||
-    p.nzbHealth
+    p.nzbHealth || p.releaseFlags.length > 0
   );
 }
 

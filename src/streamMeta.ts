@@ -49,12 +49,21 @@ export interface ParsedStream {
     | null;
 
   // ── TITLE/EPISODE row. ──────────────────────────────────────────────
-  /** Display title from `✎` or `☁︎`. */
+  /** Display title from `✎`, `☁︎` or `➤`. */
   displayTitle: string | null;
   /** Whether the entry is flagged from the user's library (☁︎). */
   library: boolean;
-  /** Year in `(YYYY)` after the title. */
+  /** Whether the addon flagged the entry as preloading to a debrid service
+   *  (`➤`). AIOStreams added this as a THIRD title glyph alongside ☁︎ / ✎. */
+  preloading: boolean;
+  /** Year in `(YYYY)` after the title, or the whole range for a multi-year
+   *  title (`"2017-19"`). Also filled from `date` when the addon emits a
+   *  full air date instead of a bare year. Display only, never parsed as a
+   *  number. */
   year: string | null;
+  /** Air / release date from the title line, e.g. "5 Jul 2026". Newer
+   *  AIOStreams TamTaro emits this in place of the bare `(YYYY)` token. */
+  date: string | null;
   /** SxxEyy-style episode tag if episodic. */
   episode: string | null;
 
@@ -89,6 +98,16 @@ export interface ParsedStream {
    *
    *   • "on"   — addon stream is being routed through a VPS / debrid
    *              proxy (filled glyph `⛊` or legacy 🛡).
+   *   • "self" - NOT proxied, but the addon host is itself the ORIGIN:
+   *              AIOStreams' built-in usenet engine (`service.shortName`
+   *              `AIO`) streams from the operator's own NNTP providers, so
+   *              the bytes come off the AIOStreams box rather than a debrid
+   *              CDN. `stream.proxied` is correctly false for these (it means
+   *              MediaFlow-style proxying), which made the outline `⛉` badge
+   *              read as "direct from a third party" when the traffic was in
+   *              fact leaving via the addon's IP. Distinct state, not folded
+   *              into "on": the mechanism differs even though both keep the
+   *              connection on the addon host.
    *   • "off"  — addon explicitly emits the outline glyph `⛉` to
    *              indicate the user has disabled their VPS proxy AND
    *              the stream is being delivered direct.
@@ -101,7 +120,7 @@ export interface ParsedStream {
    * the addon. Earlier versions used `proxied: boolean` and a fallback
    * regex that matched both shield glyphs, which silently coerced
    * "off" → "on" and made the badge useless as a state indicator. */
-  proxyState: "on" | "off" | null;
+  proxyState: "on" | "self" | "off" | null;
   /** Debrid service short code from `[TB]` / `[RD]` / `[AD]` / `[PM]` etc. */
   serviceShort: string | null;
   /** Addon display name parsed from the description (distinct from
@@ -133,6 +152,11 @@ export interface ParsedStream {
   nzbHealth: "verified" | "elf" | "unverified" | "broken" | null;
   /** Trailing subscript score (e.g. ₂₅ → 25, ₋₅ → -5). */
   seScore: number | null;
+  /** Whatever remains after the ` » ` separator once seadex / NZB / score are
+   *  taken out: AIOStreams' release-scoring matches, plus the newer
+   *  `stream.network` and `stream.editions` fields. Kept as free text so new
+   *  upstream additions surface as chips instead of being silently swallowed. */
+  releaseFlags: string[];
 
   // ── LEGACY fallback fields (kept for compatibility). ───────────────
   /** Codec — kept for back-compat with non-AIOStreams parsing. Mirrors
@@ -179,6 +203,18 @@ const QUALITY_RX    = /〈([^〉]+)〉/u;
 // like `Show.Name.S01E10.1080p` whose episode marker we want to PRESERVE
 // in the displayTitle).
 const EPISODE_STANDALONE_RX = /(?:^|\s)s\s*(\d{1,3})\s*[·‧•\-\s]+E\s*(\d{1,3})\b/i;
+// Year token on the title line. Matches a bare `(2024)` and also the RANGE
+// form newer TamTaro emits for multi-year titles - the template rewrites
+// `2017-2019` to `2017-19` (`::replace('-20','-')`), which the old
+// four-digits-then-paren pattern rejected outright, leaving `(2017-19)`
+// stranded in the display title with no year chip. Capture group 1 is the
+// START year in both shapes.
+const YEAR_TOKEN_RX = /(?:^|\s)\(((?:19|20)\d{2}(?:\s*-\s*\d{2,4})?)\)/;
+// Air / release date on the title line. AIOStreams formats it `%-d %b %Y`
+// (no zero padding, abbreviated English month), e.g. "5 Jul 2026". Newer
+// TamTaro emits this INSTEAD of the bare `(YYYY)` token for series, so the
+// year has to be recovered from it or the year chip disappears.
+const DATE_RX       = /(?:^|\s)(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+((?:19|20)\d{2}))\b/i;
 // Service short code in brackets — `[TB]`, `[RD]`, `[AD]`, `[PM]`, etc.
 // 2-3 uppercase letters/digits.
 const SERVICE_RX    = /\[([A-Z]{2,3})\]/;
@@ -194,28 +230,68 @@ const SECTION_BREAK = "»";
 // Glyphs we recognise as line-leading markers in the description. The
 // classifier walks each line, finds the first non-whitespace character,
 // and dispatches based on it.
-const GLYPH_TITLE       = "✎";   // ✎
-const GLYPH_LIBRARY     = "☁";   // ☁ (also matches ☁︎ — VS-16 stripped)
-const GLYPH_ENCODE      = "▣";   // ▣
-const GLYPH_VISUAL_PRI  = "✦";   // ✦
-const GLYPH_VISUAL_SEC  = "✧";   // ✧
-const GLYPH_AUDIO       = "♬";   // ♬
-const GLYPH_CHANNELS    = "♯";   // ♯
-const GLYPH_SIZE_PACK   = "❖";   // ❖
-const GLYPH_SIZE_SINGLE = "◈";   // ◈
-const GLYPH_SEEDERS     = "⇄";   // ⇄
-const GLYPH_PROXY_FILL  = "⛊";   // ⛊
-const GLYPH_PROXY_OUT   = "⛉";   // ⛉
-const GLYPH_LANG        = "⛿";   // ⛿
-const GLYPH_PRIVATE     = "⚿";   // ⚿
+const GLYPH_TITLE       = "✎";   // ✎ U+270E
+const GLYPH_LIBRARY     = "☁";   // ☁ U+2601 (also matches ☁︎ - VS stripped)
+const GLYPH_PRELOAD     = "➤";   // ➤ U+27A4 - third title glyph (preloading)
+const GLYPH_ENCODE      = "▣";   // ▣ U+25A3
+const GLYPH_VISUAL_PRI  = "✦";   // ✦ U+2726
+const GLYPH_VISUAL_SEC  = "✧";   // ✧ U+2727
+const GLYPH_AUDIO       = "♬";   // ♬ U+266C
+const GLYPH_CHANNELS    = "♯";   // ♯ U+266F
+const GLYPH_SIZE_PACK   = "❖";   // ❖ U+2756
+const GLYPH_SIZE_SINGLE = "◈";   // ◈ U+25C8
+const GLYPH_SEEDERS     = "⇄";   // ⇄ U+21C4
+const GLYPH_PROXY_FILL  = "⛊";   // ⛊ U+26CA
+const GLYPH_PROXY_OUT   = "⛉";   // ⛉ U+26C9
+const GLYPH_LANG        = "⛿";   // ⛿ U+26FF - languages, no subtitles
+const GLYPH_LANG_SUBBED = "✓";   // ✓ U+2713 - languages, subtitles present
+const GLYPH_PRIVATE     = "⚿";   // ⚿ U+26BF
 
-/** The line-leading glyphs unique to AIOStreams' "TamTaro" format that the
- *  parser keys on. Used by `looksLikeTamTaro` for auto-detection. */
+/** The glyphs unique to AIOStreams' "TamTaro" format that the parser keys on.
+ *  Used by `looksLikeTamTaro` for auto-detection. */
 const TAMTARO_SIGNATURE_GLYPHS = [
-  GLYPH_TITLE, GLYPH_LIBRARY, GLYPH_ENCODE, GLYPH_VISUAL_PRI, GLYPH_VISUAL_SEC,
-  GLYPH_AUDIO, GLYPH_CHANNELS, GLYPH_SIZE_PACK, GLYPH_SIZE_SINGLE, GLYPH_SEEDERS,
-  GLYPH_PROXY_FILL, GLYPH_PROXY_OUT, GLYPH_LANG, GLYPH_PRIVATE,
+  GLYPH_TITLE, GLYPH_LIBRARY, GLYPH_PRELOAD, GLYPH_ENCODE, GLYPH_VISUAL_PRI,
+  GLYPH_VISUAL_SEC, GLYPH_AUDIO, GLYPH_CHANNELS, GLYPH_SIZE_PACK,
+  GLYPH_SIZE_SINGLE, GLYPH_SEEDERS, GLYPH_PROXY_FILL, GLYPH_PROXY_OUT,
+  GLYPH_LANG, GLYPH_PRIVATE,
 ];
+
+/** Glyphs that OPEN a tagged segment, for the line splitter below.
+ *
+ *  AIOStreams packs SEVERAL tagged segments onto ONE physical line - e.g.
+ *  `▣  HEVC  ✦  HDR  ♬  DD+  ♯ 5.1` is a single line of addon output. An
+ *  earlier version of this parser dispatched on the line's FIRST character
+ *  and then consumed the whole line, so everything after the first segment
+ *  was silently discarded (audio channels and seeders never populated at all,
+ *  and visual tags vanished whenever a codec was present). We split on the
+ *  glyphs instead, so each segment is parsed on its own and the layout
+ *  upstream chooses stops mattering.
+ *
+ *  `⚿` is deliberately NOT a delimiter: it sits INSIDE the proxy/addon
+ *  segment, between the addon name and the release group, so splitting there
+ *  would orphan the group. `parseProxyServiceAddon` strips it inline.
+ *  `✓` IS a delimiter - newer TamTaro leads the language segment with it
+ *  (instead of `⛿`) whenever the stream carries subtitles. */
+const SEGMENT_GLYPHS = [
+  GLYPH_TITLE, GLYPH_LIBRARY, GLYPH_PRELOAD, GLYPH_ENCODE, GLYPH_VISUAL_PRI,
+  GLYPH_VISUAL_SEC, GLYPH_AUDIO, GLYPH_CHANNELS, GLYPH_SIZE_PACK,
+  GLYPH_SIZE_SINGLE, GLYPH_SEEDERS, GLYPH_PROXY_FILL, GLYPH_PROXY_OUT,
+  GLYPH_LANG, GLYPH_LANG_SUBBED,
+];
+const SEGMENT_SPLIT_RX = new RegExp(`(?=[${SEGMENT_GLYPHS.join("")}])`, "u");
+
+/** Split a description line into glyph-led segments. The first element has an
+ *  empty `glyph` when the line opens with untagged text (a bare `(YYYY)`
+ *  continuation line, or free-form residue). */
+function splitSegments(line: string): { glyph: string; value: string }[] {
+  return line
+    .split(SEGMENT_SPLIT_RX)
+    .filter((part) => part.length > 0)
+    .map((part) => {
+      const glyph = SEGMENT_GLYPHS.includes(part[0]) ? part[0] : "";
+      return { glyph, value: glyph ? part.slice(glyph.length).trim() : part.trim() };
+    });
+}
 
 /** Heuristic: does this stream use the TamTaro glyph-tagged format the parser
  *  is built for? Plain-label (Torrentio) and other emoji formats score 0, so
@@ -253,6 +329,18 @@ const SMALLCAPS_MAP: Record<string, string> = {
   // smallcaps glyphs AIOStreams emits for B and N.
   "ʙ": "B",
   "ɴ": "N",
+  // HOMOGLYPHS. Older TamTaro deliberately swapped three smallcaps letters
+  // for look-alikes from other scripts (`::replace('F','ғ')` etc.) because
+  // the true smallcaps forms render badly in some clients. They are NOT
+  // decomposed by NFKC, so without these entries `ᴜɴᴠᴇʀɪғɪᴇᴅ ɴᴢʙ` normalised
+  // to "UNVERIғIED NZB" and the NZB-health regex below never matched. The
+  // newer format dropped the swap from the language codes but still emits
+  // `ғ` inside the hardcoded unverified-NZB string, and old-format streams
+  // are still in the wild - so both spellings have to keep working.
+  "ғ": "F",   // U+0493 Cyrillic ghe with stroke
+  "х": "X",   // U+0445 Cyrillic small ha
+  "ϙ": "Q",   // U+03D9 Greek koppa
+  "ꜱ": "S",   // U+A731 Latin letter small capital S
 };
 
 // ── Build the FULL smallcaps regex once, including all keys from the map.
@@ -271,7 +359,11 @@ const SMALLCAPS_RX = (() => {
 function normaliseLineForRegex(s: string): string {
   let out = s
     .normalize("NFKC")
-    .replace(/[\u{FE0F}]/gu, "")
+    // Strip BOTH variation selectors. VS-16 (U+FE0F, emoji presentation) and
+    // VS-15 (U+FE0E, text presentation) - the library glyph is emitted as
+    // `☁︎` = U+2601 U+FE0E, and a surviving VS-15 rode along into the parsed
+    // display title as an invisible leading character.
+    .replace(/[\u{FE0E}\u{FE0F}]/gu, "")
     .replace(/[‐‑‒–—−]/g, "-");
   // Smallcaps → ASCII (preserves case as uppercase for visibility).
   out = out.replace(SMALLCAPS_RX, (c) => SMALLCAPS_MAP[c] ?? c);
@@ -325,13 +417,6 @@ function cleanupResidue(s: string): string {
 // ---------------------------------------------------------------------------
 // Per-line classifier helpers.
 // ---------------------------------------------------------------------------
-
-/** Strip the leading glyph and surrounding whitespace from a line. */
-function stripLeading(line: string, glyph: string): string {
-  const idx = line.indexOf(glyph);
-  if (idx < 0) return line.trim();
-  return line.slice(idx + glyph.length).trim();
-}
 
 /** Whitespace AND zero-width / bidi-format characters that `String.trim()`
  *  leaves behind. An addon that emits a stray U+200B (or similar) as a field
@@ -403,10 +488,22 @@ function parseSizeLine(raw: string): {
   // Size and optional folder size.
   const slash = head.indexOf("/");
   if (slash >= 0) {
-    const sm = SIZE_RX.exec(head.slice(0, slash));
+    const headPart = head.slice(0, slash);
+    const sm = SIZE_RX.exec(headPart);
     const fm = SIZE_RX.exec(head.slice(slash + 1));
-    if (sm) size = `${sm[1]} ${sm[2].toUpperCase()}`;
     if (fm) folderSize = `${fm[1]} ${fm[2].toUpperCase()}`;
+    if (sm) {
+      size = `${sm[1]} ${sm[2].toUpperCase()}`;
+    } else if (fm) {
+      // Newer TamTaro drops the unit off the FILE size when it and the folder
+      // size share one, emitting `12.6 / 45.2 GB`. A bare number matches no
+      // unit, so `size` parsed as null - and the fullBody fallback further
+      // down then re-filled it with the first size-shaped token in the body,
+      // which is the FOLDER size. The chip showed a plausible but wrong
+      // number, which is worse than showing none. Inherit the folder's unit.
+      const bare = /(?:^|\s)(\d+(?:[.,]\d+)?)\s*$/.exec(headPart);
+      if (bare) size = `${bare[1]} ${fm[2].toUpperCase()}`;
+    }
   } else {
     const sm = SIZE_RX.exec(head);
     if (sm) size = `${sm[1]} ${sm[2].toUpperCase()}`;
@@ -505,6 +602,7 @@ function parseMetadataFlags(raw: string): {
   seadexAlt: boolean;
   nzbHealth: "verified" | "elf" | "unverified" | "broken" | null;
   seScore: number | null;
+  flags: string[];
 } {
   let s = raw.trim();
   let seadexBest = false;
@@ -532,18 +630,37 @@ function parseMetadataFlags(raw: string): {
     s = s.replace(/\bbest\s+release\b/i, "").trim();
   }
 
-  // NZB health.
-  if (/✘\s*NZB/i.test(s) || /\bbroken\s*NZB\b/i.test(s)) {
-    nzbHealth = "broken";
-  } else if (/\bunverified\s*NZB\b/i.test(s)) {
-    nzbHealth = "unverified";
-  } else if (/\belf\s*NZB\b/i.test(s)) {
-    nzbHealth = "elf";
-  } else if (/☑\s*NZB/i.test(s) || /\bverified\s*NZB\b/i.test(s)) {
-    nzbHealth = "verified";
+  // NZB health. AIOStreams tags these with EMOJI, not the `☑` / plain words
+  // this parser originally looked for - the template rewrites its upstream
+  // health strings to `✅ ɴᴢʙ`, `🧝 ɴᴢʙ`, `💚 ɴᴢʙ`, `ᴜɴᴠᴇʀɪғɪᴇᴅ ɴᴢʙ` and
+  // `✘ɴᴢʙ`. Only the broken case ever matched; verified and elf silently never
+  // fired, and unverified was blocked by the `ғ` homoglyph that the smallcaps
+  // map now folds back to F. Order matters: `broken` and `unverified` are
+  // checked before `verified` so neither is swallowed by a looser pattern.
+  const NZB_PATTERNS: [RegExp, "verified" | "elf" | "unverified" | "broken"][] = [
+    [/(?:✘|🚫)\s*NZB|\bbroken\s*NZB\b/i,     "broken"],
+    [/(?:⚠\s*)?\bunverified\s*NZB\b/i,       "unverified"],
+    [/(?:🧝|💚)\s*NZB|\belf\s*NZB\b/i,        "elf"],
+    [/(?:✅|☑)\s*NZB|\bverified\s*NZB\b/i,    "verified"],
+  ];
+  for (const [rx, health] of NZB_PATTERNS) {
+    if (rx.test(s)) {
+      nzbHealth = health;
+      s = s.replace(rx, " ").trim();
+      break;
+    }
   }
 
-  return { seadexBest, seadexAlt, nzbHealth, seScore };
+  // Whatever survives is AIOStreams' release-scoring matches plus the newer
+  // `stream.network` / `stream.editions` fields. They used to be discarded
+  // here without a trace; keep them as free text so an upstream addition
+  // shows up as a chip instead of vanishing.
+  const leftover = cleanupResidue(s);
+  const flags = leftover.length === 0
+    ? []
+    : [leftover.length > 60 ? `${leftover.slice(0, 59)}…` : leftover];
+
+  return { seadexBest, seadexAlt, nzbHealth, seScore, flags };
 }
 
 // ---------------------------------------------------------------------------
@@ -576,7 +693,9 @@ export function parseStream(s: StreamEntry): ParsedStream {
     streamType: null,
     displayTitle: null,
     library: false,
+    preloading: false,
     year: null,
+    date: null,
     episode: null,
     encode: null,
     visualTagsPrimary: [],
@@ -602,6 +721,7 @@ export function parseStream(s: StreamEntry): ParsedStream {
     seadexAlt: false,
     nzbHealth: null,
     seScore: null,
+    releaseFlags: [],
     codec: null,
     hdr: null,
     audio: null,
@@ -636,236 +756,33 @@ export function parseStream(s: StreamEntry): ParsedStream {
     out.streamType = stMatch[1].toLowerCase() as ParsedStream["streamType"];
   }
 
-  // ── 2) Walk description lines, classify by leading glyph. ───────────
-  // Lines we consume here are removed from `descLines` so they don't
-  // appear in `extra` later.
+  // ── 2) Walk description lines, classify each glyph-led segment. ─────
+  // Segments we consume here never reach `remaining`, so they don't appear
+  // in `extra` later.
   const remaining: string[] = [];
 
   for (const rawLine of descLines) {
     let line = rawLine;
-    // Section break — split metadata-flags suffix.
+    // Section break - peel the metadata-flags suffix off FIRST, so it is
+    // handled identically whether the addon put it inline or (as newer
+    // TamTaro does once the flag run gets long) on a line of its own.
     const breakIdx = line.indexOf(SECTION_BREAK);
-    let trailingFlags: string | null = null;
     if (breakIdx >= 0) {
-      trailingFlags = line.slice(breakIdx + SECTION_BREAK.length).trim();
+      handleMetadataFlags(line.slice(breakIdx + SECTION_BREAK.length).trim(), out);
       line = line.slice(0, breakIdx).trim();
     }
+    if (line.length === 0) continue;
 
-    // Decide handler by first significant codepoint.
-    const firstChar = line.length > 0 ? line[0] : "";
-
-    if (firstChar === GLYPH_TITLE || firstChar === GLYPH_LIBRARY) {
-      // ✎ / ☁ — display title (with optional inline year + episode).
-      const isLibrary = firstChar === GLYPH_LIBRARY;
-      let body = stripLeading(line, firstChar);
-      // Year — only if `(YYYY)` appears as a SEPARATE token (preceded by
-      // whitespace or start). Inline 2024 inside a release name should
-      // stay put.
-      const ym = /(?:^|\s)\((19|20)\d{2}\)/.exec(body);
-      if (ym) {
-        const matchStr = ym[0].trim();
-        out.year = matchStr.slice(1, -1);
-        body = (body.slice(0, ym.index) + body.slice(ym.index + ym[0].length)).trim();
-      }
-      // Episode tag — STANDALONE only (don't strip "S01E10" embedded in a
-      // release filename like `Show.Name.S01E10.1080p`).
-      const em = EPISODE_STANDALONE_RX.exec(body);
-      if (em) {
-        out.episode = `S${em[1].padStart(2, "0")}E${em[2].padStart(2, "0")}`;
-        body = (body.slice(0, em.index) + body.slice(em.index + em[0].length)).trim();
-      }
-      out.displayTitle = cleanupResidue(body) || null;
-      out.library = out.library || isLibrary;
-      // Don't push to `remaining` — fully consumed.
-      // Trailing flags after a title line are unusual but possible.
-      if (trailingFlags) handleMetadataFlags(trailingFlags, out);
-      continue;
+    // Split into glyph-led segments and parse each on its own. Dispatching on
+    // the line's FIRST character instead (and consuming the rest) is what used
+    // to drop every segment after the first.
+    for (const seg of splitSegments(line)) {
+      if (handleSegment(seg.glyph, seg.value, out)) continue;
+      if (consumeUntagged(seg.value, out)) continue;
+      if (hasVisible(seg.value)) remaining.push(seg.glyph + seg.value);
     }
-
-    // Bare "(YYYY) [SxxEyy]" continuation line — AIOStreams emits the
-    // year/episode tag on a separate line beneath ✎/☁. Recognise it by
-    // a leading `(YYYY)` token.
-    if (/^\s*\((19|20)\d{2}\)/.test(line)) {
-      let body = line.trim();
-      const ym = /\((19|20)\d{2}\)/.exec(body);
-      if (ym && !out.year) out.year = ym[0].slice(1, -1);
-      if (ym) body = (body.slice(0, ym.index) + body.slice(ym.index + ym[0].length)).trim();
-      const em = EPISODE_STANDALONE_RX.exec(" " + body);
-      if (em && !out.episode) {
-        out.episode = `S${em[1].padStart(2, "0")}E${em[2].padStart(2, "0")}`;
-      }
-      if (trailingFlags) handleMetadataFlags(trailingFlags, out);
-      continue;
-    }
-
-    // Bare standalone episode line (no year prefix).
-    {
-      const em = EPISODE_STANDALONE_RX.exec(" " + line);
-      // Only treat as episode-only if the line is JUST that and no other
-      // signal (avoids eating release-note lines that happen to mention
-      // an episode).
-      if (em && line.trim().replace(em[0].trim(), "").trim().length === 0) {
-        if (!out.episode) out.episode = `S${em[1].padStart(2, "0")}E${em[2].padStart(2, "0")}`;
-        if (trailingFlags) handleMetadataFlags(trailingFlags, out);
-        continue;
-      }
-    }
-
-    if (firstChar === GLYPH_ENCODE) {
-      const v = stripLeading(line, GLYPH_ENCODE);
-      // AIOStreams sometimes glues a bit-depth onto the codec via a
-      // ✦ separator on the ▣ line, e.g. "HEVC ✦ 10BIT". Earlier strip
-      // attempts via Unicode-literal regex proved fragile, so isolate
-      // the codec via CODEC_RX (which knows the canonical names) and
-      // pull bit-depth out separately via BITDEPTH_RX. Anything after
-      // the codec is intentionally ignored at this site — it's owned
-      // by the visual / bit-depth fields, not encode.
-      const cm = CODEC_RX.exec(v);
-      if (cm) {
-        out.encode = cm[1].toUpperCase().replace(/\s+/g, "");
-      } else {
-        // Unknown codec — take the leading alphanumeric token so we
-        // still surface SOMETHING for non-canonical codecs.
-        const tm = /^([A-Za-z0-9.]+)/.exec(v);
-        out.encode = tm ? tm[1].toUpperCase() : null;
-      }
-      if (out.encode) out.codec = normaliseCodec(out.encode);
-      // Capture bit-depth from anywhere on the same line.
-      const bd = BITDEPTH_RX.exec(v);
-      if (bd && !out.bitDepth) out.bitDepth = `${bd[1]}bit`;
-      if (trailingFlags) handleMetadataFlags(trailingFlags, out);
-      continue;
-    }
-
-    if (firstChar === GLYPH_VISUAL_PRI) {
-      const v = stripLeading(line, GLYPH_VISUAL_PRI);
-      const tokens = splitOnDot(v).map((t) => t.toUpperCase());
-      out.visualTagsPrimary.push(...tokens);
-      // Mirror to legacy `hdr` field.
-      if (!out.hdr && tokens.length > 0) {
-        const joined = tokens.join("+").toUpperCase();
-        if (joined.includes("DV") && joined.includes("HDR")) out.hdr = "DV+HDR";
-        else if (joined.startsWith("DV")) out.hdr = "DV";
-        else if (joined.startsWith("HDR")) out.hdr = tokens[0];
-        else out.hdr = tokens[0];
-      }
-      // Pull bit-depth out of the visual line if it's tucked there.
-      const bd = BITDEPTH_RX.exec(v);
-      if (bd) out.bitDepth = `${bd[1]}bit`;
-      if (trailingFlags) handleMetadataFlags(trailingFlags, out);
-      continue;
-    }
-
-    if (firstChar === GLYPH_VISUAL_SEC) {
-      const v = stripLeading(line, GLYPH_VISUAL_SEC);
-      out.visualTagsSecondary.push(...splitOnDot(v).map((t) => t.toUpperCase()));
-      if (trailingFlags) handleMetadataFlags(trailingFlags, out);
-      continue;
-    }
-
-    if (firstChar === GLYPH_AUDIO) {
-      const v = stripLeading(line, GLYPH_AUDIO);
-      out.audioTags.push(...splitOnDot(v).map((t) => t.toUpperCase()));
-      // Mirror to legacy `audio` (compact first tag).
-      if (!out.audio && out.audioTags.length > 0) out.audio = out.audioTags[0];
-      if (trailingFlags) handleMetadataFlags(trailingFlags, out);
-      continue;
-    }
-
-    if (firstChar === GLYPH_CHANNELS) {
-      const v = stripLeading(line, GLYPH_CHANNELS);
-      out.audioChannels.push(...splitOnDot(v));
-      if (trailingFlags) handleMetadataFlags(trailingFlags, out);
-      continue;
-    }
-
-    if (firstChar === GLYPH_SIZE_PACK || firstChar === GLYPH_SIZE_SINGLE) {
-      const isPack = firstChar === GLYPH_SIZE_PACK;
-      const v = stripLeading(line, firstChar);
-      const sizeInfo = parseSizeLine(v);
-      if (sizeInfo.size) out.size = sizeInfo.size;
-      if (sizeInfo.folderSize) out.folderSize = sizeInfo.folderSize;
-      if (sizeInfo.bitrate) out.bitrate = sizeInfo.bitrate;
-      out.seasonPack = out.seasonPack || isPack;
-      // Recognized size line but nothing matched the size/bitrate patterns →
-      // keep the raw value so it still surfaces (in the residue) rather than
-      // vanishing into a blank.
-      if (!sizeInfo.size && !sizeInfo.folderSize && !sizeInfo.bitrate && hasVisible(v)) {
-        remaining.push(rawLine);
-      }
-      if (trailingFlags) handleMetadataFlags(trailingFlags, out);
-      continue;
-    }
-
-    if (firstChar === GLYPH_SEEDERS) {
-      const v = stripLeading(line, GLYPH_SEEDERS);
-      // Some addons drop the ❦ glyph; tolerate either case.
-      const cleaned = v.replace(/❦/g, "").trim();
-      const r = parseSeederValue(cleaned);
-      if (r.count != null) out.seeders = r.count;
-      if (r.age) out.age = r.age;
-      // Neither a seeder count nor an age parsed → surface the raw value.
-      if (r.count == null && !r.age && hasVisible(cleaned)) remaining.push(rawLine);
-      if (trailingFlags) handleMetadataFlags(trailingFlags, out);
-      continue;
-    }
-
-    if (firstChar === GLYPH_PROXY_FILL || firstChar === GLYPH_PROXY_OUT) {
-      out.proxyState = firstChar === GLYPH_PROXY_FILL ? "on" : "off";
-      const v = stripLeading(line, firstChar);
-      const r = parseProxyServiceAddon(v);
-      if (r.serviceShort) out.serviceShort = r.serviceShort;
-      if (r.addonName) out.addonName = r.addonName;
-      if (r.releaseGroupOrIndexer) {
-        // For NZB streams the field is the indexer; for torrents the
-        // release group. We don't always know — when streamType says nzb
-        // route to indexer; otherwise default to releaseGroup. Either
-        // way the chip renders.
-        if (out.streamType === "nzb") out.indexer = r.releaseGroupOrIndexer;
-        else out.releaseGroup = r.releaseGroupOrIndexer;
-      }
-      if (r.privateFlag) out.private = true;
-      if (trailingFlags) handleMetadataFlags(trailingFlags, out);
-      continue;
-    }
-
-    if (firstChar === GLYPH_LANG) {
-      const v = stripLeading(line, GLYPH_LANG);
-      const lr = parseLanguageLine(v);
-      out.languages.push(...lr.languages);
-      out.subbed = out.subbed || lr.subbed;
-      out.subtitles.push(...lr.subtitles);
-      if (!out.language && out.languages.length > 0) out.language = out.languages[0];
-      if (trailingFlags) handleMetadataFlags(trailingFlags, out);
-      continue;
-    }
-
-    // No leading glyph match — but the whole line might be metadata-only
-    // (just the section break + flags). If there's a SECTION_BREAK we
-    // already handled trailingFlags above; the `line` portion may now be
-    // empty.
-    if (line.length === 0) {
-      if (trailingFlags) handleMetadataFlags(trailingFlags, out);
-      continue;
-    }
-
-    // Recognisable trailing flag line WITHOUT a leading glyph (e.g. the
-    // user's addon emits the flags as a standalone tail).
-    if (trailingFlags) {
-      handleMetadataFlags(trailingFlags, out);
-      // Treat the head of the line as residual content — most likely
-      // free-form release notes. Fall through to `remaining`.
-    }
-
-    // Last resort — keep the line as residue. We do one more sweep
-    // below to handle bare-flag lines.
-    if (looksLikeMetadataFlags(line)) {
-      handleMetadataFlags(line, out);
-      continue;
-    }
-
-    remaining.push(rawLine);
   }
+
 
   // ── 3) Reconcile + legacy-fill from `fullBody` for non-AIOStreams. ──
   // RipType regex fallback, and use it as `ripType`. If we got a
@@ -933,6 +850,13 @@ export function parseStream(s: StreamEntry): ParsedStream {
     const gm = RELGROUP_RX.exec(titleLines[0] ?? "");
     if (gm) out.releaseGroup = gm[1];
   }
+  // AIOStreams' own service short code means its BUILT-IN usenet engine is
+  // serving the file from the operator's NNTP providers, i.e. the addon host
+  // is the origin. `stream.proxied` is false for these (it tracks MediaFlow
+  // proxying only), so without this the badge claimed "direct from a third
+  // party" for traffic that never left the addon's IP. An explicit proxy flag
+  // still wins: if the addon says it IS proxying, that's the stronger claim.
+  if (out.proxyState !== "on" && out.serviceShort === "AIO") out.proxyState = "self";
 
   // ── 4) Build the displayed `primary` and `extra`. ───────────────────
   // For AIOStreams entries (recognised when displayTitle was set), we
@@ -971,16 +895,236 @@ function handleMetadataFlags(raw: string, out: ParsedStream): void {
   out.seadexAlt  = out.seadexAlt  || r.seadexAlt;
   if (r.nzbHealth) out.nzbHealth = r.nzbHealth;
   if (r.seScore != null) out.seScore = r.seScore;
+  for (const f of r.flags) if (!out.releaseFlags.includes(f)) out.releaseFlags.push(f);
+}
+
+/** Parse ONE glyph-led segment into `out`. Returns false when the segment
+ *  carries no glyph we know, or when a known glyph turned out to hold nothing
+ *  parseable - either way the caller keeps it as visible residue rather than
+ *  dropping it. */
+function handleSegment(glyph: string, value: string, out: ParsedStream): boolean {
+  switch (glyph) {
+    // ✎ / ☁ / ➤ - display title, with optional inline date, year and episode.
+    case GLYPH_TITLE:
+    case GLYPH_LIBRARY:
+    case GLYPH_PRELOAD: {
+      if (glyph === GLYPH_LIBRARY)  out.library = true;
+      if (glyph === GLYPH_PRELOAD)  out.preloading = true;
+      let body = value;
+      // Air date - newer TamTaro emits `· 5 Jul 2026` here INSTEAD of the
+      // bare `(YYYY)` token (always for series, and for movies whenever a
+      // date is known). Take it before the year so the year survives even
+      // when only a date was sent.
+      const dm = DATE_RX.exec(body);
+      if (dm) {
+        out.date = dm[1].replace(/\s+/g, " ");
+        out.year = out.year ?? dm[2];
+        body = (body.slice(0, dm.index) + body.slice(dm.index + dm[0].length)).trim();
+      }
+      // Year - only as a SEPARATE `(YYYY)` / `(YYYY-YY)` token. An inline
+      // 2024 inside a release name should stay put.
+      const ym = YEAR_TOKEN_RX.exec(body);
+      if (ym) {
+        out.year = ym[1];
+        body = (body.slice(0, ym.index) + body.slice(ym.index + ym[0].length)).trim();
+      }
+      // Episode tag - STANDALONE only (don't strip "S01E10" embedded in a
+      // release filename like `Show.Name.S01E10.1080p`).
+      const em = EPISODE_STANDALONE_RX.exec(body);
+      if (em) {
+        out.episode = `S${em[1].padStart(2, "0")}E${em[2].padStart(2, "0")}`;
+        body = (body.slice(0, em.index) + body.slice(em.index + em[0].length)).trim();
+      }
+      out.displayTitle = cleanupResidue(body) || out.displayTitle;
+      return true;
+    }
+
+    // ▣ - codec. Isolate it via CODEC_RX (which knows the canonical names)
+    // rather than by position, and pull any bit-depth out separately.
+    case GLYPH_ENCODE: {
+      const cm = CODEC_RX.exec(value);
+      if (cm) {
+        out.encode = cm[1].toUpperCase().replace(/\s+/g, "");
+      } else {
+        // Unknown codec - take the leading alphanumeric token so we still
+        // surface SOMETHING for non-canonical codecs.
+        const tm = /^([A-Za-z0-9.]+)/.exec(value);
+        out.encode = tm ? tm[1].toUpperCase() : null;
+      }
+      if (out.encode) out.codec = normaliseCodec(out.encode);
+      const bd = BITDEPTH_RX.exec(value);
+      if (bd && !out.bitDepth) out.bitDepth = `${bd[1]}bit`;
+      return out.encode != null || out.bitDepth != null;
+    }
+
+    // ✦ - primary visual tags (HDR / DV / HLG).
+    case GLYPH_VISUAL_PRI: {
+      const tokens: string[] = [];
+      for (const t of splitOnDot(value).map((x) => x.toUpperCase())) {
+        // A bit depth tucked behind a ✦ separator on the codec segment
+        // (`▣ HEVC ✦ 10BIT`) is a bit depth, not an HDR tag. Route it to
+        // bitDepth so it can't render as a bogus "✦ 10BIT" HDR chip.
+        const bd = BITDEPTH_RX.exec(t);
+        if (bd && t.replace(BITDEPTH_RX, "").trim().length === 0) {
+          out.bitDepth = out.bitDepth ?? `${bd[1]}bit`;
+          continue;
+        }
+        tokens.push(t);
+      }
+      out.visualTagsPrimary.push(...tokens);
+      // Mirror to the legacy `hdr` field.
+      if (!out.hdr && tokens.length > 0) {
+        const joined = tokens.join("+").toUpperCase();
+        if (joined.includes("DV") && joined.includes("HDR")) out.hdr = "DV+HDR";
+        else if (joined.startsWith("DV")) out.hdr = "DV";
+        else out.hdr = tokens[0];
+      }
+      return tokens.length > 0 || out.bitDepth != null;
+    }
+
+    // ✧ - secondary visual tags (IMAX / 3D / ...).
+    case GLYPH_VISUAL_SEC: {
+      const tokens = splitOnDot(value).map((t) => t.toUpperCase());
+      out.visualTagsSecondary.push(...tokens);
+      return tokens.length > 0;
+    }
+
+    // ♬ - audio codecs.
+    case GLYPH_AUDIO: {
+      const tokens = splitOnDot(value).map((t) => t.toUpperCase());
+      out.audioTags.push(...tokens);
+      if (!out.audio && out.audioTags.length > 0) out.audio = out.audioTags[0];
+      return tokens.length > 0;
+    }
+
+    // ♯ - audio channel layouts.
+    case GLYPH_CHANNELS: {
+      const tokens = splitOnDot(value);
+      out.audioChannels.push(...tokens);
+      return tokens.length > 0;
+    }
+
+    // ❖ / ◈ - season-pack or single-file size, folder size, bit rate.
+    case GLYPH_SIZE_PACK:
+    case GLYPH_SIZE_SINGLE: {
+      if (glyph === GLYPH_SIZE_PACK) out.seasonPack = true;
+      const info = parseSizeLine(value);
+      if (info.size)       out.size = info.size;
+      if (info.folderSize) out.folderSize = info.folderSize;
+      if (info.bitrate)    out.bitrate = info.bitrate;
+      return Boolean(info.size || info.folderSize || info.bitrate);
+    }
+
+    // ⇄ - seeder count and stream age.
+    case GLYPH_SEEDERS: {
+      // Some addons drop the ❦ glyph; tolerate either case.
+      const r = parseSeederValue(value.replace(/❦/g, "").trim());
+      if (r.count != null) out.seeders = r.count;
+      if (r.age) out.age = r.age;
+      return r.count != null || r.age != null;
+    }
+
+    // ⛊ / ⛉ - VPS proxy state, then service / addon / group on the same run.
+    case GLYPH_PROXY_FILL:
+    case GLYPH_PROXY_OUT: {
+      out.proxyState = glyph === GLYPH_PROXY_FILL ? "on" : "off";
+      const r = parseProxyServiceAddon(value);
+      if (r.serviceShort) out.serviceShort = r.serviceShort;
+      if (r.addonName)    out.addonName = r.addonName;
+      if (r.releaseGroupOrIndexer) {
+        // For NZB streams the field is the indexer; for torrents the release
+        // group. When streamType says nzb route to indexer, else default to
+        // releaseGroup. Either way the chip renders.
+        if (out.streamType === "nzb") out.indexer = r.releaseGroupOrIndexer;
+        else out.releaseGroup = r.releaseGroupOrIndexer;
+      }
+      if (r.privateFlag) out.private = true;
+      return true;
+    }
+
+    // ⛿ / ✓ - audio languages, sub flag, subtitle codes. Newer TamTaro swaps
+    // the leading ⛿ for a ✓ whenever the stream carries subtitles.
+    case GLYPH_LANG:
+    case GLYPH_LANG_SUBBED: {
+      // `⛿` is unambiguous, but `✓` is a plain check mark that other addons
+      // use for anything ("✓ Verified", "✓ Cached"). Claim it only when what
+      // follows really does look like language codes, so a stray check mark
+      // can't manufacture a bogus language chip; otherwise hand the segment
+      // back and let it show as residue.
+      if (glyph === GLYPH_LANG_SUBBED && !looksLikeLanguageCodes(value)) return false;
+      const lr = parseLanguageLine(value);
+      out.languages.push(...lr.languages);
+      out.subbed = out.subbed || lr.subbed;
+      out.subtitles.push(...lr.subtitles);
+      if (!out.language && out.languages.length > 0) out.language = out.languages[0];
+      return lr.languages.length > 0 || lr.subbed || lr.subtitles.length > 0;
+    }
+
+    default:
+      return false;
+  }
+}
+
+/** Does this segment body look like AIOStreams' language list (`ᴇɴ · ᴊᴀ`,
+ *  optionally with a `sᴜʙ` flag and a trailing `(ᴇɴ)` subtitle group) rather
+ *  than arbitrary prose? Requires every token to be a short word AND at least
+ *  one to be an actual 2-3 letter code or a known dual-audio marker, so
+ *  "Verified" or "Cached" behind a check mark is rejected. */
+function looksLikeLanguageCodes(value: string): boolean {
+  const isCode = (t: string) => /^[A-Za-z]{2,3}$/.test(t);
+  const parens = /\(([^)]*)\)\s*$/.exec(value);
+  const head = parens ? value.slice(0, parens.index) : value;
+  const tokens = splitOnDot(head.replace(/\bsub\b/i, "").trim());
+  // Subtitle codes only, no audio languages listed.
+  if (tokens.length === 0) {
+    return parens != null && splitOnDot(parens[1]).every(isCode);
+  }
+  return tokens.every((t) => /^[A-Za-z-]{2,12}$/.test(t))
+      && tokens.some((t) => isCode(t) || /^(?:DUO|DUB|DUAL AUDIO|DUBBED)$/i.test(t));
+}
+
+/** Line content that carries no glyph at all but still isn't residue: the
+ *  bare `(YYYY) SxxEyy` continuation line some addons emit beneath the title,
+ *  and a standalone run of metadata flags with no ` » ` in front of it. */
+function consumeUntagged(value: string, out: ParsedStream): boolean {
+  if (!hasVisible(value)) return true;
+
+  // Bare "(YYYY) [SxxEyy]" continuation line.
+  if (value.startsWith("(")) {
+    const padded = ` ${value}`;
+    const ym = YEAR_TOKEN_RX.exec(padded);
+    if (ym) {
+      out.year = out.year ?? ym[1];
+      const rest = padded.slice(0, ym.index) + padded.slice(ym.index + ym[0].length);
+      const em = EPISODE_STANDALONE_RX.exec(rest);
+      if (em && !out.episode) {
+        out.episode = `S${em[1].padStart(2, "0")}E${em[2].padStart(2, "0")}`;
+      }
+      return true;
+    }
+  }
+
+  // Bare standalone episode line (no year prefix). Only when the line is JUST
+  // that, so a release note that happens to mention an episode isn't eaten.
+  const em = EPISODE_STANDALONE_RX.exec(` ${value}`);
+  if (em && value.replace(em[0].trim(), "").trim().length === 0) {
+    if (!out.episode) out.episode = `S${em[1].padStart(2, "0")}E${em[2].padStart(2, "0")}`;
+    return true;
+  }
+
+  // A whole line of metadata flags with no ` » ` separator in front.
+  if (looksLikeMetadataFlags(value)) {
+    handleMetadataFlags(value, out);
+    return true;
+  }
+
+  return false;
 }
 
 /** Strip any of our recognised glyphs from a residue line — they're
  *  decorative once we've parsed their value out. */
 const ALL_GLYPHS_RX = new RegExp(
-  `[${[
-    GLYPH_TITLE, GLYPH_LIBRARY, GLYPH_ENCODE, GLYPH_VISUAL_PRI, GLYPH_VISUAL_SEC,
-    GLYPH_AUDIO, GLYPH_CHANNELS, GLYPH_SIZE_PACK, GLYPH_SIZE_SINGLE, GLYPH_SEEDERS,
-    GLYPH_PROXY_FILL, GLYPH_PROXY_OUT, GLYPH_LANG, GLYPH_PRIVATE,
-  ].join("")}❦《》〈〉]`,
+  `[${[...SEGMENT_GLYPHS, GLYPH_PRIVATE].join("")}❦《》〈〉]`,
   "gu",
 );
 
@@ -1113,7 +1257,7 @@ export type ChipKind =
   | "size" | "folder" | "bitrate" | "seeders" | "age"
   | "lang" | "sub"
   | "service" | "addon" | "group" | "indexer"
-  | "proxy" | "proxy-off" | "private"
+  | "proxy" | "proxy-self" | "proxy-off" | "private"
   | "seadex-best" | "seadex-alt"
   | "nzb-verified" | "nzb-elf" | "nzb-unverified" | "nzb-broken"
   | "score"
@@ -1142,6 +1286,10 @@ export function chipStyleFor(kind: ChipKind): ChipStyle {
     case "group":         return { bg: "bg-violet-500/15",  fg: "text-violet-300",  border: "border-violet-400/30" };
     case "indexer":       return { bg: "bg-slate-500/15",   fg: "text-slate-300",   border: "border-slate-400/30" };
     case "proxy":         return { bg: "bg-teal-500/15",    fg: "text-teal-300",    border: "border-teal-400/30" };
+    // Blue, not teal: the connection still stays on the addon host, but it is
+    // the ORIGIN rather than a proxy. Distinct colour so the two aren't read
+    // as the same thing at a glance.
+    case "proxy-self":    return { bg: "bg-sky-500/15",     fg: "text-sky-300",     border: "border-sky-400/35" };
     case "proxy-off":     return { bg: "bg-rose-500/15",    fg: "text-rose-300",    border: "border-rose-400/35" };
     case "private":       return { bg: "bg-yellow-500/15",  fg: "text-yellow-300",  border: "border-yellow-400/30" };
     case "seadex-best":   return { bg: "bg-amber-400/20",   fg: "text-amber-200",   border: "border-amber-300/40" };
