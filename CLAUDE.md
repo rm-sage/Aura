@@ -339,6 +339,19 @@ These are mistakes with specific, hard-to-diagnose symptoms.
     exclusive fullscreen"; libmpv's context did not survive the reparent and video disappeared. Stick
     with the child-window architecture; `win32::enter_native_fullscreen` resizes the PARENT to the
     monitor rect with `WS_POPUP` + monitor `rcMonitor` instead.
+11. **Never hand mpv a remote URL for `sub-add`, and never let anything slow run on the engine
+    thread.** The engine thread executes every mpv FFI call INLINE inside its command drain, and
+    that drain runs to completion BEFORE `drain_mpv_events`. It is therefore the sole producer of
+    `playback-update` and `cache-state`. Anything that blocks it freezes the clock, the scrubber,
+    the pause icon, the buffer readout and the geometry pump, while mpv itself keeps decoding on its
+    own threads, so the picture keeps moving and only the UI looks dead. `sub-add <https url>` makes
+    libmpv do the HTTPS GET synchronously inside `mpv_command`: measured 1.4-3.2 s per subtitle, and
+    a burst of picks blocked the pump for 9.07 s continuously. `subtitles.rs` now downloads to
+    `app_data_dir()/subtitles` first and passes mpv a LOCAL path. Two corollaries: keep
+    `submit_get_property`'s `recv_timeout` (a bare `recv()` parks the caller forever behind a wedged
+    command), and remember that a stalled pump silently disarms App.tsx's stream-lost watchdog
+    escape hatches -- `paused` and `lastBufferProgressAtRef` are fed by the SAME pump, so a long
+    block can raise a "stream connection lost" modal on a perfectly healthy stream.
 
 ## Win32 fullscreen reality check
 
@@ -436,6 +449,8 @@ creep degrades the experience. When adding ANY feature:
   install BEFORE React mounts.
 - "Streams from addon X do not appear" -> DevConsole filter for `[X]`; `fetch_streams` logs the
   manifest gate decisions.
+- "Stream chips missing / wrong" (no audio-channel or seeder chips, size chip showing the FOLDER
+  size, raw glyph text under the title) -> `src/streamMeta.ts`. See the parsing invariant below.
 - "Ratings missing/sparse" -> `ratings.rs`: the MDBList branch needs a `tt`-prefixed IMDb id and a
   non-empty `AURA_MDBLIST_KEY` (baked from `.env.local`); the MAL/AniList branch needs a resolvable
   anime id. Non-tt non-anime ids get only addon-supplied `detail.ratings`. OMDb is fully removed.
@@ -456,6 +471,36 @@ creep degrades the experience. When adding ANY feature:
 - "A Tailwind class has no effect" -> check the theme-scale gotchas; confirm against
   `dist/assets/index-*.css`.
 - "Library page blank" -> `<ErrorBoundary scope="Library">` surfaces the render error.
+
+## Stream chip parsing: split lines into SEGMENTS, never dispatch on the first character
+
+`src/streamMeta.ts` turns an addon's stream text into the chips in the stream list. It targets
+AIOStreams' "TamTaro" formatter, which tags values with leading glyphs (`▣` codec, `✦` HDR,
+`♬` audio, `♯` channels, `◈`/`❖` size, `⇄` seeders, `⛿`/`✓` languages, `⛊`/`⛉` VPS proxy).
+
+**TamTaro packs SEVERAL tagged segments onto ONE physical line** - `▣ HEVC ✦ HDR ♬ DD+ ♯ 5.1` is
+a single line. The parser therefore splits each line on the glyph set (`splitSegments`) and handles
+every segment. An earlier version dispatched on the line's FIRST character and consumed the rest,
+which silently dropped everything after the first segment: audio channels and seeders never
+populated at all, and visual tags vanished whenever a codec was present. Do not reintroduce
+first-character dispatch, and do not let a glyph branch consume past its own segment.
+
+Two related rules:
+
+- **A fallback that fills a field with the WRONG value is worse than an empty field.** When
+  TamTaro started emitting `◈ 12.6 / 45.2 GB` (unit stripped off the file size when it matches the
+  folder size), the size parse returned null and the `fullBody` regex fallback then re-filled
+  `size` with the first size-shaped token in the body - the FOLDER size. The chip showed a
+  plausible but wrong number. `parseSizeLine` now inherits the unit across the `/`.
+- **Upstream reshuffles this template.** Aura must keep parsing BOTH the current and older shapes,
+  since users run whatever AIOStreams version they have and can write custom formatters. Glyphs
+  are load-bearing, so pin them by codepoint in comments; `➤` U+27A4 (preloading) and `✓` U+2713
+  (languages-with-subtitles) were both added by upstream after the parser shipped. `✓` is generic
+  enough that other addons use it for "✓ Verified", so it is accepted as the language glyph only
+  when the body actually looks like language codes (`looksLikeLanguageCodes`).
+
+There are no tests here; the practical check is to run the real `parseStream` over hand-rendered
+old-format and new-format samples and diff the field sets. Node runs the `.ts` file directly.
 
 ## Conventions
 
