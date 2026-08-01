@@ -1545,28 +1545,44 @@ export default function PlayerOverlay({
   useEffect(() => {
     if (!tracksReady) return;
     let cancelled = false;
+    // ONE read at a time. Each get_tracks costs 1 + 8*T blocking engine
+    // round-trips (lib.rs), so overlapping reads bury the engine thread -
+    // which is also the sole producer of playback-update, so the clock and
+    // scrubber stall while it works through them. An in-flight guard plus a
+    // single trailing re-read collapses a burst of track changes into two
+    // reads total instead of two PER change.
+    let inFlight = false;
+    let queued = false;
     const refresh = async () => {
+      if (inFlight) { queued = true; return; }
+      inFlight = true;
       try {
         const t = await invoke<TrackEntry[]>("get_tracks");
         if (!cancelled) setTrackList({ key: loadKey, list: t });
       } catch {
         if (!cancelled) setTrackList({ key: loadKey, list: EMPTY_TRACKS });
+      } finally {
+        inFlight = false;
+        if (queued && !cancelled) { queued = false; void refresh(); }
       }
     };
     const startTimer = setTimeout(() => {
       if (!cancelled) refresh();
     }, 1500);
+    // Trailing debounce, replacing the old immediate + 150 ms double-fire.
+    // mpv needs a moment to commit the new sid anyway, and `selectedSubId` is
+    // set optimistically by the picker, so nothing needs the instant read.
+    let settle: ReturnType<typeof setTimeout> | undefined;
     const onRefresh = () => {
       if (cancelled) return;
-      refresh();
-      // Reconcile after mpv commits the new sid — the immediate read can
-      // still report the OLD selected track. selectedSubId covers the gap.
-      setTimeout(() => { if (!cancelled) refresh(); }, 150);
+      clearTimeout(settle);
+      settle = setTimeout(() => { if (!cancelled) refresh(); }, 250);
     };
     window.addEventListener("aura:tracks-refresh", onRefresh);
     return () => {
       cancelled = true;
       clearTimeout(startTimer);
+      clearTimeout(settle);
       window.removeEventListener("aura:tracks-refresh", onRefresh);
     };
     // `loadKey` is a dep so the read (and the refresh listener) re-arm for
@@ -1658,6 +1674,12 @@ export default function PlayerOverlay({
   // delayed get_tracks reconcile (below) is authoritative. Reset per file so
   // a stale id can't match a different track after an episode change.
   const [selectedSubId, setSelectedSubId] = useState<number | null>(null);
+  /** True while a subtitle pick is still landing. Adding an external subtitle
+   *  occupies the single mpv engine thread, and that thread is also the only
+   *  producer of playback-update / cache-state - so a run of impatient clicks
+   *  queued a run of blocking loads and stalled the clock, the scrubber and
+   *  every other playback command behind them. One pick at a time. */
+  const subPickBusyRef = useRef(false);
   // One-shot guards for the audio + subtitle auto-select effects further down.
   // Declared here (above the reset effect) so they re-arm per file.
   const subAutoSelectedRef = useRef(false);
@@ -2536,6 +2558,16 @@ export default function PlayerOverlay({
                 } catch {}
               }}
               onPick={async (id) => {
+                // Ignore picks while one is still landing. Adding an external
+                // subtitle occupies the engine thread, so before this guard a
+                // run of impatient clicks queued a run of blocking loads and
+                // stalled every other playback command behind them. The
+                // optimistic `setSelectedSubId` calls below are what make the
+                // wait visible, so the user has no reason to click again.
+                if (subPickBusyRef.current) return;
+                subPickBusyRef.current = true;
+                const prevSubId = selectedSubId;
+                try {
                 // Picking any track also re-enables visibility.
                 try {
                   await invoke("set_subtitle_visibility", { visible: true });
@@ -2582,6 +2614,10 @@ export default function PlayerOverlay({
                     return;
                   }
                   try {
+                    // Optimistic. Adding an external subtitle is not instant,
+                    // and leaving the row on the OLD selection while it lands
+                    // is precisely what reads as "the pick did nothing".
+                    setSelectedSubId(id); // negative menu id until the refresh swaps in the live track
                     // Pass title + lang so MPV labels the new track
                     // sensibly (otherwise it auto-titles from the URL,
                     // which surfaces as e.g. "1958307247" in the
@@ -2593,7 +2629,6 @@ export default function PlayerOverlay({
                       title: ext?.title,
                       lang: ext?.lang ?? null,
                     });
-                    setSelectedSubId(id); // negative menu id until the refresh swaps in the live track
                     window.dispatchEvent(new Event("aura:tracks-refresh"));
                     fireToast(`Subtitles · ${ext?.lang?.toUpperCase() ?? "external"}`);
                     if (activeTarget && ext?.lang) {
@@ -2602,13 +2637,14 @@ export default function PlayerOverlay({
                       });
                     }
                   } catch (e) {
+                    setSelectedSubId(prevSubId);
                     console.error("sub-add failed", e);
                   }
                   return;
                 }
                 try {
-                  await invoke("set_subtitle_track", { track: id });
                   setSelectedSubId(id);
+                  await invoke("set_subtitle_track", { track: id });
                   window.dispatchEvent(new Event("aura:tracks-refresh"));
                   const t = subDropdownItems.find((x) => x.id === id);
                   fireToast(`Subtitles · ${t?.title ?? t?.lang?.toUpperCase() ?? `#${id}`}`);
@@ -2617,7 +2653,10 @@ export default function PlayerOverlay({
                       sub_lang: t.lang.toLowerCase(),
                     });
                   }
-                } catch {}
+                } catch { setSelectedSubId(prevSubId); }
+                } finally {
+                  subPickBusyRef.current = false;
+                }
               }}
               emptyHint="No subtitle tracks"
               delay={{

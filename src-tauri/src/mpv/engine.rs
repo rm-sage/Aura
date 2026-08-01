@@ -388,9 +388,22 @@ pub fn submit_get_property(
         format,
         reply: reply_tx,
     })?;
-    match reply_rx.recv() {
+    // Bounded, NOT a bare `recv()`. The engine thread runs every mpv FFI call
+    // inline, and some of them block for seconds (a `sub-add` of a remote URL
+    // does its HTTPS GET inside `mpv_command`). An unbounded wait meant one
+    // slow command parked every caller behind it on a blocking-pool thread
+    // with no way out. The deadline is generous - it exists to break a wedge,
+    // not to police latency - and the engine's reply send is already
+    // `let _ = reply.send(..)`, so a caller that has given up cannot panic it.
+    const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+    match reply_rx.recv_timeout(REPLY_TIMEOUT) {
         Ok(r) => r,
-        Err(e) => Err(format!("engine reply channel closed: {e}")),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(format!("engine did not answer within {REPLY_TIMEOUT:?}"))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("engine reply channel closed".into())
+        }
     }
 }
 

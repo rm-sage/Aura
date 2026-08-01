@@ -431,6 +431,76 @@ pub async fn download_subtitle<R: Runtime>(
     Ok(dest.to_string_lossy().into_owned())
 }
 
+/// mpv picks its subtitle demuxer from the file extension, so a cached copy has
+/// to keep the remote one. Providers routinely put it MID-path rather than at
+/// the end (`https://…/sub.vtt/?lang_code=en&sub_id=13408139`), so scan for a
+/// known extension instead of taking the suffix.
+fn subtitle_ext_from_url(url: &str) -> &'static str {
+    const KNOWN: [&str; 5] = ["vtt", "ass", "ssa", "srt", "sub"];
+    let lower = url.to_ascii_lowercase();
+    KNOWN
+        .into_iter()
+        .find(|e| lower.contains(&format!(".{e}")))
+        .unwrap_or("srt")
+}
+
+/// Fetch a remote subtitle to `app_data_dir()/subtitles` and hand back the
+/// LOCAL path.
+///
+/// Why this exists: `sub-add <https url>` makes libmpv perform the HTTPS GET
+/// synchronously INSIDE `mpv_command`, on the single engine thread that also
+/// drives the event pump. Measured against a live provider that is 1.4-3.2 s
+/// per subtitle, and for the whole of it no `playback-update` or `cache-state`
+/// reaches the UI: clock, scrubber, pause icon and buffer readout all stand
+/// still, and the picker keeps showing the OLD selection, so the switch reads
+/// as a no-op. Picking several in a row stacks those blocks back to back (one
+/// measured burst blocked the pump for 9.07 s continuously). Downloading here
+/// moves the network wait onto this async task and leaves mpv a local file to
+/// open, which is effectively instant.
+///
+/// The name is derived from a hash of the URL, so re-picking the same track
+/// reuses the file rather than re-fetching it.
+async fn prefetch_remote_subtitle(app: &AppHandle, url: &str) -> Result<String, String> {
+    // A subtitle is kilobytes. Cap the body so a mislabelled URL can't pull a
+    // video into the cache directory.
+    const MAX_BYTES: usize = 8 * 1024 * 1024;
+
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(url.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    let dest = subtitles_dir(app)?
+        .join(format!("ext-{}.{}", &digest[..16], subtitle_ext_from_url(url)));
+
+    // Already fetched (and non-empty) - reuse. This is what makes a repeated
+    // pick of the same track instant instead of another round trip.
+    if std::fs::metadata(&dest).map(|m| m.len() > 0).unwrap_or(false) {
+        return Ok(dest.to_string_lossy().into_owned());
+    }
+
+    let bytes = client()
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Subtitle fetch failed: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("Subtitle HTTP error: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("Subtitle read error: {e}"))?;
+    if bytes.is_empty() {
+        return Err("subtitle server returned an empty file".into());
+    }
+    if bytes.len() > MAX_BYTES {
+        return Err(format!(
+            "subtitle is {} bytes, over the {MAX_BYTES}-byte cap",
+            bytes.len()
+        ));
+    }
+    std::fs::write(&dest, &bytes).map_err(|e| format!("Subtitle write error: {e}"))?;
+    Ok(dest.to_string_lossy().into_owned())
+}
+
 /// Strip path components and dangerous chars from a server-supplied filename.
 fn sanitize_filename(name: &str) -> String {
     let just_name = Path::new(name)
@@ -482,6 +552,16 @@ pub async fn add_subtitle_to_mpv(
     // it as a "subtitle stream", leaking file existence and size via
     // mpv property events. Other schemes (`file://`, `\\server\share`,
     // bare drive letters) are rejected.
+    // Pull an https subtitle down HERE instead of letting mpv fetch it on the
+    // engine thread - see `prefetch_remote_subtitle` for the measurements and
+    // why it matters. Plain `http://` deliberately keeps the old behaviour:
+    // `client()` is `https_only`, and CLAUDE.md forbids adding a plaintext
+    // fallback, so those few URLs still go to mpv directly.
+    let path = if path.starts_with("https://") {
+        prefetch_remote_subtitle(&app, &path).await?
+    } else {
+        path
+    };
     let is_remote =
         path.starts_with("http://") || path.starts_with("https://");
     if !is_remote {
