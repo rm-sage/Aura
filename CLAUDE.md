@@ -576,6 +576,36 @@ high-BDP link (>=100 Mbps x >=30 ms RTT) that rebuffers mid-playback despite the
   `LOCALAPPDATA` or run
   `icacls "%USERPROFILE%\aura-*.log" /inheritance:r /grant:r "%USERNAME%:F"` after first launch.
 
+## Versioning: default to a PATCH bump
+
+Pick the version from what the release CONTAINS, never from the adjective in the request.
+"Release a minor version" / "a small release" / "a quick one" are all colloquial and usually mean
+"a modest release", which is a PATCH. If the wording and the content disagree, the content wins.
+
+**Default is a patch bump (`x.y.Z`).** This project's bar for a minor is high, and the history is
+the evidence: `1.0.7` shipped the entire Watch Trailer feature, `1.0.9` gave every theme its own
+accent colour, and `1.5.4` replaced the whole Trakt / AniList sign-in with a browser OAuth flow.
+All three were patches.
+
+**Bump the minor (`x.Y.0`) only when the release's headline is a NEW named surface** the user did
+not have before, i.e. the lead sentence of the notes can name something they could not do at all
+previously:
+
+- a new page or view (`1.4.0` Airing)
+- a new subsystem (`1.5.0` Story Arcs, Live Subtitle Sync)
+- a new capability with its own menu or settings block (`1.2.0` automatic skip detection,
+  `1.3.0` Library filters and auto-remove)
+
+**Never bump the minor for** a fix batch of any size (`1.5.1` was ~22 fixes and stayed a patch),
+restoring behaviour an upstream change broke, reworking a flow that already existed, a
+performance / RAM pass, UI polish, or new chips, badges and tooltips on an existing surface.
+
+**Never pick a major (`X.0.0`) autonomously.** It marks a milestone the maintainer declares.
+
+The one-line test: *does the notes' lead sentence name something the user could not do before?*
+No means patch. If it is genuinely borderline, ask rather than guess, since the tag, the signed
+artifacts and the updater feed all bake the number in and a published version cannot be recalled.
+
 ## Docs to consult
 
 - `ROADMAP.md` for feature phases (note: it stops around 5.8 and many "TODO" items there have since
