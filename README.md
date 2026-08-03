@@ -42,10 +42,11 @@ giving Aura full control over the video pipeline.
   to a PQ output and honors a configurable target peak (useful for OLED True Black panels).
 - **Anime4K and custom GLSL shaders** through a cinema shader pipeline, with per title persistence
   and quick profile switching.
-- **EBU R128 loudness normalization** that levels volume between sources to a broadcast standard
-  without crushing dynamics, toggleable live.
-- **Optional GPU motion interpolation** for anime (off by default) using mpv display resampling with
-  selectable kernels.
+- **Loudness normalization** that levels volume between sources without crushing dynamics,
+  toggleable live. It uses a realtime dynamic normalizer rather than EBU R128, so an opening skip
+  or any other seek does not replay a few seconds at the wrong level.
+- **GPU motion interpolation** using mpv display resampling with selectable kernels. On by default
+  and applied to anime only, since it adds judder on live action.
 - **Hover seek thumbnails** that preview the frame under the scrubber before you commit a seek.
 - **Per track control**: audio, video, and subtitle selection, plus audio and subtitle delay nudges.
 - **Subtitle styling** in player: size, position, outline, glyph color, background, and font, applied
@@ -75,8 +76,8 @@ optional but nice.
 - **Multi addon stream fan out** that queries every compatible addon in parallel, with manifest aware
   gating so addons are only asked for the types and id ranges they support.
 - **Rich quality chips** parsed from stream metadata: resolution, rip type, codec, HDR and Dolby
-  Vision, audio (Atmos, DDP), size, seeders, language, and debrid cache hints (cached vs uncached)
-  with service badges.
+  Vision, audio (Atmos, DDP) and channel layout, size, seeders, language, release group, and debrid
+  cache hints (cached vs uncached) with service badges.
 - **Source switcher** that swaps to a different source in place from inside the player, resuming at
   your current position without leaving playback.
 - **Debrid support** through addons (RealDebrid, TorBox, Premiumize, and similar), with debrid tokens
@@ -94,9 +95,12 @@ optional but nice.
   recent releases, a drag to reorder **Queue**, a day grouped **History** view, and an **Airing** page
   that gathers the shows you follow that are currently putting out episodes, with an episodes behind
   badge and grouping by air window.
-- **Filter and sort** controls (year, genre, rating, sort order) across Library, Queue, and Discover,
-  and manual marks for watched, in progress, and planned.
-- **Spoiler controls** that blur unwatched episode thumbnails, episode synopses, and cast photos.
+- **Filter and sort** controls (year range, genre, sort order) on Library, Queue, Discover, Search,
+  and the view-all catalog page, plus a Library status filter (watched, unwatched, in progress, in
+  queue, new episodes), a currently airing only toggle on Library and Queue, and manual marks for
+  watched, in progress, and planned.
+- **Spoiler controls** that blur unwatched episode thumbnails and episode synopses, plus an option
+  to hide the per actor episode counts and Main / Recurring / Guest tier on the cast hover card.
 - Lazy loaded, virtualized poster grids that stay light on memory even on very wide layouts.
 
 ## Ratings
@@ -122,13 +126,17 @@ whichever reads as the richest single image of Aura's discovery layer.
 
 ## Anime and skip tooling
 
-- **AniSkip** integration with per window modes (off, prompt, auto) for openings, endings, and recaps,
-  amber skip bands on the scrubber, and in app submission and voting to improve the community data.
+- **AuraSkip**, the in player skip system, with per window modes (off, prompt, auto) for openings,
+  endings, and recaps, amber skip bands on the scrubber, and in app submission and voting back to
+  the AniSkip community database that supplies its anime timestamps.
 - **OP and ED skip for any series**, not just anime: titled chapters are honored directly, and a
   heuristic detects likely opening and ending chapters when they are untitled.
 - **Hybrid Mode** that scans the tail of a stream with black detection and silence detection to find
-  ending boundaries for live action or unchaptered content, plus a manual silence detect opening
-  finder. These use ffmpeg, which is fetched on demand and degrades cleanly when absent.
+  ending boundaries for live action or unchaptered content, plus a silence detect pass over the
+  first ten minutes that infers a missing opening. Both run automatically whenever AniSkip and
+  chapters leave a gap, so there is no manual probe, and an Automatic skip detection toggle in
+  Settings turns them off. These use ffmpeg, which is fetched on demand and degrades cleanly when
+  absent.
 - **PublicMetaDB** skip windows for live action series, and **filler and recap** skipping in Next Up
   driven by AIOMetadata flags.
 - Cour aware MyAnimeList resolution so multi season anime map to the correct entry.
@@ -168,7 +176,8 @@ whichever reads as the richest single image of Aura's discovery layer.
   the latest one), with a persistent bell panel that survives reboots and cross checks your library so
   watched shows do not re notify.
 - An **End of Season Spotlight** overlay at playback end: a Next Up card with optional auto advance
-  countdown and spoiler gating, or an end card for finales with a live countdown to the next season.
+  countdown and spoiler gating, an end card for finales, or a caught up card with a live countdown
+  to the next episode's air date.
 - An **episode drawer** for quick season and episode navigation from inside the player, and a manual
   library refresh that nudges the release poller on demand.
 
@@ -184,8 +193,10 @@ ring if you can trigger auto-advance). The dark scrim over a paused frame looks 
 
 ## Scrobbling
 
-- **Trakt** (OAuth device flow) and **AniList** (GraphQL) scrobbling, both authorized through an in
-  app popup.
+- **Trakt** (OAuth device flow) and **AniList** (GraphQL) scrobbling, both authorized in your
+  default browser, where your provider session already lives. For Trakt, Aura shows a short code
+  and a QR so you can approve from a phone; AniList comes back through a loopback callback on
+  Aura's local bridge. Signing in through an in app popup stays available as a fallback.
 - Cour aware anime mapping with absolute episode fallbacks, completion gates (80 percent plus real
   elapsed time) to avoid false marks, proactive token refresh, and expiry alerts.
 - **Automatic scrobbling on by default**, with a separate toggle to turn it off if you would rather
@@ -220,7 +231,7 @@ ring if you can trigger auto-advance). The dark scrim over a paused frame looks 
   hover cards, and infinite scroll.
 - **Multiview** of 2, 3, or 4 channels at once, cross playlist **favorites**, group filtering, search,
   now and next on every channel card, a per playlist proxy option, and live rewind with a jump back to
-  live. New installs are seeded with the free iptv-org channel index.
+  live.
 
 <!--
 SCREENSHOT 5 (live TV): docs/screenshots/live-tv.png
@@ -254,7 +265,10 @@ can stage two clients, showing the "Make host" control on hover is a bonus.
 
 ## Stremio account and cloud sync
 
-- Sign in with your **Stremio** account (email and password), stored in the Windows Credential Manager.
+- Sign in with your **Stremio** account by email and password, or with **Facebook** or **Apple**
+  through Stremio's device link code flow: Aura shows a short code and a QR, and you finish on
+  Stremio's own sign in page in a browser or on your phone. The session is stored in the Windows
+  Credential Manager.
 - **Library normalization** collapses legacy per episode entries into clean series rooted records, so
   Library, Continue Watching, and Calendar all read consistent state.
 - **Aura Cloud Sync** mirrors per account settings, manual marks, queue order, search history, and
@@ -265,23 +279,25 @@ can stage two clients, showing the "Make host" control on hover is a bonus.
 
 - **Discord Rich Presence** for playback and browsing, with privacy controls (global toggle, hide
   titles, suppress browse states, and a per title blocklist).
-- **Windows SMTC** media controls: play, pause, and seek from the volume flyout, lock screen, and
-  media keys, with title, artwork, and position shown in the Windows overlay.
+- **Windows SMTC** media controls: play, pause, and next or previous episode from the volume flyout,
+  lock screen, and media keys, with title, artwork, and position shown in the Windows overlay.
 - A **signed auto updater** (minisign verified) that fetches a signed manifest from GitHub Releases and
   installs updates in place.
-- **On demand runtime binaries**: the mpv core, ffmpeg, and ffprobe are downloaded the first time they
-  are needed (SHA-256 verified, stored in a per user directory that survives updates) instead of being
-  bundled, which keeps the installer and every update small. A first run gate fetches the playback
-  engine before playback starts.
+- **On demand runtime binaries**: the mpv core, ffmpeg, ffprobe, and yt-dlp (trailer playback) are
+  downloaded the first time they are needed (SHA-256 verified, stored in a per user directory that
+  survives updates) instead of being bundled, which keeps the installer and every update small. A
+  first run gate fetches the playback engine before playback starts.
 - A **first run onboarding wizard** (import settings, choose preferences, install recommended addons),
-  and window behavior options such as pause on focus loss, pause when minimized, and minimize to tray.
+  a **minimize to tray on close** option, and automatic pause when the window is minimized (skipped
+  while casting or while in a synced watch party, so those keep running).
 
 ## Design and ultrawide support
 
 - **Native frameless chrome** with a custom glass title bar, a GPU accelerated spectral gradient sweep,
   and a transparent WebView2 that lets the Windows 11 Mica or Acrylic backdrop show through.
-- A **glass morphism design system** with several built in themes (Mica, Glass, Midnight for OLED,
-  Ember, Forest, Rose, and Amethyst), each with its own palette and glass layers.
+- A **glass morphism design system** with twelve built in themes (Mica, Glass, Midnight for OLED,
+  Ember, Forest, Rose, Amethyst, Ocean, Solar, Crimson, and two high contrast themes in gold and
+  azure), each with its own palette and glass layers.
 - **Built for ultrawide**: a dedicated breakpoint at 2400px and above expands the hero carousel to a
   21:9 cinematic banner and widens catalog rows to ten columns with larger gaps, while Continue
   Watching and the full catalog grids scale their column counts up on very wide displays and back down
@@ -313,8 +329,9 @@ into `src-tauri/lib/`:
 - `libmpv-2.dll` from <https://github.com/zhongfly/mpv-winbuild>
 
 End user installs download `libmpv-2.dll` automatically on first run, so it is not shipped in the
-installer. The optional `ffmpeg.exe` (silence and black detection) and `ffprobe.exe` (cast transmux)
-are likewise fetched on demand at runtime; for development you can drop them into `src-tauri/lib/` as
+installer. The optional `ffmpeg.exe` (silence and black detection), `ffprobe.exe` (cast transmux),
+and `yt-dlp.exe` (trailers) are likewise fetched on demand at runtime; for development you can drop
+them into `src-tauri/lib/` as
 well, and the app will use those copies if present. Without them, the features that need them degrade
 cleanly rather than failing.
 
@@ -334,11 +351,12 @@ cd src-tauri && cargo check     # check the Rust host
 
 ### Streaming bridge (built in)
 
-Aura runs a small loopback proxy on `127.0.0.1:11471` that forwards plain HTTP stream byte ranges. It
+Aura runs a small loopback server on `127.0.0.1:11471`. It forwards plain HTTP stream byte ranges,
+resizes and caches posters on device, and hosts the page that a browser sign in redirects back to. It
 is in process (part of the main executable, nothing to install or run separately). HTTPS streams and
 HLS manifests bypass it entirely and go straight to the player. If the port is already in use, the
-proxy disables itself gracefully (a warning is logged to the F12 DevConsole) and everything else keeps
-working.
+server disables itself gracefully (a warning is logged to the F12 DevConsole): HTTPS and HLS playback
+is unaffected, and browser sign in falls back to signing in inside Aura.
 
 ## License
 
