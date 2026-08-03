@@ -3791,6 +3791,20 @@ function formatExpiryRelative(diffMs: number): string {
   return rtf.format(yr, "year");
 }
 
+/** Tick period matching the unit `formatExpiryRelative` will actually print for
+ *  this diff, so the row never shows a value staler than the unit it displays.
+ *  Same rule as releaseCountdown.ts::showsSeconds: cadence follows RENDERED
+ *  precision, never a fixed guess. A flat 60 s used to leave the seconds branch
+ *  (|diff| < 60 s, symmetric around expiry) frozen, so a token that had already
+ *  lapsed could still read "in 42 seconds". Each tier is a 2x oversample of the
+ *  unit above it. */
+function expiryTickMs(diffMs: number): number {
+  const abs = Math.abs(diffMs);
+  if (abs < 60_000)    return 1_000;   // rendered in seconds
+  if (abs < 3_600_000) return 30_000;  // rendered in minutes
+  return 60_000;                       // hours or coarser
+}
+
 function ScrobbleAuthRow({
   service, authKey, description,
 }: {
@@ -3812,16 +3826,22 @@ function ScrobbleAuthRow({
   // Auth-code (deep-link) waiting state — only used by AniList now.
   const [pending, setPending] = useState(false);
   const timeoutRef = useRef<number | null>(null);
-  // 60s tick driving the "expires in N days" relative qualifier. Without
-  // this, the Settings page could sit open for hours showing a stale
-  // "in 23 days" line that should read "in 22 days". Only ticks when
-  // an expiring token is connected — guests / non-expiring tokens skip.
+  // Tick driving the "expires in N days" relative qualifier. Without it the
+  // Settings page could sit open for hours showing a stale "in 23 days" line
+  // that should read "in 22 days". Only runs when an expiring token is
+  // connected: guests and non-expiring tokens (AniList implicit grant) skip it.
+  //
+  // The PERIOD follows what formatExpiryRelative will print (see expiryTickMs)
+  // rather than being pinned at 60 s, and because it is recomputed from
+  // `tickNow` it sharpens on its own as the token approaches expiry.
   const [tickNow, setTickNow] = useState(() => Date.now());
+  const expiresAtMs = status?.expires_at != null ? status.expires_at * 1000 : null;
+  const tickMs = expiresAtMs == null ? null : expiryTickMs(expiresAtMs - tickNow);
   useEffect(() => {
-    if (!status || status.expires_at == null) return;
-    const id = window.setInterval(() => setTickNow(Date.now()), 60_000);
+    if (tickMs == null) return;
+    const id = window.setInterval(() => setTickNow(Date.now()), tickMs);
     return () => window.clearInterval(id);
-  }, [status]);
+  }, [tickMs]);
 
   // Device-flow state. When set, the row renders the user_code +
   // verification URL + Cancel button, and a poll loop runs until the
@@ -3852,7 +3872,14 @@ function ScrobbleAuthRow({
       { scope },
     )
       .then((s) => setStatus(service === "trakt" ? s.trakt : s.anilist))
-      .catch(() => setStatus(null));
+      .catch(() => {
+        // Deliberately does NOT clear `status`. This now also runs on a 60 s
+        // poll, and a transient IPC hiccup must not flash "not connected" over
+        // a live account once a minute. A genuine disconnect is not an error:
+        // it arrives as a SUCCESSFUL response carrying a null summary, handled
+        // by the `then` branch above. On the very first fetch `status` is
+        // already null, so leaving it alone matches the old behaviour exactly.
+      });
   }, [scope, service]);
 
   useEffect(() => {
@@ -3874,6 +3901,15 @@ function ScrobbleAuthRow({
       }
     };
   }, [refresh, clearWaiting]);
+
+  // `expired` and `stale` are computed SERVER-side at fetch time, so with only
+  // the mount fetch and the auth-changed listener above they were frozen for the
+  // whole session: a Settings page left open across the expiry moment kept
+  // showing the green "Connected" badge over a dead token while the line beneath
+  // it counted negative. Re-query on a slow cadence so the badge flips on its
+  // own. Paused while minimized with a catch-up on restore, matching the Cloud
+  // Sync section.
+  useIdleGatedInterval(() => refresh(), 60_000, { runOnResume: true });
 
   // Device-flow poll loop. Runs while `deviceFlow` is set, polls the
   // proxy at the server-suggested interval, dispatches scrobble-auth-

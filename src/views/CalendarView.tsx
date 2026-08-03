@@ -12,6 +12,7 @@ import { formatEpLabel } from "../episodeLabel";
 import { useHoverCardActivation } from "../useHoverCardActivation";
 import { closeHoverNow } from "../catalogHoverStore";
 import { getReleaseSignal } from "../releaseSignalStore";
+import { useWindowHidden } from "../windowVisibility";
 
 // ---------------------------------------------------------------------------
 // CalendarView — full-viewport month grid + day-click overlay
@@ -315,7 +316,35 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
     return { monthCells: cells, rows: r };
   }, [monthAnchor]);
 
-  const today = useMemo(() => startOfDay(new Date()), []);
+  // "Today" must not be frozen at mount. The Calendar can sit open across local
+  // midnight, which left the loud `.cal-today` ring on YESTERDAY's cell until
+  // the user navigated away and back (App only mounts this view while the tab is
+  // active, so a tab switch was the only thing that refreshed it).
+  //
+  // A self-rescheduling timeout wakes exactly once per day boundary instead of
+  // polling, and re-snapping on the hidden -> visible transition covers a
+  // machine that slept through midnight with its timers throttled. Setting the
+  // state to an unchanged value is a React no-op, so neither path costs a
+  // render on an ordinary day.
+  const hidden = useWindowHidden();
+  const [todayMs, setTodayMs] = useState(() => startOfDay(new Date()).getTime());
+  useEffect(() => {
+    setTodayMs(startOfDay(new Date()).getTime());
+    let timer = 0;
+    const arm = () => {
+      const n = new Date();
+      // Built from date PARTS rather than `startOfDay + DAYS_MS`, so the 23- and
+      // 25-hour days at a DST transition still land on the real local midnight.
+      const nextMidnight = new Date(n.getFullYear(), n.getMonth(), n.getDate() + 1).getTime();
+      timer = window.setTimeout(() => {
+        setTodayMs(startOfDay(new Date()).getTime());
+        arm();
+      }, Math.max(1_000, nextMidnight - Date.now()));
+    };
+    arm();
+    return () => window.clearTimeout(timer);
+  }, [hidden]);
+  const today = useMemo(() => new Date(todayMs), [todayMs]);
 
   const monthLabel = monthAnchor.toLocaleDateString(undefined, {
     month: "long",

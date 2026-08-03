@@ -243,23 +243,40 @@ export function airingInfo(
   return { isAiring: airedCount > 0 && anyFuture, latestAiredId, latestAiredEpisode, airedCount };
 }
 
+/** Whether `formatCountdown(target, now, opts)` will print a seconds field.
+ *
+ *  SINGLE SOURCE OF TRUTH, read by the formatter below AND by
+ *  `useCountdownNow` to pick its tick period. Keeping both on this one
+ *  predicate is the entire point: they drifted apart once already (the hook
+ *  assumed "no seconds are shown more than an hour out" while the formatter
+ *  only ever drops seconds past a DAY, and only in compact mode), which left
+ *  the Continue-Watching pill printing a live seconds digit that advanced in
+ *  30-second jumps. If you add a new seconds-suppression rule to
+ *  formatCountdown, add it HERE, not inline. */
+function showsSeconds(remainingMs: number, opts?: { compactDays?: boolean }): boolean {
+  return !(opts?.compactDays === true && remainingMs >= DAY_MS);
+}
+
 /**
- * Full-precision countdown string, always down to the second:
+ * Full-precision countdown string, down to the second:
  * "30d 16h 05m 30s", "16h 05m 30s", "5m 30s", or "30s". Lower units are
  * zero-padded once a larger unit is present so the ticking display doesn't
  * jitter in width. Returns "Released" once the target is in the past
  * (callers usually filter those out via computeReleaseCountdowns, but this
- * keeps the formatter total). Seconds are included everywhere by design —
- * consumers pair this with a 1 s tick (see useCountdownNow) so it advances
- * live.
+ * keeps the formatter total).
+ *
+ * Seconds are shown in every case except compact mode at day scale (see
+ * `showsSeconds`). Whatever you pass as `opts` here, pass the SAME opts to
+ * `useCountdownNow` so the tick cadence matches the precision on screen.
  */
 export function formatCountdown(
   targetMs: number,
   nowMs: number = Date.now(),
   opts?: { compactDays?: boolean },
 ): string {
-  let delta = targetMs - nowMs;
-  if (delta <= 0) return "Released";
+  const remaining = targetMs - nowMs;
+  if (remaining <= 0) return "Released";
+  let delta = remaining;
   const days = Math.floor(delta / DAY_MS);
   delta -= days * DAY_MS;
   const hours = Math.floor(delta / HOUR_MS);
@@ -270,8 +287,8 @@ export function formatCountdown(
   const pad = (n: number) => String(n).padStart(2, "0");
   // Compact mode (opt-in, used by the narrow episode-drawer chip): at
   // day-scale the seconds are noise AND push the string past the 120px
-  // cell, so drop them — "13d 12h 13m" instead of "13d 12h 13m 19s".
-  if (days > 0 && opts?.compactDays) return `${days}d ${pad(hours)}h ${pad(mins)}m`;
+  // cell, so drop them ("13d 12h 13m" instead of "13d 12h 13m 19s").
+  if (!showsSeconds(remaining, opts)) return `${days}d ${pad(hours)}h ${pad(mins)}m`;
   if (days > 0) return `${days}d ${pad(hours)}h ${pad(mins)}m ${pad(secs)}s`;
   if (hours > 0) return `${hours}h ${pad(mins)}m ${pad(secs)}s`;
   if (mins > 0) return `${mins}m ${pad(secs)}s`;
@@ -297,30 +314,52 @@ export function formatTargetDate(targetMs: number): string {
 // rarely changes, so compute that in the parent and let each leaf tick its
 // own value.
 //
-// CPU: two built-in economies, both invisible to the caller —
-//   * Adaptive cadence. Pass `targetMs` and the hook ticks every 30 s while the
-//     target is more than an hour out (formatCountdown shows no seconds that far
-//     away, so a 1 s tick is wasted re-renders) and switches to 1 s inside the
-//     final hour for smooth seconds. Omit `targetMs` to always tick at 1 s
-//     (callers that always show seconds, e.g. the end-of-stream countdown).
-//   * Hidden gate. While the window is minimized / occluded no countdown text is
-//     visible, so the interval is torn down entirely and `now` snaps forward the
-//     instant the window is restored. Universal across every caller.
+// CPU: two built-in economies, both invisible to the caller.
+//   * Adaptive cadence. The tick period is derived from `showsSeconds`, i.e.
+//     from what formatCountdown will ACTUALLY print for this target and these
+//     opts: 1 s whenever a seconds field is on screen, COARSE_TICK_MS once the
+//     smallest visible unit is minutes (compact mode at day scale). Pass the
+//     SAME `opts` you pass to formatCountdown. Omitting them makes the hook
+//     assume seconds are visible and tick at 1 s, which is the safe direction.
+//
+//     LANDMINE: do NOT coarsen on a plain "the target is far away" test. That
+//     was the original rule and it was wrong, because formatCountdown prints
+//     seconds at day scale too: the Continue-Watching pill sat frozen for 30 s
+//     at a time and then jumped by 30, and the episode chip did the same for
+//     the ~23 h before every episode. Cadence must follow the RENDERED
+//     precision, never the distance to the target.
+//   * Hidden gate. While the window is minimized no countdown text is visible,
+//     so the interval is torn down entirely and `now` snaps forward the instant
+//     the window is restored. Deliberately minimize-only, and deliberately the
+//     only tier: a merely unfocused window keeps ticking, and there is no
+//     "occluded" tier, because one tick is a single leaf re-render (well under
+//     a millisecond even with every countdown on screen) and throttling it
+//     further would not save measurable CPU. Occlusion is not detectable here
+//     anyway (see windowVisibility.ts).
 // ---------------------------------------------------------------------------
 
 import { useState, useEffect } from "react";
 import { useWindowHidden } from "./windowVisibility";
 
-export function useCountdownNow(targetMs?: number): number {
+/** Tick used only when the smallest VISIBLE unit is minutes. 30 s is a 2x
+ *  oversample of a 60 s display unit, so the minute is never more than ~30 s
+ *  behind, at 1/30th the wakeups of the 1 s tick. */
+const COARSE_TICK_MS = 30_000;
+
+export function useCountdownNow(
+  targetMs?: number,
+  opts?: { compactDays?: boolean },
+): number {
   const [now, setNow] = useState(() => Date.now());
   const hidden = useWindowHidden();
-  // Coarse 30 s tick while the target is >1 h out (no seconds shown), 1 s in the
-  // final hour or when no target is supplied. Recomputed from `now`, so it flips
-  // to 1 s once exactly as the target crosses the one-hour mark.
+  // Recomputed from `now`, so the cadence sharpens on its own as the target
+  // closes in and the formatter starts printing seconds. `intervalMs` is a
+  // plain number, which keeps `opts` out of the dep array below: a fresh object
+  // literal every render must not re-arm the interval.
   const intervalMs =
-    targetMs != null && targetMs - now > 60 * 60 * 1000 ? 30_000 : 1_000;
+    targetMs != null && !showsSeconds(targetMs - now, opts) ? COARSE_TICK_MS : 1_000;
   useEffect(() => {
-    if (hidden) return; // nothing visible to tick while minimized/occluded
+    if (hidden) return; // nothing visible to tick while minimized
     setNow(Date.now()); // snap on (re)mount and on resume from hidden
     const id = window.setInterval(() => setNow(Date.now()), intervalMs);
     return () => window.clearInterval(id);

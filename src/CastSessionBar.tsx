@@ -7,6 +7,7 @@
 // Play/pause, ±15 s, stop-and-resume-locally.
 // ---------------------------------------------------------------------------
 
+import { useEffect, useRef, useState } from "react";
 import type { CastStatus } from "./cast";
 
 interface CastSessionBarProps {
@@ -28,11 +29,104 @@ function fmt(sec: number): string {
     : `${m}:${String(r).padStart(2, "0")}`;
 }
 
+/**
+ * Wall-clock interpolation of the cast position between device-status polls.
+ *
+ * `fmt` above renders SECONDS, but `status` only refreshes on useCastSession's
+ * 2 s poll, so the timecode used to step 0:00 -> 0:02 -> 0:04 with jitter from
+ * the device RTT. Polling faster is the wrong fix: every poll is a fresh CASTV2
+ * TLS connect or a DLNA SOAP call, and that cadence is a deliberate LAN-chatter
+ * budget (see cast/mod.rs). So the bar runs its own clock between samples and
+ * re-anchors on each one, which costs no extra device traffic at all.
+ *
+ * Only while PLAYING: a paused or buffering device is not advancing, and a
+ * stopped one has nothing to advance. Interpolating is safe against overshoot
+ * because our anchor is already ~RTT/2 behind the device's true position, so
+ * re-anchoring pulls the display forward rather than snapping it back.
+ */
+/** How far the device may report BEHIND our projection before we believe it is
+ *  a real rewind rather than poll jitter. Comfortably above DLNA's 1 s
+ *  quantisation plus RTT variance, and far below the 15 s skip buttons. */
+const SEEK_EPSILON_SEC = 2;
+
+function useInterpolatedPosition(status: CastStatus | null): number | null {
+  const reported = status?.position_sec ?? null;
+  const duration = status?.duration_sec ?? null;
+  const playing = status?.player_state === "playing";
+
+  const [anchor, setAnchor] = useState<{ at: number; pos: number } | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  // Re-anchor on every position the device reports. The device stays the source
+  // of truth; we only fill the gaps.
+  //
+  // `playing` is load-bearing in the dep list, NOT decoration. `reported` is a
+  // primitive, so React skips this effect whenever a poll repeats the same
+  // number, and a DLNA renderer repeats it constantly: dlna.rs parses `RelTime`,
+  // which AVTransport renders as HH:MM:SS, so positions are whole seconds and do
+  // not move at all across a pause. Without `playing` here, `anchor.at` would
+  // stay pinned at the instant playback stopped while the projection below
+  // credits every millisecond since then as PLAYED time. Resuming after a
+  // 5-minute pause would then read 6:41 instead of 1:41 (or clamp to the
+  // duration and look finished) until the next poll happened to report a
+  // different second. Re-stamping on the play-state transition costs nothing:
+  // both deps are primitives, so this still only runs on genuine transitions.
+  // Chromecast masked the bug, because castv2.rs reports `currentTime` as a
+  // float that almost always differs.
+  const prevPlayingRef = useRef(playing);
+  useEffect(() => {
+    const playStateChanged = prevPlayingRef.current !== playing;
+    prevPlayingRef.current = playing;
+    if (reported == null) {
+      setAnchor(null);
+      return;
+    }
+    const at = Date.now();
+    setAnchor((prev) => {
+      // MONOTONIC GUARD. A fresh sample routinely lands slightly BEHIND what we
+      // are already projecting: it was taken ~RTT/2 ago, the RTT jitters between
+      // polls, and DLNA quantises to whole seconds. Accepting it verbatim would
+      // step the timecode backwards ("1:43 -> 1:42 -> 1:43"), which the old
+      // 2 s-stepping display never did, so it would read as a new glitch. Hold
+      // the current anchor for a sub-SEEK_EPSILON regression and let the clock
+      // carry on; a genuine rewind (the -15 s button, or a seek on the device)
+      // clears the threshold easily and is accepted at once. Clock drift cannot
+      // accumulate past the threshold, because a bigger gap is always taken.
+      //
+      // Skipped when the play state just flipped: that anchor is stale by the
+      // whole pause and MUST be replaced, however far back it drags us.
+      if (prev && playing && !playStateChanged) {
+        const projected = prev.pos + Math.max(0, at - prev.at) / 1000;
+        const regression = projected - reported;
+        if (regression > 0 && regression < SEEK_EPSILON_SEC) return prev;
+      }
+      return { at, pos: reported };
+    });
+    setNowMs(at);
+  }, [reported, playing]);
+
+  // 500 ms is a 2x oversample of the 1 s unit `fmt` prints, so a second never
+  // renders a whole unit late. No timer at all unless the device is playing.
+  useEffect(() => {
+    if (!playing) return;
+    const id = window.setInterval(() => setNowMs(Date.now()), 500);
+    return () => window.clearInterval(id);
+  }, [playing]);
+
+  if (anchor == null) return null;
+  if (!playing) return anchor.pos;
+  const projected = anchor.pos + Math.max(0, nowMs - anchor.at) / 1000;
+  // Never run past the end: if the device stops answering near EOF, a free-
+  // running clock would otherwise count on forever.
+  return duration && duration > 0 ? Math.min(projected, duration) : projected;
+}
+
 export default function CastSessionBar({
   deviceName, status, onTogglePlayPause, onSeekBy, onStop, isFullscreen,
 }: CastSessionBarProps) {
   const playing = status?.player_state === "playing";
   const buffering = status?.player_state === "buffering";
+  const positionSec = useInterpolatedPosition(status);
   return (
     <div
       className="fixed left-1/2 -translate-x-1/2 z-[10000] aura-glass-bar rounded-2xl
@@ -57,8 +151,8 @@ export default function CastSessionBar({
         <p className="text-white/45 text-[11px] tabular-nums leading-tight">
           {buffering
             ? "buffering…"
-            : status
-              ? `${fmt(status.position_sec)}${status.duration_sec ? ` / ${fmt(status.duration_sec)}` : ""}`
+            : status && positionSec != null
+              ? `${fmt(positionSec)}${status.duration_sec ? ` / ${fmt(status.duration_sec)}` : ""}`
               : "connecting…"}
         </p>
       </div>

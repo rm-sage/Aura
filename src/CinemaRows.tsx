@@ -654,9 +654,14 @@ function CWReleaseCountdown({ seriesId, episodes }: { seriesId: string; episodes
   useReleaseSignalsVersion(); // re-read getReleaseSignal when signals update
   // Resolve the target FIRST (a one-shot Date.now() is fine for picking the
   // next future episode; the live `now` below still drives the display + aired
-  // guard) so the tick hook can coarsen its cadence to 30 s when the air date
-  // is far out. SOURCE PRIORITY unchanged: authoritative meta videos first, the
+  // guard). SOURCE PRIORITY unchanged: authoritative meta videos first, the
   // cloud release signal only as a fallback (it can point at a later episode).
+  //
+  // NOTE: this pill deliberately passes NO opts to formatCountdown below, so it
+  // renders a full seconds field and useCountdownNow therefore holds a 1 s tick
+  // for its whole visible life. Do not "optimise" that back to a coarse tick
+  // without also dropping the seconds from the string: the two must agree, or
+  // the seconds digit freezes and jumps (releaseCountdown.ts::showsSeconds).
   const probe = Date.now();
   const metaNextMs = episodes ? (nextAiringEpisode(episodes, probe, { mainRunOnly: true })?.targetMs ?? null) : null;
   // Cloud fallback ignores specials (season 0): a finished show with only an

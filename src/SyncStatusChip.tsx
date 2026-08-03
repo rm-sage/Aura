@@ -1,10 +1,10 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import Tooltip from "./Tooltip";
-import { isWindowHidden } from "./windowVisibility";
+import { useIdleGatedInterval } from "./useIdleGate";
 
 // ---------------------------------------------------------------------------
 // SyncStatusChip — tiny cloud icon in the title bar that reflects the live
@@ -44,6 +44,12 @@ interface SyncStatus {
 type ChipState = "guest" | "ok" | "stale" | "error";
 
 const POLL_INTERVAL_MS = 60_000;
+/** Cadence for the relative-time tooltip. Separate from POLL_INTERVAL_MS
+ *  because the two answer different questions: one refetches server state, the
+ *  other just advances the local clock. `formatAgo`'s finest unit is a minute,
+ *  so 30 s is a 2x oversample and the "N min ago" line can never be a whole
+ *  display unit behind. */
+const TICK_INTERVAL_MS = 30_000;
 /** Treat the sync as "stale" when the most recent namespace update is
  *  older than this. One week matches the AniList token warn window —
  *  reasonable for "haven't been active on this account in a while".
@@ -57,40 +63,50 @@ export default function SyncStatusChip() {
   // its own without waiting for the next poll cycle.
   const [tickNow, setTickNow] = useState(() => Date.now());
 
+  // Guards a late `sync_status` reply landing after unmount. Set on mount (not
+  // just at declaration) so a StrictMode double-mount re-arms it.
+  const aliveRef = useRef(true);
   useEffect(() => {
-    let cancelled = false;
-    const refresh = async () => {
-      try {
-        const s = await invoke<SyncStatus>("sync_status");
-        if (cancelled) return;
-        setStatus(s);
-        setErrored(false);
-      } catch {
-        if (cancelled) return;
-        setErrored(true);
-      }
-    };
-    refresh();
-    // The chip lives in the title bar — invisible while minimized, so skip the
-    // status IPC + relative-time tick when hidden (resumes on restore).
-    const pollId = window.setInterval(() => { if (!isWindowHidden()) refresh(); }, POLL_INTERVAL_MS);
-    const tickId = window.setInterval(() => { if (!isWindowHidden()) setTickNow(Date.now()); }, POLL_INTERVAL_MS);
+    aliveRef.current = true;
+    return () => { aliveRef.current = false; };
+  }, []);
+
+  const refresh = useCallback(async () => {
+    try {
+      const s = await invoke<SyncStatus>("sync_status");
+      if (!aliveRef.current) return;
+      setStatus(s);
+      setErrored(false);
+    } catch {
+      if (!aliveRef.current) return;
+      setErrored(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
     // Refresh on settings change (theme, etc. — cheap) AND on session
     // transitions (sign-in / sign-out / account switch — the chip's
     // primary trigger for changing colour). Without the session
     // listener, the chip would lag up to one POLL_INTERVAL_MS after
     // login before going from gray to green.
-    const onRefreshSignal = () => refresh();
+    const onRefreshSignal = () => { void refresh(); };
     window.addEventListener("aura:settings-changed", onRefreshSignal);
     window.addEventListener("aura:session-changed",  onRefreshSignal);
     return () => {
-      cancelled = true;
-      window.clearInterval(pollId);
-      window.clearInterval(tickId);
       window.removeEventListener("aura:settings-changed", onRefreshSignal);
       window.removeEventListener("aura:session-changed",  onRefreshSignal);
     };
-  }, []);
+  }, [refresh]);
+
+  // The chip lives in the title bar, invisible while minimized, so both the
+  // status IPC and the relative-time tick pause there. `runOnResume` is the
+  // load-bearing half: the old hand-rolled `if (!isWindowHidden())` intervals
+  // skipped their work while hidden but had no catch-up, so restoring after an
+  // hour in the tray left the tooltip reporting whatever it said on the way
+  // out, for up to a further minute. Both now snap current on the way back in.
+  useIdleGatedInterval(() => { void refresh(); }, POLL_INTERVAL_MS, { runOnResume: true });
+  useIdleGatedInterval(() => setTickNow(Date.now()), TICK_INTERVAL_MS, { runOnResume: true });
 
   // Most recent updated_at across all namespaces. `null` when:
   //   • Guest mode (no namespaces returned)
@@ -163,7 +179,13 @@ const COLOR: Record<ChipState, string> = {
 function formatAgo(diffMs: number): string {
   if (diffMs < 0) return "in the future";
   const sec = Math.round(diffMs / 1000);
-  if (sec < 60) return `${sec}s ago`;
+  // Deliberately NO seconds bucket. The clock behind this advances every
+  // TICK_INTERVAL_MS, so a "42s ago" reading would be wrong the instant after
+  // it rendered and would sit frozen until the next tick; "just now" is true
+  // for the whole sub-minute window. Matches SettingsView's formatAgo. If you
+  // ever want real seconds here, the tick has to drop to 1 s with it (same
+  // rule as releaseCountdown.ts::showsSeconds).
+  if (sec < 45) return "just now";
   const min = Math.round(diffMs / 60_000);
   if (min < 60) return `${min} min ago`;
   const hr = Math.round(diffMs / 3_600_000);

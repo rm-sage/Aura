@@ -11,6 +11,7 @@ import {
 } from "./NotificationsContext";
 import Tooltip from "./Tooltip";
 import { openExternalUrl } from "./externalUrl";
+import { useIdleGatedInterval } from "./useIdleGate";
 
 // ---------------------------------------------------------------------------
 // NotificationsPanel — anchored ABOVE the bell (bottom-12 left-3 in absolute
@@ -56,6 +57,19 @@ export default function NotificationsPanel({
   // updates remain on the list per the kind-doc contract. The button
   // disables when there's nothing left to dismiss.
   const hasDismissable = notifications.some((n) => n.kind !== "update");
+
+  // `relativeTime` reads Date.now() at render, so without a tick of our own
+  // every row's timestamp freezes at whatever it said when the panel opened:
+  // a notification that arrived seconds ago reads "Just now" indefinitely.
+  // Nothing else re-renders this on a cadence, and NotificationRow is not
+  // memo'd, so bumping panel state is enough to refresh every row.
+  //
+  // 30 s is a 2x oversample of relativeTime's finest unit (minutes, with a 45 s
+  // "Just now" threshold). The panel only mounts while the popover is open
+  // (NotificationsBell renders it behind `open &&`), so this costs nothing the
+  // rest of the time.
+  const [, bumpClock] = useState(0);
+  useIdleGatedInterval(() => bumpClock((n) => n + 1), 30_000, { runOnResume: true });
 
   return (
     <div
@@ -522,7 +536,13 @@ function relativeTime(ts: number): string {
   if (diff < 0) return "Just now";
   const sec = Math.floor(diff / 1000);
   if (sec < 45) return "Just now";
-  const min = Math.floor(sec / 60);
+  // ROUND, not floor. With `Math.floor(sec / 60)` the 15 s band between the 45 s
+  // "Just now" threshold and the first whole minute rendered "0m ago" - a string
+  // that is simply wrong. It was always reachable, but a mount-render only
+  // sampled it by luck; now that the panel ticks, a row walks through that band
+  // on a cadence. Rounding matches the two sibling formatters (SyncStatusChip's
+  // formatAgo and SettingsView's), where 45 s reads "1 min ago".
+  const min = Math.round(diff / 60_000);
   if (min < 60) return `${min}m ago`;
   const hr = Math.floor(min / 60);
   if (hr < 24) return `${hr}h ago`;

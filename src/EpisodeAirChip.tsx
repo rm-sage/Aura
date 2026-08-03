@@ -10,15 +10,23 @@
 //
 // Render this INSIDE the thumbnail's `relative` container — it positions
 // itself absolutely (bottom-centre). Render EXACTLY ONE per list, on the
-// next-airing row. PERF: owns its own 1 s tick, so only this pill
-// re-renders each second; the surrounding episode list never ticks. Later
-// unaired rows show a static date in the card body instead.
+// next-airing row. PERF: owns its own tick, so only this pill re-renders;
+// the surrounding episode list never ticks. Later unaired rows show a static
+// date in the card body instead.
+//
+// The SAME `compactDays` opts go to both useCountdownNow and formatCountdown,
+// so the tick matches the precision on screen: 30 s at day scale (where the
+// string ends at minutes) and 1 s inside 24 h (where it grows a seconds
+// field). Passing them to only one of the two is the bug they exist to
+// prevent, see releaseCountdown.ts::showsSeconds.
 // ---------------------------------------------------------------------------
 
 import { formatCountdown, useCountdownNow } from "./releaseCountdown";
 
+const COUNTDOWN_OPTS = { compactDays: true } as const;
+
 export default function EpisodeAirChip({ targetMs }: { targetMs: number }) {
-  const now = useCountdownNow(targetMs);
+  const now = useCountdownNow(targetMs, COUNTDOWN_OPTS);
   if (targetMs <= now) return null; // aired since mount — drop the pill
   return (
     <div className="absolute inset-x-0 bottom-1.5 flex justify-center pointer-events-none z-10">
@@ -33,7 +41,7 @@ export default function EpisodeAirChip({ targetMs }: { targetMs: number }) {
           <circle cx="12" cy="12" r="9" />
           <path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
-        {formatCountdown(targetMs, now, { compactDays: true })}
+        {formatCountdown(targetMs, now, COUNTDOWN_OPTS)}
       </span>
     </div>
   );
