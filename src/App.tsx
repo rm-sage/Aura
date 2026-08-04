@@ -1577,6 +1577,37 @@ function activeTargetIsAnime(
   });
 }
 
+/**
+ * Shortest runtime Aura will accept as a real title.
+ *
+ * A debrid service or addon that fails to resolve does not always return an
+ * HTTP error: TorBox and friends answer with a short MP4 that PLAYS PERFECTLY
+ * and simply reads "REQUEST TIMED OUT" on screen. mpv sees an ordinary,
+ * healthy ~30 s file, so nothing downstream knows anything went wrong.
+ *
+ * That matters because every completion gate in this file is expressed as a
+ * RATIO of duration - "watched >= 80 %", "reached >= 90 %", "remaining <=
+ * lead" - and a 30 s clip satisfies all of them trivially by running to its
+ * own end. The observed symptom was an End-of-Season Spotlight offering the
+ * next episode as though the episode that never played had been finished.
+ *
+ * So the floor is ABSOLUTE, not proportional. 120 s is not a new invention: it
+ * is the bar PROGRESS_WARMUP_S, MEANINGFUL_WATCH_S and useScrobble's
+ * START_WARMUP_S already apply, so a file whose entire duration is under it can
+ * never produce a genuine WATCH by Aura's own existing definition. Letting it
+ * produce a genuine COMPLETION was the inconsistency. Real episodes and films
+ * are always longer; what is shorter is an error card, a sample file or a
+ * placeholder, none of which the user watched.
+ */
+const MIN_PLAUSIBLE_TITLE_S = 120;
+
+/** True when the loaded file is too short to be the title it claims to be.
+ *  A missing / zero duration means "not known yet", which is NOT short: never
+ *  suppress on absent data, only on a positive reading below the floor. */
+function isImplausiblyShortStream(duration: number | null | undefined): boolean {
+  return typeof duration === "number" && duration > 0 && duration < MIN_PLAUSIBLE_TITLE_S;
+}
+
 export default function App() {
   // ── Nav state ──
   // Restore the route from sessionStorage on a webview reload (Ctrl+R / F5)
@@ -3676,6 +3707,11 @@ export default function App() {
   // across renders).
   const pausedRef = useRef(paused);
   useEffect(() => { pausedRef.current = paused; }, [paused]);
+  // Same reason as pausedRef: the eos-detected listener is registered once and
+  // outlives every render, so it cannot read `duration` directly without
+  // capturing the value from the render that installed it (0, at load).
+  const durationRef = useRef(duration);
+  useEffect(() => { durationRef.current = duration; }, [duration]);
 
   useEffect(() => {
     const onEos = () => {
@@ -3690,6 +3726,28 @@ export default function App() {
       // while paused, so streamBroken could never flip afterwards and the
       // auto-retry effect would never run.
       if (isLivePlayback) { setStreamBroken(true); return; }
+      // The file is too short to be the episode it claims to be, so reaching
+      // its end is not a completion. This is the debrid "REQUEST TIMED OUT"
+      // clip: a healthy ~30 s MP4 that plays to EOF and would otherwise raise
+      // the Spotlight offering the NEXT episode, as though this one had been
+      // watched. Say what happened instead, and leave the current target
+      // untouched so nothing is marked, advanced or removed.
+      //
+      // Checked after the live-TV branch on purpose: a live channel reporting a
+      // short duration is a dropped stream, which belongs on the reconnect path.
+      const eosDur = durationRef.current;
+      if (isImplausiblyShortStream(eosDur)) {
+        console.warn(
+          `[eos] suppressed: stream is ${Math.round(eosDur)}s, under the ${MIN_PLAUSIBLE_TITLE_S}s ` +
+          `floor - treating as a source error clip, not a finished title`,
+        );
+        showAppToast(
+          `That stream was only ${Math.round(eosDur)}s long, so it was not the episode. ` +
+          `The source likely returned an error clip - try a different one.`,
+          { tone: "danger", duration: 7000 },
+        );
+        return;
+      }
       setEosActive(true);
       // Pause mpv at the last frame. This silences the 1 Hz stale-
       // heartbeat detector's `if (paused) return` short-circuit, so no
@@ -3758,6 +3816,9 @@ export default function App() {
     if (!activeTarget) return;
     if (nextUpLeadSeconds <= 0) return; // user disabled the feature
     if (!duration || duration <= 0) return;
+    // An error clip is not an episode, so do not spend an addon round-trip
+    // pre-resolving "what's next" for it (see MIN_PLAUSIBLE_TITLE_S).
+    if (isImplausiblyShortStream(duration)) return;
     if (!addons || addons.length === 0) return;
     const mt = (activeTarget.media_type ?? "").toLowerCase();
     if (mt !== "series" && mt !== "anime") return;
@@ -6871,7 +6932,12 @@ export default function App() {
         // removed once genuinely finished. A manual "watched" mark is explicit
         // intent. A full genuine rewatch legitimately removes it again.
         if (settings.libraryAutoRemoveWatchedMovies) {
+          // Both halves of this are RATIOS of duration, so a 30 s debrid error
+          // clip clears them by simply running out (0.7 * 30 s is 21 s). The
+          // absolute floor is what stops a failed resolve auto-removing a film
+          // from the library as "finished". See MIN_PLAUSIBLE_TITLE_S.
           const genuineFinish =
+            !isImplausiblyShortStream(duration) &&
             duration > 0 && time / duration >= 0.9 && watchedElapsedRef.current >= 0.7 * duration;
           shouldRemove = genuineFinish || getManualWatchedState(rootId) === "watched";
         }
