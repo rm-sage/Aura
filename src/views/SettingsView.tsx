@@ -5489,7 +5489,7 @@ export default function SettingsView({ addons, session }: Props) {
             <Section id="sec-window" title="Window & System">
               <SettingToggle
                 label="Minimize to tray on close"
-                description="Hide Aura to a tray icon when you click the close button instead of exiting. Click the tray icon to bring the window back, or right-click it for Quit. To exit without going to the tray first, press and hold the close button for two seconds."
+                description="Hide Aura to a tray icon when you click the close button instead of exiting. Click the tray icon to bring the window back, or right-click it for Quit. To exit without going to the tray first, press and hold the close button for a second."
                 value={backend.minimize_to_tray_on_close}
                 onChange={(v) => patchBackend({ minimize_to_tray_on_close: v })}
               />

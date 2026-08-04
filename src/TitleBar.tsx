@@ -363,7 +363,7 @@ interface BtnProps {
 /** How long the close button must be held to force a full quit. Kept in ONE
  *  place: it drives both the JS timer and the CSS fill's duration, so the bar
  *  reaching the far edge and the quit firing can never drift apart. */
-const HOLD_TO_QUIT_MS = 2000;
+const HOLD_TO_QUIT_MS = 1000;
 
 /**
  * Close button. A normal click does whatever the setting says (quit, or hide to
