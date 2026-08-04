@@ -367,6 +367,11 @@ static FORCE_QUIT: AtomicBool = AtomicBool::new(false);
 /// Backs the press-and-hold on the title-bar close button and the tray's Quit.
 #[tauri::command]
 pub fn request_quit<R: Runtime>(app: AppHandle<R>) {
+    // Logged because otherwise the three exits (X, the close-button hold, the
+    // tray's Quit) are indistinguishable in a session log: they all converge on
+    // CloseRequested and the only trace is the engine teardown, which every
+    // exit produces. This line is what says the force-quit override was used.
+    crate::devlog!(info, "window", "force quit requested - overriding minimize-to-tray");
     FORCE_QUIT.store(true, Ordering::SeqCst);
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.close();
