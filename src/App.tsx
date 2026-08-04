@@ -55,7 +55,7 @@ import { useKeybindings } from "./useKeybindings";
 import { libraryToggle, libraryRemoveAll, libraryWriteProgress, libraryClearProgress } from "./libraryActions";
 import { libraryItemSeriesId } from "./libraryNormalize";
 import { isWindowHidden, isWindowFocused, useWindowHidden, subscribeWindowVisibility } from "./windowVisibility";
-import { sourcesForMeta, openInPopupBrowser } from "./externalSources";
+import { sourcesForMeta, openSourceLink } from "./externalSources";
 import { setManualWatchedScope, getManualWatchedState, setManualWatchedState, setManualWatchedMany, getPlannedQueue } from "./manualWatched";
 import { reconcileLibraryReleaseSignals, clearReleaseSignalStore, getReleaseSignal } from "./releaseSignalStore";
 import { syncPullAll, installSyncTriggers, startBackgroundPull, clearSyncEtags, setSyncActiveScope } from "./sync";
@@ -5368,7 +5368,11 @@ export default function App() {
       // expands on hover. Anime metas surface AniList / MAL / Kitsu;
       // everything else surfaces IMDb / TMDB / Trakt / RT / Metacritic
       // / Letterboxd (movies-only).
-      const sources = sourcesForMeta(meta);
+      // Hand the richer anime verdict AND the cached detail down: the detail
+      // carries mal / kitsu / tmdb ids, which is what turns most of these rows
+      // from a title search into a direct link to the title's own page. On a
+      // cache miss it is simply null and each source falls back to search.
+      const sources = sourcesForMeta(meta, { detail: cachedDetail, isAnime });
       if (sources.length > 0) {
         items.push({
           kind: "submenu",
@@ -5380,7 +5384,7 @@ export default function App() {
           ),
           items: sources.map((s) => ({
             label: s.label,
-            onClick: () => openInPopupBrowser(s.url, s.source),
+            onClick: () => { void openSourceLink(s); },
           })),
         });
       }
