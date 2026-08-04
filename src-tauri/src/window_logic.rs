@@ -346,6 +346,41 @@ fn pause_mpv<R: Runtime>(app: &AppHandle<R>) {
 /// maximize/restore transition (not every drag-resize tick).
 static LAST_MAXIMIZED: AtomicI8 = AtomicI8::new(-1);
 
+// ---------------------------------------------------------------------------
+// Force quit
+//
+// With `minimize_to_tray_on_close` on, the X button (and Alt+F4, and every
+// other close route) only HIDES the window, and the tray icon is shown only
+// WHILE hidden - so from a visible window there was no way to actually end the
+// process. This flag is the override: set it, then issue an ordinary close, and
+// the CloseRequested handler below takes the full-exit branch instead of the
+// tray branch.
+//
+// Deliberately routed back through CloseRequested rather than calling
+// `app.exit(0)` directly. That path owns the whole shutdown discipline -
+// synchronous MPV teardown so WASAPI is released (landmine #9), the scrobble
+// flush that stops Trakt sitting on "Currently watching", cast teardown, and
+// the window-state save. `app.exit(0)` skips every one of them.
+static FORCE_QUIT: AtomicBool = AtomicBool::new(false);
+
+/// Fully exit Aura, overriding `minimize_to_tray_on_close` for this one close.
+/// Backs the press-and-hold on the title-bar close button and the tray's Quit.
+#[tauri::command]
+pub fn request_quit<R: Runtime>(app: AppHandle<R>) {
+    FORCE_QUIT.store(true, Ordering::SeqCst);
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.close();
+    }
+}
+
+/// Abandon a pending force quit. Called when the user backs out of the
+/// scrobble-in-progress prompt: without it the flag would stay armed and the
+/// NEXT ordinary X click would quit instead of minimising to tray.
+#[tauri::command]
+pub fn cancel_quit() {
+    FORCE_QUIT.store(false, Ordering::SeqCst);
+}
+
 /// Install the window-event handler. Call from Tauri `setup`.
 pub fn install<R: Runtime>(app: &AppHandle<R>) {
     let Some(window) = app.get_webview_window("main") else { return };
@@ -462,10 +497,24 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                 //
                 // Runs FIRST, before any shutdown housekeeping, so a prevented close
                 // leaves no side effects behind.
-                if !cfg.minimize_to_tray_on_close && crate::scrobble::scrobble_run_active() {
+                // Is this close actually going to END the process? Normally that
+                // is just "tray mode is off", but a force quit (press-and-hold on
+                // the close button, or the tray's Quit) overrides tray mode for
+                // this one close. Everything below branches on THIS, not on the
+                // setting, so the force-quit path gets the identical shutdown
+                // discipline an ordinary close gets.
+                let exiting =
+                    FORCE_QUIT.load(Ordering::SeqCst) || !cfg.minimize_to_tray_on_close;
+
+                if exiting && crate::scrobble::scrobble_run_active() {
                     api.prevent_close();
                     use tauri::Emitter;
                     let _ = handle.emit("aura:scrobble-close-request", ());
+                    // FORCE_QUIT is intentionally LEFT ARMED here: the prompt's
+                    // "finish" and "stop and close" paths re-issue a plain close,
+                    // and that follow-up must still quit rather than fall back to
+                    // hiding. The "keep Aura open" path disarms it explicitly via
+                    // cancel_quit().
                     return;
                 }
 
@@ -494,7 +543,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     );
                 }
 
-                if cfg.minimize_to_tray_on_close {
+                if !exiting {
                     // Tray-hide path — keep the process alive, let the user
                     // bring the window back via the tray icon. We deliberately
                     // do NOT stop MPV: hiding the window mid-playback should

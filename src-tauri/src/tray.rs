@@ -39,7 +39,16 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "tray-show" => show_main_window(app),
-            "tray-quit" => app.exit(0),
+            // Route the quit through the window's CloseRequested handler rather
+            // than exiting outright. `app.exit(0)` returns from the event loop
+            // immediately and runs NONE of the shutdown work: MPV is never torn
+            // down (so libmpv can hold its WASAPI device past process exit -
+            // landmine #9), the scrobble stop is never flushed (Trakt stays on
+            // "Currently watching"), and the cast session is never stopped.
+            // request_quit arms the force-quit flag and issues a normal close, so
+            // quitting from the tray now gets the same teardown as clicking X
+            // with tray mode off.
+            "tray-quit" => crate::window_logic::request_quit(app.clone()),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {

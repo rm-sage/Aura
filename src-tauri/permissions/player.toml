@@ -155,6 +155,12 @@ identifier = "allow-platform"
 description = "Allows the frontend to query basic host platform facts (whether the OS is Windows 10 vs 11) to gate platform-specific UI behavior"
 commands.allow = ["is_windows_10"]
 
+# ── App lifecycle (force quit) ───────────────────────────────────────────────
+[[permission]]
+identifier = "allow-app-lifecycle"
+description = "Allows the frontend to fully exit Aura even when `minimize_to_tray_on_close` would otherwise turn a close into a tray-hide (the press-and-hold on the title-bar close button), and to abandon that pending quit if the user backs out of the scrobble-in-progress prompt"
+commands.allow = ["request_quit", "cancel_quit"]
+
 # ── Phase 3B: app settings (theme, defaults) ─────────────────────────────────
 [[permission]]
 identifier = "allow-settings"

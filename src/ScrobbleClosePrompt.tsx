@@ -87,6 +87,13 @@ export default function ScrobbleClosePrompt({
     waitingRef.current = false;
     setWaiting(false);
     setOpen(false);
+    // Backing out must also disarm any pending FORCE QUIT. This prompt can be
+    // raised by a press-and-hold on the close button (a deliberate "quit even
+    // though tray mode is on"), and Rust keeps that flag armed across the
+    // prompt so the "finish" / "stop and close" paths still quit rather than
+    // silently hiding. Cancelling here is what stops the flag leaking into the
+    // NEXT ordinary X click, which would then quit instead of minimising.
+    void invoke("cancel_quit").catch(() => {});
   }, []);
 
   if (!open) return null;

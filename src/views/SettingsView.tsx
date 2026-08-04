@@ -4566,6 +4566,17 @@ export default function SettingsView({ addons, session }: Props) {
       if (Object.keys(patch).some((k) => k.startsWith("subtitle_"))) {
         invoke("apply_subtitle_style").catch(() => {});
       }
+      // The title bar's close button changes behaviour with this one setting
+      // (a click hides to tray, so it grows a hold-to-quit affordance), and it
+      // reads the value itself rather than taking a prop. Nudge it so the
+      // toggle applies immediately instead of on next launch.
+      //
+      // Deliberately narrow: `aura:settings-changed` also drives an AuraSkip
+      // re-stamp and a sync-chip refresh, so firing it on EVERY backend patch
+      // would cause pointless churn on unrelated settings.
+      if ("minimize_to_tray_on_close" in patch) {
+        window.dispatchEvent(new Event("aura:settings-changed"));
+      }
     } catch {
       // ignore — UI keeps its optimistic state
     }
@@ -5478,7 +5489,7 @@ export default function SettingsView({ addons, session }: Props) {
             <Section id="sec-window" title="Window & System">
               <SettingToggle
                 label="Minimize to tray on close"
-                description="Hide Aura to a tray icon when you click the close button instead of exiting. Click the tray icon to bring the window back."
+                description="Hide Aura to a tray icon when you click the close button instead of exiting. Click the tray icon to bring the window back, or right-click it for Quit. To exit without going to the tray first, press and hold the close button for two seconds."
                 value={backend.minimize_to_tray_on_close}
                 onChange={(v) => patchBackend({ minimize_to_tray_on_close: v })}
               />

@@ -134,6 +134,27 @@ export default function TitleBar({ subtitle, opaque }: Props) {
   const maximize = useCallback(() => { getCurrentWindow().toggleMaximize(); }, []);
   const close    = useCallback(() => { getCurrentWindow().close(); }, []);
 
+  // Whether a click on X only HIDES to tray. Drives the close button's
+  // hold-to-quit affordance and its tooltip: hold-to-quit is offered ONLY when
+  // a plain click would not exit, because otherwise it would just be a slower
+  // way to do what the click already does. Re-read on `aura:settings-changed`
+  // so toggling the setting updates the button without a restart.
+  const [trayOnClose, setTrayOnClose] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    const read = () => {
+      invoke<{ minimize_to_tray_on_close?: boolean }>("get_settings")
+        .then((s) => { if (alive) setTrayOnClose(!!s?.minimize_to_tray_on_close); })
+        .catch(() => {});
+    };
+    read();
+    window.addEventListener("aura:settings-changed", read);
+    return () => {
+      alive = false;
+      window.removeEventListener("aura:settings-changed", read);
+    };
+  }, []);
+
   // Double-click on the drag region toggles maximize, matching standard OS
   // behaviour. Works on both platforms because the drag is deferred until the
   // pointer actually moves (see handlePointerDown), so a plain double-click is
@@ -321,9 +342,7 @@ export default function TitleBar({ subtitle, opaque }: Props) {
         <TitleBarButton onClick={maximize} label={maximized ? "Restore" : "Maximize"} hover="rgba(255,255,255,0.10)">
           {maximized ? <RestoreIcon /> : <MaximizeIcon />}
         </TitleBarButton>
-        <TitleBarButton onClick={close} label="Close" hover="rgba(232, 17, 35, 0.85)" hoverColor="white">
-          <CloseIcon />
-        </TitleBarButton>
+        <CloseButton onClose={close} holdToQuit={trayOnClose} />
       </div>
     </div>
   );
@@ -339,6 +358,94 @@ interface BtnProps {
   hover: string;
   hoverColor?: string;
   children: React.ReactNode;
+}
+
+/** How long the close button must be held to force a full quit. Kept in ONE
+ *  place: it drives both the JS timer and the CSS fill's duration, so the bar
+ *  reaching the far edge and the quit firing can never drift apart. */
+const HOLD_TO_QUIT_MS = 2000;
+
+/**
+ * Close button. A normal click does whatever the setting says (quit, or hide to
+ * tray). When `holdToQuit` is set - i.e. `minimize_to_tray_on_close` is ON, so a
+ * click would only hide - pressing and HOLDING for HOLD_TO_QUIT_MS fully exits
+ * instead. Without this there is no way to actually quit from a visible window:
+ * X, Alt+F4 and every other close route all hide, and the tray icon (the only
+ * other exit) is shown ONLY while the window is already hidden.
+ *
+ * The progress fill is a pure CSS one-shot rather than a rAF loop driving React
+ * state, so holding does not re-render this button ~120 times.
+ */
+function CloseButton({ onClose, holdToQuit }: { onClose: () => void; holdToQuit: boolean }) {
+  const [hovered, setHovered] = useState(false);
+  const [holding, setHolding] = useState(false);
+  const timerRef = useRef<number | null>(null);
+  // Set when a hold completes, so the click that follows pointerup does not
+  // ALSO run the ordinary close on top of the quit we just requested.
+  const firedRef = useRef(false);
+
+  const cancelHold = useCallback(() => {
+    if (timerRef.current !== null) {
+      window.clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    setHolding(false);
+  }, []);
+
+  // Never leave a timer behind if the title bar unmounts mid-hold (entering
+  // true fullscreen unmounts it).
+  useEffect(() => cancelHold, [cancelHold]);
+
+  const beginHold = useCallback(() => {
+    if (!holdToQuit) return;
+    firedRef.current = false;
+    setHolding(true);
+    timerRef.current = window.setTimeout(() => {
+      timerRef.current = null;
+      firedRef.current = true;
+      setHolding(false);
+      // Rust arms its force-quit flag and issues a normal close, so this gets
+      // the full teardown (MPV/WASAPI, scrobble flush, cast stop) rather than
+      // an abrupt exit.
+      void invoke("request_quit").catch(() => {});
+    }, HOLD_TO_QUIT_MS);
+  }, [holdToQuit]);
+
+  const label = holdToQuit ? "Close to tray (hold to quit Aura)" : "Close";
+
+  return (
+    <Tooltip text={label} pos="bottom">
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          if (firedRef.current) { firedRef.current = false; return; }
+          onClose();
+        }}
+        onPointerDown={beginHold}
+        onPointerUp={cancelHold}
+        onPointerLeave={() => { setHovered(false); cancelHold(); }}
+        onPointerCancel={cancelHold}
+        onMouseEnter={() => setHovered(true)}
+        aria-label={label}
+        className="relative overflow-hidden flex items-center justify-center w-11 h-full
+                   transition-colors duration-100"
+        style={{
+          background: hovered ? "rgba(232, 17, 35, 0.85)" : "transparent",
+          color: hovered ? "white" : "rgba(255,255,255,0.7)",
+          pointerEvents: "auto",
+        }}
+      >
+        {holding && (
+          <span
+            aria-hidden
+            className="aura-hold-fill absolute inset-0 bg-white/25"
+            style={{ animationDuration: `${HOLD_TO_QUIT_MS}ms` }}
+          />
+        )}
+        <span className="relative"><CloseIcon /></span>
+      </button>
+    </Tooltip>
+  );
 }
 
 function TitleBarButton({ onClick, label, hover, hoverColor, children }: BtnProps) {

@@ -2398,6 +2398,9 @@ pub fn run() {
             window_logic::discord_clear_presence,
             // Watch-party: exempt an in-sync member from pause-on-minimise.
             window_logic::set_party_keep_alive,
+            // Force quit — overrides minimize_to_tray_on_close for one close.
+            window_logic::request_quit,
+            window_logic::cancel_quit,
             // ── Phase 4: OpenSubtitles ────────────────────────────────────────
             subtitles::search_subtitles,
             subtitles::download_subtitle,
