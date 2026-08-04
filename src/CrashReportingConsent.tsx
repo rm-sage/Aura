@@ -90,11 +90,11 @@ export default function CrashReportingConsent() {
       role="dialog"
       aria-modal="true"
       aria-labelledby="crash-consent-title"
-      className="fixed inset-0 z-[2000] flex items-center justify-center
+      className="aura-modal-backdrop-in fixed inset-0 z-[2000] flex items-center justify-center
                  bg-black/70 backdrop-blur-md"
     >
       <div
-        className="aura-glass-menu rounded-2xl max-w-[520px] w-[92%] p-7
+        className="aura-modal-card-in aura-glass-menu rounded-2xl max-w-[520px] w-[92%] p-7
                    text-white"
       >
         <h2

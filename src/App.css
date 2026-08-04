@@ -1853,6 +1853,83 @@ select,
   @media (prefers-reduced-motion: reduce) {
     .aura-latest-aired-caret { animation: none; }
   }
+
+  /* ------------------------------------------------------------------ */
+  /* One-shot enter transitions                                          */
+  /*                                                                     */
+  /* These are all ONE-SHOT, never loops. That is deliberate: a loop     */
+  /* keeps re-rasterising forever and has to be listed in BOTH the       */
+  /* data-reduced-motion and data-aura-idle gates to stop it burning GPU */
+  /* behind an unfocused window. A one-shot plays on an interaction and  */
+  /* then stops, so it costs exactly nothing at rest and needs no idle   */
+  /* gate (nobody is switching views on a window they are not looking    */
+  /* at). Prefer this shape when adding motion here.                     */
+  /*                                                                     */
+  /* Only `opacity` and `transform` are animated, so every one of these  */
+  /* runs on the compositor with no layout or paint work.                */
+  /* ------------------------------------------------------------------ */
+
+  /* View switch. OPACITY ONLY, and that is load-bearing: a `transform`  */
+  /* on this container would make it the containing block for every      */
+  /* `position: fixed` descendant inside the views, which silently       */
+  /* re-anchors fixed overlays (cast bar, modals, toasts) to the wrapper */
+  /* instead of the viewport. Do not add one.                            */
+  .aura-view-enter {
+    animation: aura-view-fade 150ms ease-out both;
+  }
+  @keyframes aura-view-fade {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+  }
+
+  /* Modal backdrop + card. The card is safe to translate/scale because  */
+  /* it is not itself a fixed ancestor of anything.                      */
+  .aura-modal-backdrop-in {
+    animation: aura-view-fade 160ms ease-out both;
+  }
+  .aura-modal-card-in {
+    animation: aura-modal-card-pop 190ms cubic-bezier(0.22, 1.2, 0.36, 1) both;
+  }
+  @keyframes aura-modal-card-pop {
+    from { opacity: 0; transform: translateY(8px) scale(0.985); }
+    to   { opacity: 1; transform: translateY(0)   scale(1); }
+  }
+
+  /* Bottom sheet (the in-player subtitle picker), rising from the edge  */
+  /* it is anchored to.                                                  */
+  .aura-sheet-in {
+    animation: aura-sheet-rise 200ms cubic-bezier(0.22, 1.2, 0.36, 1) both;
+  }
+  @keyframes aura-sheet-rise {
+    from { opacity: 0; transform: translateY(14px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  /* Press-and-hold progress fill (title-bar close button). Its duration is set
+     inline from HOLD_TO_QUIT_MS so the bar cannot finish before or after the
+     timer does. NOT listed in either reduced-motion gate: this is a progress
+     indicator, not decoration - without it a hold gives no feedback at all and
+     the user cannot tell how long is left. Same reasoning that keeps loading
+     bars and the buffering pulse alive there. */
+  .aura-hold-fill {
+    transform-origin: left center;
+    animation-name: aura-hold-grow;
+    animation-timing-function: linear;
+    animation-fill-mode: forwards;
+  }
+  @keyframes aura-hold-grow {
+    from { transform: scaleX(0); }
+    to   { transform: scaleX(1); }
+  }
+
+  /* Reduced motion: keep the FADE (it conveys that something appeared,
+     which is the same reasoning that keeps popup enter/exit alive in the
+     gate below) but drop the travel and the scale, which are the parts a
+     motion-sensitive user is actually opting out of. */
+  @media (prefers-reduced-motion: reduce) {
+    .aura-modal-card-in,
+    .aura-sheet-in { animation-name: aura-view-fade; }
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -2223,6 +2300,18 @@ html[data-reduced-motion="true"] .aura-hero-title {
   -webkit-text-fill-color: rgb(var(--ln-accent-rgb)) !important;
   color: rgb(var(--ln-accent-rgb)) !important;
   -webkit-text-stroke: 0 !important;
+}
+
+/* Reduced motion, forced by the Settings pref rather than the OS query:
+   collapse the one-shot enter transitions to a plain cross-fade. They are
+   NOT silenced outright, for the same reason popup enter/exit is not - the
+   fade is what tells you something appeared. Only the travel and the scale
+   go, which is the part a motion-sensitive user opted out of. Mirrors the
+   `prefers-reduced-motion` block in the components layer so the OS query
+   and the app pref behave identically. */
+html[data-reduced-motion="true"] .aura-modal-card-in,
+html[data-reduced-motion="true"] .aura-sheet-in {
+  animation-name: aura-view-fade !important;
 }
 
 /* ---------------------------------------------------------------- */

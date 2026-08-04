@@ -170,8 +170,9 @@ export default function LinkLoginModal({ provider, onSuccess, onCancel }: Props)
   const Glyph = provider === "facebook" ? FacebookGlyph : AppleGlyph;
 
   return (
-    <div className="fixed inset-0 z-[300] flex items-center justify-center bg-black/60 backdrop-blur-sm">
-      <div className="glass-panel-elevated rounded-3xl px-7 py-8 w-full max-w-[380px] mx-4
+    <div className="aura-modal-backdrop-in fixed inset-0 z-[300] flex items-center justify-center
+                    bg-black/60 backdrop-blur-sm">
+      <div className="aura-modal-card-in glass-panel-elevated rounded-3xl px-7 py-8 w-full max-w-[380px] mx-4
                       shadow-glass-edge flex flex-col gap-6">
         {/* Header */}
         <div className="flex flex-col gap-1.5">

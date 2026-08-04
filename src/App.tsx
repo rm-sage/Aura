@@ -7874,7 +7874,16 @@ export default function App() {
       />
 
       {/* ── Main content area ── */}
-      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
+      {/* `key={activeView}` is what makes the fade replay: only one view is
+          mounted at a time and switching already unmounts the old one, so the
+          key changes nothing structurally, it just gives the wrapper a fresh
+          identity per view so the enter animation re-triggers.
+          .aura-view-enter is opacity-only ON PURPOSE - see the note on it in
+          App.css before adding any transform here. */}
+      <div
+        key={activeView}
+        className="aura-view-enter flex-1 flex flex-col min-w-0 overflow-hidden"
+      >
         {activeView === "home" && (
           <HomeView
             addons={addons}

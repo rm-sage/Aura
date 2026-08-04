@@ -129,11 +129,11 @@ export default function SourceSwitcher({
       onClick={onClose}
     >
       {/* Scrim */}
-      <div className="absolute inset-0 bg-black/55 backdrop-blur-[2px]" />
+      <div className="aura-modal-backdrop-in absolute inset-0 bg-black/55 backdrop-blur-[2px]" />
 
       {/* Panel */}
       <div
-        className="relative w-[min(560px,92vw)] max-h-[78vh] flex flex-col
+        className="aura-modal-card-in relative w-[min(560px,92vw)] max-h-[78vh] flex flex-col
                    rounded-2xl aura-glass-menu shadow-glass-edge overflow-hidden"
         onClick={(e) => e.stopPropagation()}
         role="dialog"

@@ -94,13 +94,13 @@ export default function ScrobbleClosePrompt({
   const pct = Math.round((run.done / Math.max(1, run.total)) * 100);
 
   return (
-    <div className="fixed inset-0 z-[400] flex items-center justify-center
+    <div className="aura-modal-backdrop-in fixed inset-0 z-[400] flex items-center justify-center
                     bg-black/70 backdrop-blur-sm">
       <div
         role="dialog"
         aria-modal="true"
         aria-label="Scrobble in progress"
-        className="glass-panel-elevated rounded-3xl px-7 py-6 w-full max-w-[460px] mx-4
+        className="aura-modal-card-in glass-panel-elevated rounded-3xl px-7 py-6 w-full max-w-[460px] mx-4
                    shadow-glass-edge flex flex-col gap-5"
       >
         <div className="flex flex-col gap-2">

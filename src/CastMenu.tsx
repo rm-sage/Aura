@@ -43,10 +43,10 @@ export default function CastMenu({
       style={{ top: isFullscreen ? 0 : 36 }}
       onClick={onClose}
     >
-      <div className="absolute inset-0 bg-black/55 backdrop-blur-[2px]" />
+      <div className="aura-modal-backdrop-in absolute inset-0 bg-black/55 backdrop-blur-[2px]" />
 
       <div
-        className="relative w-[min(440px,92vw)] max-h-[70vh] flex flex-col
+        className="aura-modal-card-in relative w-[min(440px,92vw)] max-h-[70vh] flex flex-col
                    rounded-2xl aura-glass-menu shadow-glass-edge overflow-hidden"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
