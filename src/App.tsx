@@ -8334,6 +8334,7 @@ export default function App() {
       {!eosActive && isPlayerActive && nextUpInfo && nextUpVisible && (
         <NextUpCta
           episode={nextUpInfo.episode}
+          libraryById={libraryById}
           loading={false}
           noStream={nextUpInfo.stream == null}
           skipTag={nextUpInfo.canon ? formatEpisodeTag(nextUpInfo.canon.episode) : null}

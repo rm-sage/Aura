@@ -33,14 +33,19 @@ import { useWindowHidden } from "./windowVisibility";
 import ImageLoader from "./ImageLoader";
 import { shrinkPoster } from "./posterSize";
 import FillerRecapTags from "./FillerRecapTags";
-import type { VideoEntry } from "./types";
+import type { LibraryItem, VideoEntry } from "./types";
 import { formatEpisodeTag, episodeKindFlags } from "./nextUp";
 import { loadAuraSettings } from "./auraSettings";
+import { shouldBlurThumbnail } from "./episodeSpoilers";
 import { getWatchState } from "./watchTogether/store";
 
 interface Props {
   /** The next episode metadata. Provides the title + thumbnail + tag. */
   episode: VideoEntry;
+  /** Library index, used only to resolve whether the next episode has been
+   *  watched, which is half of the anti-spoiler blur gate. Same map the EOS
+   *  Spotlight takes, so both surfaces answer identically. */
+  libraryById: Map<string, LibraryItem>;
   /** True while the next episode's stream resolution is in flight. */
   loading: boolean;
   /** True when no playable stream resolved for the (literal) next episode. */
@@ -79,12 +84,23 @@ interface Props {
 }
 
 export default function NextUpCta({
-  episode, loading, noStream, skipTag, onSkipToCanon, onPlay, onDismiss, arcNote,
+  episode, libraryById, loading, noStream, skipTag, onSkipToCanon, onPlay, onDismiss, arcNote,
   autoAdvanceStreak, autoAdvanceCancelled,
 }: Props) {
   const tag = formatEpisodeTag(episode);
   const title = (episode.title ?? "").trim() || "Untitled episode";
   const { filler, recap } = episodeKindFlags(episode);
+  // Anti-spoiler blur. This card shows the NEXT episode's still, which is
+  // exactly the thing "Blur unwatched episode thumbnails" exists to hide, but
+  // it was the one next-up surface that never applied the gate: the Detail
+  // list, the in-player episode drawer and the EOS Spotlight all did, so the
+  // setting looked like it was being ignored. Routed through the shared
+  // episodeSpoilers predicate so all four stay in lock-step.
+  const blurThumb = shouldBlurThumbnail(
+    libraryById,
+    episode.id,
+    loadAuraSettings().blurUnwatchedThumbnails === true,
+  );
   // Skip mode: the next episode is filler/recap and a canon target (with a
   // stream) was pre-resolved. The skip is the primary action.
   const skipMode = !!(skipTag && onSkipToCanon);
@@ -220,6 +236,14 @@ export default function NextUpCta({
             alt=""
             className="absolute inset-0 w-full h-full"
             imgClassName="w-full h-full object-cover"
+            // Blur radius is scaled from the Spotlight's (16px over a 300px
+            // still) to this card's 140px, so the smearing is equally strong
+            // relative to the image rather than merely equal in pixels. The
+            // slight scale-up hides the soft edge the blur leaves at the
+            // container border.
+            imgStyle={blurThumb
+              ? { filter: "blur(8px) saturate(115%)", transform: "scale(1.08)" }
+              : undefined}
           />
         ) : (
           <div className="absolute inset-0 flex items-center justify-center text-white/25">
