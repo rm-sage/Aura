@@ -27,7 +27,7 @@ import { findAIOMetadataAddon, isAnimeMeta, markAnimeId, typeLabel } from "../ai
 import { dedupedInvoke } from "../invokeDedupe";
 import { peekRichestCachedDetailById } from "../metaCache";
 import AnimeExtrasOverlay from "../AnimeExtrasOverlay";
-import { resolveCourMalIds, type CourRef } from "../animeExtras";
+import { EXTRAS_TABS, resolveCourMalIds, type CourRef, type ExtrasTab } from "../animeExtras";
 import { PersistentCache } from "../persistentCache";
 import SeasonSelect from "../SeasonSelect";
 import FillerRecapTags from "../FillerRecapTags";
@@ -518,6 +518,11 @@ function seedHeroArt(preview: MetaPreview, resumeVideoId: string | null): HeroAr
   return heroArtFrom(seed, preview, arcHeroArt(preview.id, resumeVideoId));
 }
 
+/** One attention nudge per app session, not per detail open. Module scope on
+ *  purpose: persisting it would need a bounded localStorage key plus a
+ *  StorageReport row, which is disproportionate for a 1.1 second brighten. */
+let railHintShown = false;
+
 function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, onPlayTrailer, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
   const [detail, setDetail]                 = useState<MetaDetail | null>(null);
   // Resume pointer, read BEFORE the latch below because the latch's seed
@@ -642,6 +647,77 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // trigger never renders, so the button is absent rather than dead.
   const [extrasOpen, setExtrasOpen] = useState(false);
   const [extrasCours, setExtrasCours] = useState<CourRef[]>([]);
+  const [extrasTab, setExtrasTab]   = useState<ExtrasTab>("songs");
+  // Rail (the "More info" drawer). `railHint` is the one-shot brighten.
+  const [railOpen, setRailOpen]     = useState(false);
+  const [railHint, setRailHint]     = useState(false);
+  const railWrapRef  = useRef<HTMLDivElement | null>(null);
+  const railSpineRef = useRef<HTMLButtonElement | null>(null);
+  const railInRef    = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const railOutRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearRailTimers = useCallback(() => {
+    if (railInRef.current)  { clearTimeout(railInRef.current);  railInRef.current  = null; }
+    if (railOutRef.current) { clearTimeout(railOutRef.current); railOutRef.current = null; }
+  }, []);
+  // Hover intent, same shape as VolumeControl and the stream-meta badges: a
+  // short arm on enter so a cursor crossing the left edge on its way to Back
+  // does not pull the drawer out, and a grace on leave so the gap between the
+  // spine and the body never closes it mid-reach.
+  const openRail = useCallback((delay = 0) => {
+    clearRailTimers();
+    if (delay === 0) { setRailOpen(true); return; }
+    railInRef.current = setTimeout(() => setRailOpen(true), delay);
+  }, [clearRailTimers]);
+  const closeRail = useCallback(() => {
+    clearRailTimers();
+    railOutRef.current = setTimeout(() => setRailOpen(false), 200);
+  }, [clearRailTimers]);
+  useEffect(() => clearRailTimers, [clearRailTimers]);
+
+  const openExtras = useCallback((t: ExtrasTab) => {
+    clearRailTimers();
+    setRailOpen(false);   // never leave the rail sitting under the modal scrim
+    setExtrasTab(t);
+    setExtrasOpen(true);
+  }, [clearRailTimers]);
+
+  // One-shot attention brighten. Surface only, never a transform: a drawer
+  // flying out over the credits on the first anime page of every launch is an
+  // annoyance, whereas briefly lifting an already-labelled spine is a nudge.
+  useEffect(() => {
+    if (!entered || extrasCours.length === 0 || railHintShown) return;
+    railHintShown = true;
+    setRailHint(true);
+    const t = setTimeout(() => setRailHint(false), 1100);
+    return () => clearTimeout(t);
+  }, [entered, extrasCours.length]);
+
+  // Escape and outside-press, mounted ONLY while the rail is open so the
+  // feature costs zero global listeners at rest. Capture phase with
+  // stopPropagation, or this Escape falls through and closes the whole page.
+  useEffect(() => {
+    if (!railOpen || extrasOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      e.preventDefault();
+      clearRailTimers();
+      setRailOpen(false);
+      railSpineRef.current?.focus();
+    };
+    const onDown = (e: PointerEvent) => {
+      if (railWrapRef.current?.contains(e.target as Node)) return;
+      clearRailTimers();
+      setRailOpen(false);
+    };
+    window.addEventListener("keydown", onKey, true);
+    window.addEventListener("pointerdown", onDown, true);
+    return () => {
+      window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("pointerdown", onDown, true);
+    };
+  }, [railOpen, extrasOpen, clearRailTimers]);
   const isAnimeDetail =
     isAnimeMeta(meta) || (detail?.media_type ?? "").toLowerCase() === "anime";
   useEffect(() => {
@@ -1416,35 +1492,106 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
         >
           <ArrowBackIcon /> Back
         </button>
-        <div className="flex items-center gap-2">
-          {/* More info. Anime only, and only once at least one MAL entry has
-              resolved: a button that opens an empty panel is worse than no
-              button. Sits in the action bar's previously empty middle slot
-              rather than in the left stack, which is `justify-end` and would
-              push the hero title upward. */}
-          {extrasCours.length > 0 && (
-            <button
-              onClick={() => setExtrasOpen(true)}
-              className="pointer-events-auto flex items-center gap-2 px-3 h-9 rounded-full
-                         bg-black/60 backdrop-blur-xl border border-white/10
-                         text-white/85 hover:text-white text-xs font-medium tracking-wide
-                         transition-colors"
-            >
-              More info
-            </button>
-          )}
+        <button
+          onClick={onClose}
+          aria-label="Close"
+          className="pointer-events-auto w-9 h-9 rounded-full
+                     bg-black/60 backdrop-blur-xl border border-white/10
+                     flex items-center justify-center text-white/85 hover:text-white
+                     transition-colors"
+        >
+          <CloseIcon />
+        </button>
+      </div>
+
+      {/* ── "More info" rail ──
+          Anime only, and only once a MAL cour has resolved, so live action
+          gets no rail, no listeners and no hit area at all.
+
+          A SIBLING of the grid below, never a child of the left <section>:
+          that element is `justify-end`, so an in-flow child pushes the hero
+          title upward, and its `overflow-y-auto` forces `overflow-x: auto` per
+          spec, which would clip the parked drawer instead of hiding it.
+
+          Bottom-anchored at the same `pb-10` baseline as the metadata stack,
+          because the whole left column is bottom-weighted. A vertically
+          centred rail lines up with nothing and reads as the floating button
+          it replaces. At rest the 44px spine sits wholly inside the section's
+          48px `px-12` gutter, so it never covers the selectable synopsis or
+          the clickable credit names.
+
+          z-[35] is the only correct slot: above the grid and the z-30 action
+          bar, below AnimeExtrasOverlay's z-40 and its scrim. */}
+      {extrasCours.length > 0 && (
+        <div
+          ref={railWrapRef}
+          data-open={railOpen ? "true" : "false"}
+          data-hint={railHint ? "true" : "false"}
+          className="aura-extras-rail absolute left-0 bottom-10 z-[35] flex items-stretch"
+          onPointerEnter={() => openRail(100)}
+          onPointerLeave={closeRail}
+          onFocusCapture={() => openRail(0)}
+          onBlurCapture={(e) => {
+            // Only close when focus actually left the rail, not when it moved
+            // between the spine and a row.
+            if (!e.currentTarget.contains(e.relatedTarget as Node)) closeRail();
+          }}
+        >
+          {/* Spine. Always present, always legible: this is the affordance, so
+              a near-invisible hairline would be elegant and undiscoverable. */}
           <button
-            onClick={onClose}
-            aria-label="Close"
-            className="pointer-events-auto w-9 h-9 rounded-full
-                       bg-black/60 backdrop-blur-xl border border-white/10
-                       flex items-center justify-center text-white/85 hover:text-white
+            ref={railSpineRef}
+            type="button"
+            aria-expanded={railOpen}
+            aria-label="More info"
+            onPointerDown={() => openRail(0)}
+            onClick={() => (railOpen ? closeRail() : openRail(0))}
+            className="aura-extras-rail-spine relative flex items-center justify-center
+                       w-11 py-5 rounded-r-xl overflow-hidden
+                       glass-panel-elevated shadow-glass-edge
+                       text-white/72 hover:text-white/92 focus-visible:text-white/92
                        transition-colors"
           >
-            <CloseIcon />
+            {/* Accent stripe, same token as the column's own accent rule, so
+                it recolours with the theme. */}
+            <span aria-hidden className="absolute inset-y-0 left-0 w-[3px] bg-ln-accent/65" />
+            <span
+              className="text-[10px] font-medium uppercase tracking-[0.22em] whitespace-nowrap"
+              style={{
+                writingMode: "vertical-rl",
+                transform: "rotate(180deg)",
+                textShadow: "0 1px 6px rgba(0,0,0,0.85)",
+              }}
+            >
+              More info
+            </span>
           </button>
+
+          {/* Drawer body: a table of contents, so the reveal buys something
+              rather than just relocating a button. */}
+          <div
+            className="aura-extras-rail-body glass-panel-elevated shadow-glass-edge
+                       rounded-r-xl border-l border-white/8
+                       flex flex-col justify-center gap-0.5 py-3 px-2"
+            style={{ width: "13rem" }}
+          >
+            {EXTRAS_TABS.map((t) => (
+              <button
+                key={t.id}
+                type="button"
+                tabIndex={railOpen ? 0 : -1}
+                onClick={() => openExtras(t.id)}
+                className="text-left px-3 h-8 rounded-lg text-[12.5px]
+                           text-white/60 hover:text-white/95 hover:bg-white/8
+                           focus-visible:text-white/95 focus-visible:bg-white/8
+                           transition-colors"
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
         </div>
-      </div>
+      )}
 
       <AnimeExtrasOverlay
         open={extrasOpen}
@@ -1452,6 +1599,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
         cours={extrasCours}
         seriesName={detail?.name ?? meta.name}
         onPlayTrailer={onPlayTrailer}
+        initialTab={extrasTab}
       />
 
       {/* ── Layout: LEFT (all metadata) + RIGHT (compact unified panel) ──

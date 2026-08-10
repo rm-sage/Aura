@@ -2510,3 +2510,64 @@ html[data-reduced-motion="true"] [style*="addon-spinner-pulse"] {
 }
 html[data-reduced-motion="true"] .aura-vote-won-pop { animation: none !important; }
 html[data-reduced-motion="true"] .aura-vote-burst { display: none !important; }
+
+/* ------------------------------------------------------------------ */
+/* aura-extras-rail — the detail page's "More info" drawer.            */
+/*                                                                    */
+/* A bottom-anchored edge tab in the left column's gutter that slides  */
+/* out into an index of the extras panel's tabs. The rail is ONE       */
+/* element carrying both pointer handlers, with the spine and the body */
+/* as children, so moving the cursor between them never fires a leave  */
+/* and the grace timer only ever absorbs slop at the outer edge.       */
+/*                                                                    */
+/* The whole rail is translated by the body's own width so the body    */
+/* parks off-frame and the spine lands flush at x=0. Transform and     */
+/* opacity ONLY: the surface is a backdrop-filter region, and          */
+/* animating its geometry re-rasters the blur every frame on top of    */
+/* the root's own 380 ms transform transition.                         */
+/*                                                                    */
+/* Written as CLASSES rather than inline styles on purpose. An inline  */
+/* transition always beats a class rule, which would make the          */
+/* reduced-motion gate at the bottom silently do nothing.              */
+/* ------------------------------------------------------------------ */
+.aura-extras-rail {
+  transform: translate3d(-13rem, 0, 0);
+  transition: transform 240ms cubic-bezier(0.22, 1.2, 0.36, 1);
+  will-change: transform;
+}
+.aura-extras-rail[data-open="true"] {
+  transform: translate3d(0, 0, 0);
+}
+
+.aura-extras-rail-spine {
+  opacity: 0.55;
+  transition: opacity 180ms ease-out;
+}
+.aura-extras-rail[data-open="true"] .aura-extras-rail-spine,
+.aura-extras-rail[data-hint="true"] .aura-extras-rail-spine,
+.aura-extras-rail:focus-within .aura-extras-rail-spine {
+  opacity: 1;
+}
+
+/* The rows arrive just after the slide has begun, so they read as
+   contents being revealed rather than ghosts sliding in alongside. */
+.aura-extras-rail-body {
+  opacity: 0;
+  transition: opacity 160ms ease-out 60ms;
+}
+.aura-extras-rail[data-open="true"] .aura-extras-rail-body {
+  opacity: 1;
+}
+
+/* Parked and closed, the body must not be reachable by pointer or by
+   the accessibility tree. `tabIndex={-1}` already removes its buttons
+   from the tab order; this covers a stray click landing in the gutter. */
+.aura-extras-rail:not([data-open="true"]) .aura-extras-rail-body {
+  pointer-events: none;
+}
+
+/* Reduced motion: the rail still opens and still changes opacity (that
+   fade is what tells you it happened), it just stops travelling. */
+html[data-reduced-motion="true"] .aura-extras-rail {
+  transition-property: none !important;
+}

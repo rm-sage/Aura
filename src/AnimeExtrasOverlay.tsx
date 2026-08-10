@@ -36,7 +36,7 @@ import { shrinkPoster } from "./posterSize";
 import { loadAuraSettings } from "./auraSettings";
 import { shouldBlurThemeRange } from "./episodeSpoilers";
 import {
-  fetchExtras, formatSpans, themeLabel,
+  EXTRAS_TABS, fetchExtras, formatSpans, themeLabel,
   type AnimeStatistics, type AnimeTheme, type AnimeThemes, type AnimeTrailer,
   type CourRef, type Recommendation, type StaffCredit, type ExtrasTab,
 } from "./animeExtras";
@@ -52,14 +52,6 @@ const STAFF_AVATAR_W = 72;
 const RELATED_POSTER_W = 360;
 const TRAILER_THUMB_W = 540;
 
-const TABS: { id: ExtrasTab; label: string }[] = [
-  { id: "songs",    label: "Songs" },
-  { id: "ratings",  label: "Ratings" },
-  { id: "staff",    label: "Staff" },
-  { id: "related",  label: "Related" },
-  { id: "trailers", label: "Trailers" },
-];
-
 interface Props {
   open: boolean;
   onClose: () => void;
@@ -69,12 +61,22 @@ interface Props {
   /** Play a trailer through the existing in-MPV yt-dlp path. Takes a
    *  YouTube id, matching DetailView's own trailer button. */
   onPlayTrailer?: (ytId: string, title: string) => void;
+  /** Tab to land on. The rail picks it, so a user who chose "Ratings" does not
+   *  arrive on Songs and have to click again. */
+  initialTab?: ExtrasTab;
 }
 
 export default function AnimeExtrasOverlay({
-  open, onClose, cours, seriesName, onPlayTrailer,
+  open, onClose, cours, seriesName, onPlayTrailer, initialTab,
 }: Props) {
-  const [tab, setTab] = useState<ExtrasTab>("songs");
+  const [tab, setTab] = useState<ExtrasTab>(initialTab ?? "songs");
+
+  // Re-seed on every open. This component returns null when closed rather than
+  // unmounting, so `tab` survives a close and would otherwise strand the user
+  // on whatever they last viewed regardless of which rail row they picked.
+  useEffect(() => {
+    if (open) setTab(initialTab ?? "songs");
+  }, [open, initialTab]);
 
   // Close on Escape. Capture phase so the detail page's own Escape handler
   // does not close the whole page out from under an open panel.
@@ -129,7 +131,7 @@ export default function AnimeExtrasOverlay({
         </header>
 
         <nav className="flex items-center gap-1 px-4 pt-3 pb-2 border-b border-white/6 flex-shrink-0">
-          {TABS.map((t) => (
+          {EXTRAS_TABS.map((t) => (
             <button
               key={t.id}
               onClick={() => setTab(t.id)}
