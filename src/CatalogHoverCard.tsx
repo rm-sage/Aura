@@ -34,6 +34,7 @@ import {
 } from "./catalogHoverStore";
 import { loadAuraSettings } from "./auraSettings";
 import { resolveDefaultMetaUrl } from "./addonDefaults";
+import { findAIOMetadataAddon } from "./aiometadata";
 import { computeReleaseCountdowns, formatCountdown, formatTargetDate, isInTheaters, useCountdownNow } from "./releaseCountdown";
 import { useMovieReleaseDates } from "./releaseDates";
 
@@ -51,9 +52,34 @@ interface RatingRow { source: string; value: string; kind?: string; weight?: num
 
 // Session cache for the multi-source aggregate (MDBList IMDb/RT/Metacritic
 // + MAL/AniList for anime). Hovering re-fires the panel constantly, and
-// the upstreams have request budgets — cache by meta id so a card is
-// fetched at most once per session.
+// the upstreams have request budgets, so a card is fetched at most once per
+// distinct INPUT.
+//
+// Keyed on the ids the answer was computed from, NOT on meta.id alone. That
+// distinction is the bug fix: keying on meta.id let the very first fire (which
+// happens before the meta detail has landed, so it carries no mal/kitsu/anidb
+// id and the backend falls through to a title search) permanently pin a
+// franchise-root MAL entry for the whole session. The effect that re-runs once
+// the real ids arrive was blocked by the cache it had just poisoned, so the
+// hover disagreed with the detail page for as long as the app stayed open.
 const aggRatingsCache = new Map<string, RatingRow[]>();
+
+/** Cache / dedupe key. Carries the id material the answer depends on so a
+ *  better-resolved later fire writes a NEW entry instead of reading the
+ *  earlier, worse one. */
+function ratingsKey(
+  metaId: string,
+  isAnime: boolean,
+  ids: { mal?: number | null; kitsu?: number | null; anidb?: number | null },
+): string {
+  return [
+    metaId,
+    isAnime ? "anime" : "std",
+    ids.mal ?? "",
+    ids.kitsu ?? "",
+    ids.anidb ?? "",
+  ].join("|");
+}
 
 interface RatingChipStyle { bg: string; border: string; fg: string; }
 
@@ -203,8 +229,15 @@ function HoverPanel({
       const metaCapable = (a: AddonEntry) =>
         Array.isArray(a.resources) &&
         a.resources.some((r) => r.toLowerCase() === "meta");
+      // AIOMetadata FIRST, ahead of the user's pin. This deliberately matches
+      // DetailView's order (see its metaAddon memo) rather than the pin-first
+      // order this card used to apply. When the two disagreed, a user pinned
+      // to Cinemeta got a hover detail with no mal/kitsu/anidb ids at all and
+      // a detail page with them, so the same show showed two different MAL
+      // scores. The surfaces must elect the same provider or they cannot agree.
       const provider =
-        override
+        findAIOMetadataAddon(addons)
+        ?? override
         ?? addons.find((a) => a.url === resolveDefaultMetaUrl(addons))
         ?? addons.find(metaCapable)
         ?? addons[0]
@@ -236,49 +269,79 @@ function HoverPanel({
   // looked bare. Session-cached per id so repeat hovers don't burn the
   // upstream request budgets; dedupe shares one
   // in-flight call across rapid re-hovers.
-  const [aggRatings, setAggRatings] = useState<RatingRow[]>(
-    () => aggRatingsCache.get(meta.id) ?? [],
-  );
+  const [aggRatings, setAggRatings] = useState<RatingRow[]>([]);
   useEffect(() => {
-    const cached = aggRatingsCache.get(meta.id);
-    if (cached) { setAggRatings(cached); return; }
     let cancelled = false;
+    // `isAnime` is true from the SURFACE alone (media_type or id prefix), so
+    // it arms before `detail` has resolved and therefore before any anime id
+    // is known. That is exactly the state we must not fetch in.
     const isAnime =
       meta.media_type === "anime" ||
       /^(kitsu|mal|anidb|anilist):/.test(meta.id) ||
       !!(detail?.mal_id || detail?.kitsu_id || detail?.anidb_id);
+
+    // Clear stale chips BEFORE any early return. `HoverPanel` has no React key
+    // and `catalogHoverStore` flips the active card A -> B without a null in
+    // between, so this component is reused rather than remounted and the
+    // previous card's ratings would otherwise stay on screen.
+    setAggRatings([]);
+
+    // Wait for the meta detail on anime. Fetching now would send all-null
+    // anime ids, and the backend's last-resort title search elects the
+    // franchise-root MAL entry (it requires an exact title match, which a
+    // "... Season 2" cour cannot satisfy while the base-titled original can).
+    // Gating here removes the wrong request rather than correcting it
+    // afterwards, and saves one MAL search per hover.
+    if (isAnime && loading) return;
+
+    const ids = {
+      mal:   detail?.mal_id   ?? null,
+      kitsu: detail?.kitsu_id ?? null,
+      anidb: detail?.anidb_id ?? null,
+    };
+    const key = ratingsKey(meta.id, isAnime, ids);
+
+    const cached = aggRatingsCache.get(key);
+    if (cached) { setAggRatings(cached); return; }
+
     const input = {
       imdb_id:    meta.id.startsWith("tt") ? meta.id : null,
-      mal_id:     detail?.mal_id   ?? null,
-      kitsu_id:   detail?.kitsu_id ?? null,
+      mal_id:     ids.mal,
+      kitsu_id:   ids.kitsu,
       anilist_id: null,
-      anidb_id:   detail?.anidb_id ?? null,
+      anidb_id:   ids.anidb,
       title:      meta.name,
       year:       meta.release_info ? Number(meta.release_info.slice(0, 4)) || null : null,
       is_anime:   isAnime,
     };
     // Nothing resolvable → skip the round-trip entirely.
     if (!input.imdb_id && !isAnime) return;
-    dedupedInvoke(
-      `ratings:${meta.id}:${isAnime ? "anime" : "std"}`,
-      () => invoke<RatingRow[]>("fetch_aggregate_ratings", { input }),
-    )
+    // The dedupe key must carry the same id material as the cache key.
+    // `dedupedInvoke` coalesces on key, so a key without ids would hand a
+    // corrected second call the stale first call's promise.
+    dedupedInvoke(key, () => invoke<RatingRow[]>("fetch_aggregate_ratings", { input }))
       .then((r) => {
         if (cancelled) return;
         const list = Array.isArray(r) ? r : [];
-        // Bounded LRU (~400): this session cache was previously uncapped, so a
-        // long browse across hundreds of cards grew it monotonically. Rating
-        // arrays are small, so 400 covers a heavy session well under ~200KB.
-        if (aggRatingsCache.size >= 400 && !aggRatingsCache.has(meta.id)) {
-          const oldest = aggRatingsCache.keys().next().value;
-          if (oldest !== undefined) aggRatingsCache.delete(oldest);
+        // Do NOT cache an empty result. `[]` is truthy, so caching it used to
+        // pin "no ratings" on the card for the rest of the session even after
+        // the ids that would have resolved them arrived.
+        if (list.length > 0) {
+          // Bounded LRU (~400): this session cache was previously uncapped, so
+          // a long browse across hundreds of cards grew it monotonically.
+          // Rating arrays are small, so 400 covers a heavy session well under
+          // ~200KB.
+          if (aggRatingsCache.size >= 400 && !aggRatingsCache.has(key)) {
+            const oldest = aggRatingsCache.keys().next().value;
+            if (oldest !== undefined) aggRatingsCache.delete(oldest);
+          }
+          aggRatingsCache.set(key, list);
         }
-        aggRatingsCache.set(meta.id, list);
         setAggRatings(list);
       })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [meta.id, meta.media_type, meta.name, meta.release_info,
+  }, [meta.id, meta.media_type, meta.name, meta.release_info, loading,
       detail?.mal_id, detail?.kitsu_id, detail?.anidb_id]);
 
   // Position beside the card: prefer the right edge, flip left when

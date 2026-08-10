@@ -944,7 +944,14 @@ pub async fn resolve_mal_id_by_title(
 ) -> Result<Option<u32>, String> {
     let q = title.trim();
     if q.is_empty() { return Ok(None); }
-    let key = format!("title:{}", q.to_lowercase());
+    // The year is part of the key. It used to be omitted, so the first caller
+    // to ask about a title fixed the answer for every later caller regardless
+    // of which year they meant, and the year filter below could never be
+    // re-evaluated for them.
+    let key = match year {
+        Some(y) => format!("title:{}:{y}", q.to_lowercase()),
+        None    => format!("title:{}", q.to_lowercase()),
+    };
 
     {
         let lock = mal_resolve_cache().lock().unwrap();
@@ -1031,13 +1038,24 @@ pub async fn resolve_mal_id_by_title(
         {
             score += 100;
         }
+        // Year is a HARD FILTER when both sides have one, not a bonus.
+        //
+        // It used to be a bonus, and that let a candidate from the wrong
+        // decade win on title alone. Combined with the low-id tiebreak below
+        // it deterministically elected the franchise ROOT: a long-running
+        // series' original entry matches the bare title exactly, while the
+        // cour actually being watched is titled "... Season 3" and cannot.
+        // The result was a hover card showing a top-tier score and MAL
+        // popularity rank for a niche recent show.
         if let (Some(want), Some(have)) = (year, a.year) {
             if want == have { score += 20; }
             else if want.abs_diff(have) <= 1 { score += 10; }
+            else { continue; }
         }
-        // Lower MAL ids → older entries → preferred on duplicates.
-        // Cap the contribution so it can't outweigh title match.
-        score += (50_000_u32.saturating_sub(a.mal_id.min(50_000)) / 5_000) as i32;
+        // The old "prefer lower MAL ids" tiebreak lived here. It is gone on
+        // purpose: preferring older entries is precisely what picks a
+        // franchise root over the season in hand. Ties now resolve to the
+        // FIRST candidate, which is the upstream's own relevance order.
 
         if score >= 100 && best.is_none_or(|(s, _)| score > s) {
             best = Some((score, a.mal_id));
@@ -1048,9 +1066,15 @@ pub async fn resolve_mal_id_by_title(
     mal_resolve_cache().lock().unwrap().insert(key, MalResolveEntry {
         mal_id, cached_at: Instant::now(),
     });
+    // Logged with the winning score so a mis-election is diagnosable from the
+    // DevConsole alone: hovering a card and then opening it should produce ONE
+    // mal id, not two.
     crate::devlog!(
         info, "aniskip",
-        "resolve_mal_id_by_title '{q}' (year={year:?}) → {:?}", mal_id
+        "resolve_mal_id_by_title '{q}' (year={year:?}) -> {:?} (score={}, candidates={})",
+        mal_id,
+        best.map(|(s, _)| s).unwrap_or(0),
+        parsed.data.len()
     );
     Ok(mal_id)
 }
