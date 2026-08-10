@@ -195,6 +195,11 @@ export async function resolveCourMalIds(
   const out: CourRef[] = [];
   const seen = new Set<number>();
 
+  // How many seasons each resolved MAL id absorbed, so a PARTIAL collapse can
+  // be labelled honestly. Without this, a show whose seasons 1-3 map to one
+  // entry and season 4 to another labelled the first "Season 1", which reads
+  // as though seasons 2 and 3 were simply missing.
+  const seasonsFor = new Map<number, number[]>();
   for (const season of seasons) {
     // One representative episode id per season is all the resolver needs.
     const sample = videos.find((v) => v.season === season);
@@ -211,7 +216,9 @@ export async function resolveCourMalIds(
       resolved = null;
     }
     const malId = resolved ?? (season === 1 ? rootMal : null);
-    if (!malId || seen.has(malId)) continue;
+    if (!malId) continue;
+    seasonsFor.set(malId, [...(seasonsFor.get(malId) ?? []), season]);
+    if (seen.has(malId)) continue;
     seen.add(malId);
     out.push({
       malId,
@@ -225,9 +232,19 @@ export async function resolveCourMalIds(
   if (out.length === 0 && rootMal) {
     return [{ malId: rootMal, label: seriesName }];
   }
-  // When several seasons collapsed into one entry the label is stale
-  // ("Season 1" for an entry spanning everything), so drop it to the name.
-  if (out.length === 1) out[0].label = seriesName;
+  // Relabel from what each entry ACTUALLY absorbed. One entry for the whole
+  // show is named after the show; an entry spanning a contiguous span of
+  // seasons says so; a single season keeps "Season N".
+  if (out.length === 1) {
+    out[0].label = seriesName;
+  } else {
+    for (const c of out) {
+      const list = seasonsFor.get(c.malId) ?? [];
+      if (list.length > 1) {
+        c.label = `Seasons ${list[0]}-${list[list.length - 1]}`;
+      }
+    }
+  }
   return out;
 }
 

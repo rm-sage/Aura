@@ -26,9 +26,11 @@
 // songs). Routing both readers through one cached fetch means theme songs cost
 // zero additional requests, and repeat surfaces cost zero requests at all.
 //
-// Everything here is best-effort. A dead host, a 404 or a parse failure yields
-// None and the dependent feature ships inert. This module must never fail a
-// caller.
+// Everything here is best-effort, but it distinguishes "MAL has nothing" from
+// "we could not ask". A 404 is an ANSWER and is cacheable; a dead host, a 5xx
+// or an unparseable body is an ERROR and propagates. The frontend caches these
+// payloads for seven days, so collapsing the two would persist a transient
+// outage as "this show has no theme songs" long after Tenrai recovered.
 // ---------------------------------------------------------------------------
 
 use std::collections::HashMap;
@@ -156,9 +158,29 @@ pub async fn anime_full(mal_id: u32) -> Option<AnimeFull> {
     if let Some(hit) = cache_get(mal_id) {
         return hit;
     }
-    let value = fetch_json::<AnimeFull>(&format!("{TENRAI_API}/anime/{mal_id}/full")).await;
+    // Only an ANSWER is cached. A failure to ask propagates so the caller can
+    // surface it rather than persisting "this show has nothing".
+    match fetch_json::<AnimeFull>(&format!("{TENRAI_API}/anime/{mal_id}/full")).await {
+        Ok(value) => {
+            cache_put(mal_id, value.clone());
+            value
+        }
+        Err(_) => None,
+    }
+}
+
+/// Same as `anime_full` but preserves the ask-failed vs no-answer distinction
+/// for the commands, which must not let the frontend cache an outage.
+async fn anime_full_checked(mal_id: u32) -> Result<Option<AnimeFull>, String> {
+    if mal_id == 0 {
+        return Ok(None);
+    }
+    if let Some(hit) = cache_get(mal_id) {
+        return Ok(hit);
+    }
+    let value = fetch_json::<AnimeFull>(&format!("{TENRAI_API}/anime/{mal_id}/full")).await?;
     cache_put(mal_id, value.clone());
-    value
+    Ok(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +204,7 @@ pub struct AnimeThemes {
 
 #[tauri::command]
 pub async fn fetch_anime_themes(mal_id: u32) -> Result<Option<AnimeThemes>, String> {
-    let Some(full) = anime_full(mal_id).await else { return Ok(None) };
+    let Some(full) = anime_full_checked(mal_id).await? else { return Ok(None) };
     let Some(theme) = full.theme else { return Ok(None) };
     if theme.openings.is_empty() && theme.endings.is_empty() {
         return Ok(None);
@@ -224,7 +246,7 @@ pub struct AnimeStatistics {
 #[tauri::command]
 pub async fn fetch_anime_statistics(mal_id: u32) -> Result<Option<AnimeStatistics>, String> {
     let url = format!("{TENRAI_API}/anime/{mal_id}/statistics");
-    let stats: Option<AnimeStatistics> = fetch_json(&url).await;
+    let stats: Option<AnimeStatistics> = fetch_json(&url).await?;
     // A payload with no votes at all is not a histogram. Treat it as absent so
     // the tab renders an honest empty state instead of ten zero-width bars.
     Ok(stats.filter(|s| s.total > 0 || s.scores.iter().any(|b| b.votes > 0)))
@@ -291,7 +313,7 @@ pub struct StaffCredit {
 #[tauri::command]
 pub async fn fetch_anime_staff(mal_id: u32) -> Result<Vec<StaffCredit>, String> {
     let url = format!("{TENRAI_API}/anime/{mal_id}/staff");
-    let Some(rows) = fetch_json::<Vec<StaffRow>>(&url).await else {
+    let Some(rows) = fetch_json::<Vec<StaffRow>>(&url).await? else {
         return Ok(Vec::new());
     };
 
@@ -368,7 +390,7 @@ pub struct Recommendation {
 #[tauri::command]
 pub async fn fetch_anime_recommendations(mal_id: u32) -> Result<Vec<Recommendation>, String> {
     let url = format!("{TENRAI_API}/anime/{mal_id}/recommendations");
-    let Some(rows) = fetch_json::<Vec<RecommendationRow>>(&url).await else {
+    let Some(rows) = fetch_json::<Vec<RecommendationRow>>(&url).await? else {
         return Ok(Vec::new());
     };
     let mut out: Vec<Recommendation> = rows
@@ -438,7 +460,7 @@ pub struct AnimeTrailer {
 #[tauri::command]
 pub async fn fetch_anime_trailers(mal_id: u32) -> Result<Vec<AnimeTrailer>, String> {
     let url = format!("{TENRAI_API}/anime/{mal_id}/videos");
-    let Some(payload) = fetch_json::<VideosPayload>(&url).await else {
+    let Some(payload) = fetch_json::<VideosPayload>(&url).await? else {
         return Ok(Vec::new());
     };
 
@@ -470,27 +492,37 @@ pub async fn fetch_anime_trailers(mal_id: u32) -> Result<Vec<AnimeTrailer>, Stri
 
 /// Shared GET plus envelope unwrap. Every endpoint in this module returns
 /// `{ "data": ... }`, so the failure handling lives here once.
-async fn fetch_json<T: for<'de> Deserialize<'de>>(url: &str) -> Option<T> {
+///
+/// `Err` means "we could not ask" (transport failure, a non-404 HTTP status, or
+/// an unparseable body). `Ok(None)` means "we asked and MAL has nothing".
+///
+/// That distinction is load-bearing, and collapsing it was a real bug: the
+/// frontend caches answers for SEVEN DAYS, so a transient outage returned as an
+/// empty success got persisted as "this show has no theme songs" and survived
+/// long after Tenrai came back. Only `Ok` is cacheable.
+async fn fetch_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<Option<T>, String> {
     let resp = match client().get(url).send().await {
         Ok(r) => r,
         Err(e) => {
             crate::devlog!(warn, "tenrai", "request failed {url}: {e}");
-            return None;
+            return Err(format!("request failed: {e}"));
         }
     };
     let status = resp.status();
     if !status.is_success() {
-        // 404 usually just means the id does not exist on MAL. Quiet.
-        if status.as_u16() != 404 {
-            crate::devlog!(warn, "tenrai", "HTTP {} for {url}", status.as_u16());
+        // 404 is a real answer: the id does not exist on MAL. Everything else
+        // is us failing to ask, and must not be cached as an answer.
+        if status.as_u16() == 404 {
+            return Ok(None);
         }
-        return None;
+        crate::devlog!(warn, "tenrai", "HTTP {} for {url}", status.as_u16());
+        return Err(format!("HTTP {}", status.as_u16()));
     }
     match resp.json::<Envelope<T>>().await {
-        Ok(env) => env.data,
+        Ok(env) => Ok(env.data),
         Err(e) => {
             crate::devlog!(warn, "tenrai", "parse error for {url}: {e}");
-            None
+            Err(format!("parse error: {e}"))
         }
     }
 }

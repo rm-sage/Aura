@@ -32,6 +32,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import ImageLoader from "./ImageLoader";
+import { shrinkPoster } from "./posterSize";
 import { loadAuraSettings } from "./auraSettings";
 import { shouldBlurThemeRange } from "./episodeSpoilers";
 import {
@@ -39,6 +40,17 @@ import {
   type AnimeStatistics, type AnimeTheme, type AnimeThemes, type AnimeTrailer,
   type CourRef, type Recommendation, type StaffCredit, type ExtrasTab,
 } from "./animeExtras";
+
+// Server-resize widths. Every image in here is decorative and small, and the
+// upstream assets are not: MAL staff portraits are full-size, and the trailer
+// thumbnail chain deliberately prefers YouTube's 1280x720 maxres asset because
+// that is the only one guaranteed to exist. Decoded image memory is the app's
+// top consumer, so each one is hinted to roughly its rendered width (the
+// overlay caps at 56rem, so a 4-up poster grid is ~180px and a 3-up trailer
+// grid is ~270px; doubled for high-DPI).
+const STAFF_AVATAR_W = 72;
+const RELATED_POSTER_W = 360;
+const TRAILER_THUMB_W = 540;
 
 const TABS: { id: ExtrasTab; label: string }[] = [
   { id: "songs",    label: "Songs" },
@@ -411,7 +423,7 @@ function StaffTab({ cours }: { cours: CourRef[] }) {
                                   flex items-center justify-center">
                     {c.image ? (
                       <ImageLoader
-                        src={c.image}
+                        src={shrinkPoster(c.image, STAFF_AVATAR_W)}
                         alt=""
                         className="w-full h-full"
                         imgClassName="w-full h-full object-cover"
@@ -466,7 +478,7 @@ function RelatedTab({ cours }: { cours: CourRef[] }) {
           <div className="aspect-[2/3] rounded-lg overflow-hidden bg-white/6 mb-1.5">
             {r.image && (
               <ImageLoader
-                src={r.image}
+                src={shrinkPoster(r.image, RELATED_POSTER_W)}
                 alt=""
                 className="w-full h-full"
                 imgClassName="w-full h-full object-cover"
@@ -520,7 +532,7 @@ function TrailersTab({
                                   group-hover:ring-1 group-hover:ring-white/25 transition-shadow">
                     {t.thumbnail && (
                       <ImageLoader
-                        src={t.thumbnail}
+                        src={shrinkPoster(t.thumbnail, TRAILER_THUMB_W)}
                         alt=""
                         className="w-full h-full"
                         imgClassName="w-full h-full object-cover"

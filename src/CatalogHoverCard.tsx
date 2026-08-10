@@ -201,6 +201,12 @@ function HoverPanel({
   const { meta, rect } = target;
   const ref = useRef<HTMLDivElement>(null);
   const [detail, setDetail] = useState<MetaDetail | null>(null);
+  // WHICH meta.id `detail` belongs to. The ratings effect gates on this rather
+  // than on `loading`, because both effects re-run in the same pass when the
+  // hovered card changes and `loading` still holds the PREVIOUS card's value
+  // at that moment. Gating on the stale flag would fire a request pairing the
+  // new card's imdb id with the old card's anime ids.
+  const [detailFor, setDetailFor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [pos, setPos] = useState<{ left: number; top: number; ready: boolean }>({
     left: 0, top: 0, ready: false,
@@ -257,6 +263,7 @@ function HoverPanel({
       if (!d && alt) d = await getMetaDetailFallback(addons, alt, meta.id);
       if (cancelled) return;
       setDetail(d);
+      setDetailFor(meta.id);
       setLoading(false);
     })();
     return () => { cancelled = true; };
@@ -286,13 +293,14 @@ function HoverPanel({
     // previous card's ratings would otherwise stay on screen.
     setAggRatings([]);
 
-    // Wait for the meta detail on anime. Fetching now would send all-null
-    // anime ids, and the backend's last-resort title search elects the
-    // franchise-root MAL entry (it requires an exact title match, which a
-    // "... Season 2" cour cannot satisfy while the base-titled original can).
-    // Gating here removes the wrong request rather than correcting it
-    // afterwards, and saves one MAL search per hover.
-    if (isAnime && loading) return;
+    // Wait for the meta detail on anime, and specifically for THIS card's.
+    // Fetching sooner would send all-null anime ids, and the backend's
+    // last-resort title search elects the franchise-root MAL entry (it needs
+    // an exact title match, which a "... Season 2" cour cannot satisfy while
+    // the base-titled original can). Gating here removes the wrong request
+    // rather than correcting it afterwards, and saves one MAL search per
+    // hover.
+    if (isAnime && detailFor !== meta.id) return;
 
     const ids = {
       mal:   detail?.mal_id   ?? null,
@@ -341,7 +349,7 @@ function HoverPanel({
       })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [meta.id, meta.media_type, meta.name, meta.release_info, loading,
+  }, [meta.id, meta.media_type, meta.name, meta.release_info, detailFor,
       detail?.mal_id, detail?.kitsu_id, detail?.anidb_id]);
 
   // Position beside the card: prefer the right edge, flip left when

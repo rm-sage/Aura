@@ -488,6 +488,11 @@ async function mergeChapterSkipWindows(
    *  it the chapters read belong to the NEW file, get merged with the OLD
    *  file's windows, and the result is stamped over the new file's own. */
   isStale?: () => boolean,
+  /** Last-mile decoration applied INSIDE `publish`, so it rides the one stamp
+   *  rather than needing a second write. Used to name the OP/ED song. It runs
+   *  after `applySkipModes` because a window dropped by a mode change must not
+   *  be looked up at all. */
+  decorate?: (windows: PreparedWindow[]) => Promise<PreparedWindow[]>,
 ): Promise<PreparedWindow[]> {
   // The ONE stamp per load (see the comment in finishWithChapters). Every
   // exit below that still owns the load token has to go through here: the
@@ -502,7 +507,10 @@ async function mergeChapterSkipWindows(
     // Modes are re-applied HERE, not at derivation time, so a mode change
     // made while the chapter poll was running lands in the payload instead
     // of being reverted by it.
-    const windows = applySkipModes(raw, modeFor);
+    const windows = decorate
+      ? await decorate(applySkipModes(raw, modeFor))
+      : applySkipModes(raw, modeFor);
+    if (isStale?.()) return raw;
     try {
       await invoke("set_skip_windows", { payload: { windows } });
       const detail = windows.length === 0
@@ -2608,6 +2616,44 @@ export default function App() {
                 // worst case is a couple of seconds of opening before the
                 // seek, against the old worst case of instantly seeking to
                 // the wrong place.
+                // Theme songs for this cour, fetched at most once per load and
+                // only for anime (`opts.malId` is set on the anime path only,
+                // so live action never pays for it). It rides the cached
+                // /anime/{id}/full the ratings aggregator already fetches, so
+                // it is usually free. This runs on the async chain, never on
+                // the mpv engine thread.
+                let themes: AnimeThemes | null = null;
+                let themesFetched = false;
+                const ensureThemes = async (): Promise<AnimeThemes | null> => {
+                  if (themesFetched) return themes;
+                  themesFetched = true;
+                  if (!opts?.malId) return null;
+                  try {
+                    themes = await invoke<AnimeThemes | null>(
+                      "fetch_anime_themes", { malId: opts.malId },
+                    );
+                  } catch {
+                    themes = null;
+                  }
+                  return themes;
+                };
+                // Passed INTO the merge so the song names ride the one stamp.
+                // They used to be applied only in `republish` below, which was
+                // wrong in a way that made the feature look like it worked:
+                // all three republish call sites are gated on a MISSING window
+                // (neighbour fill, silencedetect OP, outro scan), so an episode
+                // where AniSkip supplied both an OP and an in-band ED reached
+                // none of them and never got a name. The feature was live only
+                // where the skip data was WORST.
+                const nameSongs = async (
+                  windows: PreparedWindow[],
+                ): Promise<PreparedWindow[]> => {
+                  if (!opts?.malId) return windows;
+                  return stampThemeSongs(
+                    windows, await ensureThemes(), opts?.episodeNum ?? null,
+                  );
+                };
+
                 // `published` is the list currently stamped on the file. Every
                 // later writer below extends THIS, never `merged`: the ED
                 // fallback used to be the only other writer and it did not
@@ -2615,7 +2661,9 @@ export default function App() {
                 // harmless. Now that both fallbacks stamp, building either
                 // from the pre-fallback list would silently drop the other's
                 // window.
-                let published = await mergeChapterSkipWindows(prepared, modeFor, stale);
+                let published = await mergeChapterSkipWindows(
+                  prepared, modeFor, stale, nameSongs,
+                );
                 if (stale()) return;
                 // The container duration, which the chapter poll has already
                 // waited for. Needed to decide whether an ED window sits in the
@@ -2635,27 +2683,6 @@ export default function App() {
                 // each call site: one place that cannot be forgotten, and the
                 // one thing this chain must never do is stamp the previous
                 // episode's windows onto the current file.
-                // Theme songs for this cour, fetched at most once per load and
-                // only for anime. Resolved lazily so a live-action file never
-                // pays for it, and awaited rather than raced: it rides the
-                // cached /anime/{id}/full the ratings aggregator already
-                // fetches, so it is usually free.
-                let themes: AnimeThemes | null = null;
-                let themesFetched = false;
-                const ensureThemes = async (): Promise<AnimeThemes | null> => {
-                  if (themesFetched) return themes;
-                  themesFetched = true;
-                  if (!opts?.malId) return null;
-                  try {
-                    themes = await invoke<AnimeThemes | null>(
-                      "fetch_anime_themes", { malId: opts.malId },
-                    );
-                  } catch {
-                    themes = null;
-                  }
-                  return themes;
-                };
-
                 const republish = async (
                   next: PreparedWindow[], note: string,
                 ): Promise<void> => {

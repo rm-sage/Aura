@@ -98,25 +98,34 @@ pub fn parse_theme(raw: &str) -> AnimeTheme {
         }
     }
 
-    // ── title: between the first quote and the last quote preceding ` by ` ──
-    // The closing quote is located relative to the ` by ` separator rather
-    // than by taking the second quote, because titles contain quotes of their
-    // own more often than the separator appears inside one.
-    let by_at = head.rfind(BY_SEP);
+    // ── title: the quoted span ──
+    // The title is delimited by the FIRST quote and the LAST quote in the
+    // head. Taking the whole quoted span first (rather than searching only up
+    // to ` by `) is what makes an artist-less entry safe: `"Stand by Me"` with
+    // no artist would otherwise split inside its own title, leaving the title
+    // as `Stand` and the artist as `Me"`. A wrong artist is worse than none.
+    let mut by_search_from = 0usize;
     if let Some(open) = head.find('"') {
-        let search_end = by_at.unwrap_or(head.len());
-        if search_end > open + 1 {
-            if let Some(rel) = head[open + 1..search_end].rfind('"') {
-                let close = open + 1 + rel;
-                let t = head[open + 1..close].trim();
-                if !t.is_empty() {
-                    out.title = Some(t.to_string());
-                }
+        if let Some(rel) = head[open + 1..].rfind('"') {
+            let close = open + 1 + rel;
+            let t = head[open + 1..close].trim();
+            if !t.is_empty() {
+                out.title = Some(t.to_string());
             }
+            // Only a ` by ` AFTER the closing quote separates an artist. One
+            // inside the quotes belongs to the song's name.
+            by_search_from = close + 1;
         }
     }
 
-    // ── artist: everything after ` by ` in the head ──
+    // ── artist: after the first ` by ` that follows the title ──
+    // `find` from the post-title offset, not `rfind` over the whole head: an
+    // artist may legitimately contain ` by `, and the FIRST separator after
+    // the title is the real one.
+    let by_at = head
+        .get(by_search_from..)
+        .and_then(|rest| rest.find(BY_SEP).map(|i| by_search_from + i));
+
     if let Some(at) = by_at {
         let a = head[at + BY_SEP.len()..].trim();
         if !a.is_empty() {
@@ -258,6 +267,34 @@ mod tests {
         assert_eq!(t.title.as_deref(), Some("Stand by Me"));
         assert_eq!(t.artist.as_deref(), Some("The Band"));
         assert_eq!(t.episodes, vec![EpisodeSpan { start: 1, end: 12 }]);
+    }
+
+    #[test]
+    fn title_containing_by_with_no_artist_keeps_the_whole_title() {
+        // Regression: searching for the LAST " by " anywhere in the string
+        // split inside the title here, yielding title "Stand" and artist
+        // "Me\"" - a confidently wrong artist, which is the one outcome this
+        // module exists to prevent.
+        let t = parse_theme("6: \"Stand by Me\"");
+        assert_eq!(t.title.as_deref(), Some("Stand by Me"));
+        assert_eq!(t.artist, None);
+    }
+
+    #[test]
+    fn artist_containing_by_is_kept_whole() {
+        let t = parse_theme("7: \"Song\" by Death by Stereo (eps 1-3)");
+        assert_eq!(t.title.as_deref(), Some("Song"));
+        assert_eq!(t.artist.as_deref(), Some("Death by Stereo"));
+    }
+
+    #[test]
+    fn unquoted_entry_still_splits_on_by() {
+        // No quotes at all: the artist separator is still the first " by ",
+        // and the title is left unparsed rather than guessed at.
+        let t = parse_theme("8: Some Song by Some Artist (eps 2-9)");
+        assert_eq!(t.title, None);
+        assert_eq!(t.artist.as_deref(), Some("Some Artist"));
+        assert_eq!(t.episodes, vec![EpisodeSpan { start: 2, end: 9 }]);
     }
 
     #[test]
