@@ -40,6 +40,11 @@ export interface AniSkipMenuWindow {
   source: string;
   auto: boolean;
   skip_id?: string | null;
+  /** Opening / ending song, when identified. This local copy of the window
+   *  shape is deliberate (it avoids a circular import with PlayerOverlay);
+   *  keep it in step with that file and with App.tsx. */
+  song_title?:  string | null;
+  song_artist?: string | null;
 }
 
 interface Props {

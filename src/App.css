@@ -969,6 +969,16 @@ select,
     animation: detail-backdrop-drift 14s ease-in-out infinite alternate;
   }
 
+  /* Transparent stand-in for ImageLoader's built-in skeleton inside the
+   * detail hero. The hero mounts its own always-on ambient base (the
+   * .detail-backdrop-skeleton div) underneath the backdrop, so the loader
+   * must NOT stack a second opaque skeleton on top of it — that double
+   * cover is what read as a blank screen between the entrance animation
+   * and the artwork landing. */
+  .detail-backdrop-idle {
+    background: none;
+  }
+
   /* Dither noise overlay — same SVG turbulence as .aura-ambient::after */
   .detail-backdrop-skeleton::after {
     content: "";
@@ -1402,6 +1412,22 @@ select,
   @keyframes aura-toast-pop {
     0%   { opacity: 0; transform: translate(-50%, -8px) scale(0.95); }
     100% { opacity: 1; transform: translate(-50%, 0)    scale(1.00); }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* aura-skip-toast-pop — same entry beat for the LEFT-ANCHORED skip */
+  /* prompt.                                                          */
+  /*                                                                  */
+  /* The prompt used aura-toast-pop above, whose translate(-50%) is   */
+  /* there to re-centre the horizontally-centred OSD toast. The skip  */
+  /* prompt is anchored at left: 24px with no base transform, so that */
+  /* -50% shifted it half its own width to the left for the whole     */
+  /* 220ms and it slid into place. Narrow enough to pass unnoticed    */
+  /* before; naming the song widens the box and makes it obvious.     */
+  /* ---------------------------------------------------------------- */
+  @keyframes aura-skip-toast-pop {
+    0%   { opacity: 0; transform: translateY(-8px) scale(0.95); }
+    100% { opacity: 1; transform: translateY(0)    scale(1.00); }
   }
 
   /* ---------------------------------------------------------------- */
@@ -2312,6 +2338,15 @@ html[data-reduced-motion="true"] .aura-hero-title {
 html[data-reduced-motion="true"] .aura-modal-card-in,
 html[data-reduced-motion="true"] .aura-sheet-in {
   animation-name: aura-view-fade !important;
+}
+
+/* Reduced motion: the detail hero's title slot keeps its text→logo CROSSFADE
+   (that fade is the thing telling you the artwork arrived — same reasoning as
+   the popup enter/exit above) but drops the height TRAVEL, which is pure
+   motion. The slot still lands at the right size, it just gets there in one
+   step instead of gliding. */
+html[data-reduced-motion="true"] .aura-detail-title-slot {
+  transition-property: none !important;
 }
 
 /* ---------------------------------------------------------------- */

@@ -125,6 +125,7 @@ import AccountButton from "./AccountButton";
 import NotificationsScanner, { clearScannerState } from "./NotificationsScanner";
 import { getTitleState, titleStateKey } from "./titleState";
 import { isAnimeMeta, markAnimeId } from "./aiometadata";
+import type { AnimeTheme, AnimeThemes } from "./animeExtras";
 import type {
   AddonEntry,
   ExternalSubtitle,
@@ -222,6 +223,12 @@ interface PreparedWindow {
   end:    number;
   source: string;
   auto:   boolean;
+  /** The song playing in this window, stamped below from the MAL theme
+   *  list. Absent whenever the join was not certain: see stampThemeSongs.
+   *  Mirrors Rust's PreparedWindow; PlayerOverlay and AniSkipMenu carry
+   *  their own copies of this shape and must change with it. */
+  song_title?:  string | null;
+  song_artist?: string | null;
 }
 
 // Kai-derived chapter heuristics (live-action + anime where AniSkip
@@ -403,6 +410,55 @@ function dedupeSkipWindows(windows: PreparedWindow[]): PreparedWindow[] {
 const GUESS_SKIP_SOURCES = new Set([
   "chapter-heuristic", "silencedetect", "aniskip-neighbour",
 ]);
+
+/**
+ * Name the song playing in each OP/ED window, from the MAL theme list.
+ *
+ * THE JOIN. MAL theme episode ranges are expressed in MAL-LOCAL, per-cour
+ * numbering, and so is the episode number this chain already computes for
+ * AniSkip (see the `episodeNum` note further down: cour 1's MAL id with an
+ * absolute episode 404s, cour 2's with a local one is correct). So the pair
+ * needed here is the pair AniSkip already had to get right, and this is NOT
+ * the numbering-mismatch problem `arc_align.rs` exists to solve.
+ *
+ * WHAT MAKES IT SAFE is the refusal to guess. A song is attached only when
+ * exactly ONE theme of that kind covers the episode. Three cases deliberately
+ * yield nothing, and each falls back to the existing generic label:
+ *
+ *   - the theme carried no parseable episode range, so `covers` is false for
+ *     every episode (an empty span list means UNKNOWN, never "all"),
+ *   - no theme covers this episode (common: MAL lists songs for a cour the
+ *     addon numbers differently, or the range data is simply incomplete),
+ *   - more than one covers it (One Piece reuses OP1 for episode 1000, so an
+ *     episode can genuinely sit inside two ranges).
+ *
+ * Naming the wrong song is worse than naming none, which is the same rule
+ * `streamMeta.ts` follows for stream chips.
+ */
+function stampThemeSongs(
+  windows: PreparedWindow[],
+  themes: AnimeThemes | null,
+  episodeNum: number | null,
+): PreparedWindow[] {
+  if (!themes || episodeNum === null || !Number.isFinite(episodeNum)) return windows;
+
+  const pick = (list: AnimeTheme[]): AnimeTheme | null => {
+    const hits = list.filter((t) =>
+      t.episodes.some((s) => episodeNum >= s.start && episodeNum <= s.end));
+    return hits.length === 1 ? hits[0] : null;
+  };
+  const opening = pick(themes.openings);
+  const ending  = pick(themes.endings);
+
+  return windows.map((w) => {
+    // `mixed-op` is an opening with content mixed in; it is still the OP song.
+    const t = w.type === "op" || w.type === "mixed-op" ? opening
+            : w.type === "ed" ? ending
+            : null;
+    if (!t || (!t.title && !t.artist)) return w;
+    return { ...w, song_title: t.title, song_artist: t.artist };
+  });
+}
 
 /** Re-apply the user's CURRENT per-kind modes to a window list on its way
  *  out to `set_skip_windows`: drop kinds now switched off, recompute `auto`.
@@ -2579,11 +2635,38 @@ export default function App() {
                 // each call site: one place that cannot be forgotten, and the
                 // one thing this chain must never do is stamp the previous
                 // episode's windows onto the current file.
+                // Theme songs for this cour, fetched at most once per load and
+                // only for anime. Resolved lazily so a live-action file never
+                // pays for it, and awaited rather than raced: it rides the
+                // cached /anime/{id}/full the ratings aggregator already
+                // fetches, so it is usually free.
+                let themes: AnimeThemes | null = null;
+                let themesFetched = false;
+                const ensureThemes = async (): Promise<AnimeThemes | null> => {
+                  if (themesFetched) return themes;
+                  themesFetched = true;
+                  if (!opts?.malId) return null;
+                  try {
+                    themes = await invoke<AnimeThemes | null>(
+                      "fetch_anime_themes", { malId: opts.malId },
+                    );
+                  } catch {
+                    themes = null;
+                  }
+                  return themes;
+                };
+
                 const republish = async (
                   next: PreparedWindow[], note: string,
                 ): Promise<void> => {
                   if (stale()) return;
-                  const windows = applySkipModes(dedupeSkipWindows(next), modeFor);
+                  const songs = await ensureThemes();
+                  if (stale()) return;
+                  const windows = stampThemeSongs(
+                    applySkipModes(dedupeSkipWindows(next), modeFor),
+                    songs,
+                    opts?.episodeNum ?? null,
+                  );
                   await invoke("set_skip_windows", { payload: { windows } });
                   published = windows;
                   // Report what is now STAMPED, not what was handed in: dedupe

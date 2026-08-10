@@ -1100,6 +1100,21 @@ pub struct PreparedWindow {
     /// unexpected field.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub skip_id: Option<String>,
+    /// The opening or ending SONG playing in this window, when it could be
+    /// identified with certainty. React stamps these from the MAL theme list
+    /// during the single `set_skip_windows` pass, joining on the same
+    /// cour-correct MAL id and MAL-local episode number AniSkip already
+    /// requires. Both are omitted from the wire format when absent, so the
+    /// Lua script never sees an unexpected key.
+    ///
+    /// ABSENCE IS MEANINGFUL: the join deliberately refuses ambiguous matches
+    /// (unknown episode range, no match, or more than one candidate) and
+    /// leaves these unset so the UI falls back to its generic label. Naming
+    /// the wrong song is worse than naming none.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub song_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub song_artist: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

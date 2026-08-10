@@ -3284,7 +3284,15 @@ function Scrubber({
         <div
           className="absolute bottom-full mb-3 pointer-events-none z-10
                      flex flex-col items-center gap-1.5"
-          style={{ left: `${hoverPct}%`, transform: "translateX(-50%)" }}
+          // Clamped away from the track ends. The popover is centred on the
+          // cursor, so at 0% or 100% half of it sat off-screen; a song title
+          // widens it enough to make that obvious. The clamp shifts the
+          // anchor rather than the element so the box stays fully visible
+          // while the cursor keeps its position on the track.
+          style={{
+            left: `${Math.min(92, Math.max(8, hoverPct ?? 0))}%`,
+            transform: "translateX(-50%)",
+          }}
         >
           {hoveredSegment && (
             <div className="aura-glass-menu rounded-md px-3 py-2 text-[11.5px] min-w-[160px]">
@@ -3294,6 +3302,14 @@ function Scrubber({
                   <span className="text-white/45 font-normal ml-1.5">(mixed)</span>
                 )}
               </div>
+              {/* The song, when identified. Reads above the timings because
+                  "which opening is this" is the more useful answer once it
+                  is available; absent for live action and ambiguous joins. */}
+              {songLine(hoveredSegment.seg) && (
+                <div className="text-white/70 mt-0.5 truncate max-w-[240px]">
+                  {songLine(hoveredSegment.seg)}
+                </div>
+              )}
               <div className="text-white/75 font-mono tabular-nums mt-0.5">
                 {fmtTime(hoveredSegment.seg.start)} – {fmtTime(hoveredSegment.seg.end)}
               </div>
@@ -4348,6 +4364,11 @@ interface AuraSkipWindow {
    *  "aniskip". Threaded through so the AniSkipMenu can call
    *  vote_skip_time without re-fetching. */
   skip_id?: string | null;
+  /** Opening / ending song for this window, when it was identified with
+   *  certainty. Absent is the normal case for non-anime and for any
+   *  ambiguous match, and the UI falls back to its generic label. */
+  song_title?:  string | null;
+  song_artist?: string | null;
 }
 
 /** Reactive skip-windows store. The Rust side owns the canonical
@@ -4449,6 +4470,7 @@ function SkipPromptToast({
   visible: boolean;
 }) {
   const kindLabel = skipKindLabel(w.type);
+  const song = songLine(w);
   // Top offset has to clear the "Exit playback ↗  <Title>" header above.
   // That header sits at top: 16 (fs) / 52 (windowed) and its content is
   // ~64 px tall. 96 / 132 keeps the prompt firmly below it.
@@ -4463,8 +4485,17 @@ function SkipPromptToast({
         top,
         opacity: visible ? 1 : 0,
         transition: "opacity 400ms ease",
-        animation: "aura-toast-pop 220ms cubic-bezier(0.34, 1.56, 0.64, 1)",
+        // Dedicated keyframe, NOT the shared `aura-toast-pop`: that one bakes
+        // in a translate(-50%) meant for the centre toast, and this element is
+        // left-anchored with no base transform, so it snapped sideways for the
+        // whole 220 ms. Invisible at the old width, obvious once a song title
+        // widens the box.
+        animation: "aura-skip-toast-pop 220ms cubic-bezier(0.34, 1.56, 0.64, 1)",
         textShadow: "0 1px 4px rgba(0,0,0,0.85)",
+        // Arbitrary value on purpose: tailwind.config REPLACES the maxWidth
+        // scale, so max-w-md and friends emit no CSS at all and a long song
+        // title would run this box off the right edge of the screen.
+        maxWidth: "min(30rem, calc(100vw - 3rem))",
       }}
     >
       <div className="text-[12px] uppercase tracking-[0.22em] text-white/55 mb-1">
@@ -4480,8 +4511,27 @@ function SkipPromptToast({
         </kbd>{" "}
         to skip the {kindLabel}
       </div>
+      {/* The song, when it was identified with certainty. Secondary to the
+          "press X" affordance above rather than replacing it: the prompt's
+          job is still to tell you the key. Absent for live action and for any
+          ambiguous match, which is the common case. */}
+      {song && (
+        <div className="text-[13px] text-white/50 mt-1.5 truncate">{song}</div>
+      )}
     </div>
   );
+}
+
+/** "Kaikai Kitan by Eve", or just the title when the artist is unknown.
+ *  Null when nothing was identified, which is what makes every caller fall
+ *  back to its generic label. */
+function songLine(w: AuraSkipWindow): string | null {
+  const title  = w.song_title?.trim();
+  const artist = w.song_artist?.trim();
+  if (!title && !artist) return null;
+  if (!title)  return artist!;
+  if (!artist) return title;
+  return `${title} by ${artist}`;
 }
 
 /** Headless controller — auto-skips, key bindings, prompt rendering.
