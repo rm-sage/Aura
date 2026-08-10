@@ -312,6 +312,46 @@ export function arcPositionOf(result: ArcResult | null, episodeId: string): ArcP
   return null;
 }
 
+/**
+ * Synchronous, network-free read of an already-cached arc result.
+ *
+ * Exists for the detail hero. That hero latches its artwork exactly ONCE per
+ * open and never changes it afterwards (a backdrop that swaps under the user
+ * reads as a glitch), so arc art has to be known at latch time or not at all.
+ * A live fetch cannot be: it is a TMDB round-trip plus a banded alignment, and
+ * waiting on it would delay the reveal for every anime, including the large
+ * majority that turn out to have no arcs.
+ *
+ * So the hero takes the warm path only. Cached arcs win the latch; an uncached
+ * series shows its normal artwork and picks up arc art on the next open, once
+ * the arcs view has populated the cache. `undefined` from the cache means MISS
+ * (never fetched, or expired), which is different from a cached `null` meaning
+ * "this show genuinely has no arcs".
+ */
+export function peekCachedArcs(seriesId: string): ArcResult | null {
+  // Match whichever grouping the user last chose for this series, since that
+  // is the one fetchStoryArcs cached and the one the arcs view is showing.
+  const groupingId = loadArcMode(seriesId).groupingId;
+  const cached = arcCache.get(`${seriesId}::${groupingId ?? "default"}`);
+  return cached ?? null;
+}
+
+/**
+ * The arc key art to use for a given episode, or null.
+ *
+ * FANDOM ONLY, deliberately. `arcs.rs` falls back through TMDB stills and
+ * addon episode thumbnails when a wiki has no art, and those are just frames
+ * from an episode. Substituting a random frame for designed landscape art is a
+ * downgrade, so anything that is not real key art declines to participate and
+ * the caller keeps whatever it already had.
+ */
+export function arcArtFor(result: ArcResult | null, episodeId: string | null): string | null {
+  if (!result || !episodeId) return null;
+  const pos = arcPositionOf(result, episodeId);
+  if (!pos) return null;
+  return pos.arc.image_source === "fandom" ? pos.arc.image : null;
+}
+
 /** `2001` or `2001-2002`. Empty string when the arc has no dated episodes. */
 export function arcYearRange(arc: StoryArc): string {
   if (arc.year_start == null) return "";

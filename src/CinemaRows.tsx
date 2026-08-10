@@ -18,8 +18,12 @@ import { useHoverCardActivation } from "./useHoverCardActivation";
 import { getReleaseSignal, useReleaseSignalsVersion } from "./releaseSignalStore";
 import { formatCountdown, formatTargetDate, airingInfo, nextAiringEpisode, useCountdownNow } from "./releaseCountdown";
 import { useLandscapeArt, LANDSCAPE_CARD_WIDTH } from "./landscapeArt";
-import { findAIOMetadataAddon } from "./aiometadata";
+import { findAIOMetadataAddon, isAnimeMeta } from "./aiometadata";
 import { shrinkPoster } from "./posterSize";
+import { loadAuraSettings } from "./auraSettings";
+import {
+  arcArtFor, arcsLikelyAvailable, fetchStoryArcs, loadArcMode, storyArcsAvailable,
+} from "./storyArcs";
 
 /** Per-catalog cache for the View-all popup. Keyed by
  *  `${addonUrl}|${type}|${id}`. Persists across DiscoveryRow remounts
@@ -463,6 +467,68 @@ function useCwDetail(
   return detailState;
 }
 
+/**
+ * Story-arc key art for a Continue Watching tile, matching the arc the item's
+ * resume pointer sits in. Null unless every gate passes.
+ *
+ * Unlike the detail hero, this CAN fetch: a CW tile has no reveal to hold up
+ * and no write-once latch, so art arriving a moment late is a fade-in rather
+ * than a glitch. The card's own `useCwDetail` has already fetched the
+ * MetaDetail with videos and tmdb_id that `fetchStoryArcs` needs, and it is
+ * passed in rather than re-fetched here, so the marginal cost is the arcs call
+ * alone and that is cached for 24 hours.
+ *
+ * The gates, in cheapest-first order:
+ *   1. the user opted in (this ADDS spoiler exposure, so it is off by default),
+ *   2. the item is anime, and arcs are plausibly available for it,
+ *   3. there is a resume pointer to locate within an arc,
+ *   4. `storyArcsAvailable()` (a TMDB key is actually configured),
+ *   5. the arc has real Fandom key art.
+ *
+ * Gates 2 and 4 matter because `useStoryArcs` applies them but `fetchStoryArcs`
+ * does NOT, so calling the fetch directly means re-applying them here or
+ * spraying pointless TMDB lookups across every tile in the row.
+ */
+function useCwArcArt(
+  item: LibraryItem,
+  detail: MetaDetail | null,
+): string | null {
+  const [arcArt, setArcArt] = useState<string | null>(null);
+
+  const [enabled, setEnabled] = useState(() => loadAuraSettings().arcAwareArt);
+  useEffect(() => {
+    const sync = () => setEnabled(loadAuraSettings().arcAwareArt);
+    window.addEventListener("aura:settings-changed", sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener("aura:settings-changed", sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
+
+  const rawResume = (item.state ?? {}).video_id;
+  const resumeId = typeof rawResume === "string" && rawResume.length > 0 ? rawResume : null;
+  const eligible =
+    enabled &&
+    resumeId !== null &&
+    (isAnimeMeta(item) || (item.media_type ?? "").toLowerCase() === "anime") &&
+    arcsLikelyAvailable(item.id);
+
+  useEffect(() => {
+    if (!eligible || !detail) { setArcArt(null); return; }
+    let cancelled = false;
+    (async () => {
+      if (!(await storyArcsAvailable())) return;
+      const result = await fetchStoryArcs(detail, item.id, loadArcMode(item.id).groupingId);
+      if (cancelled) return;
+      setArcArt(arcArtFor(result, resumeId));
+    })();
+    return () => { cancelled = true; };
+  }, [eligible, detail, item.id, resumeId]);
+
+  return arcArt;
+}
+
 /** Inline title-suffix indicator for CW cards. Renders a small green
  *  check (watched) or yellow dot (in-progress) next to the card title
  *  when the meta has a manual mark or library-derived progress state.
@@ -706,7 +772,22 @@ export const ContinueWatchingCard = memo(function ContinueWatchingCard(
   // old `background ?? poster` chain — inert, not broken.
   const aioAddon = useMemo(() => findAIOMetadataAddon(addons ?? []), [addons]);
   const art = useLandscapeArt(item, aioAddon, LANDSCAPE_CARD_WIDTH);
-  const src = art?.landscape ?? item.background ?? item.poster;
+  // Hoisted above the art chain because useCwArcArt needs it. Same single
+  // fetch the card already made further down; the declaration just moved.
+  const cwDetail = useCwDetail(item, addons);
+  // Story-arc key art for the arc this item's resume pointer sits in. Opt-in,
+  // anime only, and Fandom-only (see useCwArcArt). It takes precedence over
+  // the landscape chain when present because matching the arc you are
+  // actually watching is the entire point; null the rest of the time, which
+  // leaves the chain below exactly as it was.
+  const arcArt = useCwArcArt(item, cwDetail);
+  const rawSrc = arcArt ?? art?.landscape ?? item.background ?? item.poster;
+  // Shrink to the tile. Fandom arc art is a 1920x1080 master, and decoded
+  // poster memory is what degrades scrolling on big libraries, so handing a
+  // full-size image to a ~360px tile is the expensive mistake. This also
+  // shrinks the pre-existing background/poster fallbacks, which were never
+  // resized here.
+  const src = rawSrc ? shrinkPoster(rawSrc, LANDSCAPE_CARD_WIDTH) : rawSrc;
   // Logo overlay: REMOVED. Two rounds of heuristics (deny-list, then a
   // textless-by-platform-rule allowlist) still produced double-title
   // cards, because hasBakedTitle under-reports in ways no client-side
@@ -725,7 +806,6 @@ export const ContinueWatchingCard = memo(function ContinueWatchingCard(
   const progress = duration > 0 ? Math.min(1, offset / duration) : 0;
   const savedVideoId = (item.state ?? {}).video_id;
 
-  const cwDetail = useCwDetail(item, addons);
   // Subscribe to release-signal + manual-watched changes so the season slice,
   // badge, and bar all re-derive when a signal lands OR the user marks/unmarks
   // an episode. The old resume-pointer-only resolution never reacted to manual

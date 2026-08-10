@@ -113,7 +113,7 @@ import { hasUsableRating } from "../ratingValue";
 import ArcGrid, { ArcGridSkeleton } from "../ArcGrid";
 import GroupingToggle from "../EpisodeGroupingToggle";
 import {
-  absoluteEpisodeMap, arcPositionOf, arcsLikelyAvailable, arcYearRange, formatAbsoluteEpisode, loadArcMode, preferredGroupingId, saveArcMode, useStoryArcs,
+  absoluteEpisodeMap, arcArtFor, arcPositionOf, arcsLikelyAvailable, arcYearRange, formatAbsoluteEpisode, loadArcMode, peekCachedArcs, preferredGroupingId, saveArcMode, useStoryArcs,
   type EpisodeGrouping,
 } from "../storyArcs";
 
@@ -340,12 +340,35 @@ interface HeroArt {
  *  preview's landscape fields. Always returns an object: `{ background: null,
  *  logo: null }` is the legitimate "this item has no art anywhere" answer and
  *  still counts as settled, so the reveal isn't left waiting forever. */
-function heroArtFrom(d: MetaDetail | null, preview: MetaPreview): HeroArt {
+function heroArtFrom(
+  d: MetaDetail | null,
+  preview: MetaPreview,
+  /** Story-arc key art for the arc the user has progress in. Takes precedence
+   *  over every backdrop below it when present, which is the whole point of
+   *  the feature; null (the overwhelmingly common case) leaves the chain
+   *  exactly as it was. */
+  arcArt?: string | null,
+): HeroArt {
   return {
     background:
-      d?.background ?? preview.background ?? preview.fanart ?? preview.backdrop ?? preview.poster ?? null,
+      arcArt ?? d?.background ?? preview.background ?? preview.fanart ?? preview.backdrop ?? preview.poster ?? null,
     logo: d?.logo ?? preview.logo ?? null,
   };
+}
+
+/** Arc key art for the hero, from the CACHE ONLY.
+ *
+ *  See peekCachedArcs for why this cannot fetch: the hero latch is write-once
+ *  and arcs resolve far later than the meta probe, so a live fetch would
+ *  either delay the reveal for every anime or break the invariant. The warm
+ *  path is the deal: first open shows normal art, and arc art appears from the
+ *  next visit once the arcs view has populated the cache.
+ *
+ *  Returns null unless the user opted in, since this ADDS spoiler exposure. */
+function arcHeroArt(seriesId: string, resumeVideoId: string | null): string | null {
+  if (!resumeVideoId) return null;
+  if (!loadAuraSettings().arcAwareArt) return null;
+  return arcArtFor(peekCachedArcs(seriesId), resumeVideoId);
 }
 
 /** Hero title slot — the text title and the logo stacked in a single grid
@@ -489,16 +512,25 @@ function HeroTitle({
  *  treated as a miss: latching it would lock the hero to the catalog preview
  *  and then, per the invariant above, refuse the real art when the live probe
  *  returns it. Better to wait. */
-function seedHeroArt(preview: MetaPreview): HeroArt | null {
+function seedHeroArt(preview: MetaPreview, resumeVideoId: string | null): HeroArt | null {
   const seed = peekRichestCachedDetailById(preview.id);
-  return seed && (seed.background || seed.logo) ? heroArtFrom(seed, preview) : null;
+  if (!seed || !(seed.background || seed.logo)) return null;
+  return heroArtFrom(seed, preview, arcHeroArt(preview.id, resumeVideoId));
 }
 
 function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, onPlayTrailer, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
   const [detail, setDetail]                 = useState<MetaDetail | null>(null);
+  // Resume pointer, read BEFORE the latch below because the latch's seed
+  // needs it synchronously on the first render to pick the right arc's art.
+  // This is a pure context read, and useResumeVideoId is called again further
+  // down for the resume behaviour itself; two calls are free and keep that
+  // logic where it belongs.
+  const heroResumeVideoId = useResumeVideoId(meta.id);
   // Write-once hero art (see the latch notes above the component). `null`
   // means "not settled yet" — the hero shows its ambient base and waits.
-  const [heroArtLatch, setHeroArtLatch]     = useState<HeroArt | null>(() => seedHeroArt(meta));
+  const [heroArtLatch, setHeroArtLatch]     = useState<HeroArt | null>(
+    () => seedHeroArt(meta, heroResumeVideoId),
+  );
   // Decode gates for the two latched assets. The reveal waits for BOTH so the
   // backdrop and the logo land on the same frame; an asset that errors counts
   // as ready (its layer just never appears) so one dead URL can't strand the
@@ -540,7 +572,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   useEffect(() => {
     if (heroKeyRef.current === meta.id) return;
     heroKeyRef.current = meta.id;
-    setHeroArtLatch(seedHeroArt(meta));
+    setHeroArtLatch(seedHeroArt(meta, heroResumeVideoId));
     setBgReady(false);
     setLogoReady(false);
   }, [meta]);
@@ -795,7 +827,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
       // No addon will ever answer — settle on the catalog preview's art
       // immediately rather than leaving the hero waiting on a probe that
       // is never going to run.
-      setHeroArtLatch((prev) => prev ?? heroArtFrom(null, meta));
+      setHeroArtLatch((prev) => prev ?? heroArtFrom(null, meta, arcHeroArt(meta.id, heroResumeVideoId)));
       return;
     }
     let cancelled = false;
@@ -903,7 +935,9 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
         // source 2 in the latch notes). `prev ??` keeps the write once-only,
         // which is what makes a StrictMode double mount harmless.
         if (cancelled) return;
-        setHeroArtLatch((prev) => prev ?? heroArtFrom(finalDetail ?? null, meta));
+        setHeroArtLatch((prev) => prev ?? heroArtFrom(
+          finalDetail ?? null, meta, arcHeroArt(meta.id, heroResumeVideoId),
+        ));
       });
     return () => { cancelled = true; };
   }, [metaAddon, addons, meta, meta.id, meta.media_type]);
