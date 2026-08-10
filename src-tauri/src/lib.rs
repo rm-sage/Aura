@@ -64,6 +64,8 @@ mod stremio;
 mod subsync;
 mod subtitles;
 mod sync;
+mod tenrai;
+mod theme_parse;
 mod thumbs;
 mod trailer;
 mod tray;
@@ -2412,7 +2414,7 @@ pub fn run() {
             media_controls::smtc_clear,
             // ── Phase 5: stream aggregation ──────────────────────────────────
             stremio::fetch_streams,
-            // ── Multi-source ratings (MDBList + MAL via Jikan) ───────────────
+            // ── Multi-source ratings (MDBList + MAL via Tenrai) ──────────────
             ratings::fetch_aggregate_ratings,
             // ── Accurate movie Digital/Theatrical dates (MDBList) ────────────
             ratings::fetch_movie_release_dates,

@@ -878,7 +878,7 @@ pub async fn resolve_mal_id(source: String, id: u32) -> Result<Option<u32>, Stri
 }
 
 // ---------------------------------------------------------------------------
-// Title → MAL id (Jikan / MyAnimeList unofficial API).
+// Title -> MAL id (Tenrai / MyAnimeList mirror).
 //
 // Last-resort resolver for anime that come into Aura via an IMDb id
 // (`tt…`) — the most common case in practice. AIOMetadata's response
@@ -888,13 +888,13 @@ pub async fn resolve_mal_id(source: String, id: u32) -> Result<Option<u32>, Stri
 // mal:, anilist:, anidb:). Without those we can't bounce through
 // yuna.moe to get a MAL id, and AniSkip never fires.
 //
-// Jikan exposes MAL's catalogue with no API key required at
-// https://api.jikan.moe/v4/. Rate limit is 3 req/s, 60/min — well
-// within budget for one request per fresh anime title. We cache
-// positive results indefinitely (titles are stable) and negatives
-// for 24 h to ride out transient outages.
+// Tenrai exposes MAL's catalogue with no API key required at
+// https://api.tenrai.org/v1/ (see tenrai.rs; it replaced Jikan, which
+// shut down). Rate limit is 4 req/s, 120/min: well within budget for one
+// request per fresh anime title. We cache positive results indefinitely
+// (titles are stable) and negatives for 24 h to ride out transient outages.
 //
-// Matching rules: query Jikan with `?q=<title>&type=tv&limit=10`.
+// Matching rules: query Tenrai with `?q=<title>&type=tv&limit=10`.
 // Walk the results, score each candidate by:
 //   1. Exact case-insensitive match on `title`, `title_english`,
 //      `title_japanese`, or any synonym in `titles[].title` → +100
@@ -906,13 +906,13 @@ pub async fn resolve_mal_id(source: String, id: u32) -> Result<Option<u32>, Stri
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
-struct JikanSearchResponse {
+struct MalSearchResponse {
     #[serde(default)]
-    data: Vec<JikanAnime>,
+    data: Vec<MalSearchAnime>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct JikanAnime {
+struct MalSearchAnime {
     mal_id: u32,
     #[serde(default)]
     title: Option<String>,
@@ -921,19 +921,19 @@ struct JikanAnime {
     #[serde(default)]
     title_japanese: Option<String>,
     #[serde(default)]
-    titles: Vec<JikanTitle>,
+    titles: Vec<MalSearchTitle>,
     #[serde(default)]
     year: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct JikanTitle {
+struct MalSearchTitle {
     #[serde(default)]
     title: Option<String>,
 }
 
 /// Resolve a title (and optional year hint) to a MyAnimeList id via
-/// Jikan. Returns None when no exact-title match is found — see the
+/// Tenrai. Returns None when no exact-title match is found. See the
 /// matching-rules note above. Cached in the same `MAL_RESOLVE_CACHE`
 /// that the id-based resolver uses, keyed by `title:<lowercased name>`
 /// so subsequent episodes of the same series skip the round-trip.
@@ -960,7 +960,7 @@ pub async fn resolve_mal_id_by_title(
         }
     }
 
-    // Jikan limits q to 64 chars and rejects most punctuation. Strip
+    // The MAL search limits q to 64 chars and rejects most punctuation. Strip
     // anything wild — `reqwest` percent-encodes the query string for
     // us via `.query()`.
     let cleaned: String = q.chars()
@@ -968,11 +968,11 @@ pub async fn resolve_mal_id_by_title(
         .take(64)
         .collect();
     let cleaned = cleaned.trim().to_string();
-    let url = "https://api.jikan.moe/v4/anime";
+    let url = format!("{}/anime", crate::tenrai::TENRAI_API);
     crate::devlog!(info, "aniskip", "resolve_mal_id_by_title GET {url}?q={cleaned}");
 
     let resp = match client()
-        .get(url)
+        .get(&url)
         .query(&[
             ("q", cleaned.as_str()),
             ("type", "tv"),
@@ -984,7 +984,7 @@ pub async fn resolve_mal_id_by_title(
     {
         Ok(r) => r,
         Err(e) => {
-            crate::devlog!(warn, "aniskip", "Jikan request failed: {e}");
+            crate::devlog!(warn, "aniskip", "Tenrai request failed: {e}");
             mal_resolve_cache().lock().unwrap().insert(key, MalResolveEntry {
                 mal_id: None, cached_at: Instant::now(),
             });
@@ -994,17 +994,17 @@ pub async fn resolve_mal_id_by_title(
     if !resp.status().is_success() {
         crate::devlog!(
             warn, "aniskip",
-            "Jikan HTTP {} for '{q}'", resp.status().as_u16()
+            "Tenrai HTTP {} for '{q}'", resp.status().as_u16()
         );
         mal_resolve_cache().lock().unwrap().insert(key, MalResolveEntry {
             mal_id: None, cached_at: Instant::now(),
         });
         return Ok(None);
     }
-    let parsed: JikanSearchResponse = match resp.json().await {
+    let parsed: MalSearchResponse = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
-            crate::devlog!(warn, "aniskip", "Jikan JSON parse error: {e}");
+            crate::devlog!(warn, "aniskip", "Tenrai JSON parse error: {e}");
             mal_resolve_cache().lock().unwrap().insert(key, MalResolveEntry {
                 mal_id: None, cached_at: Instant::now(),
             });
@@ -1348,7 +1348,7 @@ fn extract_u64(v: &Option<serde_json::Value>) -> Option<u64> {
 ///      AIOMetadata serves under IMDb.
 ///   4. Series-root IMDb + season → Fribb anilist_id → AniList
 ///      GraphQL idMal. Covers Fribb rows with anilist but no mal.
-///   5. Title-based Jikan search (when season ≤ 1 only). Last
+///   5. Title-based MAL search (when season <= 1 only). Last
 ///      resort; multi-cour anime would return the cour-1 MAL
 ///      which is wrong for cour ≥ 2 submissions.
 ///

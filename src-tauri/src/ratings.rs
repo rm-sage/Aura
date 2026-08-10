@@ -5,11 +5,11 @@
 // Multi-source ratings aggregator.
 //
 // Folds MDBList (IMDb / RT & Metacritic audience / TMDB / Trakt /
-// Letterboxd) and the anime pair Jikan (MyAnimeList score, weighted
+// Letterboxd) and the anime pair Tenrai (MyAnimeList score, weighted
 // score, popularity rank) + AniList (averageScore) into a single
 // normalized list the DetailView renders. The MDBList key is baked at
 // build time, so the IMDb / RT / Metacritic tier always lights up;
-// Jikan + AniList add the anime scores, and addon-supplied ratings
+// Tenrai + AniList add the anime scores, and addon-supplied ratings
 // still render alongside.
 //
 // Why no Rotten Tomatoes audience score? RT's "audience" score sits
@@ -27,8 +27,9 @@
 //                                       build time (build.rs, git-ignored
 //                                       file → cargo:rustc-env). Replaced
 //                                       OMDb (critic-only, redundant now).
-//   • Jikan (api.jikan.moe v4)       — MyAnimeList score (anime only),
-//                                       no key needed, 3 req/sec ceiling.
+//   • Tenrai (api.tenrai.org v1)     - MyAnimeList score (anime only),
+//                                       no key needed, 4 req/sec ceiling.
+//                                       Replaced Jikan, which shut down.
 //   • AniList (graphql.anilist.co)   — averageScore by idMal (anime
 //                                       only), no key needed.
 //
@@ -42,7 +43,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-const JIKAN_API: &str = "https://api.jikan.moe/v4";
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -87,9 +87,9 @@ pub struct AggregateRating {
 // (not the Tomatometer), Metacritic user (not the Metascore), TMDB /
 // Trakt user scores, IMDb, Letterboxd. Pure-critic rows
 // (tomatoes/metacritic critic, rogerebert) and myanimelist are skipped
-// — MAL is owned by the richer Jikan branch below (score + rank +
+// - MAL is owned by the richer Tenrai branch below (score + rank +
 // popularity, and it works for kitsu/mal-id anime MDBList can't key);
-// AniList rides alongside Jikan from the same resolved MAL id.
+// AniList rides alongside Tenrai from the same resolved MAL id.
 // ---------------------------------------------------------------------------
 
 const MDBLIST_KEY: &str = env!("AURA_MDBLIST_KEY");
@@ -236,52 +236,18 @@ pub async fn fetch_movie_release_dates(imdb_id: String) -> Result<MovieReleaseDa
 }
 
 // ---------------------------------------------------------------------------
-// Jikan (MyAnimeList) branch
+// MyAnimeList branch
+//
+// Reads through `tenrai::anime_full`, which caches the `/anime/{id}/full`
+// payload. That payload also carries the opening and ending theme songs the
+// extras overlay renders, so the two features share one request instead of
+// issuing one each.
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct JikanFullData {
-    score: Option<f64>,
-    /// Number of users who rated. Useful for "x.x ★ from N users" UI.
-    #[allow(dead_code)]
-    scored_by: Option<u64>,
-    rank: Option<u32>,
-    popularity: Option<u32>,
-    members: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct JikanFullEnvelope {
-    data: Option<JikanFullData>,
-}
-
-async fn jikan_for_mal_id(mal_id: u32) -> Vec<AggregateRating> {
-    let url = format!("{JIKAN_API}/anime/{mal_id}/full");
-    let resp = match client().get(&url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            crate::devlog!(warn, "ratings", "jikan request failed: {e}");
-            return Vec::new();
-        }
+async fn mal_for_mal_id(mal_id: u32) -> Vec<AggregateRating> {
+    let Some(data) = crate::tenrai::anime_full(mal_id).await else {
+        return Vec::new();
     };
-    let resp = match resp.error_for_status() {
-        Ok(r) => r,
-        Err(e) => {
-            // 404 here usually means the MAL id doesn't exist; quiet.
-            if e.status().map(|s| s.as_u16()) != Some(404) {
-                crate::devlog!(warn, "ratings", "jikan HTTP error: {e}");
-            }
-            return Vec::new();
-        }
-    };
-    let env: JikanFullEnvelope = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            crate::devlog!(warn, "ratings", "jikan parse error: {e}");
-            return Vec::new();
-        }
-    };
-    let Some(data) = env.data else { return Vec::new(); };
 
     let mut out = Vec::new();
     if let Some(score) = data.score.filter(|v| *v > 0.0) {
@@ -317,7 +283,7 @@ async fn jikan_for_mal_id(mal_id: u32) -> Vec<AggregateRating> {
 // ---------------------------------------------------------------------------
 // AniList branch — public GraphQL, no key, generous rate limit. AniList
 // indexes by MAL id directly (`idMal`), so we reuse whatever MAL id the
-// Jikan branch resolved. `averageScore` is AniList's weighted 0-100
+// MAL branch resolved. `averageScore` is AniList's weighted 0-100
 // mean — the score users actually recognise on anilist.co.
 // ---------------------------------------------------------------------------
 
@@ -377,20 +343,20 @@ pub struct AggregateInput {
     /// IMDb id when known (`tt0903747`). Populates the MDBList branch.
     pub imdb_id: Option<String>,
     /// Numeric MAL id, when the caller already knows it (e.g. from
-    /// AIOMetadata). Populates the Jikan + AniList branches directly.
+    /// AIOMetadata). Populates the MAL + AniList branches directly.
     pub mal_id: Option<u32>,
-    /// Numeric Kitsu id; resolved → MAL → Jikan.
+    /// Numeric Kitsu id; resolved -> MAL -> Tenrai.
     pub kitsu_id: Option<u32>,
-    /// Numeric AniList id; resolved → MAL → Jikan.
+    /// Numeric AniList id; resolved -> MAL -> Tenrai.
     pub anilist_id: Option<u32>,
-    /// Numeric AniDB id; resolved → MAL → Jikan.
+    /// Numeric AniDB id; resolved -> MAL -> Tenrai.
     pub anidb_id: Option<u32>,
     /// Title fallback for resolution by name when no numeric id
     /// resolved. Optional release year tightens the match.
     pub title: Option<String>,
     pub year: Option<u32>,
     /// True when the meta type is "anime" or genres include the anime
-    /// signal. Gate for the Jikan branch — non-anime IMDb ids skip the
+    /// signal. Gate for the MAL branch: non-anime IMDb ids skip the
     /// resolution attempt to avoid useless calls.
     pub is_anime: bool,
 }
@@ -412,7 +378,7 @@ pub async fn fetch_aggregate_ratings(
     }
 
     // ── Anime branch (MAL + AniList, anime only) ────────────────────────
-    // Resolve a MAL id ONCE (it keys both Jikan and AniList), then fetch
+    // Resolve a MAL id ONCE (it keys both Tenrai and AniList), then fetch
     // both ratings in parallel. Title resolution is the last resort —
     // its sequel/dub/movie-of-series heuristics occasionally mispick on
     // very generic names; worst case is a slightly-off score the user
@@ -435,7 +401,7 @@ pub async fn fetch_aggregate_ratings(
             None
         };
         if let Some(mal) = mal {
-            let (j, a) = tokio::join!(jikan_for_mal_id(mal), anilist_for_mal(mal));
+            let (j, a) = tokio::join!(mal_for_mal_id(mal), anilist_for_mal(mal));
             out.extend(j);
             out.extend(a);
         }
