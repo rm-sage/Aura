@@ -161,6 +161,313 @@ pub async fn anime_full(mal_id: u32) -> Option<AnimeFull> {
     value
 }
 
+// ---------------------------------------------------------------------------
+// Extras: the on-demand payloads behind the detail page's More info overlay.
+//
+// NONE of this rides `MetaDetail`. `metaCache` holds up to 800 entries and is
+// read by catalog hover, Calendar, Continue Watching and the notification
+// scanner, so a histogram plus a staff list plus a recommendation array
+// attached there would be multiplied by 800 and paid on surfaces that never
+// render any of it. Each of these is fetched when a human opens the tab that
+// shows it, and not before.
+// ---------------------------------------------------------------------------
+
+/// Opening and ending songs, already parsed. The frontend never sees a raw
+/// display string it would have to parse itself.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct AnimeThemes {
+    pub openings: Vec<crate::theme_parse::AnimeTheme>,
+    pub endings: Vec<crate::theme_parse::AnimeTheme>,
+}
+
+#[tauri::command]
+pub async fn fetch_anime_themes(mal_id: u32) -> Result<Option<AnimeThemes>, String> {
+    let Some(full) = anime_full(mal_id).await else { return Ok(None) };
+    let Some(theme) = full.theme else { return Ok(None) };
+    if theme.openings.is_empty() && theme.endings.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(AnimeThemes {
+        openings: crate::theme_parse::parse_all(&theme.openings),
+        endings: crate::theme_parse::parse_all(&theme.endings),
+    }))
+}
+
+// ── /anime/{id}/statistics ──
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScoreBucket {
+    pub score: u32,
+    pub votes: u64,
+    pub percentage: f64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct AnimeStatistics {
+    #[serde(default)]
+    pub watching: u64,
+    #[serde(default)]
+    pub completed: u64,
+    #[serde(default)]
+    pub on_hold: u64,
+    #[serde(default)]
+    pub dropped: u64,
+    #[serde(default)]
+    pub plan_to_watch: u64,
+    #[serde(default)]
+    pub total: u64,
+    /// Ten buckets, one per whole score. Ordered 1..10 upstream.
+    #[serde(default)]
+    pub scores: Vec<ScoreBucket>,
+}
+
+#[tauri::command]
+pub async fn fetch_anime_statistics(mal_id: u32) -> Result<Option<AnimeStatistics>, String> {
+    let url = format!("{TENRAI_API}/anime/{mal_id}/statistics");
+    let stats: Option<AnimeStatistics> = fetch_json(&url).await;
+    // A payload with no votes at all is not a histogram. Treat it as absent so
+    // the tab renders an honest empty state instead of ten zero-width bars.
+    Ok(stats.filter(|s| s.total > 0 || s.scores.iter().any(|b| b.votes > 0)))
+}
+
+// ── /anime/{id}/staff ──
+
+/// Roles worth surfacing, in display order.
+///
+/// The raw response is enormous (742 rows for Frieren) because it includes
+/// every per-episode storyboard and animation-director credit. Filtering here
+/// rather than in the UI keeps that payload off the wire and out of the cache.
+const KEY_STAFF_ROLES: &[&str] = &[
+    "Original Creator",
+    "Director",
+    "Series Composition",
+    "Script",
+    "Character Design",
+    "Music",
+    "Sound Director",
+];
+
+#[derive(Deserialize)]
+struct StaffRow {
+    person: StaffPerson,
+    #[serde(default)]
+    positions: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct StaffPerson {
+    mal_id: u32,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    images: Option<ImageSet>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ImageSet {
+    #[serde(default)]
+    jpg: Option<ImageUrls>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ImageUrls {
+    #[serde(default)]
+    image_url: Option<String>,
+}
+
+/// MAL serves this placeholder for people with no photo. Mapping it to None
+/// lets the UI render its own initial-letter avatar instead of a grey glyph.
+const MAL_PLACEHOLDER: &str = "questionmark";
+
+#[derive(Clone, Debug, Serialize)]
+pub struct StaffCredit {
+    pub mal_id: u32,
+    pub name: String,
+    /// Only the roles from `KEY_STAFF_ROLES`, in that order.
+    pub positions: Vec<String>,
+    pub image: Option<String>,
+}
+
+#[tauri::command]
+pub async fn fetch_anime_staff(mal_id: u32) -> Result<Vec<StaffCredit>, String> {
+    let url = format!("{TENRAI_API}/anime/{mal_id}/staff");
+    let Some(rows) = fetch_json::<Vec<StaffRow>>(&url).await else {
+        return Ok(Vec::new());
+    };
+
+    let mut out: Vec<StaffCredit> = Vec::new();
+    for row in rows {
+        let kept: Vec<String> = KEY_STAFF_ROLES
+            .iter()
+            .filter(|role| row.positions.iter().any(|p| p.eq_ignore_ascii_case(role)))
+            .map(|r| (*r).to_string())
+            .collect();
+        if kept.is_empty() {
+            continue;
+        }
+        let Some(name) = row.person.name.filter(|n| !n.trim().is_empty()) else { continue };
+        // One person can hold several key roles (director and script is
+        // common). Merge rather than listing them twice.
+        if let Some(existing) = out.iter_mut().find(|c| c.mal_id == row.person.mal_id) {
+            for r in kept {
+                if !existing.positions.contains(&r) {
+                    existing.positions.push(r);
+                }
+            }
+            continue;
+        }
+        let image = row
+            .person
+            .images
+            .and_then(|i| i.jpg)
+            .and_then(|j| j.image_url)
+            .filter(|u| !u.contains(MAL_PLACEHOLDER));
+        out.push(StaffCredit { mal_id: row.person.mal_id, name, positions: kept, image });
+    }
+
+    // Order by the role table so a director never sorts below a sound
+    // director just because MAL listed them later.
+    out.sort_by_key(|c| {
+        c.positions
+            .iter()
+            .filter_map(|p| KEY_STAFF_ROLES.iter().position(|r| r == p))
+            .min()
+            .unwrap_or(usize::MAX)
+    });
+    Ok(out)
+}
+
+// ── /anime/{id}/recommendations ──
+
+const RECOMMENDATION_CAP: usize = 24;
+
+#[derive(Deserialize)]
+struct RecommendationRow {
+    entry: RecommendationEntry,
+    #[serde(default)]
+    votes: u32,
+}
+
+#[derive(Deserialize)]
+struct RecommendationEntry {
+    mal_id: u32,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    images: Option<ImageSet>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Recommendation {
+    pub mal_id: u32,
+    pub title: String,
+    pub votes: u32,
+    pub image: Option<String>,
+}
+
+#[tauri::command]
+pub async fn fetch_anime_recommendations(mal_id: u32) -> Result<Vec<Recommendation>, String> {
+    let url = format!("{TENRAI_API}/anime/{mal_id}/recommendations");
+    let Some(rows) = fetch_json::<Vec<RecommendationRow>>(&url).await else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<Recommendation> = rows
+        .into_iter()
+        .filter_map(|r| {
+            let title = r.entry.title.filter(|t| !t.trim().is_empty())?;
+            Some(Recommendation {
+                mal_id: r.entry.mal_id,
+                title,
+                votes: r.votes,
+                image: r.entry.images.and_then(|i| i.jpg).and_then(|j| j.image_url),
+            })
+        })
+        .collect();
+    // Upstream order is not strictly by votes. Sort so the strongest
+    // community picks lead, then cap: 80 rows for one show is a scroll, not a
+    // recommendation.
+    out.sort_by(|a, b| b.votes.cmp(&a.votes));
+    out.truncate(RECOMMENDATION_CAP);
+    Ok(out)
+}
+
+// ── /anime/{id}/videos ──
+
+#[derive(Deserialize)]
+struct VideosPayload {
+    #[serde(default)]
+    promo: Vec<PromoRow>,
+}
+
+#[derive(Deserialize)]
+struct PromoRow {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    trailer: Option<TrailerRow>,
+}
+
+#[derive(Deserialize)]
+struct TrailerRow {
+    #[serde(default)]
+    youtube_id: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    images: Option<TrailerImages>,
+}
+
+#[derive(Deserialize)]
+struct TrailerImages {
+    #[serde(default)]
+    maximum_image_url: Option<String>,
+    #[serde(default)]
+    large_image_url: Option<String>,
+    #[serde(default)]
+    medium_image_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AnimeTrailer {
+    pub youtube_id: String,
+    pub title: String,
+    pub url: String,
+    pub thumbnail: Option<String>,
+}
+
+#[tauri::command]
+pub async fn fetch_anime_trailers(mal_id: u32) -> Result<Vec<AnimeTrailer>, String> {
+    let url = format!("{TENRAI_API}/anime/{mal_id}/videos");
+    let Some(payload) = fetch_json::<VideosPayload>(&url).await else {
+        return Ok(Vec::new());
+    };
+
+    // Dedup by youtube_id is REQUIRED, not defensive: upstream genuinely
+    // repeats one video under several titles (Frieren lists the same id as
+    // both "Main Trailer" and "PV 5"). First title wins, since the earlier
+    // entries carry the more descriptive names.
+    let mut seen: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for row in payload.promo {
+        let Some(t) = row.trailer else { continue };
+        let Some(yt) = t.youtube_id.filter(|s| !s.trim().is_empty()) else { continue };
+        if seen.iter().any(|s| s == &yt) {
+            continue;
+        }
+        seen.push(yt.clone());
+        let images = t.images;
+        out.push(AnimeTrailer {
+            url: t.url.unwrap_or_else(|| format!("https://www.youtube.com/watch?v={yt}")),
+            title: row.title.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "Trailer".into()),
+            thumbnail: images.and_then(|i| {
+                i.maximum_image_url.or(i.large_image_url).or(i.medium_image_url)
+            }),
+            youtube_id: yt,
+        });
+    }
+    Ok(out)
+}
+
 /// Shared GET plus envelope unwrap. Every endpoint in this module returns
 /// `{ "data": ... }`, so the failure handling lives here once.
 async fn fetch_json<T: for<'de> Deserialize<'de>>(url: &str) -> Option<T> {

@@ -50,6 +50,7 @@
     "allow-subtitles",
     "allow-api-keys",
     "allow-aggregate-ratings",
+    "allow-anime-extras",
     "allow-release-dates",
     "allow-landscape-art",
     "allow-user-backups",

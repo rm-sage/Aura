@@ -2352,6 +2352,12 @@ pub fn run() {
             aniskip::get_skip_windows,
             aniskip::resolve_mal_id,
             aniskip::resolve_mal_id_by_title,
+            // ── Anime extras (Tenrai): the More info overlay's five tabs ──
+            tenrai::fetch_anime_themes,
+            tenrai::fetch_anime_statistics,
+            tenrai::fetch_anime_staff,
+            tenrai::fetch_anime_recommendations,
+            tenrai::fetch_anime_trailers,
             silencedetect::detect_silence_intervals,
             silencedetect::detect_outro_boundary,
             // ── publicmetadb (OP/ED skip source: live-action + anime) ──
