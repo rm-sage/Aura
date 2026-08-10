@@ -43,6 +43,7 @@ emitted), `dist/assets/index-*.css` is the artifact. It is git-ignored, so build
 
 | Area | Constraint |
 |------|------------|
+| MAL API | `api.tenrai.org/v1` via `tenrai.rs`, NOT Jikan (shut down permanently in 2026). Same response envelope and field names, but the version segment is `/v1`, not `/v4`. Public tier is 4 req/s, 120/min, 40k/day. There is exactly ONE base-URL const; do not inline a second host. |
 | HTTP client | `reqwest 0.12`, default-features off, `rustls-tls` backend. Auth / account clients enforce `https_only(true)`. Do not add a plaintext-HTTP fallback: every one removed was the result of a real wire-capture incident. |
 | TLS exception | Casting (`cast/`) uses `native-tls` (SChannel) on purpose, to accept self-signed CASTV2 device certs on the LAN. This is the only deliberate divergence from the rustls posture. |
 | Credentials | Platform-native keyring (`keyring 3`, `windows-native` / `apple-native` / `linux-native-sync-persistent`). Native backends are MANDATORY (an in-memory mock silently lost OpenSubtitles keys between launches). Passwords wrapped in `Zeroizing<String>` (`zeroize 1`). |
@@ -212,7 +213,10 @@ frontend ~40k LOC over ~70 files + ~13 views).
   `GET /oauth/callback` on the same bridge listener; nonce-guarded, re-emits the existing
   `deep-link` event so `App.tsx` persists tokens through one code path. Proxy-side contract in
   `docs/oauth-loopback-contract.md`).
-- **Metadata + ratings**: `ratings.rs` (MDBList + Jikan + AniList aggregator, anime-aware weights),
+- **Metadata + ratings**: `ratings.rs` (MDBList + MAL + AniList aggregator, anime-aware weights),
+  `tenrai.rs` (the MyAnimeList client: base URL, a bounded `/anime/{id}/full` cache shared by
+  ratings and theme songs, plus the five on-demand extras commands), `theme_parse.rs` (MAL theme
+  display-string parser, has `#[cfg(test)]` tests),
   `publicmetadb.rs` (OP/ED skip source + TMDB id resolution), `anime_id_map.rs`, `silencedetect.rs`
   (outro boundary via ffmpeg), `trailer.rs` (YouTube trailer resolve).
 - **Skip / scrobble**: `aniskip.rs` (OP/ED timing, vote/submit, id resolution), `scrobble.rs` +
@@ -451,6 +455,11 @@ creep degrades the experience. When adding ANY feature:
   manifest gate decisions.
 - "Stream chips missing / wrong" (no audio-channel or seeder chips, size chip showing the FOLDER
   size, raw glyph text under the title) -> `src/streamMeta.ts`. See the parsing invariant below.
+- "Anime ratings differ between the hover card and the detail page" -> `CatalogHoverCard.tsx`'s
+  ratings effect. Both surfaces must elect the same metadata addon AND must not fetch before the
+  meta detail resolves; a detail-less fetch sends null anime ids and falls through to the title
+  search, which can elect the wrong MAL entry. The session cache is keyed on the ids the answer was
+  computed from for exactly this reason. DevConsole `[aniskip]` logs the elected id and score.
 - "Ratings missing/sparse" -> `ratings.rs`: the MDBList branch needs a `tt`-prefixed IMDb id and a
   non-empty `AURA_MDBLIST_KEY` (baked from `.env.local`); the MAL/AniList branch needs a resolvable
   anime id. Non-tt non-anime ids get only addon-supplied `detail.ratings`. OMDb is fully removed.
@@ -509,7 +518,8 @@ old-format and new-format samples and diff the field sets. Node runs the `.ts` f
 - Rust log labels to grep in the DevConsole or `aura-mpv.log`: `[bridge]`, `[player]`, `[streams]`,
   `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[ratings]`, `[rpc]`, `[win32]`, `[smtc]`,
   `[scrobble]`, `[publicmetadb]`, `[mpv]` (the playback engine), `[cast]`, `[iptv]`, `[sync]`,
-  `[aniskip]`, `[arcs]`, `[subsync]`.
+  `[aniskip]`, `[arcs]`, `[subsync]`, `[tenrai]` (the MyAnimeList client), `[extras]` (frontend,
+  the anime More info overlay).
 - libmpv writes its own verbose log to `%USERPROFILE%\aura-mpv.log` (truncated each MPV init, rotated
   to `.old` past 50 MB). The last few lines usually pinpoint a STATUS_ACCESS_VIOLATION.
 - Discord RPC uses application ID `1499651271357890610` (`window_logic.rs`). Browse states are gated

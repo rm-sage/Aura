@@ -37,6 +37,13 @@ export interface ImageLoaderProps {
   onLoad?: (img: HTMLImageElement) => void;
   /** Optional fallback content rendered when the image errors out. */
   fallback?: React.ReactNode;
+  /** Fired once the loader has given up — every retry and the RPDB→metahub
+   *  swap exhausted. Callers that GATE something on this image being ready
+   *  (the detail hero holds its whole reveal until the backdrop decodes)
+   *  need the failure edge too, or one dead URL strands them waiting
+   *  forever. Not fired for intermediate failures that still have a retry
+   *  left. */
+  onError?: () => void;
   /** Diagnostic: when set, warn to the DevConsole if the DECODED image is
    *  pathologically large for a small tile (>1.5 MP). Surfaces a single
    *  oversized poster that tanks scroll (compositor re-rasters the big texture
@@ -73,6 +80,7 @@ export default function ImageLoader({
   imgStyle,
   skeletonClassName,
   onLoad,
+  onError,
   fallback,
   perfLabel,
 }: ImageLoaderProps) {
@@ -273,6 +281,7 @@ export default function ImageLoader({
               return;
             }
             setErrored(true);
+            onError?.();
           }}
           className={`block ${imgClassName ?? ""}`}
           style={{

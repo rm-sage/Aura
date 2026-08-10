@@ -58,6 +58,30 @@ const MAX_ARCS: usize = 120;
 ///
 /// A host that does not exist, or a wiki with no arc category, costs one failed
 /// request and then caches the miss. Adding a show is a one-line change.
+///
+/// AUDITED 2026-08-09, 38 further candidates, NET ZERO added. The bottleneck is
+/// not this table, it is TMDB: 36 of the 38 have no type-5 episode group at all,
+/// so they render no arcs and the art would have nothing to attach to. Checked
+/// and rejected, so nobody has to check them twice: Vinland Saga, Tokyo Ghoul,
+/// Seven Deadly Sins, Fire Force, Promised Neverland, Made in Abyss, Yu Yu
+/// Hakusho, InuYasha, Rurouni Kenshin, Soul Eater, Magi, Shaman King, Food Wars,
+/// Assassination Classroom, Kingdom, Golden Kamuy, Mushoku Tensei, Solo
+/// Leveling, Oshi no Ko, Overlord, D.Gray-man, Claymore, Monster, Berserk,
+/// Beastars, Parasyte, Toriko, Ranking of Kings, Sakamoto Days, Wind Breaker,
+/// Dandadan, Black Butler, Fate/Zero, Shield Hero, and Fullmetal Alchemist
+/// (2003) - the last of which is why only Brotherhood is listed below.
+///
+/// Two were near misses on `score_grouping`'s 0.85 coverage bar rather than on
+/// the group's existence: Tokyo Revengers (4 arcs, 37/50 episodes = 74%) and
+/// Hell's Paradise (3 arcs, 21/25 = 84%). Both are correctly rejected today;
+/// revisit only if TMDB's groups grow to cover their full runs.
+///
+/// Katekyo Hitman Reborn! (45857) DOES clear every mechanical gate and is still
+/// deliberately absent. Its only type-5 grouping is "Saga Española", whose arc
+/// names are Spanish ("Bala", "Batalla", "Especiales"), which would render
+/// Spanish arc titles in an English UI and would score ~0 against the English
+/// Fandom page names this module fuzzy-matches on, so it would yield no art
+/// either way. Passing a gate is not the same as being right.
 const WIKI_BY_TMDB: &[(i64, &str)] = &[
     (37854,  "onepiece.fandom.com"),
     (46260,  "naruto.fandom.com"),          // Naruto
