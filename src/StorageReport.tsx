@@ -105,6 +105,12 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
     destructive: false,
   },
   {
+    prefix:      "aura:anime-extras:v1",
+    label:       "Anime extras cache",
+    description: "Theme songs, score histograms, staff credits, recommendations and trailers for anime you have opened the More info panel on. 7-day TTL; this data barely changes. Safe to clear.",
+    destructive: false,
+  },
+  {
     prefix:      "aura:story-arcs:v8",
     label:       "Story arc cache",
     description: "Per-series story arcs (TMDB episode groups, already mapped onto your addon's episode ids). 24-hour TTL because an ongoing show gains an episode every week. Re-fetches on the next detail open. Safe to clear.",

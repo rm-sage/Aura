@@ -25,6 +25,9 @@ import { fetchReleaseSignal } from "../releaseSearch";
 import { resolveDefaultMetaUrl } from "../addonDefaults";
 import { findAIOMetadataAddon, isAnimeMeta, markAnimeId, typeLabel } from "../aiometadata";
 import { dedupedInvoke } from "../invokeDedupe";
+import { peekRichestCachedDetailById } from "../metaCache";
+import AnimeExtrasOverlay from "../AnimeExtrasOverlay";
+import { resolveCourMalIds, type CourRef } from "../animeExtras";
 import { PersistentCache } from "../persistentCache";
 import SeasonSelect from "../SeasonSelect";
 import FillerRecapTags from "../FillerRecapTags";
@@ -304,8 +307,204 @@ export default function DetailView(props: Props) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Hero art latch
+//
+// INVARIANT: the hero's backdrop + logo are resolved EXACTLY ONCE per detail
+// open and are immutable for the rest of it. Everything else on the page —
+// title text, chips, synopsis, cast, episodes — keeps filling in progressively
+// as sources land, but the ART does not, because a backdrop that changes
+// under the user reads as a glitch rather than as progress.
+//
+// It used to change from three independent directions, and patching them one
+// at a time would have left the fourth:
+//   1. the pre-meta catalog `meta.background` being replaced by the addon's
+//      `detail.background` (the reported Bleach swap),
+//   2. the first-answering addon's setDetail being replaced by the later
+//      with-videos one further down the probe loop,
+//   3. a metaCache write landing after mount.
+// One write-once latch closes all of them.
+// ---------------------------------------------------------------------------
+
+/** Length of the single hero reveal beat. The backdrop fade, the
+ *  title→logo crossfade and the title slot's height travel all run on this
+ *  so the hero settles once instead of popping a piece at a time. */
+const HERO_REVEAL_MS = 400;
+
+interface HeroArt {
+  background: string | null;
+  logo:       string | null;
+}
+
+/** Resolve hero art from a meta detail, falling back through the catalog
+ *  preview's landscape fields. Always returns an object: `{ background: null,
+ *  logo: null }` is the legitimate "this item has no art anywhere" answer and
+ *  still counts as settled, so the reveal isn't left waiting forever. */
+function heroArtFrom(d: MetaDetail | null, preview: MetaPreview): HeroArt {
+  return {
+    background:
+      d?.background ?? preview.background ?? preview.fanart ?? preview.backdrop ?? preview.poster ?? null,
+    logo: d?.logo ?? preview.logo ?? null,
+  };
+}
+
+/** Hero title slot — the text title and the logo stacked in a single grid
+ *  cell, crossfading on the SAME beat as the backdrop so the hero settles
+ *  once instead of popping twice (words, then logo a moment later).
+ *
+ *  The slot's height is animated rather than left to `auto`. A grid cell
+ *  sizes to its tallest child, so the instant a logo faded in the slot would
+ *  snap from one line of 64px text to as much as 176px of artwork. The left
+ *  column is `justify-end`, so that snap travels UPWARD — the title lurches
+ *  away from the chips instead of pushing them down — which is exactly the
+ *  kind of unexplained jump the reveal is supposed to remove. Measuring both
+ *  children lets the container travel that distance on the reveal curve.
+ *
+ *  Height stays `auto` until the relevant child has actually been measured;
+ *  animating toward an unmeasured 0 would collapse the slot. */
+function HeroTitle({
+  name, logo, revealed, onLogoSettled,
+}: {
+  name:  string;
+  logo:  string | null;
+  revealed: boolean;
+  /** Fired once the logo has decoded OR failed — the parent's reveal gate
+   *  waits on this, so a broken logo URL must still resolve it. */
+  onLogoSettled: () => void;
+}) {
+  const textRef = useRef<HTMLHeadingElement>(null);
+  const logoRef = useRef<HTMLImageElement>(null);
+  const [textH, setTextH] = useState(0);
+  const [logoH, setLogoH] = useState(0);
+  // A logo that fails to load still has to release the parent's reveal gate,
+  // but it must not then be crossfaded IN over the text — that would trade a
+  // readable title for a broken-image glyph. Tracked separately from the gate
+  // for exactly that reason.
+  const [logoBroken, setLogoBroken] = useState(false);
+  useEffect(() => { setLogoBroken(false); }, [logo]);
+
+  // Title height changes with wrapping, which changes with window width, so
+  // observe rather than measure once.
+  useLayoutEffect(() => {
+    const el = textRef.current;
+    if (!el) return;
+    const measure = () => setTextH(el.offsetHeight);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [name]);
+
+  // Logo height is driven by its intrinsic aspect ratio against the max-w /
+  // max-h caps, so it too moves with the window.
+  useLayoutEffect(() => {
+    const el = logoRef.current;
+    if (!el) { setLogoH(0); return; }
+    // Cache-hit guard. An image already in the browser cache can reach
+    // `complete` before React attaches onLoad, so the event never fires — and
+    // since the parent's reveal gate waits on it, that would strand the whole
+    // hero on the ambient base. ImageLoader carries the same guard for the
+    // same reason (see its src-reset effect). `onLogoSettled` is deliberately
+    // out of the dep list: it's an inline arrow, so including it would re-run
+    // this on every parent render.
+    if (el.complete && el.naturalWidth > 0) onLogoSettled();
+    const measure = () => setLogoH(el.offsetHeight);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [logo]);
+
+  const showLogo = !!logo && !logoBroken && revealed;
+  const target   = showLogo ? logoH : textH;
+
+  return (
+    <div
+      className="grid aura-detail-title-slot"
+      style={{
+        // Both children occupy the one cell; bottom-aligned so the crossfade
+        // is anchored where the words already were and any growth happens
+        // upward, matching the column's justify-end flow.
+        alignItems:   "end",
+        justifyItems: "start",
+        height:       target > 0 ? target : undefined,
+        transition:   `height ${HERO_REVEAL_MS}ms cubic-bezier(0.2, 0.8, 0.2, 1)`,
+      }}
+    >
+      <h1
+        ref={textRef}
+        className="text-white text-[64px] font-light tracking-tight leading-[0.98]"
+        style={{
+          gridArea:   "1 / 1",
+          textShadow: "0 4px 16px rgba(0,0,0,0.95), 0 0 30px rgba(0,0,0,0.55)",
+          opacity:    showLogo ? 0 : 1,
+          transition: `opacity ${HERO_REVEAL_MS}ms ease-out`,
+        }}
+      >
+        {name}
+      </h1>
+      {logo && (
+        <img
+          ref={logoRef}
+          src={logo}
+          alt={name}
+          draggable={false}
+          className="max-h-44 object-contain object-left"
+          onLoad={(e) => {
+            // Measure HERE, not just from the ResizeObserver. The observer
+            // delivers a frame late, and that frame would render with
+            // showLogo already true but logoH still 0 — i.e. height:auto,
+            // the grid cell snapping straight to the logo. React batches
+            // this with the parent's gate update, so the reveal commit
+            // already knows the target height and the travel animates.
+            setLogoH(e.currentTarget.offsetHeight);
+            onLogoSettled();
+          }}
+          onError={() => {
+            setLogoBroken(true);
+            onLogoSettled();
+          }}
+          style={{
+            gridArea: "1 / 1",
+            maxWidth: "min(580px, 100%)",
+            filter:
+              "drop-shadow(0 6px 18px rgba(0,0,0,0.85)) drop-shadow(0 0 28px rgba(0,0,0,0.5))",
+            opacity:    showLogo ? 1 : 0,
+            transition: `opacity ${HERO_REVEAL_MS}ms ease-out`,
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Synchronous warm-start. CatalogHoverCard already fetches full meta into the
+ *  shared cache on hover, so hover → click can paint the FINAL art on the
+ *  first frame with no wait at all.
+ *
+ *  A cached entry carrying NEITHER a backdrop nor a logo is deliberately
+ *  treated as a miss: latching it would lock the hero to the catalog preview
+ *  and then, per the invariant above, refuse the real art when the live probe
+ *  returns it. Better to wait. */
+function seedHeroArt(preview: MetaPreview): HeroArt | null {
+  const seed = peekRichestCachedDetailById(preview.id);
+  return seed && (seed.background || seed.logo) ? heroArtFrom(seed, preview) : null;
+}
+
 function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, onPlayTrailer, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
   const [detail, setDetail]                 = useState<MetaDetail | null>(null);
+  // Write-once hero art (see the latch notes above the component). `null`
+  // means "not settled yet" — the hero shows its ambient base and waits.
+  const [heroArtLatch, setHeroArtLatch]     = useState<HeroArt | null>(() => seedHeroArt(meta));
+  // Decode gates for the two latched assets. The reveal waits for BOTH so the
+  // backdrop and the logo land on the same frame; an asset that errors counts
+  // as ready (its layer just never appears) so one dead URL can't strand the
+  // hero on the ambient base forever.
+  const [bgReady, setBgReady]               = useState(false);
+  const [logoReady, setLogoReady]           = useState(false);
   const [streams, setStreams]               = useState<StreamEntry[]>([]);
   const [streamMeta, setStreamMeta]         = useState<StreamMetadata>({
     errors: [], warnings: [], info: [], stats: [],
@@ -331,6 +530,21 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     const t = setTimeout(() => setEntered(true), 480);
     return () => clearTimeout(t);
   }, [entered]);
+
+  // Re-arm the hero latch when the page swaps to a different id WITHOUT
+  // remounting (App renders <DetailView> unkeyed, so `selectedMeta` changing
+  // reuses this instance — the same reason every fetch effect below is keyed
+  // on meta.id). The ref guard skips the first run so the synchronous warm
+  // seed above survives mount.
+  const heroKeyRef = useRef(meta.id);
+  useEffect(() => {
+    if (heroKeyRef.current === meta.id) return;
+    heroKeyRef.current = meta.id;
+    setHeroArtLatch(seedHeroArt(meta));
+    setBgReady(false);
+    setLogoReady(false);
+  }, [meta]);
+
   const [activeVideo, setActiveVideo]       = useState<VideoEntry | null>(null);
   // Per-episode "user has clicked through the spoiler blur" set. Keyed
   // by VideoEntry.id; non-persisted (resets when DetailView unmounts).
@@ -388,6 +602,27 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // "N episodes behind" for an airing series (red, meta strip below). null
   // when not airing or fully caught up.
   const episodesBehind = useEpisodesBehind(detail?.videos, meta.id);
+
+  // ── Anime extras ("More info") ──
+  // The MAL entries backing the overlay, one per cour. Resolved lazily and
+  // ONLY for anime, because the resolver costs a round-trip per season and
+  // there is nothing to show for live action. An empty result means the
+  // trigger never renders, so the button is absent rather than dead.
+  const [extrasOpen, setExtrasOpen] = useState(false);
+  const [extrasCours, setExtrasCours] = useState<CourRef[]>([]);
+  const isAnimeDetail =
+    isAnimeMeta(meta) || (detail?.media_type ?? "").toLowerCase() === "anime";
+  useEffect(() => {
+    if (!isAnimeDetail || !detail) { setExtrasCours([]); return; }
+    let cancelled = false;
+    (async () => {
+      const cours = await resolveCourMalIds(
+        detail, detail.videos ?? [], detail.name ?? meta.name,
+      );
+      if (!cancelled) setExtrasCours(cours);
+    })();
+    return () => { cancelled = true; };
+  }, [isAnimeDetail, detail, meta.name]);
   // Library-tab clicks pass `ignoreResumeHint`, which suppresses the
   // CW resume behaviour: from Library, opening a series should drop
   // the user on the episode list at S01E01 regardless of where they
@@ -556,7 +791,13 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // (the next request fills them in), and rejecting those was leaving
   // anime / Cinemeta-resolved CW items stuck on a blank detail page.
   useEffect(() => {
-    if (!metaAddon || addons.length === 0) return;
+    if (!metaAddon || addons.length === 0) {
+      // No addon will ever answer — settle on the catalog preview's art
+      // immediately rather than leaving the hero waiting on a probe that
+      // is never going to run.
+      setHeroArtLatch((prev) => prev ?? heroArtFrom(null, meta));
+      return;
+    }
     let cancelled = false;
     const ordered: AddonEntry[] = [
       metaAddon,
@@ -581,7 +822,10 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
           return true; // no declared idPrefixes → addon accepts any id
         }),
     ];
-    (async () => {
+    // Resolves to the detail the page ACTUALLY ended up on (or null when no
+    // addon answered). The hero art latch below settles off that resolution
+    // rather than off the first setDetail — see the note at the tail.
+    void (async () => {
       let bestSoFar: MetaDetail | null = null;
       for (const a of ordered) {
         try {
@@ -643,13 +887,26 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
           const hasVideos = !!(d.videos && d.videos.length);
           if (!isEpisodicMeta || hasVideos) {
             setDetail(d);
-            return;
+            return d;
           }
         } catch { /* try next addon */ }
       }
-    })();
+      return bestSoFar;
+    })()
+      .catch(() => null)
+      .then((finalDetail) => {
+        // ── Hero art settles HERE, and only here ──
+        // Keyed on the probe loop TERMINATING, not on the first addon
+        // answering. `finalDetail` is whichever detail the page actually ended
+        // up on — including the with-videos one further down the list that
+        // used to replace the first answer's backdrop a beat later (swap
+        // source 2 in the latch notes). `prev ??` keeps the write once-only,
+        // which is what makes a StrictMode double mount harmless.
+        if (cancelled) return;
+        setHeroArtLatch((prev) => prev ?? heroArtFrom(finalDetail ?? null, meta));
+      });
     return () => { cancelled = true; };
-  }, [metaAddon, addons, meta.id, meta.media_type]);
+  }, [metaAddon, addons, meta, meta.id, meta.media_type]);
 
   // ── Multi-source ratings enrichment ──
   // Hits a Rust aggregator (fetch_aggregate_ratings) that fans out to
@@ -943,11 +1200,36 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     return [...map.entries()];
   }, [streams]);
 
-  // Background art priority
-  const heroArt =
-    detail?.background ?? meta.background ??
-    meta.fanart ?? meta.backdrop ?? meta.poster ?? null;
-  const logoArt = detail?.logo ?? meta.logo ?? null;
+  // Hero art — read from the LATCH, never from `detail`. That indirection is
+  // the whole fix: these two are null while the art is still resolving and
+  // then take a value exactly once, so the <img> they feed never sees a second
+  // src (which is what tripped ImageLoader's src-change reset back to a
+  // skeleton mid-view).
+  const heroArt = heroArtLatch?.background ?? null;
+  const logoArt = heroArtLatch?.logo ?? null;
+
+  // The single reveal beat: every latched asset has decoded. Both gates are
+  // vacuously true when the corresponding art is absent, so an item with no
+  // logo reveals as soon as its backdrop is ready, and an item with no art at
+  // all reveals the moment it settles.
+  const revealed =
+    heroArtLatch !== null &&
+    (!heroArt   || bgReady) &&
+    (!logoArt   || logoReady);
+
+  // Bounded wait on the logo only. Coupling the two assets is the point — it's
+  // what makes the hero settle once — but an <img> whose request stalls fires
+  // neither load nor error, and without a bound one hung logo would hold a
+  // perfectly good backdrop off screen indefinitely. After this grace period
+  // we let the reveal go; a logo that lands later simply fades in then. The
+  // BACKDROP has no equivalent bound on purpose: if it never arrives there is
+  // nothing to reveal, and the ambient base is already the correct resting
+  // state.
+  useEffect(() => {
+    if (!logoArt || logoReady) return;
+    const t = setTimeout(() => setLogoReady(true), 1200);
+    return () => clearTimeout(t);
+  }, [logoArt, logoReady]);
   // Series poster used as the thumbnail for UNAIRED episodes (instead of a
   // blurred frame) — portrait poster cropped to the 16:9 thumb.
   const episodeFallbackArt = detail?.poster ?? detail?.background ?? meta.poster ?? null;
@@ -1036,17 +1318,47 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
         transformOrigin: "center center",
       }}
     >
-      {/* Full-bleed backdrop */}
+      {/* Ambient base — ALWAYS mounted and fully opaque. Three jobs:
+            1. it's what the user looks at while the art resolves,
+            2. it stops the page underneath (Home) bleeding through the
+               semi-transparent overlay gradients below during the open
+               animation — the overlays never had an opaque layer beneath
+               them, which is why Aura flashed into view on a cold open,
+            3. it's the resting state when an item has no art, or when the
+               backdrop 404s after exhausting its retries.
+          Two elements, not one: the ambient layer is `filter: blur(28px)`,
+          and a blur has nothing beyond the element's own box to sample, so it
+          fades its outermost ~28 px toward transparent — on its own it would
+          still let a rim of Home through at the frame edge. The flat fill
+          underneath makes the base opaque edge to edge. */}
+      <div aria-hidden className="absolute inset-0" style={{ background: "rgb(8 10 14)" }} />
+      <div aria-hidden className="detail-backdrop-skeleton" />
+      {/* Full-bleed backdrop. Mounted only once the art has latched, so its
+          `src` is fixed for the element's whole life. `loading="eager"`
+          skips the IntersectionObserver round-trip — this fills the viewport
+          by definition, there is nothing to defer. */}
       {heroArt && (
         <ImageLoader
           src={shrinkPoster(heroArt, screenWidthHint())}
           alt=""
+          loading="eager"
           decoding="async"
           draggable={false}
           className="absolute inset-0 w-full h-full"
           imgClassName="w-full h-full object-cover"
-          imgStyle={{ objectPosition: "center top" }}
-          skeletonClassName="detail-backdrop-skeleton"
+          imgStyle={{
+            objectPosition: "center top",
+            // Overrides ImageLoader's own 300 ms `loaded` fade (imgStyle
+            // spreads last) so the backdrop rides the SHARED reveal beat with
+            // the title→logo crossfade instead of running on its own clock.
+            opacity:    revealed ? 1 : 0,
+            transition: `opacity ${HERO_REVEAL_MS}ms ease-out`,
+          }}
+          // The ambient base above already covers the box; a second opaque
+          // skeleton stacked on top of it was the "blank screen" flash.
+          skeletonClassName="detail-backdrop-idle"
+          onLoad={() => setBgReady(true)}
+          onError={() => setBgReady(true)}
         />
       )}
       {/* Layered overlays — heaviest on the right where the panel sits */}
@@ -1070,17 +1382,43 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
         >
           <ArrowBackIcon /> Back
         </button>
-        <button
-          onClick={onClose}
-          aria-label="Close"
-          className="pointer-events-auto w-9 h-9 rounded-full
-                     bg-black/60 backdrop-blur-xl border border-white/10
-                     flex items-center justify-center text-white/85 hover:text-white
-                     transition-colors"
-        >
-          <CloseIcon />
-        </button>
+        <div className="flex items-center gap-2">
+          {/* More info. Anime only, and only once at least one MAL entry has
+              resolved: a button that opens an empty panel is worse than no
+              button. Sits in the action bar's previously empty middle slot
+              rather than in the left stack, which is `justify-end` and would
+              push the hero title upward. */}
+          {extrasCours.length > 0 && (
+            <button
+              onClick={() => setExtrasOpen(true)}
+              className="pointer-events-auto flex items-center gap-2 px-3 h-9 rounded-full
+                         bg-black/60 backdrop-blur-xl border border-white/10
+                         text-white/85 hover:text-white text-xs font-medium tracking-wide
+                         transition-colors"
+            >
+              More info
+            </button>
+          )}
+          <button
+            onClick={onClose}
+            aria-label="Close"
+            className="pointer-events-auto w-9 h-9 rounded-full
+                       bg-black/60 backdrop-blur-xl border border-white/10
+                       flex items-center justify-center text-white/85 hover:text-white
+                       transition-colors"
+          >
+            <CloseIcon />
+          </button>
+        </div>
       </div>
+
+      <AnimeExtrasOverlay
+        open={extrasOpen}
+        onClose={() => setExtrasOpen(false)}
+        cours={extrasCours}
+        seriesName={detail?.name ?? meta.name}
+        onPlayTrailer={onPlayTrailer}
+      />
 
       {/* ── Layout: LEFT (all metadata) + RIGHT (compact unified panel) ──
           Using CSS Grid with explicit columns: a flexible left column plus a
@@ -1098,27 +1436,14 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
               ultrawide displays the synopsis and credit rows wrap instead
               of stretching across half the screen. */}
           <div className="space-y-7" style={{ maxWidth: "min(720px, 100%)" }}>
-            {/* Logo or title — bumped ~30% bigger */}
-            {logoArt ? (
-              <img
-                src={logoArt}
-                alt={detail?.name ?? meta.name}
-                draggable={false}
-                className="max-h-44 object-contain object-left"
-                style={{
-                  maxWidth: "min(580px, 100%)",
-                  filter:
-                    "drop-shadow(0 6px 18px rgba(0,0,0,0.85)) drop-shadow(0 0 28px rgba(0,0,0,0.5))",
-                }}
-              />
-            ) : (
-              <h1
-                className="text-white text-[64px] font-light tracking-tight leading-[0.98]"
-                style={{ textShadow: "0 4px 16px rgba(0,0,0,0.95), 0 0 30px rgba(0,0,0,0.55)" }}
-              >
-                {detail?.name ?? meta.name}
-              </h1>
-            )}
+            {/* Logo or title — bumped ~30% bigger. Crossfades on the shared
+                hero reveal beat; see HeroTitle. */}
+            <HeroTitle
+              name={detail?.name ?? meta.name}
+              logo={logoArt}
+              revealed={revealed}
+              onLogoSettled={() => setLogoReady(true)}
+            />
 
             {/* Dense meta strip.
                 Readability over bright hero art (e.g. a light anime
