@@ -2941,6 +2941,22 @@ function AboutSection({ addonCount }: { addonCount: number }) {
         </button>
       </div>
       <DebugOverlay open={debugOpen} onClose={() => setDebugOpen(false)} />
+
+      <div className="h-px bg-white/6" />
+
+      {/* Data-source attribution.
+          Arc key art is CC BY-SA, which requires credit wherever it is used.
+          ArcGrid carries its own contextual line, but arc art now also
+          appears on Continue Watching tiles and the detail page backdrop, and
+          neither of those has anywhere to put one. This is the app-wide
+          notice that covers those surfaces. It is unconditional on purpose:
+          a credit that appears only sometimes is worse than one that always
+          does, and it costs one line. */}
+      <p className="text-white/25 text-[10px] leading-relaxed">
+        Metadata from TMDB, MyAnimeList via Tenrai, and AniList. This product uses
+        the TMDB API but is not endorsed or certified by TMDB. Story arc artwork
+        from Fandom, licensed CC BY-SA.
+      </p>
     </Section>
   );
 }
@@ -3303,7 +3319,7 @@ const TOC_GROUPS: TocGroup[] = [
       { id: "sec-catalog",     label: "Catalog Providers" },
       { id: "sec-streams",     label: "Stream Providers" },
       { id: "sec-search",      label: "Search Providers" },
-      { id: "sec-detail-page", label: "Detail Page" },
+      { id: "sec-spoilers", label: "Spoilers" },
       { id: "sec-hover-panel", label: "Hover Meta Panel" },
       { id: "sec-open-links", label: "Open Links" },
     ],
@@ -4921,14 +4937,19 @@ export default function SettingsView({ addons, session }: Props) {
             />
           </Section>
 
-          {/* ── Detail Page ───────────────────────────────────────────────
-              Toggles affecting the detail-page surface specifically.
-              Currently a single hideCastSpoilers gate for the cast-card
-              hover overlay (Main / Recurring / Guest tier + episode
-              counts). Some shows lean on regular-vs-guest billing as a
-              plot beat (deaths, returns, cameos) so the count alone
-              can spoil. */}
-          <Section id="sec-detail-page" title="Detail Page">
+          {/* ── Spoilers ──────────────────────────────────────────────────
+              Was titled "Detail Page", which was always a misnomer: every
+              toggle in it is a spoiler control and several of them apply
+              well outside the detail page (the thumbnail blur also drives
+              the EOS Spotlight, the in-player episode panel and the Next
+              Up card).
+
+              Read the section as "settings that govern spoiler exposure",
+              in BOTH directions. Most add protection when switched on;
+              arcAwareArt at the bottom adds exposure, because arc key art
+              can depict something you have not reached. Its description
+              says so. */}
+          <Section id="sec-spoilers" title="Spoilers">
             <SettingToggle
               label="Hide cast episode counts"
               description="Some shows treat regular vs. guest billing as a plot beat (deaths, returns, surprise cameos). When on, the cast hover card shows just the name; per-actor episode counts and tier are hidden."
@@ -4948,6 +4969,20 @@ export default function SettingsView({ addons, session }: Props) {
               description="Hide the per-episode synopsis text that appears below the show synopsis when you select an episode. Click to reveal per episode. Watched episodes always show their synopsis without blur — the content's no longer a spoiler. Useful for mystery / thriller / weekly-airing anime where the per-episode description gives away plot beats."
               value={aura.blurEpisodeSynopsis}
               onChange={(v) => setLocal({ blurEpisodeSynopsis: v })}
+            />
+            <div className="h-px bg-white/6" />
+            <SettingToggle
+              label="Blur theme song episode ranges"
+              description="Hide which episodes each opening and ending covers in the anime More info panel, until you click to reveal. Song titles and artists always stay visible. The range is the spoiler, since it gives away where a cour or story arc boundary falls."
+              value={aura.blurThemeEpisodeRanges}
+              onChange={(v) => setLocal({ blurThemeEpisodeRanges: v })}
+            />
+            <div className="h-px bg-white/6" />
+            <SettingToggle
+              label="Match artwork to your current story arc"
+              description="Use story-arc key art for Continue Watching tiles and the detail page backdrop, following the latest arc you have progress in. Adds spoiler risk rather than removing it: arc artwork can show a character, form or event you have not reached yet. Only applies to shows with real arc key art; everything else keeps its usual artwork."
+              value={aura.arcAwareArt}
+              onChange={(v) => setLocal({ arcAwareArt: v })}
             />
           </Section>
 

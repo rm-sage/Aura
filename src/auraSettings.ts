@@ -138,6 +138,25 @@ export interface AuraSettings {
    *  about spoilers flip this on. Mirrors the opt-in shape of
    *  `blurUnwatchedThumbnails`. */
   blurEpisodeSynopsis: boolean;
+  /** Blur the episode ranges in the anime extras overlay's Songs tab until
+   *  clicked. The song title and artist are never blurred: the name is not
+   *  the spoiler, "this opening only runs to episode 14" is, because it
+   *  gives away where a cour or arc boundary falls. Default false, matching
+   *  the opt-in shape of the other blur toggles. */
+  blurThemeEpisodeRanges: boolean;
+  /** Use story-arc key art for Continue Watching tiles and the detail hero,
+   *  matching the latest arc you have progress in.
+   *
+   *  NOTE the inverted polarity relative to its neighbours in the Spoilers
+   *  section: the blur toggles ADD protection when on, this one ADDS
+   *  exposure, because arc art can depict a character or event you have not
+   *  reached. Default false, so it is opt-in like the rest.
+   *
+   *  Only engages when the arc has real Fandom key art (`image_source ===
+   *  "fandom"`). Everything else in the arc-image chain is a TMDB episode
+   *  still or an addon thumbnail, and swapping designed landscape art for a
+   *  random frame is a downgrade. */
+  arcAwareArt: boolean;
   /** Audio loudness normalization. When on, MPV's `af` property holds
    *  `@loudnorm:dynaudnorm=f=200:g=15` so streams from different sources
    *  level to a consistent perceived volume. (dynaudnorm, not EBU R128
@@ -255,6 +274,8 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   searchAddonUrls: null,
   hideCastSpoilers: false,
   blurUnwatchedThumbnails: false,
+  blurThemeEpisodeRanges: false,
+  arcAwareArt: false,
   heroCatalog: null,
   heroDisabled: false,
   reduceMotion: "auto",
@@ -323,6 +344,12 @@ function readFromStorage(): AuraSettings {
         : false,
       blurUnwatchedThumbnails: typeof parsed.blurUnwatchedThumbnails === "boolean"
         ? parsed.blurUnwatchedThumbnails
+        : false,
+      blurThemeEpisodeRanges: typeof parsed.blurThemeEpisodeRanges === "boolean"
+        ? parsed.blurThemeEpisodeRanges
+        : false,
+      arcAwareArt: typeof parsed.arcAwareArt === "boolean"
+        ? parsed.arcAwareArt
         : false,
       reduceMotion:
         parsed.reduceMotion === "always" || parsed.reduceMotion === "never"

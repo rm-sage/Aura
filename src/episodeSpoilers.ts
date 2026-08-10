@@ -133,3 +133,20 @@ export function shouldBlurSynopsis(
   if (revealed) return false;
   return !isEpisodeWatched(byId, episodeId);
 }
+
+/** Anime extras overlay, Songs tab: blur the EPISODE RANGE a theme song
+ *  spans, never the song's title or artist. The song name is not the
+ *  spoiler; "this opening only runs to episode 14" is, because it reveals
+ *  where a cour or an arc boundary lands.
+ *
+ *  Deliberately NOT watch-aware, unlike the two gates above. A theme spans a
+ *  RANGE rather than a single episode, so there is no one episode whose
+ *  watched state would license revealing it, and partially revealing a list
+ *  by progress would leak the boundary anyway. One click reveals one row. */
+export function shouldBlurThemeRange(
+  blurThemeEpisodeRanges: boolean,
+  revealed: boolean,
+): boolean {
+  if (!blurThemeEpisodeRanges) return false;
+  return !revealed;
+}

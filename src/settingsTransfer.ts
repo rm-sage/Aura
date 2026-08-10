@@ -113,6 +113,8 @@ const PORTABLE_AURA_FIELDS = [
   "hideCastSpoilers",
   "blurUnwatchedThumbnails",
   "blurEpisodeSynopsis",
+  "blurThemeEpisodeRanges",
+  "arcAwareArt",
   "reduceMotion",
   "autoAdvanceNextEpisode",
   "autoAdvanceDelaySeconds",
