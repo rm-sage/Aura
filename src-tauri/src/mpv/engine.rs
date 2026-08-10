@@ -969,6 +969,15 @@ struct EventTick {
     seek: bool,
     restart: bool,
     ended: bool,
+    /// The demuxer said something that means "this stream is damaged". Set from
+    /// the LOG_MESSAGE arm. Only ever ENRICHES a jump the pump detected on its
+    /// own: mpv rewords its log strings between builds, so text must never be
+    /// the thing that fires UI.
+    corrupt_hint: Option<&'static str>,
+    /// Latest `time-pos` seen this drain, so the pump can spot a discontinuity
+    /// without a `get_property` (which must never run during a state
+    /// transition; see the landmines in CLAUDE.md).
+    time_pos: Option<f64>,
 }
 
 unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineEmit) -> EventTick {
@@ -1009,12 +1018,42 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
                     "mpv_src_default_in:",
                 ];
                 if !MPV_LOG_NOISE.iter().any(|n| body.contains(n)) {
-                    crate::devlog!(
-                        debug, "mpv",
-                        "mpv/{} {}",
-                        cstr((*m).prefix).trim(),
-                        body,
-                    );
+                    // Damage markers. A corrupt container makes mpv resync to
+                    // the next intact point and adopt whatever timestamp it
+                    // finds there, which silently teleports the viewer (a real
+                    // report: a broken MKV jumped 5m37s and read as an Aura
+                    // bug). These are recorded as a HINT with a short life; the
+                    // pump decides, off the position discontinuity, whether
+                    // anything actually happened.
+                    const DAMAGE: [(&str, &str); 4] = [
+                        ("Corrupt file detected",   "corrupt-container"),
+                        ("Invalid EBML length",     "corrupt-container"),
+                        ("Invalid audio PTS",       "timestamp-reset"),
+                        ("timestamp reset",         "timestamp-reset"),
+                    ];
+                    let hit = DAMAGE.iter().find(|(needle, _)| body.contains(needle));
+                    if let Some((_, kind)) = hit {
+                        t.corrupt_hint = Some(kind);
+                    }
+                    // Damage lines go out at WARN so they are visible in the
+                    // DevConsole's default filter. Everything else stays at
+                    // debug, which is where this whole channel used to sit
+                    // regardless of mpv's own severity.
+                    if hit.is_some() {
+                        crate::devlog!(
+                            warn, "mpv",
+                            "mpv/{} {}",
+                            cstr((*m).prefix).trim(),
+                            body,
+                        );
+                    } else {
+                        crate::devlog!(
+                            debug, "mpv",
+                            "mpv/{} {}",
+                            cstr((*m).prefix).trim(),
+                            body,
+                        );
+                    }
                 }
             }
         } else if id == mpv_event_id::PROPERTY_CHANGE {
@@ -1055,6 +1094,12 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
                         debug, "mpv",
                         "decoder-frame-drop-count → {data} (decoder)",
                     );
+                }
+                // Latest position, for the pump's discontinuity check. Read
+                // from the event we already have rather than a get_property,
+                // which must never be issued during a state transition.
+                if name == "time-pos" {
+                    if let Some(v) = data.as_f64() { t.time_pos = Some(v); }
                 }
                 emit(&name, data);
             }
@@ -1729,6 +1774,21 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         let mut seeking_emitted = false;
         let mut last_transition = Instant::now();
         let mut last_cache_poll = Instant::now();
+        // ── Stream-anomaly detection ──
+        // Last observed position and the wall time we saw it, so an unexplained
+        // forward jump can be told apart from normal playback. A corrupt
+        // container makes mpv resync to the next intact point and adopt that
+        // point's timestamp, teleporting the viewer with no error anywhere in
+        // the UI. Position, not log text, is the trigger: mpv rewords its
+        // messages between builds, and a silent 5-minute skip is the thing that
+        // actually needs reporting.
+        let mut last_pos: Option<(f64, Instant)> = None;
+        // A damage line seen recently, used only to LABEL a jump we already
+        // detected. Short-lived so it can never explain an unrelated later one.
+        let mut damage_hint: Option<(&'static str, Instant)> = None;
+        // One report per load. A badly mastered file can trip the demuxer over
+        // and over, and a toast per resync would be worse than silence.
+        let mut anomaly_reported = false;
         const CACHE_POLL_INTERVAL: Duration = Duration::from_millis(500);
         const CACHE_SETTLE: Duration = Duration::from_millis(700);
         loop {
@@ -2040,6 +2100,50 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             // never emits PLAYBACK_RESTART, so without clearing `seeking` here the
             // poll gate would stay locked until the next load.
             if tick.ended   { playback_ready = false; seeking = false; last_transition = Instant::now(); }
+            if tick.started { last_pos = None; damage_hint = None; anomaly_reported = false; }
+            if let Some(kind) = tick.corrupt_hint { damage_hint = Some((kind, Instant::now())); }
+
+            // ── Unexplained position jump ──
+            //
+            // Every DELIBERATE move through the timeline raises SEEK first
+            // (mpv fires it for its own commands, the AniSkip Lua seek, and
+            // anything the frontend issues), so requiring a clean tick with no
+            // seek and no load transition leaves only movement the player did
+            // not ask for. The allowance scales with wall time and speed so
+            // fast-forward and a stalled pump both stay quiet.
+            if let Some(now_pos) = tick.time_pos {
+                let clean = playback_ready
+                    && !seeking
+                    && !tick.seek && !tick.restart && !tick.started && !tick.loaded && !tick.ended
+                    && last_transition.elapsed() >= CACHE_SETTLE;
+                if let (Some((prev_pos, prev_at)), true) = (last_pos, clean) {
+                    let wall = prev_at.elapsed().as_secs_f64();
+                    // 4x wall time absorbs speed-up and any pump hitch; the
+                    // +2 s floor and 10 s minimum keep normal playback silent.
+                    let allowance = (wall * 4.0 + 2.0).max(10.0);
+                    let delta = now_pos - prev_pos;
+                    if !anomaly_reported && delta.abs() > allowance {
+                        anomaly_reported = true;
+                        let kind = damage_hint
+                            .filter(|(_, at)| at.elapsed() < Duration::from_secs(10))
+                            .map(|(k, _)| k)
+                            .unwrap_or("timestamp-jump");
+                        crate::devlog!(
+                            warn, "mpv",
+                            "stream anomaly: {kind}, position moved {delta:+.1}s                              ({prev_pos:.1} -> {now_pos:.1}) with no seek",
+                        );
+                        let mut m = serde_json::Map::new();
+                        m.insert("kind".into(), serde_json::Value::String(kind.into()));
+                        m.insert("from".into(), serde_json::json!(prev_pos));
+                        m.insert("to".into(), serde_json::json!(now_pos));
+                        m.insert("delta".into(), serde_json::json!(delta));
+                        emit("stream-anomaly", serde_json::Value::Object(m));
+                    }
+                }
+                if clean || last_pos.is_none() {
+                    last_pos = Some((now_pos, Instant::now()));
+                }
+            }
 
             // Surface seek lifecycle to the frontend (transition-only) so the
             // loading overlay can show during a slow/buffering seek. The frontend

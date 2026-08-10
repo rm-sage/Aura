@@ -1247,6 +1247,47 @@ function usePlayback(playerActive: boolean) {
     return () => { p.then((fn) => fn()).catch(() => {}); };
   }, [playerActive]);
 
+  // ── Stream anomaly notice ──
+  //
+  // The engine reports a playhead move it cannot attribute to any seek, which
+  // in practice means the demuxer hit damage, resynced to the next intact
+  // point, and adopted that point's timestamp. A real report: a broken MKV
+  // jumped 5 minutes 37 seconds with no indication anywhere, and it read as an
+  // Aura bug rather than a bad source. The whole value here is telling the
+  // user WHICH it was, so the message names the jump and blames the stream.
+  //
+  // Deliberately a toast and not the recovery modal: playback is still
+  // running and the user has lost nothing they can get back by reloading, so
+  // interrupting them would be worse than the silence it replaces. Rust
+  // already reports at most once per load, so there is no throttle here.
+  useEffect(() => {
+    if (!playerActive) return;
+    const p = listen<{ kind: string; from: number; to: number; delta: number }>(
+      "stream-anomaly",
+      ({ payload }) => {
+        const secs = Math.abs(payload.delta);
+        const mins = Math.floor(secs / 60);
+        const rem = Math.round(secs % 60);
+        const span = mins > 0 ? `${mins}m ${rem}s` : `${rem}s`;
+        const backwards = payload.delta < 0;
+        const cause = payload.kind === "corrupt-container"
+          ? "This file is damaged"
+          : "This stream's timestamps are broken";
+        window.dispatchEvent(new CustomEvent("aura:player-toast", {
+          detail: {
+            message: `${cause} · playback ${backwards ? "rewound" : "skipped"} ${span}. Try a different source.`,
+            durationMs: 7000,
+          },
+        }));
+        console.warn(
+          `[player] stream anomaly (${payload.kind}): ${payload.from.toFixed(1)}s -> `
+          + `${payload.to.toFixed(1)}s (${payload.delta >= 0 ? "+" : ""}${payload.delta.toFixed(1)}s) with no seek`,
+        );
+      },
+    );
+    return () => { p.then((fn) => fn()).catch(() => {}); };
+  }, [playerActive]);
+
   // Stale-heartbeat detector. Wakes once a second; flags the stream
   // broken when time-pos hasn't ticked in BROKEN_STALE_MS while we
   // were genuinely playing (firstFrameSeen + !paused). The recovery

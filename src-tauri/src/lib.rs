@@ -2129,6 +2129,17 @@ pub fn run() {
                             handle.emit("playback-update", serde_json::Value::Object(update)).ok();
                         }
                     }
+                    "stream-anomaly" => {
+                        // The engine saw the playhead move with no seek behind
+                        // it, which means the demuxer resynced past damage and
+                        // adopted a new timestamp. Forwarded verbatim so the UI
+                        // can say how far it jumped: a silent skip is
+                        // indistinguishable from an Aura bug, which is exactly
+                        // how it got reported the first time.
+                        if let Some(data) = ev.get("data") {
+                            handle.emit("stream-anomaly", data.clone()).ok();
+                        }
+                    }
                     "cache-state" => {
                         // Engine's gated cache poll → real buffering state +
                         // readahead. `paused_for_cache` drives the loading

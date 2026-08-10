@@ -114,6 +114,22 @@ export function arcsLikelyAvailable(seriesId: string | null): boolean {
   return !!seriesId && arcAvailabilityCache.get(seriesId) === true;
 }
 
+/** Has this series been PROVEN to have no arcs?
+ *
+ *  The inverse of `arcsLikelyAvailable`, and deliberately not its negation:
+ *  `undefined` (never asked) is false here AND false there. Callers that are
+ *  merely smoothing a UI transition want "known yes"; callers deciding whether
+ *  to spend a fetch want "not known no", because treating unknown as no makes
+ *  the fetch that would resolve it unreachable.
+ *
+ *  That deadlock was real: the Continue Watching arc art gated itself on
+ *  `arcsLikelyAvailable`, but `fetchStoryArcs` is the only writer of this
+ *  cache, so a series whose arcs had never been fetched could never pass the
+ *  gate, and never would. */
+export function arcsKnownUnavailable(seriesId: string | null): boolean {
+  return !!seriesId && arcAvailabilityCache.get(seriesId) === false;
+}
+
 /** The parenthesised absolute-episode annotation to show next to a per-season
  *  `SxxEyy` label, e.g. `"(E88)"`. Empty string when it would be redundant or
  *  noise, so callers can drop it in unconditionally:

@@ -1504,11 +1504,16 @@ export default function PlayerOverlay({
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     const onToast = (e: Event) => {
-      const detail = (e as CustomEvent<{ message: string }>).detail;
+      const detail = (e as CustomEvent<{ message: string; durationMs?: number }>).detail;
       if (!detail?.message) return;
       setToast(detail.message);
       if (toastTimer.current) clearTimeout(toastTimer.current);
-      toastTimer.current = setTimeout(() => setToast(null), 1700);
+      // 1700 ms suits the volume / speed nudges this was built for. A message
+      // that EXPLAINS something (a stream anomaly) has to outlast a glance, so
+      // callers can ask for longer. Clamped so a bad caller cannot pin a toast
+      // over the video indefinitely.
+      const ms = Math.min(12_000, Math.max(1_000, detail.durationMs ?? 1700));
+      toastTimer.current = setTimeout(() => setToast(null), ms);
     };
     window.addEventListener("aura:player-toast", onToast);
     return () => window.removeEventListener("aura:player-toast", onToast);

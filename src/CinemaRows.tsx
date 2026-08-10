@@ -22,7 +22,7 @@ import { findAIOMetadataAddon, isAnimeMeta } from "./aiometadata";
 import { shrinkPoster } from "./posterSize";
 import { loadAuraSettings } from "./auraSettings";
 import {
-  arcArtFor, arcsLikelyAvailable, fetchStoryArcs, loadArcMode, storyArcsAvailable,
+  arcArtFor, arcsKnownUnavailable, fetchStoryArcs, loadArcMode, storyArcsAvailable,
 } from "./storyArcs";
 
 /** Per-catalog cache for the View-all popup. Keyed by
@@ -512,7 +512,14 @@ function useCwArcArt(
     enabled &&
     resumeId !== null &&
     (isAnimeMeta(item) || (item.media_type ?? "").toLowerCase() === "anime") &&
-    arcsLikelyAvailable(item.id);
+    // NOT `arcsLikelyAvailable`. That returns true only for a series whose
+    // arcs have already been fetched, and this hook is one of only two callers
+    // that could do the fetching, so gating on it meant a series nobody had
+    // opened the episodes panel for could never qualify and never would. The
+    // feature was unreachable rather than lazy. Skipping only the PROVEN-empty
+    // case keeps the useful half of the hint: once a show is known to have no
+    // arcs, no tile asks again for 90 days.
+    !arcsKnownUnavailable(item.id);
 
   useEffect(() => {
     if (!eligible || !detail) { setArcArt(null); return; }

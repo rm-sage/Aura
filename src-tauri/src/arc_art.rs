@@ -387,6 +387,63 @@ pub async fn resolve_arc_art<R: Runtime>(
     let pages = list_arc_pages(host).await;
     let mut art: HashMap<String, String> = HashMap::new();
 
+    if pages.is_empty() {
+        // ── Direct title probe ──
+        //
+        // A category listing is the good path, but a large minority of wikis
+        // simply do not have one. Measured across this table: 7 of 27 hosts
+        // return zero members for ALL SIX category candidates, including
+        // bleach, fma, deathnote, swordartonline, mob-psycho-100, haikyuu and
+        // codegeass. That is roughly a quarter of the curated shows getting no
+        // art at all, and no amount of adding category names fixes it, because
+        // those wikis do not model arcs as a category in the first place.
+        //
+        // Bleach is the worked example: it files arcs as Event pages under
+        // different names, and "Soul Society arc" is a REDIRECT to "Ryoka
+        // Invasion". So ask for the arc names as page titles directly and let
+        // MediaWiki resolve them: `fetch_page_images` already sends
+        // `redirects=1`, so a redirect lands on the target page and returns
+        // that page's lead image. Costs one batched request (40 titles each),
+        // and only on hosts where the category path already found nothing.
+        let probe: Vec<String> = arc_names
+            .iter()
+            .filter(|n| !normalize_arc_name(n).is_empty())
+            .cloned()
+            .collect();
+        let images = fetch_page_images(host, &probe).await;
+        for (title, url) in images {
+            art.insert(normalize_arc_name(&title), url);
+        }
+        // The redirect target's title is not the arc's title ("Ryoka Invasion"
+        // vs "Soul Society Arc"), so also key the art under the name we ASKED
+        // for. `arcs.rs` looks up by normalized arc name, and without this a
+        // redirect-resolved page would be fetched and then never found.
+        if !art.is_empty() {
+            let resolved: Vec<(String, String)> =
+                art.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            for name in &probe {
+                let want = normalize_arc_name(name);
+                if art.contains_key(&want) {
+                    continue;
+                }
+                let best = resolved
+                    .iter()
+                    .map(|(k, v)| (dice_bigram(&want, k), v))
+                    .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                if let Some((score, url)) = best {
+                    if score >= MIN_NAME_SIMILARITY {
+                        art.insert(want, url.clone());
+                    }
+                }
+            }
+        }
+        crate::devlog!(
+            info, "arcs",
+            "{host}: no arc category, title probe matched {}/{} arcs",
+            art.len(), arc_names.len()
+        );
+    }
+
     if !pages.is_empty() {
         // Match each TMDB arc name to its best Fandom page.
         let normalized_pages: Vec<(String, &String)> =
