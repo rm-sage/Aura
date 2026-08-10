@@ -2653,6 +2653,17 @@ export default function App() {
                     windows, await ensureThemes(), opts?.episodeNum ?? null,
                   );
                 };
+                // Warm it NOW, concurrently with the chapter poll, rather than
+                // letting `nameSongs` be the first caller. That await sits
+                // directly in front of the one `set_skip_windows` write, and
+                // that write is what arms auto-skip, so a cold fetch there
+                // would push the skip later by a whole round-trip for no
+                // reason. The chapter poll takes ~0.6-6 s and this is a cached
+                // lookup, so by the time publish runs it has almost always
+                // already resolved. Fire-and-forget: `ensureThemes` memoises
+                // and swallows its own errors, and nothing downstream needs
+                // this promise.
+                void ensureThemes();
 
                 // `published` is the list currently stamped on the file. Every
                 // later writer below extends THIS, never `merged`: the ED
