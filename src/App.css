@@ -2544,3 +2544,15 @@ html[data-theme="contrast"] .aura-hud-surface,
 html[data-theme="contrast-azure"] .aura-hud-surface {
   background: var(--ln-panel-solid, #0b0d12);
 }
+
+/* Tab pills for the detail HUD. They sit directly on key art, which can be
+   any brightness, so an inactive pill built from white-alpha alone washed out
+   completely over a pale frame. Same answer as the panel beneath them: carry
+   a dark base of their own rather than borrowing whatever is behind. */
+.aura-hud-tab {
+  background: rgba(10, 12, 16, 0.62);
+  backdrop-filter: blur(10px) saturate(1.1);
+  -webkit-backdrop-filter: blur(10px) saturate(1.1);
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.75);
+}
+.aura-hud-tab:hover { background: rgba(10, 12, 16, 0.78); }

@@ -129,13 +129,12 @@ export default function DetailHud({
               tabIndex={on ? 0 : -1}
               onClick={() => setTab(t.id)}
               className={
-                "px-3 h-7 rounded-lg text-[11px] font-medium uppercase tracking-[0.14em] "
-                + "transition-colors border "
+                "aura-hud-tab px-3 h-7 rounded-lg text-[11px] font-medium "
+                + "uppercase tracking-[0.14em] transition-colors border "
                 + (on
-                  ? "text-ln-accent bg-ln-accent/12 border-ln-accent/30"
-                  : "text-white/45 bg-white/4 border-white/8 hover:text-white/80 hover:bg-white/8")
+                  ? "text-ln-accent bg-ln-accent/16 border-ln-accent/40"
+                  : "text-white/70 border-white/12 hover:text-white")
               }
-              style={{ textShadow: on ? undefined : "0 1px 4px rgba(0,0,0,0.7)" }}
             >
               {t.label}
             </button>
@@ -167,8 +166,8 @@ export default function DetailHud({
         {tab === "songs"    && <SongsTab cours={cours} />}
         {tab === "ratings"  && <RatingsTab cours={cours} />}
         {tab === "staff"    && <StaffTab cours={cours} compact />}
-        {tab === "related"  && <RelatedTab cours={cours} compact />}
-        {tab === "trailers" && <TrailersTab cours={cours} onPlay={onPlayTrailer} compact />}
+        {tab === "related"  && <RelatedTab cours={cours} />}
+        {tab === "trailers" && <TrailersTab cours={cours} onPlay={onPlayTrailer} />}
       </div>
     </div>
   );

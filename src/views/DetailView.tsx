@@ -2802,9 +2802,8 @@ function UnifiedPanel({
     // the old alpha-fade edge mask that left the outer edges undefined. overflow
     // stays visible so floating status icons can anchor just outside the corner.
     <div
-      className="relative flex flex-col h-full rounded-xl
-                 bg-black/60 backdrop-blur-2xl
-                 border border-white/[0.09] border-t-white/[0.16]
+      className="aura-hud-surface relative flex flex-col h-full rounded-xl
+                 border-t-white/[0.16]
                  shadow-[0_24px_48px_-18px_rgba(0,0,0,0.7)]
                  [overflow:visible]"
     >

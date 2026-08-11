@@ -82,12 +82,23 @@ function Empty({ what }: { what: string }) {
 
 /** Cour heading. Suppressed when there is only one, since a single-entry show
  *  does not need to be told which season it is looking at. */
-function CourHeading({ label, show }: { label: string; show: boolean }) {
+function CourHeading({ label, show, center = false }: {
+  label: string; show: boolean; center?: boolean;
+}) {
   if (!show) return null;
+  // A label alone was not enough separation: with rows immediately above and
+  // below it, each season read as one continuous list with a stray caption in
+  // it. The rule gives the break something to land on, and the generous top
+  // margin (collapsed on the first) is what actually does the separating.
   return (
-    <p className="text-white/40 text-[10.5px] font-mono uppercase tracking-[0.18em] mt-5 mb-2 first:mt-0">
-      {label}
-    </p>
+    <div className={"flex items-center gap-3 mt-7 mb-3 first:mt-0 "
+      + (center ? "justify-center" : "")}>
+      {center && <span className="h-px flex-1 bg-white/10" aria-hidden />}
+      <span className="text-white/55 text-[10.5px] font-mono uppercase tracking-[0.22em] whitespace-nowrap">
+        {label}
+      </span>
+      <span className="h-px flex-1 bg-white/10" aria-hidden />
+    </div>
   );
 }
 
@@ -133,7 +144,7 @@ export function SongsTab({ cours }: { cours: CourRef[] }) {
         return (
           <div key={cour.malId}>
             <CourHeading label={cour.label} show={multi} />
-            <div className="flex flex-col gap-1">
+            <div className="flex flex-col gap-0.5">
               {value.openings.map((t, i) => (
                 <ThemeRow
                   key={`op-${cour.malId}-${i}`} kind="op" theme={t}
@@ -175,11 +186,14 @@ function ThemeRow({
   const hasStructure = theme.title !== null || theme.artist !== null;
 
   return (
-    <div className="flex items-baseline gap-3 py-1.5 border-b border-white/4 last:border-b-0">
-      <span className="shrink-0 w-11 text-white/35 text-[11px] font-mono tabular-nums">
+    // `w-fit` + `mx-auto`: the row is only as wide as its content and centred
+    // in the panel, so the episode range sits immediately after the artist
+    // instead of being flung to the far edge of a very wide box.
+    <div className="flex items-baseline gap-3 py-1.5 w-fit max-w-full mx-auto">
+      <span className="shrink-0 w-9 text-white/35 text-[11px] font-mono tabular-nums text-right">
         {themeLabel(kind, theme)}
       </span>
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0">
         {hasStructure ? (
           <p className="text-white/85 text-[13px] leading-snug truncate">
             {theme.title ?? "Unknown title"}
@@ -200,14 +214,15 @@ function ThemeRow({
             onClick={onReveal}
             aria-label="Reveal episode range"
             className="shrink-0 text-white/45 text-[11px] font-mono tabular-nums
-                       rounded px-1.5 py-0.5 bg-white/6 hover:bg-white/12 transition-colors"
+                       rounded px-2 py-0.5 bg-white/8 hover:bg-white/12 transition-colors"
             style={{ filter: "blur(4px)" }}
             title="Click to reveal"
           >
             {range}
           </button>
         ) : (
-          <span className="shrink-0 text-white/40 text-[11px] font-mono tabular-nums">
+          <span className="shrink-0 text-white/40 text-[11px] font-mono tabular-nums
+                           rounded px-2 py-0.5 bg-white/6">
             {range}
           </span>
         )
@@ -228,13 +243,19 @@ export function RatingsTab({ cours }: { cours: CourRef[] }) {
 
   const multi = rows.length > 1;
   return (
-    <div>
+    // Two seasons per row rather than one full-width block each. A histogram
+    // stretched across the whole panel put its bars and its vote counts an
+    // absurd distance apart, and stacking seasons vertically made every one a
+    // scroll away from the next.
+    <div className="grid gap-x-10 gap-y-2 grid-cols-1 min-[1100px]:grid-cols-2">
       {rows.map(({ cour, value }) => {
         if (!value) return null;
         const peak = Math.max(1, ...value.scores.map((b) => b.votes));
         return (
-          <div key={cour.malId}>
-            <CourHeading label={cour.label} show={multi} />
+          // `mt-0` on every heading: the grid's own row gap does the
+          // separating here, so the shared top margin would double it.
+          <div key={cour.malId} className="[&>div:first-child]:mt-0">
+            <CourHeading label={cour.label} show={multi} center />
             <div className="flex flex-col gap-1 mb-4">
               {[...value.scores].sort((a, b) => b.score - a.score).map((b) => (
                 <div key={b.score} className="flex items-center gap-2.5">
@@ -247,13 +268,13 @@ export function RatingsTab({ cours }: { cours: CourRef[] }) {
                       style={{ width: `${(b.votes / peak) * 100}%` }}
                     />
                   </div>
-                  <span className="w-24 shrink-0 text-white/35 text-[10.5px] font-mono tabular-nums text-right">
+                  <span className="w-[92px] shrink-0 text-white/35 text-[10.5px] font-mono tabular-nums text-right">
                     {b.votes.toLocaleString()} ({b.percentage.toFixed(1)}%)
                   </span>
                 </div>
               ))}
             </div>
-            <div className="grid grid-cols-3 gap-x-5 gap-y-1 text-[12px]">
+            <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-[12px]">
               <StatusRow label="Watching"     value={value.watching} />
               <StatusRow label="Completed"    value={value.completed} />
               <StatusRow label="On hold"      value={value.on_hold} />
@@ -296,7 +317,7 @@ export function StaffTab({ cours, compact = false }: { cours: CourRef[]; compact
           <div key={cour.malId}>
             <CourHeading label={cour.label} show={multi} />
             <div className={compact
-              ? "grid grid-cols-3 gap-x-5 gap-y-2"
+              ? "grid gap-x-6 gap-y-3 grid-cols-2 min-[1100px]:grid-cols-3 min-[1500px]:grid-cols-4"
               : "grid grid-cols-2 gap-x-5 gap-y-2.5"}>
               {value.map((c) => (
                 <div key={c.mal_id} className="flex items-center gap-2.5 min-w-0">
@@ -336,7 +357,7 @@ export function StaffTab({ cours, compact = false }: { cours: CourRef[]; compact
 // Related
 // ---------------------------------------------------------------------------
 
-export function RelatedTab({ cours, compact = false }: { cours: CourRef[]; compact?: boolean }) {
+export function RelatedTab({ cours }: { cours: CourRef[] }) {
   const rows = useCourPayloads<Recommendation[]>("related", cours);
   if (!rows) return <Loading />;
 
@@ -353,11 +374,14 @@ export function RelatedTab({ cours, compact = false }: { cours: CourRef[]; compa
   if (!list.length) return <Empty what="recommendations" />;
 
   return (
-    <div className={compact
-      ? "flex gap-3 overflow-x-auto pb-1"
-      : "grid grid-cols-4 gap-3"}>
+    // Wraps and flows downward with the panel's own scroll. It used to be a
+    // horizontal scroller, which meant a wide panel showed ten posters and hid
+    // the rest behind a sideways drag while metres of vertical space sat empty.
+    <div className="grid gap-x-4 gap-y-4
+                    grid-cols-3 min-[900px]:grid-cols-5
+                    min-[1200px]:grid-cols-7 min-[1500px]:grid-cols-8">
       {list.map((r) => (
-        <div key={r.mal_id} className={compact ? "w-[104px] shrink-0" : "min-w-0"}>
+        <div key={r.mal_id} className="min-w-0">
           <div className="aspect-[2/3] rounded-lg overflow-hidden bg-white/6 mb-1.5">
             {r.image && (
               <ImageLoader
@@ -384,11 +408,10 @@ export function RelatedTab({ cours, compact = false }: { cours: CourRef[]; compa
 // ---------------------------------------------------------------------------
 
 export function TrailersTab({
-  cours, onPlay, compact = false,
+  cours, onPlay,
 }: {
   cours: CourRef[];
   onPlay?: (ytId: string, title: string) => void;
-  compact?: boolean;
 }) {
   const rows = useCourPayloads<AnimeTrailer[]>("trailers", cours);
   if (!rows) return <Loading />;
@@ -403,17 +426,15 @@ export function TrailersTab({
         return (
           <div key={cour.malId}>
             <CourHeading label={cour.label} show={multi} />
-            <div className={compact
-              ? "flex gap-3 overflow-x-auto pb-1"
-              : "grid grid-cols-3 gap-3"}>
+            <div className="grid gap-x-4 gap-y-4
+                            grid-cols-2 min-[900px]:grid-cols-4 min-[1300px]:grid-cols-5">
               {value.map((t) => (
                 <button
                   key={t.youtube_id}
                   type="button"
                   onClick={() => onPlay?.(t.youtube_id, t.title)}
                   disabled={!onPlay}
-                  className={"text-left group disabled:cursor-default "
-                    + (compact ? "w-[168px] shrink-0" : "min-w-0")}
+                  className="text-left min-w-0 group disabled:cursor-default"
                 >
                   <div className="aspect-video rounded-lg overflow-hidden bg-white/6 mb-1.5
                                   group-hover:ring-1 group-hover:ring-white/25 transition-shadow">
