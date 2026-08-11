@@ -194,7 +194,29 @@ export default function ImageLoader({
   // overridden by Tailwind's utility ordering (position utilities resolve to
   // whichever class wins the cascade, not the order in className).
   return (
-    <span ref={wrapperRef} className={`block ${className ?? ""}`} style={{ overflow: "hidden" }}>
+    <span
+      ref={wrapperRef}
+      className={`block ${className ?? ""}`}
+      style={{
+        overflow: "hidden",
+        // The skeleton below is `absolute inset-0`, so this element MUST be its
+        // containing block. When a caller passes no positioning class the
+        // skeleton escapes to whatever positioned ancestor it finds, and then
+        // covers THAT instead: in the anime extras panel every one of 24 poster
+        // skeletons stretched across the whole dialog and shimmered over the
+        // header, the tabs and the loaded posters alike, forever, because tiles
+        // below the fold never entered view to clear theirs.
+        //
+        // Applied as an inline style rather than a `relative` class on purpose:
+        // position utilities collide in the cascade rather than by className
+        // order (see the note above), so adding one would fight callers that
+        // legitimately pass `absolute` or `fixed`. Those callers already supply
+        // a containing block, so they are left alone.
+        ...(/\b(absolute|fixed|sticky|relative)\b/.test(className ?? "")
+          ? null
+          : { position: "relative" as const }),
+      }}
+    >
       {/* Skeleton — visible until the image fires onLoad */}
       {!loaded && !errored && (
         <span

@@ -437,6 +437,16 @@ pub async fn resolve_arc_art<R: Runtime>(
                 }
             }
         }
+        // Drop anything not keyed to a name we actually asked for. A wiki that
+        // files arcs as SECTIONS rather than pages collapses many arc names
+        // onto one target: Bleach redirects 9 of its 21 arcs to a single
+        // "Episodes" page whose lead image is episode 1's title card. The dice
+        // guard above already refuses to hand that to an arc, but leaving the
+        // stray entry behind makes the map non-empty, which would earn it the
+        // 30-day hit TTL instead of the 1-day miss TTL and freeze the wrong
+        // answer in place for a month.
+        let wanted: Vec<String> = probe.iter().map(|n| normalize_arc_name(n)).collect();
+        art.retain(|k, _| wanted.iter().any(|w| w == k));
         crate::devlog!(
             info, "arcs",
             "{host}: no arc category, title probe matched {}/{} arcs",
