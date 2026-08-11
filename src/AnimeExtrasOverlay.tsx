@@ -25,7 +25,7 @@ import { shouldBlurThemeRange } from "./episodeSpoilers";
 import {
   fetchExtras, formatSpans, themeLabel,
   type AnimeStatistics, type AnimeTheme, type AnimeThemes, type AnimeTrailer,
-  type CourRef, type Recommendation, type StaffCredit, type ExtrasTab,
+  type AnimeCharacter, type CourRef, type Recommendation, type StaffCredit, type ExtrasTab,
 } from "./animeExtras";
 
 // Server-resize widths. Every image in here is decorative and small, and the
@@ -36,6 +36,7 @@ import {
 // overlay caps at 56rem, so a 4-up poster grid is ~180px and a 3-up trailer
 // grid is ~270px; doubled for high-DPI).
 const STAFF_AVATAR_W = 72;
+const CHARACTER_ART_W = 300;
 const RELATED_POSTER_W = 360;
 const TRAILER_THUMB_W = 540;
 
@@ -349,6 +350,126 @@ export function StaffTab({ cours, compact = false }: { cours: CourRef[]; compact
           </div>
         );
       })}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Characters
+//
+// The addon's own cast data is {name, character, photo}: an actor photo and a
+// character's NAME, never the character's art. So this tab does not decorate
+// the existing cast list, it replaces it with a source that actually has both
+// faces, and the card shows the CHARACTER by default because that is who the
+// viewer recognises. The actor is one hover away rather than the other way
+// round.
+// ---------------------------------------------------------------------------
+
+export function CharactersTab({
+  cours, blurNames,
+}: {
+  cours: CourRef[];
+  /** Hide character names and art until hovered. Character art routinely
+   *  spoils a later form or a reveal, and a name can spoil that someone
+   *  exists at all. */
+  blurNames: boolean;
+}) {
+  const rows = useCourPayloads<AnimeCharacter[]>("characters", cours);
+  if (!rows) return <Loading />;
+
+  // Merged across cours and deduped: a returning character is the same person
+  // in season 3 as in season 1, and listing them per season would be mostly
+  // repetition. Main-cast ordering from the backend is preserved.
+  const seen = new Set<number>();
+  const list: AnimeCharacter[] = [];
+  for (const { value } of rows) {
+    for (const c of value ?? []) {
+      if (seen.has(c.mal_id)) continue;
+      seen.add(c.mal_id);
+      list.push(c);
+    }
+  }
+  if (!list.length) return <Empty what="characters" />;
+
+  return (
+    <div className="grid gap-x-4 gap-y-5
+                    grid-cols-3 min-[900px]:grid-cols-5
+                    min-[1200px]:grid-cols-7 min-[1500px]:grid-cols-8">
+      {list.map((c) => (
+        <CharacterCard key={c.mal_id} character={c} blurred={blurNames} />
+      ))}
+    </div>
+  );
+}
+
+function CharacterCard({
+  character: c, blurred,
+}: {
+  character: AnimeCharacter;
+  blurred: boolean;
+}) {
+  const [hover, setHover] = useState(false);
+  const [revealed, setRevealed] = useState(false);
+  const hidden = blurred && !revealed;
+  // Hovering swaps to the actor. Suppressed while hidden, or the spoiler gate
+  // would be trivially defeated by the same gesture that reveals it.
+  const showActor = hover && !hidden && !!c.actor_image;
+
+  return (
+    <div
+      className="min-w-0"
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+    >
+      <button
+        type="button"
+        onClick={() => hidden && setRevealed(true)}
+        aria-label={hidden ? "Reveal character" : c.name}
+        className="block w-full aspect-[2/3] rounded-lg overflow-hidden
+                   bg-white/6 border border-white/8 relative
+                   focus-visible:outline focus-visible:outline-2 focus-visible:outline-ln-accent"
+      >
+        {c.image && (
+          <ImageLoader
+            src={shrinkPoster(c.image, CHARACTER_ART_W)}
+            alt=""
+            className="absolute inset-0 w-full h-full"
+            imgClassName="w-full h-full object-cover"
+            imgStyle={{
+              filter: hidden ? "blur(14px)" : undefined,
+              opacity: showActor ? 0 : 1,
+              transition: "opacity 180ms ease-out",
+            }}
+            draggable={false}
+          />
+        )}
+        {/* The actor, cross-faded in on hover. Mounted only once hovered so a
+            60-card grid does not fetch 60 extra portraits on open. */}
+        {showActor && c.actor_image && (
+          <ImageLoader
+            src={shrinkPoster(c.actor_image, CHARACTER_ART_W)}
+            alt=""
+            className="absolute inset-0 w-full h-full"
+            imgClassName="w-full h-full object-cover"
+            draggable={false}
+          />
+        )}
+        {c.role === "Main" && !hidden && (
+          <span className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded
+                           bg-black/70 text-white/85 text-[9px] font-mono
+                           uppercase tracking-[0.14em]">
+            Main
+          </span>
+        )}
+      </button>
+
+      <p className="text-white/85 text-[11.5px] leading-tight mt-1.5 line-clamp-2"
+         style={hidden ? { filter: "blur(5px)" } : undefined}>
+        {showActor ? (c.actor ?? c.name) : c.name}
+      </p>
+      <p className="text-white/35 text-[10.5px] leading-tight mt-0.5 truncate">
+        {showActor ? "Voice actor" : (c.actor ?? "")}
+      </p>
     </div>
   );
 }

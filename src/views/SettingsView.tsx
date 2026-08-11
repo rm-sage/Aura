@@ -4979,6 +4979,13 @@ export default function SettingsView({ addons, session }: Props) {
             />
             <div className="h-px bg-white/6" />
             <SettingToggle
+              label="Blur character portraits"
+              description="Hide character art and names in an anime's Cast tab until you click to reveal. Character art routinely gives away a later form, a redesign or a reveal, and a name can spoil that someone turns up at all."
+              value={aura.blurCharacterArt}
+              onChange={(v) => setLocal({ blurCharacterArt: v })}
+            />
+            <div className="h-px bg-white/6" />
+            <SettingToggle
               label="Match artwork to your current story arc"
               description="Use story-arc key art for Continue Watching tiles and the detail page backdrop, following the latest arc you have progress in. Adds spoiler risk rather than removing it: arc artwork can show a character, form or event you have not reached yet. Only applies to shows with real arc key art; everything else keeps its usual artwork."
               value={aura.arcAwareArt}

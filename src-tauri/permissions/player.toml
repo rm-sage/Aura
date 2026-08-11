@@ -206,7 +206,7 @@ commands.allow = ["fetch_aggregate_ratings"]
 [[permission]]
 identifier = "allow-anime-extras"
 description = "Allows the frontend to fetch anime opening/ending theme songs, the MyAnimeList score histogram, key staff credits, community recommendations and promo trailers"
-commands.allow = ["fetch_anime_themes", "fetch_anime_statistics", "fetch_anime_staff", "fetch_anime_recommendations", "fetch_anime_trailers"]
+commands.allow = ["fetch_anime_themes", "fetch_anime_statistics", "fetch_anime_staff", "fetch_anime_characters", "fetch_anime_recommendations", "fetch_anime_trailers"]
 
 # ── Accurate movie release dates (MDBList Digital/Theatrical) ────────────────
 [[permission]]

@@ -359,6 +359,130 @@ pub async fn fetch_anime_staff(mal_id: u32) -> Result<Vec<StaffCredit>, String> 
     Ok(out)
 }
 
+// ── /anime/{id}/characters ──
+//
+// The addon's own cast entries carry only {name, character, photo}: an actor
+// photo and a character's NAME, never the character's art. This is where that
+// art comes from, which is what lets the cast grid show the role rather than
+// only the person playing it.
+
+const CHARACTER_CAP: usize = 60;
+
+#[derive(Deserialize)]
+struct CharacterRow {
+    character: NamedEntity,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    favorites: u32,
+    #[serde(default)]
+    voice_actors: Vec<VoiceActorRow>,
+}
+
+#[derive(Deserialize)]
+struct VoiceActorRow {
+    person: NamedEntity,
+    #[serde(default)]
+    language: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct NamedEntity {
+    mal_id: u32,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    images: Option<CharImages>,
+}
+
+#[derive(Deserialize)]
+struct CharImages {
+    #[serde(default)]
+    jpg: Option<ImageUrls>,
+    #[serde(default)]
+    webp: Option<ImageUrls>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AnimeCharacter {
+    pub mal_id: u32,
+    /// MAL writes these surname-first ("Forger, Anya"). Flipped here so the UI
+    /// never has to know that, and so it matches the addon's own cast strings.
+    pub name: String,
+    pub image: Option<String>,
+    /// "Main" or "Supporting". Drives ordering.
+    pub role: Option<String>,
+    /// Japanese voice actor, which is the one that pairs with the character.
+    pub actor: Option<String>,
+    pub actor_image: Option<String>,
+}
+
+/// "Forger, Anya" -> "Anya Forger". Left alone when there is no comma, since a
+/// mononym or an already-natural name must not be mangled.
+fn flip_surname_first(raw: &str) -> String {
+    match raw.split_once(',') {
+        Some((last, first)) if !first.trim().is_empty() => {
+            format!("{} {}", first.trim(), last.trim())
+        }
+        _ => raw.trim().to_string(),
+    }
+}
+
+fn pick_image(images: Option<CharImages>) -> Option<String> {
+    let i = images?;
+    // webp first: MAL serves noticeably smaller files for identical art.
+    let url = i
+        .webp
+        .and_then(|w| w.image_url)
+        .or_else(|| i.jpg.and_then(|j| j.image_url))?;
+    if url.contains(MAL_PLACEHOLDER) { None } else { Some(url) }
+}
+
+#[tauri::command]
+pub async fn fetch_anime_characters(mal_id: u32) -> Result<Vec<AnimeCharacter>, String> {
+    let url = format!("{TENRAI_API}/anime/{mal_id}/characters");
+    let Some(rows) = fetch_json::<Vec<CharacterRow>>(&url).await? else {
+        return Ok(Vec::new());
+    };
+
+    let mut rows: Vec<(bool, u32, AnimeCharacter)> = rows
+        .into_iter()
+        .filter_map(|r| {
+            let name = r.character.name.filter(|n| !n.trim().is_empty())?;
+            // The JAPANESE voice actor is the one that belongs with the
+            // character art; an English dub would pair a different face to the
+            // same role.
+            let va = r
+                .voice_actors
+                .into_iter()
+                .find(|v| v.language.as_deref() == Some("Japanese"));
+            let is_main = r.role.as_deref() == Some("Main");
+            Some((
+                is_main,
+                r.favorites,
+                AnimeCharacter {
+                    mal_id: r.character.mal_id,
+                    name: flip_surname_first(&name),
+                    image: pick_image(r.character.images),
+                    role: r.role,
+                    actor: va
+                        .as_ref()
+                        .and_then(|v| v.person.name.clone())
+                        .map(|n| flip_surname_first(&n)),
+                    actor_image: va.and_then(|v| pick_image(v.person.images)),
+                },
+            ))
+        })
+        .collect();
+
+    // Main cast first, then by MAL favourites. Upstream order is neither, so
+    // without this a 65-entry list opens on background characters.
+    rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    let mut out: Vec<AnimeCharacter> = rows.into_iter().map(|(_, _, c)| c).collect();
+    out.truncate(CHARACTER_CAP);
+    Ok(out)
+}
+
 // ── /anime/{id}/recommendations ──
 
 const RECOMMENDATION_CAP: usize = 24;

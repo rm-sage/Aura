@@ -144,6 +144,11 @@ export interface AuraSettings {
    *  gives away where a cour or arc boundary falls. Default false, matching
    *  the opt-in shape of the other blur toggles. */
   blurThemeEpisodeRanges: boolean;
+  /** Blur character portraits and names in the anime Cast tab until clicked.
+   *  Character art is a routine spoiler: it shows a later form, a redesign or
+   *  a reveal, and a name can give away that someone exists at all. Default
+   *  false, matching the other blur toggles. */
+  blurCharacterArt: boolean;
   /** Use story-arc key art for Continue Watching tiles and the detail hero,
    *  matching the latest arc you have progress in.
    *
@@ -275,6 +280,7 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   hideCastSpoilers: false,
   blurUnwatchedThumbnails: false,
   blurThemeEpisodeRanges: false,
+  blurCharacterArt: false,
   arcAwareArt: false,
   heroCatalog: null,
   heroDisabled: false,
@@ -347,6 +353,9 @@ function readFromStorage(): AuraSettings {
         : false,
       blurThemeEpisodeRanges: typeof parsed.blurThemeEpisodeRanges === "boolean"
         ? parsed.blurThemeEpisodeRanges
+        : false,
+      blurCharacterArt: typeof parsed.blurCharacterArt === "boolean"
+        ? parsed.blurCharacterArt
         : false,
       arcAwareArt: typeof parsed.arcAwareArt === "boolean"
         ? parsed.arcAwareArt

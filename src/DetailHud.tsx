@@ -32,9 +32,10 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  RatingsTab, RelatedTab, SongsTab, StaffTab, TrailersTab,
+  CharactersTab, RatingsTab, RelatedTab, SongsTab, StaffTab, TrailersTab,
 } from "./AnimeExtrasOverlay";
 import type { CourRef } from "./animeExtras";
+import { loadAuraSettings } from "./auraSettings";
 
 /** Tabs that always exist, plus the anime-only extras. */
 export type HudTab =
@@ -76,6 +77,17 @@ export default function DetailHud({
   );
   const [tab, setTab] = useState<HudTab>("overview");
   const listRef = useRef<HTMLDivElement | null>(null);
+
+  const [blurChars, setBlurChars] = useState(() => loadAuraSettings().blurCharacterArt);
+  useEffect(() => {
+    const sync = () => setBlurChars(loadAuraSettings().blurCharacterArt);
+    window.addEventListener("aura:settings-changed", sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener("aura:settings-changed", sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
 
   // Back to Overview on a title change. Also covers the case where the new
   // title is live action and the tab we were on no longer exists.
@@ -162,7 +174,12 @@ export default function DetailHud({
         }}
       >
         {tab === "overview" && overview}
-        {tab === "cast"     && cast}
+        {/* Anime get the MAL character grid, which has both the character's
+            art and the actor's. Everything else falls back to the addon's own
+            cast rows, which carry an actor photo and nothing more. */}
+        {tab === "cast"     && (cours.length > 0
+          ? <CharactersTab cours={cours} blurNames={blurChars} />
+          : cast)}
         {tab === "songs"    && <SongsTab cours={cours} />}
         {tab === "ratings"  && <RatingsTab cours={cours} />}
         {tab === "staff"    && <StaffTab cours={cours} compact />}

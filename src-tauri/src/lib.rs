@@ -2367,6 +2367,7 @@ pub fn run() {
             tenrai::fetch_anime_themes,
             tenrai::fetch_anime_statistics,
             tenrai::fetch_anime_staff,
+            tenrai::fetch_anime_characters,
             tenrai::fetch_anime_recommendations,
             tenrai::fetch_anime_trailers,
             silencedetect::detect_silence_intervals,
