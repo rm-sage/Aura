@@ -2520,11 +2520,17 @@ html[data-reduced-motion="true"] .aura-vote-burst { display: none !important; }
 /* as children, so moving the cursor between them never fires a leave  */
 /* and the grace timer only ever absorbs slop at the outer edge.       */
 /*                                                                    */
-/* The whole rail is translated by the body's own width so the body    */
-/* parks off-frame and the spine lands flush at x=0. Transform and     */
-/* opacity ONLY: the surface is a backdrop-filter region, and          */
-/* animating its geometry re-rasters the blur every frame on top of    */
-/* the root's own 380 ms transform transition.                         */
+/* GEOMETRY, and it only works one way round. Children are BODY then    */
+/* SPINE, so the body occupies 0..13rem and the spine sits to its       */
+/* right. Shifting the whole rail left by exactly the body's width      */
+/* therefore parks the body off-frame at -13rem..0 and lands the spine  */
+/* flush at 0..44px. Put the spine first instead and the same shift     */
+/* carries the handle off-screen with it, which is how this first       */
+/* shipped completely invisible. The root clips the parked body.        */
+/*                                                                     */
+/* Transform and opacity ONLY: the surface is a backdrop-filter region, */
+/* and animating its geometry re-rasters the blur every frame on top of */
+/* the root's own 380 ms transform transition.                          */
 /*                                                                    */
 /* Written as CLASSES rather than inline styles on purpose. An inline  */
 /* transition always beats a class rule, which would make the          */

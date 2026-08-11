@@ -1537,8 +1537,38 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
             if (!e.currentTarget.contains(e.relatedTarget as Node)) closeRail();
           }}
         >
-          {/* Spine. Always present, always legible: this is the affordance, so
-              a near-invisible hairline would be elegant and undiscoverable. */}
+          {/* Drawer body: a table of contents, so the reveal buys something
+              rather than just relocating a button. */}
+          <div
+            className="aura-extras-rail-body glass-panel-elevated shadow-glass-edge
+                       border-r border-white/8
+                       flex flex-col justify-center gap-0.5 py-3 px-2"
+            style={{ width: "13rem" }}
+          >
+            {EXTRAS_TABS.map((t) => (
+              <button
+                key={t.id}
+                type="button"
+                tabIndex={railOpen ? 0 : -1}
+                onClick={() => openExtras(t.id)}
+                className="text-left px-3 h-8 rounded-lg text-[12.5px]
+                           text-white/60 hover:text-white/95 hover:bg-white/8
+                           focus-visible:text-white/95 focus-visible:bg-white/8
+                           transition-colors"
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+          {/* Spine, SECOND in DOM order and therefore to the RIGHT of the body.
+              That ordering is what makes the parked transform work: shifting
+              the whole rail left by the body's width slides the body off-frame
+              and leaves the spine sitting at x=0. With the spine first, the
+              same shift carried the handle off-screen too, which is exactly
+              how this shipped invisible the first time.
+
+              Always present and always legible: this is the affordance, so a
+              near-invisible hairline would be elegant and undiscoverable. */}
           <button
             ref={railSpineRef}
             type="button"
@@ -1567,29 +1597,6 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
             </span>
           </button>
 
-          {/* Drawer body: a table of contents, so the reveal buys something
-              rather than just relocating a button. */}
-          <div
-            className="aura-extras-rail-body glass-panel-elevated shadow-glass-edge
-                       rounded-r-xl border-l border-white/8
-                       flex flex-col justify-center gap-0.5 py-3 px-2"
-            style={{ width: "13rem" }}
-          >
-            {EXTRAS_TABS.map((t) => (
-              <button
-                key={t.id}
-                type="button"
-                tabIndex={railOpen ? 0 : -1}
-                onClick={() => openExtras(t.id)}
-                className="text-left px-3 h-8 rounded-lg text-[12.5px]
-                           text-white/60 hover:text-white/95 hover:bg-white/8
-                           focus-visible:text-white/95 focus-visible:bg-white/8
-                           transition-colors"
-              >
-                {t.label}
-              </button>
-            ))}
-          </div>
         </div>
       )}
 
