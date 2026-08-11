@@ -115,17 +115,6 @@ const extrasCache = new PersistentCache<ExtrasValue>({
 
 export type ExtrasTab = "songs" | "ratings" | "staff" | "related" | "trailers";
 
-/** The tab list, in display order. Single source for BOTH the panel's own nav
- *  and the detail page's rail, so a sixth tab appears in both at once instead
- *  of one of them quietly falling behind. */
-export const EXTRAS_TABS: { id: ExtrasTab; label: string }[] = [
-  { id: "songs",    label: "Songs" },
-  { id: "ratings",  label: "Ratings" },
-  { id: "staff",    label: "Staff" },
-  { id: "related",  label: "Related" },
-  { id: "trailers", label: "Trailers" },
-];
-
 const COMMAND_BY_TAB: Record<ExtrasTab, string> = {
   songs:    "fetch_anime_themes",
   ratings:  "fetch_anime_statistics",

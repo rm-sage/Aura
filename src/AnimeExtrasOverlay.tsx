@@ -2,27 +2,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // ---------------------------------------------------------------------------
-// AnimeExtrasOverlay — the detail page's "More info" panel.
+// Anime extras — the tab bodies behind the detail page's metadata HUD.
 //
-// WHY AN OVERLAY AND NOT A SECTION
-//
-// DetailView is already 5000+ lines and its left column is `justify-end`, so
-// anything appended to the main stack pushes the hero title UPWARD rather than
-// pushing content down. Everything in here is also genuinely secondary: a
-// score histogram and a staff list are things you go looking for, not things
-// you should have to scroll past on the way to pressing play.
-//
-// POSITIONING
-//
-// This renders ABSOLUTE inside DetailView's root, following SubtitlePicker's
-// pattern, and deliberately does NOT portal. Two reasons:
-//   1. DetailView's z-[60] root carries a transform, so a `position: fixed`
-//      descendant positions against that root rather than the viewport. Fixed
-//      positioning here would look right by accident and break on any future
-//      transform change.
-//   2. The other in-app overlays (CinemaRows' CatalogPopup, CalendarView's
-//      DayOverlay) are z-[55], i.e. BELOW DetailView. Copying either would
-//      render this underneath the page that opened it.
+// These were originally a centred modal opened from a button, then briefly from
+// a drawer rail. Both are gone: the modal's scrim hid the artwork it was
+// describing, and a rail plus a HUD meant two routes to secondary content. The
+// bodies now render inline inside DetailHud, which is why each grid-heavy tab
+// takes a `compact` flag: the HUD is WIDE and SHORT where the modal was narrow
+// and tall, so poster and trailer grids become horizontal scrollers there.
 //
 // FETCHING
 //
@@ -36,7 +23,7 @@ import { shrinkPoster } from "./posterSize";
 import { loadAuraSettings } from "./auraSettings";
 import { shouldBlurThemeRange } from "./episodeSpoilers";
 import {
-  EXTRAS_TABS, fetchExtras, formatSpans, themeLabel,
+  fetchExtras, formatSpans, themeLabel,
   type AnimeStatistics, type AnimeTheme, type AnimeThemes, type AnimeTrailer,
   type CourRef, type Recommendation, type StaffCredit, type ExtrasTab,
 } from "./animeExtras";
@@ -51,116 +38,6 @@ import {
 const STAFF_AVATAR_W = 72;
 const RELATED_POSTER_W = 360;
 const TRAILER_THUMB_W = 540;
-
-interface Props {
-  open: boolean;
-  onClose: () => void;
-  /** One entry per cour. Empty means the trigger should not have rendered. */
-  cours: CourRef[];
-  seriesName: string;
-  /** Play a trailer through the existing in-MPV yt-dlp path. Takes a
-   *  YouTube id, matching DetailView's own trailer button. */
-  onPlayTrailer?: (ytId: string, title: string) => void;
-  /** Tab to land on. The rail picks it, so a user who chose "Ratings" does not
-   *  arrive on Songs and have to click again. */
-  initialTab?: ExtrasTab;
-}
-
-export default function AnimeExtrasOverlay({
-  open, onClose, cours, seriesName, onPlayTrailer, initialTab,
-}: Props) {
-  const [tab, setTab] = useState<ExtrasTab>(initialTab ?? "songs");
-
-  // Re-seed on every open. This component returns null when closed rather than
-  // unmounting, so `tab` survives a close and would otherwise strand the user
-  // on whatever they last viewed regardless of which rail row they picked.
-  useEffect(() => {
-    if (open) setTab(initialTab ?? "songs");
-  }, [open, initialTab]);
-
-  // Close on Escape. Capture phase so the detail page's own Escape handler
-  // does not close the whole page out from under an open panel.
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      e.stopPropagation();
-      e.preventDefault();
-      onClose();
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [open, onClose]);
-
-  if (!open) return null;
-
-  return (
-    <div className="absolute inset-0 z-40 flex items-center justify-center p-8">
-      {/* Scrim. Clicking it closes, matching every other dismissable surface. */}
-      <div
-        aria-hidden
-        className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-        onClick={onClose}
-      />
-      <div
-        role="dialog"
-        aria-label={`More information about ${seriesName}`}
-        className="aura-sheet-in glass-panel-elevated relative rounded-2xl shadow-glass-edge
-                   w-full flex flex-col overflow-hidden"
-        // Arbitrary values: tailwind.config replaces the maxWidth scale, so
-        // every named max-w-* token emits no CSS at all and this would
-        // stretch to the full viewport.
-        style={{ maxWidth: "56rem", maxHeight: "78vh" }}
-      >
-        <header className="flex items-center justify-between gap-3 px-5 py-3
-                           border-b border-white/8 flex-shrink-0">
-          <div className="min-w-0">
-            <h2 className="text-white/90 text-sm font-semibold tracking-wide truncate">
-              {seriesName}
-            </h2>
-            <p className="text-white/30 text-[11px] mt-0.5">MyAnimeList via Tenrai</p>
-          </div>
-          <button
-            onClick={onClose}
-            aria-label="Close"
-            className="shrink-0 w-7 h-7 rounded-full text-white/50 hover:text-white
-                       hover:bg-white/8 flex items-center justify-center transition-colors"
-          >
-            <CloseGlyph />
-          </button>
-        </header>
-
-        <nav className="flex items-center gap-1 px-4 pt-3 pb-2 border-b border-white/6 flex-shrink-0">
-          {EXTRAS_TABS.map((t) => (
-            <button
-              key={t.id}
-              onClick={() => setTab(t.id)}
-              className={
-                "px-3 h-7 rounded-full text-[12px] font-medium transition-colors " +
-                (tab === t.id
-                  ? "bg-white/12 text-white/95"
-                  : "text-white/45 hover:text-white/80 hover:bg-white/6")
-              }
-            >
-              {t.label}
-            </button>
-          ))}
-        </nav>
-
-        <div
-          className="flex-1 min-h-0 overflow-y-auto px-5 py-4"
-          style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
-        >
-          {tab === "songs"    && <SongsTab cours={cours} />}
-          {tab === "ratings"  && <RatingsTab cours={cours} />}
-          {tab === "staff"    && <StaffTab cours={cours} />}
-          {tab === "related"  && <RelatedTab cours={cours} />}
-          {tab === "trailers" && <TrailersTab cours={cours} onPlay={onPlayTrailer} />}
-        </div>
-      </div>
-    </div>
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Shared per-cour loader
@@ -218,7 +95,7 @@ function CourHeading({ label, show }: { label: string; show: boolean }) {
 // Songs
 // ---------------------------------------------------------------------------
 
-function SongsTab({ cours }: { cours: CourRef[] }) {
+export function SongsTab({ cours }: { cours: CourRef[] }) {
   const rows = useCourPayloads<AnimeThemes>("songs", cours);
   // Read once per mount and subscribe, matching how every other consumer of a
   // spoiler toggle in the app reacts to a live settings change.
@@ -343,7 +220,7 @@ function ThemeRow({
 // Ratings histogram
 // ---------------------------------------------------------------------------
 
-function RatingsTab({ cours }: { cours: CourRef[] }) {
+export function RatingsTab({ cours }: { cours: CourRef[] }) {
   const rows = useCourPayloads<AnimeStatistics>("ratings", cours);
   if (!rows) return <Loading />;
   const any = rows.some((r) => r.value);
@@ -404,7 +281,7 @@ function StatusRow({ label, value }: { label: string; value: number }) {
 // Staff
 // ---------------------------------------------------------------------------
 
-function StaffTab({ cours }: { cours: CourRef[] }) {
+export function StaffTab({ cours, compact = false }: { cours: CourRef[]; compact?: boolean }) {
   const rows = useCourPayloads<StaffCredit[]>("staff", cours);
   if (!rows) return <Loading />;
   const any = rows.some((r) => r.value && r.value.length);
@@ -418,7 +295,9 @@ function StaffTab({ cours }: { cours: CourRef[] }) {
         return (
           <div key={cour.malId}>
             <CourHeading label={cour.label} show={multi} />
-            <div className="grid grid-cols-2 gap-x-5 gap-y-2.5">
+            <div className={compact
+              ? "grid grid-cols-3 gap-x-5 gap-y-2"
+              : "grid grid-cols-2 gap-x-5 gap-y-2.5"}>
               {value.map((c) => (
                 <div key={c.mal_id} className="flex items-center gap-2.5 min-w-0">
                   <div className="w-9 h-9 rounded-full overflow-hidden bg-white/8 shrink-0
@@ -457,7 +336,7 @@ function StaffTab({ cours }: { cours: CourRef[] }) {
 // Related
 // ---------------------------------------------------------------------------
 
-function RelatedTab({ cours }: { cours: CourRef[] }) {
+export function RelatedTab({ cours, compact = false }: { cours: CourRef[]; compact?: boolean }) {
   const rows = useCourPayloads<Recommendation[]>("related", cours);
   if (!rows) return <Loading />;
 
@@ -474,9 +353,11 @@ function RelatedTab({ cours }: { cours: CourRef[] }) {
   if (!list.length) return <Empty what="recommendations" />;
 
   return (
-    <div className="grid grid-cols-4 gap-3">
+    <div className={compact
+      ? "flex gap-3 overflow-x-auto pb-1"
+      : "grid grid-cols-4 gap-3"}>
       {list.map((r) => (
-        <div key={r.mal_id} className="min-w-0">
+        <div key={r.mal_id} className={compact ? "w-[104px] shrink-0" : "min-w-0"}>
           <div className="aspect-[2/3] rounded-lg overflow-hidden bg-white/6 mb-1.5">
             {r.image && (
               <ImageLoader
@@ -502,11 +383,12 @@ function RelatedTab({ cours }: { cours: CourRef[] }) {
 // Trailers
 // ---------------------------------------------------------------------------
 
-function TrailersTab({
-  cours, onPlay,
+export function TrailersTab({
+  cours, onPlay, compact = false,
 }: {
   cours: CourRef[];
   onPlay?: (ytId: string, title: string) => void;
+  compact?: boolean;
 }) {
   const rows = useCourPayloads<AnimeTrailer[]>("trailers", cours);
   if (!rows) return <Loading />;
@@ -521,14 +403,17 @@ function TrailersTab({
         return (
           <div key={cour.malId}>
             <CourHeading label={cour.label} show={multi} />
-            <div className="grid grid-cols-3 gap-3">
+            <div className={compact
+              ? "flex gap-3 overflow-x-auto pb-1"
+              : "grid grid-cols-3 gap-3"}>
               {value.map((t) => (
                 <button
                   key={t.youtube_id}
                   type="button"
                   onClick={() => onPlay?.(t.youtube_id, t.title)}
                   disabled={!onPlay}
-                  className="text-left min-w-0 group disabled:cursor-default"
+                  className={"text-left group disabled:cursor-default "
+                    + (compact ? "w-[168px] shrink-0" : "min-w-0")}
                 >
                   <div className="aspect-video rounded-lg overflow-hidden bg-white/6 mb-1.5
                                   group-hover:ring-1 group-hover:ring-white/25 transition-shadow">
@@ -552,13 +437,5 @@ function TrailersTab({
         );
       })}
     </div>
-  );
-}
-
-function CloseGlyph() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-      <path d="M18 6L6 18M6 6l12 12" strokeLinecap="round" />
-    </svg>
   );
 }
