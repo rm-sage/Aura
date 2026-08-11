@@ -1726,7 +1726,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                 // so they emit normally. Steps down to two columns and then one
                 // rather than letting any column fall under a readable measure.
                 <div className="grid gap-x-8 gap-y-5 items-start
-                                grid-cols-1 min-[1500px]:grid-cols-2 min-[2300px]:grid-cols-3
+                                grid-cols-1 min-[1500px]:grid-cols-2
                                 [&>*]:min-w-0">
 
                   {/* Synopsis — larger size + weight for "Command Center" presence.
@@ -1784,7 +1784,22 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                     }}
                   />
 
-                  {/* Genre chips */}
+                  {/* Production, moved out of the Cast tab. Cast is people; this is
+                the title. It also gives Overview's second column something to
+                hold besides a genre strip, which is what made the panel read
+                as mostly empty. */}
+            {(detail?.studios?.length || detail?.country) && (
+              <div className="space-y-2">
+                {detail?.studios && detail.studios.length > 0 &&
+                  <CreditRow label={detail.studios.length > 1 ? "Studios" : "Studio"}
+                    values={plainCredits(detail.studios)} />}
+                {detail?.country && (
+                  <CreditRow label="Country" values={plainCredits([detail.country])} />
+                )}
+              </div>
+            )}
+
+            {/* Genre chips */}
                   {detail?.genres && detail.genres.length > 0 && (
                     <div className="flex flex-wrap gap-2">
                       {detail.genres.map((g) => (
@@ -1846,12 +1861,6 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                       <CreditRow label={detail.creator.length > 1 ? "Creators" : "Creator"}
                         values={plainCredits(detail.creator)}
                         onClickName={onSearchByName ? (n) => { onSearchByName(n); onClose(); } : undefined} />}
-                    {detail?.studios && detail.studios.length > 0 &&
-                      <CreditRow label={detail.studios.length > 1 ? "Studios" : "Studio"}
-                        values={plainCredits(detail.studios)} />}
-                    {detail?.country && (
-                      <CreditRow label="Country" values={plainCredits([detail.country])} />
-                    )}
                   </div>
                 </div>
             )}

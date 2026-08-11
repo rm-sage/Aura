@@ -2511,3 +2511,36 @@ html[data-reduced-motion="true"] [style*="addon-spinner-pulse"] {
 html[data-reduced-motion="true"] .aura-vote-won-pop { animation: none !important; }
 html[data-reduced-motion="true"] .aura-vote-burst { display: none !important; }
 
+
+/* ------------------------------------------------------------------ */
+/* aura-hud-surface — the detail page's metadata panel.                */
+/*                                                                    */
+/* NOT .glass-panel-elevated. That class composites --ln-glass-3 over  */
+/* --ln-panel-solid, and --ln-glass-3 is TINTED PER THEME (the warm    */
+/* theme sets rgba(255,178,110,0.14)). Over a dark scrim, as in the    */
+/* changelog, that tint reads as a subtle warmth. Over full-bleed key  */
+/* art it becomes a large accent-coloured fill across the widest       */
+/* element on the page, which is the one place an accent should never  */
+/* go: accents mark things, they do not fill areas.                    */
+/*                                                                    */
+/* This follows the PLAYER surface reasoning instead (see the note     */
+/* above .aura-glass-menu): a baked-in dark gradient guarantees a      */
+/* legible, neutral base whatever is behind it, while the blur and     */
+/* saturate keep the refractive feel. Rim and text stay white-alpha,   */
+/* so the only accent in this region is the active tab.                */
+/* ------------------------------------------------------------------ */
+.aura-hud-surface {
+  background:
+    linear-gradient(rgba(10, 12, 16, 0.80), rgba(10, 12, 16, 0.80)),
+    linear-gradient(rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.05));
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  backdrop-filter: blur(var(--ln-blur-elev, 24px)) saturate(1.15);
+  -webkit-backdrop-filter: blur(var(--ln-blur-elev, 24px)) saturate(1.15);
+}
+/* Zero-blur themes have no blur to lean on, so go fully opaque rather
+   than leaving a translucent panel see-through over bright art. */
+html[data-theme="midnight"] .aura-hud-surface,
+html[data-theme="contrast"] .aura-hud-surface,
+html[data-theme="contrast-azure"] .aura-hud-surface {
+  background: var(--ln-panel-solid, #0b0d12);
+}

@@ -102,7 +102,15 @@ export default function DetailHud({
   };
 
   return (
-    <div className="flex flex-col gap-3 min-h-0">
+    // WIDTH IS CAPPED, and this is the fix for the panel reading as dead
+    // space on an ultrawide. Spanning the full column meant a ~2900px glass
+    // bar holding two blocks of text: the measure inside it stayed narrow, the
+    // surplus columns came up empty, and the bar cut straight across the
+    // artwork's subject. Capping it hands that width back to the art, which is
+    // the point of a cinematic layout, and leaves the content at a width it
+    // can actually fill. It stays left-aligned with the identity block above
+    // so the two read as one column of page furniture.
+    <div className="flex flex-col gap-3 min-h-0" style={{ width: "min(100%, 74rem)" }}>
       <div
         ref={listRef}
         role="tablist"
@@ -143,10 +151,13 @@ export default function DetailHud({
       <div
         id="aura-hud-panel"
         role="tabpanel"
-        className="glass-panel-elevated shadow-glass-edge rounded-xl
-                   px-5 py-4 overflow-y-auto min-h-0"
+        className="aura-hud-surface shadow-glass-edge rounded-xl
+                   px-6 py-5 overflow-y-auto"
         style={{
-          maxHeight: "min(38vh, 22rem)",
+          // FIXED, not a max. A panel that resized to its content made every
+          // tab switch jump the layout, which is worse than the dead space a
+          // fixed box sometimes leaves. Roughly 50% taller than the first cut.
+          height: "min(44vh, 31rem)",
           scrollbarWidth: "thin",
           scrollbarColor: "rgba(255,255,255,0.08) transparent",
         }}
