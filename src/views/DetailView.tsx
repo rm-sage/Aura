@@ -92,7 +92,7 @@ function streamCacheDelete(key: string): void {
 }
 import { useEpisodeProgress, useLibraryMap, useResumeVideoId, useEpisodesBehind } from "../LibraryContext";
 import { isEpisodeWatched } from "../episodeSpoilers";
-import { isSkipped } from "../skipMarks";
+import { isSkipped, useSkipMarksVersion } from "../skipMarks";
 import { connectedServices, useScrobbleConnections } from "../scrobbleConn";
 import { episodeKindFlags, isFillerOrRecap } from "../nextUp";
 import { clearEpisodesSkipped, markEpisodesSkipped, type SkipTarget } from "../skipActions";
@@ -548,38 +548,79 @@ function ProgressBlock({
   seriesId: string;
 }) {
   const byId = useLibraryMap();
-  // Re-derives on a manual mark as well as on a progress write, matching how
-  // the episode rows stay in step.
+  // Both stores, because a skip is a watched mark plus an annotation and each
+  // fires its own event.
   const manualVersion = useManualWatchedVersion();
+  const skipVersion = useSkipMarksVersion();
 
   const stats = useMemo(() => {
     // Season 0 is specials, which are not part of "have I finished this".
     const main = videos.filter((v) => (v.season ?? 1) > 0);
     if (main.length === 0) return null;
-    const watched = main.filter((v) => isEpisodeWatched(byId, v.id)).length;
-    return { watched, total: main.length };
+    // Per-episode states, in order, so the bar can be drawn as SEGMENTS rather
+    // than a single fill. That is what makes it match the Continue Watching
+    // tile: the same show reads the same way in both places, and a skipped run
+    // is visible as a band rather than hidden inside one aggregate number.
+    const segments = main.map((v) => {
+      if (isSkipped(v.id)) return "skipped" as const;
+      if (isEpisodeWatched(byId, v.id)) return "watched" as const;
+      return isVideoAired(v) ? ("available" as const) : ("unaired" as const);
+    });
+    const watched = segments.filter((x) => x === "watched").length;
+    const skipped = segments.filter((x) => x === "skipped").length;
+    return { segments, watched, skipped, total: main.length };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [videos, byId, seriesId, manualVersion]);
+  }, [videos, byId, seriesId, manualVersion, skipVersion]);
 
-  if (!stats || stats.watched === 0) return null;
-  const pct = Math.round((stats.watched / stats.total) * 100);
-  const remaining = stats.total - stats.watched;
+  // Nothing seen and nothing skipped is not progress; a row of zeroes on an
+  // unstarted show is noise.
+  if (!stats || (stats.watched === 0 && stats.skipped === 0)) return null;
+  const done = stats.watched + stats.skipped;
+  const pctWatched = Math.round((stats.watched / stats.total) * 100);
+  const pctSkipped = Math.round((stats.skipped / stats.total) * 100);
+  const remaining = stats.total - done;
+
+  // Segments stay legible down to a couple of pixels each, but past a few
+  // hundred episodes (One Piece) the gaps cost more than they convey, so the
+  // bar closes up rather than dissolving into stripes.
+  const dense = stats.total > 120;
+
+  const SEG_CLASS: Record<string, string> = {
+    // Same tokens as the Continue Watching bar, deliberately: two bars meaning
+    // the same thing in two colours would be worse than no second bar.
+    skipped:   "bg-purple-400",
+    watched:   "bg-emerald-400",
+    available: "bg-white/70",
+    unaired:   "bg-white/15",
+  };
 
   return (
     <section>
       <HudSectionLabel>Your Progress</HudSectionLabel>
       <div className="flex items-center gap-3">
-        <div className="flex-1 h-1.5 rounded-full bg-white/10 overflow-hidden min-w-0">
-          <div className="h-full rounded-full bg-ln-accent/80" style={{ width: `${pct}%` }} />
+        <div className={`flex-1 h-[6px] rounded-full overflow-hidden min-w-0 flex ${dense ? "" : "gap-[1.5px]"}`}>
+          {stats.segments.map((kind, i) => (
+            <div
+              key={i}
+              className={`flex-1 h-full ${SEG_CLASS[kind]}`}
+              // Individually titled so hovering a purple band answers "which
+              // episodes did I skip" without opening the episode list.
+              title={`${i + 1}. ${kind === "available" ? "Not watched"
+                : kind === "unaired" ? "Not yet aired"
+                : kind[0].toUpperCase() + kind.slice(1)}`}
+            />
+          ))}
         </div>
         <span className="shrink-0 text-white/80 text-[12.5px] font-mono tabular-nums">
-          {stats.watched}/{stats.total}
+          {done}/{stats.total}
         </span>
       </div>
       <p className="text-white/40 text-[11.5px] mt-1.5">
-        {remaining === 0
-          ? "Completed"
-          : `${pct}% watched · ${remaining} episode${remaining === 1 ? "" : "s"} left`}
+        {remaining === 0 ? "Completed" : `${remaining} episode${remaining === 1 ? "" : "s"} left`}
+        {" · "}{pctWatched}% watched
+        {stats.skipped > 0 && (
+          <span className="text-purple-300/70"> · {pctSkipped}% skipped</span>
+        )}
       </p>
     </section>
   );

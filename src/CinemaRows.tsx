@@ -12,6 +12,7 @@ import ImageLoader from "./ImageLoader";
 import { useLibraryProgress, episodeIsBeforeResume } from "./LibraryContext";
 import WatchedBadge, { useWatchedVariant, WatchedBadgeStatic } from "./WatchedBadge";
 import { getManualWatchedState, useManualWatchedVersion } from "./manualWatched";
+import { isSkipped, useSkipMarksVersion } from "./skipMarks";
 import { getMetaDetailFallback, useCanonicalReleaseYear } from "./metaCache";
 import { closeHoverNow } from "./catalogHoverStore";
 import { useHoverCardActivation } from "./useHoverCardActivation";
@@ -183,6 +184,9 @@ function SegmentedSeasonBar({
   // bookkeeping vs. the previous useState+useEffect+tick combo,
   // which mattered when 50 CW cards each carried their own bar.
   void useManualWatchedVersion();
+  // Skip annotations live in their own store and fire their own event, so the
+  // bar subscribes to both or a skip would not repaint until something else did.
+  void useSkipMarksVersion();
   // Single mousemove-driven tooltip (4b) — one element per bar, not one per
   // segment, so a row of 50 CW cards doesn't mount thousands of wrappers.
   const [tip, setTip] = useState<{ x: number; y: number; text: string } | null>(null);
@@ -255,7 +259,10 @@ function SegmentedSeasonBar({
       : (ep.episode != null ? `E${ep.episode}` : "Episode");
     const manual = getManualWatchedState(ep.id);
     let state: string;
-    if (manual === "watched" || i < impliedThroughIdx) state = "Watched";
+    // Skipped is checked first: it IS a watched mark plus an annotation, so
+    // testing watched first would always shadow it.
+    if (isSkipped(ep.id)) state = "Skipped";
+    else if (manual === "watched" || i < impliedThroughIdx) state = "Watched";
     else if ((manual === "in-progress" || (i === currentIdx && resumeActive)) && i >= lastWatchedIdx) state = "In progress";
     else if (isVideoAired(ep)) state = "Available now";
     else state = "Not yet aired";
@@ -276,7 +283,11 @@ function SegmentedSeasonBar({
       {episodes.map((ep, i) => {
         const manual = getManualWatchedState(ep.id);
         let cls: string;
-        if (manual === "watched") {
+        if (isSkipped(ep.id)) {
+          // Purple, and BEFORE the watched branch, since a skip is a watched
+          // mark plus an annotation and would otherwise always read green.
+          cls = "bg-purple-400";
+        } else if (manual === "watched") {
           cls = "bg-emerald-400";
         } else if ((manual === "in-progress" || (i === currentIdx && resumeActive)) && i >= lastWatchedIdx) {
           // Genuine current position — there IS a saved resume on this exact
@@ -340,6 +351,9 @@ function ContinuousProgressBar({
   resumeActive: boolean;
 }) {
   void useManualWatchedVersion();
+  // Skip annotations live in their own store and fire their own event, so the
+  // bar subscribes to both or a skip would not repaint until something else did.
+  void useSkipMarksVersion();
   if (episodes.length === 0) return null;
   const total = episodes.length;
   const currentIdx = currentId
