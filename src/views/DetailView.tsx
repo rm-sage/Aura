@@ -179,6 +179,9 @@ interface Props {
    *  toast originating at `originPoint`, and re-fetches the library so
    *  this view's `inLibrary` flips. */
   onLibraryToggle?: (originPoint?: { x: number; y: number }) => void;
+  /** Queue add/remove. Wired by App to the same "planned" toggle the catalog
+   *  context menu uses, so both routes share one rule set. */
+  onQueueToggle?: (originPoint?: { x: number; y: number }) => void;
   /** Play the title's trailer in Aura's MPV player. `ytId` comes from
    *  `detail.trailer_yt_id`; `title` is the display name. App.tsx resolves the
    *  id to a direct CDN URL via yt-dlp and plays it as a `trailer:<id>` target
@@ -590,7 +593,7 @@ function HudSectionLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
-function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onOpenTitle, onSearchByName, inLibrary, onLibraryToggle, onPlayTrailer, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
+function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onOpenTitle, onSearchByName, inLibrary, onLibraryToggle, onQueueToggle, onPlayTrailer, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
   const [detail, setDetail]                 = useState<MetaDetail | null>(null);
   // Resume pointer, read BEFORE the latch below because the latch's seed
   // needs it synchronously on the first render to pick the right arc's art.
@@ -598,6 +601,15 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // down for the resume behaviour itself; two calls are free and keep that
   // logic where it belongs.
   const heroResumeVideoId = useResumeVideoId(meta.id);
+  // Queue membership IS the manual "planned" mark. Read live rather than
+  // mirrored into state, and re-derived on the manual-watched version so the
+  // button stays correct when the context menu toggles it from elsewhere.
+  const manualWatchedVersion = useManualWatchedVersion();
+  const inQueue = useMemo(
+    () => getManualWatchedState(meta.id) === "planned",
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [meta.id, manualWatchedVersion],
+  );
   // Write-once hero art (see the latch notes above the component). `null`
   // means "not settled yet" — the hero shows its ambient base and waits.
   const [heroArtLatch, setHeroArtLatch]     = useState<HeroArt | null>(
@@ -1719,7 +1731,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
             {/* Action row — Library add/remove + Watch Trailer (when the addon
                 emits one). Sits below the meta strip so it never moves around
                 when ratings or runtime fields appear/disappear. */}
-            {(onLibraryToggle || (detail?.trailer_yt_id && onPlayTrailer)) && (
+            {(onLibraryToggle || onQueueToggle || (detail?.trailer_yt_id && onPlayTrailer)) && (
               <div className="flex items-center gap-3 -mt-2">
                 {onLibraryToggle && (
                 <button
@@ -1754,6 +1766,37 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                     </>
                   )}
                 </button>
+                )}
+                {/* Queue — the same "planned" state the catalog context menu
+                    sets, so both routes obey one rule set: marking planned
+                    auto-adds to the library, and removing from the library
+                    clears the planned mark. Reads through
+                    getManualWatchedState rather than holding its own copy, and
+                    re-renders on the manual-watched version so the two stay in
+                    step when the other route is used. */}
+                {onQueueToggle && (
+                  <button
+                    type="button"
+                    onClick={(e) => onQueueToggle({ x: e.clientX, y: e.clientY })}
+                    className={`group/queue flex items-center gap-2 px-4 py-2 rounded-full text-[13px] font-medium
+                                border transition-colors duration-150
+                                ${inQueue
+                                  ? "bg-ln-accent/20 text-ln-accent border-ln-accent/40 hover:bg-rose-500/15 hover:text-rose-200 hover:border-rose-300/40"
+                                  : "bg-white/8 text-white/85 border-white/15 hover:bg-ln-accent/20 hover:text-ln-accent hover:border-ln-accent/40"
+                                }`}
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                      <path d="M17 3H7c-1.1 0-2 .9-2 2v16l7-3 7 3V5c0-1.1-.9-2-2-2z" />
+                    </svg>
+                    {inQueue ? (
+                      <>
+                        <span className="group-hover/queue:hidden">In Queue</span>
+                        <span className="hidden group-hover/queue:inline">Remove from Queue</span>
+                      </>
+                    ) : (
+                      <span>Add to Queue</span>
+                    )}
+                  </button>
                 )}
                 {/* Watch Trailer — plays the title's YouTube trailer in Aura's
                     own MPV player (yt-dlp resolves a direct CDN URL). Sits to
@@ -1793,12 +1836,14 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
               onOpenTitle={onOpenTitle}
               onSearchTitle={onSearchByName ? (n) => { onSearchByName(n); onClose(); } : undefined}
               overview={(
-                // Columns, not a stack. A wide short strip is the space an
-                // ultrawide actually has, and the old single flow wasted all of
-                // it. Arbitrary-value breakpoints because tailwind.config
-                // replaces the maxWidth scale; these are widths, not maxWidths,
-                // so they emit normally. Steps down to two columns and then one
-                // rather than letting any column fall under a readable measure.
+                // Two EXPLICIT columns rather than a flat grid of sections.
+                // Auto-flow put one section per cell in source order, which
+                // left the short blocks stranded beside the very tall Details
+                // list. Assigning them by hand keeps the prose on the left and
+                // stacks the fact-shaped blocks on the right, so the tall one
+                // is balanced by two rather than by whitespace. Collapses to a
+                // single flow below the breakpoint, where the source order is
+                // the reading order.
                 <div className="grid gap-x-8 gap-y-5 items-start
                                 grid-cols-1 min-[1500px]:grid-cols-2
                                 [&>*]:min-w-0">
@@ -1855,7 +1900,6 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                 studios, producers, licensors. All of it was already arriving in
                 the cached /full payload and being discarded, so it costs no
                 request, and none of it repeats another tab. */}
-            <ProgressBlock videos={detail?.videos ?? []} seriesId={meta.id} />
 
             {/* ── Details ──
                 One list, not three. Genres come from the addon and the rest
@@ -1863,6 +1907,10 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                 of fact, so they share one label-value grid instead of sitting
                 in separate blocks with different shapes. Rendered as rows
                 rather than chips so they align with everything around them. */}
+            {/* RIGHT column: the fact-shaped blocks, stacked. Progress sits
+                UNDER Details rather than beside the synopsis, which is what
+                fills the space the tall fact list leaves below itself. */}
+            <div className="flex flex-col gap-5 min-w-0">
             {(() => {
               const leading: [string, string][] = [];
               if (detail?.genres?.length) {
@@ -1887,6 +1935,8 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                 </section>
               );
             })()}
+            <ProgressBlock videos={detail?.videos ?? []} seriesId={meta.id} />
+            </div>
 
 
                 </div>

@@ -18,7 +18,9 @@
 // ---------------------------------------------------------------------------
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import ImageLoader from "./ImageLoader";
+import { dedupedInvoke } from "./invokeDedupe";
 import { shrinkPoster } from "./posterSize";
 import { loadAuraSettings } from "./auraSettings";
 import { shouldBlurThemeRange } from "./episodeSpoilers";
@@ -548,6 +550,32 @@ function CharacterCard({
 // Related
 // ---------------------------------------------------------------------------
 
+/** Posters for relation entries. The relations payload is
+ *  {mal_id, type, name} with no artwork, so each one needs a lookup; they run
+ *  concurrently and bounded in Rust and land in the same cache that would
+ *  serve the title if the user then opened it. */
+function useRelationPosters(relations: AnimeRelation[]): Map<number, string> {
+  const [posters, setPosters] = useState<Map<number, string>>(() => new Map());
+  const key = relations.map((r) => r.mal_id).join(",");
+  useEffect(() => {
+    if (!key) { setPosters(new Map()); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const rows = await dedupedInvoke(
+          `posters:${key}`,
+          () => invoke<[number, string][]>("fetch_anime_posters", {
+            malIds: key.split(",").map(Number),
+          }),
+        );
+        if (!cancelled) setPosters(new Map(rows));
+      } catch { /* art is decorative; the tiles still open */ }
+    })();
+    return () => { cancelled = true; };
+  }, [key]);
+  return posters;
+}
+
 export function RelatedTab({ cours, onOpenTitle, onSearchTitle }: {
   cours: CourRef[];
   /** Open a title's detail page directly. */
@@ -559,9 +587,9 @@ export function RelatedTab({ cours, onOpenTitle, onSearchTitle }: {
   // Relations come from the SERIES ROOT only: every cour of a show lists the
   // same franchise, so per-cour would print the same sequels three times.
   const relRows  = useCourPayloads<AnimeRelation[]>("relations", cours.slice(0, 1));
-  if (!recRows) return <Loading />;
-
   const relations = relRows?.[0]?.value ?? [];
+  const posters = useRelationPosters(relations);
+  if (!recRows) return <Loading />;
 
   // Merged across cours and re-ranked: two cours of one show recommend largely
   // the same titles, and showing each twice is noise.
@@ -584,13 +612,16 @@ export function RelatedTab({ cours, onOpenTitle, onSearchTitle }: {
       {relations.length > 0 && (
         <section className="mb-2">
           <CourHeading label="Direct relations" show />
-          <div className="flex flex-wrap gap-2">
+          <div className="grid gap-x-4 gap-y-4
+                          grid-cols-3 min-[900px]:grid-cols-5
+                          min-[1200px]:grid-cols-7 min-[1500px]:grid-cols-8">
             {relations.map((r) => (
-              <OpenableChip
+              <OpenableTile
                 key={`${r.relation}-${r.mal_id}`}
                 malId={r.mal_id}
                 name={r.name}
-                eyebrow={r.kind ? `${r.relation} · ${r.kind}` : r.relation}
+                image={posters.get(r.mal_id) ?? null}
+                caption={r.kind ? `${r.relation} · ${r.kind}` : r.relation}
                 onOpenTitle={onOpenTitle}
                 onSearchTitle={onSearchTitle}
               />
@@ -687,33 +718,6 @@ function OpenableTile({
   );
 }
 
-function OpenableChip({
-  malId, name, eyebrow, onOpenTitle, onSearchTitle,
-}: {
-  malId: number; name: string; eyebrow: string;
-  onOpenTitle?: (id: string, mediaType: string, name: string) => void;
-  onSearchTitle?: (name: string) => void;
-}) {
-  const { go, busy, enabled } = useOpenTitle(malId, name, onOpenTitle, onSearchTitle);
-  return (
-    <button
-      type="button"
-      onClick={go}
-      disabled={!enabled}
-      className="text-left px-3 py-2 rounded-lg bg-white/6 border border-white/10
-                 hover:bg-white/12 hover:border-white/20 transition-colors
-                 disabled:cursor-default max-w-[280px]"
-      style={busy ? { opacity: 0.6 } : undefined}
-    >
-      <span className="block text-white/40 text-[9.5px] font-mono uppercase tracking-[0.16em]">
-        {eyebrow}
-      </span>
-      <span className="block text-white/85 text-[12px] leading-tight mt-0.5 truncate">
-        {name}
-      </span>
-    </button>
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Trailers

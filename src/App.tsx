@@ -8632,6 +8632,30 @@ export default function App() {
           }}
           inLibrary={library.some((i) => i.id === selectedMeta.id && !i.removed)}
           onLibraryToggle={(origin) => handleLibraryToggle(selectedMeta, origin)}
+          onQueueToggle={(origin) => {
+            // Same behaviour as the catalog context menu's Mark as Planned, on
+            // purpose: the queue has ONE rule set and two entry points, rather
+            // than two implementations that can drift. Auto-add to library on
+            // queue is part of that rule set, skipped when already in the
+            // library so the toggle's own confirm toast does not fire twice.
+            const isPlanned = getManualWatchedState(selectedMeta.id) === "planned";
+            const next = isPlanned ? null : "planned";
+            setManualWatchedState(selectedMeta.id, next);
+            showFlyUpToast(
+              next
+                ? `Added to Queue · ${selectedMeta.name}`
+                : `Removed from Queue · ${selectedMeta.name}`,
+              {
+                x: origin?.x ?? window.innerWidth / 2,
+                y: origin?.y ?? window.innerHeight / 2,
+                tone: next ? "success" : "default",
+              },
+            );
+            const inLib = library.some((i) => i.id === selectedMeta.id && !i.removed);
+            if (next === "planned" && session?.auth_key && !inLib) {
+              handleLibraryToggle(selectedMeta);
+            }
+          }}
           onPlayTrailer={handlePlayTrailer}
           openOnEpisodeId={lastPlayedEpisodeId}
           ignoreResumeHint={ignoreResumeOnNextOpen}

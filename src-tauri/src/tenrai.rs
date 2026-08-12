@@ -134,6 +134,8 @@ pub struct AnimeFull {
     pub broadcast: Option<BroadcastRaw>,
     #[serde(default)]
     pub relations: Vec<RelationRaw>,
+    #[serde(default)]
+    pub images: Option<CharImages>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -419,7 +421,7 @@ struct ImageSet {
     jpg: Option<ImageUrls>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ImageUrls {
     #[serde(default)]
     image_url: Option<String>,
@@ -523,7 +525,7 @@ struct NamedEntity {
     images: Option<CharImages>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct CharImages {
     #[serde(default)]
     jpg: Option<ImageUrls>,
@@ -623,6 +625,32 @@ pub struct AnimeRelation {
     pub relation: String,
     /// "TV", "Movie", "OVA", ...
     pub kind: Option<String>,
+}
+
+/// Posters for a set of MAL ids.
+///
+/// Relations arrive as {mal_id, type, name} with no artwork, so a poster needs
+/// a lookup per title. Those go through `anime_full`, which means each one is
+/// cached and, if the user then opens that title, its ratings and songs are
+/// already warm. Bounded and run concurrently: at Tenrai's 4 req/s a dozen
+/// sequential fetches would be a visible stall.
+#[tauri::command]
+pub async fn fetch_anime_posters(mal_ids: Vec<u32>) -> Result<Vec<(u32, String)>, String> {
+    use futures_util::stream::{self, StreamExt};
+    const MAX: usize = 14;
+    const CONCURRENCY: usize = 4;
+
+    let ids: Vec<u32> = mal_ids.into_iter().take(MAX).collect();
+    let out: Vec<(u32, String)> = stream::iter(ids)
+        .map(|id| async move {
+            let img = anime_full(id).await.and_then(|f| pick_image(f.images));
+            img.map(|u| (id, u))
+        })
+        .buffer_unordered(CONCURRENCY)
+        .filter_map(|r| async move { r })
+        .collect()
+        .await;
+    Ok(out)
 }
 
 #[tauri::command]
