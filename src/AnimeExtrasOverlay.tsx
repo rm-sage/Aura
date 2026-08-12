@@ -550,30 +550,80 @@ function CharacterCard({
 // Related
 // ---------------------------------------------------------------------------
 
-/** Posters for relation entries. The relations payload is
- *  {mal_id, type, name} with no artwork, so each one needs a lookup; they run
- *  concurrently and bounded in Rust and land in the same cache that would
- *  serve the title if the user then opened it. */
-function useRelationPosters(relations: AnimeRelation[]): Map<number, string> {
+/**
+ * Posters for relation entries, with bounded retry.
+ *
+ * The relations payload is {mal_id, type, name} with no artwork, so each entry
+ * needs its own lookup. Those miss for two different reasons and only one is
+ * worth retrying: the request failed (transient), or MAL genuinely has no
+ * image for that id (permanent, and retrying it forever would be a spin).
+ *
+ * Rust returns only the ids it RESOLVED, so a missing id is ambiguous between
+ * the two. The compromise is a small number of attempts with a widening delay,
+ * then accept the gap. `pending` marks exactly the tiles still being retried,
+ * so a placeholder can distinguish "still working" from "there is no art",
+ * which is otherwise indistinguishable to the user.
+ */
+function useRelationPosters(relations: AnimeRelation[]): {
+  posters: Map<number, string>;
+  pending: Set<number>;
+} {
   const [posters, setPosters] = useState<Map<number, string>>(() => new Map());
+  const [pending, setPending] = useState<Set<number>>(() => new Set());
   const key = relations.map((r) => r.mal_id).join(",");
+
   useEffect(() => {
-    if (!key) { setPosters(new Map()); return; }
+    if (!key) {
+      setPosters(new Map());
+      setPending(new Set());
+      return;
+    }
     let cancelled = false;
-    (async () => {
+    const ids = key.split(",").map(Number);
+    // Attempt 0 is the initial fetch, so this allows two retries. The backoff
+    // is deliberately short: this is decorative art on a tab already on screen,
+    // not something worth a long tail of background work.
+    const MAX_ATTEMPTS = 3;
+    const DELAYS = [900, 2600];
+
+    const run = async (want: number[], attempt: number): Promise<void> => {
+      if (cancelled || want.length === 0) return;
+      setPending(new Set(want));
+      let got: [number, string][] = [];
       try {
-        const rows = await dedupedInvoke(
-          `posters:${key}`,
-          () => invoke<[number, string][]>("fetch_anime_posters", {
-            malIds: key.split(",").map(Number),
-          }),
+        got = await dedupedInvoke(
+          // The attempt is part of the key so a retry is never served the
+          // failed call's own in-flight promise.
+          `posters:${want.join(",")}:${attempt}`,
+          () => invoke<[number, string][]>("fetch_anime_posters", { malIds: want }),
         );
-        if (!cancelled) setPosters(new Map(rows));
-      } catch { /* art is decorative; the tiles still open */ }
-    })();
+      } catch {
+        got = [];
+      }
+      if (cancelled) return;
+      if (got.length) {
+        setPosters((prev) => {
+          const next = new Map(prev);
+          for (const [id, url] of got) next.set(id, url);
+          return next;
+        });
+      }
+      const resolved = new Set(got.map(([id]) => id));
+      const missing = want.filter((id) => !resolved.has(id));
+      if (missing.length === 0 || attempt + 1 >= MAX_ATTEMPTS) {
+        setPending(new Set());
+        return;
+      }
+      setPending(new Set(missing));
+      await new Promise((r) => setTimeout(r, DELAYS[Math.min(attempt, DELAYS.length - 1)]));
+      if (!cancelled) await run(missing, attempt + 1);
+    };
+
+    void run(ids, 0);
     return () => { cancelled = true; };
   }, [key]);
-  return posters;
+
+  return { posters, pending };
 }
 
 export function RelatedTab({ cours, onOpenTitle, onSearchTitle }: {
@@ -588,7 +638,7 @@ export function RelatedTab({ cours, onOpenTitle, onSearchTitle }: {
   // same franchise, so per-cour would print the same sequels three times.
   const relRows  = useCourPayloads<AnimeRelation[]>("relations", cours.slice(0, 1));
   const relations = relRows?.[0]?.value ?? [];
-  const posters = useRelationPosters(relations);
+  const { posters, pending } = useRelationPosters(relations);
   if (!recRows) return <Loading />;
 
   // Merged across cours and re-ranked: two cours of one show recommend largely
@@ -621,6 +671,7 @@ export function RelatedTab({ cours, onOpenTitle, onSearchTitle }: {
                 malId={r.mal_id}
                 name={r.name}
                 image={posters.get(r.mal_id) ?? null}
+                loadingArt={pending.has(r.mal_id)}
                 caption={r.kind ? `${r.relation} · ${r.kind}` : r.relation}
                 onOpenTitle={onOpenTitle}
                 onSearchTitle={onSearchTitle}
@@ -684,9 +735,13 @@ function useOpenTitle(
 }
 
 function OpenableTile({
-  malId, name, image, caption, onOpenTitle, onSearchTitle,
+  malId, name, image, caption, loadingArt = false, onOpenTitle, onSearchTitle,
 }: {
   malId: number; name: string; image: string | null; caption: string;
+  /** This tile's artwork is still being looked up or retried. Distinguishes a
+   *  pending lookup from a title that simply has no art, which otherwise look
+   *  identical (both are an empty box). */
+  loadingArt?: boolean;
   onOpenTitle?: (id: string, mediaType: string, name: string) => void;
   onSearchTitle?: (name: string) => void;
 }) {
@@ -698,18 +753,25 @@ function OpenableTile({
       disabled={!enabled}
       className="min-w-0 text-left group disabled:cursor-default"
     >
-      <div className="aspect-[2/3] rounded-lg overflow-hidden bg-white/6 mb-1.5
+      <div className="relative aspect-[2/3] rounded-lg overflow-hidden bg-white/6 mb-1.5
                       group-hover:ring-1 group-hover:ring-white/25 transition-shadow">
-        {image && (
+        {image ? (
           <ImageLoader
             src={shrinkPoster(image, RELATED_POSTER_W)}
             alt=""
-            className="w-full h-full"
+            className="absolute inset-0 w-full h-full"
             imgClassName="w-full h-full object-cover"
             imgStyle={busy ? { opacity: 0.5 } : undefined}
             draggable={false}
           />
-        )}
+        ) : loadingArt ? (
+          // Deliberately NOT the global shimmer skeleton: that one animates at
+          // full tile brightness and a grid of them reads as a fault. A single
+          // small pulsing dot says "working" without shouting.
+          <span className="absolute inset-0 flex items-center justify-center" aria-hidden>
+            <span className="w-1.5 h-1.5 rounded-full bg-white/40 aura-poster-retry-dot" />
+          </span>
+        ) : null}
       </div>
       <p className="text-white/80 text-[11.5px] leading-tight line-clamp-2
                     group-hover:text-white transition-colors">{name}</p>

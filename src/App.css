@@ -2581,3 +2581,19 @@ html[data-reduced-motion="true"] .aura-synopsis-swap {
   animation-name: aura-view-fade;
   animation-duration: 220ms;
 }
+
+/* Retry indicator on a relation tile whose artwork lookup is still in flight.
+   A single small pulsing dot rather than the global shimmer skeleton: that one
+   animates across the whole tile at full brightness, and a grid of them reads
+   as something being wrong rather than something being fetched. */
+@keyframes aura-poster-retry-pulse {
+  0%, 100% { opacity: 0.25; transform: scale(0.85); }
+  50%      { opacity: 0.85; transform: scale(1.15); }
+}
+.aura-poster-retry-dot {
+  animation: aura-poster-retry-pulse 1.1s ease-in-out infinite;
+}
+html[data-reduced-motion="true"] .aura-poster-retry-dot {
+  animation: none;
+  opacity: 0.55;
+}
