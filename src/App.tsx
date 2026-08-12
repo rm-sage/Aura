@@ -125,6 +125,7 @@ import AccountButton from "./AccountButton";
 import NotificationsScanner, { clearScannerState } from "./NotificationsScanner";
 import { getTitleState, titleStateKey } from "./titleState";
 import { isAnimeMeta, markAnimeId } from "./aiometadata";
+import { setSkipMarksScope } from "./skipMarks";
 import type { AnimeTheme, AnimeThemes } from "./animeExtras";
 import type {
   AddonEntry,
@@ -5923,6 +5924,9 @@ export default function App() {
     }
     appliedScopeRef.current = scope;
     setManualWatchedScope(scope);
+    // Skip annotations follow the watched marks they annotate; a skip whose
+    // watched mark lives in another scope would be a ghost.
+    setSkipMarksScope(scope);
     setHistoryScope(newHistoryScope, { legacyScope: legacyAuthScope });
     // Backups follow the same scope so a sign-out / sign-in cycle's
     // auto-snapshots land under the right user-<hash> directory and

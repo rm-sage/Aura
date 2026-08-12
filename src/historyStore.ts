@@ -10,9 +10,13 @@ import { safeSetItem } from "./storageQuota";
 // (auth_key.slice(0, 12) → "user-<prefix>" or "guest"). Each entry
 // captures one AUTOMATIC watch event — i.e. the user actually played
 // content and either crossed the 90 % threshold or watched 5+ minutes.
-// Manual marks (mark-as-watched from the right-click menu) are NOT
-// recorded here, by contract: the user explicitly set state without
-// playing, so there's nothing to log.
+// Manual mark-as-WATCHED is NOT recorded here, by contract: the user set
+// state without playing, so there is nothing to log.
+//
+// SKIPS ARE THE ONE EXCEPTION (`skipped: true`). A skip is a deliberate
+// decision that an episode is DONE, which is the same claim a play makes, and
+// the user needs those rows to re-scrobble from. They carry no watched_seconds
+// and are tagged in the History view so a skip is never mistaken for a play.
 //
 // STORAGE — localStorage entry per scope: `aura:history:<scope>`. Cap
 // at 1000 entries per scope; older entries roll off when the cap is
@@ -68,6 +72,14 @@ export interface HistoryEntry {
    *  resolver's title-search fallback still covers those. */
   anilist_id?: number | null;
   anilist_episode?: number | null;
+  /** True when this row records a SKIP rather than a play.
+   *
+   *  Skips are the one exception to the "automatic playback only" rule in the
+   *  module note above: they are a deliberate completion decision the user made
+   *  about an episode, so they belong in the same log and stay re-scrobblable
+   *  from it. They carry no watched_seconds, and the History view tags them so
+   *  the two are never confused. */
+  skipped?: boolean;
 }
 
 let _activeScope: string = "guest";

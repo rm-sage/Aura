@@ -92,6 +92,8 @@ function streamCacheDelete(key: string): void {
 }
 import { useEpisodeProgress, useLibraryMap, useResumeVideoId, useEpisodesBehind } from "../LibraryContext";
 import { isEpisodeWatched } from "../episodeSpoilers";
+import { isSkipped } from "../skipMarks";
+import { clearEpisodesSkipped, markEpisodesSkipped, type SkipTarget } from "../skipActions";
 import SpectralPulse from "../SpectralPulse";
 import WatchedBadge, { useWatchedVariant } from "../WatchedBadge";
 import { openContextMenu } from "../ContextMenu";
@@ -2973,7 +2975,7 @@ function UnifiedPanel({
 // ---------------------------------------------------------------------------
 
 const EpisodeRow = ({
-  video, seriesId, seriesMediaType, isActive, onPick, seasonVideos, isNextAiring, isDeepLinked, seriesArt, groupLabel = "season", absoluteNumber = null, absoluteTag = "",
+  video, seriesId, seriesMediaType, isActive, onPick, seasonVideos, isNextAiring, isDeepLinked, seriesArt, seriesName, groupLabel = "season", absoluteNumber = null, absoluteTag = "",
 }: {
   video: VideoEntry;
   seriesId: string;
@@ -3006,6 +3008,9 @@ const EpisodeRow = ({
   isDeepLinked?: boolean;
   /** Series poster — thumbnail fallback for unaired episodes. */
   seriesArt?: string | null;
+  /** Series display name. Only used to label a skip's history row, which needs
+   *  the show name rather than the episode's. */
+  seriesName?: string | null;
 }) => {
   const progress = useEpisodeProgress(seriesId, video.id);
   const watchedVariant = useWatchedVariant(video.id);
@@ -3059,9 +3064,29 @@ const EpisodeRow = ({
         const manual = getManualWatchedState(video.id);
         const isWatched  = manual === "watched";
         const isProgress = manual === "in-progress";
+        // A skip IS a watched mark plus an annotation, so this is read from the
+        // skip store rather than from `manual`.
+        const isSkippedEp = isSkipped(video.id);
         const epLabel = video.episode != null
           ? `Episode ${video.episode}`
           : video.title || "Episode";
+
+        // Everything the history row and a later manual scrobble need. Built
+        // here because this is the only scope holding both the VideoEntry and
+        // the series identity.
+        const skipTargetFor = (v: VideoEntry): SkipTarget => ({
+          id: v.id,
+          parentId: seriesId,
+          name: seriesName ?? seriesId,
+          mediaType: seriesMediaType,
+          season: v.season,
+          episode: v.episode,
+          episodeTitle: v.title ?? null,
+          poster: seriesArt ?? null,
+          background: null,
+          anilistId: (v as { anilist_id?: number | null }).anilist_id ?? null,
+          anilistEpisode: (v as { anilist_episode?: number | null }).anilist_episode ?? null,
+        });
 
         const idx       = seasonVideos.findIndex((v) => v.id === video.id);
         const aboveSet  = idx > 0
@@ -3190,6 +3215,34 @@ const EpisodeRow = ({
             // operations. Omitted when no bulk operation would have an
             // effect (already-handled inside bulkItems gating).
             submenu: bulkItems.length > 0 ? bulkItems : undefined,
+          },
+          {
+            kind: "action",
+            label: isSkippedEp ? "Unmark Skipped" : "Mark as Skipped",
+            icon: (
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                <path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z" />
+              </svg>
+            ),
+            onClick: () => {
+              if (isSkippedEp) {
+                clearEpisodesSkipped([video.id]);
+                showFlyUpToast(`Unmarked · ${epLabel}`, { x, y });
+                return;
+              }
+              // MANUAL skip: marks and writes history, but never scrobbles.
+              // Aura has never pushed a manual mark to Trakt or AniList and
+              // this does not change that; the automatic skip paths are the
+              // ones that scrobble. See skipActions.ts.
+              void markEpisodesSkipped(
+                [skipTargetFor(video)],
+                { userInitiated: false, autoScrobbleEnabled: false, scrobbleScope: null },
+              );
+              showFlyUpToast(`Skipped · ${epLabel}`, { x, y, tone: "success" });
+              window.dispatchEvent(new CustomEvent("aura:auto-advance-watched", {
+                detail: { seriesId, episodeId: video.id, mediaType: seriesMediaType },
+              }));
+            },
           },
           {
             kind: "action",
@@ -3955,6 +4008,7 @@ function EpisodesPanel({
                     isNextAiring={v.id === nextAiringId}
                     isDeepLinked={v.id === highlightId}
                     seriesArt={seriesArt}
+                    seriesName={detail?.name ?? null}
                   />
                 </div>
               ))}

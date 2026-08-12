@@ -1,8 +1,11 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useState } from "react";
-import { getManualWatchedState, onManualWatchedChange } from "./manualWatched";
+import { useEffect, useMemo, useState } from "react";
+import {
+  getManualWatchedState, onManualWatchedChange, type ManualWatchedState,
+} from "./manualWatched";
+import { isSkipped, useSkipMarksVersion } from "./skipMarks";
 import { useLibraryProgress } from "./LibraryContext";
 
 // ---------------------------------------------------------------------------
@@ -32,7 +35,10 @@ import { useLibraryProgress } from "./LibraryContext";
 // Manual marks beat auto-derived states so a user override always wins.
 // ---------------------------------------------------------------------------
 
-type Variant = "watched" | "in-progress" | "planned" | null;
+/** "skipped" is NOT a ManualWatchedState. It is the watched state plus the
+ *  skip annotation (see skipMarks.ts), resolved into a distinct variant here
+ *  purely so the badge can label it. Everything upstream still sees watched. */
+type Variant = "watched" | "skipped" | "in-progress" | "planned" | null;
 
 /** Inline visual badge. Caller decides where to position it (typically
  *  `absolute top-1.5 left-1.5` on the poster wrapper). Returns null
@@ -82,6 +88,26 @@ export function WatchedBadgeStatic({
       </span>
     );
   }
+  if (variant === "skipped") {
+    // Purple, and a distinct glyph rather than a recoloured check: the three
+    // marks must read apart without relying on colour alone, which is also
+    // what the watched/planned pair already does.
+    return (
+      <span
+        aria-label="Skipped"
+        title="Skipped"
+        className={`inline-flex items-center justify-center w-[22px] h-[22px] rounded-full
+                    bg-purple-500/85 backdrop-blur-md text-white
+                    border border-purple-200/30 shadow-[0_2px_8px_rgba(0,0,0,0.45)]
+                    ${className ?? ""}`}
+      >
+        {/* Fast-forward glyph: "moved past this" rather than "completed it". */}
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+          <path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z" />
+        </svg>
+      </span>
+    );
+  }
   if (variant === "planned") {
     // Bookmark glyph in Aura's signature blue. Distinct shape from
     // the watched check + in-progress dot so the three states read
@@ -101,7 +127,10 @@ export function WatchedBadgeStatic({
       </span>
     );
   }
-  // in-progress
+  // in-progress. Explicit rather than a trailing fallthrough: this used to be
+  // the unguarded default, so ANY unhandled variant rendered an amber
+  // "In progress" dot with no error and no log.
+  if (variant !== "in-progress") return null;
   return (
     <span
       aria-label="In progress"
@@ -126,15 +155,25 @@ export function WatchedBadgeStatic({
  *  via the right-click menu. */
 export function useWatchedVariant(metaId: string, mediaType?: string): Variant {
   const progress = useLibraryProgress(metaId);
-  const [manual, setManual] = useState<Variant>(() => getManualWatchedState(metaId));
+  const [manual, setManual] = useState<ManualWatchedState | null>(
+    () => getManualWatchedState(metaId),
+  );
   useEffect(() => {
     const sync = () => setManual(getManualWatchedState(metaId));
     sync();
     return onManualWatchedChange(sync);
   }, [metaId]);
+  // Separate subscription: the skip annotation lives in its own store, so a
+  // skip toggle fires its own event and must be observed independently.
+  const skipVersion = useSkipMarksVersion();
+  const skipped = useMemo(
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    () => isSkipped(metaId), [metaId, skipVersion],
+  );
 
-  // Manual marks always win.
-  if (manual === "watched") return "watched";
+  // Manual marks always win. Skipped is checked FIRST because it is watched
+  // plus an annotation, so testing watched first would always shadow it.
+  if (manual === "watched") return skipped ? "skipped" : "watched";
   if (manual === "planned") return "planned";
   if (manual === "in-progress") return "in-progress";
 
