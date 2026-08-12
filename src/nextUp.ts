@@ -212,13 +212,42 @@ export async function resolveCanonSkipTarget(
   currentEpisodeId: string,
   nextEp: VideoEntry,
   now: number = Date.now(),
-): Promise<{ episode: VideoEntry; stream: StreamEntry } | null> {
+): Promise<{ episode: VideoEntry; stream: StreamEntry; skipped: VideoEntry[] } | null> {
   if (!isFillerOrRecap(nextEp)) return null;
   const canon = findNextEpisode(detail, currentEpisodeId, now, "both");
   if (!canon || canon.id === nextEp.id) return null;
   const stream = await pickFirstStreamForEpisode(addons, mediaType, canon.id);
   if (!stream) return null;
-  return { episode: canon, stream };
+  return { episode: canon, stream, skipped: spanBetween(detail, currentEpisodeId, canon.id, now) };
+}
+
+/**
+ * The episodes actually JUMPED between `fromId` and `toId`, in track order.
+ *
+ * The canon target alone is not enough to mark anything: the caller needs to
+ * know which episodes it passed over. Walks the same next-episode chain the
+ * skip itself follows, with skipping disabled, so the span is exactly what the
+ * user would have watched had they not skipped, and specials never bridge into
+ * the main run.
+ *
+ * Hard-bounded. A malformed episode list that loops would otherwise hang the
+ * caller, and no legitimate filler run is anywhere near this long.
+ */
+export function spanBetween(
+  detail: MetaDetail,
+  fromId: string,
+  toId: string,
+  now: number = Date.now(),
+): VideoEntry[] {
+  const out: VideoEntry[] = [];
+  let cursor = fromId;
+  for (let i = 0; i < 200; i++) {
+    const next = findNextEpisode(detail, cursor, now, "none");
+    if (!next || next.id === toId) break;
+    out.push(next);
+    cursor = next.id;
+  }
+  return out;
 }
 
 /** Format an SxxEyy / Sxx tag for the Next-Up button label. Falls back

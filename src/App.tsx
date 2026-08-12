@@ -126,6 +126,8 @@ import NotificationsScanner, { clearScannerState } from "./NotificationsScanner"
 import { getTitleState, titleStateKey } from "./titleState";
 import { isAnimeMeta, markAnimeId } from "./aiometadata";
 import { setSkipMarksScope } from "./skipMarks";
+import { markEpisodesSkipped } from "./skipActions";
+import { connectedServices, useScrobbleConnections } from "./scrobbleConn";
 import type { AnimeTheme, AnimeThemes } from "./animeExtras";
 import type {
   AddonEntry,
@@ -3792,13 +3794,24 @@ export default function App() {
   //
   // The lead time is settable in Settings → Video & Audio (clamped
   // 0..300; 0 = disabled).
+  // Scrobble target for automatic skips. Read once here rather than per call
+  // site so every skip path pushes to the same place.
+  const scrobbleConn = useScrobbleConnections();
+
   const [nextUpInfo, setNextUpInfo] = useState<{
     episode:  VideoEntry;
     stream:   StreamEntry | null;
     /** When `episode` is filler/recap and a later canon episode was
      *  pre-resolved (episode + first stream), drives the cards' "Skip to
      *  canon" primary action. null/absent otherwise. */
-    canon?:   { episode: VideoEntry; stream: StreamEntry } | null;
+    canon?:   {
+      episode: VideoEntry;
+      stream: StreamEntry;
+      /** The episodes this skip jumps OVER, so they can be marked skipped.
+       *  Resolved with the canon target because that is the only point where
+       *  both ends of the span are known. */
+      skipped: VideoEntry[];
+    } | null;
   } | null>(null);
   /** Per-episode dismiss flag. Keyed by the CURRENT episode's id (not
    *  the next-up id) so dismissing while watching S01E05 only suppresses
@@ -4230,10 +4243,39 @@ export default function App() {
 
   // Skip past all upcoming filler/recap straight into the pre-resolved next
   // canon episode. Only wired when `nextUpInfo.canon` is present.
-  const onNextUpSkip = useCallback(async () => {
+  const onNextUpSkip = useCallback(async (auto = false) => {
     if (!nextUpInfo?.canon) return;
+    const skippedEps = nextUpInfo.canon.skipped;
+    if (skippedEps.length > 0 && activeTarget) {
+      // `userInitiated` is the scrobble gate, and an UNATTENDED countdown is
+      // not user-initiated. Falling asleep through a filler run should leave
+      // purple tags you can clear, not a dozen Trakt plays you have to undo on
+      // their website one at a time. The marks are written either way, so the
+      // local record is the same however the skip fired.
+      void markEpisodesSkipped(
+        skippedEps.map((v: VideoEntry) => ({
+          id: v.id,
+          parentId: activeTarget.series_id ?? activeTarget.id,
+          name: activeTarget.name,
+          mediaType: activeTarget.media_type,
+          season: v.season,
+          episode: v.episode,
+          episodeTitle: v.title ?? null,
+          poster: null,
+          background: null,
+          anilistId: (v as { anilist_id?: number | null }).anilist_id ?? null,
+          anilistEpisode: (v as { anilist_episode?: number | null }).anilist_episode ?? null,
+        })),
+        {
+          userInitiated: !auto,
+          autoScrobbleEnabled: scrobbleConn.autoScrobbleEnabled,
+          scrobbleScope: scrobbleConn.scope,
+          services: connectedServices(scrobbleConn),
+        },
+      );
+    }
     await advanceToEpisode(nextUpInfo.canon.episode, nextUpInfo.canon.stream);
-  }, [nextUpInfo, advanceToEpisode]);
+  }, [nextUpInfo, advanceToEpisode, activeTarget, scrobbleConn]);
 
   const onNextUpDismiss = useCallback(() => {
     if (activeTarget) {
@@ -7276,7 +7318,7 @@ export default function App() {
   // routes through onNextUpSkip (History append + swap unchanged).
   const onEosSkipToCanon = useCallback((auto: boolean) => {
     autoAdvanceStreakRef.current = auto ? autoAdvanceStreakRef.current + 1 : 0;
-    void onNextUpSkip();
+    void onNextUpSkip(auto);
   }, [onNextUpSkip]);
 
   const onEosExit = useCallback(() => {
