@@ -201,8 +201,8 @@ description = "Allows the frontend to query MDBList + Tenrai (MAL) + AniList and
 commands.allow = ["fetch_aggregate_ratings"]
 
 # ── Anime extras (Tenrai / MyAnimeList) ─────────────────────────────────────
-# Everything behind the detail page's More info overlay. Each command is
-# fetched only when a human opens the tab that renders it.
+# Everything behind the detail page's metadata tabs. Each command is fetched
+# only when a human opens the tab that renders it.
 [[permission]]
 identifier = "allow-anime-extras"
 description = "Allows the frontend to fetch anime opening/ending theme songs, the MyAnimeList score histogram, key staff credits, community recommendations and promo trailers"

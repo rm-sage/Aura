@@ -48,12 +48,14 @@ interface ScrobbleConnState {
 }
 
 // ---------------------------------------------------------------------------
-// HistoryView — Trakt-style detailed feed of recent automatic plays.
+// HistoryView — Trakt-style detailed feed of completions.
 //
-// Source: localStorage `aura:history:<scope>` populated at exit-playback
-// when the user actually watched (≥85 % of duration OR ≥5 min). Entries
-// from manual mark-as-watched are excluded by contract (see App.tsx
-// handleExitPlayback's history-append branch).
+// Source: localStorage `aura:history:<scope>`, written from two places:
+// exit-playback when the user actually watched (>= 80 % of duration AND
+// >= 5 min), and skipActions when an episode is marked Skipped. Manual
+// mark-as-WATCHED is still excluded by contract: it claims nothing about
+// having engaged with the episode, whereas a skip is an explicit decision
+// that it is done.
 //
 // Layout: grouped by day (Today / Yesterday / "Friday May 1, 2026") with
 // a running total runtime per day in the header and one row per entry.

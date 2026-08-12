@@ -65,7 +65,7 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
   {
     prefix:      "aura:manual-state:",
     label:       "Manual watched + queue",
-    description: "Per-account watched, in-progress, and planned marks plus the Queue tab's order. Local-only; clearing wipes every manual mark you've ever set.",
+    description: "Per-account watched, in-progress, and planned marks plus the Queue tab's order. Local-only; clearing wipes every manual mark you've ever set. Skip annotations live in their own entry below and are NOT cleared with this one, so clear both together or skipped episodes keep their tag without a watched mark behind it.",
     destructive: true,
   },
   {
@@ -105,9 +105,15 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
     destructive: false,
   },
   {
+    prefix:      "aura:skip-marks:",
+    label:       "Skipped-episode marks",
+    description: "Which of your watched episodes were SKIPPED rather than played. Paired with the manual marks entry: an episode is stored as watched there and annotated here. Clearing this leaves those episodes marked watched but drops the purple Skipped tag and the skip share of the progress bars.",
+    destructive: true,
+  },
+  {
     prefix:      "aura:anime-extras:v1",
     label:       "Anime extras cache",
-    description: "Theme songs, score histograms, staff credits, recommendations and trailers for anime you have opened the More info panel on. 7-day TTL; this data barely changes. Safe to clear.",
+    description: "Theme songs, score histograms, staff, characters, recommendations, franchise relations, posters and trailers for anime whose detail-page tabs you have opened. 7-day TTL; this data barely changes. Safe to clear.",
     destructive: false,
   },
   {

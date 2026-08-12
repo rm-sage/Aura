@@ -13,12 +13,14 @@
 //      places that test `=== "watched"`; the watched mark alone loses the
 //      label. See skipMarks.ts for why these are two stores and not one union.
 //
-//   2. Scrobbling is gated on the skip being USER-INITIATED, not on it being
-//      "automatic". Aura has never scrobbled a manual mark, so a right-click
-//      skip does not either. A skip the user CLICKED (Skip to canon) does,
-//      because it is part of a playback flow. An unattended countdown that
-//      fires the same button with nobody watching does NOT: waking to a dozen
-//      Trakt plays you cannot easily undo is worse than a missing scrobble.
+//   2. Scrobbling is gated on the skip being USER-INITIATED. Any skip the user
+//      performed themselves pushes, whether from the right-click menu or the
+//      Skip-to-canon button, because a skip states the episode is finished
+//      with and the services have no way to record that other than as watched.
+//      An unattended countdown firing the same button with nobody watching
+//      does NOT: waking to a dozen Trakt plays you cannot easily undo is worse
+//      than a missing scrobble. (Manual mark-as-WATCHED still never scrobbles;
+//      that path does not come through here.)
 //
 //   3. `auto_scrobble_enabled` still gates the push, so a user who turned
 //      scrobbling off never gets one from this path either.

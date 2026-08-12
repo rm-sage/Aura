@@ -8,6 +8,11 @@
 // in localStorage (not in Stremio's cloud library). Specifically:
 //
 //   • aura:manual-state:<scope>  — Queue + manual watched/in-progress marks.
+//   • aura:skip-marks:<scope>    — which of those watched marks were SKIPS.
+//     Snapshotted WITH manual-state on purpose: a skip is an annotation over a
+//     watched mark, so restoring one without the other leaves either orphaned
+//     purple tags on unwatched episodes or silently-watched episodes that were
+//     actually skipped.
 //   • aura:history:<scope>       — local watch history log.
 //   • aura:auto-bumped-series:v1 — auto-bumped flags (cross-scope).
 //   • aura:settings:v1           — AuraSettings (cross-scope).
@@ -40,6 +45,7 @@ import { invoke } from "@tauri-apps/api/core";
 // historyStore.ts / auraSettings.ts / autoBumped.ts.
 const KEYS = {
   manualState:    "aura:manual-state:",        // suffix: scope
+  skipMarks:      "aura:skip-marks:",          // suffix: scope
   history:        "aura:history:",             // suffix: scope
   autoBumped:     "aura:auto-bumped-series:v1",
   auraSettings:   "aura:settings:v1",
@@ -64,6 +70,7 @@ export interface BackupPayload {
    *  parse the raw strings, so we don't try to type them here. */
   values: {
     manualState:  string | null;
+    skipMarks:    string | null;
     history:      string | null;
     autoBumped:   string | null;
     auraSettings: string | null;
@@ -93,6 +100,7 @@ export function collectBackupPayload(scope: string): BackupPayload {
     capturedAt: new Date().toISOString(),
     values: {
       manualState:  localStorage.getItem(`${KEYS.manualState}${safeScope}`),
+      skipMarks:    localStorage.getItem(`${KEYS.skipMarks}${safeScope}`),
       history:      localStorage.getItem(`${KEYS.history}${safeScope}`),
       autoBumped:   localStorage.getItem(KEYS.autoBumped),
       auraSettings: localStorage.getItem(KEYS.auraSettings),
@@ -120,6 +128,7 @@ export function applyBackupPayload(payload: BackupPayload): void {
   };
 
   writeOrRemove(`${KEYS.manualState}${safeScope}`, v.manualState);
+  writeOrRemove(`${KEYS.skipMarks}${safeScope}`, v.skipMarks ?? null);
   writeOrRemove(`${KEYS.history}${safeScope}`,     v.history);
   writeOrRemove(KEYS.autoBumped,                   v.autoBumped);
   writeOrRemove(KEYS.auraSettings,                 v.auraSettings);

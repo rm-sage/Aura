@@ -83,7 +83,8 @@ export function setSkipMarksScope(scope: string | null): void {
   notify();
 }
 
-/** Re-read from storage. Used after a cloud pull replaces the blob. */
+/** Re-read from storage. For a future cloud-pull path; skip marks are NOT
+ *  cloud-synced today (they ARE included in local backups). */
 export function reloadSkipMarksFromStorage(): void {
   _activeSet = loadFromStorage(_activeScope);
   _hydrated = true;
@@ -119,7 +120,7 @@ export function setSkipped(ids: string[], skipped: boolean): void {
   notify();
 }
 
-/** Replace the whole set. Used by the cloud merge. */
+/** Replace the whole set. For a future cloud merge; unused today. */
 export function replaceSkipMarks(ids: string[]): void {
   _activeSet = new Set(ids.filter((v) => typeof v === "string" && !!v));
   _hydrated = true;

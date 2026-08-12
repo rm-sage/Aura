@@ -134,7 +134,7 @@ export function shouldBlurSynopsis(
   return !isEpisodeWatched(byId, episodeId);
 }
 
-/** Anime extras overlay, Songs tab: blur the EPISODE RANGE a theme song
+/** Anime Songs tab: blur the EPISODE RANGE a theme song
  *  spans, never the song's title or artist. The song name is not the
  *  spoiler; "this opening only runs to episode 14" is, because it reveals
  *  where a cour or an arc boundary lands.

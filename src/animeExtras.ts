@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // ---------------------------------------------------------------------------
-// animeExtras — data layer for the detail page's "More info" overlay.
+// animeExtras — data layer for the detail page's metadata HUD tabs.
 //
 // Everything here is ON DEMAND. Nothing is fetched until a human opens the
 // overlay, and each tab fetches only when that tab is first opened, so a user

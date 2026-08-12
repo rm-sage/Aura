@@ -764,8 +764,8 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // when not airing or fully caught up.
   const episodesBehind = useEpisodesBehind(detail?.videos, meta.id);
 
-  // ── Anime extras ("More info") ──
-  // The MAL entries backing the overlay, one per cour. Resolved lazily and
+  // ── Anime extras ──
+  // The MAL entries backing the HUD's anime-only tabs, one per cour. Resolved lazily and
   // ONLY for anime, because the resolver costs a round-trip per season and
   // there is nothing to show for live action. An empty result means the
   // trigger never renders, so the button is absent rather than dead.
@@ -3378,10 +3378,6 @@ const EpisodeRow = ({
                 showFlyUpToast(`Unmarked · ${epLabel}`, { x, y });
                 return;
               }
-              // MANUAL skip: marks and writes history, but never scrobbles.
-              // Aura has never pushed a manual mark to Trakt or AniList and
-              // this does not change that; the automatic skip paths are the
-              // ones that scrobble. See skipActions.ts.
               void markEpisodesSkipped([skipTargetFor(video)], skipOpts());
               showFlyUpToast(`Skipped · ${epLabel}`, { x, y, tone: "success" });
               window.dispatchEvent(new CustomEvent("aura:auto-advance-watched", {

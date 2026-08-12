@@ -4952,7 +4952,7 @@ export default function SettingsView({ addons, session }: Props) {
           <Section id="sec-spoilers" title="Spoilers">
             <SettingToggle
               label="Hide cast episode counts"
-              description="Some shows treat regular vs. guest billing as a plot beat (deaths, returns, surprise cameos). When on, the cast hover card shows just the name; per-actor episode counts and tier are hidden."
+              description="Some shows treat regular vs. guest billing as a plot beat (deaths, returns, surprise cameos). When on, the cast hover card shows just the name; per-actor episode counts and tier are hidden. Applies to live action: anime use a character grid with no hover card."
               value={aura.hideCastSpoilers}
               onChange={(v) => setLocal({ hideCastSpoilers: v })}
             />
@@ -4973,7 +4973,7 @@ export default function SettingsView({ addons, session }: Props) {
             <div className="h-px bg-white/6" />
             <SettingToggle
               label="Blur theme song episode ranges"
-              description="Hide which episodes each opening and ending covers in the anime More info panel, until you click to reveal. Song titles and artists always stay visible. The range is the spoiler, since it gives away where a cour or story arc boundary falls."
+              description="Hide which episodes each opening and ending covers in an anime's Songs tab, until you click to reveal. Song titles and artists always stay visible. The range is the spoiler, since it gives away where a cour or story arc boundary falls."
               value={aura.blurThemeEpisodeRanges}
               onChange={(v) => setLocal({ blurThemeEpisodeRanges: v })}
             />
@@ -5448,7 +5448,7 @@ export default function SettingsView({ addons, session }: Props) {
                   filter becomes a no-op (every candidate passes). */}
               <SettingDropdown
                 label="Next-Up skip filler / recap"
-                description="When computing the next episode (Next-Up card and SMTC Next media key), skip episodes AIOMetadata has flagged as filler or recap. Episodes without a flag pass through unchanged."
+                description="When computing the next episode (Next-Up card and SMTC Next media key), skip episodes AIOMetadata has flagged as filler or recap. Episodes without a flag pass through unchanged. Skipping to a canon episode also MARKS the episodes it jumped as Skipped and logs them to History; if you pressed Skip yourself and automatic scrobbling is on, they are sent to Trakt / AniList as watched, since neither service can represent a skip. An unattended auto-advance marks them locally but sends nothing."
                 value={aura.nextUpSkipFillerRecap}
                 required
                 options={[
@@ -5592,7 +5592,7 @@ export default function SettingsView({ addons, session }: Props) {
               <ScrobbleAuthRow
                 service="trakt"
                 authKey={session?.auth_key ?? null}
-                description="Trakt receives playback progress for movies and series. Aura logs in directly via OAuth, no addon required. Nothing is sent while you watch: Aura adds the item to your Trakt history once, on completion (80 % progress with at least 5 min watched). The first 120 s of playback are a local preview window, so a stream you back out of never reaches your history."
+                description="Trakt receives playback progress for movies and series. Aura logs in directly via OAuth, no addon required. Nothing is sent while you watch: Aura adds the item to your Trakt history once, on completion (80 % progress with at least 5 min watched). The first 120 s of playback are a local preview window, so a stream you back out of never reaches your history. Marking an episode Skipped is the one exception: it sends immediately, with nothing played, because a skip is a decision that the episode is finished with."
               />
               <div className="h-px bg-white/6" />
               <ScrobbleAuthRow
@@ -5609,7 +5609,7 @@ export default function SettingsView({ addons, session }: Props) {
               />
               <SettingToggle
                 label="Scrobble automatically"
-                description="On by default: Aura records what you watch as you finish it. Turn this off to decide what gets recorded yourself — the History page's per-item and bulk scrobbling keeps working either way."
+                description="On by default: Aura records what you watch as you finish it, and episodes you mark as Skipped. Turn this off to decide what gets recorded yourself — nothing is sent automatically, and the History page's per-item and bulk scrobbling keeps working either way."
                 value={backend.auto_scrobble_enabled}
                 onChange={(v) => patchBackend({ auto_scrobble_enabled: v })}
                 disabled={!backend.scrobble_enabled}

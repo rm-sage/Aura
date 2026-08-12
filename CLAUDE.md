@@ -409,7 +409,7 @@ Bound every cache (see Performance & memory).
   the page you were on; cleared on app close (cold start opens Home).
 - **Notifications** (`aura:notifications:v1`): ring buffer capped at 200 entries.
 - **EPG** (`src/iptv/epgStore.ts`): localStorage, ~4-week retention, parsed off-thread in a worker.
-- **Story arcs**: `aura:story-arcs:v1` (24 h TTL, cap 60) holds the joined arcs per series; the TTL is
+- **Story arcs**: `aura:story-arcs:v8` (24 h TTL, cap 60) holds the joined arcs per series; the TTL is
   short deliberately because an ongoing show gains an episode weekly and a stale arc would be missing
   it. `aura:arc-mode:v1` (cap 200) remembers the Seasons/Arcs choice per series. Rust side:
   `arcs-cache-v1.json` (TMDB payloads, 24 h, cap 40) and `arc-art-v1.json` (Fandom art, 30 d, cap 60;
@@ -519,7 +519,7 @@ old-format and new-format samples and diff the field sets. Node runs the `.ts` f
   `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[ratings]`, `[rpc]`, `[win32]`, `[smtc]`,
   `[scrobble]`, `[publicmetadb]`, `[mpv]` (the playback engine), `[cast]`, `[iptv]`, `[sync]`,
   `[aniskip]`, `[arcs]`, `[subsync]`, `[tenrai]` (the MyAnimeList client), `[extras]` (frontend,
-  the anime More info overlay).
+  the anime metadata tabs on the detail page).
 - libmpv writes its own verbose log to `%USERPROFILE%\aura-mpv.log` (truncated each MPV init, rotated
   to `.old` past 50 MB). The last few lines usually pinpoint a STATUS_ACCESS_VIOLATION.
 - Discord RPC uses application ID `1499651271357890610` (`window_logic.rs`). Browse states are gated

@@ -99,14 +99,15 @@ optional but nice.
   and the view-all catalog page, plus a Library status filter (watched, unwatched, in progress, in
   queue, new episodes), a currently airing only toggle on Library and Queue, and manual marks for
   watched, in progress, and planned.
-- **Spoiler controls** that blur unwatched episode thumbnails and episode synopses, plus an option
-  to hide the per actor episode counts and Main / Recurring / Guest tier on the cast hover card.
+- **Spoiler controls** that blur unwatched episode thumbnails, episode synopses, anime theme-song
+  episode ranges and character portraits, plus options to hide per-actor episode counts and to opt
+  into story-arc artwork on Continue Watching tiles.
 - Lazy loaded, virtualized poster grids that stay light on memory even on very wide layouts.
 
 ## Ratings
 
 - A **multi source ratings aggregator** that merges MDBList (IMDb, Rotten Tomatoes audience,
-  Metacritic, TMDB, Trakt, Letterboxd) with MyAnimeList (Jikan) and AniList for anime, on top of any
+  Metacritic, TMDB, Trakt, Letterboxd) with MyAnimeList (via Tenrai) and AniList for anime, on top of any
   addon supplied scores.
 - Rendered as branded tiles with **per source logos** and critic vs audience tooltips, ordered by
   source authority. The IMDb, RT, and Metacritic tier needs no user supplied key.

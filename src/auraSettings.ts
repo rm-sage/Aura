@@ -138,7 +138,7 @@ export interface AuraSettings {
    *  about spoilers flip this on. Mirrors the opt-in shape of
    *  `blurUnwatchedThumbnails`. */
   blurEpisodeSynopsis: boolean;
-  /** Blur the episode ranges in the anime extras overlay's Songs tab until
+  /** Blur the episode ranges in an anime's Songs tab until
    *  clicked. The song title and artist are never blurred: the name is not
    *  the spoiler, "this opening only runs to episode 14" is, because it
    *  gives away where a cour or arc boundary falls. Default false, matching
@@ -207,7 +207,13 @@ export interface AuraSettings {
    *                    canon/normal/mixed episode.
    *  Sits near the AniSkip OP/ED controls in the player section of
    *  Settings since it's a stylistic cousin of "skip the boring
-   *  bits". */
+   *  bits".
+   *
+   *  NO LONGER PURELY NAVIGATIONAL. Skipping to a canon episode also MARKS
+   *  every episode it jumped as skipped, logs them to History, and, when the
+   *  user pressed Skip themselves and auto-scrobble is on, sends them to
+   *  Trakt / AniList as watched. An unattended auto-advance marks locally and
+   *  sends nothing. See skipActions.ts for the rule set. */
   nextUpSkipFillerRecap: "none" | "filler" | "recap" | "both";
   /** Use Aura Cloud's shared release-search feed for library /
    *  calendar reconciliation instead of probing addons per-user.

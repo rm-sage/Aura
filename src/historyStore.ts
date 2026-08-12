@@ -8,8 +8,8 @@ import { safeSetItem } from "./storageQuota";
 //
 // SCOPE — keyed by the same scope id Aura's settings + manualWatched use
 // (auth_key.slice(0, 12) → "user-<prefix>" or "guest"). Each entry
-// captures one AUTOMATIC watch event — i.e. the user actually played
-// content and either crossed the 90 % threshold or watched 5+ minutes.
+// captures one completion event — i.e. the user actually played content and
+// crossed the 80 % threshold AND watched 5+ minutes.
 // Manual mark-as-WATCHED is NOT recorded here, by contract: the user set
 // state without playing, so there is nothing to log.
 //
