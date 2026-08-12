@@ -28,6 +28,9 @@ export type MenuTone = "default" | "success" | "warning" | "danger" | "notice";
 interface BaseItem {
   /** When true, the item is rendered greyed-out and ignores clicks. */
   disabled?: boolean;
+  /** Native tooltip shown on hover. For items whose effect is not fully
+   *  described by the label, e.g. a bulk action with a stopping rule. */
+  hint?: string;
 }
 
 export interface ActionMenuItem extends BaseItem {
@@ -285,7 +288,7 @@ function ContextMenuRender({ x, y, items, onClose }: RenderProps) {
                           ${isOpen ? "bg-white/8" : ""}`}
             >
               {item.icon && <span className="flex-shrink-0 text-white/55">{item.icon}</span>}
-              <span className="flex-1 truncate">{item.label}</span>
+              <span className="flex-1 truncate" title={item.hint}>{item.label}</span>
               <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"
                    className="flex-shrink-0 text-white/40" aria-hidden>
                 <path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6z" />
@@ -326,7 +329,7 @@ function ContextMenuRender({ x, y, items, onClose }: RenderProps) {
                         ${isOpen ? "bg-white/8" : ""}`}
           >
             {item.icon && <span className="flex-shrink-0 opacity-90">{item.icon}</span>}
-            <span className="flex-1 truncate">{item.label}</span>
+            <span className="flex-1 truncate" title={item.hint}>{item.label}</span>
             {hasSubmenu && (
               <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"
                    className="flex-shrink-0 text-white/40" aria-hidden>
@@ -458,7 +461,7 @@ function Submenu({ parentRect, items, onActivate, onMouseEnter, onMouseLeave }: 
                         ${rowToneClasses(tone, item.disabled)}`}
           >
             {item.icon && <span className="flex-shrink-0 opacity-90">{item.icon}</span>}
-            <span className="flex-1 truncate">{item.label}</span>
+            <span className="flex-1 truncate" title={item.hint}>{item.label}</span>
           </button>
         );
       })}

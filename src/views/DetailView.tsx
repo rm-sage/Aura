@@ -93,6 +93,8 @@ function streamCacheDelete(key: string): void {
 import { useEpisodeProgress, useLibraryMap, useResumeVideoId, useEpisodesBehind } from "../LibraryContext";
 import { isEpisodeWatched } from "../episodeSpoilers";
 import { isSkipped } from "../skipMarks";
+import { connectedServices, useScrobbleConnections } from "../scrobbleConn";
+import { episodeKindFlags, isFillerOrRecap } from "../nextUp";
 import { clearEpisodesSkipped, markEpisodesSkipped, type SkipTarget } from "../skipActions";
 import SpectralPulse from "../SpectralPulse";
 import WatchedBadge, { useWatchedVariant } from "../WatchedBadge";
@@ -3013,6 +3015,8 @@ const EpisodeRow = ({
   seriesName?: string | null;
 }) => {
   const progress = useEpisodeProgress(seriesId, video.id);
+  // Scrobble target for skips fired from this row's menu.
+  const scrobbleConn = useScrobbleConnections();
   const watchedVariant = useWatchedVariant(video.id);
   // Release-search signal for this series — used to surface fresher
   // filler/recap flags than VideoEntry alone carries. Same hook
@@ -3074,6 +3078,18 @@ const EpisodeRow = ({
         // Everything the history row and a later manual scrobble need. Built
         // here because this is the only scope holding both the VideoEntry and
         // the series identity.
+        // Manual skips DO scrobble, unlike manual mark-as-watched. A skip is a
+        // statement that the episode is finished with, and the services have no
+        // way to represent it other than as watched, so leaving it unsent would
+        // desync the library the user actually cares about. Still gated on
+        // auto-scrobble being on and a live token.
+        const skipOpts = () => ({
+          userInitiated: true,
+          autoScrobbleEnabled: scrobbleConn.autoScrobbleEnabled,
+          scrobbleScope: scrobbleConn.scope,
+          services: connectedServices(scrobbleConn),
+        });
+
         const skipTargetFor = (v: VideoEntry): SkipTarget => ({
           id: v.id,
           parentId: seriesId,
@@ -3103,6 +3119,12 @@ const EpisodeRow = ({
         const anyOtherWatched   = (set: VideoEntry[]) =>
           otherIds(set).some((id) => getManualWatchedState(id) === "watched");
 
+        const skipIcon = (
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+            <path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z" />
+          </svg>
+        );
+
         const checkIcon = (
           <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
             <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
@@ -3128,6 +3150,31 @@ const EpisodeRow = ({
           );
         };
 
+        // ── The skip run ──
+        //
+        // A skip is about a CONTIGUOUS stretch of filler or recap, so the run
+        // walks outward from the clicked episode and stops the moment it meets
+        // a canon one. That is what makes this different from the watched bulk
+        // options, which take everything in the direction regardless: marking
+        // canon episodes skipped would claim the user passed over story they
+        // may not have.
+        //
+        // Direction adapts to what was clicked. Whichever side has more
+        // non-canon episodes is offered first, because that is almost always
+        // the run the user is pointing at.
+        const runFrom = (dir: -1 | 1): VideoEntry[] => {
+          if (idx < 0 || !isFillerOrRecap(video)) return [];
+          const out: VideoEntry[] = [video];
+          for (let i = idx + dir; i >= 0 && i < seasonVideos.length; i += dir) {
+            const v = seasonVideos[i];
+            if (!isFillerOrRecap(v)) break;
+            out.push(v);
+          }
+          return out;
+        };
+        const runBelow = runFrom(1);
+        const runAbove = runFrom(-1);
+
         type Item = Parameters<typeof openContextMenu>[2][number];
 
         // Bulk "watched" variants — collected as a sub-list so they can
@@ -3139,35 +3186,35 @@ const EpisodeRow = ({
         if (belowSet.length > 0 && anyOtherUnwatched(belowSet)) {
           bulkItems.push({
             kind: "action",
-            label: "Mark this & below as watched",
+            label: "Mark this & all below as watched",
             tone: "success",
             icon: checkIcon,
-            onClick: bulkAction(belowSet, "watched", "this & below"),
+            onClick: bulkAction(belowSet, "watched", "this & all below"),
           });
         }
         if (belowSet.length > 0 && anyOtherWatched(belowSet)) {
           bulkItems.push({
             kind: "action",
-            label: "Unmark this & below as watched",
+            label: "Unmark this & all below as watched",
             icon: checkIcon,
-            onClick: bulkAction(belowSet, null, "this & below"),
+            onClick: bulkAction(belowSet, null, "this & all below"),
           });
         }
         if (aboveSet.length > 0 && anyOtherUnwatched(aboveSet)) {
           bulkItems.push({
             kind: "action",
-            label: "Mark this & above as watched",
+            label: "Mark this & all above as watched",
             tone: "success",
             icon: checkIcon,
-            onClick: bulkAction(aboveSet, "watched", "this & above"),
+            onClick: bulkAction(aboveSet, "watched", "this & all above"),
           });
         }
         if (aboveSet.length > 0 && anyOtherWatched(aboveSet)) {
           bulkItems.push({
             kind: "action",
-            label: "Unmark this & above as watched",
+            label: "Unmark this & all above as watched",
             icon: checkIcon,
-            onClick: bulkAction(aboveSet, null, "this & above"),
+            onClick: bulkAction(aboveSet, null, "this & all above"),
           });
         }
         if (allSet.length > 1 && allSet.some((v) => getManualWatchedState(v.id) !== "watched")) {
@@ -3186,6 +3233,65 @@ const EpisodeRow = ({
             icon: checkIcon,
             onClick: bulkAction(allSet, null, `all in ${groupLabel}`),
           });
+        }
+
+        // Bulk skip variants, hung off "Mark as Skipped" the same way the
+        // watched ones hang off "Mark as Watched". Only offered when the run
+        // actually extends past the clicked episode, so a lone filler episode
+        // shows the single action and no submenu.
+        const skipBulkItems: Item[] = [];
+        const skipRunAction = (
+          run: VideoEntry[], mark: boolean, rangeLabel: string,
+        ) => () => {
+          const targets = mark ? run.filter(isVideoAired) : run;
+          if (targets.length === 0) return;
+          if (mark) {
+            void markEpisodesSkipped(targets.map(skipTargetFor), skipOpts());
+          } else {
+            clearEpisodesSkipped(targets.map((v) => v.id));
+          }
+          showFlyUpToast(
+            mark
+              ? `Skipped ${targets.length} · ${rangeLabel}`
+              : `Unmarked ${targets.length} · ${rangeLabel}`,
+            { x, y, tone: mark ? "success" : "default" },
+          );
+        };
+        // Tooltip is the same on every entry: the stopping rule is the whole
+        // point of these options and is not obvious from the label alone.
+        const runHint = "Continues until the next canon episode.";
+        const kindWord = (run: VideoEntry[]) => {
+          const flags = run.map(episodeKindFlags);
+          const anyFiller = flags.some((f) => f.filler);
+          const anyRecap  = flags.some((f) => f.recap);
+          if (anyFiller && anyRecap) return "filler/recaps";
+          return anyRecap ? "recaps" : "filler";
+        };
+        for (const [run, dirLabel] of [
+          [runBelow, "below"] as const,
+          [runAbove, "above"] as const,
+        ]) {
+          if (run.length <= 1) continue;
+          const word = kindWord(run);
+          const range = `this & all ${dirLabel} ${word}`;
+          if (run.some((v) => !isSkipped(v.id))) {
+            skipBulkItems.push({
+              kind: "action",
+              label: `Mark this & all ${dirLabel} ${word} as skipped`,
+              hint: runHint,
+              icon: skipIcon,
+              onClick: skipRunAction(run, true, range),
+            });
+          }
+          if (run.some((v) => isSkipped(v.id))) {
+            skipBulkItems.push({
+              kind: "action",
+              label: `Unmark this & all ${dirLabel} ${word} as skipped`,
+              hint: runHint,
+              icon: skipIcon,
+              onClick: skipRunAction(run, false, range),
+            });
+          }
         }
 
         const items: Item[] = [
@@ -3219,6 +3325,7 @@ const EpisodeRow = ({
           {
             kind: "action",
             label: isSkippedEp ? "Unmark Skipped" : "Mark as Skipped",
+            submenu: skipBulkItems.length > 0 ? skipBulkItems : undefined,
             icon: (
               <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                 <path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z" />
@@ -3234,10 +3341,7 @@ const EpisodeRow = ({
               // Aura has never pushed a manual mark to Trakt or AniList and
               // this does not change that; the automatic skip paths are the
               // ones that scrobble. See skipActions.ts.
-              void markEpisodesSkipped(
-                [skipTargetFor(video)],
-                { userInitiated: false, autoScrobbleEnabled: false, scrobbleScope: null },
-              );
+              void markEpisodesSkipped([skipTargetFor(video)], skipOpts());
               showFlyUpToast(`Skipped · ${epLabel}`, { x, y, tone: "success" });
               window.dispatchEvent(new CustomEvent("aura:auto-advance-watched", {
                 detail: { seriesId, episodeId: video.id, mediaType: seriesMediaType },

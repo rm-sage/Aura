@@ -3,6 +3,7 @@
 
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useScrobbleConnections } from "../scrobbleConn";
 import type { MetaPreview } from "../types";
 import {
   getHistory,
@@ -130,40 +131,12 @@ function HistoryViewBody({ onSelectMeta }: Props) {
     [],
   );
 
-  // Resolve the active scope + which scrobble services are connected.
-  // Re-runs when the account changes (aura:session-changed) or a token
-  // is (dis)connected in Settings (aura:scrobble-auth-changed) so the
-  // per-row actions appear / disappear without a manual refresh.
+  // Connection state now lives in scrobbleConn.ts, shared with the skip
+  // actions so both surfaces resolve "can we push, and to what" identically.
+  const sharedConn = useScrobbleConnections();
   useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      let scope = "guest";
-      try {
-        const sess = await invoke<{ auth_key?: string } | null>("get_session");
-        scope = sess?.auth_key ? sess.auth_key.slice(0, 12) : "guest";
-      } catch {
-        scope = "guest";
-      }
-      if (cancelled) return;
-      try {
-        const status = await invoke<{ trakt: unknown | null; anilist: unknown | null }>(
-          "get_scrobble_auth_status", { scope },
-        );
-        if (cancelled) return;
-        setConn({ scope, trakt: status.trakt != null, anilist: status.anilist != null });
-      } catch {
-        if (!cancelled) setConn({ scope, trakt: false, anilist: false });
-      }
-    };
-    void load();
-    window.addEventListener("aura:session-changed", load);
-    window.addEventListener("aura:scrobble-auth-changed", load);
-    return () => {
-      cancelled = true;
-      window.removeEventListener("aura:session-changed", load);
-      window.removeEventListener("aura:scrobble-auth-changed", load);
-    };
-  }, []);
+    setConn({ scope: sharedConn.scope, trakt: sharedConn.trakt, anilist: sharedConn.anilist });
+  }, [sharedConn.scope, sharedConn.trakt, sharedConn.anilist]);
 
   // Drop selections whose entries no longer exist (removed here or by a sync).
   useEffect(() => {
@@ -420,8 +393,8 @@ function HistoryViewBody({ onSelectMeta }: Props) {
               <h1 className="aura-row-title text-3xl font-semibold tracking-tight">History</h1>
               <p className="text-white/35 text-sm mt-1">
                 {entries.length === 0
-                  ? "Your watch history is empty. Items you finish playing show up here automatically."
-                  : `${entries.length} item${entries.length === 1 ? "" : "s"} from automatic playback.`}
+                  ? "Your watch history is empty. Items you finish playing, or skip, show up here automatically."
+                  : `${entries.length} item${entries.length === 1 ? "" : "s"} from playback and skips.`}
               </p>
             </div>
             {entries.length > 0 && (
@@ -457,8 +430,9 @@ function HistoryViewBody({ onSelectMeta }: Props) {
           {entries.length === 0 ? (
             <div className="glass-panel rounded-2xl px-6 py-10 text-center">
               <p className="text-white/55 text-sm">
-                Watch something to start a history. Only auto-tracked plays
-                appear here; manual mark-as-watched entries don't.
+                Watch something to start a history. Plays you finish and
+                episodes you skip appear here; marking something watched by
+                hand doesn't.
               </p>
             </div>
           ) : (
@@ -802,6 +776,20 @@ const HistoryCard = memo(function HistoryCard({
           <p className="text-white/90 text-[14px] font-medium leading-tight line-clamp-2">
             {entry.name}
           </p>
+          {/* Skips sit in the same feed as plays because they make the same
+              claim (this episode is done) and stay re-scrobblable from here.
+              The tag is what stops the two being confused, since a skipped row
+              has no runtime and would otherwise just look like a short play. */}
+          {entry.skipped && (
+            <span className="inline-flex items-center gap-1 mt-0.5 px-1.5 py-0.5 rounded
+                             bg-purple-500/20 border border-purple-300/30
+                             text-purple-100 text-[9.5px] font-mono uppercase tracking-[0.14em]">
+              <svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                <path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z" />
+              </svg>
+              Skipped
+            </span>
+          )}
           {epLabel && (
             <p className="text-white/55 text-[11px] font-mono tracking-wider">
               {epLabel}
