@@ -132,6 +132,25 @@ pub struct AnimeFull {
     pub demographics: Vec<NamedRef>,
     #[serde(default)]
     pub broadcast: Option<BroadcastRaw>,
+    #[serde(default)]
+    pub relations: Vec<RelationRaw>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RelationRaw {
+    #[serde(default)]
+    pub relation: Option<String>,
+    #[serde(default)]
+    pub entry: Vec<RelationEntryRaw>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RelationEntryRaw {
+    pub mal_id: u32,
+    #[serde(default, rename(deserialize = "type"))]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -589,6 +608,48 @@ pub async fn fetch_anime_characters(mal_id: u32) -> Result<Vec<AnimeCharacter>, 
     rows.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
     let mut out: Vec<AnimeCharacter> = rows.into_iter().map(|(_, _, c)| c).collect();
     out.truncate(CHARACTER_CAP);
+    Ok(out)
+}
+
+/// A direct franchise link: sequel, prequel, side story, and so on. Distinct
+/// from a recommendation, which is "people who liked this also liked", and
+/// worth showing FIRST because it is the only thing on the page that says a
+/// sequel exists at all.
+#[derive(Clone, Debug, Serialize)]
+pub struct AnimeRelation {
+    pub mal_id: u32,
+    pub name: String,
+    /// "Sequel", "Prequel", "Side story", ...
+    pub relation: String,
+    /// "TV", "Movie", "OVA", ...
+    pub kind: Option<String>,
+}
+
+#[tauri::command]
+pub async fn fetch_anime_relations(mal_id: u32) -> Result<Vec<AnimeRelation>, String> {
+    let Some(f) = anime_full_checked(mal_id).await? else { return Ok(Vec::new()) };
+    let mut out = Vec::new();
+    for r in f.relations {
+        let relation = r.relation.unwrap_or_default();
+        // "Adaptation" points at the manga or novel, which Aura cannot open
+        // and the user cannot watch. Everything else is a real title.
+        if relation.is_empty() || relation.eq_ignore_ascii_case("Adaptation") {
+            continue;
+        }
+        for e in r.entry {
+            // Same reason: only anime entries are openable.
+            if e.kind.as_deref().is_some_and(|k| k.eq_ignore_ascii_case("manga")) {
+                continue;
+            }
+            let Some(name) = e.name.filter(|n| !n.trim().is_empty()) else { continue };
+            out.push(AnimeRelation {
+                mal_id: e.mal_id,
+                name,
+                relation: relation.clone(),
+                kind: e.kind.clone(),
+            });
+        }
+    }
     Ok(out)
 }
 

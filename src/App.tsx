@@ -8609,6 +8609,18 @@ export default function App() {
           partyStreamKey={reactiveParty.status === "connected" ? reactiveParty.roomStreamKey : null}
           onClose={closeDetail}
           onPlayStream={handlePlayStream}
+          onOpenTitle={(id, mediaType, name) => {
+            // Swap the open detail page to another title in place. `openDetail`
+            // is the same entry point a catalog card uses, so the poster and
+            // the rest fill in from the meta fetch exactly as they would there;
+            // the name is the only thing shown until it lands.
+            openDetail({
+              id,
+              name,
+              media_type: mediaType,
+              poster: null,
+            } as MetaPreview);
+          }}
           onSearchByName={(name) => {
             // Cast/crew name click: flip to Home and queue the name as the
             // search query. DetailView calls onClose() right after this, so

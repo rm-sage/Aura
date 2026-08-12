@@ -51,6 +51,10 @@ interface Props {
    *  extras tab and leaves a two-tab bar. */
   cours: CourRef[];
   onPlayTrailer?: (ytId: string, title: string) => void;
+  /** Open another title's detail page, from a relation or recommendation. */
+  onOpenTitle?: (id: string, mediaType: string, name: string) => void;
+  /** Fallback when the id map cannot place a MAL entry. */
+  onSearchTitle?: (name: string) => void;
   /** Re-seeds the active tab when the page swaps to a different title, so a
    *  user who was on Trailers does not land on Trailers for the next show. */
   resetKey: string;
@@ -69,7 +73,7 @@ const EXTRA_TABS: { id: HudTab; label: string }[] = [
 ];
 
 export default function DetailHud({
-  overview, cast, cours, onPlayTrailer, resetKey,
+  overview, cast, cours, onPlayTrailer, onOpenTitle, onSearchTitle, resetKey,
 }: Props) {
   const tabs = useMemo(
     () => (cours.length > 0 ? [...BASE_TABS, ...EXTRA_TABS] : BASE_TABS),
@@ -183,7 +187,9 @@ export default function DetailHud({
         {tab === "songs"    && <SongsTab cours={cours} />}
         {tab === "ratings"  && <RatingsTab cours={cours} />}
         {tab === "staff"    && <StaffTab cours={cours} compact />}
-        {tab === "related"  && <RelatedTab cours={cours} />}
+        {tab === "related"  && (
+          <RelatedTab cours={cours} onOpenTitle={onOpenTitle} onSearchTitle={onSearchTitle} />
+        )}
         {tab === "trailers" && <TrailersTab cours={cours} onPlay={onPlayTrailer} />}
       </div>
     </div>

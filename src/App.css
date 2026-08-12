@@ -2556,3 +2556,28 @@ html[data-theme="contrast-azure"] .aura-hud-surface {
   text-shadow: 0 1px 4px rgba(0, 0, 0, 0.75);
 }
 .aura-hud-tab:hover { background: rgba(10, 12, 16, 0.78); }
+
+/* ------------------------------------------------------------------ */
+/* aura-synopsis-swap — the Overview synopsis changing source.        */
+/*                                                                    */
+/* Episodes are selected at the far RIGHT of the detail page and this  */
+/* text sits at the far LEFT, so a silent substitution happens outside */
+/* the user's focus and reads as nothing happening. The slide is       */
+/* deliberately overshooting: a linear fade at that distance is too    */
+/* easy to miss, while the bounce reads as "this was replaced" without */
+/* needing to be long.                                                 */
+/* ------------------------------------------------------------------ */
+@keyframes aura-synopsis-swap-in {
+  0%   { opacity: 0; transform: translate3d(-22px, 0, 0); }
+  60%  { opacity: 1; transform: translate3d(4px, 0, 0); }
+  100% { opacity: 1; transform: translate3d(0, 0, 0); }
+}
+.aura-synopsis-swap {
+  animation: aura-synopsis-swap-in 380ms cubic-bezier(0.22, 1.4, 0.36, 1) both;
+}
+/* Reduced motion keeps the fade, which is what signals the change, and
+   drops the travel, which is the part that is purely decorative. */
+html[data-reduced-motion="true"] .aura-synopsis-swap {
+  animation-name: aura-view-fade;
+  animation-duration: 220ms;
+}

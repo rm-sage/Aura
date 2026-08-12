@@ -90,7 +90,8 @@ function streamCacheGet(key: string): StreamFetchResult | null {
 function streamCacheDelete(key: string): void {
   streamCache.delete(key);
 }
-import { useEpisodeProgress, useResumeVideoId, useEpisodesBehind } from "../LibraryContext";
+import { useEpisodeProgress, useLibraryMap, useResumeVideoId, useEpisodesBehind } from "../LibraryContext";
+import { isEpisodeWatched } from "../episodeSpoilers";
 import SpectralPulse from "../SpectralPulse";
 import WatchedBadge, { useWatchedVariant } from "../WatchedBadge";
 import { openContextMenu } from "../ContextMenu";
@@ -98,6 +99,7 @@ import {
   getManualWatchedState,
   setManualWatchedState,
   setManualWatchedMany,
+  useManualWatchedVersion,
 } from "../manualWatched";
 import { recheckSeriesWatchedFlag } from "../autoAdvance";
 import { getSortedEpisodes } from "../episodeSort";
@@ -162,6 +164,9 @@ interface Props {
   /** Watch-party: the leader's chosen stream match-key — highlights the
    *  matching row so a member can one-tap the same stream. */
   partyStreamKey?: string | null;
+  /** Open a different title's detail page in place. Used by the Related tab so
+   *  a sequel or a recommendation is one click away rather than a search. */
+  onOpenTitle?: (id: string, mediaType: string, name: string) => void;
   /** Cast / crew name click handler. Wired by App to flip to Home + queue
    *  the name as the search query. DetailView calls this BEFORE onClose so
    *  the deep-link state is set before the unmount runs. */
@@ -523,6 +528,56 @@ function seedHeroArt(preview: MetaPreview, resumeVideoId: string | null): HeroAr
  *  the tab was several paragraphs of different things running together with no
  *  indication of where one ended and the next began. Matches the mono-caps
  *  label convention used throughout the app. */
+/** "Your progress" — the only thing in Overview that is about the VIEWER
+ *  rather than the title. Everything here comes from the library Aura already
+ *  holds, so it costs nothing and works for live action too.
+ *
+ *  Renders nothing at all when the user has watched none of it: a row of
+ *  zeroes on a show you have not started is noise, not information. */
+function ProgressBlock({
+  videos, seriesId,
+}: {
+  videos: VideoEntry[];
+  seriesId: string;
+}) {
+  const byId = useLibraryMap();
+  // Re-derives on a manual mark as well as on a progress write, matching how
+  // the episode rows stay in step.
+  const manualVersion = useManualWatchedVersion();
+
+  const stats = useMemo(() => {
+    // Season 0 is specials, which are not part of "have I finished this".
+    const main = videos.filter((v) => (v.season ?? 1) > 0);
+    if (main.length === 0) return null;
+    const watched = main.filter((v) => isEpisodeWatched(byId, v.id)).length;
+    return { watched, total: main.length };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videos, byId, seriesId, manualVersion]);
+
+  if (!stats || stats.watched === 0) return null;
+  const pct = Math.round((stats.watched / stats.total) * 100);
+  const remaining = stats.total - stats.watched;
+
+  return (
+    <section>
+      <HudSectionLabel>Your Progress</HudSectionLabel>
+      <div className="flex items-center gap-3">
+        <div className="flex-1 h-1.5 rounded-full bg-white/10 overflow-hidden min-w-0">
+          <div className="h-full rounded-full bg-ln-accent/80" style={{ width: `${pct}%` }} />
+        </div>
+        <span className="shrink-0 text-white/80 text-[12.5px] font-mono tabular-nums">
+          {stats.watched}/{stats.total}
+        </span>
+      </div>
+      <p className="text-white/40 text-[11.5px] mt-1.5">
+        {remaining === 0
+          ? "Completed"
+          : `${pct}% watched · ${remaining} episode${remaining === 1 ? "" : "s"} left`}
+      </p>
+    </section>
+  );
+}
+
 function HudSectionLabel({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex items-center gap-3 mb-3">
@@ -535,7 +590,7 @@ function HudSectionLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
-function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, onPlayTrailer, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
+function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onOpenTitle, onSearchByName, inLibrary, onLibraryToggle, onPlayTrailer, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
   const [detail, setDetail]                 = useState<MetaDetail | null>(null);
   // Resume pointer, read BEFORE the latch below because the latch's seed
   // needs it synchronously on the first render to pick the right arc's art.
@@ -1735,6 +1790,8 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
             resetKey={meta.id}
               cours={extrasCours}
               onPlayTrailer={onPlayTrailer}
+              onOpenTitle={onOpenTitle}
+              onSearchTitle={onSearchByName ? (n) => { onSearchByName(n); onClose(); } : undefined}
               overview={(
                 // Columns, not a stack. A wide short strip is the space an
                 // ultrawide actually has, and the old single flow wasted all of
@@ -1754,52 +1811,41 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                       live-action seasons; empty for MAL/Kitsu anime (it then
                       falls through to the show description until AIOMetadata
                       surfaces per-season overviews). */}
-                  {(() => {
-                    const seasonOverview =
-                      selectedSeason != null && detail?.season_credits
-                        ? detail.season_credits[String(selectedSeason)]?.overview
-                        : null;
-                    const shown =
-                      typeof seasonOverview === "string" && seasonOverview.trim()
-                        ? seasonOverview
-                        : (detail?.description ?? meta.description);
-                    if (!shown) return null;
-                    return (
-                      <section>
-                        <HudSectionLabel>Synopsis</HudSectionLabel>
-                        <p className="text-white/90 text-[14px] leading-[1.62] tracking-[0.005em]
-                                      max-w-[68ch] selectable">
-                          {shown}
-                        </p>
-                      </section>
-                    );
-                  })()}
+            {/* ── Synopsis ──
+                ONE slot, not two. The show synopsis and the selected episode's
+                synopsis were stacked, so picking an episode grew the column and
+                left two blocks of prose competing. They now REPLACE each other:
+                selecting an episode swaps this section to that episode, and
+                deselecting swaps it back.
 
-                  {/* Per-episode synopsis — surfaces below the show synopsis
-                      whenever the user has selected an episode in EpisodePane
-                      AND that episode carries an `overview`. Optionally
-                      blurred behind a "Click to reveal" gate (user setting in
-                      Detail Page section). Watched episodes auto-bypass the
-                      blur. Unmounts cleanly when nothing is selected or the
-                      episode has no overview text. */}
-                  <EpisodeSynopsisSection
-                    activeVideo={activeVideo}
-                    isWatched={
-                      activeVideo
-                        ? getManualWatchedState(activeVideo.id) === "watched"
-                        : false
-                    }
-                    revealed={
-                      activeVideo ? revealedSynopses.has(activeVideo.id) : false
-                    }
-                    onReveal={(id) => {
-                      setRevealedSynopses((prev) => {
-                        const next = new Set(prev);
-                        next.add(id);
-                        return next;
-                      });
-                    }}
-                  />
+                The swap is animated because of where it happens. Episodes are
+                picked at the far RIGHT of the page and this sits at the far
+                LEFT, so a silent substitution is easy to miss entirely; the
+                slide makes the cause and effect legible across that distance.
+                Keyed on the source id so React remounts and replays it. */}
+            <SynopsisSection
+              showText={(() => {
+                const seasonOverview =
+                  selectedSeason != null && detail?.season_credits
+                    ? detail.season_credits[String(selectedSeason)]?.overview
+                    : null;
+                return typeof seasonOverview === "string" && seasonOverview.trim()
+                  ? seasonOverview
+                  : (detail?.description ?? meta.description) ?? null;
+              })()}
+              activeVideo={activeVideo}
+              isWatched={
+                activeVideo ? getManualWatchedState(activeVideo.id) === "watched" : false
+              }
+              revealed={activeVideo ? revealedSynopses.has(activeVideo.id) : false}
+              onReveal={(id) => {
+                setRevealedSynopses((prev) => {
+                  const next = new Set(prev);
+                  next.add(id);
+                  return next;
+                });
+              }}
+            />
 
                   {/* Production, moved out of the Cast tab. Cast is people; this is
                 the title. It also gives Overview's second column something to
@@ -1809,6 +1855,8 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                 studios, producers, licensors. All of it was already arriving in
                 the cached /full payload and being discarded, so it costs no
                 request, and none of it repeats another tab. */}
+            <ProgressBlock videos={detail?.videos ?? []} seriesId={meta.id} />
+
             {/* ── Details ──
                 One list, not three. Genres come from the addon and the rest
                 from MAL's cached /full payload, but they are all the same KIND
@@ -2209,16 +2257,27 @@ function castTierLabel(tier: CastTier): string {
  *  `overview`. Optionally blurred behind a "Click to reveal" gate
  *  (per `auraSettings.blurEpisodeSynopsis`). Watched episodes bypass
  *  the blur — the content's no longer a spoiler by definition. */
-function EpisodeSynopsisSection({
-  activeVideo, isWatched, revealed, onReveal,
+/**
+ * The Overview synopsis slot. Shows the series description, or the SELECTED
+ * episode's description when one is picked, never both.
+ *
+ * Stacking them was the previous shape and it had two problems: the column
+ * grew whenever an episode was chosen, and two blocks of prose sat competing
+ * for the same attention. Replacement solves both, but replacement alone is
+ * easy to MISS: episodes are selected at the far right of the page and this
+ * lives at the far left, so the eye is nowhere near the thing that changed.
+ * Hence the slide, which is loud enough to catch peripherally and short
+ * enough not to be a nuisance on every episode click.
+ */
+function SynopsisSection({
+  showText, activeVideo, isWatched, revealed, onReveal,
 }: {
+  showText: string | null;
   activeVideo: VideoEntry | null;
   isWatched: boolean;
   revealed: boolean;
   onReveal: (id: string) => void;
 }) {
-  // Subscribe to the settings toggle so flipping it in the Settings
-  // panel takes effect without a refresh.
   const [blurOn, setBlurOn] = useState(() => loadAuraSettings().blurEpisodeSynopsis);
   useEffect(() => {
     const sync = () => setBlurOn(loadAuraSettings().blurEpisodeSynopsis);
@@ -2226,83 +2285,57 @@ function EpisodeSynopsisSection({
     return () => window.removeEventListener("aura:settings-changed", sync);
   }, []);
 
-  if (!activeVideo) return null;
-  const overview = (activeVideo.overview ?? "").trim();
-  if (!overview) return null;
+  const epText = (activeVideo?.overview ?? "").trim();
+  // An episode with no overview of its own falls back to the show, rather than
+  // blanking the slot for the sake of consistency.
+  const isEpisode = !!activeVideo && !!epText;
+  const body = isEpisode ? epText : (showText ?? "");
+  if (!body) return null;
 
-  // Heading sub-line — "S02E03 — Title" so the user can confirm which
-  // episode they selected when they're looking at the synopsis (the
-  // EpisodePane may have scrolled or the user navigated via NextUp).
-  const s = activeVideo.season;
-  const e = activeVideo.episode;
+  const s = activeVideo?.season;
+  const e = activeVideo?.episode;
   const seCode =
-    s != null && e != null
+    isEpisode && s != null && e != null
       ? `S${String(s).padStart(2, "0")}E${String(e).padStart(2, "0")}`
       : null;
-  const title = (activeVideo.title ?? "").trim();
-  const subLine = seCode && title ? `${seCode} — ${title}` : seCode ?? title;
+  const title = (activeVideo?.title ?? "").trim();
+  const subLine = isEpisode ? (seCode && title ? `${seCode} — ${title}` : seCode ?? title) : null;
 
-  const shouldBlur = blurOn && !isWatched && !revealed;
+  const shouldBlur = isEpisode && blurOn && !isWatched && !revealed;
 
   return (
-    <section className="space-y-2 pt-1" aria-label="Selected episode synopsis">
-      <div>
-        <p className="text-white/45 text-[10px] font-mono uppercase tracking-[0.22em]">
-          Episode synopsis
-        </p>
+    <section aria-label={isEpisode ? "Selected episode synopsis" : "Synopsis"}>
+      <HudSectionLabel>{isEpisode ? "Episode Synopsis" : "Synopsis"}</HudSectionLabel>
+      {/* `key` is the whole mechanism: changing it remounts the subtree, which
+          replays the entrance animation. Without it React would reconcile the
+          same node and silently swap the text with no transition at all. */}
+      <div key={isEpisode ? activeVideo!.id : "__show__"} className="aura-synopsis-swap">
         {subLine && (
-          <p className="text-white/55 text-[12px] mt-0.5 font-mono">
-            {subLine}
-          </p>
+          <p className="text-white/55 text-[11.5px] mb-1.5 font-mono">{subLine}</p>
         )}
-      </div>
-      <div className="relative max-w-[65ch]">
-        <p
-          className={[
-            "text-white/75 text-[15px] leading-relaxed transition-[filter] duration-200",
-            shouldBlur ? "select-none" : "selectable",
-          ].join(" ")}
-          style={{
-            filter: shouldBlur ? "blur(8px) saturate(120%)" : "none",
-            // user-select: none defence against highlight-to-bypass when
-            // blurred. The Tailwind `select-none` class handles it; the
-            // inline `userSelect` mirror is for browsers that ignore the
-            // class on text inside :is() selectors.
-            userSelect: shouldBlur ? "none" : "text",
-          }}
-        >
-          {overview}
-        </p>
-        {shouldBlur && (
-          <button
-            type="button"
-            onClick={() => onReveal(activeVideo.id)}
-            aria-label="Reveal episode synopsis"
-            // No always-visible chip — the blurred text itself is the
-            // affordance. Hovering surfaces a small tooltip above the
-            // pointer with the "Click to reveal spoilers" prompt, so
-            // the chip doesn't obscure the synopsis while the user is
-            // deciding. `peer` doesn't help here (the tooltip is a
-            // child) so we use `group` + `group-hover:` to keep the
-            // tooltip CSS-only.
-            className="absolute inset-0 cursor-pointer group"
+        <div className="relative max-w-[68ch]">
+          <p
+            className={[
+              "text-white/90 text-[14px] leading-[1.62] tracking-[0.005em]",
+              "transition-[filter] duration-200",
+              shouldBlur ? "select-none" : "selectable",
+            ].join(" ")}
+            style={{
+              filter: shouldBlur ? "blur(8px) saturate(120%)" : "none",
+              userSelect: shouldBlur ? "none" : "text",
+            }}
           >
-            <span
-              aria-hidden
-              className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2
-                         opacity-0 group-hover:opacity-100
-                         pointer-events-none whitespace-nowrap
-                         px-2.5 py-1 rounded-md
-                         bg-black/80 backdrop-blur-sm
-                         border border-white/20 text-white/90
-                         text-[11.5px] font-medium tracking-wide
-                         shadow-[0_2px_12px_rgba(0,0,0,0.55)]
-                         transition-opacity duration-150"
-            >
-              Click to reveal spoilers
-            </span>
-          </button>
-        )}
+            {body}
+          </p>
+          {shouldBlur && activeVideo && (
+            <button
+              type="button"
+              onClick={() => onReveal(activeVideo.id)}
+              aria-label="Reveal episode synopsis"
+              className="absolute inset-0 cursor-pointer"
+            />
+          )}
+        </div>
       </div>
     </section>
   );

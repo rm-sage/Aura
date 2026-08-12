@@ -23,9 +23,9 @@ import { shrinkPoster } from "./posterSize";
 import { loadAuraSettings } from "./auraSettings";
 import { shouldBlurThemeRange } from "./episodeSpoilers";
 import {
-  fetchExtras, formatSpans, themeLabel,
+  fetchExtras, formatSpans, openableIdForMal, themeLabel,
   type AnimeStatistics, type AnimeTheme, type AnimeThemes, type AnimeTrailer,
-  type AnimeCharacter, type AnimeFacts, type CourRef, type Recommendation, type StaffCredit, type ExtrasTab,
+  type AnimeCharacter, type AnimeFacts, type AnimeRelation, type CourRef, type Recommendation, type StaffCredit, type ExtrasTab,
 } from "./animeExtras";
 
 // Server-resize widths. Every image in here is decorative and small, and the
@@ -548,49 +548,170 @@ function CharacterCard({
 // Related
 // ---------------------------------------------------------------------------
 
-export function RelatedTab({ cours }: { cours: CourRef[] }) {
-  const rows = useCourPayloads<Recommendation[]>("related", cours);
-  if (!rows) return <Loading />;
+export function RelatedTab({ cours, onOpenTitle, onSearchTitle }: {
+  cours: CourRef[];
+  /** Open a title's detail page directly. */
+  onOpenTitle?: (id: string, mediaType: string, name: string) => void;
+  /** Fallback when Fribb has no ids for the MAL entry. */
+  onSearchTitle?: (name: string) => void;
+}) {
+  const recRows  = useCourPayloads<Recommendation[]>("related", cours);
+  // Relations come from the SERIES ROOT only: every cour of a show lists the
+  // same franchise, so per-cour would print the same sequels three times.
+  const relRows  = useCourPayloads<AnimeRelation[]>("relations", cours.slice(0, 1));
+  if (!recRows) return <Loading />;
 
-  // Merge across cours and re-rank: two cours of the same show recommend
-  // largely the same things, and showing each twice is noise.
+  const relations = relRows?.[0]?.value ?? [];
+
+  // Merged across cours and re-ranked: two cours of one show recommend largely
+  // the same titles, and showing each twice is noise.
   const merged = new Map<number, Recommendation>();
-  for (const { value } of rows) {
+  for (const { value } of recRows) {
     for (const r of value ?? []) {
       const prev = merged.get(r.mal_id);
       if (!prev || r.votes > prev.votes) merged.set(r.mal_id, r);
     }
   }
+  // A title already listed as a direct relation must not reappear below as a
+  // recommendation: it is the same show, and the relation says more about it.
+  for (const rel of relations) merged.delete(rel.mal_id);
   const list = [...merged.values()].sort((a, b) => b.votes - a.votes);
-  if (!list.length) return <Empty what="recommendations" />;
+
+  if (!relations.length && !list.length) return <Empty what="related titles" />;
 
   return (
-    // Wraps and flows downward with the panel's own scroll. It used to be a
-    // horizontal scroller, which meant a wide panel showed ten posters and hid
-    // the rest behind a sideways drag while metres of vertical space sat empty.
-    <div className="grid gap-x-4 gap-y-4
-                    grid-cols-3 min-[900px]:grid-cols-5
-                    min-[1200px]:grid-cols-7 min-[1500px]:grid-cols-8">
-      {list.map((r) => (
-        <div key={r.mal_id} className="min-w-0">
-          <div className="aspect-[2/3] rounded-lg overflow-hidden bg-white/6 mb-1.5">
-            {r.image && (
-              <ImageLoader
-                src={shrinkPoster(r.image, RELATED_POSTER_W)}
-                alt=""
-                className="w-full h-full"
-                imgClassName="w-full h-full object-cover"
-                draggable={false}
+    <div>
+      {relations.length > 0 && (
+        <section className="mb-2">
+          <CourHeading label="Direct relations" show />
+          <div className="flex flex-wrap gap-2">
+            {relations.map((r) => (
+              <OpenableChip
+                key={`${r.relation}-${r.mal_id}`}
+                malId={r.mal_id}
+                name={r.name}
+                eyebrow={r.kind ? `${r.relation} · ${r.kind}` : r.relation}
+                onOpenTitle={onOpenTitle}
+                onSearchTitle={onSearchTitle}
               />
-            )}
+            ))}
           </div>
-          <p className="text-white/80 text-[11.5px] leading-tight line-clamp-2">{r.title}</p>
-          <p className="text-white/30 text-[10.5px] mt-0.5">
-            {r.votes} {r.votes === 1 ? "rec" : "recs"}
-          </p>
-        </div>
-      ))}
+        </section>
+      )}
+
+      {list.length > 0 && (
+        <section>
+          <CourHeading label="Recommendations" show={relations.length > 0} />
+          <div className="grid gap-x-4 gap-y-4
+                          grid-cols-3 min-[900px]:grid-cols-5
+                          min-[1200px]:grid-cols-7 min-[1500px]:grid-cols-8">
+            {list.map((r) => (
+              <OpenableTile
+                key={r.mal_id}
+                malId={r.mal_id}
+                name={r.title}
+                image={r.image}
+                caption={`${r.votes} ${r.votes === 1 ? "rec" : "recs"}`}
+                onOpenTitle={onOpenTitle}
+                onSearchTitle={onSearchTitle}
+              />
+            ))}
+          </div>
+        </section>
+      )}
     </div>
+  );
+}
+
+/**
+ * Shared click behaviour for anything that names another title.
+ *
+ * Resolution is deferred to the CLICK rather than done up front: resolving
+ * every tile on render would fire dozens of lookups for links most users never
+ * follow. The lookup is a local in-memory map, so the wait is imperceptible,
+ * and a miss degrades to a search instead of doing nothing.
+ */
+function useOpenTitle(
+  malId: number,
+  name: string,
+  onOpenTitle?: (id: string, mediaType: string, name: string) => void,
+  onSearchTitle?: (name: string) => void,
+) {
+  const [busy, setBusy] = useState(false);
+  const go = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const hit = await openableIdForMal(malId);
+      if (hit && onOpenTitle) onOpenTitle(hit.id, hit.media_type, name);
+      else onSearchTitle?.(name);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return { go, busy, enabled: !!(onOpenTitle || onSearchTitle) };
+}
+
+function OpenableTile({
+  malId, name, image, caption, onOpenTitle, onSearchTitle,
+}: {
+  malId: number; name: string; image: string | null; caption: string;
+  onOpenTitle?: (id: string, mediaType: string, name: string) => void;
+  onSearchTitle?: (name: string) => void;
+}) {
+  const { go, busy, enabled } = useOpenTitle(malId, name, onOpenTitle, onSearchTitle);
+  return (
+    <button
+      type="button"
+      onClick={go}
+      disabled={!enabled}
+      className="min-w-0 text-left group disabled:cursor-default"
+    >
+      <div className="aspect-[2/3] rounded-lg overflow-hidden bg-white/6 mb-1.5
+                      group-hover:ring-1 group-hover:ring-white/25 transition-shadow">
+        {image && (
+          <ImageLoader
+            src={shrinkPoster(image, RELATED_POSTER_W)}
+            alt=""
+            className="w-full h-full"
+            imgClassName="w-full h-full object-cover"
+            imgStyle={busy ? { opacity: 0.5 } : undefined}
+            draggable={false}
+          />
+        )}
+      </div>
+      <p className="text-white/80 text-[11.5px] leading-tight line-clamp-2
+                    group-hover:text-white transition-colors">{name}</p>
+      <p className="text-white/30 text-[10.5px] mt-0.5">{caption}</p>
+    </button>
+  );
+}
+
+function OpenableChip({
+  malId, name, eyebrow, onOpenTitle, onSearchTitle,
+}: {
+  malId: number; name: string; eyebrow: string;
+  onOpenTitle?: (id: string, mediaType: string, name: string) => void;
+  onSearchTitle?: (name: string) => void;
+}) {
+  const { go, busy, enabled } = useOpenTitle(malId, name, onOpenTitle, onSearchTitle);
+  return (
+    <button
+      type="button"
+      onClick={go}
+      disabled={!enabled}
+      className="text-left px-3 py-2 rounded-lg bg-white/6 border border-white/10
+                 hover:bg-white/12 hover:border-white/20 transition-colors
+                 disabled:cursor-default max-w-[280px]"
+      style={busy ? { opacity: 0.6 } : undefined}
+    >
+      <span className="block text-white/40 text-[9.5px] font-mono uppercase tracking-[0.16em]">
+        {eyebrow}
+      </span>
+      <span className="block text-white/85 text-[12px] leading-tight mt-0.5 truncate">
+        {name}
+      </span>
+    </button>
   );
 }
 

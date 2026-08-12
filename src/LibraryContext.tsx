@@ -187,6 +187,13 @@ export function useLibraryProgress(id: string | null | undefined): ProgressInfo 
  * Returns null for movies, items not in the library, or items the user
  * hasn't started yet.
  */
+/** The whole library map. Exposed for the few consumers that need to ask
+ *  about MANY ids at once (the detail page's progress summary counts every
+ *  episode of a series) rather than one at a time through the hooks above. */
+export function useLibraryMap(): Map<string, LibraryItem> {
+  return useContext(LibraryCtx).byId;
+}
+
 export function useResumeVideoId(id: string | null | undefined): string | null {
   const { byId } = useContext(LibraryCtx);
   if (!id) return null;

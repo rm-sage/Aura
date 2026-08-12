@@ -79,6 +79,21 @@ export interface AnimeFacts {
   broadcast:    string | null;
 }
 
+export interface AnimeRelation {
+  mal_id:   number;
+  name:     string;
+  relation: string;
+  kind:     string | null;
+}
+
+/** Ids Fribb knows for a MAL entry, used to turn a bare mal_id into a real
+ *  detail-page link. Null throughout when Fribb has never heard of it. */
+export interface MalRefs {
+  imdb_id:    string | null;
+  kitsu_id:   number | null;
+  anilist_id: number | null;
+}
+
 export interface AnimeCharacter {
   mal_id:       number;
   name:         string;
@@ -126,6 +141,7 @@ type ExtrasValue =
   | AnimeStatistics
   | StaffCredit[]
   | AnimeCharacter[]
+  | AnimeRelation[]
   | AnimeFacts
   | Recommendation[]
   | AnimeTrailer[]
@@ -139,7 +155,7 @@ const extrasCache = new PersistentCache<ExtrasValue>({
 
 export type ExtrasTab =
   | "songs" | "ratings" | "staff" | "characters" | "related" | "trailers"
-  | "facts";
+  | "facts" | "relations";
 
 const COMMAND_BY_TAB: Record<ExtrasTab, string> = {
   songs:    "fetch_anime_themes",
@@ -147,6 +163,7 @@ const COMMAND_BY_TAB: Record<ExtrasTab, string> = {
   staff:    "fetch_anime_staff",
   characters: "fetch_anime_characters",
   facts:      "fetch_anime_facts",
+  relations:  "fetch_anime_relations",
   related:  "fetch_anime_recommendations",
   trailers: "fetch_anime_trailers",
 };
@@ -274,6 +291,32 @@ export async function resolveCourMalIds(
     }
   }
   return out;
+}
+
+/**
+ * Turn a MAL id into something Aura can open, or null.
+ *
+ * Fribb's reverse index gives an imdb or kitsu id for most established
+ * titles; very new or very niche entries are simply absent, and the caller
+ * falls back to a title search rather than pretending.
+ */
+export async function openableIdForMal(
+  malId: number,
+): Promise<{ id: string; media_type: string } | null> {
+  try {
+    const refs = await dedupedInvoke(
+      `malrefs:${malId}`,
+      () => invoke<MalRefs | null>("resolve_ids_for_mal", { malId }),
+    );
+    if (!refs) return null;
+    // IMDb first: it is what most addons key on, and what Aura's own library
+    // records use. Kitsu is the anime-native fallback.
+    if (refs.imdb_id) return { id: refs.imdb_id, media_type: "series" };
+    if (refs.kitsu_id) return { id: `kitsu:${refs.kitsu_id}`, media_type: "anime" };
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /** Render an episode span list as "1-47, 1000". Empty yields null, never a
