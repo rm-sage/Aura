@@ -76,6 +76,7 @@ export interface AnimeFacts {
   producers:    string[];
   licensors:    string[];
   demographics: string[];
+  broadcast:    string | null;
 }
 
 export interface AnimeCharacter {

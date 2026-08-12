@@ -27,7 +27,7 @@ import { findAIOMetadataAddon, isAnimeMeta, markAnimeId, typeLabel } from "../ai
 import { dedupedInvoke } from "../invokeDedupe";
 import { peekRichestCachedDetailById } from "../metaCache";
 import DetailHud from "../DetailHud";
-import { FactsBlock } from "../AnimeExtrasOverlay";
+import { FactList, FactsBlock } from "../AnimeExtrasOverlay";
 import { resolveCourMalIds, type CourRef } from "../animeExtras";
 import { PersistentCache } from "../persistentCache";
 import SeasonSelect from "../SeasonSelect";
@@ -525,9 +525,13 @@ function seedHeroArt(preview: MetaPreview, resumeVideoId: string | null): HeroAr
  *  label convention used throughout the app. */
 function HudSectionLabel({ children }: { children: React.ReactNode }) {
   return (
-    <p className="text-white/35 text-[10px] font-mono uppercase tracking-[0.18em] mb-2">
-      {children}
-    </p>
+    <div className="flex items-center gap-3 mb-3">
+      <span className="h-px flex-1 bg-white/10" aria-hidden />
+      <span className="text-white/55 text-[10.5px] font-mono uppercase tracking-[0.22em] whitespace-nowrap">
+        {children}
+      </span>
+      <span className="h-px flex-1 bg-white/10" aria-hidden />
+    </div>
   );
 }
 
@@ -1719,22 +1723,6 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
             )}
 
 
-            {/* Genre chips. Back in the identity stack rather than inside the
-                Overview tab: they are an at-a-glance property of the title,
-                like the rating chips above them, not something you open a tab
-                to read. */}
-            {detail?.genres && detail.genres.length > 0 && (
-              <div className="flex flex-wrap gap-2">
-                {detail.genres.map((g) => (
-                  <span key={g}
-                    className="px-3 py-1 rounded-sm text-[11px] font-mono uppercase tracking-[0.12em]
-                               bg-black/55 backdrop-blur-md text-white/80 border border-white/12"
-                    style={{ textShadow: "0 1px 4px rgba(0,0,0,0.75)" }}>
-                    {g}
-                  </span>
-                ))}
-              </div>
-            )}
           </div>
 
           {/* ── Metadata HUD ──
@@ -1821,28 +1809,36 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                 studios, producers, licensors. All of it was already arriving in
                 the cached /full payload and being discarded, so it costs no
                 request, and none of it repeats another tab. */}
-            {extrasCours.length > 0 && (
-              <section>
-                <HudSectionLabel>Details</HudSectionLabel>
-                <FactsBlock cours={extrasCours} />
-              </section>
-            )}
-
-            {/* Country only. Studios come from the fact list above for anime;
-                this covers everything else. */}
-            {(detail?.country || (extrasCours.length === 0 && detail?.studios?.length)) && (
-              <section>
-                <HudSectionLabel>Production</HudSectionLabel>
-                <div className="space-y-2">
-                  {extrasCours.length === 0 && detail?.studios && detail.studios.length > 0 &&
-                    <CreditRow label={detail.studios.length > 1 ? "Studios" : "Studio"}
-                      values={plainCredits(detail.studios)} />}
-                  {detail?.country && (
-                    <CreditRow label="Country" values={plainCredits([detail.country])} />
-                  )}
-                </div>
-              </section>
-            )}
+            {/* ── Details ──
+                One list, not three. Genres come from the addon and the rest
+                from MAL's cached /full payload, but they are all the same KIND
+                of fact, so they share one label-value grid instead of sitting
+                in separate blocks with different shapes. Rendered as rows
+                rather than chips so they align with everything around them. */}
+            {(() => {
+              const leading: [string, string][] = [];
+              if (detail?.genres?.length) {
+                leading.push(["Genres", detail.genres.join(", ")]);
+              }
+              if (detail?.country) leading.push(["Country", detail.country]);
+              // Studios only when MAL will not supply them; for anime the fact
+              // list below carries a richer version.
+              if (extrasCours.length === 0 && detail?.studios?.length) {
+                leading.push([
+                  detail.studios.length > 1 ? "Studios" : "Studio",
+                  detail.studios.join(", "),
+                ]);
+              }
+              if (!leading.length && extrasCours.length === 0) return null;
+              return (
+                <section>
+                  <HudSectionLabel>Details</HudSectionLabel>
+                  {extrasCours.length > 0
+                    ? <FactsBlock cours={extrasCours} leading={leading} />
+                    : <FactList items={leading} />}
+                </section>
+              );
+            })()}
 
 
                 </div>

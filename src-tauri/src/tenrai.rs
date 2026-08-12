@@ -130,6 +130,14 @@ pub struct AnimeFull {
     pub licensors: Vec<NamedRef>,
     #[serde(default)]
     pub demographics: Vec<NamedRef>,
+    #[serde(default)]
+    pub broadcast: Option<BroadcastRaw>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct BroadcastRaw {
+    #[serde(default)]
+    pub string: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -158,6 +166,8 @@ pub struct AnimeFacts {
     pub producers: Vec<String>,
     pub licensors: Vec<String>,
     pub demographics: Vec<String>,
+    /// "Saturdays at 23:00 (JST)". Useful on an airing show, absent otherwise.
+    pub broadcast: Option<String>,
 }
 
 fn names(v: Vec<NamedRef>) -> Vec<String> {
@@ -193,12 +203,15 @@ pub async fn fetch_anime_facts(mal_id: u32) -> Result<Option<AnimeFacts>, String
         producers: names(f.producers),
         licensors: names(f.licensors),
         demographics: names(f.demographics),
+        broadcast: f.broadcast.and_then(|b| b.string)
+            .filter(|s| !s.trim().is_empty() && !s.eq_ignore_ascii_case("unknown")),
     };
     // Nothing worth a section is nothing at all.
     let empty = facts.source.is_none() && facts.status.is_none() && facts.rating.is_none()
         && facts.premiered.is_none() && facts.aired.is_none()
         && facts.studios.is_empty() && facts.producers.is_empty()
-        && facts.licensors.is_empty() && facts.demographics.is_empty();
+        && facts.licensors.is_empty() && facts.demographics.is_empty()
+        && facts.broadcast.is_none();
     Ok(if empty { None } else { Some(facts) })
 }
 

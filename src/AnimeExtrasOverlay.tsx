@@ -361,25 +361,8 @@ export function StaffTab({ cours, compact = false }: { cours: CourRef[]; compact
 // was part of why it read as filler.
 // ---------------------------------------------------------------------------
 
-export function FactsBlock({ cours }: { cours: CourRef[] }) {
-  // The SERIES-root entry only. A per-cour fact list would repeat "Manga",
-  // "Shounen" and the studio three times for a three-season show.
-  const rows = useCourPayloads<AnimeFacts>("facts", cours.slice(0, 1));
-  const f = rows?.[0]?.value;
-  if (!f) return null;
-
-  const items: [string, string][] = [];
-  if (f.source)    items.push(["Source", f.source]);
-  if (f.status)    items.push(["Status", f.status]);
-  if (f.premiered) items.push(["Premiered", f.premiered]);
-  if (f.aired)     items.push(["Aired", f.aired]);
-  if (f.rating)    items.push(["Rating", f.rating]);
-  if (f.demographics.length) items.push(["Demographic", f.demographics.join(", ")]);
-  if (f.studios.length)   items.push([f.studios.length > 1 ? "Studios" : "Studio", f.studios.join(", ")]);
-  if (f.producers.length) items.push(["Producers", f.producers.slice(0, 6).join(", ")]);
-  if (f.licensors.length) items.push(["Licensors", f.licensors.join(", ")]);
+export function FactList({ items }: { items: [string, string][] }) {
   if (!items.length) return null;
-
   return (
     <dl className="grid gap-x-6 gap-y-2 grid-cols-[auto_1fr]">
       {items.map(([k, v]) => (
@@ -392,6 +375,34 @@ export function FactsBlock({ cours }: { cours: CourRef[] }) {
       ))}
     </dl>
   );
+}
+
+export function FactsBlock({ cours, leading = [] }: {
+  cours: CourRef[];
+  /** Rows prepended before the MAL facts. Genres arrive this way: they come
+   *  from the addon, not MAL, but belong in the same list. */
+  leading?: [string, string][];
+}) {
+  // The SERIES-root entry only. A per-cour fact list would repeat "Manga",
+  // "Shounen" and the studio three times for a three-season show.
+  const rows = useCourPayloads<AnimeFacts>("facts", cours.slice(0, 1));
+  const f = rows?.[0]?.value;
+  // The leading rows do not depend on the fetch, so they render immediately
+  // and stay put when MAL's answer lands underneath them.
+  if (!f) return <FactList items={leading} />;
+
+  const items: [string, string][] = [...leading];
+  if (f.source)    items.push(["Source", f.source]);
+  if (f.status)    items.push(["Status", f.status]);
+  if (f.premiered) items.push(["Premiered", f.premiered]);
+  if (f.aired)     items.push(["Aired", f.aired]);
+  if (f.rating)    items.push(["Rating", f.rating]);
+  if (f.demographics.length) items.push(["Demographic", f.demographics.join(", ")]);
+  if (f.studios.length)   items.push([f.studios.length > 1 ? "Studios" : "Studio", f.studios.join(", ")]);
+  if (f.producers.length) items.push(["Producers", f.producers.slice(0, 6).join(", ")]);
+  if (f.licensors.length) items.push(["Licensors", f.licensors.join(", ")]);
+  if (f.broadcast)        items.push(["Broadcast", f.broadcast]);
+  return <FactList items={items} />;
 }
 
 // ---------------------------------------------------------------------------
