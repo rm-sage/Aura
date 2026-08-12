@@ -59,6 +59,10 @@ interface ArcGridProps {
   activeGroupingId?: string;
   onSelect: (arc: StoryArc) => void;
   onGroupingChange: (groupingId: string) => void;
+  /** Right-click on an arc tile. Given the arc so the caller can mark every
+   *  episode in it; the caller owns the menu because it owns the series
+   *  identity and the scrobble connection. */
+  onArcContextMenu?: (arc: StoryArc, x: number, y: number) => void;
 }
 
 /** Episodes in this arc the user has finished. Mirrors LibraryContext's
@@ -94,12 +98,14 @@ function ArcCard({
   absoluteById,
   resumeId,
   onSelect,
+  onArcContextMenu,
 }: {
   arc: StoryArc;
   perRow: 1 | 2;
   absoluteById: Map<string, number>;
   resumeId: string | null;
   onSelect: (arc: StoryArc) => void;
+  onArcContextMenu?: (arc: StoryArc, x: number, y: number) => void;
 }) {
   const total = arc.episode_ids.length;
   const watched = watchedCount(arc.episode_ids, resumeId);
@@ -117,6 +123,11 @@ function ArcCard({
     <button
       type="button"
       onClick={() => onSelect(arc)}
+      onContextMenu={onArcContextMenu ? (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        onArcContextMenu(arc, e.clientX, e.clientY);
+      } : undefined}
       title={arc.name}
       className="group relative block w-full text-left overflow-hidden rounded-xl
                  bg-white/5 border border-white/10 hover:border-ln-accent/40
@@ -306,6 +317,7 @@ export function ArcGridSkeleton({ perRow = 1, count }: { perRow?: 1 | 2; count?:
 
 export default function ArcGrid({
   result, seriesId, videos, loading, activeGroupingId, onSelect, onGroupingChange,
+  onArcContextMenu,
 }: ArcGridProps) {
   const resumeId = useResumeVideoId(seriesId);
   // Re-render when a manual mark lands anywhere, so the progress bars stay
@@ -358,6 +370,7 @@ export default function ArcGrid({
               absoluteById={absoluteById}
               resumeId={resumeId}
               onSelect={onSelect}
+              onArcContextMenu={onArcContextMenu}
             />
           ))}
         </div>

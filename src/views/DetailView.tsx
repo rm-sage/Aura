@@ -121,7 +121,7 @@ import ArcGrid, { ArcGridSkeleton } from "../ArcGrid";
 import GroupingToggle from "../EpisodeGroupingToggle";
 import {
   absoluteEpisodeMap, arcArtFor, arcPositionOf, arcsLikelyAvailable, arcYearRange, formatAbsoluteEpisode, loadArcMode, peekCachedArcs, preferredGroupingId, saveArcMode, useStoryArcs,
-  type EpisodeGrouping,
+  type EpisodeGrouping, type StoryArc,
 } from "../storyArcs";
 
 // ---------------------------------------------------------------------------
@@ -3741,6 +3741,95 @@ function EpisodesPanel({
     () => loadArcMode(seriesId).groupingId,
   );
   const [openArcId, setOpenArcId] = useState<string | null>(null);
+  const arcScrobbleConn = useScrobbleConnections();
+
+  /**
+   * Right-click on an arc tile: mark the WHOLE arc.
+   *
+   * An arc is 8 to 60 episodes, so every action here is a bulk one and the
+   * gating matters: an option that would change nothing is omitted rather than
+   * shown inert, the same rule the per-episode menu follows. Unaired episodes
+   * are excluded from every positive mark, so marking a currently-airing arc
+   * watched does not claim episodes that do not exist yet.
+   */
+  const openArcMenu = useCallback((arc: StoryArc, x: number, y: number) => {
+    const inArc = videos.filter((v) => arc.episode_ids.includes(v.id));
+    if (inArc.length === 0) return;
+    const aired = inArc.filter(isVideoAired);
+    const ids = inArc.map((v) => v.id);
+    const airedIds = aired.map((v) => v.id);
+
+    const targetFor = (v: VideoEntry): SkipTarget => ({
+      id: v.id,
+      parentId: seriesId,
+      name: detail?.name ?? seriesId,
+      mediaType: seriesMediaType,
+      season: v.season,
+      episode: v.episode,
+      episodeTitle: v.title ?? null,
+      poster: detail?.poster ?? null,
+      background: detail?.background ?? null,
+      anilistId: (v as { anilist_id?: number | null }).anilist_id ?? null,
+      anilistEpisode: (v as { anilist_episode?: number | null }).anilist_episode ?? null,
+    });
+
+    const toast = (msg: string, tone?: "success" | "default") =>
+      showFlyUpToast(`${msg} · ${arc.name}`, { x, y, tone: tone ?? "default" });
+
+    type Item = Parameters<typeof openContextMenu>[2][number];
+    const items: Item[] = [];
+
+    if (airedIds.some((id) => getManualWatchedState(id) !== "watched")) {
+      items.push({
+        kind: "action", label: "Mark arc as watched", tone: "success",
+        onClick: () => {
+          setManualWatchedMany(airedIds, "watched");
+          toast(`Marked ${airedIds.length} watched`, "success");
+        },
+      });
+    }
+    if (ids.some((id) => getManualWatchedState(id) === "watched")) {
+      items.push({
+        kind: "action", label: "Unmark arc as watched",
+        onClick: () => {
+          // Clears the skip annotation too, or an unmarked arc would keep
+          // purple tags on episodes that are no longer marked at all.
+          clearEpisodesSkipped(ids);
+          setManualWatchedMany(ids, null);
+          toast("Unmarked");
+        },
+      });
+    }
+    if (aired.some((v) => !isSkipped(v.id))) {
+      items.push({
+        kind: "action", label: "Mark arc as skipped",
+        hint: "Marks every episode in this arc, including canon ones.",
+        onClick: () => {
+          void markEpisodesSkipped(aired.map(targetFor), {
+            userInitiated: true,
+            autoScrobbleEnabled: arcScrobbleConn.autoScrobbleEnabled,
+            scrobbleScope: arcScrobbleConn.scope,
+            services: connectedServices(arcScrobbleConn),
+          });
+          toast(`Skipped ${aired.length}`, "success");
+        },
+      });
+    }
+    if (ids.some((id) => isSkipped(id))) {
+      items.push({
+        kind: "action", label: "Unmark arc as skipped",
+        onClick: () => { clearEpisodesSkipped(ids); toast("Unmarked"); },
+      });
+    }
+    if (ids.some((id) => getManualWatchedState(id) !== "planned")) {
+      items.push({
+        kind: "action", label: "Mark arc as planned", tone: "notice",
+        onClick: () => { setManualWatchedMany(ids, "planned"); toast("Queued"); },
+      });
+    }
+    if (items.length === 0) return;
+    openContextMenu(x, y, items);
+  }, [videos, seriesId, seriesMediaType, detail, arcScrobbleConn]);
   const { arcs: arcResult, loading: arcsLoading } = useStoryArcs(detail ?? null, seriesId, groupingId);
 
   // A remembered grouping always wins. Captured once at mount so the auto-default
@@ -4031,6 +4120,7 @@ function EpisodesPanel({
               activeGroupingId={groupingId ?? arcResult!.grouping_id}
               onSelect={(arc) => setOpenArcId(arc.id)}
               onGroupingChange={switchArcGrouping}
+              onArcContextMenu={openArcMenu}
             />
           </div>
         ) : (
