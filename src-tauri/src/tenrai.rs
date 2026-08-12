@@ -104,6 +104,102 @@ pub struct AnimeFull {
     pub members: Option<u64>,
     #[serde(default)]
     pub theme: Option<AnimeThemeRaw>,
+    // ── Facts ──
+    // All of this was already arriving in the payload and being discarded.
+    // Deliberately narrow still: only fields the detail page does not already
+    // show somewhere else. Score, rank and popularity are omitted here on
+    // purpose because they are already chips in the identity block and a whole
+    // tab of their own.
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub rating: Option<String>,
+    #[serde(default)]
+    pub season: Option<String>,
+    #[serde(default)]
+    pub year: Option<u32>,
+    #[serde(default)]
+    pub aired: Option<AiredRaw>,
+    #[serde(default)]
+    pub studios: Vec<NamedRef>,
+    #[serde(default)]
+    pub producers: Vec<NamedRef>,
+    #[serde(default)]
+    pub licensors: Vec<NamedRef>,
+    #[serde(default)]
+    pub demographics: Vec<NamedRef>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct AiredRaw {
+    #[serde(default)]
+    pub string: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NamedRef {
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// The Overview tab's fact list. Flattened and pre-formatted so the frontend
+/// renders strings rather than reimplementing MAL's shapes.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct AnimeFacts {
+    pub source: Option<String>,
+    pub status: Option<String>,
+    pub rating: Option<String>,
+    /// "Spring 2022", from season + year.
+    pub premiered: Option<String>,
+    pub aired: Option<String>,
+    pub studios: Vec<String>,
+    pub producers: Vec<String>,
+    pub licensors: Vec<String>,
+    pub demographics: Vec<String>,
+}
+
+fn names(v: Vec<NamedRef>) -> Vec<String> {
+    v.into_iter()
+        .filter_map(|n| n.name)
+        .filter(|n| !n.trim().is_empty())
+        .collect()
+}
+
+#[tauri::command]
+pub async fn fetch_anime_facts(mal_id: u32) -> Result<Option<AnimeFacts>, String> {
+    let Some(f) = anime_full_checked(mal_id).await? else { return Ok(None) };
+    let premiered = match (f.season.as_deref(), f.year) {
+        (Some(s), Some(y)) if !s.is_empty() => {
+            let mut c = s.chars();
+            let season = match c.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            };
+            Some(format!("{season} {y}"))
+        }
+        _ => None,
+    };
+    let facts = AnimeFacts {
+        // MAL writes "TV" as a rating value for unrated entries and "None" for
+        // missing ones; both are noise in a fact list.
+        rating: f.rating.filter(|r| !r.eq_ignore_ascii_case("none")),
+        source: f.source.filter(|v| !v.eq_ignore_ascii_case("unknown")),
+        status: f.status,
+        premiered,
+        aired: f.aired.and_then(|a| a.string).filter(|s| !s.trim().is_empty()),
+        studios: names(f.studios),
+        producers: names(f.producers),
+        licensors: names(f.licensors),
+        demographics: names(f.demographics),
+    };
+    // Nothing worth a section is nothing at all.
+    let empty = facts.source.is_none() && facts.status.is_none() && facts.rating.is_none()
+        && facts.premiered.is_none() && facts.aired.is_none()
+        && facts.studios.is_empty() && facts.producers.is_empty()
+        && facts.licensors.is_empty() && facts.demographics.is_empty();
+    Ok(if empty { None } else { Some(facts) })
 }
 
 #[derive(Deserialize)]

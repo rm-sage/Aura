@@ -66,6 +66,18 @@ export interface AnimeStatistics {
   scores:        ScoreBucket[];
 }
 
+export interface AnimeFacts {
+  source:       string | null;
+  status:       string | null;
+  rating:       string | null;
+  premiered:    string | null;
+  aired:        string | null;
+  studios:      string[];
+  producers:    string[];
+  licensors:    string[];
+  demographics: string[];
+}
+
 export interface AnimeCharacter {
   mal_id:       number;
   name:         string;
@@ -113,6 +125,7 @@ type ExtrasValue =
   | AnimeStatistics
   | StaffCredit[]
   | AnimeCharacter[]
+  | AnimeFacts
   | Recommendation[]
   | AnimeTrailer[]
   | null;
@@ -124,13 +137,15 @@ const extrasCache = new PersistentCache<ExtrasValue>({
 });
 
 export type ExtrasTab =
-  | "songs" | "ratings" | "staff" | "characters" | "related" | "trailers";
+  | "songs" | "ratings" | "staff" | "characters" | "related" | "trailers"
+  | "facts";
 
 const COMMAND_BY_TAB: Record<ExtrasTab, string> = {
   songs:    "fetch_anime_themes",
   ratings:  "fetch_anime_statistics",
   staff:    "fetch_anime_staff",
   characters: "fetch_anime_characters",
+  facts:      "fetch_anime_facts",
   related:  "fetch_anime_recommendations",
   trailers: "fetch_anime_trailers",
 };

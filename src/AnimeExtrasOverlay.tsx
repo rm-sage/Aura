@@ -25,7 +25,7 @@ import { shouldBlurThemeRange } from "./episodeSpoilers";
 import {
   fetchExtras, formatSpans, themeLabel,
   type AnimeStatistics, type AnimeTheme, type AnimeThemes, type AnimeTrailer,
-  type AnimeCharacter, type CourRef, type Recommendation, type StaffCredit, type ExtrasTab,
+  type AnimeCharacter, type AnimeFacts, type CourRef, type Recommendation, type StaffCredit, type ExtrasTab,
 } from "./animeExtras";
 
 // Server-resize widths. Every image in here is decorative and small, and the
@@ -83,18 +83,15 @@ function Empty({ what }: { what: string }) {
 
 /** Cour heading. Suppressed when there is only one, since a single-entry show
  *  does not need to be told which season it is looking at. */
-function CourHeading({ label, show, center = false }: {
-  label: string; show: boolean; center?: boolean;
-}) {
+function CourHeading({ label, show }: { label: string; show: boolean }) {
   if (!show) return null;
   // A label alone was not enough separation: with rows immediately above and
   // below it, each season read as one continuous list with a stray caption in
   // it. The rule gives the break something to land on, and the generous top
   // margin (collapsed on the first) is what actually does the separating.
   return (
-    <div className={"flex items-center gap-3 mt-7 mb-3 first:mt-0 "
-      + (center ? "justify-center" : "")}>
-      {center && <span className="h-px flex-1 bg-white/10" aria-hidden />}
+    <div className="flex items-center gap-3 mt-7 mb-3 first:mt-0">
+      <span className="h-px flex-1 bg-white/10" aria-hidden />
       <span className="text-white/55 text-[10.5px] font-mono uppercase tracking-[0.22em] whitespace-nowrap">
         {label}
       </span>
@@ -256,7 +253,7 @@ export function RatingsTab({ cours }: { cours: CourRef[] }) {
           // `mt-0` on every heading: the grid's own row gap does the
           // separating here, so the shared top margin would double it.
           <div key={cour.malId} className="[&>div:first-child]:mt-0">
-            <CourHeading label={cour.label} show={multi} center />
+            <CourHeading label={cour.label} show={multi} />
             <div className="flex flex-col gap-1 mb-4">
               {[...value.scores].sort((a, b) => b.score - a.score).map((b) => (
                 <div key={b.score} className="flex items-center gap-2.5">
@@ -355,6 +352,49 @@ export function StaffTab({ cours, compact = false }: { cours: CourRef[]; compact
 }
 
 // ---------------------------------------------------------------------------
+// Facts
+//
+// Rendered inside Overview rather than as a tab of its own. Everything here
+// was already arriving in the cached /anime/{id}/full payload and being thrown
+// away, so it costs no request. Scores are deliberately absent: they are chips
+// in the identity block and a whole tab besides, and Overview repeating them
+// was part of why it read as filler.
+// ---------------------------------------------------------------------------
+
+export function FactsBlock({ cours }: { cours: CourRef[] }) {
+  // The SERIES-root entry only. A per-cour fact list would repeat "Manga",
+  // "Shounen" and the studio three times for a three-season show.
+  const rows = useCourPayloads<AnimeFacts>("facts", cours.slice(0, 1));
+  const f = rows?.[0]?.value;
+  if (!f) return null;
+
+  const items: [string, string][] = [];
+  if (f.source)    items.push(["Source", f.source]);
+  if (f.status)    items.push(["Status", f.status]);
+  if (f.premiered) items.push(["Premiered", f.premiered]);
+  if (f.aired)     items.push(["Aired", f.aired]);
+  if (f.rating)    items.push(["Rating", f.rating]);
+  if (f.demographics.length) items.push(["Demographic", f.demographics.join(", ")]);
+  if (f.studios.length)   items.push([f.studios.length > 1 ? "Studios" : "Studio", f.studios.join(", ")]);
+  if (f.producers.length) items.push(["Producers", f.producers.slice(0, 6).join(", ")]);
+  if (f.licensors.length) items.push(["Licensors", f.licensors.join(", ")]);
+  if (!items.length) return null;
+
+  return (
+    <dl className="grid gap-x-6 gap-y-2 grid-cols-[auto_1fr]">
+      {items.map(([k, v]) => (
+        <div key={k} className="contents">
+          <dt className="text-white/35 text-[10px] font-mono uppercase tracking-[0.16em] pt-0.5">
+            {k}
+          </dt>
+          <dd className="text-white/80 text-[12.5px] leading-snug min-w-0">{v}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Characters
 //
 // The addon's own cast data is {name, character, photo}: an actor photo and a
@@ -410,11 +450,15 @@ function CharacterCard({
 }) {
   const [hover, setHover] = useState(false);
   const [revealed, setRevealed] = useState(false);
-  const hidden = blurred && !revealed;
-  // Hovering swaps to the actor. Suppressed while hidden, or the spoiler gate
-  // would be trivially defeated by the same gesture that reveals it.
-  const showActor = hover && !hidden && !!c.actor_image;
 
+  // ACTOR is the resting state; the character is what hovering reveals. That
+  // ordering matters for the spoiler gate: the person is never a spoiler, so
+  // the card can always show something at rest, and the blur only ever has to
+  // cover the thing that is.
+  const showChar = hover && !!c.image;
+  const hideChar = blurred && !revealed;
+
+  const restImage = c.actor_image ?? c.image;
   return (
     <div
       className="min-w-0"
@@ -423,38 +467,47 @@ function CharacterCard({
     >
       <button
         type="button"
-        onClick={() => hidden && setRevealed(true)}
-        aria-label={hidden ? "Reveal character" : c.name}
+        onClick={() => { if (hideChar) setRevealed(true); }}
+        aria-label={hideChar ? `Reveal ${c.actor ?? "character"}'s role` : c.name}
         className="block w-full aspect-[2/3] rounded-lg overflow-hidden
                    bg-white/6 border border-white/8 relative
                    focus-visible:outline focus-visible:outline-2 focus-visible:outline-ln-accent"
       >
-        {c.image && (
+        {restImage && (
           <ImageLoader
-            src={shrinkPoster(c.image, CHARACTER_ART_W)}
+            src={shrinkPoster(restImage, CHARACTER_ART_W)}
             alt=""
             className="absolute inset-0 w-full h-full"
             imgClassName="w-full h-full object-cover"
             imgStyle={{
-              filter: hidden ? "blur(14px)" : undefined,
-              opacity: showActor ? 0 : 1,
+              opacity: showChar ? 0 : 1,
               transition: "opacity 180ms ease-out",
             }}
             draggable={false}
           />
         )}
-        {/* The actor, cross-faded in on hover. Mounted only once hovered so a
-            60-card grid does not fetch 60 extra portraits on open. */}
-        {showActor && c.actor_image && (
+        {/* Character art, cross-faded in on hover. Mounted only once hovered,
+            so a 60-card grid does not fetch 60 second images on open. When the
+            spoiler toggle is on it still appears, blurred, and a click clears
+            it: hiding it entirely would leave no affordance to reveal. */}
+        {showChar && c.image && (
           <ImageLoader
-            src={shrinkPoster(c.actor_image, CHARACTER_ART_W)}
+            src={shrinkPoster(c.image, CHARACTER_ART_W)}
             alt=""
             className="absolute inset-0 w-full h-full"
             imgClassName="w-full h-full object-cover"
+            imgStyle={hideChar ? { filter: "blur(16px)", transform: "scale(1.1)" } : undefined}
             draggable={false}
           />
         )}
-        {c.role === "Main" && !hidden && (
+        {showChar && hideChar && (
+          <span className="absolute inset-0 flex items-center justify-center
+                           text-white/80 text-[10px] font-mono uppercase
+                           tracking-[0.16em] bg-black/35">
+            Click to reveal
+          </span>
+        )}
+        {c.role === "Main" && !showChar && (
           <span className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded
                            bg-black/70 text-white/85 text-[9px] font-mono
                            uppercase tracking-[0.14em]">
@@ -463,13 +516,19 @@ function CharacterCard({
         )}
       </button>
 
-      <p className="text-white/85 text-[11.5px] leading-tight mt-1.5 line-clamp-2"
-         style={hidden ? { filter: "blur(5px)" } : undefined}>
-        {showActor ? (c.actor ?? c.name) : c.name}
+      {/* Both lines are FIXED: only the image swaps on hover. Swapping the
+          text too made every card jump as the cursor crossed it. The actor
+          leads because that is the resting state; the character sits under it
+          and carries the blur when gated, since the role is the spoiler. */}
+      <p className="text-white/85 text-[11.5px] leading-tight mt-1.5 line-clamp-2">
+        {c.actor ?? c.name}
       </p>
-      <p className="text-white/35 text-[10.5px] leading-tight mt-0.5 truncate">
-        {showActor ? "Voice actor" : (c.actor ?? "")}
-      </p>
+      {c.actor && (
+        <p className="text-white/35 text-[10.5px] leading-tight mt-0.5 truncate"
+           style={hideChar ? { filter: "blur(4px)" } : undefined}>
+          {c.name}
+        </p>
+      )}
     </div>
   );
 }

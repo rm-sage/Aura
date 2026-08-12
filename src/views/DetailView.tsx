@@ -27,6 +27,7 @@ import { findAIOMetadataAddon, isAnimeMeta, markAnimeId, typeLabel } from "../ai
 import { dedupedInvoke } from "../invokeDedupe";
 import { peekRichestCachedDetailById } from "../metaCache";
 import DetailHud from "../DetailHud";
+import { FactsBlock } from "../AnimeExtrasOverlay";
 import { resolveCourMalIds, type CourRef } from "../animeExtras";
 import { PersistentCache } from "../persistentCache";
 import SeasonSelect from "../SeasonSelect";
@@ -516,6 +517,18 @@ function seedHeroArt(preview: MetaPreview, resumeVideoId: string | null): HeroAr
   const seed = peekRichestCachedDetailById(preview.id);
   if (!seed || !(seed.background || seed.logo)) return null;
   return heroArtFrom(seed, preview, arcHeroArt(preview.id, resumeVideoId));
+}
+
+/** Section label inside the HUD. Every Overview block gets one: without them
+ *  the tab was several paragraphs of different things running together with no
+ *  indication of where one ended and the next began. Matches the mono-caps
+ *  label convention used throughout the app. */
+function HudSectionLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <p className="text-white/35 text-[10px] font-mono uppercase tracking-[0.18em] mb-2">
+      {children}
+    </p>
+  );
 }
 
 function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, onPlayTrailer, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
@@ -1706,6 +1719,22 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
             )}
 
 
+            {/* Genre chips. Back in the identity stack rather than inside the
+                Overview tab: they are an at-a-glance property of the title,
+                like the rating chips above them, not something you open a tab
+                to read. */}
+            {detail?.genres && detail.genres.length > 0 && (
+              <div className="flex flex-wrap gap-2">
+                {detail.genres.map((g) => (
+                  <span key={g}
+                    className="px-3 py-1 rounded-sm text-[11px] font-mono uppercase tracking-[0.12em]
+                               bg-black/55 backdrop-blur-md text-white/80 border border-white/12"
+                    style={{ textShadow: "0 1px 4px rgba(0,0,0,0.75)" }}>
+                    {g}
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* ── Metadata HUD ──
@@ -1748,13 +1777,13 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                         : (detail?.description ?? meta.description);
                     if (!shown) return null;
                     return (
-                      <p
-                        className="text-white/95 text-[18px] leading-[1.55] font-normal tracking-[0.005em]
-                                   max-w-[65ch] selectable"
-                        style={{ textShadow: "0 1px 6px rgba(0,0,0,0.85)" }}
-                      >
-                        {shown}
-                      </p>
+                      <section>
+                        <HudSectionLabel>Synopsis</HudSectionLabel>
+                        <p className="text-white/90 text-[14px] leading-[1.62] tracking-[0.005em]
+                                      max-w-[68ch] selectable">
+                          {shown}
+                        </p>
+                      </section>
                     );
                   })()}
 
@@ -1788,29 +1817,33 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                 the title. It also gives Overview's second column something to
                 hold besides a genre strip, which is what made the panel read
                 as mostly empty. */}
-            {(detail?.studios?.length || detail?.country) && (
-              <div className="space-y-2">
-                {detail?.studios && detail.studios.length > 0 &&
-                  <CreditRow label={detail.studios.length > 1 ? "Studios" : "Studio"}
-                    values={plainCredits(detail.studios)} />}
-                {detail?.country && (
-                  <CreditRow label="Country" values={plainCredits([detail.country])} />
-                )}
-              </div>
+            {/* MAL facts: source, status, premiere, rating, demographic,
+                studios, producers, licensors. All of it was already arriving in
+                the cached /full payload and being discarded, so it costs no
+                request, and none of it repeats another tab. */}
+            {extrasCours.length > 0 && (
+              <section>
+                <HudSectionLabel>Details</HudSectionLabel>
+                <FactsBlock cours={extrasCours} />
+              </section>
             )}
 
-            {/* Genre chips */}
-                  {detail?.genres && detail.genres.length > 0 && (
-                    <div className="flex flex-wrap gap-2">
-                      {detail.genres.map((g) => (
-                        <span key={g}
-                          className="px-3 py-1 rounded-sm text-[12px] font-mono uppercase tracking-[0.12em]
-                                     bg-white/8 text-white/85 border border-white/12">
-                          {g}
-                        </span>
-                      ))}
-                    </div>
+            {/* Country only. Studios come from the fact list above for anime;
+                this covers everything else. */}
+            {(detail?.country || (extrasCours.length === 0 && detail?.studios?.length)) && (
+              <section>
+                <HudSectionLabel>Production</HudSectionLabel>
+                <div className="space-y-2">
+                  {extrasCours.length === 0 && detail?.studios && detail.studios.length > 0 &&
+                    <CreditRow label={detail.studios.length > 1 ? "Studios" : "Studio"}
+                      values={plainCredits(detail.studios)} />}
+                  {detail?.country && (
+                    <CreditRow label="Country" values={plainCredits([detail.country])} />
                   )}
+                </div>
+              </section>
+            )}
+
 
                 </div>
               )}
