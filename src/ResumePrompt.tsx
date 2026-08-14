@@ -79,7 +79,18 @@ export default function ResumePrompt({ pending }: { pending: PendingResume | nul
       // so a click inside the panel doesn't propagate as "outside" by
       // accident.
       onClick={(e) => { if (e.target === e.currentTarget) pending.onCancel(); }}
-      className="fixed inset-0 z-[1500] flex items-center justify-center
+      // z-[10550]: this prompt BLOCKS a play the user has already asked for,
+      // so nothing that is merely on screen may cover it. At its old z-[1500]
+      // every in-player surface won - PlayerOverlay (9999), NextUpCta (10001),
+      // the EOS Spotlight (10300), the episode drawer (10400) - and the
+      // concrete failure was pressing Skip to canon on an episode with a saved
+      // position: the prompt rendered underneath the player and neither Resume
+      // nor Start over could be clicked, with no way forward except Esc.
+      // Above the stream-broken recovery modal (10500) too, because a break
+      // detected on the OUTGOING stream must not swallow the decision that
+      // starts the incoming one. Below PlaybackEngineGate (10600), which is a
+      // genuine "you cannot play anything yet" wall.
+      className="fixed inset-0 z-[10550] flex items-center justify-center
                  bg-black/70 backdrop-blur-md animate-[fade-in_120ms_ease-out]"
     >
       <div className="aura-glass-menu rounded-2xl max-w-[420px] w-[92%] p-6 text-white">

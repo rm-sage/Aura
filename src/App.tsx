@@ -81,7 +81,7 @@ import {
 import { useWatchTogether } from "./watchTogether/useWatchTogether";
 import { streamLabel, streamMatchKey } from "./watchTogether/streamMatch";
 import { parseStream } from "./streamMeta";
-import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPreviousEpisode, resolveCanonSkipTarget, formatEpisodeTag } from "./nextUp";
+import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPreviousEpisode, resolveCanonSkipTarget, autoSkipApplies, formatEpisodeTag } from "./nextUp";
 import { arcPositionOf, fetchStoryArcs, loadArcMode } from "./storyArcs";
 import { getMetaDetailFallback, getRichestMetaDetail, peekCachedDetailById, peekRichestCachedDetailById, peekFreshestPostersByIds } from "./metaCache";
 import { PersistentCache } from "./persistentCache";
@@ -822,6 +822,15 @@ const USER_PAUSE_GRACE_MS = 800;
 // load supersedes it, the modal never shows. Only a genuinely dead stream (no
 // life for the full grace) surfaces recovery, ~20 s later instead of instantly.
 const STREAM_ERROR_GRACE_MS = 20000;
+// The same grace for a load that has produced NO frame yet. Short, because the
+// long window buys nothing here: with no first frame there is no playback to
+// "come alive", mpv has already ended the file, and nothing re-issues a
+// loadfile on its own. What the long grace actually absorbs is an error stamped
+// around a LOAD TRANSITION, which clears the moment the new load's first
+// time-pos lands - and that case has a first frame by definition. Keeping the
+// full 20 s here just meant staring at a dead loader before anything happened.
+// Sized so the auto-retries below still fit inside the old time-to-modal.
+const STREAM_ERROR_COLD_GRACE_MS = 6000;
 
 // Per-tick forward-progress cap (s) for the History watched accumulator.
 // A `time` delta larger than this is a seek, not playback — discarded so
@@ -1532,14 +1541,19 @@ function usePlayback(playerActive: boolean) {
       // lastTimeUpdateAtRef on a new load, so this can't false-clear across
       // loads; a stale pending error is cleared by notifyNewLoad directly.)
       if (lastTimeUpdateAtRef.current > errAt) { loadErrorAtRef.current = 0; return; }
-      if (Date.now() - errAt >= STREAM_ERROR_GRACE_MS) {
+      // Cold load (no frame ever seen) gets the short grace: see the constant.
+      const grace = firstFrameSeen ? STREAM_ERROR_GRACE_MS : STREAM_ERROR_COLD_GRACE_MS;
+      if (Date.now() - errAt >= grace) {
         loadErrorAtRef.current = 0;
-        console.warn(`[playback] end-file error unrecovered after ${STREAM_ERROR_GRACE_MS / 1000}s — surfacing recovery`);
+        console.warn(`[playback] end-file error unrecovered after ${grace / 1000}s, surfacing recovery`);
         setStreamBroken(true);
       }
     }, 1000);
     return () => window.clearInterval(id);
-  }, [windowHidden]);
+    // firstFrameSeen picks the grace, so it must be a dep. Read from a stale
+    // closure it would have pinned whichever value held when the interval was
+    // created, and a cold load would have waited the full 20 s anyway.
+  }, [windowHidden, firstFrameSeen]);
 
   /** Reset playback state for a new load_video call. Called from the
    *  parent right before invoking load_video so every fresh playback
@@ -1831,6 +1845,17 @@ export default function App() {
    *  provider rejects it, leaving the channel unrecoverable without exiting to
    *  the Live grid. Same ref pattern as lastHdrHintRef. */
   const lastProxyUrlRef = useRef<string | null>(null);
+  /** The active load's external DASH audio URL (1080p+ trailers), null for
+   *  every normal stream. Like `http-proxy` this is a PER-FILE loadfile option,
+   *  so an in-place reload that omits it clears `audio-files` and the reloaded
+   *  trailer plays silently. Same ref pattern as lastProxyUrlRef. */
+  const lastAudioUrlRef = useRef<string | null>(null);
+  /** The `startSeconds` the active load was issued with. The reload paths used
+   *  to derive their resume offset from the live `time`, which is 0 whenever
+   *  the load never produced a frame - exactly the case a reload exists for -
+   *  so retrying a failed resume silently restarted the episode from the top.
+   *  Used as the fallback when `time` has nothing to say. */
+  const lastStartSecondsRef = useRef<number | null>(null);
   /** Per-load token for the OP/ED skip-window resolution chain. That chain is
    *  fire-and-forget and LONG (a 6 s chapter poll, then a possible ffmpeg
    *  fetch, then silence scans over up to 600 s of audio), while
@@ -2209,6 +2234,9 @@ export default function App() {
     setSelectedMeta(meta);
   }, []);
 
+  /** Dismiss the detail page. There is no navigation trail to unwind: a Related
+   *  tile searches for the title it names rather than opening it in place, so
+   *  the detail page is only ever one level deep. */
   const closeDetail = useCallback(() => {
     setSelectedMeta(null);
     setSelectedRect(null);
@@ -2453,6 +2481,8 @@ export default function App() {
         })();
         lastHdrHintRef.current = contentHdrHint;
         lastProxyUrlRef.current = opts?.proxyUrl ?? null;
+        lastAudioUrlRef.current = opts?.audioFileUrl ?? null;
+        lastStartSecondsRef.current = resumeAt ?? null;
 
         const t0load = Date.now();
         await invoke("load_video", {
@@ -4016,7 +4046,11 @@ export default function App() {
     void (async () => {
       let next: Awaited<ReturnType<typeof resolveNextEpisode>> = null;
       try {
-        next = await resolveNextEpisode(addons, mediaType, seriesId, currentId, loadAuraSettings().nextUpSkipFillerRecap);
+        // "none" ALWAYS. The card shows the real next episode and offers the
+        // skip as a separate button, so the resolver must never quietly walk
+        // past anything: that is what made "Play next episode" play something
+        // else, and what hid the skip from the code that marks it.
+        next = await resolveNextEpisode(addons, mediaType, seriesId, currentId, "none");
       } catch (e) {
         // A THROW is not an answer. The latch is claimed before the await so
         // the per-tick effect cannot fan out duplicate lookups, which meant one
@@ -4238,6 +4272,10 @@ export default function App() {
 
   const onNextUpPlay = useCallback(async () => {
     if (!nextUpInfo || !nextUpInfo.stream) return;
+    // Deliberately marks NOTHING. This button plays the episode it names, so
+    // if that is filler the user is watching it, not skipping it. The skip
+    // button beside it is the one that jumps a run, and it is the only path
+    // that writes skip marks.
     await advanceToEpisode(nextUpInfo.episode, nextUpInfo.stream);
   }, [nextUpInfo, advanceToEpisode]);
 
@@ -4261,8 +4299,13 @@ export default function App() {
           season: v.season,
           episode: v.episode,
           episodeTitle: v.title ?? null,
-          poster: null,
-          background: null,
+          // The SERIES art, resolved the same way the natural-finish History
+          // row does. These were null, so every skip row in History rendered
+          // art-less next to played rows that had a poster.
+          poster: library.find((i) => i.id === (activeTarget.series_id ?? activeTarget.id))?.poster
+            ?? selectedMeta?.poster ?? null,
+          background: library.find((i) => i.id === (activeTarget.series_id ?? activeTarget.id))?.background
+            ?? selectedMeta?.background ?? null,
           anilistId: (v as { anilist_id?: number | null }).anilist_id ?? null,
           anilistEpisode: (v as { anilist_episode?: number | null }).anilist_episode ?? null,
         })),
@@ -4275,7 +4318,7 @@ export default function App() {
       );
     }
     await advanceToEpisode(nextUpInfo.canon.episode, nextUpInfo.canon.stream);
-  }, [nextUpInfo, advanceToEpisode, activeTarget, scrobbleConn]);
+  }, [nextUpInfo, advanceToEpisode, activeTarget, scrobbleConn, library, selectedMeta]);
 
   const onNextUpDismiss = useCallback(() => {
     if (activeTarget) {
@@ -4526,10 +4569,8 @@ export default function App() {
     const currentId = activeTarget.id;
     let cancelled = false;
     void (async () => {
-      const res = await resolveNextEpisode(
-        addons, mediaType, seriesId, currentId,
-        loadAuraSettings().nextUpSkipFillerRecap,
-      );
+      // "none" always, matching the Next-Up resolver above.
+      const res = await resolveNextEpisode(addons, mediaType, seriesId, currentId, "none");
       if (cancelled) return;
       if (res) {
         const [stream, canon] = await Promise.all([
@@ -4625,7 +4666,23 @@ export default function App() {
       setEosCaughtUpUnaired(caughtUp);
       setEosNextAirMs(effectiveNextAirMs);
       setEosResolve("none");
-    })();
+    })().catch((e) => {
+      // A THROW anywhere in the walk (addon fetch, richest-meta fetch, stream
+      // pick) used to reject this IIFE silently, leaving `eosResolve` on
+      // "resolving" for good with the started-for latch already claimed, so it
+      // never retried either. That was survivable only because the Spotlight
+      // rendered the END-CARD while resolving; now that it correctly renders a
+      // spinner instead, an unhandled throw would park the user on that
+      // spinner forever. Fall through to the end card - the honest answer when
+      // we could not find a next episode - and release the latch so a later
+      // re-entry can try again.
+      if (cancelled) return;
+      console.warn(`[eos] resolve failed for ${currentId}: ${String(e)}`);
+      if (eosResolveStartedFor.current === currentId) eosResolveStartedFor.current = null;
+      setEosCaughtUpUnaired(false);
+      setEosNextAirMs(null);
+      setEosResolve("none");
+    });
     return () => { cancelled = true; };
   }, [eosActive, activeTarget, addons, nextUpInfo]);
   // (EOS action handlers are defined just below handleExitPlayback —
@@ -4969,12 +5026,28 @@ export default function App() {
   //       auto-derived state, so without this an already-started/finished
   //       planned item would linger in the Queue forever. Movies are
   //       unconditional (a watched movie is done); series are preference.
+  //
+  //   (c) EPISODE-shaped ids, which can only have come from the short-lived
+  //       "Mark arc as planned" option (removed 2026-08-12). Planned is a
+  //       title-level mark: the Queue looks each id up as a library record and
+  //       the media-key advance fetches full meta for it, so an episode id sits
+  //       there as an unremovable stub forever. Pruned on sight. The shape test
+  //       is deliberately strict (3+ colon-separated parts, last two numeric)
+  //       so no real root id can match: series roots are `tt0903747` or
+  //       `kitsu:49240`, episodes are `tt0903747:1:5` / `kitsu:49240:6`.
   useEffect(() => {
     if (!libraryLoaded) return;
     const planned = getPlannedQueue();
     if (planned.length === 0) return;
     const byId = new Map(library.map((it) => [it.id, it] as const));
     for (const id of planned) {
+      const parts = id.split(":");
+      if (parts.length >= 3
+          && /^\d+$/.test(parts[parts.length - 1])
+          && /^\d+$/.test(parts[parts.length - 2])) {
+        setManualWatchedState(id, null);
+        continue;
+      }
       const item = byId.get(id);
       if (!item) continue;
       if (item.removed) { setManualWatchedState(id, null); continue; }
@@ -6395,8 +6468,11 @@ export default function App() {
     enabled: !showLogin,
     handlers: {
       "toggle-pause":     () => wtTogglePause(),
-      "seek-back":        () => wtSeekRelative(-10),
-      "seek-forward":     () => wtSeekRelative(10),
+      // Step read at PRESS time, not when the handler map was built, so a
+      // change in Settings applies to the very next key press without
+      // re-registering the bindings.
+      "seek-back":        () => wtSeekRelative(-loadAuraSettings().seekStepSeconds),
+      "seek-forward":     () => wtSeekRelative(loadAuraSettings().seekStepSeconds),
       "volume-up":        () => bumpVolumeFromKey(2),
       "volume-down":      () => bumpVolumeFromKey(-2),
       "toggle-osd":       () => window.dispatchEvent(new CustomEvent("aura:toggle-osd")),
@@ -6543,12 +6619,15 @@ export default function App() {
     try {
       const detail = await getMetaDetailFallback(addons, target.media_type, seriesId);
       if (!detail) return;
-      // SMTC Next honours the user's filler/recap skip preference;
-      // SMTC Previous walks backward through the watch order unfiltered
-      // since "Previous" means "go back" — skipping past filler going
-      // backward would surprise users who just hit Next.
+      // BOTH DIRECTIONS UNFILTERED. Next used to honour the filler / recap
+      // preference, which made a media key silently jump a run with no UI to
+      // show what it passed and no code path to mark it, the same defect the
+      // Next-Up card had. That preference now means "which button an
+      // unattended countdown aims at", and a media key is a person pressing a
+      // button, not an unattended countdown. Skipping a run is an explicit
+      // action with its own button on the card.
       const candidate = direction === 1
-        ? findNextEpisode(detail, target.id, Date.now(), loadAuraSettings().nextUpSkipFillerRecap)
+        ? findNextEpisode(detail, target.id, Date.now(), "none")
         : findPreviousEpisode(detail, target.id);
       if (!candidate) {
         // Out of episodes in the current series. On Next, fall back to
@@ -7231,9 +7310,10 @@ export default function App() {
       invoke("load_video", {
         path: activeStreamUrl,
         startSeconds: null,
-        // Per-file option: without it the retry connects direct and a
+        // Per-file options: without these the retry connects direct and a
         // proxy-gated provider rejects it (see lastProxyUrlRef).
         httpProxy: lastProxyUrlRef.current,
+        audioUrl: lastAudioUrlRef.current,
       }).catch((e) => {
         console.error("[live] auto-retry reload failed", e);
       });
@@ -7254,6 +7334,93 @@ export default function App() {
     if (!isLivePlayback || !firstFrameSeen || streamBroken) return;
     if (liveRetryRef.current === 0) return;
     const t = window.setTimeout(() => { liveRetryRef.current = 0; }, LIVE_RETRY_RESET_MS);
+    return () => window.clearTimeout(t);
+  }, [isLivePlayback, firstFrameSeen, streamBroken]);
+
+  // ── VOD auto-retry (leeway before the broken-stream modal) ──
+  // The twin of the live retry above, for everything that is NOT a live
+  // channel. Live got this treatment first and VOD was deliberately left on
+  // modal-first, which turned out to be wrong for the commonest failure in a
+  // binge: advancing from the Next-Up card or the end-of-stream Spotlight
+  // surfaced "Stream connection lost" on an episode that then played fine from
+  // the modal's own Reload button, every single time. A freshly minted debrid
+  // URL is often still being assembled when mpv issues its first range
+  // request, so attempt one is both the likeliest to fail and the cheapest to
+  // repeat - and the user was being made to press a button to do exactly what
+  // Aura could have done itself.
+  //
+  // Both detectors feed this: a load that never produced a frame AND a
+  // mid-play heartbeat stall. The second is why the budget is restored after a
+  // stable hold below, so a three-hour film cannot spend both attempts on a
+  // blip in minute two and go modal-first at minute ninety.
+  //
+  // Trailers are included (a yt-dlp URL expires the same way). Live is
+  // excluded here because it has its own loop with its own timings.
+  const VOD_MAX_RETRIES = 2;
+  const vodRetryRef = useRef(0);
+  // Suppresses the recovery modal while a retry is pending, exactly as
+  // liveReconnecting does, so the popup never flashes between attempts.
+  const [vodReconnecting, setVodReconnecting] = useState(false);
+  useEffect(() => { vodRetryRef.current = 0; setVodReconnecting(false); }, [activeTarget?.id]);
+  useEffect(() => {
+    if (!streamBroken || isLivePlayback || !activeStreamUrl) { setVodReconnecting(false); return; }
+    if (vodRetryRef.current >= VOD_MAX_RETRIES) { setVodReconnecting(false); return; }
+    const attempt = vodRetryRef.current + 1;
+    vodRetryRef.current = attempt;
+    // Resume where the break happened. `time` is 0 when no frame ever
+    // arrived, which is precisely when the ORIGINAL requested offset is the
+    // right answer - without the fallback, retrying a failed resume restarted
+    // the episode from the beginning and looked like Aura had lost the
+    // position. Sub-1s offsets aren't worth a seek-and-buffer.
+    const resumeAt = time > 1 ? time : lastStartSecondsRef.current;
+    // Record the offset THIS retry is issued with. notifyNewLoad zeroes `time`,
+    // so without it a second attempt (and the modal's Reload after it) reads a
+    // ref still holding whatever the ORIGINAL load used - null for anything
+    // started from the beginning - and restarts a 40-minutes-in film at 00:00.
+    lastStartSecondsRef.current = resumeAt;
+    console.info(
+      `[playback] stream error - auto-retry ${attempt}/${VOD_MAX_RETRIES}`
+      + ` (resume ${resumeAt != null ? `${resumeAt.toFixed(0)}s` : "start"})`,
+    );
+    setVodReconnecting(true);
+    // Short: the detector that got us here already waited out its own grace
+    // (20 s for an mpv error, 8 s for a stall), so the transient has had its
+    // chance. The second attempt backs off a little further.
+    const delay = attempt === 1 ? 800 : 2500;
+    const t = window.setTimeout(() => {
+      // Deliberately NOT clearing streamBroken here - it is a dep of this
+      // effect and clearing it would re-run the cleanup and cancel this very
+      // timeout. notifyNewLoad clears it on fire, same as the live path.
+      notifyNewLoad();
+      // In-place reload: same URL and target, but mpv has re-run loadfile, so
+      // PlayerOverlay's per-file one-shots need the re-arm signal.
+      window.dispatchEvent(new Event("aura:player-reloaded"));
+      invoke("load_video", {
+        path: activeStreamUrl,
+        startSeconds: resumeAt,
+        contentHdrHint: lastHdrHintRef.current,
+        httpProxy: lastProxyUrlRef.current,
+        audioUrl: lastAudioUrlRef.current,
+      }).catch((e) => {
+        console.error("[playback] auto-retry reload failed", e);
+      });
+    }, delay);
+    return () => window.clearTimeout(t);
+    // `time` is read as a snapshot on purpose: the value when the break was
+    // detected is the position to resume from, and adding it as a dep would
+    // restart this effect (and its timer) on every heartbeat.
+    // notifyNewLoad is stable from usePlayback.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streamBroken, isLivePlayback, activeStreamUrl]);
+
+  // Restore the VOD retry budget once playback HOLDS, mirroring the live rule
+  // above and for the same reason: per-load budget on a long film is spent by
+  // unrelated hiccups hours apart. A stream that flaps never reaches 30 s of
+  // stable playback, so it still exhausts its attempts and surfaces the modal.
+  useEffect(() => {
+    if (isLivePlayback || !firstFrameSeen || streamBroken) return;
+    if (vodRetryRef.current === 0) return;
+    const t = window.setTimeout(() => { vodRetryRef.current = 0; }, LIVE_RETRY_RESET_MS);
     return () => window.clearTimeout(t);
   }, [isLivePlayback, firstFrameSeen, streamBroken]);
 
@@ -7281,11 +7448,25 @@ export default function App() {
     setAutoAdvanceCancelled(false);
     autoAdvanceStreakRef.current = 0;
     notifyNewLoad();
+    // A replay is issued from 0, so clear the "offset this load was issued
+    // with" fallback that the auto-retry and the recovery modal's Reload read.
+    // Left holding the previous pass's resume offset, a replay that dies before
+    // producing a frame gets retried at 01:20:00 of a film the user just asked
+    // to watch again from the top, landing them back on the end card.
+    lastStartSecondsRef.current = null;
     // In-place reload: activeTarget.id and activeStreamUrl are both unchanged,
     // so PlayerOverlay's per-file one-shots need an explicit re-arm signal.
     window.dispatchEvent(new Event("aura:player-reloaded"));
     try {
-      await invoke("load_video", { path: activeStreamUrl, startSeconds: null, contentHdrHint: lastHdrHintRef.current, httpProxy: lastProxyUrlRef.current });
+      await invoke("load_video", {
+        path: activeStreamUrl,
+        startSeconds: null,
+        contentHdrHint: lastHdrHintRef.current,
+        httpProxy: lastProxyUrlRef.current,
+        // Per-file, like http-proxy: omitting it clears mpv's `audio-files`,
+        // so replaying a 1080p+ trailer would come back silent.
+        audioUrl: lastAudioUrlRef.current,
+      });
     } catch (e) {
       console.error("[eos] replay failed", e);
     }
@@ -8269,12 +8450,14 @@ export default function App() {
       {/* Subtle "Reconnecting…" indicator shown while a live channel is
           mid-auto-retry — replaces the full broken-stream modal so the popup
           doesn't flash on/off between attempts. */}
-      {liveReconnecting && isPlayerActive && (
+      {(liveReconnecting || vodReconnecting) && isPlayerActive && (
         <div className="fixed inset-0 z-[10500] flex items-center justify-center pointer-events-none">
           <div className="flex items-center gap-2.5 px-4 py-2.5 rounded-xl
                           bg-black/70 backdrop-blur-md border border-white/12 text-white/85">
             <span className="w-3.5 h-3.5 rounded-full border-2 border-white/30 border-t-ln-accent animate-spin" />
-            <span className="text-[13px] font-medium">Reconnecting to channel…</span>
+            <span className="text-[13px] font-medium">
+              {liveReconnecting ? "Reconnecting to channel…" : "Reconnecting to stream…"}
+            </span>
           </div>
         </div>
       )}
@@ -8289,7 +8472,7 @@ export default function App() {
           the modal for as long as the switcher is up; picking a source clears
           streamBroken via notifyNewLoad, and closing without a pick correctly
           re-surfaces it (the stream genuinely is still broken). */}
-      {streamBroken && isPlayerActive && !liveReconnecting && !switcherOpen && (
+      {streamBroken && isPlayerActive && !liveReconnecting && !vodReconnecting && !switcherOpen && (
         <div
           // z-[10500] sits above PlayerOverlay's z-[9999] click-capture
           // layer AND its z-[10000] submenu portals. Without this,
@@ -8311,8 +8494,8 @@ export default function App() {
                     ? "This channel dropped its connection. Live streams can hiccup on the provider side — Aura already retried a couple of times. Reload to try again, or exit and pick another channel."
                     : "Aura couldn't open this channel (the provider returned an error — often a removed or temporarily-down channel). Aura already retried a couple of times. Reload to try again, or exit and pick another channel.")
                 : (firstFrameSeen
-                    ? "Aura hasn't received a playback heartbeat in 8 s. The most common cause is a transient DNS / TCP failure during a seek. Try reloading from your last position, or exit and pick another source."
-                    : "Aura couldn't open the stream. The addon's host may be down or unreachable (DNS / TCP failure). Try reloading, or exit and pick a different source.")}
+                    ? "Aura hasn't received a playback heartbeat in 8 s and retried a couple of times. The most common cause is a transient DNS / TCP failure during a seek. Try reloading from your last position, or exit and pick another source."
+                    : "Aura couldn't open the stream, and retrying a couple of times didn't help. The addon's host may be down or unreachable (DNS / TCP failure). Try reloading, or pick a different source.")}
             </p>
             <div className="flex justify-end gap-2">
               <button
@@ -8358,8 +8541,15 @@ export default function App() {
                   // resets `time` to 0. Sub-1s offsets aren't worth
                   // a "resume" — the seek-and-buffer dance would
                   // dominate the experience and the user wouldn't
-                  // notice the position difference anyway.
-                  const resumeAt = time > 1 ? time : null;
+                  // notice the position difference anyway. Falls back to the
+                  // offset this load was ISSUED with: on a load that never
+                  // produced a frame `time` is 0, and reloading from 0 threw
+                  // away the resume position the user had just accepted.
+                  const resumeAt = time > 1 ? time : lastStartSecondsRef.current;
+                  // Same reason as the auto-retry: this load is now the one
+                  // that was ISSUED with resumeAt, so a second press of Reload
+                  // inherits it instead of falling back to null.
+                  lastStartSecondsRef.current = resumeAt;
                   setStreamBroken(false);
                   notifyNewLoad();
                   // In-place reload: re-arm PlayerOverlay's per-file one-shots.
@@ -8370,6 +8560,7 @@ export default function App() {
                       startSeconds: resumeAt,
                       contentHdrHint: lastHdrHintRef.current,
                       httpProxy: lastProxyUrlRef.current,
+                      audioUrl: lastAudioUrlRef.current,
                     });
                   } catch (e) {
                     console.error("Reload failed", e);
@@ -8554,6 +8745,17 @@ export default function App() {
           // streak) never got a turn: the gate was dead code in exactly the
           // scenario it exists for.
           onSkipToCanon={nextUpInfo.canon ? onEosSkipToCanon : undefined}
+          // The canon episode itself, so the card can preview what a skip
+          // would jump to on hover.
+          canonEpisode={nextUpInfo.canon?.episode ?? null}
+          skipCount={nextUpInfo.canon?.skipped.length ?? 0}
+          // WHICH BUTTON THE UNATTENDED COUNTDOWN AIMS AT. This is the only
+          // thing the filler / recap preference decides now. Kind-specific, so
+          // "filler" does not silently jump a recap.
+          autoSkipsToCanon={
+            !!nextUpInfo.canon
+            && autoSkipApplies(loadAuraSettings().nextUpSkipFillerRecap, nextUpInfo.episode)
+          }
           onPlay={onEosPlayNext}
           onDismiss={onNextUpDismiss}
           autoAdvanceStreak={autoAdvanceStreakRef.current}
@@ -8596,6 +8798,12 @@ export default function App() {
             onPlayNext={onEosPlayNext}
             skipTag={nextEp && nextUpInfo?.canon ? formatEpisodeTag(nextUpInfo.canon.episode) : null}
             onSkipToCanon={onEosSkipToCanon}
+            canonEpisode={nextEp ? (nextUpInfo?.canon?.episode ?? null) : null}
+            skipCount={nextEp ? (nextUpInfo?.canon?.skipped.length ?? 0) : 0}
+            autoSkipsToCanon={
+              !!nextEp && !!nextUpInfo?.canon
+              && autoSkipApplies(loadAuraSettings().nextUpSkipFillerRecap, nextEp)
+            }
             arcNote={arcNote}
             autoAdvanceStreak={autoAdvanceStreakRef.current}
             autoAdvanceCancelled={autoAdvanceCancelled}
@@ -8649,29 +8857,32 @@ export default function App() {
           Strictly unmounted while a stream is active. */}
       {selectedMeta && !isPlayerActive && (
         <DetailView
+          // KEYED, and this is load-bearing rather than a micro-optimisation in
+          // reverse. Swapping `selectedMeta` in place (a Related-tab click, a
+          // Watch-Together openVideo, a notification deep-link onto an already
+          // open page) is a PROP change, so React reuses the same DetailViewBody
+          // and every mount-only initializer stays frozen on the previous
+          // title: activeVideo, panelMode, revealedSynopses, the openOnEpisode
+          // and highlight snapshots, plus EpisodesPanel's own season, grouping
+          // and four consume-once refs. The page then rendered as a hybrid of
+          // two shows, and Play on that page wrote the OLD episode id under the
+          // NEW series root. Resetting those by hand is not an option: half of
+          // them live in a child this component cannot reach, and the next
+          // field anyone adds would silently miss the list. `media_type` is in
+          // the key because isEpisodic, the meta URL and the stream fetch all
+          // fork on it, so a same-id type change has to remount too.
+          key={`${selectedMeta.media_type}:${selectedMeta.id}`}
           meta={selectedMeta}
           addons={addons}
           fromRect={selectedRect}
           partyStreamKey={reactiveParty.status === "connected" ? reactiveParty.roomStreamKey : null}
           onClose={closeDetail}
           onPlayStream={handlePlayStream}
-          onOpenTitle={(id, mediaType, name) => {
-            // Swap the open detail page to another title in place. `openDetail`
-            // is the same entry point a catalog card uses, so the poster and
-            // the rest fill in from the meta fetch exactly as they would there;
-            // the name is the only thing shown until it lands.
-            openDetail({
-              id,
-              name,
-              media_type: mediaType,
-              poster: null,
-            } as MetaPreview);
-          }}
           onSearchByName={(name) => {
-            // Cast/crew name click: flip to Home and queue the name as the
-            // search query. DetailView calls onClose() right after this, so
-            // setDeepLinkSearch must be called first to ensure HomeView's
-            // externalQuery effect picks it up on the next render.
+            // Cast / crew / staff / related-title click: flip to Home and queue
+            // the name as the search query. DetailView calls onClose() right
+            // after this, so setDeepLinkSearch must be called first to ensure
+            // HomeView's externalQuery effect picks it up on the next render.
             setActiveView("home");
             setActiveCatalog(null);
             setDeepLinkSearch(name);

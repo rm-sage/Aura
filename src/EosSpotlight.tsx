@@ -9,12 +9,19 @@
 // App.tsx). It REPLACES the false "Stream connection lost" modal at true
 // end-of-stream and gives the user one focused decision.
 //
-// Two states:
+// Three states, and the middle one is load-bearing:
 //   • NEXT-UP   — a next aired episode exists. Big thumbnail (series-art
 //                 fallback per Decision 6), SxxEyy tag, title, spoiler-
 //                 gated synopsis, primary "Play Next" (with the
 //                 NextUpCta-style countdown ring iff autoAdvance is on),
 //                 Replay, Exit, "Episodes" (opens the shared drawer).
+//   • RESOLVING - `loading` with no episode yet. The next-episode walk is
+//                 still out. This state exists because `loading` used to be
+//                 read only INSIDE the next-up branch, so a series whose
+//                 lookup had not returned fell through to the END-CARD and
+//                 announced a finale for the several seconds the addon
+//                 round-trip took, before swapping to the real Up Next card.
+//                 An end card is a CLAIM; do not make it without evidence.
 //   • END-CARD  — no next episode (movie finished / series finale / last
 //                 aired with a later season unaired). "You've finished
 //                 {title}", optional season note, Replay / Episodes
@@ -35,7 +42,7 @@ import { useWindowHidden } from "./windowVisibility";
 import ImageLoader from "./ImageLoader";
 import FillerRecapTags from "./FillerRecapTags";
 import type { LibraryItem, StreamEntry, VideoEntry } from "./types";
-import { formatEpisodeTag, episodeKindFlags } from "./nextUp";
+import { formatEpisodeTag, episodeKindFlags, episodeKindNoun } from "./nextUp";
 import { loadAuraSettings } from "./auraSettings";
 import { isEpisodeWatched, shouldBlurSynopsis } from "./episodeSpoilers";
 import { formatCountdown, useCountdownNow } from "./releaseCountdown";
@@ -79,6 +86,13 @@ interface Props {
    *  mirrors onPlayNext (counts toward the still-watching gate). Wired by App
    *  only when `skipTag` is set. */
   onSkipToCanon?: (auto: boolean) => void;
+  /** The canon episode a skip would land on, for the hover preview. */
+  canonEpisode?: VideoEntry | null;
+  /** How many episodes a skip would jump. */
+  skipCount?: number;
+  /** Should an UNATTENDED countdown press Skip rather than Play next? The
+   *  buttons are offered either way. */
+  autoSkipsToCanon?: boolean;
   /** Consecutive unattended auto-advances so far (App-tracked). At >=2, with the
    *  stillWatchingGate setting on, the auto-advance countdown is suppressed and a
    *  "Still watching?" confirm is shown instead, stopping an all-night chain. */
@@ -139,17 +153,21 @@ function NextAirCountdown({ targetMs }: { targetMs: number }) {
 
 function EosSpotlight({
   title, episode, stream, loading, isSeries, caughtUpUnaired, nextAirTargetMs,
-  seriesArt, libraryById, onPlayNext, skipTag, onSkipToCanon, autoAdvanceStreak,
+  seriesArt, libraryById, onPlayNext, skipTag, onSkipToCanon, canonEpisode,
+  skipCount, autoSkipsToCanon, autoAdvanceStreak,
   autoAdvanceCancelled,
   onReplay, onExit, onOpenEpisodes, onDismiss, episodesOpen, arcNote,
 }: Props) {
   const isNextUp = episode != null;
-  const { filler, recap } = episode
-    ? episodeKindFlags(episode)
-    : { filler: false, recap: false };
-  // Skip mode: the next episode is filler/recap and a canon target (with a
-  // stream) was pre-resolved. The skip becomes the primary action.
-  const skipMode = isNextUp && !!(skipTag && onSkipToCanon);
+  // Offered whenever a canon target exists; the preference only decides which
+  // button an unattended countdown presses. Mirrors NextUpCta exactly.
+  const canSkip = isNextUp && !!(skipTag && onSkipToCanon);
+  const skipMode = canSkip && autoSkipsToCanon === true;
+  // Kind of the LITERAL next episode, for the fallback button's label. Off
+  // `episode`, never the hover preview, so the noun cannot change under the
+  // cursor while the button still plays the same thing.
+  const playKindNoun = episode ? episodeKindNoun(episode) : null;
+  const [previewCanon, setPreviewCanon] = useState(false);
 
   // ── Countdown (NEXT-UP only) — mirrors NextUpCta's pattern exactly:
   // read autoAdvance settings once at mount, clamp delay to [5,30], arm
@@ -265,26 +283,46 @@ function EosSpotlight({
   // to the series art on misses. The previous behaviour swapped to
   // series art whenever blurUnwatchedThumbnails was on for an unwatched
   // episode; that path is removed — blur the still in place instead.
-  const epId = episode?.id ?? "";
+  // Hovering Skip fades in the canon episode's identity so the two are
+  // directly comparable before committing.
+  const shownEp = previewCanon && canonEpisode ? canonEpisode : episode;
+  const epId = shownEp?.id ?? "";
   const epWatched = isNextUp ? isEpisodeWatched(libraryById, epId) : false;
+  // The preview honours the spoiler blur on the CANON episode's own terms:
+  // previewing a skip target must not become a way to peek at its still.
   const blurThumb =
     isNextUp && settings.blurUnwatchedThumbnails && !epWatched;
   const thumbSrc = isNextUp
-    ? (episode!.thumbnail || seriesArt)
+    ? (shownEp!.thumbnail || seriesArt)
     : seriesArt;
 
-  const [revealed, setRevealed] = useState(false);
-  // Re-lock the reveal whenever the episode identity changes (a fresh
-  // EOS for a different episode shouldn't inherit the prior reveal).
-  useEffect(() => { setRevealed(false); }, [epId]);
-  const synopsis = (episode?.overview ?? "").trim();
+  // WHICH episode the user revealed, not merely THAT they revealed one.
+  //
+  // A boolean plus an `epId`-keyed reset effect was wrong in both directions
+  // once `epId` started tracking the hover preview: hovering Skip re-locked a
+  // synopsis the user had already revealed (and unhovering re-locked it again,
+  // so the reveal could not survive a mouse sweep across the buttons), while
+  // any state that DID survive would have carried a reveal from one episode
+  // onto a different one. Comparing ids answers both: the reveal belongs to the
+  // episode it was made on, follows it through preview swaps, and never
+  // transfers.
+  const [revealedId, setRevealedId] = useState<string | null>(null);
+  // Read off `shownEp`, like every other identity field here (thumbnail, tag,
+  // title, filler/recap pills). Reading `episode` while the gate below was
+  // evaluated against the PREVIEW's id paired the filler's plot with the canon
+  // episode's heading, and let a watched canon target strip the blur off an
+  // unwatched episode's synopsis.
+  const synopsis = (shownEp?.overview ?? "").trim();
   const synopsisBlurred =
     isNextUp &&
     !!synopsis &&
-    shouldBlurSynopsis(libraryById, epId, settings.blurEpisodeSynopsis, revealed);
+    shouldBlurSynopsis(libraryById, epId, settings.blurEpisodeSynopsis, revealedId === epId);
 
-  const tag = isNextUp ? formatEpisodeTag(episode!) : "";
-  const epTitle = (episode?.title ?? "").trim() || "Untitled episode";
+  const { filler, recap } = shownEp
+    ? episodeKindFlags(shownEp)
+    : { filler: false, recap: false };
+  const tag = isNextUp ? formatEpisodeTag(shownEp!) : "";
+  const epTitle = (shownEp?.title ?? "").trim() || "Untitled episode";
 
   // Shared button class fragments.
   const btnBase =
@@ -303,7 +341,7 @@ function EosSpotlight({
                  animate-[fade-in_160ms_ease-out]"
       role="dialog"
       aria-modal="true"
-      aria-label={isNextUp ? "Next episode" : "Playback finished"}
+      aria-label={isNextUp ? "Next episode" : loading ? "Finding the next episode" : "Playback finished"}
       onClick={(e) => e.stopPropagation()}
       onPointerDown={(e) => e.stopPropagation()}
       onMouseDown={(e) => e.stopPropagation()}
@@ -356,7 +394,7 @@ function EosSpotlight({
                 )}
                 {/* Filler / recap tag — surfaces what's actually next even
                     when the primary action is "Skip to canon". */}
-                <FillerRecapTags filler={filler} recap={recap} className="absolute top-2 right-2 z-10" />
+                <FillerRecapTags filler={filler} recap={recap} size="lg" className="absolute top-3 right-3 z-10" />
               </div>
 
               {/* ── Body ── */}
@@ -368,6 +406,22 @@ function EosSpotlight({
                   {epTitle}
                 </h2>
 
+                {/* What the skip COSTS, in the card rather than over it - the
+                    one fact the removed tooltip carried that the button label
+                    does not.
+                    UNCONDITIONAL, unlike NextUpCta's hover-gated twin, and the
+                    difference is layout not taste. This panel is CENTERED, so
+                    anything that appears on hover grows it about its middle and
+                    slides the very button the cursor is on by half the added
+                    height. Cursor leaves, line goes, button slides back, line
+                    returns: a flicker loop. NextUpCta is pinned by its BOTTOM
+                    edge and grows upward, so its buttons never move and it can
+                    afford to reveal this on hover. */}
+                {canSkip && skipCount != null && skipCount > 0 && (
+                  <p className="text-purple-300/75 text-[12px] leading-tight mt-1.5">
+                    Skipping marks {skipCount} episode{skipCount === 1 ? "" : "s"} watched
+                  </p>
+                )}
                 {/* Arc boundary. The episode you just finished ended a story
                     arc, so say which one, and which is next. Informational
                     only: the auto-advance countdown still runs. The next-arc
@@ -398,7 +452,7 @@ function EosSpotlight({
                     {synopsisBlurred && (
                       <button
                         type="button"
-                        onClick={() => setRevealed(true)}
+                        onClick={() => setRevealedId(epId)}
                         aria-label="Reveal episode synopsis"
                         className="absolute inset-0 cursor-pointer group"
                       >
@@ -430,21 +484,28 @@ function EosSpotlight({
 
                 {/* ── Actions ── */}
                 <div className="flex flex-wrap items-center gap-2.5 mt-5">
-                  {skipMode ? (
+                  {/* NO TOOLTIPS on these two, and no native `title` either.
+                      See the matching note in NextUpCta: a `pos="top"` bubble
+                      over the action row covered the still, the tag and the
+                      title of the episode being decided about, and only
+                      restated labels that already name their own target. */}
+                  {canSkip ? (
                     <>
-                      {/* Skip-to-canon primary (jumps past all upcoming
-                          filler/recap) + "play this anyway" fallback. */}
                       <button
                         type="button"
                         onClick={() => onSkipToCanon!(false)}
+                        onMouseEnter={() => setPreviewCanon(true)}
+                        onMouseLeave={() => setPreviewCanon(false)}
+                        onFocus={() => setPreviewCanon(true)}
+                        onBlur={() => setPreviewCanon(false)}
                         className={`relative overflow-hidden ${btnBase}
-                                    border border-ln-accent/45 bg-ln-accent/20 text-ln-accent
-                                    hover:bg-ln-accent/30 min-w-[170px]`}
+                                    border border-purple-400/45 bg-purple-500/20 text-purple-200
+                                    hover:bg-purple-500/30 min-w-[170px]`}
                       >
-                        {countdownActive && (
+                        {countdownActive && skipMode && (
                           <span
                             aria-hidden
-                            className="absolute inset-y-0 left-0 bg-ln-accent/25 transition-[width] duration-1000 ease-linear"
+                            className="absolute inset-y-0 left-0 bg-purple-400/25 transition-[width] duration-1000 ease-linear"
                             style={{ width: `${ringPct}%` }}
                           />
                         )}
@@ -452,14 +513,33 @@ function EosSpotlight({
                           <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                             <path d="M6 18l8.5-6L6 6v12zM16 6h2v12h-2z" />
                           </svg>
-                          {countdownActive
-                            ? `Skipping to canon in ${remaining}s — move to cancel`
-                            : `Skip to canon · ${skipTag}`}
+                          {countdownActive && skipMode
+                            ? `Skipping in ${remaining}s, move to cancel`
+                            : `Skip to ${skipTag}`}
                         </span>
                       </button>
                       {stream != null && (
-                        <button type="button" onClick={() => onPlayNext(false)} className={`${btnBase} ${btnGhost}`}>
-                          Play this anyway
+                        <button
+                          type="button"
+                          onClick={() => onPlayNext(false)}
+                          className={`relative overflow-hidden ${btnBase} ${btnGhost} min-w-[150px]`}
+                        >
+                          {countdownActive && !skipMode && (
+                            <span
+                              aria-hidden
+                              className="absolute inset-y-0 left-0 bg-white/12 transition-[width] duration-1000 ease-linear"
+                              style={{ width: `${ringPct}%` }}
+                            />
+                          )}
+                          <span className="relative">
+                            {countdownActive && !skipMode
+                              ? `Playing in ${remaining}s`
+                              // Names the kind of the LITERAL next episode -
+                              // the one this button plays - rather than the
+                              // generic "it". Read off `episode`, never the
+                              // hover preview, so the label is stable.
+                              : `Play ${playKindNoun ?? "it"} anyway`}
+                          </span>
                         </button>
                       )}
                     </>
@@ -527,6 +607,62 @@ function EosSpotlight({
               </div>
             </div>
           </>
+        ) : loading ? (
+          // ── RESOLVING ──
+          //
+          // The end card is a CLAIM ("You've finished Bleach", "Series
+          // finale", "Caught up"), and until the next-episode walk returns
+          // there is no evidence for it. `loading` was previously only read
+          // INSIDE the next-up branch, so a series whose lookup had not
+          // finished fell straight through to the end card and announced a
+          // finale for a few seconds before the real Up Next card replaced
+          // it. Nothing about the finished episode says which of the three
+          // outcomes applies, so this state says only what is true: we are
+          // still looking. Replay / Episodes / Exit stay live so a wedged
+          // lookup can never trap the user on a spinner.
+          <div className="flex flex-col items-center text-center py-4">
+            {thumbSrc && (
+              <div
+                className="relative w-[200px] rounded-2xl overflow-hidden mb-5
+                           bg-white/5 border border-white/10"
+                style={{ aspectRatio: "2 / 3" }}
+              >
+                <ImageLoader
+                  src={thumbSrc}
+                  alt=""
+                  className="absolute inset-0 w-full h-full"
+                  imgClassName="w-full h-full object-cover"
+                />
+              </div>
+            )}
+            <p className="text-white/45 text-[11px] font-mono uppercase tracking-[0.22em] mb-2">
+              {title}
+            </p>
+            <h2 className="text-white text-[22px] font-semibold leading-tight mb-6
+                           flex items-center gap-2.5">
+              <svg className="animate-spin" width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden>
+                <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2.5"
+                        strokeLinecap="round" strokeDasharray="32 16" />
+              </svg>
+              Finding the next episode…
+            </h2>
+            <div className="flex flex-wrap items-center justify-center gap-2.5">
+              <button type="button" onClick={onReplay} className={`${btnBase} ${btnGhost}`}>
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                  <path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z" />
+                </svg>
+                Replay
+              </button>
+              {isSeries && (
+                <button type="button" onClick={onOpenEpisodes} className={`${btnBase} ${btnGhost}`}>
+                  Episodes
+                </button>
+              )}
+              <button type="button" onClick={onExit} className={`${btnBase} ${btnGhost}`}>
+                Exit
+              </button>
+            </div>
+          </div>
         ) : (
           // ── END-CARD ──
           <div className="flex flex-col items-center text-center py-4">

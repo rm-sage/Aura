@@ -34,7 +34,7 @@ import ImageLoader from "./ImageLoader";
 import { shrinkPoster } from "./posterSize";
 import FillerRecapTags from "./FillerRecapTags";
 import type { LibraryItem, VideoEntry } from "./types";
-import { formatEpisodeTag, episodeKindFlags } from "./nextUp";
+import { formatEpisodeTag, episodeKindFlags, episodeKindNoun } from "./nextUp";
 import { loadAuraSettings } from "./auraSettings";
 import { shouldBlurThumbnail } from "./episodeSpoilers";
 import { getWatchState } from "./watchTogether/store";
@@ -58,6 +58,16 @@ interface Props {
    *  by App only when `skipTag` is set. `auto` is true when the countdown
    *  fired it unattended, false on a click. Mirrors EosSpotlight's contract. */
   onSkipToCanon?: (auto: boolean) => void;
+  /** The canon episode a skip would land on. Drives the hover preview, so the
+   *  user can see WHAT they are skipping to before committing. */
+  canonEpisode?: VideoEntry | null;
+  /** How many episodes a skip would jump. Turns the tooltip from a vague
+   *  promise into a countable one. */
+  skipCount?: number;
+  /** Should an UNATTENDED countdown press Skip rather than Play next? This is
+   *  the entirety of what the filler / recap preference now decides. Both
+   *  buttons are always offered either way. */
+  autoSkipsToCanon?: boolean;
   /** Play the (literal) next episode. In skip mode this is the "Play this
    *  anyway" fallback; otherwise the primary action. `auto` as above. */
   onPlay: (auto: boolean) => void;
@@ -84,26 +94,41 @@ interface Props {
 }
 
 export default function NextUpCta({
-  episode, libraryById, loading, noStream, skipTag, onSkipToCanon, onPlay, onDismiss, arcNote,
+  episode, libraryById, loading, noStream, skipTag, onSkipToCanon, canonEpisode,
+  skipCount, autoSkipsToCanon, onPlay, onDismiss, arcNote,
   autoAdvanceStreak, autoAdvanceCancelled,
 }: Props) {
-  const tag = formatEpisodeTag(episode);
-  const title = (episode.title ?? "").trim() || "Untitled episode";
-  const { filler, recap } = episodeKindFlags(episode);
+  // Hover preview state: which episode's identity the card is showing.
+  const [previewCanon, setPreviewCanon] = useState(false);
   // Anti-spoiler blur. This card shows the NEXT episode's still, which is
   // exactly the thing "Blur unwatched episode thumbnails" exists to hide, but
   // it was the one next-up surface that never applied the gate: the Detail
   // list, the in-player episode drawer and the EOS Spotlight all did, so the
   // setting looked like it was being ignored. Routed through the shared
   // episodeSpoilers predicate so all four stay in lock-step.
-  const blurThumb = shouldBlurThumbnail(
-    libraryById,
-    episode.id,
-    loadAuraSettings().blurUnwatchedThumbnails === true,
+  // A skip is OFFERED whenever the next episode is filler or recap and a canon
+  // target with a stream was pre-resolved. Offering it is independent of the
+  // preference: the button is always there so any single episode can be
+  // overridden either way.
+  const canSkip = !!(skipTag && onSkipToCanon);
+  // Which button an unattended countdown presses. Previously this was `canSkip`
+  // itself, so merely HAVING a canon target meant the countdown skipped, and
+  // the user had no say per episode.
+  const skipMode = canSkip && autoSkipsToCanon === true;
+  // Kind of the LITERAL next episode, for the fallback button's label. Read off
+  // `episode` and never off `shown`, so hovering Skip (which swaps the body to
+  // the canon episode) cannot relabel a button that still plays the filler.
+  const playKindNoun = episodeKindNoun(episode);
+
+  // The identity shown in the body. Hovering Skip fades in the canon episode
+  // so the two are directly comparable before committing.
+  const shown = previewCanon && canonEpisode ? canonEpisode : episode;
+  const shownTag = formatEpisodeTag(shown);
+  const shownTitle = (shown.title ?? "").trim() || "Untitled episode";
+  const shownKinds = episodeKindFlags(shown);
+  const shownBlur = shouldBlurThumbnail(
+    libraryById, shown.id, loadAuraSettings().blurUnwatchedThumbnails === true,
   );
-  // Skip mode: the next episode is filler/recap and a canon target (with a
-  // stream) was pre-resolved. The skip is the primary action.
-  const skipMode = !!(skipTag && onSkipToCanon);
 
   // ── Opt-in auto-advance ─────────────────────────────────────────────
   // When the user has flipped `autoAdvanceNextEpisode` ON in Settings,
@@ -213,10 +238,11 @@ export default function NextUpCta({
     <div
       // Z-INDEX 10001 (above PlayerOverlay's 9999) so the CTA paints
       // and receives clicks ahead of the overlay's invisible layer.
-      className="fixed bottom-28 right-6 z-[10001] pointer-events-auto
-                 bg-black/80 backdrop-blur-2xl border border-white/15
-                 rounded-2xl shadow-[0_24px_64px_rgba(0,0,0,0.65)]
-                 p-3 flex items-stretch gap-3 max-w-[420px] w-[420px]
+      // aura-float-glass rather than a hand-rolled bg + blur + border + shadow:
+      // this is a floating surface over video and the app has one recipe for
+      // those now, including the opaque fallback for the three zero-blur themes.
+      className="aura-float-glass fixed bottom-28 right-6 z-[10001] pointer-events-auto
+                 rounded-2xl p-3 flex items-stretch gap-3 w-[420px]
                  animate-[next-up-rise_220ms_ease-out]"
       role="dialog"
       aria-label="Next episode available"
@@ -230,9 +256,13 @@ export default function NextUpCta({
         className="relative flex-shrink-0 w-[140px] rounded-lg overflow-hidden bg-white/5 border border-white/8"
         style={{ aspectRatio: "16 / 9" }}
       >
-        {episode.thumbnail ? (
+        {shown.thumbnail ? (
           <ImageLoader
-            src={shrinkPoster(episode.thumbnail, 480)}
+            // Keyed on the id so a preview swap remounts the loader and the
+            // fade actually plays instead of the browser reusing the decoded
+            // image in place.
+            key={shown.id}
+            src={shrinkPoster(shown.thumbnail, 480)}
             alt=""
             className="absolute inset-0 w-full h-full"
             imgClassName="w-full h-full object-cover"
@@ -241,7 +271,10 @@ export default function NextUpCta({
             // relative to the image rather than merely equal in pixels. The
             // slight scale-up hides the soft edge the blur leaves at the
             // container border.
-            imgStyle={blurThumb
+            // The preview respects the spoiler blur for the CANON episode on
+            // its own terms: skipping to an unwatched episode must not become
+            // a way to peek at its still.
+            imgStyle={shownBlur
               ? { filter: "blur(8px) saturate(115%)", transform: "scale(1.08)" }
               : undefined}
           />
@@ -254,15 +287,16 @@ export default function NextUpCta({
         )}
         {/* Filler / recap tag — top-right of the thumbnail (mirrors the
             episode list). Shows what's actually next even in skip mode. */}
-        <FillerRecapTags filler={filler} recap={recap} className="absolute top-1.5 right-1.5 z-10" />
+        <FillerRecapTags filler={shownKinds.filler} recap={shownKinds.recap} className="absolute top-1.5 right-1.5 z-10" />
       </div>
 
       {/* ── Body ── */}
       <div className="flex-1 min-w-0 flex flex-col justify-between gap-1.5">
         <div>
           <div className="flex items-center justify-between gap-2">
-            <span className="text-white/45 text-[10.5px] font-mono uppercase tracking-[0.18em]">
-              Next up · {tag}
+            <span className={`text-[10.5px] font-mono uppercase tracking-[0.18em] ${
+              previewCanon && canonEpisode ? "text-purple-300/80" : "text-white/45"}`}>
+              {previewCanon && canonEpisode ? "Skips to" : "Next up"} · {shownTag}
             </span>
             <button
               type="button"
@@ -276,9 +310,23 @@ export default function NextUpCta({
               </svg>
             </button>
           </div>
-          <p className="text-white/95 text-sm font-medium leading-tight mt-0.5 line-clamp-2">
-            {title}
+          <p
+            key={shown.id}
+            className="aura-canon-fade text-white/95 text-sm font-medium leading-tight mt-0.5 line-clamp-2"
+          >
+            {shownTitle}
           </p>
+          {/* What the skip COSTS, shown in the card rather than over it. This
+              is the one fact the removed tooltip carried that the button label
+              does not: a skip marks everything it passes as watched, writes
+              History rows and (on a click) scrobbles them. It appears while
+              the user previews the skip, which is exactly when it matters, and
+              takes the place the preview already reserved. */}
+          {previewCanon && canonEpisode && skipCount != null && skipCount > 0 && (
+            <p className="text-purple-300/75 text-[11px] leading-tight mt-1">
+              Marks {skipCount} episode{skipCount === 1 ? "" : "s"} skipped
+            </p>
+          )}
           {/* Arc boundary. Additive to the SxxEyy tag above, not a replacement:
               the user still needs to know which episode is queued. The next-arc
               name sits on its own line so the two facts (arc ended / arc next)
@@ -293,93 +341,105 @@ export default function NextUpCta({
           )}
         </div>
 
-        {skipMode ? (
-          // ── Skip-to-canon primary + "play this anyway" fallback ──
-          <div className="flex flex-col gap-1">
-            <button
-              type="button"
-              onClick={() => onSkipToCanon!(false)}
-              className="relative w-full px-3 py-1.5 rounded-lg overflow-hidden
-                         border border-ln-accent/45 bg-ln-accent/20
-                         text-ln-accent text-[12px] font-semibold tracking-wide
-                         hover:bg-ln-accent/30 transition-colors
-                         flex items-center justify-center gap-2"
-            >
-              {countdownActive && (
-                <span
-                  aria-hidden
-                  className="absolute inset-y-0 left-0 bg-ln-accent/25 transition-[width] duration-1000 ease-linear"
-                  style={{ width: `${fillPct}%` }}
-                />
-              )}
-              <span className="relative flex items-center gap-2">
-                <SkipIcon />
-                {countdownActive
-                  ? `Skipping to canon in ${remaining}s — move to cancel`
-                  : `Skip to canon · ${skipTag}`}
-              </span>
-            </button>
-            {!noStream && (
-              <button
-                type="button"
-                onClick={() => onPlay(false)}
-                className="text-white/45 hover:text-white/85 text-[11px] tracking-wide
-                           transition-colors text-center py-0.5"
-              >
-                Play this anyway
-              </button>
-            )}
-          </div>
-        ) : noStream ? (
+        {noStream && !canSkip ? (
           <p className="text-amber-300/90 text-[11px] leading-snug">
             No streams found for this episode. Try opening it from the
             episode list.
           </p>
         ) : (
-          <button
-            type="button"
-            disabled={loading}
-            onClick={() => onPlay(false)}
-            className="relative w-full px-3 py-1.5 rounded-lg overflow-hidden
-                       border border-ln-accent/45 bg-ln-accent/20
-                       text-ln-accent text-[12px] font-semibold tracking-wide
-                       hover:bg-ln-accent/30 transition-colors
-                       disabled:opacity-55 disabled:cursor-progress
-                       flex items-center justify-center gap-2"
-          >
-            {countdownActive && (
-              <span
-                aria-hidden
-                className="absolute inset-y-0 left-0 bg-ln-accent/25 transition-[width] duration-1000 ease-linear"
-                style={{ width: `${fillPct}%` }}
-              />
+          // BOTH ACTIONS, ALWAYS, whenever a skip is available. The card used
+          // to show one primary whose meaning flipped based on a setting, so
+          // the user could neither see what would be skipped nor choose per
+          // episode. Now Skip and Play sit side by side and the preference only
+          // decides which one an unattended countdown presses.
+          // NO TOOLTIPS on either button, and no native `title` either. This
+          // card is pinned to the bottom-right corner over live video, and a
+          // `pos="top"` tooltip on a 420px-wide button covered the thumbnail,
+          // the episode tag and the title of the very episode the user was
+          // deciding about. The buttons name their own target ("Skip to
+          // S05E23", "Play filler anyway"), so the hover text was restating the
+          // label on top of the facts that justify it. Same in EosSpotlight.
+          //
+          // Hovering Skip still previews the canon episode in the body above,
+          // which is the part that was worth having.
+          <div className="flex flex-col gap-1.5">
+            {canSkip && (
+              <button
+                type="button"
+                onClick={() => onSkipToCanon!(false)}
+                onMouseEnter={() => setPreviewCanon(true)}
+                onMouseLeave={() => setPreviewCanon(false)}
+                onFocus={() => setPreviewCanon(true)}
+                onBlur={() => setPreviewCanon(false)}
+                className="relative w-full px-3 py-1.5 rounded-lg overflow-hidden
+                           border border-purple-400/45 bg-purple-500/20
+                           text-purple-200 text-[12px] font-semibold tracking-wide
+                           hover:bg-purple-500/30 transition-colors
+                           flex items-center justify-center gap-2"
+              >
+                {countdownActive && skipMode && (
+                  <span
+                    aria-hidden
+                    className="absolute inset-y-0 left-0 bg-purple-400/25 transition-[width] duration-1000 ease-linear"
+                    style={{ width: `${fillPct}%` }}
+                  />
+                )}
+                <span className="relative flex items-center gap-2">
+                  <SkipIcon />
+                  {countdownActive && skipMode
+                    ? `Skipping in ${remaining}s, move to cancel`
+                    : `Skip to ${skipTag}`}
+                </span>
+              </button>
             )}
-            {loading ? (
-              <>
-                <svg
-                  className="animate-spin"
-                  width="13"
-                  height="13"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  aria-hidden
-                >
-                  <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeDasharray="32 16" />
-                </svg>
-                Resolving stream…
-              </>
-            ) : countdownActive ? (
-              <span className="relative flex items-center gap-2">
-                <PlayIcon />
-                Playing next in {remaining}s — move to cancel
-              </span>
-            ) : (
-              <>
-                <PlayIcon />
-                Play next episode
-              </>
+            {!noStream && (
+              <button
+                type="button"
+                disabled={loading}
+                onClick={() => onPlay(false)}
+                className={`relative w-full px-3 py-1.5 rounded-lg overflow-hidden
+                           border text-[12px] font-semibold tracking-wide
+                           transition-colors flex items-center justify-center gap-2
+                           disabled:opacity-55 disabled:cursor-progress ${
+                  canSkip
+                    // Secondary when a skip is on offer: two equally loud
+                    // buttons would make the choice harder, not easier.
+                    ? "border-white/15 bg-white/8 text-white/80 hover:bg-white/12 hover:text-white"
+                    : "border-ln-accent/45 bg-ln-accent/20 text-ln-accent hover:bg-ln-accent/30"
+                }`}
+              >
+                {countdownActive && !skipMode && (
+                  <span
+                    aria-hidden
+                    className="absolute inset-y-0 left-0 bg-ln-accent/25 transition-[width] duration-1000 ease-linear"
+                    style={{ width: `${fillPct}%` }}
+                  />
+                )}
+                {loading ? (
+                  <>
+                    <svg className="animate-spin" width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden>
+                      <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeDasharray="32 16" />
+                    </svg>
+                    Resolving stream...
+                  </>
+                ) : countdownActive && !skipMode ? (
+                  <span className="relative flex items-center gap-2">
+                    <PlayIcon />
+                    Playing next in {remaining}s, move to cancel
+                  </span>
+                ) : (
+                  <>
+                    <PlayIcon />
+                    {/* Names the kind of the episode this button would actually
+                        play - the LITERAL next one - not the run as a whole. A
+                        skip can pass several episodes of mixed kinds, but this
+                        button only ever plays the first of them. */}
+                    {canSkip ? `Play ${playKindNoun ?? "it"} anyway` : "Play next episode"}
+                  </>
+                )}
+              </button>
             )}
-          </button>
+          </div>
         )}
       </div>
     </div>

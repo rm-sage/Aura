@@ -1606,33 +1606,11 @@ select,
   }
 
   /* ---------------------------------------------------------------- */
-  /* SpectralPulse — three orbiting blurred discs + breathing wrapper. */
-  /* Lives in the stream-loading panel and inline as a "still         */
-  /* discovering" badge once partial results arrive.                  */
-  /*                                                                  */
-  /* Previously these keyframes were declared inline via a React-     */
-  /* rendered `<style>` tag inside the SpectralPulse component.       */
-  /* React 19's automatic stylesheet management (the new <style>      */
-  /* hoisting + deduplication) broke that binding — the keyframe      */
-  /* rules ended up out of scope by the time the animation tried to   */
-  /* resolve them, so all three discs sat static at the centre and    */
-  /* their colours blended into a single bluish blob.                 */
-  /* ---------------------------------------------------------------- */
-  @keyframes spectral-orbit {
-    0%   { transform: rotate(0deg)   translateX(var(--orbit)) rotate(0deg); }
-    100% { transform: rotate(360deg) translateX(var(--orbit)) rotate(-360deg); }
-  }
-  @keyframes spectral-breathe {
-    0%, 100% { transform: scale(0.85); }
-    50%      { transform: scale(1.15); }
-  }
-
-  /* ---------------------------------------------------------------- */
   /* Notification preview card — the redesigned popup that replaced  */
   /* the older speech-bubble shape. Slides up from the bell with a    */
   /* small overshoot, idle-breathes via a subtle accent glow, and    */
   /* exits down + fade. Keyframes live here (not inline) for the     */
-  /* same React-19 hoisting reason SpectralPulse needed.              */
+  /* same React-19 hoisting reason the old orbit keyframes needed.    */
   /* ---------------------------------------------------------------- */
   @keyframes aura-popup-card-enter {
     0%   { opacity: 0; transform: translateY(8px) scale(0.94); }
@@ -2398,8 +2376,12 @@ html[data-aura-idle="true"] .aura-buffering-pulse {
   /* Release the GPU compositor layers these decorative elements hold:
      will-change ignores animation-play-state, so without this the layers stay
      resident while idle/minimized. They re-promote on the next frame after
-     restore. (Progress indicators like SpectralPulse / spinners deliberately
-     keep animating so a backgrounded scan still reads as live.) */
+     restore. (Cheap progress indicators like the spinners and skeleton
+     shimmers deliberately keep animating so a backgrounded scan still reads
+     as live. That licence does NOT extend to the stream panel's canvas
+     tracer, which gates itself in JS via useWindowHidden: CSS cannot pause a
+     canvas, and an unfocused borderless WebView2 is not throttled by
+     Chromium.) */
   will-change: auto !important;
 }
 
@@ -2596,4 +2578,261 @@ html[data-reduced-motion="true"] .aura-synopsis-swap {
 html[data-reduced-motion="true"] .aura-poster-retry-dot {
   animation: none;
   opacity: 0.55;
+}
+
+/* ------------------------------------------------------------------ */
+/* FLOATING HOME CHROME                                                */
+/*                                                                    */
+/* The search bar and the three side controls used to sit on opaque    */
+/* furniture: a full-width header strip reserving its own band, and    */
+/* three 40px bubbles pinned to arbitrary offsets. They now float over */
+/* the catalog and refract it.                                        */
+/*                                                                    */
+/* Built on the .aura-hud-surface reasoning, NOT .glass-panel-elevated:*/
+/* --ln-glass-3 is tinted per theme, and over a wide element sitting   */
+/* on bright key art that tint reads as an accent-coloured fill. A     */
+/* baked dark gradient guarantees a legible neutral base whatever is   */
+/* behind it, and the blur plus saturate supply the refraction.        */
+/* ------------------------------------------------------------------ */
+
+.aura-float-glass {
+  background:
+    linear-gradient(rgba(10, 12, 16, 0.62), rgba(10, 12, 16, 0.72)),
+    linear-gradient(rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.03));
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(var(--ln-blur-elev, 24px)) saturate(1.6);
+  -webkit-backdrop-filter: blur(var(--ln-blur-elev, 24px)) saturate(1.6);
+  /* The lit top edge is what sells refraction rather than a flat tint: a
+     bright inset hairline along the top, a dark one along the bottom, and
+     a soft drop shadow so the element reads as sitting ABOVE the art. */
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.14),
+    inset 0 -1px 0 0 rgba(0, 0, 0, 0.35),
+    0 10px 34px -12px rgba(0, 0, 0, 0.72);
+}
+/* Zero-blur themes have nothing to refract with, so they go opaque rather
+   than leaving a translucent bar see-through over bright art. */
+html[data-theme="midnight"] .aura-float-glass,
+html[data-theme="contrast"] .aura-float-glass,
+html[data-theme="contrast-azure"] .aura-float-glass {
+  background: var(--ln-panel-solid, #0b0d12);
+}
+
+/* The search bar's own field. Slightly lighter than the shell it sits in so
+   the input reads as an input, and the placeholder keeps a text shadow
+   because the bar can be over a pale frame. */
+.aura-search-float input::placeholder {
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+}
+
+/* Nav rail, short-window reflow. See the note on the <aside> in
+   NavSidebar.tsx: the two top side pills are `fixed z-30` directly over this
+   rail's x-range, so on a short window the vertically-centred nav rows drift
+   up underneath them and the Watch Party pill swallows the Home row's clicks.
+
+   Below the threshold the rail stretches and centres inside the band the pills
+   leave free instead of inside the whole body: 130px reserved at the top (the
+   pill stack's bottom edge, 44 + 2*40 + 6) and 52px at the bottom (the
+   Notifications pill, bottom-3 + 40). Deliberately a max-height query rather
+   than an unconditional padding change, so at normal window heights the rail
+   sits exactly where it always has.
+
+   Threshold: the overlap begins at roughly `nav content height + 260`, which
+   measures out near 776px; 800px leaves a little slack. */
+@media (max-height: 800px) {
+  .aura-nav-rail {
+    align-self: stretch;
+    justify-content: center;
+    padding-top: 130px;
+    padding-bottom: 52px;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Side pills. These replace the round bubbles and are sized to the nav */
+/* column so the top group, the menu and the bottom pill share one      */
+/* left edge and one width.                                            */
+/*                                                                    */
+/* No .aura-bell-hover here: that rotates the whole control by up to 10 */
+/* degrees, which reads as playful on a 40px circle and as broken on a  */
+/* 164px labelled pill. The replacement is a lift plus a brightening    */
+/* rim, which is the same language the nav rows already use.            */
+/* ------------------------------------------------------------------ */
+.aura-side-pill {
+  transition:
+    transform 160ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    background-color 160ms ease,
+    border-color 160ms ease,
+    box-shadow 160ms ease;
+}
+.aura-side-pill:hover {
+  transform: translateY(-1px);
+  border-color: rgba(255, 255, 255, 0.22);
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.16),
+    0 12px 30px -14px rgba(0, 0, 0, 0.8);
+}
+.aura-side-pill:active { transform: translateY(0) scale(0.985); }
+/* ACTIVE (panel open / in a party). This lives here rather than as a
+   `ring-1 ring-ln-accent/50` utility on the button, and the reason is the
+   documented .aura-float-glass shorthand trap: Tailwind's ring emits into
+   `box-shadow` at one-class specificity, and .aura-float-glass sets box-shadow
+   at the same specificity but LATER in the sheet, so it won and the ring never
+   rendered at all. Every side pill looked identical open and closed.
+
+   Composed with the glass shadow instead of replacing it, so the lit top edge
+   and the drop shadow survive. Declared after :hover (equal specificity, so
+   order decides) and the :hover pairing is spelled out explicitly, otherwise
+   hovering an open pill drops the accent ring again. */
+.aura-side-pill.is-active,
+.aura-side-pill.is-active:hover {
+  border-color: rgb(var(--ln-accent-rgb) / 0.5);
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.16),
+    inset 0 -1px 0 0 rgba(0, 0, 0, 0.35),
+    0 0 0 1px rgb(var(--ln-accent-rgb) / 0.5),
+    0 10px 34px -12px rgba(0, 0, 0, 0.72);
+}
+.aura-side-pill.is-active:hover { transform: translateY(-1px); }
+
+/* Unread notifications: the pill breathes a soft accent GLOW.
+ *
+ * The first cut used `box-shadow: 0 0 0 4px`, which is spread with no blur, so
+ * it drew a hard-edged ring that snapped in and out and read as a selection
+ * outline rather than as an alert. This is the same idea done as light: a wide
+ * blur with almost no spread, so the accent bleeds off the pill's edge and
+ * fades rather than terminating. Slower too, because a glow that pulses at a
+ * ring's tempo just looks like a ring again.
+ *
+ * Only box-shadow and (below) a static overlay, so this still composites
+ * without layout or paint work on the pill's contents. */
+@keyframes aura-pill-alert {
+  0%, 100% {
+    box-shadow:
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.10),
+      0 0 10px 0 rgb(var(--ln-accent-rgb) / 0.16),
+      0 0 22px 2px rgb(var(--ln-accent-rgb) / 0.07),
+      0 8px 26px -14px rgba(0, 0, 0, 0.75);
+  }
+  50% {
+    box-shadow:
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.16),
+      0 0 18px 1px rgb(var(--ln-accent-rgb) / 0.34),
+      0 0 40px 6px rgb(var(--ln-accent-rgb) / 0.16),
+      0 8px 26px -14px rgba(0, 0, 0, 0.75);
+  }
+}
+.aura-pill-alert {
+  animation: aura-pill-alert 3.6s ease-in-out infinite;
+  position: relative;
+}
+/* A faint grain over the pill while it is glowing. A pure gradient glow on a
+ * flat surface bands visibly on a dark UI; the noise breaks the banding up and
+ * gives the light something to sit in. Static, not animated: the movement is
+ * the glow's job. Same fractalNoise + overlay recipe the detail-page backdrop
+ * skeleton uses, so this is the app's existing texture rather than a new one. */
+.aura-pill-alert::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0.07;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* A brand-new arrival: one short pop, twice, then it settles into the
+   breathing rim above. Distinct from the steady alert so "something just
+   landed" and "something is still unread" do not look the same. */
+@keyframes aura-pill-arrive {
+  0%   { transform: translateY(0)    scale(1); }
+  35%  { transform: translateY(-2px) scale(1.02); }
+  100% { transform: translateY(0)    scale(1); }
+}
+.aura-pill-arrive { animation: aura-pill-arrive 720ms cubic-bezier(0.34, 1.56, 0.64, 1) 2; }
+
+/* Connected watch party: a slow accent sweep along the pill's own rim,
+   which is the calmest way to say "this is live" on a persistent control. */
+@keyframes aura-pill-live {
+  0%, 100% { opacity: 0.35; }
+  50%      { opacity: 0.9; }
+}
+.aura-pill-live-dot { animation: aura-pill-live 2.2s ease-in-out infinite; }
+
+/* Both global suppression gates. Every decorative loop must be listed in
+   BOTH: reduced-motion is an accessibility contract, and the idle gate
+   exists because Chromium does not throttle a merely-unfocused transparent
+   window, so an unlisted loop burns GPU behind other apps. */
+html[data-reduced-motion="true"] .aura-pill-alert,
+html[data-reduced-motion="true"] .aura-pill-arrive,
+html[data-reduced-motion="true"] .aura-pill-live-dot {
+  animation: none;
+}
+/* Keep the SIGNAL, drop the MOTION: a held mid-cycle glow, so an unread pill
+   still reads as unread without breathing. Same shape as the poster-retry
+   dot's reduced-motion rule, which settles at a static opacity rather than
+   vanishing. */
+html[data-reduced-motion="true"] .aura-pill-alert {
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.14),
+    0 0 16px 1px rgb(var(--ln-accent-rgb) / 0.26),
+    0 8px 26px -14px rgba(0, 0, 0, 0.75);
+}
+html[data-aura-idle="true"] .aura-pill-alert,
+html[data-aura-idle="true"] .aura-pill-arrive,
+html[data-aura-idle="true"] .aura-pill-live-dot {
+  animation-play-state: paused !important;
+  will-change: auto !important;
+}
+
+/* ------------------------------------------------------------------ */
+/* Detail page back / close controls.                                  */
+/*                                                                    */
+/* Same glass as every other floating element, plus motion, because    */
+/* these two sit on artwork with nothing around them and had no hover  */
+/* feedback beyond a colour change. Back slides toward where it goes;  */
+/* close rotates, which is the one gesture that reads as dismissal.    */
+/* ------------------------------------------------------------------ */
+.aura-nav-back,
+.aura-nav-close {
+  transition:
+    transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    border-color 180ms ease,
+    box-shadow 180ms ease,
+    color 150ms ease;
+}
+.aura-nav-back:hover  { transform: translateX(-2px); border-color: rgba(255, 255, 255, 0.24); }
+.aura-nav-back:active { transform: translateX(-1px) scale(0.97); }
+.aura-nav-back:hover .aura-nav-back-glyph { transform: translateX(-2px); }
+.aura-nav-back-glyph  { transition: transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1); }
+
+.aura-nav-close:hover  { transform: scale(1.06); border-color: rgba(255, 255, 255, 0.24); }
+.aura-nav-close:active { transform: scale(0.94); }
+.aura-nav-close:hover .aura-nav-close-glyph { transform: rotate(90deg); }
+.aura-nav-close-glyph  { transition: transform 220ms cubic-bezier(0.34, 1.56, 0.64, 1); }
+
+html[data-reduced-motion="true"] .aura-nav-back,
+html[data-reduced-motion="true"] .aura-nav-close,
+html[data-reduced-motion="true"] .aura-nav-back-glyph,
+html[data-reduced-motion="true"] .aura-nav-close-glyph {
+  transition: none;
+  transform: none;
+}
+
+/* ------------------------------------------------------------------ */
+/* Next-Up canon preview.                                              */
+/*                                                                    */
+/* Hovering the skip button swaps the card's episode identity for the  */
+/* one the skip would land on. A slow crossfade rather than an instant */
+/* swap, because the point is to let the user COMPARE the two, and an  */
+/* instant swap on a 140px thumbnail just reads as a flicker.          */
+/* ------------------------------------------------------------------ */
+.aura-canon-fade { animation: aura-canon-fade-in 420ms ease-out both; }
+@keyframes aura-canon-fade-in {
+  from { opacity: 0; transform: translateY(3px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+html[data-reduced-motion="true"] .aura-canon-fade {
+  animation: none;
 }

@@ -1782,6 +1782,9 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         // the UI. Position, not log text, is the trigger: mpv rewords its
         // messages between builds, and a silent 5-minute skip is the thing that
         // actually needs reporting.
+        // Set and read ONLY on a clean tick (see the update site): any seek,
+        // load or EOF clears it so a jump the player asked for is never
+        // measured as one it did not.
         let mut last_pos: Option<(f64, Instant)> = None;
         // A damage line seen recently, used only to LABEL a jump we already
         // detected. Short-lived so it can never explain an unrelated later one.
@@ -2116,6 +2119,28 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                     && !seeking
                     && !tick.seek && !tick.restart && !tick.started && !tick.loaded && !tick.ended
                     && last_transition.elapsed() >= CACHE_SETTLE;
+                // A NON-CLEAN TICK DESTROYS THE BASELINE. This is not an
+                // optimisation, it is the correctness rule, and leaving it out
+                // made every deliberate seek longer than the allowance report
+                // itself as stream damage.
+                //
+                // The mechanism: `clean` is false for the whole seek and for
+                // CACHE_SETTLE after it, and the old update rule
+                // (`if clean || last_pos.is_none()`) therefore held the
+                // PRE-seek position across the entire seek. The first clean
+                // tick afterwards then compared a pre-seek 60.0 against a
+                // post-seek 149.0 and, seeing no SEEK event in THAT tick,
+                // called an 89-second AniSkip OP jump an unexplained one. Every
+                // Bleach episode skipped its opening and then apologised for a
+                // damaged file; a manual scrub past ~10 s did the same.
+                //
+                // Clearing here means the next clean tick re-baselines from the
+                // post-seek position instead of measuring across the seek.
+                // Detection is untouched: a demuxer resync from real damage
+                // raises no SEEK, so it still lands inside a clean run.
+                if !clean {
+                    last_pos = None;
+                }
                 if let (Some((prev_pos, prev_at)), true) = (last_pos, clean) {
                     let wall = prev_at.elapsed().as_secs_f64();
                     // 4x wall time absorbs speed-up and any pump hitch; the
@@ -2140,7 +2165,11 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         emit("stream-anomaly", serde_json::Value::Object(m));
                     }
                 }
-                if clean || last_pos.is_none() {
+                // Only a clean tick may set the baseline. Seeding from a
+                // non-clean one (the old `|| last_pos.is_none()`) re-armed it
+                // mid-seek off a time-pos mpv had not yet moved, which is the
+                // same stale reading under a new timestamp.
+                if clean {
                     last_pos = Some((now_pos, Instant::now()));
                 }
             }
