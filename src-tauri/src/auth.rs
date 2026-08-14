@@ -133,10 +133,56 @@ fn store_session<R: Runtime>(
     }
     // In release builds the param is unused.
     let _ = app;
+    // Warm rather than invalidate: the value just written IS the value, so the
+    // next read costs nothing.
+    session_cache_put(Some(session.clone()));
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// In-process session cache.
+//
+// `load_session` is a KEYRING read (a DPAPI unwrap plus a credential-vault
+// RPC), and the active scope is something almost every surface needs, so the
+// call count is driven by UI shape rather than by anything this module
+// controls. It reached three digits per season open once a list row started
+// asking for it. The frontend fan-out is fixed at its own layer, but this makes
+// the command cheap regardless of what a future caller does, and de-costs
+// `fetch_stremio_account` / `backfill_user_id` / `sync::current_scope` too.
+//
+// One signed-in account at a time, so a single slot is enough, and every writer
+// in this file funnels through `store_session` / `delete_session`, so
+// invalidation is total.
+//
+// Only SUCCESSFUL reads are cached. A momentarily locked or unavailable vault
+// must be retried, never remembered: the boot path distinguishes "no session"
+// from "could not read the session" and says something different for each.
+// ---------------------------------------------------------------------------
+static SESSION_CACHE: std::sync::Mutex<Option<Option<UserSession>>> =
+    std::sync::Mutex::new(None);
+
+fn session_cache_get() -> Option<Option<UserSession>> {
+    SESSION_CACHE.lock().ok().and_then(|g| g.clone())
+}
+
+fn session_cache_put(v: Option<UserSession>) {
+    if let Ok(mut g) = SESSION_CACHE.lock() { *g = Some(v); }
+}
+
+fn session_cache_clear() {
+    if let Ok(mut g) = SESSION_CACHE.lock() { *g = None; }
+}
+
 pub(crate) fn load_session<R: Runtime>(app: &AppHandle<R>) -> Result<Option<UserSession>, String> {
+    if let Some(hit) = session_cache_get() {
+        return Ok(hit);
+    }
+    let fresh = load_session_uncached(app)?;
+    session_cache_put(fresh.clone());
+    Ok(fresh)
+}
+
+fn load_session_uncached<R: Runtime>(app: &AppHandle<R>) -> Result<Option<UserSession>, String> {
     // 1) Try the OS keyring first — it's the canonical store.
     match keyring_entry()?.get_password() {
         Ok(json) => {
@@ -172,6 +218,10 @@ fn delete_session<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         let _ = std::fs::remove_file(&path);
     }
     let _ = app;
+    // Cleared unconditionally, including on the Err arm: a failed delete means
+    // the credential may still exist, so caching "definitely signed out" would
+    // be a lie. Dropping the entry just makes the next read re-derive it.
+    session_cache_clear();
     kr
 }
 
@@ -597,6 +647,18 @@ pub async fn backfill_user_id<R: Runtime>(app: AppHandle<R>) -> Result<Option<St
     }
 }
 
+/// Last outcome `get_session` logged, so a repeat call that says the same thing
+/// says it silently.
+///
+/// The diagnostic below is worth keeping (it is what answers "is Aura seeing my
+/// login at all"), but it is worth keeping ONCE per state. `get_session` is a
+/// cheap read that several surfaces call, and logging every call buried every
+/// other line in the console behind hundreds of identical ones. Logging on
+/// CHANGE keeps the full diagnostic value: the first call still reports, and a
+/// sign-in, sign-out or a session that silently stops loading still reports,
+/// because each of those changes the summary.
+static LAST_SESSION_LOG: OnceLock<std::sync::Mutex<Option<String>>> = OnceLock::new();
+
 /// Read the stored session without any network request.
 /// Returns `null` when in guest mode (no stored token).
 #[tauri::command]
@@ -607,14 +669,36 @@ pub async fn get_session<R: Runtime>(
     // Diagnostic: when "not detecting I'm logged in" is reported, this
     // tells us whether the keyring round-trip yields a session and
     // whether `email` survived the serialise/deserialise cycle.
-    match &result {
-        Ok(Some(sess)) => crate::devlog!(
-            info, "auth",
+    let summary = match &result {
+        Ok(Some(sess)) => format!(
             "get_session → found, email_len={}, auth_key_len={}",
-            sess.email.len(), sess.auth_key.len(),
+            sess.email.len(),
+            sess.auth_key.len(),
         ),
-        Ok(None) => crate::devlog!(info, "auth", "get_session → no stored session"),
-        Err(e) => crate::devlog!(warn, "auth", "get_session → error: {}", e),
+        Ok(None) => "get_session → no stored session".to_string(),
+        Err(e) => format!("get_session → error: {e}"),
+    };
+    let changed = {
+        let cell = LAST_SESSION_LOG.get_or_init(|| std::sync::Mutex::new(None));
+        match cell.lock() {
+            Ok(mut last) => {
+                if last.as_deref() == Some(summary.as_str()) {
+                    false
+                } else {
+                    *last = Some(summary.clone());
+                    true
+                }
+            }
+            // A poisoned mutex must not cost us the diagnostic.
+            Err(_) => true,
+        }
+    };
+    if changed {
+        if result.is_err() {
+            crate::devlog!(warn, "auth", "{}", summary);
+        } else {
+            crate::devlog!(info, "auth", "{}", summary);
+        }
     }
     result
 }

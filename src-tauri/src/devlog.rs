@@ -67,7 +67,7 @@ fn format_local_hms(unix_ms: u128) -> String {
     // surrogate, but we don't have time crate. Instead, compute via
     // SystemTime → seconds, then approximate UTC, and use the OS local
     // offset.
-    let local_secs = secs_total.saturating_add(local_offset_seconds());
+    let local_secs = secs_total.saturating_add(cached_local_offset_seconds(secs_total));
     let secs_in_day = local_secs % 86400;
     let h = (secs_in_day / 3600) % 24;
     let m = (secs_in_day / 60) % 60;
@@ -75,10 +75,45 @@ fn format_local_hms(unix_ms: u128) -> String {
     format!("{h:02}:{m:02}:{s:02}.{ms:03}")
 }
 
+/// The offset, memoised, re-probed at most every `TZ_REPROBE_SECS`.
+///
+/// The uncached version below does a full LoadLibrary + GetProcAddress +
+/// FreeLibrary of kernel32 on Windows, and it sat on the formatting path of
+/// EVERY log line. That is a large fixed cost per line, and it is what made an
+/// over-chatty log expensive rather than merely noisy.
+///
+/// Re-probed rather than computed once because Aura is a long-running app and a
+/// DST transition mid-session would otherwise leave every subsequent timestamp
+/// an hour out until restart. Ten minutes bounds that error to ten minutes while
+/// still removing essentially all of the calls.
+const TZ_REPROBE_SECS: u64 = 600;
+/// (offset_seconds, unix_seconds_when_probed), packed so one atomic covers both
+/// and no lock sits on the logging path.
+static TZ_CACHE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+fn cached_local_offset_seconds(now_secs: u64) -> u64 {
+    use std::sync::atomic::Ordering;
+    let packed = TZ_CACHE.load(Ordering::Relaxed);
+    if packed != u64::MAX {
+        let probed_at = packed >> 20;
+        let offset = packed & 0xF_FFFF;
+        if now_secs.saturating_sub(probed_at) < TZ_REPROBE_SECS {
+            return offset;
+        }
+    }
+    let offset = local_offset_seconds();
+    // Offsets are seconds-of-day (< 86400), so 20 bits hold one comfortably and
+    // the remaining 44 hold a unix timestamp well past any plausible lifetime.
+    TZ_CACHE.store((now_secs << 20) | (offset & 0xF_FFFF), Ordering::Relaxed);
+    offset
+}
+
 /// Best-effort local-timezone offset (seconds east of UTC). On Windows we
 /// query GetTimeZoneInformation; on Unix we use `localtime_r`. Falls back
 /// to 0 (UTC) if the platform call fails — log timestamps will then be
 /// in UTC, which is still useful relative-to-each-other.
+///
+/// Call `cached_local_offset_seconds` instead: this one is expensive.
 #[cfg(target_os = "windows")]
 fn local_offset_seconds() -> u64 {
     // GetTimeZoneInformation returns Bias in MINUTES, where local = UTC - Bias.

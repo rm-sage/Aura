@@ -40,7 +40,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tauri::{AppHandle, Manager, Runtime};
 
 // The FULL dataset, NOT `anime-lists-reduced.json`. Fribb dropped `anilist_id`
@@ -145,35 +145,6 @@ fn map_slot() -> &'static Mutex<HashMap<String, Vec<AnimeIdRow>>> {
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// REVERSE index: MAL id -> the ids Aura can actually open a detail page with.
-///
-/// The forward map is keyed by imdb_id and its rows do not retain imdb or
-/// kitsu, so a MAL id cannot be walked back through it. This exists so a MAL
-/// recommendation or relation, which is only ever a mal_id plus a title, can
-/// become a real link into the library rather than a search box.
-///
-/// Bounded by the dataset, not by usage: one small entry per Fribb row that
-/// has a mal_id, built once at install alongside the forward index.
-#[derive(Clone, Debug, Serialize)]
-pub struct MalRefs {
-    pub imdb_id: Option<String>,
-    pub kitsu_id: Option<u64>,
-    pub anilist_id: Option<u64>,
-}
-
-static MAL_REV: OnceLock<Mutex<HashMap<u64, MalRefs>>> = OnceLock::new();
-
-fn mal_rev_slot() -> &'static Mutex<HashMap<u64, MalRefs>> {
-    MAL_REV.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Ids for a MAL entry, or None when Fribb has never heard of it (common for
-/// very new or very niche titles). Callers fall back to a title search.
-#[tauri::command]
-pub fn resolve_ids_for_mal(mal_id: u64) -> Option<MalRefs> {
-    mal_rev_slot().lock().ok()?.get(&mal_id).cloned()
-}
-
 fn cache_path<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
     let dir = app.path().app_data_dir().ok()?;
     if std::fs::create_dir_all(&dir).is_err() {
@@ -209,21 +180,6 @@ fn parse_entries(text: &str) -> Option<Vec<FribbEntry>> {
     )
 }
 
-fn build_mal_reverse(entries: &[FribbEntry]) -> HashMap<u64, MalRefs> {
-    let mut m: HashMap<u64, MalRefs> = HashMap::with_capacity(entries.len());
-    for e in entries {
-        let Some(mal) = e.mal_id else { continue };
-        // First row wins. Fribb occasionally repeats a mal_id across rows for
-        // the same show, and the earlier one is the main-run entry.
-        m.entry(mal).or_insert_with(|| MalRefs {
-            imdb_id: e.imdb_id.clone().filter(|s| !s.is_empty()),
-            kitsu_id: e.kitsu_id,
-            anilist_id: e.anilist_id,
-        });
-    }
-    m
-}
-
 fn build_index(entries: &[FribbEntry]) -> HashMap<String, Vec<AnimeIdRow>> {
     let mut m: HashMap<String, Vec<AnimeIdRow>> = HashMap::with_capacity(entries.len());
     for e in entries {
@@ -256,20 +212,12 @@ fn install(entries: Vec<FribbEntry>) {
     // Fribb rows) BEFORE taking the map lock — so the transient overlap of
     // {parse Vec + new index + old index under lock} is trimmed at startup.
     let next = build_index(&entries);
-    let rev = build_mal_reverse(&entries);
     drop(entries);
     let count = next.len();
-    let rev_count = rev.len();
     if let Ok(mut g) = map_slot().lock() {
         *g = next;
     }
-    if let Ok(mut g) = mal_rev_slot().lock() {
-        *g = rev;
-    }
-    crate::devlog!(
-        info, "anime-id-map",
-        "installed {count} imdb->anime-ids entries, {rev_count} mal->ids reverse"
-    );
+    crate::devlog!(info, "anime-id-map", "installed {count} imdb->anime-ids entries");
 }
 
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();

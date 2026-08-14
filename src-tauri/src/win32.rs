@@ -295,7 +295,14 @@ unsafe extern "system" fn cb(child: *mut c_void, _lparam: isize) -> i32 {
             crate::devlog!(debug, "win32", "skip child '{}' (webview host)", class);
             return 1;
         }
-        crate::devlog!(info, "win32", "resize child '{}' → ({},{},{},{})",
+        // debug, not info: this fires once per surviving child while the
+        // summary below already carries the same geometry once per call, so at
+        // info an edge-RESIZE drag (which changes the client rect on every 5 ms
+        // pump tick) wrote it twice a tick. Classification only for now:
+        // devlog has no level floor, so a debug line still formats, still
+        // writes to stderr and still emits its dev-log event. Adding that floor
+        // is the real lever on log cost and is a separate change.
+        crate::devlog!(debug, "win32", "resize child '{}' → ({},{},{},{})",
             if class.is_empty() { "<unknown>" } else { &class },
             0, y, w, h
         );

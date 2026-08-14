@@ -2371,7 +2371,6 @@ pub fn run() {
             tenrai::fetch_anime_facts,
             tenrai::fetch_anime_relations,
             tenrai::fetch_anime_posters,
-            anime_id_map::resolve_ids_for_mal,
             tenrai::fetch_anime_recommendations,
             tenrai::fetch_anime_trailers,
             silencedetect::detect_silence_intervals,

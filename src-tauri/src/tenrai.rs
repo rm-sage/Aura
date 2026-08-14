@@ -632,8 +632,14 @@ pub struct AnimeRelation {
 /// Relations arrive as {mal_id, type, name} with no artwork, so a poster needs
 /// a lookup per title. Those go through `anime_full`, which means each one is
 /// cached and, if the user then opens that title, its ratings and songs are
-/// already warm. Bounded and run concurrently: at Tenrai's 4 req/s a dozen
-/// sequential fetches would be a visible stall.
+/// already warm.
+///
+/// `CONCURRENCY` is a PIPELINE depth, not a rate limit - the rate limit lives
+/// in `pace()` on the shared request path, because this cap alone let the burst
+/// out at whatever speed the link allowed and earned a wall of HTTP 429s. Keep
+/// it: overlapping the request latency still hides most of the round trips
+/// behind each other, while `pace()` decides when each one actually leaves.
+/// A cache hit never reaches the network and so never consumes a slot.
 #[tauri::command]
 pub async fn fetch_anime_posters(mal_ids: Vec<u32>) -> Result<Vec<(u32, String)>, String> {
     use futures_util::stream::{self, StreamExt};
@@ -723,7 +729,17 @@ pub async fn fetch_anime_recommendations(mal_id: u32) -> Result<Vec<Recommendati
                 mal_id: r.entry.mal_id,
                 title,
                 votes: r.votes,
-                image: r.entry.images.and_then(|i| i.jpg).and_then(|j| j.image_url),
+                // Same placeholder filter every sibling path applies. MAL
+                // serves a grey question-mark image rather than omitting the
+                // field, so passing it through renders THAT instead of the
+                // app's own empty-tile fallback. This was the one extras
+                // command that let it out.
+                image: r
+                    .entry
+                    .images
+                    .and_then(|i| i.jpg)
+                    .and_then(|j| j.image_url)
+                    .filter(|u| !u.contains(MAL_PLACEHOLDER)),
             })
         })
         .collect();
@@ -812,6 +828,48 @@ pub async fn fetch_anime_trailers(mal_id: u32) -> Result<Vec<AnimeTrailer>, Stri
     Ok(out)
 }
 
+/// Minimum spacing between two outbound Tenrai requests.
+///
+/// Tenrai's public tier is 4 req/s, so 250 ms is the fastest legal cadence.
+const MIN_REQUEST_SPACING: Duration = Duration::from_millis(250);
+
+/// Wall-clock at which the next request may go out. Shared by every caller.
+static NEXT_SLOT: OnceLock<tokio::sync::Mutex<Instant>> = OnceLock::new();
+
+/// Hold the caller until its rate-limit slot comes up.
+///
+/// A CONCURRENCY CAP IS NOT A RATE CAP, and conflating the two is what made
+/// this necessary. `fetch_anime_posters` fans out over `buffer_unordered(4)`
+/// with a comment reading "at Tenrai's 4 req/s" - but that only bounds how many
+/// are in flight at once, and the moment one finishes another starts, so on a
+/// fast link the burst went out far quicker than 4 per second. Confirmed on the
+/// wire, not theorised: opening one detail page produced ten `HTTP 429` lines
+/// inside two seconds, and every rejected lookup is a relation tile with no
+/// poster (which the retry pass then asks for again, hitting the same wall).
+///
+/// Every request in this module goes through `fetch_json`, so gating there
+/// covers the fan-out, the retries and the single-shot commands together. The
+/// slot is claimed BEFORE the await so queued callers space out rather than all
+/// reading the same past deadline and firing at once.
+///
+/// 4 req/s is the burst ceiling; the 120/min sustained one is not a concern for
+/// the bounded bursts here (14 posters at 250 ms is 3.5 s and 14 requests), and
+/// the response cache absorbs repeat visits.
+async fn pace() {
+    let slot = NEXT_SLOT.get_or_init(|| tokio::sync::Mutex::new(Instant::now()));
+    let sleep_until = {
+        let mut next = slot.lock().await;
+        let now = Instant::now();
+        let go = (*next).max(now);
+        *next = go + MIN_REQUEST_SPACING;
+        go
+    };
+    let now = Instant::now();
+    if sleep_until > now {
+        tokio::time::sleep(sleep_until - now).await;
+    }
+}
+
 /// Shared GET plus envelope unwrap. Every endpoint in this module returns
 /// `{ "data": ... }`, so the failure handling lives here once.
 ///
@@ -823,6 +881,7 @@ pub async fn fetch_anime_trailers(mal_id: u32) -> Result<Vec<AnimeTrailer>, Stri
 /// empty success got persisted as "this show has no theme songs" and survived
 /// long after Tenrai came back. Only `Ok` is cacheable.
 async fn fetch_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<Option<T>, String> {
+    pace().await;
     let resp = match client().get(url).send().await {
         Ok(r) => r,
         Err(e) => {

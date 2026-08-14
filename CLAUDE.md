@@ -261,6 +261,33 @@ frontend ~40k LOC over ~70 files + ~13 views).
   `settingsTransfer.ts`, `sessionRoute.ts`, `catalogHoverStore.ts`, `releaseSignalStore.ts`,
   `historyStore.ts`, `streamMeta.ts`, `aiometadata.ts`. See "Caching boundaries".
 
+## Floating surfaces: use `.aura-float-glass`
+
+Every element that FLOATS over content uses one class, `.aura-float-glass` (`src/App.css`).
+Tooltips, context menus and submenus, the Home search bar and its recents dropdown, the three side
+pills, the notifications panel and thought bubble, the profile popover, the watch-together panel,
+the source popup, the subtitle picker, and the detail page's Back / Close / Library / Queue /
+Trailer buttons all already route through it. New floating UI should too, rather than inventing a
+sixth glass recipe.
+
+What it is and why, because both halves are load-bearing:
+
+- A BAKED DARK GRADIENT plus blur and saturate, not blur alone. Three themes (`midnight`,
+  `contrast`, `contrast-azure`) set `--ln-blur: 0px`, so a surface built on `backdrop-filter` alone
+  is fully see-through on them. The class carries an opaque `--ln-panel-solid` override for exactly
+  those three.
+- NOT `.glass-panel-elevated`. That composites `--ln-glass-3`, which is TINTED PER THEME (the warm
+  themes push it toward orange). Over a wide element on bright key art that reads as an
+  accent-coloured fill, and accents mark things rather than filling areas. This is the tint that had
+  to be removed from the recents dropdown.
+- An inset bright top hairline plus an inset dark bottom one plus a drop shadow. The lit top edge is
+  what reads as refraction; without it the surface is just a flat tint.
+
+Two practical notes. The class sets `background`, `border` and `box-shadow` in one shorthand, so
+drop any `bg-*` / `border-*` / `shadow-*` utility you are replacing rather than leaving it to fight
+the class (it wins today only because it is declared later in the sheet). And it is a plain class,
+so it composes with layout utilities normally: `className="aura-float-glass fixed z-[200] rounded-xl"`.
+
 ## Tailwind theme-scale gotchas (silent no-op classes)
 
 `tailwind.config.ts` REPLACES the `maxWidth` scale and EXTENDS `opacity`. Two classes of utility
