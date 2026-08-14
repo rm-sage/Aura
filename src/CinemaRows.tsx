@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { createPortal } from "react-dom";
 import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "./FilterBar";
 import { useRowWindow } from "./useRowWindow";
 import { invoke } from "@tauri-apps/api/core";
@@ -21,6 +20,7 @@ import { formatCountdown, formatTargetDate, airingInfo, nextAiringEpisode, useCo
 import { useLandscapeArt, LANDSCAPE_CARD_WIDTH } from "./landscapeArt";
 import { findAIOMetadataAddon, isAnimeMeta } from "./aiometadata";
 import { shrinkPoster } from "./posterSize";
+import { BarTooltip, episodeTag, formatProgressPct, type BarTip } from "./progressBar";
 import { loadAuraSettings } from "./auraSettings";
 import {
   arcArtFor, arcsKnownUnavailable, fetchStoryArcs, loadArcMode, storyArcsAvailable,
@@ -189,7 +189,7 @@ function SegmentedSeasonBar({
   void useSkipMarksVersion();
   // Single mousemove-driven tooltip (4b) — one element per bar, not one per
   // segment, so a row of 50 CW cards doesn't mount thousands of wrappers.
-  const [tip, setTip] = useState<{ x: number; y: number; text: string } | null>(null);
+  const [tip, setTip] = useState<BarTip | null>(null);
 
   if (episodes.length === 0) return null;
 
@@ -254,9 +254,7 @@ function SegmentedSeasonBar({
   // user learns what each colour means + the latest-aired marker. Mirrors the
   // segment colour branches below so the words match the colour.
   const segLabel = (ep: VideoEntry, i: number): string => {
-    const sxe = ep.season != null && ep.episode != null
-      ? `S${String(ep.season).padStart(2, "0")}E${String(ep.episode).padStart(2, "0")}`
-      : (ep.episode != null ? `E${ep.episode}` : "Episode");
+    const sxe = episodeTag(ep.season, ep.episode);
     const manual = getManualWatchedState(ep.id);
     let state: string;
     // Skipped is checked first: it IS a watched mark plus an annotation, so
@@ -309,21 +307,7 @@ function SegmentedSeasonBar({
           </div>
         );
       })}
-      {tip && createPortal(
-        <div
-          className="pointer-events-none fixed z-[300] px-2 py-0.5 rounded-md
-                     bg-black/85 backdrop-blur-sm border border-white/15
-                     text-white text-[11px] font-medium whitespace-nowrap
-                     -translate-x-1/2 -translate-y-full"
-          style={{
-            left: Math.max(60, Math.min(window.innerWidth - 60, tip.x)),
-            top: tip.y - 6,
-          }}
-        >
-          {tip.text}
-        </div>,
-        document.body,
-      )}
+      <BarTooltip tip={tip} />
     </div>
   );
 }
@@ -354,6 +338,12 @@ function ContinuousProgressBar({
   // Skip annotations live in their own store and fire their own event, so the
   // bar subscribes to both or a skip would not repaint until something else did.
   void useSkipMarksVersion();
+  // This bar has no segments to point at, so its hover answers the question the
+  // shape itself raises ("how much is left?") rather than naming one episode.
+  // The wording mirrors the detail page's Your Progress line, but the SCOPE
+  // does not: this bar covers the resume episode's SEASON, while the detail
+  // page counts the whole series. Same sentence, different denominator.
+  const [tip, setTip] = useState<BarTip | null>(null);
   if (episodes.length === 0) return null;
   const total = episodes.length;
   const currentIdx = currentId
@@ -429,12 +419,63 @@ function ContinuousProgressBar({
     ? episodes.findIndex((v) => v.id === air.latestAiredId)
     : -1;
   const frontierPct = latestAiredIdx >= 0 ? ((latestAiredIdx + 1) / total) * 100 : null;
+
+  // Counted by the SEGMENTED bar's rule, not by `engagedThroughIdx`.
+  //
+  // The distinction matters: `engaged` folds in "in-progress" marks, so a
+  // single in-progress mark on a late episode would have reported every
+  // episode before it as watched. The segmented sibling implies watched only
+  // through `max(currentIdx, lastWatchedIdx)`, which is Aura's documented
+  // position-implied rule, and using the same one here keeps the words and the
+  // two bars in agreement. Skipped is tested first because a skip is a watched
+  // mark plus an annotation, so testing watched first would swallow it. The
+  // episode AT the implied frontier is the amber "you are here" tip and counts
+  // as remaining, not as finished.
+  const impliedThroughIdx = Math.max(currentIdx, lastWatchedIdx);
+  let watchedCount = 0;
+  let skippedCount = 0;
+  for (let i = 0; i < total; i += 1) {
+    if (isSkipped(episodes[i].id)) { skippedCount += 1; continue; }
+    if (getManualWatchedState(episodes[i].id) === "watched" || i < impliedThroughIdx) {
+      watchedCount += 1;
+    }
+  }
+  const remaining = total - watchedCount - skippedCount;
+  const tipText = [
+    remaining <= 0
+      ? "Completed"
+      : `${remaining} episode${remaining === 1 ? "" : "s"} left`,
+    `${formatProgressPct(watchedCount / total)} watched`,
+    ...(skippedCount > 0 ? [`${formatProgressPct(skippedCount / total)} skipped`] : []),
+  ].join(" · ");
+
   return (
-    <div className="absolute left-2 right-2 bottom-1 h-[5px] rounded-full overflow-visible">
+    <div
+      className="absolute left-2 right-2 bottom-1 h-[5px] rounded-full overflow-visible"
+      // The label does not vary along this bar, so the pill is anchored to the
+      // bar's CENTRE and the state is only written when it would actually
+      // differ; returning `prev` lets React bail out of the render entirely.
+      // That matters here specifically: this component is the branch taken when
+      // a season exceeds the segmented bar's 50-aired cap, so its episode list
+      // is long by construction and four figures on a long-runner, and its
+      // whole derivation lives in the render body (seven O(n) passes, one of
+      // them a Date.parse per episode via airingInfo). A pointer-following
+      // tooltip would re-run all of that on every pixel of travel.
+      onMouseMove={(e) => {
+        const r = e.currentTarget.getBoundingClientRect();
+        const x = r.left + r.width / 2;
+        setTip((prev) =>
+          prev && prev.x === x && prev.y === r.top && prev.text === tipText
+            ? prev
+            : { x, y: r.top, text: tipText });
+      }}
+      onMouseLeave={() => setTip(null)}
+    >
       <div className="absolute inset-0 rounded-full overflow-hidden bg-white/15">
         <div aria-hidden className="h-full" style={fillStyle} />
       </div>
       {frontierPct != null && <LatestAiredCaret leftPct={frontierPct} />}
+      <BarTooltip tip={tip} />
     </div>
   );
 }

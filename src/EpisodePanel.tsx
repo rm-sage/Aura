@@ -32,7 +32,10 @@ import { getMetaDetailFallback, peekCachedDetailById } from "./metaCache";
 import { getSortedEpisodes } from "./episodeSort";
 import { loadAuraSettings } from "./auraSettings";
 import { shouldBlurThumbnail, isEpisodeWatched } from "./episodeSpoilers";
-import { formatEpisodeTag } from "./nextUp";
+import { episodeKindFlags, formatEpisodeTag } from "./nextUp";
+import FillerRecapTags from "./FillerRecapTags";
+import { isSkipped, useSkipMarksVersion } from "./skipMarks";
+import { useReleaseSignal } from "./releaseSignalStore";
 import { isVideoAired } from "./types";
 import { nextAiringEpisode, formatTargetDate } from "./releaseCountdown";
 import EpisodeAirChip from "./EpisodeAirChip";
@@ -233,6 +236,14 @@ function EpisodePanel({
   );
 
   const blurThumbs = loadAuraSettings().blurUnwatchedThumbnails;
+  // Skip annotations live in their own store and fire their own event, so this
+  // panel has to subscribe or a skip made from the Next Up card would not
+  // repaint the rows behind it.
+  void useSkipMarksVersion();
+  // Same merge order the detail page's episode rows use: the cloud signal
+  // polls faster than a library refresh, so it sees AIOMetadata's filler and
+  // recap flags first, and the VideoEntry booleans are the fallback.
+  const cloudSignal = useReleaseSignal(seriesId);
 
   // Auto-scroll the playing episode into view on open. Re-runs when the visible
   // list changes (season pick, or the open arc), so the current row is centred
@@ -405,6 +416,16 @@ function EpisodePanel({
               const isCurrent = v.id === currentEpisodeId;
               const isNext = v.id === nextEpisodeId;
               const watched = isEpisodeWatched(libraryById, v.id);
+              // A SKIP is a watched mark plus an annotation, so testing
+              // watched alone drew a green tick on skipped episodes and the
+              // panel could not tell the two apart. That is exactly what
+              // "it marked the filler as watched instead of skipped" was:
+              // the mark was right, this panel just had no way to say so.
+              const skipped = isSkipped(v.id);
+              const cloudForThis = (cloudSignal?.episode_kinds ?? []).filter((k) => k.id === v.id);
+              const kinds = episodeKindFlags(v);
+              const showFiller = kinds.filler || cloudForThis.some((k) => k.kind === "filler");
+              const showRecap  = kinds.recap  || cloudForThis.some((k) => k.kind === "recap");
               const blurThumb = shouldBlurThumbnail(libraryById, v.id, blurThumbs);
               const isPending = pendingPlayId === v.id;
               // Season-mode absolute annotation ("(E88)") on a saga show; empty
@@ -469,14 +490,28 @@ function EpisodePanel({
                       <div aria-hidden className="absolute inset-0 bg-black/45" />
                     )}
                     {watched && (
-                      <span className="absolute bottom-1 right-1 w-4 h-4 rounded-full
-                                       bg-emerald-500/90 border border-emerald-200/40
-                                       flex items-center justify-center">
-                        <svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                          <path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
-                        </svg>
+                      <span className={`absolute bottom-1 right-1 w-4 h-4 rounded-full
+                                       flex items-center justify-center border ${skipped
+                                         ? "bg-purple-500/90 border-purple-200/40"
+                                         : "bg-emerald-500/90 border-emerald-200/40"}`}>
+                        {skipped ? (
+                          // The same double-chevron the skip menu and the
+                          // History skip tag use, so one glyph means one thing.
+                          <svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                            <path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z" />
+                          </svg>
+                        ) : (
+                          <svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                            <path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
+                          </svg>
+                        )}
                       </span>
                     )}
+                    <FillerRecapTags
+                      filler={showFiller}
+                      recap={showRecap}
+                      className="absolute top-1.5 right-1.5 z-10"
+                    />
                     {/* Next-to-air countdown pill — CW-tile style overlay. */}
                     {isNextAiring && airMs != null && (
                       <EpisodeAirChip targetMs={airMs} />

@@ -78,6 +78,47 @@ export function episodeKindFlags(v: VideoEntry): { filler: boolean; recap: boole
   };
 }
 
+/** Filler / recap flags with the Aura Cloud release signal merged in.
+ *
+ *  THE ONE PREDICATE every surface that shows or acts on a kind must use.
+ *  `episodeKindFlags` reads the VideoEntry alone, which is only half the
+ *  answer: the cloud signal's `episode_kinds` is the higher-priority source and
+ *  is the ONLY source for a great many episodes (addons that ship no
+ *  is_filler / episode_kind at all). The episode-row pill already merged both,
+ *  while the right-click skip-run menu tested the VideoEntry alone, so an
+ *  episode visibly badged FILLER could offer no skip-run options at all and,
+ *  worse, silently TERMINATE a run scan that should have walked through it -
+ *  the menu's own "continues until the next canon episode" promise, broken on
+ *  an episode the same screen was calling filler.
+ *
+ *  `kinds` is the raw `cloudSignal?.episode_kinds ?? []` array; passing an
+ *  empty one degrades exactly to `episodeKindFlags`. */
+export function mergedKindFlags(
+  v: VideoEntry,
+  kinds: { id: string; kind: string }[],
+): { filler: boolean; recap: boolean } {
+  const base = episodeKindFlags(v);
+  return {
+    filler: base.filler || kinds.some((k) => k.id === v.id && k.kind === "filler"),
+    recap:  base.recap  || kinds.some((k) => k.id === v.id && k.kind === "recap"),
+  };
+}
+
+/** The user-facing noun for an episode's skip-worthy kind, or null when it is
+ *  neither. Drives the next-up cards' "Play filler anyway" / "Play recap
+ *  anyway" fallback button, which used to read a generic "Play it anyway" that
+ *  never said WHAT it was about to play.
+ *
+ *  Filler wins when an episode carries BOTH flags, matching FillerRecapTags,
+ *  which stacks the rose filler pill above the amber recap one. The button and
+ *  the tag on the thumbnail beside it therefore always agree. */
+export function episodeKindNoun(v: VideoEntry): "filler" | "recap" | null {
+  const { filler, recap } = episodeKindFlags(v);
+  if (filler) return "filler";
+  if (recap) return "recap";
+  return null;
+}
+
 /** True when an episode is filler or recap (skip-worthy for "skip to canon"). */
 export function isFillerOrRecap(v: VideoEntry): boolean {
   const { filler, recap } = episodeKindFlags(v);
@@ -192,6 +233,33 @@ export async function resolveNextEpisode(
   const next = findNextEpisode(detail, currentEpisodeId, Date.now(), skipMode);
   if (!next) return null;
   return { detail, next };
+}
+
+/**
+ * Should the UNATTENDED countdown target the skip button rather than the play
+ * button?
+ *
+ * This is the whole job of the filler / recap preference now. It used to be
+ * fed into `resolveNextEpisode`, where it changed what "the next episode"
+ * meant: the card said "Play next episode" and played a different one, the
+ * user could not see what was being skipped or opt out for a single episode,
+ * and because the skip happened inside the resolver, nothing downstream knew a
+ * skip had occurred, so the jumped run was never marked. The card now always
+ * shows the true next episode and offers both actions, and this decides only
+ * which one a countdown with nobody watching should pick.
+ *
+ * Kind-specific on purpose: someone who set "filler" wants a recap played, not
+ * silently jumped.
+ */
+export function autoSkipApplies(
+  mode: SkipFillerRecapMode,
+  nextEp: VideoEntry,
+): boolean {
+  if (mode === "none") return false;
+  const { filler, recap } = episodeKindFlags(nextEp);
+  if (mode === "both")   return filler || recap;
+  if (mode === "filler") return filler;
+  return recap;
 }
 
 /**

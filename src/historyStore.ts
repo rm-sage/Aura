@@ -170,6 +170,19 @@ export function setHistoryScope(
   window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
 }
 
+/** The scope history is CURRENTLY keyed by.
+ *
+ *  Exists because history's scope deliberately differs from every other
+ *  per-account store's: it follows the stable `user_id` so a fresh login
+ *  (Stremio rotates auth_keys) does not orphan the play log, while
+ *  manual-watched, skip marks and the backup ledger stay on the auth_key
+ *  prefix. Anything that reads or writes the history KEY rather than going
+ *  through this module has to ask, instead of deriving a scope of its own and
+ *  silently addressing a key nothing writes. */
+export function getHistoryScope(): string {
+  return _activeScope;
+}
+
 /** Append a new history entry. Older identical (id, played_at) pairs
  *  are deduped — the same finished play emitted twice doesn't double
  *  up the list. Newest entry is kept at index 0 for fast view render. */
@@ -188,6 +201,41 @@ export function addHistoryEntry(entry: HistoryEntry): void {
     }
   }
   saveToStorage(_activeScope, _entries);
+  window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
+}
+
+/** Many entries, ONE serialise and ONE change event.
+ *
+ *  `addHistoryEntry` stringifies the entire store and dispatches on every call,
+ *  which is fine for a finished play and wasteful for the bulk paths: marking a
+ *  60-episode arc skipped meant 60 full serialises of a 1000-entry array and 60
+ *  re-renders of every history consumer. Mirrors `markScrobbledMany` and
+ *  `removeHistoryEntries`, which already exist for the same reason. */
+export function addHistoryEntries(entries: HistoryEntry[]): void {
+  ensureHydrated();
+  const fresh = entries.filter((e) => e?.id && e.played_at);
+  if (fresh.length === 0) return;
+  for (const entry of fresh) {
+    const dupeIdx = _entries.findIndex(
+      (e) => e.id === entry.id && e.played_at === entry.played_at,
+    );
+    if (dupeIdx >= 0) _entries[dupeIdx] = entry;
+    else _entries.unshift(entry);
+  }
+  // Trimmed once, after the whole batch: trimming per insert could evict a row
+  // this same batch is about to push back down.
+  if (_entries.length > MAX_ENTRIES) _entries.length = MAX_ENTRIES;
+  saveToStorage(_activeScope, _entries);
+  window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
+}
+
+/** Re-read the in-memory mirror from storage. The store hydrates ONCE and
+ *  short-circuits afterwards, so anything that rewrites this scope's
+ *  localStorage entry behind its back (a backup restore) must call this or the
+ *  mirror keeps serving the pre-restore rows for the rest of the session. */
+export function reloadHistoryFromStorage(): void {
+  _entries = loadFromStorage(_activeScope);
+  _hydrated = true;
   window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
 }
 

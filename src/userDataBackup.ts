@@ -13,7 +13,9 @@
 //     watched mark, so restoring one without the other leaves either orphaned
 //     purple tags on unwatched episodes or silently-watched episodes that were
 //     actually skipped.
-//   • aura:history:<scope>       — local watch history log.
+//   • aura:history:<historyScope> - local watch history log. NOTE the
+//     different scope: history keys on the stable user_id, everything else
+//     here on the auth_key prefix, so the payload carries both.
 //   • aura:auto-bumped-series:v1 — auto-bumped flags (cross-scope).
 //   • aura:settings:v1           — AuraSettings (cross-scope).
 //
@@ -40,6 +42,9 @@
 // ---------------------------------------------------------------------------
 
 import { invoke } from "@tauri-apps/api/core";
+import { reloadManualWatchedFromStorage } from "./manualWatched";
+import { reloadSkipMarksFromStorage } from "./skipMarks";
+import { getHistoryScope, reloadHistoryFromStorage } from "./historyStore";
 
 // Storage keys we snapshot. Keep in sync with manualWatched.ts /
 // historyStore.ts / auraSettings.ts / autoBumped.ts.
@@ -62,8 +67,17 @@ const AUTO_REASON_KEY  = "auto-snapshot";
 export interface BackupPayload {
   /** Schema version. Bump when adding required fields. */
   schemaVersion: number;
-  /** Scope this snapshot belongs to. */
+  /** Scope this snapshot belongs to. Addresses every key EXCEPT history. */
   scope: string;
+  /** The scope `history` was read from, which is NOT `scope`.
+   *
+   *  History keys on the stable `user_id` (`user-<userId16>`) so a fresh login
+   *  does not orphan the play log, while everything else here stays on the
+   *  auth_key prefix (`user-<authKey12>`). Reusing `scope` for history read a
+   *  key nothing writes, so for every signed-in user the snapshot captured
+   *  NOTHING and a restore then removed the real log. Absent on v1 snapshots,
+   *  which fall back to `scope` so they keep their original behaviour. */
+  historyScope?: string;
   /** ISO timestamp for human display. */
   capturedAt: string;
   /** localStorage values verbatim — Aura's other modules know how to
@@ -94,14 +108,17 @@ export interface BackupMeta {
  *  empty-string survives the round-trip. */
 export function collectBackupPayload(scope: string): BackupPayload {
   const safeScope = (scope ?? "").trim() || "guest";
+  // Ask the store, do not re-derive. See BackupPayload.historyScope.
+  const hScope = getHistoryScope().trim() || safeScope;
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     scope: safeScope,
+    historyScope: hScope,
     capturedAt: new Date().toISOString(),
     values: {
       manualState:  localStorage.getItem(`${KEYS.manualState}${safeScope}`),
       skipMarks:    localStorage.getItem(`${KEYS.skipMarks}${safeScope}`),
-      history:      localStorage.getItem(`${KEYS.history}${safeScope}`),
+      history:      localStorage.getItem(`${KEYS.history}${hScope}`),
       autoBumped:   localStorage.getItem(KEYS.autoBumped),
       auraSettings: localStorage.getItem(KEYS.auraSettings),
     },
@@ -117,6 +134,10 @@ export function collectBackupPayload(scope: string): BackupPayload {
  *  surface a confirmation prompt before invoking. */
 export function applyBackupPayload(payload: BackupPayload): void {
   const safeScope = (payload.scope ?? "").trim() || "guest";
+  // v1 snapshots have no historyScope; falling back to `scope` reproduces
+  // exactly what they were written against, so an old snapshot restores where
+  // it came from rather than being redirected to a key it never captured.
+  const hScope = (payload.historyScope ?? "").trim() || safeScope;
   const v = payload.values ?? {} as BackupPayload["values"];
 
   const writeOrRemove = (key: string, value: string | null) => {
@@ -129,14 +150,23 @@ export function applyBackupPayload(payload: BackupPayload): void {
 
   writeOrRemove(`${KEYS.manualState}${safeScope}`, v.manualState);
   writeOrRemove(`${KEYS.skipMarks}${safeScope}`, v.skipMarks ?? null);
-  writeOrRemove(`${KEYS.history}${safeScope}`,     v.history);
+  writeOrRemove(`${KEYS.history}${hScope}`,        v.history);
   writeOrRemove(KEYS.autoBumped,                   v.autoBumped);
   writeOrRemove(KEYS.auraSettings,                 v.auraSettings);
 
-  // Re-fire the change events so subscribed components re-hydrate from
-  // the freshly-restored values without a manual refresh.
-  window.dispatchEvent(new CustomEvent("aura:manual-watched-changed"));
-  window.dispatchEvent(new CustomEvent("aura:history-changed"));
+  // RELOAD the in-memory mirrors, do not merely re-render.
+  //
+  // manualWatched, skipMarks and historyStore each hydrate from localStorage
+  // ONCE and short-circuit every read afterwards, so writing the keys above and
+  // firing a change event only re-rendered components that then read the
+  // PRE-RESTORE values. The restore appeared to do nothing until the app was
+  // restarted, which is exactly what "Restored. Refresh views to see the
+  // change." was trying and failing to describe. Each reload dispatches its own
+  // change event, so the explicit ones below are only for the settings blob,
+  // which has no mirror of its own.
+  reloadManualWatchedFromStorage();
+  reloadSkipMarksFromStorage();
+  reloadHistoryFromStorage();
   window.dispatchEvent(new CustomEvent("aura:settings-changed"));
 }
 

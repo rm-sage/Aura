@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { safeSetItem } from "./storageQuota";
+import { setSkipped } from "./skipMarks";
 import { showAppToast } from "./AppToast";
 
 // ---------------------------------------------------------------------------
@@ -206,6 +207,15 @@ export function setManualWatchedState(id: string, state: ManualWatchedState | nu
     // at least visible instead of a mystery.
     showAppToast("Couldn't save your watched mark: local storage is full. It may not stick after a restart (clear space in Settings > Storage).", { duration: 5000 });
   }
+  // A skip is an ANNOTATION OVER a watched mark, so it cannot outlive one.
+  // Enforced here rather than at the call sites because there are four ways to
+  // leave "watched" (Unmark Watched, the bulk unmark, the catalog fan-out, and
+  // Mark as In Progress on an already-skipped episode) and only one of them
+  // ever cleared the annotation. The orphan is visible: the progress bars test
+  // the skip store FIRST, so they kept painting a purple "Skipped" band and
+  // counting the episode as done, while WatchedBadge, which requires the
+  // watched mark, showed it as unwatched.
+  if (current === "watched" && state !== "watched") setSkipped([id], false);
   window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
   emitSync([{ id, oldState: current, newState: state }]);
 }
@@ -231,6 +241,13 @@ export function setManualWatchedMany(
   }
   if (mutated) {
     saveToStorageDirect(_activeScope, _activeMap);
+    // Same rule as the single-id setter above: leaving "watched" drops the skip
+    // annotation with it. `setSkipped` is a no-op when nothing changes, so the
+    // common bulk write costs one Set lookup per id and fires no extra event.
+    const demoted = diffs
+      .filter((d) => d.oldState === "watched" && d.newState !== "watched")
+      .map((d) => d.id);
+    if (demoted.length > 0) setSkipped(demoted, false);
     window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
     emitSync(diffs);
   }
