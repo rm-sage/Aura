@@ -45,15 +45,21 @@ export type HudTab =
 interface Props {
   /** Rendered inside the Overview tab: synopsis, genres, per-episode text. */
   overview: React.ReactNode;
-  /** Rendered inside the Cast tab. */
+  /** The cast roster itself. Replaced wholesale by the MAL character grid on
+   *  anime, which is why the crew below is a SEPARATE prop. */
   cast: React.ReactNode;
+  /** Voice actors, directors, writers, producers, composers, creators. Shown on
+   *  every title, under whichever cast presentation applies. Kept apart from
+   *  `cast` because the anime branch swaps that node out entirely, and folding
+   *  the crew into it meant anime silently lost all of these rows. */
+  crew?: React.ReactNode;
   /** MAL entries, one per cour. Empty for live action, which removes every
    *  extras tab and leaves a two-tab bar. */
   cours: CourRef[];
   onPlayTrailer?: (ytId: string, title: string) => void;
-  /** Open another title's detail page, from a relation or recommendation. */
-  onOpenTitle?: (id: string, mediaType: string, name: string) => void;
-  /** Fallback when the id map cannot place a MAL entry. */
+  /** Run a search. Used by the Related tiles (searching the title they name)
+   *  and by the Cast and Staff tabs (searching the person they name). One
+   *  handler because it is one action: put this string in the search box. */
   onSearchTitle?: (name: string) => void;
   /** Re-seeds the active tab when the page swaps to a different title, so a
    *  user who was on Trailers does not land on Trailers for the next show. */
@@ -73,7 +79,7 @@ const EXTRA_TABS: { id: HudTab; label: string }[] = [
 ];
 
 export default function DetailHud({
-  overview, cast, cours, onPlayTrailer, onOpenTitle, onSearchTitle, resetKey,
+  overview, cast, crew, cours, onPlayTrailer, onSearchTitle, resetKey,
 }: Props) {
   const tabs = useMemo(
     () => (cours.length > 0 ? [...BASE_TABS, ...EXTRA_TABS] : BASE_TABS),
@@ -178,17 +184,25 @@ export default function DetailHud({
         }}
       >
         {tab === "overview" && overview}
-        {/* Anime get the MAL character grid, which has both the character's
-            art and the actor's. Everything else falls back to the addon's own
-            cast rows, which carry an actor photo and nothing more. */}
-        {tab === "cast"     && (cours.length > 0
-          ? <CharactersTab cours={cours} blurNames={blurChars} />
-          : cast)}
+        {/* Anime get the MAL character grid, whose tiles carry both the
+            character's art and the actor's. Everything else gets the same
+            grid with one face per tile (PersonGrid, assembled in DetailView),
+            built from the addon's own cast photos plus the TMDB
+            Main / Recurring / Guest tier. The fork is about the DATA: only
+            anime have character art to put on a second face. */}
+        {tab === "cast"     && (
+          <div className="space-y-5">
+            {cours.length > 0
+              ? <CharactersTab cours={cours} blurNames={blurChars} onSearchName={onSearchTitle} />
+              : cast}
+            {crew}
+          </div>
+        )}
         {tab === "songs"    && <SongsTab cours={cours} />}
         {tab === "ratings"  && <RatingsTab cours={cours} />}
-        {tab === "staff"    && <StaffTab cours={cours} compact />}
+        {tab === "staff"    && <StaffTab cours={cours} compact onSearchName={onSearchTitle} />}
         {tab === "related"  && (
-          <RelatedTab cours={cours} onOpenTitle={onOpenTitle} onSearchTitle={onSearchTitle} />
+          <RelatedTab cours={cours} onSearchTitle={onSearchTitle} />
         )}
         {tab === "trailers" && <TrailersTab cours={cours} onPlay={onPlayTrailer} />}
       </div>

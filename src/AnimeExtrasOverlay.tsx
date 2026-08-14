@@ -25,7 +25,7 @@ import { shrinkPoster } from "./posterSize";
 import { loadAuraSettings } from "./auraSettings";
 import { shouldBlurThemeRange } from "./episodeSpoilers";
 import {
-  fetchExtras, formatSpans, openableIdForMal, themeLabel,
+  fetchExtras, formatSpans, themeLabel,
   type AnimeStatistics, type AnimeTheme, type AnimeThemes, type AnimeTrailer,
   type AnimeCharacter, type AnimeFacts, type AnimeRelation, type CourRef, type Recommendation, type StaffCredit, type ExtrasTab,
 } from "./animeExtras";
@@ -238,24 +238,52 @@ function ThemeRow({
 export function RatingsTab({ cours }: { cours: CourRef[] }) {
   const rows = useCourPayloads<AnimeStatistics>("ratings", cours);
   if (!rows) return <Loading />;
-  const any = rows.some((r) => r.value);
-  if (!any) return <Empty what="score data" />;
+  // Filter BEFORE choosing the layout. `rows` has one entry per cour we ASKED
+  // about, not per cour MAL answered for, so keying the layout off its length
+  // sent a three-cour show with statistics on only one of them down the
+  // two-column path: one histogram on the left, an empty column beside it.
+  const shown = rows.filter(
+    (r): r is { cour: CourRef; value: AnimeStatistics } => r.value != null,
+  );
+  if (shown.length === 0) return <Empty what="score data" />;
 
-  const multi = rows.length > 1;
+  const one = shown.length === 1;
   return (
     // Two seasons per row rather than one full-width block each. A histogram
     // stretched across the whole panel put its bars and its vote counts an
     // absurd distance apart, and stacking seasons vertically made every one a
     // scroll away from the next.
-    <div className="grid gap-x-10 gap-y-2 grid-cols-1 min-[1100px]:grid-cols-2">
-      {rows.map(({ cour, value }) => {
-        if (!value) return null;
+    //
+    // A show with ONE cour is not a one-item grid: left-aligned in a two-column
+    // track it sat against the panel's left edge with the whole right half
+    // empty, which read as content that had failed to load. It gets a single
+    // centred column at the same measure a column of the two-up layout has, so
+    // the histogram is the same size either way and only its position differs.
+    // The single-cour column is sized as a FRACTION, not a fixed rem value: a
+    // two-up column is `(100% - gap) / 2` and therefore tracks the panel, so a
+    // fixed cap only matched it at the panel's own 74rem ceiling and was nearly
+    // twice a column's width at a 1280px window, which is exactly the spacing
+    // the grid exists to avoid. `gap-x-10` is 2.5rem, hence the 1.25rem. Below
+    // the 1100px breakpoint the grid is a single full-width column anyway, so
+    // this matches it by staying full-width there too.
+    <div className={one
+      ? "mx-auto w-full min-[1100px]:w-[calc(50%-1.25rem)]"
+      : "grid gap-x-10 gap-y-2 grid-cols-1 min-[1100px]:grid-cols-2"}
+    >
+      {shown.map(({ cour, value }) => {
         const peak = Math.max(1, ...value.scores.map((b) => b.votes));
         return (
           // `mt-0` on every heading: the grid's own row gap does the
           // separating here, so the shared top margin would double it.
           <div key={cour.malId} className="[&>div:first-child]:mt-0">
-            <CourHeading label={cour.label} show={multi} />
+            {/* ALWAYS headed, unlike the other tabs. A lone histogram rendered
+                bare read as a fragment rather than a section, and the label is
+                the only thing saying WHAT is being counted. A show that was
+                never split into cours has one MAL entry scoring the whole run,
+                so "All Cours" is the honest label. A multi-cour show that only
+                answered for one keeps that cour's own label, because there the
+                numbers really are just that cour's. */}
+            <CourHeading label={cours.length > 1 ? cour.label : "All Cours"} show />
             <div className="flex flex-col gap-1 mb-4">
               {[...value.scores].sort((a, b) => b.score - a.score).map((b) => (
                 <div key={b.score} className="flex items-center gap-2.5">
@@ -302,7 +330,33 @@ function StatusRow({ label, value }: { label: string; value: number }) {
 // Staff
 // ---------------------------------------------------------------------------
 
-export function StaffTab({ cours, compact = false }: { cours: CourRef[]; compact?: boolean }) {
+/** One staff row: a search button when a handler is available, otherwise inert
+ *  markup. Keeps the whole row as the hit target rather than just the name. */
+function RowTag({ onSearchName, name, className, children }: {
+  onSearchName?: (name: string) => void;
+  name: string;
+  className: string;
+  children: React.ReactNode;
+}) {
+  if (!onSearchName) return <div className={className}>{children}</div>;
+  return (
+    <button
+      type="button"
+      onClick={() => onSearchName(name)}
+      title={`Search for "${name}"`}
+      className={className + " group/staff cursor-pointer focus:outline-none focus-visible:underline"}
+    >
+      {children}
+    </button>
+  );
+}
+
+export function StaffTab({ cours, compact = false, onSearchName }: {
+  cours: CourRef[];
+  compact?: boolean;
+  /** Search for this staff member by name. */
+  onSearchName?: (name: string) => void;
+}) {
   const rows = useCourPayloads<StaffCredit[]>("staff", cours);
   if (!rows) return <Loading />;
   const any = rows.some((r) => r.value && r.value.length);
@@ -320,7 +374,15 @@ export function StaffTab({ cours, compact = false }: { cours: CourRef[]; compact
               ? "grid gap-x-6 gap-y-3 grid-cols-2 min-[1100px]:grid-cols-3 min-[1500px]:grid-cols-4"
               : "grid grid-cols-2 gap-x-5 gap-y-2.5"}>
               {value.map((c) => (
-                <div key={c.mal_id} className="flex items-center gap-2.5 min-w-0">
+                // A button when it can search, a plain div otherwise, rather
+                // than a permanently disabled control: the whole row is the
+                // target so the small avatar is not the only thing to hit.
+                <RowTag
+                  key={c.mal_id}
+                  onSearchName={onSearchName}
+                  name={c.name}
+                  className="flex items-center gap-2.5 min-w-0 text-left w-full bg-transparent p-0 border-0"
+                >
                   <div className="w-9 h-9 rounded-full overflow-hidden bg-white/8 shrink-0
                                   flex items-center justify-center">
                     {c.image ? (
@@ -338,12 +400,17 @@ export function StaffTab({ cours, compact = false }: { cours: CourRef[]; compact
                     )}
                   </div>
                   <div className="min-w-0">
-                    <p className="text-white/85 text-[12.5px] leading-tight truncate">{c.name}</p>
+                    <p className={"text-[12.5px] leading-tight truncate "
+                      + (onSearchName
+                        ? "text-white/85 group-hover/staff:text-ln-accent transition-colors"
+                        : "text-white/85")}>
+                      {c.name}
+                    </p>
                     <p className="text-white/35 text-[11px] leading-tight truncate">
                       {c.positions.join(", ")}
                     </p>
                   </div>
-                </div>
+                </RowTag>
               ))}
             </div>
           </div>
@@ -419,13 +486,17 @@ export function FactsBlock({ cours, leading = [] }: {
 // ---------------------------------------------------------------------------
 
 export function CharactersTab({
-  cours, blurNames,
+  cours, blurNames, onSearchName,
 }: {
   cours: CourRef[];
   /** Hide character names and art until hovered. Character art routinely
    *  spoils a later form or a reveal, and a name can spoil that someone
    *  exists at all. */
   blurNames: boolean;
+  /** Search for the person on the card. The VOICE ACTOR, not the character:
+   *  a character name is not a searchable title, and the actor is the thing a
+   *  viewer actually wants to look up after recognising a voice. */
+  onSearchName?: (name: string) => void;
 }) {
   const rows = useCourPayloads<AnimeCharacter[]>("characters", cours);
   if (!rows) return <Loading />;
@@ -449,17 +520,23 @@ export function CharactersTab({
                     grid-cols-3 min-[900px]:grid-cols-5
                     min-[1200px]:grid-cols-7 min-[1500px]:grid-cols-8">
       {list.map((c) => (
-        <CharacterCard key={c.mal_id} character={c} blurred={blurNames} />
+        <CharacterCard
+          key={c.mal_id}
+          character={c}
+          blurred={blurNames}
+          onSearchName={onSearchName}
+        />
       ))}
     </div>
   );
 }
 
 function CharacterCard({
-  character: c, blurred,
+  character: c, blurred, onSearchName,
 }: {
   character: AnimeCharacter;
   blurred: boolean;
+  onSearchName?: (name: string) => void;
 }) {
   const [hover, setHover] = useState(false);
   const [revealed, setRevealed] = useState(false);
@@ -472,6 +549,16 @@ function CharacterCard({
   const hideChar = blurred && !revealed;
 
   const restImage = c.actor_image ?? c.image;
+  // THE RESTING STATE IS NOT ALWAYS THE ACTOR, and the gate above assumed it
+  // was. Both resting slots fall back to the character when the entry has no
+  // voice actor: `restImage` falls back to `c.image`, and the name line below
+  // falls back to `c.name`. For those entries the tile showed the character's
+  // art and the character's name completely unblurred with the toggle on, which
+  // is the whole thing the toggle exists to hide - and MAL leaves the actor
+  // empty for exactly the characters most likely to be a reveal (an unvoiced
+  // late-arrival, a form a character takes later).
+  const restIsChar = !c.actor_image && !!c.image;
+  const restNameIsChar = !c.actor;
   return (
     <div
       className="min-w-0"
@@ -495,6 +582,11 @@ function CharacterCard({
             imgStyle={{
               opacity: showChar ? 0 : 1,
               transition: "opacity 180ms ease-out",
+              // Blurred only when this resting image IS the character art.
+              // An actor portrait is never a spoiler and stays sharp.
+              ...(hideChar && restIsChar
+                ? { filter: "blur(16px)", transform: "scale(1.1)" }
+                : null),
             }}
             draggable={false}
           />
@@ -513,7 +605,9 @@ function CharacterCard({
             draggable={false}
           />
         )}
-        {showChar && hideChar && (
+        {/* The reveal affordance has to cover the actor-less tiles too, or
+            their blur would have no way out. */}
+        {hideChar && (showChar || restIsChar) && (
           <span className="absolute inset-0 flex items-center justify-center
                            text-white/80 text-[10px] font-mono uppercase
                            tracking-[0.16em] bg-black/35">
@@ -532,10 +626,31 @@ function CharacterCard({
       {/* Both lines are FIXED: only the image swaps on hover. Swapping the
           text too made every card jump as the cursor crossed it. The actor
           leads because that is the resting state; the character sits under it
-          and carries the blur when gated, since the role is the spoiler. */}
-      <p className="text-white/85 text-[11.5px] leading-tight mt-1.5 line-clamp-2">
-        {c.actor ?? c.name}
-      </p>
+          and carries the blur when gated, since the role is the spoiler.
+          The actor line is the clickable one: searching a character name finds
+          nothing, searching the person finds their other work. */}
+      {onSearchName ? (
+        <button
+          type="button"
+          onClick={() => onSearchName(c.actor ?? c.name)}
+          title={`Search for "${c.actor ?? c.name}"`}
+          // Blurred when this line has fallen back to the CHARACTER name,
+          // which is the same spoiler the line below carries when an actor
+          // exists. Sharp whenever it is a real person.
+          style={hideChar && restNameIsChar ? { filter: "blur(4px)" } : undefined}
+          className="block w-full text-left bg-transparent p-0 border-0 cursor-pointer
+                     text-white/85 text-[11.5px] leading-tight mt-1.5 line-clamp-2
+                     hover:text-ln-accent transition-colors
+                     focus:outline-none focus-visible:underline"
+        >
+          {c.actor ?? c.name}
+        </button>
+      ) : (
+        <p className="text-white/85 text-[11.5px] leading-tight mt-1.5 line-clamp-2"
+           style={hideChar && restNameIsChar ? { filter: "blur(4px)" } : undefined}>
+          {c.actor ?? c.name}
+        </p>
+      )}
       {c.actor && (
         <p className="text-white/35 text-[10.5px] leading-tight mt-0.5 truncate"
            style={hideChar ? { filter: "blur(4px)" } : undefined}>
@@ -626,11 +741,9 @@ function useRelationPosters(relations: AnimeRelation[]): {
   return { posters, pending };
 }
 
-export function RelatedTab({ cours, onOpenTitle, onSearchTitle }: {
+export function RelatedTab({ cours, onSearchTitle }: {
   cours: CourRef[];
-  /** Open a title's detail page directly. */
-  onOpenTitle?: (id: string, mediaType: string, name: string) => void;
-  /** Fallback when Fribb has no ids for the MAL entry. */
+  /** Run a search for the clicked title. The only thing a tile does now. */
   onSearchTitle?: (name: string) => void;
 }) {
   const recRows  = useCourPayloads<Recommendation[]>("related", cours);
@@ -673,7 +786,6 @@ export function RelatedTab({ cours, onOpenTitle, onSearchTitle }: {
                 image={posters.get(r.mal_id) ?? null}
                 loadingArt={pending.has(r.mal_id)}
                 caption={r.kind ? `${r.relation} · ${r.kind}` : r.relation}
-                onOpenTitle={onOpenTitle}
                 onSearchTitle={onSearchTitle}
               />
             ))}
@@ -694,7 +806,6 @@ export function RelatedTab({ cours, onOpenTitle, onSearchTitle }: {
                 name={r.title}
                 image={r.image}
                 caption={`${r.votes} ${r.votes === 1 ? "rec" : "recs"}`}
-                onOpenTitle={onOpenTitle}
                 onSearchTitle={onSearchTitle}
               />
             ))}
@@ -706,51 +817,34 @@ export function RelatedTab({ cours, onOpenTitle, onSearchTitle }: {
 }
 
 /**
- * Shared click behaviour for anything that names another title.
+ * A tile that names another title. Clicking it SEARCHES for that title.
  *
- * Resolution is deferred to the CLICK rather than done up front: resolving
- * every tile on render would fire dozens of lookups for links most users never
- * follow. The lookup is a local in-memory map, so the wait is imperceptible,
- * and a miss degrades to a search instead of doing nothing.
+ * It used to resolve the MAL id to a Stremio id through Fribb's reverse map and
+ * open that title's detail page in place. That was a large surface for a small
+ * feature: the swap had to reset a dozen pieces of page state, a MAL id that
+ * Fribb maps to a film opened under the wrong media type and 404'd on every
+ * addon, and many MAL ids collapse onto one IMDb id so a relation could
+ * silently resolve to the page you were already on. Search reaches the same
+ * place through a path that already works everywhere else in the app, and it
+ * cannot land the user on a broken page.
  */
-function useOpenTitle(
-  malId: number,
-  name: string,
-  onOpenTitle?: (id: string, mediaType: string, name: string) => void,
-  onSearchTitle?: (name: string) => void,
-) {
-  const [busy, setBusy] = useState(false);
-  const go = async () => {
-    if (busy) return;
-    setBusy(true);
-    try {
-      const hit = await openableIdForMal(malId);
-      if (hit && onOpenTitle) onOpenTitle(hit.id, hit.media_type, name);
-      else onSearchTitle?.(name);
-    } finally {
-      setBusy(false);
-    }
-  };
-  return { go, busy, enabled: !!(onOpenTitle || onSearchTitle) };
-}
-
 function OpenableTile({
-  malId, name, image, caption, loadingArt = false, onOpenTitle, onSearchTitle,
+  malId, name, image, caption, loadingArt = false, onSearchTitle,
 }: {
   malId: number; name: string; image: string | null; caption: string;
   /** This tile's artwork is still being looked up or retried. Distinguishes a
    *  pending lookup from a title that simply has no art, which otherwise look
    *  identical (both are an empty box). */
   loadingArt?: boolean;
-  onOpenTitle?: (id: string, mediaType: string, name: string) => void;
   onSearchTitle?: (name: string) => void;
 }) {
-  const { go, busy, enabled } = useOpenTitle(malId, name, onOpenTitle, onSearchTitle);
+  void malId;
   return (
     <button
       type="button"
-      onClick={go}
-      disabled={!enabled}
+      onClick={onSearchTitle ? () => onSearchTitle(name) : undefined}
+      disabled={!onSearchTitle}
+      title={onSearchTitle ? `Search for "${name}"` : undefined}
       className="min-w-0 text-left group disabled:cursor-default"
     >
       <div className="relative aspect-[2/3] rounded-lg overflow-hidden bg-white/6 mb-1.5
@@ -761,7 +855,6 @@ function OpenableTile({
             alt=""
             className="absolute inset-0 w-full h-full"
             imgClassName="w-full h-full object-cover"
-            imgStyle={busy ? { opacity: 0.5 } : undefined}
             draggable={false}
           />
         ) : loadingArt ? (

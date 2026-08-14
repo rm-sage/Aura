@@ -30,6 +30,8 @@ import DetailHud from "../DetailHud";
 import { FactList, FactsBlock } from "../AnimeExtrasOverlay";
 import { resolveCourMalIds, type CourRef } from "../animeExtras";
 import { PersistentCache } from "../persistentCache";
+import { BarTooltip, episodeTag, formatProgressPct, type BarTip } from "../progressBar";
+import PersonGrid from "../PersonGrid";
 import SeasonSelect from "../SeasonSelect";
 import FillerRecapTags from "../FillerRecapTags";
 
@@ -94,9 +96,9 @@ import { useEpisodeProgress, useLibraryMap, useResumeVideoId, useEpisodesBehind 
 import { isEpisodeWatched } from "../episodeSpoilers";
 import { isSkipped, useSkipMarksVersion } from "../skipMarks";
 import { connectedServices, useScrobbleConnections } from "../scrobbleConn";
-import { episodeKindFlags, isFillerOrRecap } from "../nextUp";
-import { clearEpisodesSkipped, markEpisodesSkipped, type SkipTarget } from "../skipActions";
-import SpectralPulse from "../SpectralPulse";
+import { mergedKindFlags } from "../nextUp";
+import { clearEpisodesSkipped, isSkipMarkable, markEpisodesSkipped, type SkipTarget } from "../skipActions";
+import SymbolTracer from "../SymbolTracer";
 import WatchedBadge, { useWatchedVariant } from "../WatchedBadge";
 import { openContextMenu } from "../ContextMenu";
 import {
@@ -145,6 +147,9 @@ interface Props {
   meta: MetaPreview;
   addons: AddonEntry[];
   fromRect?: DOMRect | null;
+  /** Dismiss the detail page. Both the Back button and the X, which do the same
+   *  thing again now that a Related tile searches instead of opening a title in
+   *  place: there is no trail left to step back through. */
   onClose: () => void;
   onPlayStream: (
     stream: StreamEntry,
@@ -168,9 +173,6 @@ interface Props {
   /** Watch-party: the leader's chosen stream match-key — highlights the
    *  matching row so a member can one-tap the same stream. */
   partyStreamKey?: string | null;
-  /** Open a different title's detail page in place. Used by the Related tab so
-   *  a sequel or a recommendation is one click away rather than a search. */
-  onOpenTitle?: (id: string, mediaType: string, name: string) => void;
   /** Cast / crew name click handler. Wired by App to flip to Home + queue
    *  the name as the search query. DetailView calls this BEFORE onClose so
    *  the deep-link state is set before the unmount runs. */
@@ -454,7 +456,13 @@ function HeroTitle({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [logo]);
 
-  const showLogo = !!logo && !logoBroken && revealed;
+  // `logoH > 0` is load-bearing. The parent's reveal gate is BOUNDED (a timeout
+  // releases it even if the logo never loads), so `revealed` can flip while the
+  // image is still in flight. Without this the words faded out with nothing to
+  // replace them, and `target` fell back to `auto`, which cannot be
+  // transitioned, so the logo then hard-snapped in. Holding the text until
+  // there is a logo to put in its place is what that bound always meant.
+  const showLogo = !!logo && !logoBroken && revealed && logoH > 0;
   const target   = showLogo ? logoH : textH;
 
   return (
@@ -465,16 +473,43 @@ function HeroTitle({
         // is anchored where the words already were and any growth happens
         // upward, matching the column's justify-end flow.
         alignItems:   "end",
-        justifyItems: "start",
+        // THE COLD-LOAD OVERLAP FIX. The single row is auto-sized, so it takes
+        // the height of the TALLER child, and the logo is mounted and laid out
+        // (up to max-h-44 = 176px) as soon as it decodes, which is well before
+        // the much larger backdrop releases the reveal. Until then `height`
+        // below is still pinned to the TEXT's ~63px. A track taller than its
+        // container gets START alignment under the default `normal` (stretch
+        // only distributes POSITIVE free space), so the row was laid out from
+        // the slot's top and overflowed the bottom by the difference, and
+        // `alignItems: end` then placed both children at the bottom of THAT
+        // track: the visible words rendered ~113px below the slot, painting
+        // over the meta chips, the rating tiles and the action buttons. The
+        // slot's own box never moved, which is why nothing was pushed aside and
+        // it read as the title clipping into everything.
+        //
+        // `end` pins the surplus to the TOP instead, where it overflows into
+        // empty artwork at opacity 0. It is a no-op the moment the slot is at
+        // least as tall as its content, so the reveal choreography is
+        // unchanged: the height still animates 63 -> 176 on the shared beat.
+        alignContent: "end",
+        // Centred, matching the identity column around it. The logo and the
+        // text title share this one grid cell, so they crossfade over the same
+        // centre point rather than pivoting around a left edge.
+        justifyItems: "center",
         height:       target > 0 ? target : undefined,
         transition:   `height ${HERO_REVEAL_MS}ms cubic-bezier(0.2, 0.8, 0.2, 1)`,
       }}
     >
       <h1
         ref={textRef}
-        className="text-white text-[64px] font-light tracking-tight leading-[0.98]"
+        className="text-white text-[64px] font-light tracking-tight leading-[0.98] text-center text-balance"
         style={{
           gridArea:   "1 / 1",
+          // Capped so a long live-action name (the case with no logo to swap
+          // in) wraps to a centred block instead of running the full width of
+          // the info box. `text-balance` then evens the lines rather than
+          // leaving one orphaned word centred under a full one.
+          maxWidth:   "min(900px, 100%)",
           textShadow: "0 4px 16px rgba(0,0,0,0.95), 0 0 30px rgba(0,0,0,0.55)",
           opacity:    showLogo ? 0 : 1,
           transition: `opacity ${HERO_REVEAL_MS}ms ease-out`,
@@ -488,7 +523,7 @@ function HeroTitle({
           src={logo}
           alt={name}
           draggable={false}
-          className="max-h-44 object-contain object-left"
+          className="max-h-44 object-contain object-center"
           onLoad={(e) => {
             // Measure HERE, not just from the ResizeObserver. The observer
             // delivers a frame late, and that frame would render with
@@ -506,6 +541,10 @@ function HeroTitle({
           style={{
             gridArea: "1 / 1",
             maxWidth: "min(580px, 100%)",
+            // Decorative. An opacity-0 image that overflows its slot still
+            // swallows clicks, and during the cold window this one overflows
+            // across the chips strip and the action buttons underneath it.
+            pointerEvents: "none",
             filter:
               "drop-shadow(0 6px 18px rgba(0,0,0,0.85)) drop-shadow(0 0 28px rgba(0,0,0,0.5))",
             opacity:    showLogo ? 1 : 0,
@@ -531,6 +570,29 @@ function seedHeroArt(preview: MetaPreview, resumeVideoId: string | null): HeroAr
   return heroArtFrom(seed, preview, arcHeroArt(preview.id, resumeVideoId));
 }
 
+/** Segment colours. Module scope because they are constant: rebuilt inside the
+ *  component they reallocated on every render, including the tooltip's. Same
+ *  tokens as the Continue Watching bar, deliberately: two bars meaning the same
+ *  thing in two colour schemes would be worse than no second bar. */
+const SEG_CLASS: Record<string, string> = {
+  skipped:     "bg-purple-400",
+  watched:     "bg-emerald-400",
+  "in-progress": "bg-amber-400",
+  available:   "bg-white/70",
+  unaired:     "bg-white/15",
+};
+
+/** The words the hover label uses. Byte-identical to the Continue Watching
+ *  bar's, so the same episode never reads "Available now" on one surface and
+ *  something else on the other. */
+const STATE_WORD: Record<string, string> = {
+  skipped:       "Skipped",
+  watched:       "Watched",
+  "in-progress": "In progress",
+  available:     "Available now",
+  unaired:       "Not yet aired",
+};
+
 /** Section label inside the HUD. Every Overview block gets one: without them
  *  the tab was several paragraphs of different things running together with no
  *  indication of where one ended and the next began. Matches the mono-caps
@@ -552,6 +614,10 @@ function ProgressBlock({
   // fires its own event.
   const manualVersion = useManualWatchedVersion();
   const skipVersion = useSkipMarksVersion();
+  // One mousemove-driven label for the whole bar rather than a `title` per
+  // segment: a 1000-episode show would otherwise mount 1000 tooltip owners, and
+  // the native tooltip cannot be styled to match the Continue Watching bar.
+  const [tip, setTip] = useState<BarTip | null>(null);
 
   const stats = useMemo(() => {
     // Season 0 is specials, which are not part of "have I finished this".
@@ -561,23 +627,42 @@ function ProgressBlock({
     // than a single fill. That is what makes it match the Continue Watching
     // tile: the same show reads the same way in both places, and a skipped run
     // is visible as a band rather than hidden inside one aggregate number.
+    // The episode rides along with its state: the hover label needs SxxEyy, and
+    // re-deriving it from an index would go wrong the moment the list has a gap.
     const segments = main.map((v) => {
-      if (isSkipped(v.id)) return "skipped" as const;
-      if (isEpisodeWatched(byId, v.id)) return "watched" as const;
-      return isVideoAired(v) ? ("available" as const) : ("unaired" as const);
+      // Skipped is tested FIRST because a skip is a watched mark plus an
+      // annotation, so testing watched first would always shadow it. The
+      // in-progress branch exists so this bar and the Continue Watching bar
+      // describe the same episode with the same word.
+      const kind = isSkipped(v.id) ? ("skipped" as const)
+        : isEpisodeWatched(byId, v.id) ? ("watched" as const)
+        : getManualWatchedState(v.id) === "in-progress" ? ("in-progress" as const)
+        : isVideoAired(v) ? ("available" as const)
+        : ("unaired" as const);
+      return { kind, video: v };
     });
-    const watched = segments.filter((x) => x === "watched").length;
-    const skipped = segments.filter((x) => x === "skipped").length;
+    const watched = segments.filter((x) => x.kind === "watched").length;
+    const skipped = segments.filter((x) => x.kind === "skipped").length;
     return { segments, watched, skipped, total: main.length };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [videos, byId, seriesId, manualVersion, skipVersion]);
+
+  // ELEMENT IDENTITY is the point, and this must stay above the early return
+  // below or the hook count changes between renders. React skips reconciling a
+  // child whose element object is unchanged, so the segments (up to a thousand
+  // divs on a long-runner) are not rebuilt every time the tooltip's own state
+  // churns under the pointer.
+  const segmentEls = useMemo(
+    () => stats?.segments.map((seg, i) => (
+      <div key={i} className={`flex-1 h-full ${SEG_CLASS[seg.kind]}`} />
+    )) ?? null,
+    [stats],
+  );
 
   // Nothing seen and nothing skipped is not progress; a row of zeroes on an
   // unstarted show is noise.
   if (!stats || (stats.watched === 0 && stats.skipped === 0)) return null;
   const done = stats.watched + stats.skipped;
-  const pctWatched = Math.round((stats.watched / stats.total) * 100);
-  const pctSkipped = Math.round((stats.skipped / stats.total) * 100);
   const remaining = stats.total - done;
 
   // Segments stay legible down to a couple of pixels each, but past a few
@@ -585,31 +670,33 @@ function ProgressBlock({
   // bar closes up rather than dissolving into stripes.
   const dense = stats.total > 120;
 
-  const SEG_CLASS: Record<string, string> = {
-    // Same tokens as the Continue Watching bar, deliberately: two bars meaning
-    // the same thing in two colours would be worse than no second bar.
-    skipped:   "bg-purple-400",
-    watched:   "bg-emerald-400",
-    available: "bg-white/70",
-    unaired:   "bg-white/15",
-  };
-
   return (
     <section>
       <HudSectionLabel>Your Progress</HudSectionLabel>
       <div className="flex items-center gap-3">
-        <div className={`flex-1 h-[6px] rounded-full overflow-hidden min-w-0 flex ${dense ? "" : "gap-[1.5px]"}`}>
-          {stats.segments.map((kind, i) => (
-            <div
-              key={i}
-              className={`flex-1 h-full ${SEG_CLASS[kind]}`}
-              // Individually titled so hovering a purple band answers "which
-              // episodes did I skip" without opening the episode list.
-              title={`${i + 1}. ${kind === "available" ? "Not watched"
-                : kind === "unaired" ? "Not yet aired"
-                : kind[0].toUpperCase() + kind.slice(1)}`}
-            />
-          ))}
+        <div
+          className={`flex-1 h-[6px] rounded-full overflow-hidden min-w-0 flex ${dense ? "" : "gap-[1.5px]"}`}
+          // Hover only in the SEGMENTED rendering. Past the density threshold
+          // the gaps close up and the bar reads as one continuous gradient, at
+          // which point a per-episode label is answering a question the shape
+          // did not ask: the pointer is nowhere near a segment boundary the eye
+          // can see, so "S01E20 · Watched" looks like a claim about the 20%
+          // mark. The summary line below already covers the dense case.
+          onMouseMove={dense ? undefined : (e) => {
+            const r = e.currentTarget.getBoundingClientRect();
+            const frac = Math.max(0, Math.min(0.9999, (e.clientX - r.left) / r.width));
+            const i = Math.min(stats.segments.length - 1, Math.floor(frac * stats.segments.length));
+            const seg = stats.segments[i];
+            setTip({
+              x: e.clientX,
+              y: r.top,
+              text: `${episodeTag(seg.video.season, seg.video.episode)} · ${STATE_WORD[seg.kind]}`,
+            });
+          }}
+          onMouseLeave={dense ? undefined : () => setTip(null)}
+        >
+          {segmentEls}
+          <BarTooltip tip={dense ? null : tip} />
         </div>
         <span className="shrink-0 text-white/80 text-[12.5px] font-mono tabular-nums">
           {done}/{stats.total}
@@ -617,9 +704,11 @@ function ProgressBlock({
       </div>
       <p className="text-white/40 text-[11.5px] mt-1.5">
         {remaining === 0 ? "Completed" : `${remaining} episode${remaining === 1 ? "" : "s"} left`}
-        {" · "}{pctWatched}% watched
+        {" · "}{formatProgressPct(stats.watched / stats.total)} watched
         {stats.skipped > 0 && (
-          <span className="text-purple-300/70"> · {pctSkipped}% skipped</span>
+          <span className="text-purple-300/70">
+            {" "}· {formatProgressPct(stats.skipped / stats.total)} skipped
+          </span>
         )}
       </p>
     </section>
@@ -638,7 +727,7 @@ function HudSectionLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
-function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onOpenTitle, onSearchByName, inLibrary, onLibraryToggle, onQueueToggle, onPlayTrailer, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
+function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, onQueueToggle, onPlayTrailer, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
   const [detail, setDetail]                 = useState<MetaDetail | null>(null);
   // Resume pointer, read BEFORE the latch below because the latch's seed
   // needs it synchronously on the first render to pick the right arc's art.
@@ -770,8 +859,31 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // there is nothing to show for live action. An empty result means the
   // trigger never renders, so the button is absent rather than dead.
   const [extrasCours, setExtrasCours] = useState<CourRef[]>([]);
-  const isAnimeDetail =
-    isAnimeMeta(meta) || (detail?.media_type ?? "").toLowerCase() === "anime";
+  // The FULL heuristic, over the resolved detail as well as the preview.
+  //
+  // The previous form was `isAnimeMeta(meta) || detail.media_type === "anime"`,
+  // and both halves fail on a title reached by a stub: a Related-tab click, a
+  // notification deep-link and an `aura://detail` link all build a MetaPreview
+  // carrying only an id, a name and a type. `openableIdForMal` prefers IMDb, so
+  // the common related-anime case is `{ tt..., "series" }` with no genres, and
+  // Cinemeta / AIOMetadata report anime as `type: "series"` too. Both halves
+  // therefore said "not anime" and Songs, Ratings, Staff, Related and Trailers
+  // silently vanished on exactly the page the user had just navigated to.
+  //
+  // The detail response has what the stub lacks (genres, originalLanguage,
+  // productionCountries), and this is the same call the "Anime" badge below
+  // already makes, so hoisting it also stops the badge and the tabs from
+  // disagreeing about the same title.
+  const isAnimeDetail = useMemo(
+    () => isAnimeMeta({
+      media_type:           detail?.media_type ?? meta.media_type,
+      id:                   meta.id,
+      genres:               detail?.genres ?? meta.genres ?? null,
+      original_language:    detail?.original_language ?? null,
+      production_countries: detail?.production_countries ?? null,
+    }),
+    [meta, detail],
+  );
   useEffect(() => {
     if (!isAnimeDetail || !detail) { setExtrasCours([]); return; }
     let cancelled = false;
@@ -880,12 +992,15 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     return () => cancelAnimationFrame(id);
   }, []);
 
-  // ESC closes
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  // NO local Escape handler. App owns Escape app-wide with an explicit
+  // top-down priority (fullscreen, then the EOS layers, then playback, then
+  // this page), and it already only reaches the detail branch while this
+  // component is mounted. A second window listener here fired IN ADDITION to
+  // that one -- `stopPropagation` does not stop a sibling listener on the same
+  // target -- which was harmless only because both did the same thing. Now
+  // that Escape steps back through the related-title trail instead of
+  // discarding it, a duplicate handler calling the full close would race it
+  // and win about half the time.
 
   // Release-search single-fetch on detail open — pulls the cloud
   // signal for this series so EpisodeRow's filler/recap banner
@@ -1131,7 +1246,16 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
       is_anime:   isAnime,
     };
     dedupedInvoke(
-      `ratings:${meta.id}:${isAnime ? "anime" : "std"}`,
+      // Keyed on the IDS THE ANSWER IS COMPUTED FROM, not just the meta id.
+      // This effect runs twice: once before the meta probe resolves (mal /
+      // kitsu / anidb all null) and again once it has. Keyed on meta.id alone
+      // those two runs collided, the second was handed the first's in-flight
+      // promise, and the id-less answer -- which falls through to a title
+      // search and can elect the wrong MAL entry -- was what got rendered AND
+      // written into the 7-day ratings cache. Same hazard CLAUDE.md documents
+      // for the hover card, and the same fix.
+      `ratings:${meta.id}:${isAnime ? "anime" : "std"}`
+        + `:${detail?.mal_id ?? ""}:${detail?.kitsu_id ?? ""}:${detail?.anidb_id ?? ""}`,
       () => invoke<AggregateRating[]>("fetch_aggregate_ratings", { input }),
     )
       .then((r) => {
@@ -1537,22 +1661,19 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
         <button
           onClick={onClose}
           aria-label="Back"
-          className="pointer-events-auto flex items-center gap-2 px-3 h-9 rounded-full
-                     bg-black/60 backdrop-blur-xl border border-white/10
-                     text-white/85 hover:text-white text-xs font-medium tracking-wide
-                     transition-colors"
+          className="aura-float-glass aura-nav-back pointer-events-auto flex items-center
+                     gap-2 px-3 h-9 rounded-full
+                     text-white/85 hover:text-white text-xs font-medium tracking-wide"
         >
-          <ArrowBackIcon /> Back
+          <span className="aura-nav-back-glyph flex"><ArrowBackIcon /></span> Back
         </button>
         <button
           onClick={onClose}
           aria-label="Close"
-          className="pointer-events-auto w-9 h-9 rounded-full
-                     bg-black/60 backdrop-blur-xl border border-white/10
-                     flex items-center justify-center text-white/85 hover:text-white
-                     transition-colors"
+          className="aura-float-glass aura-nav-close pointer-events-auto w-9 h-9 rounded-full
+                     flex items-center justify-center text-white/85 hover:text-white"
         >
-          <CloseIcon />
+          <span className="aura-nav-close-glyph flex"><CloseIcon /></span>
         </button>
       </div>
 
@@ -1576,11 +1697,20 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
             its content without it, and the cap would silently do nothing. */}
         <section className="min-w-0 h-full px-12 pt-24 pb-10 flex flex-col justify-end
                             overflow-hidden gap-7 min-h-0">
-          {/* Identity keeps a reading-width cap: a title, a meta line and two
-              buttons stretched across half an ultrawide would look lost. The
-              HUD below deliberately does NOT inherit it, because its whole job
-              is to use that width in columns. */}
-          <div className="space-y-7 shrink-0" style={{ maxWidth: "min(720px, 100%)" }}>
+          {/* Identity is CENTRED OVER THE INFO BOX, which is why its width is
+              the HUD's `min(100%, 74rem)` and not a reading-width cap of its
+              own. It used to be capped at 720px and left-aligned; centring
+              inside that cap would have centred the stack over an invisible box
+              rather than over the panel it belongs to, and the two would only
+              have agreed at one window width.
+              The tab row inside the HUD deliberately stays LEFT: it is the one
+              thing here that controls the panel below it, so it anchors to that
+              panel's edge. On a live-action title with only two tabs, centring
+              them stranded a pair of pills in the middle of a wide column. */}
+          <div
+            className="flex flex-col items-center text-center space-y-7 shrink-0"
+            style={{ width: "min(100%, 74rem)" }}
+          >
             {/* Logo or title — bumped ~30% bigger. Crossfades on the shared
                 hero reveal beat; see HeroTitle. */}
             <HeroTitle
@@ -1607,16 +1737,22 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                 Together they keep the mid-tone mono text and the accent
                 countdown legible on any backdrop. */}
             <div
-              className="flex items-center gap-3 flex-wrap text-[14px] font-mono uppercase tracking-[0.14em]"
+              className="flex items-center justify-center gap-3 flex-wrap text-[14px] font-mono uppercase tracking-[0.14em]"
               style={{
                 textShadow: "0 1px 4px rgba(0,0,0,0.92), 0 0 10px rgba(0,0,0,0.6)",
+                // SYMMETRIC plate. The original was anchored left and faded out
+                // to the right, which is correct for a left-aligned strip and
+                // wrong for a centred one: the text would have sat half on the
+                // scrim and half off it. Same darkest value in the middle where
+                // the words are, fading at both ends so it never reads as a
+                // hard-edged box on the artwork.
                 background:
-                  "linear-gradient(100deg, rgba(0,0,0,0.62) 0%, rgba(0,0,0,0.44) 50%, rgba(0,0,0,0) 100%)",
+                  "linear-gradient(90deg, rgba(0,0,0,0) 0%, rgba(0,0,0,0.58) 16%, rgba(0,0,0,0.58) 84%, rgba(0,0,0,0) 100%)",
                 paddingTop: "7px",
                 paddingBottom: "7px",
-                paddingLeft: "14px",
+                paddingLeft: "28px",
                 paddingRight: "28px",
-                marginLeft: "-14px",
+                marginLeft: "-28px",
                 marginRight: "-28px",
                 borderRadius: "10px",
               }}
@@ -1627,13 +1763,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                   detail's originalLanguage + productionCountries, which
                   catches IMDb-id'd anime films that lack mal/kitsu/
                   anidb anchors (Chainsaw Man, Jujutsu Kaisen, etc.). */}
-              {isAnimeMeta({
-                media_type:           detail?.media_type ?? meta.media_type,
-                id:                   meta.id,
-                genres:               detail?.genres ?? meta.genres ?? null,
-                original_language:    detail?.original_language ?? null,
-                production_countries: detail?.production_countries ?? null,
-              }) && (
+              {isAnimeDetail && (
                 <span className="px-2.5 py-1 rounded-sm bg-pink-500/25 border border-pink-400/40
                                  text-pink-100 text-[12px] font-semibold backdrop-blur-sm">Anime</span>
               )}
@@ -1759,7 +1889,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                 most six. */}
             {mergedRatings.length > 0 && (
               <div
-                className="flex items-center gap-2.5 flex-wrap -mt-1"
+                className="flex items-center justify-center gap-2.5 flex-wrap -mt-1"
                 style={{ textShadow: "0 1px 3px rgba(0,0,0,0.85)" }}
               >
                 {mergedRatings.slice(0, 6).map((r) => (
@@ -1777,7 +1907,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                 emits one). Sits below the meta strip so it never moves around
                 when ratings or runtime fields appear/disappear. */}
             {(onLibraryToggle || onQueueToggle || (detail?.trailer_yt_id && onPlayTrailer)) && (
-              <div className="flex items-center gap-3 -mt-2">
+              <div className="flex items-center justify-center gap-3 -mt-2">
                 {onLibraryToggle && (
                 <button
                   type="button"
@@ -1786,7 +1916,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                               border transition-colors duration-150
                               ${inLibrary
                                 ? "bg-ln-accent/20 text-ln-accent border-ln-accent/40 hover:bg-rose-500/15 hover:text-rose-200 hover:border-rose-300/40"
-                                : "bg-white/8 text-white/85 border-white/15 hover:bg-ln-accent/20 hover:text-ln-accent hover:border-ln-accent/40"
+                                : "aura-float-glass text-white/85 hover:text-ln-accent hover:border-ln-accent/40"
                               }`}
                 >
                   {inLibrary ? (
@@ -1827,7 +1957,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                                 border transition-colors duration-150
                                 ${inQueue
                                   ? "bg-ln-accent/20 text-ln-accent border-ln-accent/40 hover:bg-rose-500/15 hover:text-rose-200 hover:border-rose-300/40"
-                                  : "bg-white/8 text-white/85 border-white/15 hover:bg-ln-accent/20 hover:text-ln-accent hover:border-ln-accent/40"
+                                  : "aura-float-glass text-white/85 hover:text-ln-accent hover:border-ln-accent/40"
                                 }`}
                   >
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
@@ -1853,7 +1983,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                     onClick={() => onPlayTrailer(detail.trailer_yt_id!, detail?.name ?? meta.name)}
                     className="flex items-center gap-2 px-4 py-2 rounded-full text-[13px] font-medium
                                border transition-colors duration-150
-                               bg-white/8 text-white/85 border-white/15
+                               aura-float-glass text-white/85
                                hover:bg-ln-accent/20 hover:text-ln-accent hover:border-ln-accent/40"
                   >
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
@@ -1878,7 +2008,6 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
             resetKey={meta.id}
               cours={extrasCours}
               onPlayTrailer={onPlayTrailer}
-              onOpenTitle={onOpenTitle}
               onSearchTitle={onSearchByName ? (n) => { onSearchByName(n); onClose(); } : undefined}
               overview={(
                 // Two EXPLICIT columns rather than a flat grid of sections.
@@ -1980,27 +2109,66 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                 </section>
               );
             })()}
-            <ProgressBlock videos={detail?.videos ?? []} seriesId={meta.id} />
+            {/* SORTED, not the addon's raw array. The bar is drawn left to
+                right in whatever order it is handed, and the episode list on
+                this same page sorts before rendering, so an addon that returns
+                videos out of order drew a bar whose bands did not correspond to
+                the show's own order. That was tolerable while the hover text
+                was a bare ordinal; now that it names an episode, the bar reads
+                as a timeline and has to be one. getSortedEpisodes is
+                WeakMap-memoized, so this costs nothing. */}
+            <ProgressBlock
+              videos={detail ? getSortedEpisodes(detail) : []}
+              seriesId={meta.id}
+            />
             </div>
 
 
                 </div>
               )}
-              cast={(
-                <div className="space-y-5">
-                  {/* Crew & cast — moved from the right column. Each row a wide
-                      "About" line. Names are clickable — they fire onSearchByName
-                      to flip to Home and queue the name as the deep-link query.
-                      Section order: Cast → Directors → Writers → Producers →
-                      Composers → Creators. Country is non-clickable text. */}
-                  <div className="space-y-3 pt-1">
-                    <SeasonAwareCastBlock
-                      detail={detail}
-                      meta={meta}
-                      selectedSeason={selectedSeason}
-                      onClickName={onSearchByName ? (n) => { onSearchByName(n); onClose(); } : undefined}
-                    />
-
+              cast={hasAnyCredits(detail) ? (
+                <div className="space-y-3 pt-1">
+                  <SeasonAwareCastBlock
+                    detail={detail}
+                    meta={meta}
+                    selectedSeason={selectedSeason}
+                    onClickName={onSearchByName ? (n) => { onSearchByName(n); onClose(); } : undefined}
+                  />
+                </div>
+              ) : detail === null ? (
+                // STILL LOADING is not the same as EMPTY. The HUD mounts
+                // immediately while the meta probe runs (10-30 s on a cold
+                // anime), so a bare empty state here flashed "No cast listed"
+                // on every single open before the credits arrived. The anime
+                // tabs avoid this the same way, via their own Loading state.
+                <p className="text-white/35 text-[12.5px] py-6 text-center">
+                  Loading credits...
+                </p>
+              ) : (
+                // Never a blank panel. A tab that opens on nothing at all reads
+                // as broken rather than as "this addon shipped no credits",
+                // which is the common case for a Cinemeta-only movie. Wording
+                // matches the anime tabs' own empty state.
+                <p className="text-white/35 text-[12.5px] py-6 text-center">
+                  No cast listed for this title.
+                </p>
+              )}
+              // CREW IS SEPARATE FROM CAST, and that split is the fix for a
+              // parity gap running the other way: the HUD swaps the whole
+              // `cast` node out for the MAL character grid on anime, so an
+              // anime lost its Voice Actors, Directors, Writers, Producers,
+              // Composers and Creators rows entirely. The Staff tab does not
+              // cover them (it carries MAL staff, not the addon's crew). Passed
+              // apart, the grid replaces only the cast and the crew survives on
+              // both kinds of title.
+              crew={(
+                // No `pt-1` here: the HUD's own `space-y-5` already separates
+                // this from the cast block above it.
+                <div className="space-y-3">
+                  {/* Names are clickable: they fire onSearchByName to flip to
+                      Home and queue the name as the deep-link query. Order:
+                      Voice Actors, Directors, Writers, Producers, Composers,
+                      Creators. */}
                     {detail?.voice_actors && detail.voice_actors.length > 0 && !voiceActorsDuplicateCast(detail) &&
                       <CreditRow label={detail.voice_actors.length > 1 ? "Voice Actors" : "Voice Actor"}
                         values={plainCredits(detail.voice_actors)}
@@ -2014,14 +2182,29 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                         values={plainCredits(detail.writer)}
                         onClickName={onSearchByName ? (n) => { onSearchByName(n); onClose(); } : undefined} />}
                     {(() => {
-                      const producerEntries = (detail?.producer_detailed && detail.producer_detailed.length > 0)
-                        ? detail.producer_detailed
-                        : plainCredits(detail?.producer ?? []);
-                      return producerEntries.length > 0
+                      const click = onSearchByName
+                        ? (n: string) => { onSearchByName(n); onClose(); }
+                        : undefined;
+                      // Detailed producers carry photos and roles, so they get
+                      // the same grid the cast does. This was the only OTHER
+                      // route to the deleted hover card, and therefore the only
+                      // other place a photo could go missing with it.
+                      const detailed = detail?.producer_detailed ?? [];
+                      if (detailed.length > 0) {
+                        return (
+                          <section>
+                            <HudSectionLabel>
+                              {detailed.length > 1 ? "Producers" : "Producer"}
+                            </HudSectionLabel>
+                            <PersonGrid entries={detailed} onClickName={click} />
+                          </section>
+                        );
+                      }
+                      const plain = plainCredits(detail?.producer ?? []);
+                      return plain.length > 0
                         ? (
-                          <CreditRow label={producerEntries.length > 1 ? "Producers" : "Producer"}
-                            values={producerEntries}
-                            onClickName={onSearchByName ? (n) => { onSearchByName(n); onClose(); } : undefined} />
+                          <CreditRow label={plain.length > 1 ? "Producers" : "Producer"}
+                            values={plain} onClickName={click} />
                         )
                         : null;
                     })()}
@@ -2033,11 +2216,10 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                       <CreditRow label={detail.creator.length > 1 ? "Creators" : "Creator"}
                         values={plainCredits(detail.creator)}
                         onClickName={onSearchByName ? (n) => { onSearchByName(n); onClose(); } : undefined} />}
-                  </div>
                 </div>
-            )}
-          />
-        </section>
+              )}
+            />
+          </section>
 
         {/* RIGHT — fixed grid column. Width is controlled entirely by the
             grid template above; the aside just fills its assigned cell.
@@ -2316,10 +2498,11 @@ function RatingTile({
  *  meta source supplied them (AIOMetadata's `app_extras.cast`/
  *  `app_extras.producers`); otherwise null and we render just the
  *  name. The trailing `episode_count` / `total_show_episodes` /
- *  `tier` fields are TMDB-only — they fuel the cast hover overlay's
- *  Main / Recurring / Guest classification, gated by the
- *  `hideCastSpoilers` setting. Optional everywhere; CreditHoverCard
- *  silently omits the tier overlay when they aren't set. */
+ *  `tier` fields are TMDB-only. They classify a credit Main / Recurring /
+ *  Guest, gated by the `hideCastSpoilers` setting; only "Main" is rendered
+ *  (the tile is ~63px wide, so the longer two clipped). The cast HOVER CARD
+ *  they used to feed is gone: credits render as PersonGrid tiles now.
+ *  Optional everywhere, and the badge is simply absent when unset. */
 interface CreditEntry {
   name: string;
   character: string | null;
@@ -2342,8 +2525,37 @@ function classifyCastTier(episodeCount: number, totalShowEpisodes: number): Cast
   return "guest";
 }
 
-function castTierLabel(tier: CastTier): string {
-  return tier === "main" ? "Main cast" : tier === "recurring" ? "Recurring" : "Guest";
+/** Tier as a corner badge, or nothing.
+ *
+ *  ONLY the main tier gets one, for two reasons. The badge sits on a tile that
+ *  is ~63px wide at the app's minimum window size, so "Recurring" clipped
+ *  mid-word and "Main cast" wrapped to two lines over the face; and the anime
+ *  character grid this matches badges exactly one thing, "Main". Who the leads
+ *  are is the signal worth a badge, and a grid where nearly every tile carries
+ *  a label is a grid where none of them read. The full tier is still available
+ *  from the episode counts if it is ever wanted elsewhere. */
+function castTierBadge(tier: CastTier): string | null {
+  return tier === "main" ? "Main" : null;
+}
+
+/** Does this title have ANY credit worth opening the Cast tab for? Every block
+ *  in that tab self-hides when its own source is empty, so without this check a
+ *  title with no credits at all rendered an empty panel, which reads as a
+ *  failure rather than as an absence. */
+function hasAnyCredits(detail: MetaDetail | null): boolean {
+  if (!detail) return false;
+  const lists: (unknown[] | null | undefined)[] = [
+    detail.cast, detail.cast_detailed, detail.voice_actors, detail.director,
+    detail.writer, detail.producer, detail.producer_detailed, detail.composer,
+    detail.creator,
+  ];
+  if (lists.some((l) => Array.isArray(l) && l.length > 0)) return true;
+  // season_credits is checked LAST but matters MOST: it is the FIRST source
+  // SeasonAwareCastBlock reads, so an addon that ships only per-season rosters
+  // has a full cast to render while every show-level list above is empty.
+  // Omitting it made this gate claim "No cast listed" over a populated roster.
+  return Object.values(detail.season_credits ?? {})
+    .some((roster) => (roster?.cast?.length ?? 0) > 0);
 }
 
 /** Renders the per-episode synopsis section that lives below the show
@@ -2615,12 +2827,14 @@ function CreditRow({
 }
 
 // ---------------------------------------------------------------------------
-// CreditName — renders one credit entry's name as either a clickable
-// "search for this person" button or static text. When the entry has a
-// character (role / voiced character) and/or a photo, hovering exposes
-// a small floating card with both. Photo is rendered with a contained
-// fixed-size box so addons that ship oversized headshots don't blow
-// out the row.
+// CreditName: one credit entry's name, as either a clickable "search for this
+// person" button or static text. That is all it is now.
+//
+// It used to own a hover card carrying the photo, the character and the TMDB
+// tier. That card was absolutely positioned inside the HUD panel, which is a
+// scroll container, so it was clipped on both axes and the clipped remnant was
+// a verbatim copy of the line it floated over. Everything it showed lives on a
+// PersonGrid tile instead; see the note at the top of PersonGrid.tsx.
 // ---------------------------------------------------------------------------
 
 function CreditName({
@@ -2628,20 +2842,12 @@ function CreditName({
 }: {
   entry: CreditEntry;
   onClick?: () => void;
-  /** When true, the character pairing renders as a small line BELOW
-   *  the actor's name (used by the cast / voice-cast / producer rows
-   *  where the character is meaningful). When false (the inline
-   *  `·`-separated rows like Director / Writer), the character only
-   *  appears in the hover photo card — keeps those rows compact. */
+  /** When true, the character pairing renders as a small line BELOW the
+   *  person's name. False (the inline `·`-separated rows like Director /
+   *  Writer) keeps those rows compact, and the character is simply not shown:
+   *  it does not apply to crew credits. */
   showCharacterBelow?: boolean;
 }) {
-  const [hovered, setHovered] = useState(false);
-  const hasTierInfo =
-    typeof entry.episode_count === "number" &&
-    typeof entry.total_show_episodes === "number" &&
-    entry.total_show_episodes > 0;
-  const hasExtras = !!entry.character || !!entry.photo || hasTierInfo;
-
   const nameEl = onClick ? (
     <button
       type="button"
@@ -2649,7 +2855,12 @@ function CreditName({
       className="text-white/95 hover:text-ln-accent transition-colors cursor-pointer
                  bg-transparent p-0 border-0 text-[14.5px] leading-snug font-inherit text-left
                  focus:outline-none focus-visible:underline"
-      title={entry.character ? `${entry.name} as ${entry.character}` : `Search for "${entry.name}"`}
+      // Always the search hint, never "Name as Character". The character is
+      // already printed directly beneath the name in stacked mode, so the
+      // native tooltip was a THIRD copy of the same pair (the row, the deleted
+      // hover card, and this) and it is the one that survives an overflow
+      // ancestor, so it would have outlived the card's removal.
+      title={`Search for "${entry.name}"`}
     >
       {entry.name}
     </button>
@@ -2657,104 +2868,25 @@ function CreditName({
     <span className="text-white/95 text-[14.5px] leading-snug">{entry.name}</span>
   );
 
-  // Inline mode (no character below) — just the name, with optional
-  // hover photo card. Used for crew credits where character pairing
-  // doesn't apply.
-  if (!showCharacterBelow) {
-    if (!hasExtras) return nameEl;
-    return (
-      <span
-        className="relative inline-block"
-        onMouseEnter={() => setHovered(true)}
-        onMouseLeave={() => setHovered(false)}
-      >
-        {nameEl}
-        {hovered && <CreditHoverCard entry={entry} />}
-      </span>
-    );
-  }
+  // Inline mode (no character below): crew credits, where character pairing
+  // does not apply.
+  if (!showCharacterBelow) return nameEl;
 
-  // Stacked mode — name on top, "as Character" beneath in a smaller,
-  // dimmer line. Each entry is a self-contained inline-flex column so
-  // the parent can flex-wrap them across the row without inline-text
-  // alignment artifacts.
+  // Stacked mode: name on top, "as Character" beneath in a smaller, dimmer
+  // line. Each entry is a self-contained inline-flex column so the parent can
+  // flex-wrap them across the row without inline-text alignment artifacts.
   return (
-    <span
-      className="relative inline-flex flex-col items-start min-w-0"
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-    >
+    <span className="inline-flex flex-col items-start min-w-0">
       {nameEl}
       {entry.character && (
         <span className="text-white/45 text-[11.5px] leading-tight italic mt-0.5">
           as {entry.character}
         </span>
       )}
-      {hovered && hasExtras && <CreditHoverCard entry={entry} />}
     </span>
   );
 }
 
-/** Floating card shown above a hovered credit when the entry has a
- *  photo and/or character pairing. Centred over the trigger; uses
- *  pointer-events: none so the hover stays on the trigger element.
- *  When the entry carries `episode_count` + `total_show_episodes`
- *  (TMDB series only, gated by the hideCastSpoilers setting), a tier
- *  + count line is appended to the bottom of the card. */
-function CreditHoverCard({ entry }: { entry: CreditEntry }) {
-  const showTier =
-    typeof entry.episode_count === "number" &&
-    typeof entry.total_show_episodes === "number" &&
-    entry.total_show_episodes > 0;
-  const tier = showTier
-    ? classifyCastTier(entry.episode_count!, entry.total_show_episodes!)
-    : null;
-  return (
-    <span
-      aria-hidden
-      className="absolute z-50 left-1/2 -translate-x-1/2 bottom-full mb-2
-                 pointer-events-none
-                 px-3 py-2 rounded-lg
-                 bg-black/92 backdrop-blur-xl border border-white/15
-                 shadow-[0_18px_42px_-12px_rgba(0,0,0,0.85)]
-                 flex flex-col items-center gap-2 min-w-[140px]"
-      style={{ whiteSpace: "nowrap" }}
-    >
-      {entry.photo && (
-        <span
-          className="block rounded-md overflow-hidden bg-white/5 border border-white/10"
-          style={{ width: 96, height: 128 }}
-        >
-          <img
-            src={entry.photo}
-            alt={entry.name}
-            className="w-full h-full object-cover"
-            draggable={false}
-          />
-        </span>
-      )}
-      <span className="text-white/95 text-[12.5px] font-medium leading-tight">
-        {entry.name}
-      </span>
-      {entry.character && (
-        <span className="text-white/55 text-[11px] leading-tight italic">
-          as {entry.character}
-        </span>
-      )}
-      {tier && (
-        <span className="flex flex-col items-center gap-0.5 mt-1 pt-2
-                         border-t border-white/12 self-stretch">
-          <span className="text-white/65 text-[10px] uppercase tracking-[0.16em]">
-            {castTierLabel(tier)}
-          </span>
-          <span className="text-white/85 text-[11px] font-mono tabular-nums">
-            {entry.episode_count} of {entry.total_show_episodes} eps
-          </span>
-        </span>
-      )}
-    </span>
-  );
-}
 
 // ---------------------------------------------------------------------------
 // SeasonAwareCastBlock — renders the detail-page cast row, swapping
@@ -2762,8 +2894,8 @@ function CreditHoverCard({ entry }: { entry: CreditEntry }) {
 // `app_extras.seasonCredits`. Cross-fades on season change via a
 // key + CSS opacity transition (no framer-motion dep). Each cast
 // entry is enriched with `episode_count` + `total_show_episodes`
-// when `aggregate_credits` is available, fueling the hover overlay's
-// Main / Recurring / Guest classifier — gated by the
+// when `aggregate_credits` is available, driving the Main / Recurring /
+// Guest classifier behind each tile's "Main" badge - gated by the
 // `hideCastSpoilers` setting because some shows treat regular vs.
 // guest billing as a plot beat.
 // ---------------------------------------------------------------------------
@@ -2789,7 +2921,16 @@ function SeasonAwareCastBlock({
     };
   }, []);
 
-  const animeLike = isAnimeMeta(meta) || (detail?.media_type ?? "").toLowerCase() === "anime";
+  // Same full heuristic the page's own isAnimeDetail uses. The narrow form
+  // (media_type only) said "not anime" for every IMDb-id'd anime, so the
+  // roster was labelled "Cast" on a show whose credits are voice actors.
+  const animeLike = isAnimeMeta({
+    media_type:           detail?.media_type ?? meta.media_type,
+    id:                   meta.id,
+    genres:               detail?.genres ?? meta.genres ?? null,
+    original_language:    detail?.original_language ?? null,
+    production_countries: detail?.production_countries ?? null,
+  });
   const castLabel = animeLike && (detail?.voice_actors?.length ?? 0) === 0 ? "Voice Cast" : "Cast";
 
   // Diagnostic — surfaces what the React side actually got, so a
@@ -2866,13 +3007,46 @@ function SeasonAwareCastBlock({
   // there are no seasonCredits we don't key by season (the cast
   // never changes — keying would still trigger spurious fades).
   const fadeKey = hasSeasonCredits ? (seasonKey ?? "default") : "static";
+  // The same cleaning CreditRow does internally, hoisted so BOTH branches get
+  // it. Skipping it sent AIOMetadata's documented exact-repeat rows straight
+  // into the grid as two identical tiles, and lost the photo / episode_count
+  // backfill dedupeCredits performs while merging them.
+  const cleanedCast = dedupeCredits(
+    enrichedCast.filter((v) => !!v.name && v.name.trim().length > 0),
+  );
+  // A grid needs PHOTOS. Gating on "photo or character" let a roster that has
+  // roles but no headshots through, and a grid of initials placeholders is
+  // exactly the wall of empty boxes the gate exists to prevent; those read
+  // better as the text row, which still pairs each name with its character.
+  const photoCount = cleanedCast.filter((e) => !!e.photo).length;
+  const rich = photoCount > 0 && photoCount >= cleanedCast.length / 2;
+  if (cleanedCast.length === 0) return null;
   return (
     <div key={fadeKey} className="aura-cast-fade">
-      <CreditRow
-        label={castLabel}
-        values={enrichedCast}
-        onClickName={onClickName}
-      />
+      {rich ? (
+        <>
+          <HudSectionLabel>{castLabel}</HudSectionLabel>
+          <PersonGrid
+            entries={cleanedCast}
+            onClickName={onClickName}
+            // The same tier the deleted hover card showed, moved onto the tile.
+            // `hideCastSpoilers` still gates it for free: aggIndex is null when
+            // that setting is on, so episode_count is never stamped.
+            badgeFor={(e) =>
+              typeof e.episode_count === "number"
+              && typeof e.total_show_episodes === "number"
+              && e.total_show_episodes > 0
+                ? castTierBadge(classifyCastTier(e.episode_count, e.total_show_episodes))
+                : null}
+          />
+        </>
+      ) : (
+        <CreditRow
+          label={castLabel}
+          values={enrichedCast}
+          onClickName={onClickName}
+        />
+      )}
     </div>
   );
 }
@@ -3078,10 +3252,17 @@ const EpisodeRow = ({
     };
   }, []);
   const isWatched = watchedVariant === "watched";
-  // Blur lifts on watched (manual mark OR auto-derived from progress >= 0.9
-  // via useWatchedVariant). The transition makes the un-blur feel
-  // intentional when the user marks an episode watched.
-  const shouldBlur = blurEnabled && !isWatched;
+  // Blur lifts on watched (manual mark OR auto-derived from progress >= 0.9 via
+  // useWatchedVariant) AND on skipped. The transition makes the un-blur feel
+  // intentional when the user marks an episode.
+  //
+  // Skipped has to be named explicitly: a skip IS a watched mark plus an
+  // annotation, and useWatchedVariant reports the annotation, returning
+  // "skipped" instead of "watched". Testing `isWatched` alone therefore left
+  // every skipped episode blurred, which is backwards. A skip is a statement
+  // that the episode is finished with, so there is no spoiler left to hide.
+  const isFinished = isWatched || watchedVariant === "skipped";
+  const shouldBlur = blurEnabled && !isFinished;
 
   // Unaired = a parseable FUTURE air date. isVideoAired treats missing /
   // unparseable dates as aired, so undated specials stay untouched. The
@@ -3203,12 +3384,23 @@ const EpisodeRow = ({
         // Direction adapts to what was clicked. Whichever side has more
         // non-canon episodes is offered first, because that is almost always
         // the run the user is pointing at.
+        // MERGED kinds, matching the pill on the row itself. Testing the
+        // VideoEntry alone meant an episode the cloud signal (and the visible
+        // rose tag) called filler read as canon here: it offered no skip-run
+        // options, and it BROKE a run scan mid-way, so "continues until the
+        // next canon episode" stopped on an episode this screen was badging
+        // filler.
+        const menuCloudKinds = cloudSignal?.episode_kinds ?? [];
+        const isSkipWorthy = (v: VideoEntry) => {
+          const f = mergedKindFlags(v, menuCloudKinds);
+          return f.filler || f.recap;
+        };
         const runFrom = (dir: -1 | 1): VideoEntry[] => {
-          if (idx < 0 || !isFillerOrRecap(video)) return [];
+          if (idx < 0 || !isSkipWorthy(video)) return [];
           const out: VideoEntry[] = [video];
           for (let i = idx + dir; i >= 0 && i < seasonVideos.length; i += dir) {
             const v = seasonVideos[i];
-            if (!isFillerOrRecap(v)) break;
+            if (!isSkipWorthy(v)) break;
             out.push(v);
           }
           return out;
@@ -3284,7 +3476,12 @@ const EpisodeRow = ({
         const skipRunAction = (
           run: VideoEntry[], mark: boolean, rangeLabel: string,
         ) => () => {
-          const targets = mark ? run.filter(isVideoAired) : run;
+          // Narrowed to what the write will ACTUALLY touch, so the toast's
+          // count is not a lie: the option is offered as soon as one episode in
+          // the run qualifies, and the stores now no-op on the rest.
+          const targets = mark
+            ? run.filter(isVideoAired).filter((v) => isSkipMarkable(v.id))
+            : run.filter((v) => isSkipped(v.id));
           if (targets.length === 0) return;
           if (mark) {
             void markEpisodesSkipped(targets.map(skipTargetFor), skipOpts());
@@ -3302,7 +3499,8 @@ const EpisodeRow = ({
         // point of these options and is not obvious from the label alone.
         const runHint = "Continues until the next canon episode.";
         const kindWord = (run: VideoEntry[]) => {
-          const flags = run.map(episodeKindFlags);
+          // Merged too, or a cloud-only recap run gets labelled "filler".
+          const flags = run.map((v) => mergedKindFlags(v, menuCloudKinds));
           const anyFiller = flags.some((f) => f.filler);
           const anyRecap  = flags.some((f) => f.recap);
           if (anyFiller && anyRecap) return "filler/recaps";
@@ -3319,6 +3517,7 @@ const EpisodeRow = ({
             skipBulkItems.push({
               kind: "action",
               label: `Mark this & all ${dirLabel} ${word} as skipped`,
+              tone: "skip",
               hint: runHint,
               icon: skipIcon,
               onClick: skipRunAction(run, true, range),
@@ -3327,6 +3526,10 @@ const EpisodeRow = ({
           if (run.some((v) => isSkipped(v.id))) {
             skipBulkItems.push({
               kind: "action",
+              // No tone, matching the watched family: a top-level toggle row
+              // keeps its colour in both directions, but a bulk UNMARK row is
+              // neutral. Colouring this one purple would put two rows that do
+              // opposite things in the same colour.
               label: `Unmark this & all ${dirLabel} ${word} as skipped`,
               hint: runHint,
               icon: skipIcon,
@@ -3366,6 +3569,7 @@ const EpisodeRow = ({
           {
             kind: "action",
             label: isSkippedEp ? "Unmark Skipped" : "Mark as Skipped",
+            tone: "skip",
             submenu: skipBulkItems.length > 0 ? skipBulkItems : undefined,
             icon: (
               <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
@@ -3475,16 +3679,13 @@ const EpisodeRow = ({
             Filler = rose (skip-worthy), recap = amber (informational).
             Canon / normal / mixed render nothing. */}
         {(() => {
-          const cloudKinds = cloudSignal?.episode_kinds ?? [];
-          const cloudForThis = cloudKinds.filter((k) => k.id === video.id);
-          const cloudFiller = cloudForThis.some((k) => k.kind === "filler");
-          const cloudRecap  = cloudForThis.some((k) => k.kind === "recap");
-          const showFiller = cloudFiller || !!video.is_filler || video.episode_kind === "filler";
-          const showRecap  = cloudRecap  || !!video.is_recap  || video.episode_kind === "recap";
+          // Shared predicate, so this pill and the right-click skip menu can
+          // never disagree about whether an episode is filler.
+          const { filler, recap } = mergedKindFlags(video, cloudSignal?.episode_kinds ?? []);
           return (
             <FillerRecapTags
-              filler={showFiller}
-              recap={showRecap}
+              filler={filler}
+              recap={recap}
               className="absolute top-1.5 right-1.5"
             />
           );
@@ -3837,33 +4038,45 @@ function EpisodesPanel({
         },
       });
     }
-    if (aired.some((v) => !isSkipped(v.id))) {
+    if (aired.some((v) => isSkipMarkable(v.id))) {
       items.push({
-        kind: "action", label: "Mark arc as skipped",
-        hint: "Marks every episode in this arc, including canon ones.",
+        kind: "action", label: "Mark arc as skipped", tone: "skip",
+        hint: "Marks every episode in this arc that you haven't already watched or skipped.",
         onClick: () => {
-          void markEpisodesSkipped(aired.map(targetFor), {
+          // `isSkipMarkable`, not a local `!isSkipped`: it is the same
+          // predicate `markEpisodesSkipped` writes with, so the count in the
+          // toast cannot claim episodes the write skipped over. It also leaves
+          // hand-marked-watched episodes alone, which is what keeps a later
+          // "Unmark arc as skipped" from unwatching them.
+          const fresh = aired.filter((v) => isSkipMarkable(v.id));
+          if (fresh.length === 0) return;
+          void markEpisodesSkipped(fresh.map(targetFor), {
             userInitiated: true,
             autoScrobbleEnabled: arcScrobbleConn.autoScrobbleEnabled,
             scrobbleScope: arcScrobbleConn.scope,
             services: connectedServices(arcScrobbleConn),
           });
-          toast(`Skipped ${aired.length}`, "success");
+          toast(`Skipped ${fresh.length}`, "success");
         },
       });
     }
     if (ids.some((id) => isSkipped(id))) {
       items.push({
+        // Neutral, exactly like "Unmark arc as watched" two rows up. All four
+        // arc rows sit in one flat menu, so a purple unmark beside a purple
+        // mark would read as the same action twice.
         kind: "action", label: "Unmark arc as skipped",
         onClick: () => { clearEpisodesSkipped(ids); toast("Unmarked"); },
       });
     }
-    if (ids.some((id) => getManualWatchedState(id) !== "planned")) {
-      items.push({
-        kind: "action", label: "Mark arc as planned", tone: "notice",
-        onClick: () => { setManualWatchedMany(ids, "planned"); toast("Queued"); },
-      });
-    }
+    // NO "mark arc as planned". "Planned" is a TITLE-level concept everywhere
+    // else in Aura: it IS queue membership, the Queue tab looks each planned id
+    // up as a library record, and the media-key queue-advance fetches full meta
+    // for it. Stamping an arc's EPISODE ids planned put 20 to 60 ids that can
+    // never resolve into that queue, and because the states are exclusive it
+    // also silently overwrote the watched marks on an arc the user had already
+    // finished. The series-level equivalent the user actually wants is the
+    // In Queue button in the actions row.
     if (items.length === 0) return;
     openContextMenu(x, y, items);
   }, [videos, seriesId, seriesMediaType, detail, arcScrobbleConn]);
@@ -4823,12 +5036,12 @@ function StreamsPanel({
         style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
       >
         {loading && streams.length === 0 ? (
-          // Three orbiting discs, breathing in / out, centred in the
-          // panel with a "Loading…" caption. Brightness ramps over the
-          // AIOStreams cap (7 s movies, 12 s series).
+          // Particles racing a path and leaving neon trails, resolving into a
+          // symbol picked fresh on every play. The cap (7 s movies, 12 s
+          // series) paces the draw so the shape is legible well before a
+          // typical fetch returns.
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-            <SpectralPulse
-              active
+            <SymbolTracer
               capSeconds={isEpisodic ? CAP_SERIES_SECONDS : CAP_MOVIE_SECONDS}
             />
           </div>
@@ -4858,15 +5071,12 @@ function StreamsPanel({
                 onDismiss={dismissHint}
               />
             )}
-            {loading && (
-              <div className="px-2 py-1">
-                <SpectralPulse
-                  small
-                  active
-                  capSeconds={isEpisodic ? CAP_SERIES_SECONDS : CAP_MOVIE_SECONDS}
-                />
-              </div>
-            )}
+            {/* No inline loader here. `runStreamFetch` clears the list at the
+                start of every fetch, so `streams.length > 0 && loading` cannot
+                both hold: this branch was unreachable and the compact variant
+                it rendered existed only to serve it. The header already
+                carries two live signals while a fetch runs (the spinning
+                refresh glyph and the "Searching..." chip). */}
             {groups.map(([provider, list]) => (
               <div key={provider} className="space-y-1.5">
                 <div className="flex items-center gap-2 px-2">
