@@ -3,6 +3,7 @@
 
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
 import { createPortal } from "react-dom";
+import Tooltip from "./Tooltip";
 
 // ---------------------------------------------------------------------------
 // ContextMenu — custom React-based right-click menu (singleton-style).
@@ -20,16 +21,23 @@ import { createPortal } from "react-dom";
 //   • divider  — horizontal rule, visually separates groups (no click)
 //
 // Tones:
-//   default | success | warning | danger
+//   default | success | warning | danger | notice | skip
+//
+// `skip` is purple on purpose and not a generic colour name: purple IS the skip
+// colour everywhere else in Aura (the progress-bar segment, the History tag,
+// the episode-row badge), so a skip action reading in any other colour breaks
+// the one association the user has already learned.
 // ---------------------------------------------------------------------------
 
-export type MenuTone = "default" | "success" | "warning" | "danger" | "notice";
+export type MenuTone =
+  | "default" | "success" | "warning" | "danger" | "notice" | "skip";
 
 interface BaseItem {
   /** When true, the item is rendered greyed-out and ignores clicks. */
   disabled?: boolean;
-  /** Native tooltip shown on hover. For items whose effect is not fully
-   *  described by the label, e.g. a bulk action with a stopping rule. */
+  /** Explanatory hint shown on hover, as an instant glass tooltip (see
+   *  MenuLabel). For items whose effect is not fully described by the label,
+   *  e.g. a bulk action with a stopping rule. */
   hint?: string;
 }
 
@@ -137,6 +145,31 @@ export default function ContextMenuHost() {
 // Tone styling — shared between the parent menu and submenus.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// MenuLabel - a row's text, with its hint as an INSTANT GLASS tooltip.
+//
+// The hint used to be a native `title` attribute. Two problems, and the first
+// is fatal for what these hints say: the OS waits about a second before showing
+// one, which is longer than it takes to read a menu row and click it, so a hint
+// explaining that "Mark this and all below as skipped" stops at the next canon
+// episode routinely arrived after the user had already committed to the action.
+// The second is that a native tooltip cannot be styled at all, so the one piece
+// of explanatory text in the app rendered as an OS-grey box on top of a glass
+// menu.
+//
+// Routed through the shared Tooltip, which is portal-rendered (so the menu's
+// own clipping cannot eat it), collision-aware (menus open near screen edges by
+// definition) and glass, matching every other floating surface in the app.
+// ---------------------------------------------------------------------------
+function MenuLabel({ hint, children }: { hint?: string; children: React.ReactNode }) {
+  if (!hint) return <span className="flex-1 truncate">{children}</span>;
+  return (
+    <Tooltip text={hint} pos="right" className="flex-1 min-w-0">
+      <span className="w-full truncate">{children}</span>
+    </Tooltip>
+  );
+}
+
 function rowToneClasses(tone: MenuTone, disabled: boolean | undefined): string {
   if (disabled) return "text-white/25 cursor-not-allowed";
   // Each row gets a tone-matched hover state: subtle bg tint + an inset
@@ -152,6 +185,10 @@ function rowToneClasses(tone: MenuTone, disabled: boolean | undefined): string {
       return "text-rose-300/95    hover:bg-rose-400/12    hover:shadow-[inset_0_0_22px_-4px_rgba(251,113,133,0.34)]";
     case "notice":
       return "text-ln-accent      hover:bg-ln-accent/12   hover:shadow-[inset_0_0_22px_-4px_rgba(91,164,255,0.34)]";
+    // purple-300 text over a purple-400 tint: the same pair the skip segment
+    // (bg-purple-400) and the skipped-episode tag (text-purple-300) already use.
+    case "skip":
+      return "text-purple-300/95  hover:bg-purple-400/12  hover:shadow-[inset_0_0_22px_-4px_rgba(192,132,252,0.34)]";
     default:
       return "text-white/85       hover:bg-white/8        hover:shadow-[inset_0_0_22px_-4px_rgba(255,255,255,0.18)]";
   }
@@ -237,10 +274,9 @@ function ContextMenuRender({ x, y, items, onClose }: RenderProps) {
     <div
       ref={ref}
       role="menu"
-      className="fixed z-[200] min-w-[220px] py-1.5 rounded-xl
-                 bg-black/92 backdrop-blur-2xl
-                 shadow-[0_18px_42px_-12px_rgba(0,0,0,0.75)]
-                 select-none border border-white/20"
+      // aura-float-glass carries the background, border and shadow, so the
+      // utilities that used to set those are gone rather than fighting it.
+      className="aura-float-glass fixed z-[200] min-w-[220px] py-1.5 rounded-xl select-none"
       style={{
         left: pos.left,
         top:  pos.top,
@@ -288,7 +324,7 @@ function ContextMenuRender({ x, y, items, onClose }: RenderProps) {
                           ${isOpen ? "bg-white/8" : ""}`}
             >
               {item.icon && <span className="flex-shrink-0 text-white/55">{item.icon}</span>}
-              <span className="flex-1 truncate" title={item.hint}>{item.label}</span>
+              <MenuLabel hint={item.hint}>{item.label}</MenuLabel>
               <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"
                    className="flex-shrink-0 text-white/40" aria-hidden>
                 <path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6z" />
@@ -329,7 +365,7 @@ function ContextMenuRender({ x, y, items, onClose }: RenderProps) {
                         ${isOpen ? "bg-white/8" : ""}`}
           >
             {item.icon && <span className="flex-shrink-0 opacity-90">{item.icon}</span>}
-            <span className="flex-1 truncate" title={item.hint}>{item.label}</span>
+            <MenuLabel hint={item.hint}>{item.label}</MenuLabel>
             {hasSubmenu && (
               <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"
                    className="flex-shrink-0 text-white/40" aria-hidden>
@@ -426,10 +462,7 @@ function Submenu({ parentRect, items, onActivate, onMouseEnter, onMouseLeave }: 
       data-aura-submenu
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
-      className="fixed z-[210] min-w-[220px] py-1.5 rounded-xl
-                 bg-black/92 backdrop-blur-2xl
-                 shadow-[0_18px_42px_-12px_rgba(0,0,0,0.75)]
-                 select-none border border-white/20"
+      className="aura-float-glass fixed z-[210] min-w-[220px] py-1.5 rounded-xl select-none"
       style={{
         left: pos.left,
         top:  pos.top,
@@ -461,7 +494,7 @@ function Submenu({ parentRect, items, onActivate, onMouseEnter, onMouseLeave }: 
                         ${rowToneClasses(tone, item.disabled)}`}
           >
             {item.icon && <span className="flex-shrink-0 opacity-90">{item.icon}</span>}
-            <span className="flex-1 truncate" title={item.hint}>{item.label}</span>
+            <MenuLabel hint={item.hint}>{item.label}</MenuLabel>
           </button>
         );
       })}

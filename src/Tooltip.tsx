@@ -37,7 +37,11 @@ interface Props {
   pos?: TooltipPos;
   /** Show keyboard hint after the label (e.g. "Sign in · S"). */
   shortcut?: string;
-  /** Display delay in ms — default 120 ms (matches macOS/Windows feel). */
+  /** Display delay in ms. Default 0: these appear INSTANTLY on hover, which is
+   *  the whole reason they exist rather than a native `title`. The OS tooltip
+   *  waits about a second, which is long enough that a hint explaining what a
+   *  bulk action will do never arrived before the user had already clicked.
+   *  Pass a value to re-introduce a delay for a trigger that needs one. */
   delay?: number;
   /** Extra classes merged into the wrapper span. The wrapper is `inline-flex`
    *  (shrink-to-fit) by default; pass e.g. `w-full` when the trigger should
@@ -59,6 +63,33 @@ function clampToViewport(x: number, y: number, w: number, h: number): { x: numbe
   if (nx < VIEWPORT_PAD) nx = VIEWPORT_PAD;
   if (ny < VIEWPORT_PAD) ny = VIEWPORT_PAD;
   return { x: nx, y: ny };
+}
+
+/** Rects of every menu surface currently on screen.
+ *
+ *  A tooltip is z-[400] and a context menu is z-[200]/z-[210], so a tip that
+ *  lands on a menu covers it. That matters most where these two actually meet:
+ *  a menu row's hint, whose trigger is INSIDE a menu and whose preferred
+ *  placement is straight into the submenu that row just opened. Both menu roots
+ *  carry role="menu", so they are addressable without a new global. */
+function openMenuRects(): DOMRect[] {
+  const out: DOMRect[] = [];
+  document.querySelectorAll('[role="menu"]').forEach((el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) out.push(r);
+  });
+  return out;
+}
+
+function overlaps(
+  left: number, top: number, w: number, h: number, rects: DOMRect[],
+): boolean {
+  for (const r of rects) {
+    if (left < r.right && left + w > r.left && top < r.bottom && top + h > r.top) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function computePos(
@@ -101,8 +132,29 @@ function computePos(
   };
   const order: TooltipPos[] = [preferred, opposite[preferred], "top", "bottom", "left", "right"];
   let chosen = candidates[preferred];
-  for (const p of order) {
-    if (candidates[p].fits) { chosen = candidates[p]; break; }
+
+  // PASS 1: a placement that fits the viewport AND clears every open menu.
+  // This is what stops a menu row's hint from landing on the submenu that same
+  // row just opened, which is where the tip is least readable and most in the
+  // way.
+  const menus = openMenuRects();
+  let picked = false;
+  if (menus.length > 0) {
+    for (const p of order) {
+      const c = candidates[p];
+      if (c.fits && !overlaps(c.left, c.top, tipW, tipH, menus)) {
+        chosen = c;
+        picked = true;
+        break;
+      }
+    }
+  }
+  // PASS 2: fall back to fit alone. A tip that is covering a menu still beats
+  // a tip that is off-screen, and on a small window every side can be blocked.
+  if (!picked) {
+    for (const p of order) {
+      if (candidates[p].fits) { chosen = candidates[p]; break; }
+    }
   }
 
   // Final clamp keeps the tip inside the viewport even when no candidate
@@ -111,7 +163,7 @@ function computePos(
   return { left: clamped.x, top: clamped.y };
 }
 
-export default function Tooltip({ text, content, pos = "right", shortcut, delay = 120, className, children }: Props) {
+export default function Tooltip({ text, content, pos = "right", shortcut, delay = 0, className, children }: Props) {
   const triggerRef = useRef<HTMLSpanElement>(null);
   const tipRef     = useRef<HTMLSpanElement>(null);
   const [open, setOpen]         = useState(false);
@@ -127,6 +179,9 @@ export default function Tooltip({ text, content, pos = "right", shortcut, delay 
 
   const scheduleShow = () => {
     cancelShow();
+    // Synchronous when there is no delay: a zero-length timeout still costs a
+    // macrotask, which is a visible beat on a fast pointer sweep.
+    if (delay <= 0) { setOpen(true); return; }
     showTimer.current = setTimeout(() => setOpen(true), delay);
   };
 
@@ -194,10 +249,13 @@ export default function Tooltip({ text, content, pos = "right", shortcut, delay 
         <span
           ref={tipRef}
           role="tooltip"
-          className="fixed z-[400] pointer-events-none whitespace-nowrap
+          // aura-float-glass, not glass-panel-elevated: that composites
+          // --ln-glass-3, which is TINTED per theme, so a tooltip over key art
+          // picked up an accent-coloured wash. This is the same surface the
+          // search bar and the menus use.
+          className="aura-float-glass fixed z-[400] pointer-events-none whitespace-nowrap
                      px-2.5 py-1.5 rounded-lg
                      text-[11px] font-medium tracking-wide
-                     glass-panel-elevated
                      transition-opacity duration-150"
           style={{
             color: "var(--text-primary)",

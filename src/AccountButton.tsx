@@ -4,6 +4,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ProfilePopover } from "./NavSidebar";
 import AuraLogoA from "./AuraLogoA";
+import SidePill, { SIDE_PILL_LEFT_PX, SIDE_PILL_TOP_PX } from "./SidePill";
 
 // ---------------------------------------------------------------------------
 // AccountButton — compact circular Aura logo button + popover, anchored
@@ -85,52 +86,45 @@ export default function AccountButton({
   // recipe + ring-on-open accent the bell / refresh buttons use, so the
   // three floating affordances feel like a set.
   return (
-    <div className="fixed top-[44px] left-3 z-30" style={{ pointerEvents: "auto" }}>
-      <button
+    <div
+      // The z-index LIFTS while the popover is open, and this is not cosmetic.
+      // A `fixed z-30` wrapper is its own stacking context, so the popover's
+      // own z-[10045] only ranks it against its siblings INSIDE this div. The
+      // Watch Party pill is a separate fixed z-30 element later in the DOM, so
+      // at equal z it won and painted straight over the open panel.
+      className={open ? "fixed z-[10046]" : "fixed z-30"}
+      style={{
+        top: SIDE_PILL_TOP_PX,
+        left: SIDE_PILL_LEFT_PX,
+        pointerEvents: "auto",
+      }}
+    >
+      <SidePill
         ref={triggerRef}
-        data-profile-trigger
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        aria-label={profileTitle}
-        aria-expanded={open}
+        label="User Panel"
         title={profileTitle}
-        className={[
-          "relative w-10 h-10 rounded-full",
-          "flex items-center justify-center",
-          "bg-white/[0.08] hover:bg-white/[0.14] active:bg-white/[0.18]",
-          "border border-white/10 hover:border-white/20",
-          "backdrop-blur-xl shadow-lg",
-          "transition-colors duration-150",
-          "aura-bell-hover",
-          open ? "ring-1 ring-ln-accent/50" : "",
-        ].filter(Boolean).join(" ")}
-      >
-        {initials ? (
+        ariaLabel={profileTitle}
+        ariaExpanded={open}
+        active={open}
+        onClick={() => setOpen((o) => !o)}
+        // data-profile-trigger is a CONTRACT: the outside-click guard finds
+        // this node by selector, so dropping it makes the popover close on
+        // its own trigger.
+        extraProps={{ "data-profile-trigger": true }}
+        icon={initials ? (
           <span className="text-ln-accent text-[15px] font-semibold leading-none tracking-tight select-none">
             {initials}
           </span>
         ) : (
-          <AuraLogoA size={24} />
+          <AuraLogoA size={22} />
         )}
-        {/* Tiny status dot — green when signed in, neutral when guest.
-            Matches the marker pattern on the bell + popover for visual
-            consistency. */}
-        <span
-          aria-hidden
-          className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-[1.5px]
-                      ${loggedIn
-                        ? "bg-emerald-400 border-black/85"
-                        : "bg-white/30 border-black/85"}`}
-          style={{ boxShadow: loggedIn ? "0 0 6px rgba(110,231,183,0.65)" : undefined }}
-        />
-      </button>
+      />
       <ProfilePopover
         open={open}
         triggerRef={triggerRef}
         loggedIn={loggedIn}
         email={email}
         nickname={nickname}
-        onClose={() => setOpen(false)}
         onLogin={() => { setOpen(false); onLoginRequest?.(); }}
         onLogout={() => { setOpen(false); onLogout?.(); }}
       />

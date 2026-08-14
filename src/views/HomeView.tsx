@@ -598,7 +598,7 @@ export default function HomeView({
   const handleClearSearch  = () => setActiveQuery(null);
 
   return (
-    <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
+    <div className="relative flex-1 flex flex-col min-w-0 overflow-hidden">
       {/* Centered search bar. The filter & sort button used to live in
           this bar; it's now scoped to the surfaces where filtering a
           finite list actually makes sense — view-all catalog page,
@@ -606,8 +606,18 @@ export default function HomeView({
           catalogs the user already chose to surface, so layering a
           global filter on top blurred the distinction between
           "browsing what an addon offers" and "narrowing my own list". */}
-      <div className="flex-shrink-0 pt-4 pb-2 px-6 relative z-30">
-        <div className="mx-auto relative w-full" style={{ maxWidth: HERO_MAX_WIDTH }}>
+      {/* FLOATING, not a header band. The strip used to reserve its own row
+          above the scroller, so the bar had nothing behind it but the app
+          background and there was nothing to refract. Overlaying it on the
+          catalog is what makes the glass mean something: the art moves under
+          it as the page scrolls.
+          The scroller below compensates with matching top padding, so no
+          content is permanently parked underneath. */}
+      <div className="absolute inset-x-0 top-0 z-30 pt-4 pb-2 px-6 pointer-events-none">
+        <div
+          className="mx-auto relative w-full pointer-events-auto"
+          style={{ maxWidth: HERO_MAX_WIDTH }}
+        >
           <SearchBar
             committedQuery={activeQuery}
             onSubmit={handleSubmitSearch}
@@ -617,11 +627,16 @@ export default function HomeView({
       </div>
 
       {activeQuery ? (
-        <SearchView
-          addons={submitSearchAddons}
-          query={activeQuery}
-          onSelectMeta={onSelectMeta}
-        />
+        // Same top inset as the scroller: the floating bar overlays this
+        // branch too, and results starting underneath it would be unreachable
+        // at the top of the list.
+        <div className="flex-1 min-h-0 flex flex-col pt-[66px]">
+          <SearchView
+            addons={submitSearchAddons}
+            query={activeQuery}
+            onSelectMeta={onSelectMeta}
+          />
+        </div>
       ) : (
         <div
           // `px-3` is NOT cosmetic padding: this scroll container is the
@@ -633,7 +648,7 @@ export default function HomeView({
           // rows already self-pad (px-6) so net layout shift is minor and
           // uniform, and the symmetrical right inset softens the (latent)
           // identical clip on the rightmost card.
-          className="flex-1 min-h-0 overflow-y-auto px-3"
+          className="flex-1 min-h-0 overflow-y-auto px-3 pt-[66px]"
           style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
         >
           {/* Empty state when no addons */}

@@ -762,7 +762,7 @@ export default function SourcePopupHost() {
         type="button"
         onClick={restore}
         aria-label="Restore popup"
-        className="fixed bottom-4 right-4 z-[270] glass-panel-elevated
+        className="fixed bottom-4 right-4 z-[270] aura-float-glass
                    rounded-full px-4 py-2.5 flex items-center gap-3
                    text-left shadow-glass-edge hover:bg-white/[0.06]
                    transition-colors max-w-[min(420px,80vw)]"

@@ -223,7 +223,14 @@ export default function NavSidebar({
       // carousel art, catalog cards). `relative` is required so the
       // absolutely-positioned decoration layer and profile popover are
       // scoped to this stacking context.
-      className="relative z-20 self-center flex-shrink-0 flex flex-col w-[180px] px-2 py-3"
+      // `aura-nav-rail` carries the SHORT-WINDOW reflow only. The rail centres
+      // itself in the whole body, but the User Panel / Watch Party pills are
+      // `fixed z-30` over x 20..184, y 44..130 - directly on top of this rail's
+      // x-range and above its z-20. Once the window is short enough that
+      // centring pushes the first nav rows up into that band, the Watch Party
+      // pill sits on the Home row and eats its clicks. The rule is scoped to a
+      // max-height media query so the layout above the threshold is unchanged.
+      className="aura-nav-rail relative z-20 self-center flex-shrink-0 flex flex-col w-[180px] px-2 py-3"
       aria-label="Navigation"
     >
       {/* Profile button + popover moved out of the sidebar in
@@ -549,14 +556,13 @@ function NavRow({ label, icon, active, onClick }: RowProps) {
 const PROFILE_EXIT_MS = 200;
 
 export function ProfilePopover({
-  open, triggerRef, loggedIn, email, nickname, onClose, onLogin, onLogout,
+  open, triggerRef, loggedIn, email, nickname, onLogin, onLogout,
 }: {
   open: boolean;
   triggerRef: React.RefObject<HTMLButtonElement | null>;
   loggedIn: boolean;
   email?: string | null;
   nickname?: string | null;
-  onClose: () => void;
   onLogin: () => void;
   onLogout: () => void;
 }) {
@@ -643,7 +649,7 @@ export function ProfilePopover({
       // the glass aesthetic.
       className="fixed w-[300px] z-[10045] overflow-y-auto
                  rounded-2xl border border-white/15 shadow-glass-edge
-                 bg-[rgba(12,12,16,0.96)] backdrop-blur-2xl"
+                 aura-float-glass"
       style={{
         top: anchor.top,
         ...(anchor.side === "left" ? { left: anchor.left } : { right: anchor.right }),
@@ -746,14 +752,6 @@ export function ProfilePopover({
         )}
       </div>
 
-      <button
-        onClick={onClose}
-        className="absolute top-2 right-2 w-6 h-6 rounded-md text-white/40 hover:text-white
-                   hover:bg-white/10 flex items-center justify-center text-sm"
-        aria-label="Close"
-      >
-        ×
-      </button>
     </div>
   );
 }

@@ -170,7 +170,7 @@ export default function SubtitlePicker({
   return (
     <div className="absolute inset-0 z-40 flex items-end justify-center p-6 pointer-events-none">
       <div
-        className="aura-sheet-in glass-panel-elevated rounded-2xl shadow-glass-edge w-full max-w-[42rem]
+        className="aura-sheet-in aura-float-glass rounded-2xl w-full max-w-[42rem]
                    pointer-events-auto flex flex-col max-h-[60vh] overflow-hidden"
       >
         {/* Header */}

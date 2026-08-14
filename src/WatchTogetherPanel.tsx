@@ -81,6 +81,25 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
     return () => window.removeEventListener("resize", onResize);
   }, [open]);
 
+  // Escape dismisses, matching the notifications panel and the profile popover.
+  // The close button was dropped on the grounds that this panel "dismisses on
+  // an outside click and on Escape" - but no Escape handler existed, so the
+  // second half of that was not true, and during WINDOWED playback Escape
+  // reached App's app-wide ladder and tore playback down instead of closing
+  // the panel. CAPTURE phase + stopPropagation is what shields that ladder,
+  // mirroring CastMenu.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      e.stopPropagation();
+      onClose();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [open, onClose]);
+
   // Keep the local fields in step if the panel re-opens.
   useEffect(() => {
     if (open) {
@@ -134,7 +153,7 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
       />
       <div
         className="fixed z-[10041] w-[360px] max-w-[92vw] rounded-2xl border border-white/12
-                   bg-[rgba(16,16,20,0.98)] backdrop-blur-2xl shadow-glass-edge p-5 overflow-y-auto"
+                   aura-float-glass p-5 overflow-y-auto"
         style={{
           top: anchor.top,
           ...horizontal,
@@ -152,18 +171,13 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
         role="dialog"
         aria-label="Watch Together"
       >
-        <div className="flex items-center justify-between mb-3">
+        {/* No close button, matching the notifications panel and the profile
+            popover: all three dismiss on an outside click and on Escape, and a
+            panel offering both plus an X offers three ways to do one thing. */}
+        <div className="mb-3">
           <h2 className="text-white/95 text-[15px] font-semibold flex items-center gap-2">
             <PeopleGlyph /> Watch Together
           </h2>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close"
-            className="w-7 h-7 rounded-lg flex items-center justify-center text-white/50 hover:text-white hover:bg-white/[0.08]"
-          >
-            ✕
-          </button>
         </div>
 
         {w.error && (

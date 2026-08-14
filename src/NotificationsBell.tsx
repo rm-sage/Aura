@@ -7,6 +7,7 @@ import NotificationsPanel from "./NotificationsPanel";
 import { nudgeReleasePoller } from "./releaseSearch";
 import { loadAuraSettings } from "./auraSettings";
 import type { LibraryItem } from "./types";
+import SidePill, { SIDE_PILL_LEFT_PX } from "./SidePill";
 
 // ---------------------------------------------------------------------------
 // NotificationsBell — fixed bottom-3 left-3, z-30 (above app body, below
@@ -155,8 +156,8 @@ export default function NotificationsBell({ library }: { library: LibraryItem[] 
   return (
     <div
       ref={containerRef}
-      className="fixed bottom-3 left-3 z-30"
-      style={{ pointerEvents: "auto" }}
+      className="fixed bottom-3 z-30"
+      style={{ left: SIDE_PILL_LEFT_PX, pointerEvents: "auto" }}
     >
       {open && (
         <NotificationsPanel
@@ -179,60 +180,58 @@ export default function NotificationsBell({ library }: { library: LibraryItem[] 
           onDismiss={dismissPopup}
         />
       )}
-      <button
-        type="button"
-        data-notifications-bell
+      <SidePill
+        label="Notifications"
+        ariaLabel={unreadCount > 0
+          ? `Notifications (${unreadCount} unread)`
+          : "Notifications"}
+        ariaExpanded={open}
+        active={open}
         onClick={openPanel}
-        aria-label={
-          unreadCount > 0
-            ? `Notifications (${unreadCount} unread)`
-            : "Notifications"
-        }
+        // data-notifications-bell is a CONTRACT: the outside-click guard
+        // finds this node by selector.
+        extraProps={{ "data-notifications-bell": true }}
         className={[
-          "relative h-10 w-10 rounded-full",
-          "flex items-center justify-center",
-          "bg-white/[0.08] hover:bg-white/[0.14] active:bg-white/[0.18]",
-          "border border-white/10 hover:border-white/20",
-          "backdrop-blur-xl",
-          "text-white/80 hover:text-white",
-          "transition-colors duration-200",
-          "shadow-lg",
-          "aura-bell-hover",
-          // While the popup is showing it's already drawing the eye —
-          // skip the pulse to avoid two animations stacking awkwardly.
-          hasNew && !popupVisible ? "aura-bell-pulse" : "",
+          // STATE 1 - something just landed: one short pop, twice. Suppressed
+          // while the thought bubble is showing, because that is already
+          // drawing the eye and two animations would stack.
+          hasNew && !popupVisible ? "aura-pill-arrive" : "",
+          // STATE 2 - still unread and dismissable: the pill's own rim
+          // breathes. On a labelled control the label is what should draw the
+          // eye, so the glow runs around the whole pill rather than ringing
+          // an icon nobody is looking at. `update` notifications deliberately
+          // do not qualify, exactly as before: they have their own surface
+          // and would otherwise pulse forever.
+          hasDismissableUnread ? "aura-pill-alert" : "",
         ].filter(Boolean).join(" ")}
-      >
-        {/* The icon (not the button) gets the rotation so the hover/
-            border ring stays straight and doesn't tilt with the ring. */}
-        <BellIcon
-          className={[
-            "h-5 w-5",
-            hasDismissableUnread ? "aura-bell-ringing" : "",
-          ].filter(Boolean).join(" ")}
-        />
-        {unreadCount > 0 && (
+        icon={
+          <BellIcon
+            className={[
+              "h-5 w-5",
+              hasDismissableUnread ? "aura-bell-ringing" : "",
+            ].filter(Boolean).join(" ")}
+          />
+        }
+        trailing={unreadCount > 0 ? (
           <span
             aria-hidden
             className={[
-              "absolute -top-1 -right-1",
-              "min-w-[18px] h-[18px] px-1",
-              "rounded-full",
+              "min-w-[18px] h-[18px] px-1 rounded-full",
               "flex items-center justify-center",
               "text-[10px] font-semibold leading-none",
               "bg-ln-accent text-black",
-              "ring-2 ring-black/40",
-              "shadow-[0_0_8px_rgba(91,164,255,0.55)]",
-              // Initial pop on appearance, then continuous bounce in
-              // sync with the bell ring (same 5 s cycle, peaks 76-82 %).
+              // Accent-derived, not a hardcoded blue: twelve themes ship
+              // different triplets and the old rgba(91,164,255) was one of
+              // them wearing all the others' clothes.
+              "shadow-[0_0_8px_rgb(var(--ln-accent-rgb)/0.55)]",
               "aura-bell-badge-pop",
               hasDismissableUnread ? "aura-bell-badge-bouncing" : "",
             ].filter(Boolean).join(" ")}
           >
             {badgeText}
           </span>
-        )}
-      </button>
+        ) : undefined}
+      />
     </div>
   );
 }
@@ -338,7 +337,7 @@ function NotificationThoughtBubble({
         // the settings panels. Drops the plain-black opaque shell
         // of the old thought bubble in favour of the theme's
         // signature blurred-glass + subtle accent edge.
-        "glass-panel-elevated",
+        "aura-float-glass",
         "shadow-[0_12px_36px_-10px_rgba(0,0,0,0.7),0_0_22px_-8px_rgba(91,164,255,0.35)]",
         "cursor-pointer select-none text-left",
         phase === "enter" ? "aura-popup-card-enter" : "",

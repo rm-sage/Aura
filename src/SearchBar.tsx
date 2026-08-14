@@ -169,9 +169,9 @@ export default function SearchBar({
         />
       )}
 
-      <div ref={containerRef} className="relative z-40">
+      <div ref={containerRef} className="aura-search-float relative z-40">
         <div className="relative">
-          <span className="absolute left-4 top-1/2 -translate-y-1/2 text-white/40 pointer-events-none">
+          <span className="absolute left-4 top-1/2 -translate-y-1/2 text-white/55 pointer-events-none z-10">
             <SearchIcon />
           </span>
           <input
@@ -192,12 +192,17 @@ export default function SearchBar({
             }}
             placeholder="Search all sources…"
             spellCheck={false}
-            className={`w-full bg-white/5 border rounded-full pl-10 pr-4 py-2.5 text-sm
-                        placeholder:text-white/30 outline-none transition-colors
-                        ${focused
-                          ? "border-white/30 bg-black/40"
-                          : "border-white/10 hover:border-white/20"
-                        }`}
+            // The focus border is a `focus:` VARIANT, not a `focused`-state
+            // ternary. `.aura-float-glass` sets the `border` shorthand at
+            // one-class specificity and later in the sheet, so a bare
+            // `border-white/30` tied and lost: focusing changed nothing while
+            // hovering visibly did (a `:hover` variant is one step higher),
+            // which is exactly backwards. `focus:` ties with `hover:` and is
+            // emitted after it, so focus correctly wins.
+            className={`aura-float-glass w-full rounded-full pl-10 pr-4 py-2.5 text-sm
+            placeholder:text-white/40 outline-none
+            transition-[border-color,box-shadow] duration-150
+            hover:border-white/25 focus:border-white/30`}
             style={{ color: "var(--text-primary)" }}
             aria-label="Global search"
           />
@@ -206,9 +211,13 @@ export default function SearchBar({
         {/* Dropdown: recent searches only (shown when the input is empty) */}
         {showDropdown && (
           <div
-            className="absolute left-0 right-0 top-full mt-2 z-40 rounded-2xl
-                       glass-panel-elevated shadow-glass-edge overflow-hidden
-                       border border-white/12"
+            // aura-float-glass, matching the bar above it. It was
+            // glass-panel-elevated, which composites --ln-glass-3, and that
+            // token is TINTED per theme: on the warm themes it pushed the
+            // whole panel toward orange, which is the accent wash the user
+            // asked to lose. This surface carries a neutral dark base instead.
+            className="aura-float-glass absolute left-0 right-0 top-full mt-2 z-40
+                       rounded-2xl overflow-hidden"
             style={{ animation: "search-dropdown-in 220ms ease-out" }}
           >
             <div className="py-2">

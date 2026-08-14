@@ -91,7 +91,7 @@ export default function NotificationsPanel({
         // `backdrop-saturate-150 backdrop-blur-2xl` preserves the glassy
         // look. `backdrop-brightness-75` only existed to compensate for
         // the (absent) fill — now redundant, dropped.
-        "bg-ln-base/85 backdrop-saturate-150 backdrop-blur-2xl",
+        "aura-float-glass",
         "border border-white/15",
         "shadow-2xl",
         "flex flex-col",
