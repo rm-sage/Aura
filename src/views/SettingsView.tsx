@@ -1415,7 +1415,12 @@ function LocalDataBackupsSubsection() {
         return;
       }
       applyBackupPayload(payload);
-      setStatus({ kind: "ok", message: "Restored. Refresh views to see the change." });
+      // No longer asks for a refresh: applyBackupPayload now reloads the stores'
+      // in-memory mirrors, so the restored data is live immediately. It used to
+      // only write localStorage and fire change events, which re-rendered
+      // against the pre-restore values, and no amount of refreshing short of an
+      // app restart would have helped.
+      setStatus({ kind: "ok", message: "Restored." });
       await refresh();
     } catch (e) {
       setStatus({ kind: "error", message: `Restore failed: ${String(e)}` });
@@ -4593,6 +4598,14 @@ export default function SettingsView({ addons, session }: Props) {
       if ("minimize_to_tray_on_close" in patch) {
         window.dispatchEvent(new Event("aura:settings-changed"));
       }
+      // The scrobble toggles get their own signal for the same reason the
+      // above is narrow. `scrobbleConn` caches both of them in a module-level
+      // snapshot that resolves once per session, and without this the cached
+      // answer never changed: turning scrobbling off and then skipping a
+      // filler run still pushed plays to Trakt / AniList.
+      if ("scrobble_enabled" in patch || "auto_scrobble_enabled" in patch) {
+        window.dispatchEvent(new Event("aura:scrobble-settings-changed"));
+      }
     } catch {
       // ignore — UI keeps its optimistic state
     }
@@ -4951,8 +4964,8 @@ export default function SettingsView({ addons, session }: Props) {
               says so. */}
           <Section id="sec-spoilers" title="Spoilers">
             <SettingToggle
-              label="Hide cast episode counts"
-              description="Some shows treat regular vs. guest billing as a plot beat (deaths, returns, surprise cameos). When on, the cast hover card shows just the name; per-actor episode counts and tier are hidden. Applies to live action: anime use a character grid with no hover card."
+              label="Hide the Main cast badge"
+              description="Some shows treat regular vs. guest billing as a plot beat (deaths, returns, surprise cameos): a face badged Main is a face that sticks around. When on, that badge is hidden from live-action cast tiles, leaving just the name and role. Anime character tiles carry their own Main badge from a different source and are unaffected."
               value={aura.hideCastSpoilers}
               onChange={(v) => setLocal({ hideCastSpoilers: v })}
             />
@@ -5100,6 +5113,17 @@ export default function SettingsView({ addons, session }: Props) {
                   />
                 </>
               )}
+              <div className="h-px bg-white/6" />
+              <SettingSlider
+                label="Seek step"
+                description="How far one press of Seek Back / Seek Forward moves the playhead. Applies to the arrow keys (or whatever you have those actions bound to) and to the two skip buttons either side of Play, which relabel themselves to match. Default 5 seconds: 10 tends to overshoot the line of dialogue you were going back for."
+                value={aura.seekStepSeconds}
+                min={1}
+                max={60}
+                step={1}
+                suffix=" s"
+                onChange={(v) => setLocal({ seekStepSeconds: v })}
+              />
               <div className="h-px bg-white/6" />
               <NextUpLeadTimeRow
                 value={backend.next_up_lead_seconds ?? 60}
@@ -5447,15 +5471,15 @@ export default function SettingsView({ addons, session }: Props) {
                   metadata addons emit nothing for this field and the
                   filter becomes a no-op (every candidate passes). */}
               <SettingDropdown
-                label="Next-Up skip filler / recap"
-                description="When computing the next episode (Next-Up card and SMTC Next media key), skip episodes AIOMetadata has flagged as filler or recap. Episodes without a flag pass through unchanged. Skipping to a canon episode also MARKS the episodes it jumped as Skipped and logs them to History; if you pressed Skip yourself and automatic scrobbling is on, they are sent to Trakt / AniList as watched, since neither service can represent a skip. An unattended auto-advance marks them locally but sends nothing."
+                label="Auto-skip filler / recap during autoplay"
+                description="Decides which button an UNATTENDED countdown presses when the next episode is filler or recap. Off, it counts down on Play next and the filler plays. Set to filler, recap or both, it counts down on Skip instead and jumps to the next canon episode. Either way the buttons are always both there, so you can override it for any single episode. Skipping marks every episode it jumped as Skipped and logs them to History; if you pressed Skip yourself and automatic scrobbling is on they are also sent to Trakt and AniList as watched, since neither service can represent a skip. An unattended skip marks locally and sends nothing. Requires AIOMetadata per-episode filler and recap flags; without them nothing is ever flagged and no skip button appears."
                 value={aura.nextUpSkipFillerRecap}
                 required
                 options={[
-                  { value: "none",   label: "Don't skip" },
-                  { value: "filler", label: "Skip filler" },
-                  { value: "recap",  label: "Skip recap" },
-                  { value: "both",   label: "Skip both" },
+                  { value: "none",   label: "Never auto-skip" },
+                  { value: "filler", label: "Auto-skip filler" },
+                  { value: "recap",  label: "Auto-skip recap" },
+                  { value: "both",   label: "Auto-skip both" },
                 ]}
                 onChange={(v) => {
                   if (v === "none" || v === "filler" || v === "recap" || v === "both") {

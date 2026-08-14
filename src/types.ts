@@ -418,8 +418,10 @@ export type KeybindAction =
 
 export const KEYBIND_ACTIONS: { id: KeybindAction; label: string; description: string }[] = [
   { id: "toggle-pause",     label: "Toggle Play / Pause", description: "Resume or pause playback" },
-  { id: "seek-back",        label: "Seek Back",            description: "Skip backward 10 seconds" },
-  { id: "seek-forward",     label: "Seek Forward",         description: "Skip forward 10 seconds" },
+  // No fixed number in these two: the step is the `seekStepSeconds` setting
+  // (Playback), so naming one here would go stale the moment it is changed.
+  { id: "seek-back",        label: "Seek Back",            description: "Skip backward by the seek step" },
+  { id: "seek-forward",     label: "Seek Forward",         description: "Skip forward by the seek step" },
   { id: "volume-up",        label: "Volume Up",            description: "Increase volume by 2%" },
   { id: "volume-down",      label: "Volume Down",          description: "Decrease volume by 2%" },
   { id: "toggle-osd",       label: "Toggle Performance OSD", description: "Show or hide the perf overlay" },

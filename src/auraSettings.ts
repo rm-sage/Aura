@@ -115,6 +115,17 @@ export interface AuraSettings {
    *  `autoAdvanceNextEpisode === true`). Clamped to [5, 30] on load
    *  to guarantee the user always has a window to cancel. */
   autoAdvanceDelaySeconds: number;
+  /** How far one press of Seek Back / Seek Forward moves the playhead, in
+   *  seconds. Drives BOTH the arrow keys (or whatever those actions are bound
+   *  to) and the two skip buttons either side of Play, because they are the
+   *  same action and two different step sizes for it would be incoherent. The
+   *  buttons' labels and tooltips read the value, so they always name what
+   *  they actually do.
+   *
+   *  Default 5, down from the flat 10 this replaced: 10 s overshoots a line of
+   *  dialogue you missed, which is the thing people seek backwards for.
+   *  Clamped to [1, 60] on load. */
+  seekStepSeconds: number;
   /** "Still watching?" binge gate. After 2 CONSECUTIVE unattended auto-
    *  advances (i.e. once the 3rd episode in a row finishes via auto-advance),
    *  the next end-of-stream shows a confirm instead of auto-playing, and the
@@ -209,11 +220,18 @@ export interface AuraSettings {
    *  Settings since it's a stylistic cousin of "skip the boring
    *  bits".
    *
-   *  NO LONGER PURELY NAVIGATIONAL. Skipping to a canon episode also MARKS
-   *  every episode it jumped as skipped, logs them to History, and, when the
-   *  user pressed Skip themselves and auto-scrobble is on, sends them to
-   *  Trakt / AniList as watched. An unattended auto-advance marks locally and
-   *  sends nothing. See skipActions.ts for the rule set. */
+   *  SCOPE: this decides WHICH BUTTON AN UNATTENDED COUNTDOWN PRESSES, and
+   *  nothing else. It used to be fed to `resolveNextEpisode`, where it changed
+   *  what "the next episode" was: the card said "Play next episode" and played
+   *  a different one, the user could not see what was being jumped or opt out
+   *  for a single episode, and because the walk happened inside the resolver
+   *  nothing downstream knew a skip had occurred, so the run was never marked.
+   *  The card now always shows the true next episode with both buttons on it.
+   *
+   *  Skipping marks every episode it jumped, logs them to History, and, when
+   *  the user pressed Skip themselves and auto-scrobble is on, sends them to
+   *  Trakt / AniList as watched. An unattended skip marks locally and sends
+   *  nothing. See skipActions.ts for the rule set. */
   nextUpSkipFillerRecap: "none" | "filler" | "recap" | "both";
   /** Use Aura Cloud's shared release-search feed for library /
    *  calendar reconciliation instead of probing addons per-user.
@@ -293,6 +311,7 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   reduceMotion: "auto",
   autoAdvanceNextEpisode: false,
   autoAdvanceDelaySeconds: 10,
+  seekStepSeconds: 5,
   stillWatchingGate: true,
   autoSkipDetect: true,
   blurEpisodeSynopsis: false,
@@ -377,6 +396,10 @@ function readFromStorage(): AuraSettings {
         && Number.isFinite(parsed.autoAdvanceDelaySeconds)
         ? Math.max(5, Math.min(30, Math.round(parsed.autoAdvanceDelaySeconds)))
         : 10,
+      seekStepSeconds: typeof parsed.seekStepSeconds === "number"
+        && Number.isFinite(parsed.seekStepSeconds)
+        ? Math.max(1, Math.min(60, Math.round(parsed.seekStepSeconds)))
+        : 5,
       stillWatchingGate: typeof parsed.stillWatchingGate === "boolean"
         ? parsed.stillWatchingGate
         : true,

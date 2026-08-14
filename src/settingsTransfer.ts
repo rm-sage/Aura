@@ -119,6 +119,7 @@ const PORTABLE_AURA_FIELDS = [
   "reduceMotion",
   "autoAdvanceNextEpisode",
   "autoAdvanceDelaySeconds",
+  "seekStepSeconds",
   "stillWatchingGate",
   "autoSkipDetect",
   "nextUpSkipFillerRecap",

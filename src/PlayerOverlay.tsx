@@ -1369,6 +1369,20 @@ export default function PlayerOverlay({
     seekAbsolute(Math.max(dvr.windowStart, dvr.edge - 3));
   };
 
+  // How far the two skip buttons either side of Play move the playhead. The
+  // SAME setting the Seek Back / Seek Forward keys use: they are one action,
+  // and two different step sizes for it would be incoherent. Mirrored through
+  // the auraSettings event bus (like loudness / interpolation below) so a
+  // change in Settings reaches an open player without a remount, and the
+  // labels below interpolate it so a button never names a number it does not
+  // actually seek.
+  const [seekStep, setSeekStep] = useState(() => loadAuraSettings().seekStepSeconds);
+  useEffect(() => {
+    const sync = () => setSeekStep(loadAuraSettings().seekStepSeconds);
+    window.addEventListener("aura:settings-changed", sync);
+    return () => window.removeEventListener("aura:settings-changed", sync);
+  }, []);
+
   // AniSkip OP/ED/recap windows for the current episode. Surfaced as
   // amber bands on the scrubber so the user can see where skip
   // boundaries land before crossing them. Same hook used elsewhere
@@ -2399,9 +2413,9 @@ export default function PlayerOverlay({
                 edge there's nothing ahead to seek into. */}
             <div className={`flex items-center gap-1.5 ${partyFollower ? "opacity-[0.45] pointer-events-none" : ""}`}>
               <IconButton
-                onClick={() => seekRelative(-10)}
-                label="Skip back 10 seconds"
-                tooltip="Back 10 s"
+                onClick={() => seekRelative(-seekStep)}
+                label={`Skip back ${seekStep} seconds`}
+                tooltip={`Back ${seekStep} s`}
               >
                 <ReplayIcon />
               </IconButton>
@@ -2420,9 +2434,9 @@ export default function PlayerOverlay({
 
               {(!isLive || !dvr.atLive) && (
                 <IconButton
-                  onClick={() => seekRelative(10)}
-                  label="Skip forward 10 seconds"
-                  tooltip="Forward 10 s"
+                  onClick={() => seekRelative(seekStep)}
+                  label={`Skip forward ${seekStep} seconds`}
+                  tooltip={`Forward ${seekStep} s`}
                 >
                   <ForwardIcon />
                 </IconButton>
