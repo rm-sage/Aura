@@ -160,6 +160,14 @@ interface Options {
   /** Optional override for the auto-complete warmup. Defaults to
    *  COMPLETE_WARMUP_S_DEFAULT (300). */
   completeWarmupSecs?: number;
+  /** False while the reported playhead cannot be trusted, i.e. the stream was
+   *  truncated by its origin and mpv's `keep-open` handling has parked
+   *  `time-pos` at `duration`. Auto-complete MUST NOT fire then: the ratio
+   *  gate reads 1.0 and the warmup is long since satisfied on any real
+   *  episode, so a dropped connection would otherwise scrobble a "watched" to
+   *  Trakt / AniList and auto-advance past an episode nobody finished.
+   *  Defaults to true (trusted) when omitted. */
+  positionTrusted?: boolean;
 }
 
 export function useScrobble({
@@ -168,6 +176,7 @@ export function useScrobble({
   scope,
   startWarmupSecs,
   completeWarmupSecs,
+  positionTrusted = true,
 }: Options) {
   const startedFor = useRef<string | null>(null);   // session id we already started
   const completed = useRef<boolean>(false);         // suppress duplicate ends
@@ -388,7 +397,10 @@ export function useScrobble({
       !completed.current &&
       playback.duration > 0 &&
       playback.time / playback.duration >= COMPLETE_THRESHOLD &&
-      elapsedThisSession.current >= completeWarmup
+      elapsedThisSession.current >= completeWarmup &&
+      // A truncated stream reports time == duration, which satisfies the
+      // ratio gate outright. See `positionTrusted`.
+      positionTrusted
     ) {
       completed.current = true;
       // Remember this key — endSession resets startedFor + completed to
@@ -411,5 +423,5 @@ export function useScrobble({
       }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, playback.time, playback.duration, playback.paused]);
+  }, [active, playback.time, playback.duration, playback.paused, positionTrusted]);
 }

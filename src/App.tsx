@@ -778,9 +778,53 @@ interface PlaybackPayload {
   cache_pct?: number;
   /** Demuxer readahead buffered ahead of the playhead, seconds. */
   cache_seconds?: number;
+  /** The demuxer's reader thread has hit end-of-stream. NOT a fault on its
+   *  own (it is also how a healthy file ends) - only meaningful against
+   *  `cache_end` vs `duration`. See `streamTruncatedRef`. */
+  demux_eof?: boolean;
+  /** Absolute timestamp of the last cached packet (mpv `demuxer-cache-time`,
+   *  the same value as `demuxer-cache-state/cache-end`). */
+  cache_end?: number;
   /** Seek lifecycle (SEEK → PLAYBACK_RESTART) — drives the loading overlay on seeks. */
   seeking?: boolean;
 }
+
+// ── Truncated-stream detection ──────────────────────────────────────────
+// An origin that drops the response body mid-transfer is reported by mpv as
+// a clean EOF: `stream.c` collapses every I/O error into `s->eof = 1`, and
+// the demuxer then latches the cached range `eof=1`. After that latch
+// `find_cache_seek_range()` accepts any pts, every seek resolves in-cache,
+// and mpv NEVER issues another HTTP request for that load - so the stream is
+// unrecoverable even once the origin comes back, and a forward seek past the
+// cached data makes `keep-open=yes` run `seek_to_last_frame()`, teleporting
+// `time-pos` to `duration` and looking exactly like a finished episode.
+//
+// The discriminator is demuxer EOF while the cached range ends far short of
+// the container duration. A real EOF has `cache_end ~= duration`.
+//
+// The floor absorbs container-duration slop (an MKV header duration can be a
+// second or two off the last packet); the ratio scales it for long files. In
+// the incident that motivated this the shortfall was 1210 s of a 1419 s file,
+// so neither value is delicate.
+const EOF_SHORTFALL_MIN_S = 20;
+const EOF_SHORTFALL_RATIO = 0.02;
+// Consecutive qualifying samples before the condition latches. The engine
+// polls at CACHE_POLL_INTERVAL (500 ms), so this debounces a single odd read
+// without adding meaningful latency to recovery.
+const TRUNCATED_CONFIRM_SAMPLES = 2;
+// How close the playhead must get to the END of the cached data before a
+// truncated stream actually triggers a reload.
+//
+// Detection and recovery are deliberately DECOUPLED. The demuxer EOFs the
+// instant the origin drops, but mpv keeps playing out of a cache holding up
+// to `cache-secs=180`. Reloading immediately would therefore interrupt up to
+// three minutes of perfectly good playback to fix a problem the viewer cannot
+// see yet. So the verdict latches at once (it has to: it is what stops the
+// false end card and the poisoned progress writes) while the reload waits
+// until the runway is nearly gone. The lead time is what lets the reload
+// re-open and re-buffer while the last seconds drain, instead of stalling
+// first and reloading after.
+const TRUNCATED_RECOVERY_LEAD_S = 12;
 
 // Tail window (seconds before metadata duration) considered "near end"
 // for EOS detection. Shared between the in-listener paused-transition
@@ -980,6 +1024,33 @@ function usePlayback(playerActive: boolean) {
    *  load. Stops the same milestone from spamming the log on
    *  every poll tick (e.g. "duration appeared"). */
   const loadEventsSeenRef = useRef<Set<string>>(new Set());
+  /** True once mpv has confirmed the CURRENT load's file is open, i.e. the
+   *  positions arriving on `playback-update` are known to belong to the file
+   *  we asked for.
+   *
+   *  This exists because the property channel is anonymous. `playback-update`
+   *  carries no file identity, and the load window opens HERE - at
+   *  notifyNewLoad, which runs before the awaited `resolve_stream` and before
+   *  `load_video` is even invoked - while the OUTGOING file is still loaded
+   *  and still emitting a perfectly valid `time-pos` at ~30 Hz. Every one of
+   *  those ticks used to be applied to the incoming load.
+   *
+   *  Mostly that self-healed one tick after the new file opened. It did not
+   *  when the new file NEVER opened: an episode advance onto a stream that
+   *  404'd left `time` holding the previous episode's playhead, and the VOD
+   *  auto-retry read it as "where this load broke" and re-issued the episode
+   *  at 1341 s of 1476 s - the end card of something the user had not watched.
+   *  The same tick also latched `firstFrameSeen` on a file with no frames,
+   *  which armed the 8 s mid-play stall detector (it gates on firstFrameSeen)
+   *  and upgraded the error grace from the 6 s cold-load value to the 20 s
+   *  warm one, so the failure was even diagnosed down the wrong path.
+   *
+   *  Cleared by notifyNewLoad, set by mpv's FILE_LOADED (`playback-file-loaded`).
+   *  `duration > 0` is a second, independent unseal: mpv cannot report a
+   *  runtime for a file it has not opened, so a missed FILE_LOADED can never
+   *  strand the UI. Which path unsealed is logged, so a build where the event
+   *  stops arriving is diagnosable rather than silently degraded. */
+  const positionOwnedRef = useRef(false);
   /** Last cache-buffering-state percentage we logged, so we only
    *  emit on meaningful changes (≥5 % delta or boundary crossings). */
   const lastCacheBufferLogRef = useRef<number | null>(null);
@@ -1019,6 +1090,105 @@ function usePlayback(playerActive: boolean) {
   // time-pos — that's a buffer, NOT a broken stream, so the stale-heartbeat
   // detector gives a grace window after any seek before flagging a break.
   const lastSeekAtRef = useRef<number>(0);
+  // ── Truncated-stream state (see EOF_SHORTFALL_MIN_S) ──
+  // `streamTruncated` is the latched verdict: mpv's demuxer is at EOF but the
+  // cached range ends far short of the container duration, i.e. the origin
+  // dropped the body and this load can never fetch another byte. The ref is
+  // what the once-registered listeners read (they outlive every render); the
+  // state exists so effects can react to the transition.
+  const [streamTruncated, setStreamTruncated] = useState(false);
+  const streamTruncatedRef = useRef(false);
+  const truncatedSamplesRef = useRef(0);
+  /** Mirror of truncatedSamplesRef for the un-latch direction, and the cached
+   *  range end at the moment the verdict landed. Together they let the verdict
+   *  be released ONLY on proof that the demuxer fetched new data, which is the
+   *  one thing a false positive cannot fake. */
+  const truncatedRecoverSamplesRef = useRef(0);
+  const truncatedAtEndRef = useRef<number | null>(null);
+  /** True once a truncated stream's remaining cached runway is nearly spent.
+   *  This, not `streamTruncated`, is what arms recovery. See
+   *  TRUNCATED_RECOVERY_LEAD_S. */
+  const [truncatedRunout, setTruncatedRunout] = useState(false);
+  const truncatedRunoutRef = useRef(false);
+  /** Absolute timestamp of the last cached packet. Frozen once the demuxer
+   *  EOFs (nothing more is ever fetched), so `cacheEnd - time` is exactly the
+   *  playable runway left. */
+  const cacheEndRef = useRef<number | null>(null);
+  // Last position observed while the stream was NOT truncated. Once mpv's
+  // keep-open handling teleports `time-pos` to `duration`, every reload path
+  // (`ownedTime()` included) would otherwise "resume" at the end of the
+  // episode. This is the position recovery must actually use.
+  const lastSanePosRef = useRef<number | null>(null);
+
+  // One-shot guard so the fast near-end EOS short-circuit dispatches
+  // `aura:eos-detected` exactly once per stream. Reset per load inside
+  // notifyNewLoad (alongside the other fresh-load state resets).
+  const nearEndEosFiredRef = useRef(false);
+
+  /** Release the ENTIRE truncation state group, including the EOS fuse.
+   *
+   *  There are two exits from a truncation and both must land in the same
+   *  place: a fresh load (notifyNewLoad) and an un-latch, which fires when the
+   *  demuxer proves it is fetching again after a FALSE POSITIVE. Clearing only
+   *  the verdict on the second path left `truncatedRunout` armed, which
+   *  permanently disables the heartbeat's `setStreamBroken(false)` self-heal
+   *  and strands the recovery modal over a stream that is demonstrably fine,
+   *  and left `nearEndEosFiredRef` burned by the suppression path so the real
+   *  end card could never fire for that episode. One helper so the two exits
+   *  cannot drift apart again.
+   *
+   *  `cacheEndRef` is deliberately NOT reset here: on the un-latch path it
+   *  holds the live cached range and is still wanted. notifyNewLoad clears it
+   *  separately. */
+  const clearTruncationState = useCallback(() => {
+    streamTruncatedRef.current = false;
+    truncatedSamplesRef.current = 0;
+    truncatedRecoverSamplesRef.current = 0;
+    truncatedAtEndRef.current = null;
+    truncatedRunoutRef.current = false;
+    nearEndEosFiredRef.current = false;
+    setStreamTruncated(false);
+    setTruncatedRunout(false);
+  }, []);
+  /** Single gate + fuse for every end-of-stream trigger.
+   *
+   *  There are five detectors (immediate near-end tick, keep-open paused
+   *  transition, 1.5 s near-end stale heartbeat, 8 s stale near-end, and
+   *  `playback-end` reason=eof) and before this they each dispatched
+   *  `aura:eos-detected` inline. Two problems that fixes:
+   *
+   *  1. A TRUNCATED stream reaches four of the five. When an origin drops the
+   *     body, a forward seek past the cached data makes mpv's keep-open run
+   *     `seek_to_last_frame()`, which reports `time-pos == duration` and
+   *     auto-pauses - satisfying every near-end predicate at once, on an
+   *     episode the viewer is 15% into. Suppressing here is what stops the
+   *     false end card, and (because the end card pauses mpv, and the break
+   *     detector early-returns while paused) it is also what keeps recovery
+   *     reachable at all.
+   *  2. None of them logged, so after the fact there was no way to tell WHICH
+   *     detector raised a card. `reason` is recorded for exactly that.
+   *
+   *  Deliberately NOT gated on accumulated watch time: a viewer who scrubs
+   *  straight into the last few seconds has almost none, and must still get
+   *  the end card. Suppression requires positive evidence of truncation. */
+  const fireEos = useCallback((reason: string) => {
+    if (nearEndEosFiredRef.current) return;
+    if (streamTruncatedRef.current) {
+      // Burn the fuse on this path too. The 1.5 s and 8 s near-end detectors
+      // live in a 1 Hz setInterval that re-evaluates from scratch every tick,
+      // so without this a truncated-and-teleported playhead re-enters here
+      // once a second for as long as the recovery modal is up. Safe: a
+      // truncated load can never reach a genuine end of stream (mpv issues no
+      // further requests for it), and notifyNewLoad clears this fuse and the
+      // truncation latch together, so the recovery reload re-arms both.
+      nearEndEosFiredRef.current = true;
+      console.warn(`[eos] suppressed (${reason}): stream is truncated, not finished`);
+      return;
+    }
+    nearEndEosFiredRef.current = true;
+    console.info(`[eos] fired by ${reason}`);
+    window.dispatchEvent(new CustomEvent("aura:eos-detected"));
+  }, []);
 
   useEffect(() => {
     // Previous tick's `payload.paused` for the keep-open EOS branch
@@ -1038,7 +1208,33 @@ function usePlayback(playerActive: boolean) {
     // matches the natural fresh-listener lifetime).
     let prevPayloadPaused = false;
     const p = listen<PlaybackPayload>("playback-update", ({ payload }) => {
-      if (typeof payload.time === "number") {
+      // Backup unseal (see positionOwnedRef). mpv cannot report a runtime for
+      // a file it has not opened, so a duration for THIS load is independent
+      // proof the new file is up - and it means a missed `playback-file-loaded`
+      // degrades to today's behaviour instead of stranding the scrubber at
+      // 00:00 for the whole episode. Checked before the position block so a
+      // payload that somehow carries both is not discarded.
+      if (
+        !positionOwnedRef.current &&
+        typeof payload.duration === "number" && payload.duration > 0
+      ) {
+        positionOwnedRef.current = true;
+        logLoadEvent("position unsealed via duration (no file-loaded event)", {
+          duration: payload.duration,
+        });
+      }
+      // Scoped rather than an early `return`: a payload carries one changed
+      // property today, but dropping the whole tick would silently swallow
+      // `paused` / `volume` / cache telemetry the day that stops being true.
+      if (typeof payload.time === "number" && positionOwnedRef.current) {
+        // Drop positions that belong to the OUTGOING file. Not an edge case:
+        // between notifyNewLoad and mpv opening the new file the previous one
+        // is still decoding and still emitting at ~30 Hz, so WITHOUT this every
+        // episode advance re-poisons `time`, `firstFrameSeen` and the stall
+        // detector's heartbeat with the previous episode's playhead. `duration`
+        // is deliberately NOT gated: it arrives once per file and this handler
+        // is its only writer, so swallowing it would kill the scrubber for the
+        // whole episode, whereas `time` self-corrects on the very next tick.
         lastTimeUpdateAtRef.current = Date.now();
         // Accumulate real forward-progress for the History gate. Only
         // positive sub-cap deltas count, so a seek-to-end never inflates
@@ -1049,6 +1245,44 @@ function usePlayback(playerActive: boolean) {
         }
         watchedElapsedLastTimeRef.current = payload.time;
         setTime(payload.time);
+        // Snapshot the last position from BEFORE the stream went bad. Once
+        // mpv's keep-open handling runs seek_to_last_frame() the reported
+        // playhead is `duration`, and every resume path (`ownedTime()`
+        // included) would otherwise restart the episode at its end.
+        // A position is honest when the stream is healthy, OR when it is
+        // truncated but still inside the frozen cached range - those frames
+        // are real, the viewer is watching them, and that is where a reload
+        // must resume. Only the keep-open `seek_to_last_frame()` lie lands
+        // PAST `cacheEnd`, and the truncation test guarantees
+        // `duration > cacheEnd + EOF_SHORTFALL_MIN_S`, so the lie can never
+        // pass this test. Without the second case the resume point froze at
+        // the instant the demuxer EOF'd, which is a whole readahead
+        // (`demuxer-readahead-secs=120`) behind where the viewer actually got
+        // to, and every recovery rewound them by up to two minutes.
+        const _cachedEnd = cacheEndRef.current;
+        if (
+          !streamTruncatedRef.current ||
+          (_cachedEnd != null && payload.time <= _cachedEnd + 1)
+        ) {
+          lastSanePosRef.current = payload.time;
+        }
+        if (streamTruncatedRef.current && !truncatedRunoutRef.current) {
+          // Truncated: count down the cached runway. `cacheEnd` is frozen (the
+          // demuxer will never fetch again), so this shrinks purely as
+          // playback consumes what is left. Arms recovery once the lead time
+          // is reached - or immediately if the cache was already spent when
+          // the verdict landed.
+          const end = cacheEndRef.current;
+          const runway = end != null ? end - payload.time : 0;
+          if (runway <= TRUNCATED_RECOVERY_LEAD_S) {
+            truncatedRunoutRef.current = true;
+            setTruncatedRunout(true);
+            console.warn(
+              `[playback] truncated stream: ${runway > 0 ? `${runway.toFixed(0)}s` : "no"} `
+              + `cached runway left - arming recovery`,
+            );
+          }
+        }
         // First-frame latch: any time > 0 reading means MPV has
         // started producing frames for the current file. Once
         // flipped, stays true until notifyNewLoad() resets it.
@@ -1063,7 +1297,21 @@ function usePlayback(playerActive: boolean) {
           // self-recovered (mpv reconnected, or the user successfully
           // reloaded). The recovery overlay's listener uses the same
           // ref so the latch resets symmetrically.
-          setStreamBroken(false);
+          //
+          // EXCEPT once truncation has armed recovery. Every other detector
+          // triggers ON the heartbeat stopping, so no tick can arrive to undo
+          // them; truncation is the only one that arms while `time-pos` is
+          // still ticking at ~30 Hz (TRUNCATED_RECOVERY_LEAD_S deliberately
+          // fires ~12 s BEFORE the cached runway ends, so the reload can
+          // re-buffer while it drains). `streamBroken` is a dep of the VOD
+          // auto-retry effect, so clearing it here runs that effect's cleanup
+          // and cancels the pending reload roughly one tick after it was
+          // scheduled - leaving the player to coast to a frozen stop with no
+          // modal, no retry, and one retry attempt silently burned. The frames
+          // still arriving are the cache draining, NOT recovery: mpv cannot
+          // un-latch the demuxer's cached-range eof. notifyNewLoad clears both
+          // flags together, so a successful reload still un-latches normally.
+          if (!truncatedRunoutRef.current) setStreamBroken(false);
         }
       }
       if (typeof payload.duration === "number") {
@@ -1135,6 +1383,78 @@ function usePlayback(playerActive: boolean) {
         });
       }
 
+      // ── Truncated-stream verdict ──
+      // `demux_eof` and `cache_end` arrive together on the engine's cache
+      // poll, so this is evaluated on that combined payload only. `duration`
+      // never rides along (it is an observed property on its own partial
+      // payload), hence lastPosRef.
+      if (typeof payload.demux_eof === "boolean") {
+        const dur = lastPosRef.current.duration;
+        const end = typeof payload.cache_end === "number"
+          ? payload.cache_end
+          : null;
+        // Require a real duration and a real cache end. Without both there is
+        // nothing to compare, and guessing here would mean declaring a
+        // healthy stream dead - strictly worse than missing a broken one.
+        const shortfall = (dur > 0 && end != null && end > 0) ? dur - end : null;
+        const qualifies =
+          payload.demux_eof &&
+          shortfall != null &&
+          shortfall > Math.max(EOF_SHORTFALL_MIN_S, dur * EOF_SHORTFALL_RATIO);
+
+        if (end != null) cacheEndRef.current = end;
+
+        if (qualifies) {
+          truncatedSamplesRef.current += 1;
+          if (
+            truncatedSamplesRef.current >= TRUNCATED_CONFIRM_SAMPLES &&
+            !streamTruncatedRef.current
+          ) {
+            streamTruncatedRef.current = true;
+            truncatedAtEndRef.current = end;
+            truncatedRecoverSamplesRef.current = 0;
+            setStreamTruncated(true);
+            // Take down any Next-Up card already on screen. Its visibility
+            // effect is gated on the verdict from here on, but a card raised
+            // just before the teleport would otherwise sit there counting down
+            // through the recovery reload (its per-target reset is keyed on
+            // activeTarget.id, which an in-place reload does not change).
+            window.dispatchEvent(new CustomEvent("aura:stream-truncated"));
+            console.warn(
+              `[playback] stream truncated: demuxer EOF at ${end!.toFixed(0)}s of `
+              + `${dur.toFixed(0)}s (${shortfall!.toFixed(0)}s missing) - the origin dropped `
+              + `the body and mpv will not request more data for this load`,
+            );
+          }
+        } else {
+          truncatedSamplesRef.current = 0;
+          // Un-latch, but only on POSITIVE evidence that the demuxer fetched
+          // fresh data for this load - never on `demux_eof === false` alone.
+          // The latch is what suppresses the false end card and the poisoned
+          // writes, so releasing it cheaply would re-arm every failure this
+          // batch fixes. Two things must both hold: the demuxer is no longer
+          // at EOF, AND the cached range now extends past where it was frozen.
+          // In the real failure mpv issues no further requests at all, so
+          // neither can happen; this exists so a detector FALSE POSITIVE
+          // cannot poison progress, History and scrobbling for the whole
+          // remaining episode. Debounced through the same sample counter for
+          // symmetry with the latch.
+          if (streamTruncatedRef.current && payload.demux_eof === false) {
+            const frozenEnd = truncatedAtEndRef.current;
+            if (end != null && frozenEnd != null && end > frozenEnd + 1) {
+              truncatedRecoverSamplesRef.current += 1;
+              if (truncatedRecoverSamplesRef.current >= TRUNCATED_CONFIRM_SAMPLES) {
+                console.info(
+                  `[playback] stream recovered: demuxer is fetching again `
+                  + `(cache end ${frozenEnd.toFixed(0)}s -> ${end.toFixed(0)}s)`,
+                );
+                clearTruncationState();
+              }
+            }
+          }
+        }
+      }
+
       // EOS Spotlight — immediate-fire on the live tick. mpv's time-pos halts
       // within ~0.5 s of duration at true EOF on this libmpv build; without
       // this, the stale-heartbeat path adds a 1.5 s floor. Shares the one-shot
@@ -1157,8 +1477,7 @@ function usePlayback(playerActive: boolean) {
         _d - _t <= 0.5 &&
         !_isPaused
       ) {
-        nearEndEosFiredRef.current = true;
-        window.dispatchEvent(new CustomEvent("aura:eos-detected"));
+        fireEos("near-end-tick");
       }
 
       // EOS Spotlight — keep-open paused-transition branch (2026-05-20).
@@ -1207,8 +1526,7 @@ function usePlayback(playerActive: boolean) {
         // poll fires ~1.5 s later, long after this timestamp grace expires.
         userPausedNearEndRef.current = true;
       } else if (!nearEndEosFiredRef.current && pausedNearEnd) {
-        nearEndEosFiredRef.current = true;
-        window.dispatchEvent(new CustomEvent("aura:eos-detected"));
+        fireEos("keep-open-pause");
       }
 
       // Update prev-paused tracker AT THE END so the next tick
@@ -1220,7 +1538,7 @@ function usePlayback(playerActive: boolean) {
       }
     });
     return () => { p.then((fn) => fn()).catch(() => {}); };
-  }, [logLoadEvent]);
+  }, [logLoadEvent, fireEos]);
 
   // Pause → unpause transition: reset the heartbeat baseline so the
   // stale-heartbeat detector measures from "just resumed", not "last
@@ -1328,10 +1646,6 @@ function usePlayback(playerActive: boolean) {
    *  Reset per load in notifyNewLoad. */
   const watchedElapsedRef = useRef<number>(0);
   const watchedElapsedLastTimeRef = useRef<number>(0);
-  // One-shot guard so the fast near-end EOS short-circuit dispatches
-  // `aura:eos-detected` exactly once per stream. Reset per load inside
-  // notifyNewLoad (alongside the other fresh-load state resets).
-  const nearEndEosFiredRef = useRef(false);
   /** Latched when a paused transition inside the end-of-stream tail was
    *  attributed to the user rather than to mpv's keep-open auto-pause. There
    *  are TWO near-end EOS detectors and a timestamp grace can only cover the
@@ -1373,6 +1687,58 @@ function usePlayback(playerActive: boolean) {
       const staleFor = Date.now() - last;
       const { time: t, duration: d } = lastPosRef.current;
       const nearEnd = t > 0 && d > 0 && d - t <= EOS_TAIL_SECONDS;
+      // Truncated stream whose heartbeat has stopped: the cached runway is
+      // spent. This is the TERMINAL state of the failure - mpv played out
+      // everything it had, hit its latched EOF, and `keep-open-pause=yes`
+      // auto-paused on the last frame, so `time-pos` will never tick again and
+      // the runway countdown in the playback-update listener can never
+      // complete on its own.
+      //
+      // It MUST sit above the `if (paused) return` guard below, for exactly
+      // the reason the near-end EOS branch does: from here, mpv's auto-pause
+      // and a person pressing space are the same signal. Unlike that branch
+      // there is no ambiguity to resolve, because a user pause on a stream we
+      // have already PROVEN truncated still ends in the same place - the
+      // stream is dead either way, and recovery is what the viewer wants.
+      if (streamTruncatedRef.current) {
+        // A stopped heartbeat is only runout if the cached runway is actually
+        // gone. A deliberate user pause halts `time-pos` identically, and
+        // arming on that would throw away the buffer the viewer could still
+        // watch - the exact thing decoupling detection from recovery exists to
+        // protect (up to `cache-secs=180` of it). So test the runway directly
+        // rather than trying to tell the two pauses apart: mpv's own keep-open
+        // auto-pause can only happen once the cache is exhausted, so it always
+        // satisfies this, while a mid-buffer user pause never does. When they
+        // resume, the countdown in the playback-update listener takes over.
+        //
+        // A null `cacheEnd` (never sampled) counts as spent: if we cannot tell
+        // how much is left, recovering is the safe default.
+        const _end = cacheEndRef.current;
+        const _runwaySpent =
+          _end == null || _end - lastPosRef.current.time <= TRUNCATED_RECOVERY_LEAD_S;
+        if (
+          !truncatedRunoutRef.current &&
+          staleFor >= EOS_NEAR_END_STALE_MS &&
+          _runwaySpent
+        ) {
+          truncatedRunoutRef.current = true;
+          setTruncatedRunout(true);
+          console.warn("[playback] truncated stream: playback stopped, cached data exhausted - arming recovery");
+        }
+        if (truncatedRunoutRef.current) {
+          // Re-assert every tick rather than relying on the one-shot effect.
+          // The modal's "Switch source" button clears `streamBroken` WITHOUT
+          // issuing a load, so if the user closes the switcher without picking
+          // anything the stream is still dead and the modal has to come back -
+          // which is the behaviour the stale-heartbeat detector already
+          // provides for every other break. Idempotent: setting a state to the
+          // value it already holds does not re-render, so this cannot re-enter
+          // the auto-retry effect. It stops on its own when the recovery reload
+          // calls notifyNewLoad and clears the truncation latch.
+          setStreamBroken(true);
+        }
+        return;
+      }
       // Near-end EOS short-circuit (~1.5 s): runs REGARDLESS of the
       // paused flag. Under `keep-open=yes` + `keep-open-pause=yes`
       // (player.rs init_mpv), mpv at true EOF auto-pauses on the last
@@ -1400,8 +1766,7 @@ function usePlayback(playerActive: boolean) {
         !userPausedNearEndRef.current &&
         staleFor >= EOS_NEAR_END_STALE_MS
       ) {
-        nearEndEosFiredRef.current = true;
-        window.dispatchEvent(new CustomEvent("aura:eos-detected"));
+        fireEos("near-end-stale-1.5s");
         return;
       }
       // Genuine-break path below: only meaningful while playback was
@@ -1422,10 +1787,7 @@ function usePlayback(playerActive: boolean) {
         if (nearEnd) {
           // Near-end stall → end-of-stream, not a break. App owns the
           // Spotlight; one dispatch is enough (the listener latches).
-          if (!nearEndEosFiredRef.current) {
-            nearEndEosFiredRef.current = true;
-            window.dispatchEvent(new CustomEvent("aura:eos-detected"));
-          }
+          fireEos("near-end-stale-8s");
           return;
         }
         // Buffer-aware: a cache stall legitimately halts time-pos. If the
@@ -1438,7 +1800,7 @@ function usePlayback(playerActive: boolean) {
       }
     }, 1000);
     return () => window.clearInterval(id);
-  }, [paused, firstFrameSeen, windowHidden]);
+  }, [paused, firstFrameSeen, windowHidden, fireEos]);
 
   // ── Load-failure detector ──
   // The stale-heartbeat detector above only catches mid-play stalls
@@ -1485,14 +1847,37 @@ function usePlayback(playerActive: boolean) {
       // exit). The near-end stale-heartbeat path above is the fallback
       // for containers whose `eof` event never arrives.
       if (reason === "eof") {
-        if (!nearEndEosFiredRef.current) {
-          nearEndEosFiredRef.current = true;
-          window.dispatchEvent(new CustomEvent("aura:eos-detected"));
+        // Position-gated like every other trigger. Near-unreachable while
+        // `keep-open=yes` holds (mpv converts AT_END_OF_FILE into KEEP_PLAYING
+        // rather than emitting END_FILE), but it becomes live the moment
+        // keep-open changes or the playlist gains a second entry - and an
+        // ungated one is exactly how a premature EOF would fake an end card.
+        const { time: eofT, duration: eofD } = lastPosRef.current;
+        if (eofD > 0 && eofD - eofT > EOS_TAIL_SECONDS) {
+          console.warn(
+            `[eos] ignoring end-file eof at ${eofT.toFixed(0)}s of ${eofD.toFixed(0)}s `
+            + `- too far from the end to be a completion`,
+          );
+        } else {
+          fireEos("playback-end-eof");
         }
       }
     });
     return () => { p.then((fn) => fn()).catch(() => {}); };
-  }, []);
+  }, [fireEos]);
+
+  // mpv opened the file the current load asked for → positions on
+  // `playback-update` now belong to it. Mounted unconditionally (NOT behind
+  // `playerActive`) and with an empty dep list, so the listener is live before
+  // the session's first load rather than racing it.
+  useEffect(() => {
+    const p = listen("playback-file-loaded", () => {
+      if (positionOwnedRef.current) return;
+      positionOwnedRef.current = true;
+      logLoadEvent("file opened (positions now owned by this load)");
+    });
+    return () => { p.then((fn) => fn()).catch(() => {}); };
+  }, [logLoadEvent]);
 
   // Belt-and-suspenders watchdog: if loadStartedAtRef has been non-
   // zero for >LOAD_TIMEOUT_MS and firstFrameSeen is still false, the
@@ -1567,6 +1952,11 @@ function usePlayback(playerActive: boolean) {
     // stream broken 20 s in.
     loadErrorAtRef.current = 0;
     loadEventsSeenRef.current = new Set();
+    // Nothing about the OUTGOING file survives this point. Re-opened only by
+    // mpv confirming the new file is up (see positionOwnedRef) - until then
+    // `time` stays 0 and the resume paths correctly fall back to the offset
+    // this load was ISSUED with.
+    positionOwnedRef.current = false;
     lastTimeUpdateAtRef.current = 0;
     lastCacheBufferLogRef.current = null;
     lastCacheSecondsRef.current = 0;
@@ -1577,6 +1967,13 @@ function usePlayback(playerActive: boolean) {
     userPausedNearEndRef.current = false;
     watchedElapsedRef.current = 0;
     watchedElapsedLastTimeRef.current = 0;
+    // A fresh loadfile is the ONLY thing that can clear a truncation: mpv
+    // cannot un-latch a cached range's eof flag, so the verdict is sticky for
+    // the life of the load. `lastSanePosRef` is deliberately NOT cleared here
+    // - the recovery reload is issued from it, and this runs immediately
+    // BEFORE that reload.
+    clearTruncationState();
+    cacheEndRef.current = null;
     console.info("[load] +0ms notifyNewLoad — fresh load sequence begins");
     setBuffering(true);
     setFirstFrameSeen(false);
@@ -1659,6 +2056,12 @@ function usePlayback(playerActive: boolean) {
     togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
     notifyNewLoad, logLoadEvent,
     watchedElapsedRef,
+    positionOwnedRef,
+    // Truncated-stream verdict + the last position from before it latched.
+    // App owns recovery (the auto-retry and the modal both live there), so it
+    // needs the state to react to and the ref to resume from.
+    streamTruncated, streamTruncatedRef, lastSanePosRef,
+    truncatedRunout, cacheEndRef,
   };
 }
 
@@ -1948,7 +2351,34 @@ export default function App() {
     togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
     notifyNewLoad, logLoadEvent,
     watchedElapsedRef,
+    positionOwnedRef,
+    streamTruncated, streamTruncatedRef, lastSanePosRef,
+    truncatedRunout, cacheEndRef,
   } = usePlayback(isPlayerActive);
+
+  /** `time`, but only when it is known to belong to the file currently loaded
+   *  - null during a load, before mpv has confirmed the new file is open.
+   *
+   *  EVERY "where should I resume from" decision must go through this. Read
+   *  raw, `time` can still be holding the PREVIOUS episode's playhead (see
+   *  positionOwnedRef), which is how a retry of a failed episode advance
+   *  resumed an unwatched episode at 91% and dropped the viewer on its end
+   *  card. There were three independent copies of the raw read; one helper so
+   *  a fourth cannot drift in.
+   *
+   *  It also applies the TRUNCATION rule, for the same "one place" reason. On
+   *  a stream whose origin dropped the body, mpv's keep-open
+   *  `seek_to_last_frame()` parks `time-pos` at `duration`, so a resume built
+   *  on the live playhead restarts the title at its end. `lastSanePosRef` is
+   *  the last position observed while the data was real. Keeping this inside
+   *  the helper is what stops the rule from being applied at three of the four
+   *  resume sites and forgotten at the fourth (the source switcher). */
+  const ownedTime = useCallback(
+    () => (positionOwnedRef.current
+      ? (streamTruncatedRef.current ? lastSanePosRef.current : time)
+      : null),
+    [positionOwnedRef, streamTruncatedRef, lastSanePosRef, time],
+  );
 
   // ── Watch-Together ──────────────────────────────────────────────────────
   // Refs the playback bridge reads, so the bridge is registered ONCE and never
@@ -1965,6 +2395,41 @@ export default function App() {
   // RAW speed setter for the bridge's remote-apply path (sets the engine speed
   // WITHOUT broadcasting — apply() is applying, not originating).
   const wtCommitSpeedRef = useRef(commitSpeed); wtCommitSpeedRef.current = commitSpeed;
+  /** The position to tell the party we are at.
+   *
+   *  While a load is in flight `time` is 0 (see positionOwnedRef), and 0 is a
+   *  catastrophic thing to broadcast: an in-sync follower reads it as a
+   *  twenty-minute backward drift and seeks the whole room to 00:00.
+   *  `lastStartSecondsRef` is the right stand-in because it is the offset the
+   *  IN-FLIGHT load was issued with, i.e. where this player is about to be -
+   *  0 for a fresh episode (correct), the pre-swap playhead for a source swap
+   *  (correct), the break point for a retry (correct).
+   *
+   *  Distinct from the leader TICK, which skips entirely while loading
+   *  (`LocalPlayback.loading`): a tick is an unprompted "here is my playhead"
+   *  and we have none, whereas a control frame is the user doing something and
+   *  must carry both the action and a position the room can trust.
+   *
+   *  Reads REFS, never `time`, so it is stable for the lifetime of the
+   *  component. Built on `ownedTime()` first, it inherited that callback's
+   *  per-tick identity and made every control it is a dep of churn ~30x/sec -
+   *  which re-subscribed the `smtc-event` listener (whose effect deps include
+   *  wtTogglePause) at the same rate, with a listener-less gap on each pass. */
+  const wtPosition = useCallback(
+    () => {
+      if (!positionOwnedRef.current) return lastStartSecondsRef.current ?? 0;
+      // Same truncation rule as ownedTime(), and for a louder reason: this
+      // value is BROADCAST. mpv's keep-open `seek_to_last_frame()` parks the
+      // playhead at `duration` on a dropped stream, so a leader whose source
+      // cut out would seek every in-sync member of the room to the end of the
+      // episode. Refs only, so the callback identity stays stable.
+      if (streamTruncatedRef.current) {
+        return lastSanePosRef.current ?? wtTimeRef.current;
+      }
+      return wtTimeRef.current;
+    },
+    [positionOwnedRef, streamTruncatedRef, lastSanePosRef],
+  );
   // `togglePause` is a relative, fire-and-forget command and the observed
   // `paused`/`wtPausedRef` only update on the next MPV event — so a remote
   // apply that toggles against the lagging ref can desync when two control
@@ -2019,7 +2484,14 @@ export default function App() {
           (t.media_type === "tv" || t.id.startsWith("iptv:") || t.id.startsWith("trailer:"));
         return {
           paused: wtPausedRef.current,
-          position: wtTimeRef.current,
+          // Safe to call here even though this bridge is registered ONCE:
+          // wtPosition reads refs only, so it never freezes a stale `time`.
+          position: wtPosition(),
+          // Tell the store that position may be a projection, not a playhead:
+          // it is where this load is about to land, which is the right thing
+          // for a control frame to carry but NOT something to tick at the room
+          // unprompted. The leader timer skips on this.
+          loading: !positionOwnedRef.current,
           speed: wtSpeedRef.current,
           videoKey: isLive ? null : (t?.id ?? null),
           metaId: isLive ? null : (t?.series_id ?? t?.id ?? null),
@@ -2106,8 +2578,8 @@ export default function App() {
     const next = !wtIntendedPausedRef.current;
     togglePause();
     wtIntendedPausedRef.current = next;
-    notifyLocalControl({ paused: next, position: wtTimeRef.current });
-  }, [togglePause, wtStagedHold, wtFollowerLocked]);
+    notifyLocalControl({ paused: next, position: wtPosition() });
+  }, [togglePause, wtStagedHold, wtFollowerLocked, wtPosition]);
   const wtSeekAbsolute = useCallback((t: number) => {
     if (wtStagedHold() || wtFollowerLocked()) return;
     seekAbsolute(t);
@@ -2116,8 +2588,8 @@ export default function App() {
   const wtSeekRelative = useCallback((d: number) => {
     if (wtStagedHold() || wtFollowerLocked()) return;
     seekRelative(d);
-    notifyLocalControl({ paused: wtIntendedPausedRef.current, position: wtTimeRef.current + d });
-  }, [seekRelative, wtStagedHold, wtFollowerLocked]);
+    notifyLocalControl({ paused: wtIntendedPausedRef.current, position: wtPosition() + d });
+  }, [seekRelative, wtStagedHold, wtFollowerLocked, wtPosition]);
   // Playback-speed change. A follower is locked out (the leader controls
   // playback); the leader broadcasts the new speed so everyone matches it —
   // otherwise followers stay at 1x and constantly re-seek to chase the host.
@@ -2125,8 +2597,8 @@ export default function App() {
     if (wtFollowerLocked()) return;
     commitSpeed(s);
     wtSpeedRef.current = s;
-    notifyLocalControl({ paused: wtIntendedPausedRef.current, position: wtTimeRef.current, speed: s });
-  }, [commitSpeed, wtFollowerLocked]);
+    notifyLocalControl({ paused: wtIntendedPausedRef.current, position: wtPosition(), speed: s });
+  }, [commitSpeed, wtFollowerLocked, wtPosition]);
   // Start the party (unpause + clear staging) — the leader's "Start now"
   // override, also called by the auto-start effect once everyone's ready.
   // Bypasses the staging gate above (we're the one releasing it): clears
@@ -2138,8 +2610,8 @@ export default function App() {
       togglePause();
       wtIntendedPausedRef.current = false;
     }
-    notifyLocalControl({ paused: false, position: wtTimeRef.current });
-  }, [togglePause]);
+    notifyLocalControl({ paused: false, position: wtPosition() });
+  }, [togglePause, wtPosition]);
   // NB: NO auto-start. Even once every member is on the party's stream, playback
   // stays staged (paused) until the HOST presses "Start now" (wtStartParty, the
   // PlayerPartyHud onStart). This is deliberate — the leader controls the start.
@@ -2423,6 +2895,15 @@ export default function App() {
         // logLoadEvent calls emit `[load] +Xms` lines so the user can
         // see exactly which phase is slow when a stream hangs at
         // "Loading… N%".
+        //
+        // Stamped BEFORE notifyNewLoad, not next to the load_video call below.
+        // notifyNewLoad closes the position seal, and for as long as it is
+        // closed this ref IS the answer to "where is the local player" for the
+        // resume paths and the party. Stamping it after the awaited
+        // resolve_stream left it describing the PREVIOUS load for that whole
+        // window. `resumeAt` is final from the forceStart branch above and
+        // nothing between here and load_video touches it.
+        lastStartSecondsRef.current = resumeAt ?? null;
         notifyNewLoad();
         const t0resolve = Date.now();
         // Per-playlist Live TV proxy: viaProxy bypasses the local bridge so mpv
@@ -2482,7 +2963,6 @@ export default function App() {
         lastHdrHintRef.current = contentHdrHint;
         lastProxyUrlRef.current = opts?.proxyUrl ?? null;
         lastAudioUrlRef.current = opts?.audioFileUrl ?? null;
-        lastStartSecondsRef.current = resumeAt ?? null;
 
         const t0load = Date.now();
         await invoke("load_video", {
@@ -3398,6 +3878,13 @@ export default function App() {
         console.error("Stream load failed", e);
         // Never leave party staging armed for a load that failed.
         wtPendingStageRef.current = false;
+        // Nor the position seal. notifyNewLoad closed it on the assumption a
+        // loadfile would follow; if the throw happened before mpv got one, no
+        // `playback-file-loaded` is coming and whatever is still on screen
+        // would otherwise sit with a frozen 00:00 scrubber. Re-opening is
+        // right rather than merely safe: any file still loaded here is the one
+        // these positions belong to.
+        positionOwnedRef.current = true;
         // setActiveTarget is the LAST statement of the try, so a resolve_stream
         // or load_video failure leaves isPlayerActive false: PlayerOverlay never
         // mounts, and with it neither the `aura:player-toast` host nor the
@@ -4113,7 +4600,15 @@ export default function App() {
       && time >= edStart && remaining > 0;
     const leadTriggered =
       nextUpLeadSeconds > 0 && duration > 0 && remaining <= nextUpLeadSeconds && remaining > 0;
-    const shouldShow = edTriggered || leadTriggered;
+    // A truncated stream must not offer "next episode" either. `fireEos` gates
+    // the EOS Spotlight, but this card is an independent surface with its own
+    // unattended countdown, and `eosActive` is false here precisely BECAUSE
+    // the Spotlight was suppressed - so the mutual-exclusion gate in the JSX
+    // does not cover it. mpv's keep-open teleport parks the playhead a
+    // fraction of a second short of `duration`, which satisfies
+    // `leadTriggered` outright, and with auto-advance enabled the card would
+    // then skip to the next episode and cancel the recovery.
+    const shouldShow = (edTriggered || leadTriggered) && !streamTruncatedRef.current;
     if (shouldShow) {
       if (!nextUpVisible) setNextUpVisible(true);
       return;
@@ -4126,7 +4621,16 @@ export default function App() {
     if (nextUpVisible && duration > 0 && remaining > nextUpLeadSeconds + 5) {
       setNextUpVisible(false);
     }
-  }, [activeTarget, time, duration, nextUpInfo, nextUpLeadSeconds, nextUpVisible]);
+  }, [activeTarget, time, duration, nextUpInfo, nextUpLeadSeconds, nextUpVisible,
+      streamTruncated, streamTruncatedRef]);
+
+  // Tear down a Next-Up card when a stream is proven truncated. Dispatched
+  // from the verdict site in usePlayback, which cannot reach this state.
+  useEffect(() => {
+    const onTruncated = () => { setNextUpVisible(false); setNextUpInfo(null); };
+    window.addEventListener("aura:stream-truncated", onTruncated);
+    return () => window.removeEventListener("aura:stream-truncated", onTruncated);
+  }, []);
 
   // "Hard EOF" NextUp forcer REMOVED (EOS Spotlight, 2026-05-19): it
   // was gated on the dead `eof` carrier (Rust never sets
@@ -4158,7 +4662,9 @@ export default function App() {
     // in handleExitPlayback: meaningful = ≥ 80% AND ≥ 5 min watched.
     {
       const { time: watched, duration: dur } = playbackRef.current;
-      const meaningfulRatio = dur > 0 && watched / dur >= 0.80;
+      // A truncated stream parks the playhead at `duration`, so the ratio
+      // below reads 1.0 on an episode nobody finished. See streamTruncatedRef.
+      const meaningfulRatio = dur > 0 && watched / dur >= 0.80 && !streamTruncatedRef.current;
       // Real summed forward-progress, NOT the raw playhead — seeking to
       // the end leaves watchedElapsedRef at ~0 so a skip-to-end episode
       // is correctly excluded from History.
@@ -4455,7 +4961,14 @@ export default function App() {
       if (!ytId || trailerResolvingRef.current) return;
       const t = writebackTarget.current;
       if (!t || !t.id.startsWith("trailer:")) return;
-      const startAt = playbackRef.current.time;
+      // Same rule as onPickSource, and for the same reason: a quality swap
+      // replays the SAME trailer, so the live playhead is the right answer -
+      // but only while it is ours. handlePlayStream resolves when load_video
+      // returns, which is BEFORE mpv reports the file open, so a second
+      // quality pick in that gap sees a sealed (0) position and would restart
+      // the trailer from the top. lastStartSecondsRef carries the offset the
+      // in-flight load was issued with, so it is scoped to this play.
+      const startAt = ownedTime() ?? lastStartSecondsRef.current ?? 0;
       const center = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
       trailerResolvingRef.current = true;
       setIsTrailerResolving(true);
@@ -4499,7 +5012,8 @@ export default function App() {
         setIsTrailerResolving(false);
       }
     },
-    [handlePlayStream],
+    // lastStartSecondsRef is a stable ref, so it needs no dep entry.
+    [handlePlayStream, ownedTime],
   );
 
   // ── EOS Spotlight wiring (2026-05-19) ───────────────────────────────
@@ -6323,13 +6837,26 @@ export default function App() {
   // "guest" when signed out). scrobble.rs reads this off the session
   // it receives at scrobble_start time.
   const scrobbleScope = session?.auth_key ? session.auth_key.slice(0, 12) : "guest";
+  // Hand the scrobbler the last HONEST position. A truncated origin parks
+  // `time` at `duration` (mpv keep-open `seek_to_last_frame`), and
+  // `scrobble_end` treats >= 80% as an unconditional "mark watched" on Trakt /
+  // AniList. `positionTrusted` below stops the auto-complete branch, but every
+  // TEARDOWN route into scrobble_end (exiting the player, switching episode,
+  // beforeunload, unmount) reads the playback snapshot instead - so sanitizing
+  // it here is what actually stops a dropped stream reporting a finished
+  // episode.
+  const scrobbleTime = streamTruncated ? (lastSanePosRef.current ?? 0) : time;
   useScrobble({
     // Live TV channels / trailers never scrobble — there's no episode or
     // completion to report. Passing null keeps the hook fully inert for
     // `iptv:` and `trailer:` targets.
     active: isLivePlayback || isTrailerPlayback ? null : activeTarget,
-    playback: { time, duration, paused },
+    playback: { time: scrobbleTime, duration, paused },
     scope: scrobbleScope,
+    // Belt to the sanitized playhead's braces: this gates the auto-complete
+    // branch itself, so a truncation can never satisfy the 80% ratio even if
+    // a sane position was never recorded.
+    positionTrusted: !streamTruncated,
   });
 
   // ── DevConsole `scrobble` test command bridge ──
@@ -6737,7 +7264,21 @@ export default function App() {
       || st.video_id == null
       || st.video_id === activeTarget.id;
     const savedOffset = sameVideo && typeof st.timeOffset === "number" ? st.timeOffset : 0;
-    const startAt = time > 5 ? time : Math.max(time, savedOffset);
+    // A swap plays the SAME content, so the live position is the right answer
+    // - but only while it is genuinely ours. If the user swaps again while the
+    // FIRST pick is still resolving (the switcher stays open until the
+    // .finally), the seal is closed and `time` is 0, which would drop them
+    // back to the library's last WRITTEN offset (debounced, 120 s warmup) or
+    // to 00:00 on a swap that should be frame-accurate.
+    //
+    // The fallback is lastStartSecondsRef and NOT the newest position we
+    // happen to have seen, because it is scoped to the CURRENT play by
+    // construction: handlePlayStream stamps it with the offset every load is
+    // issued with, and the paths that mean "start this again from the top"
+    // (EOS Replay) null it deliberately. A position-shaped snapshot would
+    // instead survive a start-over and resume the pre-restart playhead.
+    const live = ownedTime() ?? lastStartSecondsRef.current ?? 0;
+    const startAt = live > 5 ? live : Math.max(live, savedOffset);
     void handlePlayStream(stream, {
       id:            activeTarget.id,
       series_id:     activeTarget.series_id,
@@ -6765,7 +7306,7 @@ export default function App() {
         setSwitcherResolvingKey(null);
         setSwitcherOpen(false);
       });
-  }, [activeTarget, currentStream, handlePlayStream, time]);
+  }, [activeTarget, currentStream, handlePlayStream, ownedTime]);
 
   // ── Casting (Chromecast + DLNA) ──
   // Device picker + session state live in useCastSession; opened via the
@@ -6885,7 +7426,20 @@ export default function App() {
   }>({ time: 0, duration: 0, watched: 0, targetId: null });
   useEffect(() => {
     playbackRef.current = { time, duration };
-    if (duration > 0 && time > 0) {
+    // Never stamp a position the demuxer cannot actually hold. `flushProgress`
+    // exempts this snapshot from its truncation guard on the grounds that it
+    // is "frozen from before the break by construction" - that is only true if
+    // the producer stops refreshing it. Without this the activeTarget-change
+    // cleanup writes timeOffset ~= duration straight to the cloud library on
+    // exit or on the recovery reload, overwriting the viewer's real resume
+    // position with the full runtime. Positions still inside the frozen cached
+    // range are genuine and keep updating; only the keep-open
+    // `seek_to_last_frame()` value past `cacheEnd` is rejected.
+    const cachedEnd = cacheEndRef.current;
+    const positionHonest =
+      !streamTruncatedRef.current ||
+      (cachedEnd != null && time <= cachedEnd + 1);
+    if (duration > 0 && time > 0 && positionHonest) {
       lastLoadedRef.current = {
         time,
         duration,
@@ -6937,6 +7491,18 @@ export default function App() {
       const { time, duration } = snap ?? playbackRef.current;
       const watched = snap ? snap.watched : watchedElapsedRef.current;
       if (!sess?.auth_key || !target || duration <= 0) return;
+      // A truncated stream's playhead is not a playhead. mpv's keep-open
+      // `seek_to_last_frame()` reports `duration`, and both gates below
+      // (`time >= 120`, `watched >= 120`) pass trivially on a long episode, so
+      // without this the resume position and Continue Watching would be
+      // rewritten to the END of an episode the viewer was minutes into. The
+      // snapshot path is exempt: it carries a position frozen from before the
+      // break by construction. Defence in depth - with the EOS suppression in
+      // place the auto-pause that schedules this flush no longer happens.
+      if (!snap && streamTruncatedRef.current) {
+        console.warn("[library] skipping progress write: stream truncated, playhead is unreliable");
+        return;
+      }
       // Live TV / trailers: no Continue-Watching / progress write — an `iptv:`
       // or `trailer:` target has no library record and no meaningful resume
       // position (writing one would create a garbage Stremio library entry).
@@ -7118,13 +7684,17 @@ export default function App() {
     if (activeTarget && playedEpisodeId && !isLivePlayback && !isTrailerPlayback) {
       const watched = time;
       const dur     = duration;
+      // Same truncation rule as the auto-advance history append above: the
+      // reported playhead is `duration` on a dropped stream, so every ratio
+      // gate in this block would pass on an unfinished episode.
+      const posTrusted = !streamTruncatedRef.current;
       // Both conditions must hold: at least 80 % progress AND at least
       // 5 minutes of fresh playback. The previous OR was over-eager
       // — a 5-minute drive-by on a 2-hour movie (or any 80 %+ resume
       // glance regardless of fresh-content) appended a history entry.
       // AND requires both engagement AND substantive progress, which
       // matches the user's expectation of "I actually watched this."
-      const meaningfulRatio = dur > 0 && watched / dur >= 0.80;
+      const meaningfulRatio = dur > 0 && watched / dur >= 0.80 && posTrusted;
       // Real summed forward-progress, NOT the raw playhead — seeking to
       // the end leaves watchedElapsedRef at ~0 so a skip-to-end episode
       // is correctly excluded from History.
@@ -7225,6 +7795,7 @@ export default function App() {
           // from the library as "finished". See MIN_PLAUSIBLE_TITLE_S.
           const genuineFinish =
             !isImplausiblyShortStream(duration) &&
+            !streamTruncatedRef.current &&
             duration > 0 && time / duration >= 0.9 && watchedElapsedRef.current >= 0.7 * duration;
           shouldRemove = genuineFinish || getManualWatchedState(rootId) === "watched";
         }
@@ -7356,6 +7927,43 @@ export default function App() {
   //
   // Trailers are included (a yt-dlp URL expires the same way). Live is
   // excluded here because it has its own loop with its own timings.
+  // ── Truncated stream → arm recovery ───────────────────────────────────
+  // The recovery machinery below (auto-retry + modal) is correct and was
+  // always reachable in principle; the problem was that NOTHING could set
+  // `streamBroken` for a dropped origin. mpv reports the drop as a clean EOF
+  // and `keep-open-pause=yes` auto-pauses on the last frame, so:
+  //   * the 1 Hz stale-heartbeat detector early-returns on `if (paused)`,
+  //   * `end-file reason=error` never fires, so the error-grace path never
+  //     arms either,
+  //   * and the near-end EOS branches cannot fire because the playhead is
+  //     nowhere near `duration` (until a forward seek teleports it there,
+  //     which is the false end card `fireEos` now suppresses).
+  // So this is the missing edge.
+  //
+  // It is keyed on `truncatedRunout`, NOT on the verdict itself. The verdict
+  // lands the moment the origin drops, but mpv keeps playing out of a cache
+  // holding up to `cache-secs=180` - reloading then would interrupt minutes of
+  // good playback to fix something the viewer cannot see yet. Runout is
+  // reached either by the playhead eating the remaining cached runway, or by
+  // the heartbeat stopping outright (the 1 Hz detector's truncation branch);
+  // whichever comes first.
+  //
+  // Live TV is excluded for free: the truncation test requires `duration > 0`
+  // and a live stream has none, so `streamTruncated` cannot latch there.
+  // Why the CURRENT recovery modal is up. `streamTruncated` cannot answer that:
+  // every retry calls notifyNewLoad, which clears the verdict, so by the time
+  // the attempts are exhausted and the modal actually renders the flag is
+  // usually false again and the copy falls back to the generic
+  // "connection lost" text. Latched here and released only when the target
+  // changes, so the modal explains the failure the viewer actually hit.
+  const [breakWasTruncation, setBreakWasTruncation] = useState(false);
+  useEffect(() => { setBreakWasTruncation(false); }, [activeTarget?.id]);
+  useEffect(() => {
+    if (!truncatedRunout || !isPlayerActive) return;
+    setBreakWasTruncation(true);
+    setStreamBroken(true);
+  }, [truncatedRunout, isPlayerActive, setStreamBroken]);
+
   const VOD_MAX_RETRIES = 2;
   const vodRetryRef = useRef(0);
   // Suppresses the recovery modal while a retry is pending, exactly as
@@ -7367,12 +7975,20 @@ export default function App() {
     if (vodRetryRef.current >= VOD_MAX_RETRIES) { setVodReconnecting(false); return; }
     const attempt = vodRetryRef.current + 1;
     vodRetryRef.current = attempt;
-    // Resume where the break happened. `time` is 0 when no frame ever
-    // arrived, which is precisely when the ORIGINAL requested offset is the
-    // right answer - without the fallback, retrying a failed resume restarted
-    // the episode from the beginning and looked like Aura had lost the
-    // position. Sub-1s offsets aren't worth a seek-and-buffer.
-    const resumeAt = time > 1 ? time : lastStartSecondsRef.current;
+    // Resume where the break happened. `ownedTime()` is null when no frame
+    // ever arrived for THIS file, which is precisely when the ORIGINAL
+    // requested offset is the right answer - without the fallback, retrying a
+    // failed resume restarted the episode from the beginning and looked like
+    // Aura had lost the position. Sub-1s offsets aren't worth a
+    // seek-and-buffer.
+    //
+    // It MUST be ownedTime() and not `time`: on an episode advance whose
+    // stream failed to open, raw `time` still holds the PREVIOUS episode's
+    // playhead, and this line then retried the new episode 91% of the way in.
+    // ownedTime() already substitutes the last sane position on a truncated
+    // stream, so this is safe against the keep-open playhead lie.
+    const live = ownedTime();
+    const resumeAt = live != null && live > 1 ? live : lastStartSecondsRef.current;
     // Record the offset THIS retry is issued with. notifyNewLoad zeroes `time`,
     // so without it a second attempt (and the modal's Reload after it) reads a
     // ref still holding whatever the ORIGINAL load used - null for anything
@@ -7387,25 +8003,113 @@ export default function App() {
     // (20 s for an mpv error, 8 s for a stall), so the transient has had its
     // chance. The second attempt backs off a little further.
     const delay = attempt === 1 ? 800 : 2500;
+    // Attempt 1 re-loads the SAME url: cheap, and it is the right answer for a
+    // transient (a dropped keep-alive, a 502 while the origin restarts).
+    // Attempt 2 RE-RESOLVES from the addon instead, because the failure that
+    // motivated this batch cannot be fixed by re-sending the url: an addon
+    // proxy token that answers 404 answers 404 forever, and re-issuing it just
+    // burns the second attempt. Re-resolving mints a fresh token (and, for
+    // debrid, a fresh upstream link), which is the ONLY client-side move with
+    // a real chance. Falls back to the plain reload whenever it cannot find
+    // the same source again - a wrong source is worse than a retry that fails.
+    const reResolve = attempt >= 2 && !isTrailerPlayback && !!activeTarget && !!currentStream;
+    // Everything below the timeout is fire-and-forget, and `fetch_streams` can
+    // run for tens of seconds while the UI stays interactive (the reconnect
+    // pill is pointer-events-none; Escape still exits the player). Without a
+    // guard, a re-resolve that lands after the viewer exited or moved to
+    // another title yanks them back into the abandoned episode, and a
+    // plainReload restarts mpv on a dead url with no player mounted. The
+    // effect's cleanup runs on exit / target change, so this flag closes both.
+    let cancelled = false;
     const t = window.setTimeout(() => {
       // Deliberately NOT clearing streamBroken here - it is a dep of this
       // effect and clearing it would re-run the cleanup and cancel this very
       // timeout. notifyNewLoad clears it on fire, same as the live path.
-      notifyNewLoad();
-      // In-place reload: same URL and target, but mpv has re-run loadfile, so
-      // PlayerOverlay's per-file one-shots need the re-arm signal.
-      window.dispatchEvent(new Event("aura:player-reloaded"));
-      invoke("load_video", {
-        path: activeStreamUrl,
-        startSeconds: resumeAt,
-        contentHdrHint: lastHdrHintRef.current,
-        httpProxy: lastProxyUrlRef.current,
-        audioUrl: lastAudioUrlRef.current,
-      }).catch((e) => {
-        console.error("[playback] auto-retry reload failed", e);
-      });
+      const plainReload = () => {
+        if (cancelled) return;
+        notifyNewLoad();
+        // In-place reload: same URL and target, but mpv has re-run loadfile, so
+        // PlayerOverlay's per-file one-shots need the re-arm signal.
+        window.dispatchEvent(new Event("aura:player-reloaded"));
+        invoke("load_video", {
+          path: activeStreamUrl,
+          startSeconds: resumeAt,
+          contentHdrHint: lastHdrHintRef.current,
+          httpProxy: lastProxyUrlRef.current,
+          audioUrl: lastAudioUrlRef.current,
+        }).catch((e) => {
+          console.error("[playback] auto-retry reload failed", e);
+        });
+      };
+      if (cancelled) return;
+      if (!reResolve) { plainReload(); return; }
+      const tgt = activeTarget!;
+      const { streamAddonUrls } = loadAuraSettings();
+      const queryAddons = streamAddonUrls === null
+        ? addons
+        : streamAddonUrls
+            .map((url) => addons.find((a) => a.url === url))
+            .filter((a): a is AddonEntry => !!a);
+      console.info("[playback] auto-retry 2 - re-resolving the source for a fresh link");
+      invoke<StreamFetchResult>("fetch_streams", {
+        addons: queryAddons,
+        mediaType: tgt.media_type,
+        id: tgt.id,
+      })
+        .then((r) => {
+          // Re-check liveness AND identity: the closure's `activeTarget` is
+          // itself the stale copy, so compare against the render-time mirror.
+          if (cancelled || activeTargetRef.current?.id !== tgt.id) {
+            console.info("[playback] re-resolve landed after the target changed - discarding");
+            return;
+          }
+          const rows = Array.isArray(r) ? (r as StreamEntry[]) : (r?.streams ?? []);
+          // Same identity test the source switcher uses (info_hash, else
+          // addon + filename). Matching on url would defeat the point: the
+          // whole reason for re-resolving is that the url has changed.
+          const match = rows.find((row) => sameStreamSource(row, currentStream));
+          if (!match) {
+            console.warn("[playback] re-resolve found no matching source - falling back to a plain reload");
+            plainReload();
+            return;
+          }
+          // handlePlayStream calls notifyNewLoad itself, but it does NOT fire
+          // `aura:player-reloaded` (a normal source switch re-arms
+          // PlayerOverlay's per-file one-shots via the changed url in its
+          // loadKey). A re-resolve usually yields a fresh url too, but it is
+          // not guaranteed to, so fire it explicitly: the nonce is the only
+          // thing that re-arms those one-shots when the url comes back
+          // identical.
+          window.dispatchEvent(new Event("aura:player-reloaded"));
+          return handlePlayStream(match, {
+            id:         tgt.id,
+            series_id:  tgt.series_id,
+            media_type: tgt.media_type,
+            name:       tgt.name,
+            episode:       tgt.episode,
+            episode_title: tgt.episode_title,
+            season:        tgt.season,
+            episode_num:   tgt.episode_num,
+            // Same item, same load, so the scoring signals must carry over
+            // verbatim. Omitting them nulls activeScoringMeta and the audio
+            // scorer drops the "original" priority token, silently resuming
+            // the episode on the English dub. Mirrors advanceToEpisode and
+            // onPickSource, which re-nest for exactly this reason.
+            scoring: activeScoringMeta ?? {
+              original_language:    tgt.original_language ?? null,
+              production_countries: tgt.production_countries ?? [],
+              genres:               tgt.genres ?? undefined,
+              country:              null,
+            },
+          }, { forceStartSeconds: resumeAt ?? 0 });
+        })
+        .catch((e) => {
+          console.error("[playback] re-resolve failed, falling back to a plain reload", e);
+          plainReload();
+        });
     }, delay);
-    return () => window.clearTimeout(t);
+    // Cancels the pending timer AND disarms anything already in flight.
+    return () => { cancelled = true; window.clearTimeout(t); };
     // `time` is read as a snapshot on purpose: the value when the break was
     // detected is the position to resume from, and adding it as a dep would
     // restart this effect (and its timer) on every heartbeat.
@@ -7420,9 +8124,18 @@ export default function App() {
   useEffect(() => {
     if (isLivePlayback || !firstFrameSeen || streamBroken) return;
     if (vodRetryRef.current === 0) return;
-    const t = window.setTimeout(() => { vodRetryRef.current = 0; }, LIVE_RETRY_RESET_MS);
+    const t = window.setTimeout(() => {
+      // Checked at FIRE time, not effect time: a stream can truncate part-way
+      // through this 30 s window. Thirty seconds of playback out of a frozen
+      // cache is not "playback holding" - refunding the budget for it means a
+      // repeatedly-truncating source relives attempt 1 (reload the same url)
+      // forever and never escalates to attempt 2's re-resolve, which is the
+      // only attempt that can actually fix a dead link.
+      if (streamTruncatedRef.current) return;
+      vodRetryRef.current = 0;
+    }, LIVE_RETRY_RESET_MS);
     return () => window.clearTimeout(t);
-  }, [isLivePlayback, firstFrameSeen, streamBroken]);
+  }, [isLivePlayback, firstFrameSeen, streamBroken, streamTruncatedRef]);
 
   // ── EOS Spotlight action handlers ───────────────────────────────────
   // Defined here (not next to the resolution effect above) because they
@@ -8486,16 +9199,20 @@ export default function App() {
             <h2 className="text-[16px] font-semibold tracking-tight mb-2">
               {isLivePlayback
                 ? (firstFrameSeen ? "Channel connection lost" : "Channel unavailable")
-                : (firstFrameSeen ? "Stream connection lost" : "Stream unavailable")}
+                : (breakWasTruncation
+                    ? "Stream ended early"
+                    : firstFrameSeen ? "Stream connection lost" : "Stream unavailable")}
             </h2>
             <p className="text-white/70 text-[13px] leading-relaxed mb-5">
               {isLivePlayback
                 ? (firstFrameSeen
                     ? "This channel dropped its connection. Live streams can hiccup on the provider side — Aura already retried a couple of times. Reload to try again, or exit and pick another channel."
                     : "Aura couldn't open this channel (the provider returned an error — often a removed or temporarily-down channel). Aura already retried a couple of times. Reload to try again, or exit and pick another channel.")
-                : (firstFrameSeen
-                    ? "Aura hasn't received a playback heartbeat in 8 s and retried a couple of times. The most common cause is a transient DNS / TCP failure during a seek. Try reloading from your last position, or exit and pick another source."
-                    : "Aura couldn't open the stream, and retrying a couple of times didn't help. The addon's host may be down or unreachable (DNS / TCP failure). Try reloading, or pick a different source.")}
+                : breakWasTruncation
+                    ? "The source stopped sending data partway through, so the rest of this episode never arrived. Aura already retried and re-resolved the source. Reloading resumes from where the stream cut out; switching source is usually the faster fix."
+                    : (firstFrameSeen
+                        ? "Aura hasn't received a playback heartbeat in 8 s and retried a couple of times. The most common cause is a transient DNS / TCP failure during a seek. Try reloading from your last position, or exit and pick another source."
+                        : "Aura couldn't open the stream, and retrying a couple of times didn't help. The addon's host may be down or unreachable (DNS / TCP failure). Try reloading, or pick a different source.")}
             </p>
             <div className="flex justify-end gap-2">
               <button
@@ -8543,9 +9260,12 @@ export default function App() {
                   // dominate the experience and the user wouldn't
                   // notice the position difference anyway. Falls back to the
                   // offset this load was ISSUED with: on a load that never
-                  // produced a frame `time` is 0, and reloading from 0 threw
-                  // away the resume position the user had just accepted.
-                  const resumeAt = time > 1 ? time : lastStartSecondsRef.current;
+                  // produced a frame there is no owned position, and reloading
+                  // from 0 threw away the resume position the user had just
+                  // accepted. ownedTime(), never raw `time` - see the VOD
+                  // auto-retry for what a cross-episode position does here.
+                  const live = ownedTime();
+                  const resumeAt = live != null && live > 1 ? live : lastStartSecondsRef.current;
                   // Same reason as the auto-retry: this load is now the one
                   // that was ISSUED with resumeAt, so a second press of Reload
                   // inherits it instead of falling back to null.

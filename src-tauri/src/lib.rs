@@ -2162,6 +2162,21 @@ pub fn run() {
                                 update.insert("cache_seconds".into(), serde_json::Value::Number(n));
                             }
                         }
+                        // Truncated-stream pair. `demux_eof` alone is NOT a
+                        // fault: it is also how a healthy file ends. Only the
+                        // frontend can judge it, because only the frontend
+                        // owns `duration` - a real EOF has cache_end ~=
+                        // duration, a dropped origin has cache_end far short
+                        // of it. Always forwarded (including `false`) so the
+                        // frontend can clear the condition on recovery.
+                        if let Some(b) = data.get("demux_eof").and_then(|v| v.as_bool()) {
+                            update.insert("demux_eof".into(), serde_json::Value::Bool(b));
+                        }
+                        if let Some(e) = data.get("cache_end").and_then(|v| v.as_f64()) {
+                            if let Some(n) = serde_json::Number::from_f64(e) {
+                                update.insert("cache_end".into(), serde_json::Value::Number(n));
+                            }
+                        }
                         if !update.is_empty() {
                             handle.emit("playback-update", serde_json::Value::Object(update)).ok();
                         }
@@ -2223,6 +2238,16 @@ pub fn run() {
                             );
                         }
                         handle.emit("playback-end", serde_json::Value::Object(out)).ok();
+                    }
+                    "file-loaded" => {
+                        // mpv opened the file that the last `load_video` asked
+                        // for. This is the frontend's ONLY way to tell a
+                        // position belonging to the incoming file from one the
+                        // OUTGOING file was still legitimately emitting while
+                        // `loadfile` was in flight - the property channel is
+                        // anonymous. See `positionOwnedRef` in App.tsx and the
+                        // FILE_LOADED arm in mpv/engine.rs.
+                        handle.emit("playback-file-loaded", serde_json::Value::Null).ok();
                     }
                     _ => {}
                 }

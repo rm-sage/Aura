@@ -312,6 +312,25 @@ export default function CinemaSuite({
         invoke<boolean | null>("get_property", { name, format: "flag" })
           .then((v) => v === true)
           .catch(() => false);
+      // `demuxer-cache-state` must be read WHOLE. Its handler in mpv's
+      // player/command.c implements only M_PROPERTY_GET_TYPE and
+      // M_PROPERTY_GET and returns M_PROPERTY_NOT_IMPLEMENTED for everything
+      // else, so the sub-path form ("demuxer-cache-state/total-bytes") is
+      // dispatched as M_PROPERTY_KEY_ACTION and always fails. This readout
+      // silently reported 0 bytes and 0 B/s for as long as it has existed.
+      // (`video-params/*` and `audio-params/*` DO implement KEY_ACTION, which
+      // is why the sub-path idiom works for them a few lines below.) mpv
+      // prints a node property as JSON for a string get, so one read covers
+      // both fields - and it is one fewer invoke than the two it replaces.
+      const cacheState: Record<string, unknown> = await invoke<string | null>(
+        "get_property", { name: "demuxer-cache-state", format: "string" },
+      )
+        .then((v) => (typeof v === "string" ? JSON.parse(v) : {}))
+        .catch(() => ({}));
+      const cacheStateNum = (key: string) => {
+        const v = cacheState[key];
+        return typeof v === "number" && Number.isFinite(v) ? v : 0;
+      };
 
       const [
         drops, dw, dh, fps, containerFps, estVfFps, shader,
@@ -337,9 +356,9 @@ export default function CinemaSuite({
         num("avsync",                    "double"),
         num("cache-secs",                "double"),
         num("demuxer-cache-duration",    "double"),
-        num("demuxer-cache-state/total-bytes", "int64"),
+        Promise.resolve(cacheStateNum("total-bytes")),
         flag("paused-for-cache"),
-        num("demuxer-cache-state/raw-input-rate", "double"),
+        Promise.resolve(cacheStateNum("raw-input-rate")),
         str("audio-device"),
         str("aid"),
         str("audio-params/lang"),

@@ -995,10 +995,34 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
             t.video_reconfig = true;
             continue;
         }
-        // Load/seek lifecycle — tracked (not emitted) purely to gate the
-        // cache-state poll below away from the loadfile/seek critical sections.
+        // Load/seek lifecycle - tracked to gate the cache-state poll below
+        // away from the loadfile/seek critical sections. FILE_LOADED is ALSO
+        // forwarded (see below); the other three stay internal.
         if id == mpv_event_id::START_FILE { t.started = true; continue; }
-        if id == mpv_event_id::FILE_LOADED { t.loaded = true; continue; }
+        // FILE_LOADED is the ONLY moment the frontend can know that a position
+        // it receives belongs to the file it just asked for. Everything on the
+        // property channel is anonymous - `{name, data}` with no file identity
+        // - and `loadfile` is asynchronous, so the OUTGOING file keeps emitting
+        // perfectly valid `time-pos` at ~30 Hz for as long as it takes mpv to
+        // tear it down (measured: 21 ms). React's "new load" window opens even
+        // earlier, at notifyNewLoad(), which runs BEFORE `load_video` is
+        // invoked - so the frontend cannot solve this alone and neither can a
+        // gate keyed on the LoadFile command arriving here.
+        //
+        // The bug that earned this event: an episode advance whose stream
+        // 404'd got auto-retried at the PREVIOUS episode's playhead (1341 s of
+        // a 1476 s file), dumping the viewer on the end card of an episode
+        // they had not watched. See the frontend's `positionOwnedRef`.
+        //
+        // START_FILE deliberately NOT used as the signal: mpv generates
+        // PROPERTY_CHANGE events only once its queued core events are drained,
+        // so a stale `time-pos` can legitimately arrive AFTER START_FILE - and
+        // START_FILE also fires for files that never open at all.
+        if id == mpv_event_id::FILE_LOADED {
+            t.loaded = true;
+            emit("file-loaded", serde_json::Value::Null);
+            continue;
+        }
         if id == mpv_event_id::SEEK { t.seek = true; continue; }
         if id == mpv_event_id::PLAYBACK_RESTART { t.restart = true; continue; }
         if id == mpv_event_id::LOG_MESSAGE {
@@ -1538,13 +1562,70 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             (b"cache-pause-wait\0", b"4.0\0"),
             (b"cache-pause\0", b"yes\0"),
             (b"network-timeout\0", b"60\0"),
-            // libavformat HTTP resilience — reconnect on EOF / network
-            // errors with capped backoff. Without these, debrid hosts
-            // that close idle keep-alives mid-episode surface as a
-            // hard "End of file" stop.
+            // libavformat HTTP resilience. THE NAMESPACE MATTERS and the two
+            // below are NOT interchangeable:
+            //
+            //   * `stream-lavf-o` is the AVDictionary mpv hands to
+            //     `avio_open2` in stream/stream_lavf.c `open_f()`. For a
+            //     progressive http(s) stream mpv opens the socket ITSELF and
+            //     installs its own AVIOContext as `avfc->pb`, so this is the
+            //     ONLY namespace the http protocol handler ever sees.
+            //   * `demuxer-lavf-o` is the dict passed to
+            //     `avformat_open_input`. FFmpeg's `init_input()` early-returns
+            //     when `pb` is already set, so for a progressive stream these
+            //     options never reach the protocol at all (aura-mpv.log fills
+            //     with `[lavf] Could not set AVOption reconnect='1'`). It IS
+            //     the correct lever for HLS/DASH, which `demux_lavf.c` marks
+            //     `no_stream = true` so lavf owns the socket. Kept for Live TV,
+            //     but note its reach is limited to the manifest open: FFmpeg's
+            //     hls.c rebuilds per-segment options from a small whitelist
+            //     that does not carry the reconnect_* keys, so segment fetches
+            //     are not covered by it.
+            //
+            // mpv sets `reconnect=1` + `reconnect_delay_max=7` itself just
+            // before merging `--stream-lavf-o`, so ours win (and note 4 would
+            // have been a REGRESSION against mpv's own default).
+            //
+            // `reconnect_on_http_error=5xx` is the load-bearing addition.
+            // FFmpeg defaults it to NULL, which makes EVERY http status
+            // terminal after a single attempt: `http_should_reconnect()`
+            // returns 0 unless the status group is listed. A 502/503 from an
+            // origin that is restarting (gateway up, app not yet) therefore
+            // killed the stream permanently ~270 ms in. 4xx is deliberately
+            // NOT listed: a 404 on a signed proxy token means that URL is
+            // genuinely gone and retrying it is pointless, so it belongs on
+            // the app-level re-resolve path instead (App.tsx VOD auto-retry).
+            // (If a second group is ever wanted, mpv's KEYVALUELIST parser
+            // accepts a quoted value, so the comma is not the obstacle here;
+            // the semantics are.)
+            //
+            // Known interaction, deliberate: plain `http://` streams go through
+            // Aura's own bridge, which answers ANY upstream failure with a
+            // blanket 502 (`streaming.rs`). Those are now retryable, so a dead
+            // http stream takes up to the backoff window to surface instead of
+            // failing instantly. That is the wanted trade: re-requesting the
+            // bridge url re-runs the upstream fetch, so the retries are real
+            // attempts at a recovering origin, and the delay sits inside the
+            // frontend's existing BUFFER_STALL_MS + BROKEN_STALE_MS window, so
+            // the recovery modal still appears at roughly the same moment.
+            //
+            // `reconnect_delay_max=30` gives the schedule 0, 1, 3, 7, 15
+            // (five attempts over ~26 s). Chosen to stay UNDER the frontend's
+            // BUFFER_STALL_MS + BROKEN_STALE_MS window so a late reconnect
+            // still lands before the recovery modal appears; raise both
+            // together or not at all. The sleep is interruptible via mpv's
+            // `mp_cancel` hook, so it cannot wedge shutdown or a new loadfile.
+            //
+            // Do NOT add `reconnect_at_eof`: on a VOD body with a known
+            // Content-Length that retries the GENUINE end of file forever and
+            // breaks real EOF detection. It exists for endless/live streams.
+            (
+                b"stream-lavf-o\0",
+                b"reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=5xx,reconnect_delay_max=30\0",
+            ),
             (
                 b"demuxer-lavf-o\0",
-                b"reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=4\0",
+                b"reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_on_http_error=5xx,reconnect_delay_max=30\0",
             ),
         ];
         for (name, value) in INIT_OPTS {
@@ -1774,6 +1855,11 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         let mut seeking_emitted = false;
         let mut last_transition = Instant::now();
         let mut last_cache_poll = Instant::now();
+        // Rising-edge latch for the demuxer-EOF log line, and a once-per-run
+        // guard so an unreadable property warns instead of silently disabling
+        // truncated-stream detection. Both reset on START_FILE below.
+        let mut last_demux_eof = false;
+        let mut eof_read_failed = false;
         // ── Stream-anomaly detection ──
         // Last observed position and the wall time we saw it, so an unexplained
         // forward jump can be told apart from normal playback. A corrupt
@@ -2104,6 +2190,10 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             // poll gate would stay locked until the next load.
             if tick.ended   { playback_ready = false; seeking = false; last_transition = Instant::now(); }
             if tick.started { last_pos = None; damage_hint = None; anomaly_reported = false; }
+            // Per-load reset for the truncation telemetry: a fresh file has not
+            // hit EOF, and the unreadable-property warning is worth repeating
+            // once per load rather than once per process.
+            if tick.started { last_demux_eof = false; eof_read_failed = false; }
             if let Some(kind) = tick.corrupt_hint { damage_hint = Some((kind, Instant::now())); }
 
             // ── Unexplained position jump ──
@@ -2215,11 +2305,106 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 } else {
                     None
                 };
+                // -- Truncated-stream telemetry (2026-08-19) --
+                // mpv's stream layer collapses EVERY I/O error into plain EOF
+                // (`stream.c`: `if (res <= 0) { s->eof = 1; return 0; }`), so
+                // an origin that drops the body mid-transfer is reported to
+                // the demuxer as a clean end-of-file and LATCHES the cached
+                // range as `eof=1`. From that moment `find_cache_seek_range()`
+                // accepts ANY pts, every seek resolves in-cache, and mpv never
+                // issues another HTTP request for that load: the stream cannot
+                // recover even if the origin comes back. Nothing else in the
+                // poll can see it, because `demux.c` forces `idle` true and
+                // `underrun` false once eof is set, so `paused-for-cache`
+                // stays false and `cache_pct` is never even sampled.
+                //
+                // The one discriminator is the PAIR below: demuxer EOF while
+                // the cached range ends far short of the container duration.
+                // A real EOF has `cache_end ~= duration`. The frontend does
+                // the comparison (it owns `duration`); we just ship both.
+                // `demuxer-cache-state` must be read WHOLE, as a string.
+                //
+                // It is a CONF_TYPE_NODE property whose handler
+                // (`mp_property_demuxer_cache_state` in mpv's player/command.c)
+                // implements only M_PROPERTY_GET_TYPE and M_PROPERTY_GET, and
+                // returns M_PROPERTY_NOT_IMPLEMENTED for everything else.
+                // Sub-path access ("demuxer-cache-state/eof") is dispatched as
+                // M_PROPERTY_KEY_ACTION, so it CANNOT work on any mpv build -
+                // unlike `video-params/*` and `audio-params/*`, which do
+                // implement KEY_ACTION and are why the sub-path idiom looks
+                // safe elsewhere in this codebase. A sub-path read here fails
+                // silently and the whole detector degrades to "never
+                // truncated", which is exactly the class of bug it exists to
+                // catch.
+                //
+                // STRING, never NODE (landmine 4): mpv prints a CONF_TYPE_NODE
+                // property as JSON for a string get, so one read yields the
+                // whole map and we parse `eof` out of it. The payload is a few
+                // hundred bytes and this runs at CACHE_POLL_INTERVAL, so the
+                // parse is nothing next to the FFI call itself.
+                let cache_state_json = get_property_generic(&lib, handle, "demuxer-cache-state", GetFormat::String)
+                    .map_err(|e| {
+                        // Warn ONCE per load. A silently unreadable property
+                        // here means no truncated stream is ever detected, and
+                        // that must be visible in the DevConsole rather than
+                        // looking like "this never happens".
+                        if !eof_read_failed {
+                            eof_read_failed = true;
+                            crate::devlog!(
+                                warn, "mpv",
+                                "demuxer-cache-state unreadable ({e}) - truncated-stream detection is INACTIVE",
+                            );
+                        }
+                    })
+                    .ok();
+                let cache_state = cache_state_json
+                    .as_ref()
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+                let eof_opt = cache_state
+                    .as_ref()
+                    .and_then(|v| v.get("eof"))
+                    .and_then(|v| v.as_bool());
+                // The read succeeding is not enough: an unparseable payload or
+                // a renamed/absent `eof` key degrades the detector to "never
+                // truncated" just as completely as a failed read, and that is
+                // precisely the silent failure this feature exists to remove.
+                // Same once-per-load guard, so a future libmpv that reshapes
+                // the map is loud instead of quiet.
+                if eof_opt.is_none() && cache_state_json.is_some() && !eof_read_failed {
+                    eof_read_failed = true;
+                    crate::devlog!(
+                        warn, "mpv",
+                        "demuxer-cache-state has no usable `eof` field - truncated-stream detection is INACTIVE",
+                    );
+                }
+                let demux_eof = eof_opt.unwrap_or(false);
+                // Absolute timestamp of the last cached packet. Taken from
+                // the SAME snapshot as `eof` so the pair can never disagree
+                // across a poll boundary; `demuxer-cache-time` is the
+                // documented top-level equivalent and covers the case where
+                // the map read or parse failed.
+                let cache_end = cache_state
+                    .as_ref()
+                    .and_then(|v| v.get("cache-end"))
+                    .and_then(|v| v.as_f64())
+                    .or_else(|| {
+                        get_property_generic(&lib, handle, "demuxer-cache-time", GetFormat::Double)
+                            .ok().and_then(|v| v.as_f64())
+                    })
+                    .filter(|v| v.is_finite() && *v >= 0.0);
+
                 let mut m = serde_json::Map::new();
                 m.insert("paused_for_cache".into(), serde_json::Value::Bool(paused_for_cache));
+                m.insert("demux_eof".into(), serde_json::Value::Bool(demux_eof));
                 if let Some(s) = cache_seconds {
                     if let Some(n) = serde_json::Number::from_f64(s) {
                         m.insert("cache_seconds".into(), serde_json::Value::Number(n));
+                    }
+                }
+                if let Some(e) = cache_end {
+                    if let Some(n) = serde_json::Number::from_f64(e) {
+                        m.insert("cache_end".into(), serde_json::Value::Number(n));
                     }
                 }
                 if let Some(p) = cache_pct {
@@ -2227,6 +2412,16 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         m.insert("cache_pct".into(), serde_json::Value::Number(n));
                     }
                 }
+                // Log the rising edge only. This is the single line that makes
+                // the next occurrence diagnosable without a 60 MB mpv log.
+                if demux_eof && !last_demux_eof {
+                    crate::devlog!(
+                        info, "mpv",
+                        "demuxer hit EOF at cache_end={:.1}s",
+                        cache_end.unwrap_or(-1.0),
+                    );
+                }
+                last_demux_eof = demux_eof;
                 emit("cache-state", serde_json::Value::Object(m));
             }
 
