@@ -100,6 +100,12 @@ export type ServerMsg =
 export interface LocalPlayback {
   paused: boolean;
   position: number;
+  /** True while a load is in flight and `position` is therefore not a real
+   *  playhead. mpv has not confirmed the new file open yet, so the host
+   *  reports 0. The leader tick MUST skip on this: a broadcast 0 is taken by
+   *  every in-sync follower as a 1200-second backward drift and seeks the
+   *  whole room to 00:00. */
+  loading: boolean;
   /** Current local playback speed (1 = normal). */
   speed: number;
   videoKey: string | null;

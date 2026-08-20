@@ -499,7 +499,20 @@ function handleMessage(data: string) {
       ingestRoomState(msg.state, !ownerReconnect);
       if (ownerReconnect && local) {
         if (!local.paused) { localStaging = false; ui.amStaging = false; }
-        broadcastControl(local.paused, local.position);
+        // Same rule as the leader tick: while a load is in flight our position
+        // is a projection, not a playhead, and this is the OTHER unprompted
+        // broadcast - nobody pressed anything, so a wrong position here is
+        // silent. Worse than a tick, in fact: a full control frame is not
+        // something a follower can shrug off, so a socket blip during an
+        // episode advance would re-assert 0 and seek every in-sync member to
+        // the top of an episode they were twenty minutes into.
+        //
+        // Skipping is safe. `ingestRoomState(…, drive=false)` above already
+        // ran, so we are not snapped to the relay's stale snapshot locally,
+        // and the leader tick re-asserts the truth within TICK_MS of the seal
+        // opening. The staging reconciliation above stays OUTSIDE this guard:
+        // it is local bookkeeping, not a broadcast.
+        if (!local.loading) broadcastControl(local.paused, local.position);
       }
       emit();
       break;
@@ -744,7 +757,13 @@ function startLeaderTimer() {
     if (!bridge || ui.status !== "connected") return;
     const local = bridge.getLocal();
     // Only drive drift while WE are watching the room title and playing.
-    if (local.paused || local.videoKey == null || local.videoKey !== ui.roomVideoKey) return;
+    // `loading` is checked for the same reason as `paused`: our position is
+    // not a real playhead, so we have nothing to drive the room with. The
+    // videoKey guard does NOT cover this - activeTarget still names the
+    // OUTGOING episode for the whole load, so an in-place source swap (which
+    // never changes it at all) would otherwise tick a 0 at the room.
+    if (local.paused || local.loading) return;
+    if (local.videoKey == null || local.videoKey !== ui.roomVideoKey) return;
     send({ t: "tick", position: local.position, paused: false, speed: local.speed });
   }, TICK_MS);
 }
