@@ -30,6 +30,7 @@
 //!
 //!   - `settings`        — backend AppSettings + frontend auraSettings
 //!   - `manual-state`    — queue + manual watched/in-progress marks
+//!   - `skip-marks`      - episodes marked skipped rather than watched
 //!   - `auto-bumped`     — series IDs the user finished
 //!   - `notifications`   — last-7-days ring buffer
 //!   - `recent-searches` — recent search query strings
@@ -77,6 +78,7 @@ const MAX_BLOB_BYTES: usize = 1024 * 1024;
 const NAMESPACES: &[&str] = &[
     "settings",
     "manual-state",
+    "skip-marks",
     "auto-bumped",
     "notifications",
     "recent-searches",

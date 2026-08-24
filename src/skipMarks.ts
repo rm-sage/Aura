@@ -25,6 +25,13 @@
 // SCOPE + PERSISTENCE mirror manualWatched.ts exactly, including the per-account
 // key, because the two stores are always read together and a skip whose watched
 // mark lives in another scope would be a ghost.
+//
+// CLOUD: synced through Aura Cloud under its own `skip-marks` namespace, pulled
+// and pushed in the same sweep as `manual-state` and ordered immediately after
+// it, so an episode's skip annotation and the watched mark it annotates travel
+// together. Union merge, matching manual-state and auto-bumped: a skip made on
+// either device applies everywhere, and (like every other namespace today)
+// UNSKIPPING does not propagate.
 // ---------------------------------------------------------------------------
 
 import { useSyncExternalStore } from "react";
@@ -83,8 +90,8 @@ export function setSkipMarksScope(scope: string | null): void {
   notify();
 }
 
-/** Re-read from storage. For a future cloud-pull path; skip marks are NOT
- *  cloud-synced today (they ARE included in local backups). */
+/** Re-read from storage. Used by the cloud-pull path and by local backup
+ *  restore, both of which write the scoped localStorage entry directly. */
 export function reloadSkipMarksFromStorage(): void {
   _activeSet = loadFromStorage(_activeScope);
   _hydrated = true;
@@ -120,12 +127,19 @@ export function setSkipped(ids: string[], skipped: boolean): void {
   notify();
 }
 
-/** Replace the whole set. For a future cloud merge; unused today. */
-export function replaceSkipMarks(ids: string[]): void {
+/** Replace the whole set. Used by the Aura Cloud merge.
+ *
+ *  `silent` suppresses the change event. The sync layer needs it: the event
+ *  is what schedules a debounced push, so notifying here would make every
+ *  PULL immediately schedule a PUSH of the blob it just received. Mirrors
+ *  `setAllHistory(..., { silent: true })`. React consumers do not go stale,
+ *  because a pull only lands a set that already differs from the server's,
+ *  and the next genuine mutation re-renders them. */
+export function replaceSkipMarks(ids: string[], opts?: { silent?: boolean }): void {
   _activeSet = new Set(ids.filter((v) => typeof v === "string" && !!v));
   _hydrated = true;
   persist();
-  notify();
+  if (!opts?.silent) notify();
 }
 
 export function onSkipMarksChange(cb: () => void): () => void {

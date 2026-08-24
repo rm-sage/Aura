@@ -2052,11 +2052,13 @@ interface SyncStatusResp {
 const NAMESPACE_LABEL: Record<string, string> = {
   "settings":         "App settings",
   "manual-state":     "Watched marks & queue",
+  "skip-marks":       "Skipped episodes",
   "auto-bumped":      "Auto-bumped series",
   "notifications":    "Notifications",
   "recent-searches":  "Recent searches",
   "title-state":      "Per-title preferences",
   "anilist-id-map":   "AniList ID cache",
+  "history":          "Watch history",
 };
 
 function CloudSyncSection({ authKey }: { authKey: string | null }) {

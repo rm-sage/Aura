@@ -188,12 +188,21 @@ The proxy MUST whitelist the namespace name on every request. Current set:
 ```
 settings
 manual-state
+skip-marks
 auto-bumped
 notifications
 recent-searches
 title-state
 anilist-id-map
+history
 ```
+
+`history` and `skip-marks` are the two most recent additions; if the deployed
+proxy predates them it answers `400 unknown_namespace` for those names and the
+desktop keeps them local (it latches the name off for the session and logs one
+line explaining this, then resumes automatically once the proxy accepts it).
+Every other namespace is unaffected, because the pull sweep logs and continues
+per namespace rather than aborting.
 
 Anything else returns `400 Bad Request` with body `{"error":"unknown_namespace","name":"..."}`. Adding a new namespace is intentionally a two-place change (proxy + `sync.rs`) so a typo can't accidentally create stray blobs.
 

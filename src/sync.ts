@@ -24,6 +24,8 @@ import { safeSetItem } from "./storageQuota";
 //
 //         settings        — last-writer-wins per top-level key
 //         manual-state    — union with tombstone-aware deletions
+//         skip-marks      - union of episode ids (a skip made on one
+//                           device applies everywhere)
 //         auto-bumped     — union of IDs (a finished series is finished
 //                           on every device)
 //         notifications   — union dedup'd on (kind, id, ts), capped 100
@@ -87,7 +89,12 @@ export interface SyncStatus {
 
 export const SYNC_NAMESPACES = [
   "settings",
+  // `skip-marks` sits immediately after `manual-state` on purpose: a skip is
+  // an ANNOTATION over a watched mark (see skipMarks.ts), so the two blobs are
+  // pulled in this order and applied in this order, and an episode's skip
+  // never lands before the watched mark it annotates.
   "manual-state",
+  "skip-marks",
   "auto-bumped",
   "notifications",
   "recent-searches",
@@ -406,6 +413,24 @@ const mergeManualState: MergeFn<ManualState> = (local, server) => {
   return out;
 };
 
+/** Skip marks - union of episode ids, same rule as auto-bumped.
+ *
+ *  A skip is a deliberate user mark ("I did not watch this, and I do not want
+ *  to be asked again"), so a skip made on either device should hold on both.
+ *  Union therefore, NOT last-writer-wins: a device that has not seen the newer
+ *  marks yet must not be able to erase them by pushing its shorter list.
+ *
+ *  The known limitation, shared with every other namespace today: UNSKIPPING
+ *  does not propagate, because an absent id is indistinguishable from an id
+ *  the other device has never heard of. Un-skipping locally also clears the
+ *  watched mark through `setManualWatchedState`, and manual-state is union
+ *  too, so the pair stays consistent, just not deletable cross-device.
+ *  Tombstones are the fix for both and belong in one change, not this one. */
+const mergeSkipMarks: MergeFn<string[]> = (local, server) => {
+  const safeServer = isStringArray(server) ? server : [];
+  return Array.from(new Set<string>([...(local ?? []), ...safeServer]));
+};
+
 interface AnilistMapEntry {
   anilist_id?: number;
   episodes?: number | null;
@@ -476,6 +501,7 @@ const mergeHistory: MergeFn<HistoryWireEntry[]> = (local, server) => {
 const MERGERS: Record<SyncNamespace, MergeFn<any>> = {
   "settings":        mergeSettings as MergeFn<any>,
   "manual-state":    mergeManualState as MergeFn<any>,
+  "skip-marks":      mergeSkipMarks as MergeFn<any>,
   "auto-bumped":     mergeAutoBumped as MergeFn<any>,
   notifications:     mergeNotifications as MergeFn<any>,
   "recent-searches": mergeServerWinsRecentSearches,
@@ -688,6 +714,17 @@ async function readLocal(namespace: SyncNamespace): Promise<unknown> {
   if (namespace === "manual-state") {
     return readManualStateAggregate();
   }
+  if (namespace === "skip-marks") {
+    // skipMarks owns the scoped localStorage entry; its in-memory set is the
+    // authoritative read and is already the wire shape (a string array).
+    // Dynamic import for the same reason manualWatched uses one below: that
+    // module registers a listener at module scope, and sync.ts deliberately
+    // touches no browser global until it is called.
+    try {
+      const m = await import("./skipMarks");
+      return m.getSkippedIds();
+    } catch { return []; }
+  }
   if (namespace === "history") {
     // historyStore reads from its scoped localStorage entry — same
     // shape that flies on the wire (an array of HistoryEntry).
@@ -725,6 +762,19 @@ async function writeLocal(namespace: SyncNamespace, value: unknown): Promise<voi
   }
   if (namespace === "manual-state") {
     writeManualStateAggregate(value as ManualState);
+    return;
+  }
+  if (namespace === "skip-marks") {
+    // silent: true for the same reason as history - the change event is what
+    // schedules a debounced push, so notifying here would make every pull
+    // immediately schedule a push of the blob it just merged.
+    const ids = isStringArray(value) ? value : [];
+    try {
+      const m = await import("./skipMarks");
+      m.replaceSkipMarks(ids, { silent: true });
+    } catch (e) {
+      console.warn("[sync] writeLocal skip-marks failed:", e);
+    }
     return;
   }
   if (namespace === "history") {
@@ -898,6 +948,14 @@ export function syncPullAll(): Promise<void> {
       });
       let etagsMutated = false;
       for (const outcome of outcomes) {
+        // Any outcome at all (200 / 304 / 404) means the proxy now accepts
+        // this name, so release a latch set while it did not. Lets a proxy
+        // deploy take effect on the next sweep instead of needing a restart.
+        const answered = (outcome as { namespace?: string; blob?: { namespace?: string } });
+        const answeredNs = (answered.namespace ?? answered.blob?.namespace) as SyncNamespace | undefined;
+        if (answeredNs && unsupportedNamespaces.delete(answeredNs)) {
+          console.info(`[sync] proxy now accepts "${answeredNs}" - resuming sync for it`);
+        }
         if (outcome.status === "fresh") {
           const blob = outcome.blob;
           const ns = blob.namespace as SyncNamespace;
@@ -965,10 +1023,43 @@ export function syncPullAll(): Promise<void> {
  * listeners; immediate-write callers (e.g. user-triggered "Push now")
  * should call `syncPushNow` to surface errors instead.
  */
+/** Namespaces the proxy rejected with 400 for this session.
+ *
+ *  The allowlist is enforced on BOTH sides (proxy spec section 5), so a
+ *  namespace that ships in the client before the proxy is redeployed gets a
+ *  400 `unknown_namespace` on every attempt. Without this latch a background
+ *  namespace would log once per user action forever - a bulk "skip these
+ *  episodes" is one warning per push - which buries real sync errors.
+ *
+ *  Latched per session and per namespace, and released as soon as the proxy
+ *  answers for it again (see the pull sweep), so deploying the proxy fixes it
+ *  without an app restart. Everything else keeps syncing normally throughout:
+ *  `sync_pull_all` already logs-and-continues per namespace. */
+const unsupportedNamespaces = new Set<SyncNamespace>();
+
+/** The proxy's rejection for a name that is not on its allowlist. Matched on
+ *  the status because that is all `sync.rs` puts in the error string
+ *  ("sync_push <ns> http 400"); a malformed-JSON body is the only other 400
+ *  the spec defines and we never send one. */
+function isUnknownNamespaceError(e: unknown): boolean {
+  const msg = typeof e === "string" ? e : String((e as { message?: string })?.message ?? e);
+  return msg.includes("http 400");
+}
+
 export async function syncPush(namespace: SyncNamespace): Promise<void> {
+  if (unsupportedNamespaces.has(namespace)) return;
   try {
     await syncPushNow(namespace);
   } catch (e) {
+    if (isUnknownNamespaceError(e)) {
+      unsupportedNamespaces.add(namespace);
+      console.warn(
+        `[sync] the proxy does not know the "${namespace}" namespace (400). `
+        + `Add it to the proxy allowlist (spec section 5) and redeploy; `
+        + `until then this namespace stays local and every other one syncs normally.`,
+      );
+      return;
+    }
     console.warn(`[sync] push ${namespace} failed:`, e);
   }
 }
@@ -1101,6 +1192,7 @@ export function installSyncTriggers(): void {
     debouncedPush("settings");
   });
   window.addEventListener("aura:manual-watched-changed",  () => debouncedPush("manual-state"));
+  window.addEventListener("aura:skip-marks-changed",      () => debouncedPush("skip-marks"));
   window.addEventListener("aura:auto-bumped-changed",     () => debouncedPush("auto-bumped"));
   window.addEventListener("aura:notifications-changed",   () => debouncedPush("notifications"));
   window.addEventListener("aura:recent-searches-changed", () => debouncedPush("recent-searches"));
