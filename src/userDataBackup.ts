@@ -59,6 +59,11 @@ const KEYS = {
 const AUTO_DEBOUNCE_MS = 30_000;       // 30 s of inactivity before auto-snapshot
 const AUTO_MAX_KEEP    = 10;           // rolling backup count per scope
 const AUTO_REASON_KEY  = "auto-snapshot";
+/** Fired when the active backup scope changes, so readers can re-derive. */
+export const BACKUP_SCOPE_EVENT = "aura:backup-scope-changed";
+const SCOPE_EVENT = BACKUP_SCOPE_EVENT;
+/** True between startAutoBackup and the first resolved scope. */
+let startupSnapshotPending = false;
 
 // ---------------------------------------------------------------------------
 // Backup payload shape
@@ -281,11 +286,19 @@ export function startAutoBackup(initialScope: string): () => void {
   window.addEventListener("aura:manual-watched-changed", onChange);
   window.addEventListener("aura:history-changed",        onChange);
   window.addEventListener("aura:settings-changed",       onChange);
-  // Take an initial snapshot at startup so even read-only sessions
-  // capture the current state at least once. Best-effort fire-and-
-  // forget; users on disk-quota-exhausted machines can disable
-  // backups in Settings if needed.
-  void createSnapshot("startup", autoScopeSnapshot);
+  // The startup snapshot is DEFERRED to the first setAutoBackupScope call.
+  //
+  // It used to fire here, but App.tsx calls startAutoBackup("guest") before
+  // the Stremio session has resolved, so every launch wrote a ~3 KB snapshot
+  // of empty guest state. Those accumulated in the guest ledger, and since
+  // each bucket keeps only the 10 most recent, the auto bucket filled with
+  // useless startup entries while the real per-account snapshots sat in the
+  // signed-in scope's directory. Waiting for the resolved scope also means the
+  // snapshot captures real data instead of a pre-hydration blank.
+  //
+  // Guests still get one: App.tsx calls setAutoBackupScope on every session
+  // outcome, "guest" included, so the deferral fires either way.
+  startupSnapshotPending = true;
   return () => {
     autoEnabled = false;
     if (autoSnapshotTimer) {
@@ -303,5 +316,33 @@ export function startAutoBackup(initialScope: string): () => void {
  *  user was signed-in land under their `user-<hash>` directory and
  *  guest-mode backups land under `guest`. */
 export function setAutoBackupScope(scope: string | null): void {
-  autoScopeSnapshot = scope?.trim() || "guest";
+  const next = scope?.trim() || "guest";
+  const changed = next !== autoScopeSnapshot;
+  autoScopeSnapshot = next;
+  // Readers (the Settings panel) must re-derive: this is the moment the real
+  // account scope becomes known, and it lands AFTER their first render.
+  if (changed) window.dispatchEvent(new CustomEvent(SCOPE_EVENT));
+  // Deferred startup snapshot, now that we know which account it belongs to.
+  if (startupSnapshotPending && autoEnabled) {
+    startupSnapshotPending = false;
+    void createSnapshot("startup", autoScopeSnapshot);
+  }
+}
+
+/** The scope snapshots are currently being WRITTEN under.
+ *
+ *  This is the only correct answer to "which scope is active", and every
+ *  reader must use it. App.tsx derives it from the live auth_key and pushes it
+ *  here via `setAutoBackupScope`, so it tracks account switches exactly as the
+ *  writer does.
+ *
+ *  Do NOT re-derive it by scanning localStorage for an `aura:manual-state:`
+ *  key. That was the previous approach in the Settings panel and it is wrong:
+ *  every Stremio re-login rotates `auth_key`, so the prefix changes and the OLD
+ *  `aura:manual-state:user-<hex>` entries are never removed. The scan returns
+ *  whichever key enumeration reaches first, which in practice is the OLDEST
+ *  scope, so the panel listed a stale directory and reported "0 auto" while
+ *  snapshots were being written correctly to the real one. */
+export function getActiveBackupScope(): string {
+  return autoScopeSnapshot;
 }

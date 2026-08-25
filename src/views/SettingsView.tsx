@@ -1,4 +1,4 @@
-// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// Aura - © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from "react";
@@ -23,6 +23,8 @@ import {
   createSnapshot,
   deleteSnapshot,
   listSnapshots,
+  getActiveBackupScope,
+  BACKUP_SCOPE_EVENT,
   readSnapshot,
   type BackupMeta,
 } from "../userDataBackup";
@@ -66,7 +68,7 @@ import auraIconAsset from "../assets/aura-icon.png";
 const APP_VERSION = (import.meta.env.VITE_APP_VERSION as string | undefined) ?? "0.0.0";
 
 // ---------------------------------------------------------------------------
-// Backend-side settings shape — must mirror Rust AppSettings.
+// Backend-side settings shape - must mirror Rust AppSettings.
 // ---------------------------------------------------------------------------
 interface BackendSettings {
   theme: string;
@@ -107,7 +109,7 @@ interface BackendSettings {
    *  0 disables the feature. */
   next_up_lead_seconds: number;
   audio_passthrough: boolean;
-  /** Backend mirror of auraSettings.loudnessNormalization — written by
+  /** Backend mirror of auraSettings.loudnessNormalization - written by
    *  the set_audio_loudnorm command so the engine can install the
    *  @loudnorm filter at mpv init. Not edited directly from this view. */
   loudness_normalization: boolean;
@@ -222,7 +224,7 @@ interface ToggleProps {
   description: string;
   value: boolean;
   onChange: (v: boolean) => void;
-  /** Greys the row out and refuses input — for a toggle whose parent switch is
+  /** Greys the row out and refuses input - for a toggle whose parent switch is
    *  off, where flipping it would mean nothing. */
   disabled?: boolean;
 }
@@ -378,7 +380,7 @@ function SettingText({
 }
 
 // ---------------------------------------------------------------------------
-// SettingSlider — labeled range input with live numeric readout
+// SettingSlider - labeled range input with live numeric readout
 // ---------------------------------------------------------------------------
 
 function SettingSlider({
@@ -425,13 +427,13 @@ function SettingSlider({
 }
 
 // ---------------------------------------------------------------------------
-// SubLangFilterInput — comma-separated language codes (en, es, ja, …)
+// SubLangFilterInput - comma-separated language codes (en, es, ja, …)
 //
 // Why this exists: SettingText is fully controlled and reflects whatever
 // `value` is. If we filter the typed text on every keystroke through a
-// regex that only accepts 2–3 letters, partial input ("e", "en, ") gets
+// regex that only accepts 2-3 letters, partial input ("e", "en, ") gets
 // rejected, the parent state goes back to empty, and the input clears
-// on the next keystroke — typing becomes impossible.
+// on the next keystroke - typing becomes impossible.
 //
 // This component holds a local DRAFT string that the user can edit
 // freely. On blur (or Enter), we parse the draft into normalized ISO
@@ -451,7 +453,7 @@ function SubLangFilterInput({
   const lastSyncedRef = useRef(joined);
 
   // Pull in upstream changes when they actually shift (settings reload,
-  // import, etc.) — but never while the user is mid-edit.
+  // import, etc.) - but never while the user is mid-edit.
   useEffect(() => {
     if (joined !== lastSyncedRef.current) {
       lastSyncedRef.current = joined;
@@ -498,7 +500,7 @@ function SubLangFilterInput({
 }
 
 // ---------------------------------------------------------------------------
-// AudioPriorityInput — ordered list of language tokens for the audio
+// AudioPriorityInput - ordered list of language tokens for the audio
 // scoring algorithm. Same draft-on-blur pattern as SubLangFilterInput,
 // but tolerates the literal token "original" alongside ISO 639-1 codes.
 // ---------------------------------------------------------------------------
@@ -559,7 +561,7 @@ function AudioPriorityInput({
 }
 
 // ---------------------------------------------------------------------------
-// SortableAddonRow — dnd-kit-driven row used inside AddonMultiPicker.
+// SortableAddonRow - dnd-kit-driven row used inside AddonMultiPicker.
 // ---------------------------------------------------------------------------
 
 function SortableAddonRow({
@@ -590,7 +592,7 @@ function SortableAddonRow({
                     ? "border-ln-accent/45 bg-ln-accent/15 shadow-[0_8px_24px_-4px_rgba(0,0,0,0.5)]"
                     : "border-white/10"}`}
     >
-      {/* Drag handle — only this element listens for drag activation so the
+      {/* Drag handle - only this element listens for drag activation so the
           "Remove" button stays clickable without grabbing the row. */}
       <button
         {...attributes}
@@ -624,7 +626,7 @@ function SortableAddonRow({
 
 // ---------------------------------------------------------------------------
 // Resource-tag predicates used to filter the addon-picker lists. Match is
-// case-insensitive against the addon's `resources` list — Stremio spec
+// case-insensitive against the addon's `resources` list - Stremio spec
 // strings are lowercase but we don't want a vendor-side casing tweak to
 // silently empty either picker.
 // ---------------------------------------------------------------------------
@@ -634,19 +636,19 @@ function hasResource(addon: AddonEntry, ...needles: string[]): boolean {
   return needles.some((n) => set.includes(n.toLowerCase()));
 }
 
-/** Catalog Providers picker — addons that surface metadata or that wrap
+/** Catalog Providers picker - addons that surface metadata or that wrap
  *  other addons (i.e. things you'd reasonably expect to feed Home). Pure
  *  stream / subtitle addons are filtered out. */
 function isCatalogProvider(addon: AddonEntry): boolean {
   return hasResource(addon, "meta", "addon_catalog");
 }
 
-/** Stream Providers picker — addons declaring the stream resource. */
+/** Stream Providers picker - addons declaring the stream resource. */
 function isStreamProvider(addon: AddonEntry): boolean {
   return hasResource(addon, "stream");
 }
 
-/** Search Providers picker — addons whose manifest probe set the
+/** Search Providers picker - addons whose manifest probe set the
  *  has_search flag at install/sync time. AddonEntry exposes that as
  *  a flat boolean so we don't need to walk catalogs/extras here. */
 function isSearchProvider(addon: AddonEntry): boolean {
@@ -654,7 +656,7 @@ function isSearchProvider(addon: AddonEntry): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Unified home sources picker — single sortable list; position 0 = primary.
+// Unified home sources picker - single sortable list; position 0 = primary.
 // Replaces the separate "Default Home Catalog" dropdown + "Additional Sources"
 // multi-picker so the user can reorder even the primary entry.
 //
@@ -674,7 +676,7 @@ interface UnifiedHomePickerProps {
 }
 
 // ---------------------------------------------------------------------------
-// HeroCatalogPicker — two cascading selects (Addon → Catalog) that
+// HeroCatalogPicker - two cascading selects (Addon → Catalog) that
 // pin a specific catalog as the source for the Home hero band. Lists
 // EVERY catalog the addon exposes (including is_hidden_from_home), so
 // the user can lift a Discover-only catalog like AIOMetadata's "AI
@@ -912,7 +914,7 @@ function UnifiedHomeSourcesPicker({
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// AboutSection — condensed app-info panel + fun-stats readout
+// AboutSection - condensed app-info panel + fun-stats readout
 //
 // Replaces the spaced-out "Aura · Phase 3 Optimization / Installed addons / 8"
 // pair with a single tight info row, the bundled app icon, the live version
@@ -929,7 +931,7 @@ interface AuraStats {
 }
 
 // ---------------------------------------------------------------------------
-// BackupRestoreSection — portable settings export/import.
+// BackupRestoreSection - portable settings export/import.
 //
 // Only addon-INDEPENDENT backend fields round-trip. The settingsTransfer
 // module owns the whitelist + parse/serialize logic; this component is
@@ -981,7 +983,7 @@ function BackupRestoreSection({
       // Backend wipe via the reset_settings Tauri command (writes a
       // fresh AppSettings::default() to disk and returns the snapshot).
       await invoke<BackendSettings>("reset_settings");
-      // Frontend wipe — drop the localStorage-backed AuraSettings so
+      // Frontend wipe - drop the localStorage-backed AuraSettings so
       // home/meta/stream/search overrides return to manifest-id
       // defaults instead of pointing at whatever the user had pinned.
       try { localStorage.removeItem("aura:settings:v1"); } catch {}
@@ -1020,7 +1022,7 @@ function BackupRestoreSection({
           merged[`${name}_api_key`] = v;
         }
       } catch {
-        // Keyring unavailable on this platform — keep the merged value
+        // Keyring unavailable on this platform - keep the merged value
         // (possibly empty from the migrated settings.json) so the
         // export still ships *something*.
       }
@@ -1088,7 +1090,7 @@ function BackupRestoreSection({
 
       await onApply(backendPatch as Partial<BackendSettings>);
 
-      // Now write the imported keys to the keyring. Best-effort —
+      // Now write the imported keys to the keyring. Best-effort -
       // if the keyring fails (Linux without Secret Service), nothing
       // is left in settings.json either (the user can re-paste the
       // key manually). Skip empty values so we don't overwrite an
@@ -1152,9 +1154,11 @@ function BackupRestoreSection({
     <Section id="sec-backup" title="Backup & Restore">
       <p className="text-white/55 text-xs leading-relaxed">
         Export portable settings (theme, audio / subtitles, keybindings, Discord
-        RPC, anime-skip modes, etc.) as a file or pasteable string. Catalog,
-        stream, and search-provider lists are intentionally excluded so an
-        import on a fresh install doesn't point at addons that aren't there.
+        RPC, anime-skip modes, etc.) as a file or pasteable string. Your catalog,
+        stream, and search-provider choices ride along too, encoded by addon id
+        rather than URL: on import, any addon you don't have installed is skipped
+        and counted in the result, so an import on a fresh install never points
+        at addons that aren't there.
       </p>
 
       {/* ── Export ── */}
@@ -1284,7 +1288,7 @@ function BackupRestoreSection({
           manual watched marks, AuraSettings). Snapshots are auto-
           captured on change (debounced 30 s) and capped at 10 per
           scope; the user can also create / restore / delete by hand
-          here. Restore overwrites the current state — confirm-prompts
+          here. Restore overwrites the current state - confirm-prompts
           guard the destructive path. */}
       <LocalDataBackupsSubsection />
 
@@ -1323,7 +1327,7 @@ function BackupRestoreSection({
 }
 
 // ---------------------------------------------------------------------------
-// LocalDataBackupsSubsection — view + restore + create/delete the on-disk
+// LocalDataBackupsSubsection - view + restore + create/delete the on-disk
 // snapshots written by `userDataBackup.ts`.
 //
 // Lists every backup across every scope so a user who accidentally
@@ -1343,21 +1347,30 @@ function LocalDataBackupsSubsection() {
     message: "",
   });
 
-  // Resolve the currently active scope from the manualWatched store
-  // (mirrors what App.tsx's applySettingsScope set). The backup list
-  // is filtered to this scope so the per-scope "10 max" cap displayed
-  // in the UI actually matches the on-disk reality. Switching accounts
-  // surfaces the other scope's backups; users wanting cross-scope
-  // recovery can switch profiles to see them.
-  const currentScope = (() => {
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (key && key.startsWith("aura:manual-state:")) {
-        return key.replace("aura:manual-state:", "");
-      }
-    }
-    return "guest";
-  })();
+  // The scope snapshots are actually being written under. Must come from
+  // `getActiveBackupScope()`, which App.tsx feeds from the live auth_key -
+  // the same value the auto-snapshot writer uses.
+  //
+  // This used to scan localStorage for the first `aura:manual-state:` key and
+  // take its suffix. That silently listed the WRONG directory: every Stremio
+  // re-login rotates `auth_key`, the scope prefix changes with it, and the old
+  // `aura:manual-state:user-<hex>` entries are never cleaned up - so the scan
+  // returned whichever key enumeration reached first (in practice the oldest
+  // account) while snapshots kept being written to the current one. The
+  // symptom was a panel reporting "0 auto" next to a multi-megabyte on-disk
+  // total, with a month of real auto-snapshots sitting invisible one directory
+  // over. `backupStorageUsed()` counts every scope, which is why the byte
+  // total looked right while the list did not.
+  // Reactive: App.tsx resolves the account scope from the auth session AFTER
+  // this panel's first render, so a value read once at render time would be
+  // stuck on the pre-resolution "guest" and list the wrong directory.
+  const [currentScope, setCurrentScope] = useState(getActiveBackupScope);
+  useEffect(() => {
+    const sync = () => setCurrentScope(getActiveBackupScope());
+    sync();
+    window.addEventListener(BACKUP_SCOPE_EVENT, sync);
+    return () => window.removeEventListener(BACKUP_SCOPE_EVENT, sync);
+  }, []);
 
   const refresh = useCallback(async () => {
     const [items, used] = await Promise.all([
@@ -1375,19 +1388,10 @@ function LocalDataBackupsSubsection() {
   const onCreate = useCallback(async () => {
     setBusy(true);
     try {
-      // Snapshot the CURRENT scope. Reading the scope from the
-      // manualWatched store is the cheapest source of truth — it
-      // mirrors what App.tsx's applySettingsScope set.
-      const scope = (() => {
-        for (let i = 0; i < localStorage.length; i++) {
-          const key = localStorage.key(i);
-          if (key && key.startsWith("aura:manual-state:")) {
-            return key.replace("aura:manual-state:", "");
-          }
-        }
-        return "guest";
-      })();
-      const meta = await createSnapshot("manual", scope);
+      // Same authoritative scope the list and the auto-writer use. The old
+      // localStorage scan here was the reason a manual snapshot could land in
+      // a stale account's directory and then not appear in the list beside it.
+      const meta = await createSnapshot("manual", getActiveBackupScope());
       if (meta) {
         setStatus({ kind: "ok", message: "Snapshot created." });
         await refresh();
@@ -1406,7 +1410,7 @@ function LocalDataBackupsSubsection() {
       // Defensive: take a "pre-restore" snapshot of the CURRENT state
       // before overwriting, so the user can roll back if the restore
       // wasn't what they expected. This is the recommended pattern in
-      // userDataBackup.ts's header — practising what we preach here
+      // userDataBackup.ts's header - practising what we preach here
       // is what makes the recovery story actually trustworthy.
       await createSnapshot("pre-restore", meta.scope);
       const payload = await readSnapshot(meta.scope, meta.fileName);
@@ -1436,7 +1440,7 @@ function LocalDataBackupsSubsection() {
       // deleteSnapshot returns false on failure (it swallows the
       // invoke error internally so the toast can render correctly).
       // Without this guard the optimistic "Snapshot deleted." toast
-      // fired even when the file wasn't actually removed — the bug
+      // fired even when the file wasn't actually removed - the bug
       // the user surfaced before the BackupMeta camelCase fix landed.
       const ok = await deleteSnapshot(meta.scope, meta.fileName);
       if (!ok) {
@@ -1468,7 +1472,7 @@ function LocalDataBackupsSubsection() {
     return `${yyyy}-${mm}-${dd} ${HH}:${MM}`;
   };
 
-  // Manual / auto split — manual snapshots ("manual" + "pre-restore"
+  // Manual / auto split - manual snapshots ("manual" + "pre-restore"
   // reasons) are kept in their own ledger so they CAN'T be silently
   // overwritten by the auto-snapshot scheduler firing every 30 s.
   // Both buckets cap at 10 per scope independently.
@@ -1525,8 +1529,10 @@ function LocalDataBackupsSubsection() {
         <p className="text-white/75 text-sm font-medium">Local user-data backups</p>
         <p className="text-white/40 text-xs leading-relaxed mt-0.5">
           Snapshots of your <strong>Queue</strong>, watch <strong>History</strong>,
-          manual <em>watched / in-progress / planned</em> marks, and your
-          per-account UI preferences. Stored on disk under
+          manual <em>watched / in-progress / planned</em> marks, which episodes
+          you marked <em>skipped</em>, auto-bumped series, and your device-wide
+          Aura UI preferences (shared by every account on this PC). Stored on
+          disk under
           <code className="font-mono text-white/55 mx-1">backups/</code>
           in Aura's app-data folder.
           {" "}<strong className="text-white/65">Manual</strong> snapshots
@@ -1625,7 +1631,7 @@ function LocalDataBackupsSubsection() {
   );
 }
 
-/** Centred modal confirm dialog — replaces the previous inline "are you
+/** Centred modal confirm dialog - replaces the previous inline "are you
  *  sure?" row that pushed the rest of the page around when it appeared.
  *  Renders into a portal so the backdrop covers the whole viewport, with
  *  Esc-to-cancel and click-outside-to-cancel handled centrally. */
@@ -1716,16 +1722,16 @@ function HdrPeakNitsRow({
       className="space-y-2"
       data-settings-row=""
       data-settings-label="HDR display peak (nits)"
-      data-settings-description="Passthrough only: the brightness mpv tone-maps HDR content down to. Leave on Auto unless highlights look blown out — that means Windows is reporting a higher peak than your panel's current mode can show (common on OLEDs in DisplayHDR True Black mode; try 400-465)."
+      data-settings-description="Passthrough only: the brightness mpv tone-maps HDR content down to. Leave on Auto unless highlights look blown out - that means Windows is reporting a higher peak than your panel's current mode can show (common on OLEDs in DisplayHDR True Black mode; try 400-465)."
     >
       <div>
         <p className="text-white/75 text-sm font-medium">HDR display peak (nits)</p>
         <p className="text-white/35 text-xs mt-0.5">
           The brightness mpv tone-maps HDR content down to in Passthrough
-          mode. Leave on Auto unless highlights look blown out — that means
+          mode. Leave on Auto unless highlights look blown out - that means
           Windows is reporting a higher peak than your panel's current mode
           can actually show (common on OLEDs in DisplayHDR True Black mode;
-          try 400–465).
+          try 400-465).
         </p>
       </div>
       <div className="flex items-center gap-2 flex-wrap">
@@ -1779,7 +1785,7 @@ function NextUpLeadTimeRow({
       className="space-y-2"
       data-settings-row=""
       data-settings-label="Next-Up lead time"
-      data-settings-description="Seconds before an episode ends to surface the Next Up card during series / anime playback. Set to 0 to disable the prompt entirely. The card never appears for movies or for the last aired episode of a series."
+      data-settings-description="Seconds before an episode ends to surface the Next Up card during series / anime playback. On anime where an ending theme was detected, the card appears when the ending starts instead, which can be earlier than this. Set to 0 to disable the prompt entirely. The card never appears for movies or for the last aired episode of a series."
     >
       <div>
         <p className="text-white/75 text-sm font-medium">Next-Up lead time</p>
@@ -1833,7 +1839,7 @@ function NextUpLeadTimeRow({
 
 /** Countdown-seconds selector for the Auto-advance toggle. Same chip
  *  + number-input pattern as NextUpLeadTimeRow, but a tighter range
- *  ([5, 30]) since the user has consciously opted into auto-advance —
+ *  ([5, 30]) since the user has consciously opted into auto-advance -
  *  zero would be "skip immediately" (not useful), >30 would be no
  *  better than the standard manual CTA. Default 10 is a comfortable
  *  middle ground that gives time to grab the remote / mouse. */
@@ -1899,7 +1905,7 @@ function AutoAdvanceDelayRow({
 }
 
 // ---------------------------------------------------------------------------
-// KeyringApiKeyInput — text input backed directly by the OS keyring
+// KeyringApiKeyInput - text input backed directly by the OS keyring
 // (via the Rust api_keyring commands). Reads on mount; writes on every
 // blur / Enter to avoid hammering the keyring on every keystroke.
 // Wrapped with the same data-settings-row attributes as SettingText so
@@ -1952,7 +1958,7 @@ function KeyringApiKeyInput({
       });
   }, [name, value, persisted]);
 
-  // Masked vs revealed — masked is the default since these are
+  // Masked vs revealed - masked is the default since these are
   // credentials. The "Show" button flips to plain text. Clearing the
   // input still works whether or not it's revealed.
   const masked = !revealed && value.length > 0
@@ -2015,17 +2021,17 @@ function KeyringApiKeyInput({
 }
 
 // ---------------------------------------------------------------------------
-// CloudSyncSection — diagnostic + control surface for Aura Cloud sync.
+// CloudSyncSection - diagnostic + control surface for Aura Cloud sync.
 //
 // Three top-level states based on `sync_status()`:
-//   • Guest — no Stremio session → no sync available. Show a card with
+//   • Guest - no Stremio session → no sync available. Show a card with
 //     a "Sign in" CTA (dispatches `aura:show-login` for App.tsx to
 //     surface the LoginView modal).
-//   • Connected, empty — connected but no namespaces have been written
+//   • Connected, empty - connected but no namespaces have been written
 //     yet. Show a "you're set up, nothing pushed yet" message + the
 //     Pull Now / Clear actions (so the user can manually pull state
 //     from another device).
-//   • Connected, active — full namespace table with last-updated +
+//   • Connected, active - full namespace table with last-updated +
 //     size per row, total/quota footer, Pull / Purge actions.
 //
 // Polls `sync_status` every 30 s while mounted, re-fetches immediately
@@ -2066,7 +2072,7 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
   const [errored, setErrored] = useState(false);
   const [busyAction, setBusyAction] = useState<null | "pull" | "purge" | "push">(null);
   const [purgeConfirm, setPurgeConfirm] = useState(false);
-  // Tick for relative-time labels — refreshes every 30 s so "5 minutes
+  // Tick for relative-time labels - refreshes every 30 s so "5 minutes
   // ago" stays current. Cheap; the relative formatter is O(1).
   const [tickNow, setTickNow] = useState(() => Date.now());
 
@@ -2151,18 +2157,19 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
       <div
         data-settings-row=""
         data-settings-label="Cloud Sync"
-        data-settings-description="Aura Cloud sync — requires Stremio sign-in to enable per-account state sync."
+        data-settings-description="Aura Cloud sync - requires Stremio sign-in to enable per-account state sync."
         className="space-y-2"
       >
         <p className="text-white/55 text-sm leading-relaxed">
           Cloud Sync requires a Stremio account. Sign in to keep your
-          settings, queue, manual marks, AniList ID cache, and
-          notifications in sync across devices.
+          settings, queue, manual watched marks, skipped episodes, watch
+          history, recent searches, per-title preferences, AniList ID cache,
+          and notifications in sync across devices.
         </p>
         <p className="text-white/35 text-xs leading-relaxed">
-          Library / watch progress are not synced here — Stremio's own
-          cloud handles those. The Aura proxy never sees your raw
-          auth_key; a SHA-256 hash computed locally is what
+          Your Stremio library and resume positions are not synced here -
+          Stremio's own cloud handles those. The Aura proxy never sees your
+          account id or your auth_key; a SHA-256 hash computed locally is what
           authenticates each request.
         </p>
         <button
@@ -2227,7 +2234,7 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
       {/* Top status line */}
       <div className="flex items-center justify-between gap-3 text-[12px]">
         <span className="text-white/75 font-medium">
-          {lastSyncMs ? `Last activity ${formatAgo(tickNow - lastSyncMs)}` : "Connected — no data yet"}
+          {lastSyncMs ? `Last activity ${formatAgo(tickNow - lastSyncMs)}` : "Connected - no data yet"}
         </span>
         <span className="text-white/35 font-mono tabular-nums">
           {formatBytes(status.total_size)} / {formatBytes(status.quota)}
@@ -2237,7 +2244,7 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
       {/* Approaching-quota hint */}
       {quotaPctTotal >= 95 && (
         <p className="text-amber-300/85 text-[11px]">
-          Approaching the 10 MB per-account quota. Consider clearing old data via the destructive action below.
+          Approaching the {formatBytes(status.quota)} per-account quota. Consider clearing old data via the destructive action below.
         </p>
       )}
 
@@ -2246,7 +2253,7 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
         <div className="rounded-lg border border-white/8 divide-y divide-white/6">
           {status.namespaces.map((ns) => {
             const ago = ns.updated_at ? formatAgo(tickNow - ns.updated_at * 1000) : "Never";
-            const sizeKb = ns.size != null ? formatBytes(ns.size) : "—";
+            const sizeKb = ns.size != null ? formatBytes(ns.size) : "-";
             const overQuota = ns.size != null && ns.size > 1024 * 1024 * 0.95;
             return (
               <div key={ns.name}
@@ -2306,10 +2313,11 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
 
       {/* Privacy footer */}
       <p className="text-white/35 text-[10.5px] leading-relaxed pt-2 border-t border-white/6">
-        Cloud Sync uses a derived hash of your Stremio auth_key (SHA-256,
-        computed locally, never sent) as the storage key. The proxy
-        never sees your raw auth_key. Library / watch progress are not
-        synced here — Stremio's own cloud handles those.
+        Cloud Sync uses a derived hash of your Stremio account id (SHA-256,
+        computed locally, never sent) as the storage key. Neither your raw
+        account id nor your auth_key ever reaches the proxy. Your Stremio
+        library and resume positions are not synced here - Stremio's own cloud
+        handles those.
       </p>
 
       {/* Purge confirm modal */}
@@ -2320,7 +2328,7 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
             <h3 className="text-white/95 text-sm font-semibold tracking-wide">Clear cloud sync data?</h3>
             <p className="text-white/55 text-xs leading-relaxed">
               This permanently deletes all your synced data on the Aura Cloud proxy.
-              Local state stays intact — your settings, queue, and marks remain on
+              Local state stays intact - your settings, queue, and marks remain on
               this device. Other devices will pull this device's state on their next
               sync.
             </p>
@@ -2375,7 +2383,7 @@ function formatAgo(diffMs: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Debug Panel — engine + mpv diagnostics + off-focus drop-rate test.
+// Debug Panel - engine + mpv diagnostics + off-focus drop-rate test.
 //
 // Surfaced as a modal overlay opened from a button in the About section
 // rather than a Settings section. It's a diagnostic tool, not a setting,
@@ -2454,7 +2462,7 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
   const [loadingPattern, setLoadingPattern] = useState(false);
 
   // Live 1 Hz polling of the engine snapshot. Only polls while the
-  // overlay is open — closing the overlay tears down the interval.
+  // overlay is open - closing the overlay tears down the interval.
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
@@ -2499,7 +2507,7 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
     try {
       // Stop whatever's currently playing first. mpv's loadfile-replace
       // already swaps files, but the user reported repeated loads
-      // appearing to "stack and brighten" — likely a render-context
+      // appearing to "stack and brighten" - likely a render-context
       // state quirk on rapid re-load. An explicit stop in between is
       // free insurance and makes each Load click idempotent.
       try { await invoke("debug_stop_playback"); } catch {}
@@ -2564,7 +2572,7 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
-      // Clipboard unavailable — fall back to a download? Skip for now;
+      // Clipboard unavailable - fall back to a download? Skip for now;
       // user can still screenshot the panel.
     }
   }, [snap, result]);
@@ -2619,8 +2627,8 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
         <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12.5px]">
           <DebugRow label="Engine active" value={fmtBool(snap?.engine.mpv_active)} />
           <DebugRow label="Engine running" value={fmtBool(snap?.engine.mpv_running)} />
-          <DebugRow label="Present mode" value={snap?.engine.present_mode ?? "—"} />
-          <DebugRow label="HWND" value={snap?.window.hwnd_hex ?? "—"} />
+          <DebugRow label="Present mode" value={snap?.engine.present_mode ?? "-"} />
+          <DebugRow label="HWND" value={snap?.window.hwnd_hex ?? "-"} />
           <DebugRow label="Foreground" value={fmtBool(snap?.window.is_foreground)} />
           <DebugRow label="Visible (WS_VISIBLE)" value={fmtBool(snap?.window.is_visible)} />
           <DebugRow label="Minimised (IsIconic)" value={fmtBool(snap?.window.is_iconic)} />
@@ -2637,26 +2645,26 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
         </p>
         {snap?.engine.mpv_running ? (
           <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12.5px]">
-            <DebugRow label="Codec" value={snap?.mpv?.video_codec ?? "—"} />
+            <DebugRow label="Codec" value={snap?.mpv?.video_codec ?? "-"} />
             <DebugRow
               label="Resolution"
               value={
                 snap?.mpv?.video_w && snap?.mpv?.video_h
                   ? `${snap.mpv.video_w}×${snap.mpv.video_h}`
-                  : "—"
+                  : "-"
               }
             />
             <DebugRow label="Source FPS" value={fmtFps(snap?.mpv?.fps)} />
             <DebugRow label="Display FPS" value={fmtFps(snap?.mpv?.display_fps)} />
-            <DebugRow label="Hardware decode" value={snap?.mpv?.hwdec_current ?? "—"} />
-            <DebugRow label="Pixel format" value={snap?.mpv?.pixelformat ?? "—"} />
-            <DebugRow label="Primaries" value={snap?.mpv?.primaries ?? "—"} />
-            <DebugRow label="Gamma / transfer" value={snap?.mpv?.gamma ?? "—"} />
+            <DebugRow label="Hardware decode" value={snap?.mpv?.hwdec_current ?? "-"} />
+            <DebugRow label="Pixel format" value={snap?.mpv?.pixelformat ?? "-"} />
+            <DebugRow label="Primaries" value={snap?.mpv?.primaries ?? "-"} />
+            <DebugRow label="Gamma / transfer" value={snap?.mpv?.gamma ?? "-"} />
             <DebugRow
               label="HDR"
               value={
                 snap?.mpv?.hdr_kind ??
-                (snap?.mpv?.hdr_detected ? "detected" : "—")
+                (snap?.mpv?.hdr_detected ? "detected" : "-")
               }
             />
             <DebugRow
@@ -2667,12 +2675,12 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
                   : "not detected"
               }
             />
-            <DebugRow label="Audio codec" value={snap?.mpv?.audio_codec ?? "—"} />
+            <DebugRow label="Audio codec" value={snap?.mpv?.audio_codec ?? "-"} />
             <DebugRow
               label="Paused"
               value={
                 snap?.mpv?.paused === undefined
-                  ? "—"
+                  ? "-"
                   : snap.mpv?.paused
                     ? "yes"
                     : "no"
@@ -2688,13 +2696,13 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
 
       <div className="h-px bg-white/6" />
 
-      {/* Drop counters (live) — cumulative since playback started.
+      {/* Drop counters (live) - cumulative since playback started.
           The drop-test result below shows the DELTA across the test
           window, which is the more meaningful figure for "did this
           mode change cause drops?". */}
       <div>
         <p className="text-white/40 text-[10.5px] font-mono uppercase tracking-[0.18em] mb-2">
-          Drop counters (live — cumulative since playback start)
+          Drop counters (live - cumulative since playback start)
         </p>
         <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12.5px]">
           <DebugRow
@@ -2720,7 +2728,7 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
           Off-focus drop test
         </p>
         <p className="text-white/55 text-[12px] leading-relaxed">
-          Click <span className="text-white/80">Run test</span> — if nothing
+          Click <span className="text-white/80">Run test</span> - if nothing
           is playing, a synthetic SMPTE-bars pattern auto-loads via mpv's
           lavfi source (no file, no network). Then move Aura to the state
           you want to measure (alt-tab away, drag to another monitor,
@@ -2802,8 +2810,8 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
                     : "✗ Drops"
               }
             />
-            <DebugRow label="Mode at start" value={result.initial_mode ?? "—"} />
-            <DebugRow label="Mode at end" value={result.final_mode ?? "—"} />
+            <DebugRow label="Mode at start" value={result.initial_mode ?? "-"} />
+            <DebugRow label="Mode at end" value={result.final_mode ?? "-"} />
             <DebugRow
               label="VO drops"
               value={`${result.delta_vo} (${result.rate_vo.toFixed(2)} /s)`}
@@ -2853,15 +2861,15 @@ function DebugRow({ label, value }: { label: string; value: string }) {
 }
 
 function fmtBool(b: boolean | undefined): string {
-  if (b === undefined) return "—";
+  if (b === undefined) return "-";
   return b ? "yes" : "no";
 }
 function fmtCount(n: number | null | undefined): string {
-  if (n === null || n === undefined) return "—";
+  if (n === null || n === undefined) return "-";
   return n.toLocaleString();
 }
 function fmtFps(n: number | null | undefined): string {
-  if (n === null || n === undefined) return "—";
+  if (n === null || n === undefined) return "-";
   return `${n.toFixed(3)} fps`;
 }
 
@@ -2927,7 +2935,7 @@ function AboutSection({ addonCount }: { addonCount: number }) {
 
       <div className="h-px bg-white/6" />
 
-      {/* Debug panel — a one-button entry point to the diagnostic
+      {/* Debug panel - a one-button entry point to the diagnostic
           overlay. Lives under About (not in the TOC) because it's a
           tool, not a setting. The overlay manages its own playback
           test lifecycle so the user doesn't need to set up a stream
@@ -2978,7 +2986,7 @@ function StatRow({ label, value, tooltip }: { label: string; value: string; tool
 }
 
 // ---------------------------------------------------------------------------
-// CheckForUpdatesButton — manual GitHub releases check, rate-limited.
+// CheckForUpdatesButton - manual GitHub releases check, rate-limited.
 //
 // Aura's auto-check is gated to once-per-12h on the home screen; the manual
 // button gives the user an "I want to know NOW" affordance without waiting.
@@ -3031,7 +3039,7 @@ function CheckForUpdatesButton() {
       // checkForUpdatePlugin returns null for "no update", network
       // error, or signature mismatch. We can't disambiguate from
       // the API surface, but in practice the most common outcome
-      // is "you're up to date" — call it that to avoid alarming
+      // is "you're up to date" - call it that to avoid alarming
       // the user on every blip.
       setState("uptodate");
     }
@@ -3081,11 +3089,11 @@ function fmtHrs(secs: number | undefined): string {
 }
 
 // ---------------------------------------------------------------------------
-// SettingsSearchInput — search-bar pill with grow-in animation, clear button,
+// SettingsSearchInput - search-bar pill with grow-in animation, clear button,
 // and a small "n matches" pill that fades in once the user starts typing.
 //
 // Behaviour:
-//   • Focus animation — grows the pill width from 220 px → 320 px when
+//   • Focus animation - grows the pill width from 220 px → 320 px when
 //     focused or non-empty, signalling that the search is "active".
 //   • Esc clears the query AND blurs the input.
 //   • Cmd/Ctrl-K focuses it from anywhere on the Settings page (covers the
@@ -3315,7 +3323,7 @@ type TocGroup = {
 // "Subtitle Style" and "Subtitles · Defaults". Nesting lets the user
 // drill into the right area without reading every label first.
 //
-// SECTION IDS REMAIN STABLE — `id="sec-..."` in the JSX hasn't moved,
+// SECTION IDS REMAIN STABLE - `id="sec-..."` in the JSX hasn't moved,
 // only the navigation-tree structure here changes. Existing deep-link
 // fragments and the search filter still target the same DOM nodes.
 const TOC_GROUPS: TocGroup[] = [
@@ -3422,7 +3430,7 @@ function fastScrollToSettingsEl(
 
 interface SettingsTocProps {
   scrollRoot: HTMLDivElement | null;
-  /** Search state — when present, the TOC renders the search input
+  /** Search state - when present, the TOC renders the search input
    *  underneath its list of contents so the page header can stay
    *  free of sticky chrome. The aside itself is `sticky top-6`, which
    *  keeps the search input in view while the user scrolls without
@@ -3437,7 +3445,7 @@ interface SettingsTocProps {
 }
 
 function SettingsToc({ scrollRoot, search }: SettingsTocProps) {
-  // Always-expanded layout — the collapsing UX added complexity that the
+  // Always-expanded layout - the collapsing UX added complexity that the
   // user found more annoying than helpful. Every leaf is visible at once.
   const [activeId, setActiveId] = useState<string>(TOC_GROUPS[0].sections[0].id);
 
@@ -3457,7 +3465,7 @@ function SettingsToc({ scrollRoot, search }: SettingsTocProps) {
   //      closest to a fixed 16 px offset. Broke for short sections.
   //   2. IntersectionObserver with a negative rootMargin "active band"
   //      between 25 %-50 % from top. The IO callback only fires on
-  //      intersection state CHANGES — for sections taller than the
+  //      intersection state CHANGES - for sections taller than the
   //      band, neither edge of the band ever crosses the section's
   //      boundary while the user reads through, so no callback fires
   //      and the active id doesn't update.
@@ -3465,7 +3473,7 @@ function SettingsToc({ scrollRoot, search }: SettingsTocProps) {
   //      Worked but cached the section list once at mount time, so
   //      anything gated by `{backend && (...)}` (Playback, Window,
   //      Integrations, Performance) was missing from the cache and
-  //      never highlighted — the spy walk silently skipped over them.
+  //      never highlighted - the spy walk silently skipped over them.
   //   4. (current) Same rAF-debounced walk, but query DOM each frame
   //      instead of caching. 18 querySelector(`#id`) lookups per frame
   //      is microsecond-cheap and means async section mounts (backend
@@ -3530,7 +3538,7 @@ function SettingsToc({ scrollRoot, search }: SettingsTocProps) {
         {TOC_GROUPS.map((g) => {
           const isActiveGroup = g.sections.some((s) => s.id === activeId);
           // Flatten when the group has exactly one sub-section AND its
-          // label is the same as the header — drops the redundant
+          // label is the same as the header - drops the redundant
           // subheader row that just repeated the parent name.
           const flat = g.sections.length === 1 && g.sections[0].label === g.label;
           return (
@@ -3570,12 +3578,12 @@ function SettingsToc({ scrollRoot, search }: SettingsTocProps) {
       {/* Search input lives at the FOOTER of the TOC sidebar instead
           of in a sticky page header. Two payoffs:
             • The whole content column reclaims the vertical strip the
-              sticky bar used to consume — the user actually sees more
+              sticky bar used to consume - the user actually sees more
               of each section while scrolling.
             • Because the aside itself is `sticky top-6`, the search
               stays in view as the user scrolls without needing a
               second sticky context. */}
-      </div>{/* /scroll region — search footer below stays pinned + visible */}
+      </div>{/* /scroll region - search footer below stays pinned + visible */}
 
       {search && (
         <div className="pt-3 mt-4 border-t border-white/8 space-y-2 flex-shrink-0">
@@ -3601,7 +3609,7 @@ function SettingsToc({ scrollRoot, search }: SettingsTocProps) {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// KeybindRow — captures a KeyboardEvent.code on press
+// KeybindRow - captures a KeyboardEvent.code on press
 // ---------------------------------------------------------------------------
 
 interface KeybindRowProps {
@@ -3621,7 +3629,7 @@ function KeybindRow({ label, description, code, onChange }: KeybindRowProps) {
     // Capture-mode keydown handler. The user can either press a plain
     // key (records bare code, e.g. "Space") or hold Ctrl/Alt/Shift/Meta
     // and press a non-modifier (records "Ctrl+Digit1"). Modifier-only
-    // presses are ignored — we wait for the actual chord-completing
+    // presses are ignored - we wait for the actual chord-completing
     // keystroke before persisting.
     const onKey = (e: KeyboardEvent) => {
       e.preventDefault();
@@ -3689,7 +3697,7 @@ const MOUSE_BTN_LABELS: Record<number, string> = {
 
 /** Captures one of the three non-conflicting mouse buttons (middle /
  *  back / forward) on the next press. Left (0) and right (2) are
- *  rejected — left selects/navigates, right is the card context menu.
+ *  rejected - left selects/navigates, right is the card context menu.
  *  Esc cancels capture. Mirrors KeybindRow's capture UX. */
 function MouseBindRow({
   label, description, button, onChange,
@@ -3710,7 +3718,7 @@ function MouseBindRow({
         onChange(e.button as 1 | 3 | 4);
         setCapturing(false);
       }
-      // Left (0) / right (2): ignore — keep waiting for a valid button.
+      // Left (0) / right (2): ignore - keep waiting for a valid button.
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); setCapturing(false); }
@@ -3755,7 +3763,7 @@ function MouseBindRow({
 }
 
 // ---------------------------------------------------------------------------
-// ScrobbleAuthRow — one row in the new Trakt + AniList Settings section.
+// ScrobbleAuthRow - one row in the new Trakt + AniList Settings section.
 // Shows connection state ("Not connected" or "Connected as <user>"), a
 // Connect button that opens the OAuth authorize URL in the user's
 // default browser, and a Disconnect button when authenticated. The
@@ -3796,7 +3804,7 @@ function formatExpiryAbsolute(expiresAt: number | null): string | null {
 /** Pick the coarsest reasonable unit so the relative qualifier reads
  *  naturally ("in 23 days" rather than "in 1987200 seconds"). Uses
  *  `Intl.RelativeTimeFormat` with `numeric: "always"` so the output is
- *  always quantitative ("1 day ago", never "yesterday") — matches the
+ *  always quantitative ("1 day ago", never "yesterday") - matches the
  *  precision the task asked for. */
 function formatExpiryRelative(diffMs: number): string {
   const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "always" });
@@ -3846,7 +3854,7 @@ function ScrobbleAuthRow({
 
   const [status, setStatus] = useState<ScrobbleAuthSummary | null>(null);
   const [busy, setBusy] = useState(false);
-  // Auth-code (deep-link) waiting state — only used by AniList now.
+  // Auth-code (deep-link) waiting state - only used by AniList now.
   const [pending, setPending] = useState(false);
   const timeoutRef = useRef<number | null>(null);
   // Tick driving the "expires in N days" relative qualifier. Without it the
@@ -4034,7 +4042,7 @@ function ScrobbleAuthRow({
   // default browser registered, `openUrl` refused, or port 11471 squatted
   // by an orphaned process so the loopback callback has nowhere to land.
   // The tradeoff is that its cookie jar drops session cookies at app exit,
-  // so the user usually has to type their password again — which is the
+  // so the user usually has to type their password again - which is the
   // whole reason it is no longer the default.
   const connectInApp = useCallback(async () => {
     try {
@@ -4076,7 +4084,7 @@ function ScrobbleAuthRow({
     try {
       // Both providers now start in the user's DEFAULT BROWSER, which is
       // what RFC 8252 ("OAuth 2.0 for Native Apps") recommends for native
-      // clients — not for purity, but because the system browser already
+      // clients - not for purity, but because the system browser already
       // holds the user's Trakt / AniList session. Re-authorizing becomes
       // one click on "Authorize" instead of retyping a password into a
       // webview whose cookie jar drops session cookies when Aura exits.
@@ -4085,10 +4093,10 @@ function ScrobbleAuthRow({
       // AUTO-redirect into a foreign protocol handler, so the proxy's old
       // terminal `aura://oauth/<svc>` hop died silently (Firefox being the
       // canonical case). Two different mechanisms avoid that hop now:
-      //   • Trakt   — device flow (RFC 8628). No redirect at all; the Rust
+      //   • Trakt   - device flow (RFC 8628). No redirect at all; the Rust
       //               poll loop detects authorization on its own, from
       //               whichever device the user approved on.
-      //   • AniList — loopback redirect (RFC 8252 §7.3). The proxy lands on
+      //   • AniList - loopback redirect (RFC 8252 §7.3). The proxy lands on
       //               http://127.0.0.1:11471/oauth/callback, which is plain
       //               HTTP and so is never blocked; oauth_callback.rs
       //               nonce-checks it and re-emits the usual `deep-link`.
@@ -4112,7 +4120,7 @@ function ScrobbleAuthRow({
         // Hand the activation page to the user's browser, where they are
         // most likely already signed in to Trakt. The panel below keeps
         // the code (and a QR for approving on a phone) on screen, and the
-        // Rust poll loop clears it the moment Trakt reports Authorized —
+        // Rust poll loop clears it the moment Trakt reports Authorized -
         // regardless of which device did the approving.
         openExternalUrl(begin.verification_url);
       } else {
@@ -4125,7 +4133,7 @@ function ScrobbleAuthRow({
         // point the proxy at 127.0.0.1. It errors (rather than silently
         // downgrading) if the bridge never bound its port, because opening
         // a browser tab that has nowhere to return to is exactly the kind
-        // of silent dead end the silent-failure audit set out to remove —
+        // of silent dead end the silent-failure audit set out to remove -
         // so fall back to the in-app popup and tell the user why.
         let url: string;
         try {
@@ -4182,7 +4190,7 @@ function ScrobbleAuthRow({
       await navigator.clipboard.writeText(deviceFlow.user_code);
       showAppToast("Code copied", { duration: 2000 });
     } catch {
-      // Clipboard API may be blocked; non-fatal — code is still
+      // Clipboard API may be blocked; non-fatal - code is still
       // visible on screen for the user to type manually.
     }
   }, [deviceFlow]);
@@ -4360,7 +4368,7 @@ function ScrobbleAuthRow({
                         p-3 flex flex-col sm:flex-row sm:items-center gap-3">
           <div className="flex-1 min-w-0">
             <p className="text-white/70 text-[11px] leading-snug mb-1">
-              Trakt has opened in your browser — enter this code there to
+              Trakt has opened in your browser - enter this code there to
               authorize Aura, or scan the QR to approve from your phone.
               Aura connects itself once you click Allow.
             </p>
@@ -4393,7 +4401,7 @@ function ScrobbleAuthRow({
               {deviceFlow.verification_url}
             </p>
             {/* Escape hatch. Only worth surfacing while a flow is actually
-                in progress — as a permanent control it would invite users
+                in progress - as a permanent control it would invite users
                 into the worse path (the popup's cookie jar drops session
                 cookies at app exit, so it asks for a password every time). */}
             <button
@@ -4405,7 +4413,7 @@ function ScrobbleAuthRow({
               Browser didn't open? Sign in inside Aura instead
             </button>
           </div>
-          {/* White plate regardless of theme — scanners need the quiet zone
+          {/* White plate regardless of theme - scanners need the quiet zone
               and the light/dark polarity to be right. */}
           {deviceQr && (
             <div className="shrink-0 self-center rounded-md bg-white p-1.5">
@@ -4434,7 +4442,7 @@ function ScrobbleAuthRow({
         <div className="mt-2 rounded-lg border border-ln-accent/25 bg-ln-accent/[0.06] p-3">
           <p className="text-white/70 text-[11px] leading-snug">
             Finish signing in to {label} in your browser. Aura will connect
-            itself the moment you approve — you can leave this page open.
+            itself the moment you approve - you can leave this page open.
           </p>
           <button
             type="button"
@@ -4457,7 +4465,7 @@ function ScrobbleAuthRow({
         <p className="text-amber-400/80 text-xs">
           {service === "anilist"
             ? "AniList token expires within a week. Reconnect to extend (no automatic renewal)."
-            : "Token expires soon. Reconnect to refresh."}
+            : "Token expires soon. Aura renews it automatically on the next scrobble; reconnect only if it lapses first."}
         </p>
       )}
     </div>
@@ -4508,7 +4516,7 @@ export default function SettingsView({ addons, session }: Props) {
   // Every keystroke in a text field drives a `patchBackend` (live save).
   // Showing a toast for each one stacks 3+ "Settings saved" pills when
   // the user is just typing a word. Coalesce to one toast that fires
-  // after typing settles for TOAST_QUIET_MS — fast enough that discrete
+  // after typing settles for TOAST_QUIET_MS - fast enough that discrete
   // clicks (toggles, selects) still feel acknowledged immediately, but
   // slow enough that a typed word produces a single confirmation.
   const TOAST_QUIET_MS = 700;
@@ -4543,7 +4551,7 @@ export default function SettingsView({ addons, session }: Props) {
   }, []);
 
   // Load + watch the crash-reporting sidecar. Refresh whenever the
-  // consent modal or another tab writes — keeps both surfaces in sync
+  // consent modal or another tab writes - keeps both surfaces in sync
   // (`aura:crash-reporting-changed` is the canonical event).
   useEffect(() => {
     const refresh = () => {
@@ -4583,7 +4591,7 @@ export default function SettingsView({ addons, session }: Props) {
       const updated = await invoke<BackendSettings>("update_settings", { patch });
       setBackend(updated);
       queueSavedToast();
-      // Live-apply subtitle styling — when the user adjusts size/colour/etc.
+      // Live-apply subtitle styling - when the user adjusts size/colour/etc.
       // we want the change to show up immediately in the active player
       // without waiting for the next stream load.
       if (Object.keys(patch).some((k) => k.startsWith("subtitle_"))) {
@@ -4609,7 +4617,7 @@ export default function SettingsView({ addons, session }: Props) {
         window.dispatchEvent(new Event("aura:scrobble-settings-changed"));
       }
     } catch {
-      // ignore — UI keeps its optimistic state
+      // ignore - UI keeps its optimistic state
     }
   }, [queueSavedToast]);
 
@@ -4685,7 +4693,7 @@ export default function SettingsView({ addons, session }: Props) {
   //
   // Forgiving fuzzy filter over visible Sections. Each whitespace-separated
   // token in the query must appear as a CHARACTER SUBSEQUENCE in the
-  // section's text content (case-insensitive) — so "subfsz" matches
+  // section's text content (case-insensitive) - so "subfsz" matches
   // "Subtitle Font Size" without the user having to type the words
   // verbatim. Sections that don't match are visually hidden via inline
   // display:none + opacity transition; the underlying React tree stays
@@ -4733,7 +4741,7 @@ export default function SettingsView({ addons, session }: Props) {
       const ok = matchesSettingRow(q, label, description);
       if (ok) {
         matches += 1;
-        // DOM-position-based id — stable within a render and unique
+        // DOM-position-based id - stable within a render and unique
         // even if two settings happen to share a label.
         matchedNow.push(String(idx));
         r.classList.add("settings-row-matched");
@@ -4744,7 +4752,7 @@ export default function SettingsView({ addons, session }: Props) {
     matchCountRef.current = matches;
     setMatchCount(matches);
     setMatchedIds(matchedNow);
-    // Reset to the first match when the matched-list changes — the
+    // Reset to the first match when the matched-list changes - the
     // user typically wants to start at the top of results.
     setCurrentMatchIdx(matchedNow.length > 0 ? 0 : -1);
   }, [searchQuery]);
@@ -4801,7 +4809,7 @@ export default function SettingsView({ addons, session }: Props) {
             gridTemplateColumns: "200px minmax(0, 1fr) 200px",
           }}
         >
-          {/* TOC — sticky so it stays in view while the user scrolls.
+          {/* TOC - sticky so it stays in view while the user scrolls.
               The search input now lives at the BOTTOM of this sidebar
               (instead of in a sticky page header) so the content
               column doesn't lose vertical real estate to a fixed bar.
@@ -4828,7 +4836,7 @@ export default function SettingsView({ addons, session }: Props) {
             />
           </aside>
 
-          {/* Settings content column. No more sticky page header — the
+          {/* Settings content column. No more sticky page header - the
               first section's title sits at the same vertical baseline
               as the TOC's "Contents" heading so the two columns align
               cleanly at the top of the viewport. */}
@@ -4859,7 +4867,7 @@ export default function SettingsView({ addons, session }: Props) {
 
           <GroupHeader label="Browsing" />
 
-          {/* Catalog providers — filtered to addons that actually serve
+          {/* Catalog providers - filtered to addons that actually serve
               metadata or addon-catalog content so stream-only and
               subtitle-only addons don't clutter the picker. */}
           <Section id="sec-catalog" title="Catalog Providers">
@@ -4890,7 +4898,7 @@ export default function SettingsView({ addons, session }: Props) {
             />
           </Section>
 
-          {/* Stream providers — filtered to addons declaring the stream
+          {/* Stream providers - filtered to addons declaring the stream
               resource. The list controls which addons fetch_streams
               actually queries. While streamAddonUrls is null (the
               backward-compatible default), every stream-resource addon is
@@ -4981,7 +4989,7 @@ export default function SettingsView({ addons, session }: Props) {
             <div className="h-px bg-white/6" />
             <SettingToggle
               label="Blur selected episode synopsis"
-              description="Hide the per-episode synopsis text that appears below the show synopsis when you select an episode. Click to reveal per episode. Watched episodes always show their synopsis without blur — the content's no longer a spoiler. Useful for mystery / thriller / weekly-airing anime where the per-episode description gives away plot beats."
+              description="Hide the per-episode synopsis text that appears below the show synopsis when you select an episode. Click to reveal per episode. Watched episodes always show their synopsis without blur - the content's no longer a spoiler. Useful for mystery / thriller / weekly-airing anime where the per-episode description gives away plot beats."
               value={aura.blurEpisodeSynopsis}
               onChange={(v) => setLocal({ blurEpisodeSynopsis: v })}
             />
@@ -5013,12 +5021,12 @@ export default function SettingsView({ addons, session }: Props) {
               (poster, ratings, plot, cast). Default: opens on hover.
               The toggle switches every surface (Home / Search / Library
               / Discover / Queue / Calendar day view) to open it on a
-              mouse-button press instead — useful if hover-open feels
+              mouse-button press instead - useful if hover-open feels
               twitchy or for click-only navigation. */}
           <Section id="sec-hover-panel" title="Hover Meta Panel">
             <SettingDropdown
               label="How the meta panel opens"
-              description="The mini-meta panel (poster, ratings, plot, cast) beside a catalog card. Hover opens it on mouse-over; Mouse button opens it on a bound button press; Press & hold opens it on a long-press of a poster — best for trackpads."
+              description="The mini-meta panel (poster, ratings, plot, cast) beside a catalog card. Hover opens it on mouse-over; Mouse button opens it on a bound button press; Press & hold opens it on a long-press of a poster - best for trackpads."
               value={aura.metaPanelActivation}
               required
               options={[
@@ -5035,7 +5043,7 @@ export default function SettingsView({ addons, session }: Props) {
                 <div className="h-px bg-white/6" />
                 <MouseBindRow
                   label="Meta panel button"
-                  description="Mouse button that opens / dismisses the panel. Middle, Back, or Forward only — left stays select/navigate and right stays the context menu. Click the chip, then press the button. Esc cancels."
+                  description="Mouse button that opens / dismisses the panel. Middle, Back, or Forward only - left stays select/navigate and right stays the context menu. Click the chip, then press the button. Esc cancels."
                   button={aura.metaPanelBindButton}
                   onChange={(b) => setLocal({ metaPanelBindButton: b })}
                 />
@@ -5061,7 +5069,7 @@ export default function SettingsView({ addons, session }: Props) {
           <Section id="sec-open-links" title="Open Links">
             <SettingToggle
               label="Open external links in my browser"
-              description="When on, the right-click “Open in…” links (IMDb, MyAnimeList, Trakt, etc.) open in your default system browser instead of Aura's in-app popup. Off by default — links stay in-app."
+              description="When on, the right-click “Open in…” links (IMDb, MyAnimeList, Trakt, etc.) open in your default system browser instead of Aura's in-app popup. Off by default - links stay in-app."
               value={aura.openLinksExternally}
               onChange={(v) => setLocal({ openLinksExternally: v })}
             />
@@ -5075,9 +5083,9 @@ export default function SettingsView({ addons, session }: Props) {
               <SettingDropdown
                 label="HDR mode"
                 description={
-                  // Keep this short — the user reading this is debugging
+                  // Keep this short - the user reading this is debugging
                   // playback colour, not learning colour science.
-                  "Pick what to do with HDR sources. \"Tone-map for SDR\" is the safe default for laptop / desktop monitors. \"Passthrough\" outputs HDR (requires HDR enabled in Windows) with mpv tone-mapping to your panel's peak — set the nits below to your panel's real peak if highlights clip. Mode changes fully apply from the next playback. \"Off\" disables all HDR processing."
+                  "Pick what to do with HDR sources. \"Tone-map for SDR\" is the safe default for laptop / desktop monitors. \"Passthrough\" outputs HDR (requires HDR enabled in Windows) with mpv tone-mapping to your panel's peak - set the nits below to your panel's real peak if highlights clip. Mode changes fully apply from the next playback. \"Off\" disables all HDR processing."
                 }
                 value={(() => {
                   const m = (backend.hdr_mode ?? "").trim().toLowerCase();
@@ -5134,7 +5142,7 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Auto-advance to next episode"
-                description="When the Next-Up card surfaces, automatically start the next episode after a short countdown. Mouse movement, any key press, scrolling, or the dismiss button cancels the countdown — you only get the auto-jump when you're genuinely afk during the credits. Default off."
+                description="When the Next-Up card surfaces, automatically start the next episode after a short countdown. Mouse movement, any key press, scrolling, or the dismiss button cancels the countdown - you only get the auto-jump when you're genuinely afk during the credits. Default off."
                 value={aura.autoAdvanceNextEpisode}
                 onChange={(v) => setLocal({ autoAdvanceNextEpisode: v })}
               />
@@ -5148,7 +5156,7 @@ export default function SettingsView({ addons, session }: Props) {
                   <div className="h-px bg-white/6" />
                   <SettingToggle
                     label={'"Still watching?" check'}
-                    description="Once a few episodes have auto-played in a row with no input, pause and ask if you're still watching instead of starting the next one — so a binge chain doesn't run all night against your debrid quota. Resets the moment you continue or exit. Default on."
+                    description="Once a few episodes have auto-played in a row with no input, pause and ask if you're still watching instead of starting the next one - so a binge chain doesn't run all night against your debrid quota. Resets the moment you continue or exit. Default on."
                     value={aura.stillWatchingGate}
                     onChange={(v) => setLocal({ stillWatchingGate: v })}
                   />
@@ -5171,8 +5179,8 @@ export default function SettingsView({ addons, session }: Props) {
                 label="Loudness normalization"
                 description={
                   backend.audio_passthrough
-                    ? "Disabled while audio passthrough is active — bitstream output bypasses the audio filter chain. Turn passthrough off to use loudness normalization."
-                    : "EBU R128 loudness normalization for consistent volume across sources. Levels are normalized to −23 LUFS with a true-peak ceiling of −2 dBTP and a 7 LU loudness range. Adds ~100 ms of latency on stream load."
+                    ? "Disabled while audio passthrough is active - bitstream output bypasses the audio filter chain. Turn passthrough off to use loudness normalization."
+                    : "Evens out volume across sources so a quiet dialogue scene and a loud trailer sit at similar levels. Uses a real-time adaptive gain filter (mpv's dynaudnorm) that keeps working through seeks instead of re-settling after every skip. Installed when the player starts, so it applies from the first frame."
                 }
                 value={aura.loudnessNormalization && !backend.audio_passthrough}
                 onChange={(v) => {
@@ -5184,7 +5192,7 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SettingDropdown
                 label="Trailer quality"
-                description="Preferred quality for the Watch Trailer player. 1080p and above stream video and audio separately (DASH, muxed by the player); 720p is a single file. Auto picks the best available. Falls back to the best the trailer offers, and you can change it per trailer from the player's quality menu."
+                description="Preferred quality for the Watch Trailer player. Video and audio usually arrive as separate DASH streams that the player muxes together, falling back to a single muxed file when the trailer has no DASH. Auto picks the best available. Falls back to the best the trailer offers, and you can change it per trailer from the player's quality menu."
                 required
                 value={backend.trailer_quality ?? "1080"}
                 options={[
@@ -5261,10 +5269,10 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Motion interpolation"
-                description="mpv's built-in GPU frame interpolation (video-sync=display-resample). Smooths low-frame-rate content (24 fps film, anime) on a high-refresh display. GPU-cheap. Tune the look with the kernel dropdown below. Applies to anime only — it is skipped on live-action, where it adds judder."
+                description="mpv's built-in GPU frame interpolation (video-sync=display-resample). Smooths low-frame-rate content (24 fps film, anime) on a high-refresh display. GPU-cheap. Tune the look with the kernel dropdown below. Applies to anime only - it is skipped on live-action, where it adds judder."
                 value={!!aura.motionInterpolation}
                 onChange={(v) => {
-                  // Persist ONLY — do not apply live from Settings. Interp is
+                  // Persist ONLY - do not apply live from Settings. Interp is
                   // anime-gated and this view has no active-target context, so
                   // a live invoke here would enable interpolation on whatever
                   // is currently playing (incl. live-action), bypassing the
@@ -5276,19 +5284,19 @@ export default function SettingsView({ addons, session }: Props) {
               />
               <SettingDropdown
                 label="Interpolation kernel (smoothness)"
-                description="The tscale kernel — the smoothness dial. 'oversample' only fixes cadence judder and synthesises no in-between motion, so it looks barely interpolated (especially when your refresh rate is an exact multiple of the video fps). The blending kernels add visibly smoother motion with progressively more softening. Applies live when interpolation is on."
+                description="The tscale kernel - the smoothness dial. 'oversample' only fixes cadence judder and synthesises no in-between motion, so it looks barely interpolated (especially when your refresh rate is an exact multiple of the video fps). The blending kernels add visibly smoother motion with progressively more softening. Takes effect on the next stream you start; use the player's three-dots menu to change what is playing now."
                 value={aura.interpolationTscale ?? "mitchell"}
                 options={[
-                  { value: "oversample",  label: "Oversample — sharpest · judder-fix only (least obvious)" },
-                  { value: "catmull_rom", label: "Catmull-Rom — sharp · light smoothing" },
-                  { value: "mitchell",    label: "Mitchell — balanced smoothing (recommended)" },
-                  { value: "gaussian",    label: "Gaussian — smooth · soft" },
-                  { value: "bicubic",     label: "Bicubic — smoothest · softest" },
+                  { value: "oversample",  label: "Oversample - sharpest · judder-fix only (least obvious)" },
+                  { value: "catmull_rom", label: "Catmull-Rom - sharp · light smoothing" },
+                  { value: "mitchell",    label: "Mitchell - balanced smoothing (recommended)" },
+                  { value: "gaussian",    label: "Gaussian - smooth · soft" },
+                  { value: "bicubic",     label: "Bicubic - smoothest · softest" },
                 ]}
                 required
                 onChange={(v) => {
                   const k = v || "mitchell";
-                  // Persist ONLY — see the Motion-interpolation toggle above.
+                  // Persist ONLY - see the Motion-interpolation toggle above.
                   // Applying live here would push interpolation onto whatever
                   // is playing without the anime gate; the kernel takes effect
                   // on the next play via the gated load path.
@@ -5298,7 +5306,7 @@ export default function SettingsView({ addons, session }: Props) {
             </Section>
           )}
 
-          {/* Audio scoring — Original Language preference + dub aversion */}
+          {/* Audio scoring - Original Language preference + dub aversion */}
           {backend && (
             <Section id="sec-audio-tracks" title="Audio Track Selection">
               <AudioPriorityInput
@@ -5325,7 +5333,7 @@ export default function SettingsView({ addons, session }: Props) {
             </Section>
           )}
 
-          {/* Subtitle defaults — language preference + picker filter.
+          {/* Subtitle defaults - language preference + picker filter.
               Audio defaults moved to "Audio Track Selection" above; the
               older split between global-and-anime defaults was redundant
               once audio_priority + the subtitle preference cover both. */}
@@ -5347,7 +5355,7 @@ export default function SettingsView({ addons, session }: Props) {
             </Section>
           )}
 
-          {/* Subtitle styling — pushed to MPV via apply_subtitle_style.
+          {/* Subtitle styling - pushed to MPV via apply_subtitle_style.
               Changes apply on next stream load AND on every patch (the
               backend re-pushes when the active player updates). */}
           {backend && (
@@ -5424,11 +5432,14 @@ export default function SettingsView({ addons, session }: Props) {
           {backend && (
             <Section id="sec-anime-skip" title="Anime OP / ED Skip">
               <p className="text-white/40 text-xs">
-                Aura looks up timestamps from the AniSkip community
-                database for anime episodes that have a MyAnimeList id.
-                Per-type modes: <span className="text-white/65">off</span> hides
-                the segment, <span className="text-white/65">prompt</span> shows
-                a "Press S to skip" toast, <span className="text-white/65">auto</span> skips
+                Aura sources opening / ending / recap timestamps from the
+                AniSkip community database (anime with a MyAnimeList id), the
+                PublicMetaDB skip database, the file's own chapters, and an
+                on-device audio scan. The modes below apply to whichever source
+                produced the window, on anime and live-action alike.
+                Per-type modes: <span className="text-white/65">off</span> offers
+                no skip for that segment, <span className="text-white/65">prompt</span> shows
+                a "Press X to skip" toast, <span className="text-white/65">auto</span> skips
                 without asking.
               </p>
               <SkipModeRow
@@ -5454,7 +5465,7 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Treat mixed-OP as OP"
-                description="AniSkip's `mixed-op` results bundle a recap into the opening. When on, they're handled with your OP mode; when off, they fall through (effectively unskipped)."
+                description="AniSkip's `mixed-op` results bundle a recap into the opening. This only controls whether they are labelled as an opening; either way they are handled with your OP mode."
                 value={backend.skip_treat_mixed_op_as_op}
                 onChange={(v) => patchBackend({ skip_treat_mixed_op_as_op: v })}
               />
@@ -5466,7 +5477,7 @@ export default function SettingsView({ addons, session }: Props) {
                 onChange={(v) => setLocal({ autoSkipDetect: v })}
               />
               <div className="h-px bg-white/6" />
-              {/* Next-Up filler/recap skip — lives here because users
+              {/* Next-Up filler/recap skip - lives here because users
                   who care about OP/ED skipping typically also care
                   about not auto-advancing into filler. Requires
                   AIOMetadata's per-episode `episodeKind` field; older
@@ -5530,12 +5541,12 @@ export default function SettingsView({ addons, session }: Props) {
               onChange={(v) => v && setTheme(v as ThemeId)}
             />
             <div className="h-px bg-white/6" />
-            {/* Reduced motion — disables Aura's decorative infinite-loop
+            {/* Reduced motion - disables Aura's decorative infinite-loop
                 animations (title bar sweep, ambient backdrop drift,
                 sidebar pill pulse, bell ring + badge bounce, popup
                 breathe, hover-glow rotate). Loading bars, buffering
                 pulses, popup enter/exit transitions, and skeleton
-                shimmer stay on — they convey work-in-progress. The
+                shimmer stay on - they convey work-in-progress. The
                 attribute is applied synchronously before React mounts
                 so OS-pref users never see the BootSplash sweep. */}
             <SettingDropdown
@@ -5543,7 +5554,7 @@ export default function SettingsView({ addons, session }: Props) {
               description="Disable Aura's decorative ambient animations (title-bar sweep, backdrop drift, sidebar glow pulse, bell ring + bounce). Auto follows the OS setting; Always forces motion off regardless of OS; Never forces motion on even if the OS asked for reduce."
               value={aura.reduceMotion}
               options={[
-                { value: "auto",   label: "Auto — follow OS setting" },
+                { value: "auto",   label: "Auto - follow OS setting" },
                 { value: "always", label: "Always reduce" },
                 { value: "never",  label: "Never reduce" },
               ]}
@@ -5578,14 +5589,14 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Show titles in presence"
-                description="When off, Discord just shows 'Watching Aura'."
+                description="When off, playback shows only 'Watching Aura' with no title or artwork. Browse states are unaffected - turn those off separately below."
                 value={backend.discord_rpc_show_titles}
                 onChange={(v) => patchBackend({ discord_rpc_show_titles: v })}
               />
               <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Show what I'm browsing"
-                description="Publish presence for Home, Library, Calendar, Add-ons, Settings, Search and Detail screens. When off, Discord only lights up while a stream is playing."
+                description="Publish presence for every non-playback screen: Home, Discover, Library, Queue, Airing, Live TV, Calendar, History, Add-ons, Settings, Search and Detail. When off, Discord only lights up while a stream is playing."
                 value={backend.discord_rpc_browse_states}
                 onChange={(v) => patchBackend({ discord_rpc_browse_states: v })}
               />
@@ -5605,7 +5616,7 @@ export default function SettingsView({ addons, session }: Props) {
             </Section>
           )}
 
-          {/* Scrobbling — direct Trakt + AniList OAuth.
+          {/* Scrobbling - direct Trakt + AniList OAuth.
               Replaces the AIOMetadata-addon scrobble path with a
               direct connection to each provider. Tokens are stored in
               the OS keyring per Stremio account so signing out and
@@ -5624,18 +5635,18 @@ export default function SettingsView({ addons, session }: Props) {
               <ScrobbleAuthRow
                 service="anilist"
                 authKey={session?.auth_key ?? null}
-                description="AniList tracks anime episode progress. When connected, Aura updates your AniList list as you finish episodes. Detected automatically for anime targets; movies and live-action use Trakt instead."
+                description="AniList tracks anime episode progress. When connected, Aura updates your AniList list as you finish episodes; anime detection is automatic. AniList is additional to Trakt, not instead of it: an anime episode with an IMDb id is sent to both connected services."
               />
               <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Enable scrobbling"
-                description="Master switch. When off, Aura sends no scrobble traffic to either provider, useful for pausing without disconnecting your accounts."
+                description="Master switch. When off, Aura sends nothing automatically to either provider, useful for pausing without disconnecting your accounts. The History page's per-row and bulk scrobble buttons still send when you press them."
                 value={backend.scrobble_enabled}
                 onChange={(v) => patchBackend({ scrobble_enabled: v })}
               />
               <SettingToggle
                 label="Scrobble automatically"
-                description="On by default: Aura records what you watch as you finish it, and episodes you mark as Skipped. Turn this off to decide what gets recorded yourself — nothing is sent automatically, and the History page's per-item and bulk scrobbling keeps working either way."
+                description="On by default: Aura records what you watch as you finish it, and episodes you mark as Skipped. Turn this off to decide what gets recorded yourself - nothing is sent automatically, and the History page's per-item and bulk scrobbling keeps working either way."
                 value={backend.auto_scrobble_enabled}
                 onChange={(v) => patchBackend({ auto_scrobble_enabled: v })}
                 disabled={!backend.scrobble_enabled}
@@ -5643,7 +5654,7 @@ export default function SettingsView({ addons, session }: Props) {
             </Section>
           )}
 
-          {/* Cloud Sync — diagnostic + manual controls for the
+          {/* Cloud Sync - diagnostic + manual controls for the
               per-account state sync (Phase 7). Engine runs silently in
               the background; this section surfaces last-pull / last-
               push / size per namespace plus on-demand Pull / Purge. */}
@@ -5654,7 +5665,7 @@ export default function SettingsView({ addons, session }: Props) {
                 per docs/release-search-spec.md §6.4. When off, the
                 desktop falls back to per-user addon probes for
                 library / calendar reconciliation (same code path as
-                pre-Phase 9). Ignored for guests — they always use the
+                pre-Phase 9). Ignored for guests - they always use the
                 addon path because the cloud requires a signed-in
                 scope hash on the batch + nudge endpoints. */}
             {/* No `disabled` prop on SettingToggle. The setting is
@@ -5664,7 +5675,7 @@ export default function SettingsView({ addons, session }: Props) {
                 endpoints require a signed-in scope hash. */}
             <SettingToggle
               label="Use Aura Cloud's shared release feed"
-              description="When on, Aura asks the cloud service whether new episodes have aired instead of probing addons from your machine. Faster library refresh and lower bandwidth, but Aura Cloud sees the imdb-ids in your library (it never sees streams, watch history, or your Debrid keys). Signed-in only."
+              description="When on, Aura asks the cloud service whether new episodes have aired instead of probing addons from your machine. Faster library refresh and lower bandwidth, but the release feed sends Aura Cloud the imdb-ids in your library (the feed itself never sees streams or your Debrid keys). Signed-in only."
               value={aura.releaseSearchEnabled}
               onChange={(v) => setLocal({ releaseSearchEnabled: v })}
             />
@@ -5692,7 +5703,7 @@ export default function SettingsView({ addons, session }: Props) {
             </Section>
           )}
 
-          {/* Crash reporting — opt-in Sentry integration. The toggle
+          {/* Crash reporting - opt-in Sentry integration. The toggle
               flips `crash_reporting_consent` to true / false (matching
               the consent dialog's two outcomes); the DSN field is
               the per-project key from the Sentry dashboard. Both the
@@ -5702,7 +5713,7 @@ export default function SettingsView({ addons, session }: Props) {
             <Section id="sec-crash-reporting" title="Crash Reporting">
               <SettingToggle
                 label="Send crash reports"
-                description="When enabled, Aura sends anonymised crash reports (error message, stack trace, OS / app version) to the developer's Sentry endpoint. Before an event leaves your machine Aura clears the Sentry user record (username, email, account id), pins the IP to 0.0.0.0, and drops the geolocation and request blocks. The crash text itself is not rewritten, so it can still contain whatever the failing code was handling. Reports help fix bugs that would otherwise vanish silently on the user's machine. Takes effect on next app restart."
+                description="When enabled, Aura sends anonymised diagnostics (error message, stack trace, console warnings and errors, OS / app version) to the developer's Sentry endpoint, plus a masked session replay: a recording of UI interactions and network metadata for every session that hits an error and for roughly one in ten sessions that don't. All text is masked and all media blocked in the replay, so it never captures a password, a title or a stream URL. Before an event leaves your machine Aura clears the Sentry user record (username, email, account id), pins the IP to 0.0.0.0, and drops the geolocation and request blocks. The crash text itself is not rewritten, so it can still contain whatever the failing code was handling. Takes effect on next app restart."
                 value={crashConfig.consent === true}
                 onChange={(v) => patchCrashConfig({ consent: v })}
               />
@@ -5710,7 +5721,7 @@ export default function SettingsView({ addons, session }: Props) {
                   It's now hardcoded into the build (mirrored in
                   src-tauri/src/lib.rs::HARDCODED_SENTRY_DSN and
                   src/main.tsx::HARDCODED_SENTRY_DSN) so end users
-                  have nothing to configure — the only thing they
+                  have nothing to configure - the only thing they
                   decide is whether reports send at all (the toggle
                   above). Developers can still override via the
                   SENTRY_DSN / VITE_SENTRY_DSN env vars at build time,
@@ -5721,7 +5732,7 @@ export default function SettingsView({ addons, session }: Props) {
 
           <GroupHeader label="System" />
 
-          {/* Performance — rendering toggles that need a restart to
+          {/* Performance - rendering toggles that need a restart to
               take effect. Today: just hardware acceleration; future
               additions (e.g. low-power mode, animation reduction
               overrides) would join here. */}
@@ -5736,7 +5747,7 @@ export default function SettingsView({ addons, session }: Props) {
             </Section>
           )}
 
-          {/* Storage — disk + localStorage cache inspection. Clear
+          {/* Storage - disk + localStorage cache inspection. Clear
               buttons remove individual entries; "user data" badge
               flags the destructive ones (manual marks, settings,
               etc.). */}
@@ -5744,7 +5755,7 @@ export default function SettingsView({ addons, session }: Props) {
             <StorageReport />
           </Section>
 
-          {/* Optional Components — on-demand ffmpeg/ffprobe download. Not
+          {/* Optional Components - on-demand ffmpeg/ffprobe download. Not
               bundled (keeps ~314 MB out of every update); fetched here when
               the user wants silence detection / casting transmux. */}
           <Section id="sec-optional-components" title="Optional Components">
@@ -5753,7 +5764,7 @@ export default function SettingsView({ addons, session }: Props) {
 
           <GroupHeader label="Backup & Restore" />
 
-          {/* Backup & Restore — portable settings export/import.
+          {/* Backup & Restore - portable settings export/import.
               Only addon-INDEPENDENT fields round-trip (theme / audio /
               subtitles / keybindings / discord / skip / etc.). Provider
               URL lists are excluded so an import on a fresh machine
@@ -5769,7 +5780,7 @@ export default function SettingsView({ addons, session }: Props) {
                 invoke<BackendSettings>("get_settings")
                   .then(setBackend)
                   .catch(() => {});
-                // Reset local Aura settings state too — the listener
+                // Reset local Aura settings state too - the listener
                 // on aura:settings-changed already fires reads, but
                 // doing it explicitly here keeps the controls in sync
                 // even if the listener registration ordering ever
@@ -5779,7 +5790,7 @@ export default function SettingsView({ addons, session }: Props) {
             />
           )}
 
-          {/* About — also hosts the Debug Panel button (overlay
+          {/* About - also hosts the Debug Panel button (overlay
               modal). Debug surfaced via About-button instead of its
               own page section because it's a diagnostic tool, not a
               setting; the modal also manages its own playback test
@@ -5787,7 +5798,7 @@ export default function SettingsView({ addons, session }: Props) {
           <AboutSection addonCount={addons.length} />
           </div>{/* /content column */}
 
-          {/* Mirror of the TOC width — empty third column. Keeps the
+          {/* Mirror of the TOC width - empty third column. Keeps the
               content column centred on the page rather than off to the
               right next to the TOC. */}
           <div aria-hidden />

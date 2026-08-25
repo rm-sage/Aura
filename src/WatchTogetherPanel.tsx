@@ -252,9 +252,10 @@ function ConfigNotice({
     <div className="space-y-3">
       {firstTime && (
         <p className="text-white/55 text-[12.5px] leading-relaxed">
-          Watch Together needs a relay. Deploy the bundled Cloudflare Worker
-          (see <span className="text-white/75">watch-relay/README.md</span>), then
-          paste its <span className="text-white/75">wss://</span> URL here.
+          Aura ships with a default relay, so you normally only need a room
+          code. Point this at your own deployed Cloudflare Worker (see{" "}
+          <span className="text-white/75">watch-relay/README.md</span>) if you
+          would rather not use the shared one.
         </p>
       )}
       <Field label="Relay URL">

@@ -1,8 +1,8 @@
-// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// Aura - © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // ---------------------------------------------------------------------------
-// RuntimeComponentsSection — Settings UI for the on-demand optional binaries
+// RuntimeComponentsSection - Settings UI for the on-demand optional binaries
 // (ffmpeg / ffprobe). They aren't bundled in the installer (keeps ~314 MB out
 // of every update); the user downloads them here once when they want the
 // dependent features. Downloads are verified against a baked SHA-256 on the
@@ -26,9 +26,9 @@ interface DepUi {
 }
 
 const DEPS: DepUi[] = [
-  { name: "ffmpeg.exe",  label: "FFmpeg",  approxMb: 97,  purpose: "Silence detection — automatic OP/ED skip inference (Hybrid mode)." },
-  { name: "ffprobe.exe", label: "FFprobe", approxMb: 97,  purpose: "Casting transmux — play files a Chromecast can't natively decode (e.g. some MKVs)." },
-  { name: "yt-dlp.exe",  label: "yt-dlp",  approxMb: 18,  purpose: "Watch Trailer — resolves a title's YouTube trailer to a direct stream for Aura's player (downloaded automatically on first use)." },
+  { name: "ffmpeg.exe",  label: "FFmpeg",  approxMb: 97,  purpose: "Automatic OP/ED skip detection, Live Subtitle Sync on embedded subtitle tracks, and casting transmux." },
+  { name: "ffprobe.exe", label: "FFprobe", approxMb: 97,  purpose: "Casting transmux (files a Chromecast can't natively decode, e.g. some MKVs) and Live Subtitle Sync's embedded-track probe." },
+  { name: "yt-dlp.exe",  label: "yt-dlp",  approxMb: 18,  purpose: "Watch Trailer - resolves a title's YouTube trailer to a direct stream for Aura's player (downloaded automatically on first use)." },
 ];
 
 const fmtMb = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(0)} MB`;
@@ -67,7 +67,7 @@ export default function RuntimeComponentsSection() {
   return (
     <div className="rounded-xl border border-white/10 bg-white/[0.03] p-4">
       <p className="text-white/55 text-[12.5px] leading-relaxed mb-4">
-        These components aren&apos;t bundled with Aura — download them once to enable the
+        These components aren&apos;t bundled with Aura - download them once to enable the
         features below. They&apos;re stored separately and survive app updates, so you
         won&apos;t re-download them on the next version.
       </p>

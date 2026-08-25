@@ -1,4 +1,4 @@
-// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// Aura - © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useCallback, useEffect, useState } from "react";
@@ -7,7 +7,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { bumpImageEpoch } from "./imageCacheBust";
 
 // ---------------------------------------------------------------------------
-// StorageReport — Settings → Storage panel.
+// StorageReport - Settings → Storage panel.
 //
 // Surfaces two groups of state:
 //
@@ -20,7 +20,7 @@ import { bumpImageEpoch } from "./imageCacheBust";
 //      is a direct localStorage.removeItem call.
 //
 // All clear actions show a single shared confirm/warning toast first
-// — caches that are auto-rebuildable (recent searches, library cache,
+// - caches that are auto-rebuildable (recent searches, library cache,
 // scanner state) are safe; the manual-watched store and per-account
 // settings are NOT auto-rebuildable and we flag those explicitly.
 // ---------------------------------------------------------------------------
@@ -45,7 +45,7 @@ interface LocalStorageEntry {
   description: string;
   bytes: number;
   /** True when clearing this entry would lose user-authored data
-   *  (manual-watched marks, queue order, settings — not just a cache
+   *  (manual-watched marks, queue order, settings - not just a cache
    *  that can be re-fetched). The UI shows a stronger warning before
    *  letting the user clear these. */
   destructive: boolean;
@@ -65,7 +65,7 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
   {
     prefix:      "aura:manual-state:",
     label:       "Manual watched + queue",
-    description: "Per-account watched, in-progress, and planned marks plus the Queue tab's order. Local-only; clearing wipes every manual mark you've ever set. Skip annotations live in their own entry below and are NOT cleared with this one, so clear both together or skipped episodes keep their tag without a watched mark behind it.",
+    description: "Per-account watched, in-progress, and planned marks plus the Queue tab's order. Synced to Aura Cloud when you're signed in, so a signed-in device can re-merge the server copy after a clear; on a guest install this is the only copy. Skip annotations live in their own entry below and are NOT cleared with this one, so clear both together or skipped episodes keep their tag without a watched mark behind it. Skip annotations live in their own entry below and are NOT cleared with this one, so clear both together or skipped episodes keep their tag without a watched mark behind it.",
     destructive: true,
   },
   {
@@ -89,7 +89,7 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
   {
     prefix:      "aura:meta-cache:v1",
     label:       "Meta detail cache",
-    description: "Persisted MetaDetail responses (cast, runtime, episode lists) shared across Home, Calendar, Continue Watching, and Detail. 24 h TTL. Re-fetches lazily on use. Safe to clear.",
+    description: "Persisted MetaDetail responses (cast, runtime, episode lists) shared across Home, Calendar, Continue Watching, and Detail. 4-hour TTL for series and anime (they gain episodes as they air), 7 days for movies. Re-fetches lazily on use. Safe to clear.",
     destructive: false,
   },
   {
@@ -101,7 +101,7 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
   {
     prefix:      "aura:aniskip-cache:v1",
     label:       "AniSkip op/ed window cache",
-    description: "Per-episode opening, ending, and recap skip windows fetched from the AniSkip API. 30-day TTL; windows for an aired episode are immutable once committed. Safe to clear.",
+    description: "Per-episode opening, ending, and recap skip windows fetched from the AniSkip API. 3-day TTL, so a community correction to an episode's timestamps surfaces within days instead of a month. Capped at 600 episodes. Safe to clear.",
     destructive: false,
   },
   {
@@ -264,7 +264,8 @@ export default function StorageReport() {
         Aura keeps a small set of files on disk for crash diagnostics and a few
         localStorage entries for fast UI startup. Most are safe to clear and
         will rebuild on use; entries flagged "user data" wipe content you've
-        authored (manual marks, queue order, settings) and aren't recoverable.
+        authored (manual marks, queue order, skipped-episode marks). To reset
+        your preferences instead, use Backup &amp; Restore &gt; Reset all settings.
       </div>
 
       {error && (
@@ -365,7 +366,7 @@ export default function StorageReport() {
             <div className="flex-1 min-w-0">
               <p className="text-white/90 text-[13px] font-medium leading-tight">Cached posters &amp; images</p>
               <p className="text-white/40 text-[11px] mt-0.5 leading-snug">
-                Posters, backdrops, and logos are cached on disk by the webview, keyed by URL — so if an
+                Posters, backdrops, and logos are cached on disk by the webview, keyed by URL - so if an
                 image's source or size changed on the server, the old one keeps showing for the same URL.
                 Reloading re-downloads every image from source at the current size. Uses bandwidth; nothing
                 is deleted.
@@ -469,7 +470,7 @@ function ClearConfirmModal({
             </h3>
             <p className="text-white/70 text-[13px] leading-relaxed">
               {pending.destructive
-                ? `This will permanently erase your ${pending.label.toLowerCase()}. The data is local-only and not recoverable from cloud sync.`
+                ? `This will permanently erase your ${pending.label.toLowerCase()} on this device. If you are signed in, Cloud Sync may restore some of it on the next pull, and Settings > Backup & Restore keeps local snapshots you can roll back to. Otherwise it is not recoverable.`
                 : isImages
                   ? "Aura will re-download every poster, backdrop, and logo from source at the current size. Uses bandwidth; nothing is deleted. Use this after a poster source or size change."
                   : `Clear ${pending.label.toLowerCase()}? Aura will rebuild it on next use; this only frees storage.`
