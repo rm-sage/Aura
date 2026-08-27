@@ -477,6 +477,9 @@ pub async fn sync_push<R: Runtime>(
     // we'd rather surface "Setting blob too large" locally than waste a
     // request on a doomed payload.
     let serialized = serde_json::to_vec(&data).map_err(|e| format!("serialize: {e}"))?;
+    // Captured before `serialized` is moved into the request body, so the
+    // success log can report the real payload size.
+    let serialized_len = serialized.len();
     if serialized.len() > MAX_BLOB_BYTES {
         return Err(format!(
             "sync_push {namespace} too large: {} bytes (max {})",
@@ -526,8 +529,12 @@ pub async fn sync_push<R: Runtime>(
         Ok(body) => {
             crate::devlog!(
                 debug, "sync",
-                "pushed {namespace} ({} bytes, etag={})",
-                body.updated_at, body.etag,
+                // `updated_at` is the server's unix-seconds stamp, NOT a size.
+                // It was previously printed as "{n} bytes", which read as a
+                // 1.7 GB blob in the log. The real size is the payload we just
+                // serialized; the PUT response carries only etag + updated_at.
+                "pushed {namespace} ({} bytes, updated_at={}, etag={})",
+                serialized_len, body.updated_at, body.etag,
             );
             Ok(PushOutcome::Ok(PushResult {
                 etag: body.etag,
