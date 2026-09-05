@@ -138,6 +138,10 @@ function loadFromStorage(): Notification[] {
       const title = obj.title;
       const createdAt = obj.createdAt;
       if (typeof id !== "string" || !id) continue;
+      // Download completions are no longer announced (the downloads panel is
+      // the whole report), so drop any that a previous build persisted rather
+      // than leaving dead entries in the bell forever.
+      if (id.startsWith("download:") && kind === "success") continue;
       if (
         kind !== "release"
         && kind !== "episode"

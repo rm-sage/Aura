@@ -25,6 +25,16 @@ import { createPortal } from "react-dom";
 // Safe for buttons inside `data-tauri-drag-region`: pointer-events on the
 // floating tip are explicitly `none`, so it never interferes with the host
 // button's hit-testing or with drag-region detection.
+//
+// Z-INDEX: z-[10700], above EVERY other surface in the app (the highest are
+// the z-[10600] modals). A tooltip is only ever on screen while its own
+// trigger is hovered, so it can never bury something the user is trying to
+// reach, and it is pointer-events-none regardless. It was z-[400], which lost
+// to the whole 10000+ band: the downloads panel (z-[10047]) swallowed the
+// tooltips of its own "Show in folder" / "Remove from list" buttons, and the
+// side panels and popovers would have done the same. Overlap with a context
+// menu is handled by REPOSITIONING (see openMenuRects below), not by z-order,
+// so raising this does not cover a menu.
 // ---------------------------------------------------------------------------
 
 export type TooltipPos = "right" | "left" | "top" | "bottom";
@@ -67,7 +77,7 @@ function clampToViewport(x: number, y: number, w: number, h: number): { x: numbe
 
 /** Rects of every menu surface currently on screen.
  *
- *  A tooltip is z-[400] and a context menu is z-[200]/z-[210], so a tip that
+ *  A tooltip is z-[10700] and a context menu is z-[200]/z-[210], so a tip that
  *  lands on a menu covers it. That matters most where these two actually meet:
  *  a menu row's hint, whose trigger is INSIDE a menu and whose preferred
  *  placement is straight into the submenu that row just opened. Both menu roots
@@ -253,7 +263,7 @@ export default function Tooltip({ text, content, pos = "right", shortcut, delay 
           // --ln-glass-3, which is TINTED per theme, so a tooltip over key art
           // picked up an accent-coloured wash. This is the same surface the
           // search bar and the menus use.
-          className="aura-float-glass fixed z-[400] pointer-events-none whitespace-nowrap
+          className="aura-float-glass fixed z-[10700] pointer-events-none whitespace-nowrap
                      px-2.5 py-1.5 rounded-lg
                      text-[11px] font-medium tracking-wide
                      transition-opacity duration-150"

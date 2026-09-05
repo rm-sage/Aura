@@ -121,31 +121,32 @@ export function downloadsSnapshot(): DownloadsSnapshot {
 const notified = new Set<string>();
 const NOTIFIED_CAP = 300;
 
-/** Announce a job that just reached a terminal state.
+/** Announce a job that FAILED.
  *
- *  Fires BOTH channels, which is the house idiom for "important and must
- *  survive": the bell keeps it (via the existing `aura:notify-force` bridge in
- *  App), and a toast surfaces it now. The toast is a non-player surface at
- *  z-[300], so during playback only the bell entry lands; that matches how the
- *  bell already defers its popup while the player is up and shows it the next
- *  time the user reaches a bell-visible surface. */
+ *  Success is deliberately silent on both channels: a finished download is
+ *  already history in the downloads panel, where the row carries its size and
+ *  the time it landed, so a bell entry and a toast were duplicate reporting of
+ *  something the user can see in one place. A failure is different: it needs
+ *  the user to do something (retry, pick another source) and the panel may
+ *  never be opened, so it still fires BOTH channels, which is the house idiom
+ *  for "important and must survive". The bell keeps it (via the existing
+ *  `aura:notify-force` bridge in App) and a toast surfaces it now. The toast is
+ *  a non-player surface at z-[300], so during playback only the bell entry
+ *  lands; that matches how the bell already defers its popup while the player
+ *  is up and shows it the next time the user reaches a bell-visible surface. */
 function announce(job: DownloadJob): void {
-  const ok = job.state === "completed";
   window.dispatchEvent(
     new CustomEvent("aura:notify-force", {
       detail: {
         id: `download:${job.id}`,
-        kind: ok ? "success" : "error",
-        title: ok ? "Download finished" : "Download failed",
-        subtitle: ok ? job.title : `${job.title} - ${job.error ?? "unknown error"}`,
+        kind: "error",
+        title: "Download failed",
+        subtitle: `${job.title} - ${job.error ?? "unknown error"}`,
       },
     }),
   );
   void import("./AppToast").then(({ showAppToast }) => {
-    showAppToast(
-      ok ? `Downloaded ${job.title}` : `Could not download ${job.title}`,
-      { tone: ok ? "success" : "danger", duration: ok ? 4000 : 6000 },
-    );
+    showAppToast(`Could not download ${job.title}`, { tone: "danger", duration: 6000 });
   });
 }
 
@@ -153,13 +154,14 @@ function apply(next: DownloadsSnapshot): void {
   const previous = snapshot;
   snapshot = next;
 
-  // Announce only on a TRANSITION into a terminal state. The very first
-  // snapshot after a launch is skipped: jobs restored from disk as `failed`
-  // are old news, and toasting them at startup would be noise.
+  // Announce only on a TRANSITION into failure. The very first snapshot after
+  // a launch is skipped: jobs restored from disk as `failed` are old news, and
+  // toasting them at startup would be noise. Completion is not announced at
+  // all; the panel row is the whole report.
   if (previous !== EMPTY) {
     const before = new Map(previous.jobs.map((j) => [j.id, j.state]));
     for (const j of next.jobs) {
-      if (j.state !== "completed" && j.state !== "failed") continue;
+      if (j.state !== "failed") continue;
       if (notified.has(j.id)) continue;
       const was = before.get(j.id);
       if (was === undefined || was === j.state) continue;
