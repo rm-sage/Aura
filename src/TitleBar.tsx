@@ -7,6 +7,7 @@ import { PhysicalPosition } from "@tauri-apps/api/dpi";
 import { invoke } from "@tauri-apps/api/core";
 import Tooltip from "./Tooltip";
 import SyncStatusChip from "./SyncStatusChip";
+import DownloadsButton from "./DownloadsButton";
 
 // Movement (CSS px, either axis) before an armed press becomes a real drag.
 // Below this a press-release stays a plain click, so double-click-to-maximize
@@ -276,6 +277,11 @@ export default function TitleBar({ subtitle, opaque }: Props) {
 
   return (
     <div
+      // CONTRACT: panels anchored under this bar find it by selector to decide
+      // whether an outside-click should dismiss them. On the ROOT because the
+      // bar's clickable surface is mostly the anonymous full-bleed drag layer
+      // below, which has no identity of its own.
+      data-aura-titlebar
       className="relative flex items-center h-9 flex-shrink-0 select-none
                  border-b border-white/6 overflow-hidden"
       style={{
@@ -329,6 +335,12 @@ export default function TitleBar({ subtitle, opaque }: Props) {
           (sec-cloud-sync) once that section ships. */}
       <div className="relative flex items-stretch h-full pl-2" data-no-drag>
         <SyncStatusChip />
+        {/* After the chip, never before: this button expands to ~200px when
+            something is downloading, and expanding to the LEFT of a status
+            icon would shove that icon sideways several times a session. Here
+            it grows into the flex-1 spacer, so nothing else on the bar moves,
+            window controls included. */}
+        <DownloadsButton />
       </div>
 
       {/* Spacer pushes window controls to the right */}

@@ -98,6 +98,11 @@ const PORTABLE_BACKEND_FIELDS = [
   "demuxer_max_mib",
   "scrobble_enabled",
   "auto_scrobble_enabled",
+  // Organised vs flat download layout. A real preference, so it travels.
+  // `download_dir` deliberately does NOT: it is a machine-local path, like
+  // `screenshot_dir`, and is also stripped from the cloud blob in sync.ts
+  // (absence from this list gates file export/import only).
+  "download_organise",
 ] as const;
 
 export type PortableBackendField = typeof PORTABLE_BACKEND_FIELDS[number];

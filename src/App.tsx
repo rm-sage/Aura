@@ -34,6 +34,12 @@ import { CatalogHoverHost } from "./CatalogHoverCard";
 import AppToastHost, { showAppToast } from "./AppToast";
 import ScrobbleRunBar from "./ScrobbleRunBar";
 import ScrobbleClosePrompt from "./ScrobbleClosePrompt";
+import DownloadsClosePrompt from "./DownloadsClosePrompt";
+import DownloadsPanelHost from "./DownloadsPanelHost";
+import DownloadsRelinkBridge from "./DownloadsRelinkBridge";
+import { startDownloadsStore } from "./downloadsStore";
+import { useDownloadsPanelPhase } from "./downloadsPanel";
+import { ConfirmDialogHost } from "./ConfirmDialog";
 import { safeSetItem } from "./storageQuota";
 import FlyUpToastHost, { showFlyUpToast } from "./FlyUpToast";
 import { runtimeDepPresent, ensureRuntimeDep } from "./runtimeDeps";
@@ -2300,6 +2306,13 @@ export default function App() {
   /** True while the "you're closing mid-scrobble" prompt owns the screen — it
    *  renders its own progress, so the floating bar stands down. */
   const [scrobbleClosePromptOpen, setScrobbleClosePromptOpen] = useState(false);
+  // The downloads panel is an App-root sibling, so it cannot reach
+  // PlayerOverlay's MenuTrackerCtx. Reading the phase here and threading it
+  // down as a prop is the same route `subsOpen` takes, and it is what stops a
+  // dismissing click on the video from also toggling pause.
+  const downloadsPanelPhase = useDownloadsPanelPhase();
+  // Rust owns the job list; this only subscribes the projection to it.
+  useEffect(() => startDownloadsStore(), []);
   // Mirror of PlayerOverlay's auto-hide `controlsVisible` so the sibling
   // PlayerPartyHud pill can fade in lockstep with the player chrome.
   const [playerControlsVisible, setPlayerControlsVisible] = useState(true);
@@ -9320,6 +9333,7 @@ export default function App() {
           commitSpeed={wtCommitSpeed}
           onExitPlayback={handleExitPlayback}
           subsOpen={subsOpen}
+          downloadsOpen={downloadsPanelPhase !== "closed"}
           setSubsOpen={setSubsOpen}
           isFullscreen={isFullscreen}
           onToggleFullscreen={toggleFullscreen}
@@ -9701,6 +9715,26 @@ export default function App() {
 
       {/* Answers Rust's refusal to close the window mid-scrobble. */}
       <ScrobbleClosePrompt onOpenChange={setScrobbleClosePromptOpen} />
+
+      {/* Same shape, for downloads still running. */}
+      <DownloadsClosePrompt />
+
+      {/* Answers a job Rust parked in `relinking` after its link expired.
+          Lives on this side because streamQueryAddons reads localStorage,
+          which Rust cannot see: re-implementing that scoping in Rust would
+          query providers the user has switched off. */}
+      <DownloadsRelinkBridge addons={addons} />
+
+      {/* Downloads panel. Mounted HERE, outside the app-body div that gets
+          `hidden` during playback, and portalled to document.body from
+          inside so it escapes .aura-app-shell's stacking context: the
+          singleton ContextMenu renders inline at z-[200] in that context, and
+          a panel above it there would bury its own rows' right-click menus. */}
+      <DownloadsPanelHost isFullscreen={isFullscreen} />
+
+      {/* Answers askConfirm() for callers that are not components (context
+          menu items, event closures) and so cannot use the useConfirm hook. */}
+      <ConfirmDialogHost />
 
       {/* Fly-up toast — spawns at the click point and floats upward.
           Fed by showFlyUpToast(); used for library add/remove feedback

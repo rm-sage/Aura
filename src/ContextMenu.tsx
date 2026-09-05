@@ -274,6 +274,12 @@ function ContextMenuRender({ x, y, items, onClose }: RenderProps) {
     <div
       ref={ref}
       role="menu"
+      // CONTRACT: floating panels test for this with closest() to decide
+      // whether an outside-click should dismiss them. A menu raised FROM a
+      // panel row is not a DOM descendant of that panel (this host lives
+      // elsewhere in the tree), so without a marker the first click on a menu
+      // item would close the panel underneath it.
+      data-aura-context-menu
       // aura-float-glass carries the background, border and shadow, so the
       // utilities that used to set those are gone rather than fighting it.
       className="aura-float-glass fixed z-[200] min-w-[220px] py-1.5 rounded-xl select-none"

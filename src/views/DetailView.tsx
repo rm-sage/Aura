@@ -25,6 +25,7 @@ import { fetchReleaseSignal } from "../releaseSearch";
 import { resolveDefaultMetaUrl } from "../addonDefaults";
 import { findAIOMetadataAddon, isAnimeMeta, markAnimeId, typeLabel } from "../aiometadata";
 import { dedupedInvoke } from "../invokeDedupe";
+import { buildStreamMenu, type StreamMenuContext } from "../downloadsMenu";
 import { peekRichestCachedDetailById } from "../metaCache";
 import DetailHud from "../DetailHud";
 import { FactList, FactsBlock } from "../AnimeExtrasOverlay";
@@ -2288,8 +2289,27 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
               setPanelMode("episodes");
             }}
             onPlay={(s) => onPlayStream(s, targetForPlay(activeVideo))}
-            onCopy={(text) => navigator.clipboard.writeText(text).catch(() => {})}
-            onPlayExternal={(url) => openExternalUrl(url)}
+            menuCtx={{
+              // The id the streams were actually fetched for, so a relink
+              // re-queries the same episode rather than the series root.
+              streamId: (isEpisodic
+                ? (activeVideo?.id ?? resumeVideoId ?? openEpisodeSnapshot ?? meta.id)
+                : (activeVideo?.id ?? meta.id)),
+              naming: {
+                media_type: meta.media_type,
+                title: detail?.name ?? meta.name,
+                // Same derivation the HUD uses, so the folder name and the
+                // page agree about which year this is.
+                year: meta.release_info
+                  ? Number(meta.release_info.slice(0, 4)) || null
+                  : null,
+                season: activeVideo?.season ?? null,
+                episode: activeVideo?.episode ?? null,
+                episode_title: activeVideo?.title ?? null,
+              },
+              onCopy: (text: string) => navigator.clipboard.writeText(text).catch(() => {}),
+              onPlayExternal: (url: string) => openExternalUrl(url),
+            }}
             scrollToVideoId={scrollOnceTo}
             highlightVideoId={ringEpisodeId}
             seriesArt={episodeFallbackArt}
@@ -3084,8 +3104,9 @@ interface PanelProps {
   onPickEpisode: (v: VideoEntry) => void;
   onBackToEpisodes: () => void;
   onPlay: (s: StreamEntry) => void;
-  onCopy: (text: string) => void;
-  onPlayExternal: (url: string) => void;
+  /** Identity + naming for the stream row's right-click menu, including the
+   *  copy and play-externally handlers it used to take separately. */
+  menuCtx: StreamMenuContext;
   /** When provided, the EpisodesPanel scrolls this id to the top of the
    *  list on mount and pre-selects the matching season. */
   scrollToVideoId?: string | null;
@@ -3107,7 +3128,7 @@ interface PanelProps {
 
 function UnifiedPanel({
   mode, partyStreamKey, isEpisodic, seriesId, seriesMediaType, videos, activeVideo, streams, streamMeta, streamsLoading,
-  groupedStreams, metaLoading, onPickEpisode, onBackToEpisodes, onPlay, onCopy, onPlayExternal,
+  groupedStreams, metaLoading, onPickEpisode, onBackToEpisodes, onPlay, menuCtx,
   scrollToVideoId, onScrollHandled, seasonHint, seasonNames, highlightVideoId, seriesArt, detail,
 }: PanelProps) {
   // Absolute-episode annotation for the streams header (e.g. "(E88)" next to
@@ -3164,8 +3185,7 @@ function UnifiedPanel({
               partyStreamKey={partyStreamKey}
               onBack={isEpisodic ? onBackToEpisodes : undefined}
               onPlay={onPlay}
-              onCopy={onCopy}
-              onPlayExternal={onPlayExternal}
+              menuCtx={menuCtx}
               absoluteTag={streamAbsoluteTag}
             />
           </div>
@@ -4920,7 +4940,7 @@ function StreamMessagesEmptyState({ metadata }: { metadata: StreamMetadata }) {
 const STREAM_FORMAT_HINT_KEY = "aura:stream-format-hint-dismissed";
 
 function StreamsPanel({
-  isEpisodic, activeVideo, streams, streamMeta, loading, groups, partyStreamKey, onBack, onPlay, onCopy, onPlayExternal, absoluteTag,
+  isEpisodic, activeVideo, streams, streamMeta, loading, groups, partyStreamKey, onBack, onPlay, menuCtx, absoluteTag,
 }: {
   isEpisodic: boolean;
   activeVideo: VideoEntry | null;
@@ -4931,8 +4951,10 @@ function StreamsPanel({
   partyStreamKey?: string | null;
   onBack?: () => void;
   onPlay: (s: StreamEntry) => void;
-  onCopy: (text: string) => void;
-  onPlayExternal: (url: string) => void;
+  /** Identity + naming for the right-click menu's Download entry. Built by the
+   *  parent because a stream row has none of it: the show, year, season,
+   *  episode and episode title all live up there. */
+  menuCtx: StreamMenuContext;
   /** Absolute-episode annotation ("(E88)") when this show uses per-season
    *  numbering but has arcs; empty otherwise. Computed by the parent, which has
    *  the full episode list. Sits between the SxxEyy tag and the title so the
@@ -5092,8 +5114,7 @@ function StreamsPanel({
                       stream: s,
                       partyMatch,
                       onPlay: () => onPlay(s),
-                      onCopy,
-                      onPlayExternal,
+                      menuCtx,
                     };
                     return formatterOn
                       ? <StreamRow key={key} {...rowProps} />
@@ -5259,13 +5280,12 @@ function StreamFormatHint({ onTurnOff, onDismiss }: { onTurnOff: () => void; onD
  *  no detail is lost when the parser can't read the format. Play + right-click
  *  actions mirror StreamRow. */
 function RawStreamRow({
-  stream, partyMatch, onPlay, onCopy, onPlayExternal,
+  stream, partyMatch, onPlay, menuCtx,
 }: {
   stream: StreamEntry;
   partyMatch?: boolean;
   onPlay: () => void;
-  onCopy: (text: string) => void;
-  onPlayExternal: (url: string) => void;
+  menuCtx: StreamMenuContext;
 }) {
   return (
     <button
@@ -5273,16 +5293,10 @@ function RawStreamRow({
       onClick={onPlay}
       onContextMenu={(e) => {
         e.preventDefault();
-        const items = [
-          stream.url ? { label: "Copy stream link", onClick: () => onCopy(stream.url!) } : null,
-          stream.info_hash
-            ? { label: "Copy magnet link", onClick: () => onCopy(`magnet:?xt=urn:btih:${stream.info_hash}`) }
-            : null,
-          stream.url
-            ? { label: "Play externally", icon: <ExternalIcon />, onClick: () => onPlayExternal(stream.url!) }
-            : null,
-        ].filter(Boolean) as Array<{ label: string; icon?: React.ReactNode; onClick: () => void }>;
-        openContextMenu(e.clientX, e.clientY, items);
+        openContextMenu(
+          e.clientX, e.clientY,
+          buildStreamMenu(stream, menuCtx, <ExternalIcon />),
+        );
       }}
       title={stream.filename ?? undefined}
       className={[
@@ -5337,13 +5351,12 @@ function RawStreamRow({
 // ---------------------------------------------------------------------------
 
 function StreamRow({
-  stream, partyMatch, onPlay, onCopy, onPlayExternal,
+  stream, partyMatch, onPlay, menuCtx,
 }: {
   stream: StreamEntry;
   partyMatch?: boolean;
   onPlay: () => void;
-  onCopy: (text: string) => void;
-  onPlayExternal: (url: string) => void;
+  menuCtx: StreamMenuContext;
 }) {
   const ref = useRef<HTMLButtonElement>(null);
   const parsed = useMemo(() => parseStream(stream), [stream]);
@@ -5378,22 +5391,10 @@ function StreamRow({
       onClick={onPlay}
       onContextMenu={(e) => {
         e.preventDefault();
-        const items = [
-          stream.url
-            ? { label: "Copy stream link", onClick: () => onCopy(stream.url!) }
-            : null,
-          stream.info_hash
-            ? { label: "Copy magnet link",
-                onClick: () => onCopy(`magnet:?xt=urn:btih:${stream.info_hash}`) }
-            : null,
-          stream.url
-            ? { label: "Play externally", icon: <ExternalIcon />,
-                onClick: () => onPlayExternal(stream.url!) }
-            : null,
-        ].filter(Boolean) as Array<{
-          label: string; icon?: React.ReactNode; onClick: () => void;
-        }>;
-        openContextMenu(e.clientX, e.clientY, items);
+        openContextMenu(
+          e.clientX, e.clientY,
+          buildStreamMenu(stream, menuCtx, <ExternalIcon />),
+        );
       }}
       className={[
         "relative hover-glow w-full text-left rounded-xl px-4 py-3",

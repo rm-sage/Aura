@@ -607,10 +607,13 @@ async function readBackendSettings(): Promise<BackendSettingsLite> {
 async function applyBackendSettings(s: BackendSettingsLite): Promise<void> {
   if (!s || typeof s !== "object" || Object.keys(s).length === 0) return;
   try {
-    // `update_settings` accepts a partial JSON patch; the Rust side
-    // whitelists known fields and ignores anything outside that
-    // surface, so feeding it a stale or unknown key is a no-op rather
-    // than an error.
+    // `update_settings` accepts a partial JSON patch. NOTE: it does NOT
+    // whitelist - it shallow-merges every key of the patch into the current
+    // settings object and deserializes the result (settings.rs). An unknown
+    // key is dropped by serde, but a KNOWN key is applied whatever it is.
+    // That is why machine-local paths have to be stripped explicitly below
+    // rather than merely left out of the portable field lists, which gate
+    // file export/import only.
     await invoke("update_settings", { patch: s });
   } catch (e) {
     console.warn("[sync] applyBackendSettings failed:", e);
@@ -643,7 +646,15 @@ async function readSettingsBlob(): Promise<SettingsSyncBlob> {
   // settings were pulled, merged, then silently discarded. Bumps
   // happen in saveAuraSettings (frontend) and in the settings-
   // changed listener installed by installSyncTriggers (backend).
-  return { backend, frontend, updated_at: getSettingsUpdatedAt(), api_keys };
+  // Machine-local PATHS never leave this device. A `D:\Media` root synced to
+  // a laptop with no D drive would fail every download against a folder the
+  // user never chose, and a screenshot folder is the same problem. Stripping
+  // outbound as well as inbound means the cloud blob never even carries them,
+  // so an older client that predates the inbound guard cannot apply one either.
+  const backendShared: BackendSettingsLite = { ...backend };
+  delete (backendShared as Record<string, unknown>).download_dir;
+  delete (backendShared as Record<string, unknown>).screenshot_dir;
+  return { backend: backendShared, frontend, updated_at: getSettingsUpdatedAt(), api_keys };
 }
 
 async function writeSettingsBlob(blob: Partial<SettingsSyncBlob>): Promise<void> {
@@ -669,7 +680,16 @@ async function writeSettingsBlob(blob: Partial<SettingsSyncBlob>): Promise<void>
     );
   }
   if (blob.backend) {
-    await applyBackendSettings(blob.backend);
+    // Same carve-out on the way in. Re-reading the local values and pinning
+    // them into the patch is what makes this safe against the shallow merge
+    // described in applyBackendSettings: omitting a key is not enough if the
+    // incoming blob still has it.
+    const localBackend = await readBackendSettings();
+    await applyBackendSettings({
+      ...blob.backend,
+      download_dir: localBackend.download_dir,
+      screenshot_dir: localBackend.screenshot_dir,
+    });
   }
   // Decrypt the API-keys blob (if present) and persist the
   // contained values to the local OS keyring. Silently skips when

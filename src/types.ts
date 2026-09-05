@@ -293,6 +293,21 @@ export interface StreamEntry {
    *  StreamRow swaps the star rating for a red "Unreliable" badge only when
    *  this is exactly `true`. */
   episode_pack?: boolean | null;
+  /** `behaviorHints.proxyHeaders.request` - headers the addon says the origin
+   *  REQUIRES, typically a Referer or a specific User-Agent.
+   *
+   *  Playback never needed these: mpv connects direct and sends its own Lavf
+   *  User-Agent, which is what provider gating is usually keyed on. A DOWNLOAD
+   *  goes out through reqwest instead, so without forwarding these a stream
+   *  that plays perfectly would 403 the moment you tried to save it. Pairs
+   *  rather than a map so the addon's order survives. */
+  proxy_headers?: Array<[string, string]> | null;
+  /** `behaviorHints.videoSize` - the file size in BYTES, when the addon sends
+   *  it. Everything else size-related on the wire is a human string parsed out
+   *  of the title text (`streamMeta.ts` produces "12.6 GB", never a number), so
+   *  this is the only real byte count available before a download's first
+   *  response, and it is what the free-space preflight uses. */
+  video_size?: number | null;
 }
 
 /** AIOStreams emits structured payloads alongside the canonical `streams`

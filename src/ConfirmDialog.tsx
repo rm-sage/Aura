@@ -78,6 +78,64 @@ export function useConfirm(): {
   return { ask, dialog };
 }
 
+// ---------------------------------------------------------------------------
+// Singleton form — for callers that are not React components.
+//
+// `useConfirm` is a hook, so it cannot be reached from a context-menu item's
+// onClick, an event-listener closure, or any other plain function. Those get
+// `askConfirm()` instead, answered by the one <ConfirmDialogHost /> mounted
+// near the app root. Same module-level global-setter shape as
+// ContextMenu.tsx's `openContextMenu`, and for the same reason: the alternative
+// is threading a prop through every level of the tree.
+// ---------------------------------------------------------------------------
+
+type HostState = { opts: ConfirmOptions; resolve: (v: boolean) => void };
+
+let _confirmSetter: ((s: HostState | null) => void) | null = null;
+
+/** Imperative confirm for non-component callers. Resolves false when no host
+ *  is mounted, so a missing host degrades to "the user said no" rather than
+ *  hanging the caller forever. */
+export function askConfirm(opts: ConfirmOptions): Promise<boolean> {
+  if (!_confirmSetter) {
+    console.warn("[confirm] askConfirm called but no ConfirmDialogHost is mounted");
+    return Promise.resolve(false);
+  }
+  return new Promise<boolean>((resolve) => {
+    _confirmSetter?.({ opts, resolve });
+  });
+}
+
+/** Mount once near the app root. */
+export function ConfirmDialogHost() {
+  const [state, setState] = useState<HostState | null>(null);
+
+  useEffect(() => {
+    _confirmSetter = setState;
+    return () => {
+      if (_confirmSetter === setState) _confirmSetter = null;
+    };
+  }, []);
+
+  // Unmounting with a question open must not strand its awaiter.
+  const pending = useRef<HostState | null>(null);
+  pending.current = state;
+  useEffect(() => () => pending.current?.resolve(false), []);
+
+  if (!state) return null;
+  const settle = (v: boolean) => {
+    setState(null);
+    state.resolve(v);
+  };
+  return (
+    <ConfirmDialog
+      {...state.opts}
+      onConfirm={() => settle(true)}
+      onCancel={() => settle(false)}
+    />
+  );
+}
+
 function ConfirmDialog({
   title, message, detail, confirmLabel = "Confirm", cancelLabel = "Cancel",
   tone = "accent", onConfirm, onCancel,

@@ -2836,3 +2836,183 @@ html[data-reduced-motion="true"] .aura-nav-close-glyph {
 html[data-reduced-motion="true"] .aura-canon-fade {
   animation: none;
 }
+
+/* ------------------------------------------------------------------ */
+/* Download manager.                                                   */
+/*                                                                    */
+/* Two constraints shape everything here. The title bar is            */
+/* `overflow-hidden` (TitleBar.tsx), so nothing on the button may use  */
+/* an OUTER box-shadow: a glow would be clipped flat at y=0 and y=36.  */
+/* Every attention treatment is therefore `inset`, and the completion  */
+/* halo is an SVG circle rather than a shadow spread. And              */
+/* `.aura-float-glass` sets background, border AND box-shadow in one   */
+/* shorthand while sitting outside @layer components, so it beats any  */
+/* Tailwind utility regardless of source order: every state ring below */
+/* is a class, never a `ring-*` utility, which would emit into         */
+/* box-shadow and lose silently.                                      */
+/* ------------------------------------------------------------------ */
+
+/* Expansion to "3 downloads in progress". The 0fr -> 1fr grid trick
+   animates to the label's INTRINSIC width, so the pill re-flows correctly
+   when the text changes from "3 downloads" to "12 downloads" with no JS
+   measurement. If grid-template-columns interpolation is ever unavailable
+   the two end states are still right, so it snaps rather than breaking.
+   Curve is the app's `cinematic` bezier, shared with .aura-bell-panel-in
+   and .settings-section-enter. */
+.aura-dl-label {
+  display: grid;
+  grid-template-columns: 0fr;
+  margin-left: 0;
+  opacity: 0;
+  transition:
+    grid-template-columns 320ms cubic-bezier(0.16, 1, 0.3, 1),
+    margin-left 320ms cubic-bezier(0.16, 1, 0.3, 1),
+    opacity 180ms ease-out 60ms;
+}
+.aura-dl-btn.is-expanded .aura-dl-label {
+  grid-template-columns: 1fr;
+  margin-left: 7px;
+  opacity: 1;
+}
+.aura-dl-label > span {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.aura-dl-btn {
+  transition: background-color 180ms ease-out, box-shadow 180ms ease-out,
+              color 220ms ease-out, opacity 220ms ease-out;
+}
+/* Matches the hover the other three title-bar buttons pass as a prop. */
+.aura-dl-btn:hover { background: rgba(255, 255, 255, 0.10); }
+.aura-dl-btn.is-open {
+  background: rgb(var(--ln-accent-rgb) / 0.12);
+  box-shadow: inset 0 0 0 1px rgb(var(--ln-accent-rgb) / 0.42);
+}
+
+/* In-icon progress arc. `linear`, never an ease: an eased segment per tick
+   makes the arc visibly accelerate and decelerate twice a second, which
+   reads as stutter rather than motion. The duration is matched to the
+   engine's 500ms snapshot cadence so each step lands just as the next
+   arrives. */
+.aura-dl-ring {
+  stroke-dasharray: 66;
+  stroke-dashoffset: 66;
+  transform: rotate(-90deg);
+  transform-origin: center;
+  transition: stroke-dashoffset 520ms linear;
+}
+.aura-dl-ring.is-indeterminate {
+  stroke-dasharray: 18 48;
+  stroke-dashoffset: 0;
+  transition: none;
+  /* Reuses the existing refresh spinner keyframe rather than defining a
+     second identical one. */
+  animation: aura-refresh-spin 1.1s linear infinite;
+}
+
+/* Completion flourish: the glyph drops into the tray and settles. Spring
+   curve is the app's `spatial`, shared with .aura-bell-badge-pop. */
+@keyframes aura-dl-land {
+  0%   { transform: translateY(-3px)  scale(1);    }
+  45%  { transform: translateY(1.5px) scale(1.10); }
+  70%  { transform: translateY(0)     scale(0.97); }
+  100% { transform: translateY(0)     scale(1);    }
+}
+.aura-dl-btn.is-complete .aura-dl-glyph {
+  animation: aura-dl-land 440ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+/* Emerald ring expanding out of the icon. scale(1.55) on r=10.5 reaches
+   about 10.7 CSS px at a 16px render; the icon centre sits at y=18 in the
+   36px bar, so the furthest extent is y = 7.3..28.7 and stays inside the
+   bar's clip. */
+@keyframes aura-dl-halo {
+  0%   { opacity: 0;    transform: scale(0.35); }
+  22%  { opacity: 0.85; transform: scale(0.85); }
+  100% { opacity: 0;    transform: scale(1.55); }
+}
+.aura-dl-halo-ring {
+  opacity: 0;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+.aura-dl-btn.is-complete .aura-dl-halo-ring {
+  animation: aura-dl-halo 720ms ease-out forwards;
+}
+
+/* Unacknowledged failure. INSET only (see the header note). The 3.6s period
+   is deliberately the same as .aura-pill-alert so the app's two attention
+   loops beat in step rather than against each other. Stops the moment the
+   panel opens: the user has seen it, so stop chasing them. */
+@keyframes aura-dl-alert {
+  0%, 100% {
+    box-shadow: inset 0 0 0 1px rgb(251 113 133 / 0.20),
+                inset 0 0 10px -2px rgb(251 113 133 / 0.18);
+  }
+  50% {
+    box-shadow: inset 0 0 0 1px rgb(251 113 133 / 0.42),
+                inset 0 0 16px -1px rgb(251 113 133 / 0.40);
+  }
+}
+.aura-dl-alert { animation: aura-dl-alert 3.6s ease-in-out infinite; }
+
+/* Panel. transform-origin is 36px from its left edge because the panel sits
+   at left:20 and the trigger icon's centre is at x=56, so it unfolds from
+   directly under the icon rather than from a corner. */
+@keyframes aura-dl-panel-in {
+  from { opacity: 0; transform: translateY(-8px) scale(0.965); }
+  to   { opacity: 1; transform: translateY(0)    scale(1); }
+}
+@keyframes aura-dl-panel-out {
+  from { opacity: 1; transform: translateY(0)    scale(1); }
+  to   { opacity: 0; transform: translateY(-6px) scale(0.975); }
+}
+.aura-dl-panel { transform-origin: 36px top; }
+.aura-dl-panel-in  { animation: aura-dl-panel-in  220ms cubic-bezier(0.16, 1, 0.3, 1) both; }
+.aura-dl-panel-out { animation: aura-dl-panel-out 180ms ease-in both; }
+
+/* Row entrance, staggered by the host and capped at six so a long list does
+   not spend a second cascading. */
+@keyframes aura-dl-row-in {
+  from { opacity: 0; transform: translateY(5px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.aura-dl-row-in { animation: aura-dl-row-in 240ms cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+/* Progress bar. Same linear rule as the icon arc, and for the same reason. */
+.aura-dl-bar {
+  background: var(--ln-accent);
+  transition: width 520ms linear, background-color 200ms ease-out;
+}
+.aura-dl-bar.is-paused { background: rgba(255, 255, 255, 0.45); }
+.aura-dl-bar.is-error  { background: rgb(251, 113, 133); width: 100%; }
+/* No size known yet: a sliver that travels, rather than a fraction that
+   would be a fiction. */
+.aura-dl-bar.is-indeterminate {
+  width: 35%;
+  animation: aura-dl-bar-slide 1.4s ease-in-out infinite;
+}
+@keyframes aura-dl-bar-slide {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(320%); }
+}
+
+/* Reduced motion. The infinite decorative loops go; the panel enter/exit and
+   the row entrance STAY, because they communicate where the panel came from,
+   and the indeterminate bar stays because it is the only signal that work is
+   happening at all. Same reasoning as the existing block above: functional
+   state-conveying animation is not decoration. */
+html[data-reduced-motion="true"] .aura-dl-alert,
+html[data-reduced-motion="true"] .aura-dl-btn.is-complete .aura-dl-glyph,
+html[data-reduced-motion="true"] .aura-dl-btn.is-complete .aura-dl-halo-ring {
+  animation: none !important;
+}
+html[data-reduced-motion="true"] .aura-dl-panel-in,
+html[data-reduced-motion="true"] .aura-dl-panel-out,
+html[data-reduced-motion="true"] .aura-dl-row-in {
+  animation-duration: 1ms;
+}

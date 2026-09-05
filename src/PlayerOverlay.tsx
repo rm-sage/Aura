@@ -1097,6 +1097,13 @@ interface Props {
 
   // Subtitle picker (the EXTERNAL OpenSubtitles search)
   subsOpen: boolean;
+  /** True while the title-bar Downloads panel is open (including its exit
+   *  animation). Threaded exactly like `subsOpen`, and for the same reason:
+   *  `useMenuOpenSync` is a silent no-op outside MenuTrackerCtx.Provider,
+   *  which is mounted inside THIS component, so an App-root panel can never
+   *  reach it. Feeding `anyMenuOpen` is what stops a dismissing click on the
+   *  video from also toggling pause. */
+  downloadsOpen?: boolean;
   setSubsOpen: (open: boolean) => void;
 
   // Lifted fullscreen state
@@ -1301,7 +1308,7 @@ export default function PlayerOverlay({
   onControlsVisibleChange,
   togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
   onExitPlayback,
-  subsOpen, setSubsOpen,
+  subsOpen, setSubsOpen, downloadsOpen = false,
   isFullscreen, onToggleFullscreen,
   streamUrl, externalSubs, preferredSubLang, preferredAudioLang,
   selectableSubLangs,
@@ -1324,7 +1331,7 @@ export default function PlayerOverlay({
     openMenuCountRef.current = openMenuCount;
   }, [openMenuCount]);
 
-  const anyMenuOpen = openMenuCount > 0 || subsOpen;
+  const anyMenuOpen = openMenuCount > 0 || subsOpen || downloadsOpen;
   const anyMenuOpenRef = useRef(false);
   useEffect(() => { anyMenuOpenRef.current = anyMenuOpen; }, [anyMenuOpen]);
 
@@ -2141,7 +2148,14 @@ export default function PlayerOverlay({
   // notification.
   const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dismissNextClickRef = useRef(false);
-  const handleVideoMouseDown = useCallback(() => {
+  const handleVideoMouseDown = useCallback((e: React.MouseEvent) => {
+    // LEFT BUTTON ONLY. React's onMouseDown fires for the secondary button but
+    // onClick does not, and main.tsx suppresses `contextmenu`. So without this
+    // guard a right-click while a menu is open arms the flag, no `click` ever
+    // arrives to consume it, and the user's NEXT left-click on the video is
+    // silently eaten. Latent while only `subsOpen` fed anyMenuOpen; reachable
+    // every session once right-clicking over an open panel is a real gesture.
+    if (e.button !== 0) return;
     if (anyMenuOpenRef.current) {
       dismissNextClickRef.current = true;
     }

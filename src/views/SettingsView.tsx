@@ -117,6 +117,13 @@ interface BackendSettings {
   demuxer_readahead_secs: number;
   demuxer_max_mib: number;
   screenshot_dir: string;
+  /** Root folder downloads are written to. Empty = not chosen yet; the first
+   *  download prompts for one. Machine-local: stripped from the cloud blob in
+   *  sync.ts and absent from both portable lists. */
+  download_dir: string;
+  /** true = organised layout (Show/Season 01/...), false = flat. A real
+   *  preference, so unlike the path it does sync and is portable. */
+  download_organise: boolean;
   keybindings: Record<string, string>;
   skip_op_mode: string;
   skip_ed_mode: string;
@@ -3357,6 +3364,7 @@ const TOC_GROUPS: TocGroup[] = [
     sections: [
       { id: "sec-appearance", label: "Theme" },
       { id: "sec-window",     label: "Window & System" },
+      { id: "sec-downloads",  label: "Downloads" },
     ],
   },
   {
@@ -5571,6 +5579,66 @@ export default function SettingsView({ addons, session }: Props) {
                 description="Hide Aura to a tray icon when you click the close button instead of exiting. Click the tray icon to bring the window back, or right-click it for Quit. To exit without going to the tray first, press and hold the close button for a second."
                 value={backend.minimize_to_tray_on_close}
                 onChange={(v) => patchBackend({ minimize_to_tray_on_close: v })}
+              />
+          </Section>
+          )}
+
+          {/* Downloads */}
+          {backend && (
+            <Section id="sec-downloads" title="Downloads">
+              <div className="px-1 py-3" data-settings-label="Download folder">
+                <p className="text-white/75 text-sm font-medium">Download folder</p>
+                <p className="text-white/45 text-[12.5px] leading-snug mt-0.5 mb-2">
+                  Where files saved from a title's source list are written. If you
+                  leave this blank, Aura asks the first time you download something.
+                  This folder stays on this computer: it is never synced to your
+                  other devices, since a drive letter rarely means the same thing twice.
+                </p>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={backend.download_dir ?? ""}
+                    placeholder="Not set yet"
+                    readOnly
+                    className="flex-1 min-w-0 bg-white/[0.06] border border-white/10 rounded-lg px-3 py-2 text-[13px] text-white/85 placeholder:text-white/30 focus:outline-none focus:border-ln-accent/50"
+                  />
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const picked = await invoke<string | null>("pick_folder").catch(() => null);
+                      if (!picked) return;
+                      try {
+                        // Validated in Rust, which also RESOLVES it: an 8.3
+                        // short name expands and a trailing separator is
+                        // normalised, so store what comes back rather than
+                        // what was picked.
+                        const resolved = await invoke<string>("downloads_set_root", { path: picked });
+                        patchBackend({ download_dir: resolved });
+                      } catch (e) {
+                        showAppToast(e instanceof Error ? e.message : String(e), { tone: "danger" });
+                      }
+                    }}
+                    className="flex-shrink-0 px-3 py-2 rounded-lg text-[13px] text-white/85 bg-white/[0.08] hover:bg-white/[0.14] border border-white/10 transition-colors"
+                  >
+                    Browse
+                  </button>
+                  {(backend.download_dir ?? "").trim() !== "" && (
+                    <button
+                      type="button"
+                      onClick={() => patchBackend({ download_dir: "" })}
+                      className="flex-shrink-0 px-3 py-2 rounded-lg text-[13px] text-white/55 hover:text-white hover:bg-white/[0.08] transition-colors"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div className="h-px bg-white/6" />
+              <SettingToggle
+                label="Sort downloads into folders"
+                description="Save as Show Name/Season 01/Show Name - S01E07 - Episode Title.mkv, and movies as Dune (2021)/Dune (2021).mkv. This is the layout Plex and Jellyfin expect, so the folder stays useful outside Aura. Turn it off to drop every file straight into the download folder under its original release name."
+                value={backend.download_organise ?? true}
+                onChange={(v) => patchBackend({ download_organise: v })}
               />
             </Section>
           )}
