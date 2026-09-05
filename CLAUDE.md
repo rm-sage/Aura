@@ -156,6 +156,24 @@ Every new Rust `#[tauri::command]` must be:
 Skip any of those and the command silently 401s at runtime. There are ~90 registered commands;
 `lib.rs` is the canonical list.
 
+Two details that cause the same silent 401 and are easy to get wrong:
+
+- **In `capabilities/default.json`, Aura's own permission sets are BARE
+  identifiers** (`"allow-load-video"`, `"allow-downloads"`), matching the
+  `identifier = "allow-..."` lines in `player.toml`. The `plugin:` prefix
+  (`"clipboard-manager:"`, `"core:"`, `"shell:"`, `"opener:"`) is for
+  third-party plugins ONLY. Writing `"player:allow-downloads"` looks right and
+  resolves to nothing.
+- **Prefer one command taking a tagged action enum over N near-identical ones.**
+  Each command costs three registration sites, so eight control verbs would be
+  24 places to get wrong. `downloads_control` is the worked example.
+
+Related: **there is no Tauri managed state anywhere in this crate.**
+`grep -rn "\.manage(\|tauri::State" src-tauri/src/` returns nothing across 57
+files; the house pattern is a module-level static (`settings.rs` `CACHE`,
+`scrobble.rs` `SCROBBLE_RUN_ACTIVE`, `downloads/manager.rs` `STATE`), of which
+there are ~69. Follow it rather than introducing `.manage()` for one subsystem.
+
 ### Frontend <-> Rust serialization quirk
 
 `#[serde(rename = "...")]` applies to BOTH directions. Tauri sends struct fields back to the frontend
@@ -380,6 +398,16 @@ What it is and why, because both halves are load-bearing:
   to be removed from the recents dropdown.
 - An inset bright top hairline plus an inset dark bottom one plus a drop shadow. The lit top edge is
   what reads as refraction; without it the surface is just a flat tint.
+
+One trap worth knowing before you add a panel: **`ContextMenuHost` renders its
+menu INLINE at `z-[200]`, not through a portal** (only its hover SUBMENU
+portals, to `document.body`), and it sits inside `.aura-app-shell`, which is its
+own stacking context (`position: relative; z-index: 0`). A floating panel
+rendered in that same context at any z-index therefore paints OVER any
+right-click menu raised from its own rows, while that menu's submenu appears
+from nowhere. Portal the panel to `document.body` and exempt
+`[data-aura-context-menu]` from its outside-click guard (see
+`DownloadsPanelHost.tsx`).
 
 Two practical notes. The class sets `background`, `border` and `box-shadow` in one shorthand, so
 drop any `bg-*` / `border-*` / `shadow-*` utility you are replacing rather than leaving it to fight
