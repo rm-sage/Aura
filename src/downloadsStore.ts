@@ -299,6 +299,36 @@ export function formatEta(secs: number | null | undefined): string {
   return `${Math.round(hr / 24)}d left`;
 }
 
+/** When a finished download finished, for the history rows.
+ *
+ *  Relative for the two days a user is most likely to be looking for something
+ *  ("Today at 14:32"), absolute after that, because a file you are trying to
+ *  find on disk is easier to place by date than by "4 days ago". The year is
+ *  added only when it is not the current one, which keeps the common case
+ *  short on a narrow row.
+ *
+ *  Locale-formatted rather than hand-built, so a 24-hour user does not get
+ *  AM/PM and the day/month order follows the system. */
+export function formatFinishedAt(ms: number | null | undefined): string {
+  if (ms == null || !Number.isFinite(ms) || ms <= 0) return "";
+  const then = new Date(ms);
+  const now = new Date();
+  const time = then.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+
+  const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const DAY = 86_400_000;
+  if (ms >= midnight) return `Today at ${time}`;
+  if (ms >= midnight - DAY) return `Yesterday at ${time}`;
+
+  const sameYear = then.getFullYear() === now.getFullYear();
+  const date = then.toLocaleDateString(undefined, {
+    day: "numeric",
+    month: "short",
+    ...(sameYear ? {} : { year: "numeric" }),
+  });
+  return `${date} at ${time}`;
+}
+
 /** Fraction complete, or null when the size is unknown and a bar would be a
  *  fiction. */
 export function jobProgress(j: DownloadJob): number | null {
@@ -329,8 +359,14 @@ export function jobStatusLine(j: DownloadJob): string {
       return "Refreshing link";
     case "needs_source":
       return j.error ?? "Source unavailable";
-    case "completed":
-      return formatBytes(j.total_bytes ?? j.bytes_done);
+    case "completed": {
+      // Size first, then when it landed: the history rows are how someone
+      // finds a file again later, and "which one was 2.4 GB" is a much weaker
+      // handle than "the one from Tuesday evening".
+      const size = formatBytes(j.total_bytes ?? j.bytes_done);
+      const when = formatFinishedAt(j.completed_at);
+      return when ? `${size} · ${when}` : size;
+    }
     case "failed":
       return j.error ?? "Failed";
   }

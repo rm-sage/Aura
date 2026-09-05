@@ -11,6 +11,7 @@ import { openContextMenu, type ContextMenuItem } from "./ContextMenu";
 import { showAppToast } from "./AppToast";
 import {
   cancelDownload,
+  formatFinishedAt,
   jobProgress,
   jobStatusLine,
   pauseDownload,
@@ -234,12 +235,16 @@ export default function DownloadRow({ job, sortable = false }: Props) {
 
 /** Full text for the status line's tooltip, so a clipped failure reason is
  *  still readable. Undefined when the line already fits, which keeps a tooltip
- *  from appearing over every ordinary progress row. */
+ *  from appearing over every ordinary progress row.
+ *
+ *  A failed row is history too, so it carries when it gave up. That goes here
+ *  rather than in the line itself, which is already full of the reason. */
 function j_status_title(job: DownloadJob): string | undefined {
-  if (job.state === "failed" || job.state === "needs_source") {
-    return job.error ?? undefined;
-  }
-  return undefined;
+  if (job.state !== "failed" && job.state !== "needs_source") return undefined;
+  const when = formatFinishedAt(job.completed_at);
+  const reason = job.error ?? "Failed";
+  return when ? `${reason}
+${when}` : reason;
 }
 
 function IconBtn({

@@ -140,7 +140,11 @@ function ArcCard({
         e.stopPropagation();
         onArcContextMenu(arc, e.clientX, e.clientY);
       } : undefined}
-      title={kind.name}
+      title={
+        kind.known && kind.filler > 0
+          ? `${kind.name} · ${kind.filler} of ${kind.total} filler`
+          : kind.name
+      }
       className="group relative block w-full text-left overflow-hidden rounded-xl
                  bg-white/5 border border-white/10 hover:border-ln-accent/40
                  transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ln-accent/60"
@@ -156,9 +160,14 @@ function ArcCard({
           imgClassName="w-full h-full object-cover transition-transform duration-500 group-hover:scale-[1.03]"
         />
       ) : (
-        <div className="absolute inset-0 grid place-items-center text-white/20 text-[11px] font-mono uppercase tracking-[0.18em]">
-          no art
-        </div>
+        // Deliberately EMPTY. The placeholder used to read "no art", centred
+        // in the tile, which at two-up is exactly where the title block starts:
+        // the words rendered through the arc name as an unreadable smudge, and
+        // there is no collision-free band left on a 16/9 tile once the badges
+        // own the top and the title owns the bottom. The button's own tinted
+        // background plus the scrim already read as "card with no image", and
+        // the title is right there saying which arc it is.
+        <div className="absolute inset-0" aria-hidden />
       )}
 
       {/* Scrim. Taller than the CW card's because this tile carries two lines of
@@ -196,48 +205,86 @@ function ArcCard({
       <div className={`absolute inset-x-0 bottom-0 ${perRow === 1 ? "px-4 pb-3.5" : "px-3 pb-3"}`}>
         <div
           className={[
-            "font-semibold text-white leading-tight line-clamp-2",
+            "font-semibold text-white leading-tight",
             "drop-shadow-[0_2px_4px_rgba(0,0,0,0.85)]",
+            // Two lines need about 70px of block, and the corner badges end at
+            // 34px, so a narrow window cannot fit both. Aura's own minimum is
+            // 900px wide, where a two-up tile is only 90px tall and the title's
+            // first line would sit ON the badges. One line below 1080px.
+            "line-clamp-2 max-[1080px]:line-clamp-1",
             perRow === 1 ? "text-[19px]" : "text-[15px]",
           ].join(" ")}
         >
           {kind.name}
         </div>
+        {/* Meta line, built so it can NEVER become two.
+
+            It lives in an absolute bottom-anchored block, so a second line
+            grows UPWARD into the title and the corner badges, which is what
+            made this look broken once a filler count was added.
+
+            `flex` was not the guard it looked like: `flex-wrap: nowrap` is
+            already the CSS default, so the ROW never wrapped. Each span is a
+            flex item with `flex-shrink: 1`, and a text span's min-content width
+            is its longest WORD, so the spans collapsed to word width and
+            wrapped their own text internally ("20" over "episodes"). The real
+            guards are `whitespace-nowrap` so no item may break inside itself,
+            `shrink-0` so the fixed facts hold full size, and exactly ONE item
+            allowed to give, which truncates rather than pushing.
+
+            "Completed" is gone. It was triplicated: the emerald check pinned
+            top-right (which carries the accessible name, so nothing is lost to
+            a screen reader) and the progress bar sitting at 100% right below
+            both already say it, and it was the widest optional item here. */}
         <div
           className={[
-            "mt-1 flex items-center gap-2 text-white/70 tabular-nums",
+            "mt-1 flex items-center gap-2 overflow-hidden whitespace-nowrap leading-tight",
+            "text-white/70 tabular-nums",
             perRow === 1 ? "text-[12px]" : "text-[11px]",
           ].join(" ")}
         >
-          <span className="font-medium">
-            {total} {total === 1 ? "episode" : "episodes"}
+          {/* Spelled out on the full-width banner, abbreviated at two-up where
+              the whole line has about 200px. The size ternary right above does
+              the same thing, so adapting the copy to the density too is
+              consistent within the component, and "ep"/"eps" is already Aura's
+              wording for an arc's length: it is what the count chip on the
+              breadcrumb THIS tile opens into says. */}
+          <span className="shrink-0 font-medium">
+            {total}{" "}
+            {perRow === 1
+              ? total === 1 ? "episode" : "episodes"
+              : total === 1 ? "ep" : "eps"}
           </span>
           {years && (
             <>
-              <span className="text-white/30" aria-hidden>&middot;</span>
-              <span className="font-mono">{years}</span>
+              <span className="shrink-0 text-white/30" aria-hidden>&middot;</span>
+              <span className="shrink-0 font-mono">{years}</span>
             </>
           )}
           {kind.known && kind.filler > 0 && (
             <>
-              <span className="text-white/30" aria-hidden>&middot;</span>
+              <span className="shrink-0 text-white/30" aria-hidden>&middot;</span>
               {/* Rose is the filler colour everywhere else in Aura (the
-                  episode-row pill, the count chip's breakdown), so an arc
-                  reads the same way as the episodes inside it. A PARTIAL arc
-                  says how much rather than flattening to "Filler", because
-                  Bleach's Gotei 13 Invading Army is filler except for its
-                  last episode and a flat label cannot express that. */}
-              <span className="text-rose-300 font-medium">
-                {kind.filler === kind.total
+                  episode-row pill, the count chip's breakdown), so an arc reads
+                  the same way as the episodes inside it. A PARTIAL arc says how
+                  MANY rather than flattening to "Filler", because Bleach's
+                  Gotei 13 Invading Army is filler except for its last episode
+                  and a flat label cannot express that.
+
+                  No denominator: the line already opens with this arc's episode
+                  count, so "12 filler" reads the same in half the pixels, and it
+                  matches what the opened arc's count chip renders. The flat word
+                  is gated on every episode having RESOLVED as well as being
+                  filler, or an arc where only a few ids mapped would claim to be
+                  filler outright.
+
+                  The only item allowed to truncate: the rose still carries the
+                  meaning when it clips. */}
+              <span className="min-w-0 truncate text-rose-300 font-medium">
+                {kind.filler === kind.total && kind.resolved === kind.total
                   ? "Filler"
-                  : `${kind.filler} of ${kind.total} filler`}
+                  : `${kind.filler} filler`}
               </span>
-            </>
-          )}
-          {complete && (
-            <>
-              <span className="text-white/30" aria-hidden>&middot;</span>
-              <span className="text-emerald-300 font-medium">Completed</span>
             </>
           )}
         </div>
@@ -392,7 +439,11 @@ export default function ArcGrid({
           active={active}
           onChange={onGroupingChange}
         />
-        <span className="text-[12px] text-white/40 font-medium tabular-nums">
+        {/* ml-auto, not justify-between alone: GroupingSelect renders null
+            when a show has only one grouping, and a lone child in a
+            `justify-between` row sits at flex-START, so the count jumped to the
+            left edge on exactly the commonest case. */}
+        <span className="ml-auto text-[12px] text-white/40 font-medium tabular-nums">
           {loading
             ? "Loading arcs…"
             : `${arcs.length} ${arcs.length === 1 ? "arc" : "arcs"}`}
@@ -414,6 +465,7 @@ export default function ArcGrid({
                   name: arc.name,
                   filler: 0,
                   total: arc.episode_ids.length,
+                  resolved: arc.episode_ids.length,
                   known: false,
                 }
               }

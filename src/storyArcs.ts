@@ -540,8 +540,15 @@ export interface ArcKindSummary {
   name: string;
   /** Episodes in this arc that Aura considers filler. */
   filler: number;
-  /** Arc episodes Aura could resolve at all. */
+  /** The arc's REAL length, not the number of episodes that resolved. Those
+   *  differ: TMDB lists episodes Aura cannot always map (see `StoryArc.dropped`),
+   *  and counting only the resolved ones made `filler === total` true for an arc
+   *  where 3 of 20 ids resolved and all 3 happened to be filler, flattening a
+   *  mostly-canon arc to the bare word "Filler". */
   total: number;
+  /** How many of `total` Aura could actually look at. `filler` is drawn from
+   *  these, so `resolved < total` means the filler figure is a floor. */
+  resolved: number;
   /** False when the show has no kind data anywhere, in which case `filler` is
    *  meaningless and TMDB's own marker was left in `name`. */
   known: boolean;
@@ -576,20 +583,21 @@ export function arcKindSummary(
   kinds: { id: string; kind: string }[],
   known: boolean,
 ): ArcKindSummary {
+  const total = arc.episode_ids.length;
   if (!known) {
-    return { name: arc.name, filler: 0, total: arc.episode_ids.length, known: false };
+    return { name: arc.name, filler: 0, total, resolved: total, known: false };
   }
   let filler = 0;
-  let total = 0;
+  let resolved = 0;
   for (const id of arc.episode_ids) {
     const v = byId.get(id);
     if (!v) continue;
-    total += 1;
+    resolved += 1;
     const isFiller =
       kinds.some((k) => k.id === id && k.kind === "filler") ||
       v.is_filler === true ||
       v.episode_kind === "filler";
     if (isFiller) filler += 1;
   }
-  return { name: stripArcKindSuffix(arc.name), filler, total, known: true };
+  return { name: stripArcKindSuffix(arc.name), filler, total, resolved, known: true };
 }

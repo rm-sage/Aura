@@ -15,6 +15,7 @@
 //! is the order that runs.
 
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -85,6 +86,17 @@ fn state() -> &'static Mutex<State> {
             root: String::new(),
         })
     })
+}
+
+/// Wall-clock millis. Used only for the finished-at stamp: `created_at` comes
+/// from the frontend so the list orders consistently with what the UI shows,
+/// but a completion happens HERE, and round-tripping it through the webview
+/// would lose the stamp entirely if the window were closed at the time.
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 pub fn app() -> Option<&'static AppHandle<Wry>> {
@@ -408,6 +420,7 @@ fn finish(id: &str, outcome: Outcome) {
                     j.state = DownloadState::Completed;
                     j.error = None;
                     j.attempt = 0;
+                    j.completed_at = Some(now_millis());
                     j.dest_path = final_path;
                     if let Ok(m) = std::fs::metadata(&j.dest_path) {
                         // The file on disk is the last word on its own size.
@@ -446,6 +459,7 @@ fn finish(id: &str, outcome: Outcome) {
                     if j.attempt >= 5 {
                         j.state = DownloadState::Failed;
                         j.error = Some(msg);
+                        j.completed_at = Some(now_millis());
                     } else {
                         // Back into the queue; the pump will retry it behind
                         // anything else that is waiting.
@@ -456,6 +470,7 @@ fn finish(id: &str, outcome: Outcome) {
                 Outcome::Fatal(msg) => {
                     j.state = DownloadState::Failed;
                     j.error = Some(msg);
+                    j.completed_at = Some(now_millis());
                 }
             }
         }
