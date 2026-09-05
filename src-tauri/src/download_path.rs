@@ -703,21 +703,6 @@ pub fn claim_part(dir: &Path, stem: &str, ext: &str) -> Result<(PathBuf, File), 
     Err("Too many files already share that name in the download folder.".into())
 }
 
-/// Re-open an existing in-progress file for append-style resume. Returns the
-/// handle and the bytes already on disk.
-pub fn reopen_part(part: &Path) -> Result<(File, u64), String> {
-    let f = OpenOptions::new()
-        .write(true)
-        .read(true)
-        .open(part)
-        .map_err(|e| format!("Could not reopen '{}': {e}", part.display()))?;
-    let len = f
-        .metadata()
-        .map_err(|e| format!("Could not stat '{}': {e}", part.display()))?
-        .len();
-    Ok((f, len))
-}
-
 /// Publish a completed download: claim a free final name, then rename onto it.
 ///
 /// The claim matters because `std::fs::rename` CLOBBERS on Windows. Claiming

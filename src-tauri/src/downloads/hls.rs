@@ -668,25 +668,27 @@ async fn passthrough(
     // no Content-Length for an HLS stream.
     if let Some(stdout) = child.stdout.take() {
         let id = job.id.clone();
+        let out_for_progress = out.clone();
         std::thread::spawn(move || {
             use std::io::BufRead;
             let reader = std::io::BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
-                if let Some(v) = line.strip_prefix("out_time_us=") {
-                    if let Ok(us) = v.trim().parse::<u64>() {
-                        if total_duration > 0.0 {
-                            let frac =
-                                ((us as f64 / 1_000_000.0) / total_duration).clamp(0.0, 1.0);
-                            // Scale to a nominal size so the row can show a
-                            // bar; the real byte count arrives at publish.
-                            super::manager::record_progress(
-                                &id,
-                                (frac * 1000.0) as u64,
-                                Some(1000),
-                            );
-                        }
-                    }
+                let Some(v) = line.strip_prefix("out_time_us=") else { continue };
+                let Ok(us) = v.trim().parse::<u64>() else { continue };
+                if total_duration <= 0.0 {
+                    continue;
                 }
+                let frac = ((us as f64 / 1_000_000.0) / total_duration).clamp(0.0, 1.0);
+                // REAL bytes off the growing output file, with the total
+                // projected through the time fraction. Reporting the fraction
+                // itself as a byte count made the row read "1000 B of 1000 B".
+                let done = std::fs::metadata(&out_for_progress).map(|m| m.len()).unwrap_or(0);
+                let projected = if frac > 0.02 && done > 0 {
+                    Some((done as f64 / frac) as u64)
+                } else {
+                    None
+                };
+                super::manager::record_progress(&id, done, projected);
             }
         });
     }
@@ -705,12 +707,7 @@ async fn passthrough(
                 }
             }
 
-            status = tokio::task::spawn_blocking({
-                // try_wait on a short poll rather than moving the child.
-                let _ = ();
-                move || std::thread::sleep(Duration::from_millis(400))
-            }) => {
-                let _ = status;
+            _ = tokio::time::sleep(Duration::from_millis(400)) => {
                 match child.try_wait() {
                     Ok(Some(st)) => {
                         if st.success() {

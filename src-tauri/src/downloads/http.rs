@@ -205,7 +205,7 @@ pub async fn run(
         // We asked past the end. Either the file is complete or it shrank.
         if let Some(total) = job.total_bytes {
             if have >= total {
-                return finish(job, have);
+                return finish(job);
             }
         }
         let _ = std::fs::write(&job.part_path, b"");
@@ -308,7 +308,14 @@ pub async fn run(
                                 ));
                             }
                         }
-                        return finish(job, written);
+                        // CLOSE THE HANDLE FIRST. Rust opens files without
+                        // FILE_SHARE_DELETE, so on Windows the rename inside
+                        // `finish` fails with a sharing violation while this
+                        // handle is alive. `return finish(...)` would evaluate
+                        // the call BEFORE dropping `file`, so the drop has to
+                        // be explicit and has to come first.
+                        drop(file);
+                        return finish(job);
                     }
                     Err(e) => {
                         let _ = file.flush();
@@ -325,7 +332,11 @@ pub async fn run(
 }
 
 /// Rename the partial onto its final name, claiming a free one first.
-fn finish(job: &DownloadJob, _written: u64) -> Outcome {
+///
+/// The caller MUST have dropped its handle on the partial: Rust opens files
+/// without FILE_SHARE_DELETE, so on Windows the rename below fails with a
+/// sharing violation while any handle is still open.
+fn finish(job: &DownloadJob) -> Outcome {
     let dest = std::path::Path::new(&job.dest_path);
     let Some(dir) = dest.parent() else {
         return Outcome::Fatal("The download destination is not a valid path.".into());

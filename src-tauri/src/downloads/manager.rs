@@ -175,12 +175,6 @@ fn emit(st: &State) {
     }
 }
 
-/// Emit right now, outside any lock the caller already holds.
-pub fn emit_now() {
-    let st = state().lock().unwrap();
-    emit(&st);
-}
-
 // ---------------------------------------------------------------------------
 // Ticker: progress sampling, snapshot cadence, relink timeout
 // ---------------------------------------------------------------------------
@@ -378,6 +372,7 @@ fn finish(id: &str, outcome: Outcome) {
 
         let mut drop_claim: Option<String> = None;
         let mut remove_job = false;
+        let mut cancelled: Option<DownloadJob> = None;
 
         {
             let j = &mut st.jobs[idx];
@@ -398,6 +393,12 @@ fn finish(id: &str, outcome: Outcome) {
                     drop_claim = Some(crate::download_path::duplicate_key(
                         std::path::Path::new(&j.dest_path),
                     ));
+                    // Delete HERE, not in the worker and not in `control`: the
+                    // worker has just dropped its file handle (Windows refuses
+                    // to unlink an open file), and `control` only reaches the
+                    // not-running case. Without this a cancelled transfer left
+                    // its .aurapart on disk with nothing pointing at it.
+                    cancelled = Some(j.clone());
                     remove_job = true;
                 }
                 Outcome::Expired(msg) => {
@@ -429,6 +430,9 @@ fn finish(id: &str, outcome: Outcome) {
 
         if let Some(k) = drop_claim {
             st.claims.remove(&k);
+        }
+        if let Some(j) = cancelled {
+            super::cleanup_partial(&j);
         }
         if remove_job {
             st.jobs.remove(idx);
