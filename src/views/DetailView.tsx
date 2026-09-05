@@ -4381,6 +4381,7 @@ function EpisodesPanel({
               result={arcResult!}
               seriesId={seriesId}
               videos={videos}
+              cloudKinds={cloudSignal?.episode_kinds ?? []}
               loading={arcsLoading}
               activeGroupingId={groupingId ?? arcResult!.grouping_id}
               onSelect={(arc) => setOpenArcId(arc.id)}

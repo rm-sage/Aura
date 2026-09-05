@@ -37,7 +37,9 @@ import { getManualWatchedState, useManualWatchedVersion } from "./manualWatched"
 import { shrinkPoster } from "./posterSize";
 import {
   arcEpisodeRange, arcYearRange, orderGroupings, absoluteEpisodeMap,
-  type ArcGrouping, type ArcResult, type StoryArc, groupingDisplayName,} from "./storyArcs";
+  arcKindSummary, showHasKindData,
+  type ArcGrouping, type ArcKindSummary, type ArcResult, type StoryArc,
+  groupingDisplayName,} from "./storyArcs";
 import type { VideoEntry } from "./types";
 
 /** Above this arc count a grouping is "dense" and switches to two tiles per
@@ -49,8 +51,13 @@ interface ArcGridProps {
   result: ArcResult;
   seriesId: string;
   /** The addon's real episode list, used to resolve each arc's episode ids into
-   *  a displayable episode-number range. */
+   *  a displayable episode-number range, and to work out how much of each arc
+   *  is filler. */
   videos: VideoEntry[];
+  /** `cloudSignal?.episode_kinds`, the highest-priority filler / recap source
+   *  and the ONLY source for many episodes. Passing an empty array degrades to
+   *  the VideoEntry flags alone, exactly as `mergedKindFlags` does. */
+  cloudKinds?: { id: string; kind: string }[];
   /** A grouping switch is in flight: show the skeleton in the tile shape of the
    *  grouping being loaded, not the stale arcs of the previous one. */
   loading?: boolean;
@@ -97,6 +104,7 @@ function ArcCard({
   perRow,
   absoluteById,
   resumeId,
+  kind,
   onSelect,
   onArcContextMenu,
 }: {
@@ -104,6 +112,10 @@ function ArcCard({
   perRow: 1 | 2;
   absoluteById: Map<string, number>;
   resumeId: string | null;
+  /** Aura's own reading of this arc's composition. Replaces the filler marker
+   *  TMDB bakes into the arc NAME, which is wrong in both directions on
+   *  Bleach. See the block comment in storyArcs.ts. */
+  kind: ArcKindSummary;
   onSelect: (arc: StoryArc) => void;
   onArcContextMenu?: (arc: StoryArc, x: number, y: number) => void;
 }) {
@@ -128,7 +140,7 @@ function ArcCard({
         e.stopPropagation();
         onArcContextMenu(arc, e.clientX, e.clientY);
       } : undefined}
-      title={arc.name}
+      title={kind.name}
       className="group relative block w-full text-left overflow-hidden rounded-xl
                  bg-white/5 border border-white/10 hover:border-ln-accent/40
                  transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ln-accent/60"
@@ -189,7 +201,7 @@ function ArcCard({
             perRow === 1 ? "text-[19px]" : "text-[15px]",
           ].join(" ")}
         >
-          {arc.name}
+          {kind.name}
         </div>
         <div
           className={[
@@ -204,6 +216,22 @@ function ArcCard({
             <>
               <span className="text-white/30" aria-hidden>&middot;</span>
               <span className="font-mono">{years}</span>
+            </>
+          )}
+          {kind.known && kind.filler > 0 && (
+            <>
+              <span className="text-white/30" aria-hidden>&middot;</span>
+              {/* Rose is the filler colour everywhere else in Aura (the
+                  episode-row pill, the count chip's breakdown), so an arc
+                  reads the same way as the episodes inside it. A PARTIAL arc
+                  says how much rather than flattening to "Filler", because
+                  Bleach's Gotei 13 Invading Army is filler except for its
+                  last episode and a flat label cannot express that. */}
+              <span className="text-rose-300 font-medium">
+                {kind.filler === kind.total
+                  ? "Filler"
+                  : `${kind.filler} of ${kind.total} filler`}
+              </span>
             </>
           )}
           {complete && (
@@ -316,7 +344,7 @@ export function ArcGridSkeleton({ perRow = 1, count }: { perRow?: 1 | 2; count?:
 }
 
 export default function ArcGrid({
-  result, seriesId, videos, loading, activeGroupingId, onSelect, onGroupingChange,
+  result, seriesId, videos, cloudKinds, loading, activeGroupingId, onSelect, onGroupingChange,
   onArcContextMenu,
 }: ArcGridProps) {
   const resumeId = useResumeVideoId(seriesId);
@@ -332,6 +360,19 @@ export default function ArcGrid({
   // Absolute episode numbers, computed once, so every arc range reads as a plain
   // unambiguous E20-E67 no matter how the addon seasons the show.
   const absoluteById = useMemo(() => absoluteEpisodeMap(videos), [videos]);
+
+  // One pass over the show, reused by every tile. `known` is computed at SHOW
+  // level on purpose: a fully-canon arc inside a show that does have data
+  // carries no flags at all, and testing per-arc would read that as "no data"
+  // and fall back to the very TMDB label this replaces.
+  const kindByArc = useMemo(() => {
+    const kinds = cloudKinds ?? [];
+    const byId = new Map(videos.map((v) => [v.id, v]));
+    const known = showHasKindData(videos, kinds);
+    return new Map(
+      result.arcs.map((a) => [a.id, arcKindSummary(a, byId, kinds, known)]),
+    );
+  }, [result.arcs, videos, cloudKinds]);
 
   const active = activeGroupingId ?? result.grouping_id;
   // Tile density follows the grouping the user asked for, so a switch to a
@@ -368,6 +409,14 @@ export default function ArcGrid({
               arc={arc}
               perRow={perRow}
               absoluteById={absoluteById}
+              kind={
+                kindByArc.get(arc.id) ?? {
+                  name: arc.name,
+                  filler: 0,
+                  total: arc.episode_ids.length,
+                  known: false,
+                }
+              }
               resumeId={resumeId}
               onSelect={onSelect}
               onArcContextMenu={onArcContextMenu}

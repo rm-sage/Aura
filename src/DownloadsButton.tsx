@@ -54,7 +54,6 @@ export default function DownloadsButton() {
   const { jobs, active, overall } = useDownloads();
   const phase = useDownloadsPanelPhase();
   const panelOpen = phase !== "closed";
-  const [hovered, setHovered] = useState(false);
 
   const counts = useMemo(() => {
     let running = 0;
@@ -126,8 +125,14 @@ export default function DownloadsButton() {
     return "";
   }, [tone, counts, jobs]);
 
-  const expanded =
-    active > 0 || counts.failed > 0 || counts.paused > 0 || panelOpen || hovered || dwelling;
+  // Expand ONLY when there is something to reveal. Expanding on hover or on
+  // the panel opening still applied the label's 7px left margin to an empty
+  // span, so the button grew on its right side alone and the icon sat visibly
+  // off-centre inside its own hover highlight. Nothing is lost by gating on the
+  // label: every tone that produces one already implies an active, failed,
+  // paused or just-completed job, so the pill was open in all those cases
+  // anyway.
+  const expanded = label !== "";
 
   const tooltip = label || (jobs.length ? "Downloads" : "Downloads (nothing yet)");
 
@@ -157,8 +162,6 @@ export default function DownloadsButton() {
         aria-label={tooltip}
         aria-expanded={panelOpen}
         onClick={toggleDownloadsPanel}
-        onMouseEnter={() => setHovered(true)}
-        onMouseLeave={() => setHovered(false)}
         className={cls}
         style={{ color: TONE_COLOR[tone], opacity: tone === "idle" && !jobs.length ? 0.45 : 0.85 }}
       >

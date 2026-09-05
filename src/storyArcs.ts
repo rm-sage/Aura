@@ -497,3 +497,99 @@ export function arcEpisodeRange(
   if (first == null || last == null) return "";
   return first === last ? `E${first}` : `E${first}-E${last}`;
 }
+
+// ---------------------------------------------------------------------------
+// Arc kind labelling: trust Aura's episodes, not TMDB's arc NAME.
+//
+// TMDB bakes a filler marker into the arc's title string ("The Past (Filler)",
+// "Gotei 13 Invading Army (Filler)"), and Aura used to render that verbatim.
+// It is wrong often enough to matter, in both directions:
+//
+//   * Bleach's "The Past" arc is titled "(Filler)" and is fully CANON. Every
+//     episode row underneath it correctly showed no filler tag, so the tile
+//     and the list it opened contradicted each other.
+//   * "Gotei 13 Invading Army" is titled "(Filler)" and is filler EXCEPT for
+//     its last episode (E342), which is canon. A flat label cannot say that.
+//
+// Aura already has per-episode filler / recap data from AIOMetadata and the
+// Aura Cloud release signal, and that is what every other surface renders. So
+// the arc tile derives its label from the SAME data, using the SAME predicate,
+// and the two can no longer disagree.
+//
+// The fallback matters as much as the fix: for a show Aura has NO kind data
+// for, TMDB's parenthetical is the only signal there is, so it is kept. The
+// test is made at the SHOW level, not the arc level, because a fully-canon arc
+// inside a show that does have data carries no flags at all, and an arc-level
+// test would read that as "no data" and fall straight back to the wrong label.
+// ---------------------------------------------------------------------------
+
+/** Trailing parenthetical or dash-suffixed kind marker in a TMDB arc name. */
+const ARC_KIND_SUFFIX =
+  /\s*[([\u2013-]\s*(?:mostly\s+|partly\s+|part\s+)?(?:filler|anime[- ]only|non[- ]canon|recap)(?:\s+arc)?\s*[)\]]?\s*$/i;
+
+/** Drop TMDB's baked-in kind marker so Aura can render its own, accurate one. */
+export function stripArcKindSuffix(name: string): string {
+  const out = name.replace(ARC_KIND_SUFFIX, "").trim();
+  // Never return an empty title: an arc genuinely called "Filler" would
+  // otherwise lose its whole name.
+  return out.length > 0 ? out : name.trim();
+}
+
+export interface ArcKindSummary {
+  /** The name to render: TMDB's, minus its kind marker, when Aura has data. */
+  name: string;
+  /** Episodes in this arc that Aura considers filler. */
+  filler: number;
+  /** Arc episodes Aura could resolve at all. */
+  total: number;
+  /** False when the show has no kind data anywhere, in which case `filler` is
+   *  meaningless and TMDB's own marker was left in `name`. */
+  known: boolean;
+}
+
+/** True when this show carries filler / recap data from any source, and Aura is
+ *  therefore the better authority on an arc's composition than TMDB's title. */
+export function showHasKindData(
+  videos: VideoEntry[],
+  kinds: { id: string; kind: string }[],
+): boolean {
+  if (kinds.length > 0) return true;
+  return videos.some(
+    (v) =>
+      v.is_filler === true ||
+      v.is_recap === true ||
+      v.episode_kind === "filler" ||
+      v.episode_kind === "recap",
+  );
+}
+
+/** How much of an arc is filler, by Aura's own reckoning.
+ *
+ *  The predicate is deliberately identical to DetailView's `countFillerRecap`
+ *  and to `mergedKindFlags`: cloud signal first, then the VideoEntry booleans,
+ *  then the legacy string. Any divergence here would put a tile and the
+ *  episode rows it opens into disagreement, which is the bug this exists to
+ *  prevent. */
+export function arcKindSummary(
+  arc: StoryArc,
+  byId: Map<string, VideoEntry>,
+  kinds: { id: string; kind: string }[],
+  known: boolean,
+): ArcKindSummary {
+  if (!known) {
+    return { name: arc.name, filler: 0, total: arc.episode_ids.length, known: false };
+  }
+  let filler = 0;
+  let total = 0;
+  for (const id of arc.episode_ids) {
+    const v = byId.get(id);
+    if (!v) continue;
+    total += 1;
+    const isFiller =
+      kinds.some((k) => k.id === id && k.kind === "filler") ||
+      v.is_filler === true ||
+      v.episode_kind === "filler";
+    if (isFiller) filler += 1;
+  }
+  return { name: stripArcKindSuffix(arc.name), filler, total, known: true };
+}
