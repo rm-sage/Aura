@@ -237,6 +237,17 @@ pub async fn handle(Query(params): Query<HashMap<String, String>>) -> Response {
             // The user's attention is in the browser right now; pull Aura
             // forward so the "Connected as <user>" toast is actually seen.
             if let Some(win) = app.get_webview_window("main") {
+                // show() first for the same reason as tray::show_main_window:
+                // a tray-hidden window is hidden AND minimized, and a bare
+                // unminimize() on it would SW_RESTORE then be re-hidden in the
+                // same tao flag pass, leaving a hidden window with WS_MINIMIZE
+                // cleared. That is invisible here and disarms the animation on
+                // the NEXT tray click. Deliberately not routed through
+                // tray::show_main_window: that also emits
+                // aura:window-restored-from-tray, whose refresh_video nudge has
+                // a documented expand-then-shrink flicker, and an OAuth
+                // completion can land mid-playback.
+                let _ = win.show();
                 let _ = win.unminimize();
                 let _ = win.set_focus();
             }

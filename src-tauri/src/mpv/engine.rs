@@ -600,6 +600,46 @@ pub fn set_display_awake_desired(awake: bool) {
     DISPLAY_AWAKE_DESIRED.store(awake, Ordering::Release);
 }
 
+/// The pump thread's handle, published once the loop is entered and cleared on
+/// teardown. `None` means the engine is not running, so a late wake is a no-op
+/// rather than an unpark aimed at a dead thread.
+static PUMP_THREAD: Mutex<Option<thread::Thread>> = Mutex::new(None);
+
+/// Set by [`wake_and_resync`], consumed once per pump iteration. Forces BOTH
+/// the parent-visibility re-detect and the geometry pass, which are otherwise
+/// rate-limited / edge-triggered and would sleep through a restore.
+static FORCE_RESYNC: AtomicBool = AtomicBool::new(false);
+
+/// Cut the current pump wait short and force one full resync. Called from the
+/// window-event thread when the window goes from minimized back to restored
+/// (tray click, taskbar button, Win+D, a second instance raising the first).
+///
+/// Both halves are needed, and neither is sufficient alone:
+///   * While hidden the pump sits on a 150 ms [`HIDDEN_TICK`], so a restore is
+///     up to that late servicing the host window's `WM_PAINT` and draining any
+///     queued command.
+///   * The geometry pass is edge-triggered on a CHANGED rect. Restoring at the
+///     SAME size leaves `target_geom == last_geom`, so without the flag it
+///     issues no `SetWindowPos` and never re-runs
+///     `resize_mpv_child_to_parent`, which is also what re-applies the
+///     windowed MPO-poison region. Waking without forcing would be a silent
+///     no-op on the common same-size restore.
+///
+/// Landmine-11 safe: one atomic store plus an unpark. It never touches mpv,
+/// never blocks, and hands the engine thread no work. The store happens BEFORE
+/// the unpark so a pump that is mid-iteration and about to park still observes
+/// it, and `unpark` leaves a token when the thread is not parked yet, so a wake
+/// raced against the park is never lost (the next park returns immediately,
+/// costing one extra iteration and nothing more).
+pub fn wake_and_resync() {
+    FORCE_RESYNC.store(true, Ordering::Release);
+    if let Ok(guard) = PUMP_THREAD.lock() {
+        if let Some(t) = guard.as_ref() {
+            t.unpark();
+        }
+    }
+}
+
 /// Read the engine's current [`PresentMode`]. Returns `None` when the
 /// engine isn't running.
 pub fn current_present_mode() -> Option<PresentMode> {
@@ -1880,8 +1920,34 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         let mut anomaly_reported = false;
         const CACHE_POLL_INTERVAL: Duration = Duration::from_millis(500);
         const CACHE_SETTLE: Duration = Duration::from_millis(700);
+        // A forced resync (see `wake_and_resync`) stays armed for at most this
+        // long. The wake can land a frame or two before the restored window has
+        // a non-degenerate client rect, and a forced pass is only safe once it
+        // has, so a single shot could miss. Bounded so a rect that never
+        // recovers cannot pin the force on and turn the visibility poll into a
+        // per-tick DWM round-trip, which is exactly what MODE_POLL_INTERVAL
+        // exists to avoid.
+        const FORCE_RESYNC_GRACE: Duration = Duration::from_millis(500);
+        let mut force_until: Option<Instant> = None;
+        // Publish the pump thread so `wake_and_resync` can unpark it. Cleared
+        // in teardown below.
+        if let Ok(mut g) = PUMP_THREAD.lock() {
+            *g = Some(thread::current());
+        }
         loop {
             let tick_start = Instant::now();
+
+            // Restore resync, armed by `wake_and_resync` from the window-event
+            // thread. Forces the visibility re-detect and the geometry pass
+            // below, both of which would otherwise skip a same-size restore.
+            // The AcqRel swap pairs with the Release store in the setter.
+            if FORCE_RESYNC.swap(false, Ordering::AcqRel) {
+                force_until = Some(tick_start + FORCE_RESYNC_GRACE);
+            }
+            let forced = force_until.is_some_and(|t| tick_start < t);
+            if !forced {
+                force_until = None;
+            }
 
             // Keep the monitor awake while the frontend says playback is
             // active + unpaused. Applied here (the render thread) because
@@ -2105,7 +2171,13 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             // switch; etc. Nothing is applied to mpv — this exists so
             // off-focus playback reports can be correlated with the
             // window state in DevConsole.
-            if last_mode_poll.elapsed() >= MODE_POLL_INTERVAL {
+            // `forced` short-circuits the rate limit. A wake landing less than
+            // MODE_POLL_INTERVAL after the last poll would otherwise skip the
+            // re-detect, leave `mode` on Hidden, and pick HIDDEN_TICK again for
+            // another 150 ms. `mode` also gates the cache poll and the 1 ms
+            // timer re-assert, so flipping it promptly is what un-coarsens the
+            // pump on restore.
+            if forced || last_mode_poll.elapsed() >= MODE_POLL_INTERVAL {
                 last_mode_poll = Instant::now();
                 let now_mode = detect_present_mode(parent);
                 if now_mode != mode {
@@ -2137,10 +2209,10 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             let in_fs = crate::win32::is_in_native_fullscreen();
             let y_off = if in_fs { 0 } else { TITLE_BAR_H };
             let mut parent_rc = RECT::default();
-            let (target_w, target_h) = if GetClientRect(parent, &mut parent_rc).is_ok()
+            let rect_ok = GetClientRect(parent, &mut parent_rc).is_ok()
                 && parent_rc.right > parent_rc.left
-                && parent_rc.bottom > parent_rc.top
-            {
+                && parent_rc.bottom > parent_rc.top;
+            let (target_w, target_h) = if rect_ok {
                 let pw = parent_rc.right - parent_rc.left;
                 let ph = (parent_rc.bottom - parent_rc.top - y_off).max(1);
                 (pw, ph)
@@ -2148,7 +2220,28 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 (last_geom.2, last_geom.3)
             };
             let target_geom = (0, y_off, target_w, target_h);
-            if target_geom != last_geom {
+            // `forced && rect_ok` is the restore case this exists for: coming
+            // back at the SAME size leaves target_geom == last_geom, so the
+            // pass below (host SetWindowPos, then the child resize that also
+            // re-applies the windowed MPO-poison region) would never run. The
+            // rect_ok half is load-bearing: never drive the child from a
+            // degenerate rect, which is the documented dead-vo symptom.
+            if target_geom != last_geom || (forced && rect_ok) {
+                // Consume the force window only on a pass that actually
+                // measured the parent. The branch can also be entered while
+                // forced with a degenerate rect (y_off alone changed, e.g. a
+                // fullscreen toggle), and that pass ran on the fallback size,
+                // so it neither is nor should be logged as the restore resync.
+                // Leaving the window armed lets the next iteration retry once
+                // the rect is real, still bounded by FORCE_RESYNC_GRACE.
+                if forced && rect_ok {
+                    force_until = None;
+                    crate::devlog!(
+                        debug, "mpv",
+                        "forced geometry resync after restore ({}x{})",
+                        target_geom.2, target_geom.3,
+                    );
+                }
                 if let Err(e) = SetWindowPos(
                     hwnd,
                     None,
@@ -2467,7 +2560,12 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             };
             let elapsed = tick_start.elapsed();
             if elapsed < tick_target {
-                thread::sleep(tick_target - elapsed);
+                // park_timeout, not sleep: `wake_and_resync` unparks this
+                // thread, so a restore cuts a 150 ms HIDDEN_TICK short instead
+                // of waiting it out. A spurious early return costs one extra
+                // loop iteration and nothing else. Same OS wait as sleep
+                // otherwise, so frame pacing at the 5 ms TICK is unchanged.
+                thread::park_timeout(tick_target - elapsed);
             }
         }
 
@@ -2490,9 +2588,14 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         (lib.terminate_destroy)(handle);
         let _ = DestroyWindow(hwnd);
 
-        // Reset the published mode so debug callers see "not running"
-        // after teardown.
+        // Reset the published mode so debug callers see "not running" after
+        // teardown, and drop the pump handle so a late `wake_and_resync` is a
+        // no-op rather than an unpark aimed at a thread on its way out.
         CURRENT_MODE.store(255, Ordering::Release);
+        if let Ok(mut g) = PUMP_THREAD.lock() {
+            *g = None;
+        }
+        FORCE_RESYNC.store(false, Ordering::Release);
         crate::devlog!(info, "mpv", "engine torn down cleanly");
     }
 }

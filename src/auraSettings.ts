@@ -14,6 +14,7 @@
 // ---------------------------------------------------------------------------
 
 import { safeSetItem } from "./storageQuota";
+import type { AddonEntry } from "./types";
 
 const SETTINGS_KEY = "aura:settings:v1";
 const CHANGE_EVENT = "aura:settings-changed";
@@ -598,4 +599,22 @@ export function applyReducedMotionAttribute(): void {
     "data-reduced-motion",
     effectiveReducedMotion() ? "true" : "false",
   );
+}
+
+/**
+ * The addons a stream query should actually be sent to, honouring the user's
+ * `streamAddonUrls` choice in Settings. `null` (the default) means "all of
+ * them"; a list means "only these, in the order they were installed".
+ *
+ * Exists because this scoping was open-coded at each fetch site and the
+ * Next-Up pre-resolve was missing it, so auto-advance queried addons the user
+ * had explicitly excluded from stream lookups and could advance into a source
+ * that would never appear in the switcher. One helper, one behaviour.
+ */
+export function streamQueryAddons(addons: AddonEntry[]): AddonEntry[] {
+  const { streamAddonUrls } = loadAuraSettings();
+  if (streamAddonUrls === null) return addons;
+  return streamAddonUrls
+    .map((url) => addons.find((a) => a.url === url))
+    .filter((a): a is AddonEntry => !!a);
 }

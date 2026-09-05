@@ -85,7 +85,7 @@ import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPre
 import { arcPositionOf, fetchStoryArcs, loadArcMode } from "./storyArcs";
 import { getMetaDetailFallback, getRichestMetaDetail, peekCachedDetailById, peekRichestCachedDetailById, peekFreshestPostersByIds } from "./metaCache";
 import { PersistentCache } from "./persistentCache";
-import { applyReducedMotionAttribute, loadAuraSettings } from "./auraSettings";
+import { applyReducedMotionAttribute, loadAuraSettings, streamQueryAddons } from "./auraSettings";
 
 interface AniSkipResult {
   found: boolean;
@@ -7228,12 +7228,7 @@ export default function App() {
       setSwitcherStreams([]);
       // Same stream-addon scoping DetailView uses (respects the user's
       // streamAddonUrls setting; fetch_streams gates by capability anyway).
-      const { streamAddonUrls } = loadAuraSettings();
-      const queryAddons = streamAddonUrls === null
-        ? addons
-        : streamAddonUrls
-            .map((url) => addons.find((a) => a.url === url))
-            .filter((a): a is AddonEntry => !!a);
+      const queryAddons = streamQueryAddons(addons);
       invoke<StreamFetchResult>("fetch_streams", {
         addons: queryAddons,
         mediaType: activeTarget.media_type,
@@ -8044,12 +8039,7 @@ export default function App() {
       if (cancelled) return;
       if (!reResolve) { plainReload(); return; }
       const tgt = activeTarget!;
-      const { streamAddonUrls } = loadAuraSettings();
-      const queryAddons = streamAddonUrls === null
-        ? addons
-        : streamAddonUrls
-            .map((url) => addons.find((a) => a.url === url))
-            .filter((a): a is AddonEntry => !!a);
+      const queryAddons = streamQueryAddons(addons);
       console.info("[playback] auto-retry 2 - re-resolving the source for a fresh link");
       invoke<StreamFetchResult>("fetch_streams", {
         addons: queryAddons,

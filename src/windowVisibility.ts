@@ -67,16 +67,36 @@ function ensureInit(): void {
   import("@tauri-apps/api/window")
     .then(({ getCurrentWindow }) => {
       const w = getCurrentWindow();
+      // Last-request-wins guard. Close-to-tray used to fire NO resize events
+      // at all; now that the hide leaves the window minimized it fires at least
+      // two in quick succession (minimize on the way out, restore on the way
+      // back), each starting its own isMinimized() IPC. If the minimize-time
+      // response resolves AFTER the restore-time one, `minimized` latches true
+      // while the window is plainly visible and `hidden` never clears again.
+      // That failure is silent and total: countdowns stop ticking, the sync
+      // pull stops, cast polling stops, auto-advance freezes.
+      let minSeq = 0;
       const syncMinimized = () => {
+        const seq = ++minSeq;
         w.isMinimized()
           .then((m) => {
+            if (seq !== minSeq) return;
             minimized = m;
             recomputeHidden();
           })
           .catch(() => {});
       };
       void w.onResized(syncMinimized).catch(() => {});
-      void w.onFocusChanged(({ payload }) => setFocused(!!payload)).catch(() => {});
+      // Focus changes resync as well. Nothing else re-polls the minimize state,
+      // so a single dropped resize event would leave `hidden` latched with no
+      // self-healing path. A restore delivers its focus change after the
+      // restore has landed, which makes this a reliable backstop.
+      void w
+        .onFocusChanged(({ payload }) => {
+          setFocused(!!payload);
+          syncMinimized();
+        })
+        .catch(() => {});
       syncMinimized();
     })
     .catch(() => {});

@@ -28,6 +28,7 @@
     "allow-load-video",
     "allow-cast",
     "allow-runtime-deps",
+    "allow-downloads",
     "allow-trailer",
     "allow-iptv",
     "allow-player-controls",

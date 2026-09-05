@@ -19,7 +19,7 @@ import { isVideoAired } from "../types";
 import { computeReleaseCountdowns, formatCountdown, formatTargetDate, isInTheaters, nextAiringEpisode, useCountdownNow } from "../releaseCountdown";
 import { useMovieReleaseDates } from "../releaseDates";
 import EpisodeAirChip from "../EpisodeAirChip";
-import { loadAuraSettings, saveAuraSettings } from "../auraSettings";
+import { loadAuraSettings, saveAuraSettings, streamQueryAddons } from "../auraSettings";
 import { useReleaseSignal } from "../releaseSignalStore";
 import { fetchReleaseSignal } from "../releaseSearch";
 import { resolveDefaultMetaUrl } from "../addonDefaults";
@@ -1348,12 +1348,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     setStreamsLoading(true);
     setStreams([]);
     setStreamMeta({ errors: [], warnings: [], info: [], stats: [] });
-    const { streamAddonUrls } = loadAuraSettings();
-    const queryAddons = streamAddonUrls === null
-      ? addons
-      : streamAddonUrls
-          .map((url) => addons.find((a) => a.url === url))
-          .filter((a): a is AddonEntry => !!a);
+    const queryAddons = streamQueryAddons(addons);
     // Dedupe key: addon-url set + media_type + targetId. The set is
     // hashed via JSON to keep it stable; addon order doesn't change
     // within a render batch so JSON.stringify is sufficient.

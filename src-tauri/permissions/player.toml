@@ -377,3 +377,21 @@ commands.allow = ["get_crash_reporting", "set_crash_reporting"]
 identifier = "allow-log-export"
 description = "Allows the DevConsole to open a native Save-As dialog and write the log buffer to disk, and Settings to open a native folder picker"
 commands.allow = ["save_text_with_dialog", "pick_folder"]
+
+# -- Download manager -------------------------------------------------------
+# Right-click a stream source on the detail page to download the file; a
+# title-bar panel manages the queue. See src-tauri/src/downloads/.
+# The control surface is ONE command taking a tagged action enum rather than
+# eight near-identical ones, because every command needs three registration
+# sites (here, lib.rs generate_handler!, capabilities/default.json) and
+# missing any one of them is a silent 401 at runtime.
+[[permission]]
+identifier = "allow-downloads"
+description = "Allows the frontend to list, start, and control file downloads, and to set the download folder"
+commands.allow = [
+  "downloads_list",
+  "downloads_enqueue",
+  "downloads_control",
+  "downloads_plan_path",
+  "downloads_set_root",
+]

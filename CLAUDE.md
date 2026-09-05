@@ -124,6 +124,28 @@ setup (no sidecar; the old `aura-bridge.exe` was internalised). `resolve_stream`
 
 Do not undo either the HTTPS or the HLS bypass.
 
+### Two stream-list invariants that auto-advance depends on
+
+The source switcher and the Next-Up pre-resolve issue SEPARATE `fetch_streams` calls for the same
+episode, and the user compares them by eye. They must agree, so:
+
+1. **Every `StreamEntry` that reaches the frontend is playable.** `sanitize_stream` filters the url
+   for scheme and length BEFORE the "url or infoHash" gate, never after. With the filter below the
+   gate, a non-http(s) or over-4096-char url passed the gate and was then nulled, emitting an entry
+   with `url == None` AND `info_hash == None`: it rendered as a row in the switcher but could not be
+   played (the play path builds `magnet:?xt=urn:btih:null`, which the bridge 501s), and it shifted
+   what auto-advance picked. The `unwrap_or_else(|| s.title.clone())` fallback in the dedup key is a
+   leftover from that era, not licence to reintroduce it.
+2. **`fetch_streams` returns ADDON order, deterministically.** The fan-out tags each task with its
+   addon index and sorts before merging, because `JoinSet::join_next` yields COMPLETION order - the
+   list would otherwise be ordered by whichever addon answered fastest, differently on every call.
+
+Consequently `pickFirstStreamForEpisode` (`src/nextUp.ts`) takes `streams[0]`, full stop. It must not
+filter or re-rank: for AIOStreams users that ordering is the sort criteria they configured, so the top
+row IS the answer. It also scopes through `streamQueryAddons` (`src/auraSettings.ts`), the single
+definition of "which addons answer a stream query"; auto-advance used to skip that scoping and query
+addons the user had excluded in Settings.
+
 ### Tauri command registration is three places, all required
 
 Every new Rust `#[tauri::command]` must be:
@@ -419,6 +441,70 @@ auto-hide only triggers for users with "Automatically hide the taskbar" enabled.
 `SW_HIDE` workaround was tried and reverted (broke secondary-monitor tray icons). True DXGI exclusive
 fullscreen would require a render rewrite and is deferred.
 
+## Restore from minimize / tray: the animation runs, the content is just late
+
+Symptom, and it is real: restoring from the taskbar button or the tray icon looks sudden and
+jarring, with no visible zoom. It is NOT a missing animation. Frame capture through a real restore:
+`SW_RESTORE` at 121 ms, nothing on screen at 193 and 222 ms, an empty near-black full-screen
+rectangle at 258 and 296 ms, the OS animation ends around 330 ms, and the complete UI appears in one
+step at 357 ms. The user sees the terminal pop.
+
+Three deliberate choices compound, and not one of them is a bug. (1) The top-level window owns ZERO
+opaque pixels: transparency is what lets the mpv child show through (blur-behind per-pixel alpha,
+NULL class brush, and the mpv host wndproc does BeginPaint/EndPaint with no GDI work), so DWM has a
+live surface to scale but nothing in it until WebView2 paints. (2) WebView2's first post-restore
+frame is late. (3) Every theme's `--ln-bg` is `transparent`, a 45%-alpha near-black, or a near-black
+/ `#000000` (`src/App.css`; max channel across the whole palette is `0x14`) against a dark desktop,
+so even the fallback fill is invisible. Firefox is the control that isolates it: Firefox shows a
+visible mid-grey rectangle at 213 ms with no page content, i.e. the SAME late content, just opaque
+and high-contrast enough that a human reads it as an animation.
+
+Refuted by controlled A/B, not by argument. DO NOT re-run these: transparency does not disable the
+animation (a transparent window WITH content animates identically); DWM animates the live surface,
+not a stale pre-minimize snapshot; Mica is not a lever; supplying an iconic bitmap
+(`DWMWA_HAS_ICONIC_BITMAP` + `DWMWA_FORCE_ICONIC_REPRESENTATION`) does nothing because DWM already
+holds a pixel-perfect representation and never sent the messages (the tray-hidden taskbar thumbnail
+shows Aura's full live UI, which is the same fact from the UI side); and a black GDI `PrintWindow`
+at flags=0 proves nothing, since every Chromium / Electron app on the machine prints black too and
+still animates. The environment is stock: `MinAnimate=1`, `DWMWA_TRANSITIONS_FORCEDISABLED=0`,
+`GetWindowRgn` 0, `GWL_STYLE=0x15CF0000` (WS_CAPTION present, no WS_POPUP - tao keeps WS_CAPTION on
+undecorated top-level windows and goes borderless via `WM_NCCALCSIZE`, so this is not the Electron
+frameless case), `GWL_EXSTYLE=0x00040110` (no LAYERED, no NOREDIRECTIONBITMAP).
+
+Restore LATENCY is a separate finding, and DWELL is its dominant variable. A cross-process
+`ShowWindow(SW_RESTORE)` is an inter-thread send, so its block time measures how late the window is.
+How long the window sat minimized dominates that: interleaved 1 s vs 45 s dwells inside one run give
+Aura **60.8 -> 125.0 ms (+64)**, Firefox 38.5 -> 47.7 (+9), opaque native (Telegram) 5.3 -> 19.1 (+14).
+Every app degrades after a long minimize (OS working-set trimming, DWM releasing resources for a
+long-hidden window); what is Aura-specific is the SIZE. This is most likely what "it looks jarring"
+actually is: a recently-used Aura restores in ~60 ms and looks fine, one that sat in the tray for
+minutes takes ~125 ms and lands its content after the animation ended. MEASURE WITHIN ONE RUN ONLY -
+absolute figures on this machine drift badly between runs (Firefox measured 61.6 ms in one session
+and 38.5 ms an hour later, unchanged), so cross-run comparisons are worthless and an earlier one here
+was withdrawn.
+
+`src-tauri/src/win_probe.rs` (dev-only wndproc subclass, armed with `AURA_WIN_PROBE=1 pnpm tauri dev`,
+logs under the `wintiming` label; the Tauri-side split lives in the `Resized` arm of
+`window_logic.rs`) shows where the time goes: Aura's own window-event callback costs **0.0-0.8 ms**,
+the whole wndproc chain is busy 38-41 ms over ~14 messages (dominated by the top-level `WM_PAINT` at
+25.7-28.7 ms), and the remaining ~60 ms is gaps between messages in win32k / DWM with no Aura frame on
+the stack. There is NO hotspot to delete. Two specific dead ends: the `save_window_state` synchronous
+disk write in the `Resized` arm fired on one restore in six and cost 0.8 ms, and pinning the WebView2
+runtime back to 151.0.4129.107 (from 152.0.4191.53) with `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` changed
+nothing (86.6 / 131.5 ms against 88.9 / 131.5 at the two dwells).
+
+Two changes shipped alongside this investigation and NEITHER fixes the animation, so do not describe
+them that way. `tray.rs::show_main_window` minimizes before hiding to tray and restores with `show()`
+THEN `unminimize()` - the order is load-bearing, because tao applies its whole window-flag diff in one
+pass ending in an unconditional `SW_HIDE` when the new flags lack VISIBLE, so `unminimize()` first
+would `SW_RESTORE` and then immediately re-hide. And `mpv::engine::wake_and_resync` unparks the
+geometry pump on restore, because the pump is otherwise asleep on a 150 ms `HIDDEN_TICK` and its
+geometry pass is edge-triggered on a CHANGED rect, so a same-size restore issued no `SetWindowPos` at
+all.
+
+Full write-up, including the remedies that were considered and rejected:
+`docs/research/2026-09-03-restore-animation.md`.
+
 ## Caching boundaries
 
 Bound every cache (see Performance & memory).
@@ -506,6 +592,13 @@ creep degrades the experience. When adding ANY feature:
   `app_data_dir()/subtitles` and `add_subtitle_to_mpv` enforces containment.
 - "A Tailwind class has no effect" -> check the theme-scale gotchas; confirm against
   `dist/assets/index-*.css`.
+- "Restore from minimize / tray has no animation" -> nothing to fix in the animation; it runs. Read
+  the restore section above BEFORE investigating, and note that the nearby restore-latency cost is
+  not in Aura's code either. Instrument with `AURA_WIN_PROBE=1 pnpm tauri dev` (`wintiming` label).
+- "Next Up / auto-advance plays a different source than the top of the switcher list" -> read the two
+  stream-list invariants above. In order: `sanitize_stream` emitting an unplayable entry,
+  `fetch_streams` returning completion order, and `pickFirstStreamForEpisode` scoping its query
+  differently from the switcher. All three are fixed; a recurrence means one was undone.
 - "Library page blank" -> `<ErrorBoundary scope="Library">` surfaces the render error.
 
 ## Stream chip parsing: split lines into SEGMENTS, never dispatch on the first character
@@ -649,4 +742,5 @@ artifacts and the updater feed all bake the number in and a published version ca
   shipped; trust the code over the roadmap).
 - `src-tauri/permissions/player.toml` + `src-tauri/capabilities/default.json`: the permission ledger,
   and the usual silent failure mode for a new command.
-- `docs/research/` for one-off forensic deep-dives (e.g. the off-focus frame-drop analysis).
+- `docs/research/` for one-off forensic deep-dives (e.g. the off-focus frame-drop analysis, and the
+  restore-animation investigation).

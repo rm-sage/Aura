@@ -81,8 +81,24 @@ pub fn set_tray_visible<R: Runtime>(app: &AppHandle<R>, visible: bool) {
 
 fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(w) = app.get_webview_window("main") {
-        let _ = w.unminimize();
+        // ORDER IS LOAD-BEARING: show() first, unminimize() second.
+        //
+        // The close-to-tray path leaves the window hidden AND minimized, and
+        // that is deliberate: ShowWindow(SW_SHOW) on a merely hidden window
+        // never animates, which is why the tray restore used to snap in with no
+        // transition at all. Windows animates the iconic to restored edge, so
+        // the window has to still be iconic when we ask for it.
+        //
+        // show() re-shows it still minimized (SW_SHOW preserves WS_MINIMIZE),
+        // and unminimize() is then the SW_RESTORE that animates. Doing it the
+        // other way round breaks it silently: tao applies its whole flag diff
+        // in one pass and ends with an unconditional SW_HIDE whenever the new
+        // flags lack VISIBLE, so unminimize() on a hidden window would
+        // SW_RESTORE and immediately re-hide, leaving a cleared WS_MINIMIZE for
+        // the following show() to reveal with no animation. Matches the
+        // single-instance handler in lib.rs.
         let _ = w.show();
+        let _ = w.unminimize();
         let _ = w.set_focus();
         // Window is back on screen — the tray icon's job is done; hide it again.
         set_tray_visible(app, false);

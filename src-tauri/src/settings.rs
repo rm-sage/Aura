@@ -312,10 +312,36 @@ pub struct AppSettings {
     /// Directory screenshots are saved to. Empty = the default `Pictures/Aura`
     /// folder (with `app_data_dir()/screenshots` as the fallback when the
     /// Pictures known-folder can't be resolved; see `save_screenshot` in lib.rs).
-    /// A machine-local PATH, so it is NOT in the portable / cloud-sync field
-    /// lists (paths don't transfer across machines).
+    /// A machine-local PATH, so it is NOT in the portable field lists in
+    /// `settingsTransfer.ts` (paths don't transfer across machines).
+    ///
+    /// CLOUD SYNC: excluded by an explicit strip in `sync.ts`. Note that being
+    /// absent from the portable lists is NOT sufficient on its own — those
+    /// gate file export/import only. `sync.ts` ships the whole `get_settings`
+    /// object opaquely and `update_settings` below shallow-merges rather than
+    /// whitelisting, so a field is excluded only when something actively
+    /// removes it. This comment previously claimed an exclusion that did not
+    /// exist; the strip was added alongside `download_dir`.
     #[serde(default)]
     pub screenshot_dir: String,
+
+    // ── Downloads ──────────────────────────────────────────────────────────
+    /// Root folder downloads are written to. Empty = not chosen yet, in which
+    /// case the first download attempt prompts for one via `pick_folder`
+    /// (`log_export.rs:92`) and writes the answer back here.
+    ///
+    /// A machine-local PATH, with the same two exclusions as `screenshot_dir`
+    /// above: out of both portable lists, and actively stripped in `sync.ts`.
+    /// Without the strip a `D:\` root would sync to a laptop that has no D
+    /// drive and every download would fail on a folder the user never chose.
+    /// This is the lesson `iptv_playlists` learned the expensive way.
+    #[serde(default)]
+    pub download_dir: String,
+    /// true = organised layout (`Show (Year)/Season 01/Show - S01E07 - Title`),
+    /// false = flat (the raw release filename straight into the root). A real
+    /// preference rather than a machine fact, so it DOES sync and IS portable.
+    #[serde(default = "default_true")]
+    pub download_organise: bool,
     // NOTE: crash_reporting_consent + crash_reporting_dsn used to live
     // here but moved to a scope-independent sidecar at
     // `<app_data_dir>/crash-reporting.json` (see crash_reporting.rs).
@@ -458,6 +484,8 @@ impl Default for AppSettings {
             demuxer_readahead_secs:      default_readahead_secs(),
             demuxer_max_mib:             default_demuxer_max_mib(),
             screenshot_dir:              String::new(),
+            download_dir:                String::new(),
+            download_organise:           true,
             iptv_playlists:              Vec::new(),
             iptv_default_playlist_id:    None,
         }

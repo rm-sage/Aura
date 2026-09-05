@@ -855,6 +855,23 @@ pub struct StreamEntry {
     /// older build — treat as unknown and render normally. The UI swaps the
     /// star rating for a red "Unreliable" badge only when this is `Some(true)`.
     pub episode_pack: Option<bool>,
+    /// `behaviorHints.proxyHeaders.request` — headers the addon says the
+    /// origin REQUIRES, typically a Referer or a specific User-Agent.
+    ///
+    /// Playback never needed these because mpv connects direct and sends its
+    /// own Lavf User-Agent, which is what provider gating is usually keyed on
+    /// (the same gating CLAUDE.md's HLS bypass exists for). A download goes out
+    /// through reqwest instead, so without forwarding these a stream that
+    /// plays perfectly would 403 the moment you tried to save it. Emitted as
+    /// pairs rather than a map so the order the addon gave is preserved and
+    /// the TS type stays a plain array.
+    pub proxy_headers: Option<Vec<(String, String)>>,
+    /// `behaviorHints.videoSize` — the file size in BYTES, when the addon
+    /// bothers to send it. Everything else on the wire is a human string
+    /// parsed out of the title text (`streamMeta.ts` produces "12.6 GB", never
+    /// a number), so this is the only real byte count available before the
+    /// first response, and it is what the free-space preflight uses.
+    pub video_size: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3441,9 +3458,17 @@ pub async fn fetch_streams(
         addons.len()
     );
 
-    let mut set: tokio::task::JoinSet<AddonFetchOutput> = tokio::task::JoinSet::new();
+    // Tagged with the addon's position so results can be re-ordered below.
+    // `JoinSet::join_next` yields COMPLETION order, which made the stream list
+    // depend on which addon happened to answer first - a different order on
+    // every call, for the same episode. That is invisible with one stream addon
+    // and actively confusing with several: the source switcher and the Next-Up
+    // pre-resolve issue separate fetches, so they could disagree about which
+    // stream is "first" and auto-advance would play something other than the
+    // top of the list the user was looking at.
+    let mut set: tokio::task::JoinSet<(usize, AddonFetchOutput)> = tokio::task::JoinSet::new();
 
-    for addon in addons {
+    for (addon_idx, addon) in addons.into_iter().enumerate() {
         let media_type = safe_type.clone();
         let id         = safe_id.clone();
         set.spawn(async move {
@@ -3474,7 +3499,7 @@ pub async fn fetch_streams(
                         label
                     );
                 }
-                return AddonFetchOutput::empty();
+                return (addon_idx, AddonFetchOutput::empty());
             }
             let addon_name = addon.name.clone();
 
@@ -3505,7 +3530,7 @@ pub async fn fetch_streams(
                         "[{}] {}: {}",
                         label, cat, e
                     );
-                    return AddonFetchOutput::empty();
+                    return (addon_idx, AddonFetchOutput::empty());
                 }
             };
             let status = resp.status();
@@ -3516,7 +3541,7 @@ pub async fn fetch_streams(
                     "[{}] HTTP {} for {}",
                     label, status.as_u16(), url
                 );
-                return AddonFetchOutput::empty();
+                return (addon_idx, AddonFetchOutput::empty());
             }
 
             let json = match resp.json::<serde_json::Value>().await {
@@ -3528,7 +3553,7 @@ pub async fn fetch_streams(
                         "[{}] JSON parse failed: {}",
                         label, e
                     );
-                    return AddonFetchOutput::empty();
+                    return (addon_idx, AddonFetchOutput::empty());
                 }
             };
 
@@ -3591,30 +3616,38 @@ pub async fn fetch_streams(
                 );
             }
 
-            AddonFetchOutput { streams: kept, errors, warnings, info, stats }
+            (addon_idx, AddonFetchOutput { streams: kept, errors, warnings, info, stats })
         });
     }
 
     let mut all: Vec<StreamEntry> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut metadata = StreamMetadata::default();
+    // Drain, then restore addon order before merging. Sorting here rather than
+    // awaiting the tasks in sequence keeps the fan-out fully parallel.
+    let mut outputs: Vec<(usize, AddonFetchOutput)> = Vec::new();
     while let Some(task_result) = set.join_next().await {
-        if let Ok(out) = task_result {
-            for s in out.streams {
-                let key = s
-                    .url
-                    .clone()
-                    .or_else(|| s.info_hash.clone())
-                    .unwrap_or_else(|| s.title.clone());
-                if seen.insert(key) {
-                    all.push(s);
-                }
-            }
-            metadata.errors.extend(out.errors);
-            metadata.warnings.extend(out.warnings);
-            metadata.info.extend(out.info);
-            metadata.stats.extend(out.stats);
+        if let Ok(tagged) = task_result {
+            outputs.push(tagged);
         }
+    }
+    outputs.sort_by_key(|(idx, _)| *idx);
+
+    for (_, out) in outputs {
+        for s in out.streams {
+            let key = s
+                .url
+                .clone()
+                .or_else(|| s.info_hash.clone())
+                .unwrap_or_else(|| s.title.clone());
+            if seen.insert(key) {
+                all.push(s);
+            }
+        }
+        metadata.errors.extend(out.errors);
+        metadata.warnings.extend(out.warnings);
+        metadata.info.extend(out.info);
+        metadata.stats.extend(out.stats);
     }
 
     crate::devlog!(
@@ -3854,22 +3887,37 @@ fn sanitize_stream(s: &serde_json::Value, addon_name: &str) -> Option<StreamEntr
     // chip-parsing; we trust the addon's content here.
     let title = cap(raw_title.to_string(), 1024);
 
-    let url = s.get("url").and_then(|v| v.as_str()).map(String::from);
+    // ORDER IS LOAD-BEARING: reject an unusable url BEFORE the gate below,
+    // never after. The scheme/length filter used to run underneath the gate,
+    // so a stream whose only address was a non-http(s) scheme or an over-long
+    // url PASSED the gate, then had its url nulled, and was emitted with both
+    // `url == None` and `info_hash == None`. Two visible consequences:
+    //
+    //   * the row still rendered in the source list but could not be played -
+    //     `handlePlayStream` builds `magnet:?xt=urn:btih:null` from it and the
+    //     bridge answers 501.
+    //   * it silently shifted what Next-Up auto-advanced into. That picker
+    //     skips unplayable entries, so a dead row at the top of the list moved
+    //     the pick down to a source the user had not chosen, while the source
+    //     switcher still showed the dead one first.
+    //
+    // Filtering first makes the invariant real: every StreamEntry that reaches
+    // the frontend is playable, so the list the user sees and the entry the
+    // picker takes can no longer disagree.
+    let url = s
+        .get("url")
+        .and_then(|v| v.as_str())
+        .filter(|u| {
+            let lower = u.to_lowercase();
+            (lower.starts_with("http://") || lower.starts_with("https://")) && u.len() <= 4096
+        })
+        .map(String::from);
     let info_hash = s.get("infoHash").and_then(|v| v.as_str()).map(String::from);
 
     // A usable stream needs at least one of these.
     if url.is_none() && info_hash.is_none() {
         return None;
     }
-
-    let url = url.and_then(|u| {
-        let lower = u.to_lowercase();
-        if (lower.starts_with("http://") || lower.starts_with("https://")) && u.len() <= 4096 {
-            Some(u)
-        } else {
-            None
-        }
-    });
 
     // behaviorHints.filename — populated by AIOStreams (and some other
     // addons) with the raw release filename. Cap matches `title` to
@@ -3892,6 +3940,45 @@ fn sanitize_stream(s: &serde_json::Value, addon_name: &str) -> Option<StreamEntr
         .and_then(|v| v.get("episodePack"))
         .and_then(|v| v.as_bool());
 
+    // behaviorHints.proxyHeaders.request — see the struct field for why this
+    // matters only on the download path. Bounded hard on every axis: an addon
+    // is untrusted input and these end up on a real outbound request.
+    let proxy_headers = s
+        .get("behaviorHints")
+        .and_then(|v| v.get("proxyHeaders"))
+        .and_then(|v| v.get("request"))
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| {
+                    let val = v.as_str()?;
+                    // Reject anything that could smuggle a second header or a
+                    // body separator into the request line.
+                    if k.is_empty()
+                        || k.len() > 128
+                        || val.len() > 1024
+                        // is_control() already covers CR and LF, which are the
+                        // two that would smuggle a second header.
+                        || k.chars().any(|c| c.is_control() || c == ':')
+                        || val.chars().any(|c| c.is_control())
+                    {
+                        return None;
+                    }
+                    Some((k.clone(), val.to_string()))
+                })
+                .take(16)
+                .collect::<Vec<_>>()
+        })
+        .filter(|v: &Vec<(String, String)>| !v.is_empty());
+
+    // behaviorHints.videoSize, in bytes. Some addons send it as a JSON number,
+    // some as a numeric string; accept both and reject anything implausible.
+    let video_size = s
+        .get("behaviorHints")
+        .and_then(|v| v.get("videoSize"))
+        .and_then(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse::<u64>().ok()))
+        .filter(|n| *n > 0 && *n < 1024u64.pow(5));
+
     Some(StreamEntry {
         title,
         addon_name: cap(addon_name.to_string(), 64),
@@ -3904,6 +3991,8 @@ fn sanitize_stream(s: &serde_json::Value, addon_name: &str) -> Option<StreamEntr
             .map(|s| cap(s.to_string(), 1024)),
         filename,
         episode_pack,
+        proxy_headers,
+        video_size,
     })
 }
 

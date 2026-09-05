@@ -26,6 +26,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { AddonEntry, MetaDetail, StreamEntry, VideoEntry } from "./types";
 import { getMetaDetailFallback } from "./metaCache";
+import { streamQueryAddons } from "./auraSettings";
 import { getSortedEpisodes as sortedEpisodes } from "./episodeSort";
 
 /** True when the episode's release date is in the past (or unknown).
@@ -189,11 +190,22 @@ export function findPreviousEpisode(
 }
 
 /**
- * Pick the highest-priority stream for the supplied episode by
- * delegating to the existing `fetch_streams` command and returning
- * `streams[0]` (addons return ranked best-first).
+ * Pick the stream for the supplied episode: literally `streams[0]`.
  *
- * Returns null when no playable stream is available — callers should
+ * Addons return their list already ranked, and for AIOStreams users that
+ * ranking is the sort criteria they configured themselves, so the top row IS
+ * the answer. Aura must not second-guess it. This used to be
+ * `streams.find(s => s.url || s.info_hash)`, a defensive skip that quietly
+ * walked past entries the source switcher still displayed - so auto-advance
+ * played the 3rd source while the user was looking at a list whose 1st source
+ * was the one they wanted. `sanitize_stream` now guarantees every returned
+ * entry is playable, so the skip has nothing left to defend against and the
+ * displayed list and the picked entry cannot disagree.
+ *
+ * Scoped through `streamQueryAddons` so auto-advance queries exactly the
+ * addons the switcher and the detail page do.
+ *
+ * Returns null when no playable stream is available - callers should
  * surface a soft toast in that case ("No streams found for next
  * episode") rather than silently ignore.
  */
@@ -204,14 +216,16 @@ export async function pickFirstStreamForEpisode(
 ): Promise<StreamEntry | null> {
   if (!addons || addons.length === 0) return null;
   if (!mediaType || !episodeId) return null;
+  const queryAddons = streamQueryAddons(addons);
+  if (queryAddons.length === 0) return null;
   try {
     const result = await invoke<{ streams: StreamEntry[] }>("fetch_streams", {
-      addons,
+      addons: queryAddons,
       mediaType,
       id: episodeId,
     });
     const streams = Array.isArray(result?.streams) ? result.streams : [];
-    return streams.find((s) => !!s.url || !!s.info_hash) ?? null;
+    return streams[0] ?? null;
   } catch (err) {
     console.warn("[next-up] fetch_streams failed:", err);
     return null;

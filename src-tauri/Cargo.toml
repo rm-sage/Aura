@@ -98,6 +98,13 @@ raw-window-handle = "0.5"
 # features) since hash throughput isn't on any hot path here.
 sha2 = "0.10"
 hex = "0.4"
+# RFC 3986 resolution for HLS segment URIs (downloads/hls.rs). A media
+# playlist's segment lines are routinely relative ("../v/seg.ts",
+# "/live/seg.ts", "//cdn/seg.ts"), and resolving them by hand is a bug farm
+# where a mistake means downloading the wrong bytes. Already in the graph
+# transitively via reqwest/tauri, so promoting it to a direct dep costs no
+# extra compile time.
+url = "2"
 # UUID v4 — used by aniskip.rs to mint the per-install submitterId
 # AniSkip wants stamped on every POST /v2/skip-times submission. The
 # id is persisted to <app_data>/aniskip-submitter-id.txt and reused
@@ -157,6 +164,11 @@ windows = { version = "0.61", features = [
     # rendering; only minimised / cloaked / hidden windows should drop
     # to the timer-paced background path.
     "Win32_Graphics_Dwm",
+    # GetDiskFreeSpaceExW - the free-space preflight in download_path.rs. We
+    # want lpFreeBytesAvailableToCaller (quota-aware), not the volume total:
+    # on a quota-managed share the two differ and only the former is what we
+    # can actually write.
+    "Win32_Storage_FileSystem",
 ] }
 
 # Dev-profile slimming. The default debug profile produced ~43 GB of

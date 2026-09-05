@@ -33,6 +33,8 @@ mod cast;
 mod cinema;
 mod crash_reporting;
 mod devlog;
+mod download_path;
+mod downloads;
 mod log_export;
 mod anime_id_map;
 mod api_keyring;
@@ -71,6 +73,10 @@ mod trailer;
 mod tray;
 #[cfg(target_os = "windows")]
 mod win32;
+// TEMPORARY restore-latency instrument. Dev builds only - see
+// `win_probe.rs` for what it measures and why.
+#[cfg(all(target_os = "windows", debug_assertions))]
+mod win_probe;
 mod window_logic;
 
 use std::sync::{Arc, Mutex};
@@ -1852,6 +1858,12 @@ pub fn run() {
                     // disabling MPO globally). No-op for SDR / off. Re-applied
                     // on HDR-settings change + fullscreen transitions.
                     win32::apply_mpo_poison(parent_hwnd);
+
+                    // Restore-latency probe (dev only). Subclasses the
+                    // main wndproc so we can see exactly which message
+                    // a cross-process SW_RESTORE is blocking on.
+                    #[cfg(debug_assertions)]
+                    win_probe::install(parent_hwnd);
                 }
             }
 
@@ -1969,6 +1981,10 @@ pub fn run() {
             // window, and the bridge task has none. Must precede the
             // listener so no callback can race an uninitialised handle.
             oauth_callback::init(app.handle());
+            // Downloads: after settings::load (the root path lives there) and
+            // after runtime_deps::init (an HLS job needs to find ffmpeg).
+            downloads::init(app.handle().clone());
+
             streaming::start_in_process();
 
             // ── Deep-link handler ─────────────────────────────────────────
@@ -2474,6 +2490,12 @@ pub fn run() {
             backup::read_user_backup,
             backup::delete_user_backup,
             backup::user_backup_storage_used,
+            // -- Download manager ---------------------------------------------
+            downloads::commands::downloads_list,
+            downloads::commands::downloads_enqueue,
+            downloads::commands::downloads_control,
+            downloads::commands::downloads_plan_path,
+            downloads::commands::downloads_set_root,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

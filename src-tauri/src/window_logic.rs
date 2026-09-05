@@ -346,6 +346,47 @@ fn pause_mpv<R: Runtime>(app: &AppHandle<R>) {
 /// maximize/restore transition (not every drag-resize tick).
 static LAST_MAXIMIZED: AtomicI8 = AtomicI8::new(-1);
 
+/// Whether the last observed resize found the window minimized. Makes the
+/// restore wake below EDGE-triggered: an ordinary drag-resize must not turn
+/// into a wake storm, which would negate the coarse-tick power discipline the
+/// engine's HIDDEN_TICK / IDLE_TICK tiers exist for.
+static LAST_MINIMIZED: AtomicBool = AtomicBool::new(false);
+
+/// TEMPORARY restore-latency instrument (dev builds only). Times one
+/// pass through the window-event callback and logs it if it was slow
+/// enough to matter. A `Drop` guard rather than a wrapper because the
+/// arms below `return` early. Threshold is deliberately low: this
+/// callback should never be a measurable fraction of a restore.
+#[cfg(all(target_os = "windows", debug_assertions))]
+struct EvTimer(&'static str, std::time::Instant);
+
+#[cfg(all(target_os = "windows", debug_assertions))]
+impl EvTimer {
+    fn new(event: &WindowEvent) -> Self {
+        let name = match event {
+            WindowEvent::Resized(_) => "Resized",
+            WindowEvent::Moved(_) => "Moved",
+            WindowEvent::Focused(true) => "Focused(true)",
+            WindowEvent::Focused(false) => "Focused(false)",
+            WindowEvent::CloseRequested { .. } => "CloseRequested",
+            WindowEvent::ScaleFactorChanged { .. } => "ScaleFactorChanged",
+            WindowEvent::ThemeChanged(_) => "ThemeChanged",
+            _ => "other",
+        };
+        Self(name, std::time::Instant::now())
+    }
+}
+
+#[cfg(all(target_os = "windows", debug_assertions))]
+impl Drop for EvTimer {
+    fn drop(&mut self) {
+        let ms = self.1.elapsed().as_secs_f64() * 1000.0;
+        if ms >= 2.0 && crate::win_probe::enabled() {
+            crate::devlog!(warn, "wintiming", "on_window_event {} took {ms:.1} ms", self.0);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Force quit
 //
@@ -393,6 +434,13 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
     let win = window.clone();
 
     window.clone().on_window_event(move |event| {
+        // TEMPORARY restore-latency instrument (dev builds only). This
+        // callback runs INSIDE the main wndproc, so every millisecond it
+        // spends is a millisecond a cross-process ShowWindow(SW_RESTORE)
+        // blocks on. `win_probe` times the whole wndproc; this splits out
+        // how much of that is ours. See win_probe.rs.
+        #[cfg(all(target_os = "windows", debug_assertions))]
+        let _ev_timer = EvTimer::new(event);
         let cfg = settings::snapshot();
         match event {
             // Focus REGAIN backstop. After an alt-tab cycle (especially
@@ -432,6 +480,8 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
             // Resyncing in Rust costs nothing and guarantees the child
             // tracks the parent's client area.
             WindowEvent::Resized(_) => {
+                #[cfg(all(target_os = "windows", debug_assertions))]
+                let t_arm = std::time::Instant::now();
                 // Minimised path — pause MPV (if configured) and BAIL
                 // before the child-resize backstop below. A Resized
                 // event during a minimise/restore cycle reports a
@@ -445,7 +495,11 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                 // handler above already re-syncs the child rect when
                 // the window comes back, so skipping the resize here
                 // is safe.
+                #[cfg(all(target_os = "windows", debug_assertions))]
+                let t_step = std::time::Instant::now();
                 let minimised = matches!(win.is_minimized(), Ok(true));
+                #[cfg(all(target_os = "windows", debug_assertions))]
+                let ms_is_min = t_step.elapsed().as_secs_f64() * 1000.0;
                 if minimised {
                     // Pause on minimise is the default now, with TWO exemptions
                     // that must keep video + audio rolling while hidden:
@@ -462,8 +516,26 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                         crate::devlog!(info, "win", "minimised → pause MPV");
                         pause_mpv(&handle);
                     }
+                    LAST_MINIMIZED.store(true, Ordering::Relaxed);
                     return;
                 }
+                // Restored from minimize: tray click, taskbar button, Win+D, or
+                // a second instance raising this one. Wake the engine pump. It
+                // is asleep on a 150 ms HIDDEN_TICK, and its geometry pass is
+                // edge-triggered on a CHANGED rect, so a same-size restore
+                // would otherwise leave the host window unpainted and any
+                // queued command up to a full tick late. Deliberately NOT
+                // hooked to Focused(true), which fires on every alt-tab and
+                // would run a forced pass on a very common gesture.
+                #[cfg(all(target_os = "windows", debug_assertions))]
+                let t_step = std::time::Instant::now();
+                let restored = LAST_MINIMIZED.swap(false, Ordering::Relaxed);
+                if restored {
+                    #[cfg(target_os = "windows")]
+                    crate::mpv::engine::wake_and_resync();
+                }
+                #[cfg(all(target_os = "windows", debug_assertions))]
+                let ms_wake = t_step.elapsed().as_secs_f64() * 1000.0;
                 // Non-minimise resizes need no backstop here — the
                 // engine's pump loop tracks the parent rect itself.
                 //
@@ -477,12 +549,44 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                 // actual state change (not every drag tick), and only while
                 // visible (the early return above handles minimized, where
                 // is_maximized() falsely reports false).
+                #[cfg(all(target_os = "windows", debug_assertions))]
+                let t_step = std::time::Instant::now();
                 let maxi = matches!(win.is_maximized(), Ok(true)) as i8;
+                #[cfg(all(target_os = "windows", debug_assertions))]
+                let ms_is_max = t_step.elapsed().as_secs_f64() * 1000.0;
+                #[cfg(all(target_os = "windows", debug_assertions))]
+                let mut ms_save = f64::NAN;
                 if LAST_MAXIMIZED.swap(maxi, Ordering::Relaxed) != maxi {
                     use tauri_plugin_window_state::{AppHandleExt, StateFlags};
+                    #[cfg(all(target_os = "windows", debug_assertions))]
+                    let t_save = std::time::Instant::now();
                     let _ = handle.save_window_state(
                         StateFlags::all() ^ StateFlags::FULLSCREEN,
                     );
+                    #[cfg(all(target_os = "windows", debug_assertions))]
+                    {
+                        ms_save = t_save.elapsed().as_secs_f64() * 1000.0;
+                    }
+                }
+                // One line, emitted after every measurement is taken, so
+                // the log itself cannot inflate any of the numbers it
+                // reports. Only on a restore or a slow pass, so an
+                // ordinary drag-resize stays quiet.
+                #[cfg(all(target_os = "windows", debug_assertions))]
+                {
+                    let total = t_arm.elapsed().as_secs_f64() * 1000.0;
+                    if (restored || total >= 2.0) && crate::win_probe::enabled() {
+                        let save = if ms_save.is_nan() {
+                            "skipped".to_string()
+                        } else {
+                            format!("{ms_save:.1} ms")
+                        };
+                        crate::devlog!(
+                            warn, "wintiming",
+                            "Resized arm{}: {total:.1} ms total (is_minimized {ms_is_min:.1}, wake {ms_wake:.1}, is_maximized {ms_is_max:.1}, save_window_state {save})",
+                            if restored { " [RESTORE]" } else { "" },
+                        );
+                    }
                 }
             }
             WindowEvent::CloseRequested { api, .. } => {
@@ -520,6 +624,23 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     // and that follow-up must still quit rather than fall back to
                     // hiding. The "keep Aura open" path disarms it explicitly via
                     // cancel_quit().
+                    return;
+                }
+
+                // Same shape as the scrobble gate above, for the same reason:
+                // a 40 GB transfer is exactly the thing a user does not want
+                // to lose to a reflexive click on the X. The prompt's "quit
+                // anyway" path re-issues a plain close, by which time the
+                // downloads have been parked and this gate passes.
+                //
+                // FORCE_QUIT stays armed for the same reason it does above.
+                if exiting && crate::downloads::active_count() > 0 {
+                    api.prevent_close();
+                    use tauri::Emitter;
+                    let _ = handle.emit(
+                        "aura:downloads-close-request",
+                        crate::downloads::active_count(),
+                    );
                     return;
                 }
 
@@ -571,6 +692,16 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                         pause_mpv(&handle);
                     }
                     api.prevent_close();
+                    // Minimize BEFORE hiding, so the window carries WS_MINIMIZE
+                    // while it sits in the tray. That is what gives the restore
+                    // (show then unminimize, in tray::show_main_window) a real
+                    // iconic to restored transition for Windows to animate;
+                    // showing a merely hidden window never animates. Order is
+                    // load-bearing in both directions: after prevent_close and
+                    // the pause above, and before the hide, because SW_MINIMIZE
+                    // carries SWP_SHOWWINDOW and would un-hide an
+                    // already-hidden window.
+                    let _ = win.minimize();
                     let _ = win.hide();
                     // Window is now hidden to the tray — surface the tray icon,
                     // which is its only route back. Hidden again on restore
@@ -612,6 +743,15 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     // un-joined teardown leaks nothing the OS won't reclaim.
                     #[cfg(target_os = "windows")]
                     bg.push(std::thread::spawn(crate::mpv::thumb::shutdown));
+
+                    // Park every running download and write the job list. Cheap
+                    // and synchronous: it signals the workers (which stop at
+                    // their next select, so within a chunk) and writes one
+                    // small JSON file. Doing it here rather than on a bg thread
+                    // means it cannot be cut short by the 2500 ms deadline and
+                    // lose the list, which would strand .aurapart files with
+                    // nothing pointing at them.
+                    crate::downloads::shutdown();
 
                     // MANDATORY + main-thread only: the engine join pumps Win32
                     // messages (a child DestroyWindow posts WM_PARENTNOTIFY back
