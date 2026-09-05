@@ -63,6 +63,9 @@ export interface DownloadJob {
   created_at: number;
   completed_at: number | null;
   truncated: boolean;
+  /** What a running job is doing when it is not moving bytes (an HLS remux).
+   *  Absent means "fetching". */
+  stage?: string | null;
   /** Live, computed by Rust at snapshot time. */
   speed_bps: number | null;
   eta_secs: number | null;
@@ -309,6 +312,9 @@ export function jobStatusLine(j: DownloadJob): string {
     case "queued":
       return "Waiting";
     case "running": {
+      // Every byte is already fetched during an HLS remux, so the byte line
+      // would read as finished for the minutes it takes.
+      if (j.stage) return `${j.stage}: reassembling the video`;
       const done = formatBytes(j.bytes_done);
       const total = j.total_bytes ? ` of ${formatBytes(j.total_bytes)}` : "";
       const speed = j.speed_bps ? ` · ${formatSpeed(j.speed_bps)}` : "";

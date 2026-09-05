@@ -577,7 +577,13 @@ async fn ledger_run(
     let _ = file.flush();
     drop(file);
 
-    remux(job, work, &media, &mut stop).await
+    // Every byte is fetched by this point, so the bar reads 100%. The remux
+    // that follows is minutes of work on a large file, and without saying so
+    // the row looks finished but stubbornly refuses to complete.
+    super::manager::record_stage(&job.id, Some("Finishing"));
+    let out = remux(job, work, &media, &mut stop).await;
+    super::manager::record_stage(&job.id, None);
+    out
 }
 
 fn current_reason(stop: &watch::Receiver<Option<StopReason>>) -> StopReason {

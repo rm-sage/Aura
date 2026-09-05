@@ -206,6 +206,72 @@ tests, including a regression test for exactly the off-by-one above; keep them. 
 sub-0.5-confidence pair is DROPPED and logged rather than rendered. Fail visible, never fail
 off-by-one. Season 0 is excluded on both sides (the two databases' specials do not correspond).
 
+### Downloads: two landmines and one governing rule
+
+`src-tauri/src/downloads/` (engine) plus `src-tauri/src/download_path.rs` (path
+safety) plus `src/Downloads*.tsx` / `src/downloads*.ts`. Right-click a source on
+the DETAIL PAGE to download it; a title-bar button beside the Aura Cloud chip
+opens the panel. Downloads are FILE downloads only: `load_video` still refuses
+local paths and offline playback is not in scope.
+
+Rust is authoritative; the React store is a projection that rehydrates from
+`downloads_list`, because F5 and the stream-lost modal's Reload must not lose a
+40 GB transfer. Two concurrent, promoted by a PUMP rather than a
+`tokio::sync::Semaphore` (a Semaphore hands out permits in wait-arrival order,
+which would make drag-to-reorder decorative). The control primitive is a
+`watch` channel read in a **`biased`** select against the body read: without
+`biased`, a pause issued while the body is stalled waits on a dead network
+future, and a stalled body is the most common debrid failure.
+
+**LANDMINE 1: never use `-ss` to resume an HLS download.** Measured against the
+bundled ffmpeg 8.1.1 on a 5 x 6.000 s VOD playlist, `-ss 15` and `-ss 18`
+produce BYTE-IDENTICAL output: on a mid-segment value ffmpeg lands on the start
+of the containing segment, but on an exact segment BOUNDARY it lands one whole
+segment early. A resume point is always a boundary, so the error is every
+resume, not some, and the mpegts muxer rebases each run to the same origin so
+the duplicated segment is invisible downstream. ffmpeg exits 0 with no
+diagnostic. The offset is not a constant you can subtract (1 segment at
+boundaries, 0 mid-segment, dependent on `#EXT-X-TARGETDURATION`, undocumented
+`hls.c` behaviour), and correcting it needs `-copyts` plus `-to`, which is the
+documented zero-bytes landmine. **No download-job ffmpeg invocation may pass
+`-ss`, `-copyts`, `-t` or `-to`.** Mode A therefore fetches segments in Rust and
+lets ffmpeg do exactly one local remux at the end; pause is byte-exact
+(verified `cmp`-identical, including fMP4/CMAF). Mode B (encrypted or
+discontinuous playlists) is a single ffmpeg pass and is genuinely NOT pausable,
+so it says so; `JobKind` is written back once the admission gate has run,
+because a job that lies about being pausable turns a Pause press into a silent
+cancel.
+
+**LANDMINE 2: a body that ends early looks exactly like success.** `chunk()`
+returning `None` is not proof of completion (this is the mpv truncated-stream
+bug from v2.0.1, in a different costume). Completion requires the byte count to
+match what the origin promised. Likewise, when a host sends neither `ETag` nor
+`Last-Modified` (common for debrid), a resume compares a 64 KiB tail hash before
+appending: without it a rotated link answers 206 at the stored offset and two
+different releases get spliced into one file that reports no error at all. Same
+rule for a ranged HLS segment: a 200 to a `Range` request is the WHOLE resource,
+and appending it yields K concatenated copies that ffmpeg remuxes happily.
+
+**The governing rule in `download_path.rs`:** it does not try to model
+`RtlGetFullPathName_U`, it emits only paths that are FIXED POINTS of it. Win32
+strips trailing dots and spaces from every component before the kernel sees it,
+which is why `".. "` is a traversal that passes a naive containment check.
+Applying that strip ourselves, then re-validating, makes the traversal
+structurally unrepresentable, and sound lexical containment follows. The module
+also covers reserved device names (`CON.mkv` included), bidi and zero-width
+spoofs, an extension ALLOWLIST (without it `payload.exe` lands), UTF-16 MAX_PATH
+budgeting, and `create_new` collision claims. It does NOT normalize: NFKC maps
+U+FF0F to `/` and U+FF1A to `:`, i.e. it manufactures path separators. 17 tests,
+plus 10 for the HLS parser and relink guard.
+
+`download_dir` is machine-local and is stripped from the cloud blob in BOTH
+directions in `sync.ts`. Being absent from `PORTABLE_*_FIELDS` is NOT sufficient:
+those gate file export/import, while `update_settings` shallow-merges whatever
+the cloud sends. The `screenshot_dir` comment used to claim an exclusion it did
+not have; it does now.
+
+Full design: `docs/superpowers/specs/2026-09-05-download-manager-design.md`.
+
 ### Build-time secrets
 
 `build.rs` parses `../.env.local` (git-ignored) or real environment variables and bakes three keys
@@ -256,6 +322,11 @@ frontend ~40k LOC over ~70 files + ~13 views).
 - **Casting + live TV**: `cast/mod.rs` + `cast/castv2.rs` + `cast/dlna.rs` + `cast/hls.rs` +
   `cast/media_server.rs` (Chromecast via hand-rolled CASTV2 + DLNA + on-the-fly HLS transcode),
   `iptv.rs` (EPG fetch + Xtream password keyring).
+- **Downloads**: `downloads/` (`manager.rs` registry + pump, `http.rs` direct
+  transport, `hls.rs` the two HLS modes, `store.rs` `downloads.json`,
+  `taskbar.rs` ITaskbarList3, `commands.rs` the five commands),
+  `download_path.rs` (Windows path safety, standalone + tested). Devlog label
+  `[downloads]`.
 - **Settings + infra**: `settings.rs` (per-scope AppSettings + theme + HDR resolver), `api_keyring.rs`
   (user API keys in keyring), `backup.rs` (user-data export), `storage.rs`, `stats.rs`,
   `crash_reporting.rs` (Sentry + minidump self-spawn), `runtime_deps.rs` (on-demand binary fetch),
@@ -279,6 +350,11 @@ frontend ~40k LOC over ~70 files + ~13 views).
   watch-together in `src/watchTogether/*` (WebSocket to the `watch-relay/` Cloudflare Workers + DO
   relay), casting via `cast.ts` + `useCastSession.ts`, notifications in `Notifications*.tsx`
   (ring buffer + background scanner), updater in `updater*.ts` + `UpdatePopup.tsx` + `Changelog.tsx`.
+- **Downloads**: `downloadsStore.ts` (projection of the Rust list),
+  `downloadsPanel.ts` (open/closing/closed), `DownloadsButton.tsx`,
+  `DownloadsPanelHost.tsx` (portalled to body), `DownloadRow.tsx`,
+  `downloadsMenu.tsx` (the shared stream-row menu builder),
+  `DownloadsClosePrompt.tsx`, `DownloadsRelinkBridge.tsx`.
 - **Data / caching**: `metaCache.ts`, `persistentCache.ts`, `libraryNormalize.ts`, `auraSettings.ts`,
   `settingsTransfer.ts`, `sessionRoute.ts`, `catalogHoverStore.ts`, `releaseSignalStore.ts`,
   `historyStore.ts`, `streamMeta.ts`, `aiometadata.ts`. See "Caching boundaries".
@@ -600,6 +676,17 @@ creep degrades the experience. When adding ANY feature:
   `fetch_streams` returning completion order, and `pickFirstStreamForEpisode` scoping its query
   differently from the switcher. All three are fixed; a recurrence means one was undone.
 - "Library page blank" -> `<ErrorBoundary scope="Library">` surfaces the render error.
+- "A download fails instantly at 0 bytes" -> the container refinement in
+  `downloads/mod.rs::refine_extension`. It renames the partial, so the worker
+  must use the paths it RETURNS, not its own clone of the job.
+- "A download will not pause" / "the window will not close" -> a single-pass HLS
+  job (`JobKind::HlsPassthrough`) cannot be paused. Everything that must reach
+  `active_count() == 0` cancels those instead, and the quit prompt says so.
+- "The downloaded file is corrupt in the middle" -> the resume validator in
+  `downloads/http.rs`. A host with no `ETag` needs the tail-hash compare; a 206
+  alone proves nothing about WHICH file answered.
+- "A download sits Queued with nothing running" -> `manager::pump`. A collapsed
+  pump request must be DEFERRED via `PUMP_AGAIN`, never dropped.
 
 ## Stream chip parsing: split lines into SEGMENTS, never dispatch on the first character
 
@@ -638,7 +725,7 @@ old-format and new-format samples and diff the field sets. Node runs the `.ts` f
 - Rust log labels to grep in the DevConsole or `aura-mpv.log`: `[bridge]`, `[player]`, `[streams]`,
   `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[ratings]`, `[rpc]`, `[win32]`, `[smtc]`,
   `[scrobble]`, `[publicmetadb]`, `[mpv]` (the playback engine), `[cast]`, `[iptv]`, `[sync]`,
-  `[aniskip]`, `[arcs]`, `[subsync]`, `[tenrai]` (the MyAnimeList client), `[extras]` (frontend,
+  `[aniskip]`, `[arcs]`, `[subsync]`, `[downloads]`, `[tenrai]` (the MyAnimeList client), `[extras]` (frontend,
   the anime metadata tabs on the detail page).
 - libmpv writes its own verbose log to `%USERPROFILE%\aura-mpv.log` (truncated each MPV init, rotated
   to `.old` past 50 MB). The last few lines usually pinpoint a STATUS_ACCESS_VIOLATION.

@@ -214,6 +214,9 @@ export default function DownloadRow({ job, sortable = false }: Props) {
       )}
 
       <p
+        // The status line is one row, so a long failure reason is clipped.
+        // The title makes the whole thing readable without growing the row.
+        title={j_status_title(job)}
         className={[
           "mt-1.5 text-[11px] leading-snug truncate",
           job.state === "failed" || job.state === "needs_source"
@@ -227,6 +230,16 @@ export default function DownloadRow({ job, sortable = false }: Props) {
       </p>
     </div>
   );
+}
+
+/** Full text for the status line's tooltip, so a clipped failure reason is
+ *  still readable. Undefined when the line already fits, which keeps a tooltip
+ *  from appearing over every ordinary progress row. */
+function j_status_title(job: DownloadJob): string | undefined {
+  if (job.state === "failed" || job.state === "needs_source") {
+    return job.error ?? undefined;
+  }
+  return undefined;
 }
 
 function IconBtn({

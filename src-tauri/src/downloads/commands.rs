@@ -128,6 +128,7 @@ pub async fn downloads_enqueue(req: EnqueueRequest) -> Result<DownloadJobDto, St
         created_at: req.created_at,
         completed_at: None,
         truncated: plan.truncated,
+        stage: None,
     };
     crate::devlog!(info, "downloads", "queued {} -> {}", job.title, job.dest_path);
     manager::enqueue(job)

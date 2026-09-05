@@ -638,16 +638,23 @@ pub fn control(action: ControlAction) -> Result<DownloadsSnapshot, String> {
         }
         ControlAction::ClearFinished => {
             let mut st = state().lock().unwrap();
-            let gone: Vec<String> = st
-                .jobs
-                .iter()
-                .filter(|j| j.state.is_finished())
-                .map(|j| crate::download_path::duplicate_key(std::path::Path::new(&j.dest_path)))
-                .collect();
-            for k in gone {
-                st.claims.remove(&k);
+            let (finished, keep): (Vec<DownloadJob>, Vec<DownloadJob>) =
+                st.jobs.drain(..).partition(|j| j.state.is_finished());
+            for j in &finished {
+                st.claims.remove(&crate::download_path::duplicate_key(
+                    std::path::Path::new(&j.dest_path),
+                ));
+                // A FAILED job still owns a partial file. Clearing the row
+                // without removing it left orphaned .aurapart files in the
+                // user's download folder with nothing referencing them. A
+                // COMPLETED job's partial is already gone: it was renamed onto
+                // the final name, and cleanup_partial only touches the part
+                // path, never the finished file.
+                if j.state == DownloadState::Failed {
+                    super::cleanup_partial(j);
+                }
             }
-            st.jobs.retain(|j| !j.state.is_finished());
+            st.jobs = keep;
             super::store::mark_dirty();
             emit(&st);
             let jobs = st.jobs.clone();
@@ -726,6 +733,15 @@ pub fn unpausable_active() -> usize {
                 .count()
         })
         .unwrap_or(0)
+}
+
+/// Note what a running job is doing when it is not moving bytes.
+pub fn record_stage(id: &str, stage: Option<&str>) {
+    let mut st = state().lock().unwrap();
+    if let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) {
+        j.stage = stage.map(|s| s.to_string());
+    }
+    emit(&st);
 }
 
 /// Record the transport mode actually chosen, which for HLS is only known once

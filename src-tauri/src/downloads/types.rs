@@ -172,6 +172,13 @@ pub struct DownloadJob {
     /// limit. Surfaced as a row tooltip only.
     #[serde(default)]
     pub truncated: bool,
+    /// What a Running job is doing right now, when that is not "fetching
+    /// bytes". An HLS ledger job spends its last stretch remuxing, which for a
+    /// multi-gigabyte file is minutes during which every byte HAS been fetched:
+    /// without this the row sat at 100% looking finished but never completing.
+    /// Never persisted, since it only means anything while a worker is live.
+    #[serde(skip)]
+    pub stage: Option<String>,
 }
 
 /// Live, non-persisted numbers computed at snapshot time.
