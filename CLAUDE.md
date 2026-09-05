@@ -224,6 +224,19 @@ tests, including a regression test for exactly the off-by-one above; keep them. 
 sub-0.5-confidence pair is DROPPED and logged rather than rendered. Fail visible, never fail
 off-by-one. Season 0 is excluded on both sides (the two databases' specials do not correspond).
 
+**Related: never trust TMDB's arc NAME for filler status either.** TMDB bakes a
+marker into the title string ("The Past (Filler)"), and it is wrong in both
+directions on Bleach: "The Past" is titled filler and is fully CANON, while
+"Gotei 13 Invading Army" is titled filler and is filler except for its last
+episode. Aura has per-episode filler data from AIOMetadata plus the cloud
+release signal, so `arcKindSummary` (`src/storyArcs.ts`) derives the label from
+that, using the SAME predicate as `countFillerRecap` and `mergedKindFlags` so a
+tile can never disagree with the episode rows it opens. The parenthetical is
+stripped from the displayed name only when the show HAS kind data; for a show
+with none, TMDB's marker is the only signal and is kept. That check is made at
+SHOW level, because a fully-canon arc inside a show that does have data carries
+no flags at all and an arc-level check would misread that as "no data".
+
 ### Downloads: two landmines and one governing rule
 
 `src-tauri/src/downloads/` (engine) plus `src-tauri/src/download_path.rs` (path
@@ -686,6 +699,10 @@ creep degrades the experience. When adding ANY feature:
   episode group of `type == 5` that clears the coverage bar. Most shows have no arcs at all: arcs are
   a property of long-running manga, so the toggle is *supposed* to be absent nearly everywhere.
   DevConsole `[arcs]` logs the grouping choice and the alignment score.
+- "An arc says Filler but its episodes are not" (or vice versa) -> that label
+  comes from TMDB's arc NAME and is unreliable; `arcKindSummary` derives it from
+  Aura's own episode data instead. Check whether the show has any filler data at
+  all first, since with none Aura deliberately falls back to TMDB's marker.
 - "Arc shows the wrong episodes" / "arc is off by one" -> read the story-arcs section above. This is
   the failure the aligner exists to prevent; check the `[arcs]` min-score log before touching
   anything else.
