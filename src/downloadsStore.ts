@@ -6,7 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 // ---------------------------------------------------------------------------
-// downloadsStore — a PROJECTION of the Rust job list, not a copy that drifts.
+// downloadsStore: a PROJECTION of the Rust job list, not a copy that drifts.
 //
 // Rust is authoritative. This module holds whatever the last
 // `downloads-snapshot` event carried, and rehydrates by calling
@@ -180,11 +180,15 @@ function apply(next: DownloadsSnapshot): void {
 
 let started = false;
 let unlisten: (() => void) | null = null;
+/** Set by a cleanup that ran before `listen` resolved. Without it that cleanup
+ *  had nothing to call and the listener stayed attached for the page's life. */
+let stopped = false;
 
 /** Mount once from App. Idempotent, so a StrictMode double-effect is free. */
 export function startDownloadsStore(): () => void {
   if (started) return () => {};
   started = true;
+  stopped = false;
 
   void invoke<DownloadsSnapshot>("downloads_list")
     .then(apply)
@@ -197,10 +201,16 @@ export function startDownloadsStore(): () => void {
   void listen<DownloadsSnapshot>("downloads-snapshot", (e) => {
     apply(e.payload);
   }).then((fn) => {
+    if (stopped) {
+      // Cleanup beat the subscription. Undo it now rather than leaking it.
+      fn();
+      return;
+    }
     unlisten = fn;
   });
 
   return () => {
+    stopped = true;
     unlisten?.();
     unlisten = null;
     started = false;
@@ -252,7 +262,7 @@ export const relinkFailed = (id: string, reason?: string) =>
   control({ op: "relink_failed", id, reason });
 
 // ---------------------------------------------------------------------------
-// Formatting — shared by the button, the rows and the toasts so the three
+// Formatting, shared by the button, the rows and the toasts so the three
 // never disagree about how a number reads.
 // ---------------------------------------------------------------------------
 

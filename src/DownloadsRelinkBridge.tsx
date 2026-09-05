@@ -9,7 +9,7 @@ import type { AddonEntry, StreamEntry, StreamFetchResult } from "./types";
 import { relinkDownload, relinkFailed, useDownloads } from "./downloadsStore";
 
 // ---------------------------------------------------------------------------
-// DownloadsRelinkBridge — answers a job that Rust parked in `relinking`.
+// DownloadsRelinkBridge: answers a job that Rust parked in `relinking`.
 //
 // Debrid and signed CDN links expire, so a download paused overnight, or a
 // partial recovered after a quit, will very likely 401/403 on resume. Rust

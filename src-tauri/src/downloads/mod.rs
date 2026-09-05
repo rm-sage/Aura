@@ -36,7 +36,7 @@ pub mod types;
 
 use types::{DownloadJob, JobKind};
 
-pub use manager::{active_count, shutdown};
+pub use manager::{active_count, shutdown, unpausable_active};
 
 /// Called once from the lib.rs setup hook, after settings have loaded (the
 /// root path comes from there) and after `runtime_deps` has resolved, so an
@@ -78,15 +78,23 @@ pub fn cleanup_partial(job: &DownloadJob) {
 /// addon filename or the URL path stated explicitly is more trustworthy than a
 /// header, and `application/octet-stream` (what most debrid hosts send) says
 /// nothing at all.
-fn refine_extension(job: &DownloadJob, content_type: &str) {
+/// Returns the new `(dest_path, part_path)` when the container was upgraded,
+/// so the CALLER can keep using paths that exist.
+///
+/// The worker holds an owned clone of its `DownloadJob`, and updating only the
+/// registry left that clone pointing at a file this function had just renamed:
+/// the next `open()` hit a missing path and killed the job with `Fatal` at zero
+/// bytes, on the first response, for every source whose container is elected
+/// from `Content-Type`.
+fn refine_extension(job: &DownloadJob, content_type: &str) -> Option<(String, String)> {
     let dest = std::path::Path::new(&job.dest_path);
     let current = dest.extension().and_then(|e| e.to_str()).unwrap_or("");
     if current != crate::download_path::DEFAULT_EXT {
-        return;
+        return None;
     }
     let (elected, source) = crate::download_path::choose_extension(None, None, Some(content_type));
     if source != crate::download_path::ExtSource::ContentType || elected == current {
-        return;
+        return None;
     }
     let new_dest = dest.with_extension(&elected);
     let new_part = std::path::PathBuf::from(format!(
@@ -102,16 +110,15 @@ fn refine_extension(job: &DownloadJob, content_type: &str) {
                 warn, "downloads",
                 "could not rename the partial to {}: {e}", new_part.display()
             );
-            return;
+            return None;
         }
     }
     crate::devlog!(
         info, "downloads",
         "{}: container refined to .{elected} from Content-Type", job.title
     );
-    manager::record_dest(
-        &job.id,
-        new_dest.to_string_lossy().into_owned(),
-        new_part.to_string_lossy().into_owned(),
-    );
+    let dest_s = new_dest.to_string_lossy().into_owned();
+    let part_s = new_part.to_string_lossy().into_owned();
+    manager::record_dest(&job.id, dest_s.clone(), part_s.clone());
+    Some((dest_s, part_s))
 }

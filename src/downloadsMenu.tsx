@@ -13,7 +13,7 @@ import { streamMatchKey } from "./watchTogether/streamMatch";
 //
 // Both detail-page row variants (the parsed StreamRow and the raw RawStreamRow)
 // used to build this array inline and cast it to
-// `Array<{ label; icon?; onClick }>` — a type with no `disabled` and no `hint`,
+// `Array<{ label; icon?; onClick }>` - a type with no `disabled` and no `hint`,
 // so a greyed-out entry was not even expressible. Collapsing them here fixes
 // that and guarantees the two rows can never drift apart.
 // ---------------------------------------------------------------------------

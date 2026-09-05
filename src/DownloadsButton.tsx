@@ -7,7 +7,7 @@ import { useDownloads } from "./downloadsStore";
 import { toggleDownloadsPanel, useDownloadsPanelPhase } from "./downloadsPanel";
 
 // ---------------------------------------------------------------------------
-// DownloadsButton — the title-bar affordance, sitting immediately after the
+// DownloadsButton: the title-bar affordance, sitting immediately after the
 // Aura Cloud sync chip.
 //
 // Placement is after the chip, not before, and that is load-bearing: the button
@@ -75,12 +75,17 @@ export default function DownloadsButton() {
   const [flourish, setFlourish] = useState(false);
   const [dwelling, setDwelling] = useState(false);
   const prevActive = useRef(active);
+  // `jobs` is read through a ref, NOT a dependency: it is a fresh array on
+  // every 500ms snapshot, so depending on it re-ran this effect constantly and
+  // its own cleanup cancelled the timers it had just set. The animation never
+  // finished and the label never held.
+  const jobsRef = useRef(jobs);
+  jobsRef.current = jobs;
   useEffect(() => {
     const fell = prevActive.current > 0 && active === 0;
     prevActive.current = active;
     if (!fell) return;
-    const anyCompleted = jobs.some((j) => j.state === "completed");
-    if (!anyCompleted) return;
+    if (!jobsRef.current.some((j) => j.state === "completed")) return;
     setFlourish(true);
     setDwelling(true);
     const a = setTimeout(() => setFlourish(false), DL_FLOURISH_MS);
@@ -89,7 +94,7 @@ export default function DownloadsButton() {
       clearTimeout(a);
       clearTimeout(b);
     };
-  }, [active, jobs]);
+  }, [active]);
 
   // A new download starting inside the dwell cancels it, so the pill never
   // collapses only to re-expand a moment later.

@@ -35,7 +35,7 @@ import {
 } from "./downloadsPanel";
 
 // ---------------------------------------------------------------------------
-// DownloadsPanelHost — the anchored overlay under the title-bar button.
+// DownloadsPanelHost: the anchored overlay under the title-bar button.
 //
 // PORTALLED TO document.body, and that is not a style choice. ContextMenuHost
 // renders its menu INLINE at z-[200] (not through a portal; only its submenu

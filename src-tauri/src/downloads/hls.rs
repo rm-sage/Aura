@@ -92,6 +92,13 @@ struct Ledger {
     /// `#EXT-X-MAP` init segment, written at byte 0.
     #[serde(default)]
     init: Option<String>,
+    /// The playlist URL these segment URLs came from. A relink writes a fresh
+    /// playlist URL onto the job, and without comparing against this the run
+    /// would reuse the OLD segment list forever: every fetch would 403 again,
+    /// re-enter Relinking, and the job would spin between the two states
+    /// hammering every enabled addon.
+    #[serde(default)]
+    source_url: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +256,18 @@ fn parse_playlist(body: &str, base: &str) -> Parsed {
     }
 }
 
+/// A network error with no URL in it. See the call sites: a raw reqwest
+/// Display leaks the signed token from a debrid link into the UI and the logs.
+fn short_net_err(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "the host stopped responding"
+    } else if e.is_connect() {
+        "could not connect"
+    } else {
+        "network error"
+    }
+}
+
 async fn fetch_text(url: &str, job: &DownloadJob) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -265,7 +284,10 @@ async fn fetch_text(url: &str, job: &DownloadJob) -> Result<String, String> {
     if !saw_ua {
         req = req.header(reqwest::header::USER_AGENT, super::http::DEFAULT_UA);
     }
-    let resp = req.send().await.map_err(|e| format!("could not fetch the playlist: {e}"))?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("could not fetch the playlist: {}", short_net_err(&e)))?;
     let status = resp.status();
     if !status.is_success() {
         return Err(format!("playlist returned HTTP {}", status.as_u16()));
@@ -343,27 +365,104 @@ pub async fn run(job: &DownloadJob, stop: watch::Receiver<Option<StopReason>>) -
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok());
 
-    let (kind, ledger) = match existing {
-        Some(l) => (JobKind::HlsLedger, l),
-        None => match admit(job).await {
+    // Reuse the ledger where it is still valid, so a re-signed manifest cannot
+    // renumber the segments under a half-written accumulation file. It stops
+    // being valid the moment the job's playlist URL changes, which is exactly
+    // what a relink does.
+    let ledger = match existing {
+        Some(l) if l.source_url == job.url => l,
+        Some(stale) => match admit(job).await {
             Ok((JobKind::HlsPassthrough, p)) => {
+                // The refreshed playlist no longer qualifies for the ledger.
+                // Bytes already accumulated cannot be reconciled with a
+                // single-pass remux, so start clean rather than splice.
+                super::manager::record_kind(&job.id, JobKind::HlsPassthrough);
+                let _ = std::fs::remove_file(&ledger_path);
+                let _ = std::fs::remove_file(work.join(MEDIA_FILE));
                 return passthrough(job, &work, p.total_duration, stop).await;
             }
-            Ok((_, p)) => {
-                let l = Ledger {
-                    segments: p.segments,
-                    next: 0,
-                    committed: 0,
-                    total_duration: p.total_duration,
-                    init: p.init,
-                };
-                (JobKind::HlsLedger, l)
+            Ok((_, fresh)) => match relink_ledger(stale, fresh, &job.url) {
+                Some(l) => {
+                    crate::devlog!(
+                        info, "downloads",
+                        "{}: refreshed {} segment URLs, resuming at {}",
+                        job.title, l.segments.len(), l.next
+                    );
+                    save_ledger(&work, &l);
+                    l
+                }
+                None => {
+                    // The refreshed playlist is a different cut of the stream.
+                    // Appending its segments to what we hold would splice two
+                    // sources, so restart rather than corrupt.
+                    crate::devlog!(
+                        warn, "downloads",
+                        "{}: the stream changed shape; restarting the download", job.title
+                    );
+                    let _ = std::fs::remove_file(work.join(MEDIA_FILE));
+                    let p = match admit(job).await {
+                        Ok((_, p)) => p,
+                        Err(o) => return o,
+                    };
+                    Ledger {
+                        segments: p.segments,
+                        next: 0,
+                        committed: 0,
+                        total_duration: p.total_duration,
+                        init: p.init,
+                        source_url: job.url.clone(),
+                    }
+                }
+            },
+            Err(o) => return o,
+        },
+        None => match admit(job).await {
+            Ok((JobKind::HlsPassthrough, p)) => {
+                // Persist the real transport, or the job keeps claiming to be
+                // pausable and a Pause press would silently cancel it.
+                super::manager::record_kind(&job.id, JobKind::HlsPassthrough);
+                return passthrough(job, &work, p.total_duration, stop).await;
             }
+            Ok((_, p)) => Ledger {
+                segments: p.segments,
+                next: 0,
+                committed: 0,
+                total_duration: p.total_duration,
+                init: p.init,
+                source_url: job.url.clone(),
+            },
             Err(o) => return o,
         },
     };
-    let _ = kind;
+    super::manager::record_kind(&job.id, JobKind::HlsLedger);
     ledger_run(job, &work, ledger, stop).await
+}
+
+/// Carry an in-progress ledger onto a freshly-signed playlist.
+///
+/// Accepted only when the two describe the SAME cut of the stream: identical
+/// segment count and matching per-segment durations. A playlist that has
+/// gained, lost or re-cut segments is a different source, and appending it to
+/// bytes already on disk would splice two files together with no error.
+fn relink_ledger(stale: Ledger, fresh: Parsed, new_url: &str) -> Option<Ledger> {
+    if fresh.segments.len() != stale.segments.len() || stale.next > fresh.segments.len() {
+        return None;
+    }
+    // Durations are floats parsed from the manifest, so compare with a
+    // tolerance rather than for equality.
+    for (a, b) in stale.segments.iter().zip(fresh.segments.iter()) {
+        if (a.duration - b.duration).abs() > 0.05 || a.byte_range != b.byte_range {
+            return None;
+        }
+    }
+    Some(Ledger {
+        segments: fresh.segments,
+        next: stale.next,
+        committed: stale.committed,
+        total_duration: fresh.total_duration,
+        init: fresh.init.or(stale.init),
+        source_url: new_url.to_string(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -478,7 +577,7 @@ async fn ledger_run(
     let _ = file.flush();
     drop(file);
 
-    remux(job, work, &media).await
+    remux(job, work, &media, &mut stop).await
 }
 
 fn current_reason(stop: &watch::Receiver<Option<StopReason>>) -> StopReason {
@@ -525,7 +624,12 @@ async fn fetch_segment(
         }
 
         res = req.send() => {
-            let resp = res.map_err(|e| Outcome::Transient(format!("Could not fetch a segment: {e}")))?;
+            // NOT `{e}`: reqwest's Display embeds the full request URL, and
+            // for debrid and signed-CDN links that URL carries an auth token.
+            // It would land in the row, in the devlog and in an exported log.
+            let resp = res.map_err(|e| {
+                Outcome::Transient(format!("Could not fetch a segment: {}.", short_net_err(&e)))
+            })?;
             let status = resp.status();
             if status == reqwest::StatusCode::UNAUTHORIZED
                 || status == reqwest::StatusCode::FORBIDDEN
@@ -537,10 +641,26 @@ async fn fetch_segment(
             if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
                 return Err(Outcome::Transient(format!("A segment returned HTTP {}.", status.as_u16())));
             }
-            let bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| Outcome::Transient(format!("A segment download failed: {e}")))?;
+            // A byte-range segment MUST come back ranged. A host (or a
+            // re-signing proxy) that drops the Range header answers 200 with
+            // the ENTIRE single-file resource, and appending that as if it
+            // were one segment yields a file that is K concatenated copies of
+            // the whole stream, which ffmpeg then remuxes with exit code 0.
+            if range.is_some() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+                return Err(Outcome::Fatal(
+                    "This stream needs partial downloads and the host does not support them.".into(),
+                ));
+            }
+            let bytes = resp.bytes().await.map_err(|e| {
+                Outcome::Transient(format!("A segment download failed: {}.", short_net_err(&e)))
+            })?;
+            if let Some((len, _)) = range {
+                if bytes.len() as u64 != len {
+                    return Err(Outcome::Transient(
+                        "A segment came back the wrong size; retrying.".into(),
+                    ));
+                }
+            }
             Ok(Some(bytes.to_vec()))
         }
     }
@@ -577,6 +697,7 @@ async fn remux(
     job: &DownloadJob,
     work: &std::path::Path,
     media: &std::path::Path,
+    stop: &mut watch::Receiver<Option<StopReason>>,
 ) -> Outcome {
     let ff = match ffmpeg_path() {
         Ok(p) => p,
@@ -602,20 +723,54 @@ async fn remux(
     ])
     .arg(&out)
     .stdout(Stdio::null())
-    .stderr(Stdio::piped());
+    .stderr(Stdio::null());
     hide_console(&mut cmd);
 
-    let output = match tokio::task::spawn_blocking(move || cmd.output()).await {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => return Outcome::Fatal(format!("Could not run the video tools: {e}")),
+    // Spawned and POLLED, not awaited as one blocking call. A -c copy pass over
+    // a multi-gigabyte accumulation file takes minutes, and awaiting it outright
+    // meant a pause or a quit issued during that window was not observed at all:
+    // the job stayed Running, so the close gate refused the window every time.
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
         Err(e) => return Outcome::Fatal(format!("Could not run the video tools: {e}")),
     };
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        let tail = err.lines().rev().take(2).collect::<Vec<_>>().join(" ");
-        return Outcome::Fatal(format!("Could not assemble the video. {tail}"));
+    let pid = child.id();
+
+    loop {
+        tokio::select! {
+            biased;
+
+            changed = stop.changed() => {
+                if changed.is_err() || stop.borrow_and_update().is_some() {
+                    kill_tree(&mut child, pid);
+                    // The half-written out.mkv is worthless, but media.bin and
+                    // the ledger are untouched, so a resume simply re-runs this
+                    // remux from the start. Nothing downloaded is lost.
+                    let _ = std::fs::remove_file(&out);
+                    let reason = stop.borrow().unwrap_or(StopReason::Pause);
+                    return Outcome::Stopped(reason);
+                }
+            }
+
+            _ = tokio::time::sleep(Duration::from_millis(300)) => {
+                match child.try_wait() {
+                    Ok(Some(st)) => {
+                        if st.success() {
+                            return publish(job, &out);
+                        }
+                        let _ = std::fs::remove_file(&out);
+                        return Outcome::Fatal(
+                            "Could not assemble the downloaded video.".into(),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Outcome::Fatal(format!("Lost track of the video tools: {e}"))
+                    }
+                }
+            }
+        }
     }
-    publish(job, &out)
 }
 
 /// Mode B: one ffmpeg pass that both fetches and remuxes.
@@ -762,12 +917,9 @@ fn publish(job: &DownloadJob, out: &std::path::Path) -> Outcome {
 
     match crate::download_path::finalize(dir, &stem, &ext, out) {
         Ok(final_path) => {
-            let size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
-            super::manager::record_final_path(&job.id, final_path.to_string_lossy().into_owned());
-            super::manager::record_progress(&job.id, size, Some(size));
             // The work dir has served its purpose.
             let _ = std::fs::remove_dir_all(std::path::Path::new(&job.part_path));
-            Outcome::Completed
+            Outcome::Finished(final_path.to_string_lossy().into_owned())
         }
         Err(e) => Outcome::Fatal(e),
     }
@@ -856,6 +1008,83 @@ all.ts\n\
         let up = "#EXTM3U\n#EXTINF:6.000,\n../v/seg.ts\n#EXT-X-ENDLIST\n";
         let p = parse_playlist(up, "https://h/a/b/index.m3u8");
         assert_eq!(p.segments[0].url, "https://h/a/v/seg.ts");
+    }
+
+    fn ledger_of(durations: &[f64], next: usize, committed: u64, url: &str) -> Ledger {
+        Ledger {
+            segments: durations
+                .iter()
+                .enumerate()
+                .map(|(i, d)| Segment {
+                    url: format!("{url}/old{i}.ts"),
+                    byte_range: None,
+                    duration: *d,
+                })
+                .collect(),
+            next,
+            committed,
+            total_duration: durations.iter().sum(),
+            init: None,
+            source_url: url.to_string(),
+        }
+    }
+
+    fn parsed_of(durations: &[f64]) -> Parsed {
+        Parsed {
+            segments: durations
+                .iter()
+                .enumerate()
+                .map(|(i, d)| Segment {
+                    url: format!("https://new/seg{i}.ts?token=fresh"),
+                    byte_range: None,
+                    duration: *d,
+                })
+                .collect(),
+            total_duration: durations.iter().sum(),
+            init: None,
+            blockers: Vec::new(),
+            variant: None,
+            has_endlist: true,
+        }
+    }
+
+    #[test]
+    fn relink_carries_progress_onto_a_matching_playlist() {
+        // The point of the whole mechanism: a re-signed manifest for the SAME
+        // cut keeps the bytes already on disk and just swaps the URLs.
+        let stale = ledger_of(&[6.0, 6.0, 6.0, 6.0], 2, 4_000_000, "https://old");
+        let fresh = parsed_of(&[6.0, 6.0, 6.0, 6.0]);
+        let out = relink_ledger(stale, fresh, "https://new/index.m3u8").expect("should relink");
+        assert_eq!(out.next, 2, "progress must survive the relink");
+        assert_eq!(out.committed, 4_000_000);
+        assert_eq!(out.source_url, "https://new/index.m3u8");
+        assert!(out.segments[0].url.contains("token=fresh"), "URLs must be the new ones");
+    }
+
+    #[test]
+    fn relink_refuses_a_playlist_that_is_a_different_cut() {
+        // Appending a different cut's segments to bytes already on disk would
+        // splice two sources into one file and report success, so every one of
+        // these must be refused rather than accepted.
+        let base = || ledger_of(&[6.0, 6.0, 6.0, 6.0], 2, 4_000_000, "https://old");
+
+        // Fewer segments.
+        assert!(relink_ledger(base(), parsed_of(&[6.0, 6.0, 6.0]), "u").is_none());
+        // More segments.
+        assert!(relink_ledger(base(), parsed_of(&[6.0, 6.0, 6.0, 6.0, 6.0]), "u").is_none());
+        // Same count, re-cut boundaries.
+        assert!(relink_ledger(base(), parsed_of(&[6.0, 5.0, 7.0, 6.0]), "u").is_none());
+
+        // A float that differs only by parse noise is still the same cut.
+        assert!(relink_ledger(base(), parsed_of(&[6.0, 6.001, 6.0, 5.999]), "u").is_some());
+    }
+
+    #[test]
+    fn relink_refuses_when_progress_would_be_out_of_range() {
+        // `next` past the end of the fresh list would index out of bounds on
+        // the very next fetch.
+        let stale = ledger_of(&[6.0, 6.0, 6.0, 6.0], 4, 8_000_000, "https://old");
+        assert!(relink_ledger(stale, parsed_of(&[6.0, 6.0, 6.0]), "u").is_none());
     }
 
     #[test]

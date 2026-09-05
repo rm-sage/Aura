@@ -286,7 +286,11 @@ pub enum StopReason {
 /// How a worker finished.
 #[derive(Debug)]
 pub enum Outcome {
-    Completed,
+    /// Finished, carrying the path the file actually landed at, which can
+    /// differ from the plan when a collision forced a " (2)" suffix or a
+    /// Content-Type refined the container. The MANAGER applies it: a worker
+    /// mutating the registry mid-flight is how the stale-clone bug happened.
+    Finished(String),
     Stopped(StopReason),
     /// The origin rejected the link. Triggers the relink flow rather than a
     /// plain failure.

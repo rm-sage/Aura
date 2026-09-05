@@ -72,6 +72,9 @@ struct State {
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 static APP: OnceLock<AppHandle<Wry>> = OnceLock::new();
 static PUMPING: AtomicBool = AtomicBool::new(false);
+/// Set when a pump request arrives while one is already running. The owner
+/// re-scans instead of the request being dropped. See `pump`.
+static PUMP_AGAIN: AtomicBool = AtomicBool::new(false);
 
 fn state() -> &'static Mutex<State> {
     STATE.get_or_init(|| {
@@ -263,15 +266,19 @@ fn spawn_ticker() {
 // ---------------------------------------------------------------------------
 
 /// Add a job and start it if a slot is free.
+///
+/// The user-facing duplicate guard lives in `commands`, where the user can
+/// override it. This function does NOT re-reject: it did once, and that made
+/// "Download again" on the duplicate prompt a no-op that surfaced a raw error.
+/// Writing into the same partial is prevented structurally instead, by
+/// `claim_part`'s `create_new`, which hands a second job a " (2)" name.
 pub fn enqueue(job: DownloadJob) -> Result<DownloadJobDto, String> {
     let dto;
     {
         let mut st = state().lock().unwrap();
-        let key = crate::download_path::duplicate_key(std::path::Path::new(&job.dest_path));
-        if st.claims.contains(&key) {
-            return Err("That file is already in the download list.".into());
-        }
-        st.claims.insert(key);
+        st.claims.insert(crate::download_path::duplicate_key(
+            std::path::Path::new(&job.dest_path),
+        ));
         st.jobs.push(job.clone());
         super::store::mark_dirty();
         dto = DownloadJobDto {
@@ -303,13 +310,34 @@ pub fn set_root(root: String) {
 
 /// Promote queued jobs into free slots, newest list order first.
 ///
-/// Re-entrant callers are collapsed by `PUMPING`: every transition calls
-/// `pump()`, and without the guard a completion that frees a slot could
-/// recurse through the spawn it just made.
+/// Concurrent callers are collapsed by `PUMPING`, but a collapsed request is
+/// DEFERRED, never dropped. Dropping it was a lost wakeup: enqueue, resume,
+/// retry and relink all mutate state under their own lock and then pump, so a
+/// pump that landed inside another one's window would leave a job Queued with
+/// both slots free and nothing remaining to start it.
 pub fn pump() {
     if PUMPING.swap(true, Ordering::AcqRel) {
+        PUMP_AGAIN.store(true, Ordering::Release);
         return;
     }
+    loop {
+        PUMP_AGAIN.store(false, Ordering::Release);
+        pump_once();
+        // Release the guard, then check once more: a request that arrived
+        // between the last scan and the store would otherwise be lost in
+        // exactly the same way.
+        PUMPING.store(false, Ordering::Release);
+        if !PUMP_AGAIN.load(Ordering::Acquire) {
+            return;
+        }
+        if PUMPING.swap(true, Ordering::AcqRel) {
+            // Someone else took ownership and will do the re-scan for us.
+            return;
+        }
+    }
+}
+
+fn pump_once() {
     let mut to_start: Vec<DownloadJob> = Vec::new();
     {
         let mut st = state().lock().unwrap();
@@ -339,7 +367,6 @@ pub fn pump() {
     for job in to_start {
         spawn_worker(job);
     }
-    PUMPING.store(false, Ordering::Release);
 }
 
 fn spawn_worker(job: DownloadJob) {
@@ -377,11 +404,16 @@ fn finish(id: &str, outcome: Outcome) {
         {
             let j = &mut st.jobs[idx];
             match outcome {
-                Outcome::Completed => {
+                Outcome::Finished(final_path) => {
                     j.state = DownloadState::Completed;
                     j.error = None;
                     j.attempt = 0;
-                    if let Some(t) = j.total_bytes {
+                    j.dest_path = final_path;
+                    if let Ok(m) = std::fs::metadata(&j.dest_path) {
+                        // The file on disk is the last word on its own size.
+                        j.bytes_done = m.len();
+                        j.total_bytes = Some(m.len());
+                    } else if let Some(t) = j.total_bytes {
                         j.bytes_done = t;
                     }
                     crate::devlog!(info, "downloads", "completed {}", j.dest_path);
@@ -528,15 +560,28 @@ pub fn control(action: ControlAction) -> Result<DownloadsSnapshot, String> {
                 let jobs = st.jobs.clone();
                 drop(st);
                 super::store::flush(&jobs);
+                // Cancelling frees a slot, so something queued may now start.
+                pump();
             }
         }
         ControlAction::Retry { id } => {
             {
                 let mut st = state().lock().unwrap();
                 if let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) {
-                    j.state = DownloadState::Queued;
-                    j.attempt = 0;
-                    j.error = None;
+                    // Gated like Resume. Without this a double-click on the
+                    // Try again button demoted a job that was already Running,
+                    // and the pump then started a SECOND worker on the same
+                    // .aurapart while the first still held it open.
+                    if matches!(
+                        j.state,
+                        DownloadState::Failed
+                            | DownloadState::NeedsSource
+                            | DownloadState::Paused
+                    ) {
+                        j.state = DownloadState::Queued;
+                        j.attempt = 0;
+                        j.error = None;
+                    }
                 }
                 super::store::mark_dirty();
                 emit(&st);
@@ -610,16 +655,23 @@ pub fn control(action: ControlAction) -> Result<DownloadsSnapshot, String> {
             super::store::flush(&jobs);
         }
         ControlAction::PauseAll => {
-            let ids: Vec<String> = {
+            // Every active job must end up NOT active, or the quit gate (which
+            // tests active_count() > 0) refuses the re-issued close forever and
+            // the window becomes unclosable. A single-pass HLS remux cannot be
+            // paused, so for it "stop" can only mean cancel; `stoppable_summary`
+            // lets the UI say so BEFORE the user commits.
+            let targets: Vec<(String, bool)> = {
                 let st = state().lock().unwrap();
                 st.jobs
                     .iter()
-                    .filter(|j| j.state.is_active() && j.kind.pausable())
-                    .map(|j| j.id.clone())
+                    .filter(|j| j.state.is_active())
+                    .map(|j| (j.id.clone(), j.kind.pausable()))
                     .collect()
             };
-            for id in ids {
-                if !signal(&id, StopReason::Pause) {
+            for (id, pausable) in targets {
+                let reason = if pausable { StopReason::Pause } else { StopReason::Cancel };
+                if !signal(&id, reason) {
+                    // Not running (Queued or Relinking): settle it here.
                     let mut st = state().lock().unwrap();
                     if let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) {
                         j.state = DownloadState::Paused;
@@ -638,16 +690,16 @@ pub fn control(action: ControlAction) -> Result<DownloadsSnapshot, String> {
 /// Stop every worker and write the list. Called synchronously from the
 /// `CloseRequested` handler, where the process is about to go away.
 pub fn shutdown() {
-    let ids: Vec<String> = {
+    let ids: Vec<(String, bool)> = {
         let st = state().lock().unwrap();
         st.jobs
             .iter()
             .filter(|j| j.state == DownloadState::Running)
-            .map(|j| j.id.clone())
+            .map(|j| (j.id.clone(), j.kind.pausable()))
             .collect()
     };
-    for id in &ids {
-        signal(id, StopReason::Pause);
+    for (id, pausable) in &ids {
+        signal(id, if *pausable { StopReason::Pause } else { StopReason::Cancel });
     }
     let mut st = state().lock().unwrap();
     for j in &mut st.jobs {
@@ -659,6 +711,38 @@ pub fn shutdown() {
     drop(st);
     super::store::flush(&jobs);
     crate::devlog!(info, "downloads", "shutdown: parked {} running job(s)", ids.len());
+}
+
+/// How many active jobs cannot be paused, and therefore would be cancelled by
+/// a "stop everything" action. The quit prompt reads this so it can warn
+/// honestly instead of promising to keep work it is about to destroy.
+pub fn unpausable_active() -> usize {
+    state()
+        .lock()
+        .map(|st| {
+            st.jobs
+                .iter()
+                .filter(|j| j.state.is_active() && !j.kind.pausable())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Record the transport mode actually chosen, which for HLS is only known once
+/// the playlist has been fetched and the admission gate has run.
+pub fn record_kind(id: &str, kind: JobKind) {
+    let mut st = state().lock().unwrap();
+    let changed = match st.jobs.iter_mut().find(|j| j.id == id) {
+        Some(j) if j.kind != kind => {
+            j.kind = kind;
+            true
+        }
+        _ => false,
+    };
+    if changed {
+        super::store::mark_dirty();
+        emit(&st);
+    }
 }
 
 /// Apply a learned fact from the first response: total size, whether the origin
@@ -703,16 +787,6 @@ pub fn reset_attempt(id: &str) {
     if let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) {
         j.attempt = 0;
     }
-}
-
-/// Record where the file actually landed, which may differ from the planned
-/// path when a collision forced a ` (2)` suffix.
-pub fn record_final_path(id: &str, path: String) {
-    let mut st = state().lock().unwrap();
-    if let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) {
-        j.dest_path = path;
-    }
-    super::store::mark_dirty();
 }
 
 /// Replace a job's destination after the container was refined by a response

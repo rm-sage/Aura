@@ -2,26 +2,48 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useCallback, useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { pauseAllDownloads, useDownloads } from "./downloadsStore";
 
 // ---------------------------------------------------------------------------
-// DownloadsClosePrompt — "you are closing with downloads running".
+// DownloadsClosePrompt: "you are closing with downloads running".
 //
 // Rust's CloseRequested handler refuses the close while any job is active and
-// emits `aura:downloads-close-request` with the count. Modelled on
-// ScrobbleClosePrompt, which answers the same shape of gate.
+// emits `aura:downloads-close-request`. Modelled on ScrobbleClosePrompt, which
+// answers the same shape of gate.
 //
-// The release mechanism is the pleasant part: the Rust gate tests
-// `downloads::active_count() > 0`, and pausing everything drives that to zero,
-// so the re-issued close simply passes. There is no separate override flag to
-// set and therefore none to leak, which is the failure mode that would make
-// the window unclosable.
+// TWO things here are load-bearing and were both got wrong first time round:
 //
-// Quitting keeps the partial files and the job list, so the next launch shows
-// each one Paused and one click from resuming.
+// 1. EVERY dismiss path must call `cancel_quit`. The Rust gate deliberately
+//    leaves FORCE_QUIT armed when it refuses (a force-quit's follow-up close
+//    has to still quit rather than fall back to hiding), so it relies on this
+//    prompt to disarm it. Backing out without disarming means the NEXT ordinary
+//    click on the X fully exits instead of minimising to tray, long after the
+//    downloads have finished and with no prompt to explain it.
+//
+// 2. Quitting has to reach a state where `active_count()` is ZERO, or the
+//    re-issued close is refused again and the window cannot be closed at all.
+//    A single-pass HLS remux cannot be paused, so for it "stop" can only mean
+//    cancel; the copy below says so rather than promising to keep work it is
+//    about to destroy.
 // ---------------------------------------------------------------------------
+
+interface CloseRequest {
+  active: number;
+  unpausable: number;
+}
+
+/** Disarm the force-quit the gate left armed, then dismiss. */
+async function keepOpen(): Promise<void> {
+  try {
+    await invoke("cancel_quit");
+  } catch {
+    // Nothing useful to do: the flag lives in Rust and a failed clear only
+    // means the next close behaves as a quit. Not worth a dialog.
+  }
+}
 
 async function closeForReal(): Promise<void> {
   try {
@@ -33,13 +55,22 @@ async function closeForReal(): Promise<void> {
 
 export default function DownloadsClosePrompt() {
   const [open, setOpen] = useState(false);
-  const [count, setCount] = useState(0);
+  const [req, setReq] = useState<CloseRequest>({ active: 0, unpausable: 0 });
   const [busy, setBusy] = useState(false);
   const { active } = useDownloads();
 
   useEffect(() => {
-    const un = listen<number>("aura:downloads-close-request", (e) => {
-      setCount(typeof e.payload === "number" ? e.payload : 0);
+    const un = listen<CloseRequest | number>("aura:downloads-close-request", (e) => {
+      const p = e.payload;
+      setReq(
+        typeof p === "number"
+          ? { active: p, unpausable: 0 }
+          : { active: p?.active ?? 0, unpausable: p?.unpausable ?? 0 },
+      );
+      // A re-fired request means a previous attempt did not get us out. Clear
+      // `busy` so the buttons work again rather than staying disabled with the
+      // primary stuck reading "Stopping".
+      setBusy(false);
       setOpen(true);
     });
     return () => {
@@ -47,36 +78,47 @@ export default function DownloadsClosePrompt() {
     };
   }, []);
 
+  const dismiss = useCallback(() => {
+    setBusy(false);
+    setOpen(false);
+    void keepOpen();
+  }, []);
+
   const quit = useCallback(async () => {
     setBusy(true);
     // Park everything first. A worker stops at its next select, so this is a
-    // matter of one chunk, not one file.
+    // matter of one chunk, not one file. Anything that cannot be paused is
+    // cancelled, because the alternative is a window that will not close.
     await pauseAllDownloads();
     await closeForReal();
+    // Only reached if the close was refused anyway. Re-enable rather than
+    // leaving the user staring at two dead buttons.
+    setBusy(false);
   }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!open) return;
+      if (!open || busy) return;
       if (e.key === "Escape") {
         e.preventDefault();
-        setOpen(false);
+        dismiss();
       }
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [open]);
+  }, [open, busy, dismiss]);
 
   if (!open) return null;
 
-  const n = count || active;
+  const n = req.active || active;
   const noun = n === 1 ? "download is" : "downloads are";
+  const lost = req.unpausable;
 
   return (
     <div
       className="aura-modal-backdrop-in fixed inset-0 z-[10600] flex items-center justify-center
                  bg-black/60 backdrop-blur-sm"
-      onClick={() => !busy && setOpen(false)}
+      onClick={() => !busy && dismiss()}
     >
       <div
         role="dialog"
@@ -91,12 +133,18 @@ export default function DownloadsClosePrompt() {
             {n} {noun} still running
           </h2>
           <p className="text-white/70 text-sm leading-relaxed">
-            Quitting now pauses them and keeps what has downloaded so far.
+            {lost > 0
+              ? `Quitting pauses them and keeps what has downloaded so far, except for ${
+                  lost === 1 ? "one that is" : `${lost} that are`
+                } being reassembled in a single pass and cannot be paused. ${
+                  lost === 1 ? "That one" : "Those"
+                } will be cancelled.`
+              : "Quitting now pauses them and keeps what has downloaded so far."}
           </p>
           <p className="text-white/40 text-[12.5px] leading-relaxed">
-            They will be waiting, paused, the next time you open Aura. Links from
-            some sources expire, and Aura will refresh those on its own when you
-            resume.
+            Paused downloads will be waiting the next time you open Aura. Links
+            from some sources expire, and Aura refreshes those on its own when
+            you resume.
           </p>
         </div>
 
@@ -104,7 +152,7 @@ export default function DownloadsClosePrompt() {
           <button
             type="button"
             disabled={busy}
-            onClick={() => setOpen(false)}
+            onClick={dismiss}
             className="px-4 py-1.5 rounded-full text-xs font-medium
                        bg-white/5 text-white/70 border border-white/15
                        hover:bg-white/12 hover:text-white transition-colors
@@ -116,11 +164,14 @@ export default function DownloadsClosePrompt() {
             type="button"
             disabled={busy}
             onClick={() => void quit()}
-            className="px-4 py-1.5 rounded-full text-xs font-semibold border
-                       bg-ln-accent text-black border-ln-accent
-                       hover:brightness-110 transition-all disabled:opacity-60"
+            className={`px-4 py-1.5 rounded-full text-xs font-semibold border
+                        transition-all disabled:opacity-60 ${
+                          lost > 0
+                            ? "bg-rose-500/85 text-white border-rose-300/50 hover:bg-rose-500"
+                            : "bg-ln-accent text-black border-ln-accent hover:brightness-110"
+                        }`}
           >
-            {busy ? "Pausing…" : "Pause and quit"}
+            {busy ? "Stopping" : lost > 0 ? "Stop and quit" : "Pause and quit"}
           </button>
         </div>
       </div>

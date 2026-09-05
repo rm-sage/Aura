@@ -993,3 +993,61 @@ mod tests {
         assert_eq!(nth_name("Dune (2021)", "mkv", 2), "Dune (2021) (2).mkv");
     }
 }
+
+#[cfg(test)]
+mod tmp_probe {
+    use super::*;
+
+    #[test]
+    fn probe_reserved_after_truncation() {
+        // 1. The primitive, in isolation, as the reviewer describes it.
+        println!("prim CONTACT@3   = {:?}", sanitize_component("CONTACT", 3));
+        println!("prim Con Air@3   = {:?}", sanitize_component("Con Air - S01E01", 3));
+
+        // 2. What `plan` actually does: pre-truncate to the SAME budget, then sanitize.
+        for budget in 1usize..10 {
+            let squeezed = truncate_utf16("Con Air - S01E01 - Pilot", budget);
+            println!(
+                "plan-shape budget={budget} squeezed={squeezed:?} -> {:?}",
+                sanitize_component(&squeezed, budget)
+            );
+        }
+
+        // 3. End-to-end through plan(), with a root deep enough to squeeze the stem.
+        for rootlen in [150usize, 160, 170, 176, 178, 179, 180] {
+            let root = PathBuf::from(format!(r"D:\{}", "x".repeat(rootlen)));
+            let l = Layout {
+                dirs: vec!["Con Air (1997)".into(), "Season 01".into()],
+                stem: "Con Air - S01E01 - Pilot".into(),
+                ext: "mkv".into(),
+            };
+            match plan(&root, l) {
+                Ok(p) => println!(
+                    "plan rootlen={rootlen} ({} u) stem={:?} planned_leaf={:?}",
+                    utf16_len(&root.to_string_lossy()),
+                    p.stem,
+                    p.planned.file_name().unwrap()
+                ),
+                Err(e) => println!("plan rootlen={rootlen} ERR {e}"),
+            }
+        }
+
+        // 4. Same, with the dir components eating the budget the way the repro wants.
+        for rootlen in [140usize, 150, 155, 158, 160, 165, 170] {
+            let root = PathBuf::from(format!(r"D:\{}", "x".repeat(rootlen)));
+            let l = Layout {
+                dirs: vec!["Contact The Very Long Show Name Here (1997)".into(), "Season 01".into()],
+                stem: "Contact - S01E01 - Some Episode Title".into(),
+                ext: "mkv".into(),
+            };
+            match plan(&root, l) {
+                Ok(p) => println!(
+                    "plan2 rootlen={rootlen} dirs_last={:?} stem={:?}",
+                    p.dir.file_name().unwrap(),
+                    p.stem
+                ),
+                Err(e) => println!("plan2 rootlen={rootlen} ERR {e}"),
+            }
+        }
+    }
+}

@@ -26,7 +26,7 @@ use std::sync::OnceLock;
 
 use tauri::{AppHandle, Manager, Runtime};
 
-use super::types::{DownloadJob, DownloadState};
+use super::types::{DownloadJob, DownloadState, JobKind};
 
 /// Bumped when the on-disk shape changes incompatibly. An unknown version is
 /// treated as "start empty" rather than as an error, so a downgrade cannot
@@ -94,15 +94,36 @@ pub fn load() -> Vec<DownloadJob> {
     let mut jobs = parsed.jobs;
     for j in &mut jobs {
         match j.state {
-            DownloadState::Running => j.state = DownloadState::Paused,
+            // Nothing auto-starts on launch. Both of these were mid-flight when
+            // the process ended, and the close prompt tells the user they will
+            // be "waiting, paused" next time; silently resuming a 40 GB
+            // transfer the moment Aura opens would make that a lie and would
+            // surprise anyone on a metered connection.
+            DownloadState::Running | DownloadState::Queued => {
+                j.state = DownloadState::Paused
+            }
             DownloadState::Relinking => {
                 j.state = DownloadState::NeedsSource;
                 j.error = Some("Aura closed while refreshing this link.".into());
             }
             _ => {}
         }
-        // The partial on disk is the truth about progress.
-        j.bytes_done = std::fs::metadata(&j.part_path).map(|m| m.len()).unwrap_or(0);
+        // The partial on disk is the truth about progress. For the HLS ledger
+        // `part_path` is a DIRECTORY, so its metadata length is meaningless;
+        // the accumulation file inside it is the real figure. Without this an
+        // interrupted HLS download came back reading 0 bytes and 0%, as if
+        // nothing had been fetched.
+        j.bytes_done = match j.kind {
+            JobKind::Http => std::fs::metadata(&j.part_path).map(|m| m.len()).unwrap_or(0),
+            JobKind::HlsLedger | JobKind::HlsPassthrough => {
+                std::fs::metadata(std::path::Path::new(&j.part_path).join("media.bin"))
+                    .or_else(|_| {
+                        std::fs::metadata(std::path::Path::new(&j.part_path).join("out.mkv"))
+                    })
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            }
+        };
     }
     crate::devlog!(info, "downloads", "loaded {} job(s)", jobs.len());
     jobs

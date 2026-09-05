@@ -20,7 +20,7 @@ import {
 } from "./downloadsStore";
 
 // ---------------------------------------------------------------------------
-// DownloadRow — one job.
+// DownloadRow: one job.
 //
 // Right-clicking a row opens the app's singleton context menu. That menu
 // renders at z-[200] INSIDE .aura-app-shell's stacking context, while this

@@ -639,7 +639,13 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     use tauri::Emitter;
                     let _ = handle.emit(
                         "aura:downloads-close-request",
-                        crate::downloads::active_count(),
+                        serde_json::json!({
+                            "active": crate::downloads::active_count(),
+                            // Jobs a "stop everything" would have to CANCEL
+                            // rather than pause, so the prompt can say so
+                            // before the user commits.
+                            "unpausable": crate::downloads::unpausable_active(),
+                        }),
                     );
                     return;
                 }

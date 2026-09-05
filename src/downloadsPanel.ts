@@ -4,7 +4,7 @@
 import { useSyncExternalStore } from "react";
 
 // ---------------------------------------------------------------------------
-// downloadsPanel — open/closed state for the title-bar downloads overlay.
+// downloadsPanel: open/closed state for the title-bar downloads overlay.
 //
 // Module scope rather than App state, mirroring scrobbleRun.ts, because three
 // consumers need it and none is an ancestor of the others:

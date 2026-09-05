@@ -205,7 +205,7 @@ pub async fn run(
         // We asked past the end. Either the file is complete or it shrank.
         if let Some(total) = job.total_bytes {
             if have >= total {
-                return finish(job);
+                return finish(&job.dest_path, &job.part_path);
             }
         }
         let _ = std::fs::write(&job.part_path, b"");
@@ -232,15 +232,24 @@ pub async fn run(
 
     // Refine the container now that a real Content-Type is in hand, but only
     // when nothing more confident already decided it.
+    //
+    // The worker tracks its OWN paths from here on. `job` is an owned clone
+    // made when the task was spawned, so once the refinement renames the file
+    // on disk that clone points at something that no longer exists.
+    let mut dest_path = job.dest_path.clone();
+    let mut part_path = job.part_path.clone();
     if let Some(ct) = header_str(&headers, reqwest::header::CONTENT_TYPE) {
-        super::refine_extension(job, &ct);
+        if let Some((d, p)) = super::refine_extension(job, &ct) {
+            dest_path = d;
+            part_path = p;
+        }
     }
 
     // Free-space preflight. This cannot run earlier: there is no byte count on
     // the wire (StreamEntry has no size field), so the first response is the
     // first moment a real number exists.
     if let Some(t) = total {
-        let dir = std::path::Path::new(&job.part_path)
+        let dir = std::path::Path::new(&part_path)
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_default();
@@ -257,7 +266,7 @@ pub async fn run(
     }
 
     // Open for append at the right offset.
-    let mut file = match std::fs::OpenOptions::new().write(true).read(true).open(&job.part_path) {
+    let mut file = match std::fs::OpenOptions::new().write(true).read(true).open(&part_path) {
         Ok(f) => f,
         Err(e) => return Outcome::Fatal(format!("Could not open the partial file: {e}")),
     };
@@ -315,7 +324,7 @@ pub async fn run(
                         // the call BEFORE dropping `file`, so the drop has to
                         // be explicit and has to come first.
                         drop(file);
-                        return finish(job);
+                        return finish(&dest_path, &part_path);
                     }
                     Err(e) => {
                         let _ = file.flush();
@@ -336,8 +345,8 @@ pub async fn run(
 /// The caller MUST have dropped its handle on the partial: Rust opens files
 /// without FILE_SHARE_DELETE, so on Windows the rename below fails with a
 /// sharing violation while any handle is still open.
-fn finish(job: &DownloadJob) -> Outcome {
-    let dest = std::path::Path::new(&job.dest_path);
+fn finish(dest_path: &str, part_path: &str) -> Outcome {
+    let dest = std::path::Path::new(dest_path);
     let Some(dir) = dest.parent() else {
         return Outcome::Fatal("The download destination is not a valid path.".into());
     };
@@ -352,11 +361,8 @@ fn finish(job: &DownloadJob) -> Outcome {
         .unwrap_or(crate::download_path::DEFAULT_EXT)
         .to_string();
 
-    match crate::download_path::finalize(dir, &stem, &ext, std::path::Path::new(&job.part_path)) {
-        Ok(final_path) => {
-            super::manager::record_final_path(&job.id, final_path.to_string_lossy().into_owned());
-            Outcome::Completed
-        }
+    match crate::download_path::finalize(dir, &stem, &ext, std::path::Path::new(part_path)) {
+        Ok(final_path) => Outcome::Finished(final_path.to_string_lossy().into_owned()),
         Err(e) => Outcome::Fatal(e),
     }
 }
