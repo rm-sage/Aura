@@ -4053,27 +4053,87 @@ function EpisodesPanel({
         },
       });
     }
-    if (aired.some((v) => isSkipMarkable(v.id))) {
-      items.push({
-        kind: "action", label: "Mark arc as skipped", tone: "skip",
-        hint: "Marks every episode in this arc that you haven't already watched or skipped.",
-        onClick: () => {
-          // `isSkipMarkable`, not a local `!isSkipped`: it is the same
-          // predicate `markEpisodesSkipped` writes with, so the count in the
-          // toast cannot claim episodes the write skipped over. It also leaves
-          // hand-marked-watched episodes alone, which is what keeps a later
-          // "Unmark arc as skipped" from unwatching them.
-          const fresh = aired.filter((v) => isSkipMarkable(v.id));
-          if (fresh.length === 0) return;
-          void markEpisodesSkipped(fresh.map(targetFor), {
-            userInitiated: true,
-            autoScrobbleEnabled: arcScrobbleConn.autoScrobbleEnabled,
-            scrobbleScope: arcScrobbleConn.scope,
-            services: connectedServices(arcScrobbleConn),
-          });
-          toast(`Skipped ${fresh.length}`, "success");
-        },
+    // Skipping an arc is almost always "skip the junk", so the DEFAULT action
+    // is filler-only whenever the arc has any. Marking a whole arc skipped
+    // stamps CANON episodes as deliberately-not-watched, which is destructive
+    // and rarely what was meant: Bleach's Gotei 13 Invading Army is filler
+    // except for its last episode, and TMDB's own arc title calls the fully
+    // canon "The Past" arc filler, so an arc-wide skip taken on the strength of
+    // that label would bury real episodes.
+    //
+    // The whole-arc action is kept, on the hover submenu, because a canon arc
+    // someone genuinely wants to skip is a real case and a show with no filler
+    // data at all has no other option. The house pattern is the same one the
+    // episode row uses: click the parent for the safe action, hover it for the
+    // wider variants.
+    //
+    // `mergedKindFlags` is the ONE predicate every filler-aware surface reads
+    // (cloud signal first, then the VideoEntry flags), so this can never
+    // disagree with the tags on the rows or with the arc tile's own label.
+    const arcKinds = cloudSignal?.episode_kinds ?? [];
+    const markable = aired.filter((v) => isSkipMarkable(v.id));
+    // Recaps ride along with filler: both are the "skip to canon" set
+    // everywhere else in Aura (`isFillerOrRecap`). They are counted separately
+    // only so the label can name what it is actually about to mark, rather
+    // than saying "filler" over a set that includes recaps.
+    let recapsIncluded = false;
+    const fillerMarkable = markable.filter((v) => {
+      const { filler, recap } = mergedKindFlags(v, arcKinds);
+      if (recap && !filler) recapsIncluded = true;
+      return filler || recap;
+    });
+    const junkNoun = recapsIncluded ? "filler and recaps" : "filler";
+
+    const runSkip = (list: VideoEntry[], noun: string) => {
+      if (list.length === 0) return;
+      void markEpisodesSkipped(list.map(targetFor), {
+        userInitiated: true,
+        autoScrobbleEnabled: arcScrobbleConn.autoScrobbleEnabled,
+        scrobbleScope: arcScrobbleConn.scope,
+        services: connectedServices(arcScrobbleConn),
       });
+      toast(`Skipped ${list.length} ${noun}`, "success");
+    };
+
+    if (markable.length > 0) {
+      // `isSkipMarkable`, not a local `!isSkipped`: it is the same predicate
+      // `markEpisodesSkipped` writes with, so the count in the toast cannot
+      // claim episodes the write skipped over. It also leaves hand-marked-
+      // watched episodes alone, which is what keeps a later "Unmark arc as
+      // skipped" from unwatching them.
+      const wholeArcItem: Item = {
+        kind: "action",
+        label: `Skip the whole arc (${markable.length})`,
+        tone: "skip",
+        hint: "Marks every episode in this arc you have not already watched or skipped, canon included.",
+        onClick: () => runSkip(markable, markable.length === 1 ? "episode" : "episodes"),
+      };
+
+      if (fillerMarkable.length > 0 && fillerMarkable.length < markable.length) {
+        // Mixed arc: filler-only by default, whole arc one hover away.
+        items.push({
+          kind: "action",
+          label: `Skip the ${junkNoun} (${fillerMarkable.length} of ${markable.length})`,
+          tone: "skip",
+          hint: "Marks only the skippable episodes in this arc, leaving the canon ones alone.",
+          onClick: () => runSkip(fillerMarkable, junkNoun),
+          submenu: [wholeArcItem],
+        });
+      } else {
+        // Either the arc is entirely filler (both actions are the same set) or
+        // it has none (nothing to narrow to), so one honest row is enough.
+        items.push(
+          fillerMarkable.length === markable.length
+            ? {
+                kind: "action",
+                label: `Skip the ${junkNoun} (${markable.length})`,
+                tone: "skip",
+                hint: "Every episode in this arc is filler or recap, so this is the whole arc.",
+                onClick: () => runSkip(markable, junkNoun),
+              }
+            : wholeArcItem,
+        );
+      }
     }
     if (ids.some((id) => isSkipped(id))) {
       items.push({
@@ -4094,7 +4154,7 @@ function EpisodesPanel({
     // In Queue button in the actions row.
     if (items.length === 0) return;
     openContextMenu(x, y, items);
-  }, [videos, seriesId, seriesMediaType, detail, arcScrobbleConn]);
+  }, [videos, seriesId, seriesMediaType, detail, arcScrobbleConn, cloudSignal]);
   const { arcs: arcResult, loading: arcsLoading } = useStoryArcs(detail ?? null, seriesId, groupingId);
 
   // A remembered grouping always wins. Captured once at mount so the auto-default
