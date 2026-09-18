@@ -882,6 +882,14 @@ const STREAM_ERROR_GRACE_MS = 20000;
 // Sized so the auto-retries below still fit inside the old time-to-modal.
 const STREAM_ERROR_COLD_GRACE_MS = 6000;
 
+// Cold-load grace for a TRAILER. Short because there is nothing to wait for: a
+// trailer is excluded from the VOD auto-retry (its googlevideo link is signed
+// and static, so a refusal reproduces exactly), which is what the 6 s above is
+// sized to accommodate. This only needs to outlast an error stamped around a
+// load transition. The recovery modal then explains the real cause instead of
+// showing a loader for a verdict already reached.
+const TRAILER_ERROR_COLD_GRACE_MS = 1500;
+
 // Per-tick forward-progress cap (s) for the History watched accumulator.
 // A `time` delta larger than this is a seek, not playback — discarded so
 // skipping to the end never inflates summed watched time. Matches
@@ -925,7 +933,7 @@ function heightToRung(height: number): string {
   return "auto";
 }
 
-function usePlayback(playerActive: boolean) {
+function usePlayback(playerActive: boolean, isTrailer: boolean) {
   const [time, setTime]           = useState(0);
   const [duration, setDuration]   = useState(0);
   const [paused, setPaused]       = useState(true);
@@ -1933,7 +1941,15 @@ function usePlayback(playerActive: boolean) {
       // loads; a stale pending error is cleared by notifyNewLoad directly.)
       if (lastTimeUpdateAtRef.current > errAt) { loadErrorAtRef.current = 0; return; }
       // Cold load (no frame ever seen) gets the short grace: see the constant.
-      const grace = firstFrameSeen ? STREAM_ERROR_GRACE_MS : STREAM_ERROR_COLD_GRACE_MS;
+      // A cold TRAILER failure is shorter still. The cold grace is sized to fit
+      // the VOD auto-retries, and trailers are excluded from those, so the
+      // window would otherwise be spent showing a loader for a verdict already
+      // reached. YouTube refusing a signed link is deterministic, not a hiccup;
+      // the only value left in waiting is absorbing an error stamped around a
+      // load transition, which resolves in well under a second.
+      const grace = firstFrameSeen
+        ? STREAM_ERROR_GRACE_MS
+        : isTrailer ? TRAILER_ERROR_COLD_GRACE_MS : STREAM_ERROR_COLD_GRACE_MS;
       if (Date.now() - errAt >= grace) {
         loadErrorAtRef.current = 0;
         console.warn(`[playback] end-file error unrecovered after ${grace / 1000}s, surfacing recovery`);
@@ -1941,10 +1957,10 @@ function usePlayback(playerActive: boolean) {
       }
     }, 1000);
     return () => window.clearInterval(id);
-    // firstFrameSeen picks the grace, so it must be a dep. Read from a stale
-    // closure it would have pinned whichever value held when the interval was
-    // created, and a cold load would have waited the full 20 s anyway.
-  }, [windowHidden, firstFrameSeen]);
+    // firstFrameSeen and isTrailer pick the grace, so both must be deps. Read
+    // from a stale closure they would have pinned whichever value held when the
+    // interval was created, and a cold load would have waited the full 20 s.
+  }, [windowHidden, firstFrameSeen, isTrailer]);
 
   /** Reset playback state for a new load_video call. Called from the
    *  parent right before invoking load_video so every fresh playback
@@ -2355,6 +2371,17 @@ export default function App() {
   // Guards the "Watch Trailer" button against spam-clicks: the yt-dlp resolve
   // takes 1-3 s, during which the DetailView button is still clickable.
   const trailerLaunchingRef = useRef(false);
+  // The ytId whose launch is in flight, as STATE so the clicked button can show
+  // a pending affordance. A ref alone can't: it renders nothing. Holding the id
+  // rather than a bool is what lets the ONE clicked tile in the anime-extras
+  // Trailers grid spin instead of all of them. `setActiveTarget` is the last
+  // statement of handlePlayStream's try (see the comment there), so
+  // `isPlayerActive` stays false for the whole resolve + load window and the
+  // player's own BufferingOverlay cannot cover it. This is the only feedback
+  // the user gets between the click and the first frame.
+  const [trailerLaunching, setTrailerLaunching] = useState<string | null>(null);
+  // One-time yt-dlp fetch (~18 MB) progress, 0-1, or null when not downloading.
+  const [trailerDepProgress, setTrailerDepProgress] = useState<number | null>(null);
 
   // ── Playback hook — gated on activeTarget so the polling fallback only
   //     runs while a stream is loaded.
@@ -2367,7 +2394,7 @@ export default function App() {
     positionOwnedRef,
     streamTruncated, streamTruncatedRef, lastSanePosRef,
     truncatedRunout, cacheEndRef,
-  } = usePlayback(isPlayerActive);
+  } = usePlayback(isPlayerActive, isTrailerPlayback);
 
   /** `time`, but only when it is known to belong to the file currently loaded
    *  - null during a load, before mpv has confirmed the new file is open.
@@ -4896,19 +4923,24 @@ export default function App() {
       // the DetailView button stays clickable until the player opens over it.
       if (trailerLaunchingRef.current) return;
       trailerLaunchingRef.current = true;
+      setTrailerLaunching(ytId);
       try {
       const center = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
-      // First-use gate: download yt-dlp if it isn't already on disk. The toast
-      // covers the one-time fetch; the player's own loading overlay takes over
-      // once load_video starts. Subsequent trailer plays skip this entirely.
+      // First-use gate: download yt-dlp if it isn't already on disk. Reports
+      // real progress rather than a single 2.4 s toast that then goes silent
+      // for the rest of an 18 MB fetch.
       const present = await runtimeDepPresent("yt-dlp.exe").catch(() => false);
       if (!present) {
-        showFlyUpToast("Preparing trailer playback…", center);
+        setTrailerDepProgress(0);
         try {
-          await ensureRuntimeDep("yt-dlp.exe");
+          await ensureRuntimeDep("yt-dlp.exe", (p) => {
+            setTrailerDepProgress(p.total > 0 ? p.downloaded / p.total : 0);
+          });
         } catch (e) {
           showFlyUpToast(`Couldn't set up trailer playback: ${String(e)}`, { ...center, tone: "danger" });
           return;
+        } finally {
+          setTrailerDepProgress(null);
         }
       }
       // Default quality comes from the sharable `trailer_quality` setting;
@@ -4953,12 +4985,19 @@ export default function App() {
       // forceStartSeconds: 0 forces a clean start (no resume prompt — a trailer
       // has no library record / saved position anyway). audioFileUrl is the
       // separate DASH audio stream (null for a muxed 720p single file).
-      void handlePlayStream(stream, target, {
+      //
+      // AWAITED, not fire-and-forget: handlePlayStream sets activeTarget as the
+      // last statement of its try, so awaiting is what makes the pending state
+      // (and the spam guard) cover the whole click -> first-frame window. A
+      // void call released both while resolve_stream / load_video were still
+      // running, which is most of the dead time the user actually sees.
+      await handlePlayStream(stream, target, {
         forceStartSeconds: 0,
         audioFileUrl: res.audio_url ?? undefined,
       });
       } finally {
         trailerLaunchingRef.current = false;
+        setTrailerLaunching(null);
       }
     },
     [handlePlayStream],
@@ -7980,6 +8019,15 @@ export default function App() {
   useEffect(() => { vodRetryRef.current = 0; setVodReconnecting(false); }, [activeTarget?.id]);
   useEffect(() => {
     if (!streamBroken || isLivePlayback || !activeStreamUrl) { setVodReconnecting(false); return; }
+    // Trailers are excluded, not just partially carved out. The retry loop
+    // exists for an addon URL that went stale mid-play, where re-issuing
+    // load_video can win because the host mints a fresh token. A googlevideo
+    // URL is neither: it is signed and static, so a 403 on it is deterministic
+    // and every attempt reproduces it exactly. Retrying twice only bought ~15 s
+    // of "Reconnecting to stream…" on a failure that could never recover, and
+    // it delayed the one action that CAN work (re-resolving through yt-dlp,
+    // which the recovery modal now does for trailer targets).
+    if (isTrailerPlayback) { setVodReconnecting(false); return; }
     if (vodRetryRef.current >= VOD_MAX_RETRIES) { setVodReconnecting(false); return; }
     const attempt = vodRetryRef.current + 1;
     vodRetryRef.current = attempt;
@@ -9202,15 +9250,21 @@ export default function App() {
             <h2 className="text-[16px] font-semibold tracking-tight mb-2">
               {isLivePlayback
                 ? (firstFrameSeen ? "Channel connection lost" : "Channel unavailable")
-                : (breakWasTruncation
-                    ? "Stream ended early"
-                    : firstFrameSeen ? "Stream connection lost" : "Stream unavailable")}
+                : isTrailerPlayback
+                  ? (firstFrameSeen ? "Trailer stopped" : "Trailer unavailable")
+                  : (breakWasTruncation
+                      ? "Stream ended early"
+                      : firstFrameSeen ? "Stream connection lost" : "Stream unavailable")}
             </h2>
             <p className="text-white/70 text-[13px] leading-relaxed mb-5">
               {isLivePlayback
                 ? (firstFrameSeen
                     ? "This channel dropped its connection. Live streams can hiccup on the provider side — Aura already retried a couple of times. Reload to try again, or exit and pick another channel."
                     : "Aura couldn't open this channel (the provider returned an error — often a removed or temporarily-down channel). Aura already retried a couple of times. Reload to try again, or exit and pick another channel.")
+                : isTrailerPlayback
+                ? (firstFrameSeen
+                    ? "YouTube stopped serving this trailer. Its playback links are signed and expire after a few hours, so a trailer left paused for a while has to be fetched again. Reload re-fetches it."
+                    : "YouTube refused the playback link for this trailer. The usual cause is that Aura's copy of yt-dlp has gone stale: YouTube changes how it issues links every few weeks, and an out-of-date copy produces links it then rejects. Reload re-fetches the link, which fixes an expired one. If it keeps failing, update yt-dlp under Settings, Optional Components.")
                 : breakWasTruncation
                     ? "The source stopped sending data partway through, so the rest of this episode never arrived. Aura already retried and re-resolved the source. Reloading resumes from where the stream cut out; switching source is usually the faster fix."
                     : (firstFrameSeen
@@ -9277,6 +9331,42 @@ export default function App() {
                   notifyNewLoad();
                   // In-place reload: re-arm PlayerOverlay's per-file one-shots.
                   window.dispatchEvent(new Event("aura:player-reloaded"));
+                  // A trailer needs a NEW url, not the same one again. Its
+                  // googlevideo link is signed and carries an `expire` stamp,
+                  // so replaying activeStreamUrl re-sends the exact request
+                  // that just failed and can never succeed. Re-running yt-dlp
+                  // is the only thing that can, and it also covers the common
+                  // case of a trailer left paused past the link's lifetime.
+                  const trailerYtId = activeTrailerYtIdRef.current;
+                  if (isTrailerPlayback && trailerYtId) {
+                    try {
+                      const res = await invoke<TrailerResolution>("resolve_trailer_url", {
+                        ytId: trailerYtId,
+                        maxHeight: qualityToHeight(trailerQuality),
+                      });
+                      currentTrailerHeightRef.current = res.height;
+                      lastAudioUrlRef.current = res.audio_url ?? null;
+                      setTrailerMaxHeight(res.max_height_available);
+                      setTrailerQuality(heightToRung(res.height));
+                      setTrailerQualityLabel(res.quality_label);
+                      await invoke("load_video", {
+                        path: res.video_url,
+                        startSeconds: resumeAt,
+                        contentHdrHint: lastHdrHintRef.current,
+                        httpProxy: lastProxyUrlRef.current,
+                        audioUrl: res.audio_url ?? null,
+                      });
+                    } catch (e) {
+                      console.error("Trailer re-resolve failed", e);
+                      showFlyUpToast(`Trailer unavailable: ${String(e)}`, {
+                        x: window.innerWidth / 2,
+                        y: window.innerHeight / 2,
+                        tone: "danger",
+                      });
+                      handleExitPlayback();
+                    }
+                    return;
+                  }
                   try {
                     await invoke("load_video", {
                       path: activeStreamUrl,
@@ -9294,7 +9384,7 @@ export default function App() {
                            hover:bg-ln-accent/25 hover:border-ln-accent/55
                            transition-colors"
               >
-                Reload stream
+                {isTrailerPlayback ? "Reload trailer" : "Reload stream"}
               </button>
             </div>
           </div>
@@ -9638,6 +9728,8 @@ export default function App() {
             }
           }}
           onPlayTrailer={handlePlayTrailer}
+          trailerLaunchingId={trailerLaunching}
+          trailerDepProgress={trailerDepProgress}
           openOnEpisodeId={lastPlayedEpisodeId}
           ignoreResumeHint={ignoreResumeOnNextOpen}
           onConsumeOpenHint={consumeLastPlayedEpisode}

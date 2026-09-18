@@ -194,6 +194,13 @@ interface Props {
    *  id to a direct CDN URL via yt-dlp and plays it as a `trailer:<id>` target
    *  (no scrobble / history / Continue-Watching). Absent ⇒ button hidden. */
   onPlayTrailer?: (ytId: string, title: string) => void;
+  /** The ytId whose launch is currently in flight, or null. The resolve takes
+   *  2-3 s and the player does not mount until it finishes, so without this
+   *  the click has no visible effect at all. An id rather than a boolean so
+   *  the one clicked tile in the Trailers grid shows the spinner. */
+  trailerLaunchingId?: string | null;
+  /** 0-1 while the one-time ~18 MB yt-dlp fetch is running, else null. */
+  trailerDepProgress?: number | null;
   /** When set, DetailView opens in episodes mode (instead of streams),
    *  selects the season containing this episode id, and scrolls the
    *  matching row to the top of the list. Used after exiting playback
@@ -728,7 +735,7 @@ function HudSectionLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
-function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, onQueueToggle, onPlayTrailer, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
+function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, onQueueToggle, onPlayTrailer, trailerLaunchingId, trailerDepProgress, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
   const [detail, setDetail]                 = useState<MetaDetail | null>(null);
   // Resume pointer, read BEFORE the latch below because the latch's seed
   // needs it synchronously on the first render to pick the right arc's art.
@@ -1973,21 +1980,47 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                     own MPV player (yt-dlp resolves a direct CDN URL). Sits to
                     the RIGHT of the library button; only shown when the addon
                     meta carried a trailer id. */}
-                {detail?.trailer_yt_id && onPlayTrailer && (
+                {detail?.trailer_yt_id && onPlayTrailer && (() => {
+                  // The resolve is 2-3 s and the player does not mount until it
+                  // lands, so without a pending state the click looks ignored.
+                  // Matches NextUpCta's "clicked a play button, resolving" shape
+                  // (same spinner geometry as SourceSwitcher / CastMenu).
+                  const launching = trailerLaunchingId === detail.trailer_yt_id;
+                  const pct = trailerDepProgress == null
+                    ? null
+                    : Math.round(trailerDepProgress * 100);
+                  return (
                   <button
                     type="button"
+                    disabled={launching}
                     onClick={() => onPlayTrailer(detail.trailer_yt_id!, detail?.name ?? meta.name)}
-                    className="flex items-center gap-2 px-4 py-2 rounded-full text-[13px] font-medium
+                    className={`flex items-center gap-2 px-4 py-2 rounded-full text-[13px] font-medium
                                border transition-colors duration-150
                                aura-float-glass text-white/85
-                               hover:bg-ln-accent/20 hover:text-ln-accent hover:border-ln-accent/40"
+                               ${launching
+                                 ? "cursor-progress"
+                                 : "hover:bg-ln-accent/20 hover:text-ln-accent hover:border-ln-accent/40"}`}
                   >
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                      <path d="M8 5v14l11-7z" />
-                    </svg>
-                    <span>Watch Trailer</span>
+                    {launching ? (
+                      <svg className="animate-spin" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
+                        <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2.5"
+                                strokeLinecap="round" strokeDasharray="32 16" />
+                      </svg>
+                    ) : (
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                        <path d="M8 5v14l11-7z" />
+                      </svg>
+                    )}
+                    <span>
+                      {!launching
+                        ? "Watch Trailer"
+                        : pct != null
+                          ? `Setting up… ${pct}%`
+                          : "Loading trailer…"}
+                    </span>
                   </button>
-                )}
+                  );
+                })()}
               </div>
             )}
 

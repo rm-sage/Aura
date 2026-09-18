@@ -879,10 +879,13 @@ function OpenableTile({
 // ---------------------------------------------------------------------------
 
 export function TrailersTab({
-  cours, onPlay,
+  cours, onPlay, launchingId = null,
 }: {
   cours: CourRef[];
   onPlay?: (ytId: string, title: string) => void;
+  /** ytId whose launch is in flight. Scoped to the one clicked tile rather
+   *  than a page-wide boolean, so the other thumbnails stay interactive. */
+  launchingId?: string | null;
 }) {
   const rows = useCourPayloads<AnimeTrailer[]>("trailers", cours);
   if (!rows) return <Loading />;
@@ -899,15 +902,18 @@ export function TrailersTab({
             <CourHeading label={cour.label} show={multi} />
             <div className="grid gap-x-4 gap-y-4
                             grid-cols-2 min-[900px]:grid-cols-4 min-[1300px]:grid-cols-5">
-              {value.map((t) => (
+              {value.map((t) => {
+                const launching = launchingId === t.youtube_id;
+                return (
                 <button
                   key={t.youtube_id}
                   type="button"
                   onClick={() => onPlay?.(t.youtube_id, t.title)}
-                  disabled={!onPlay}
-                  className="text-left min-w-0 group disabled:cursor-default"
+                  disabled={!onPlay || launching}
+                  className={`text-left min-w-0 group disabled:cursor-default
+                              ${launching ? "disabled:cursor-progress" : ""}`}
                 >
-                  <div className="aspect-video rounded-lg overflow-hidden bg-white/6 mb-1.5
+                  <div className="relative aspect-video rounded-lg overflow-hidden bg-white/6 mb-1.5
                                   group-hover:ring-1 group-hover:ring-white/25 transition-shadow">
                     {t.thumbnail && (
                       <ImageLoader
@@ -918,12 +924,24 @@ export function TrailersTab({
                         draggable={false}
                       />
                     )}
+                    {launching && (
+                      // Scrim + spinner over the clicked thumbnail: the resolve
+                      // is 2-3 s and the player does not mount until it lands.
+                      <div className="absolute inset-0 grid place-items-center bg-black/60">
+                        <svg className="animate-spin text-white/90" width="20" height="20"
+                             viewBox="0 0 24 24" fill="none" aria-hidden>
+                          <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2.5"
+                                  strokeLinecap="round" strokeDasharray="32 16" />
+                        </svg>
+                      </div>
+                    )}
                   </div>
                   <p className="text-white/80 text-[11.5px] leading-tight line-clamp-2">
                     {t.title}
                   </p>
                 </button>
-              ))}
+                );
+              })}
             </div>
           </div>
         );

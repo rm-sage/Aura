@@ -57,6 +57,9 @@ interface Props {
    *  extras tab and leaves a two-tab bar. */
   cours: CourRef[];
   onPlayTrailer?: (ytId: string, title: string) => void;
+  /** ytId whose launch is in flight, for the pending affordance on the one
+   *  clicked tile in the Trailers grid. */
+  trailerLaunchingId?: string | null;
   /** Run a search. Used by the Related tiles (searching the title they name)
    *  and by the Cast and Staff tabs (searching the person they name). One
    *  handler because it is one action: put this string in the search box. */
@@ -79,7 +82,7 @@ const EXTRA_TABS: { id: HudTab; label: string }[] = [
 ];
 
 export default function DetailHud({
-  overview, cast, crew, cours, onPlayTrailer, onSearchTitle, resetKey,
+  overview, cast, crew, cours, onPlayTrailer, trailerLaunchingId, onSearchTitle, resetKey,
 }: Props) {
   const tabs = useMemo(
     () => (cours.length > 0 ? [...BASE_TABS, ...EXTRA_TABS] : BASE_TABS),
@@ -204,7 +207,9 @@ export default function DetailHud({
         {tab === "related"  && (
           <RelatedTab cours={cours} onSearchTitle={onSearchTitle} />
         )}
-        {tab === "trailers" && <TrailersTab cours={cours} onPlay={onPlayTrailer} />}
+        {tab === "trailers" && (
+          <TrailersTab cours={cours} onPlay={onPlayTrailer} launchingId={trailerLaunchingId} />
+        )}
       </div>
     </div>
   );
