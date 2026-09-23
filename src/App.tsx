@@ -2201,6 +2201,16 @@ export default function App() {
 
   // ── Addons ──
   const [addons, setAddons] = useState<AddonEntry[]>([]);
+  // True once an addon load path has FINISHED (synced or local, success or
+  // failure). Distinct from `addons.length > 0`: after a reload the detail
+  // page mounts from sessionStorage before any load has run, and an empty
+  // array then means "not loaded yet", not "none installed". DetailView's
+  // write-once hero latch treated the two the same and, whenever its metaCache
+  // seed had expired, permanently latched the library record's backdrop
+  // instead of the meta addon's, so the same title showed a different hero
+  // depending on cache age at the moment of the reload (Bleach: orange
+  // fanart.tv art vs a black TMDB lineup). Monotonic: never reset.
+  const [addonsSettled, setAddonsSettled] = useState(false);
 
   // ── Library (Continue Watching + Calendar source) ──
   const [library, setLibrary] = useState<LibraryItem[]>([]);
@@ -5538,7 +5548,12 @@ export default function App() {
     await invoke("logout").catch(() => {});
     setSession(null);
     setLibrary([]); setRawLibrary([]);
-    invoke<AddonEntry[]>("list_addons").then(setAddons).catch(() => setAddons([]));
+    // Awaited so callers resume only once the local list has LANDED.
+    // loadSyncedAddons flips addonsSettled in a finally right after this
+    // returns; fire-and-forget let it report "settled" with addons still [],
+    // which is exactly the state DetailView reads as "none installed" and
+    // latches the wrong hero on.
+    await invoke<AddonEntry[]>("list_addons").then(setAddons).catch(() => setAddons([]));
   }, []);
 
   // ── Library refresh — fires after any context-menu library toggle ──
@@ -6504,48 +6519,55 @@ export default function App() {
     if (cached) setAddons(cached);
 
     try {
-      const synced = await invoke<AddonEntry[]>("get_synced_addons", { authKey: sess.auth_key });
-      // Suspicion check: a fresh fetch returning empty OR fewer than half
-      // the previously-cached count is almost always a sync glitch
-      // rather than a real user-driven wipe. Treat it as transient and
-      // keep the cache; the user can manually refresh to re-attempt.
-      if (
-        cached
-        && cached.length >= 2
-        && synced.length < Math.floor(cached.length / 2)
-      ) {
-        console.warn(
-          `[addons] cloud sync returned ${synced.length} addons; cache had ${cached.length}. ` +
-          `Keeping cached list to avoid a destructive wipe; re-open the Addons tab to retry.`,
-        );
-        showAppToast(
-          `Cloud sync returned ${synced.length} addons (${cached.length} cached). ` +
-          `Showing cached list to be safe.`,
-          { duration: 5000 },
-        );
-        setAddons(cached);
-        return;
+      try {
+        const synced = await invoke<AddonEntry[]>("get_synced_addons", { authKey: sess.auth_key });
+        // Suspicion check: a fresh fetch returning empty OR fewer than half
+        // the previously-cached count is almost always a sync glitch
+        // rather than a real user-driven wipe. Treat it as transient and
+        // keep the cache; the user can manually refresh to re-attempt.
+        if (
+          cached
+          && cached.length >= 2
+          && synced.length < Math.floor(cached.length / 2)
+        ) {
+          console.warn(
+            `[addons] cloud sync returned ${synced.length} addons; cache had ${cached.length}. ` +
+            `Keeping cached list to avoid a destructive wipe; re-open the Addons tab to retry.`,
+          );
+          showAppToast(
+            `Cloud sync returned ${synced.length} addons (${cached.length} cached). ` +
+            `Showing cached list to be safe.`,
+            { duration: 5000 },
+          );
+          setAddons(cached);
+          return;
+        }
+        setAddons(synced);
+        // Persist the latest healthy fetch so future sessions on this
+        // device have a fallback. JSON.stringify is cheap for the typical
+        // <30 addons most users have.
+        try { localStorage.setItem(key, JSON.stringify(synced)); } catch { /* quota */ }
+      } catch (err) {
+        if (String(err) === SESSION_EXPIRED) {
+          await handleSessionExpired();
+        } else if (cached) {
+          // Network failure during initial sync: fall back to whatever
+          // we cached last time so the Addons tab and home rows aren't
+          // empty while the user troubleshoots.
+          console.warn(`[addons] cloud sync failed; falling back to cache (${cached.length} addons).`);
+          setAddons(cached);
+        }
       }
-      setAddons(synced);
-      // Persist the latest healthy fetch so future sessions on this
-      // device have a fallback. JSON.stringify is cheap for the typical
-      // <30 addons most users have.
-      try { localStorage.setItem(key, JSON.stringify(synced)); } catch { /* quota */ }
-    } catch (err) {
-      if (String(err) === SESSION_EXPIRED) {
-        await handleSessionExpired();
-      } else if (cached) {
-        // Network failure during initial sync — fall back to whatever
-        // we cached last time so the Addons tab and home rows aren't
-        // empty while the user troubleshoots.
-        console.warn(`[addons] cloud sync failed; falling back to cache (${cached.length} addons).`);
-        setAddons(cached);
-      }
+    } finally {
+      setAddonsSettled(true);
     }
   }, [cloudAddonCacheKey, handleSessionExpired]);
 
   const loadLocalAddons = useCallback(() => {
-    invoke<AddonEntry[]>("list_addons").then(setAddons).catch(() => {});
+    invoke<AddonEntry[]>("list_addons")
+      .then(setAddons)
+      .catch(() => {})
+      .finally(() => setAddonsSettled(true));
   }, []);
 
   // ── Popup-browser first-open hint ──
@@ -9731,6 +9753,7 @@ export default function App() {
             }
           }}
           onPlayTrailer={handlePlayTrailer}
+          addonsSettled={addonsSettled}
           trailerLaunchingId={trailerLaunching}
           trailerDepProgress={trailerDepProgress}
           openOnEpisodeId={lastPlayedEpisodeId}

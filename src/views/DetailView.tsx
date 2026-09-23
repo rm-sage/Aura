@@ -201,6 +201,11 @@ interface Props {
   trailerLaunchingId?: string | null;
   /** 0-1 while the one-time ~18 MB yt-dlp fetch is running, else null. */
   trailerDepProgress?: number | null;
+  /** True once App has finished an addon load (synced or local, success or
+   *  failure). While false, an empty `addons` means "not loaded yet" rather
+   *  than "none installed", so the hero must not settle on the preview's art.
+   *  Defaults to true so a caller that doesn't pass it keeps the old rule. */
+  addonsSettled?: boolean;
   /** When set, DetailView opens in episodes mode (instead of streams),
    *  selects the season containing this episode id, and scrolls the
    *  matching row to the top of the list. Used after exiting playback
@@ -735,7 +740,7 @@ function HudSectionLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
-function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, onQueueToggle, onPlayTrailer, trailerLaunchingId, trailerDepProgress, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
+function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, onQueueToggle, onPlayTrailer, trailerLaunchingId, trailerDepProgress, addonsSettled = true, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
   const [detail, setDetail]                 = useState<MetaDetail | null>(null);
   // Resume pointer, read BEFORE the latch below because the latch's seed
   // needs it synchronously on the first render to pick the right arc's art.
@@ -1073,8 +1078,24 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // valid series meta with an empty videos array on the first tier
   // (the next request fills them in), and rejecting those was leaving
   // anime / Cinemeta-resolved CW items stuck on a blank detail page.
+  // Pending only while the list is EMPTY and no load has finished. Deliberately
+  // not `addonsSettled` itself: once a cached list is showing, the flag can
+  // still flip later (sync failed, suspicious shrink, session expired, all of
+  // which re-set the same array), and depending on it restarted the whole meta
+  // probe for nothing. This flips at most once, only in the case it guards.
+  const addonsPending = addons.length === 0 && !addonsSettled;
   useEffect(() => {
     if (!metaAddon || addons.length === 0) {
+      // Addons not loaded YET is not the same as none installed. After a
+      // reload this page mounts from sessionStorage on App's first render,
+      // before any addon load has run, so `addons` is [] for a moment even
+      // for a user with a dozen installed. Latching here then was permanent
+      // (the latch is write-once), and it picked the library record's
+      // backdrop over the meta addon's whenever the metaCache seed above had
+      // expired, so a reload could show a different hero than a normal open.
+      // Wait instead: this effect re-runs when addons land (or when App
+      // reports the load finished empty) and takes the normal path.
+      if (addonsPending) return;
       // No addon will ever answer — settle on the catalog preview's art
       // immediately rather than leaving the hero waiting on a probe that
       // is never going to run.
@@ -1191,7 +1212,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
         ));
       });
     return () => { cancelled = true; };
-  }, [metaAddon, addons, meta, meta.id, meta.media_type]);
+  }, [metaAddon, addons, addonsPending, meta, meta.id, meta.media_type]);
 
   // ── Multi-source ratings enrichment ──
   // Hits a Rust aggregator (fetch_aggregate_ratings) that fans out to
