@@ -1926,6 +1926,20 @@ select,
     to   { transform: scaleX(1); }
   }
 
+  /* History header swapping between the page title and the selection  */
+  /* toolbar. The small rise is what makes the mode change register:     */
+  /* the old floating selection bar appeared in one frame and was easy   */
+  /* to miss. Ends on `transform: none`, not translateY(0): with fill    */
+  /* mode `both` the end value persists, and any residual transform      */
+  /* would make this row a containing block for fixed descendants.       */
+  .aura-header-swap {
+    animation: aura-header-swap 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  @keyframes aura-header-swap {
+    from { opacity: 0; transform: translateY(5px); }
+    to   { opacity: 1; transform: none; }
+  }
+
   /* Reduced motion: keep the FADE (it conveys that something appeared,
      which is the same reasoning that keeps popup enter/exit alive in the
      gate below) but drop the travel and the scale, which are the parts a
@@ -1934,6 +1948,11 @@ select,
     .aura-modal-card-in,
     .aura-sheet-in { animation-name: aura-view-fade; }
   }
+  /* The header swap follows the in-app setting rather than the OS query:
+     the attribute already resolves auto (the OS preference, re-applied live
+     when it changes), always and never, and an unconditional media query
+     would override an explicit "Never reduce". */
+  html[data-reduced-motion="true"] .aura-header-swap { animation-name: aura-view-fade; }
 }
 
 /* ------------------------------------------------------------------ */

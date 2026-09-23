@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useScrobbleConnections } from "../scrobbleConn";
 import type { MetaPreview } from "../types";
@@ -29,6 +29,7 @@ import {
   type ScrobbleWorkItem,
 } from "../scrobbleRun";
 import ImageLoader from "../ImageLoader";
+import Tooltip from "../Tooltip";
 import { shrinkPoster } from "../posterSize";
 import ErrorBoundary from "../ErrorBoundary";
 import { showAppToast } from "../AppToast";
@@ -371,8 +372,8 @@ function HistoryViewBody({ onSelectMeta }: Props) {
     const confirmed = await ask({
       title: "Clear history",
       message: `Clear all ${n} history entr${n === 1 ? "y" : "ies"}?`,
-      detail: "This can't be undone. It only clears Aura's local history — anything already scrobbled stays on Trakt / AniList.",
-      confirmLabel: "Clear All",
+      detail: "This can't be undone. It only clears Aura's local history; anything already scrobbled stays on Trakt / AniList.",
+      confirmLabel: "Clear history",
       tone: "danger",
     });
     if (!confirmed) return;
@@ -383,51 +384,48 @@ function HistoryViewBody({ onSelectMeta }: Props) {
 
   const selectionActive = selected.size > 0;
 
+  // Whether the sticky header is floating over content, which is when it needs
+  // its glass. It rests 24 px down (the column's py-6) and sticks at 12 px, so
+  // anything past 12 px of scroll has content sliding underneath it. Only
+  // commits on a change, so scrolling a long history re-renders twice, not
+  // once per frame.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [stuck, setStuck] = useState(false);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const next = el.scrollTop > 12;
+      setStuck((prev) => (prev === next ? prev : next));
+    };
+    onScroll();
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, []);
+
   return (
     <div className="relative flex-1 flex flex-col min-w-0 overflow-hidden">
       <div
+        ref={scrollRef}
         className="flex-1 overflow-y-auto"
         style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
       >
         <div className="max-w-[1100px] mx-auto px-6 py-6 space-y-7">
-          <div className="flex items-end justify-between gap-4 flex-wrap">
-            <div>
-              <h1 className="aura-row-title text-3xl font-semibold tracking-tight">History</h1>
-              <p className="text-white/35 text-sm mt-1">
-                {entries.length === 0
-                  ? "Your watch history is empty. Items you finish playing, or skip, show up here automatically."
-                  : `${entries.length} item${entries.length === 1 ? "" : "s"} from playback and skips.`}
-              </p>
-            </div>
-            {entries.length > 0 && (
-              <div className="flex items-center gap-2">
-                {anyService && (
-                  <button
-                    disabled={busy}
-                    onClick={() => void runScrobble(entries, "your entire history")}
-                    className="px-3.5 py-1.5 rounded-full text-xs font-medium
-                               bg-ln-accent/15 text-ln-accent border border-ln-accent/35
-                               hover:bg-ln-accent/25 hover:text-white
-                               disabled:opacity-40 disabled:cursor-default
-                               transition-colors"
-                  >
-                    Scrobble All
-                  </button>
-                )}
-                <button
-                  disabled={busy}
-                  onClick={() => void clearAll()}
-                  className="px-3.5 py-1.5 rounded-full text-xs font-medium
-                             bg-white/5 text-white/60 border border-white/10
-                             hover:bg-rose-500/15 hover:text-rose-200 hover:border-rose-300/40
-                             disabled:opacity-40 disabled:cursor-default
-                             transition-colors"
-                >
-                  Clear All
-                </button>
-              </div>
+          <HistoryHeader
+            total={entries.length}
+            selectedCount={selected.size}
+            stuck={stuck}
+            anyService={anyService}
+            busy={busy}
+            onScrobbleAll={() => void runScrobble(entries, "your entire history")}
+            onClearHistory={() => void clearAll()}
+            onScrobbleSelected={() => void runScrobble(
+              selectedEntries,
+              `${selected.size} selected item${selected.size === 1 ? "" : "s"}`,
             )}
-          </div>
+            onRemoveSelected={() => void removeSelected()}
+            onCancelSelection={() => setSelected(new Set())}
+          />
 
           {entries.length === 0 ? (
             <div className="glass-panel rounded-2xl px-6 py-10 text-center">
@@ -455,35 +453,12 @@ function HistoryViewBody({ onSelectMeta }: Props) {
             ))
           )}
 
-          {/* Bottom padding so the floating action bar never covers the last row. */}
-          {(selectionActive || busy) && <div className="h-16" aria-hidden />}
+          {/* Bottom padding so the globally-rendered ScrobbleRunBar (fixed,
+              bottom-centre, only while a bulk job runs) never covers the last
+              row. The selection actions no longer float, so they need none. */}
+          {busy && <div className="h-16" aria-hidden />}
         </div>
       </div>
-
-      {/* Multi-selection actions. There is no progress variant here any more: the
-          run's bar is rendered globally from App (ScrobbleRunBar) so it survives
-          navigating away from this page. While a run is in flight the Scrobble
-          action goes inert, so a second job can never be stacked on the first. */}
-      {selectionActive && (
-        <ActionBar raised={busy}>
-          <span className="text-white/85 text-xs font-medium">
-            {selected.size} selected
-          </span>
-          {anyService && (
-            <BarButton
-              tone="accent"
-              disabled={busy}
-              onClick={() => void runScrobble(selectedEntries, `${selected.size} selected item${selected.size === 1 ? "" : "s"}`)}
-            >
-              Scrobble
-            </BarButton>
-          )}
-          <BarButton tone="danger" disabled={busy} onClick={() => void removeSelected()}>
-            Remove
-          </BarButton>
-          <BarButton onClick={() => setSelected(new Set())}>Clear</BarButton>
-        </ActionBar>
-      )}
 
       {dialog}
     </div>
@@ -491,47 +466,211 @@ function HistoryViewBody({ onSelectMeta }: Props) {
 }
 
 // ---------------------------------------------------------------------------
-// Floating bar shell + its buttons.
+// Page header, which becomes the selection toolbar.
 // ---------------------------------------------------------------------------
 
-/** `raised` lifts the bar clear of the globally-rendered ScrobbleRunBar, which
- *  occupies the same bottom-centre slot while a bulk job is in flight. */
-function ActionBar({ children, raised = false }: { children: React.ReactNode; raised?: boolean }) {
-  return (
-    <div className={`absolute left-1/2 -translate-x-1/2 z-30
-                     flex items-center gap-3 px-4 py-2.5 rounded-full
-                     bg-black/80 backdrop-blur-xl border border-white/15
-                     shadow-2xl shadow-black/50 transition-[bottom] duration-200
-                     ${raised ? "bottom-[4.75rem]" : "bottom-5"}`}>
-      {children}
-    </div>
-  );
-}
+/** Shared pill geometry, so both states sit at exactly the same height and the
+ *  swap never shifts the page. */
+const PILL = "px-3.5 py-1.5 rounded-full text-xs font-medium border transition-colors "
+  + "disabled:opacity-40 disabled:cursor-default";
 
-function BarButton({
-  children, onClick, tone = "plain", disabled = false,
+/**
+ * The page header, which BECOMES the selection toolbar while anything is
+ * selected. One slot, two states, so the global actions (Scrobble All, Clear
+ * history) and the selection actions (Scrobble N, Remove N, Cancel) are never
+ * on screen together.
+ *
+ * They used to be. The global pair sat up here while a small floating pill
+ * carried the selection actions at the bottom, in the SAME pill grammar and
+ * the same accent-vs-neutral weighting, so the eye went to the header and
+ * weight said nothing about scope. Worst of all, "Clear All" (wipes the whole
+ * local history) had a near-identical twin "Clear" (only deselects). Now the
+ * scope is written into the labels (the counts), and the only way to reach a
+ * global action is to leave selection mode first.
+ *
+ * Sticky, so the toolbar is reachable anywhere in a long history. Its glass
+ * fades in only once it is actually floating over content (or while
+ * selecting), and a separate accent layer marks selection mode itself.
+ */
+function HistoryHeader({
+  total, selectedCount, stuck, anyService, busy,
+  onScrobbleAll, onClearHistory, onScrobbleSelected, onRemoveSelected, onCancelSelection,
 }: {
-  children: React.ReactNode;
-  onClick: () => void;
-  tone?: "plain" | "accent" | "danger";
-  disabled?: boolean;
+  total: number;
+  selectedCount: number;
+  stuck: boolean;
+  anyService: boolean;
+  /** A bulk scrobble job is running (module-level, see scrobbleRun.ts). */
+  busy: boolean;
+  onScrobbleAll: () => void;
+  onClearHistory: () => void;
+  onScrobbleSelected: () => void;
+  onRemoveSelected: () => void;
+  onCancelSelection: () => void;
 }) {
-  const toneCls =
-    tone === "accent"
-      ? "bg-ln-accent/20 text-ln-accent border-ln-accent/40 hover:bg-ln-accent/30 hover:text-white"
-      : tone === "danger"
-        ? "bg-white/5 text-white/70 border-white/15 hover:bg-rose-500/20 hover:text-rose-200 hover:border-rose-300/40"
-        : "bg-white/5 text-white/70 border-white/15 hover:bg-white/12 hover:text-white";
+  const selecting = selectedCount > 0;
+
+  // Leaving selection mode puts "Clear history" (rest state) where a selection
+  // control just was. Cancel now lives on the LEFT, so a double-click on it
+  // lands on the static title, but the selection can also empty under a still
+  // pointer (a sync prunes the selected entries while it rests on Remove N).
+  // A click on the history wipe that soon after the swap is not a decision
+  // about the new button, so it is ignored. Not a substitute for the confirm
+  // dialog; a guard in front of it.
+  const leftSelectionAt = useRef(0);
+  const wasSelecting = useRef(selecting);
+  // Cancel unmounts itself (the whole selecting row is keyed away), which
+  // would drop keyboard focus to <body>. When the user cancelled, hand focus
+  // to the page title instead. Only then: a selection emptied by anything
+  // else must not pull focus out of the list the user is working in.
+  const restoreFocusOnExit = useRef(false);
+  const titleRef = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    if (wasSelecting.current && !selecting) {
+      leftSelectionAt.current = performance.now();
+      if (restoreFocusOnExit.current) titleRef.current?.focus({ preventScroll: true });
+    }
+    restoreFocusOnExit.current = false;
+    wasSelecting.current = selecting;
+  }, [selecting]);
+  const clearHistoryGuarded = () => {
+    if (performance.now() - leftSelectionAt.current < 450) return;
+    onClearHistory();
+  };
+
   return (
-    <button
-      type="button"
-      disabled={disabled}
-      onClick={onClick}
-      className={`px-3 py-1 rounded-full text-xs font-medium border transition-colors
-                  disabled:opacity-40 disabled:cursor-default ${toneCls}`}
-    >
-      {children}
-    </button>
+    <div className="sticky top-3 z-20 -mx-4">
+      {/* Two separate layers rather than classes on one element:
+          .aura-float-glass sets background, border and box-shadow as
+          shorthands, which silently beats any border or ring utility on the
+          same element, so the accent rim has to be its own layer. Both are
+          opacity-only, so the fade runs on the compositor. */}
+      <div
+        aria-hidden
+        className={`pointer-events-none absolute inset-0 rounded-2xl aura-float-glass
+                    transition-opacity duration-200 ${stuck || selecting ? "opacity-100" : "opacity-0"}`}
+      />
+      <div
+        aria-hidden
+        className={`pointer-events-none absolute inset-0 rounded-2xl
+                    border border-ln-accent/45 bg-ln-accent/10
+                    transition-opacity duration-200 ${selecting ? "opacity-100" : "opacity-0"}`}
+      />
+      {/* Always mounted, outside the keyed row. A live region inserted with
+          its text already in place is not spoken, so one living inside the
+          selecting branch never announced the switch INTO selection mode. */}
+      <p className="sr-only" aria-live="polite" aria-atomic="true">
+        {selecting ? `${selectedCount} selected` : ""}
+      </p>
+      {/* Keyed on the MODE (not the count), so the swap plays its enter
+          animation once per mode change and a count change never re-triggers
+          it. */}
+      <div
+        key={selecting ? "selecting" : "rest"}
+        className="aura-header-swap relative flex items-end justify-between gap-4 flex-wrap px-4 py-3"
+      >
+        {selecting ? (
+          <>
+            {/* Cancel leads, beside the count, and never sits in the right-hand
+                cluster: both clusters are flush right, bottom-aligned and 30 px
+                tall, so a right-aligned X shared its hit area with the rest
+                state's "Clear history" pill. A double-click on Cancel then
+                deselected, swapped the header, and opened the history-wipe
+                confirm with its destructive button focused. Here, the spot it
+                vacates is the rest state's static title. */}
+            <div className="min-w-0 flex items-center gap-3">
+              <Tooltip text="Cancel selection" pos="bottom">
+                <button
+                  type="button"
+                  aria-label="Cancel selection"
+                  onClick={() => { restoreFocusOnExit.current = true; onCancelSelection(); }}
+                  className="w-[30px] h-[30px] rounded-full grid place-items-center shrink-0
+                             bg-white/5 text-white/70 border border-white/15
+                             hover:bg-white/12 hover:text-white transition-colors"
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                       strokeWidth="2.5" strokeLinecap="round" aria-hidden>
+                    <path d="M6 6l12 12M18 6L6 18" />
+                  </svg>
+                </button>
+              </Tooltip>
+              <div className="min-w-0">
+                <h1 className="sr-only">History</h1>
+                <p className="text-3xl font-semibold tracking-tight text-white">
+                  <span className="text-ln-accent tabular-nums">{selectedCount}</span> selected
+                </p>
+                <p className="text-white/45 text-sm mt-1">
+                  of {total} · click a card to add or remove it
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              {anyService && (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={onScrobbleSelected}
+                  className={`${PILL} bg-ln-accent/20 text-ln-accent border-ln-accent/45
+                              hover:bg-ln-accent/30 hover:text-white`}
+                >
+                  Scrobble {selectedCount}
+                </button>
+              )}
+              <button
+                type="button"
+                disabled={busy}
+                onClick={onRemoveSelected}
+                className={`${PILL} bg-white/5 text-white/75 border-white/15
+                            hover:bg-rose-500/15 hover:text-rose-200 hover:border-rose-300/40`}
+              >
+                Remove {selectedCount}
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="min-w-0">
+              <h1
+                ref={titleRef}
+                tabIndex={-1}
+                className="aura-row-title text-3xl font-semibold tracking-tight outline-none"
+              >
+                History
+              </h1>
+              <p className="text-white/35 text-sm mt-1">
+                {total === 0
+                  ? "Your watch history is empty. Items you finish playing, or skip, show up here automatically."
+                  : `${total} item${total === 1 ? "" : "s"} from playback and skips.`}
+              </p>
+            </div>
+            {total > 0 && (
+              <div className="flex items-center gap-2">
+                {anyService && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={onScrobbleAll}
+                    className={`${PILL} bg-ln-accent/15 text-ln-accent border-ln-accent/35
+                                hover:bg-ln-accent/25 hover:text-white`}
+                  >
+                    Scrobble All
+                  </button>
+                )}
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={clearHistoryGuarded}
+                  className={`${PILL} bg-white/5 text-white/60 border-white/10
+                              hover:bg-rose-500/15 hover:text-rose-200 hover:border-rose-300/40`}
+                >
+                  Clear history
+                </button>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -614,7 +753,13 @@ const DayGroup = memo(function DayGroup({
   const someSelected = selectedInDay > 0 && !allSelected;
 
   return (
-    <section className="space-y-3">
+    // Every focusable control in the list is a <button> (cards are plain
+    // divs), so one descendant rule covers the day and card checkboxes, the
+    // hover remove X and the scrobble pills. 108 px clears the stuck
+    // HistoryHeader (top-3 = 12, plus ~84 tall) with 12 px to spare. Chromium
+    // scrolls focus into view only when the target leaves the scrollport, so
+    // without this a control under the stuck header took focus invisibly.
+    <section className="space-y-3 [&_button]:scroll-mt-[108px]">
       <header className="group/day flex items-center justify-between gap-3 border-b border-white/8 pb-2">
         <div className="flex items-center gap-3">
           {/* Select every play on this date. Hidden until hover unless the day
