@@ -30,6 +30,12 @@ mod backup;
 // Casting (Chromecast CASTV2 + DLNA SOAP) — discovery, LAN media proxy,
 // load/control. See cast/mod.rs.
 mod cast;
+
+/// Set by the main webview's first ContentLoading. See the `.on_page_load` hook:
+/// that first load is the cold start, every later one is a reload, and only a
+/// reload can have playback running behind it.
+static MAIN_PAGE_LOADED_ONCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 mod cinema;
 mod crash_reporting;
 mod devlog;
@@ -1759,6 +1765,84 @@ pub fn run() {
         // the config, the plugin still loads but check() / download()
         // fail with a "signature mismatch" error. See PRODUCTION.md.
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // A reload of the main page ends playback, exactly as Exit does.
+        //
+        // mpv's file, its --wid host window and its audio output all belong to
+        // this process, not to the page, so a webview reload (F5, Ctrl+R,
+        // Ctrl+Shift+R, a DevTools or Vite reload) used to leave the stream
+        // playing underneath the restored detail page: audible, often visible
+        // through the transparent shell, still steerable by Space, with no
+        // player UI left to stop it. The only stop_video call lives in the
+        // page's handleExitPlayback, which a reload never reaches, and
+        // `beforeunload` only flushes progress and scrobble. sessionRoute.ts
+        // already documents the intended behaviour ("playback is not
+        // persisted"); this is what makes it true, for every reload trigger at
+        // once rather than per shortcut.
+        //
+        // `Started` is WebView2's ContentLoading: a NEW document, never a
+        // same-document history navigation. Filtered to "main" because the hook
+        // fires for every webview, including the in-app browser. It runs on the
+        // WebView2 UI thread, so everything here is non-blocking, mirroring
+        // stop_video. The engine channel is FIFO and ContentLoading precedes the
+        // new page's scripts, so this stop is queued ahead of anything the new
+        // page can submit.
+        //
+        // The process's FIRST main load is skipped: it is the cold start, which
+        // cannot have playback behind it. is_running() cannot make that call,
+        // because setup() spawns the engine before WebView2 dispatches the first
+        // ContentLoading, so without the latch every launch sent a stray `stop`
+        // to an idle mpv and logged a reload that never happened. A reload while
+        // idle (engine up, no file) still sends one; mpv ignores it, and the
+        // engine's seek flag it arms is reset by the next load.
+        .on_page_load(|webview, payload| {
+            if webview.label() != "main"
+                || payload.event() != tauri::webview::PageLoadEvent::Started
+            {
+                return;
+            }
+            if !MAIN_PAGE_LOADED_ONCE.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                return;
+            }
+            // A cast has no page left to control it after a reload (the cast bar
+            // is gone and nothing rebuilds it), so a reload ends it too: reload
+            // means exit playback everywhere. cast_stop also clears the transcode
+            // sessions and temp dirs. Async and fire-and-forget, never on this
+            // UI thread.
+            if crate::cast::has_active_session() {
+                crate::devlog!(info, "cast", "main page reloaded: ending the cast session");
+                tauri::async_runtime::spawn(async {
+                    let _ = crate::cast::cast_stop().await;
+                });
+            }
+            #[cfg(target_os = "windows")]
+            {
+                if mpv::engine::is_running() {
+                    crate::devlog!(info, "player", "main page reloaded: ending playback");
+                    let _ = tauri::async_runtime::spawn_blocking(crate::mpv::thumb::shutdown);
+                    let _ = mpv::engine::submit_command(vec!["stop".into()]);
+                }
+                // handleExitPlayback leaves native fullscreen before it stops,
+                // and a reload skips that too. Without this the window stays
+                // covering the monitor while the new page believes it is
+                // windowed: win.isFullscreen() cannot see the Win32 path, and
+                // the fullscreen binding is gated on an active player.
+                if win32::is_in_native_fullscreen() {
+                    if let Some(p) = webview
+                        .app_handle()
+                        .get_webview_window("main")
+                        .and_then(|w| w.hwnd().ok())
+                        .map(|h| h.0 as isize)
+                    {
+                        crate::devlog!(info, "player", "main page reloaded: leaving native fullscreen");
+                        let _ = tauri::async_runtime::spawn_blocking(move || {
+                            if let Err(e) = win32::exit_native_fullscreen(p) {
+                                crate::devlog!(warn, "player", "exit fullscreen on reload failed: {e}");
+                            }
+                        });
+                    }
+                }
+            }
+        })
         .setup(|app| {
             // ── DevLog — install first so subsequent setup steps can log ──
             devlog::install(app.handle());

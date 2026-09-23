@@ -433,6 +433,8 @@ fn snapshot_session() -> Option<SessionSnapshot> {
 
 /// True while any cast session is active — the HLS evictor uses this so it
 /// never reaps the transcode of a live (even paused/buffering) cast.
+/// Also read by lib.rs's page-load hook to end a cast when the page reloads.
+/// Lock-and-peek only, so it is safe from the WebView2 UI thread.
 pub(super) fn has_active_session() -> bool {
     active_slot().lock().map(|s| s.is_some()).unwrap_or(false)
 }
