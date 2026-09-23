@@ -26,9 +26,11 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 /// One downloadable binary.
 struct Dep {
-    /// Filename on disk AND the GitHub asset name.
+    /// Filename on disk. Usually also the GitHub asset name, but not always:
+    /// yt-dlp is published under a VERSIONED asset name (see its entry).
     name: &'static str,
-    /// Direct download URL (runtime-deps prerelease asset).
+    /// Direct download URL (runtime-deps prerelease asset). Independent of
+    /// `name`: the file always lands on disk as `name`.
     url: &'static str,
     /// Lowercase-hex SHA-256 of the expected file. Bump this (and replace the
     /// asset) to ship a newer binary — a mismatch forces a fresh download.
@@ -55,14 +57,29 @@ const DEPS: &[Dep] = &[
         url: "https://github.com/rm-sage/Aura/releases/download/runtime-deps/libmpv-2.dll",
         sha256: "9826b77fb42559752cd37a19191169a986aa4e929eb37705c3345d25a5f6d034",
     },
-    // yt-dlp (Windows) — resolves a "Watch Trailer" YouTube id to a direct CDN
-    // URL for in-player playback. Optional: absent ⇒ the trailer button shows a
-    // one-time download prompt. SHA matches the binary uploaded to the
-    // runtime-deps prerelease; bump both to ship a newer yt-dlp.
+    // yt-dlp (Windows): resolves a "Watch Trailer" YouTube id to a direct CDN
+    // URL for in-player playback. Optional: absent means the trailer button
+    // fetches it on first use.
+    //
+    // Unlike the other three, yt-dlp ROTS. It tracks YouTube's server side,
+    // which changes every few weeks, so a pinned copy is guaranteed to stop
+    // working on a schedule. 2026.06.09 did: it resolved through the ANDROID_VR
+    // player client, whose links Google began refusing for the open-ended range
+    // Lavf sends, so every trailer failed with mpv error -13 while the resolve
+    // itself "succeeded". 2026.08.19 resolves through VISIONOS and plays.
+    //
+    // Published under a VERSIONED asset name, never by overwriting yt-dlp.exe.
+    // Every shipped build bakes its own URL + SHA; overwriting the asset they
+    // point at would turn a fresh install of an older build into a checksum
+    // failure. To bump: verify the release's SHA2-256SUMS against its .sig and
+    // yt-dlp's public.key, upload as yt-dlp-<version>.exe, update both lines.
+    //
+    // 2026.08.19, SHA verified against yt-dlp's signed SHA2-256SUMS
+    // (signing key AC0C BBE6 848D 6A87 3464 AF4E 57CF 6593 3B5A 7581).
     Dep {
         name: "yt-dlp.exe",
-        url: "https://github.com/rm-sage/Aura/releases/download/runtime-deps/yt-dlp.exe",
-        sha256: "3a48cb955d55c8821b60ccbdbbc6f61bc958f2f3d3b7ad5eaf3d83a543293a27",
+        url: "https://github.com/rm-sage/Aura/releases/download/runtime-deps/yt-dlp-2026.08.19.exe",
+        sha256: "66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a",
     },
 ];
 

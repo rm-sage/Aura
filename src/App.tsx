@@ -4926,22 +4926,25 @@ export default function App() {
       setTrailerLaunching(ytId);
       try {
       const center = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
-      // First-use gate: download yt-dlp if it isn't already on disk. Reports
-      // real progress rather than a single 2.4 s toast that then goes silent
-      // for the rest of an 18 MB fetch.
-      const present = await runtimeDepPresent("yt-dlp.exe").catch(() => false);
-      if (!present) {
-        setTrailerDepProgress(0);
-        try {
-          await ensureRuntimeDep("yt-dlp.exe", (p) => {
-            setTrailerDepProgress(p.total > 0 ? p.downloaded / p.total : 0);
-          });
-        } catch (e) {
-          showFlyUpToast(`Couldn't set up trailer playback: ${String(e)}`, { ...center, tone: "danger" });
-          return;
-        } finally {
-          setTrailerDepProgress(null);
-        }
+      // Verify yt-dlp against the baked SHA on EVERY launch, not only when the
+      // file is missing. This used to be gated on runtimeDepPresent, which is
+      // existence-only, so a bumped pin never reached anyone who already had a
+      // copy: the stale binary kept running and every trailer kept failing.
+      // yt-dlp is the one runtime dep that rots (see runtime_deps.rs), so the
+      // pin is only useful if it is actually enforced. ensure_runtime_dep is a
+      // no-op after one SHA-256 of an ~18 MB file when the copy is current,
+      // which is noise next to the ~2 s yt-dlp resolve that follows.
+      // Progress is only shown once bytes actually start moving, so the check
+      // itself never flashes "Setting up".
+      try {
+        await ensureRuntimeDep("yt-dlp.exe", (p) => {
+          setTrailerDepProgress(p.total > 0 ? p.downloaded / p.total : 0);
+        });
+      } catch (e) {
+        showFlyUpToast(`Couldn't set up trailer playback: ${String(e)}`, { ...center, tone: "danger" });
+        return;
+      } finally {
+        setTrailerDepProgress(null);
       }
       // Default quality comes from the sharable `trailer_quality` setting;
       // the in-player menu can override it per trailer afterward. 1080p+ is
