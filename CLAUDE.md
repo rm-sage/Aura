@@ -642,8 +642,11 @@ Bound every cache (see Performance & memory).
 - **Story arcs**: `aura:story-arcs:v8` (24 h TTL, cap 60) holds the joined arcs per series; the TTL is
   short deliberately because an ongoing show gains an episode weekly and a stale arc would be missing
   it. `aura:arc-mode:v1` (cap 200) remembers the Seasons/Arcs choice per series. Rust side:
-  `arcs-cache-v1.json` (TMDB payloads, 24 h, cap 40) and `arc-art-v1.json` (Fandom art, 30 d, cap 60;
-  an empty map is a cached MISS and is honoured, so a show with no art does not re-probe every visit).
+  `arcs-cache-v1.json` (TMDB payloads, 24 h, cap 40) and `arc-art-v1.json` (Fandom art, cap 60; a hit
+  lives 30 d, an empty map is a cached MISS honoured for only 24 h, because it is ambiguous between "this
+  wiki has no arc art" and "Fandom was down when we asked"). A show in the curated wiki table is not
+  proof it HAS arc art: Bleach is listed and has never produced any (no arc category, and 9 of 21 arc
+  names redirect to one generic Episodes page).
 - **Addon manifest fields**: `AddonEntry.stream_types`, `id_prefixes`, `stream_id_prefixes` are
   populated at install/sync time; `fetch_streams` reads them directly and never re-fetches manifests
   per stream request (a transient failure during that re-probe used to kill all stream lookups).
