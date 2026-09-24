@@ -12,7 +12,9 @@
 //
 // USAGE PATTERN
 //   const homeUrls = resolveDefaultUrls(addons, DEFAULT_HOME_ORDER);
-//   const metaUrl  = resolveDefaultMetaUrl(addons);
+//
+// Meta is NOT defaulted here any more: who answers meta is decided by addon
+// order in addonElection.ts (electMetaAddons), with no manifest-id table.
 //
 // Each `*_ORDER` constant is a ranked list of manifest.id values. The
 // resolver walks the list, finds the first installed addon for each id,
@@ -22,18 +24,11 @@
 // ---------------------------------------------------------------------------
 
 import type { AddonEntry } from "./types";
+import { AIOMETADATA_MANIFEST_ID } from "./aiometadata";
 
-/** Cinemeta — the universal Stremio meta provider. Used as the meta
- *  fallback when AIOMetadata isn't installed, since Cinemeta ships with
+/** Cinemeta: the universal Stremio catalog provider, which ships with
  *  every Stremio install and exposes the same media-type catalogs. */
 export const CINEMETA_MANIFEST_ID = "com.linvo.cinemeta";
-
-/** AIOMetadata's manifest id — the user's preferred meta provider. The
- *  exact string comes from the addon's manifest.json. We prefer this
- *  over Cinemeta when installed because AIOMetadata exposes richer
- *  fields (originalLanguage / productionCountries / mal/kitsu/anidb id
- *  cross-refs) that drive Aura's audio scoring + anime-skip path. */
-export const AIOMETADATA_MANIFEST_ID = "com.aiometadata";
 
 /**
  * Default home-catalog ordering, in priority order. The first installed
@@ -44,12 +39,6 @@ export const DEFAULT_HOME_ORDER: readonly string[] = [
   AIOMETADATA_MANIFEST_ID,
   "community.aiosearch",
   "community.aisearch",
-  CINEMETA_MANIFEST_ID,
-] as const;
-
-/** Default meta-provider preference: AIOMetadata first, Cinemeta fallback. */
-export const DEFAULT_META_ORDER: readonly string[] = [
-  AIOMETADATA_MANIFEST_ID,
   CINEMETA_MANIFEST_ID,
 ] as const;
 
@@ -93,16 +82,6 @@ export function resolveDefaultUrls(
     }
   }
   return out;
-}
-
-/**
- * Resolve the default meta-provider URL: AIOMetadata if installed,
- * Cinemeta otherwise, null if neither is installed (caller falls back
- * to first installed addon with the meta resource, or to no override).
- */
-export function resolveDefaultMetaUrl(addons: AddonEntry[]): string | null {
-  const ranked = resolveDefaultUrls(addons, DEFAULT_META_ORDER);
-  return ranked[0] ?? null;
 }
 
 /**

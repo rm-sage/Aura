@@ -3,9 +3,7 @@
 
 import { useState, useEffect, useRef, useMemo } from "react";
 import type { LibraryItem, AddonEntry, MetaDetail, MetaPreview, VideoEntry } from "../types";
-import { loadAuraSettings } from "../auraSettings";
-import { resolveDefaultMetaUrl } from "../addonDefaults";
-import { getMetaDetail } from "../metaCache";
+import { getMetaDetailFallback } from "../metaCache";
 import ImageLoader from "../ImageLoader";
 import { shrinkPoster } from "../posterSize";
 import { formatEpLabel } from "../episodeLabel";
@@ -159,22 +157,6 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
   // overlayDate drives the day-click modal; null = closed.
   const [overlayDate, setOverlayDate] = useState<Date | null>(null);
 
-  // Resolve metadata addon: explicit setting > manifest-id default
-  // (AIOMetadata → Cinemeta) > first installed. Fresh-install users
-  // with only Cinemeta get Cinemeta; users with AIOMetadata get that.
-  const metaAddon = useMemo(() => {
-    const { defaultMetadataAddonUrl } = loadAuraSettings();
-    const override = defaultMetadataAddonUrl &&
-      addons.find((a) => a.url === defaultMetadataAddonUrl);
-    if (override) return override;
-    const defaultUrl = resolveDefaultMetaUrl(addons);
-    if (defaultUrl) {
-      const m = addons.find((a) => a.url === defaultUrl);
-      if (m) return m;
-    }
-    return addons[0] ?? null;
-  }, [addons]);
-
   // Fetch detail for every library item via the shared metaCache. Two things
   // keep this responsive even on a cold-ish cache (episodic meta has a 4 h TTL,
   // so the calendar re-fetches series meta a few times a day):
@@ -188,8 +170,15 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
   //     fetched FIRST, so the current month populates before older / ended
   //     shows and movies stream in behind it. Falls back to library order when
   //     no signal is present (release-search off, guest, or not yet reconciled).
+  //
+  // Each item is resolved over the elected meta providers for ITS id
+  // (getMetaDetailFallback -> electMetaAddons, the same election DetailView
+  // makes), with fallback down the list. `keepThin` keeps a series answer
+  // that has no episodes yet rather than dropping it, because the movie-style
+  // bucket below still reads its `released` date. `details` stays keyed by
+  // item id whichever addon answered.
   useEffect(() => {
-    if (!metaAddon || library.length === 0) {
+    if (addons.length === 0 || library.length === 0) {
       setDetails(new Map());
       return;
     }
@@ -235,8 +224,8 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
           const i = cursor++;
           if (i >= order.length) return;
           const item = order[i];
-          // getMetaDetail handles cache + dedupe + null-on-error.
-          const d = await getMetaDetail(metaAddon, item.media_type, item.id)
+          // metaCache handles cache + dedupe + null-on-error.
+          const d = await getMetaDetailFallback(addons, item.media_type, item.id, { keepThin: true })
             .catch(() => null);
           acc.set(item.id, d);
           scheduleFlush();
@@ -254,7 +243,7 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
       cancelled = true;
       if (flushTimer != null) window.clearTimeout(flushTimer);
     };
-  }, [library, metaAddon]);
+  }, [library, addons]);
 
   // Build a date-keyed bucket of entries across the entire library.
   //
@@ -417,14 +406,14 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
         </div>
 
         {/* Empty/empty-addon states */}
-        {!metaAddon && (
+        {addons.length === 0 && (
           <div className="glass-panel rounded-2xl px-5 py-4 mb-3">
             <p className="text-white/55 text-sm">
               Add an addon (in the Addons tab) to populate the calendar.
             </p>
           </div>
         )}
-        {metaAddon && library.length === 0 && !loading && (
+        {addons.length > 0 && library.length === 0 && !loading && (
           <div className="glass-panel rounded-2xl px-5 py-4 mb-3">
             <p className="text-white/55 text-sm">
               Your library is empty. Items you save show up here when their

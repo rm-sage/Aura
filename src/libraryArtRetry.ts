@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import type { AddonEntry, LibraryItem, MetaDetail } from "./types";
+import type { AddonEntry, LibraryItem } from "./types";
+import { electMetaAddons } from "./addonElection";
+import { getMetaDetail } from "./metaCache";
 
 // ---------------------------------------------------------------------------
 // libraryArtRetry — best-effort backfill of missing Library posters.
@@ -14,13 +15,21 @@ import type { AddonEntry, LibraryItem, MetaDetail } from "./types";
 // and updates the in-memory Library item's poster on success. It NEVER mutates
 // the Stremio cloud record — purely a UI enrichment, same as App's poster-warm.
 //
-// It bypasses the metaCache TTL (calls fetch_meta_detail directly) so the
-// hourly cadence actually re-queries instead of returning a stale null from a
-// recently-cached "no poster" response.
+// It asks the elected meta providers through metaCache, so it shares the
+// single-flight with every other surface and a poster it finds lands in the
+// shared cache. The normal TTL (up to 7 days for a movie) would pin a cached
+// "no poster yet" answer across many hourly passes, so it reads with a short
+// max age instead (RECHECK_MAX_AGE_MS): only an answer another surface fetched
+// minutes ago is reused, and anything older is re-queried.
 // ---------------------------------------------------------------------------
 
 const KEY = "aura:art-retry:v1";
 const HOUR_MS = 60 * 60 * 1000;
+/** Well under the hourly cadence on purpose. The attempt is stamped BEFORE
+ *  its fetch lands, so the cache entry that fetch writes is always slightly
+ *  younger than the throttle says; a max age of a full hour would turn the
+ *  next pass into a cache hit on the very answer it is retrying. */
+const RECHECK_MAX_AGE_MS = 10 * 60 * 1000;
 const CONCURRENCY = 4;
 
 function loadAttempts(): Record<string, number> {
@@ -32,7 +41,7 @@ function saveAttempts(a: Record<string, number>) {
 }
 
 /** Hourly retry: for Library items with a null poster whose last attempt was
- *  >= 1h ago, query meta-capable addons directly until one returns a poster;
+ *  >= 1h ago, walk the elected meta providers until one returns a poster;
  *  call applyPoster(id, poster) on success. In-memory only. */
 export function useLibraryArtRetry(
   library: LibraryItem[],
@@ -53,9 +62,6 @@ export function useLibraryArtRetry(
       const items = libRef.current;
       const adds = addonsRef.current;
       if (!adds || adds.length === 0 || items.length === 0) return;
-      const metaAddons = adds.filter((a) =>
-        Array.isArray(a.resources) && a.resources.some((r) => r.toLowerCase() === "meta"));
-      if (metaAddons.length === 0) return;
 
       const now = Date.now();
       const currentIds = new Set(items.map((i) => i.id));
@@ -79,13 +85,11 @@ export function useLibraryArtRetry(
           const batch = due.slice(i, i + CONCURRENCY);
           await Promise.all(batch.map(async (it) => {
             attempts[it.id] = Date.now();
-            for (const a of metaAddons) {
-              try {
-                const d = await invoke<MetaDetail | null>("fetch_meta_detail", {
-                  addonUrl: a.url, mediaType: it.media_type, id: it.id,
-                }).catch(() => null);
-                if (d?.poster) { applyRef.current(it.id, d.poster); return; }
-              } catch { /* try next addon */ }
+            // getMetaDetail resolves null on any failure, so a dead addon
+            // just moves the walk on to the next candidate.
+            for (const a of electMetaAddons(adds, it.media_type, it.id)) {
+              const d = await getMetaDetail(a, it.media_type, it.id, RECHECK_MAX_AGE_MS);
+              if (d?.poster) { applyRef.current(it.id, d.poster); return; }
             }
           }));
         }

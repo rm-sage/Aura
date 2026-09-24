@@ -107,6 +107,10 @@ export function electAddons(addons: AddonEntry[], q: ElectQuery): Elected[];
 export function electSearchAddons(addons: AddonEntry[]): Elected[];
 export function applyOverride(elected: Elected[], urls: string[] | null): Elected[];
 export function applyPrimary(elected: Elected[], url: string | null): Elected[];
+// The one meta election every meta surface calls: the meta election with
+// defaultMetadataAddonUrl holding the tier-2 exemption, then
+// applyPrimary(..., defaultMetadataAddonUrl), as AddonEntry[].
+export function electMetaAddons(addons: AddonEntry[], type: string, id: string): AddonEntry[];
 ```
 
 Gates, in order, mirroring `is_resource_supported`:
@@ -138,13 +142,54 @@ direction. Aura's existing consumers already do this (`metaCache.ts:274`,
 `DetailView.tsx:1093`, `DiscoverView.tsx:115`, `libraryArtRetry.ts:57`), so this
 formalises a convention rather than inventing one.
 
-4. **Primary exemption.** The first addon passing gates 1 and 2 is kept even if it
-   fails the prefix gate. This generalises the AIOMetadata carve-out at
-   `metaCache.ts:250-256` from "AIOMetadata always answers, even for ids it
-   under-declares" to "whoever the user put on top always answers", which is what
-   keeps `kitsu:` and `mal:` ids resolving.
+One more empty-equivalent case, found during implementation: `types` is truncated to
+8 entries on the Rust side (`collect_wire_types` and `extract_manifest_types` both
+`take(8)`), so a list at the cap cannot prove a type is absent. The type gate fails
+open on a miss in a list at the cap, the same as on an empty one. AIOMetadata's
+manifest alone declares 7 types plus catalog types, so this is not hypothetical.
 
-5. **Order.** Output is in `addons` array order. No tiers, no sort, no ranking table.
+4. **Order, for every resource except meta.** Output is in `addons` array order. No
+   tiers, no sort, no exemption, no ranking table. The stream-list invariants in
+   CLAUDE.md depend on this.
+
+5. **Order for meta: tiers, with array order deciding within each tier.** Amended
+   after reading a real user's addon list, which overrides the pure-order wording
+   this section originally had for meta. That list, in order, is: AI Search
+   (`catalog, meta, stream`, empty `idPrefixes`), AIOMetadata (`catalog, meta`,
+   prefixes `tmdb: tt tvdb: mal: tvmaze: kitsu:`), three subtitle addons, Cinemeta
+   (`catalog, addon_catalog` only), three AIOStreams instances. Pure order with
+   fail-open prefixes elects AI Search, a prefix-less catch-all whose meta for a
+   foreign id is an empty stub, as the meta provider for every title. A catch-all at
+   the top would win in Stremio too; Aura deliberately ranks declared providers above
+   catch-alls for meta instead:
+
+   | Tier | Reason | Rule |
+   |---|---|---|
+   | 1 | `declared` | declares `meta`, has non-empty id prefixes, and one matches the id (`open-type` ranks here too) |
+   | 2 | `primary-exempt` | the PRIMARY, when it failed ONLY the prefix gate and no addon declares a prefix matching the id. The primary is the user's `defaultMetadataAddonUrl` pin if it declares `meta` with non-empty prefixes and passes the resource and type gates, else the FIRST addon in array order that does |
+   | 3 | `open-prefix` | declares `meta` with empty prefixes (a catch-all such as AI Search) |
+   | 4 | `open-resource` | `resources` empty (a stale cached entry), fail-open |
+
+   An addon that declares `meta` with non-empty prefixes that miss is rejected,
+   and so is the primary once any addon claims the id (probing it then only adds a
+   404 behind the real answer). The type gate applies to every tier. Tier 2 is the
+   primary exemption: it generalises the AIOMetadata carve-out at
+   `metaCache.ts:250-256` from "AIOMetadata always answers, even for ids it
+   under-declares" to "the pinned, else the first declared, meta provider answers
+   ids nobody declares", which keeps ids such as `anidb:` and `anilist:` resolving.
+   It is meta-only; no other resource gets an exemption.
+
+   The pin must be able to claim the exemption, not just lead. Found in review: in
+   Stremio's default order (Cinemeta, `meta` with prefix `tt`, at index 0), a
+   first-declared-only rule hands the exemption to Cinemeta, so a pinned AIOMetadata
+   was rejected by prefix for an `anidb:` id and `applyPrimary`, which only hoists
+   existing candidates, could not bring it back. Without a pin that order still
+   elects Cinemeta alone for such an id; the pin is the fix.
+
+   For the list above this reproduces the old behaviour exactly (AIOMetadata first,
+   AI Search last) without naming any addon. The user's `defaultMetadataAddonUrl`
+   pin holds the tier-2 exemption and is then hoisted to the front of the tiers by
+   `applyPrimary`, so a pin still leads.
 
 Search keeps its own entry point because `has_search` is fail-**closed** on the Rust
 side (`search_addon_grouped` returns `Ok(vec![])` for `!addon.has_search`), so

@@ -6,7 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { AddonEntry, MetaDetail } from "./types";
 import { dedupedInvoke } from "./invokeDedupe";
 import { registerStorageReclaimer, isQuotaError } from "./storageQuota";
-import { findAIOMetadataAddon } from "./aiometadata";
+import { electMetaAddons } from "./addonElection";
 
 // ---------------------------------------------------------------------------
 // metaCache — shared module-level cache of MetaDetail responses keyed by
@@ -194,17 +194,24 @@ function cacheKey(addonUrl: string, mediaType: string, id: string): string {
  *  has nothing useful (`!detail.name`) — caller should treat null as a
  *  signal to try the next addon in its fallback list, not a hard
  *  error. Concurrent callers for the same key share a single
- *  in-flight request via `dedupedInvoke`. */
+ *  in-flight request via `dedupedInvoke`.
+ *
+ *  `maxAgeMs` tightens the TTL for one caller: a hit older than it is
+ *  refetched (and the fresh answer cached for everyone). For a caller whose
+ *  whole point is to notice a field APPEARING, which the normal multi-day
+ *  TTL would hide. */
 export async function getMetaDetail(
   addon: AddonEntry,
   mediaType: string,
   id: string,
+  maxAgeMs?: number,
 ): Promise<MetaDetail | null> {
   const key = cacheKey(addon.url, mediaType, id);
   const hit = cache.get(key);
   if (hit) {
     const ttl = hit.detail ? ttlFor(mediaType) : TTL_NULL_MS;
-    if (Date.now() - hit.ts < ttl) return hit.detail;
+    const limit = maxAgeMs !== undefined ? Math.min(ttl, maxAgeMs) : ttl;
+    if (Date.now() - hit.ts < limit) return hit.detail;
   }
 
   const fetched = await dedupedInvoke(`meta:${key}`, () =>
@@ -212,12 +219,25 @@ export async function getMetaDetail(
       addonUrl:  addon.url,
       mediaType,
       id,
+      // Names the addon in the Rust `[meta]` log line, which otherwise
+      // shows a redacted raw URL.
+      addonName: addon.name,
     }).catch(() => null as MetaDetail | null),
   );
   // Store BOTH success and null — caching null prevents a CW row from
   // re-firing the same dead fetch every render. The TTL aging will
   // re-attempt eventually.
   const detail = fetched && fetched.name ? fetched : null;
+  // Except over an answer still inside its normal TTL. Only a `maxAgeMs`
+  // recheck (libraryArtRetry) refetches one of those, and an empty result
+  // there (a network blip, an addon timeout) must not evict it: that would
+  // hide it from every peek for TTL_NULL_MS and drop it from disk. Re-read
+  // after the await so a named answer a concurrent caller just wrote is kept
+  // too. Only a named answer overwrites.
+  const cur = cache.get(key);
+  if (!detail && cur?.detail && Date.now() - cur.ts < ttlFor(mediaType)) {
+    return cur.detail;
+  }
   const ts = Date.now();
   cache.set(key, { detail, ts });
   noteYear(id, detail, ts);
@@ -226,64 +246,43 @@ export async function getMetaDetail(
   return detail;
 }
 
-/** Walk the addon list in priority order, returning the first detail
- *  with usable data. Mirrors DetailView's fallback chain so CW cards
+/** Walk the elected meta providers in priority order, returning the first
+ *  detail with usable data. Mirrors DetailView's fallback chain so CW cards
  *  behave consistently when the primary addon's response is thin
- *  (no videos array etc). */
+ *  (no videos array etc).
+ *
+ *  Who is asked, and in what order, is `electMetaAddons` (addonElection.ts):
+ *  the same call DetailView makes, so a stub catch-all such as "AI Search"
+ *  is only reached for ids nothing better can resolve. Addons whose recorded
+ *  `resources` omit `meta` are never probed, and neither is a meta addon
+ *  whose id prefixes miss this id, with two exceptions: the primary (the
+ *  pinned provider, else the first declared one) is still asked when no
+ *  addon declares the id at all, and an entry with no recorded `resources`
+ *  (a stale addons.json) is tried last, fail-open.
+ *
+ *  `keepThin`: for an episodic id that no provider returns videos for,
+ *  resolve to the first NAMED answer instead of null. For surfaces that also
+ *  read the meta-level fields (name, poster, released) and would lose them
+ *  on a null. Off by default, which keeps the first-usable walk exactly as
+ *  it was for every other caller. */
 export async function getMetaDetailFallback(
   addons: AddonEntry[],
   mediaType: string,
   id: string,
+  opts?: { keepThin?: boolean },
 ): Promise<MetaDetail | null> {
-  // A real per-id meta source declares the `meta` resource AND — when it
-  // declares idPrefixes — those prefixes match this id. "AI Search" lists
-  // `meta` but only returns an empty "?" stub for foreign ids, so the bare
-  // resource check still let it eat a `/meta/...` round-trip on EVERY hover
-  // / CW / Calendar / detail lookup. Gate on the id prefix too (mirrors
-  // DetailView and the backend stream gate); an addon with NO declared
-  // idPrefixes is treated as universal so a prefix-less provider is kept.
-  const idMatches = (a: AddonEntry): boolean => {
-    const p = a.id_prefixes;
-    if (Array.isArray(p) && p.length > 0) return p.some((pre) => id.startsWith(pre));
-    return true;
-  };
-  // ALWAYS keep the resolved primary meta provider (AIOMetadata) even if its
-  // declared idPrefixes don't list this id's prefix — it's the universal
-  // source and may serve a prefix it under-declares. Mirrors DetailView,
-  // which prepends the meta addon unconditionally and only prefix-gates the
-  // fallbacks; without this carve-out a surviving stub could answer in
-  // AIOMetadata's place.
-  const forcedUrl = findAIOMetadataAddon(addons)?.url ?? null;
-  const metaCapable = addons.filter((a) =>
-    Array.isArray(a.resources) &&
-    a.resources.some((r) => r.toLowerCase() === "meta") &&
-    (a.url === forcedUrl || idMatches(a)),
-  );
-  // Order: the primary provider first, then addons that EXPLICITLY declare a
-  // matching id prefix (real meta addons — Cinemeta), then prefix-less
-  // catch-alls (e.g. "AI Search"). So the real provider answers first and the
-  // fallthrough only reaches a stub for ids nothing else can resolve. Stable
-  // sort preserves the user's order within each tier.
-  const rank = (a: AddonEntry): number => {
-    if (a.url === forcedUrl) return 2;
-    const p = a.id_prefixes;
-    return Array.isArray(p) && p.length > 0 && p.some((pre) => id.startsWith(pre)) ? 1 : 0;
-  };
-  metaCapable.sort((a, b) => rank(b) - rank(a));
-  // Back-compat: if NO addon advertises `meta` (old addons.json predating
-  // the `resources` capture), fall back to the full list so we never
-  // regress to "no metadata at all".
-  const candidates = metaCapable.length > 0 ? metaCapable : addons;
-  for (const a of candidates) {
+  const isEpisodic = mediaType === "series" || mediaType === "anime";
+  let thin: MetaDetail | null = null;
+  for (const a of electMetaAddons(addons, mediaType, id)) {
     const d = await getMetaDetail(a, mediaType, id);
     if (!d) continue;
     // For series, prefer a response with videos populated — otherwise
     // the segmented-bar caller has nothing to render.
-    const isEpisodic = mediaType === "series" || mediaType === "anime";
     if (!isEpisodic) return d;
     if (d.videos && d.videos.length > 0) return d;
+    if (opts?.keepThin && !thin) thin = d;
   }
-  return null;
+  return thin;
 }
 
 /** Synchronous best-effort peek — the freshest non-stale cached detail
@@ -352,20 +351,19 @@ export function useCanonicalReleaseYear(id: string, fallback: string | null): st
  *  marked complete + dropped from Continue Watching). DetailView reaches
  *  the rich addon because it probes every addon and prefers videos; this
  *  mirrors that for the detection paths. Low-frequency only (once per
- *  episode finish) — per-addon cache hits keep repeat calls cheap. */
+ *  episode finish); per-addon cache hits keep repeat calls cheap.
+ *
+ *  Same candidates as getMetaDetailFallback, including its id-prefix gate:
+ *  without it this walk probed every meta addon for every id, which is the
+ *  404 spam the gate exists to stop. */
 export async function getRichestMetaDetail(
   addons: AddonEntry[],
   mediaType: string,
   id: string,
 ): Promise<MetaDetail | null> {
-  const metaCapable = addons.filter((a) =>
-    Array.isArray(a.resources) &&
-    a.resources.some((r) => r.toLowerCase() === "meta"),
-  );
-  const candidates = metaCapable.length > 0 ? metaCapable : addons;
   let best: MetaDetail | null = null;
   let bestCount = -1;
-  for (const a of candidates) {
+  for (const a of electMetaAddons(addons, mediaType, id)) {
     const d = await getMetaDetail(a, mediaType, id);
     if (!d) continue;
     const count = Array.isArray(d.videos) ? d.videos.length : 0;

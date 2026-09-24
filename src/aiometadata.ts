@@ -215,17 +215,35 @@ export function isAnimeLibraryItem(i: LibraryItem): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// AIOMetadata addon detection — used by SettingsView's scrobble lock.
+// AIOMetadata addon detection.
 //
-// Match heuristic: addon name OR URL contains "aiometadata" / "aio-metadata"
-// (case-insensitive). Returns the first match in the user's installed list.
+// For FIELD-SCOPED calls addressed at AIOMetadata specifically, never for
+// deciding who answers meta (that is addonElection.ts, by addon order).
+// Exactly two callers, both fetching something no other addon can supply:
+// the Home hero's title logos (HomeView) and the CW cards' landscape art
+// (CinemaRows -> landscapeArt.ts, AIOMetadata's own /api/art/landscape).
 // ---------------------------------------------------------------------------
 
+/** AIOMetadata's upstream manifest id, from its manifest.json. */
+export const AIOMETADATA_MANIFEST_ID = "com.aiometadata";
+
+const AIO_NAME_RE = /aio[\s-]?metadata/i;
+
+/** THE AIOMetadata identity test; there is no other. Either signal is
+ *  enough, because each misses a real case on its own:
+ *   - the manifest id survives a renamed or re-hosted instance, but a fork
+ *     ships its own ("AIOMetadata (Sage's Fork)" declares "aio-metadata")
+ *     and a legacy addons.json entry has none at all;
+ *   - the name / URL match covers both of those, but not a renamed
+ *     instance on a neutral host. */
+export function isAIOMetadataAddon(a: AddonEntry): boolean {
+  return a.manifest_id === AIOMETADATA_MANIFEST_ID
+    || AIO_NAME_RE.test(a.name ?? "")
+    || AIO_NAME_RE.test(a.url ?? "");
+}
+
+/** The first installed AIOMetadata instance, in addon order. */
 export function findAIOMetadataAddon(addons: AddonEntry[]): AddonEntry | null {
-  const isAIO = (s: string) => /aio[\s-]?metadata/i.test(s);
-  for (const a of addons) {
-    if (isAIO(a.name) || isAIO(a.url)) return a;
-  }
-  return null;
+  return addons.find(isAIOMetadataAddon) ?? null;
 }
 

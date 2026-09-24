@@ -22,8 +22,8 @@ import EpisodeAirChip from "../EpisodeAirChip";
 import { loadAuraSettings, saveAuraSettings, streamQueryAddons } from "../auraSettings";
 import { useReleaseSignal } from "../releaseSignalStore";
 import { fetchReleaseSignal } from "../releaseSearch";
-import { resolveDefaultMetaUrl } from "../addonDefaults";
-import { findAIOMetadataAddon, isAnimeMeta, markAnimeId, typeLabel } from "../aiometadata";
+import { electMetaAddons } from "../addonElection";
+import { isAnimeMeta, markAnimeId, typeLabel } from "../aiometadata";
 import { dedupedInvoke } from "../invokeDedupe";
 import { buildStreamMenu, type StreamMenuContext } from "../downloadsMenu";
 import { peekRichestCachedDetailById } from "../metaCache";
@@ -1036,39 +1036,23 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   }, [meta.id]);
 
   // ── Metadata addon resolution ─────────────────────────────────────
-  // Pick order:
-  //   1. AIOMetadata if installed — richest data (originalLanguage,
-  //      productionCountries, anime IDs). This was previously gated on
-  //      anime-prefixed IDs, but Continue Watching items often arrive
-  //      with `tt`-prefixed series IDs that AIOMetadata still resolves
-  //      better than Cinemeta. Defaulting to AIOMetadata first
-  //      eliminates the "CW opens an empty page" symptom.
-  //   2. The user-pinned default metadata addon.
-  //   3. The first addon that advertises the "meta" resource.
-  //   4. Plain addons[0] as last-ditch fallback.
-  const metaAddon = useMemo(() => {
-    const { defaultMetadataAddonUrl } = loadAuraSettings();
-    const aio = findAIOMetadataAddon(addons);
-    if (aio) return aio;
-    if (defaultMetadataAddonUrl) {
-      const pinned = addons.find((a) => a.url === defaultMetadataAddonUrl);
-      if (pinned) return pinned;
-    }
-    // Manifest-id default — picks Cinemeta when AIOMetadata wasn't
-    // found above and no explicit pin exists. Stays inside the meta
-    // ordering list (AIOMetadata → Cinemeta) so we don't accidentally
-    // grab a less-capable addon.
-    const defaultUrl = resolveDefaultMetaUrl(addons);
-    if (defaultUrl) {
-      const m = addons.find((a) => a.url === defaultUrl);
-      if (m) return m;
-    }
-    return (
-      addons.find((a) => a.resources?.includes("meta")) ??
-      addons[0] ??
-      null
-    );
-  }, [addons, meta.id, meta.media_type]);
+  // `electMetaAddons` (addonElection.ts) is the one meta election, shared
+  // with the hover card, Calendar, Airing and the metaCache walks. It drops
+  // addons that declare resources without `meta`, and meta addons whose id
+  // prefixes miss THIS id (the primary provider excepted, and only for an id
+  // no addon declares), so an id the lead provider returns empty for (e.g. a
+  // `kitsu:` id it doesn't resolve) no longer sprays /meta/<id> 404s at
+  // subtitle / stream-only addons that expose no /meta endpoint at all. An
+  // entry with no recorded resources is tried last, fail-open. The order is
+  // the user's addon order, with declared providers above prefix-less
+  // catch-alls and the "Default Metadata Provider" pin hoisted to the front.
+  // The first entry is the lead (`metaAddon`); the rest are the fallback
+  // chain the effect below walks.
+  const metaCandidates = useMemo(
+    () => electMetaAddons(addons, meta.media_type, meta.id),
+    [addons, meta.id, meta.media_type],
+  );
+  const metaAddon = metaCandidates[0] ?? null;
 
   // Fetch full meta detail. If the chosen addon errors or returns a
   // truly empty response, fall back through the remaining addons.
@@ -1103,35 +1087,13 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
       return;
     }
     let cancelled = false;
-    const ordered: AddonEntry[] = [
-      metaAddon,
-      // Only fall back to addons that can ACTUALLY serve meta for THIS id.
-      // Previously this sprayed /meta/<id> at every installed addon, so any
-      // id the primary source (AIOMetadata) returned empty for — e.g. a
-      // `kitsu:` id it doesn't resolve — triggered a burst of 404s against
-      // subtitle/stream-only addons (OpenSubtitles, SubDL, AIOStreams) that
-      // expose no /meta endpoint at all. Gate on the declared `meta`
-      // resource AND a matching id prefix, mirroring the backend stream
-      // gate (addon_entry_supports_stream_for in stremio.rs). The empty
-      // meta itself is upstream (AIOMetadata); this just stops Aura from
-      // 404-spamming addons that were never going to answer.
-      ...addons
-        .filter((a) => a.url !== metaAddon.url)
-        .filter((a) => {
-          if (!a.resources?.includes("meta")) return false;
-          const prefixes = a.id_prefixes;
-          if (prefixes && prefixes.length > 0) {
-            return prefixes.some((p) => meta.id.startsWith(p));
-          }
-          return true; // no declared idPrefixes → addon accepts any id
-        }),
-    ];
     // Resolves to the detail the page ACTUALLY ended up on (or null when no
     // addon answered). The hero art latch below settles off that resolution
     // rather than off the first setDetail — see the note at the tail.
     void (async () => {
       let bestSoFar: MetaDetail | null = null;
-      for (const a of ordered) {
+      // The lead first, then the fallbacks, exactly as elected above.
+      for (const a of metaCandidates) {
         try {
           // Single-flight via the addon URL + meta type/id triplet so
           // StrictMode's double-mount doesn't fire twice for the same
@@ -1143,6 +1105,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
               addonUrl:  a.url,
               mediaType: meta.media_type,
               id:        meta.id,
+              addonName: a.name,
             }),
           );
           if (cancelled) return;
@@ -1212,7 +1175,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
         ));
       });
     return () => { cancelled = true; };
-  }, [metaAddon, addons, addonsPending, meta, meta.id, meta.media_type]);
+  }, [metaAddon, metaCandidates, addons, addonsPending, meta, meta.id, meta.media_type]);
 
   // ── Multi-source ratings enrichment ──
   // Hits a Rust aggregator (fetch_aggregate_ratings) that fans out to

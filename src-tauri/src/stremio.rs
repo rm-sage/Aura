@@ -2263,17 +2263,24 @@ pub async fn cloud_reorder_addons(auth_key: String, urls: Vec<String>) -> Result
 // ---------------------------------------------------------------------------
 
 /// Fetch the full meta object for a single id from a specific addon.
-/// Used by the calendar (release dates) and the future detail view.
+/// Which addon to ask is decided on the frontend (`electMetaAddons` in
+/// `src/addonElection.ts`); this command only fetches and maps.
+///
+/// `addon_name` is optional and only names the addon in the `[meta]` log
+/// lines. Every caller holds the `AddonEntry`, so it passes the name; without
+/// one `log_label` falls back to a redacted raw URL.
 #[tauri::command]
 pub async fn fetch_meta_detail(
     addon_url: String,
     media_type: String,
     id: String,
+    addon_name: Option<String>,
 ) -> Result<MetaDetail, String> {
     validate_url(&addon_url)?;
     let base = normalise_addon_base(&addon_url);
     let url = format!("{base}/meta/{media_type}/{id}.json");
-    let label = log_label("", &base);
+    let addon_name = cap(addon_name.unwrap_or_default(), 64);
+    let label = log_label(&addon_name, &base);
 
     crate::devlog!(info, "meta", "[{}] GET {}", label, redact_sensitive_url(&url));
 

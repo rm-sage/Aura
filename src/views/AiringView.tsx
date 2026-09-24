@@ -15,8 +15,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { AddonEntry, LibraryItem, MetaDetail, MetaPreview } from "../types";
 import { loadAuraSettings, saveAuraSettings } from "../auraSettings";
-import { resolveDefaultMetaUrl } from "../addonDefaults";
-import { getMetaDetail } from "../metaCache";
+import { getMetaDetailFallback } from "../metaCache";
 import { PAGE_CONTENT_MAX_W } from "../pageLayout";
 import { ContinueWatchingCard } from "../CinemaRows";
 import { useEpisodesBehind } from "../LibraryContext";
@@ -78,15 +77,6 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
   const signalsVersion = useReleaseSignalsVersion();
   const manualVersion = useManualWatchedVersion();
 
-  const metaAddon = useMemo(() => {
-    const { defaultMetadataAddonUrl } = loadAuraSettings();
-    const override = defaultMetadataAddonUrl && addons.find((a) => a.url === defaultMetadataAddonUrl);
-    if (override) return override;
-    const defaultUrl = resolveDefaultMetaUrl(addons);
-    if (defaultUrl) { const m = addons.find((a) => a.url === defaultUrl); if (m) return m; }
-    return addons[0] ?? null;
-  }, [addons]);
-
   // Cheap candidate pre-filter (no network). With cloud signals we trust
   // next_aired; without them (guest / release-search off) we scan every
   // series/anime and confirm via meta below.
@@ -108,9 +98,12 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
 
   // Progressive, soonest-first meta fetch for the candidate subset (mirrors
   // CalendarView: throttled batched flush, concurrency 8) so tiles paint as
-  // they resolve and cached hits appear instantly.
+  // they resolve and cached hits appear instantly. Each item walks the
+  // elected meta providers for its own id with fallback, the same election
+  // DetailView makes; `keepThin` keeps an episode-less answer for the tile
+  // rather than dropping it. `details` stays keyed by item id.
   useEffect(() => {
-    if (!metaAddon || candidates.length === 0) { setDetails(new Map()); setLoading(false); return; }
+    if (addons.length === 0 || candidates.length === 0) { setDetails(new Map()); setLoading(false); return; }
     let cancelled = false;
     setLoading(true);
     const order = [...candidates].sort(
@@ -133,7 +126,8 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
           const i = cursor++;
           if (i >= order.length) return;
           const item = order[i];
-          const d = await getMetaDetail(metaAddon, item.media_type, item.id).catch(() => null);
+          const d = await getMetaDetailFallback(addons, item.media_type, item.id, { keepThin: true })
+            .catch(() => null);
           acc.set(item.id, d);
           scheduleFlush();
         }
@@ -146,7 +140,7 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
       }
     })();
     return () => { cancelled = true; if (flushTimer != null) window.clearTimeout(flushTimer); };
-  }, [candidates, metaAddon]);
+  }, [candidates, addons]);
 
   // Confirm airing: cloud candidates pass immediately (next_aired); fallback-scan
   // candidates only appear once their fetched meta reports airingInfo.isAiring.

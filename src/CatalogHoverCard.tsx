@@ -33,8 +33,7 @@ import {
   type HoverTarget,
 } from "./catalogHoverStore";
 import { loadAuraSettings } from "./auraSettings";
-import { resolveDefaultMetaUrl } from "./addonDefaults";
-import { findAIOMetadataAddon } from "./aiometadata";
+import { electMetaAddons } from "./addonElection";
 import { computeReleaseCountdowns, formatCountdown, formatTargetDate, isInTheaters, useCountdownNow } from "./releaseCountdown";
 import { useMovieReleaseDates } from "./releaseDates";
 
@@ -212,53 +211,44 @@ function HoverPanel({
     left: 0, top: 0, ready: false,
   });
 
-  // Fetch the meta detail (cached). Goes ONLY to the user's default
-  // metadata provider — fan-out across every installed addon would
-  // pull search-only addons (e.g. AISearch) into the meta path, where
-  // they return empty "?" stubs and waste a network round-trip on
-  // every hover. Resolution order matches CalendarView / DetailView:
-  // explicit setting > manifest-id default (AIOMetadata → Cinemeta) >
-  // first installed addon advertising `meta`.
+  // Fetch the meta detail (cached). Goes FIRST to the lead meta provider
+  // only: fan-out across every installed addon would pull search-only
+  // addons (e.g. AISearch) into the meta path, where they return empty
+  // "?" stubs and waste a network round-trip on every hover.
   //
   // Alt-type fallback mirrors the CW card: anime catalogs often tag
   // content as series/movie with an anime-prefixed id, so the first
-  // lookup against the default provider can miss.
+  // lookup against the lead provider can miss.
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setDetail(null);
     (async () => {
-      const { defaultMetadataAddonUrl } = loadAuraSettings();
-      const override = defaultMetadataAddonUrl
-        ? addons.find((a) => a.url === defaultMetadataAddonUrl)
-        : null;
-      const metaCapable = (a: AddonEntry) =>
-        Array.isArray(a.resources) &&
-        a.resources.some((r) => r.toLowerCase() === "meta");
-      // AIOMetadata FIRST, ahead of the user's pin. This deliberately matches
-      // DetailView's order (see its metaAddon memo) rather than the pin-first
-      // order this card used to apply. When the two disagreed, a user pinned
-      // to Cinemeta got a hover detail with no mal/kitsu/anidb ids at all and
-      // a detail page with them, so the same show showed two different MAL
-      // scores. The surfaces must elect the same provider or they cannot agree.
-      const provider =
-        findAIOMetadataAddon(addons)
-        ?? override
-        ?? addons.find((a) => a.url === resolveDefaultMetaUrl(addons))
-        ?? addons.find(metaCapable)
-        ?? addons[0]
-        ?? null;
-      if (!provider) {
+      // The SAME election DetailView makes (its metaCandidates memo), by
+      // construction rather than by copy: both call electMetaAddons with the
+      // same addons, type and id. When the two used to disagree, a user
+      // pinned to Cinemeta got a hover detail with no mal/kitsu/anidb ids at
+      // all and a detail page with them, so the same show showed two
+      // different MAL scores. The surfaces must elect the same provider or
+      // they cannot agree.
+      if (addons.length === 0) {
         setLoading(false);
         return;
       }
+      const provider = electMetaAddons(addons, meta.media_type, meta.id)[0] ?? null;
       const alt = meta.media_type === "series" ? "anime"
         : meta.media_type === "anime" ? "series" : null;
-      let d = await getMetaDetail(provider, meta.media_type, meta.id);
-      if (!d && alt) d = await getMetaDetail(provider, alt, meta.id);
-      // Fall back across ALL meta-capable addons (mirrors the detail page)
-      // when the preferred provider has nothing for this item — fixes hover
-      // meta missing for items only another addon serves.
+      let d: MetaDetail | null = null;
+      // No lead for this type is not the end: the alt-type walk below can
+      // still elect one (an addon that only declares `anime` for a card
+      // tagged `series`).
+      if (provider) {
+        d = await getMetaDetail(provider, meta.media_type, meta.id);
+        if (!d && alt) d = await getMetaDetail(provider, alt, meta.id);
+      }
+      // Fall back down the rest of the elected list (mirrors the detail page)
+      // when the lead provider has nothing for this item: fixes hover meta
+      // missing for items only another addon serves.
       if (!d) d = await getMetaDetailFallback(addons, meta.media_type, meta.id);
       if (!d && alt) d = await getMetaDetailFallback(addons, alt, meta.id);
       if (cancelled) return;
