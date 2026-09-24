@@ -5018,7 +5018,7 @@ export default function SettingsView({ addons, session }: Props) {
             <div className="h-px bg-white/6" />
             <SettingToggle
               label="Match artwork to your current story arc"
-              description="Use story-arc key art for Continue Watching tiles and the detail page backdrop, following the latest arc you have progress in. Adds spoiler risk rather than removing it: arc artwork can show a character, form or event you have not reached yet. Only applies to shows with real arc key art; everything else keeps its usual artwork."
+              description="Use story-arc key art for Continue Watching tiles and the detail page backdrop, following the latest arc you have progress in. Adds spoiler risk rather than removing it: arc artwork can show a character, form or event you have not reached yet. Arc artwork comes from each show's fan wiki, so only some shows have it; everything else keeps its usual artwork."
               value={aura.arcAwareArt}
               onChange={(v) => setLocal({ arcAwareArt: v })}
             />
