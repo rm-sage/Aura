@@ -328,6 +328,17 @@ fn mark_catalog_failed(base: &str, catalog_type: &str, catalog_id: &str) {
     }
 }
 
+/// Lift THIS catalog's cooldown. Only a forced fetch that succeeded calls
+/// it: the catalog has just answered, so a cooldown stamped by the failure
+/// the user retried past would otherwise keep serving other callers the
+/// stale fallback for the rest of its 30 s.
+fn clear_catalog_failed(base: &str, catalog_type: &str, catalog_id: &str) {
+    let key = fail_key(base, catalog_type, catalog_id);
+    if let Ok(mut cache) = addon_fail_cache().lock() {
+        cache.remove(&key);
+    }
+}
+
 /// Pull the last successful response if it's within the stale TTL.
 /// Returned vec is cloned so we don't hold the cache lock across an
 /// await.
@@ -1663,6 +1674,13 @@ pub async fn reorder_addons<R: tauri::Runtime>(
 /// cells" without touching the wire format. Sanitisation only runs on
 /// the kept slice, so requesting limit=10 saves 90 metadata-validation
 /// passes per row.
+///
+/// `force` (default false) skips the soft-fail cooldown below for this one
+/// catalog: it is an explicit user Retry (a failed Home row), which asks
+/// for the network, not for the answer the last timeout left behind. The
+/// outcome is still recorded: a failure re-stamps the cooldown and can
+/// still fall back to a stale payload, a success refreshes that payload
+/// and lifts the cooldown. Every other caller omits it.
 #[tauri::command]
 pub async fn fetch_catalog(
     addon_url: String,
@@ -1670,7 +1688,9 @@ pub async fn fetch_catalog(
     catalog_id: String,
     skip: Option<u32>,
     limit: Option<u32>,
+    force: Option<bool>,
 ) -> Result<Vec<MetaPreview>, String> {
+    let force = force.unwrap_or(false);
     validate_url(&addon_url)?;
     let base = normalise_addon_base(&addon_url);
     let url = match skip {
@@ -1688,7 +1708,8 @@ pub async fn fetch_catalog(
     // normally. If we have a stale-but-cached payload for this
     // catalog, return it instead of an error so the home row stays
     // populated with the previous data while the cooldown drains.
-    if is_catalog_soft_failed(&base, &catalog_type, &catalog_id) {
+    // A forced fetch (user Retry) goes to the network regardless.
+    if !force && is_catalog_soft_failed(&base, &catalog_type, &catalog_id) {
         if let Some(stale) = cached_catalog_metas(&base, &catalog_type, &catalog_id) {
             crate::devlog!(
                 info, "catalog",
@@ -1707,8 +1728,9 @@ pub async fn fetch_catalog(
 
     crate::devlog!(
         info, "catalog",
-        "[{}] GET {} (skip={:?} limit={:?})",
+        "[{}] GET {} (skip={:?} limit={:?}){}",
         label, url, skip, limit,
+        if force { " forced (retry)" } else { "" },
     );
 
     // Live fetch. Network-class failures fall through to the stale
@@ -1796,6 +1818,9 @@ pub async fn fetch_catalog(
     if skip.unwrap_or(0) == 0 {
         store_catalog_metas(&base, &catalog_type, &catalog_id, &sanitized);
     }
+    if force {
+        clear_catalog_failed(&base, &catalog_type, &catalog_id);
+    }
     Ok(sanitized)
 }
 
@@ -1855,6 +1880,7 @@ pub async fn fetch_catalog_paginated(
             catalog_type.clone(),
             catalog_id.clone(),
             skip,
+            None,
             None,
         )
         .await?;

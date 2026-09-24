@@ -253,10 +253,17 @@ home key changes or HomeView remounts.
 
 Rows are built from every installed addon in array order, then each addon's manifest
 catalogs in manifest order, keeping the three existing programmatic filters
-(`is_search_only`, `is_hidden_from_home`, `CATALOG_ID_DENYLIST`) and adding a new
-`hiddenHomeCatalogs: string[]` keyed `${addonUrl}|${type}|${id}`. That identity string
-already exists twice in the codebase, at `CinemaRows.tsx:1350` (pagination cache key)
-and `HomeView.tsx:688` (React row key), and is the same in both.
+(`is_search_only`, `is_hidden_from_home`, `CATALOG_ID_DENYLIST`). The sources come
+from `electHomeAddons` in `addonElection.ts`: every addon the fail-open catalog
+resource gate (`mayServe(addon, "catalog")`) keeps, in array order, logged as one
+`[election] home` line. `DEFAULT_HOME_ORDER` and `resolveDefaultUrls` are deleted.
+
+**Superseded: `hiddenHomeCatalogs`.** An earlier draft of this section added a
+`hiddenHomeCatalogs: string[]` setting (keyed `${addonUrl}|${type}|${id}`) with a
+per-row hide control. At implementation time the maintainer chose "full parity plus
+windowing" over the option with a hide control, so there is no such setting and no
+hide-row UI. The default Home is exactly Stremio's board: every home-eligible catalog
+of every catalog addon. Narrowing it is the job of the existing Home override below.
 
 This takes Home from roughly 5 to 15 rows to roughly 30 to 80. Three things become
 mandatory rather than optional:
@@ -283,9 +290,64 @@ refetch.
 Tolerable at 5 rows, invisible data loss at 40. Add a per-row error state with a retry
 affordance, and an `<ErrorBoundary scope="Home">`, which Home lacks entirely.
 
+As built (Phase 2): rows are made exactly uniform rather than roughly so. DiscoveryRow's
+`uniformHeight` gives every card the fixed title block the View-all popup already uses
+and makes the skeleton and failed states reserve it, so the hook's one measured row is
+the stride for all of them. That block is the tightest fit for its content, not a
+round number: two 19 px `leading-tight` title lines (47.5 px), the year's 2 px margin
+and one 15.5 px year line at the inherited 1.5 (23.25 px) make 72.75 px, reserved as
+`h-[4.55rem]` (72.8 px; measured in Chromium at 100 to 200% scaling, nothing clips).
+The popup shares the block, so it tightens by the same 11 px. The header is made uniform
+the same way: every state lays out the loaded row's "View all" button, invisible and
+inert where there is none, because its line box, baseline-aligned against the row
+title's, reaches 0.5 px below it. Without that, a skeleton or failed row was 0.5 px
+shorter than a loaded one (386.55 against 387.05 px in Edge 153, the WebView2 engine,
+at 100 to 200% scaling); with it all three measure 387.05 px.
+
+The queue keeps 4 requests in flight and walks the row window plus 2 rows past its
+end in row order; a row that scrolls away keeps its items. It starts only rows of the
+current build generation, stamped on each row, so a pass that runs between a rebuild
+and the new list landing cannot mark the old list's keys as started. Past the window it
+goes for one reason: with no hero catalog pinned, the hero is the first row with items,
+and that must not depend on the window. While no row has items, a slot the rows near
+the window do not need goes to the next pending row past it, in row order, at the same
+concurrency, until one row has items or every row has been tried. So a first addon
+whose catalogs all fail still gets a hero from the first healthy row further down, as
+it did when every row was fetched at once. Otherwise a row the window has not reached
+is not requested. A row this walk tried outside the window that fails is not marked
+failed, since the user never asked for it and its addon may be back by the time they
+scroll there: it goes back to pending, the walk passes over it from then on (so the walk
+stays one pass over the list), and the window fetches it the ordinary way when it comes
+near.
+
+A failed request keeps its row, with a Retry pill that refetches that row alone. The
+retry passes `fetch_catalog`'s optional `force`, which skips Rust's 30 s per-catalog
+soft-fail cooldown for that one request (every other caller omits it and keeps the
+cooldown): a timeout or connect failure arms that cooldown, and without `force` the
+retry would be refused unsent until it drained. The outcome is still recorded, a
+failure re-stamping the cooldown and a success lifting it. An empty catalog still
+hides its row, and when that row sat above the viewport the scroll offset is
+compensated so the page does not jump. A row whose View-all popup is open stays
+mounted while the window moves (keyboard scrolling reaches Home underneath the popup).
+Only that one row is added: it joins the window's rows in the same keyed list, so the
+popup keeps its state, and one spacer of `k * stride - gap` stands in for the k rows
+between it and the window, so it still sits at exactly `index * stride`. Stretching the
+mounted range to reach it instead would mount every row in between, most of Home after
+an End, for as long as the popup is open.
+
 The Advanced Home override (`defaultHomeAddonUrl` plus `additionalHomeAddonUrls`) still
 works: when set it restricts to those addons, in that order, before the catalog
-flatten.
+flatten. The primary comes first, then the additionals in order; a URL listed twice
+keeps its first position (`applyOverride`); an uninstalled URL drops out. There is no
+migration, so a user whose override names installed addons sees exactly the rows they
+saw before. It is NOT identical to before when the override has gone stale, and that is
+deliberate. The old resolver substituted `addons[0]` whenever the primary was unset or
+not installed. Two things follow from dropping that substitution. First, an uninstalled
+primary now simply drops out. Second, an override that names no installed addon at all
+behaves as no override: Home shows the automatic default board, with a one-time
+`[election]` warning. Before, it stranded the user on `addons[0]`'s catalogs, which was
+itself an arbitrary fallback. Home does not go empty either, because the picker lists
+only installed addons, so a stale override that matches nothing is invisible there.
 
 ### 6. AIOMetadata
 

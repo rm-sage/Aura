@@ -1,7 +1,10 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useState, useEffect, useMemo, useRef } from "react";
+import {
+  useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback,
+  type ReactElement, type RefObject,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { AddonEntry, MetaPreview, LibraryItem } from "../types";
 import { getMetaDetail } from "../metaCache";
@@ -12,6 +15,8 @@ import { isManuallyWatched, onManualWatchedChange } from "../manualWatched";
 import { isAutoBumped, onAutoBumpedChange } from "../autoBumped";
 import { ContinueWatchingRow, DiscoveryRow, HOME_VISIBLE } from "../CinemaRows";
 import NoProvidersWarning from "../NoProvidersWarning";
+import ErrorBoundary from "../ErrorBoundary";
+import { useRowWindow } from "../useRowWindow";
 
 /** Per-row cap on the initial home payload. Matches the home grid's
  *  visible-cell count: at ultrawide we render 10 cells per row, at
@@ -20,6 +25,28 @@ import NoProvidersWarning from "../NoProvidersWarning";
  *  hides them, doesn't remove them). View-all expansion is handled by
  *  DiscoveryRow's own pagination call. */
 const HOME_VISIBLE_CAP = HOME_VISIBLE;
+
+/** Catalog requests Home keeps in flight at once. Home carries every
+ *  catalog of every catalog addon, 30 to 80 rows and often 20 or more of
+ *  them on one self-hosted addon, each with a 20 s timeout, so rows are
+ *  fetched a few at a time in row order, window first, never all at once. */
+const HOME_FETCH_CONCURRENCY = 4;
+
+/** Rows past the end of the row window that are fetched ahead, so a row
+ *  usually has its items by the time it scrolls into view. */
+const HOME_FETCH_AHEAD = 2;
+
+/** Rows mounted, and wanted by the fetch queue, before the row window has
+ *  measured anything. About one 1080p viewport of catalog rows. */
+const HOME_INITIAL_ROWS = 4;
+
+/** Vertical gap between catalog rows in px (the `space-y-8` the rows used
+ *  before windowing). The row window's stride arithmetic needs a number. */
+const HOME_ROW_GAP = 32;
+
+/** Row-stride fallback until the first row is measured: a 1080p row
+ *  (header + poster + title block) plus the gap. */
+const HOME_EST_ROW_STRIDE = 479;
 
 /** Module-level cache of resolved hero-logo URLs keyed by
  *  `${media_type}:${id}`. Survives HomeView remounts (which happen when
@@ -44,12 +71,8 @@ const CATALOG_ID_DENYLIST = new Set<string>([
 import SearchBar from "../SearchBar";
 import SearchView from "./SearchView";
 import { findAIOMetadataAddon, withTypeSuffix } from "../aiometadata";
-import { loadAuraSettings, type AuraSettings, HOME_RELEVANT_SETTING_KEYS, SEARCH_RELEVANT_SETTING_KEYS, settingsChangeIncludes } from "../auraSettings";
-import {
-  resolveDefaultUrls,
-  DEFAULT_HOME_ORDER,
-} from "../addonDefaults";
-import { electSearchAddons } from "../addonElection";
+import { loadAuraSettings, HOME_RELEVANT_SETTING_KEYS, SEARCH_RELEVANT_SETTING_KEYS, settingsChangeIncludes } from "../auraSettings";
+import { electHomeAddons, electSearchAddons } from "../addonElection";
 // FilterBar moved to per-view sidebars (CatalogPageView, LibraryView,
 // QueueView, DiscoverView) — Home now only emits the unfiltered row list.
 
@@ -63,15 +86,50 @@ interface ManifestCache {
   has_search: boolean;
 }
 
+/** Where a row's catalog request stands. `pending` is both "queued" (the
+ *  window has not come near it yet) and "in flight"; both draw the
+ *  skeleton. `failed` is kept apart from an `ok` row with no items: an empty
+ *  catalog hides its row as it always has, a failed one keeps its place and
+ *  offers Retry instead of silently vanishing. */
+type RowStatus = "pending" | "ok" | "failed";
+
 interface CatalogRow {
+  /** `${addonUrl}|${type}-${id}`: the React key, and what the fetch queue
+   *  tracks a row by. */
+  key: string;
   /** addon URL the catalog belongs to (used for the row key + future click handlers). */
   addonUrl: string;
   /** addon display name — prefixed onto the row title to disambiguate sources. */
   addonName: string;
   catalog: CatalogInfo;
   items: MetaPreview[];
-  loading: boolean;
+  status: RowStatus;
+  /** The build generation this row belongs to. The queue starts only rows
+   *  of the current generation: the build effect bumps it one render before
+   *  the new list lands, and a queue pass in between must not start the OLD
+   *  list's rows under the new generation (their keys would be marked
+   *  started, and the same keys in the new list then never fetched). */
+  gen: number;
+  /** The hero walk (see the fetch queue) requested this row outside the row
+   *  window and it failed. That try was speculative, so the row went back to
+   *  `pending` rather than to a Retry the user would have to click: the
+   *  window fetches it once, as usual, when it gets near. The walk itself
+   *  skips it, which is what keeps the walk to one pass over the list. */
+  walked?: boolean;
+  /** Set by Retry: this row's next request passes `force`, skipping Rust's
+   *  per-catalog soft-fail cooldown, because the user asked for the
+   *  network. Window-driven requests leave it off, so scrolling never
+   *  re-pays a 20 s timeout on a catalog that just timed out. */
+  retry?: boolean;
 }
+
+/** A half-open range of row indexes, `end` exclusive. */
+interface RowRange {
+  start: number;
+  end: number;
+}
+
+const INITIAL_WANT: RowRange = { start: 0, end: HOME_INITIAL_ROWS };
 
 interface Props {
   addons: AddonEntry[];
@@ -94,54 +152,26 @@ interface Props {
 }
 
 // ---------------------------------------------------------------------------
-// Resolve which addons should fuel Home, in order:
-//   1. Primary (defaultHomeAddonUrl) or first installed if unset
-//   2. Any URL in additionalHomeAddonUrls that's still installed
-// Duplicates filtered, preserving order.
+// HomeView - Cinema Flow
+//
+// Which addons feed Home, and in what order, is electHomeAddons' call
+// (addonElection.ts): every catalog addon in Addons-page order, or the
+// Settings "Home Catalog Sources" override when one is set. Each elected
+// addon contributes every home-eligible catalog in its manifest's order.
+//
+// An <ErrorBoundary> wraps the whole view, so a row that throws while
+// rendering falls back to a small diagnostic card instead of a blank Home.
 // ---------------------------------------------------------------------------
 
-function resolveHomeAddons(addons: AddonEntry[], settings: AuraSettings): AddonEntry[] {
-  if (addons.length === 0) return [];
-
-  // If the user has explicit settings, use them. Otherwise fall back to
-  // the manifest-id default ordering (AIOMetadata → AISearch → Cinemeta).
-  // This ensures fresh-install users with the same manifest.ids
-  // installed get a meaningful primary + additional ordering rather
-  // than just "whichever addon happened to install first".
-  const hasExplicit =
-    settings.defaultHomeAddonUrl != null
-    || (settings.additionalHomeAddonUrls && settings.additionalHomeAddonUrls.length > 0);
-
-  if (!hasExplicit) {
-    const ranked = resolveDefaultUrls(addons, DEFAULT_HOME_ORDER);
-    if (ranked.length > 0) {
-      return ranked
-        .map((u) => addons.find((a) => a.url === u))
-        .filter((a): a is AddonEntry => !!a);
-    }
-    // No manifest-id matches at all — default to first installed.
-    return [addons[0]];
-  }
-
-  const primary =
-    (settings.defaultHomeAddonUrl &&
-      addons.find((a) => a.url === settings.defaultHomeAddonUrl)) ||
-    addons[0];
-
-  const result: AddonEntry[] = [primary];
-  for (const extra of settings.additionalHomeAddonUrls ?? []) {
-    if (extra === primary.url) continue;
-    const found = addons.find((a) => a.url === extra);
-    if (found && !result.some((r) => r.url === found.url)) result.push(found);
-  }
-  return result;
+export default function HomeView(props: Props) {
+  return (
+    <ErrorBoundary scope="Home">
+      <HomeViewBody {...props} />
+    </ErrorBoundary>
+  );
 }
 
-// ---------------------------------------------------------------------------
-// HomeView — Cinema Flow
-// ---------------------------------------------------------------------------
-
-export default function HomeView({
+function HomeViewBody({
   addons, library, onSelectMeta, onSelectFromCW, resetKey,
   externalQuery, onExternalQueryConsumed,
 }: Props) {
@@ -189,8 +219,28 @@ export default function HomeView({
       }),
     );
   }, [activeQuery]);
+  /** Every home-eligible catalog of every elected source, in row order,
+   *  including rows whose catalog came back empty. `shownRows` below is
+   *  what renders. */
   const [rows, setRows] = useState<CatalogRow[]>([]);
   const [bootstrapped, setBootstrapped] = useState(false);
+  /** The row window (the rows in or near the viewport), as indexes into
+   *  `shownRows`. The fetch queue works through these (plus
+   *  HOME_FETCH_AHEAD) first. A row pinned by its open View-all popup can
+   *  be mounted outside the window; it is not part of this range. */
+  const [want, setWant] = useState<RowRange>(INITIAL_WANT);
+  /** Bumped whenever the row list is rebuilt, so a catalog answer that
+   *  arrives for a superseded list is dropped instead of written into
+   *  whichever row now sits at its key. */
+  const fetchGenRef = useRef(0);
+  /** Row keys requested in this generation and not failed: queued rows are
+   *  never requested twice, and a row that scrolled away keeps its answer,
+   *  so scrolling back never refetches. A failure leaves the set, so the
+   *  row's Retry is the one way back into the queue (or, for a walked row,
+   *  the window reaching it; see CatalogRow.walked). */
+  const fetchStartedRef = useRef<Set<string>>(new Set());
+  /** Requests of this generation still in flight. */
+  const fetchInflightRef = useRef(0);
   /** Fires `aura:home-ready` exactly once per HomeView mount, after the first
    *  `bootstrapped` transition, so App.tsx can lower the boot splash only when
    *  catalog data has actually settled. */
@@ -257,16 +307,32 @@ export default function HomeView({
     };
   }, []);
 
-  // Fan out across the resolved source list. Each addon is fetched in
-  // parallel; rows update as they trickle in.
+  // `bootstrapped` flips as soon as the FIRST row resolves (or 1.5 s
+  // elapses, whichever comes first). Earlier this awaited every catalog,
+  // which let one slow addon (debrid mirror under load → 10 s reqwest
+  // timeout) hold the splash for the full timeout. The 8 s safety valve in
+  // App.tsx::aura:home-ready still catches the absolute worst case but is
+  // no longer the primary gate. Setting it again is a no-op.
+  const markBootstrapped = () => setBootstrapped(true);
+
+  // Build the row list from the elected sources' manifests. Only the
+  // manifests are fetched here (24 h cached on the Rust side, so in
+  // parallel); the catalogs themselves go through the queue below.
   useEffect(() => {
+    // A new list: drop whatever the previous one still has in flight.
+    fetchGenRef.current += 1;
+    const gen = fetchGenRef.current;
+    fetchStartedRef.current = new Set();
+    fetchInflightRef.current = 0;
+    setWant(INITIAL_WANT);
     if (addons.length === 0) {
       setRows([]);
       setBootstrapped(true);
       return;
     }
     let cancelled = false;
-    const sources = resolveHomeAddons(addons, loadAuraSettings());
+    let bootstrapFallback: number | undefined;
+    const sources = electHomeAddons(addons);
     if (sources.length === 0) {
       setRows([]);
       setBootstrapped(true);
@@ -300,6 +366,10 @@ export default function HomeView({
       // empty. AIOMetadata's `calendar-videos` is the canonical case;
       // extend this list as more addon manifest bugs are observed.
       const initial: CatalogRow[] = [];
+      // First occurrence wins: the same catalog declared twice in one
+      // manifest (or one addon URL listed twice) would otherwise mint two
+      // rows with one key.
+      const seen = new Set<string>();
       for (const { addon, manifest } of manifests) {
         if (!manifest) continue;
         for (const c of manifest.catalogs) {
@@ -311,76 +381,171 @@ export default function HomeView({
           // rows here. The Discover tab still picks them up.
           if (c.is_hidden_from_home) continue;
           if (CATALOG_ID_DENYLIST.has(c.id)) continue;
+          const key = `${addon.url}|${c.media_type}-${c.id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
           initial.push({
+            key,
             addonUrl:  addon.url,
             addonName: manifest.name || addon.name,
             catalog:   c,
             items:     [],
-            loading:   true,
+            status:    "pending",
+            gen,
           });
         }
       }
       setRows(initial);
-
-      // Fetch each catalog with `limit = HOME_VISIBLE_CAP` so the
-      // initial home payload only carries enough items for the visible
-      // row cells. Wire bytes are unchanged (Stremio addons return one
-      // page = up to 100 items regardless), but Rust's per-meta
-      // sanitisation runs only on the kept slice — and the React tree
-      // holds 10 items per row instead of 100. The remaining items
-      // come in lazily via `fetch_catalog_paginated` when the user
-      // opens View all on a specific row.
-      //
-      // `bootstrapped` flips as soon as the FIRST row resolves (or
-      // 1.5 s elapses, whichever comes first). Earlier this awaited
-      // `Promise.all(initial.map(...))`, which let one slow addon
-      // (debrid mirror under load → 10 s reqwest timeout) hold the
-      // splash for the full timeout. The 8 s safety valve in
-      // App.tsx::aura:home-ready still catches the absolute worst
-      // case but is no longer the primary gate.
-      let firstSettled = false;
-      const markBootstrapped = () => {
-        if (firstSettled || cancelled) return;
-        firstSettled = true;
+      if (initial.length === 0) {
+        // No catalog rows at all: nothing will ever settle, so the
+        // splash must not wait for one.
         setBootstrapped(true);
-      };
-      const bootstrapFallback = setTimeout(markBootstrapped, 1500);
-      await Promise.all(
-        initial.map(async (row, idx) => {
-          try {
-            const items = await invoke<MetaPreview[]>("fetch_catalog", {
-              addonUrl:    row.addonUrl,
-              catalogType: row.catalog.media_type,
-              catalogId:   row.catalog.id,
-              limit:       HOME_VISIBLE_CAP,
-            });
-            if (cancelled) return;
-            setRows((prev) => {
-              const next = [...prev];
-              if (next[idx]) next[idx] = { ...next[idx], items, loading: false };
-              return next;
-            });
-            markBootstrapped();
-          } catch {
-            if (cancelled) return;
-            setRows((prev) => {
-              const next = [...prev];
-              if (next[idx]) next[idx] = { ...next[idx], items: [], loading: false };
-              return next;
-            });
-            markBootstrapped();
-          }
-        })
-      );
-      clearTimeout(bootstrapFallback);
-      // Defensive: if every row threw before the first-settled hook
-      // fired (initial = []? all sync throws?), set bootstrapped now
-      // so the splash doesn't strand.
-      if (!cancelled) setBootstrapped(true);
+        return;
+      }
+      bootstrapFallback = window.setTimeout(markBootstrapped, 1500);
     })();
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      if (bootstrapFallback !== undefined) window.clearTimeout(bootstrapFallback);
+    };
   }, [addons, settingsTick]);
+
+  // User-chosen hero catalog override. When set, the hero band fetches
+  // its OWN copy of the catalog (independent of the home grid's row
+  // pipeline) so the user can pin a Discover-only / hidden-from-home
+  // catalog as the hero source without surfacing it in the grid below.
+  // `null` means "fall back to first row" (the default since 0.6.x).
+  // Declared ahead of the fetch queue, which reads both: the default hero
+  // is what makes it look past the row window.
+  const heroCatalogPref = useMemo(
+    () => loadAuraSettings().heroCatalog,
+    [settingsTick],
+  );
+  // Hero entirely disabled by the user (the "Disable" picker item). When true
+  // the banner is hidden AND none of its catalog / logo fetches run.
+  const heroDisabled = useMemo(
+    () => loadAuraSettings().heroDisabled,
+    [settingsTick],
+  );
+
+  // The rows that render: an `ok` row whose catalog came back empty hides
+  // itself, as it always has. A failed row stays, with its Retry.
+  const shownRows = useMemo(
+    () => rows.filter((r) => r.status !== "ok" || r.items.length > 0),
+    [rows],
+  );
+
+  const handleWindowChange = useCallback((start: number, end: number) => {
+    setWant((prev) => (prev.start === start && prev.end === end ? prev : { start, end }));
+  }, []);
+
+  // Answer one row. A superseded generation's answer is dropped, and does
+  // not free a slot: the counter was reset along with the list. The write
+  // matches the generation as well as the key, so it lands on the row it
+  // was requested for or nowhere. Settling ends a Retry's `force`. Anything
+  // but `ok` (a failure, or a walked row sent back to pending) leaves the
+  // started set, so the row can be requested again.
+  const settleRow = (
+    key: string,
+    gen: number,
+    patch: Pick<CatalogRow, "items" | "status" | "walked">,
+  ) => {
+    if (gen !== fetchGenRef.current) return;
+    fetchInflightRef.current -= 1;
+    if (patch.status !== "ok") fetchStartedRef.current.delete(key);
+    setRows((prev) => prev.map((r) => (
+      r.key === key && r.gen === gen ? { ...r, ...patch, retry: false } : r
+    )));
+    markBootstrapped();
+  };
+
+  // The fetch queue. Walks the wanted rows (the row window, plus
+  // HOME_FETCH_AHEAD past its end) in row order and starts pending ones
+  // until HOME_FETCH_CONCURRENCY are in flight. It re-runs whenever a row
+  // settles or the window moves, which is what keeps it draining. Only rows
+  // of the current generation start (see CatalogRow.gen).
+  //
+  // The default hero is the one reason to look past the window. With no
+  // hero catalog pinned, the hero is the first row with items, and that must
+  // not depend on where the window sits: if the rows near it produce nothing
+  // (the first addon's catalogs all failing, say), the hero would never
+  // appear. So while no row has items, a slot the rows near the window do
+  // not need goes to the next pending row past it, in row order, at the same
+  // concurrency, until one row has items or every row has been tried. After
+  // that, a row the window never reaches is never requested. A walked row
+  // that fails is not failed for good: the user never asked for it, and its
+  // addon may well be back by the time they scroll there. It returns to
+  // `pending` as `walked`, the walk passes over it from then on, and the
+  // window fetches it the ordinary way when it comes near.
+  //
+  // Each catalog is fetched with `limit = HOME_VISIBLE_CAP` so the home
+  // payload only carries enough items for the visible row cells. Wire
+  // bytes are unchanged (Stremio addons return one page = up to 100 items
+  // regardless), but Rust's per-meta sanitisation runs only on the kept
+  // slice, and the React tree holds 10 items per row instead of 100. The
+  // remaining items come in lazily via `fetch_catalog_paginated` when the
+  // user opens View all on a specific row.
+  useEffect(() => {
+    const gen = fetchGenRef.current;
+    const near = shownRows.slice(want.start, want.end + HOME_FETCH_AHEAD);
+    const heroWaiting = !heroDisabled && !heroCatalogPref
+      && !shownRows.some((r) => r.items.length > 0);
+    const candidates = near.map((row) => ({ row, walk: false }));
+    if (heroWaiting) {
+      for (const row of shownRows) {
+        if (!row.walked) candidates.push({ row, walk: true });
+      }
+    }
+    const starting: typeof candidates = [];
+    for (const c of candidates) {
+      if (fetchInflightRef.current + starting.length >= HOME_FETCH_CONCURRENCY) break;
+      const { row } = c;
+      if (row.gen !== gen || row.status !== "pending" || fetchStartedRef.current.has(row.key)) {
+        continue;
+      }
+      // Recorded before any request goes out, so a second pass of this
+      // effect before the answers land (StrictMode, or a window change)
+      // cannot start the same row again, and the hero walk, which meets
+      // the rows near the window twice, starts each once (as `walk: false`,
+      // since the near rows come first).
+      fetchStartedRef.current.add(row.key);
+      starting.push(c);
+    }
+    fetchInflightRef.current += starting.length;
+    for (const { row, walk } of starting) {
+      invoke<MetaPreview[]>("fetch_catalog", {
+        addonUrl:    row.addonUrl,
+        catalogType: row.catalog.media_type,
+        catalogId:   row.catalog.id,
+        limit:       HOME_VISIBLE_CAP,
+        // A walked row the window now reaches skips Rust's per-catalog
+        // soft-fail cooldown once: its walk request may have failed moments
+        // ago, and without this the cooldown refuses it unsent and it lands
+        // on Retry although the addon may be back. The user scrolling to it
+        // is as deliberate as pressing Retry, and it happens once per row
+        // (it settles ok or failed, never back to pending, from here).
+        force:       row.retry === true || (!walk && row.walked === true),
+      })
+        .then((items) => settleRow(row.key, gen, { items, status: "ok" }))
+        .catch(() => settleRow(row.key, gen, walk
+          ? { items: [], status: "pending", walked: true }
+          : { items: [], status: "failed" }));
+    }
+  }, [shownRows, want, heroCatalogPref, heroDisabled]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Retry one failed row: back to pending, so the queue picks it up on its
+  // next pass (it is in the window, since its Retry button was just
+  // clicked), flagged `retry` so that request really goes to the network:
+  // a timeout or connect failure arms Rust's 30 s per-catalog cooldown, and
+  // without `force` the retry would be refused by that cooldown unsent.
+  // Only a FAILED row moves, so a repeat call while the retry is in flight
+  // cannot queue it twice.
+  const retryRow = useCallback((key: string) => {
+    setRows((prev) => prev.map((r) => (
+      r.key === key && r.status === "failed" ? { ...r, status: "pending", retry: true } : r
+    )));
+  }, []);
 
   // Memoize search-addon resolution. electSearchAddons() builds a fresh
   // array every call, and these were previously inlined into the JSX
@@ -398,21 +563,6 @@ export default function HomeView({
     [addons, settingsTick, searchTick],
   );
 
-  // User-chosen hero catalog override. When set, the hero band fetches
-  // its OWN copy of the catalog (independent of the home grid's row
-  // pipeline) so the user can pin a Discover-only / hidden-from-home
-  // catalog as the hero source without surfacing it in the grid below.
-  // `null` means "fall back to first row" (the default since 0.6.x).
-  const heroCatalogPref = useMemo(
-    () => loadAuraSettings().heroCatalog,
-    [settingsTick],
-  );
-  // Hero entirely disabled by the user (the "Disable" picker item). When true
-  // the banner is hidden AND none of its catalog / logo fetches run.
-  const heroDisabled = useMemo(
-    () => loadAuraSettings().heroDisabled,
-    [settingsTick],
-  );
   const [heroOverrideItems, setHeroOverrideItems] = useState<MetaPreview[] | null>(null);
   const [heroOverrideLabel, setHeroOverrideLabel] = useState<string | null>(null);
   useEffect(() => {
@@ -445,28 +595,41 @@ export default function HomeView({
     return () => { cancelled = true; };
   }, [heroCatalogPref, heroDisabled]);
 
+  // The first row with items: the hero's default source. The fetch queue
+  // walks past the row window until one exists, so it does not wait on the
+  // window's rows loading. Rows now settle one by one as the window moves,
+  // long after the hero is filled, so the two memos below key on this row
+  // rather than on `rows`. A settled row is never rewritten, so it keeps
+  // its identity until an EARLIER row gains items and takes its place.
+  const firstFilledRow = useMemo(() => rows.find((r) => r.items.length > 0), [rows]);
+
   // Source for the hero — override catalog when configured, otherwise
   // the first browseable row's first ~5 art-bearing items. Empty when the
   // hero is disabled, which both hides the banner and skips the per-item
   // logo fetches below.
   const heroItemsRaw: MetaPreview[] = useMemo(() => {
     if (heroDisabled) return [];
-    const source = heroOverrideItems ?? rows.find((r) => r.items.length > 0)?.items ?? [];
+    const source = heroOverrideItems ?? firstFilledRow?.items ?? [];
     return source
       .filter((it) => it.background ?? it.fanart ?? it.backdrop ?? it.poster)
       .slice(0, 10);
-  }, [heroDisabled, heroOverrideItems, rows]);
+  }, [heroDisabled, heroOverrideItems, firstFilledRow]);
 
   /** Display name of the catalog the hero is pulled from — surfaces
    *  as a subtle top-left chip on the hero card so the user knows
    *  which row contributed the current selection. Empty when there's
    *  no resolved source row. */
+  /** Identity of the hero's source, for keying the carousel: the pinned
+   *  catalog when one is set, else the default source row. */
+  const heroSourceKey = heroOverrideItems
+    ? "pinned-hero"
+    : (firstFilledRow?.key ?? "no-hero-source");
+
   const heroSourceLabel: string | null = useMemo(() => {
     if (heroOverrideLabel) return heroOverrideLabel;
-    const first = rows.find((r) => r.items.length > 0);
-    if (!first) return null;
-    return withTypeSuffix(first.catalog.name, first.catalog.media_type);
-  }, [heroOverrideLabel, rows]);
+    if (!firstFilledRow) return null;
+    return withTypeSuffix(firstFilledRow.catalog.name, firstFilledRow.catalog.media_type);
+  }, [heroOverrideLabel, firstFilledRow]);
 
   // Catalog responses don't carry the `logo` field — only meta-detail does.
   // Without this, the hero falls back to plain `<h2>{name}</h2>` instead of
@@ -524,8 +687,10 @@ export default function HomeView({
   );
 
   // Filtered rows used to derive from the home FilterBar's state; that
-  // bar moved to per-view sidebars, so the home grid now renders the
-  // unfiltered `rows` list directly.
+  // bar moved to per-view sidebars, so Home applies no user filter. The
+  // grid renders `shownRows` (`rows` minus catalogs that answered empty)
+  // through the windowed HomeRowList, so the row window's indexes, and the
+  // fetch queue's `want`, refer to `shownRows`, not `rows`.
 
   // Continue Watching — match stremio-core's `is_in_continue_watching`
   // filter exactly: `time_offset > 0` is the ONLY required signal. The
@@ -561,6 +726,15 @@ export default function HomeView({
   // Search commit / clear handlers — feed the Stremio-style SearchView.
   const handleSubmitSearch = (q: string) => setActiveQuery(q);
   const handleClearSearch  = () => setActiveQuery(null);
+
+  // The scroll container is held as state, not a plain ref: it unmounts
+  // while a search is showing, and the row window's effects must re-run
+  // against the new element when it comes back. The hook lists its refs as
+  // dependencies, so a fresh ref object per element is what re-runs them.
+  const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
+  const scrollRef = useMemo(() => ({ current: scrollEl }), [scrollEl]);
+  /** Everything above the catalog rows (hero + Continue Watching). */
+  const leadRef = useRef<HTMLDivElement>(null);
 
   return (
     <div className="relative flex-1 flex flex-col min-w-0 overflow-hidden">
@@ -604,6 +778,7 @@ export default function HomeView({
         </div>
       ) : (
         <div
+          ref={setScrollEl}
           // `px-3` is NOT cosmetic padding: this scroll container is the
           // horizontal clip box (overflow-y-auto forces overflow-x to
           // compute to clip). Without inner padding, the leftmost catalog
@@ -624,43 +799,47 @@ export default function HomeView({
             </div>
           )}
 
-          {/* Hero carousel */}
-          {heroItems.length > 0 && (
-            <div className="px-6 pt-2 pb-4">
-              <HeroCarousel
-                items={heroItems}
-                onSelect={onSelectMeta}
-                sourceLabel={heroSourceLabel ?? undefined}
-              />
-            </div>
-          )}
+          {/* Everything above the catalog rows, in ONE element so the row
+              window can watch its height: the hero lands after the first
+              row does and pushes every row down by its own height. */}
+          <div ref={leadRef}>
+            {/* Hero carousel */}
+            {heroItems.length > 0 && (
+              <div className="px-6 pt-2 pb-4">
+                <HeroCarousel
+                  // Keyed on the SOURCE so a change of source (a pinned hero
+                  // catalog, or an earlier row filling and becoming the first
+                  // row with items) starts at slide 0 rather than keeping a
+                  // slide index that belongs to the old list.
+                  key={heroSourceKey}
+                  items={heroItems}
+                  onSelect={onSelectMeta}
+                  sourceLabel={heroSourceLabel ?? undefined}
+                />
+              </div>
+            )}
 
-          {/* Continue Watching — 16:9 row */}
-          {continueWatching.length > 0 && (
-            <div className="pt-2 pb-2">
-              <ContinueWatchingRow items={continueWatching} onSelectMeta={onSelectFromCW ?? onSelectMeta} addons={addons} />
-            </div>
-          )}
+            {/* Continue Watching: 16:9 row */}
+            {continueWatching.length > 0 && (
+              <div className="pt-2 pb-2">
+                <ContinueWatchingRow items={continueWatching} onSelectMeta={onSelectFromCW ?? onSelectMeta} addons={addons} />
+              </div>
+            )}
+          </div>
 
           {/* Discovery rows — preserve native Stremio manifest order. We
               deliberately don't prefix rows with the addon name; the catalog's
               own name is sufficient and the prefix added visual noise on
               multi-source setups. */}
-          {rows.length > 0 && (
-            <div className="pt-2 pb-10 space-y-8">
-              {rows.map((row) => (
-                <DiscoveryRow
-                  key={`${row.addonUrl}|${row.catalog.media_type}-${row.catalog.id}`}
-                  title={withTypeSuffix(row.catalog.name, row.catalog.media_type)}
-                  items={row.items}
-                  loading={row.loading}
-                  onSelectMeta={onSelectMeta}
-                  addonUrl={row.addonUrl}
-                  catalogType={row.catalog.media_type}
-                  catalogId={row.catalog.id}
-                />
-              ))}
-            </div>
+          {shownRows.length > 0 && (
+            <HomeRowList
+              rows={shownRows}
+              scrollRef={scrollRef}
+              leadRef={leadRef}
+              onWindowChange={handleWindowChange}
+              onSelectMeta={onSelectMeta}
+              onRetry={retryRow}
+            />
           )}
 
           {/* Manifests still loading */}
@@ -684,6 +863,184 @@ export default function HomeView({
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// HomeRowList: the catalog rows, windowed.
+//
+// Only the rows in or near the viewport mount (and, while its View-all popup
+// is open, the row that owns it; see below). That is what frees posters:
+// ImageLoader disconnects its observer on first intersect and never unmounts
+// its <img>, so with every row mounted, one scroll to the bottom of 40 rows
+// kept ~400 decoded posters alive for as long as Home was, the same GPU and
+// decode cost Library already hit. One catalog row per window row (cols: 1),
+// and every row state is exactly one stride tall (DiscoveryRow's
+// `uniformHeight`), which is what lets the hook place them all from a single
+// measured row.
+// ---------------------------------------------------------------------------
+
+/** One catalog row per window row. Module-level because the hook's layout
+ *  effect lists it as a dependency, like the View-all popup's options. */
+const ONE_ROW_PER_WINDOW_ROW = () => 1;
+
+function HomeRowList({
+  rows, scrollRef, leadRef, onWindowChange, onSelectMeta, onRetry,
+}: {
+  rows: CatalogRow[];
+  scrollRef: RefObject<HTMLDivElement | null>;
+  leadRef: RefObject<HTMLDivElement | null>;
+  /** The row window (the rows in or near the viewport), which is the fetch
+   *  queue's priority. A row pinned by its open View-all popup can mount
+   *  outside it and is not reported. */
+  onWindowChange: (start: number, end: number) => void;
+  onSelectMeta?: (meta: MetaPreview) => void;
+  onRetry: (key: string) => void;
+}) {
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const gridRef = useRef<HTMLDivElement>(null);
+  const win = useRowWindow(scrollRef, wrapperRef, gridRef, rows.length, {
+    gap:          HOME_ROW_GAP,
+    estRowStride: HOME_EST_ROW_STRIDE,
+    resolveCols:  ONE_ROW_PER_WINDOW_ROW,
+    initialItems: HOME_INITIAL_ROWS,
+    leadRef,
+  });
+
+  useEffect(() => {
+    onWindowChange(win.start, win.end);
+  }, [win.start, win.end, onWindowChange]);
+
+  // A row whose View-all popup is open stays mounted wherever the window
+  // goes. The popup, with its loaded page and filters, lives in the row, and
+  // Home can move underneath it: the View-all button keeps focus, so End or
+  // PageDown scroll Home, and a resize re-measures the stride. Either would
+  // unmount the row mid-use. Only that ONE row is added: stretching the
+  // mounted range to reach it would mount every row in between, which after
+  // an End is most of Home, posters and all, for as long as the popup is
+  // open. The pinned row goes in the same keyed list as the window's rows
+  // (so React keeps its state as it leaves the window), with one spacer
+  // standing in for the rows it skips: `k * rowStride - gap` tall, since the
+  // flex gap on either side of the spacer supplies the rest, which puts the
+  // pinned row at exactly its own `index * rowStride`. The spacer only ever
+  // sits between the pin and the window's rows, so the grid's first child,
+  // which the hook measures the stride from, is always a row. The fetch
+  // queue follows the window alone (`onWindowChange` above).
+  const [popupKey, setPopupKey] = useState<string | null>(null);
+  const handleOverflowChange = useCallback((key: string, open: boolean) => {
+    setPopupKey((prev) => (open ? key : prev === key ? null : prev));
+  }, []);
+  const popupIdx = popupKey == null ? -1 : rows.findIndex((r) => r.key === popupKey);
+  const pinnedAbove = popupIdx >= 0 && popupIdx < win.start;
+  const pinnedBelow = popupIdx >= win.end;
+
+  // Scroll offset before the current commit. The listener sees every frame's
+  // offset before any later task can commit, and the effect below refreshes
+  // it after each commit of its own.
+  const scrollTopRef = useRef(0);
+  useEffect(() => {
+    const scroll = scrollRef.current;
+    if (!scroll) return;
+    const note = () => { scrollTopRef.current = scroll.scrollTop; };
+    note();
+    scroll.addEventListener("scroll", note, { passive: true });
+    return () => scroll.removeEventListener("scroll", note);
+  }, [scrollRef]);
+
+  // Keep the viewport still when rows above it leave the list. A row whose
+  // catalog comes back empty hides itself, and one above the viewport (the
+  // window's overscan, or rows met again after a jump down the scrollbar)
+  // would otherwise shift everything on screen up by a stride. The offset is
+  // restored from the pre-commit value, not nudged from the current one:
+  // near the bottom the shorter spacer has already clamped scrollTop, and a
+  // relative nudge would then move the page twice.
+  const keysRef = useRef<string[]>([]);
+  useLayoutEffect(() => {
+    const prev = keysRef.current;
+    const keys = rows.map((r) => r.key);
+    keysRef.current = keys;
+    const scroll = scrollRef.current;
+    const wrapper = wrapperRef.current;
+    if (!scroll || !wrapper) return;
+    const kept = new Set(keys);
+    const prevSet = new Set(prev);
+    // Only a pure removal; a rebuilt list has nothing to keep still.
+    if (keys.length < prev.length && keys.every((k) => prevSet.has(k))) {
+      const gridTop = wrapper.getBoundingClientRect().top
+        - scroll.getBoundingClientRect().top + scroll.scrollTop;
+      const within = scrollTopRef.current - gridTop;
+      let removedAbove = 0;
+      prev.forEach((k, i) => {
+        if (!kept.has(k) && i * win.rowStride < within) removedAbove += 1;
+      });
+      if (removedAbove > 0) {
+        scroll.scrollTop = Math.max(0, scrollTopRef.current - removedAbove * win.rowStride);
+      }
+    }
+    scrollTopRef.current = scroll.scrollTop;
+  }, [rows, scrollRef, win.rowStride]);
+
+  const renderRow = (row: CatalogRow) => (
+    <DiscoveryRow
+      key={row.key}
+      title={withTypeSuffix(row.catalog.name, row.catalog.media_type)}
+      items={row.items}
+      loading={row.status === "pending"}
+      failed={row.status === "failed"}
+      onRetry={row.status === "failed" ? () => onRetry(row.key) : undefined}
+      onSelectMeta={onSelectMeta}
+      addonUrl={row.addonUrl}
+      catalogType={row.catalog.media_type}
+      catalogId={row.catalog.id}
+      uniformHeight
+      rowKey={row.key}
+      onOverflowChange={handleOverflowChange}
+    />
+  );
+  const mounted: ReactElement[] = rows.slice(win.start, win.end).map(renderRow);
+  if (pinnedAbove || pinnedBelow) {
+    const skipped = pinnedAbove ? win.start - popupIdx - 1 : popupIdx - win.end;
+    const pin: ReactElement[] = [renderRow(rows[popupIdx])];
+    const spacer = skipped > 0 ? [
+      <div
+        // One key per SIDE. A shared key survives a jump from pinned-above
+        // to pinned-below, and React then MOVES the pinned row's DOM past
+        // it, which resets the open View-all popup's scroll and blanks its
+        // virtualized grid. Distinct keys leave the pin as the only matched
+        // node, so React inserts around it instead.
+        key={pinnedAbove ? "pinned-spacer-above" : "pinned-spacer-below"}
+        aria-hidden
+        style={{ height: skipped * win.rowStride - HOME_ROW_GAP }}
+      />,
+    ] : [];
+    if (pinnedAbove) mounted.unshift(...pin, ...spacer);
+    else mounted.push(...spacer, ...pin);
+  }
+
+  return (
+    <div className="pt-2 pb-10">
+      <div ref={wrapperRef} style={{ position: "relative", height: win.totalHeight }}>
+        <div
+          ref={gridRef}
+          className="flex flex-col"
+          style={{
+            position: "absolute",
+            // One row per window row, so row i sits at i * rowStride; with
+            // no popup pinned above the window this is exactly `win.offsetY`.
+            top: (pinnedAbove ? popupIdx : win.start) * win.rowStride,
+            left: 0,
+            right: 0,
+            gap: HOME_ROW_GAP,
+            // Out of the browser's own scroll anchoring. The effect above is
+            // the one adjustment for a row leaving; a second one from the
+            // browser would move the page twice.
+            overflowAnchor: "none",
+          }}
+        >
+          {mounted}
+        </div>
+      </div>
     </div>
   );
 }

@@ -110,7 +110,14 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
       return next;
     });
   };
-  const [index, setIndex] = useState(0);
+  const [rawIndex, setIndex] = useState(0);
+  // Clamped at READ time. The effect below resets the state when the list
+  // shrinks, but it runs after the render that sees the shorter list, and that
+  // render reads items[index] for the current slide: an out-of-range index
+  // there is a crash, not a flash. Home's default hero can shrink under a
+  // mounted carousel (its source row is the first row with items, which can
+  // change as rows load), so every read goes through this value instead.
+  const index = rawIndex < items.length ? rawIndex : 0;
   const [hovered, setHovered] = useState(false);
   /** Indices where we've detected a dual-layer fallback (low-res or portrait-only). */
   const [dualLayer, setDualLayer] = useState<Set<number>>(new Set());
@@ -140,8 +147,8 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
 
   // Clamp index when items list shrinks
   useEffect(() => {
-    if (index >= items.length) setIndex(0);
-  }, [items.length, index]);
+    if (rawIndex >= items.length) setIndex(0);
+  }, [items.length, rawIndex]);
 
   // Auto-advance (paused while the window is hidden / minimized).
   const hidden = useWindowHidden();

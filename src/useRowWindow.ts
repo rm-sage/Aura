@@ -32,6 +32,9 @@ export interface RowWindow {
   totalHeight: number;
   offsetY: number;
   cols: number;
+  /** The measured row stride (row height + gap), for a consumer that has to
+   *  convert a row count into pixels (Home's scroll compensation). */
+  rowStride: number;
 }
 
 export interface RowWindowOptions {
@@ -46,6 +49,15 @@ export interface RowWindowOptions {
   /** Override the column count (e.g. a `repeat(var(--cols), …)` grid). Receives
    *  the wrapper width + the grid element so it can read a CSS var. */
   resolveCols?: (width: number, grid: HTMLElement | null) => number;
+  /** Items mounted on the first paint, before the scroll handler has placed
+   *  the window. 40 is a few rows of cards; a list of tall rows (Home's
+   *  catalog rows, one per window row) wants far fewer. */
+  initialItems?: number;
+  /** Content above the wrapper that can change height after mount (Home's
+   *  hero arrives after its first rows). Observed with the wrapper, so the
+   *  grid top follows it, and the range with it, instead of going stale
+   *  until the next resize or scroll. */
+  leadRef?: React.RefObject<HTMLElement | null>;
 }
 
 export function useRowWindow(
@@ -55,11 +67,18 @@ export function useRowWindow(
   itemCount: number,
   opts: RowWindowOptions,
 ): RowWindow {
-  const { gap, minCardW = 180, bufferRows = 2, estRowStride = 360, resolveCols } = opts;
+  const {
+    gap, minCardW = 180, bufferRows = 2, estRowStride = 360, resolveCols,
+    initialItems = 40, leadRef,
+  } = opts;
   const [cols, setCols] = useState(1);
   const [rowStride, setRowStride] = useState(estRowStride);
-  const [range, setRange] = useState({ start: 0, end: 40 });
+  const [range, setRange] = useState({ start: 0, end: initialItems });
   const gridTopRef = useRef(0);
+  // State twin of gridTopRef. The scroll handler reads the ref; this only
+  // re-runs the range when the grid MOVES without a scroll (content above
+  // it changing height), which a ref alone would not.
+  const [gridTop, setGridTop] = useState(0);
 
   useLayoutEffect(() => {
     const scroll = scrollRef.current;
@@ -81,14 +100,18 @@ export function useRowWindow(
       }
       const wrapRect = wrapper.getBoundingClientRect();
       const scrollRect = scroll.getBoundingClientRect();
-      gridTopRef.current = wrapRect.top - scrollRect.top + scroll.scrollTop;
+      const top = wrapRect.top - scrollRect.top + scroll.scrollTop;
+      gridTopRef.current = top;
+      setGridTop((prev) => (Math.abs(prev - top) < 0.5 ? prev : top));
     };
     measure();
     const ro = new ResizeObserver(measure);
     ro.observe(wrapper);
     ro.observe(scroll);
+    const lead = leadRef?.current;
+    if (lead) ro.observe(lead);
     return () => ro.disconnect();
-  }, [scrollRef, wrapperRef, gridRef, itemCount, gap, minCardW, resolveCols]);
+  }, [scrollRef, wrapperRef, gridRef, itemCount, gap, minCardW, resolveCols, leadRef]);
 
   useEffect(() => {
     const scroll = scrollRef.current;
@@ -114,10 +137,10 @@ export function useRowWindow(
     compute();
     scroll.addEventListener("scroll", compute, { passive: true });
     return () => scroll.removeEventListener("scroll", compute);
-  }, [scrollRef, cols, rowStride, itemCount, bufferRows]);
+  }, [scrollRef, cols, rowStride, itemCount, bufferRows, gridTop]);
 
   const totalRows = Math.ceil(itemCount / cols);
   const totalHeight = totalRows > 0 ? totalRows * rowStride - gap : 0;
   const offsetY = Math.floor(range.start / cols) * rowStride;
-  return { start: range.start, end: range.end, totalHeight, offsetY, cols };
+  return { start: range.start, end: range.end, totalHeight, offsetY, cols, rowStride };
 }

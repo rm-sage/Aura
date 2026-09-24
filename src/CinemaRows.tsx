@@ -1128,7 +1128,8 @@ interface CatalogCardProps {
   onSelect?: (meta: MetaPreview) => void;
   /** Constrain the title/year block to a fixed height so cards are uniform —
    *  required by the View-all popup's row-virtualization (which derives row
-   *  stride from one measured card). Home rows leave it off (unchanged). */
+   *  stride from one measured card), and by Home's row window for the same
+   *  reason (via DiscoveryRow's `uniformHeight`). Search rows leave it off. */
   fixedTitle?: boolean;
 }
 
@@ -1232,8 +1233,15 @@ export const CatalogCard = memo(function CatalogCard({ meta, onSelect, fixedTitl
           Castle (Movie 2)") and long localized show names. Cheap
           universal solution; no extra components / no per-cell event
           handlers. Same pattern wired into CW + Library tiles below. */}
+      {/* The fixed block is the tightest fit for its content: two title
+          lines (19px x leading-tight 1.25 = 23.75px each, 47.5px), the
+          year's mt-0.5 (2px) and one year line (15.5px x the inherited
+          preflight 1.5 = 23.25px) make 72.75px, and 4.55rem is 72.8px.
+          Measured in Chromium at 100 to 200% display scaling: layout is
+          exact and nothing clips. PlaceholderCell and RowFailedNotice
+          reserve the same block, and must change with it. */}
       {fixedTitle ? (
-        <div className="h-[5.25rem] overflow-hidden">
+        <div className="h-[4.55rem] overflow-hidden">
           <p
             className="text-white/90 text-[19px] font-medium leading-tight line-clamp-2 text-center"
             title={meta.name}
@@ -1284,25 +1292,67 @@ interface DiscoveryRowProps {
     catalogId: string;
     query:     string;
   };
+  /** The catalog request FAILED, as opposed to answering with an empty
+   *  catalog (which still hides the row). The row keeps its place and says
+   *  so, with a Retry button when `onRetry` is set, instead of vanishing. */
+  failed?: boolean;
+  /** Refetch just this row. Home's Retry passes `fetch_catalog` its `force`,
+   *  so the request goes out even while Rust's per-catalog cooldown from the
+   *  failure is still running. */
+  onRetry?: () => void;
+  /** Every state is exactly as tall as every other: cards get the fixed
+   *  title block, and the skeleton and failed states reserve it too, as
+   *  every state reserves the loaded row's "View all" in its header. Home
+   *  sets this because its row window derives one stride from one measured
+   *  row, so a row of any other height would shift every row below it (and
+   *  a successful Retry would reflow the page). Search rows leave it off. */
+  uniformHeight?: boolean;
+  /** Told when this row's View-all popup opens and closes, with `rowKey`.
+   *  The popup lives in the row, so a windowed parent (Home) keeps the row
+   *  mounted while it is open. Must be stable to keep this row memoized. */
+  onOverflowChange?: (rowKey: string, open: boolean) => void;
+  rowKey?: string;
 }
 
 export const DiscoveryRow = memo(function DiscoveryRow(
-  { title, items, loading, onSelectMeta, addonUrl, catalogType, catalogId, searchExpand }: DiscoveryRowProps
+  {
+    title, items, loading, onSelectMeta, addonUrl, catalogType, catalogId, searchExpand,
+    failed, onRetry, uniformHeight, onOverflowChange, rowKey,
+  }: DiscoveryRowProps
 ) {
   const [overflowOpen, setOverflowOpen]   = useState(false);
   const [overflowItems, setOverflowItems] = useState<MetaPreview[] | null>(null);
   const [overflowLoading, setOverflowLoading] = useState(false);
 
+  // Reported from an effect rather than the open/close handlers so the
+  // close also fires when the row unmounts with its popup open (a rebuilt
+  // list), and the parent is never left holding a pin for a dead row.
+  useEffect(() => {
+    if (!overflowOpen || rowKey === undefined || !onOverflowChange) return;
+    onOverflowChange(rowKey, true);
+    return () => onOverflowChange(rowKey, false);
+  }, [overflowOpen, rowKey, onOverflowChange]);
+
   // Skeleton — render exactly 10 placeholder cells.
   if (loading && items.length === 0) {
     return (
-      <RowFrame title={title}>
+      <RowFrame title={title} reserveSubtitle={uniformHeight}>
         {Array.from({ length: HOME_VISIBLE }).map((_, i) => (
-          <div
-            key={i}
-            className="rounded-xl bg-white/5 image-loader-skeleton"
-            style={{ aspectRatio: "2 / 3" }}
-          />
+          <PlaceholderCell key={i} withTitle={uniformHeight} />
+        ))}
+      </RowFrame>
+    );
+  }
+
+  if (failed && items.length === 0) {
+    return (
+      <RowFrame
+        title={title}
+        overlay={<RowFailedNotice onRetry={onRetry} withTitle={uniformHeight} />}
+        reserveSubtitle={uniformHeight}
+      >
+        {Array.from({ length: HOME_VISIBLE }).map((_, i) => (
+          <PlaceholderCell key={i} failed withTitle={uniformHeight} />
         ))}
       </RowFrame>
     );
@@ -1448,12 +1498,14 @@ export const DiscoveryRow = memo(function DiscoveryRow(
         title={title}
         subtitle={hasOverflow ? "View all" : undefined}
         onSubtitleClick={hasOverflow ? handleViewAll : undefined}
+        reserveSubtitle={uniformHeight}
       >
         {visible.map((meta) => (
           <CatalogCard
             key={`${meta.media_type}:${meta.id}`}
             meta={meta}
             onSelect={onSelectMeta}
+            fixedTitle={uniformHeight}
           />
         ))}
       </RowFrame>
@@ -1470,51 +1522,133 @@ export const DiscoveryRow = memo(function DiscoveryRow(
   );
 });
 
+/** One empty poster cell, the same box as a CatalogCard's poster: the
+ *  shimmering skeleton while its row loads, a faint static outline once the
+ *  row has failed. `withTitle` also reserves the card's fixed title block
+ *  (CatalogCard's `fixedTitle`: h-[4.55rem] under a gap-2), so an empty
+ *  row is exactly as tall as a loaded one. */
+function PlaceholderCell({ failed, withTitle }: { failed?: boolean; withTitle?: boolean }) {
+  const poster = (
+    <div
+      className={failed
+        ? "rounded-xl border border-white/6 bg-white/2"
+        : "rounded-xl bg-white/5 image-loader-skeleton"}
+      style={{ aspectRatio: "2 / 3" }}
+    />
+  );
+  if (!withTitle) return poster;
+  return (
+    <div className="flex flex-col gap-2">
+      {poster}
+      <div className="h-[4.55rem]" />
+    </div>
+  );
+}
+
+/** A failed row's message, centered over its empty poster cells. */
+function RowFailedNotice({ onRetry, withTitle }: { onRetry?: () => void; withTitle?: boolean }) {
+  return (
+    <div
+      // With the title block reserved, pad it off (4.55rem block + the
+      // 0.5rem gap) so the message sits on the posters, not below them.
+      className={`absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center
+                  ${withTitle ? "pb-[5.05rem]" : ""}`}
+    >
+      <p className="text-white/55 text-sm">Couldn't load this catalog.</p>
+      {onRetry && (
+        <button
+          type="button"
+          onClick={onRetry}
+          className="px-3 py-1.5 rounded-full text-xs font-medium
+                     bg-white/8 hover:bg-white/15 text-white/80 transition-colors"
+        >
+          Retry
+        </button>
+      )}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // RowFrame — header + grid body. Subtitle becomes a clickable
 // "View all N →" affordance when an onSubtitleClick is provided.
 // ---------------------------------------------------------------------------
 
 function RowFrame({
-  title, subtitle, onSubtitleClick, children,
+  title, subtitle, onSubtitleClick, overlay, reserveSubtitle, children,
 }: {
   title: string;
   subtitle?: string;
   onSubtitleClick?: () => void;
+  /** Laid over the grid body (a failed row's message). Kept OUT of the
+   *  grid: a grid child would count toward the `:nth-child(n+9)` rule
+   *  that hides cells 9 and 10 below 2400 px. */
+  overlay?: ReactNode;
+  /** With no subtitle, still lay out the "View all" button, invisible and
+   *  inert, so the header is the height a loaded row's is. The button's
+   *  line box, baseline-aligned against the title's, reaches 0.5 px below
+   *  it, and DiscoveryRow's `uniformHeight` promises every state one height.
+   *  The SAME markup rather than a fixed header height, so the two can
+   *  never disagree whatever the fonts' metrics. */
+  reserveSubtitle?: boolean;
   children: React.ReactNode;
 }) {
+  const reserved = !subtitle && !!reserveSubtitle;
+  const shownSubtitle = reserved ? "View all" : subtitle;
+  const asButton = !!onSubtitleClick || reserved;
   // Pull the digits out of the subtitle ("View all 24" → "24") so we
   // can render the count in a brighter colour while keeping the
   // surrounding label muted — same emphasis pattern the previous
   // "<N> total" subtitle used.
-  const m = subtitle ? /^(.*?)(\d[\d,]*)(.*)$/.exec(subtitle) : null;
+  const m = shownSubtitle ? /^(.*?)(\d[\d,]*)(.*)$/.exec(shownSubtitle) : null;
   const subtitleContent = m ? (
     <>
       <span className="text-white/55">{m[1]}</span>
       <span className="text-white/95 font-semibold">{m[2]}</span>
       <span className="text-white/45">{m[3]}</span>
-      {onSubtitleClick && <span className="text-ln-accent ml-1">→</span>}
+      {asButton && <span className="text-ln-accent ml-1">→</span>}
     </>
   ) : (
     <>
-      <span className={onSubtitleClick ? "text-white/85" : "text-white/55"}>{subtitle}</span>
-      {onSubtitleClick && <span className="text-ln-accent ml-1">→</span>}
+      <span className={asButton ? "text-white/85" : "text-white/55"}>{shownSubtitle}</span>
+      {asButton && <span className="text-ln-accent ml-1">→</span>}
     </>
+  );
+
+  const grid = (
+    <div
+      className="grid aura-catalog-row"
+      // Column template + gap come from CSS vars in App.css. Ultrawide:
+      // 10 equal columns / 14 px gap. < 2400 px: 8 equal columns / 8 px
+      // gap with a :nth-child rule hiding items 9-10. Items beyond 8
+      // still mount in the React tree so the View-all popup has access
+      // to the full loaded list.
+      style={{
+        gridTemplateColumns: "var(--catalog-grid-template)",
+        gap: "var(--catalog-gap)",
+      }}
+    >
+      {children}
+    </div>
   );
 
   return (
     <section className="relative px-6">
       <div className="flex items-baseline justify-between mb-3 px-1">
         <h3 className="aura-row-title text-2xl font-semibold tracking-tight">{title}</h3>
-        {subtitle && (
-          onSubtitleClick ? (
+        {shownSubtitle && (
+          asButton ? (
             <button
               type="button"
               onClick={onSubtitleClick}
-              className="text-[15px] font-mono tabular-nums tracking-wide
+              // Reserved: `invisible` (visibility: hidden) also takes it out
+              // of the tab order and the accessibility tree.
+              aria-hidden={reserved || undefined}
+              tabIndex={reserved ? -1 : undefined}
+              className={`text-[15px] font-mono tabular-nums tracking-wide
                          hover:opacity-90 transition-opacity cursor-pointer
                          bg-transparent p-0 border-0 focus:outline-none
-                         focus-visible:underline"
+                         focus-visible:underline${reserved ? " invisible" : ""}`}
             >
               {subtitleContent}
             </button>
@@ -1525,20 +1659,7 @@ function RowFrame({
           )
         )}
       </div>
-      <div
-        className="grid aura-catalog-row"
-        // Column template + gap come from CSS vars in App.css. Ultrawide:
-        // 10 equal columns / 14 px gap. < 2400 px: 8 equal columns / 8 px
-        // gap with a :nth-child rule hiding items 9-10. Items beyond 8
-        // still mount in the React tree so the View-all popup has access
-        // to the full loaded list.
-        style={{
-          gridTemplateColumns: "var(--catalog-grid-template)",
-          gap: "var(--catalog-gap)",
-        }}
-      >
-        {children}
-      </div>
+      {overlay ? <div className="relative">{grid}{overlay}</div> : grid}
     </section>
   );
 }

@@ -37,6 +37,10 @@
 // SEARCH is not a gate here. It is a precomputed `has_search` flag that the
 // Rust side enforces, so it fails CLOSED instead (see electSearchAddons).
 //
+// HOME is the catalog resource gate over the whole list (electHomeAddons):
+// every addon that may serve catalogs, in array order, which is Stremio's
+// board. Which catalogs each one contributes is its live manifest's call.
+//
 // Meta is ranked in tiers, with array order deciding WITHIN each tier:
 //   1 declared        declares meta, has id prefixes, and one matches the id
 //   2 primary-exempt  the PRIMARY, kept even though its prefixes miss this
@@ -318,6 +322,55 @@ export function electSearchAddons(addons: readonly AddonEntry[]): AddonEntry[] {
   return final.map((e) => e.addon);
 }
 
+/** The addons whose catalogs make up Home, in row order. Every addon that
+ *  may serve catalogs (the fail-open resource gate Discover uses), in
+ *  addon-array order, like Stremio's board.
+ *
+ *  The Settings "Home Catalog Sources" picker is an override on top: its
+ *  primary (`defaultHomeAddonUrl`) then `additionalHomeAddonUrls`, through
+ *  applyOverride, so a URL listed twice keeps its first position and an
+ *  uninstalled one drops out.
+ *
+ *  An override that names no installed addon at all DELIBERATELY behaves as
+ *  no override: Home shows the automatic board above, with a one-time
+ *  `[election]` warning. The old resolver put `addons[0]` in whenever the
+ *  primary was unset or uninstalled, so this case stranded the user on that
+ *  one addon's catalogs, an arbitrary pick; that substitution is gone. Nor
+ *  does Home go empty: the picker lists only installed addons, so a stale
+ *  override that matches nothing is invisible there and the user could not
+ *  see what to undo. */
+export function electHomeAddons(addons: readonly AddonEntry[]): AddonEntry[] {
+  const elected: Elected[] = [];
+  const rejected: Rejected[] = [];
+  addons.forEach((addon, rank) => {
+    if (!mayServe(addon, "catalog")) {
+      rejected.push({ addon, rank, gate: "resource" });
+      return;
+    }
+    const reason: ElectReason = listOf(addon.resources).length === 0 ? "open-resource" : "declared";
+    elected.push({ addon, rank, reason });
+  });
+
+  // Unset means both halves empty, the rule the old Home resolver used, so
+  // a primary alone or additionals alone each count as an override.
+  const { defaultHomeAddonUrl: primary, additionalHomeAddonUrls } = loadAuraSettings();
+  const additional = additionalHomeAddonUrls ?? [];
+  let final = elected;
+  if (primary != null || additional.length > 0) {
+    const urls = primary != null ? [primary, ...additional] : additional;
+    if (urls.some((url) => addons.some((a) => a.url === url))) {
+      final = applyOverride(elected, urls);
+      for (const e of elected) {
+        if (!final.includes(e)) rejected.push({ addon: e.addon, rank: e.rank, gate: "override" });
+      }
+    } else {
+      warnStaleHomeOverride(urls);
+    }
+  }
+  logElection({ resource: "home" }, addons, final, rejected, null);
+  return final.map((e) => e.addon);
+}
+
 // ── Capability predicates ─────────────────────────────────────────────────
 // "Can this addon do X at all", for the lists that are not a per-title
 // election: Discover's addon picker and the three Settings provider pickers.
@@ -414,8 +467,9 @@ function nameOf(a: AddonEntry): string {
 }
 
 /** What an election line is about. Search is not an ElectResource (it is
- *  never gated like one) but logs through the same line. */
-type LogSubject = Omit<ElectQuery, "resource"> & { resource: ElectResource | "search" };
+ *  never gated like one) and Home is a catalog election with its own
+ *  override, but both log through the same line. */
+type LogSubject = Omit<ElectQuery, "resource"> & { resource: ElectResource | "search" | "home" };
 
 function logElection(
   q: LogSubject,
@@ -447,9 +501,24 @@ function logElection(
   console.info(`[election] ${subject} ${parts.join("; ")}`);
 }
 
-/** Pins already warned about. A pin is one URL per resource, so this stays
- *  tiny; the clear is only a backstop against a pathological session. */
+/** Pins (and stale Home overrides, by hash) already warned about. A pin is
+ *  one URL per resource, so this stays tiny; the clear is only a backstop
+ *  against a pathological session. */
 const warnedPins = new Set<string>();
+
+/** Warn ONCE per override value when the Home override names no installed
+ *  addon and electHomeAddons falls back to every catalog addon. Hashed, like
+ *  the log dedupe, so no token-bearing URL is held. */
+function warnStaleHomeOverride(urls: readonly string[]): void {
+  const key = `home:${hashOf(urls.join("\n"))}`;
+  if (warnedPins.has(key)) return;
+  if (warnedPins.size >= 16) warnedPins.clear();
+  warnedPins.add(key);
+  console.warn(
+    `[election] home sources override ignored: none of its ${urls.length} addon(s) ` +
+      "is installed, so Home shows every catalog addon",
+  );
+}
 
 /** Warn ONCE when the pinned addon is installed but does not declare the
  *  resource at all. That pin can never lead, so it is ignored, and silently
