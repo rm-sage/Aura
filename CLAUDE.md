@@ -636,8 +636,9 @@ Bound every cache (see Performance & memory).
   a 5-minute focus-refetch debounce, plus a 5-minute `recentlyCleared` overlay that re-zeroes
   `state.timeOffset` for ids cleared in the last window (Stremio's `datastoreGet` is eventually
   consistent on `_mtime`, so a fresh fetch within the window can return stale non-zero state).
-- **metaCache.ts** (`aura:meta-cache:v1`): TTL 4 h series/anime, 7 d movies, 90 s nulls; cap ~800
-  entries (~1.5 MB); 500 ms write debounce; null entries not persisted.
+- **metaCache.ts** (`aura:meta-cache:v2`): TTL 4 h series/anime, 7 d movies, 90 s nulls; cap ~800
+  entries (~1.5 MB); 500 ms write debounce; null entries not persisted. A meta whose videos embed
+  their own streams lives 3 min (`TTL_EMBEDDED_STREAMS_MS`) and is never persisted.
 - **persistentCache.ts**: generic TTL + size-capped store (AniSkip uses it at 3 days / 600 entries,
   dropping the oldest 25% on overflow; negative misses are never cached).
 - **Calendar meta**: 24-hour module-level `Map` keyed by `${addonUrl}::${type}::${id}`.

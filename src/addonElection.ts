@@ -72,7 +72,7 @@
 // ---------------------------------------------------------------------------
 
 import type { AddonEntry } from "./types";
-import { loadAuraSettings } from "./auraSettings";
+import { loadAuraSettings, type AuraSettings } from "./auraSettings";
 
 export type ElectResource = "meta" | "stream" | "subtitles" | "catalog" | "addon_catalog";
 
@@ -395,36 +395,66 @@ function namesHomeSource(urls: readonly string[], addons: readonly AddonEntry[])
 
 export type ProviderJob = "home" | "search" | "streams";
 
+/** The job's provider list from Settings while it is in force, else `null`.
+ *  Search and Streams are in force whenever set, `[]` included. Home only
+ *  while it names an installed Home source: electHomeAddons ignores a stale
+ *  one. */
+function overrideInForce(addons: readonly AddonEntry[], job: ProviderJob): readonly string[] | null {
+  switch (job) {
+    case "home": {
+      const home = homeOverrideUrls();
+      return home !== null && namesHomeSource(home, addons) ? home : null;
+    }
+    case "search":
+      return loadAuraSettings().searchAddonUrls;
+    case "streams":
+      return loadAuraSettings().streamAddonUrls;
+  }
+}
+
 /** Why `job` has no provider: "override" when its Settings override is the
  *  cause, else "addons". Call it only once the job is known to be empty. */
 export function emptyElectionCause(
   addons: readonly AddonEntry[],
   job: ProviderJob,
 ): "addons" | "override" {
-  const s = loadAuraSettings();
-  let urls: readonly string[] | null;
-  let capable: (addon: AddonEntry) => boolean;
-  switch (job) {
-    case "home": {
-      // A stale Home override is not in force (electHomeAddons ignores it).
-      const home = homeOverrideUrls();
-      urls = home !== null && namesHomeSource(home, addons) ? home : null;
-      capable = isHomeSource;
-      break;
-    }
-    case "search":
-      urls = s.searchAddonUrls;
-      capable = isSearchProvider;
-      break;
-    case "streams":
-      urls = s.streamAddonUrls;
-      capable = isStreamProvider;
-      break;
-  }
+  const urls = overrideInForce(addons, job);
   if (urls === null) return "addons";
+  const capable = job === "home" ? isHomeSource : job === "search" ? isSearchProvider : isStreamProvider;
   const listed = new Set(urls);
   return addons.some((a) => capable(a) && !listed.has(a.url)) ? "override" : "addons";
 }
+
+/** A job whose provider the user can override in Settings, behind "Show
+ *  advanced settings": the three provider lists plus the Default Metadata
+ *  Provider pin. */
+export type OverridableJob = ProviderJob | "meta";
+
+/** Every job whose Settings override is in force, in Settings page order.
+ *  For the Addons page, which says that addon order alone does not decide
+ *  these. The meta pin counts while it names an installed addon that may
+ *  serve meta: one that is not installed is never a candidate for
+ *  applyPrimary, and one that serves no meta is ignored (warnIncapablePin). */
+export function overriddenJobs(addons: readonly AddonEntry[]): OverridableJob[] {
+  const pin = loadAuraSettings().defaultMetadataAddonUrl ?? null;
+  const metaPinned = pin !== null && addons.some((a) => a.url === pin && mayServe(a, "meta"));
+  const out: OverridableJob[] = [];
+  if (overrideInForce(addons, "home") !== null) out.push("home");
+  if (metaPinned) out.push("meta");
+  if (overrideInForce(addons, "streams") !== null) out.push("streams");
+  if (overrideInForce(addons, "search") !== null) out.push("search");
+  return out;
+}
+
+/** The AuraSettings keys `overriddenJobs` reads, for a view that re-renders
+ *  on a change (a cloud pull can land while it is open). */
+export const OVERRIDE_SETTING_KEYS = new Set<keyof AuraSettings>([
+  "defaultHomeAddonUrl",
+  "additionalHomeAddonUrls",
+  "defaultMetadataAddonUrl",
+  "streamAddonUrls",
+  "searchAddonUrls",
+]);
 
 // ── Capability predicates ─────────────────────────────────────────────────
 // "Can this addon do X at all", for the lists that are not a per-title

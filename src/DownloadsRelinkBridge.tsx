@@ -55,6 +55,13 @@ export default function DownloadsRelinkBridge({ addons }: { addons: AddonEntry[]
             await relinkFailed(job.id, "No stream providers are active.");
             return;
           }
+          // The addon fan-out only, never a meta's embedded per-video streams
+          // (the detail page and Next-Up short-circuit on those; this must
+          // NOT). A relink exists because the url expired, and an embedded url
+          // is static, baked into the meta response: handing it back would
+          // resume against the same dead link. A download that came from one
+          // relinks only when a stream addon offers the same source, and
+          // otherwise fails with the message below.
           const r = await invoke<StreamFetchResult>("fetch_streams", {
             addons: queryAddons,
             mediaType: job.origin.media_type,

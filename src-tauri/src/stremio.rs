@@ -828,6 +828,13 @@ pub struct VideoEntry {
     /// meaningful alongside `anilist_id`.
     #[serde(default)]
     pub anilist_episode: Option<i64>,
+    /// Streams the meta addon embedded in this Video object (Stremio parity,
+    /// see `extract_embedded_streams`). When non-empty, the detail page and
+    /// Next-Up show these INSTEAD of the addon stream fan-out for this video.
+    /// Omitted from the JSON when empty, so a meta that embeds nothing (nearly
+    /// all of them) costs the IPC payload and the meta cache no extra bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streams: Vec<StreamEntry>,
 }
 
 #[derive(Clone, Serialize)]
@@ -2389,6 +2396,9 @@ pub async fn fetch_meta_detail(
     let url = format!("{base}/meta/{media_type}/{id}.json");
     let addon_name = cap(addon_name.unwrap_or_default(), 64);
     let label = log_label(&addon_name, &base);
+    // What embedded per-video streams carry as `addon_name`, which the stream
+    // list groups by. The label stands in when the caller named no addon.
+    let stream_addon_name = if addon_name.is_empty() { label.clone() } else { addon_name.clone() };
 
     crate::devlog!(info, "meta", "[{}] GET {}", label, redact_sensitive_url(&url));
 
@@ -2545,7 +2555,7 @@ pub async fn fetch_meta_detail(
         }
     }
 
-    let videos = extract_videos(meta);
+    let videos = extract_videos(meta, &stream_addon_name);
 
     // ── External anime-database ids (AniSkip + future history sync) ────
     // AIOMetadata stamps `_malId` / `_kitsuId` / `_anidbId` at top
@@ -2956,7 +2966,10 @@ fn repair_broken_video_id(raw_id: &str, parent_id: &str, video: &serde_json::Val
 /// otherwise-supported title. We rebuild the prefix from the parent meta id
 /// when we detect this pattern; episode addons keyed off the canonical
 /// `<imdb>:<s>:<e>` shape then resolve normally.
-fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
+///
+/// `addon_name` is the meta addon's display name, stamped on any streams a
+/// video embeds (`extract_embedded_streams`).
+fn extract_videos(meta: &serde_json::Value, addon_name: &str) -> Vec<VideoEntry> {
     let parent_id = meta.get("id").and_then(|x| x.as_str()).unwrap_or("");
     let Some(arr) = meta.get("videos").and_then(|v| v.as_array()) else {
         return Vec::new();
@@ -3038,6 +3051,7 @@ fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
                 is_recap,
                 anilist_id,
                 anilist_episode,
+                streams: extract_embedded_streams(v, addon_name),
             })
         })
         .collect();
@@ -3065,6 +3079,15 @@ fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
             "extract_videos: parsed {} videos ({} filler, {} recap); canonical fields on first entry: {:?}",
             videos.len(), filler_count, recap_count, canonical_keys_present,
         );
+        // Rare enough to be worth a line: these videos skip the stream
+        // fan-out on the detail page and in Next-Up.
+        let embedding = videos.iter().filter(|v| !v.streams.is_empty()).count();
+        if embedding > 0 {
+            crate::devlog!(
+                info, "meta",
+                "extract_videos: {embedding} video(s) embed their own streams, shown instead of the addon fan-out",
+            );
+        }
         if repaired_count > 0 {
             crate::devlog!(
                 warn, "meta",
@@ -3074,6 +3097,51 @@ fn extract_videos(meta: &serde_json::Value) -> Vec<VideoEntry> {
         }
     }
     videos
+}
+
+/// Per-video cap on embedded streams: the same raw cap `fetch_streams`
+/// applies to one addon's stream response.
+const EMBEDDED_STREAMS_CAP: usize = 80;
+
+/// The streams a meta addon embedded in one Video object (Stremio parity).
+///
+/// The SDK lets a Video carry `streams`, and Stremio then shows those INSTEAD
+/// of the addon stream fan-out for that video. stremio-core reads the key as
+/// `OneOrMany`, so a bare object is a list of one, and the SDK also accepts
+/// the singular `stream`. A key holding anything else (null, a string) is
+/// ignored, and the other spelling is tried.
+///
+/// Each entry goes through `sanitize_stream`, so stream-list invariant 1 holds
+/// here too: an entry with no usable url and no info hash is dropped rather
+/// than rendered as a row that cannot play. NOT through
+/// `partition_aio_pseudo_streams`, which strips AIOStreams' notice rows from a
+/// stream response; a meta response carries none. Deduplicated on the key
+/// `fetch_streams` merges with, so the list keeps the uniqueness a fan-out
+/// result has.
+///
+/// Stricter than a fan-out on one point: an entry must carry a url, and an
+/// info-hash-only one is dropped. Aura has no torrent engine (the bridge's
+/// `/magnet` route is a permanent 501), and this list REPLACES the fan-out on
+/// the detail page and in Next-Up, so a magnet here would stand in for
+/// playable debrid rows, with no way back (Refresh takes the same branch). An
+/// embed of magnets only therefore yields an empty list, and the fan-out runs
+/// as it would without one.
+fn extract_embedded_streams(v: &serde_json::Value, addon_name: &str) -> Vec<StreamEntry> {
+    let raw = ["streams", "stream"]
+        .iter()
+        .find_map(|k| v.get(*k).filter(|x| x.is_array() || x.is_object()));
+    let list: &[serde_json::Value] = match raw {
+        Some(serde_json::Value::Array(arr)) => arr,
+        Some(obj) => std::slice::from_ref(obj),
+        None => return Vec::new(),
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    list.iter()
+        .take(EMBEDDED_STREAMS_CAP)
+        .filter_map(|s| sanitize_stream(s, addon_name))
+        .filter(|s| s.url.is_some())
+        .filter(|s| seen.insert(stream_dedup_key(s)))
+        .collect()
 }
 
 /// Helper — pull a string array from arbitrary serde_json::Value, capping
@@ -3811,12 +3879,7 @@ pub async fn fetch_streams(
 
     for (_, out) in outputs {
         for s in out.streams {
-            let key = s
-                .url
-                .clone()
-                .or_else(|| s.info_hash.clone())
-                .unwrap_or_else(|| s.title.clone());
-            if seen.insert(key) {
+            if seen.insert(stream_dedup_key(&s)) {
                 all.push(s);
             }
         }
@@ -4051,6 +4114,17 @@ fn strip_leading_emoji(s: &str) -> &str {
     &s[end..]
 }
 
+/// The identity two streams are deduplicated on, in `fetch_streams`' merge and
+/// in an embedded per-video list. The title fallback is a leftover from before
+/// `sanitize_stream` guaranteed a url or an info hash (CLAUDE.md, stream-list
+/// invariant 1), not a case that still arises.
+fn stream_dedup_key(s: &StreamEntry) -> String {
+    s.url
+        .clone()
+        .or_else(|| s.info_hash.clone())
+        .unwrap_or_else(|| s.title.clone())
+}
+
 fn sanitize_stream(s: &serde_json::Value, addon_name: &str) -> Option<StreamEntry> {
     // Title is the primary display string; fall back to "name" then "<addon>".
     let raw_title = s
@@ -4109,8 +4183,13 @@ fn sanitize_stream(s: &serde_json::Value, addon_name: &str) -> Option<StreamEntr
     // file can't be verified for a single-episode request. `None` when
     // streamData is absent (gated off, non-AIOStreams addon, or older build).
     // streamData is a sibling of the standard Stremio fields, NOT nested under
-    // behaviorHints. Pseudo-streams (streamData.type "statistic"/"error") never
-    // reach here — they're partitioned out before this sanitize loop runs.
+    // behaviorHints. On the `fetch_streams` path, pseudo-streams
+    // (streamData.type "statistic"/"error") never reach here:
+    // `partition_aio_pseudo_streams` takes them out first. Embedded per-video
+    // streams (`extract_embedded_streams`) come here WITHOUT that step, so a
+    // pseudo-stream there is an ordinary entry: a real one has no url or
+    // infoHash and the gate above drops it, and one that carries an address
+    // is kept as a row.
     let episode_pack = s
         .get("streamData")
         .and_then(|v| v.get("episodePack"))
@@ -4711,5 +4790,75 @@ mod tests {
             ..addon_entry_from_wire("https://example.invalid".into(), &wire, false)
         };
         assert!(matches!(addon_entry_supports_stream_for(&refreshed, "series", "p19:1:1"), StreamGate::Supported));
+    }
+
+    /// Embedded per-video streams, in every shape stremio-core accepts: an
+    /// array, a bare object, and the singular `stream` key. Each entry goes
+    /// through sanitize_stream, so one with no usable address is dropped
+    /// rather than rendered as a row that cannot play, and the list is capped.
+    /// An info-hash-only entry is dropped too (Aura cannot play a magnet), so
+    /// an embed of magnets only is empty and the fan-out runs instead.
+    #[test]
+    fn embedded_video_streams_parse() {
+        let url = |n: &str| format!("https://cdn.example.invalid/{n}.mkv");
+        let many: Vec<serde_json::Value> = (0..100)
+            .map(|i| serde_json::json!({ "url": url(&i.to_string()) }))
+            .collect();
+        let meta = serde_json::json!({
+            "id": "tt1",
+            "videos": [
+                { "id": "tt1:1:1", "streams": [
+                    { "title": "A", "url": url("a") },
+                    { "title": "no address" },
+                    { "title": "wrong scheme", "url": "ftp://example.invalid/b.mkv" },
+                    { "title": "B", "infoHash": "abc123" },
+                    { "title": "C", "url": url("c"), "infoHash": "def456" },
+                    { "title": "A again", "url": url("a") },
+                ] },
+                { "id": "tt1:1:2", "streams": { "title": "One", "url": url("one") } },
+                { "id": "tt1:1:3", "stream": [{ "url": url("singular") }] },
+                { "id": "tt1:1:4", "streams": many },
+                { "id": "tt1:1:5" },
+                { "id": "tt1:1:6", "streams": null, "stream": { "url": url("fallback") } },
+                { "id": "tt1:1:7", "streams": [{ "infoHash": "abc123" }, { "infoHash": "def456" }] },
+            ],
+        });
+        let videos = extract_videos(&meta, "Meta Addon");
+        assert_eq!(videos.len(), 7);
+
+        // Array: the address-less, non-http and info-hash-only entries are
+        // dropped, a url that also carries a hash is kept, a repeated url is
+        // kept once, order holds.
+        let titles: Vec<&str> = videos[0].streams.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, ["A", "C"]);
+        assert!(videos[0].streams.iter().all(|s| s.addon_name == "Meta Addon"));
+        assert_eq!(videos[0].streams[1].info_hash.as_deref(), Some("def456"));
+
+        // A bare object is a list of one.
+        assert_eq!(videos[1].streams.len(), 1);
+        assert_eq!(videos[1].streams[0].url.as_deref(), Some(url("one").as_str()));
+
+        // The singular key; with no title the addon name stands in.
+        assert_eq!(videos[2].streams.len(), 1);
+        assert_eq!(videos[2].streams[0].title, "Meta Addon");
+
+        // Capped, keeping the first entries.
+        assert_eq!(videos[3].streams.len(), EMBEDDED_STREAMS_CAP);
+        assert_eq!(videos[3].streams[0].url.as_deref(), Some(url("0").as_str()));
+
+        // No key at all, and a null `streams` that falls through to `stream`.
+        assert!(videos[4].streams.is_empty());
+        assert_eq!(videos[5].streams.len(), 1);
+        assert_eq!(videos[5].streams[0].url.as_deref(), Some(url("fallback").as_str()));
+
+        // Magnets only: nothing survives, so this video takes the fan-out.
+        assert!(videos[6].streams.is_empty());
+        assert!(videos.iter().flat_map(|v| &v.streams).all(|s| s.url.is_some()));
+
+        // Empty lists stay off the wire, so a meta that embeds nothing costs
+        // the IPC payload and the meta cache nothing.
+        let json = serde_json::to_value(&videos[4]).expect("serializes");
+        assert!(json.get("streams").is_none());
+        assert!(serde_json::to_value(&videos[0]).expect("serializes").get("streams").is_some());
     }
 }

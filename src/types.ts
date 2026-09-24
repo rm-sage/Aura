@@ -247,6 +247,14 @@ export interface VideoEntry {
    *  movies, and addons without the patch. */
   anilist_id?: number | null;
   anilist_episode?: number | null;
+  /** Streams the meta addon embedded in this video (Stremio parity). When
+   *  present, the detail page and Next-Up show these INSTEAD of the addon
+   *  stream fan-out, and the in-player source switcher lists them first.
+   *  Absent when the addon embeds none (Rust omits an empty list). Every
+   *  entry carries a url (Rust drops magnets, which Aura cannot play). A meta
+   *  that embeds any is never written to disk by metaCache, and lives there
+   *  for minutes, not hours. */
+  streams?: StreamEntry[];
 }
 
 /** True when a video has aired (release date in the past) or its

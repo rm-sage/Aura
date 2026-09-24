@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import {
   DndContext,
   PointerSensor,
@@ -29,6 +29,8 @@ import { showAppToast } from "../AppToast";
 import Tooltip from "../Tooltip";
 import { requestReopenAddons } from "../onboarding";
 import { copyTextToClipboard } from "../clipboard";
+import { overriddenJobs, OVERRIDE_SETTING_KEYS, type OverridableJob } from "../addonElection";
+import { settingsChangeIncludes } from "../auraSettings";
 
 /** Glass icon-button styling shared by the addon-row action cluster.
  *  ACCENT = Copy/Configure/Refresh (blue accent hover); DESTRUCTIVE =
@@ -54,6 +56,17 @@ const DESTRUCTIVE_ICON_BTN =
   "disabled:opacity-40 disabled:hover:bg-white/[0.04] " +
   "disabled:hover:border-white/10 disabled:hover:shadow-none " +
   "active:scale-95 active:bg-rose-500/20";
+
+/** What the Installed list's override line calls each overridden job, and the
+ *  Settings section its link opens. The deep link reveals that section's
+ *  advanced rows even with Show advanced settings off (the same event and ids
+ *  NoProvidersWarning uses). */
+const OVERRIDE_LINKS: Record<OverridableJob, { label: string; section: string }> = {
+  home:    { label: "Home catalogs", section: "sec-catalog" },
+  meta:    { label: "Metadata",      section: "sec-catalog" },
+  streams: { label: "Streams",       section: "sec-streams" },
+  search:  { label: "Search",        section: "sec-search" },
+};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -729,6 +742,19 @@ export default function AddonsView({
     onReorder(next.map((a) => a.url));
   };
 
+  // Jobs a Settings override decides instead of addon order. Read from
+  // Settings at render; a cloud pull can change them while this page is
+  // open, so re-render when one of those keys does.
+  const [, setOverrideTick] = useState(0);
+  useEffect(() => {
+    const onChange = (e: Event) => {
+      if (settingsChangeIncludes(e, OVERRIDE_SETTING_KEYS)) setOverrideTick((n) => n + 1);
+    };
+    window.addEventListener("aura:settings-changed", onChange);
+    return () => window.removeEventListener("aura:settings-changed", onChange);
+  }, []);
+  const overridden = overriddenJobs(addons);
+
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
       <div
@@ -791,11 +817,42 @@ export default function AddonsView({
           />
         </section>
 
-        {/* Installed addons */}
+        {/* Installed addons. The first line under the header says what the
+            order does, which this page never used to: the topmost capable
+            addon does a job first, for meta, streams, search, subtitles and
+            Home alike (addonElection.ts). The second appears only while a
+            Settings override takes a job out of that rule. */}
         <section className="space-y-3">
-          <h2 className="text-white/40 text-xs font-semibold tracking-[0.1em] uppercase">
-            Installed · {addons.length}
-          </h2>
+          <div>
+            <h2 className="text-white/40 text-xs font-semibold tracking-[0.1em] uppercase">
+              Installed · {addons.length}
+            </h2>
+            {addons.length > 1 && (
+              <p className="text-white/35 text-xs mt-1">
+                The topmost addon that can do a job does it first. Drag addons to change that.
+              </p>
+            )}
+            {addons.length > 0 && overridden.length > 0 && (
+              <p className="text-white/35 text-xs mt-1">
+                Some jobs are pinned in Settings, under Show advanced settings:{" "}
+                {overridden.map((job, i) => (
+                  <Fragment key={job}>
+                    {i > 0 && ", "}
+                    <button
+                      type="button"
+                      onClick={() => window.dispatchEvent(new CustomEvent("aura:open-settings", {
+                        detail: { section: OVERRIDE_LINKS[job].section },
+                      }))}
+                      className="text-ln-accent/80 hover:text-ln-accent font-medium transition-colors"
+                    >
+                      {OVERRIDE_LINKS[job].label}
+                    </button>
+                  </Fragment>
+                ))}
+                .
+              </p>
+            )}
+          </div>
           {addons.length === 0 ? (
             <p className="text-white/25 text-sm">No addons installed yet.</p>
           ) : (

@@ -4432,6 +4432,13 @@ export default function App() {
    *  the suggestion for THIS playback; opening S01E06 fresh produces a
    *  new CTA when its own end approaches. */
   const nextUpDismissedFor = useRef<string | null>(null);
+  /** The advance still re-reading an embedded pick (see advanceToEpisode).
+   *  That wait leaves the Next-Up card and the Spotlight mounted, so while it
+   *  is held a second press, a re-fired countdown or a Skip is ignored, and a
+   *  Dismiss withdraws it by clearing it. Released before handlePlayStream,
+   *  which tears both surfaces down first, so a load that never settles (a
+   *  resume prompt left open) cannot latch auto-advance off. */
+  const advancingRef = useRef<object | null>(null);
 
   /** Arc context for the episode currently playing, but ONLY when finishing it
    *  crosses a story-arc boundary. The Next-Up card and the EOS Spotlight then
@@ -4658,7 +4665,7 @@ export default function App() {
       // episode + its stream so the card can offer a one-tap "skip to
       // canon" (null when next isn't filler/recap or no canon lies ahead).
       const [stream, canon] = await Promise.all([
-        pickFirstStreamForEpisode(addons, mediaType, next.next.id),
+        pickFirstStreamForEpisode(addons, mediaType, next.next.id, next.next),
         resolveCanonSkipTarget(addons, next.detail, mediaType, currentId, next.next),
       ]);
       // Guard against state changes during the await — only commit if
@@ -4746,9 +4753,42 @@ export default function App() {
   // recording the CURRENT episode into History first (same gate as
   // handleExitPlayback). Shared by "Play next episode" and "Skip to canon"
   // so both carry the identical History/scrobble + target-build + swap path.
-  const advanceToEpisode = useCallback(async (ep: VideoEntry, stream: StreamEntry) => {
-    if (!activeTarget) return;
+  const advanceToEpisode = useCallback(async (ep: VideoEntry, picked: StreamEntry) => {
+    if (!activeTarget || advancingRef.current) return;
     const seriesId = activeTarget.series_id ?? activeTarget.id;
+
+    // A pick from the episode's EMBEDDED streams is re-read first. It was made
+    // at the pre-resolve (50 % in, or earlier), so it can be as old as the
+    // rest of the episode plus any pause, and an embedded url can be an
+    // expiring debrid or signed link that the stream-lost retry cannot mend
+    // (it re-resolves from the fan-out only). getMetaDetailFallback refetches
+    // a meta that embeds streams once it is past TTL_EMBEDDED_STREAMS_MS, so
+    // the pick below is never older than that. When the re-read no longer
+    // embeds any for the episode, the fan-out resolves it, as it would have
+    // for a video that never embedded. A fan-out pick plays as picked: the
+    // retry can re-resolve that one.
+    let stream = picked;
+    if (ep.streams?.includes(picked)) {
+      const claim = {};
+      advancingRef.current = claim;
+      try {
+        const live = () => advancingRef.current === claim && activeTargetRef.current?.id === activeTarget.id;
+        const detail = await getMetaDetailFallback(addons, activeTarget.media_type, seriesId).catch(() => null);
+        if (!live()) return;
+        const fresh = detail?.videos?.find((v) => v.id === ep.id) ?? null;
+        const again = await pickFirstStreamForEpisode(addons, activeTarget.media_type, ep.id, fresh);
+        if (!live()) return;
+        if (!again) {
+          window.dispatchEvent(new CustomEvent("aura:player-toast", {
+            detail: { message: "No streams found" },
+          }));
+          return;
+        }
+        stream = again;
+      } finally {
+        if (advancingRef.current === claim) advancingRef.current = null;
+      }
+    }
 
     // ── Record CURRENT episode into history before advancing ──
     // handlePlayStream swaps the active target without going through
@@ -4871,7 +4911,7 @@ export default function App() {
     await handlePlayStream(stream, target);
     // Allow the new target's CTA to arm when its own end approaches.
     nextUpResolvedFor.current = null;
-  }, [activeTarget, activeScoringMeta, library, selectedMeta]);
+  }, [activeTarget, activeScoringMeta, addons, library, selectedMeta]);
 
   const onNextUpPlay = useCallback(async () => {
     if (!nextUpInfo || !nextUpInfo.stream) return;
@@ -4932,6 +4972,9 @@ export default function App() {
     // not arm a fresh countdown a minute later.
     autoAdvanceStreakRef.current = 0;
     setAutoAdvanceCancelled(true);
+    // A countdown that fired just before this may still be re-reading its
+    // stream: the refusal withdraws it.
+    advancingRef.current = null;
     setNextUpInfo(null);
   }, [activeTarget]);
 
@@ -5200,7 +5243,7 @@ export default function App() {
       if (cancelled) return;
       if (res) {
         const [stream, canon] = await Promise.all([
-          pickFirstStreamForEpisode(addons, mediaType, res.next.id),
+          pickFirstStreamForEpisode(addons, mediaType, res.next.id, res.next),
           resolveCanonSkipTarget(addons, res.detail, mediaType, currentId, res.next),
         ]);
         if (cancelled) return;
@@ -7238,7 +7281,7 @@ export default function App() {
       // entry, else the meta id itself for movies.
       const firstEp = videos.find((v) => (v.season ?? 0) > 0) ?? videos[0];
       const targetId = firstEp?.id ?? nextRootId;
-      const stream = await pickFirstStreamForEpisode(addons, candidateType, targetId);
+      const stream = await pickFirstStreamForEpisode(addons, candidateType, targetId, firstEp ?? null);
       if (!stream) continue;
       const epTag =
         firstEp && firstEp.season != null && firstEp.episode != null
@@ -7316,7 +7359,7 @@ export default function App() {
         }));
         return;
       }
-      const stream = await pickFirstStreamForEpisode(addons, target.media_type, candidate.id);
+      const stream = await pickFirstStreamForEpisode(addons, target.media_type, candidate.id, candidate);
       if (!stream) {
         window.dispatchEvent(new CustomEvent("aura:player-toast", {
           detail: { message: "No streams found" },
@@ -7363,31 +7406,106 @@ export default function App() {
   const [switcherStreams, setSwitcherStreams] = useState<StreamEntry[]>([]);
   const [switcherLoading, setSwitcherLoading] = useState(false);
   const [switcherResolvingKey, setSwitcherResolvingKey] = useState<string | null>(null);
+  // Bumped on every open, so an answer that lands after a later open (or a
+  // re-open of the same panel) is dropped instead of overwriting its list.
+  const switcherSeqRef = useRef(0);
 
   useEffect(() => {
     const onOpen = () => {
       if (!activeTarget) return;
       const mt = (activeTarget.media_type ?? "").toLowerCase();
       if (!["movie", "series", "anime"].includes(mt)) return; // not live channels
+      const seq = ++switcherSeqRef.current;
       setSwitcherOpen(true);
       setSwitcherLoading(true);
       setSwitcherResolvingKey(null);
       setSwitcherStreams([]);
+      // Embedded per-video streams (Stremio parity) are listed FIRST, then the
+      // fan-out minus any row they already show. The detail page and Next-Up
+      // show them INSTEAD of the fan-out, but offering alternatives is this
+      // panel's whole job, so it merges; with them first its top row is still
+      // the one Next-Up would have picked.
+      //
+      // The two lookups settle independently and each republishes the merge.
+      // Fan-out rows show the moment they land; embedded rows join on top
+      // whenever the meta answers. The meta lookup must never hold rows back:
+      // on a metaCache miss (usual for a movie, which nothing warms during
+      // playback, and for a meta that embeds streams once its 3 minute life
+      // is past) it walks the elected meta addons one at a time, each on a
+      // 10 s timeout, for a list that is empty for nearly every title. But an
+      // EMPTY fan-out is not a verdict while it is pending, since a meta addon
+      // can embed streams for a title no stream addon covers: the spinner
+      // then holds until the meta settles, so "No other sources available"
+      // is never shown ahead of rows that are coming. It goes through
+      // metaCache, the same walk Next-Up's resolver makes, so the two agree,
+      // and metaCache keeps a meta that embeds streams for minutes only, so
+      // these rows are no staler.
+      //
+      // `seq` drops an answer a later open superseded, and `videoId` one for
+      // an episode that is no longer playing (a media-key Next moves
+      // activeTarget with the panel open): picking such a row would play the
+      // old episode's source under the new episode's id. The effect below
+      // re-opens an open panel for the new episode, which bumps `seq`; when
+      // it cannot (the new target is not switchable), the panel is emptied
+      // and its spinner ended here rather than left running.
+      const videoId = activeTarget.id;
+      let own: StreamEntry[] = [];
+      let rest: StreamEntry[] = [];
+      let fanoutDone = false;
+      let metaDone = false;
+      const publish = () => {
+        if (switcherSeqRef.current !== seq) return;
+        if (activeTargetRef.current?.id !== videoId) {
+          setSwitcherStreams([]);
+          setSwitcherLoading(false);
+          return;
+        }
+        // A fan-out row the embed already lists goes: same stream key, or the
+        // same source (addon plus release filename, else title), since an
+        // addon that also serves /stream can sign or unrestrict its url per
+        // response, and the two copies of one source differ only there.
+        const shown = new Set(own.map(streamKey));
+        setSwitcherStreams([
+          ...own,
+          ...rest.filter((s) => !shown.has(streamKey(s)) && !own.some((e) => sameStreamSource(s, e))),
+        ]);
+        if (fanoutDone && (metaDone || rest.length > 0)) setSwitcherLoading(false);
+      };
       // Same stream-addon scoping DetailView uses (respects the user's
       // streamAddonUrls setting; fetch_streams gates by capability anyway).
       const queryAddons = streamQueryAddons(addons);
       invoke<StreamFetchResult>("fetch_streams", {
         addons: queryAddons,
         mediaType: activeTarget.media_type,
-        id: activeTarget.id,
+        id: videoId,
       })
-        .then((r) => setSwitcherStreams(Array.isArray(r) ? (r as StreamEntry[]) : (r?.streams ?? [])))
-        .catch(() => setSwitcherStreams([]))
-        .finally(() => setSwitcherLoading(false));
+        .then((r) => { rest = Array.isArray(r) ? (r as StreamEntry[]) : (r?.streams ?? []); })
+        .catch(() => { rest = []; })
+        .finally(() => {
+          fanoutDone = true;
+          publish();
+        });
+      getMetaDetailFallback(addons, activeTarget.media_type, activeTarget.series_id ?? videoId)
+        .then((d) => { own = d?.videos?.find((v) => v.id === videoId)?.streams ?? []; })
+        .catch(() => {})
+        .finally(() => {
+          metaDone = true;
+          publish();
+        });
     };
     window.addEventListener("aura:open-source-switcher", onOpen);
     return () => window.removeEventListener("aura:open-source-switcher", onOpen);
   }, [activeTarget, addons]);
+
+  // A panel left open while the episode changes (media-key Next, a party
+  // leader's advance) re-runs its lookup for the new one instead of listing
+  // the old episode's sources. Declared after the listener above, so the
+  // event reaches the one bound to the new target. `switcherOpen` is read,
+  // not a dep: opening the panel must not fire a second lookup.
+  useEffect(() => {
+    if (switcherOpen) window.dispatchEvent(new CustomEvent("aura:open-source-switcher"));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTarget?.id]);
 
   const onPickSource = useCallback((stream: StreamEntry) => {
     if (!activeTarget) return;
@@ -8196,6 +8314,13 @@ export default function App() {
       if (!reResolve) { plainReload(); return; }
       const tgt = activeTarget!;
       const queryAddons = streamQueryAddons(addons);
+      // Always the addon fan-out, even for a video whose meta embeds its own
+      // streams (the detail page and Next-Up short-circuit on those; this must
+      // NOT). An embedded url is static, baked into the meta response, so it
+      // cannot mint the fresh link this attempt exists for: serving it here
+      // re-sends the url that just died and burns the last retry. An embedded
+      // source the fan-out does not offer finds no match below and takes the
+      // plain reload, which is the most it could have had anyway.
       console.info("[playback] auto-retry 2 - re-resolving the source for a fresh link");
       invoke<StreamFetchResult>("fetch_streams", {
         addons: queryAddons,
@@ -8350,6 +8475,9 @@ export default function App() {
    *  alongside the other next-up state, and on an in-place replay. */
   const [autoAdvanceCancelled, setAutoAdvanceCancelled] = useState(false);
   const onEosPlayNext = useCallback((auto: boolean) => {
+    // An advance already under way (see advancingRef) owns this press: a second
+    // one would count the streak twice and, for a skip, write its marks again.
+    if (advancingRef.current) return;
     autoAdvanceStreakRef.current = auto ? autoAdvanceStreakRef.current + 1 : 0;
     void onNextUpPlay();
   }, [onNextUpPlay]);
@@ -8357,6 +8485,7 @@ export default function App() {
   // "Skip to canon" from the Spotlight — same streak bookkeeping as Play Next,
   // routes through onNextUpSkip (History append + swap unchanged).
   const onEosSkipToCanon = useCallback((auto: boolean) => {
+    if (advancingRef.current) return;
     autoAdvanceStreakRef.current = auto ? autoAdvanceStreakRef.current + 1 : 0;
     void onNextUpSkip(auto);
   }, [onNextUpSkip]);
@@ -8380,6 +8509,8 @@ export default function App() {
     // dismiss for this episode instead. Escape is the worst case: the keydown
     // lands before the card mounts, so no cancel listener would ever see it.
     if (activeTarget) nextUpDismissedFor.current = activeTarget.id;
+    // Withdraws an advance still re-reading its stream, as the card's dismiss does.
+    advancingRef.current = null;
     // Dismissing the end card is someone being present, which is the only thing
     // the still-watching streak measures. Leaving it counting meant a viewer who
     // kept clicking through end cards still got told "Auto-play paused after a

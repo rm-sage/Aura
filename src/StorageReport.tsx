@@ -87,7 +87,7 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
     destructive: false,
   },
   {
-    prefix:      "aura:meta-cache:v1",
+    prefix:      "aura:meta-cache:v2",
     label:       "Meta detail cache",
     description: "Persisted MetaDetail responses (cast, runtime, episode lists) shared across Home, Calendar, Continue Watching, and Detail. 4-hour TTL for series and anime (they gain episodes as they air), 7 days for movies. Re-fetches lazily on use. Safe to clear.",
     destructive: false,

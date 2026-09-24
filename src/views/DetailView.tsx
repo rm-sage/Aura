@@ -26,7 +26,7 @@ import { electMetaAddons, isStreamProvider } from "../addonElection";
 import { isAnimeMeta, markAnimeId, typeLabel } from "../aiometadata";
 import { dedupedInvoke } from "../invokeDedupe";
 import { buildStreamMenu, type StreamMenuContext } from "../downloadsMenu";
-import { peekRichestCachedDetailById } from "../metaCache";
+import { getMetaDetail, keptWithoutStreams, peekRichestCachedDetailById, TTL_EMBEDDED_STREAMS_MS } from "../metaCache";
 import DetailHud from "../DetailHud";
 import { FactList, FactsBlock } from "../AnimeExtrasOverlay";
 import { resolveCourMalIds, type CourRef } from "../animeExtras";
@@ -1068,6 +1068,11 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // which re-set the same array), and depending on it restarted the whole meta
   // probe for nothing. This flips at most once, only in the case it guards.
   const addonsPending = addons.length === 0 && !addonsSettled;
+  // Which addon produced `detail`, and when. Its embedded per-video streams
+  // are re-read from that same addon once they are older than
+  // TTL_EMBEDDED_STREAMS_MS (see runStreamFetch). Written with every
+  // setDetail below, so it always describes the detail on screen.
+  const detailOriginRef = useRef<{ addon: AddonEntry; at: number } | null>(null);
   useEffect(() => {
     if (!metaAddon || addons.length === 0) {
       // Addons not loaded YET is not the same as none installed. After a
@@ -1114,6 +1119,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
           // while we keep looking for a better source.
           if (!bestSoFar) {
             bestSoFar = d;
+            detailOriginRef.current = { addon: a, at: Date.now() };
             setDetail(d);
           }
           // Diagnostic — surfaces what the addon returned for cast /
@@ -1153,6 +1159,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
           );
           const hasVideos = !!(d.videos && d.videos.length);
           if (!isEpisodicMeta || hasVideos) {
+            detailOriginRef.current = { addon: a, at: Date.now() };
             setDetail(d);
             return d;
           }
@@ -1322,8 +1329,32 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // `force` to bypass the in-memory cache. The wrapper effect below
   // drives the automatic fetch on target / addon change exactly as
   // before; `force` only matters for the manual refresh path.
+  //
+  // `detailVideos` is a dep for the embedded-streams check alone: a movie's
+  // target never becomes `activeVideo`, so without it a fan-out started
+  // before the meta landed would stand. The re-run is cheap either way (an
+  // in-flight fan-out is shared through dedupedInvoke, a finished one is a
+  // cache hit).
+  const detailVideos = detail?.videos;
+  // The latest re-read of the addon that produced `detail`, with when it
+  // answered. `detail` is only as fresh as the page, and an embedded url can
+  // be a signed or debrid link that has since expired, so a Refresh, or a run
+  // over an embed older than TTL_EMBEDDED_STREAMS_MS, re-reads the meta. The
+  // answer is parked here rather than swapped into `detail`, which would
+  // re-run every effect keyed on it (arcs, anime extras, credits) for the
+  // videos' streams. Valid only over the `detail.videos` it was read against:
+  // a newer meta load supersedes it.
+  const [refreshedEmbedded, setRefreshedEmbedded] = useState<{
+    of: VideoEntry[] | undefined;
+    videos: VideoEntry[];
+    at: number;
+  } | null>(null);
+  // Bumped by every run, so a re-read that fails after a later run took over
+  // does not end that run's spinner.
+  const streamRunRef = useRef(0);
   const runStreamFetch = useCallback((force = false): (() => void) | void => {
     let cancelled = false;
+    const run = ++streamRunRef.current;
     // `openEpisodeSnapshot` is the explicitly-requested episode (e.g. a
     // watch-party "Join & sync" lands here with the room's videoKey). Use the
     // mount-stable SNAPSHOT (not the live prop, which is consumed/nulled on
@@ -1337,14 +1368,91 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
       return;
     }
     const targetId = isEpisodic ? episodicId! : meta.id;
-    setStreamsLoading(true);
-    setStreams([]);
-    setStreamMeta({ errors: [], warnings: [], info: [], stats: [] });
     const queryAddons = streamQueryAddons(addons);
     // Dedupe key: addon-url set + media_type + targetId. The set is
     // hashed via JSON to keep it stable; addon order doesn't change
     // within a render batch so JSON.stringify is sufficient.
     const queryKey = `streams:${meta.media_type}:${targetId}:${queryAddons.map((a) => a.url).join("|")}`;
+
+    // Embedded per-video streams (Stremio parity): a meta addon may put a
+    // `streams` list on the Video object itself, and Stremio then shows those
+    // INSTEAD of the addon fan-out for that video. Checked before the stream
+    // cache so a fan-out cached for this target cannot shadow them. The
+    // lookup by id covers every target that is not `activeVideo` (a movie's
+    // own id, and the resume / party ids, which are bare strings). Never
+    // written to the stream cache, which holds fan-out results under the
+    // fan-out key: parked there, an embedded list would be served as a
+    // fan-out by any later run that does not see it, until a Refresh cleared
+    // it. It is rebuilt from the meta on every run instead.
+    //
+    // The page's own `detail` decides WHETHER this video embeds, and the
+    // latest re-read of its addon decides WHAT it embeds now. A re-read with
+    // no streams for it means the fan-out, but not for good: every Refresh
+    // re-reads again for as long as the page's own detail embeds.
+    const pageEmbedded = activeVideo?.id === targetId && activeVideo.streams?.length
+      ? activeVideo.streams
+      : detailVideos?.find((v) => v.id === targetId)?.streams;
+    if (pageEmbedded && pageEmbedded.length > 0) {
+      const origin = detailOriginRef.current;
+      const reread = refreshedEmbedded && refreshedEmbedded.of === detailVideos ? refreshedEmbedded : null;
+      const embedded = reread ? reread.videos.find((v) => v.id === targetId)?.streams ?? [] : pageEmbedded;
+      const readAt = reread?.at ?? origin?.at ?? Date.now();
+      const stale = embedded.length > 0 && Date.now() - readAt >= TTL_EMBEDDED_STREAMS_MS;
+      if (origin && (force || stale)) {
+        // Re-read the SAME addon the list came from, not the elected walk: a
+        // later provider answering without an embed says nothing about this
+        // one. Through metaCache with no age allowance, which also hands
+        // Next-Up and the source switcher the fresh links. The answer lands
+        // in `refreshedEmbedded`, whose change re-runs this fetch for the
+        // current target and ends the spinner. Only a real answer counts:
+        // when the addon fails (null, the stripped copy metaCache keeps over
+        // a failed refetch, or a series answer with no episode list), the
+        // list already shown stays. With the fan-out standing in, that
+        // fan-out owns the spinner, so a failure here leaves it alone.
+        const of = detailVideos;
+        void getMetaDetail(origin.addon, meta.media_type, meta.id, 0)
+          .catch(() => null)
+          .then((d) => {
+            if (!d || keptWithoutStreams(d) || (isEpisodic && !d.videos?.length)) {
+              if (force && embedded.length > 0 && streamRunRef.current === run) setStreamsLoading(false);
+              return;
+            }
+            const videos = d.videos ?? [];
+            // A Refresh that finds the embed gone falls back to the fan-out,
+            // and that must be a fresh one too, not the stream cache's.
+            if (force && embedded.length > 0 && !videos.find((v) => v.id === targetId)?.streams?.length) {
+              streamCacheDelete(queryKey);
+            }
+            setRefreshedEmbedded({ of, videos, at: Date.now() });
+          });
+        if (embedded.length > 0) {
+          // Refresh spins over the rows until the answer lands. An aged list
+          // shows at once instead, with no spinner, and the re-read's rows
+          // replace it.
+          if (force) {
+            setStreamsLoading(true);
+          } else {
+            setStreams(embedded);
+            setStreamMeta({ errors: [], warnings: [], info: [], stats: [] });
+            setStreamsLoading(false);
+          }
+          return;
+        }
+        // A Refresh while the fan-out stands in: refresh that below as well,
+        // and let the re-read swap the embedded rows back in if they return.
+        // The run that swap starts supersedes this one, so the fan-out's
+        // late answer cannot overwrite them (see `run` below).
+      } else if (embedded.length > 0) {
+        setStreams(embedded);
+        setStreamMeta({ errors: [], warnings: [], info: [], stats: [] });
+        setStreamsLoading(false);
+        return;
+      }
+    }
+
+    setStreamsLoading(true);
+    setStreams([]);
+    setStreamMeta({ errors: [], warnings: [], info: [], stats: [] });
 
     // 3-minute in-memory cache — closing and reopening the same
     // episode shouldn't refetch from every addon. Skips both the
@@ -1369,13 +1477,17 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
       }
     }
 
+    // `run` as well as `cancelled`: a Refresh's run is never cancelled (the
+    // event handler has nowhere to keep the cleanup), so without it a force
+    // fan-out that lands after a later run would overwrite that run's list.
+    const superseded = () => cancelled || streamRunRef.current !== run;
     dedupedInvoke(queryKey, () => invoke<StreamFetchResult>("fetch_streams", {
       addons:    queryAddons,
       mediaType: meta.media_type,
       id:        targetId,
     }))
       .then((r) => {
-        if (cancelled) return;
+        if (superseded()) return;
         streamCachePut(queryKey, r);
         // Tauri may emit either the new `{ streams, metadata }` envelope or
         // (for the brief moment a stale dev build is running) the legacy
@@ -1390,9 +1502,9 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
         }
       })
       .catch(() => {})
-      .finally(() => { if (!cancelled) setStreamsLoading(false); });
+      .finally(() => { if (!superseded()) setStreamsLoading(false); });
     return () => { cancelled = true; };
-  }, [addons, meta.id, meta.media_type, activeVideo, resumeVideoId, isEpisodic, openEpisodeSnapshot]);
+  }, [addons, meta.id, meta.media_type, activeVideo, detailVideos, refreshedEmbedded, resumeVideoId, isEpisodic, openEpisodeSnapshot]);
 
   useEffect(() => runStreamFetch(), [runStreamFetch]);
 

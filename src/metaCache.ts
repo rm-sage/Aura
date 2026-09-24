@@ -30,8 +30,10 @@ import { electMetaAddons } from "./addonElection";
 //     browser's 5 MB quota and Aura's other localStorage tenants). A
 //     media player rarely needs more than a few hundred distinct detail
 //     records live, and the synchronous peeks stay correct at this size.
+//   • A meta whose videos embed their own streams stays in memory only,
+//     and for minutes rather than hours (see TTL_EMBEDDED_STREAMS_MS).
 //   • Storage management UI in Settings → Storage exposes a clear
-//     button keyed to `aura:meta-cache:v1` for surgical invalidation.
+//     button keyed to `aura:meta-cache:v2` for surgical invalidation.
 // ---------------------------------------------------------------------------
 
 interface CacheEntry {
@@ -68,10 +70,60 @@ function ttlFor(mediaType: string): number {
   const t = mediaType.toLowerCase();
   return (t === "series" || t === "anime") ? TTL_EPISODIC_MS : TTL_MOVIE_MS;
 }
+/** A meta whose videos embed their own streams lives no longer than
+ *  DetailView's in-memory stream cache. Those urls can be expiring debrid or
+ *  signed links, and Next-Up and the source switcher read them from here, so
+ *  a 4 h (series) or 7 d (movie) hit would hand a dead link to auto-advance,
+ *  which the stream-lost retry cannot mend (it re-resolves from the stream
+ *  addons, and an embedded url is not theirs). Such metas are rare, so the
+ *  refetches this costs are too. */
+export const TTL_EMBEDDED_STREAMS_MS = 3 * 60 * 1000;
+function embedsStreams(detail: MetaDetail | null): boolean {
+  return !!detail && Array.isArray(detail.videos)
+    && detail.videos.some((x) => (x.streams?.length ?? 0) > 0);
+}
+/** Copies of metas that embedded streams, kept over a failed refetch with
+ *  those streams stripped (see getMetaDetail), each mapped to when the meta it
+ *  was copied from was fetched. Keyed by object so the mark cannot leak into
+ *  the MetaDetail every other surface reads. */
+const strippedFrom = new WeakMap<MetaDetail, number>();
+function withoutEmbeddedStreams(detail: MetaDetail, fetchedAt: number): MetaDetail {
+  const kept: MetaDetail = {
+    ...detail,
+    videos: detail.videos.map((v) => {
+      const c = { ...v };
+      delete c.streams;
+      return c;
+    }),
+  };
+  strippedFrom.set(kept, fetchedAt);
+  return kept;
+}
+/** Whether `detail` is such a stripped copy: a failed refetch, not the
+ *  addon's answer. A caller that tells "the addon no longer embeds streams"
+ *  from "the addon did not answer" (DetailView's re-read) checks this. */
+export function keptWithoutStreams(detail: MetaDetail): boolean {
+  return strippedFrom.has(detail);
+}
+/** The life of one cached answer: a null's, a meta's by media type, or the
+ *  embedded-streams cap when its videos carry any. A stripped copy lives a
+ *  null's, since it too stands for a failed fetch that should be retried
+ *  soon. */
+function ttlForEntry(mediaType: string, detail: MetaDetail | null): number {
+  if (!detail || strippedFrom.has(detail)) return TTL_NULL_MS;
+  const ttl = ttlFor(mediaType);
+  return embedsStreams(detail) ? Math.min(ttl, TTL_EMBEDDED_STREAMS_MS) : ttl;
+}
 /** Used by the hydrate / persist pruning paths: anything older than the
  *  longest TTL is unconditionally stale regardless of media type. */
 const TTL_MAX_MS = TTL_MOVIE_MS;
-const STORAGE_KEY = "aura:meta-cache:v1";
+/** v2 since embedded per-video streams. A v1 blob was written by a build
+ *  that never parsed `streams`, so a meta that embeds them was stored
+ *  without them, and restoring one would serve that copy as a fresh hit for
+ *  hours (days, for a movie) while the detail page showed the embed. Removed
+ *  once at hydrate; the cost is one cold refetch per meta. */
+const STORAGE_KEY = "aura:meta-cache:v2";
+const LEGACY_STORAGE_KEY = "aura:meta-cache:v1";
 const MAX_ENTRIES = 800;
 const PERSIST_DEBOUNCE_MS = 500;
 
@@ -99,6 +151,7 @@ function noteYear(id: string, detail: MetaDetail | null, ts: number) {
 // install. Stale entries (past TTL) are dropped during hydration so
 // they don't push live entries out under the size cap.
 (function hydrate() {
+  try { localStorage.removeItem(LEGACY_STORAGE_KEY); } catch { /* ignore */ }
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return;
@@ -120,6 +173,22 @@ function noteYear(id: string, detail: MetaDetail | null, ts: number) {
     }
   } catch { /* corrupt blob — start fresh */ }
 })();
+
+/** Whether an entry may be written to disk. A meta whose videos embed their
+ *  own streams never is: those can be expiring debrid or signed links (which
+ *  is also why it lives only TTL_EMBEDDED_STREAMS_MS in memory), and a long
+ *  anime embedding a few per episode would eat this blob's budget and push
+ *  unrelated metas out. Skipped WHOLE rather than written with the streams
+ *  stripped: hydrate would restore a stripped copy as a fresh hit, and after a
+ *  restart Next-Up and the source switcher would then miss streams the detail
+ *  page (which always fetches live) still shows. Skipped, a warm start misses
+ *  and fetches live like the detail page does. For the same reason the
+ *  stripped copy a failed refetch keeps (getMetaDetail) never is. Both disk
+ *  writes (persistNow, reclaimSpace) filter on this; nulls are never
+ *  persisted either. */
+function persistable([, v]: [string, CacheEntry]): boolean {
+  return !!v.detail && !embedsStreams(v.detail) && !strippedFrom.has(v.detail);
+}
 
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 function schedulePersist() {
@@ -149,8 +218,7 @@ function persistNow() {
     // storm-suppression artifact with a 90 s in-memory life — it must
     // never survive a restart, or a transient miss would re-stick the
     // "No extra details available" state across sessions.
-    const persistable = [...cache.entries()].filter(([, v]) => v.detail);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(persistable));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify([...cache.entries()].filter(persistable)));
   } catch (e) {
     // On a quota hit, drop our oldest half and rewrite a smaller blob (the
     // in-memory cache keeps working). A serialization failure is just skipped.
@@ -177,7 +245,7 @@ function reclaimSpace() {
     if (idPart) noteYear(idPart, v.detail, v.ts);
   }
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify([...cache.entries()]));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify([...cache.entries()].filter(persistable)));
   } catch {
     // Still over quota even halved — drop the on-disk cache entirely so the
     // writer that triggered us gets the most room.
@@ -209,7 +277,7 @@ export async function getMetaDetail(
   const key = cacheKey(addon.url, mediaType, id);
   const hit = cache.get(key);
   if (hit) {
-    const ttl = hit.detail ? ttlFor(mediaType) : TTL_NULL_MS;
+    const ttl = ttlForEntry(mediaType, hit.detail);
     const limit = maxAgeMs !== undefined ? Math.min(ttl, maxAgeMs) : ttl;
     if (Date.now() - hit.ts < limit) return hit.detail;
   }
@@ -229,14 +297,35 @@ export async function getMetaDetail(
   // re-attempt eventually.
   const detail = fetched && fetched.name ? fetched : null;
   // Except over an answer still inside its normal TTL. Only a `maxAgeMs`
-  // recheck (libraryArtRetry) refetches one of those, and an empty result
-  // there (a network blip, an addon timeout) must not evict it: that would
-  // hide it from every peek for TTL_NULL_MS and drop it from disk. Re-read
-  // after the await so a named answer a concurrent caller just wrote is kept
-  // too. Only a named answer overwrites.
+  // recheck (libraryArtRetry, DetailView's Refresh) refetches one of those,
+  // and an empty result there (a network blip, an addon timeout) must not
+  // evict it: that would hide it from every peek for TTL_NULL_MS and drop it
+  // from disk. Re-read after the await so a named answer a concurrent caller
+  // just wrote is kept too. Only a named answer overwrites.
+  //
+  // A meta that embeds streams is past its life after TTL_EMBEDDED_STREAMS_MS,
+  // but only its streams are presumed dead then, not its episode list. So a
+  // failed refetch of one still inside its media-type TTL keeps the meta with
+  // the streams stripped, re-stamped so it no longer counts as embedding.
+  // Nulling it instead hid the whole meta from every peek, and made Next-Up's
+  // resolver miss the next episode for a title only that addon resolves,
+  // which latches the card off for the rest of the episode. Callers fall back
+  // to the stream fan-out for the stripped copy's videos. It lives a null's
+  // TTL, so the addon is retried as soon as it would have been; it is never
+  // persisted; and a failure past the original meta's media-type TTL nulls
+  // it like any other entry.
   const cur = cache.get(key);
-  if (!detail && cur?.detail && Date.now() - cur.ts < ttlFor(mediaType)) {
-    return cur.detail;
+  if (!detail && cur?.detail) {
+    const now = Date.now();
+    if (now - cur.ts < ttlForEntry(mediaType, cur.detail)) return cur.detail;
+    const fetchedAt = strippedFrom.get(cur.detail) ?? cur.ts;
+    if (now - fetchedAt < ttlFor(mediaType)
+        && (strippedFrom.has(cur.detail) || embedsStreams(cur.detail))) {
+      const kept = strippedFrom.has(cur.detail) ? cur.detail : withoutEmbeddedStreams(cur.detail, fetchedAt);
+      cache.set(key, { detail: kept, ts: now });
+      bumpMetaCacheVersion();
+      return kept;
+    }
   }
   const ts = Date.now();
   cache.set(key, { detail, ts });
@@ -264,17 +353,19 @@ export async function getMetaDetail(
  *  resolve to the first NAMED answer instead of null. For surfaces that also
  *  read the meta-level fields (name, poster, released) and would lose them
  *  on a null. Off by default, which keeps the first-usable walk exactly as
- *  it was for every other caller. */
+ *  it was for every other caller.
+ *
+ *  `maxAgeMs`: getMetaDetail's, for every provider the walk reaches. */
 export async function getMetaDetailFallback(
   addons: AddonEntry[],
   mediaType: string,
   id: string,
-  opts?: { keepThin?: boolean },
+  opts?: { keepThin?: boolean; maxAgeMs?: number },
 ): Promise<MetaDetail | null> {
   const isEpisodic = mediaType === "series" || mediaType === "anime";
   let thin: MetaDetail | null = null;
   for (const a of electMetaAddons(addons, mediaType, id)) {
-    const d = await getMetaDetail(a, mediaType, id);
+    const d = await getMetaDetail(a, mediaType, id, opts?.maxAgeMs);
     if (!d) continue;
     // For series, prefer a response with videos populated — otherwise
     // the segmented-bar caller has nothing to render.
@@ -424,7 +515,7 @@ export function peekFreshestPostersByIds(ids: Iterable<string>): Map<string, str
 }
 
 /** Drop everything — useful as a last-resort cache buster. Wired to
- *  the Storage section in Settings via the `aura:meta-cache:v1`
+ *  the Storage section in Settings via the `aura:meta-cache:v2`
  *  localStorage key, but also exposed here for "refresh metadata"
  *  actions that want to invalidate without touching localStorage. */
 export function clearMetaCache(): void {

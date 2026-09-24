@@ -205,6 +205,18 @@ export function findPreviousEpisode(
  * Scoped through `streamQueryAddons` so auto-advance queries exactly the
  * addons the switcher and the detail page do.
  *
+ * Embedded per-video streams come first (Stremio parity): when `video`
+ * carries its own `streams`, those replace the fan-out, exactly as on the
+ * detail page, and the answer is their first entry, unfiltered like the
+ * fan-out's. Checked before the addon gates, since a meta addon can embed
+ * streams for a title no stream addon covers. Callers pass the VideoEntry
+ * they already hold; without one (or for a different id) the fan-out runs.
+ * Every caller takes it from metaCache, which keeps a meta that embeds
+ * streams for minutes only, so the url handed back is about as fresh as a
+ * fan-out answer rather than hours old. A pick that is held before it plays
+ * (the Next-Up card's, made mid-episode) is re-read at play time by App's
+ * advanceToEpisode.
+ *
  * Returns null when no playable stream is available - callers should
  * surface a soft toast in that case ("No streams found for next
  * episode") rather than silently ignore.
@@ -213,7 +225,10 @@ export async function pickFirstStreamForEpisode(
   addons: AddonEntry[],
   mediaType: string,
   episodeId: string,
+  video: VideoEntry | null = null,
 ): Promise<StreamEntry | null> {
+  const embedded = video && video.id === episodeId ? video.streams : undefined;
+  if (embedded && embedded.length > 0) return embedded[0];
   if (!addons || addons.length === 0) return null;
   if (!mediaType || !episodeId) return null;
   const queryAddons = streamQueryAddons(addons);
@@ -298,7 +313,7 @@ export async function resolveCanonSkipTarget(
   if (!isFillerOrRecap(nextEp)) return null;
   const canon = findNextEpisode(detail, currentEpisodeId, now, "both");
   if (!canon || canon.id === nextEp.id) return null;
-  const stream = await pickFirstStreamForEpisode(addons, mediaType, canon.id);
+  const stream = await pickFirstStreamForEpisode(addons, mediaType, canon.id, canon);
   if (!stream) return null;
   return { episode: canon, stream, skipped: spanBetween(detail, currentEpisodeId, canon.id, now) };
 }
