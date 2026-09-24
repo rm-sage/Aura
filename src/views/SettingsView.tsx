@@ -1,7 +1,9 @@
 // Aura - © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from "react";
+import {
+  createContext, useState, useEffect, useLayoutEffect, useCallback, useContext, useId, useMemo, useRef,
+} from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { checkForUpdatePlugin, downloadAndInstallUpdatePlugin } from "../updaterPlugin";
@@ -38,7 +40,7 @@ import {
   saveAuraSettings,
   type AuraSettings,
 } from "../auraSettings";
-import { isCatalogProvider, isSearchProvider, isStreamProvider } from "../addonElection";
+import { isHomeSource, isSearchProvider, isStreamProvider } from "../addonElection";
 import { showAppToast } from "../AppToast";
 import { openExternalUrl } from "../externalUrl";
 import { encodeQr } from "../qrCode";
@@ -171,6 +173,146 @@ function matchesSettingRow(query: string, label: string, description: string): b
   });
 }
 
+// ---------------------------------------------------------------------------
+// Advanced settings
+//
+// "Show advanced settings" (AuraSettings.showAdvancedSettings, the switch
+// under the search box) hides the provider overrides and the power-user rows.
+// What hides is one of two UNITS:
+//   • a whole Section, when its TOC leaf is marked `advanced` (TOC_GROUPS).
+//     The TOC asks the same question through tocLeafShown, so an entry and
+//     its section can never disagree about being there, and the scrollspy
+//     never lands on an anchor that is not on screen.
+//   • an <AdvancedOnly> block inside an ordinary Section: a row plus the
+//     divider that separates it from its neighbour, so hiding it leaves no
+//     stray rule behind.
+// With the switch off, a unit is:
+//   • rendered and tagged "Advanced" in a section a deep link
+//     (aura:open-settings) opened during this visit to Settings;
+//   • MOUNTED but `hidden` while a search is active, because the search walks
+//     the DOM for [data-settings-row] and can only match a row that exists.
+//     A unit holding a match (its `data-advanced-id`, collected by that walk)
+//     is shown and tagged; the rest stay hidden. This is why every searchable
+//     row keeps the data-settings-* attributes on its outermost element.
+//   • otherwise not rendered at all, so none of its effects or IPC run,
+//     UNLESS it was on screen earlier in this visit (the query has since
+//     cleared, or the switch went off): then it stays mounted and `hidden`
+//     (useLatchedUnitState), so what it had in flight survives.
+// Neither a search nor a deep link writes the persisted switch.
+// ---------------------------------------------------------------------------
+
+interface AdvancedView {
+  /** The persisted "Show advanced settings" switch. */
+  show: boolean;
+  /** A settings search query is active. */
+  searching: boolean;
+  /** `data-advanced-id` of every unit holding a search match. */
+  hits: ReadonlySet<string>;
+  /** Sections a deep link opened since the user came to Settings. */
+  revealed: ReadonlySet<string>;
+}
+
+const NO_IDS: ReadonlySet<string> = new Set();
+
+const AdvancedViewContext = createContext<AdvancedView>({
+  show: true, searching: false, hits: NO_IDS, revealed: NO_IDS,
+});
+/** True inside a unit that is on screen only because of a search or a deep
+ *  link, so its rows carry the "Advanced" tag. */
+const AdvancedMarkContext = createContext(false);
+/** The enclosing Section's id, for AdvancedOnly's deep-link check. */
+const SectionIdContext = createContext<string | undefined>(undefined);
+
+type AdvancedUnitState = "shown" | "marked" | "hidden" | "absent";
+
+function advancedUnitState(
+  adv: AdvancedView, unitId: string, sectionId: string | undefined,
+): AdvancedUnitState {
+  if (adv.show) return "shown";
+  if (sectionId !== undefined && adv.revealed.has(sectionId)) return "marked";
+  if (!adv.searching) return "absent";
+  return adv.hits.has(unitId) ? "marked" : "hidden";
+}
+
+/** A unit that has been on screen (shown or marked) stays MOUNTED, `hidden`,
+ *  for the rest of this visit to Settings where it would otherwise go absent.
+ *  Unmounting throws away component state mid-flight: an Optional Components
+ *  download's progress, after which a remount offers the same download again
+ *  while the first is still writing, or a half-typed API key. SettingsView
+ *  unmounts when the user leaves, which ends the latch, and a unit never on
+ *  screen is never latched, so a plain visit still renders none of them. */
+function useLatchedUnitState(state: AdvancedUnitState): AdvancedUnitState {
+  const [latched, setLatched] = useState(false);
+  // Set during render (React's pattern for state derived from props): React
+  // re-renders before committing, so the latch is in place before the unit
+  // could ever go absent.
+  if (!latched && (state === "shown" || state === "marked")) setLatched(true);
+  return state === "absent" && latched ? "hidden" : state;
+}
+
+function AdvancedPill() {
+  return (
+    <span className="ml-2 inline-block align-middle px-1.5 py-0.5 rounded leading-none
+                     text-[9px] font-mono font-medium uppercase tracking-wider
+                     bg-ln-accent/15 text-ln-accent/90 border border-ln-accent/30">
+      Advanced
+    </span>
+  );
+}
+
+/** Goes inline after a row's label: the "Advanced" tag while the row's unit
+ *  is on screen only because of a search or a deep link, else nothing. */
+function AdvancedTag() {
+  return useContext(AdvancedMarkContext) ? <AdvancedPill /> : null;
+}
+
+/** Advanced rows inside an ordinary Section (see the block comment above).
+ *  The wrapper repeats the Section body's `space-y-5`, so its children space
+ *  exactly as they would unwrapped, and a `hidden` wrapper drops out of the
+ *  outer spacing. Put the row's separating divider inside it too. */
+function AdvancedOnly({ children }: { children: React.ReactNode }) {
+  const adv = useContext(AdvancedViewContext);
+  const sectionId = useContext(SectionIdContext);
+  const unitId = useId();
+  const state = useLatchedUnitState(advancedUnitState(adv, unitId, sectionId));
+  if (state === "absent") return null;
+  return (
+    <div className="space-y-5" data-advanced-id={unitId} hidden={state === "hidden"}>
+      <AdvancedMarkContext.Provider value={state === "marked"}>
+        {children}
+      </AdvancedMarkContext.Provider>
+    </div>
+  );
+}
+
+/** The pill switch: SettingToggle's control, and the page's own "Show
+ *  advanced settings" switch, so the two cannot drift apart. */
+function ToggleSwitch({
+  value, onChange, disabled = false,
+}: {
+  value: boolean;
+  onChange: (v: boolean) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      onClick={() => { if (!disabled) onChange(!value); }}
+      disabled={disabled}
+      role="switch"
+      aria-checked={value}
+      className={`relative w-10 h-6 rounded-full transition-colors duration-150 flex-shrink-0
+                  disabled:cursor-default
+                  ${value ? "bg-ln-accent/80" : "bg-white/15"}`}
+    >
+      <span
+        className="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white
+                   shadow-md transition-transform duration-150"
+        style={{ transform: value ? "translateX(16px)" : "translateX(0)" }}
+      />
+    </button>
+  );
+}
+
 interface DropdownProps {
   label: string;
   description: string;
@@ -195,7 +337,7 @@ function SettingDropdown({
     >
       <div>
         <div className="flex items-center gap-2">
-          <p className="text-white/75 text-sm font-medium">{label}</p>
+          <p className="text-white/75 text-sm font-medium">{label}<AdvancedTag /></p>
           {badge}
         </div>
         <p className="text-white/35 text-xs mt-0.5">{description}</p>
@@ -246,24 +388,10 @@ function SettingToggle({ label, description, value, onChange, disabled = false }
       data-settings-description={description}
     >
       <div className="flex-1 min-w-0">
-        <p className="text-white/75 text-sm font-medium">{label}</p>
+        <p className="text-white/75 text-sm font-medium">{label}<AdvancedTag /></p>
         <p className="text-white/35 text-xs mt-0.5">{description}</p>
       </div>
-      <button
-        onClick={() => { if (!disabled) onChange(!value); }}
-        disabled={disabled}
-        role="switch"
-        aria-checked={value}
-        className={`relative w-10 h-6 rounded-full transition-colors duration-150 flex-shrink-0
-                    disabled:cursor-default
-                    ${value ? "bg-ln-accent/80" : "bg-white/15"}`}
-      >
-        <span
-          className="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white
-                     shadow-md transition-transform duration-150"
-          style={{ transform: value ? "translateX(16px)" : "translateX(0)" }}
-        />
-      </button>
+      <ToggleSwitch value={value} onChange={onChange} disabled={disabled} />
     </div>
   );
 }
@@ -345,7 +473,7 @@ function SettingText({
       data-settings-description={description}
     >
       <div className="flex items-center gap-2">
-        <p className="text-white/75 text-sm font-medium">{label}</p>
+        <p className="text-white/75 text-sm font-medium">{label}<AdvancedTag /></p>
         {badge}
       </div>
       <p className="text-white/35 text-xs -mt-1">{description}</p>
@@ -409,9 +537,14 @@ function SettingSlider({
   const span = Math.max(1, max - min);
   const frac = Math.max(0, Math.min(1, (value - min) / span));
   return (
-    <div className="space-y-2">
+    <div
+      className="space-y-2"
+      data-settings-row=""
+      data-settings-label={label}
+      data-settings-description={description}
+    >
       <div className="flex items-baseline justify-between gap-3">
-        <p className="text-white/75 text-sm font-medium">{label}</p>
+        <p className="text-white/75 text-sm font-medium">{label}<AdvancedTag /></p>
         <span className="text-white/65 text-[12px] font-mono tabular-nums">
           {value}{suffix ?? ""}
         </span>
@@ -638,8 +771,8 @@ function SortableAddonRow({
 // multi-picker so the user can reorder even the primary entry.
 //
 // Optional `filter` narrows the picker to a subset of addons (e.g. only those
-// declaring the `meta` / `addon_catalog` resources, so the Catalog Providers
-// list isn't cluttered with stream-only or subtitle-only addons).
+// that may serve catalogs, the Home election's own rule, so the Catalog
+// Providers list isn't cluttered with subtitle-only addons).
 // ---------------------------------------------------------------------------
 
 interface UnifiedHomePickerProps {
@@ -702,7 +835,12 @@ function HeroCatalogPicker({
   const browseable = (manifest?.catalogs ?? []).filter((c) => !c.is_search_only);
 
   return (
-    <div className="space-y-2">
+    <div
+      className="space-y-2"
+      data-settings-row=""
+      data-settings-label="Hero Carousel Source"
+      data-settings-description="Catalog whose items rotate in the Home hero band. Hidden-from-home catalogs are valid picks, useful for surfacing curated lists (AIOMetadata's AI Recommendations, mdblist, Trakt user lists) as the hero source. Default falls back to your first browseable row. Choose Disable to hide the hero entirely."
+    >
       <p className="text-white/85 text-sm font-medium">Hero Carousel Source</p>
       <p className="text-white/40 text-xs leading-relaxed">
         Catalog whose items rotate in the Home hero band. Hidden-from-home
@@ -827,9 +965,14 @@ function UnifiedHomeSourcesPicker({
     .sort((a, b) => a.name.localeCompare(b.name));
 
   return (
-    <div className="space-y-2">
+    <div
+      className="space-y-2"
+      data-settings-row=""
+      data-settings-label={title}
+      data-settings-description={description}
+    >
       <div>
-        <p className="text-white/75 text-sm font-medium">{title}</p>
+        <p className="text-white/75 text-sm font-medium">{title}<AdvancedTag /></p>
         <p className="text-white/35 text-xs mt-0.5">{description}</p>
       </div>
       {visibleAddons.length === 0 ? (
@@ -1269,36 +1412,43 @@ function BackupRestoreSection({
           guard the destructive path. */}
       <LocalDataBackupsSubsection />
 
-      <div className="h-px bg-white/6" />
-
       {/* ── Danger zone: full reset ──
           Wipes both the backend AppSettings (theme / audio / subs /
           keybindings / discord / scrobble / etc.) AND the localStorage
           AuraSettings (catalog / stream / search provider URL lists).
           Two-click confirm: first click arms; second click within 5 s
-          actually fires. Auto-disarms after 5 s. */}
-      <div className="space-y-2">
-        <p className="text-rose-300/95 text-sm font-medium">Reset all settings</p>
-        <p className="text-white/45 text-xs leading-relaxed">
-          Wipes every setting back to defaults: theme, audio / subtitle prefs,
-          keybindings, Discord RPC, anime-skip modes, and your catalog /
-          stream / search provider lists. Installed addons themselves are not
-          removed. There is no undo.
-        </p>
-        <button
-          type="button"
-          onClick={resetArmed ? confirmReset : armReset}
-          className={[
-            "px-3 py-1.5 rounded-lg text-[12px] font-medium tracking-wide",
-            "border transition-colors",
-            resetArmed
-              ? "border-rose-300/60 bg-rose-500/25 text-rose-100 hover:bg-rose-500/35"
-              : "border-rose-400/30 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20",
-          ].join(" ")}
+          actually fires. Auto-disarms after 5 s. Behind Show advanced
+          settings; export / import above stays visible. */}
+      <AdvancedOnly>
+        <div className="h-px bg-white/6" />
+        <div
+          className="space-y-2"
+          data-settings-row=""
+          data-settings-label="Reset all settings"
+          data-settings-description="Wipes every setting back to defaults: theme, audio / subtitle prefs, keybindings, Discord RPC, anime-skip modes, and your catalog / stream / search provider lists. Installed addons themselves are not removed. There is no undo."
         >
-          {resetArmed ? "Click again within 5 s to confirm" : "Reset all settings"}
-        </button>
-      </div>
+          <p className="text-rose-300/95 text-sm font-medium">Reset all settings<AdvancedTag /></p>
+          <p className="text-white/45 text-xs leading-relaxed">
+            Wipes every setting back to defaults: theme, audio / subtitle prefs,
+            keybindings, Discord RPC, anime-skip modes, and your catalog /
+            stream / search provider lists. Installed addons themselves are not
+            removed. There is no undo.
+          </p>
+          <button
+            type="button"
+            onClick={resetArmed ? confirmReset : armReset}
+            className={[
+              "px-3 py-1.5 rounded-lg text-[12px] font-medium tracking-wide",
+              "border transition-colors",
+              resetArmed
+                ? "border-rose-300/60 bg-rose-500/25 text-rose-100 hover:bg-rose-500/35"
+                : "border-rose-400/30 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20",
+            ].join(" ")}
+          >
+            {resetArmed ? "Click again within 5 s to confirm" : "Reset all settings"}
+          </button>
+        </div>
+      </AdvancedOnly>
     </Section>
   );
 }
@@ -2014,6 +2164,11 @@ function KeyringApiKeyInput({
 // Polls `sync_status` every 30 s while mounted, re-fetches immediately
 // on `aura:settings-changed` + `aura:session-changed`, and on any
 // user-triggered push/pull/purge action.
+//
+// Only the guest card is always on screen. The loading state and the
+// connected panel (namespace table, Push / Pull / Clear) are behind Show
+// advanced settings, so each branch returns its own trailing divider: a
+// hidden panel takes its separator from the release-feed toggle with it.
 // ---------------------------------------------------------------------------
 
 interface SyncNamespaceStatus {
@@ -2131,62 +2286,68 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
   // ── Guest state ───────────────────────────────────────────────────
   if (!authKey || (status && !status.connected)) {
     return (
-      <div
-        data-settings-row=""
-        data-settings-label="Cloud Sync"
-        data-settings-description="Aura Cloud sync - requires Stremio sign-in to enable per-account state sync."
-        className="space-y-2"
-      >
-        <p className="text-white/55 text-sm leading-relaxed">
-          Cloud Sync requires a Stremio account. Sign in to keep your
-          settings, queue, manual watched marks, skipped episodes, watch
-          history, recent searches, per-title preferences, AniList ID cache,
-          and notifications in sync across devices.
-        </p>
-        <p className="text-white/35 text-xs leading-relaxed">
-          Your Stremio library and resume positions are not synced here -
-          Stremio's own cloud handles those. The Aura proxy never sees your
-          account id or your auth_key; a SHA-256 hash computed locally is what
-          authenticates each request.
-        </p>
-        <button
-          type="button"
-          onClick={() => window.dispatchEvent(new CustomEvent("aura:show-login"))}
-          className="mt-1 px-3 py-1.5 rounded-lg border border-ln-accent/45 bg-ln-accent/15
-                     text-ln-accent text-[12px] font-semibold tracking-wide
-                     hover:bg-ln-accent/25 transition-colors"
+      <>
+        <div
+          data-settings-row=""
+          data-settings-label="Cloud Sync"
+          data-settings-description="Aura Cloud sync - requires Stremio sign-in to enable per-account state sync."
+          className="space-y-2"
         >
-          Sign in to Stremio
-        </button>
-      </div>
+          <p className="text-white/55 text-sm leading-relaxed">
+            Cloud Sync requires a Stremio account. Sign in to keep your
+            settings, queue, manual watched marks, skipped episodes, watch
+            history, recent searches, per-title preferences, AniList ID cache,
+            and notifications in sync across devices.
+          </p>
+          <p className="text-white/35 text-xs leading-relaxed">
+            Your Stremio library and resume positions are not synced here -
+            Stremio's own cloud handles those. The Aura proxy never sees your
+            account id or your auth_key; a SHA-256 hash computed locally is what
+            authenticates each request.
+          </p>
+          <button
+            type="button"
+            onClick={() => window.dispatchEvent(new CustomEvent("aura:show-login"))}
+            className="mt-1 px-3 py-1.5 rounded-lg border border-ln-accent/45 bg-ln-accent/15
+                       text-ln-accent text-[12px] font-semibold tracking-wide
+                       hover:bg-ln-accent/25 transition-colors"
+          >
+            Sign in to Stremio
+          </button>
+        </div>
+        <div className="h-px bg-white/6 my-3" />
+      </>
     );
   }
 
   // ── Loading / error state ─────────────────────────────────────────
   if (!status) {
     return (
-      <div
-        data-settings-row=""
-        data-settings-label="Cloud Sync"
-        data-settings-description="Aura Cloud sync status loading."
-        className="text-white/40 text-xs"
-      >
-        {errored ? (
-          <div className="space-y-2">
-            <p>Couldn't reach Aura Cloud.</p>
-            <button
-              type="button"
-              onClick={() => void refresh()}
-              className="px-3 py-1.5 rounded-md border border-white/15 bg-white/5 text-white/75
-                         hover:bg-white/10 transition-colors text-[11px] font-medium"
-            >
-              Retry
-            </button>
-          </div>
-        ) : (
-          <p>Loading sync status…</p>
-        )}
-      </div>
+      <AdvancedOnly>
+        <div
+          data-settings-row=""
+          data-settings-label="Cloud Sync"
+          data-settings-description="Aura Cloud sync status loading."
+          className="text-white/40 text-xs"
+        >
+          {errored ? (
+            <div className="space-y-2">
+              <p>Couldn't reach Aura Cloud.<AdvancedTag /></p>
+              <button
+                type="button"
+                onClick={() => void refresh()}
+                className="px-3 py-1.5 rounded-md border border-white/15 bg-white/5 text-white/75
+                           hover:bg-white/10 transition-colors text-[11px] font-medium"
+              >
+                Retry
+              </button>
+            </div>
+          ) : (
+            <p>Loading sync status…<AdvancedTag /></p>
+          )}
+        </div>
+        <div className="h-px bg-white/6 my-3" />
+      </AdvancedOnly>
     );
   }
 
@@ -2202,137 +2363,141 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
   const quotaPctTotal = status.quota > 0 ? (status.total_size / status.quota) * 100 : 0;
 
   return (
-    <div
-      data-settings-row=""
-      data-settings-label="Cloud Sync"
-      data-settings-description="Per-namespace last pull / push / size; Pull now and Clear cloud sync data actions."
-      className="space-y-3"
-    >
-      {/* Top status line */}
-      <div className="flex items-center justify-between gap-3 text-[12px]">
-        <span className="text-white/75 font-medium">
-          {lastSyncMs ? `Last activity ${formatAgo(tickNow - lastSyncMs)}` : "Connected - no data yet"}
-        </span>
-        <span className="text-white/35 font-mono tabular-nums">
-          {formatBytes(status.total_size)} / {formatBytes(status.quota)}
-        </span>
-      </div>
+    <AdvancedOnly>
+      <div
+        data-settings-row=""
+        data-settings-label="Cloud Sync"
+        data-settings-description="Per-namespace last pull / push / size; Pull now and Clear cloud sync data actions."
+        className="space-y-3"
+      >
+        {/* Top status line */}
+        <div className="flex items-center justify-between gap-3 text-[12px]">
+          <span className="text-white/75 font-medium">
+            {lastSyncMs ? `Last activity ${formatAgo(tickNow - lastSyncMs)}` : "Connected - no data yet"}
+            <AdvancedTag />
+          </span>
+          <span className="text-white/35 font-mono tabular-nums">
+            {formatBytes(status.total_size)} / {formatBytes(status.quota)}
+          </span>
+        </div>
 
-      {/* Approaching-quota hint */}
-      {quotaPctTotal >= 95 && (
-        <p className="text-amber-300/85 text-[11px]">
-          Approaching the {formatBytes(status.quota)} per-account quota. Consider clearing old data via the destructive action below.
-        </p>
-      )}
+        {/* Approaching-quota hint */}
+        {quotaPctTotal >= 95 && (
+          <p className="text-amber-300/85 text-[11px]">
+            Approaching the {formatBytes(status.quota)} per-account quota. Consider clearing old data via the destructive action below.
+          </p>
+        )}
 
-      {/* Namespace table */}
-      {status.namespaces.length > 0 && (
-        <div className="rounded-lg border border-white/8 divide-y divide-white/6">
-          {status.namespaces.map((ns) => {
-            const ago = ns.updated_at ? formatAgo(tickNow - ns.updated_at * 1000) : "Never";
-            const sizeKb = ns.size != null ? formatBytes(ns.size) : "-";
-            const overQuota = ns.size != null && ns.size > 1024 * 1024 * 0.95;
-            return (
-              <div key={ns.name}
-                   className="flex items-center justify-between gap-3 px-3 py-2 text-[12px]">
-                <div className="min-w-0 flex-1">
-                  <p className="text-white/85 font-medium truncate">
-                    {NAMESPACE_LABEL[ns.name] ?? ns.name}
-                  </p>
-                  <p className="text-white/40 text-[10.5px] mt-0.5">
-                    {ago} · <span className={overQuota ? "text-amber-300/80" : ""}>{sizeKb}</span>
-                  </p>
+        {/* Namespace table */}
+        {status.namespaces.length > 0 && (
+          <div className="rounded-lg border border-white/8 divide-y divide-white/6">
+            {status.namespaces.map((ns) => {
+              const ago = ns.updated_at ? formatAgo(tickNow - ns.updated_at * 1000) : "Never";
+              const sizeKb = ns.size != null ? formatBytes(ns.size) : "-";
+              const overQuota = ns.size != null && ns.size > 1024 * 1024 * 0.95;
+              return (
+                <div key={ns.name}
+                     className="flex items-center justify-between gap-3 px-3 py-2 text-[12px]">
+                  <div className="min-w-0 flex-1">
+                    <p className="text-white/85 font-medium truncate">
+                      {NAMESPACE_LABEL[ns.name] ?? ns.name}
+                    </p>
+                    <p className="text-white/40 text-[10.5px] mt-0.5">
+                      {ago} · <span className={overQuota ? "text-amber-300/80" : ""}>{sizeKb}</span>
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() => void handlePushNamespace(ns.name)}
+                    className="px-2 py-1 rounded-md text-[10.5px] font-medium tracking-wide
+                               bg-white/5 text-white/65 border border-white/10
+                               hover:bg-white/10 hover:text-white
+                               disabled:opacity-40 disabled:cursor-not-allowed
+                               transition-colors"
+                  >
+                    {busyAction === "push" ? "…" : "Push"}
+                  </button>
                 </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Actions row */}
+        <div className="flex items-center gap-2 pt-1">
+          <button
+            type="button"
+            disabled={busyAction !== null}
+            onClick={() => void handlePullNow()}
+            className="px-3 py-1.5 rounded-lg border border-ln-accent/40 bg-ln-accent/15
+                       text-ln-accent text-[11.5px] font-semibold tracking-wide
+                       hover:bg-ln-accent/25 transition-colors
+                       disabled:opacity-50 disabled:cursor-progress"
+          >
+            {busyAction === "pull" ? "Pulling…" : "Pull now"}
+          </button>
+          <button
+            type="button"
+            disabled={busyAction !== null || status.namespaces.length === 0}
+            onClick={() => setPurgeConfirm(true)}
+            className="px-3 py-1.5 rounded-lg border border-rose-400/35 bg-rose-500/10
+                       text-rose-300/95 text-[11.5px] font-medium tracking-wide
+                       hover:bg-rose-500/20 hover:border-rose-400/50
+                       disabled:opacity-40 disabled:cursor-not-allowed
+                       transition-colors"
+          >
+            Clear cloud sync data
+          </button>
+        </div>
+
+        {/* Privacy footer */}
+        <p className="text-white/35 text-[10.5px] leading-relaxed pt-2 border-t border-white/6">
+          Cloud Sync uses a derived hash of your Stremio account id (SHA-256,
+          computed locally, never sent) as the storage key. Neither your raw
+          account id nor your auth_key ever reaches the proxy. Your Stremio
+          library and resume positions are not synced here - Stremio's own cloud
+          handles those.
+        </p>
+
+        {/* Purge confirm modal */}
+        {purgeConfirm && (
+          <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm">
+            <div className="max-w-[400px] mx-4 rounded-2xl bg-black/90 border border-white/12 p-5 space-y-3
+                            shadow-[0_18px_42px_-12px_rgba(0,0,0,0.75)]">
+              <h3 className="text-white/95 text-sm font-semibold tracking-wide">Clear cloud sync data?</h3>
+              <p className="text-white/55 text-xs leading-relaxed">
+                This permanently deletes all your synced data on the Aura Cloud proxy.
+                Local state stays intact - your settings, queue, and marks remain on
+                this device. Other devices will pull this device's state on their next
+                sync.
+              </p>
+              <div className="flex items-center justify-end gap-2 pt-2">
                 <button
                   type="button"
-                  disabled={busyAction !== null}
-                  onClick={() => void handlePushNamespace(ns.name)}
-                  className="px-2 py-1 rounded-md text-[10.5px] font-medium tracking-wide
-                             bg-white/5 text-white/65 border border-white/10
-                             hover:bg-white/10 hover:text-white
-                             disabled:opacity-40 disabled:cursor-not-allowed
+                  onClick={() => setPurgeConfirm(false)}
+                  className="px-3 py-1.5 rounded-lg border border-white/15 bg-white/5
+                             text-white/75 text-[11px] font-medium hover:bg-white/10
                              transition-colors"
                 >
-                  {busyAction === "push" ? "…" : "Push"}
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handlePurge()}
+                  className="px-3 py-1.5 rounded-lg border border-rose-400/45 bg-rose-500/20
+                             text-rose-200 text-[11px] font-semibold hover:bg-rose-500/30
+                             transition-colors"
+                >
+                  Clear data
                 </button>
               </div>
-            );
-          })}
-        </div>
-      )}
-
-      {/* Actions row */}
-      <div className="flex items-center gap-2 pt-1">
-        <button
-          type="button"
-          disabled={busyAction !== null}
-          onClick={() => void handlePullNow()}
-          className="px-3 py-1.5 rounded-lg border border-ln-accent/40 bg-ln-accent/15
-                     text-ln-accent text-[11.5px] font-semibold tracking-wide
-                     hover:bg-ln-accent/25 transition-colors
-                     disabled:opacity-50 disabled:cursor-progress"
-        >
-          {busyAction === "pull" ? "Pulling…" : "Pull now"}
-        </button>
-        <button
-          type="button"
-          disabled={busyAction !== null || status.namespaces.length === 0}
-          onClick={() => setPurgeConfirm(true)}
-          className="px-3 py-1.5 rounded-lg border border-rose-400/35 bg-rose-500/10
-                     text-rose-300/95 text-[11.5px] font-medium tracking-wide
-                     hover:bg-rose-500/20 hover:border-rose-400/50
-                     disabled:opacity-40 disabled:cursor-not-allowed
-                     transition-colors"
-        >
-          Clear cloud sync data
-        </button>
-      </div>
-
-      {/* Privacy footer */}
-      <p className="text-white/35 text-[10.5px] leading-relaxed pt-2 border-t border-white/6">
-        Cloud Sync uses a derived hash of your Stremio account id (SHA-256,
-        computed locally, never sent) as the storage key. Neither your raw
-        account id nor your auth_key ever reaches the proxy. Your Stremio
-        library and resume positions are not synced here - Stremio's own cloud
-        handles those.
-      </p>
-
-      {/* Purge confirm modal */}
-      {purgeConfirm && (
-        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm">
-          <div className="max-w-[400px] mx-4 rounded-2xl bg-black/90 border border-white/12 p-5 space-y-3
-                          shadow-[0_18px_42px_-12px_rgba(0,0,0,0.75)]">
-            <h3 className="text-white/95 text-sm font-semibold tracking-wide">Clear cloud sync data?</h3>
-            <p className="text-white/55 text-xs leading-relaxed">
-              This permanently deletes all your synced data on the Aura Cloud proxy.
-              Local state stays intact - your settings, queue, and marks remain on
-              this device. Other devices will pull this device's state on their next
-              sync.
-            </p>
-            <div className="flex items-center justify-end gap-2 pt-2">
-              <button
-                type="button"
-                onClick={() => setPurgeConfirm(false)}
-                className="px-3 py-1.5 rounded-lg border border-white/15 bg-white/5
-                           text-white/75 text-[11px] font-medium hover:bg-white/10
-                           transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => void handlePurge()}
-                className="px-3 py-1.5 rounded-lg border border-rose-400/45 bg-rose-500/20
-                           text-rose-200 text-[11px] font-semibold hover:bg-rose-500/30
-                           transition-colors"
-              >
-                Clear data
-              </button>
             </div>
           </div>
-        </div>
-      )}
-    </div>
+        )}
+      </div>
+      <div className="h-px bg-white/6 my-3" />
+    </AdvancedOnly>
   );
 }
 
@@ -3241,16 +3406,31 @@ function SettingsSearchInput({
   );
 }
 
+/** A section whose TOC leaf is marked `advanced` is itself an advanced unit
+ *  (see "Advanced settings" above): absent, hidden, or shown and tagged at
+ *  its title, never half-rendered. */
 function Section({ id, title, children }: { id?: string; title: string; children: React.ReactNode }) {
+  const adv = useContext(AdvancedViewContext);
+  const advanced = id !== undefined && ADVANCED_SECTION_IDS.has(id);
+  const state = useLatchedUnitState(advanced ? advancedUnitState(adv, id, id) : "shown");
+  if (state === "absent") return null;
   return (
-    <section id={id} className="space-y-4 scroll-mt-6">
-      <h2 className="text-white/40 text-xs font-semibold tracking-[0.1em] uppercase">
-        {title}
-      </h2>
-      <div className="space-y-5 bg-white/3 border border-white/8 rounded-2xl px-5 py-5">
-        {children}
-      </div>
-    </section>
+    <SectionIdContext.Provider value={id}>
+      <section
+        id={id}
+        className="space-y-4 scroll-mt-6"
+        data-advanced-id={advanced ? id : undefined}
+        hidden={state === "hidden"}
+      >
+        <h2 className="text-white/40 text-xs font-semibold tracking-[0.1em] uppercase">
+          {title}
+          {state === "marked" && <AdvancedPill />}
+        </h2>
+        <div className="space-y-5 bg-white/3 border border-white/8 rounded-2xl px-5 py-5">
+          {children}
+        </div>
+      </section>
+    </SectionIdContext.Provider>
   );
 }
 
@@ -3280,7 +3460,13 @@ function GroupHeader({ label }: { label: string }) {
 // <Section> below.
 // ---------------------------------------------------------------------------
 
-type TocLeaf  = { id: string; label: string };
+type TocLeaf  = {
+  id: string;
+  label: string;
+  /** Every row in the section is behind Show advanced settings, so the
+   *  section and this leaf hide together (tocLeafShown / Section). */
+  advanced?: true;
+};
 type TocGroup = {
   key: string;
   label: string;
@@ -3308,9 +3494,9 @@ const TOC_GROUPS: TocGroup[] = [
     key: "browse",
     label: "Browsing",
     sections: [
-      { id: "sec-catalog",     label: "Catalog Providers" },
+      { id: "sec-catalog",     label: "Catalog Providers", advanced: true },
       { id: "sec-streams",     label: "Stream Providers" },
-      { id: "sec-search",      label: "Search Providers" },
+      { id: "sec-search",      label: "Search Providers", advanced: true },
       { id: "sec-spoilers", label: "Spoilers" },
       { id: "sec-hover-panel", label: "Hover Meta Panel" },
       { id: "sec-open-links", label: "Open Links" },
@@ -3344,17 +3530,19 @@ const TOC_GROUPS: TocGroup[] = [
       { id: "sec-discord",         label: "Discord Rich Presence" },
       { id: "sec-scrobble",        label: "Trakt & AniList" },
       { id: "sec-cloud-sync",      label: "Cloud Sync" },
-      { id: "sec-api-keys",        label: "API Keys" },
-      { id: "sec-crash-reporting", label: "Crash Reporting" },
+      { id: "sec-api-keys",        label: "API Keys", advanced: true },
+      { id: "sec-crash-reporting", label: "Crash Reporting", advanced: true },
     ],
   },
   {
+    // Every leaf is advanced, so the whole group (and its page header)
+    // disappears with the switch off.
     key: "system",
     label: "System",
     sections: [
-      { id: "sec-performance", label: "Performance" },
-      { id: "sec-storage",     label: "Storage" },
-      { id: "sec-optional-components", label: "Optional Components" },
+      { id: "sec-performance", label: "Performance", advanced: true },
+      { id: "sec-storage",     label: "Storage", advanced: true },
+      { id: "sec-optional-components", label: "Optional Components", advanced: true },
     ],
   },
   {
@@ -3365,6 +3553,18 @@ const TOC_GROUPS: TocGroup[] = [
     ],
   },
 ];
+
+const ADVANCED_SECTION_IDS: ReadonlySet<string> = new Set(
+  TOC_GROUPS.flatMap((g) => g.sections.filter((s) => s.advanced).map((s) => s.id)),
+);
+
+/** Whether a TOC leaf is listed: the same unit rule its Section renders by,
+ *  so the TOC and the scrollspy only ever point at a section on screen. */
+function tocLeafShown(leaf: TocLeaf, adv: AdvancedView): boolean {
+  if (!leaf.advanced) return true;
+  const state = advancedUnitState(adv, leaf.id, leaf.id);
+  return state === "shown" || state === "marked";
+}
 
 /** Fast ease-out rAF scroll of `scrollRoot` so `el` is brought into view -
  *  roughly 1.6x faster than native scrollIntoView({ behavior: "smooth" }),
@@ -3408,6 +3608,14 @@ function fastScrollToSettingsEl(
 
 interface SettingsTocProps {
   scrollRoot: HTMLDivElement | null;
+  /** TOC_GROUPS narrowed to what is on screen (tocLeafShown), with any group
+   *  left empty dropped. Drives both the list and the scrollspy. */
+  groups: TocGroup[];
+  /** The "Show advanced settings" switch, rendered under the search. */
+  advanced?: {
+    value: boolean;
+    onChange: (v: boolean) => void;
+  };
   /** Search state - when present, the TOC renders the search input
    *  underneath its list of contents so the page header can stay
    *  free of sticky chrome. The aside itself is `sticky top-6`, which
@@ -3422,10 +3630,10 @@ interface SettingsTocProps {
   };
 }
 
-function SettingsToc({ scrollRoot, search }: SettingsTocProps) {
+function SettingsToc({ scrollRoot, groups, advanced, search }: SettingsTocProps) {
   // Always-expanded layout - the collapsing UX added complexity that the
   // user found more annoying than helpful. Every leaf is visible at once.
-  const [activeId, setActiveId] = useState<string>(TOC_GROUPS[0].sections[0].id);
+  const [activeId, setActiveId] = useState<string>(groups[0]?.sections[0]?.id ?? "");
 
   const scrollToSection = (id: string) => {
     if (!scrollRoot) return;
@@ -3457,9 +3665,13 @@ function SettingsToc({ scrollRoot, search }: SettingsTocProps) {
   //      is microsecond-cheap and means async section mounts (backend
   //      resolution, conditional renders) join the spy walk the moment
   //      they appear.
+  // The walk covers only the listed leaves (`groups`), and re-primes when
+  // they change, so Show advanced settings can never leave the highlight on
+  // a section that just went away. A `hidden` section is skipped as well:
+  // its rect is all zeros, which would read as "scrolled past".
   useEffect(() => {
     if (!scrollRoot) return;
-    const ALL_SECTIONS = TOC_GROUPS.flatMap((g) => g.sections);
+    const ALL_SECTIONS = groups.flatMap((g) => g.sections);
 
     let raf: number | null = null;
     const update = () => {
@@ -3470,7 +3682,7 @@ function SettingsToc({ scrollRoot, search }: SettingsTocProps) {
       let firstFound: string | null = null;
       for (const s of ALL_SECTIONS) {
         const el = scrollRoot.querySelector<HTMLElement>(`#${s.id}`);
-        if (!el) continue;
+        if (!el || el.hidden) continue;
         if (firstFound == null) firstFound = s.id;
         const top = el.getBoundingClientRect().top;
         if (top <= threshold) {
@@ -3501,7 +3713,7 @@ function SettingsToc({ scrollRoot, search }: SettingsTocProps) {
       scrollRoot.removeEventListener("scroll", onScroll);
       window.removeEventListener("resize", onScroll);
     };
-  }, [scrollRoot]);
+  }, [scrollRoot, groups]);
 
   return (
     <nav className="flex flex-col max-h-[calc(100vh-6rem)] text-[13px] leading-snug select-none">
@@ -3513,7 +3725,7 @@ function SettingsToc({ scrollRoot, search }: SettingsTocProps) {
         Contents
       </p>
       <ul className="space-y-2.5">
-        {TOC_GROUPS.map((g) => {
+        {groups.map((g) => {
           const isActiveGroup = g.sections.some((s) => s.id === activeId);
           // Flatten when the group has exactly one sub-section AND its
           // label is the same as the header - drops the redundant
@@ -3576,6 +3788,18 @@ function SettingsToc({ scrollRoot, search }: SettingsTocProps) {
             onStepMatch={search.onStepMatch}
             compact
           />
+          {/* Beside the search on purpose: a search reaches the advanced
+              rows whether or not this is on (see "Advanced settings"). The
+              label wraps the switch, so clicking the text flips it too. */}
+          {advanced && (
+            <label
+              className="flex items-center justify-between gap-3 pt-1.5 cursor-pointer"
+              title="Show the provider overrides and power-user settings"
+            >
+              <span className="text-white/60 text-[12px] leading-snug">Show advanced settings</span>
+              <ToggleSwitch value={advanced.value} onChange={advanced.onChange} />
+            </label>
+          )}
         </div>
       )}
     </nav>
@@ -4512,10 +4736,18 @@ export default function SettingsView({ addons, session }: Props) {
     };
   }, []);
 
-  // Persist localStorage settings whenever they change
+  // Persist localStorage settings whenever they change. A change to Show
+  // advanced settings alone raises no toast: it is a view preference, not a
+  // setting, and hydratedRef only covers the hydration case. (A no-op patch,
+  // which changes no key, still toasts as it always did.)
+  const prevAuraRef = useRef(aura);
   useEffect(() => {
     saveAuraSettings(aura);
-    if (hydratedRef.current) queueSavedToast();
+    const prev = prevAuraRef.current;
+    prevAuraRef.current = aura;
+    const changed = (Object.keys(aura) as (keyof AuraSettings)[]).filter((k) => aura[k] !== prev[k]);
+    const viewPrefOnly = changed.length > 0 && changed.every((k) => k === "showAdvancedSettings");
+    if (hydratedRef.current && !viewPrefOnly) queueSavedToast();
   }, [aura, queueSavedToast]);
 
   // Load backend settings on mount
@@ -4606,6 +4838,15 @@ export default function SettingsView({ addons, session }: Props) {
   const themeOptions: { value: ThemeId; label: string }[] =
     (Object.entries(THEME_LABELS) as [ThemeId, string][]).map(([value, label]) => ({ value, label }));
 
+  // ── Show advanced settings ────────────────────────────────────────────
+  // The persisted switch lives in `aura`; the two temporary reveals do not,
+  // so neither a search nor a deep link ever writes it (see "Advanced
+  // settings" at the top of this file). `revealedSections` is component
+  // state on purpose: SettingsView unmounts when the user leaves Settings,
+  // which is exactly when a deep link's reveal should end.
+  const [revealedSections, setRevealedSections] = useState<ReadonlySet<string>>(NO_IDS);
+  const [advancedHits, setAdvancedHits] = useState<ReadonlySet<string>>(NO_IDS);
+
   // Pre-compute the URL list shown in the Stream Providers picker. While
   // streamAddonUrls is null (the backward-compatible default), the picker
   // reflects "every stream addon is queried" by showing all of them as
@@ -4645,6 +4886,10 @@ export default function SettingsView({ addons, session }: Props) {
       // navigation to Settings (NavSidebar) doesn't re-scroll from a stale
       // hash. replaceState fires no `hashchange` and leaves no bare `#`.
       history.replaceState(null, "", window.location.pathname + window.location.search);
+      // Reveal the target's advanced rows (or the whole section, when it is
+      // an advanced one) until the user leaves Settings. The section renders
+      // on the next commit; the settle-window re-runs below reach it there.
+      setRevealedSections((prev) => (prev.has(id) ? prev : new Set(prev).add(id)));
       const scrollToTarget = () => {
         const el = scrollEl.querySelector<HTMLElement>(`#${window.CSS.escape(id)}`);
         if (el) el.scrollIntoView({ behavior: "auto", block: "start" });
@@ -4709,10 +4954,12 @@ export default function SettingsView({ addons, session }: Props) {
       setMatchCount(null);
       setMatchedIds([]);
       setCurrentMatchIdx(-1);
+      setAdvancedHits(NO_IDS);
       return;
     }
     let matches = 0;
     const matchedNow: string[] = [];
+    const hits = new Set<string>();
     rows.forEach((r, idx) => {
       const label       = r.getAttribute("data-settings-label") ?? "";
       const description = r.getAttribute("data-settings-description") ?? "";
@@ -4723,6 +4970,18 @@ export default function SettingsView({ addons, session }: Props) {
         // even if two settings happen to share a label.
         matchedNow.push(String(idx));
         r.classList.add("settings-row-matched");
+        // A match inside an advanced unit reveals the unit. With the switch
+        // off, every unit is mounted `hidden` while a query is active, so
+        // this walk sees its rows; the re-render this schedules (before
+        // paint) un-hides the ones that match. Hiding only toggles an
+        // attribute, so `matchedNow`'s DOM positions survive it.
+        for (
+          let unit = r.closest<HTMLElement>("[data-advanced-id]");
+          unit;
+          unit = unit.parentElement?.closest<HTMLElement>("[data-advanced-id]") ?? null
+        ) {
+          hits.add(unit.getAttribute("data-advanced-id") ?? "");
+        }
       } else {
         r.classList.remove("settings-row-matched");
       }
@@ -4730,6 +4989,11 @@ export default function SettingsView({ addons, session }: Props) {
     matchCountRef.current = matches;
     setMatchCount(matches);
     setMatchedIds(matchedNow);
+    // Keep the old Set when nothing changed, so a keystroke that reveals
+    // nothing new does not re-filter the TOC or re-arm its scrollspy.
+    setAdvancedHits((prev) => (
+      prev.size === hits.size && [...hits].every((h) => prev.has(h)) ? prev : hits
+    ));
     // Reset to the first match when the matched-list changes - the
     // user typically wants to start at the top of results.
     setCurrentMatchIdx(matchedNow.length > 0 ? 0 : -1);
@@ -4762,7 +5026,27 @@ export default function SettingsView({ addons, session }: Props) {
     });
   }, [matchedIds.length]);
 
+  const searching = searchQuery.trim().length > 0;
+  const advancedView = useMemo<AdvancedView>(() => ({
+    show: aura.showAdvancedSettings,
+    searching,
+    hits: advancedHits,
+    revealed: revealedSections,
+  }), [aura.showAdvancedSettings, searching, advancedHits, revealedSections]);
+  // What the TOC lists, and which page-level group headers render: a leaf
+  // goes when its section goes, and a group goes with its last leaf.
+  const tocGroups = useMemo(
+    () => TOC_GROUPS
+      .map((g) => ({ ...g, sections: g.sections.filter((s) => tocLeafShown(s, advancedView)) }))
+      .filter((g) => g.sections.length > 0),
+    [advancedView],
+  );
+  const shownGroups = new Set(tocGroups.map((g) => g.key));
+
+  // Sections and AdvancedOnly rows read the advanced view from context; the
+  // TOC takes its already-narrowed groups as a prop.
   return (
+    <AdvancedViewContext.Provider value={advancedView}>
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
       <div
         ref={scrollRef}
@@ -4804,6 +5088,11 @@ export default function SettingsView({ addons, session }: Props) {
           >
             <SettingsToc
               scrollRoot={scrollEl}
+              groups={tocGroups}
+              advanced={{
+                value: aura.showAdvancedSettings,
+                onChange: (v) => setLocal({ showAdvancedSettings: v }),
+              }}
               search={{
                 value: searchQuery,
                 onChange: setSearchQuery,
@@ -4843,17 +5132,25 @@ export default function SettingsView({ addons, session }: Props) {
               scrolls. Group separators below mirror the TOC groups
               so the page itself reads as the same hierarchy. */}
 
-          <GroupHeader label="Browsing" />
+          {/* A group header renders only while its TOC group lists a
+              section: with Show advanced settings off, System has none. */}
+          {shownGroups.has("browse") && <GroupHeader label="Browsing" />}
 
-          {/* Catalog providers - filtered to addons that actually serve
-              metadata or addon-catalog content so stream-only and
-              subtitle-only addons don't clutter the picker. */}
+          {/* Catalog providers - every control here overrides the automatic
+              election, so the whole section is advanced (TOC_GROUPS). The
+              Home picker lists what the automatic Home board can draw on
+              (isHomeSource, the election's own rule, AIOStreams included),
+              so an override can name anything the default board shows. A
+              saved entry it cannot list (a meta-only addon the older picker
+              allowed) is not shown here and does not hold the override in
+              force either (electHomeAddons), so removing every listed entry
+              always returns Home to the automatic board. */}
           <Section id="sec-catalog" title="Catalog Providers">
             <UnifiedHomeSourcesPicker
               addons={addons}
               primaryUrl={aura.defaultHomeAddonUrl}
               additionalUrls={aura.additionalHomeAddonUrls}
-              filter={isCatalogProvider}
+              filter={isHomeSource}
               onChange={(primary, additional) => setLocal({
                 defaultHomeAddonUrl: primary,
                 additionalHomeAddonUrls: additional,
@@ -4881,28 +5178,32 @@ export default function SettingsView({ addons, session }: Props) {
               actually queries. While streamAddonUrls is null (the
               backward-compatible default), every stream-resource addon is
               queried; the picker reflects that by showing all of them as
-              selected. The user's first edit commits a specific array. */}
+              selected. The user's first edit commits a specific array.
+              The picker is an override, so it is advanced; the formatter
+              toggle below it is not. */}
           <Section id="sec-streams" title="Stream Providers">
-            <UnifiedHomeSourcesPicker
-              addons={addons}
-              filter={isStreamProvider}
-              primaryUrl={effectiveStreamUrls[0] ?? null}
-              additionalUrls={effectiveStreamUrls.slice(1)}
-              onChange={(primary, additional) => {
-                const urls = [
-                  ...(primary ? [primary] : []),
-                  ...additional,
-                ];
-                setLocal({ streamAddonUrls: urls });
-              }}
-              title="Active Stream Providers"
-              description={
-                aura.streamAddonUrls === null
-                  ? "All installed stream addons are queried (default). Remove any addon to stop sending it stream-fetch requests."
-                  : "Drag to reorder. Only the listed addons are queried for streams; remove an entry to skip it on every lookup."
-              }
-            />
-            <div className="h-px bg-white/6" />
+            <AdvancedOnly>
+              <UnifiedHomeSourcesPicker
+                addons={addons}
+                filter={isStreamProvider}
+                primaryUrl={effectiveStreamUrls[0] ?? null}
+                additionalUrls={effectiveStreamUrls.slice(1)}
+                onChange={(primary, additional) => {
+                  const urls = [
+                    ...(primary ? [primary] : []),
+                    ...additional,
+                  ];
+                  setLocal({ streamAddonUrls: urls });
+                }}
+                title="Active Stream Providers"
+                description={
+                  aura.streamAddonUrls === null
+                    ? "All installed stream addons are queried (default). Remove any addon to stop sending it stream-fetch requests."
+                    : "Drag to reorder. Only the listed addons are queried for streams; remove an entry to skip it on every lookup."
+                }
+              />
+              <div className="h-px bg-white/6" />
+            </AdvancedOnly>
             <SettingToggle
               label="Aura stream formatting"
               description="Parse addon stream details into tidy chips (built for AIOStreams' TamTaro format). Turn off to show the addon's raw output, like Stremio. Also toggleable from the cog in the stream list, where Aura flags non-TamTaro output automatically."
@@ -4915,7 +5216,8 @@ export default function SettingsView({ addons, session }: Props) {
               Addons hit on a deliberate Enter search (the SearchView grouped
               results). Cost-tolerant: expensive AI providers belong here.
               Defaults to "all search-capable installed addons"; the first
-              user edit commits a concrete array. */}
+              user edit commits a concrete array. An override, so the whole
+              section is advanced (TOC_GROUPS). */}
           <Section id="sec-search" title="Search Providers">
             <UnifiedHomeSourcesPicker
               addons={addons}
@@ -5053,9 +5355,12 @@ export default function SettingsView({ addons, session }: Props) {
             />
           </Section>
 
-          <GroupHeader label="Playback" />
+          {shownGroups.has("playback") && <GroupHeader label="Playback" />}
 
-          {/* Video & Audio quality */}
+          {/* Video & Audio quality. Audio passthrough, both forward-buffer
+              sliders, the screenshot folder and motion interpolation are
+              behind Show advanced settings (<AdvancedOnly>); HDR mode and
+              peak nits stay visible by decision. */}
           {backend && (
             <Section id="sec-video-audio" title="Video & Audio">
               <SettingDropdown
@@ -5140,24 +5445,30 @@ export default function SettingsView({ addons, session }: Props) {
                   />
                 </>
               )}
-              <div className="h-px bg-white/6" />
-              <SettingToggle
-                label="Audio passthrough (bitstream)"
-                description="WASAPI exclusive mode + AC3/DTS/TrueHD bitstream output to an AVR or soundbar. Other audio apps will lose device access while Aura is open. Takes effect on next app restart."
-                value={backend.audio_passthrough}
-                onChange={(v) => patchBackend({ audio_passthrough: v })}
-              />
-              {backend.audio_passthrough && (
-                <p className="text-amber-400/75 text-xs mt-1">
-                  Restart Aura for audio passthrough to take effect.
-                </p>
-              )}
+              <AdvancedOnly>
+                <div className="h-px bg-white/6" />
+                <SettingToggle
+                  label="Audio passthrough (bitstream)"
+                  description="WASAPI exclusive mode + AC3/DTS/TrueHD bitstream output to an AVR or soundbar. Other audio apps will lose device access while Aura is open. Takes effect on next app restart."
+                  value={backend.audio_passthrough}
+                  onChange={(v) => patchBackend({ audio_passthrough: v })}
+                />
+                {backend.audio_passthrough && (
+                  <p className="text-amber-400/75 text-xs mt-1">
+                    Restart Aura for audio passthrough to take effect.
+                  </p>
+                )}
+              </AdvancedOnly>
               <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Loudness normalization"
                 description={
+                  // With the switch off the passthrough row above is not on
+                  // screen, so the copy names the switch that brings it back.
                   backend.audio_passthrough
-                    ? "Disabled while audio passthrough is active - bitstream output bypasses the audio filter chain. Turn passthrough off to use loudness normalization."
+                    ? aura.showAdvancedSettings
+                      ? "Disabled while audio passthrough is active - bitstream output bypasses the audio filter chain. Turn passthrough off to use loudness normalization."
+                      : "Disabled while audio passthrough is active - bitstream output bypasses the audio filter chain. To use loudness normalization, turn on Show advanced settings, then turn Audio passthrough off."
                     : "Evens out volume across sources so a quiet dialogue scene and a loud trailer sit at similar levels. Uses a real-time adaptive gain filter (mpv's dynaudnorm) that keeps working through seeks instead of re-settling after every skip. Installed when the player starts, so it applies from the first frame."
                 }
                 value={aura.loudnessNormalization && !backend.audio_passthrough}
@@ -5182,105 +5493,118 @@ export default function SettingsView({ addons, session }: Props) {
                 ]}
                 onChange={(v) => patchBackend({ trailer_quality: v ?? "1080" })}
               />
-              <div className="h-px bg-white/6" />
-              <SettingSlider
-                label="Forward buffer (seconds)"
-                description="How many seconds of video to buffer ahead (mpv cache + readahead). Higher = smoother on bursty / high-latency links, at the cost of RAM. Most people never need to touch this. Applies immediately, including to a stream that is already playing."
-                value={backend.cache_secs ?? 180}
-                min={30}
-                max={600}
-                suffix=" s"
-                onChange={(v) => {
-                  const ra = Math.max(5, Math.round(v * 0.67));
-                  patchBackend({ cache_secs: v, demuxer_readahead_secs: ra });
-                  invoke("apply_buffer_settings", { cacheSecs: v, readaheadSecs: ra, maxMib: backend.demuxer_max_mib ?? 768 }).catch(() => {});
-                }}
-              />
-              <div className="h-px bg-white/6" />
-              <SettingSlider
-                label="Forward buffer memory cap"
-                description="Hard ceiling on buffered-ahead RAM (mpv demuxer-max-bytes). The seconds value above is usually the binding limit; raise this only if 4K remuxes underrun mid-playback. Each step is real memory. Applies immediately."
-                value={backend.demuxer_max_mib ?? 768}
-                min={128}
-                max={2048}
-                suffix=" MiB"
-                onChange={(v) => {
-                  patchBackend({ demuxer_max_mib: v });
-                  invoke("apply_buffer_settings", { cacheSecs: backend.cache_secs ?? 180, readaheadSecs: backend.demuxer_readahead_secs ?? 120, maxMib: v }).catch(() => {});
-                }}
-              />
-              <div className="h-px bg-white/6" />
-              <div className="px-1 py-3" data-settings-label="Screenshot folder">
-                <p className="text-white/75 text-sm font-medium">Screenshot folder</p>
-                <p className="text-white/45 text-[12.5px] leading-snug mt-0.5 mb-2">
-                  Where the Screenshot key (default c) saves PNGs. Leave blank for the default Pictures\Aura folder.
-                </p>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    value={backend.screenshot_dir ?? ""}
-                    placeholder="Default: Pictures\Aura"
-                    onChange={(e) => patchBackend({ screenshot_dir: e.target.value })}
-                    className="flex-1 min-w-0 bg-white/[0.06] border border-white/10 rounded-lg px-3 py-2 text-[13px] text-white/85 placeholder:text-white/30 focus:outline-none focus:border-ln-accent/50"
-                  />
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      const picked = await invoke<string | null>("pick_folder").catch(() => null);
-                      if (picked) patchBackend({ screenshot_dir: picked });
-                    }}
-                    className="flex-shrink-0 px-3 py-2 rounded-lg text-[13px] text-white/85 bg-white/[0.08] hover:bg-white/[0.14] border border-white/10 transition-colors"
-                  >
-                    Browse
-                  </button>
-                  {(backend.screenshot_dir ?? "").trim() !== "" && (
+              <AdvancedOnly>
+                <div className="h-px bg-white/6" />
+                <SettingSlider
+                  label="Forward buffer (seconds)"
+                  description="How many seconds of video to buffer ahead (mpv cache + readahead). Higher = smoother on bursty / high-latency links, at the cost of RAM. Most people never need to touch this. Applies immediately, including to a stream that is already playing."
+                  value={backend.cache_secs ?? 180}
+                  min={30}
+                  max={600}
+                  suffix=" s"
+                  onChange={(v) => {
+                    const ra = Math.max(5, Math.round(v * 0.67));
+                    patchBackend({ cache_secs: v, demuxer_readahead_secs: ra });
+                    invoke("apply_buffer_settings", { cacheSecs: v, readaheadSecs: ra, maxMib: backend.demuxer_max_mib ?? 768 }).catch(() => {});
+                  }}
+                />
+              </AdvancedOnly>
+              <AdvancedOnly>
+                <div className="h-px bg-white/6" />
+                <SettingSlider
+                  label="Forward buffer memory cap"
+                  description="Hard ceiling on buffered-ahead RAM (mpv demuxer-max-bytes). The seconds value above is usually the binding limit; raise this only if 4K remuxes underrun mid-playback. Each step is real memory. Applies immediately."
+                  value={backend.demuxer_max_mib ?? 768}
+                  min={128}
+                  max={2048}
+                  suffix=" MiB"
+                  onChange={(v) => {
+                    patchBackend({ demuxer_max_mib: v });
+                    invoke("apply_buffer_settings", { cacheSecs: backend.cache_secs ?? 180, readaheadSecs: backend.demuxer_readahead_secs ?? 120, maxMib: v }).catch(() => {});
+                  }}
+                />
+              </AdvancedOnly>
+              <AdvancedOnly>
+                <div className="h-px bg-white/6" />
+                <div
+                  className="px-1 py-3"
+                  data-settings-row=""
+                  data-settings-label="Screenshot folder"
+                  data-settings-description="Where the Screenshot key (default c) saves PNGs. Leave blank for the default Pictures\Aura folder."
+                >
+                  <p className="text-white/75 text-sm font-medium">Screenshot folder<AdvancedTag /></p>
+                  <p className="text-white/45 text-[12.5px] leading-snug mt-0.5 mb-2">
+                    Where the Screenshot key (default c) saves PNGs. Leave blank for the default Pictures\Aura folder.
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={backend.screenshot_dir ?? ""}
+                      placeholder="Default: Pictures\Aura"
+                      onChange={(e) => patchBackend({ screenshot_dir: e.target.value })}
+                      className="flex-1 min-w-0 bg-white/[0.06] border border-white/10 rounded-lg px-3 py-2 text-[13px] text-white/85 placeholder:text-white/30 focus:outline-none focus:border-ln-accent/50"
+                    />
                     <button
                       type="button"
-                      onClick={() => patchBackend({ screenshot_dir: "" })}
-                      className="flex-shrink-0 px-3 py-2 rounded-lg text-[13px] text-white/55 hover:text-white hover:bg-white/[0.08] transition-colors"
+                      onClick={async () => {
+                        const picked = await invoke<string | null>("pick_folder").catch(() => null);
+                        if (picked) patchBackend({ screenshot_dir: picked });
+                      }}
+                      className="flex-shrink-0 px-3 py-2 rounded-lg text-[13px] text-white/85 bg-white/[0.08] hover:bg-white/[0.14] border border-white/10 transition-colors"
                     >
-                      Reset
+                      Browse
                     </button>
-                  )}
+                    {(backend.screenshot_dir ?? "").trim() !== "" && (
+                      <button
+                        type="button"
+                        onClick={() => patchBackend({ screenshot_dir: "" })}
+                        className="flex-shrink-0 px-3 py-2 rounded-lg text-[13px] text-white/55 hover:text-white hover:bg-white/[0.08] transition-colors"
+                      >
+                        Reset
+                      </button>
+                    )}
+                  </div>
                 </div>
-              </div>
-              <div className="h-px bg-white/6" />
-              <SettingToggle
-                label="Motion interpolation"
-                description="mpv's built-in GPU frame interpolation (video-sync=display-resample). Smooths low-frame-rate content (24 fps film, anime) on a high-refresh display. GPU-cheap. Tune the look with the kernel dropdown below. Applies to anime only - it is skipped on live-action, where it adds judder."
-                value={!!aura.motionInterpolation}
-                onChange={(v) => {
-                  // Persist ONLY - do not apply live from Settings. Interp is
-                  // anime-gated and this view has no active-target context, so
-                  // a live invoke here would enable interpolation on whatever
-                  // is currently playing (incl. live-action), bypassing the
-                  // gate. The per-load path (enabled && animeFlag) applies it
-                  // correctly on the next play; the in-player MoreMenu toggle
-                  // handles live changes for the anime that's actually on screen.
-                  setLocal({ motionInterpolation: v });
-                }}
-              />
-              <SettingDropdown
-                label="Interpolation kernel (smoothness)"
-                description="The tscale kernel - the smoothness dial. 'oversample' only fixes cadence judder and synthesises no in-between motion, so it looks barely interpolated (especially when your refresh rate is an exact multiple of the video fps). The blending kernels add visibly smoother motion with progressively more softening. Takes effect on the next stream you start; use the player's three-dots menu to change what is playing now."
-                value={aura.interpolationTscale ?? "mitchell"}
-                options={[
-                  { value: "oversample",  label: "Oversample - sharpest · judder-fix only (least obvious)" },
-                  { value: "catmull_rom", label: "Catmull-Rom - sharp · light smoothing" },
-                  { value: "mitchell",    label: "Mitchell - balanced smoothing (recommended)" },
-                  { value: "gaussian",    label: "Gaussian - smooth · soft" },
-                  { value: "bicubic",     label: "Bicubic - smoothest · softest" },
-                ]}
-                required
-                onChange={(v) => {
-                  const k = v || "mitchell";
-                  // Persist ONLY - see the Motion-interpolation toggle above.
-                  // Applying live here would push interpolation onto whatever
-                  // is playing without the anime gate; the kernel takes effect
-                  // on the next play via the gated load path.
-                  setLocal({ interpolationTscale: k });
-                }}
-              />
+              </AdvancedOnly>
+              <AdvancedOnly>
+                <div className="h-px bg-white/6" />
+                <SettingToggle
+                  label="Motion interpolation"
+                  description="mpv's built-in GPU frame interpolation (video-sync=display-resample). Smooths low-frame-rate content (24 fps film, anime) on a high-refresh display. GPU-cheap. Tune the look with the kernel dropdown below. Applies to anime only - it is skipped on live-action, where it adds judder."
+                  value={!!aura.motionInterpolation}
+                  onChange={(v) => {
+                    // Persist ONLY - do not apply live from Settings. Interp is
+                    // anime-gated and this view has no active-target context, so
+                    // a live invoke here would enable interpolation on whatever
+                    // is currently playing (incl. live-action), bypassing the
+                    // gate. The per-load path (enabled && animeFlag) applies it
+                    // correctly on the next play; the in-player MoreMenu toggle
+                    // handles live changes for the anime that's actually on screen.
+                    setLocal({ motionInterpolation: v });
+                  }}
+                />
+                <SettingDropdown
+                  label="Interpolation kernel (smoothness)"
+                  description="The tscale kernel - the smoothness dial. 'oversample' only fixes cadence judder and synthesises no in-between motion, so it looks barely interpolated (especially when your refresh rate is an exact multiple of the video fps). The blending kernels add visibly smoother motion with progressively more softening. Takes effect on the next stream you start; use the player's three-dots menu to change what is playing now."
+                  value={aura.interpolationTscale ?? "mitchell"}
+                  options={[
+                    { value: "oversample",  label: "Oversample - sharpest · judder-fix only (least obvious)" },
+                    { value: "catmull_rom", label: "Catmull-Rom - sharp · light smoothing" },
+                    { value: "mitchell",    label: "Mitchell - balanced smoothing (recommended)" },
+                    { value: "gaussian",    label: "Gaussian - smooth · soft" },
+                    { value: "bicubic",     label: "Bicubic - smoothest · softest" },
+                  ]}
+                  required
+                  onChange={(v) => {
+                    const k = v || "mitchell";
+                    // Persist ONLY - see the Motion-interpolation toggle above.
+                    // Applying live here would push interpolation onto whatever
+                    // is playing without the anime gate; the kernel takes effect
+                    // on the next play via the gated load path.
+                    setLocal({ interpolationTscale: k });
+                  }}
+                />
+              </AdvancedOnly>
             </Section>
           )}
 
@@ -5440,20 +5764,24 @@ export default function SettingsView({ addons, session }: Props) {
                 value={backend.skip_recap_mode}
                 onChange={(v) => patchBackend({ skip_recap_mode: v })}
               />
-              <div className="h-px bg-white/6" />
-              <SettingToggle
-                label="Treat mixed-OP as OP"
-                description="AniSkip's `mixed-op` results bundle a recap into the opening. This only controls whether they are labelled as an opening; either way they are handled with your OP mode."
-                value={backend.skip_treat_mixed_op_as_op}
-                onChange={(v) => patchBackend({ skip_treat_mixed_op_as_op: v })}
-              />
-              <div className="h-px bg-white/6" />
-              <SettingToggle
-                label="Automatic skip detection"
-                description="When AniSkip and chapters don't cover a series, infer the missing opening / ending with a quick on-device audio scan (ffmpeg silencedetect). It only scans the part that wasn't already detected (opening if no opening, ending if no ending). ffmpeg downloads once (~97 MB) the first time a series needs it. Turn off to disable the scan and that download. Per-type auto / prompt / off is still set above."
-                value={aura.autoSkipDetect}
-                onChange={(v) => setLocal({ autoSkipDetect: v })}
-              />
+              <AdvancedOnly>
+                <div className="h-px bg-white/6" />
+                <SettingToggle
+                  label="Treat mixed-OP as OP"
+                  description="AniSkip's `mixed-op` results bundle a recap into the opening. This only controls whether they are labelled as an opening; either way they are handled with your OP mode."
+                  value={backend.skip_treat_mixed_op_as_op}
+                  onChange={(v) => patchBackend({ skip_treat_mixed_op_as_op: v })}
+                />
+              </AdvancedOnly>
+              <AdvancedOnly>
+                <div className="h-px bg-white/6" />
+                <SettingToggle
+                  label="Automatic skip detection"
+                  description="When AniSkip and chapters don't cover a series, infer the missing opening / ending with a quick on-device audio scan (ffmpeg silencedetect). It only scans the part that wasn't already detected (opening if no opening, ending if no ending). ffmpeg downloads once (~97 MB) the first time a series needs it. Turn off to disable the scan and that download. Per-type auto / prompt / off is still set above."
+                  value={aura.autoSkipDetect}
+                  onChange={(v) => setLocal({ autoSkipDetect: v })}
+                />
+              </AdvancedOnly>
               <div className="h-px bg-white/6" />
               {/* Next-Up filler/recap skip - lives here because users
                   who care about OP/ED skipping typically also care
@@ -5506,7 +5834,7 @@ export default function SettingsView({ addons, session }: Props) {
             </Section>
           )}
 
-          <GroupHeader label="Appearance & Window" />
+          {shownGroups.has("appearance") && <GroupHeader label="Appearance & Window" />}
 
           {/* Theme */}
           <Section id="sec-appearance" title="Theme">
@@ -5613,7 +5941,7 @@ export default function SettingsView({ addons, session }: Props) {
             </Section>
           )}
 
-          <GroupHeader label="Integrations" />
+          {shownGroups.has("integrations") && <GroupHeader label="Integrations" />}
 
           {/* Discord Rich Presence */}
           {backend && (
@@ -5697,8 +6025,9 @@ export default function SettingsView({ addons, session }: Props) {
               the background; this section surfaces last-pull / last-
               push / size per namespace plus on-demand Pull / Purge. */}
           <Section id="sec-cloud-sync" title="Cloud Sync">
+            {/* Renders its own trailing divider: the connected panel is
+                advanced and takes the divider with it when hidden. */}
             <CloudSyncSection authKey={session?.auth_key ?? null} />
-            <div className="h-px bg-white/6 my-3" />
             {/* Release-search opt-in. Default on for signed-in users
                 per docs/release-search-spec.md §6.4. When off, the
                 desktop falls back to per-user addon probes for
@@ -5768,7 +6097,7 @@ export default function SettingsView({ addons, session }: Props) {
             </Section>
           )}
 
-          <GroupHeader label="System" />
+          {shownGroups.has("system") && <GroupHeader label="System" />}
 
           {/* Performance - rendering toggles that need a restart to
               take effect. Today: just hardware acceleration; future
@@ -5788,19 +6117,36 @@ export default function SettingsView({ addons, session }: Props) {
           {/* Storage - disk + localStorage cache inspection. Clear
               buttons remove individual entries; "user data" badge
               flags the destructive ones (manual marks, settings,
-              etc.). */}
+              etc.). Like everything in System it is advanced, and the
+              row attributes on the wrapper are what let a search find
+              and reveal it. */}
           <Section id="sec-storage" title="Storage">
-            <StorageReport />
+            <div
+              data-settings-row=""
+              data-settings-label="Storage"
+              data-settings-description="Disk files and localStorage entries Aura keeps, with their sizes and a Clear button for each. Clear caches or user data."
+            >
+              <StorageReport />
+            </div>
           </Section>
 
           {/* Optional Components - on-demand ffmpeg/ffprobe download. Not
               bundled (keeps ~314 MB out of every update); fetched here when
-              the user wants silence detection / casting transmux. */}
+              the user wants silence detection / casting transmux. Error
+              copy elsewhere (the trailer and cast failures) sends users
+              here to update yt-dlp or fetch FFmpeg, hence the searchable
+              row naming all three. */}
           <Section id="sec-optional-components" title="Optional Components">
-            <RuntimeComponentsSection />
+            <div
+              data-settings-row=""
+              data-settings-label="Optional Components"
+              data-settings-description="Download or update FFmpeg, FFprobe and yt-dlp: automatic skip detection, Live Subtitle Sync, casting transmux and Watch Trailer."
+            >
+              <RuntimeComponentsSection />
+            </div>
           </Section>
 
-          <GroupHeader label="Backup & Restore" />
+          {shownGroups.has("backup") && <GroupHeader label="Backup & Restore" />}
 
           {/* Backup & Restore - portable settings export/import.
               Only addon-INDEPENDENT fields round-trip (theme / audio /
@@ -5843,5 +6189,6 @@ export default function SettingsView({ addons, session }: Props) {
         </div>{/* /grid */}
       </div>
     </div>
+    </AdvancedViewContext.Provider>
   );
 }

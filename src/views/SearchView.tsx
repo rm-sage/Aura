@@ -48,6 +48,9 @@ function runDedupedAddonSearch(addon: AddonEntry, query: string): Promise<Search
 interface Props {
   /** The addons to search, in order: electSearchAddons' output. */
   addons: AddonEntry[];
+  /** Every installed addon. Read only by the no-providers warning, which has
+   *  to know what the Search Providers override left out. */
+  installedAddons: AddonEntry[];
   query: string;
   onSelectMeta?: (meta: MetaPreview) => void;
 }
@@ -71,7 +74,7 @@ interface AddonSearchSlot {
   groups: SearchGroup[];
 }
 
-function SearchViewBody({ addons, query, onSelectMeta }: Props) {
+function SearchViewBody({ addons, installedAddons, query, onSelectMeta }: Props) {
   const [slots, setSlots] = useState<AddonSearchSlot[] | null>(null);
   const lastQueryRef = useRef<string>("");
 
@@ -179,15 +182,13 @@ function SearchViewBody({ addons, query, onSelectMeta }: Props) {
             </div>
           )}
 
-          {/* No search providers active (the resolved set is empty — the
-              user disabled all in Settings, or no search-capable addon is
-              installed). Point them at Search Providers. */}
+          {/* No search providers active (the resolved set is empty: no
+              search-capable addon is installed, or the Search Providers
+              override leaves every one out). The warning points at the
+              Addons page, or at Search Providers when the override is why. */}
           {slots && slots.length === 0 && (
             <div className="px-6 pt-8">
-              <NoProvidersWarning
-                section="sec-search"
-                message="No search providers are active, so nothing can be searched."
-              />
+              <NoProvidersWarning job="search" addons={installedAddons} />
             </div>
           )}
 

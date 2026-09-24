@@ -22,7 +22,7 @@ import EpisodeAirChip from "../EpisodeAirChip";
 import { loadAuraSettings, saveAuraSettings, streamQueryAddons } from "../auraSettings";
 import { useReleaseSignal } from "../releaseSignalStore";
 import { fetchReleaseSignal } from "../releaseSearch";
-import { electMetaAddons } from "../addonElection";
+import { electMetaAddons, isStreamProvider } from "../addonElection";
 import { isAnimeMeta, markAnimeId, typeLabel } from "../aiometadata";
 import { dedupedInvoke } from "../invokeDedupe";
 import { buildStreamMenu, type StreamMenuContext } from "../downloadsMenu";
@@ -2306,6 +2306,9 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
               setPanelMode("episodes");
             }}
             onPlay={(s) => onPlayStream(s, targetForPlay(activeVideo))}
+            addons={addons}
+            addonsPending={addonsPending}
+            onLeave={onClose}
             menuCtx={{
               // The id the streams were actually fetched for, so a relink
               // re-queries the same episode rather than the series root.
@@ -3121,6 +3124,14 @@ interface PanelProps {
   onPickEpisode: (v: VideoEntry) => void;
   onBackToEpisodes: () => void;
   onPlay: (s: StreamEntry) => void;
+  /** Installed addons, for the streams panel's no-providers warning. */
+  addons: AddonEntry[];
+  /** `addons` is empty only because no load has finished yet (after a
+   *  reload), which the no-providers warning must not read as none. */
+  addonsPending: boolean;
+  /** Closes the detail page. The no-providers warning runs it before it
+   *  navigates, since the page it opens would otherwise sit behind this one. */
+  onLeave: () => void;
   /** Identity + naming for the stream row's right-click menu, including the
    *  copy and play-externally handlers it used to take separately. */
   menuCtx: StreamMenuContext;
@@ -3145,7 +3156,7 @@ interface PanelProps {
 
 function UnifiedPanel({
   mode, partyStreamKey, isEpisodic, seriesId, seriesMediaType, videos, activeVideo, streams, streamMeta, streamsLoading,
-  groupedStreams, metaLoading, onPickEpisode, onBackToEpisodes, onPlay, menuCtx,
+  groupedStreams, metaLoading, onPickEpisode, onBackToEpisodes, onPlay, addons, addonsPending, onLeave, menuCtx,
   scrollToVideoId, onScrollHandled, seasonHint, seasonNames, highlightVideoId, seriesArt, detail,
 }: PanelProps) {
   // Absolute-episode annotation for the streams header (e.g. "(E88)" next to
@@ -3202,6 +3213,9 @@ function UnifiedPanel({
               partyStreamKey={partyStreamKey}
               onBack={isEpisodic ? onBackToEpisodes : undefined}
               onPlay={onPlay}
+              addons={addons}
+              addonsPending={addonsPending}
+              onLeave={onLeave}
               menuCtx={menuCtx}
               absoluteTag={streamAbsoluteTag}
             />
@@ -5018,7 +5032,7 @@ function StreamMessagesEmptyState({ metadata }: { metadata: StreamMetadata }) {
 const STREAM_FORMAT_HINT_KEY = "aura:stream-format-hint-dismissed";
 
 function StreamsPanel({
-  isEpisodic, activeVideo, streams, streamMeta, loading, groups, partyStreamKey, onBack, onPlay, menuCtx, absoluteTag,
+  isEpisodic, activeVideo, streams, streamMeta, loading, groups, partyStreamKey, onBack, onPlay, addons, addonsPending, onLeave, menuCtx, absoluteTag,
 }: {
   isEpisodic: boolean;
   activeVideo: VideoEntry | null;
@@ -5029,6 +5043,12 @@ function StreamsPanel({
   partyStreamKey?: string | null;
   onBack?: () => void;
   onPlay: (s: StreamEntry) => void;
+  /** Installed addons, for the no-providers warning. */
+  addons: AddonEntry[];
+  /** No addon load has finished yet, so an empty `addons` proves nothing. */
+  addonsPending: boolean;
+  /** Closes the detail page before the warning navigates away. */
+  onLeave: () => void;
   /** Identity + naming for the right-click menu's Download entry. Built by the
    *  parent because a stream row has none of it: the show, year, season,
    *  episode and episode title all live up there. */
@@ -5080,13 +5100,16 @@ function StreamsPanel({
   }, []);
   const showHint = formatterOn && nonTamTaro && !hintDismissed;
 
-  // No active stream providers — the user removed all in Settings, so streams
-  // are fetched from zero addons. (Re-read each render; the formatter-state
-  // subscription above re-renders on aura:settings-changed.)
-  const streamProvidersEmpty = (() => {
-    const u = loadAuraSettings().streamAddonUrls;
-    return Array.isArray(u) && u.length === 0;
-  })();
+  // No active stream providers: not one addon the stream query goes to can
+  // serve streams (the Rust gate's rule, isStreamProvider), either because
+  // none is installed or because the Stream Providers override leaves them
+  // all out. Not while the addon list is still loading after a reload: the
+  // fetch ran against [] and came back empty, but that is not "none
+  // installed" (see addonsPending in DetailViewBody). (Re-read each render;
+  // the formatter-state subscription above re-renders on
+  // aura:settings-changed.)
+  const streamProvidersEmpty = !addonsPending
+    && !streamQueryAddons(addons).some(isStreamProvider);
 
   return (
     <>
@@ -5141,15 +5164,13 @@ function StreamsPanel({
             />
           </div>
         ) : streams.length === 0 ? (
-          // Empty state. No active stream providers gets a settings-link
-          // warning first; otherwise surface any addon errors/warnings/info,
-          // then the legacy "nothing found" fallback.
+          // Empty state. No active stream providers gets the no-providers
+          // warning first (Addons page, or Settings when the override is
+          // why); otherwise surface any addon errors/warnings/info, then the
+          // legacy "nothing found" fallback.
           streamProvidersEmpty ? (
             <div className="px-2 pt-4">
-              <NoProvidersWarning
-                section="sec-streams"
-                message="No stream providers are active, so no sources can be fetched."
-              />
+              <NoProvidersWarning job="streams" addons={addons} onNavigate={onLeave} />
             </div>
           ) : totalMessages > 0 ? (
             <StreamMessagesEmptyState metadata={streamMeta} />

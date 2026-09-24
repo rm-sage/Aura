@@ -4254,8 +4254,19 @@ export default function App() {
         window.location.hash = detail.section;
       }
     };
+    // Same idea for the Addons page, which NoProvidersWarning sends the user
+    // to when nothing installed can do the job (Settings cannot fix that).
+    // Mirrors NavSidebar's onNavigate.
+    const onOpenAddons = () => {
+      setActiveCatalog(null);
+      setActiveView("addons");
+    };
     window.addEventListener("aura:open-settings", onOpen);
-    return () => window.removeEventListener("aura:open-settings", onOpen);
+    window.addEventListener("aura:open-addons", onOpenAddons);
+    return () => {
+      window.removeEventListener("aura:open-settings", onOpen);
+      window.removeEventListener("aura:open-addons", onOpenAddons);
+    };
   }, []);
 
   // ── Reduced-motion attribute live-updater ──
@@ -9348,7 +9359,7 @@ export default function App() {
                 : isTrailerPlayback
                 ? (firstFrameSeen
                     ? "YouTube stopped serving this trailer. Its playback links are signed and expire after a few hours, so a trailer left paused for a while has to be fetched again. Reload re-fetches it."
-                    : "YouTube refused the playback link for this trailer. The usual cause is that Aura's copy of yt-dlp has gone stale: YouTube changes how it issues links every few weeks, and an out-of-date copy produces links it then rejects. Reload re-fetches the link, which fixes an expired one. If it keeps failing, update yt-dlp under Settings, Optional Components.")
+                    : "YouTube refused the playback link for this trailer. The usual cause is that Aura's copy of yt-dlp has gone stale: YouTube changes how it issues links every few weeks, and an out-of-date copy produces links it then rejects. Reload re-fetches the link, which fixes an expired one. If it keeps failing, turn on Show advanced settings in Settings, then update yt-dlp under Optional Components.")
                 : breakWasTruncation
                     ? "The source stopped sending data partway through, so the rest of this episode never arrived. Aura already retried and re-resolved the source. Reloading resumes from where the stream cut out; switching source is usually the faster fix."
                     : (firstFrameSeen

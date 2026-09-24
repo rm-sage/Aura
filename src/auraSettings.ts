@@ -297,6 +297,14 @@ export interface AuraSettings {
    *  devices). "small" is the compact scaling; "medium" (default) is 50% larger;
    *  "large" is 100% larger. */
   airingTileSize: "small" | "medium" | "large";
+  /** Settings page "Show advanced settings" toggle. Off hides the provider
+   *  overrides (Catalog / Metadata / Hero / Stream / Search pickers) and the
+   *  power-user rows behind it; a settings search or a deep link reveals them
+   *  without writing this. A view preference rather than a setting, so
+   *  flipping it raises no "Settings saved" toast, but it is remembered,
+   *  portable (PORTABLE_AURA_FIELDS) and cloud-synced like the rest of this
+   *  blob. Default false. */
+  showAdvancedSettings: boolean;
 }
 
 export const DEFAULT_AURA_SETTINGS: AuraSettings = {
@@ -334,6 +342,7 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   airingGroupBy: "type",
   airingSort: "recent",
   airingTileSize: "medium",
+  showAdvancedSettings: false,
 };
 
 // Module-level memoization snapshot. loadAuraSettings is called many
@@ -470,6 +479,9 @@ function readFromStorage(): AuraSettings {
         ? (parsed.heroCatalog as AuraSettings["heroCatalog"])
         : null,
       heroDisabled: typeof parsed.heroDisabled === "boolean" ? parsed.heroDisabled : false,
+      showAdvancedSettings: typeof parsed.showAdvancedSettings === "boolean"
+        ? parsed.showAdvancedSettings
+        : false,
     };
   } catch {
     return { ...DEFAULT_AURA_SETTINGS };

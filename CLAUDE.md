@@ -743,6 +743,13 @@ creep degrades the experience. When adding ANY feature:
   `fetch_streams` returning completion order, and `pickFirstStreamForEpisode` scoping its query
   differently from the switcher. All three are fixed; a recurrence means one was undone.
 - "Library page blank" -> `<ErrorBoundary scope="Library">` surfaces the render error.
+- "A Settings row or section is missing" (provider pickers, buffers, API keys, Storage, the whole
+  System group) -> it is behind "Show advanced settings", under the Settings search box; searching
+  for it reveals it without the switch. The Conventions entry on advanced rows has the rules.
+- "A no-providers warning opens the wrong page" -> `emptyElectionCause` (`src/addonElection.ts`).
+  It routes to Settings only when that job's override is in force and leaves out an installed addon
+  that could do the job; otherwise to the Addons page (`aura:open-addons`), since Settings cannot
+  fix a missing addon.
 - "A download fails instantly at 0 bytes" -> the container refinement in
   `downloads/mod.rs::refine_extension`. It renames the partial, so the worker
   must use the paths it RETURNS, not its own clone of the job.
@@ -806,6 +813,20 @@ old-format and new-format samples and diff the field sets. Node runs the `.ts` f
 - Any Settings-page change must be evaluated for export/import (`PORTABLE_AURA_FIELDS` /
   `PORTABLE_BACKEND_FIELDS` in `settingsTransfer.ts`) and cloud-sync sharability, to stop the drift
   that left prefs unsharable.
+- A new Settings row is visible by default. A provider override or power-user knob goes behind
+  "Show advanced settings" (`AuraSettings.showAdvancedSettings`) instead: wrap it, with the divider
+  that separates it from its neighbour, in `<AdvancedOnly>`, or mark its `TOC_GROUPS` leaf
+  `advanced: true` when EVERY row of the section is advanced (the section, its TOC entry and, when
+  a group empties, the page group header then hide together). Every searchable row must keep
+  `data-settings-row` / `data-settings-label` / `data-settings-description` on its outermost
+  element: settings search finds hidden advanced rows by walking those attributes (units are
+  mounted `hidden` while a query is active), and a row without them can never be revealed. A
+  search or an `aura:open-settings` deep link reveals rows temporarily and never writes the
+  switch. A unit that has been on screen stays mounted (`hidden`) for the rest of the visit
+  rather than unmounting, so in-flight state (a component download) survives the query
+  clearing. Copy elsewhere that names a hidden control must say to turn the switch on.
+  Design and as-built notes: section 7 of
+  `docs/superpowers/specs/2026-09-11-addon-election-and-advanced-settings-design.md`.
 
 ### Native dependencies and runtime binaries
 

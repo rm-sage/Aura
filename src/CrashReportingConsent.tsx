@@ -131,7 +131,8 @@ export default function CrashReportingConsent() {
         </div>
 
         <p className="text-[11.5px] text-white/55 leading-relaxed mb-5">
-          You can change your answer any time in Settings → Crash Reporting.
+          You can change your answer any time in Settings → Crash Reporting,
+          with Show advanced settings turned on.
           Reports only start sending after you restart Aura.
         </p>
 

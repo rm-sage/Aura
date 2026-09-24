@@ -205,7 +205,7 @@ export function setManualWatchedState(id: string, state: ManualWatchedState | nu
     // cache eviction + retry. Tell the user so an explicit mark that silently
     // reverts on restart (and the stale value a sync push would then carry) is
     // at least visible instead of a mystery.
-    showAppToast("Couldn't save your watched mark: local storage is full. It may not stick after a restart (clear space in Settings > Storage).", { duration: 5000 });
+    showAppToast("Couldn't save your watched mark: local storage is full. It may not stick after a restart (clear space in Settings > Storage, with Show advanced settings on).", { duration: 5000 });
   }
   // A skip is an ANNOTATION OVER a watched mark, so it cannot outlive one.
   // Enforced here rather than at the call sites because there are four ways to

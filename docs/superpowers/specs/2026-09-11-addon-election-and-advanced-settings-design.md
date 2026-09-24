@@ -427,6 +427,88 @@ Behind the toggle:
 Staying visible by explicit decision: **HDR mode and HDR display peak nits**
 (`:5091-5133`), and **Backup and Restore export / import** (`:1161-1274`).
 
+As built (Phase 3). The switch is not in a page header, because the page no longer
+has one: the search box moved to the footer of the TOC sidebar, so "Show advanced
+settings" sits directly under it there, drawn with the same pill switch as every
+SettingToggle (`ToggleSwitch`, now shared). A change to it alone raises no toast: the
+save effect diffs the previous `aura` and skips the toast when the only changed key is
+`showAdvancedSettings`.
+
+A hidden thing is one of two units, and both obey one rule (`advancedUnitState`):
+
+- **A whole section**, when its `TOC_GROUPS` leaf carries `advanced: true`. `Section`
+  and the TOC ask the same function about the same leaf (`tocLeafShown`), so an entry
+  and its anchor cannot disagree, and a group with no leaf left disappears from the TOC
+  and takes its page `GroupHeader` with it. Advanced sections: `sec-catalog`,
+  `sec-search`, `sec-api-keys`, `sec-crash-reporting`, and all three of System
+  (`sec-performance`, `sec-storage`, `sec-optional-components`), so System vanishes
+  entirely with the switch off. A revealed section carries the "Advanced" tag in its
+  title.
+- **An `<AdvancedOnly>` block** inside an ordinary section: one row plus the divider
+  that separates it from its neighbour, so hiding it leaves no stray rule. Its wrapper
+  repeats the section body's `space-y-5`, and a `hidden` wrapper drops out of Tailwind's
+  `:not([hidden])` spacing. Used for Active Stream Providers, audio passthrough, both
+  forward-buffer sliders, the screenshot folder, motion interpolation with its kernel,
+  treat mixed-OP as OP, automatic skip detection, Reset all settings, and Cloud Sync's
+  connected panel (status line, namespace table, Push / Pull / Clear). Cloud Sync's
+  guest sign-in card stays visible, and the release-feed toggle stays visible. A
+  revealed row carries the tag after its label (`AdvancedTag`, read from context by the
+  row primitives).
+
+With the switch off a unit is: shown and tagged in a section a deep link opened; mounted
+but `hidden` while a search query is active; otherwise not rendered, so none of its
+effects or IPC run (no keyring reads, no storage scan, no runtime-dep probes). The
+exception is a unit that has already been on screen during this visit: when the query
+clears or the switch goes off it stays mounted and `hidden` (`useLatchedUnitState`)
+rather than unmounting, because unmounting dropped whatever it had in flight. The case
+that found it: a search-revealed Optional Components lost its download progress when
+the query cleared, and the remount offered a second download of the same binary while
+the first was still writing the same `.part` file.
+
+Search reveal works through the existing DOM contract rather than a second registry.
+While a query is active every unit is mounted `hidden`, so the `[data-settings-row]`
+walk can see its rows; each match records the `data-advanced-id` of every unit around
+it, and the re-render that state triggers (before paint) un-hides exactly those units
+and their TOC leaves. Hiding only flips an attribute, so the match stepper's DOM
+positions survive it. Clearing the query restores. To make this reach every advanced
+control, rows that lacked the attributes gained them: `SettingSlider` (so every slider
+is now searchable), both provider pickers and the hero picker, the screenshot folder,
+Reset all settings, and wrappers around StorageReport and RuntimeComponentsSection (the
+latter's description names FFmpeg, FFprobe and yt-dlp, since error copy sends users
+there).
+
+Deep-link reveal: SettingsView's hash consumer adds the target id to a component-state
+set, and a unit is revealed when its section id is in it. SettingsView unmounts when the
+user leaves Settings, which is exactly when the reveal should end, so no cleanup exists.
+Neither reveal ever writes the persisted switch.
+
+`NoProvidersWarning` now takes the job and the installed addon list and asks
+`emptyElectionCause` (`addonElection.ts`) why the election is empty. "override" means
+the job's override is in force and leaves out an installed addon that could do it;
+only then does the click deep-link to Settings. Otherwise it fires `aura:open-addons`,
+which App.tsx routes like NavSidebar's Addons entry. A Home override that names no
+installed Home source counts as no override, matching `electHomeAddons`. The detail
+page's warning closes the detail page first, since it is a full-window overlay the
+destination would sit behind. Its condition was widened from "the override is `[]`" to
+"no addon the stream query reaches declares `stream`", so a user with no stream addon at
+all now sees it too. It stays off while `addonsPending` (a reload restores the page
+before any addon load has finished, so an empty list there proves nothing), which keeps
+it from claiming "none installed" and navigating away for a user with a dozen.
+
+The Home Catalog Sources picker lists `isHomeSource` addons, the same fail-open catalog
+gate `electHomeAddons` uses (AIOStreams included); `isCatalogProvider` is gone. The
+Stream and Search pickers keep their strict sets. Because the old picker allowed an
+addon declaring only `meta` or `addon_catalog`, a saved override can name one the new
+picker does not list. The override is therefore in force only while it names an
+installed Home source (`namesHomeSource`), the same test `emptyElectionCause` makes;
+otherwise a hidden, unremovable entry kept Home restricted, or empty, with the
+warning's deep link opening a picker that showed nothing to remove.
+
+Copy that names a newly hidden control says to turn the switch on: the trailer error's
+yt-dlp hint, the Chromecast FFmpeg error, Crash Reporting's consent footer, the
+local-storage toast, and Loudness normalization's disabled-by-passthrough description
+(with the switch off, the passthrough row it points at is not on screen).
+
 ### 8. No migration
 
 Stored provider lists keep being honoured as overrides. There is no upgrade-time code,

@@ -331,19 +331,21 @@ export function electSearchAddons(addons: readonly AddonEntry[]): AddonEntry[] {
  *  applyOverride, so a URL listed twice keeps its first position and an
  *  uninstalled one drops out.
  *
- *  An override that names no installed addon at all DELIBERATELY behaves as
- *  no override: Home shows the automatic board above, with a one-time
- *  `[election]` warning. The old resolver put `addons[0]` in whenever the
- *  primary was unset or uninstalled, so this case stranded the user on that
- *  one addon's catalogs, an arbitrary pick; that substitution is gone. Nor
- *  does Home go empty: the picker lists only installed addons, so a stale
- *  override that matches nothing is invisible there and the user could not
- *  see what to undo. */
+ *  An override that names no installed Home source at all DELIBERATELY
+ *  behaves as no override: Home shows the automatic board above, with a
+ *  one-time `[election]` warning. The old resolver put `addons[0]` in
+ *  whenever the primary was unset or uninstalled, so this case stranded the
+ *  user on that one addon's catalogs, an arbitrary pick; that substitution is
+ *  gone. Nor does Home go empty: the picker lists only installed Home sources
+ *  (isHomeSource), so a stale override that matches none of them is invisible
+ *  there and the user could not see what to undo. That includes an addon the
+ *  older picker allowed (one declaring `meta` or `addon_catalog` but not
+ *  `catalog`), which is installed but no longer listed. */
 export function electHomeAddons(addons: readonly AddonEntry[]): AddonEntry[] {
   const elected: Elected[] = [];
   const rejected: Rejected[] = [];
   addons.forEach((addon, rank) => {
-    if (!mayServe(addon, "catalog")) {
+    if (!isHomeSource(addon)) {
       rejected.push({ addon, rank, gate: "resource" });
       return;
     }
@@ -351,14 +353,10 @@ export function electHomeAddons(addons: readonly AddonEntry[]): AddonEntry[] {
     elected.push({ addon, rank, reason });
   });
 
-  // Unset means both halves empty, the rule the old Home resolver used, so
-  // a primary alone or additionals alone each count as an override.
-  const { defaultHomeAddonUrl: primary, additionalHomeAddonUrls } = loadAuraSettings();
-  const additional = additionalHomeAddonUrls ?? [];
   let final = elected;
-  if (primary != null || additional.length > 0) {
-    const urls = primary != null ? [primary, ...additional] : additional;
-    if (urls.some((url) => addons.some((a) => a.url === url))) {
+  const urls = homeOverrideUrls();
+  if (urls !== null) {
+    if (namesHomeSource(urls, addons)) {
       final = applyOverride(elected, urls);
       for (const e of elected) {
         if (!final.includes(e)) rejected.push({ addon: e.addon, rank: e.rank, gate: "override" });
@@ -369,6 +367,63 @@ export function electHomeAddons(addons: readonly AddonEntry[]): AddonEntry[] {
   }
   logElection({ resource: "home" }, addons, final, rejected, null);
   return final.map((e) => e.addon);
+}
+
+/** The Home Catalog Sources override as one list, the primary first, or
+ *  `null` when it is unset. Unset means both halves empty, the rule the old
+ *  Home resolver used, so a primary alone or additionals alone each count. */
+function homeOverrideUrls(): string[] | null {
+  const { defaultHomeAddonUrl: primary, additionalHomeAddonUrls } = loadAuraSettings();
+  const additional = additionalHomeAddonUrls ?? [];
+  if (primary == null && additional.length === 0) return null;
+  return primary != null ? [primary, ...additional] : additional;
+}
+
+/** Whether the Home override is in force: it names at least one installed
+ *  addon the Home picker can show, i.e. one it could be edited back from. */
+function namesHomeSource(urls: readonly string[], addons: readonly AddonEntry[]): boolean {
+  return urls.some((url) => addons.some((a) => a.url === url && isHomeSource(a)));
+}
+
+// ── Empty elections ───────────────────────────────────────────────────────
+// Under automatic election an empty result usually means nothing INSTALLED
+// can do the job, which Settings cannot fix; only the Addons page can. A
+// provider override is the cause only when it is in force and leaves out an
+// installed addon that could have done the job. NoProvidersWarning routes on
+// this, so it sends the user to Settings only when there is something there
+// to undo.
+
+export type ProviderJob = "home" | "search" | "streams";
+
+/** Why `job` has no provider: "override" when its Settings override is the
+ *  cause, else "addons". Call it only once the job is known to be empty. */
+export function emptyElectionCause(
+  addons: readonly AddonEntry[],
+  job: ProviderJob,
+): "addons" | "override" {
+  const s = loadAuraSettings();
+  let urls: readonly string[] | null;
+  let capable: (addon: AddonEntry) => boolean;
+  switch (job) {
+    case "home": {
+      // A stale Home override is not in force (electHomeAddons ignores it).
+      const home = homeOverrideUrls();
+      urls = home !== null && namesHomeSource(home, addons) ? home : null;
+      capable = isHomeSource;
+      break;
+    }
+    case "search":
+      urls = s.searchAddonUrls;
+      capable = isSearchProvider;
+      break;
+    case "streams":
+      urls = s.streamAddonUrls;
+      capable = isStreamProvider;
+      break;
+  }
+  if (urls === null) return "addons";
+  const listed = new Set(urls);
+  return addons.some((a) => capable(a) && !listed.has(a.url)) ? "override" : "addons";
 }
 
 // ── Capability predicates ─────────────────────────────────────────────────
@@ -392,12 +447,13 @@ export function mayServe(addon: AddonEntry, resource: ElectResource): boolean {
   return list.length === 0 || hasCi(list, resource);
 }
 
-/** Settings' Catalog Providers picker: addons that surface metadata or wrap
- *  other addons, i.e. what can reasonably feed Home. Keyed on `meta` and
- *  `addon_catalog`, NOT `catalog`: a pure stream addon that ships a catalog
- *  (AIOStreams does) does not belong in it. */
-export function isCatalogProvider(addon: AddonEntry): boolean {
-  return declaresResource(addon, "meta", "addon_catalog");
+/** Home eligibility: every addon that may serve catalogs, AIOStreams
+ *  included, since the automatic board shows its catalogs. electHomeAddons
+ *  and Settings' Home Catalog Sources picker both use this, so the override
+ *  can name any addon the default board would draw on. Fail-open like the
+ *  election it mirrors, unlike the two strict pickers below. */
+export function isHomeSource(addon: AddonEntry): boolean {
+  return mayServe(addon, "catalog");
 }
 
 /** Settings' Stream Providers picker. Strict like the Rust stream gate,
@@ -516,7 +572,7 @@ function warnStaleHomeOverride(urls: readonly string[]): void {
   warnedPins.add(key);
   console.warn(
     `[election] home sources override ignored: none of its ${urls.length} addon(s) ` +
-      "is installed, so Home shows every catalog addon",
+      "is an installed catalog source, so Home shows every catalog addon",
   );
 }
 

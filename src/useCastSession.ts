@@ -155,7 +155,7 @@ export function useCastSession({
             setConnectingId(null);
             setError(
               "This file needs the FFmpeg and FFprobe components to cast to Chromecast. " +
-                "Install both under Settings > Optional Components, or cast to a DLNA TV.",
+                "Turn on Show advanced settings in Settings and install both under Optional Components, or cast to a DLNA TV.",
             );
           }
         })

@@ -141,6 +141,9 @@ const PORTABLE_AURA_FIELDS = [
   "libraryAutoRemoveWatchedMovies",
   "libraryAutoRemoveWatchedSeries",
   "airingTileSize",
+  // A view preference, but a portable one: someone who wants the power-user
+  // rows on one machine wants them on the next.
+  "showAdvancedSettings",
 ] as const;
 export type PortableAuraField = typeof PORTABLE_AURA_FIELDS[number];
 

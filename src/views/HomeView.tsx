@@ -772,6 +772,7 @@ function HomeViewBody({
         <div className="flex-1 min-h-0 flex flex-col pt-[66px]">
           <SearchView
             addons={submitSearchAddons}
+            installedAddons={addons}
             query={activeQuery}
             onSelectMeta={onSelectMeta}
           />
@@ -850,15 +851,13 @@ function HomeViewBody({
           )}
 
           {/* No catalog provider feeds Home — addons are installed but none
-              produce catalog rows. Point the user at Catalog Providers. (Rows
-              are created per-catalog before items load, so an empty rows list
-              after bootstrap means no catalog provider, not a slow fetch.) */}
+              produce catalog rows. (Rows are created per-catalog before items
+              load, so an empty rows list after bootstrap means no catalog
+              provider, not a slow fetch.) The warning points at the Addons
+              page, or at Catalog Providers when the Home override is why. */}
           {rows.length === 0 && addons.length > 0 && bootstrapped && (
             <div className="px-6 pt-10">
-              <NoProvidersWarning
-                section="sec-catalog"
-                message="No catalog providers are active, so Home has nothing to show."
-              />
+              <NoProvidersWarning job="home" addons={addons} />
             </div>
           )}
         </div>
