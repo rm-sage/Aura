@@ -93,6 +93,10 @@ import { getMetaDetailFallback, getRichestMetaDetail, peekCachedDetailById, peek
 import { PersistentCache } from "./persistentCache";
 import { applyReducedMotionAttribute, loadAuraSettings, streamQueryAddons } from "./auraSettings";
 import { electAddons } from "./addonElection";
+import {
+  isHashableStreamUrl, mergeSubtitleAnswers, playingFilename, streamSourceKey,
+  type AddonSubtitleAnswer, type StreamHash, type SubtitleRequestExtras,
+} from "./subtitleExtras";
 
 interface AniSkipResult {
   found: boolean;
@@ -3972,14 +3976,116 @@ export default function App() {
     [closeDetail, selectedMeta, library]
   );
 
+  // ── Subtitle picker overlay ──
+  // Declared ahead of the hash below, which reads it.
+  const [subsOpen, setSubsOpen] = useState(false);
+
+  // ── Playing-file hash ─────────────────────────────────────────────────
+  // The OpenSubtitles hash and exact byte size of the playing file, from ONE
+  // `compute_opensubtitles_hash` per stream url: two ranged GETs in a plain
+  // async command on the tokio runtime, never on the mpv engine thread
+  // (CLAUDE.md landmine 11). Two readers: the addon subtitle fetch below (the
+  // `videoHash` / `videoSize` extras) and SubtitlePicker's OpenSubtitles
+  // search (`moviehash` / `moviebytesize`), which used to compute its own copy
+  // when it opened. The size is the Content-Range total rather than
+  // `StreamEntry.video_size`: exact by construction, where the addon's figure
+  // has never been measured.
+  //
+  // Computed only when something will read it: an elected subtitle addon for
+  // this id, or the picker open. With neither, the two GETs (one of them a
+  // seek to the end of a file that can be tens of GB) bought nothing, and the
+  // picker used to compute lazily on open for exactly that reason.
+  const [streamHash, setStreamHash] = useState<StreamHash | null>(null);
+  // The file whose hash is computed or in flight, and the url it answers for.
+  // Keyed like the subtitle session below (target plus stream SOURCE), because
+  // a stream-lost re-resolve mints a fresh debrid url for the SAME file: that
+  // re-stamps the hash onto the new url instead of paying two more ranged GETs
+  // for bytes that have not changed. The entry's identity is also how a
+  // superseded answer is recognised, rather than an effect cleanup: a cleanup
+  // would also run when the picker closes mid-compute and throw the answer away.
+  const hashedRef = useRef<{ key: string; url: string } | null>(null);
+  const subsSourceKey = activeTarget
+    ? `${activeTarget.media_type}:${activeTarget.id}::${streamSourceKey(currentStream, activeStreamUrl)}`
+    : null;
+  const hasSubtitleAddons = useMemo(
+    () => !!activeTarget && electAddons(addons, { resource: "subtitles", id: activeTarget.id }).length > 0,
+    [addons, activeTarget],
+  );
+  const hashWanted = hasSubtitleAddons || subsOpen;
+  useEffect(() => {
+    // Live TV and trailers get no subtitle fetch below, and a live stream has
+    // no file to hash.
+    if (!activeStreamUrl || !subsSourceKey || isLivePlayback || isTrailerPlayback) {
+      hashedRef.current = null;
+      setStreamHash(null);
+      return;
+    }
+    const url = activeStreamUrl;
+    if (!hashWanted) return;
+    const cur = hashedRef.current;
+    if (cur && cur.key === subsSourceKey) {
+      if (cur.url !== url) {
+        // Same file, fresh link. Only this file's own answer moves: until its
+        // compute lands, the state may still hold the previous file's hash,
+        // and that must not be stamped onto this url.
+        const prevUrl = cur.url;
+        cur.url = url;
+        setStreamHash((h) => (h && h.url === prevUrl ? { ...h, url } : h));
+      }
+      return;
+    }
+    const entry = { key: subsSourceKey, url };
+    hashedRef.current = entry;
+    if (!isHashableStreamUrl(url)) {
+      setStreamHash({ url, hash: null, bytesize: null });
+      return;
+    }
+    invoke<{ hash: string; bytesize: number }>("compute_opensubtitles_hash", { url })
+      .then((res) => {
+        // `entry.url`, not `url`: a re-resolve while this was in flight moved it.
+        if (hashedRef.current === entry) setStreamHash({ url: entry.url, hash: res.hash, bytesize: res.bytesize });
+      })
+      .catch((e) => {
+        // An ERROR, never a degraded hash (Range refused, a file under 128 KB,
+        // a dropped connection), so a failure is final for this file. Only the
+        // lead of the message is logged: past it, a request failure carries a
+        // reqwest error whose Display includes the stream url and its token.
+        console.info(
+          "[subtitles] OS hash compute skipped:",
+          String(e).split(":").slice(0, 2).join(":"),
+        );
+        if (hashedRef.current === entry) setStreamHash({ url: entry.url, hash: null, bytesize: null });
+      });
+  }, [activeStreamUrl, subsSourceKey, isLivePlayback, isTrailerPlayback, hashWanted]);
+
   // ── External subtitles fetch ──────────────────────────────────────────
-  // Fires once per activeTarget after MPV has produced a duration. We
-  // ask the elected subtitle addons and surface the result to PlayerOverlay
-  // so the subtitle dropdown can merge external entries with MPV's track-list.
+  // Asks the elected subtitle addons about the playing file and surfaces the
+  // result to PlayerOverlay so the subtitle dropdown can merge external
+  // entries with MPV's track-list.
   // We DO NOT auto-`sub-add` every track up front any more — that storm
   // crashed playback in earlier phases. The user picks one from the menu;
   // PlayerOverlay calls `add_subtitle_to_mpv` lazily for the chosen URL.
-  const subsFetchedFor = useRef<string | null>(null);
+  //
+  // Up to two requests per (target, source), answered into ONE list:
+  //   0. bare, as soon as the stream is known: the request Aura always sent,
+  //      so nothing about the extras can cost the user their list;
+  //   1. with `filename` / `videoHash` / `videoSize`, once the hash for THIS
+  //      stream url lands, or at once with `filename` alone when the url can
+  //      never be hashed (plain http, HLS) or its hash failed (a host that
+  //      refuses Range). Its answer REPLACES request 0's per addon, never
+  //      appends to it (`mergeSubtitleAnswers`).
+  // Stremio's "skip the fan-out while no extras are known" gate is deliberately
+  // not copied: extras rank results for the addons that read them, they never
+  // admit them (the addon-election spec has the evidence).
+  //
+  // Both answers are kept on the session and every landing re-merges them, so
+  // arrival order does not matter: a request 0 that lands after request 1
+  // still fills the slots of an addon request 1 came back empty for.
+  const subsFetchedFor = useRef<{
+    key: string;
+    extrasSent: boolean;
+    answers: [AddonSubtitleAnswer[] | null, AddonSubtitleAnswer[] | null];
+  } | null>(null);
   useEffect(() => {
     if (!activeTarget) return;
     // Live TV / trailers have no IMDb id / episode / Stremio meta to match —
@@ -3987,25 +4093,52 @@ export default function App() {
     // fans out junk lookups to every installed subtitle addon (incl. the
     // user's VPS) per tune-in. Skip it.
     if (isLivePlayback || isTrailerPlayback) {
+      // Retire the VOD session too, so a late answer for it cannot land here.
+      subsFetchedFor.current = null;
       setActiveExternalSubs([]);
       return;
     }
-    const key = `${activeTarget.media_type}:${activeTarget.id}`;
-    if (subsFetchedFor.current === key) return;
-    subsFetchedFor.current = key;
-    // Drop the OUTGOING episode's list before the new one lands. These are
-    // per-episode subtitle files, and PlayerOverlay's external-sub fallback
-    // auto-adds the first entry as soon as the new file's track list shows no
-    // embedded subs. That read can win the race against this fetch, in which
-    // case the fallback would sub-add the PREVIOUS episode's .srt onto the
-    // current one: right language, wrong timings, and nothing on screen says
-    // so. Clearing first makes the worst case "no external sub yet" instead.
-    setActiveExternalSubs([]);
+    // Keyed on the SOURCE as well as the target. A source switch for the same
+    // episode brings a new filename and hash, and a target-only key swallowed
+    // exactly that refetch. Not on the url: a stream-lost re-resolve mints a
+    // fresh debrid url for the SAME file, and a url key emptied the menu and
+    // refetched both requests for a filename and hash that had not changed.
+    // The session survives it, and if request 1 had not gone out yet, the new
+    // url's hash can still send it.
+    const key = subsSourceKey ?? "";
+    const prev = subsFetchedFor.current;
+    const session: NonNullable<typeof prev> = prev && prev.key === key
+      ? prev
+      : { key, extrasSent: false, answers: [null, null] };
+    const isNew = session !== prev;
+    // Request 1's extras, once they are known and it has not gone out. The hash
+    // must be for THIS url. A url that can never be hashed does not wait for
+    // one, and neither does one whose hash failed: the filename goes out alone,
+    // since holding it for a hash that is not coming meant a plain-http or HLS
+    // stream, or a host refusing Range, never sent it at all.
+    let extras: SubtitleRequestExtras | null = null;
+    if (!session.extrasSent) {
+      const hash = streamHash && streamHash.url === activeStreamUrl ? streamHash : null;
+      const filename = playingFilename(currentStream, activeStreamUrl);
+      if (hash?.hash) {
+        extras = { videoHash: hash.hash, videoSize: hash.bytesize, filename };
+      } else if (filename && activeStreamUrl && (!isHashableStreamUrl(activeStreamUrl) || hash?.hash === null)) {
+        extras = { filename };
+      }
+    }
+    if (!isNew && !extras) return;
+    if (isNew) {
+      subsFetchedFor.current = session;
+      // Drop the OUTGOING episode's list before the new one lands. These are
+      // per-episode subtitle files, and PlayerOverlay's external-sub fallback
+      // auto-adds the first entry as soon as the new file's track list shows no
+      // embedded subs. That read can win the race against this fetch, in which
+      // case the fallback would sub-add the PREVIOUS episode's .srt onto the
+      // current one: right language, wrong timings, and nothing on screen says
+      // so. Clearing first makes the worst case "no external sub yet" instead.
+      setActiveExternalSubs([]);
+    }
 
-    // Ignore a response that arrives after the target moved on again (a fast
-    // double-advance): without this the loser of that race overwrites the
-    // winner and the menu lists an episode the user is no longer watching.
-    let cancelled = false;
     // Only the addons that can answer this id, in addon order: the resource
     // and id-prefix gates (an episode id like `tt0434665:1:1` matches a `tt`
     // prefix). The Rust side still checks the live manifest for the subtitles
@@ -4020,18 +4153,34 @@ export default function App() {
       resource: "subtitles",
       id:       activeTarget.id,
     }).map((e) => e.addon);
-    invoke<ExternalSubtitle[]>("fetch_external_subtitles", {
-      addons:    subtitleAddons,
-      mediaType: activeTarget.media_type,
-      id:        activeTarget.id,
-    })
-      .then((subs) => { if (!cancelled) setActiveExternalSubs(subs ?? []); })
-      .catch(() => { if (!cancelled) setActiveExternalSubs([]); });
-    return () => { cancelled = true; };
-  }, [activeTarget, addons, isLivePlayback, isTrailerPlayback]);
-
-  // ── Subtitle picker overlay ──
-  const [subsOpen, setSubsOpen] = useState(false);
+    const request = (rank: 0 | 1, sent: SubtitleRequestExtras) => {
+      invoke<ExternalSubtitle[][]>("fetch_external_subtitles", {
+        addons:    subtitleAddons,
+        mediaType: activeTarget.media_type,
+        id:        activeTarget.id,
+        ...sent,
+      })
+        .then((slots) => {
+          // Ignore an answer for a session that is over (a fast double-advance,
+          // a source switch, an exit): without this the loser of that race
+          // overwrites the winner and the menu lists subtitles for a file the
+          // user is no longer watching. No effect cleanup does this job, since
+          // one would also fire on the hash landing and cancel request 0.
+          if (subsFetchedFor.current !== session) return;
+          // One slot per addon, in the order they were passed.
+          session.answers[rank] = subtitleAddons.map((a, i) => ({ addonUrl: a.url, subs: slots?.[i] ?? [] }));
+          setActiveExternalSubs(mergeSubtitleAnswers(session.answers[0], session.answers[1]));
+        })
+        // A failed request leaves the list as it is: the other one may have
+        // filled it, and a new session starts from empty anyway.
+        .catch(() => {});
+    };
+    if (isNew) request(0, {});
+    if (extras) {
+      session.extrasSent = true;
+      request(1, extras);
+    }
+  }, [activeTarget, activeStreamUrl, currentStream, subsSourceKey, streamHash, addons, isLivePlayback, isTrailerPlayback]);
 
   // ── Keybindings + preferred subtitle language ──
   // Both come from the backend `AppSettings`. The preferred subs lang
@@ -8084,8 +8233,9 @@ export default function App() {
     setActiveExternalSubs([]);
     // Re-arm the fetch memo alongside the list it guards. Leaving it stamped
     // while the list is cleared meant replaying the SAME title later in the
-    // session hit the `subsFetchedFor.current === key` early-return, so the
-    // subtitle menu stayed permanently empty of addon tracks until restart.
+    // session hit the same-key early-return, so the subtitle menu stayed
+    // permanently empty of addon tracks until restart. Clearing it also
+    // retires the session, so an answer still in flight is dropped.
     subsFetchedFor.current = null;
     setActiveScoringMeta(null);
     // EOS Spotlight: ensure the end screen is torn down the instant the
@@ -9654,6 +9804,7 @@ export default function App() {
           isFullscreen={isFullscreen}
           onToggleFullscreen={toggleFullscreen}
           streamUrl={activeStreamUrl}
+          streamHash={streamHash}
           externalSubs={activeExternalSubs}
           preferredAudioLang={
             // Per-title override is the ONLY thing that should pre-empt

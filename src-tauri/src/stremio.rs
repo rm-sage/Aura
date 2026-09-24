@@ -4460,9 +4460,10 @@ fn collect_wire_stream_resource_info(wire: &WireManifest) -> (Vec<String>, Vec<S
 // External subtitles — companion to fetch_streams.
 //
 // Fans out across every addon that exposes the `subtitles` resource and pulls
-// `/subtitles/{type}/{id}.json`. The frontend pipes the resulting URLs to
-// MPV via `sub-add`. Lighter wrapper than the OpenSubtitles API: no auth, no
-// downloads — addons return direct .srt/.vtt URLs.
+// `/subtitles/{type}/{id}.json`, or `/subtitles/{type}/{id}/{extra}.json` once
+// the playing file's filename / hash / size are known. The frontend pipes the
+// resulting URLs to MPV via `sub-add`. Lighter wrapper than the OpenSubtitles
+// API: no auth, no downloads, since addons return direct .srt/.vtt URLs.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Serialize)]
@@ -4489,23 +4490,125 @@ fn manifest_has_subtitle_resource(wire: &WireManifest) -> bool {
     })
 }
 
+/// Longest `filename` extra sent, in chars. Its own cap rather than the id's
+/// 128, because a release name legitimately runs longer than that. 255 is the
+/// per-component limit on NTFS and ext4 alike, so nothing longer can be a real
+/// file name, and a longer value is DROPPED, not truncated: a cut-off name is a
+/// plausible wrong value, which is worse than no value.
+const SUBTITLE_FILENAME_CAP: usize = 255;
+
+/// Percent-encode with JavaScript's `encodeURIComponent` set: every byte of the
+/// UTF-8 form except `A-Z a-z 0-9 - _ . ! ~ * ' ( )`, as uppercase `%XX`. That
+/// is the set stremio-core applies to each extra key and value, and the SDK
+/// router's inverse (`querystring.parse`) reads a raw `+` as a space, so `+`
+/// must go out as `%2B`, which this set does.
+fn encode_uri_component(s: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')' => out.push(b as char),
+            _ => { let _ = write!(out, "%{b:02X}"); }
+        }
+    }
+    out
+}
+
+/// The `{extra}` path segment of a Stremio subtitles request, or `None` when
+/// no extra is known (the caller then keeps the bare URL, byte for byte).
+///
+/// Keys are exactly `videoHash`, `videoSize` and `filename` (there is no
+/// `videoFilename` on the wire). Each key and each value is encoded on its own
+/// and joined with a literal `&`; the joined string is NOT encoded again, or
+/// the separators would arrive as `%26` / `%3D` and the addon would see one
+/// garbage key. An unusable value is omitted, never sent empty: a hash that is
+/// not the 16 lowercase hex `compute_opensubtitles_hash` produces, a zero
+/// size, a blank or over-cap filename.
+fn subtitle_extra_segment(
+    video_hash: Option<&str>,
+    video_size: Option<u64>,
+    filename:   Option<&str>,
+) -> Option<String> {
+    let mut pairs: Vec<(&str, String)> = Vec::new();
+    if let Some(h) = video_hash {
+        if h.len() == 16 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            pairs.push(("videoHash", h.to_string()));
+        }
+    }
+    if let Some(n) = video_size.filter(|n| *n > 0) {
+        pairs.push(("videoSize", n.to_string()));
+    }
+    if let Some(f) = filename {
+        if !f.trim().is_empty() && f.chars().count() <= SUBTITLE_FILENAME_CAP {
+            pairs.push(("filename", f.to_string()));
+        }
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+    Some(
+        pairs.iter()
+            .map(|(k, v)| format!("{}={}", encode_uri_component(k), encode_uri_component(v)))
+            .collect::<Vec<_>>()
+            .join("&"),
+    )
+}
+
+/// `/subtitles/{type}/{id}.json`, or `/subtitles/{type}/{id}/{extra}.json` when
+/// an extras segment is known. The id is spliced in raw, as it always was, so
+/// an episode id keeps its literal colons (`tt0903747:1:1`).
+fn subtitles_request_url(base: &str, media_type: &str, id: &str, extra: Option<&str>) -> String {
+    match extra {
+        Some(extra) => format!("{base}/subtitles/{media_type}/{id}/{extra}.json"),
+        None        => format!("{base}/subtitles/{media_type}/{id}.json"),
+    }
+}
+
+/// Fans the subtitles request out across `addons`. The three extras are
+/// Stremio's (`videoHash`, `videoSize`, `filename`) and all optional: with none
+/// of them the request is the bare URL, exactly as before they existed. They
+/// are a ranking input for addons that read them, never an admission ticket,
+/// so a missing extra never skips the fan-out.
+///
+/// Returns one slot per addon, in the order `addons` was passed, rather than a
+/// merged list. The frontend asks twice per file (bare, then with extras) and
+/// merges the answers PER ADDON, which a flattened list made impossible: an
+/// addon that failed on the second request looked exactly like one that had
+/// no subtitles, and the whole list was replaced without it. An empty slot is
+/// still ambiguous (failed, or nothing to offer); the merge treats both alike.
 #[tauri::command]
 pub async fn fetch_external_subtitles(
     addons: Vec<AddonEntry>,
     media_type: String,
     id: String,
-) -> Result<Vec<ExternalSubtitle>, String> {
+    video_hash: Option<String>,
+    video_size: Option<u64>,
+    filename: Option<String>,
+) -> Result<Vec<Vec<ExternalSubtitle>>, String> {
     if addons.is_empty() {
         return Ok(vec![]);
     }
     let safe_type = cap(media_type, 32);
     let safe_id   = cap(id, 128);
+    let extra = subtitle_extra_segment(video_hash.as_deref(), video_size, filename.as_deref());
+    // The GET line names the extras rather than printing them: the filename is
+    // a release name, and `redact_sensitive_url` only knows secret-shaped keys.
+    let extra_note = match &extra {
+        Some(e) => format!(
+            " +extras[{}]",
+            e.split('&').map(|p| p.split('=').next().unwrap_or("")).collect::<Vec<_>>().join(","),
+        ),
+        None => String::new(),
+    };
 
     let slot_len = addons.len();
     let mut set: tokio::task::JoinSet<(usize, Vec<ExternalSubtitle>)> = tokio::task::JoinSet::new();
     for (idx, addon) in addons.into_iter().enumerate() {
         let media_type = safe_type.clone();
         let id         = safe_id.clone();
+        let extra      = extra.clone();
+        let extra_note = extra_note.clone();
         set.spawn(async move {
             let base = normalise_addon_base(&addon.url);
 
@@ -4534,8 +4637,14 @@ pub async fn fetch_external_subtitles(
             }
             let addon_name = wire.name.clone();
 
-            let url = format!("{base}/subtitles/{media_type}/{id}.json");
-            crate::devlog!(info, "subtitles", "[{}] GET {}", label, redact_sensitive_url(&url));
+            let url = subtitles_request_url(&base, &media_type, &id, extra.as_deref());
+            crate::devlog!(
+                info, "subtitles",
+                "[{}] GET {}{}",
+                label,
+                redact_sensitive_url(&subtitles_request_url(&base, &media_type, &id, None)),
+                extra_note,
+            );
             let Ok(resp) = client().get(&url).send().await else {
                 crate::devlog!(warn, "subtitles", "[{}] request failed", label);
                 return (idx, vec![]);
@@ -4563,10 +4672,11 @@ pub async fn fetch_external_subtitles(
         });
     }
 
-    // Collect into per-addon slots so the merged list follows installed-addon
-    // order regardless of which network task finished first. JoinSet yields in
+    // Collect into per-addon slots so the result follows installed-addon order
+    // regardless of which network task finished first. JoinSet yields in
     // completion order — relying on that scrambled the subtitle list (the
-    // ordering bug). Dedupe-by-URL is applied in addon order.
+    // ordering bug). Dedupe-by-URL now happens in the frontend merge
+    // (`mergeSubtitleAnswers`, src/subtitleExtras.ts), still in addon order.
     let mut slots: Vec<Vec<ExternalSubtitle>> =
         std::iter::repeat_with(Vec::new).take(slot_len).collect();
     while let Some(task_result) = set.join_next().await {
@@ -4577,17 +4687,7 @@ pub async fn fetch_external_subtitles(
         }
     }
 
-    let mut all: Vec<ExternalSubtitle> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    for slot in slots {
-        for s in slot {
-            if seen.insert(s.url.clone()) {
-                all.push(s);
-            }
-        }
-    }
-
-    Ok(all)
+    Ok(slots)
 }
 
 fn sanitize_external_subtitle(s: &serde_json::Value, addon_name: &str) -> Option<ExternalSubtitle> {
@@ -4860,5 +4960,150 @@ mod tests {
         let json = serde_json::to_value(&videos[4]).expect("serializes");
         assert!(json.get("streams").is_none());
         assert!(serde_json::to_value(&videos[0]).expect("serializes").get("streams").is_some());
+    }
+
+    const SUB_BASE: &str = "https://subs.example.invalid/cfg";
+    const SUB_HASH: &str = "8e245d9679d31e12";
+
+    /// The whole printable ASCII range, against the output of JavaScript's own
+    /// `encodeURIComponent` over the same string (captured from Node). Any
+    /// drift from that set breaks a value's round trip through the SDK router.
+    #[test]
+    fn encode_uri_component_matches_javascript() {
+        let printable: String = (0x20u8..0x7f).map(char::from).collect();
+        assert_eq!(
+            encode_uri_component(&printable),
+            "%20!%22%23%24%25%26'()*%2B%2C-.%2F0123456789%3A%3B%3C%3D%3E%3F%40\
+             ABCDEFGHIJKLMNOPQRSTUVWXYZ%5B%5C%5D%5E_%60abcdefghijklmnopqrstuvwxyz%7B%7C%7D~",
+        );
+    }
+
+    /// No extras means the URL Aura always sent, byte for byte, including the
+    /// raw colons of an episode id. Values that are present but unusable
+    /// count as absent, so they cannot turn a bare request into `/.json`.
+    #[test]
+    fn subtitle_url_is_bare_without_usable_extras() {
+        let bare = "https://subs.example.invalid/cfg/subtitles/series/tt0903747:1:1.json";
+        assert_eq!(subtitles_request_url(SUB_BASE, "series", "tt0903747:1:1", None), bare);
+        assert_eq!(subtitle_extra_segment(None, None, None), None);
+        let junk = subtitle_extra_segment(Some(""), Some(0), Some("   "));
+        assert_eq!(junk, None);
+        assert_eq!(subtitles_request_url(SUB_BASE, "series", "tt0903747:1:1", junk.as_deref()), bare);
+    }
+
+    #[test]
+    fn subtitle_extras_each_key_alone() {
+        assert_eq!(
+            subtitle_extra_segment(Some(SUB_HASH), None, None).as_deref(),
+            Some("videoHash=8e245d9679d31e12"),
+        );
+        assert_eq!(
+            subtitle_extra_segment(None, Some(1_468_006_400), None).as_deref(),
+            Some("videoSize=1468006400"),
+        );
+        assert_eq!(
+            subtitle_extra_segment(None, None, Some("Show.S01E01.1080p.WEB-DL.mkv")).as_deref(),
+            Some("filename=Show.S01E01.1080p.WEB-DL.mkv"),
+        );
+    }
+
+    /// All three, in stremio-core's order, joined by a RAW `&` and spliced into
+    /// the path as its own segment before `.json`.
+    #[test]
+    fn subtitle_extras_all_three_build_the_extra_segment() {
+        let extra = subtitle_extra_segment(
+            Some(SUB_HASH), Some(1_468_006_400), Some("Breaking Bad S01E01.mkv"),
+        );
+        assert_eq!(
+            subtitles_request_url(SUB_BASE, "series", "tt0903747:1:1", extra.as_deref()),
+            "https://subs.example.invalid/cfg/subtitles/series/tt0903747:1:1/\
+             videoHash=8e245d9679d31e12&videoSize=1468006400&filename=Breaking%20Bad%20S01E01.mkv.json",
+        );
+    }
+
+    /// Every separator the router splits on is escaped INSIDE a value, so a
+    /// filename carrying `&`, `=`, `#`, `%`, `/` or `+` still arrives as one
+    /// value. The SDK router undoes this with `querystring.parse`;
+    /// `form_urlencoded::parse` applies the same rules (split on `&` then the
+    /// first `=`, `+` as space, percent-decode), so it stands in for it here.
+    #[test]
+    fn subtitle_filename_round_trips_reserved_and_unicode() {
+        let cases = [
+            ("A B&C=D#E%F/G+H.mkv", "filename=A%20B%26C%3DD%23E%25F%2FG%2BH.mkv"),
+            ("It's (a) ~test*!.mkv", "filename=It's%20(a)%20~test*!.mkv"),
+            ("Amélie.2001.1080p.mkv", "filename=Am%C3%A9lie.2001.1080p.mkv"),
+            (
+                "葬送のフリーレン S01E01.mkv",
+                "filename=%E8%91%AC%E9%80%81%E3%81%AE%E3%83%95%E3%83%AA%E3%83%BC%E3%83%AC%E3%83%B3%20S01E01.mkv",
+            ),
+        ];
+        for (name, want) in cases {
+            let seg = subtitle_extra_segment(None, None, Some(name)).expect("filename kept");
+            assert_eq!(seg, want, "encoding of {name:?}");
+            assert!(!seg.contains(&['/', '#', '?', ' '][..]), "{seg} would break the path");
+
+            let all = subtitle_extra_segment(Some(SUB_HASH), Some(42_000_000), Some(name)).expect("kept");
+            let parsed: Vec<(String, String)> = url::form_urlencoded::parse(all.as_bytes())
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            assert_eq!(
+                parsed,
+                vec![
+                    ("videoHash".to_string(), SUB_HASH.to_string()),
+                    ("videoSize".to_string(), "42000000".to_string()),
+                    ("filename".to_string(), name.to_string()),
+                ],
+            );
+        }
+    }
+
+    /// The filename has its own cap, well above the id's 128, and a name past
+    /// it is dropped whole rather than cut: the other extras still go out.
+    #[test]
+    fn subtitle_filename_cap_drops_rather_than_truncates() {
+        let release = format!(
+            "{}.2160p.UHD.BluRay.REMUX.DV.HDR.HEVC.TrueHD.7.1.Atmos-GROUP.mkv",
+            "A.Long.Title".repeat(10),
+        );
+        let len = release.chars().count();
+        assert!(len > 128 && len <= SUBTITLE_FILENAME_CAP, "fixture is {len} chars");
+        let seg = subtitle_extra_segment(None, None, Some(&release)).expect("long release name kept");
+        assert_eq!(seg, format!("filename={release}"));
+
+        // Counted in chars, not bytes: a CJK name at the cap is 3x that in UTF-8.
+        let at_cap: String = "の".repeat(SUBTITLE_FILENAME_CAP);
+        assert!(subtitle_extra_segment(None, None, Some(&at_cap)).is_some());
+
+        let over = format!("{}.mkv", "a".repeat(SUBTITLE_FILENAME_CAP));
+        assert_eq!(subtitle_extra_segment(None, None, Some(&over)), None);
+        assert_eq!(
+            subtitle_extra_segment(Some(SUB_HASH), Some(7), Some(&over)).as_deref(),
+            Some("videoHash=8e245d9679d31e12&videoSize=7"),
+        );
+    }
+
+    /// Only the exact shape `compute_opensubtitles_hash` emits is sent. Anything
+    /// else is dropped on its own, and the size beside it still goes out.
+    #[test]
+    fn subtitle_hash_must_be_sixteen_lowercase_hex() {
+        let bad_hashes = [
+            "8E245D9679D31E12",  // uppercase
+            "8e245d9679d31e1",   // 15 chars
+            "8e245d9679d31e123", // 17 chars
+            "8e245d9679d31e1g",  // not hex
+            " 8e245d9679d31e1",  // padded
+            "",
+        ];
+        for bad in bad_hashes {
+            assert_eq!(
+                subtitle_extra_segment(Some(bad), Some(99), None).as_deref(),
+                Some("videoSize=99"),
+                "hash {bad:?} should be dropped",
+            );
+        }
+        assert_eq!(
+            subtitle_extra_segment(Some("0000000000000000"), None, None).as_deref(),
+            Some("videoHash=0000000000000000"),
+        );
     }
 }

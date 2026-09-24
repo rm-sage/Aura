@@ -686,8 +686,92 @@ bug (`9a17813fe8`, "fix video params logic").
 Carried honestly: because the one testable addon ignores all three extras, the payoff for
 `videoHash` depends on which subtitle addons users install. Subsource could not be verified
 (`subsource.strem.io/manifest.json` did not resolve; `subs.strem.io` is behind an anti-bot
-interstitial). `filename` ships unconditionally; hash and size ship because they are nearly
-free given the existing command, not because a target addon is known to use them.
+interstitial). `filename` ships unconditionally; hash and size ship because they are nearly free given the existing
+command, not because a target addon is known to use them.
+
+As built (Phase 4b):
+
+- **Wire.** `fetch_external_subtitles` takes `video_hash`, `video_size` and `filename`,
+  all `Option` (same command, no registration change). Two pure helpers in `stremio.rs`
+  build the URL: `subtitle_extra_segment` encodes each key and each value on its own
+  (`encode_uri_component`, the `encodeURIComponent` set), joins them with a raw `&` in
+  stremio-core's order (`videoHash`, `videoSize`, `filename`) and returns `None` when
+  nothing usable is known; `subtitles_request_url` then emits the bare `/{id}.json`,
+  byte for byte as before. An unusable value is omitted: a hash that is not exactly 16
+  lowercase hex, a zero size, a blank filename, or one over its 255-char cap (the NTFS
+  and ext4 per-component limit, so nothing longer is a real file name). An over-cap
+  filename is DROPPED, not truncated, because a cut-off name is a plausible wrong value.
+  The GET log line prints the bare URL through `redact_sensitive_url` and names the
+  extras (`+extras[videoHash,videoSize,filename]`) rather than printing them. Seven tests
+  in `stremio::tests` cover printable ASCII against Node's own `encodeURIComponent`
+  output, the bare URL (unusable values included), each key alone, all three, a
+  reserved-character and unicode round trip through `form_urlencoded::parse` (which
+  applies `querystring.parse`'s rules), the filename cap, and the hash shape. The
+  command now returns one slot per addon, in the order passed, instead of a merged
+  list, and the URL dedupe moved to the frontend merge (see "Order").
+- **Hash and size.** App.tsx owns `streamHash` (`{ url, hash, bytesize }`): one
+  `compute_opensubtitles_hash` per FILE, none for live TV or trailers, and only while
+  something will read it (a subtitle addon elected for the id, or the picker open), so a
+  user with no subtitle addon pays nothing until the picker opens, as before. The file is
+  identified by the same key as the subtitle session (see "Guard"), so a stream-lost
+  re-resolve, which mints a fresh url for the same file, re-stamps the existing answer
+  onto the new url instead of paying two more ranged GETs; only that file's own answer
+  moves, never a previous file's hash still in the state. Once started it runs to
+  completion, and a superseded answer is dropped by comparing the ref's entry, not by an
+  effect cleanup that closing the picker would also fire.
+  It is never attempted on an HLS url or a non-https one (`isHashableStreamUrl`,
+  `src/subtitleExtras.ts`): hashing a playlist hashes the manifest and reports its size,
+  and the hash command's client is `https_only`, so a plain-http url failed every time.
+  SubtitlePicker's own
+  computation is deleted; it reads the state through PlayerOverlay and still checks
+  `url` against its `streamUrl`, so its OpenSubtitles search behaves as before, except
+  that the hash is usually ready before the picker opens. `StreamEntry.video_size` is not
+  used.
+- **Filename.** `playingFilename` (`src/subtitleExtras.ts`): `behaviorHints.filename`,
+  else the url's last path segment from `new URL(url).pathname`, `decodeURIComponent`d,
+  kept only when it ends in a video container extension and holds no separator. An
+  opaque debrid id (`/dl/9f2c41`) or `index.m3u8` is not a file name.
+- **Order.** Request 0 is bare, fired when the stream is known. Request 1 carries every
+  known extra and fires once the hash for THAT url lands, or with `filename` alone when
+  the url can never be hashed (plain http, HLS, at once) or its hash failed (an https host
+  that refuses `Range`, a file under 128 KB), where waiting for a hash that is not coming
+  meant the filename never went out. Request 1 replaces request 0 PER ADDON
+  (`mergeSubtitleAnswers`): an addon's request 1 slot wins only when it holds something,
+  so one addon hitting a 429 or a timeout on the second of two requests seconds apart
+  keeps the entries it listed on the first. A flattened list could not do that, because a
+  failed addon and one with nothing to offer looked the same. Both answers stay on the
+  session and every landing re-merges them, so arrival order does not matter. A failed
+  hash with no known filename means no request 1: one fetch, list kept. (The original
+  plan kept every failed-hash case to one fetch; that left `filename` unsent on exactly
+  the hosts where it is the only extra Aura can offer, and Stremio sends it there.)
+- **Guard.** The session key is `${media_type}:${id}::` plus the stream's SOURCE
+  (`streamSourceKey`: `info_hash`, else addon + release filename, else the url; the
+  fields and precedence `sameStreamSource` compares), so a source switch starts a new
+  session (list cleared, both requests again with the new stream's extras). Not the url:
+  a stream-lost re-resolve mints a fresh debrid url for the same file, and a url key
+  emptied the menu and refetched both requests for a filename and hash that had not
+  changed. The dependency array lists everything the effect reads. A stale answer is
+  recognised by session identity in the ref rather than by an effect cleanup, because a
+  cleanup would also run when the hash lands and cancel request 0. That also closes a
+  latent loss found while reading the old effect (not reproduced at runtime): its cleanup
+  ran on ANY dependency change, and the absolute-episode / AniList patch replaces
+  `activeTarget` within milliseconds on a warm meta cache for S2+ and AIOMetadata anime
+  episodes, which cancelled the in-flight fetch while the once-per-target guard refused
+  the re-run, so the list never landed. An `addons` change mid-fetch did the same.
+- **Menu identity.** Replacing the list mid-file broke PlayerOverlay's matching, which
+  was positional: an unlabelled external's title is `Addon · LANG #N` by position, and a
+  sub-added track is matched back to its row BY that title, so a reorder after a sub-add
+  lit up another url's row, made that url unreachable, and re-added the playing one.
+  Each url is now pinned to the title it was sub-added under for the rest of the file
+  (the rest are numbered around the pins), and a synthetic row id is a hash of the url
+  rather than its index, so the optimistic selection cannot move to another row.
+- **No skip gate**, as decided above.
+- **Known follow-up, not a regression.** PlayerOverlay's external-sub fallback on a
+  sub-less file sub-adds the first preferred-language external as soon as the track list
+  shows no embedded subs. If that read beats request 1, it picks from request 0's list,
+  which is the list it has always picked from; it simply misses request 1's ranking for
+  that file. Holding the fallback until request 1 settles (with a cap) would fix it at
+  the cost of a delay on every sub-less file, and is left for a measured decision.
 
 ## Cleanup in the same pass
 
@@ -734,8 +818,10 @@ Runtime checks per phase, since most of this is behavioural and neither gate cat
    searching "API key" with Advanced off reveals it; the three `NoProvidersWarning`
    deep links land on a visible control.
 4. Parity: an addon that embeds `video.streams` short-circuits on the detail page and in
-   Next-Up, and does **not** short-circuit on a stream-lost retry; subtitle requests carry
-   `filename` and the fan-out still returns results against a `Range`-refusing host.
+   Next-Up, and does **not** short-circuit on a stream-lost retry; the second subtitle
+   request carries `filename` / `videoHash` / `videoSize` (DevConsole `[subtitles]` GET
+   line, `+extras[...]`), and the fan-out still returns the bare request's results against
+   a `Range`-refusing host.
 
 ## Phases
 

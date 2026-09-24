@@ -4,6 +4,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { SubtitleEntry } from "./types";
+import type { StreamHash } from "./subtitleExtras";
 
 // ---------------------------------------------------------------------------
 // SubtitlePicker — glass overlay floating over the player
@@ -24,14 +25,18 @@ interface Props {
   initialQuery?: string;
   initialYear?: number;
   initialImdbId?: string;
-  /** Resolved stream URL of the currently-playing file. When present
-   *  (and HTTP/HTTPS), the picker computes an OpenSubtitles MovieHash
-   *  via two Range GETs before searching, then includes it in the
-   *  search payload. Hash-matched entries are frame-accurate to the
-   *  exact release and bubble to the top with a "Hash match" badge.
-   *  Hash compute failures (Range refused, file too small, non-HTTP
-   *  URL) silently fall back to query / IMDB / year matching. */
+  /** Resolved stream URL of the currently-playing file. Only used to
+   *  check that `streamHash` belongs to it. */
   streamUrl?: string | null;
+  /** App's OpenSubtitles MovieHash of the playing file (two Range GETs,
+   *  computed once per stream URL and shared with the addon subtitle
+   *  fetch). When it matches `streamUrl` the search includes it, and
+   *  hash-matched entries are frame-accurate to the exact release and
+   *  bubble to the top with a "Hash match" badge. A failed or pending
+   *  hash (Range refused, file too small, non-https URL, HLS) silently
+   *  falls back to query / IMDB / year matching, and a hash that lands
+   *  while the picker is open re-runs the search with it. */
+  streamHash?: StreamHash | null;
   onClose: () => void;
 }
 
@@ -59,14 +64,8 @@ const CloseIcon = () => (
   </svg>
 );
 
-interface MovieHashCache {
-  url: string;
-  hash: string | null;     // null when compute failed for this URL
-  bytesize: number | null;
-}
-
 export default function SubtitlePicker({
-  open, initialQuery, initialYear, initialImdbId, streamUrl, onClose,
+  open, initialQuery, initialYear, initialImdbId, streamUrl, streamHash, onClose,
 }: Props) {
   const [query, setQuery] = useState(initialQuery ?? "");
   const [language, setLanguage] = useState("en");
@@ -75,49 +74,15 @@ export default function SubtitlePicker({
   const [error, setError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState<number | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
-  // Per-URL hash cache. Computing the hash requires two Range GETs
-  // against the stream URL (first 64 KB + last 64 KB); we don't want
-  // to refire those on every keystroke / language change. Cached by
-  // URL so an episode change naturally invalidates.
-  const [hashCache, setHashCache] = useState<MovieHashCache | null>(null);
+  // Only a hash of the file that is playing NOW: App's state trails a source
+  // switch by one round trip, and a stale hash would rank another release's
+  // subtitles as a match.
+  const hash = streamHash && streamUrl && streamHash.url === streamUrl ? streamHash : null;
 
   // Prefill query when activeTarget changes
   useEffect(() => {
     if (open) setQuery(initialQuery ?? "");
   }, [open, initialQuery]);
-
-  // Compute the OpenSubtitles MovieHash when the picker opens against
-  // a fresh stream. Best-effort: Range-refused / non-HTTP / small-file
-  // URLs all surface as cache.hash=null, which the search path then
-  // skips silently.
-  useEffect(() => {
-    if (!open) return;
-    if (!streamUrl) return;
-    if (hashCache?.url === streamUrl) return;
-    // Bail early on non-http URLs so we don't churn a network round
-    // trip for magnets / file:// (the latter would actually work for
-    // local files Task #19's local-file work would route through MPV's
-    // path, but that's out of scope here).
-    if (!streamUrl.startsWith("http://") && !streamUrl.startsWith("https://")) {
-      setHashCache({ url: streamUrl, hash: null, bytesize: null });
-      return;
-    }
-    let cancelled = false;
-    invoke<{ hash: string; bytesize: number }>("compute_opensubtitles_hash", { url: streamUrl })
-      .then((res) => {
-        if (cancelled) return;
-        setHashCache({ url: streamUrl, hash: res.hash, bytesize: res.bytesize });
-      })
-      .catch((e) => {
-        // Range refused / file too small / non-200 → silently disable
-        // hash matching for this URL. The search still works via
-        // query / IMDB / year.
-        console.info("[subtitles] OS hash compute skipped:", String(e));
-        if (cancelled) return;
-        setHashCache({ url: streamUrl, hash: null, bytesize: null });
-      });
-    return () => { cancelled = true; };
-  }, [open, streamUrl, hashCache]);
 
   const search = useCallback(async () => {
     setLoading(true);
@@ -129,8 +94,8 @@ export default function SubtitlePicker({
         year: initialYear ?? null,
         imdbId: initialImdbId ?? null,
         languages: language,
-        moviehash: hashCache?.url === streamUrl ? hashCache?.hash : null,
-        moviebytesize: hashCache?.url === streamUrl ? hashCache?.bytesize : null,
+        moviehash: hash?.hash ?? null,
+        moviebytesize: hash?.bytesize ?? null,
       });
       setResults(r);
     } catch (e) {
@@ -138,7 +103,7 @@ export default function SubtitlePicker({
     } finally {
       setLoading(false);
     }
-  }, [query, language, initialYear, initialImdbId, hashCache, streamUrl]);
+  }, [query, language, initialYear, initialImdbId, hash]);
 
   // Auto-search on open or language change
   useEffect(() => {

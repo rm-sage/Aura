@@ -13,6 +13,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import Tooltip from "./Tooltip";
 import SubtitlePicker from "./SubtitlePicker";
+import type { StreamHash } from "./subtitleExtras";
 import CinemaSuite from "./CinemaSuite";
 import ImageLoader from "./ImageLoader";
 import type { ActiveScrobbleTarget } from "./useScrobble";
@@ -55,6 +56,23 @@ function subLangMatches(lang: string | null | undefined, pref: string): boolean 
   const langNorm = toLang2(raw);
   if (langNorm && langNorm === prefNorm) return true;
   return raw.startsWith(pref);
+}
+
+/** An external subtitle's menu title before any `#N` suffix: the addon's own
+ *  label, else `Addon · LANG`. */
+function externalBaseTitle(s: ExternalSubtitle): string {
+  return s.label ? s.label : `${s.addon_name}${s.lang ? ` · ${s.lang.toUpperCase()}` : ""}`;
+}
+
+/** A negative menu id for an external subtitle that depends on its url alone
+ *  (FNV-1a over the url, 30 bits), so it survives App replacing the list. */
+function externalSubId(url: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < url.length; i++) {
+    h ^= url.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return -1 - ((h >>> 0) & 0x3fffffff);
 }
 
 // ---------------------------------------------------------------------------
@@ -1112,6 +1130,10 @@ interface Props {
 
   /** Direct (un-proxied) stream URL — used for Copy / Download / External. */
   streamUrl: string | null;
+  /** App's OpenSubtitles hash of the playing file, keyed by url. Read by
+   *  SubtitlePicker for its hash-matched search; computed once in App so the
+   *  addon subtitle fetch and the picker share one pair of ranged GETs. */
+  streamHash?: StreamHash | null;
   /** Stream-addon-derived external subtitles (.srt/.vtt) — merged with
    *  MPV's track-list in the subtitle dropdown. Already sorted by addon
    *  order with the preferred-language priority applied. */
@@ -1310,7 +1332,7 @@ export default function PlayerOverlay({
   onExitPlayback,
   subsOpen, setSubsOpen, downloadsOpen = false,
   isFullscreen, onToggleFullscreen,
-  streamUrl, externalSubs, preferredSubLang, preferredAudioLang,
+  streamUrl, streamHash = null, externalSubs, preferredSubLang, preferredAudioLang,
   selectableSubLangs,
   scoringMeta, audioPriority, avoidDubs, userRegion,
   silentWakeCodes,
@@ -1715,6 +1737,15 @@ export default function PlayerOverlay({
   // sub-less episode of a binge got an external subtitle: every later one
   // played bare while the menu still listed the addon's tracks as available.
   const extSubFallbackRef = useRef(false);
+  // The title each external subtitle was sub-added under, by its url, for the
+  // current file. mpv reports a sub-added track under the title we passed, and
+  // the menu matches that track back to its row BY TITLE, so a url's title must
+  // not move while its track is live. It would: App replaces the external list
+  // mid-file (the second addon request, with extras, can reorder an addon's
+  // entries), and the `#N` titles are positional. Unpinned, the live track then
+  // lit up another url's row, that url could never be added, and the real row
+  // added the same file a second time.
+  const extTitleByUrlRef = useRef(new Map<string, string>());
   // Reset per file: on episode change AND on a source switch (streamUrl change).
   // A source switch swaps the stream WITHOUT unmounting PlayerOverlay, so
   // without re-arming these one-shot pickers they keep the PREVIOUS source's
@@ -1727,6 +1758,8 @@ export default function PlayerOverlay({
     subAutoSelectedRef.current = false;
     audioAutoSelectedRef.current = false;
     extSubFallbackRef.current = false;
+    // A loadfile drops every sub-added track, so nothing holds a title any more.
+    extTitleByUrlRef.current = new Map();
     // `reloadNonce`: an in-place reload re-runs loadfile, which drops the
     // sub-add'd external track and reverts aid / sid to the file's defaults.
     // These guards have to re-arm for it too, or the user's language picks are
@@ -1833,6 +1866,8 @@ export default function PlayerOverlay({
 
     const title = externalTitleFor(target);
     extSubFallbackRef.current = true;
+    const pins = extTitleByUrlRef.current;
+    pins.set(target.url, title);
     invoke("add_subtitle_to_mpv", {
       path: target.url,
       flag: "select",
@@ -1840,7 +1875,7 @@ export default function PlayerOverlay({
       lang: target.lang ?? null,
     })
       .then(() => window.dispatchEvent(new Event("aura:tracks-refresh")))
-      .catch(() => {});
+      .catch(() => { if (pins.get(target.url) === title) pins.delete(target.url); });
   }, [tracks.length, embeddedSubTracks.length, externalSubs, preferredSubLang, isLive, isTrailer]);
 
   // ── Audio auto-select ─────────────────────────────────────────────
@@ -1938,22 +1973,37 @@ export default function PlayerOverlay({
   // sub-added because the title-keyed match finds the same live entry.
   // Adding a "#N" suffix to duplicates keeps the visible label concise
   // while making the matching key unique.
+  //
+  // A url that has been sub-added keeps the title it was added under
+  // (`extTitleByUrlRef`), and the rest are numbered around it: no other row
+  // may take a title a live track holds. Pinning only records the title the
+  // url already had, so it changes no row's title by itself; only a later
+  // list replacement renumbers, and then only the unpinned rows.
   const externalTitleFor = useCallback((s: ExternalSubtitle): string => {
     if (s.label) return s.label;
-    const base = `${s.addon_name}${s.lang ? ` · ${s.lang.toUpperCase()}` : ""}`;
-    // Count duplicates of `base` and append #N to anything past the first.
+    const pins = extTitleByUrlRef.current;
+    const pinned = pins.get(s.url);
+    if (pinned) return pinned;
+    const base = externalBaseTitle(s);
+    const taken = new Set(pins.values());
+    // Count duplicates of `base` and append #N to anything past the first,
+    // skipping every #N a sub-added track already holds.
     let n = 0;
+    let held = 0;
     let myIdx = 0;
     for (const other of externalSubs) {
-      const otherBase = other.label
-        ? other.label
-        : `${other.addon_name}${other.lang ? ` · ${other.lang.toUpperCase()}` : ""}`;
-      if (otherBase === base) {
-        n += 1;
-        if (other === s) myIdx = n;
-      }
+      if (externalBaseTitle(other) !== base) continue;
+      if (pins.has(other.url)) { held += 1; continue; }
+      n += 1;
+      if (other === s) myIdx = n;
     }
-    return n > 1 ? `${base} #${myIdx}` : base;
+    if (n + held <= 1 && !taken.has(base)) return base;
+    let k = 0;
+    for (let free = 0; free < myIdx; ) {
+      k += 1;
+      if (!taken.has(`${base} #${k}`)) free += 1;
+    }
+    return `${base} #${k}`;
   }, [externalSubs]);
 
   const subDropdownItems: TrackEntry[] = useMemo(() => {
@@ -1990,6 +2040,7 @@ export default function PlayerOverlay({
       }
     }
     const usedTitles = new Set<string>();
+    const usedIds = new Set<number>();
 
     // Externals ordering: OpenSubtitles bucket → preferred-language →
     // addon-installed order. Array.sort is stable in V8, so equal-key pairs
@@ -2020,13 +2071,16 @@ export default function PlayerOverlay({
         usedTitles.add(title);
         return live;
       }
-      // Synthetic id keyed on the ORIGINAL externalSubs position, NOT the
-      // sorted index — a re-sort (e.g. preferredSubLang change) would
-      // otherwise remap ids and make the optimistic selectedSubId highlight
-      // point at the wrong row until the next reconcile.
-      const originalIdx = externalSubs.indexOf(s);
+      // Synthetic id keyed on the url, NOT on any position. A sorted index
+      // remaps on a re-sort (e.g. preferredSubLang change), and so does the
+      // position in `externalSubs`, which App replaces mid-file: either would
+      // make the optimistic selectedSubId highlight point at the wrong row, and
+      // after the replace keep it there even once the pick went live.
+      let id = externalSubId(s.url);
+      while (usedIds.has(id)) id -= 1; // a hash collision: stay unique
+      usedIds.add(id);
       return {
-        id: -1 - originalIdx,
+        id,
         type: "sub",
         title,
         lang: s.lang || null,
@@ -2655,7 +2709,9 @@ export default function PlayerOverlay({
                     // sensibly (otherwise it auto-titles from the URL,
                     // which surfaces as e.g. "1958307247" in the
                     // dropdown). The title is also what powers the
-                    // dedupe above on the next refresh.
+                    // dedupe above on the next refresh, so it is pinned to
+                    // this url for the rest of the file.
+                    if (ext?.title) extTitleByUrlRef.current.set(url, ext.title);
                     await invoke("add_subtitle_to_mpv", {
                       path: url,
                       flag: "select",
@@ -2671,6 +2727,9 @@ export default function PlayerOverlay({
                     }
                   } catch (e) {
                     setSelectedSubId(prevSubId);
+                    if (ext?.title && extTitleByUrlRef.current.get(url) === ext.title) {
+                      extTitleByUrlRef.current.delete(url);
+                    }
                     console.error("sub-add failed", e);
                   }
                   return;
@@ -2773,6 +2832,7 @@ export default function PlayerOverlay({
             : undefined
         }
         streamUrl={streamUrl}
+        streamHash={streamHash}
         onClose={() => setSubsOpen(false)}
       />
 
