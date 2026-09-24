@@ -54,3 +54,30 @@ export async function ensureRuntimeDep(
     unlisten?.();
   }
 }
+
+/** One successful ensure per binary per session. */
+const ensuredThisSession = new Map<RuntimeDepName, Promise<string>>();
+
+/**
+ * `ensureRuntimeDep`, at most once per binary per app session once it has
+ * succeeded. For a caller on a HOT path: ensuring re-hashes the file every
+ * time (a ~97 MB SHA-256 for ffmpeg), which is fine on a click but not on
+ * every episode load, while a presence check alone is too weak, since a copy
+ * left over from an older pin passes it and a bumped pin then never reaches
+ * anyone who already has the binary. A failure is not remembered, so the
+ * next call tries again. `onProgress` only fires on the call that actually
+ * does the work. Bounded: the map holds one entry per RuntimeDepName.
+ */
+export function ensureRuntimeDepOnce(
+  name: RuntimeDepName,
+  onProgress?: (p: RuntimeDepProgress) => void,
+): Promise<string> {
+  const known = ensuredThisSession.get(name);
+  if (known) return known;
+  const p = ensureRuntimeDep(name, onProgress);
+  ensuredThisSession.set(name, p);
+  p.catch(() => {
+    if (ensuredThisSession.get(name) === p) ensuredThisSession.delete(name);
+  });
+  return p;
+}

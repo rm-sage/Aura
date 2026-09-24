@@ -42,7 +42,7 @@ import { useDownloadsPanelPhase } from "./downloadsPanel";
 import { ConfirmDialogHost } from "./ConfirmDialog";
 import { safeSetItem } from "./storageQuota";
 import FlyUpToastHost, { showFlyUpToast } from "./FlyUpToast";
-import { runtimeDepPresent, ensureRuntimeDep } from "./runtimeDeps";
+import { runtimeDepPresent, ensureRuntimeDep, ensureRuntimeDepOnce } from "./runtimeDeps";
 import PartyToastHost from "./PartyToast";
 import SourcePopupHost from "./SourcePopup";
 import DevConsole from "./DevConsole";
@@ -3443,12 +3443,25 @@ export default function App() {
                 const willDetect = autoDetect && url != null
                   && ((!hasOp && modeFor("op") !== "off")
                     || (edStart == null && fileDuration > 0 && modeFor("ed") !== "off"));
-                if (willDetect && !(await runtimeDepPresent("ffmpeg.exe").catch(() => false))) {
-                  window.dispatchEvent(new CustomEvent("aura:player-toast", {
-                    detail: { message: "Setting up automatic skip detection (one-time FFmpeg download)" },
-                  }));
+                // Ensured, not just checked for: a presence check let a copy
+                // from an older pin pass forever, so a bumped ffmpeg pin never
+                // reached anyone who already had one. Once per session, since
+                // ensuring re-hashes ~97 MB. The toast names a first download
+                // up front; a stale copy being replaced says so on its first
+                // progress event instead.
+                if (willDetect) {
+                  const present = await runtimeDepPresent("ffmpeg.exe").catch(() => false);
+                  const toast = (message: string) => window.dispatchEvent(
+                    new CustomEvent("aura:player-toast", { detail: { message } }),
+                  );
+                  if (!present) toast("Setting up automatic skip detection (one-time FFmpeg download)");
+                  let announced = !present;
                   try {
-                    await ensureRuntimeDep("ffmpeg.exe");
+                    await ensureRuntimeDepOnce("ffmpeg.exe", () => {
+                      if (announced) return;
+                      announced = true;
+                      toast("Updating FFmpeg for automatic skip detection");
+                    });
                   } catch {
                     // Couldn't fetch it: the detect calls below no-op cleanly.
                   }
