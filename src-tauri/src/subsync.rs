@@ -765,13 +765,16 @@ fn resolve_local_source<R: Runtime>(app: &AppHandle<R>, path: &str) -> Result<Pa
 /// and a chunked / lying response is cut off the moment the accumulated bytes
 /// cross it.
 async fn fetch_remote_subtitle(url: &str) -> Result<Vec<u8>, String> {
+    // `without_url`: reqwest's Display ends ` for url (<url>)`, and an addon's
+    // subtitle URL can carry its config in the path. The class and HTTP
+    // status are what the message needs.
     let mut resp = client()
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("subtitle fetch failed: {e}"))?
+        .map_err(|e| format!("subtitle fetch failed: {}", e.without_url()))?
         .error_for_status()
-        .map_err(|e| format!("subtitle HTTP error: {e}"))?;
+        .map_err(|e| format!("subtitle HTTP error: {}", e.without_url()))?;
 
     if let Some(len) = resp.content_length() {
         ensure_within_cap(len as usize, "subtitle response")?;
@@ -781,7 +784,7 @@ async fn fetch_remote_subtitle(url: &str) -> Result<Vec<u8>, String> {
     while let Some(chunk) = resp
         .chunk()
         .await
-        .map_err(|e| format!("subtitle read failed: {e}"))?
+        .map_err(|e| format!("subtitle read failed: {}", e.without_url()))?
     {
         ensure_within_cap(buf.len() + chunk.len(), "subtitle response")?;
         buf.extend_from_slice(&chunk);
@@ -830,7 +833,7 @@ pub async fn parse_subtitle_cues<R: Runtime>(
         cues.len(),
         format,
         bytes.len(),
-        src.chars().take(80).collect::<String>(),
+        crate::stremio::redact_sensitive_url(&src),
     );
     if cues.is_empty() {
         return Err("no subtitle cues could be parsed from that source".to_string());

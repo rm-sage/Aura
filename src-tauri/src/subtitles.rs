@@ -412,17 +412,18 @@ pub async fn download_subtitle<R: Runtime>(
         .map(sanitize_filename)
         .unwrap_or_else(|| format!("{file_id}.srt"));
 
-    // Step 2: GET the link directly
+    // Step 2: GET the link directly. It is a temporary download URL, so its
+    // errors leave it out too (see prefetch_remote_subtitle).
     let bytes = client()
         .get(link)
         .send()
         .await
-        .map_err(|e| format!("Subtitle fetch failed: {e}"))?
+        .map_err(|e| format!("Subtitle fetch failed: {}", e.without_url()))?
         .error_for_status()
-        .map_err(|e| format!("Subtitle HTTP error: {e}"))?
+        .map_err(|e| format!("Subtitle HTTP error: {}", e.without_url()))?
         .bytes()
         .await
-        .map_err(|e| format!("Subtitle read error: {e}"))?;
+        .map_err(|e| format!("Subtitle read error: {}", e.without_url()))?;
 
     // Step 3: write to subtitles cache dir
     let dest = subtitles_dir(&app)?.join(&file_name);
@@ -478,16 +479,20 @@ async fn prefetch_remote_subtitle(app: &AppHandle, url: &str) -> Result<String, 
         return Ok(dest.to_string_lossy().into_owned());
     }
 
+    // `without_url`: reqwest's Display ends ` for url (<url>)`, an addon's
+    // subtitle URL can carry its config in the path, and the player logs
+    // this message when a pick fails. The class and HTTP status are what
+    // the message needs.
     let bytes = client()
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("Subtitle fetch failed: {e}"))?
+        .map_err(|e| format!("Subtitle fetch failed: {}", e.without_url()))?
         .error_for_status()
-        .map_err(|e| format!("Subtitle HTTP error: {e}"))?
+        .map_err(|e| format!("Subtitle HTTP error: {}", e.without_url()))?
         .bytes()
         .await
-        .map_err(|e| format!("Subtitle read error: {e}"))?;
+        .map_err(|e| format!("Subtitle read error: {}", e.without_url()))?;
     if bytes.is_empty() {
         return Err("subtitle server returned an empty file".into());
     }

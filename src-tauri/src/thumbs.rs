@@ -154,7 +154,7 @@ async fn extract_via_ffmpeg(
     let mut out_path = std::env::temp_dir();
     out_path.push(format!("aura-thumb-{seq}.jpg"));
     let out_str = out_path.to_string_lossy().to_string();
-    let label: String = url.chars().take(80).collect();
+    let label = crate::stremio::redact_sensitive_url(url);
     let ss = format!("{at_seconds}");
 
     let mut cmd = crate::silencedetect::ffmpeg_command(app);

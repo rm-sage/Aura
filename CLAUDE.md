@@ -872,8 +872,12 @@ high-BDP link (>=100 Mbps x >=30 ms RTT) that rebuffers mid-playback despite the
 
 - `%USERPROFILE%\aura-mpv.log` (verbose libmpv) records every loaded URL verbatim, including
   `?token=` / `auth=` query params (debrid, signed CDN). Treat it like your debrid auth; redact URLs
-  before sharing. The DevConsole "Export logs" button is safer (it captures only Aura's own labelled
-  lines, not libmpv internals).
+  before sharing. The DevConsole "Export logs" button is safer: it captures Aura's own labelled
+  lines plus libmpv's info-level messages (forwarded under `[mpv]`), not libmpv's verbose log, and
+  every URL in those lines goes through `redact_sensitive_url` (`stremio.rs`: opaque path segments,
+  userinfo, secret-named query values, nested URLs) or `redact_urls_in_text` for libmpv's prose.
+  Keep it that way: log a request by addon label plus `{type}/{id}`, a reqwest error through
+  `reqwest_err_for_log` (its Display appends the URL), and never feed a log label into data.
 - `%USERPROFILE%\aura-panic.log` (Rust panic backtraces) is smaller surface (no URL leakage in normal
   operation).
 - Both inherit the `%USERPROFILE%` DACL, which on a default install grants only the owning user (plus

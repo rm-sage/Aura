@@ -1083,6 +1083,30 @@ fn describe_reqwest_err(e: &reqwest::Error) -> &'static str {
     else                                    { "send error" }
 }
 
+/// A reqwest error as a log line may print it. reqwest's own Display ends
+/// ` for url (<the full request url>)`, and an addon URL carries the user's
+/// config (often a debrid key too) in its path, so a log line never prints
+/// the error itself. The class from `describe_reqwest_err` says what went
+/// wrong; the innermost cause (the OS error, the TLS alert, serde's line
+/// and column) tells two failures of one class apart. reqwest gives the URL
+/// to the top-level error only, and a cause that carries one anyway is
+/// dropped rather than printed.
+fn reqwest_err_for_log(e: &reqwest::Error) -> String {
+    let class = describe_reqwest_err(e);
+    let mut root = None;
+    let mut next = std::error::Error::source(e);
+    while let Some(err) = next {
+        root = Some(err);
+        next = std::error::Error::source(err);
+    }
+    match root.map(|err| err.to_string()) {
+        Some(cause) if !cause.is_empty() && !cause.contains("://") => {
+            format!("{class}: {}", cap(cause, 200))
+        }
+        _ => class.to_string(),
+    }
+}
+
 /// Reject obviously-malformed addon URLs before any network call. The Rust
 /// reqwest layer would also error on a bad URL, but doing the cheap structural
 /// checks here gives the user a precise message and prevents wasted DNS / TLS
@@ -1318,15 +1342,30 @@ fn log_label(name: &str, url: &str) -> String {
 /// Strip API-key / token shaped fragments from a URL before it's
 /// devlog'd. Stream addons routinely return URLs with debrid bearer
 /// keys embedded as `?api_key=…`, `?token=…`, or `/api_key/<key>/…`
-/// path segments — devlog'ing the raw URL persists them to
-/// `aura-mpv.log` AND the DevConsole ring buffer (which gets exported
-/// from the Help menu). The redacted form preserves the host and the
-/// non-secret path so debugging still works.
+/// path segments, and most keep them in a bare path segment instead: a
+/// debrid download link's id, an AIOStreams / AIOMetadata config UUID, a
+/// Torrentio `realdebrid=<key>` config. Devlog'ing the raw URL persists
+/// them to `aura-mpv.log` AND the DevConsole ring buffer (which gets
+/// exported from the Help menu). The redacted form preserves the host and
+/// the readable path so debugging still works.
 ///
-/// Conservative scope: redact ONLY parameters whose name matches the
-/// well-known secret-bearing keys. Aura's own addon URLs (configured by
-/// the user, e.g. AIOMetadata `?lang=en&…`) stay readable.
+/// Query parameters are redacted ONLY when their name reads as a secret or
+/// their value is itself a URL carrying one (`redact_query`), so Aura's own
+/// addon URLs (configured by the user, e.g. AIOMetadata `?lang=en&…`) stay
+/// readable. The path and any `user:pass@` are handled by
+/// `redact_path_tokens`.
 pub(crate) fn redact_sensitive_url(input: &str) -> String {
+    redact_url_at(input, 0)
+}
+
+/// How deep `query_pair_is_secret` may look into a query value that is
+/// itself a URL. Past it the value is redacted whole without a look: a
+/// proxy's `d=<upstream>` is one level, and nothing legitimate nests three.
+/// Unbounded, a crafted chain of `?d=` levels (an M3U channel line has no
+/// length cap) recursed once per level and overflowed the stack.
+const MAX_NESTED_URL_DEPTH: u8 = 2;
+
+fn redact_url_at(input: &str, depth: u8) -> String {
     // Path-segment form: `…/api_key/<value>/…` → `…/api_key/<redacted>/…`
     const PATH_KEYS: &[&str] = &["api_key", "apikey", "token", "auth"];
     // Query-param form: `?api_key=<value>` / `&token=<value>` → `<redacted>`
@@ -1349,10 +1388,14 @@ pub(crate) fn redact_sensitive_url(input: &str) -> String {
                 .find(|c: char| c == '/' || c == '?')
                 .unwrap_or(tail.len());
             if end > 0 {
-                s.replace_range(abs..abs + end, "<redacted>");
+                s.replace_range(abs..abs + end, REDACTED);
             }
-            // Advance past the redaction so we don't re-scan it.
-            search_start = abs + "<redacted>".len();
+            // Advance past the redaction so we don't re-scan it, or to just
+            // after the marker when there was nothing to redact. Always
+            // stepping REDACTED's length could land inside a multibyte
+            // char (a decoded nested URL can hold any text) and panic on
+            // the next slice.
+            search_start = if end > 0 { abs + REDACTED.len() } else { abs };
             if search_start >= s.len() {
                 break;
             }
@@ -1372,9 +1415,9 @@ pub(crate) fn redact_sensitive_url(input: &str) -> String {
                     .find(|c: char| c == '&' || c == '#')
                     .unwrap_or(tail.len());
                 if end > 0 {
-                    s.replace_range(abs..abs + end, "<redacted>");
+                    s.replace_range(abs..abs + end, REDACTED);
                 }
-                search_start = abs + "<redacted>".len();
+                search_start = if end > 0 { abs + REDACTED.len() } else { abs };
                 if search_start >= s.len() {
                     break;
                 }
@@ -1382,7 +1425,190 @@ pub(crate) fn redact_sensitive_url(input: &str) -> String {
         }
     }
 
-    s
+    // Pass 3: userinfo and opaque path segments, then the query values the
+    // exact names above miss. Split before the query, so a `://` inside it
+    // (a magnet's `tr=udp://…`) is never taken for the scheme.
+    let path_end = s.find(|c: char| c == '?' || c == '#').unwrap_or(s.len());
+    let (head, rest) = s.split_at(path_end);
+    let mut out = redact_path_tokens(head);
+    out.push_str(&redact_query(rest, depth));
+    out
+}
+
+/// Every URL inside a free-text line, redacted as `redact_sensitive_url`
+/// would. For text Aura does not compose itself: libmpv's own messages name
+/// the file they open (`Playing: <url>`, `Failed to open <url>.`, an HLS
+/// `Opening '<segment url>' for reading`). Borrowed when the line holds no
+/// URL, which is nearly every line, so it stays cheap on the engine thread.
+pub(crate) fn redact_urls_in_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("://") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for (i, word) in text.split(' ').enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        if !word.contains("://") {
+            out.push_str(word);
+            continue;
+        }
+        // Quotes, brackets and a sentence's full stop wrap the URL; they
+        // are not part of it.
+        let start = word.len() - word.trim_start_matches(|c: char| "(['\"<".contains(c)).len();
+        let end = word.trim_end_matches(|c: char| ".,;:)]'\">".contains(c)).len();
+        out.push_str(&word[..start]);
+        out.push_str(&redact_sensitive_url(&word[start..end]));
+        out.push_str(&word[end..]);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+const REDACTED: &str = "<redacted>";
+
+/// Stremio resource names, for spotting the protocol tail of an addon
+/// request: `…/{resource}/{type}/{id}[/{extra}].json`.
+const STREMIO_RESOURCES: &[&str] = &["catalog", "meta", "stream", "subtitles", "addon_catalog"];
+
+/// The path half of `redact_sensitive_url` (`head` stops before any `?` or
+/// `#`): any `user:pass@` in the authority, and every path segment that
+/// reads as a credential rather than a word (see `segment_looks_opaque`).
+///
+/// An addon request's tail (`/stream/series/tt0903747:1:5.json`) is the
+/// Stremio protocol, not the user's config, and it is what says which
+/// catalog, meta or stream a log line is about, so it is kept verbatim.
+/// Only a path that ENDS in `.json`, with a resource name three or four
+/// segments from the end followed by a word-shaped type, has one. A
+/// debrid link has no such tail, so every segment of it is checked.
+fn redact_path_tokens(head: &str) -> String {
+    let auth_start = head.find("://").map_or(0, |i| i + 3);
+    let auth_end = head[auth_start..].find('/').map_or(head.len(), |i| auth_start + i);
+    let authority = &head[auth_start..auth_end];
+
+    let mut out = String::with_capacity(head.len());
+    out.push_str(&head[..auth_start]);
+    match authority.rfind('@') {
+        Some(at) => {
+            out.push_str(REDACTED);
+            out.push_str(&authority[at..]);
+        }
+        None => out.push_str(authority),
+    }
+
+    let path = &head[auth_end..];
+    if let Some(path) = path.strip_prefix('/') {
+        let segs: Vec<&str> = path.split('/').collect();
+        let n = segs.len();
+        let is_request = segs[n - 1].ends_with(".json");
+        let tail_from = [4usize, 3]
+            .into_iter()
+            .filter_map(|k| n.checked_sub(k))
+            .find(|&i| {
+                is_request
+                    && STREMIO_RESOURCES.contains(&segs[i])
+                    && !segment_looks_opaque(segs[i + 1])
+            })
+            .unwrap_or(n);
+        for (i, seg) in segs.iter().enumerate() {
+            out.push('/');
+            if i < tail_from {
+                out.push_str(&redact_segment(seg));
+            } else {
+                out.push_str(seg);
+            }
+        }
+    }
+    out
+}
+
+/// Query names whose value is a credential, matched as a SUFFIX of the
+/// lowercased name so a prefixed one is caught too: MediaFlow's
+/// `api_password`, an `access_token`, a forwarded `h_authorization` header.
+const SECRET_QUERY_SUFFIXES: &[&str] = &[
+    "password", "passwd", "token", "key", "secret", "auth", "authorization", "signature", "sig", "pin",
+];
+
+/// The query half of `redact_sensitive_url` (`rest` starts at the `?` or
+/// `#`). A value goes when its name ends in a secret word, or when it is
+/// itself a URL that carries a credential (a proxy's `d=<upstream>`,
+/// encoded or not). A nested URL goes whole: its own `/`, `?` and `&` cannot
+/// be told apart from the outer query's once it is written back. Every other
+/// value stays, since `lang=en` or a magnet's `xt=` is what makes a line
+/// readable.
+fn redact_query(rest: &str, depth: u8) -> String {
+    let frag_at = rest.find('#').unwrap_or(rest.len());
+    let (query, frag) = rest.split_at(frag_at);
+    let Some(query) = query.strip_prefix('?') else {
+        return rest.to_string();
+    };
+    let mut out = String::with_capacity(rest.len());
+    out.push('?');
+    for (i, pair) in query.split('&').enumerate() {
+        if i > 0 {
+            out.push('&');
+        }
+        match pair.split_once('=') {
+            Some((name, _)) if query_pair_is_secret(pair, depth) => {
+                out.push_str(name);
+                out.push('=');
+                out.push_str(REDACTED);
+            }
+            _ => out.push_str(pair),
+        }
+    }
+    out.push_str(frag);
+    out
+}
+
+/// One raw `name=value` pair, judged on its DECODED name and value, so a
+/// percent-encoded upstream URL is seen for what it is.
+fn query_pair_is_secret(pair: &str, depth: u8) -> bool {
+    let Some((name, value)) = url::form_urlencoded::parse(pair.as_bytes()).next() else {
+        return false;
+    };
+    if value.is_empty() || value == REDACTED {
+        return false;
+    }
+    let name = name.to_ascii_lowercase();
+    SECRET_QUERY_SUFFIXES.iter().any(|s| name.ends_with(s))
+        // A nested URL is judged by redacting it in turn, to a bounded
+        // depth; one nested deeper than that goes unexamined, as secret.
+        || (value.contains("://")
+            && (depth >= MAX_NESTED_URL_DEPTH || redact_url_at(&value, depth + 1) != value))
+}
+
+/// One path segment, redacted when it reads as a credential. A short file
+/// extension survives (`<redacted>.m3u8`), so a log still tells an HLS load
+/// from a file.
+fn redact_segment(seg: &str) -> String {
+    let (stem, ext) = match seg.rfind('.') {
+        Some(i) if i > 0 && is_short_extension(&seg[i + 1..]) => seg.split_at(i),
+        _ => (seg, ""),
+    };
+    if stem != REDACTED && segment_looks_opaque(stem) {
+        format!("{REDACTED}{ext}")
+    } else {
+        seg.to_string()
+    }
+}
+
+/// 1-5 ASCII alphanumerics with at least one letter (`mkv`, `m3u8`, `json`).
+/// All digits is a token fragment (`abc.12345`), not an extension.
+fn is_short_extension(ext: &str) -> bool {
+    (1..=5).contains(&ext.len())
+        && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+        && ext.bytes().any(|b| b.is_ascii_alphabetic())
+}
+
+/// Credential-shaped: 24+ chars of anything, or 10+ that are not a plain
+/// lowercase word. That catches UUIDs, base64 / hex / JWT blobs,
+/// percent-encoded configs and Real-Debrid's 13-char link id, and leaves
+/// `stremio`, `playlist`, `d`, `v3` or `api` readable. A token under 10
+/// chars, or one of lowercase letters only, gets through: this is a
+/// heuristic for log lines, not a parser.
+fn segment_looks_opaque(seg: &str) -> bool {
+    let n = seg.chars().count();
+    n >= 24 || (n >= 10 && !seg.chars().all(|c| c.is_ascii_lowercase() || c == '-' || c == '_'))
 }
 
 /// What `refresh_addon_manifest` returns: exactly what `get_addon_manifest`
@@ -1736,7 +1962,7 @@ pub async fn fetch_catalog(
     crate::devlog!(
         info, "catalog",
         "[{}] GET {} (skip={:?} limit={:?}){}",
-        label, url, skip, limit,
+        label, redact_sensitive_url(&url), skip, limit,
         if force { " forced (retry)" } else { "" },
     );
 
@@ -1755,8 +1981,8 @@ pub async fn fetch_catalog(
         Err(e) => {
             let cat = describe_reqwest_err(&e);
             crate::devlog!(
-                warn, "catalog", "[{}] {}/{} {}: {}",
-                label, catalog_type, catalog_id, cat, e,
+                warn, "catalog", "[{}] {}/{} {}",
+                label, catalog_type, catalog_id, reqwest_err_for_log(&e),
             );
             if e.is_timeout() || e.is_connect() || e.is_request() {
                 mark_catalog_failed(&base, &catalog_type, &catalog_id);
@@ -1786,8 +2012,8 @@ pub async fn fetch_catalog(
             // is returning malformed JSON — recurring "JSON parse error" with
             // no identifier was useless for triage.
             crate::devlog!(
-                warn, "catalog", "[{}] {}/{} JSON parse error: {}",
-                label, catalog_type, catalog_id, e,
+                warn, "catalog", "[{}] {}/{} JSON parse error ({})",
+                label, catalog_type, catalog_id, reqwest_err_for_log(&e),
             );
             return Err(format!("Catalog parse error: {e}"));
         }
@@ -2006,8 +2232,8 @@ pub async fn search_addon_grouped(
                 if !resp.status().is_success() {
                     crate::devlog!(
                         warn, "search",
-                        "[{}] {} → HTTP {}",
-                        addon_name_str, url, resp.status().as_u16(),
+                        "[{}] {}/{} → HTTP {}",
+                        addon_name_str, c.media_type, c.id, resp.status().as_u16(),
                     );
                     continue;
                 }
@@ -2019,19 +2245,18 @@ pub async fn search_addon_grouped(
                     Err(e) => {
                         crate::devlog!(
                             warn, "search",
-                            "[{}] {} JSON parse failed: {}",
-                            addon_name_str, url, e,
+                            "[{}] {}/{} JSON parse failed ({})",
+                            addon_name_str, c.media_type, c.id, reqwest_err_for_log(&e),
                         );
                         continue;
                     }
                 }
             }
             Err(e) => {
-                let cat = describe_reqwest_err(&e);
                 crate::devlog!(
                     warn, "search",
-                    "[{}] {} {}: {}",
-                    addon_name_str, url, cat, e,
+                    "[{}] {}/{} {}",
+                    addon_name_str, c.media_type, c.id, reqwest_err_for_log(&e),
                 );
                 continue;
             }
@@ -2165,8 +2390,8 @@ pub async fn global_search_grouped(
                         if !resp.status().is_success() {
                             crate::devlog!(
                                 warn, "search",
-                                "[{}] {} → HTTP {}",
-                                addon_name_str, url, resp.status().as_u16(),
+                                "[{}] {}/{} → HTTP {}",
+                                addon_name_str, c.media_type, c.id, resp.status().as_u16(),
                             );
                             continue;
                         }
@@ -2178,19 +2403,18 @@ pub async fn global_search_grouped(
                             Err(e) => {
                                 crate::devlog!(
                                     warn, "search",
-                                    "[{}] {} JSON parse failed: {}",
-                                    addon_name_str, url, e,
+                                    "[{}] {}/{} JSON parse failed ({})",
+                                    addon_name_str, c.media_type, c.id, reqwest_err_for_log(&e),
                                 );
                                 continue;
                             }
                         }
                     }
                     Err(e) => {
-                        let cat = describe_reqwest_err(&e);
                         crate::devlog!(
                             warn, "search",
-                            "[{}] {} {}: {}",
-                            addon_name_str, url, cat, e,
+                            "[{}] {}/{} {}",
+                            addon_name_str, c.media_type, c.id, reqwest_err_for_log(&e),
                         );
                         continue;
                     }
@@ -2397,8 +2621,17 @@ pub async fn fetch_meta_detail(
     let addon_name = cap(addon_name.unwrap_or_default(), 64);
     let label = log_label(&addon_name, &base);
     // What embedded per-video streams carry as `addon_name`, which the stream
-    // list groups by. The label stands in when the caller named no addon.
-    let stream_addon_name = if addon_name.is_empty() { label.clone() } else { addon_name.clone() };
+    // list groups and keys by, so it is shown and compared. When the caller
+    // named no addon the host stands in, never `label`: that is a LOG string,
+    // and its fallback is redacted for logs (`<redacted>` segments on screen).
+    let stream_addon_name = if addon_name.is_empty() {
+        url::Url::parse(&base)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_default()
+    } else {
+        addon_name.clone()
+    };
 
     crate::devlog!(info, "meta", "[{}] GET {}", label, redact_sensitive_url(&url));
 
@@ -2408,7 +2641,7 @@ pub async fn fetch_meta_detail(
         .await
         .map_err(|e| {
             let cat = describe_reqwest_err(&e);
-            crate::devlog!(warn, "meta", "[{}] {}: {}", label, cat, e);
+            crate::devlog!(warn, "meta", "[{}] {}/{} {}", label, media_type, id, reqwest_err_for_log(&e));
             format!("Meta fetch {cat}: {e}")
         })?
         .error_for_status()
@@ -2419,7 +2652,7 @@ pub async fn fetch_meta_detail(
         .json()
         .await
         .map_err(|e| {
-            crate::devlog!(warn, "meta", "[{}] JSON parse error: {}", label, e);
+            crate::devlog!(warn, "meta", "[{}] {}/{} JSON parse error ({})", label, media_type, id, reqwest_err_for_log(&e));
             format!("Meta parse error: {e}")
         })?;
 
@@ -3363,13 +3596,13 @@ pub async fn library_put(
         .send()
         .await
         .map_err(|e| {
-            crate::devlog!(warn, "library", "datastorePut network error: {}", e);
+            crate::devlog!(warn, "library", "datastorePut network error: {}", reqwest_err_for_log(&e));
             format!("Network error: {e}")
         })?
         .error_for_status()
         .map_err(|e| {
             let status = e.status().map(|s| s.as_u16()).unwrap_or(0);
-            crate::devlog!(warn, "library", "datastorePut HTTP {}: {}", status, e);
+            crate::devlog!(warn, "library", "datastorePut HTTP {}", status);
             if status == 401 { SESSION_EXPIRED.into() }
             else { format!("HTTP error: {e}") }
         })?;
@@ -3489,7 +3722,7 @@ pub async fn fetch_landscape_art(
         Err(e) => {
             // Endpoint not deployed yet / network blip — quiet, the card
             // falls back to its existing background/poster.
-            crate::devlog!(debug, "meta", "[{}] landscape art fetch failed: {}", label, e);
+            crate::devlog!(debug, "meta", "[{}] landscape art fetch failed: {}", label, reqwest_err_for_log(&e));
             return Ok(LandscapeArt::default());
         }
     };
@@ -3537,7 +3770,7 @@ pub async fn fetch_landscape_art(
             Ok(art)
         }
         Err(e) => {
-            crate::devlog!(debug, "meta", "[{}] landscape art parse error: {}", label, e);
+            crate::devlog!(debug, "meta", "[{}] landscape art parse error ({})", label, reqwest_err_for_log(&e));
             Ok(LandscapeArt::default())
         }
     }
@@ -3767,12 +4000,11 @@ pub async fn fetch_streams(
             {
                 Ok(r) => r,
                 Err(e) => {
-                    let cat = describe_reqwest_err(&e);
                     crate::devlog!(
                         warn,
                         "streams",
-                        "[{}] {}: {}",
-                        label, cat, e
+                        "[{}] {}/{} {}",
+                        label, media_type, id, reqwest_err_for_log(&e)
                     );
                     return (addon_idx, AddonFetchOutput::empty());
                 }
@@ -3782,8 +4014,8 @@ pub async fn fetch_streams(
                 crate::devlog!(
                     warn,
                     "streams",
-                    "[{}] HTTP {} for {}",
-                    label, status.as_u16(), url
+                    "[{}] HTTP {} for {}/{}",
+                    label, status.as_u16(), media_type, id
                 );
                 return (addon_idx, AddonFetchOutput::empty());
             }
@@ -3794,8 +4026,8 @@ pub async fn fetch_streams(
                     crate::devlog!(
                         warn,
                         "streams",
-                        "[{}] JSON parse failed: {}",
-                        label, e
+                        "[{}] {}/{} JSON parse failed ({})",
+                        label, media_type, id, reqwest_err_for_log(&e)
                     );
                     return (addon_idx, AddonFetchOutput::empty());
                 }
@@ -5105,5 +5337,218 @@ mod tests {
             subtitle_extra_segment(Some("0000000000000000"), None, None).as_deref(),
             Some("videoHash=0000000000000000"),
         );
+    }
+
+    const CONFIG_UUID: &str = "9f2c1b1e-5d2a-4c1f-9e7b-3a4d5c6b7a81";
+
+    /// An addon's config lives in its base path. It goes; the Stremio request
+    /// tail after it stays, since that says which catalog or stream it was.
+    #[test]
+    fn redact_collapses_addon_config_and_keeps_the_request_tail() {
+        let aiostreams = format!(
+            "https://aiostreams.example.dev/stremio/{CONFIG_UUID}/eyJhbGciOiJBMjU2S1ciLCJlbmMiOiJBMjU2R0NNIn0/stream/series/tt0903747:1:5.json",
+        );
+        assert_eq!(
+            redact_sensitive_url(&aiostreams),
+            "https://aiostreams.example.dev/stremio/<redacted>/<redacted>/stream/series/tt0903747:1:5.json",
+        );
+        let catalog = format!("https://meta.example.dev/stremio/{CONFIG_UUID}/catalog/movie/tmdb.trending/skip=100.json");
+        assert_eq!(
+            redact_sensitive_url(&catalog),
+            "https://meta.example.dev/stremio/<redacted>/catalog/movie/tmdb.trending/skip=100.json",
+        );
+        let torrentio = "https://torrentio.strem.fun/sort=qualitysize|realdebrid=ABCDEFGHIJKLMNOP1234/stream/movie/tt0111161.json";
+        assert_eq!(
+            redact_sensitive_url(torrentio),
+            "https://torrentio.strem.fun/<redacted>/stream/movie/tt0111161.json",
+        );
+        // A nameless addon's log label is its base, and a base has no tail.
+        assert_eq!(
+            log_label("", &format!("https://meta.example.dev/stremio/{CONFIG_UUID}")),
+            "https://meta.example.dev/stremio/<redacted>",
+        );
+    }
+
+    /// A debrid link has no request tail, so each segment is judged on its
+    /// own. A short extension survives so HLS still reads as HLS.
+    #[test]
+    fn redact_collapses_link_ids_and_keeps_the_extension() {
+        assert_eq!(
+            redact_sensitive_url("https://27.download.real-debrid.com/d/ABCDEFGHIJ234/Breaking.Bad.S01E01.1080p.WEB-DL.mkv"),
+            "https://27.download.real-debrid.com/d/<redacted>/<redacted>.mkv",
+        );
+        assert_eq!(
+            redact_sensitive_url("https://live.example.dev/hls/0f3a9c2e7b4d6a8f1e2c/index.m3u8"),
+            "https://live.example.dev/hls/<redacted>/index.m3u8",
+        );
+        // The bridge percent-encodes the whole upstream into one segment.
+        assert_eq!(
+            redact_sensitive_url("http://127.0.0.1:11471/proxy/http%3A%2F%2Fcdn.example.dev%2Fv%2Fabc%3Ftoken%3Dxyz"),
+            "http://127.0.0.1:11471/proxy/<redacted>",
+        );
+        // `.json` alone does not make a tail: the segment after `stream` must
+        // be a type, and this one is a token.
+        assert_eq!(
+            redact_sensitive_url("https://cdn.example.dev/stream/0123456789ABCDEFtoken/file.json"),
+            "https://cdn.example.dev/stream/<redacted>/file.json",
+        );
+    }
+
+    #[test]
+    fn redact_masks_userinfo_and_still_masks_query_keys() {
+        assert_eq!(
+            redact_sensitive_url("https://someone:hunter2@members.example.dev/dl/abc/file.mkv"),
+            "https://<redacted>@members.example.dev/dl/abc/file.mkv",
+        );
+        assert_eq!(
+            redact_sensitive_url(&format!("https://x.example.dev/{CONFIG_UUID}/stream/movie/tt0111161.json?token=abc&lang=en")),
+            "https://x.example.dev/<redacted>/stream/movie/tt0111161.json?token=<redacted>&lang=en",
+        );
+        assert_eq!(
+            redact_sensitive_url("https://x.example.dev/api_key/SECRET/stream/movie/tt0111161.json"),
+            "https://x.example.dev/api_key/<redacted>/stream/movie/tt0111161.json",
+        );
+    }
+
+    /// Readable URLs come back byte-identical, and a second pass is a no-op.
+    #[test]
+    fn redact_leaves_readable_urls_alone_and_is_idempotent() {
+        for url in [
+            "https://v3-cinemeta.strem.io/manifest.json",
+            "https://v3-cinemeta.strem.io/catalog/movie/top.json",
+            "https://opensubtitles-v3.strem.io/subtitles/series/tt0903747:1:5.json",
+            "https://cdn.example.dev/api/v1/playlist.m3u8",
+            "https://cdn.example.dev",
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&tr=udp://tracker.example.dev:80/announce",
+            "https://mfp.example.dev/proxy/stream?d=https%3A%2F%2Fcdn.example.dev%2Fvideo.mp4&lang=en",
+        ] {
+            assert_eq!(redact_sensitive_url(url), url);
+        }
+        for url in [
+            format!("https://x.example.dev/stremio/{CONFIG_UUID}/stream/movie/tt0111161.json?token=abc"),
+            "https://someone:hunter2@cdn.example.dev/d/ABCDEFGHIJ234/Movie.2020.1080p.mkv".to_string(),
+            format!("https://mfp.example.dev/proxy/stream?d={MFP_UPSTREAM}&api_password=hunter2"),
+        ] {
+            let once = redact_sensitive_url(&url);
+            assert_eq!(redact_sensitive_url(&once), once);
+        }
+    }
+
+    /// A MediaFlow-style proxy link, whose upstream (a debrid link id and
+    /// all) is percent-encoded into the `d=` query value.
+    const MFP_UPSTREAM: &str =
+        "https%3A%2F%2F27.download.real-debrid.com%2Fd%2FABCDEFGHIJ234%2Ffile.mkv";
+
+    /// A query value goes when its name ENDS in a secret word, or when it is
+    /// itself a URL carrying a credential, encoded or not, in either order.
+    #[test]
+    fn redact_masks_nested_upstream_urls_and_suffix_named_secrets() {
+        assert_eq!(
+            redact_sensitive_url(&format!("https://mfp.example.dev/proxy/stream?d={MFP_UPSTREAM}&api_password=hunter2")),
+            "https://mfp.example.dev/proxy/stream?d=<redacted>&api_password=<redacted>",
+        );
+        assert_eq!(
+            redact_sensitive_url("https://mfp.example.dev/proxy/stream?api_password=hunter2&d=https://27.download.real-debrid.com/d/ABCDEFGHIJ234/file.mkv"),
+            "https://mfp.example.dev/proxy/stream?api_password=<redacted>&d=<redacted>",
+        );
+        assert_eq!(
+            redact_sensitive_url("https://cdn.example.dev/v.m3u8?access_token=abc&h_authorization=Bearer%20xyz&lang=en#t=10"),
+            "https://cdn.example.dev/v.m3u8?access_token=<redacted>&h_authorization=<redacted>&lang=en#t=10",
+        );
+    }
+
+    /// Two inputs that crashed the first version. An all-ASCII URL whose
+    /// DECODED nested value holds multibyte text next to an empty secret
+    /// used to panic on a mid-char slice (it ran in load_video, before the
+    /// stream reached mpv, and on the engine thread for mpv's own lines).
+    /// A deep chain of nested `?d=` URLs used to recurse once per level and
+    /// overflow the stack; it must now finish, and quickly.
+    #[test]
+    fn redact_survives_decoded_multibyte_and_deep_nesting() {
+        let multibyte = "https://mfp.example.dev/proxy/stream?d=https%3A%2F%2Fcdn.example.dev%2Fv.mkv%3Ftoken%3D%26name%3D%E3%83%AF%E3%83%B3%E3%83%94%E3%83%BC%E3%82%B9&api_password=x";
+        assert_eq!(
+            redact_sensitive_url(multibyte),
+            "https://mfp.example.dev/proxy/stream?d=https%3A%2F%2Fcdn.example.dev%2Fv.mkv%3Ftoken%3D%26name%3D%E3%83%AF%E3%83%B3%E3%83%94%E3%83%BC%E3%82%B9&api_password=<redacted>",
+        );
+        // The same shape, undecoded, straight into pass 2.
+        let _ = redact_sensitive_url("https://h/v.mkv?token=&name=ワンピース&pin=&x=ü");
+
+        let deep = format!("https://a/{}", "?d=https://a/".repeat(20_000));
+        let started = std::time::Instant::now();
+        let out = redact_sensitive_url(&deep);
+        assert!(out.starts_with("https://a/?d=<redacted>"), "{}", &out[..40.min(out.len())]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// libmpv's own lines are prose around a URL. Only the URL changes, the
+    /// wrapping punctuation stays put, and a line without one is not copied.
+    #[test]
+    fn redact_urls_in_text_rewrites_only_the_urls() {
+        assert_eq!(
+            redact_urls_in_text("Failed to open https://27.download.real-debrid.com/d/ABCDEFGHIJ234/Breaking.Bad.S01E01.1080p.WEB-DL.mkv."),
+            "Failed to open https://27.download.real-debrid.com/d/<redacted>/<redacted>.mkv.",
+        );
+        assert_eq!(
+            redact_urls_in_text("Opening 'https://live.example.dev/hls/0f3a9c2e7b4d6a8f1e2c/seg1.ts' for reading"),
+            "Opening 'https://live.example.dev/hls/<redacted>/seg1.ts' for reading",
+        );
+        // A `?` in the prose ahead of the URL does not hide the URL's path.
+        assert_eq!(
+            redact_urls_in_text(&format!("retry? Playing: https://mfp.example.dev/proxy/stream?d={MFP_UPSTREAM}")),
+            "retry? Playing: https://mfp.example.dev/proxy/stream?d=<redacted>",
+        );
+        assert!(matches!(
+            redact_urls_in_text("Multiple Dolby Vision RPUs found in one AU"),
+            std::borrow::Cow::Borrowed(_),
+        ));
+    }
+
+    /// A one-shot loopback server that answers with `reply`, or hangs up
+    /// without answering when it is `None`. Returns the port.
+    fn one_shot_server(reply: Option<&'static [u8]>) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            if let Some(reply) = reply {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf);
+                let _ = sock.write_all(reply);
+            }
+        });
+        (port, handle)
+    }
+
+    /// The premise first: reqwest's own Display names the request URL. The
+    /// log text must not, and must still say what kind of failure it was.
+    #[tokio::test]
+    async fn reqwest_error_log_text_never_carries_the_url() {
+        let (port, server) = one_shot_server(None);
+        let url = format!("http://127.0.0.1:{port}/stremio/{CONFIG_UUID}/stream/movie/tt0111161.json");
+        let client = reqwest::Client::builder().no_proxy().build().expect("client");
+        let err = client.get(&url).send().await.expect_err("the server hung up");
+        server.join().expect("server thread");
+        assert!(err.to_string().contains(CONFIG_UUID), "premise: {err}");
+        let line = reqwest_err_for_log(&err);
+        assert!(!line.contains(CONFIG_UUID) && !line.contains("://"), "{line}");
+        assert!(line.starts_with(describe_reqwest_err(&err)), "{line}");
+    }
+
+    /// A malformed body keeps serde's position, which is what makes a
+    /// "JSON parse error" line worth reading.
+    #[tokio::test]
+    async fn reqwest_decode_error_log_text_keeps_the_serde_cause() {
+        let (port, server) = one_shot_server(Some(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+        ));
+        let url = format!("http://127.0.0.1:{port}/stremio/{CONFIG_UUID}/meta/movie/tt0111161.json");
+        let client = reqwest::Client::builder().no_proxy().build().expect("client");
+        let resp = client.get(&url).send().await.expect("a 200");
+        let err = resp.json::<serde_json::Value>().await.expect_err("not JSON");
+        server.join().expect("server thread");
+        let line = reqwest_err_for_log(&err);
+        assert!(line.starts_with("decode failed: ") && line.contains("line 1"), "{line}");
+        assert!(!line.contains(CONFIG_UUID), "{line}");
     }
 }

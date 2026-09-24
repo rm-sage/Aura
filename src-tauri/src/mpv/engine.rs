@@ -1099,6 +1099,11 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
                     if let Some((_, kind)) = hit {
                         t.corrupt_hint = Some(kind);
                     }
+                    // mpv names the file it opens (`Playing: <url>`,
+                    // `Failed to open <url>.`), and these lines reach the
+                    // DevConsole export, so any URL is redacted the way
+                    // Aura's own lines are. Borrowed when there is none.
+                    let logged = crate::stremio::redact_urls_in_text(body);
                     // Damage lines go out at WARN so they are visible in the
                     // DevConsole's default filter. Everything else stays at
                     // debug, which is where this whole channel used to sit
@@ -1108,14 +1113,14 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
                             warn, "mpv",
                             "mpv/{} {}",
                             cstr((*m).prefix).trim(),
-                            body,
+                            logged,
                         );
                     } else {
                         crate::devlog!(
                             debug, "mpv",
                             "mpv/{} {}",
                             cstr((*m).prefix).trim(),
-                            body,
+                            logged,
                         );
                     }
                 }
@@ -2083,7 +2088,8 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         match run_mpv_command(&lib, handle, &args_v) {
                             Ok(()) => crate::devlog!(
                                 info, "mpv",
-                                "loadfile accepted: {url}{start_log}{}",
+                                "loadfile accepted: {}{start_log}{}",
+                                crate::stremio::redact_sensitive_url(&url),
                                 if proxied { " [via proxy]" } else { "" },
                             ),
                             Err(e) => crate::devlog!(
@@ -2134,9 +2140,15 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         let borrowed: Vec<&str> =
                             args.iter().map(String::as_str).collect();
                         if let Err(e) = run_mpv_command(&lib, handle, &borrowed) {
+                            // An arg can be a URL (a plain-http `sub-add`),
+                            // so it is redacted like every logged URL.
+                            let shown: Vec<_> = borrowed
+                                .iter()
+                                .map(|a| crate::stremio::redact_urls_in_text(a))
+                                .collect();
                             crate::devlog!(
                                 warn, "mpv",
-                                "command {:?} failed: {e}", borrowed,
+                                "command {:?} failed: {e}", shown,
                             );
                         }
                     }

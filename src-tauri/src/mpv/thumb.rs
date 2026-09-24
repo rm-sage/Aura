@@ -449,7 +449,7 @@ unsafe fn process(
             crate::devlog!(
                 warn, "mpv",
                 "thumb: demuxer open (FILE_LOADED) timed out for {}",
-                url.chars().take(64).collect::<String>(),
+                crate::stremio::redact_sensitive_url(url),
             );
             return Ok(ThumbOutcome::NoFrame);
         }
@@ -532,7 +532,7 @@ unsafe fn process(
         debug, "mpv",
         "thumb: no frame at {:.1}s ({}) for {}",
         at_seconds, last_stage,
-        url.chars().take(64).collect::<String>(),
+        crate::stremio::redact_sensitive_url(url),
     );
     Ok(ThumbOutcome::NoFrame)
 }

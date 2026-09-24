@@ -4741,14 +4741,55 @@ export default function SettingsView({ addons, session }: Props) {
   // setting, and hydratedRef only covers the hydration case. (A no-op patch,
   // which changes no key, still toasts as it always did.)
   const prevAuraRef = useRef(aura);
+  // The `aura` objects that must NOT be saved: re-reads from storage (see
+  // adoptStoredAura). Each already IS storage as of its read, so saving it
+  // would only write it back (after a reset, recreating the key) and raise
+  // "Settings saved" for a change this page did not make. Matched by
+  // identity, so a later edit (always a new object) saves normally. A SET,
+  // not one slot: two external changes can straddle a commit (an import's
+  // backend dispatch, then its keyring round trip, then its own save), and
+  // with one slot the second adopt overwrote the mark before the first
+  // one's effect ran, which then saved the pre-import copy over the import.
+  const adoptedAuraRef = useRef(new WeakSet<AuraSettings>());
+  // True only while the effect below is saving, so the settings-changed
+  // listener can tell this page's own save (dispatched synchronously) from
+  // anyone else's.
+  const savingAuraRef = useRef(false);
   useEffect(() => {
-    saveAuraSettings(aura);
+    if (adoptedAuraRef.current.has(aura)) {
+      prevAuraRef.current = aura;
+      return;
+    }
+    savingAuraRef.current = true;
+    try {
+      saveAuraSettings(aura);
+    } finally {
+      savingAuraRef.current = false;
+    }
     const prev = prevAuraRef.current;
     prevAuraRef.current = aura;
     const changed = (Object.keys(aura) as (keyof AuraSettings)[]).filter((k) => aura[k] !== prev[k]);
     const viewPrefOnly = changed.length > 0 && changed.every((k) => k === "showAdvancedSettings");
     if (hydratedRef.current && !viewPrefOnly) queueSavedToast();
   }, [aura, queueSavedToast]);
+
+  // Take whatever storage now holds, without saving it back. For a change
+  // made anywhere but this page's own save: a full reset, an import, a cloud
+  // pull, a player-side toggle. Merging into `aura` instead kept the page's
+  // OLD copy, and the next save (on reset, the nudge itself) wrote every
+  // stale value straight back over the change.
+  const adoptStoredAura = useCallback(() => {
+    const fresh = loadAuraSettings();
+    adoptedAuraRef.current.add(fresh);
+    setAura(fresh);
+  }, []);
+  useEffect(() => {
+    const onChanged = () => {
+      if (!savingAuraRef.current) adoptStoredAura();
+    };
+    window.addEventListener("aura:settings-changed", onChanged);
+    return () => window.removeEventListener("aura:settings-changed", onChanged);
+  }, [adoptStoredAura]);
 
   // Load backend settings on mount
   useEffect(() => {
@@ -6164,12 +6205,13 @@ export default function SettingsView({ addons, session }: Props) {
                 invoke<BackendSettings>("get_settings")
                   .then(setBackend)
                   .catch(() => {});
-                // Reset local Aura settings state too - the listener
-                // on aura:settings-changed already fires reads, but
-                // doing it explicitly here keeps the controls in sync
-                // even if the listener registration ordering ever
-                // changes.
-                setLocal({}); // no-op patch to nudge a re-render
+                // Re-read the Aura settings from the storage the reset
+                // just cleared (defaults, the key being gone). The
+                // settings-changed listener has already done so; doing it
+                // here too keeps the controls right even if that ordering
+                // ever changes, and it is a no-op otherwise (the same
+                // cached object).
+                adoptStoredAura();
               }}
             />
           )}

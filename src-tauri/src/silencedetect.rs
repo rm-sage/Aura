@@ -346,7 +346,7 @@ pub async fn detect_silence_intervals(
     crate::devlog!(
         info, "silence",
         "detect_silence_intervals (parallel OP scan) max_secs={max_secs} url={}",
-        url.chars().take(80).collect::<String>(),
+        crate::stremio::redact_sensitive_url(&url),
     );
 
     // Security guard: only remote http(s) streams (what mpv already
@@ -581,7 +581,7 @@ pub async fn detect_outro_boundary(
     crate::devlog!(
         info, "silence",
         "detect_outro_boundary tail={tail}s duration={duration:.1} url={}",
-        url.chars().take(80).collect::<String>(),
+        crate::stremio::redact_sensitive_url(&url),
     );
 
     // Security guard: only remote http(s) streams (what mpv already
