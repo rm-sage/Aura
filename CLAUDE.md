@@ -331,7 +331,9 @@ frontend ~40k LOC over ~70 files + ~13 views).
   `oauth_callback.rs` (RFC 8252 §7.3 loopback landing pad for system-browser OAuth, served as
   `GET /oauth/callback` on the same bridge listener; nonce-guarded, re-emits the existing
   `deep-link` event so `App.tsx` persists tokens through one code path. Proxy-side contract in
-  `docs/oauth-loopback-contract.md`).
+  `docs/oauth-loopback-contract.md`. Also serves `GET /oauth/callback/simkl`, Simkl's own PKCE
+  redirect target with no proxy involved: the `state` is a nonce carrying the PKCE verifier, the
+  code is exchanged there, and the result leaves through the same `deep-link` re-emit).
 - **Metadata + ratings**: `ratings.rs` (MDBList + MAL + AniList aggregator, anime-aware weights),
   `tenrai.rs` (the MyAnimeList client: base URL, a bounded `/anime/{id}/full` cache shared by
   ratings and theme songs, plus the five on-demand extras commands), `theme_parse.rs` (MAL theme
@@ -343,6 +345,18 @@ frontend ~40k LOC over ~70 files + ~13 views).
   exposes the manual `scrobble_history_trakt` / `scrobble_history_anilist` commands (the per-row
   buttons on the History tab in `src/views/HistoryView.tsx`), which backdate the mark to the original
   watch time: Trakt exact via `watched_at`, AniList day-precision via `completedAt`.
+  `scrobble_simkl.rs` is the third provider: OAuth 2.0 authorization code + PKCE as a public client
+  (no proxy, no secret; lands on `/oauth/callback/simkl`), COMPLETION-ONLY like Trakt
+  (`POST /sync/history`, never `/scrobble/*`: one POST per finished item, plus one fallback POST
+  with show-level ids when an anime episode's cour-level ids come back not_found), and it
+  supplements AniList (an anime episode goes to both). Every Simkl POST is paced at least 1.1 s
+  apart (Simkl's budget is 1 POST/s: overage answers `429 {"error":"rate_limit"}` and starts a
+  throttling block, reported as `412 client_id_failed` while active, that repeated overage extends;
+  `400 RATE_LIMIT`, spelled `rate_limit` in the sync guide, is the 20 s per-user write lock, not a
+  rate limit), and `scrobble_history_simkl` takes the History rows as ONE batch (chunks of 100) and
+  returns a result per row. All of it is inert while
+  `SIMKL_CLIENT_ID` (beside `TRAKT_CLIENT_ID` in `scrobble_auth.rs`) is empty;
+  `scrobble_services_available` is how the frontend tells "not in this build" from "not connected".
 - **Subtitles + media**: `subtitles.rs` (OpenSubtitles v1: search incl. moviehash, download,
   add-to-mpv), `subsync.rs` (Live Sync cue lists: SRT / WebVTT / ASS parsing for external tracks,
   WINDOWED ffmpeg extraction for embedded ones), `media_controls.rs` (SMTC via souvlaki),

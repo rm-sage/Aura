@@ -9,7 +9,7 @@
 //! gets a separate (or absent) Trakt / AniList connection rather than
 //! inheriting the previous account's tokens. The keyring service name
 //! is `aura`; the entry user name follows the pattern
-//! `<service>-<scope>` where service is `trakt` / `anilist` and scope
+//! `<service>-<scope>` where service is `trakt` / `anilist` / `simkl` and scope
 //! is the first 12 chars of the Stremio auth_key (or `guest`).
 //!
 //! Token shape on disk: a small JSON object with access_token,
@@ -37,6 +37,14 @@
 //!     The deep-link handler in App.tsx persists via
 //!     `set_scrobble_auth_token`.
 //!
+//!   • Simkl does NOT go through the proxy. It is a public OAuth 2.0
+//!     client (authorization code + PKCE, no client_secret), so Aura
+//!     opens Simkl's authorize page itself and Simkl redirects straight
+//!     to the loopback bridge at `/oauth/callback/simkl`, which exchanges
+//!     the code and re-emits the same `aura://oauth/simkl?…` deep-link.
+//!     See scrobble_simkl.rs. Every Simkl path is inert while
+//!     `SIMKL_CLIENT_ID` below is empty.
+//!
 //! IMPORTANT: AniList does NOT issue refresh tokens. Their access
 //! tokens last 1 year, and the only way to renew is full re-auth
 //! (the user has to click Connect again and walk through the auth
@@ -63,8 +71,10 @@ const KEYRING_SERVICE: &str = "aura";
 /// The ONE allowlist: every command that takes a `service` from the frontend
 /// goes through `validate_service`, so a keyring entry name or a proxy URL can
 /// only ever be built from a value listed here. Mirrored by
-/// `SCROBBLE_SERVICES` in src/scrobbleConn.ts.
-pub const SCROBBLE_SERVICES: &[&str] = &["trakt", "anilist"];
+/// `SCROBBLE_SERVICES` in src/scrobbleConn.ts. "simkl" is listed even in a
+/// build with no `SIMKL_CLIENT_ID`: the list says which keyring entries exist,
+/// and `scrobble_services_available` says which services can sign in.
+pub const SCROBBLE_SERVICES: &[&str] = &["trakt", "anilist", "simkl"];
 
 /// Reject a service name that is not in `SCROBBLE_SERVICES`. The error text is
 /// the one every command returned before this was centralised.
@@ -137,12 +147,18 @@ pub type ScrobbleAuthStatus = BTreeMap<String, ScrobbleAuthSummary>;
 #[derive(Clone, Debug, Serialize)]
 pub struct ScrobbleAuthSummary {
     pub username: Option<String>,
+    /// When the connection lapses, in unix seconds. For Trakt and AniList
+    /// that is the stored access token's expiry. For Simkl it is the
+    /// RENEWAL DEADLINE instead (see `summarise`): its 7-day access token
+    /// renews itself on the next write, so its expiry is not a date the
+    /// user has to act on.
     pub expires_at: Option<u64>,
     /// True when the access_token is approaching expiry but still
     /// usable. The threshold is provider-aware: AniList tokens last a
     /// year and have NO refresh path (the user must re-auth manually
     /// when the token finally lapses), so we warn 7 days ahead. Trakt
-    /// tokens last 90 days; we warn 24 h ahead. The frontend renders
+    /// tokens last 90 days; we warn 24 h ahead. Simkl warns 7 days
+    /// before its renewal deadline. The frontend renders
     /// this as a soft amber "reconnect when convenient" hint.
     pub stale: bool,
     /// True when `expires_at` has already passed. The frontend
@@ -186,17 +202,42 @@ fn summarise(service: &str, token: Option<ScrobbleAuthToken>) -> Option<Scrobble
         "anilist" => 7 * 24 * 3600,
         _         => 24 * 3600,
     };
-    let stale = match token.expires_at {
+
+    // Simkl measures against its REFRESH path, not the access token. The
+    // access token lives 7 days and every write renews it silently
+    // (scrobble_simkl.rs refreshes proactively inside its last day, and
+    // reactively on a 401), so warning on it would put an amber "expires in
+    // 6 days" on a connection that never needs the user. What CAN lapse is
+    // the refresh token: 180 days, sliding forward on every refresh, and a
+    // refresh stamps a fresh 7-day `expires_at`. So the last refresh (or the
+    // sign-in) happened at `expires_at - 7d`, and the grant dies unrenewed at
+    // that moment + 180d. That deadline is what `expires_at` reports for
+    // Simkl; `stale` is its last 7 days (watching anything renews it) and
+    // `expired` is past it, the one state that needs a reconnect. A token
+    // stored without a refresh_token has no silent renewal and is judged on
+    // its access-token expiry, like Trakt.
+    let simkl_refreshable = service == "simkl"
+        && token.refresh_token.as_deref().is_some_and(|r| !r.is_empty());
+    let reported_expiry = match token.expires_at {
+        Some(exp) if simkl_refreshable => Some(
+            exp.saturating_sub(crate::scrobble_simkl::ACCESS_TOKEN_TTL_SECS)
+                + crate::scrobble_simkl::REFRESH_TOKEN_TTL_SECS,
+        ),
+        other => other,
+    };
+    let warn_window = if simkl_refreshable { 7 * 24 * 3600 } else { warn_window };
+
+    let stale = match reported_expiry {
         Some(exp) => exp > now && exp <= now + warn_window,
         None      => false,
     };
-    let expired = match token.expires_at {
+    let expired = match reported_expiry {
         Some(exp) => exp <= now,
         None      => false,
     };
     Some(ScrobbleAuthSummary {
         username:   token.username.clone(),
-        expires_at: token.expires_at,
+        expires_at: reported_expiry,
         stale,
         expired,
     })
@@ -259,10 +300,10 @@ pub async fn clear_scrobble_auth_token(
     // Best-effort server-side revoke BEFORE dropping the local entry so
     // Trakt invalidates the token on their side too — otherwise a
     // "disconnected" token stays live on Trakt until its 90-day TTL.
-    // Trakt-only: AniList exposes no revoke endpoint, so its arm in
-    // `revoke_access_token` does nothing. Every failure is swallowed
-    // inside `revoke_trakt_token`; the local clear below runs regardless
-    // of whether the proxy/Trakt was reachable.
+    // Trakt and Simkl only: AniList exposes no revoke endpoint, so its arm
+    // in `revoke_access_token` does nothing. Every failure is swallowed
+    // inside the provider's revoke; the local clear below runs regardless
+    // of whether the provider was reachable.
     revoke_access_token(&service, &scope).await;
 
     let e = entry(&service, &scope)?;
@@ -306,6 +347,18 @@ pub fn clear_token_for(service: &str, scope: &str) {
     }
 }
 
+/// Replace the stored token for `(service, scope)`. Used by a refresh that
+/// happens in Rust (scrobble_simkl.rs); a sign-in still persists through
+/// `set_scrobble_auth_token` from the deep-link handler.
+pub(crate) fn store_token_for(
+    service: &str,
+    scope:   &str,
+    token:   &ScrobbleAuthToken,
+) -> Result<(), String> {
+    let json = serde_json::to_string(token).map_err(|e| e.to_string())?;
+    entry(service, scope)?.set_password(&json).map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Provider constants — the bits that DO live in the desktop binary
 // (per the integration doc, §5: client_id is fine to embed; only
@@ -317,6 +370,20 @@ pub fn clear_token_for(service: &str, scope: &str) {
 /// proxy in env (`TRAKT_CLIENT_SECRET`); the desktop never sees it.
 pub const TRAKT_CLIENT_ID: &str =
     "6005fd2f46b73d6fdf40547c34af33acd2d2aeed1df73c9601fbac4634a40a9c";
+
+/// Simkl client_id. PASTE the public client_id from
+/// https://simkl.com/settings/developer/ here. It is public and safe to
+/// commit (Simkl's docs say so: an AUTH V2 client_id on its own reaches only
+/// public catalog data). There is NO client_secret: Aura is registered as a
+/// public desktop client and proves itself with PKCE instead, so a secret
+/// must never be added here or anywhere in the binary.
+///
+/// While this is empty every Simkl path is inert: no request is ever made,
+/// the authorize command returns an error saying sign-in is not set up in
+/// this build, the completion and shutdown pushes return at once, and
+/// `scrobble_services_available` leaves "simkl" out so the frontend can tell
+/// "not in this build" from "not connected".
+pub const SIMKL_CLIENT_ID: &str = "";
 
 // ---------------------------------------------------------------------------
 // OAuth authorize URL helpers — give the frontend the right URL to
@@ -371,12 +438,21 @@ fn parsed_host_of(raw: &str) -> Option<String> {
 /// Requesting loopback while the bridge is down is an error rather than a
 /// silent downgrade: the caller needs to know to use the popup instead,
 /// otherwise it would open a browser tab that can never come back.
+///
+/// Simkl is the exception to all of the above: it is not behind the proxy.
+/// Its arm returns Simkl's OWN authorize URL (PKCE challenge + a single-use
+/// `state` minted here), `loopback` is ignored because Simkl can only ever
+/// land on the loopback route, and a build with no `SIMKL_CLIENT_ID` gets an
+/// error instead of a URL. See `scrobble_simkl::authorize_url`.
 #[tauri::command]
 pub fn scrobble_oauth_authorize_url(
     service:  String,
     loopback: Option<bool>,
 ) -> Result<String, String> {
     validate_service(&service)?;
+    if service == "simkl" {
+        return crate::scrobble_simkl::authorize_url();
+    }
     let base = format!("{REDIRECT_BASE}/{service}/start");
     if loopback != Some(true) {
         return Ok(base);
@@ -400,6 +476,32 @@ pub fn scrobble_oauth_authorize_url(
         "oauth start ({service}) → system browser, loopback callback on port {port}",
     );
     Ok(url.to_string())
+}
+
+/// Whether this BUILD holds the client credentials `service` needs. Trakt's
+/// client_id is baked in above and AniList's credentials live on the proxy,
+/// so both are always available; Simkl is available only once
+/// `SIMKL_CLIENT_ID` has been filled in.
+fn service_available(service: &str) -> bool {
+    match service {
+        "trakt" => !TRAKT_CLIENT_ID.is_empty(),
+        "simkl" => crate::scrobble_simkl::is_configured(),
+        _ => true,
+    }
+}
+
+/// The scrobble services this build can sign in to, in `SCROBBLE_SERVICES`
+/// order. Separate from `get_scrobble_auth_status` (which says what is
+/// CONNECTED) so the frontend can tell "Simkl is not set up in this build"
+/// apart from "Simkl is not connected" and hide the row instead of offering a
+/// Connect button that can only fail.
+#[tauri::command]
+pub fn scrobble_services_available() -> Vec<String> {
+    SCROBBLE_SERVICES
+        .iter()
+        .filter(|&&service| service_available(service))
+        .map(|&service| service.to_string())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +563,16 @@ pub enum DeviceFlowPoll {
     Error { message: String },
 }
 
+/// The device-flow commands talk to the proxy, which has no Simkl endpoints:
+/// Simkl signs in through `scrobble_oauth_authorize_url` and the loopback
+/// route instead. Refuse it here rather than send a request that can only 404.
+fn reject_non_proxy_service(service: &str) -> Result<(), String> {
+    if service == "simkl" {
+        return Err("Simkl signs in through the browser, not the device flow".into());
+    }
+    Ok(())
+}
+
 fn device_flow_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .https_only(true)
@@ -475,6 +587,7 @@ fn device_flow_client() -> Result<reqwest::Client, String> {
 #[tauri::command]
 pub async fn scrobble_oauth_device_begin(service: String) -> Result<DeviceFlowBegin, String> {
     validate_service(&service)?;
+    reject_non_proxy_service(&service)?;
     let url = format!("{REDIRECT_BASE}/{service}/device/code");
     let client = device_flow_client()?;
     let resp = client.post(&url).send().await.map_err(|e| e.to_string())?;
@@ -501,6 +614,7 @@ pub async fn scrobble_oauth_device_poll(
     device_code: String,
 ) -> Result<DeviceFlowPoll, String> {
     validate_service(&service)?;
+    reject_non_proxy_service(&service)?;
     let url = format!("{REDIRECT_BASE}/{service}/device/token");
     let client = device_flow_client()?;
     let resp = client
@@ -626,18 +740,20 @@ pub async fn scrobble_oauth_device_poll(
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-/// Per-Trakt-scope refresh lock registry. Each scope gets its own
+/// Per-scope refresh lock registry. Each key gets its own
 /// `tokio::sync::Mutex`; the outer `std::sync::Mutex` only guards the
-/// short map lookup/insert and is never held across an await.
+/// short map lookup/insert and is never held across an await. Trakt keys
+/// by the bare scope; Simkl by `simkl:<scope>`, so the two providers never
+/// queue behind each other's refresh.
 fn refresh_locks() -> &'static std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
     static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>
         = OnceLock::new();
     LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-fn refresh_lock_for(scope: &str) -> Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn refresh_lock_for(key: &str) -> Arc<tokio::sync::Mutex<()>> {
     let mut map = refresh_locks().lock().unwrap_or_else(|e| e.into_inner());
-    map.entry(scope.to_string())
+    map.entry(key.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
 }
@@ -651,6 +767,10 @@ fn refresh_lock_for(scope: &str) -> Arc<tokio::sync::Mutex<()>> {
 ///   • `Transient` — 429 / 502 / 400 / network / decode error. The
 ///     stored token is untouched and still usable; the caller should
 ///     fail this attempt without clearing.
+///
+/// Simkl's refresh (scrobble_simkl.rs) answers with the same three, with
+/// `Rejected` meaning Simkl said `invalid_grant` (refresh token revoked, or
+/// idle past its 180 days) and the keyring entry already cleared.
 #[derive(Debug)]
 pub(crate) enum RefreshError {
     /// No `refresh_token` stored for this scope.
@@ -673,10 +793,11 @@ pub(crate) struct RefreshOutcome {
 /// entry point: scrobble.rs calls this rather than a provider-named helper,
 /// so a provider that gains a refresh path is one more arm here.
 ///
-/// Only Trakt has one. AniList issues no refresh token and exposes no
-/// refresh endpoint (see the module docs), so it reports `NoRefreshToken`,
-/// the same answer a Trakt token stored without a `refresh_token` gets, and
-/// nothing is sent anywhere.
+/// Trakt refreshes through the proxy; Simkl refreshes against its own token
+/// endpoint (a public client needs no secret, see scrobble_simkl.rs). AniList
+/// issues no refresh token and exposes no refresh endpoint (see the module
+/// docs), so it reports `NoRefreshToken`, the same answer a Trakt token stored
+/// without a `refresh_token` gets, and nothing is sent anywhere.
 pub(crate) async fn refresh_access_token(
     service: &str,
     scope: &str,
@@ -686,6 +807,7 @@ pub(crate) async fn refresh_access_token(
         "trakt" => refresh_trakt_token(scope, failing_access_token).await,
         // No refresh path at all; renewal is a full re-auth.
         "anilist" => Err(RefreshError::NoRefreshToken),
+        "simkl" => crate::scrobble_simkl::refresh_token(scope, failing_access_token).await,
         // Not a service this module stores tokens for.
         _ => Err(RefreshError::NoRefreshToken),
     }
@@ -693,9 +815,9 @@ pub(crate) async fn refresh_access_token(
 
 /// Best-effort server-side revoke of the stored token for `(service, scope)`,
 /// run by the Disconnect path before the local keyring entry is dropped.
-/// Only Trakt exposes a revoke endpoint; for AniList there is nothing to call,
-/// so its arm does nothing (and does not even read the keyring), exactly as
-/// the old `service == "trakt"` gate behaved.
+/// Trakt and Simkl expose a revoke endpoint; for AniList there is nothing to
+/// call, so its arm does nothing (and does not even read the keyring), exactly
+/// as the old `service == "trakt"` gate behaved.
 pub(crate) async fn revoke_access_token(service: &str, scope: &str) {
     match service {
         "trakt" => {
@@ -705,6 +827,8 @@ pub(crate) async fn revoke_access_token(service: &str, scope: &str) {
         }
         // No revoke endpoint; the caller's local keyring clear is all there is.
         "anilist" => {}
+        // Never blocks the disconnect: capped at 5 s, every failure swallowed.
+        "simkl" => crate::scrobble_simkl::revoke(scope).await,
         // Not a service this module stores tokens for.
         _ => {}
     }
@@ -1085,4 +1209,71 @@ pub async fn open_oauth_popup_webview(
         .map_err(|e| format!("add_child failed: {e}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DAY: u64 = 24 * 3600;
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn token(expires_at: u64, refresh: bool) -> ScrobbleAuthToken {
+        ScrobbleAuthToken {
+            access_token:  "a".into(),
+            refresh_token: refresh.then(|| "r".to_string()),
+            expires_at:    Some(expires_at),
+            username:      None,
+        }
+    }
+
+    #[test]
+    fn simkl_summary_tracks_the_renewal_deadline() {
+        let now = now();
+        // Fresh sign-in: reports the refresh window's end, nothing to warn about.
+        let s = summarise("simkl", Some(token(now + 7 * DAY, true))).unwrap();
+        assert_eq!(s.expires_at, Some(now + 180 * DAY));
+        assert!(!s.stale && !s.expired);
+        // Access token lapsed a week ago: still renews silently on the next write.
+        let s = summarise("simkl", Some(token(now - 7 * DAY, true))).unwrap();
+        assert!(!s.stale && !s.expired);
+        // Idle for ~174 days: inside the last week of the refresh window.
+        let s = summarise("simkl", Some(token(now - 170 * DAY, true))).unwrap();
+        assert!(s.stale && !s.expired);
+        // Idle past 180 days: only a reconnect helps.
+        let s = summarise("simkl", Some(token(now - 200 * DAY, true))).unwrap();
+        assert!(s.expired);
+        // No refresh token: judged on the access token itself, like Trakt.
+        let s = summarise("simkl", Some(token(now - DAY, false))).unwrap();
+        assert!(s.expired);
+    }
+
+    #[test]
+    fn trakt_and_anilist_scrobble_summaries_are_unchanged() {
+        let now = now();
+        let s = summarise("trakt", Some(token(now + 12 * 3600, true))).unwrap();
+        assert_eq!(s.expires_at, Some(now + 12 * 3600));
+        assert!(s.stale && !s.expired);
+        let s = summarise("anilist", Some(token(now + 3 * DAY, false))).unwrap();
+        assert!(s.stale && !s.expired);
+        let s = summarise("trakt", Some(token(now - 1, true))).unwrap();
+        assert!(s.expired);
+    }
+
+    #[test]
+    fn simkl_is_listed_but_only_available_with_a_client_id() {
+        assert!(SCROBBLE_SERVICES.contains(&"simkl"));
+        assert_eq!(
+            scrobble_services_available().contains(&"simkl".to_string()),
+            !SIMKL_CLIENT_ID.is_empty(),
+        );
+        assert!(scrobble_services_available().contains(&"trakt".to_string()));
+        assert!(scrobble_services_available().contains(&"anilist".to_string()));
+    }
 }

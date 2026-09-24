@@ -49,6 +49,17 @@
 //! established handler persists the token via `set_scrobble_auth_token`
 //! along exactly the code path the OS scheme handler would have taken. No
 //! second persistence path to keep in sync.
+//!
+//! ## Simkl: `GET /oauth/callback/simkl`
+//!
+//! Simkl is a public PKCE client with no proxy in the middle, so Simkl
+//! itself redirects here with `code` + `state` (+ `iss`), and this module
+//! does the code exchange. The same nonce machinery guards it: the `state`
+//! IS a nonce, minted by `issue_pkce_state` bound to "simkl" and carrying
+//! the PKCE verifier, and redeemed exactly once. A PKCE record is only ever
+//! accepted on the Simkl route, and a plain proxy nonce only on
+//! `/oauth/callback`, so neither route can redeem the other's flow. The
+//! result still leaves through the same `deep-link` re-emit.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -58,10 +69,16 @@ use axum::extract::Query;
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use tauri::{AppHandle, Emitter, Manager, Url};
+use zeroize::Zeroizing;
 
 /// Path the proxy redirects to. Kept public so `scrobble_auth.rs` can build
 /// the `/start` URL without restating the string.
 pub const CALLBACK_PATH: &str = "/oauth/callback";
+
+/// Path Simkl redirects to. Registered with Simkl as part of
+/// `scrobble_simkl::REDIRECT_URI`, byte for byte; a test there pins the two
+/// together so neither can drift.
+pub const SIMKL_CALLBACK_PATH: &str = "/oauth/callback/simkl";
 
 /// How long a minted nonce stays redeemable. Long enough for a slow
 /// sign-in (find the password, 2FA prompt, pick an account) but short
@@ -86,6 +103,11 @@ pub fn init(app: &AppHandle) {
 struct Pending {
     service: String,
     issued:  Instant,
+    /// The PKCE `code_verifier` for a flow Aura exchanges itself (Simkl).
+    /// `None` for a proxy flow, whose exchange happens on the proxy. Kept in
+    /// memory only and zeroed on drop: it is half of what turns a stolen
+    /// authorization code into a token.
+    pkce_verifier: Option<Zeroizing<String>>,
 }
 
 static PENDING: OnceLock<Mutex<HashMap<String, Pending>>> = OnceLock::new();
@@ -97,6 +119,18 @@ fn pending() -> &'static Mutex<HashMap<String, Pending>> {
 /// Mint a single-use nonce bound to `service`. Called when the user starts
 /// a flow; the value travels to the proxy and back.
 pub fn issue_nonce(service: &str) -> String {
+    insert_pending(service, None)
+}
+
+/// Mint a single-use OAuth `state` for a flow Aura exchanges itself, holding
+/// its PKCE verifier until the provider redirects back. Same rules as a proxy
+/// nonce: single use, `NONCE_TTL`, at most `MAX_PENDING` in flight, so a
+/// declined or abandoned consent expires on its own.
+pub(crate) fn issue_pkce_state(service: &str, verifier: Zeroizing<String>) -> String {
+    insert_pending(service, Some(verifier))
+}
+
+fn insert_pending(service: &str, pkce_verifier: Option<Zeroizing<String>>) -> String {
     let nonce = uuid::Uuid::new_v4().to_string();
     if let Ok(mut map) = pending().lock() {
         map.retain(|_, p| p.issued.elapsed() < NONCE_TTL);
@@ -112,25 +146,34 @@ pub fn issue_nonce(service: &str) -> String {
         }
         map.insert(
             nonce.clone(),
-            Pending { service: service.to_string(), issued: Instant::now() },
+            Pending { service: service.to_string(), issued: Instant::now(), pkce_verifier },
         );
     }
     nonce
 }
 
-/// Redeem a nonce, returning the service it was minted for. Single-use:
+/// Redeem a nonce, returning the record it was minted with. Single-use:
 /// a second redemption of the same value fails.
-fn consume_nonce(nonce: &str) -> Option<String> {
+fn consume_nonce(nonce: &str) -> Option<Pending> {
     let mut map = pending().lock().ok()?;
     map.retain(|_, p| p.issued.elapsed() < NONCE_TTL);
-    map.remove(nonce).map(|p| p.service)
+    map.remove(nonce)
 }
 
 /// Minimal self-contained result page. No external resources (the user's
 /// browser has no reason to reach out to anything for this), and it tries
 /// `window.close()` for the case where the tab was script-opened.
 fn page(title: &str, headline: &str, body: &str, ok: bool) -> Html<String> {
-    let accent = if ok { "#8ad6a0" } else { "#e88a92" };
+    page_with_accent(title, headline, body, if ok { "#8ad6a0" } else { "#e88a92" })
+}
+
+/// `page` with a caller-chosen headline colour, for the one outcome that is
+/// neither a success nor a failure: the user declining on purpose.
+///
+/// Every string reaching this is a constant from this module. Never pass it
+/// text from the query string or a provider response: it is interpolated
+/// into HTML unescaped.
+fn page_with_accent(title: &str, headline: &str, body: &str, accent: &str) -> Html<String> {
     Html(format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
@@ -149,6 +192,22 @@ p{{margin:0;color:#a8adb8;font-size:.9rem}}\
     ))
 }
 
+/// The "start again" page every refused callback gets: nothing about WHY is
+/// shown, since the reasons (unknown, expired, replayed, wrong route) are all
+/// the same instruction to the user.
+fn expired_page() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        page(
+            "Aura",
+            "That sign-in link has expired",
+            "Start the connection again from Aura's Settings page.",
+            false,
+        ),
+    )
+        .into_response()
+}
+
 /// `GET /oauth/callback` — the proxy's final redirect target.
 ///
 /// Expects `nonce` plus the same token params the `aura://` deep-link
@@ -161,21 +220,27 @@ pub async fn handle(Query(params): Query<HashMap<String, String>>) -> Response {
     // Fail closed. An absent, expired, replayed or simply wrong nonce means
     // this callback is not one Aura started, so it never reaches the token
     // persistence path.
-    let Some(service) = consume_nonce(nonce) else {
-        crate::devlog!(
-            warn, "scrobble",
-            "oauth loopback callback REJECTED: unknown / expired / replayed nonce",
-        );
-        return (
-            StatusCode::BAD_REQUEST,
-            page(
-                "Aura",
-                "That sign-in link has expired",
-                "Start the connection again from Aura's Settings page.",
-                false,
-            ),
-        )
-            .into_response();
+    let service = match consume_nonce(nonce) {
+        Some(p) if p.pkce_verifier.is_none() => p.service,
+        // A PKCE state only ever comes back on its provider's own route, with
+        // a code rather than a token. Presented here it is forged or
+        // misrouted, and this route takes the token from the query string, so
+        // it is refused (and, being consumed, cannot be tried again).
+        Some(p) => {
+            crate::devlog!(
+                warn, "scrobble",
+                "oauth loopback callback REJECTED: a {} PKCE state arrived on the proxy route",
+                p.service,
+            );
+            return expired_page();
+        }
+        None => {
+            crate::devlog!(
+                warn, "scrobble",
+                "oauth loopback callback REJECTED: unknown / expired / replayed nonce",
+            );
+            return expired_page();
+        }
     };
 
     // A callback with no token is the provider or proxy telling us the user
@@ -199,9 +264,21 @@ pub async fn handle(Query(params): Query<HashMap<String, String>>) -> Response {
             .into_response();
     }
 
-    // Rebuild the deep-link URL App.tsx already knows how to parse. Only the
-    // four params it reads are forwarded — `nonce` deliberately is not, so
-    // it never lands in a log line or the frontend's URL parsing.
+    // Only the four params App.tsx reads are forwarded: `nonce` deliberately
+    // is not, so it never lands in a log line or the frontend's URL parsing.
+    let pairs: Vec<(&str, &str)> = ["token", "refresh", "expires", "user"]
+        .into_iter()
+        .filter_map(|key| params.get(key).map(|v| (key, v.as_str())))
+        .collect();
+    deliver(&service, &pairs)
+}
+
+/// Rebuild the deep-link URL App.tsx already knows how to parse from
+/// `pairs` (empty values dropped), emit it on the `deep-link` channel, pull
+/// Aura to the front, and answer the browser with the "connected" page. The
+/// one exit both loopback routes share, so a token only ever reaches the
+/// keyring through `set_scrobble_auth_token`.
+fn deliver(service: &str, pairs: &[(&str, &str)]) -> Response {
     let mut deep_link = match Url::parse(&format!("aura://oauth/{service}")) {
         Ok(u) => u,
         Err(e) => {
@@ -215,11 +292,9 @@ pub async fn handle(Query(params): Query<HashMap<String, String>>) -> Response {
     };
     {
         let mut qp = deep_link.query_pairs_mut();
-        for key in ["token", "refresh", "expires", "user"] {
-            if let Some(v) = params.get(key) {
-                if !v.is_empty() {
-                    qp.append_pair(key, v);
-                }
+        for &(key, v) in pairs {
+            if !v.is_empty() {
+                qp.append_pair(key, v);
             }
         }
     }
@@ -275,4 +350,157 @@ pub async fn handle(Query(params): Query<HashMap<String, String>>) -> Response {
         true,
     )
     .into_response()
+}
+
+/// `GET /oauth/callback/simkl`: Simkl's redirect target (AUTH V2).
+///
+/// Simkl answers with `code` + `state` + `iss` on approval and with
+/// `error=access_denied` + `state` + `iss` on refusal. The state is redeemed
+/// FIRST on both paths, so a decline also retires it and a replay of either
+/// fails closed. On approval the code is exchanged here (no secret: Aura is a
+/// public PKCE client), the display name is read best-effort, and the pair
+/// leaves through `deliver` as
+/// `aura://oauth/simkl?token=&refresh=&expires=&user=`, with `expires` in
+/// absolute unix seconds as App.tsx and `set_scrobble_auth_token` expect.
+pub async fn handle_simkl(Query(params): Query<HashMap<String, String>>) -> Response {
+    let state = params.get("state").map(String::as_str).unwrap_or_default();
+    let verifier = match consume_nonce(state) {
+        Some(Pending { service, pkce_verifier: Some(verifier), .. }) if service == "simkl" => {
+            verifier
+        }
+        _ => {
+            crate::devlog!(
+                warn, "scrobble",
+                "Simkl oauth callback REJECTED: unknown / expired / replayed state",
+            );
+            return expired_page();
+        }
+    };
+
+    // RFC 9207 mix-up defence, which Simkl's docs ask every client to make:
+    // a response naming any other issuer is refused before the code goes
+    // anywhere. An absent `iss` is let through: AUTH V2 always sends it, and
+    // the state above already proves Aura started this flow.
+    if let Some(iss) = params.get("iss") {
+        if iss != crate::scrobble_simkl::ISSUER {
+            crate::devlog!(
+                warn, "scrobble",
+                "Simkl oauth callback REJECTED: issuer is not {}",
+                crate::scrobble_simkl::ISSUER,
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                page(
+                    "Aura",
+                    "That response did not come from Simkl",
+                    "Nothing was connected. Start the connection again from Aura's Settings page.",
+                    false,
+                ),
+            )
+                .into_response();
+        }
+    }
+
+    if let Some(error) = params.get("error").filter(|e| !e.is_empty()) {
+        if error == "access_denied" {
+            crate::devlog!(info, "scrobble", "Simkl sign-in declined by the user; nothing stored");
+            return page_with_accent(
+                "Aura",
+                "You declined",
+                "Nothing was connected. You can close this tab.",
+                "#a9b8d0",
+            )
+            .into_response();
+        }
+        // Log only a plain error code; the value came off the query string.
+        let code: String = error
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .take(40)
+            .collect();
+        crate::devlog!(warn, "scrobble", "Simkl sign-in came back with error={code}");
+        return (
+            StatusCode::BAD_REQUEST,
+            page(
+                "Aura",
+                "Simkl did not complete the sign-in",
+                "Nothing was connected. You can close this tab and try again from Aura.",
+                false,
+            ),
+        )
+            .into_response();
+    }
+
+    let code = params.get("code").map(String::as_str).unwrap_or_default();
+    if code.is_empty() {
+        crate::devlog!(
+            warn, "scrobble",
+            "Simkl oauth callback carried neither a code nor an error",
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            page(
+                "Aura",
+                "Authorization was not completed",
+                "No code came back. You can close this tab and try again from Aura.",
+                false,
+            ),
+        )
+            .into_response();
+    }
+
+    use crate::scrobble_simkl::ExchangeError;
+    let grant = match crate::scrobble_simkl::exchange_code(code, &verifier).await {
+        Ok(grant) => grant,
+        Err(ExchangeError::InvalidClient) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                page(
+                    "Aura",
+                    "Simkl sign-in is not enabled for this app",
+                    "Simkl rejected Aura's client id. The app has to be registered for OAuth 2.0 \
+                     (AUTH V2) as a desktop app in Simkl's developer settings. Nothing was connected.",
+                    false,
+                ),
+            )
+                .into_response();
+        }
+        Err(ExchangeError::ReadOnly) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                page(
+                    "Aura",
+                    "Simkl granted read-only access",
+                    "Aura needs permission to update your Simkl history. Nothing was connected; \
+                     try connecting again from Aura.",
+                    false,
+                ),
+            )
+                .into_response();
+        }
+        Err(ExchangeError::NotConfigured | ExchangeError::Rejected | ExchangeError::Transient) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                page(
+                    "Aura",
+                    "Could not finish connecting to Simkl",
+                    "The sign-in code could not be exchanged. Try connecting again from Aura.",
+                    false,
+                ),
+            )
+                .into_response();
+        }
+    };
+
+    let user = crate::scrobble_simkl::fetch_username(&grant.access_token).await;
+    let expires = grant.expires_at.to_string();
+    deliver(
+        "simkl",
+        &[
+            ("token",   grant.access_token.as_str()),
+            ("refresh", grant.refresh_token.as_deref().unwrap_or_default()),
+            ("expires", expires.as_str()),
+            ("user",    user.as_deref().unwrap_or_default()),
+        ],
+    )
 }

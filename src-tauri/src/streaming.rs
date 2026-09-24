@@ -268,6 +268,12 @@ pub fn start_in_process() {
             .route(
                 crate::oauth_callback::CALLBACK_PATH,
                 get(crate::oauth_callback::handle),
+            )
+            // Simkl's own redirect target (PKCE, no proxy). Guarded by the
+            // same single-use state machinery; see oauth_callback.rs.
+            .route(
+                crate::oauth_callback::SIMKL_CALLBACK_PATH,
+                get(crate::oauth_callback::handle_simkl),
             );
 
         let addr = SocketAddr::from(([127, 0, 0, 1], BRIDGE_PORT));

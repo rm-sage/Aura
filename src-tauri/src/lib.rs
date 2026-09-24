@@ -62,6 +62,7 @@ mod runtime_deps;
 mod scrobble;
 mod scrobble_anilist;
 mod scrobble_auth;
+mod scrobble_simkl;
 mod per_title;
 mod settings;
 mod silencedetect;
@@ -2515,9 +2516,11 @@ pub fn run() {
             scrobble_auth::scrobble_oauth_device_begin,
             scrobble_auth::scrobble_oauth_device_poll,
             scrobble_auth::open_oauth_popup_webview,
+            scrobble_auth::scrobble_services_available,
             scrobble::scrobble_test_fire,
             scrobble::scrobble_history_trakt,
             scrobble::scrobble_history_anilist,
+            scrobble::scrobble_history_simkl,
             scrobble::set_scrobble_run_active,
             // ── API keys (OS keyring) ─────────────────────────────────────────
             api_keyring::get_api_key,

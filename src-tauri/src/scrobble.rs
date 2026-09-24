@@ -73,6 +73,13 @@ use crate::settings;
 // on `ActiveScrobbleTarget` so Cinemeta-supplied IMDB anime
 // (Frieren, Demon Slayer, etc.) flows through correctly.
 //
+// Simkl is the third provider (scrobble_simkl.rs), completion-only like
+// Trakt (POST /sync/history, never /scrobble/*): one POST per finished
+// movie / episode, plus one fallback POST with show-level ids for an anime
+// episode whose cour-level ids come back not_found, every one paced by
+// send_paced. Anime goes alongside AniList rather than instead of it. Inert
+// in a build without a Simkl client_id.
+//
 // All scrobble traffic is best-effort: failures are logged via
 // `crate::devlog!` but never propagate to the user. The scrobble
 // pipeline must never block playback.
@@ -622,7 +629,10 @@ static LAST_PROACTIVE_REFRESH: OnceLock<Mutex<std::collections::HashMap<String, 
 ///
 /// The reactive (401) refresh is deliberately NOT gated by this: that one only
 /// fires when the server has already rejected the token, so it is self-limiting.
-fn proactive_refresh_allowed(scope: &str) -> bool {
+///
+/// The key is Trakt's bare scope; scrobble_simkl.rs passes `simkl:<scope>`, so
+/// the two providers never spend each other's cooldown.
+pub(crate) fn proactive_refresh_allowed(scope: &str) -> bool {
     const REFRESH_COOLDOWN: Duration = Duration::from_secs(60);
     let map = LAST_PROACTIVE_REFRESH.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let Ok(mut guard) = map.lock() else { return true };
@@ -856,12 +866,13 @@ async fn trakt_sync_history(
 enum Provider {
     Trakt,
     Anilist,
+    Simkl,
 }
 
 impl Provider {
     /// Every provider, in dispatch order. The sequential callers run them in
-    /// exactly this order: Trakt, then AniList.
-    const ALL: &'static [Provider] = &[Provider::Trakt, Provider::Anilist];
+    /// exactly this order: Trakt, then AniList, then Simkl.
+    const ALL: &'static [Provider] = &[Provider::Trakt, Provider::Anilist, Provider::Simkl];
 }
 
 /// Which kind of push `dispatch` is making.
@@ -881,6 +892,9 @@ enum ProviderOutcome {
     Trakt(TraktSyncResult),
     /// A 401 in here has already been handled (token cleared) by `dispatch`.
     Anilist(Result<crate::scrobble_anilist::SaveOutcome, crate::scrobble_anilist::AnilistError>),
+    /// Refresh, 401 and not_found handling already happened inside
+    /// `push_completion`, which also logged the outcome.
+    Simkl(crate::scrobble_simkl::SimklSyncResult),
     /// A `Push::Shutdown` flush. Fire-and-forget, so there is nothing to report.
     Flushed,
 }
@@ -969,6 +983,18 @@ async fn dispatch<R: Runtime>(
                 save_progress(app, scope, sess, None),
             )
             .await;
+            ProviderOutcome::Flushed
+        }
+        // Simkl: movies, series AND anime (it supplements AniList, so an anime
+        // episode reaches both). Returns at once, with no request, in a build
+        // without a Simkl client_id or when no Simkl token is stored.
+        (Provider::Simkl, Push::Completion { .. }) => {
+            ProviderOutcome::Simkl(crate::scrobble_simkl::push_completion(scope, sess).await)
+        }
+        // One POST of the best candidate, no refresh and no not_found retry,
+        // capped at 2 s inside flush_on_shutdown like the other providers.
+        (Provider::Simkl, Push::Shutdown { progress_pct }) => {
+            crate::scrobble_simkl::flush_on_shutdown(scope, sess, progress_pct).await;
             ProviderOutcome::Flushed
         }
     }
@@ -1072,7 +1098,8 @@ pub async fn scrobble_end<R: Runtime>(
         "scrobble_end: id={} progress={:.0}% anime={} scope={} - dispatching to providers",
         sess.imdb_id, progress, sess.is_anime, scope,
     );
-    // In order, one after the other, exactly as before: Trakt, then AniList.
+    // In order, one after the other, exactly as before: Trakt, then AniList,
+    // then Simkl.
     use crate::scrobble_anilist::AnilistError;
     let push = Push::Completion { time, duration };
     for &provider in Provider::ALL {
@@ -1089,6 +1116,8 @@ pub async fn scrobble_end<R: Runtime>(
             ProviderOutcome::Anilist(Err(e)) => {
                 crate::devlog!(warn, "scrobble", "AniList save failed: {e}");
             }
+            // push_completion logs its own outcome.
+            ProviderOutcome::Simkl(_) => {}
             // Only a Push::Shutdown flush reports this.
             ProviderOutcome::Flushed => {}
         }
@@ -1115,6 +1144,9 @@ pub struct ScrobbleTestResult {
     pub trakt_fired: bool,
     /// Did AniList fire (token present + is_anime + resolvable id)?
     pub anilist_fired: bool,
+    /// Did Simkl record it (client_id in this build + token present + an id
+    /// Simkl matched)? A new field, so older frontends simply ignore it.
+    pub simkl_fired: bool,
     /// Human-readable summary the DevConsole prints verbatim.
     pub message: String,
 }
@@ -1143,6 +1175,7 @@ pub struct ScrobbleTestResult {
 // Honors the same gates as scrobble_end:
 //   - Trakt token present (skipped silently if not connected)
 //   - AniList: is_anime + token present + resolvable IMDB id
+//   - Simkl: a client_id in this build + token present + an id Simkl can use
 //
 // Pretends time = 95% of duration so Trakt's /sync/history records
 // as a normal completion instead of the 0%-watched edge case. If
@@ -1167,7 +1200,7 @@ pub async fn scrobble_test_fire<R: Runtime>(
                 return Ok(ScrobbleTestResult {
                     session_active: false,
                     id: None, media_type: None, is_anime: false,
-                    trakt_fired: false, anilist_fired: false,
+                    trakt_fired: false, anilist_fired: false, simkl_fired: false,
                     message: "no active stream - either load_video hasn't been called \
                               or the frontend didn't pass an activeTarget".into(),
                 });
@@ -1204,12 +1237,14 @@ pub async fn scrobble_test_fire<R: Runtime>(
         sess.season, sess.episode_num,
     );
 
-    // Same order as scrobble_end (Trakt, then AniList), one after the other.
-    // Each provider contributes its `*_fired` flag and one "<Name>: <outcome>"
-    // leg of the message, which joins to the exact text this always printed.
+    // Same order as scrobble_end (Trakt, then AniList, then Simkl), one after
+    // the other. Each provider contributes its `*_fired` flag and one
+    // "<Name>: <outcome>" leg of the message; the Trakt and AniList legs are
+    // the exact text this always printed.
     let push = Push::Completion { time: test_time, duration: test_duration };
     let mut trakt_fired = false;
     let mut anilist_fired = false;
+    let mut simkl_fired = false;
     let mut legs: Vec<String> = Vec::with_capacity(Provider::ALL.len());
     for &provider in Provider::ALL {
         match dispatch(provider, push, &app, &scope, &sess).await {
@@ -1239,6 +1274,19 @@ pub async fn scrobble_test_fire<R: Runtime>(
                 };
                 legs.push(format!("AniList: {anilist_msg}"));
             }
+            ProviderOutcome::Simkl(simkl_result) => {
+                use crate::scrobble_simkl::SimklSyncResult;
+                simkl_fired = simkl_result == SimklSyncResult::Fired;
+                let simkl_msg = match simkl_result {
+                    SimklSyncResult::Fired         => "fired",
+                    SimklSyncResult::NotFound      => "not_found (no catalog match on Simkl)",
+                    SimklSyncResult::NoToken       => "skipped (no token)",
+                    SimklSyncResult::NoUsableId    => "skipped (no id Simkl can use)",
+                    SimklSyncResult::NotConfigured => "skipped (not configured in this build)",
+                    SimklSyncResult::Failed        => "failed (network or HTTP error)",
+                };
+                legs.push(format!("Simkl: {simkl_msg}"));
+            }
             // Only a Push::Shutdown flush reports this.
             ProviderOutcome::Flushed => {}
         }
@@ -1256,6 +1304,7 @@ pub async fn scrobble_test_fire<R: Runtime>(
         is_anime: sess.is_anime,
         trakt_fired,
         anilist_fired,
+        simkl_fired,
         message,
     })
 }
@@ -1271,6 +1320,10 @@ pub async fn scrobble_test_fire<R: Runtime>(
 // backdate and (b) returning a human-readable outcome string (or an Err
 // with a legible reason) so the UI can toast it. Nothing here fails
 // silently.
+//
+// Simkl's command is the one BATCHED sibling: Simkl allows about one POST
+// per second, so a bulk run takes the rows in one call and gets one result
+// per row back (see scrobble_simkl::history_batch).
 // ---------------------------------------------------------------------------
 
 /// Assemble a `ScrobbleSession` from the fields a History row carries.
@@ -1281,7 +1334,7 @@ pub async fn scrobble_test_fire<R: Runtime>(
 /// field names.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
-fn session_from_history(
+pub(crate) fn session_from_history(
     id:              String,
     parent_id:       Option<String>,
     media_type:      String,
@@ -1442,6 +1495,23 @@ pub async fn scrobble_history_anilist<R: Runtime>(
         // transient. NOT marked permanent: the runner should back off and retry.
         Err(e) => Err(format!("AniList request failed: {e}")),
     }
+}
+
+/// Push a BATCH of History items to Simkl's /sync/history, each backdated to
+/// its own `played_at`. Takes the same per-row fields as the two commands
+/// above (see `SimklHistoryItem`) and the same `scope`, but many rows per
+/// call: Simkl's budget of about one POST per second makes one call per row
+/// unsafe for a bulk run. Returns one result per item, in input order
+/// (`added` / `not_found` / `failed` / `skipped`, each with a short message;
+/// only `failed` is worth retrying), or an Err for the whole batch when Simkl
+/// is not set up in this build or not connected.
+#[tauri::command]
+pub async fn scrobble_history_simkl<R: Runtime>(
+    _app:  AppHandle<R>,
+    scope: String,
+    items: Vec<crate::scrobble_simkl::SimklHistoryItem>,
+) -> Result<Vec<crate::scrobble_simkl::SimklHistoryResult>, String> {
+    crate::scrobble_simkl::history_batch(&scope, items).await
 }
 
 // ---------------------------------------------------------------------------

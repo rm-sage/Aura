@@ -254,17 +254,18 @@ commands.allow = ["fetch_external_subtitles"]
 [[permission]]
 identifier = "allow-scrobble"
 description = "Allows the frontend to fire scrobble Start/Heartbeat/End events to the configured AIOMetadata addon, plus a DevConsole-only manual test trigger that re-fires the same provider dispatch against the active session without consuming it."
-commands.allow = ["scrobble_start", "scrobble_heartbeat", "scrobble_end", "scrobble_test_fire", "scrobble_history_trakt", "scrobble_history_anilist", "set_scrobble_run_active"]
+commands.allow = ["scrobble_start", "scrobble_heartbeat", "scrobble_end", "scrobble_test_fire", "scrobble_history_trakt", "scrobble_history_anilist", "scrobble_history_simkl", "set_scrobble_run_active"]
 
 # ── Trakt + AniList direct-scrobble OAuth (replaces AIOMetadata) ─────────────
 [[permission]]
 identifier = "allow-scrobble-auth"
-description = "Allows the frontend to read/write/clear OAuth tokens for the direct Trakt and AniList scrobble path, and to compute the authorize URL the user's browser should open."
+description = "Allows the frontend to read/write/clear OAuth tokens for the direct Trakt, AniList and Simkl scrobble path, to compute the authorize URL the user's browser should open, and to ask which scrobble services this build can sign in to."
 commands.allow = [
   "get_scrobble_auth_status",
   "set_scrobble_auth_token",
   "clear_scrobble_auth_token",
   "scrobble_oauth_authorize_url",
+  "scrobble_services_available",
   "scrobble_oauth_device_begin",
   "scrobble_oauth_device_poll",
   "open_oauth_popup_webview",
