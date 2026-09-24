@@ -112,6 +112,8 @@ import { recheckSeriesWatchedFlag } from "../autoAdvance";
 import { getSortedEpisodes } from "../episodeSort";
 import { showFlyUpToast } from "../FlyUpToast";
 import ImageLoader from "../ImageLoader";
+import HeroBackdropPicker from "../HeroBackdropPicker";
+import { collectBackdropCandidates, loadHeroBackdrop, saveHeroBackdrop, type BackdropCandidate } from "../heroBackdrop";
 import { shrinkPoster, screenWidthHint } from "../posterSize";
 import ErrorBoundary from "../ErrorBoundary";
 import { parseStream, chipStyleFor, looksLikeTamTaro, type ChipKind } from "../streamMeta";
@@ -206,6 +208,13 @@ interface Props {
    *  than "none installed", so the hero must not settle on the preview's art.
    *  Defaults to true so a caller that doesn't pass it keeps the old rule. */
   addonsSettled?: boolean;
+  /** True once App's library has loaded (warm start or fetch), or once auth
+   *  has resolved with no session, since a guest has no library to wait for.
+   *  While false the resume episode is unknown, so the hero cannot yet
+   *  tell which arc's key art to use; it holds its latch briefly instead of
+   *  settling on non-arc art (see heroAwaitsLibrary). Defaults to true so a
+   *  caller that doesn't pass it never waits. */
+  libraryLoaded?: boolean;
   /** When set, DetailView opens in episodes mode (instead of streams),
    *  selects the season containing this episode id, and scrolls the
    *  matching row to the top of the list. Used after exiting playback
@@ -262,6 +271,21 @@ const ExternalIcon = () => (
     <path d="M14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7zM19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7z" />
   </svg>
 );
+const BackdropIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+    <path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z" />
+  </svg>
+);
+
+/** Right-clicks landing in any of these never raise the hero's backdrop menu:
+ *  anything interactive (episode, stream and arc rows are all buttons, with
+ *  menus of their own), the HUD's tab bar and panel, and regions marked
+ *  `data-hero-menu-exempt` (the HUD root and the episode / stream panel).
+ *  Everything else on the page is drawn over the backdrop, title and chips
+ *  included, and counts as the hero. */
+const HERO_MENU_EXEMPT =
+  'button, a, input, textarea, select, [role="button"], [role="tab"], [role="tablist"], '
+  + '[role="tabpanel"], [role="menu"], [role="dialog"], [data-hero-menu-exempt]';
 
 type PanelMode = "episodes" | "streams";
 
@@ -352,6 +376,22 @@ export default function DetailView(props: Props) {
 //      with-videos one further down the probe loop,
 //   3. a metaCache write landing after mount.
 // One write-once latch closes all of them.
+//
+// The ONE exception is an explicit user pick. Choosing a backdrop in the
+// picker (a stored per-title choice, or Automatic) re-latches the background
+// at once, through the same reveal machinery, because the user asked for that
+// change and is watching for it. Nothing automatic may do the same. The stored
+// choice is read synchronously at every latch site (the seed and both
+// meta-effect sites), so the FIRST frame of a revisit already shows it, never
+// automatic art followed by a swap. A stored choice whose image will not load
+// falls back to automatic art once per open, silently; that is the only
+// re-latch the user did not ask for, and it replaces an image that never
+// appeared.
+//
+// The latch may also be HELD (left unset) for a moment after a reload, while
+// the library that names the resume episode is still loading; see
+// heroAwaitsLibrary. Held is not latched: the ambient base shows, exactly as
+// it does while the meta probe runs.
 // ---------------------------------------------------------------------------
 
 /** Length of the single hero reveal beat. The backdrop fade, the
@@ -362,6 +402,13 @@ const HERO_REVEAL_MS = 400;
 interface HeroArt {
   background: string | null;
   logo:       string | null;
+  /** The meta detail this art was resolved from. Kept so a later re-latch (a
+   *  picker choice, or the dead-override fallback) resolves "automatic"
+   *  against the SAME source, and so leaves the logo exactly as it was. */
+  source:     MetaDetail | null;
+  /** True when `background` is the user's stored per-title choice rather
+   *  than the automatic chain. The load-error fallback keys on it. */
+  overridden: boolean;
 }
 
 /** Resolve hero art from a meta detail, falling back through the catalog
@@ -376,12 +423,50 @@ function heroArtFrom(
    *  the feature; null (the overwhelmingly common case) leaves the chain
    *  exactly as it was. */
   arcArt?: string | null,
+  /** The user's stored backdrop for this title (heroBackdrop.ts). Beats
+   *  EVERYTHING, arc art included, because it is an explicit choice. The
+   *  background only: the logo is never overridden. */
+  override?: string | null,
 ): HeroArt {
   return {
     background:
-      arcArt ?? d?.background ?? preview.background ?? preview.fanart ?? preview.backdrop ?? preview.poster ?? null,
+      override ?? arcArt ?? d?.background ?? preview.background ?? preview.fanart ?? preview.backdrop ?? preview.poster ?? null,
     logo: d?.logo ?? preview.logo ?? null,
+    source: d,
+    overridden: !!override,
   };
+}
+
+/** What every latch site latches: the stored choice when there is one, else
+ *  the automatic chain with the resume arc's art. Reading the override HERE,
+ *  synchronously, is what makes the first frame of a revisit show it. */
+function resolveHeroArt(d: MetaDetail | null, preview: MetaPreview, resumeVideoId: string | null): HeroArt {
+  return heroArtFrom(d, preview, arcHeroArt(preview.id, resumeVideoId), loadHeroBackdrop(preview.id));
+}
+
+/** How long the hero waits for the library after mount before latching with
+ *  what it has (see heroAwaitsLibrary). */
+const HERO_LIBRARY_WAIT_MS = 1500;
+
+/** Should the latch be HELD until the library loads?
+ *
+ *  Arc art is chosen from the resume episode, which comes from the library.
+ *  After a reload the page is restored before App's library has loaded, so
+ *  the resume id reads null on the first render, the seed latches non-arc
+ *  art, and the write-once latch then refuses the arc art for the whole open.
+ *  So the hero waits, but only when arc art could actually apply: the setting
+ *  is on and the arcs cache holds key art for this show. Everything else
+ *  (the overwhelmingly common case) latches exactly as before, with no delay.
+ *  A stored backdrop wins regardless of arcs, so it never waits either, and
+ *  nor does a guest: with no library there is no resume id, so App reports a
+ *  sessionless user as loaded. The wait is bounded by HERO_LIBRARY_WAIT_MS at
+ *  the call site. */
+function heroAwaitsLibrary(seriesId: string, libraryLoaded: boolean): boolean {
+  if (libraryLoaded) return false;
+  if (loadHeroBackdrop(seriesId)) return false;
+  if (!loadAuraSettings().arcAwareArt) return false;
+  const arcs = peekCachedArcs(seriesId);
+  return !!arcs && arcs.arcs.some((a) => a.image_source === "fandom" && !!a.image);
 }
 
 /** Arc key art for the hero, from the CACHE ONLY.
@@ -576,11 +661,16 @@ function HeroTitle({
  *  A cached entry carrying NEITHER a backdrop nor a logo is deliberately
  *  treated as a miss: latching it would lock the hero to the catalog preview
  *  and then, per the invariant above, refuse the real art when the live probe
- *  returns it. Better to wait. */
+ *  returns it. Better to wait.
+ *
+ *  A stored backdrop does not change that rule. It covers the background but
+ *  not the logo, which still has to come from a real detail, so a miss waits
+ *  for the probe with a stored choice too (showing the ambient base, never
+ *  the automatic art). */
 function seedHeroArt(preview: MetaPreview, resumeVideoId: string | null): HeroArt | null {
   const seed = peekRichestCachedDetailById(preview.id);
   if (!seed || !(seed.background || seed.logo)) return null;
-  return heroArtFrom(seed, preview, arcHeroArt(preview.id, resumeVideoId));
+  return resolveHeroArt(seed, preview, resumeVideoId);
 }
 
 /** Segment colours. Module scope because they are constant: rebuilt inside the
@@ -740,7 +830,7 @@ function HudSectionLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
-function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, onQueueToggle, onPlayTrailer, trailerLaunchingId, trailerDepProgress, addonsSettled = true, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
+function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, onQueueToggle, onPlayTrailer, trailerLaunchingId, trailerDepProgress, addonsSettled = true, libraryLoaded = true, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
   const [detail, setDetail]                 = useState<MetaDetail | null>(null);
   // Resume pointer, read BEFORE the latch below because the latch's seed
   // needs it synchronously on the first render to pick the right arc's art.
@@ -748,6 +838,21 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // down for the resume behaviour itself; two calls are free and keep that
   // logic where it belongs.
   const heroResumeVideoId = useResumeVideoId(meta.id);
+  // The same value for the latch sites that run LATER than the render that
+  // armed them (the meta probe's tail, the hold release, a picker choice).
+  // Their closures were created before the library may have loaded, and a
+  // stale null there picks non-arc art.
+  const heroResumeRef = useRef(heroResumeVideoId);
+  heroResumeRef.current = heroResumeVideoId;
+  // Library hold (see heroAwaitsLibrary). Memoised because the page re-renders
+  // constantly and the inputs that matter only change with these three.
+  const [libraryWaitOver, setLibraryWaitOver] = useState(false);
+  const heroHold = useMemo(
+    () => !libraryWaitOver && heroAwaitsLibrary(meta.id, libraryLoaded),
+    [meta.id, libraryLoaded, libraryWaitOver],
+  );
+  const heroHoldRef = useRef(heroHold);
+  heroHoldRef.current = heroHold;
   // Queue membership IS the manual "planned" mark. Read live rather than
   // mirrored into state, and re-derived on the manual-watched version so the
   // button stays correct when the context menu toggles it from elsewhere.
@@ -758,9 +863,10 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     [meta.id, manualWatchedVersion],
   );
   // Write-once hero art (see the latch notes above the component). `null`
-  // means "not settled yet" — the hero shows its ambient base and waits.
+  // means "not settled yet": the hero shows its ambient base and waits. A
+  // held latch (heroHold) starts unset for the same reason.
   const [heroArtLatch, setHeroArtLatch]     = useState<HeroArt | null>(
-    () => seedHeroArt(meta, heroResumeVideoId),
+    () => (heroHold ? null : seedHeroArt(meta, heroResumeVideoId)),
   );
   // Decode gates for the two latched assets. The reveal waits for BOTH so the
   // backdrop and the logo land on the same frame; an asset that errors counts
@@ -768,6 +874,31 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // hero on the ambient base forever.
   const [bgReady, setBgReady]               = useState(false);
   const [logoReady, setLogoReady]           = useState(false);
+  // True once the first reveal has played. A picker choice re-latches the
+  // background, which resets bgReady for the new image's decode; this keeps
+  // that from also fading the logo back to the text title and the page back
+  // to the ambient base.
+  const [heroShown, setHeroShown]           = useState(false);
+  // The backdrop that was on screen when a picker choice replaced it. It stays
+  // mounted UNDER the new one until that has decoded and faded in, so a swap
+  // is a crossfade rather than a trip through the ambient base.
+  const [bgUnderlay, setBgUnderlay]         = useState<string | null>(null);
+  // Where the meta probe settled, for a latch that was held past it.
+  const heroSettledRef = useRef<{ id: string; detail: MetaDetail | null } | null>(null);
+  // The dead-override fallback runs at most once per open, so an image that
+  // keeps failing can never bounce the hero between two sources.
+  const overrideFallbackUsedRef = useRef(false);
+  // Backdrop picker: open at the right-click, or closed.
+  const [backdropPicker, setBackdropPicker] = useState<{
+    x: number;
+    y: number;
+    automatic: string | null;
+    automaticSource: string | null;
+    candidates: BackdropCandidate[];
+    current: string | null;
+    returnFocus: HTMLElement | null;
+  } | null>(null);
+  const closeBackdropPicker = useCallback(() => setBackdropPicker(null), []);
   const [streams, setStreams]               = useState<StreamEntry[]>([]);
   const [streamMeta, setStreamMeta]         = useState<StreamMetadata>({
     errors: [], warnings: [], info: [], stats: [],
@@ -803,10 +934,43 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   useEffect(() => {
     if (heroKeyRef.current === meta.id) return;
     heroKeyRef.current = meta.id;
-    setHeroArtLatch(seedHeroArt(meta, heroResumeVideoId));
+    heroSettledRef.current = null;
+    overrideFallbackUsedRef.current = false;
+    setHeroArtLatch(heroHoldRef.current ? null : seedHeroArt(meta, heroResumeRef.current));
     setBgReady(false);
     setLogoReady(false);
+    setHeroShown(false);
+    setBgUnderlay(null);
+    setBackdropPicker(null);
   }, [meta]);
+
+  // Bound the library hold: a hung library fetch must not strand the hero on
+  // the ambient base. Past the bound it latches with what is known.
+  useEffect(() => {
+    if (!heroHold) return;
+    const t = setTimeout(() => setLibraryWaitOver(true), HERO_LIBRARY_WAIT_MS);
+    return () => clearTimeout(t);
+  }, [heroHold]);
+
+  // Latch once a hold ends (the library loaded, or the bound ran out). The
+  // meta probe may have finished while held, in which case its result is
+  // waiting in heroSettledRef; if it has not, the seed gets its chance now and
+  // the probe's own latch site takes over when it lands.
+  const heroWasHeldRef = useRef(heroHold);
+  useEffect(() => {
+    if (heroHold) { heroWasHeldRef.current = true; return; }
+    if (!heroWasHeldRef.current) return;
+    heroWasHeldRef.current = false;
+    const settled = heroSettledRef.current;
+    setHeroArtLatch((prev) => {
+      if (prev) return prev;
+      if (settled && settled.id === meta.id) {
+        return resolveHeroArt(settled.detail, meta, heroResumeRef.current);
+      }
+      return seedHeroArt(meta, heroResumeRef.current);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [heroHold]);
 
   const [activeVideo, setActiveVideo]       = useState<VideoEntry | null>(null);
   // Per-episode "user has clicked through the spoiler blur" set. Keyed
@@ -1014,6 +1178,10 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // that Escape steps back through the related-title trail instead of
   // discarding it, a duplicate handler calling the full close would race it
   // and win about half the time.
+  //
+  // The backdrop picker is the one layer above this page that takes Escape
+  // for itself: while open it consumes the key in the capture phase, so
+  // Escape closes the picker and leaves the page alone.
 
   // Release-search single-fetch on detail open — pulls the cloud
   // signal for this series so EpisodeRow's filler/recap banner
@@ -1087,8 +1255,11 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
       if (addonsPending) return;
       // No addon will ever answer — settle on the catalog preview's art
       // immediately rather than leaving the hero waiting on a probe that
-      // is never going to run.
-      setHeroArtLatch((prev) => prev ?? heroArtFrom(null, meta, arcHeroArt(meta.id, heroResumeVideoId)));
+      // is never going to run. Unless the latch is held for the library, in
+      // which case the hold's release latches from this.
+      heroSettledRef.current = { id: meta.id, detail: null };
+      if (heroHoldRef.current) return;
+      setHeroArtLatch((prev) => prev ?? resolveHeroArt(null, meta, heroResumeRef.current));
       return;
     }
     let cancelled = false;
@@ -1176,9 +1347,16 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
         // used to replace the first answer's backdrop a beat later (swap
         // source 2 in the latch notes). `prev ??` keeps the write once-only,
         // which is what makes a StrictMode double mount harmless.
+        //
+        // The resume id and the hold are read through refs: this runs seconds
+        // after the effect that created it, and the library may have loaded
+        // in between. A held latch is left for the hold's release, which
+        // picks up `finalDetail` from heroSettledRef.
         if (cancelled) return;
-        setHeroArtLatch((prev) => prev ?? heroArtFrom(
-          finalDetail ?? null, meta, arcHeroArt(meta.id, heroResumeVideoId),
+        heroSettledRef.current = { id: meta.id, detail: finalDetail ?? null };
+        if (heroHoldRef.current) return;
+        setHeroArtLatch((prev) => prev ?? resolveHeroArt(
+          finalDetail ?? null, meta, heroResumeRef.current,
         ));
       });
     return () => { cancelled = true; };
@@ -1585,11 +1763,14 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     return [...map.entries()];
   }, [streams]);
 
-  // Hero art — read from the LATCH, never from `detail`. That indirection is
-  // the whole fix: these two are null while the art is still resolving and
-  // then take a value exactly once, so the <img> they feed never sees a second
-  // src (which is what tripped ImageLoader's src-change reset back to a
-  // skeleton mid-view).
+  // Hero art: read from the LATCH, never from `detail`. These two are null
+  // while the art is still resolving (or held, see heroAwaitsLibrary) and then
+  // take a value once. The logo never changes after that; the background
+  // changes again only for an explicit picker choice or the one-shot
+  // dead-override fallback (see the INVARIANT). Even then no <img> sees a
+  // second src, because the backdrop layer is KEYED by URL: a new background
+  // mounts a new element rather than changing the old one's src (a src change
+  // is what tripped ImageLoader's reset back to a skeleton mid-view).
   const heroArt = heroArtLatch?.background ?? null;
   const logoArt = heroArtLatch?.logo ?? null;
 
@@ -1597,10 +1778,143 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // vacuously true when the corresponding art is absent, so an item with no
   // logo reveals as soon as its backdrop is ready, and an item with no art at
   // all reveals the moment it settles.
-  const revealed =
+  const firstReveal =
     heroArtLatch !== null &&
     (!heroArt   || bgReady) &&
     (!logoArt   || logoReady);
+  // Revealed stays revealed for the rest of the open. A picker choice swaps
+  // the backdrop under a page that is already showing; it does not replay the
+  // entrance (the backdrop layer gates its own fade on bgReady instead).
+  const revealed = heroShown || firstReveal;
+  useEffect(() => {
+    if (firstReveal) setHeroShown(true);
+  }, [firstReveal]);
+
+  // The crossfade's outgoing image is dropped once the incoming one has
+  // decoded AND finished fading in over it.
+  useEffect(() => {
+    if (!bgUnderlay || !bgReady) return;
+    const t = setTimeout(() => setBgUnderlay(null), HERO_REVEAL_MS);
+    return () => clearTimeout(t);
+  }, [bgUnderlay, bgReady]);
+
+  // What "Automatic" resolves to right now: the hero's art with no stored
+  // choice. Resolved against the latch's own source detail, so with no choice
+  // stored the Automatic tile is exactly what the hero is showing. Before the
+  // latch settles, against the best detail on hand.
+  const automaticHeroArt = (): HeroArt => heroArtFrom(
+    heroArtLatch ? heroArtLatch.source : (detail ?? peekRichestCachedDetailById(meta.id)),
+    meta,
+    arcHeroArt(meta.id, heroResumeRef.current),
+  );
+
+  // Re-latch the BACKGROUND (never the logo) for an explicit choice or the
+  // dead-override fallback. Whatever is on screen right now stays underneath
+  // as bgUnderlay until the new image has decoded, so the swap never shows the
+  // ambient base. Going back to an image that is still MOUNTED (the one on
+  // screen, or the outgoing underlay of a crossfade in flight, including one
+  // whose incoming image has already decoded and is fading in over it) reuses
+  // that element, which is kept by key: its onLoad will not fire again, so it
+  // must count as ready now or its layer would sit at opacity 0 for good.
+  const swapHeroBackground = (nextBg: string | null, overridden: boolean) => {
+    const onScreen = bgUnderlay && !bgReady
+      ? bgUnderlay
+      : heroShown && bgReady ? heroArt : null;
+    const reused = nextBg !== null && (nextBg === onScreen || nextBg === bgUnderlay);
+    setHeroArtLatch((prev) => prev
+      ? { ...prev, background: nextBg, overridden }
+      // A choice made before the latch settled latches now. The logo comes
+      // from the best detail on hand, since an explicit pick should not wait.
+      : { ...heroArtFrom(detail ?? peekRichestCachedDetailById(meta.id), meta), background: nextBg, overridden });
+    setBgUnderlay(onScreen && onScreen !== nextBg ? onScreen : null);
+    setBgReady(nextBg === null || reused);
+  };
+
+  // A picker tile was chosen (null = the Automatic tile).
+  const applyBackdropChoice = (chosen: string | null) => {
+    const auto = automaticHeroArt().background;
+    // Choosing what Automatic already shows stores NOTHING, so a later change
+    // to the addon's art still flows through instead of being frozen by a
+    // choice that changed nothing.
+    const stored = chosen && chosen !== auto ? chosen : null;
+    saveHeroBackdrop(meta.id, stored);
+    setBackdropPicker((p) => (p ? { ...p, current: stored } : p));
+    const nextBg = stored ?? auto;
+    if (heroArtLatch && nextBg === heroArt) {
+      if (heroArtLatch.overridden !== !!stored) {
+        setHeroArtLatch({ ...heroArtLatch, overridden: !!stored });
+      }
+      return;
+    }
+    swapHeroBackground(nextBg, !!stored);
+  };
+
+  // ImageLoader has already spent its retries when this fires. A stored
+  // choice that will not load falls back to automatic art for THIS open,
+  // silently and at most once (a second failure is an ordinary dead backdrop),
+  // and the stored choice is KEPT: the failure may be transient, and the next
+  // open tries it again. If automatic resolves to the same URL there is
+  // nothing to fall back to.
+  const onHeroBackdropError = () => {
+    if (heroArtLatch?.overridden && !overrideFallbackUsedRef.current) {
+      overrideFallbackUsedRef.current = true;
+      const auto = automaticHeroArt().background;
+      if (auto !== heroArtLatch.background) {
+        console.info("[meta] stored hero backdrop did not load; using automatic art for this open");
+        swapHeroBackground(auto, false);
+        return;
+      }
+    }
+    setBgReady(true);
+  };
+
+  // Right-click on bare hero area offers the backdrop picker. Which clicks
+  // count is decided by TARGET (see HERO_MENU_EXEMPT): main.tsx's suppressor
+  // preventDefault()s every contextmenu event, so `defaultPrevented` cannot
+  // say whether an episode row or stream row already raised its own menu. A
+  // portalled child (a stream badge popover, the picker itself) bubbles here
+  // through React without being a DOM descendant, hence the `contains`.
+  const libraryById = useLibraryMap();
+  const onHeroContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
+    const t = e.target;
+    if (!(t instanceof Element) || !e.currentTarget.contains(t)) return;
+    if (t.closest(HERO_MENU_EXEMPT)) return;
+    e.preventDefault();
+    const x = e.clientX;
+    const y = e.clientY;
+    const active = document.activeElement;
+    const returnFocus = active instanceof HTMLElement && active !== document.body ? active : null;
+    const current = loadHeroBackdrop(meta.id);
+    const origin = detailOriginRef.current;
+    const candidates = collectBackdropCandidates({
+      preview: meta,
+      addons,
+      live: detail && origin ? { detail, addonUrl: origin.addon.url } : null,
+      libraryBackground: libraryById.get(meta.id)?.background ?? null,
+      resumeVideoId: heroResumeRef.current,
+      override: current,
+    });
+    const automatic = automaticHeroArt().background;
+    // A choice needs two different images, counting what Automatic shows.
+    const distinct = new Set(candidates.map((c) => c.url));
+    if (automatic) distinct.add(automatic);
+    const choosable = distinct.size >= 2;
+    openContextMenu(x, y, [{
+      label: "Change backdrop…",
+      icon: <BackdropIcon />,
+      disabled: !choosable,
+      hint: choosable ? undefined : "Aura only knows one backdrop for this title.",
+      onClick: () => setBackdropPicker({
+        x,
+        y,
+        automatic,
+        automaticSource: candidates.find((c) => c.url === automatic)?.label ?? null,
+        candidates,
+        current,
+        returnFocus,
+      }),
+    }]);
+  };
 
   // Bounded wait on the logo only. Coupling the two assets is the point — it's
   // what makes the hero settle once — but an <img> whose request stalls fires
@@ -1682,6 +1996,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   return (
     <div
       className="fixed left-0 right-0 bottom-0 z-[60] overflow-hidden"
+      onContextMenu={onHeroContextMenu}
       onTransitionEnd={(e) => {
         // Only the transform settle matters for badge anchoring (the
         // opacity transition finishes earlier, at a different time).
@@ -1718,34 +2033,43 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
           underneath makes the base opaque edge to edge. */}
       <div aria-hidden className="absolute inset-0" style={{ background: "rgb(8 10 14)" }} />
       <div aria-hidden className="detail-backdrop-skeleton" />
-      {/* Full-bleed backdrop. Mounted only once the art has latched, so its
-          `src` is fixed for the element's whole life. `loading="eager"`
-          skips the IntersectionObserver round-trip — this fills the viewport
-          by definition, there is nothing to defer. */}
-      {heroArt && (
-        <ImageLoader
-          src={shrinkPoster(heroArt, screenWidthHint())}
-          alt=""
-          loading="eager"
-          decoding="async"
-          draggable={false}
-          className="absolute inset-0 w-full h-full"
-          imgClassName="w-full h-full object-cover"
-          imgStyle={{
-            objectPosition: "center top",
-            // Overrides ImageLoader's own 300 ms `loaded` fade (imgStyle
-            // spreads last) so the backdrop rides the SHARED reveal beat with
-            // the title→logo crossfade instead of running on its own clock.
-            opacity:    revealed ? 1 : 0,
-            transition: `opacity ${HERO_REVEAL_MS}ms ease-out`,
-          }}
-          // The ambient base above already covers the box; a second opaque
-          // skeleton stacked on top of it was the "blank screen" flash.
-          skeletonClassName="detail-backdrop-idle"
-          onLoad={() => setBgReady(true)}
-          onError={() => setBgReady(true)}
-        />
-      )}
+      {/* Full-bleed backdrop. Mounted only once the art has latched, and
+          KEYED by its URL, so each element's `src` is fixed for its whole
+          life. `loading="eager"` skips the IntersectionObserver round-trip:
+          this fills the viewport by definition, there is nothing to defer.
+          One array, so a picker choice can crossfade: the outgoing image
+          (bgUnderlay) keeps its mounted, decoded element under the incoming
+          one, and React keeps that element across the swap by key. */}
+      {[bgUnderlay, heroArt].map((src, i) => {
+        if (!src || (i === 0 && src === heroArt)) return null;
+        const top = i === 1;
+        return (
+          <ImageLoader
+            key={src}
+            src={shrinkPoster(src, screenWidthHint())}
+            alt=""
+            loading="eager"
+            decoding="async"
+            draggable={false}
+            className="absolute inset-0 w-full h-full"
+            imgClassName="w-full h-full object-cover"
+            imgStyle={{
+              objectPosition: "center top",
+              // Overrides ImageLoader's own 300 ms `loaded` fade (imgStyle
+              // spreads last) so the backdrop rides the SHARED reveal beat
+              // with the title→logo crossfade instead of running on its own
+              // clock. The underlay is already on screen and stays put.
+              opacity:    !top || (revealed && bgReady) ? 1 : 0,
+              transition: `opacity ${HERO_REVEAL_MS}ms ease-out`,
+            }}
+            // The ambient base above already covers the box; a second opaque
+            // skeleton stacked on top of it was the "blank screen" flash.
+            skeletonClassName="detail-backdrop-idle"
+            onLoad={top ? () => setBgReady(true) : undefined}
+            onError={top ? onHeroBackdropError : undefined}
+          />
+        );
+      })}
       {/* Layered overlays — heaviest on the right where the panel sits */}
       <div aria-hidden className="absolute inset-0 pointer-events-none"
            style={{ background: "radial-gradient(ellipse at 25% 50%, rgba(0,0,0,0.20) 0%, rgba(0,0,0,0.55) 70%, rgba(0,0,0,0.92) 100%)" }} />
@@ -1753,6 +2077,22 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
            style={{ background: "linear-gradient(to right, rgba(0,0,0,0) 0%, rgba(0,0,0,0.55) 45%, rgba(0,0,0,0.85) 100%)" }} />
       <div aria-hidden className="absolute inset-x-0 bottom-0 h-2/3 pointer-events-none"
            style={{ background: "linear-gradient(to top, rgba(0,0,0,0.92) 0%, rgba(0,0,0,0.5) 50%, rgba(0,0,0,0) 100%)" }} />
+
+      {/* Backdrop picker, raised from the hero's right-click menu. Portalled
+          to document.body by the component itself. */}
+      {backdropPicker && (
+        <HeroBackdropPicker
+          x={backdropPicker.x}
+          y={backdropPicker.y}
+          automatic={backdropPicker.automatic}
+          automaticSource={backdropPicker.automaticSource}
+          candidates={backdropPicker.candidates}
+          current={backdropPicker.current}
+          returnFocus={backdropPicker.returnFocus}
+          onPick={applyBackdropChoice}
+          onClose={closeBackdropPicker}
+        />
+      )}
 
       {/* Top action bar — sits inside the detail-view zone, below the
           window title bar. */}
@@ -3289,6 +3629,9 @@ function UnifiedPanel({
     // the old alpha-fade edge mask that left the outer edges undefined. overflow
     // stays visible so floating status icons can anchor just outside the corner.
     <div
+      // Not hero: a right-click in here is never the backdrop menu, even on
+      // the panel's own chrome between rows (see HERO_MENU_EXEMPT).
+      data-hero-menu-exempt
       className="aura-hud-surface relative flex flex-col h-full rounded-xl
                  border-t-white/[0.16]
                  shadow-[0_24px_48px_-18px_rgba(0,0,0,0.7)]

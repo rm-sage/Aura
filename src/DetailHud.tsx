@@ -135,7 +135,9 @@ export default function DetailHud({
     // the point of a cinematic layout, and leaves the content at a width it
     // can actually fill. It stays left-aligned with the identity block above
     // so the two read as one column of page furniture.
-    <div className="flex flex-col gap-3 min-h-0" style={{ width: "min(100%, 74rem)" }}>
+    // `data-hero-menu-exempt`: a right-click anywhere on the info panel is not
+    // a right-click on the hero's backdrop (DetailView's HERO_MENU_EXEMPT).
+    <div data-hero-menu-exempt className="flex flex-col gap-3 min-h-0" style={{ width: "min(100%, 74rem)" }}>
       <div
         ref={listRef}
         role="tablist"

@@ -377,6 +377,10 @@ frontend ~40k LOC over ~70 files + ~13 views).
 - **Views (`src/views/`)**: Home, Library, Queue, Discover, Live, Calendar, History, Detail, Search,
   Addons, Settings, Onboarding, CatalogPage. Live subviews in `src/views/live/`
   (Guide, MultiView, PlaylistForm).
+- **Detail hero backdrop**: `heroBackdrop.ts` (the per-title override store and the synchronous,
+  network-free candidate list) and `HeroBackdropPicker.tsx` (the portalled picker panel), raised by
+  right-clicking bare hero area on the detail page. The override is read at every hero latch site
+  (see "Hero art latch" in `DetailView.tsx`).
 - **Subsystem modules**: live TV in `src/iptv/*` (M3U / Xtream / XMLTV parse, EPG store + worker),
   watch-together in `src/watchTogether/*` (WebSocket to the `watch-relay/` Cloudflare Workers + DO
   relay), casting via `cast.ts` + `useCastSession.ts`, notifications in `Notifications*.tsx`
@@ -656,6 +660,11 @@ Bound every cache (see Performance & memory).
   Bleach was removed from the table for that reason: it never produced any (no arc category, and 9
   of 21 arc names redirect to one generic Episodes page), and the names that do reach a real page
   land on event pages whose lead images are episode screenshots, some of them spoilers.
+- **Hero backdrop choice**: `aura:hero-backdrop:v1` (365 d TTL, cap 300) holds the backdrop URL the
+  user picked for a title's detail hero (`heroBackdrop.ts`), validated on read. Device-local like
+  `aura:arc-mode:v1`: not cloud-synced, not in settings export/import. Settings > Storage clears it
+  through `clearHeroBackdrops`, because a bare `removeItem` under a live `PersistentCache` is written
+  back, cleared entries included, by the cache's next save.
 - **Addon manifest fields**: `AddonEntry`'s capability fields (`resources`, `types`, `id_prefixes`,
   `stream_types`, `stream_id_prefixes`, `has_search`) are populated at install/sync time and REBUILT
   by a manifest refresh (`refresh_addon_manifest`: the Refresh button, or the silent refresh after

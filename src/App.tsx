@@ -10106,6 +10106,13 @@ export default function App() {
           }}
           onPlayTrailer={handlePlayTrailer}
           addonsSettled={addonsSettled}
+          // With no session there is no library to wait for (a guest, or a
+          // saved sign-in the vault could not read), so the hero's arc hold
+          // must not engage. Not a bare `!session`: that is also true before
+          // get_session resolves, the reload window the hold exists for. And
+          // not App's own flag, whose other readers (the Queue prune, the
+          // Library prop) keep their guest behaviour.
+          libraryLoaded={libraryLoaded || (authChecked && !session)}
           trailerLaunchingId={trailerLaunching}
           trailerDepProgress={trailerDepProgress}
           openOnEpisodeId={lastPlayedEpisodeId}

@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { bumpImageEpoch } from "./imageCacheBust";
+import { HERO_BACKDROP_STORAGE_KEY, clearHeroBackdrops } from "./heroBackdrop";
 
 // ---------------------------------------------------------------------------
 // StorageReport - Settings → Storage panel.
@@ -17,7 +18,8 @@ import { bumpImageEpoch } from "./imageCacheBust";
 //
 //   2. Browser-localStorage entries (enumerated client-side): every
 //      Aura-prefixed key, plus its blob size in bytes. Clearing here
-//      is a direct localStorage.removeItem call.
+//      is a direct localStorage.removeItem call, except for a key whose
+//      in-memory cache would write it back (see performClear).
 //
 // All clear actions show a single shared confirm/warning toast first
 // - caches that are auto-rebuildable (recent searches, library cache,
@@ -132,6 +134,12 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
     prefix:      "aura:arc-mode:v1",
     label:       "Seasons / Arcs choice",
     description: "Remembers, per series, whether you last browsed it by season or by story arc, and which arc grouping you picked. Clearing just sends every show back to the Seasons default. Safe to clear.",
+    destructive: false,
+  },
+  {
+    prefix:      HERO_BACKDROP_STORAGE_KEY,
+    label:       "Chosen backdrops",
+    description: "The backdrop you picked for a title's detail page (right-click the artwork, then Change backdrop). Kept on this device only. Clearing sends every title back to its automatic artwork.",
     destructive: false,
   },
   {
@@ -253,7 +261,10 @@ export default function StorageReport() {
         setBusy(false);
       }
     } else {
-      clearLocalStoragePrefix(pending.target);
+      // A key owned by a live in-memory cache must be cleared THROUGH that
+      // cache, or its next write puts every cleared entry back.
+      if (pending.target === HERO_BACKDROP_STORAGE_KEY) clearHeroBackdrops();
+      else clearLocalStoragePrefix(pending.target);
       setLocalEntries(enumerateLocalStorage());
     }
   }, [refresh]);

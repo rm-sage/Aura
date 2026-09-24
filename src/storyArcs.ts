@@ -331,18 +331,21 @@ export function arcPositionOf(result: ArcResult | null, episodeId: string): ArcP
 /**
  * Synchronous, network-free read of an already-cached arc result.
  *
- * Exists for the detail hero. That hero latches its artwork exactly ONCE per
- * open and never changes it afterwards (a backdrop that swaps under the user
- * reads as a glitch), so arc art has to be known at latch time or not at all.
- * A live fetch cannot be: it is a TMDB round-trip plus a banded alignment, and
- * waiting on it would delay the reveal for every anime, including the large
- * majority that turn out to have no arcs.
+ * Exists for the detail hero. That hero latches its artwork ONCE per open and
+ * nothing automatic changes it afterwards (a backdrop that swaps under the
+ * user reads as a glitch; only an explicit backdrop pick may, see the
+ * INVARIANT in DetailView), so arc art has to be known at latch time or not
+ * at all. A live fetch cannot be: it is a TMDB round-trip plus a banded
+ * alignment, and waiting on it would delay the reveal for every anime,
+ * including the large majority that turn out to have no arcs.
  *
- * So the hero takes the warm path only. Cached arcs win the latch; an uncached
- * series shows its normal artwork and picks up arc art on the next open, once
- * the arcs view has populated the cache. `undefined` from the cache means MISS
- * (never fetched, or expired), which is different from a cached `null` meaning
- * "this show genuinely has no arcs".
+ * So the hero takes the warm path only. Cached arcs win the latch over the
+ * addon's art (a stored per-title backdrop from heroBackdrop.ts outranks them,
+ * being an explicit choice); an uncached series shows its normal artwork and
+ * picks up arc art on the next open, once the arcs view has populated the
+ * cache. `undefined` from the cache means MISS (never fetched, or expired),
+ * which is different from a cached `null` meaning "this show genuinely has no
+ * arcs".
  */
 export function peekCachedArcs(seriesId: string): ArcResult | null {
   // Match whichever grouping the user last chose for this series, since that

@@ -483,6 +483,27 @@ export function peekRichestCachedDetailById(id: string): MetaDetail | null {
   return best;
 }
 
+/** Every fresh cached `background` for an id, one row per cache entry that
+ *  carries one: so one per addon that answered, or two when an addon answered
+ *  under two media types. No network, one pass over the cache, and the same
+ *  freshness rule as the peeks above. For the detail hero's backdrop picker,
+ *  which offers each addon's art rather than only the richest answer's.
+ *  Unordered; the caller sorts by its own addon order. Bounded by the cache
+ *  itself (MAX_ENTRIES), so it needs no cap of its own. */
+export function peekCachedBackgroundsById(id: string): { addonUrl: string; background: string }[] {
+  if (!id) return [];
+  const suffix = `::${id}`;
+  const now = Date.now();
+  const out: { addonUrl: string; background: string }[] = [];
+  for (const [k, v] of cache) {
+    if (!v.detail?.background || !k.endsWith(suffix)) continue;
+    const parts = k.split("::");
+    if (now - v.ts >= ttlFor(parts[1] ?? "")) continue;
+    out.push({ addonUrl: parts[0] ?? "", background: v.detail.background });
+  }
+  return out;
+}
+
 /** Batch-peek the freshest non-stale poster for each id in `ids`. One
  *  pass over the cache regardless of how many ids are queried, so it's
  *  safe to call against a full library (~hundreds of items) per render
