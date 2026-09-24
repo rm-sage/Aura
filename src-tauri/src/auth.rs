@@ -871,23 +871,7 @@ pub async fn get_synced_addons(auth_key: String) -> Result<Vec<AddonEntry>, Stri
                 .unwrap_or("Unknown")
                 .to_string();
 
-            let has_search = manifest
-                .get("catalogs")
-                .and_then(|c| c.as_array())
-                .map(|cats| {
-                    cats.iter().any(|cat| {
-                        cat.get("extra")
-                            .and_then(|e| e.as_array())
-                            .map(|extras| {
-                                extras.iter().any(|ex| {
-                                    ex.get("name").and_then(|v| v.as_str()) == Some("search")
-                                })
-                            })
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false);
-
+            let has_search  = crate::stremio::extract_manifest_has_search(manifest);
             let types       = crate::stremio::extract_manifest_types(manifest);
             let resources   = crate::stremio::extract_manifest_resources(manifest);
             let id_prefixes = crate::stremio::extract_manifest_id_prefixes(manifest);

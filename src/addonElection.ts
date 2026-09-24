@@ -24,9 +24,11 @@
 //
 // EVERY GATE FAILS OPEN ON AN EMPTY FIELD. Deliberate, and the one real
 // divergence from upstream: Stremio evaluates a live manifest, Aura evaluates
-// cached AddonEntry fields that are often empty and never heal (a bare-string
+// cached AddonEntry fields that are often empty (a bare-string
 // `"resources": ["stream"]` leaves stream_types empty; an old addons.json entry
-// predates `resources`). Empty means "unknown", and unknown is kept.
+// predates `resources`) and heal only when the user refreshes that addon's
+// manifest, which rebuilds the entry (for a signed-in user, only until the next
+// launch). Empty means "unknown", and unknown is kept.
 //
 // ORDER. Every resource except meta comes back in plain addon-array order:
 // no tiers, no exemption. The stream-list invariants in CLAUDE.md depend on

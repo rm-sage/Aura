@@ -655,9 +655,20 @@ Bound every cache (see Performance & memory).
   Bleach was removed from the table for that reason: it never produced any (no arc category, and 9
   of 21 arc names redirect to one generic Episodes page), and the names that do reach a real page
   land on event pages whose lead images are episode screenshots, some of them spoilers.
-- **Addon manifest fields**: `AddonEntry.stream_types`, `id_prefixes`, `stream_id_prefixes` are
-  populated at install/sync time; `fetch_streams` reads them directly and never re-fetches manifests
-  per stream request (a transient failure during that re-probe used to kill all stream lookups).
+- **Addon manifest fields**: `AddonEntry`'s capability fields (`resources`, `types`, `id_prefixes`,
+  `stream_types`, `stream_id_prefixes`, `has_search`) are populated at install/sync time and REBUILT
+  by a manifest refresh (`refresh_addon_manifest`: the Refresh button, or the silent refresh after
+  Configure), with the same builder `add_addon` uses. The rebuild is persisted to `addons.json` for
+  guests; for a signed-in user it lasts the session only, because Aura does not write the Stremio
+  cloud collection, so the collection's stored manifest snapshot wins again at the next launch or
+  sign-in. One cap differs between the builders: the live one keeps the first 16 manifest-level
+  `id_prefixes` (`GUEST_ID_PREFIXES_CAP`), the cloud ones keep all of them. The entry a refresh
+  hands back keeps all of them, so a refresh never SHORTENS a signed-in user's list (the prefix gates
+  treat a non-empty list as complete, so a cut list rejects real ids); only what it saves for a guest
+  keeps the cap. `has_search` follows ONE rule on every path (`manifest_declares_search` in `stremio.rs`:
+  a catalog `search` extra OR a `search` resource); the cloud paths used to check the extra only.
+  `fetch_streams` and `src/addonElection.ts` read these fields directly and never re-fetch
+  manifests per request (a transient failure during that re-probe used to kill all stream lookups).
 
 ## Performance and memory (build every feature memory-conscious)
 

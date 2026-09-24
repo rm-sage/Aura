@@ -10,6 +10,33 @@ use tauri::Manager;
 // Persisted addon entry
 // ---------------------------------------------------------------------------
 
+/// One installed addon. Every field except `url` is derived from the
+/// addon's manifest, and an entry is built in exactly four places:
+///
+/// - `add_addon` (guest install) and `refresh_addon_manifest` share one
+///   builder over the LIVE manifest. A refresh replaces a guest's entry in
+///   `addons.json` in place (same position, same url), so a guest's fields
+///   heal whenever the addon is refreshed (the Refresh button, or the
+///   silent refresh after Configure).
+/// - `cloud_add_addon` and `auth.rs::get_synced_addons` build from the
+///   manifest SNAPSHOT stored in the user's Stremio addon collection, and
+///   Aura never rewrites that snapshot (a refresh does not write the
+///   collection). For a signed-in user a refresh therefore heals the fields
+///   for the running session only: the next launch or sign-in rebuilds the
+///   entry from the snapshot again.
+///
+/// The two builders differ in one cap. The live-manifest one keeps the
+/// first 16 manifest-level `id_prefixes`; the cloud one keeps them all. The
+/// entry a refresh HANDS BACK to the frontend keeps them all too, so a
+/// refresh never shortens a signed-in user's list (a shorter list makes the
+/// prefix gates reject ids that matched). What a refresh SAVES for a guest
+/// keeps the 16-entry cap, exactly as `add_addon` does, so a guest whose
+/// manifest declares more than 16 holds the longer list until the next
+/// launch only.
+///
+/// Nothing heals a field the manifest itself leaves empty: a bare-string
+/// `"stream"` resource has no per-resource types or prefixes to read, so
+/// `stream_types` and `stream_id_prefixes` stay empty after any rebuild.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddonEntry {
     pub url: String,
@@ -21,8 +48,10 @@ pub struct AddonEntry {
     /// instance changes (a user moving from one AIOMetadata host to
     /// another keeps the same `manifest_id` even though the URL differs).
     /// Default-empty for back-compat with existing addons.json files
-    /// pre-dating this field — those addons just won't participate in
-    /// id-based default matching until the next manifest refresh.
+    /// pre-dating this field. Such an entry does not participate in
+    /// id-based matching until the addon's manifest is refreshed, which
+    /// rebuilds and saves it. Cloud entries are rebuilt from the collection
+    /// snapshot at every sync, so they always carry it.
     #[serde(default)]
     pub manifest_id: String,
     /// Distinct media types covered by this addon's catalogs (e.g., "movie",
@@ -36,7 +65,8 @@ pub struct AddonEntry {
     pub resources: Vec<String>,
     /// Manifest's stream-resource type list (the `types` field on the
     /// resource object), if the addon advertised one. Empty = "any of
-    /// `types` above". Cached at install time so fetch_streams doesn't
+    /// `types` above". Cached at install time (and rebuilt on a manifest
+    /// refresh, see the struct doc) so fetch_streams doesn't
     /// have to re-probe the manifest on every request — that re-probe
     /// was producing the "manifest fetch failed" cascade visible in the
     /// user's logs whenever the network flapped, killing all stream
@@ -57,7 +87,8 @@ pub struct AddonEntry {
     /// `#[serde(default)]` (=> `false`) keeps older `addons.json` files —
     /// and addons whose manifest predates this capture — loading
     /// forward-compatibly; the value is (re)populated whenever the entry
-    /// is rebuilt (local add, cloud add, or the launch-time cloud sync).
+    /// is rebuilt (local add, cloud add, the launch-time cloud sync, or a
+    /// manifest refresh).
     #[serde(default)]
     pub configurable: bool,
 }

@@ -64,6 +64,10 @@ interface Props {
   session: UserSession | null;
   onAdd: (entry: AddonEntry) => void;
   onRemove: (url: string) => void;
+  /** A manifest refresh rebuilt this addon's entry (capability fields and
+   *  all). `url` is the row's own url, which the parent matches on and
+   *  keeps; `entry` is what Rust rebuilt from the fresh manifest. */
+  onRefreshed: (url: string, entry: AddonEntry) => void;
   /** Persist a new addon ordering. The parent handles optimistic UI
    *  state — this callback fires the cloud / local invoke and is
    *  expected to swallow + toast on failure. */
@@ -272,12 +276,14 @@ function AddonRow({
   addon,
   session,
   onRemove,
+  onRefreshed,
   onSessionExpired,
   reorderEnabled,
 }: {
   addon: AddonEntry;
   session: UserSession | null;
   onRemove: (url: string) => void;
+  onRefreshed: (url: string, entry: AddonEntry) => void;
   onSessionExpired: () => void;
   /** False collapses the drag handle to a non-interactive spacer so
    *  single-addon lists keep a stable leading-edge width. */
@@ -337,18 +343,22 @@ function AddonRow({
   // without forcing a remove + re-add cycle. Toast on success with the
   // catalog count so the user gets concrete feedback; toast + shake on
   // error so a network blip is obvious without burying the chip.
-  // Dispatches `aura:addon-manifest-refreshed` so HomeView re-bootstraps
-  // its catalog rows against the new manifest without waiting for an
-  // unrelated settings change to bump its settingsTick.
+  // Rust also rebuilds the addon's AddonEntry from the fresh manifest
+  // (saved to addons.json for a guest); `onRefreshed` hands it up so App
+  // swaps it into the addon list and the election sees the new capability
+  // fields. Dispatches `aura:addon-manifest-refreshed` so HomeView
+  // re-bootstraps its catalog rows against the new manifest without
+  // waiting for an unrelated settings change to bump its settingsTick.
   const handleRefresh = async (silent = false) => {
     if (refreshing) return;
     setRefreshing(true);
     try {
-      const manifest = await invoke<{ catalogs: unknown[]; name?: string }>(
+      const manifest = await invoke<{ catalogs: unknown[]; name?: string; entry: AddonEntry }>(
         "refresh_addon_manifest",
         { addonUrl: addon.url },
       );
       const count = Array.isArray(manifest.catalogs) ? manifest.catalogs.length : 0;
+      if (manifest.entry) onRefreshed(addon.url, manifest.entry);
       window.dispatchEvent(new CustomEvent("aura:addon-manifest-refreshed", {
         detail: { url: addon.url, catalogCount: count },
       }));
@@ -691,6 +701,7 @@ export default function AddonsView({
   session,
   onAdd,
   onRemove,
+  onRefreshed,
   onReorder,
   onLoginSuccess,
   onLogout,
@@ -804,6 +815,7 @@ export default function AddonsView({
                       addon={addon}
                       session={session}
                       onRemove={onRemove}
+                      onRefreshed={onRefreshed}
                       onSessionExpired={onSessionExpired}
                       reorderEnabled={addons.length > 1}
                     />

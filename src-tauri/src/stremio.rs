@@ -291,10 +291,11 @@ static ADDON_FAIL_CACHE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::n
 const ADDON_FAIL_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Successful-catalog-response cache. Same key shape as the fail cache
-/// (`{url}|{type}/{id}`). 10-minute TTL: longer than the 5-minute
-/// manifest cache because catalog ITEMS change less frequently than
-/// the manifest's addon-id list, AND because the whole point is to
-/// give the home page something to render when a refresh fails.
+/// (`{url}|{type}/{id}`). It is only ever served in place of a failed or
+/// cooling-down fetch (see above), never instead of a live one, so the
+/// 10-minute TTL bounds how old a payload the home page may show while an
+/// addon is failing. It is unrelated to the manifest cache, whose window
+/// is `MANIFEST_TTL` (24 h).
 static CATALOG_OK_CACHE: OnceLock<Mutex<HashMap<String, (Instant, Vec<MetaPreview>)>>> =
     OnceLock::new();
 const CATALOG_STALE_TTL: Duration = Duration::from_secs(600);
@@ -1179,16 +1180,10 @@ async fn fetch_manifest(base: &str) -> Result<(WireManifest, bool), String> {
         .await
         .map_err(|e| format!("Manifest parse error: {e}"))?;
 
-    let search_in_extra = wire.catalogs.iter().any(|c| {
-        c.extra.iter().any(|ex| ex.get("name").and_then(|v| v.as_str()) == Some("search"))
-    });
-    let search_in_resources = wire.resources.iter().any(|r| match r {
-        serde_json::Value::String(s) => s == "search",
-        serde_json::Value::Object(o) => o.get("name").and_then(|v| v.as_str()) == Some("search"),
-        _ => false,
-    });
-
-    let has_search = search_in_extra || search_in_resources;
+    let has_search = manifest_declares_search(
+        wire.catalogs.iter().map(|c| c.extra.as_slice()),
+        &wire.resources,
+    );
 
     {
         let mut cache = manifest_cache().lock().unwrap();
@@ -1372,14 +1367,45 @@ pub(crate) fn redact_sensitive_url(input: &str) -> String {
     s
 }
 
-/// Force a fresh manifest fetch, bypassing the 5-minute MANIFEST_CACHE
-/// TTL. Used by the per-addon "Refresh" button in AddonsView so users
-/// can pick up newly-added catalogs (typical for self-hosted
-/// AIOMetadata where catalogs are toggled in the addon's configure
-/// page) without removing and re-adding the addon. The shape matches
-/// `get_addon_manifest` so callers can reuse the same response type.
+/// What `refresh_addon_manifest` returns: exactly what `get_addon_manifest`
+/// returns, flattened so `name` / `catalogs` / `has_search` stay top-level,
+/// plus `entry`, the `AddonEntry` rebuilt from the fresh manifest (with the
+/// complete idPrefixes list, see the command).
+#[derive(Serialize)]
+pub struct RefreshedAddonManifest {
+    #[serde(flatten)]
+    pub manifest: AddonManifest,
+    pub entry: AddonEntry,
+}
+
+/// Force a fresh manifest fetch, bypassing the 24 h `MANIFEST_TTL`. Used
+/// by the per-addon "Refresh" button in AddonsView (and the silent refresh
+/// after Configure) so users can pick up newly-added catalogs (typical for
+/// self-hosted AIOMetadata where catalogs are toggled in the addon's
+/// configure page) without removing and re-adding the addon.
+///
+/// It also REBUILDS the addon's `AddonEntry` from the fresh manifest, with
+/// the same builder `add_addon` uses, because every capability field
+/// (`resources`, `types`, `id_prefixes`, the stream overrides, `has_search`)
+/// was otherwise frozen at install forever, and the frontend election reads
+/// them on every request. When the addon is in the local `addons.json` (a
+/// guest install) the entry is replaced in place, same position and same
+/// url, and saved. The rebuilt entry is returned either way so the frontend
+/// can swap it into its list. The returned copy can differ from the saved
+/// one in one respect only: it keeps every idPrefix, where addons.json
+/// keeps `add_addon`'s first 16 (see the note at the end of the body).
+///
+/// It deliberately does NOT write the Stremio cloud addon collection: that
+/// is an outward write to the user's account, shared with the official
+/// Stremio apps, and needs the maintainer's explicit decision. For a
+/// signed-in user the rebuilt fields therefore last until the next launch
+/// (or sign-in), when `get_synced_addons` reads the collection's stored
+/// manifest snapshot again and the install-time fields come back.
 #[tauri::command]
-pub async fn refresh_addon_manifest(addon_url: String) -> Result<AddonManifest, String> {
+pub async fn refresh_addon_manifest<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    addon_url: String,
+) -> Result<RefreshedAddonManifest, String> {
     validate_url(&addon_url)?;
     let base = normalise_addon_base(&addon_url);
     // Drop the cached entry BEFORE the refetch so the very next call
@@ -1393,7 +1419,70 @@ pub async fn refresh_addon_manifest(addon_url: String) -> Result<AddonManifest, 
     let prefix = format!("{base}|");
     if let Ok(mut ok)   = catalog_ok_cache().lock()   { ok.retain(|k, _| !k.starts_with(&prefix)); }
     if let Ok(mut fail) = addon_fail_cache().lock()   { fail.retain(|k, _| !k.starts_with(&prefix)); }
-    get_addon_manifest(addon_url).await
+
+    let (wire, has_search) = fetch_manifest(&base).await?;
+    let label = log_label(&wire.name, &base);
+    let entry = addon_entry_from_wire(base.clone(), &wire, has_search);
+
+    // Guest persistence. A persist failure is logged, not returned: the
+    // manifest refresh itself succeeded, and the fields still reach this
+    // session through the returned entry.
+    match addons::load(&app) {
+        Ok(mut list) => {
+            let mut hits = 0usize;
+            for slot in list.iter_mut() {
+                if normalise_addon_base(&slot.url) != base { continue; }
+                // Keep the stored url verbatim: it is the key the frontend
+                // list, the Settings provider lists and dnd-kit all hold.
+                *slot = AddonEntry { url: std::mem::take(&mut slot.url), ..entry.clone() };
+                hits += 1;
+            }
+            if hits == 0 {
+                crate::devlog!(
+                    info, "catalog",
+                    "[{}] manifest refreshed; not in addons.json (cloud addon), rebuilt fields last this session only",
+                    label,
+                );
+            } else if let Err(e) = addons::save(&app, &list) {
+                crate::devlog!(
+                    warn, "catalog",
+                    "[{}] manifest refreshed but saving the rebuilt entry failed: {}",
+                    label, e,
+                );
+            } else {
+                crate::devlog!(
+                    info, "catalog",
+                    "[{}] manifest refreshed; entry rebuilt and saved to addons.json",
+                    label,
+                );
+            }
+        }
+        Err(e) => crate::devlog!(
+            warn, "catalog",
+            "[{}] manifest refreshed but addons.json could not be read to save it: {}",
+            label, e,
+        ),
+    }
+
+    // The entry handed back keeps EVERY manifest-level idPrefix, the rule
+    // the cloud builders follow (`extract_manifest_id_prefixes` has no
+    // count cap). For a signed-in user it replaces an entry
+    // `get_synced_addons` built uncapped, and `add_addon`'s 16-entry cap
+    // would make the prefix gates (`fetch_streams`, addonElection.ts) reject
+    // ids that matched before the refresh. This is unconditional rather
+    // than keyed on `hits == 0`, because signing in does not clear
+    // addons.json and a signed-in user can still hold a guest entry for the
+    // same url. addons.json above keeps the add_addon-identical entry, so a
+    // guest whose manifest declares more than 16 prefixes holds the longer
+    // list until the next launch, which only ever accepts more ids.
+    let entry = AddonEntry { id_prefixes: collect_wire_id_prefixes_complete(&wire), ..entry };
+
+    crate::devlog!(
+        info, "manifest",
+        "[{}] {} catalogs, has_search={}",
+        label, wire.catalogs.len(), has_search,
+    );
+    Ok(RefreshedAddonManifest { manifest: addon_manifest_from_wire(wire, has_search), entry })
 }
 
 #[tauri::command]
@@ -1407,7 +1496,12 @@ pub async fn get_addon_manifest(addon_url: String) -> Result<AddonManifest, Stri
         "[{}] {} catalogs, has_search={}",
         label, wire.catalogs.len(), has_search,
     );
+    Ok(addon_manifest_from_wire(wire, has_search))
+}
 
+/// The frontend view of a manifest: display-ready catalogs plus the search
+/// flag. Shared by `get_addon_manifest` and `refresh_addon_manifest`.
+fn addon_manifest_from_wire(wire: WireManifest, has_search: bool) -> AddonManifest {
     let catalogs = wire
         .catalogs
         .into_iter()
@@ -1437,7 +1531,7 @@ pub async fn get_addon_manifest(addon_url: String) -> Result<AddonManifest, Stri
         })
         .collect();
 
-    Ok(AddonManifest { name: wire.name, catalogs, has_search })
+    AddonManifest { name: wire.name, catalogs, has_search }
 }
 
 /// A catalog is "search-only" when one of its `extra` parameters is `search`
@@ -1492,32 +1586,35 @@ pub async fn add_addon<R: tauri::Runtime>(
         return Err("Addon already added".into());
     }
 
-    // Build types/resources from the manifest so the Addons UI can render
-    // colored tags without re-fetching the manifest. Also cache the
-    // stream-resource metadata + idPrefixes so fetch_streams doesn't have
-    // to re-probe the manifest on every request (a transient network
-    // failure during that re-probe was killing all stream lookups).
-    let types       = collect_wire_types(&wire);
-    let resources   = collect_wire_resources(&wire);
-    let id_prefixes = collect_wire_id_prefixes(&wire);
-    let (stream_types, stream_id_prefixes) = collect_wire_stream_resource_info(&wire);
-    let configurable = wire.behavior_hints.configurable;
-
-    let entry = AddonEntry {
-        url: base,
-        name: wire.name,
-        manifest_id: wire.id,
-        has_search,
-        types,
-        resources,
-        stream_types,
-        id_prefixes,
-        stream_id_prefixes,
-        configurable,
-    };
+    let entry = addon_entry_from_wire(base, &wire, has_search);
     list.push(entry.clone());
     addons::save(&app, &list)?;
     Ok(entry)
+}
+
+/// Build an `AddonEntry` from a parsed manifest. The ONE builder for the
+/// live-manifest paths (`add_addon` and `refresh_addon_manifest`), so a
+/// refresh derives every field exactly as an install did.
+///
+/// Types/resources let the Addons UI render colored tags without
+/// re-fetching the manifest. The stream-resource metadata + idPrefixes are
+/// cached so fetch_streams doesn't have to re-probe the manifest on every
+/// request (a transient network failure during that re-probe was killing
+/// all stream lookups).
+fn addon_entry_from_wire(url: String, wire: &WireManifest, has_search: bool) -> AddonEntry {
+    let (stream_types, stream_id_prefixes) = collect_wire_stream_resource_info(wire);
+    AddonEntry {
+        url,
+        name: wire.name.clone(),
+        manifest_id: wire.id.clone(),
+        has_search,
+        types: collect_wire_types(wire),
+        resources: collect_wire_resources(wire),
+        stream_types,
+        id_prefixes: collect_wire_id_prefixes(wire),
+        stream_id_prefixes,
+        configurable: wire.behavior_hints.configurable,
+    }
 }
 
 #[tauri::command]
@@ -2138,22 +2235,7 @@ pub async fn cloud_add_addon(auth_key: String, url: String) -> Result<AddonEntry
         .unwrap_or("")
         .to_string();
 
-    let has_search = manifest_json
-        .get("catalogs")
-        .and_then(|c| c.as_array())
-        .map(|cats| {
-            cats.iter().any(|cat| {
-                cat.get("extra")
-                    .and_then(|e| e.as_array())
-                    .map(|extras| {
-                        extras
-                            .iter()
-                            .any(|ex| ex.get("name").and_then(|v| v.as_str()) == Some("search"))
-                    })
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false);
+    let has_search = extract_manifest_has_search(&manifest_json);
 
     let transport_url = format!("{base}/manifest.json");
     let base_norm = normalize_addon_url(&base);
@@ -3367,43 +3449,57 @@ pub async fn fetch_landscape_art(
     }
 }
 
+/// Verdict of [`addon_entry_supports_stream_for`]. Only `Supported` is
+/// queried; the other variants name the gate that failed so the `[streams]`
+/// log line can say why. The old `(bool, Option<declared types>)` return
+/// told a skip apart by whether `stream_types` was set, which printed "has
+/// no stream resource" for every type or id-prefix miss on an addon without
+/// per-resource stream types.
+enum StreamGate<'a> {
+    Supported,
+    /// `resources` does not name `stream`, or is empty (an entry that
+    /// predates the field).
+    NoStreamResource,
+    /// `types` is the list the type gate read; `per_resource` says whether
+    /// it was the stream resource's own `types` or the manifest-level list.
+    TypeMismatch { types: &'a [String], per_resource: bool },
+    /// Same shape for the idPrefixes gate.
+    PrefixMismatch { prefixes: &'a [String], per_resource: bool },
+}
+
 /// Cached-metadata version of the stream-resource gate — used by
 /// fetch_streams so we don't have to re-fetch every addon's manifest on
 /// every request. Reads `resources` / `stream_types` / `id_prefixes` /
-/// `stream_id_prefixes` straight off the persisted AddonEntry. Returns
-/// `(supports, declared_stream_types_for_logging)`.
-fn addon_entry_supports_stream_for(
-    addon: &AddonEntry,
+/// `stream_id_prefixes` straight off the persisted AddonEntry.
+fn addon_entry_supports_stream_for<'a>(
+    addon: &'a AddonEntry,
     media_type: &str,
     id: &str,
-) -> (bool, Option<Vec<String>>) {
+) -> StreamGate<'a> {
     let has_stream = addon
         .resources
         .iter()
         .any(|r| r.eq_ignore_ascii_case("stream"));
     if !has_stream {
-        return (false, None);
+        return StreamGate::NoStreamResource;
     }
     // The stream resource's per-resource `types` (if declared) takes
     // precedence; otherwise fall back to the manifest-level `types`.
-    let supported = if !addon.stream_types.is_empty() {
+    let per_resource_types = !addon.stream_types.is_empty();
+    let supported = if per_resource_types {
         &addon.stream_types
     } else {
         &addon.types
     };
-    let declared = if !addon.stream_types.is_empty() {
-        Some(addon.stream_types.clone())
-    } else {
-        None
-    };
     let type_ok = supported.is_empty()
         || supported.iter().any(|t| t.eq_ignore_ascii_case(media_type));
     if !type_ok {
-        return (false, declared);
+        return StreamGate::TypeMismatch { types: supported, per_resource: per_resource_types };
     }
     // idPrefixes gate. Per-resource override > manifest-level. Empty list
     // = "accepts every prefix".
-    let prefixes: &Vec<String> = if !addon.stream_id_prefixes.is_empty() {
+    let per_resource_prefixes = !addon.stream_id_prefixes.is_empty();
+    let prefixes: &Vec<String> = if per_resource_prefixes {
         &addon.stream_id_prefixes
     } else {
         &addon.id_prefixes
@@ -3411,9 +3507,9 @@ fn addon_entry_supports_stream_for(
     if !prefixes.is_empty()
         && !prefixes.iter().any(|p| id.starts_with(p))
     {
-        return (false, declared);
+        return StreamGate::PrefixMismatch { prefixes, per_resource: per_resource_prefixes };
     }
-    (true, declared)
+    StreamGate::Supported
 }
 
 /// Per-task return type for the addon fan-out — the streams plus the four
@@ -3487,26 +3583,73 @@ pub async fn fetch_streams(
             // a single transient network failure cascade into "no streams
             // found" for every addon, including ones that were perfectly
             // healthy. The cache is populated at addon install time
-            // (add_addon / cloud_add_addon / get_synced_addons) so we
-            // already know each addon's resources, types, and idPrefixes.
-            let (supports, declared) = addon_entry_supports_stream_for(&addon, &media_type, &id);
-            if !supports {
-                if declared.is_some() {
-                    crate::devlog!(
-                        info,
-                        "streams",
-                        "[{}] declares stream types {:?}, skipping {} {} (type or id-prefix mismatch)",
-                        label, declared.unwrap_or_default(), media_type, id
-                    );
-                } else {
-                    crate::devlog!(
-                        info,
-                        "streams",
-                        "[{}] has no stream resource, skipping",
-                        label
-                    );
+            // (add_addon / cloud_add_addon / get_synced_addons) and
+            // rebuilt by refresh_addon_manifest, so we already know each
+            // addon's resources, types, and idPrefixes.
+            //
+            // The gate decides; the match below only logs WHY an addon is
+            // skipped. Every skip returns the same empty slot as before.
+            match addon_entry_supports_stream_for(&addon, &media_type, &id) {
+                StreamGate::Supported => {}
+                StreamGate::NoStreamResource => {
+                    if addon.resources.is_empty() {
+                        crate::devlog!(
+                            info,
+                            "streams",
+                            "[{}] skipping {} {}: no resources cached (an old entry; Refresh the addon to rebuild it)",
+                            label, media_type, id
+                        );
+                    } else {
+                        crate::devlog!(
+                            info,
+                            "streams",
+                            "[{}] skipping {} {}: no stream resource (declares {:?})",
+                            label, media_type, id, addon.resources
+                        );
+                    }
+                    return (addon_idx, AddonFetchOutput::empty());
                 }
-                return (addon_idx, AddonFetchOutput::empty());
+                // The manifest-level lists are Aura's CACHED copies, and a
+                // copy at its count cap may have lost the very entry that
+                // would have matched. Say so rather than blame the
+                // manifest: that is exactly the case where the frontend
+                // election (fail-open at TYPES_CAP) and this gate disagree.
+                StreamGate::TypeMismatch { types, per_resource } => {
+                    let maybe_cut = !per_resource && types.len() >= CACHED_TYPES_CAP;
+                    crate::devlog!(
+                        info,
+                        "streams",
+                        "[{}] skipping {} {}: type not in the {} {:?}{}",
+                        label, media_type, id,
+                        if per_resource { "stream resource's types" } else { "cached manifest types" },
+                        types,
+                        if maybe_cut {
+                            format!(" (the list is at its {CACHED_TYPES_CAP}-entry cap and may have dropped a declared type)")
+                        } else {
+                            String::new()
+                        }
+                    );
+                    return (addon_idx, AddonFetchOutput::empty());
+                }
+                StreamGate::PrefixMismatch { prefixes, per_resource } => {
+                    // Only a guest-built list is capped; a cloud-built one
+                    // of exactly this length is complete, hence "may".
+                    let maybe_cut = !per_resource && prefixes.len() == GUEST_ID_PREFIXES_CAP;
+                    crate::devlog!(
+                        info,
+                        "streams",
+                        "[{}] skipping {} {}: id matches none of the {} {:?}{}",
+                        label, media_type, id,
+                        if per_resource { "stream resource's idPrefixes" } else { "cached manifest idPrefixes" },
+                        prefixes,
+                        if maybe_cut {
+                            format!(" (the list has {GUEST_ID_PREFIXES_CAP} entries, the install-time cap, and may be missing declared prefixes)")
+                        } else {
+                            String::new()
+                        }
+                    );
+                    return (addon_idx, AddonFetchOutput::empty());
+                }
             }
             let addon_name = addon.name.clone();
 
@@ -4007,6 +4150,19 @@ fn sanitize_stream(s: &serde_json::Value, addon_name: &str) -> Option<StreamEntr
 // Manifest tag helpers — drive the colored tag list in the Addons UI.
 // ---------------------------------------------------------------------------
 
+/// Count cap on the cached manifest-level `types` (the manifest's `types`
+/// first, then catalog types), on the live and the cloud builders alike. A
+/// list AT the cap may have dropped a type the manifest declares, which the
+/// `fetch_streams` skip log and `src/addonElection.ts` (`TYPES_CAP`) both
+/// account for.
+const CACHED_TYPES_CAP: usize = 8;
+
+/// Count cap on manifest-level `idPrefixes` in the live-manifest builder
+/// only (`add_addon`, and what a refresh saves to addons.json). The cloud
+/// builders (`extract_manifest_id_prefixes`) and the entry a refresh hands
+/// back keep every prefix.
+const GUEST_ID_PREFIXES_CAP: usize = 16;
+
 fn collect_wire_types(wire: &WireManifest) -> Vec<String> {
     let mut out: Vec<String> = wire.types.iter().map(|t| cap(t.clone(), 32)).collect();
     // Some manifests omit `types` and only declare them on each catalog.
@@ -4016,7 +4172,7 @@ fn collect_wire_types(wire: &WireManifest) -> Vec<String> {
             out.push(t);
         }
     }
-    out.into_iter().take(8).collect()
+    out.into_iter().take(CACHED_TYPES_CAP).collect()
 }
 
 fn collect_wire_resources(wire: &WireManifest) -> Vec<String> {
@@ -4051,7 +4207,7 @@ pub fn extract_manifest_types(manifest: &serde_json::Value) -> Vec<String> {
         }
     }
 
-    out.into_iter().take(8).collect()
+    out.into_iter().take(CACHED_TYPES_CAP).collect()
 }
 
 /// Public helper — extracts the `resources` array (string or `{name, …}`
@@ -4083,6 +4239,41 @@ pub fn extract_manifest_id_prefixes(manifest: &serde_json::Value) -> Vec<String>
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| cap(s.into(), 32))).collect())
         .unwrap_or_default()
+}
+
+/// The ONE `has_search` rule: some catalog declares a `search` extra, OR
+/// `resources` names `search` (bare string or `{ name }` object form).
+/// Every path that builds an `AddonEntry` goes through it: `fetch_manifest`
+/// (local add and refresh) directly, `cloud_add_addon` and
+/// `auth.rs::get_synced_addons` via [`extract_manifest_has_search`]. The two
+/// cloud paths used to check the catalog extra only, so an addon declaring
+/// `"resources": ["search"]` read `true` in guest mode and `false` once
+/// signed in.
+fn manifest_declares_search<'a>(
+    catalog_extras: impl IntoIterator<Item = &'a [serde_json::Value]>,
+    resources: &[serde_json::Value],
+) -> bool {
+    let in_extra = catalog_extras.into_iter().any(|extras| {
+        extras.iter().any(|ex| ex.get("name").and_then(|v| v.as_str()) == Some("search"))
+    });
+    let in_resources = resources.iter().any(|r| match r {
+        serde_json::Value::String(s) => s == "search",
+        serde_json::Value::Object(o) => o.get("name").and_then(|v| v.as_str()) == Some("search"),
+        _ => false,
+    });
+    in_extra || in_resources
+}
+
+/// Public helper - [`manifest_declares_search`] over a raw manifest JSON
+/// value, for the two cloud paths that never parse a `WireManifest`.
+pub fn extract_manifest_has_search(manifest: &serde_json::Value) -> bool {
+    fn as_slice(v: Option<&serde_json::Value>) -> &[serde_json::Value] {
+        v.and_then(|v| v.as_array()).map(Vec::as_slice).unwrap_or(&[])
+    }
+    manifest_declares_search(
+        as_slice(manifest.get("catalogs")).iter().map(|c| as_slice(c.get("extra"))),
+        as_slice(manifest.get("resources")),
+    )
 }
 
 /// Public helper — whether the manifest declares
@@ -4128,7 +4319,15 @@ pub fn extract_stream_resource_info(
 }
 
 fn collect_wire_id_prefixes(wire: &WireManifest) -> Vec<String> {
-    wire.id_prefixes.iter().map(|t| cap(t.clone(), 32)).take(16).collect()
+    wire.id_prefixes.iter().map(|t| cap(t.clone(), 32)).take(GUEST_ID_PREFIXES_CAP).collect()
+}
+
+/// [`collect_wire_id_prefixes`] without the count cap: the cloud builders'
+/// rule (`extract_manifest_id_prefixes`) over a parsed manifest. Only
+/// `refresh_addon_manifest` uses it, for the entry it hands back, so a
+/// refresh never shortens a list the cloud path built complete.
+fn collect_wire_id_prefixes_complete(wire: &WireManifest) -> Vec<String> {
+    wire.id_prefixes.iter().map(|t| cap(t.clone(), 32)).collect()
 }
 
 fn collect_wire_stream_resource_info(wire: &WireManifest) -> (Vec<String>, Vec<String>) {
@@ -4205,9 +4404,27 @@ pub async fn fetch_external_subtitles(
         set.spawn(async move {
             let base = normalise_addon_base(&addon.url);
 
-            let Ok((wire, _)) = fetch_manifest(&base).await else { return (idx, vec![]); };
+            let (wire, _) = match fetch_manifest(&base).await {
+                Ok(m) => m,
+                Err(e) => {
+                    // Only the text before the first ':' is logged. That is
+                    // fetch_manifest's own category ("Manifest fetch failed",
+                    // "Manifest HTTP error", "Manifest parse error"); the rest
+                    // is a reqwest error, whose Display carries the request
+                    // URL, and addon URLs routinely embed the user's config
+                    // or debrid token in the path.
+                    crate::devlog!(
+                        warn, "subtitles",
+                        "[{}] skipped: {}",
+                        log_label(&addon.name, &base),
+                        e.split(':').next().unwrap_or("manifest error"),
+                    );
+                    return (idx, vec![]);
+                }
+            };
             let label = log_label(&wire.name, &base);
             if !manifest_has_subtitle_resource(&wire) {
+                crate::devlog!(info, "subtitles", "[{}] skipped: manifest has no subtitles resource", label);
                 return (idx, vec![]);
             }
             let addon_name = wire.name.clone();
@@ -4355,5 +4572,118 @@ mod tests {
         assert_eq!(dropped, 0);
         assert_eq!(metas[0].release_info.as_deref(), Some("2024"));
         assert_eq!(metas[0].imdb_rating, None);
+    }
+
+    /// The guest path (`fetch_manifest` over a `WireManifest`) and the two
+    /// signed-in paths (`extract_manifest_has_search` over raw JSON) must
+    /// agree. They used to disagree on a `search` resource with no search
+    /// extra, which read `true` in guest mode and `false` once signed in.
+    #[test]
+    fn has_search_is_one_rule_on_every_path() {
+        let cases = [
+            (serde_json::json!({
+                "name": "resource form", "resources": ["catalog", "search"],
+                "catalogs": [{ "type": "movie", "id": "top" }],
+            }), true),
+            (serde_json::json!({
+                "name": "object form", "resources": [{ "name": "search", "types": ["movie"] }],
+                "catalogs": [],
+            }), true),
+            (serde_json::json!({
+                "name": "extra form", "resources": ["catalog"],
+                "catalogs": [{ "type": "movie", "id": "s", "extra": [{ "name": "search", "isRequired": true }] }],
+            }), true),
+            (serde_json::json!({
+                "name": "neither", "resources": ["stream"],
+                "catalogs": [{ "type": "movie", "id": "top", "extra": [{ "name": "genre" }] }],
+            }), false),
+        ];
+        for (raw, expected) in cases {
+            let wire: WireManifest = serde_json::from_value(raw.clone()).expect("fixture parses");
+            let local = manifest_declares_search(
+                wire.catalogs.iter().map(|c| c.extra.as_slice()),
+                &wire.resources,
+            );
+            assert_eq!(local, expected, "guest path: {}", wire.name);
+            assert_eq!(extract_manifest_has_search(&raw), expected, "cloud path: {}", wire.name);
+        }
+    }
+
+    fn entry(resources: &[&str], types: &[&str], stream_types: &[&str], id_prefixes: &[&str]) -> AddonEntry {
+        let own = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        AddonEntry {
+            url: "https://example.invalid".into(),
+            name: "Test".into(),
+            has_search: false,
+            manifest_id: String::new(),
+            types: own(types),
+            resources: own(resources),
+            stream_types: own(stream_types),
+            id_prefixes: own(id_prefixes),
+            stream_id_prefixes: Vec::new(),
+            configurable: false,
+        }
+    }
+
+    /// Each skip names the gate that actually failed. The type and prefix
+    /// misses on an addon WITHOUT per-resource stream types are the cases
+    /// the old `(bool, Option<declared>)` return logged as "has no stream
+    /// resource".
+    #[test]
+    fn stream_gate_names_the_failing_gate() {
+        let bare = entry(&[], &["movie"], &[], &[]);
+        assert!(matches!(addon_entry_supports_stream_for(&bare, "movie", "tt1"), StreamGate::NoStreamResource));
+
+        let meta_only = entry(&["catalog", "meta"], &["movie"], &[], &[]);
+        assert!(matches!(addon_entry_supports_stream_for(&meta_only, "movie", "tt1"), StreamGate::NoStreamResource));
+
+        let movies = entry(&["stream"], &["movie"], &[], &[]);
+        assert!(matches!(
+            addon_entry_supports_stream_for(&movies, "series", "tt1:1:1"),
+            StreamGate::TypeMismatch { per_resource: false, .. },
+        ));
+        assert!(matches!(addon_entry_supports_stream_for(&movies, "MOVIE", "tt1"), StreamGate::Supported));
+
+        let own_types = entry(&["stream"], &["movie", "series"], &["movie"], &[]);
+        assert!(matches!(
+            addon_entry_supports_stream_for(&own_types, "series", "tt1:1:1"),
+            StreamGate::TypeMismatch { per_resource: true, .. },
+        ));
+
+        let tt_only = entry(&["stream"], &["series"], &[], &["tt"]);
+        assert!(matches!(
+            addon_entry_supports_stream_for(&tt_only, "series", "kitsu:1:1"),
+            StreamGate::PrefixMismatch { per_resource: false, .. },
+        ));
+        assert!(matches!(addon_entry_supports_stream_for(&tt_only, "series", "tt1:1:1"), StreamGate::Supported));
+
+        // Empty type and prefix lists accept everything.
+        let open = entry(&["stream"], &[], &[], &[]);
+        assert!(matches!(addon_entry_supports_stream_for(&open, "anime", "kitsu:1"), StreamGate::Supported));
+    }
+
+    /// A refresh hands back the idPrefixes list the cloud builders would
+    /// have built, never the live builder's 16-entry cut. A signed-in
+    /// user's entry is cloud-built and complete, and swapping in the cut
+    /// list made the prefix gates reject an id that matched prefix 17+.
+    #[test]
+    fn refreshed_id_prefixes_match_the_cloud_builder() {
+        let prefixes: Vec<String> = (0..20).map(|i| format!("p{i}:")).collect();
+        let raw = serde_json::json!({
+            "name": "Many prefixes", "resources": ["stream"], "types": ["series"],
+            "catalogs": [], "idPrefixes": prefixes,
+        });
+        let wire: WireManifest = serde_json::from_value(raw.clone()).expect("fixture parses");
+        let cloud = extract_manifest_id_prefixes(&raw);
+        assert_eq!(cloud.len(), 20);
+        assert_eq!(collect_wire_id_prefixes_complete(&wire), cloud);
+        // The saved guest entry keeps add_addon's cap, which is unchanged.
+        assert_eq!(collect_wire_id_prefixes(&wire).len(), GUEST_ID_PREFIXES_CAP);
+
+        let refreshed = AddonEntry {
+            id_prefixes: collect_wire_id_prefixes_complete(&wire),
+            ..addon_entry_from_wire("https://example.invalid".into(), &wire, false)
+        };
+        assert!(matches!(addon_entry_supports_stream_for(&refreshed, "series", "p19:1:1"), StreamGate::Supported));
     }
 }

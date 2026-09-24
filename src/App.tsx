@@ -2156,6 +2156,27 @@ function isImplausiblyShortStream(duration: number | null | undefined): boolean 
   return typeof duration === "number" && duration > 0 && duration < MIN_PLAUSIBLE_TITLE_S;
 }
 
+/** `list` with every entry at `url` replaced by `entry` (a manifest
+ *  refresh's rebuild), in place and keeping `url` itself: it is the key
+ *  the Settings provider lists and the Addons page rows hold. `null` when
+ *  nothing changed, so a refresh that found the same manifest does not
+ *  hand every `addons`-keyed effect a new array. */
+function withRefreshedAddon(
+  list: readonly AddonEntry[],
+  url: string,
+  entry: AddonEntry,
+): AddonEntry[] | null {
+  let changed = false;
+  const next = list.map((a) => {
+    if (a.url !== url) return a;
+    const fresh: AddonEntry = { ...entry, url };
+    if (JSON.stringify(fresh) === JSON.stringify(a)) return a;
+    changed = true;
+    return fresh;
+  });
+  return changed ? next : null;
+}
+
 export default function App() {
   // ── Nav state ──
   // Restore the route from sessionStorage on a webview reload (Ctrl+R / F5)
@@ -6803,6 +6824,29 @@ export default function App() {
     setAddons((prev) => prev.filter((a) => a.url !== url));
   }, []);
 
+  /** A manifest refresh rebuilt one addon's entry. Swap it in by url so
+   *  order is untouched. A guest's entry is already saved to addons.json
+   *  by Rust. A signed-in user's is not written anywhere upstream: Aura
+   *  does not write the Stremio cloud collection (an outward write to the
+   *  account the official Stremio apps share), so the fresh fields live in
+   *  state plus the warm cache below until the next launch or sign-in,
+   *  when get_synced_addons returns the collection's stored manifest
+   *  snapshot and overwrites both. The cache is patched in its own terms
+   *  rather than from state, so two refreshes in flight cannot drop each
+   *  other's update. */
+  const handleAddonRefreshed = useCallback((url: string, entry: AddonEntry) => {
+    setAddons((prev) => withRefreshedAddon(prev, url, entry) ?? prev);
+    if (!session?.auth_key) return;
+    const key = cloudAddonCacheKey(session.auth_key);
+    try {
+      const raw = localStorage.getItem(key);
+      const cached: unknown = raw ? JSON.parse(raw) : null;
+      if (!Array.isArray(cached)) return;
+      const next = withRefreshedAddon(cached as AddonEntry[], url, entry);
+      if (next) localStorage.setItem(key, JSON.stringify(next));
+    } catch { /* corrupt cache or quota */ }
+  }, [session, cloudAddonCacheKey]);
+
   /** Persist the new addon order to disk (guest) or to the Stremio cloud
    *  (logged-in). Optimistically updates local state immediately so the
    *  drag-drop feels instant; reverts on failure and surfaces a toast.
@@ -9173,6 +9217,7 @@ export default function App() {
             session={session}
             onAdd={handleAddonAdded}
             onRemove={handleAddonRemoved}
+            onRefreshed={handleAddonRefreshed}
             onReorder={handleAddonsReorder}
             onLoginSuccess={handleLoginSuccess}
             onLogout={handleLogout}
