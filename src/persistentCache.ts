@@ -43,6 +43,11 @@ interface Options {
   maxEntries?: number;
   /** Persist debounce in milliseconds. Default 250 ms. */
   debounceMs?: number;
+  /** Whether a quota squeeze elsewhere may drop our oldest half (see the
+   *  constructor). Default true, which suits a cache of data that re-fetches.
+   *  False for a store of the user's own CHOICES, which nothing re-fetches:
+   *  losing them would silently undo what the user picked. */
+  reclaimable?: boolean;
 }
 
 export class PersistentCache<V> {
@@ -62,7 +67,7 @@ export class PersistentCache<V> {
     // Disposable cache: when the shared localStorage origin hits quota during
     // ANOTHER tenant's important write, yield room (drop our oldest half) rather
     // than letting that write fail silently. The data re-fetches on next use.
-    registerStorageReclaimer(() => this.reclaimSpace());
+    if (opts.reclaimable ?? true) registerStorageReclaimer(() => this.reclaimSpace());
   }
 
   private hydrate(): void {

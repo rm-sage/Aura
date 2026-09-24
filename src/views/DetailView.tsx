@@ -112,6 +112,7 @@ import { recheckSeriesWatchedFlag } from "../autoAdvance";
 import { getSortedEpisodes } from "../episodeSort";
 import { showFlyUpToast } from "../FlyUpToast";
 import ImageLoader from "../ImageLoader";
+import { closeDownloadsPanel } from "../downloadsPanel";
 import HeroBackdropPicker from "../HeroBackdropPicker";
 import { collectBackdropCandidates, loadHeroBackdrop, saveHeroBackdrop, type BackdropCandidate } from "../heroBackdrop";
 import { shrinkPoster, screenWidthHint } from "../posterSize";
@@ -961,13 +962,16 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     if (heroHold) { heroWasHeldRef.current = true; return; }
     if (!heroWasHeldRef.current) return;
     heroWasHeldRef.current = false;
-    const settled = heroSettledRef.current;
+    const settled = heroSettledRef.current?.id === meta.id ? heroSettledRef.current : null;
     setHeroArtLatch((prev) => {
       if (prev) return prev;
-      if (settled && settled.id === meta.id) {
-        return resolveHeroArt(settled.detail, meta, heroResumeRef.current);
-      }
-      return seedHeroArt(meta, heroResumeRef.current);
+      // A probe that settled WITH a detail is the freshest answer. One that
+      // settled with none (every addon failed) must not beat the warm seed,
+      // which a normal open would have latched at mount: that would make a
+      // reload show different art from an ordinary open.
+      if (settled?.detail) return resolveHeroArt(settled.detail, meta, heroResumeRef.current);
+      return seedHeroArt(meta, heroResumeRef.current)
+        ?? (settled ? resolveHeroArt(null, meta, heroResumeRef.current) : null);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [heroHold]);
@@ -1811,15 +1815,15 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // Re-latch the BACKGROUND (never the logo) for an explicit choice or the
   // dead-override fallback. Whatever is on screen right now stays underneath
   // as bgUnderlay until the new image has decoded, so the swap never shows the
-  // ambient base. Going back to an image that is still MOUNTED (the one on
-  // screen, or the outgoing underlay of a crossfade in flight, including one
-  // whose incoming image has already decoded and is fading in over it) reuses
-  // that element, which is kept by key: its onLoad will not fire again, so it
+  // ambient base. While a crossfade is still in flight the underlay is the
+  // one that stays: it is fully opaque, where the incoming image may be half
+  // faded in, and dropping the underlay then let the ambient base show
+  // through (a dark dip on every quick second pick). Going back to an image
+  // that is still MOUNTED (the underlay, or the image on screen) reuses that
+  // element, which is kept by key: its onLoad will not fire again, so it
   // must count as ready now or its layer would sit at opacity 0 for good.
   const swapHeroBackground = (nextBg: string | null, overridden: boolean) => {
-    const onScreen = bgUnderlay && !bgReady
-      ? bgUnderlay
-      : heroShown && bgReady ? heroArt : null;
+    const onScreen = bgUnderlay ?? (heroShown && bgReady ? heroArt : null);
     const reused = nextBg !== null && (nextBg === onScreen || nextBg === bgUnderlay);
     setHeroArtLatch((prev) => prev
       ? { ...prev, background: nextBg, overridden }
@@ -1855,7 +1859,30 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // and the stored choice is KEPT: the failure may be transient, and the next
   // open tries it again. If automatic resolves to the same URL there is
   // nothing to fall back to.
+  //
+  // A pick that fails MID-CROSSFADE (its predecessor still mounted underneath)
+  // goes back to that predecessor instead, whatever the fallback budget: the
+  // alternative was to mark the dead image ready, drop the underlay 400 ms
+  // later and leave the hero on the ambient base for the rest of the open.
+  // A choice that has just failed in front of the user is not kept either:
+  // the stored choice follows what is back on screen.
   const onHeroBackdropError = () => {
+    if (bgUnderlay && bgUnderlay !== heroArt) {
+      const back = bgUnderlay;
+      const stored = loadHeroBackdrop(meta.id);
+      if (heroArt && stored === heroArt) {
+        const keep = back === automaticHeroArt().background ? null : back;
+        saveHeroBackdrop(meta.id, keep);
+        setBackdropPicker((p) => (p ? { ...p, current: keep } : p));
+      }
+      console.info("[meta] picked hero backdrop did not load; kept the previous one");
+      setHeroArtLatch((prev) => (prev
+        ? { ...prev, background: back, overridden: loadHeroBackdrop(meta.id) === back }
+        : prev));
+      setBgUnderlay(null);
+      setBgReady(true);
+      return;
+    }
     if (heroArtLatch?.overridden && !overrideFallbackUsedRef.current) {
       overrideFallbackUsedRef.current = true;
       const auto = automaticHeroArt().background;
@@ -1898,13 +1925,21 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     // A choice needs two different images, counting what Automatic shows.
     const distinct = new Set(candidates.map((c) => c.url));
     if (automatic) distinct.add(automatic);
-    const choosable = distinct.size >= 2;
+    // Not before the hero has settled either: a pick then latched from
+    // whatever detail was on hand, freezing the logo and what Automatic means
+    // for the rest of the open, and the probe's answer was thrown away.
+    const settled = heroArtLatch !== null;
+    const choosable = settled && distinct.size >= 2;
     openContextMenu(x, y, [{
       label: "Change backdrop…",
       icon: <BackdropIcon />,
       disabled: !choosable,
-      hint: choosable ? undefined : "Aura only knows one backdrop for this title.",
-      onClick: () => setBackdropPicker({
+      hint: choosable
+        ? undefined
+        : settled ? "Aura only knows one backdrop for this title." : "Available once the artwork has loaded.",
+      // The Downloads panel sits above the picker's layer and both close on
+      // Escape, so one press would close both; it goes first.
+      onClick: () => { closeDownloadsPanel(); setBackdropPicker({
         x,
         y,
         automatic,
@@ -1912,7 +1947,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
         candidates,
         current,
         returnFocus,
-      }),
+      }); },
     }]);
   };
 

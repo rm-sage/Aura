@@ -188,6 +188,14 @@ export default function HeroBackdropPicker({
       className="aura-float-glass fixed z-[10045] flex flex-col w-[480px] max-w-[calc(100vw-32px)]
                  max-h-[min(540px,calc(100vh-60px))] rounded-2xl overflow-hidden select-none"
       style={{ left: pos.left, top: pos.top, animation: "fade-in 140ms ease-out" }}
+      // Keys pressed in here stop here. App's window-level keybindings do not
+      // check defaultPrevented and bind the arrows (volume, seek) and Space
+      // (pause) by default, so without this every arrow step through the
+      // tiles also changed and SAVED the volume, and Space paused mpv instead
+      // of pressing the focused tile. Function keys still go through (F12
+      // opens the DevConsole). Escape never reaches here: the capture-phase
+      // listener above takes it first.
+      onKeyDown={(e) => { if (!/^F\d{1,2}$/.test(e.key)) e.stopPropagation(); }}
     >
       <header className="flex items-center gap-2 pl-4 pr-2.5 pt-3 pb-2">
         <div className="flex-1 min-w-0">

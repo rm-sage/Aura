@@ -39,11 +39,14 @@ export const HERO_BACKDROP_STORAGE_KEY = "aura:hero-backdrop:v1";
 
 /** Keyed by the detail page's meta id; the value is the chosen URL only.
  *  Mirrors arcModeCache: a year's TTL and a cap, so a big library cannot grow
- *  it without limit. */
+ *  it without limit. NOT reclaimable: these are the user's choices, not data
+ *  that re-fetches, and a quota squeeze elsewhere must not quietly undo half
+ *  of them for the few KB they hold. */
 const heroBackdropCache = new PersistentCache<string>({
   storageKey: HERO_BACKDROP_STORAGE_KEY,
   ttlMs: 365 * 24 * 60 * 60 * 1000,
   maxEntries: 300,
+  reclaimable: false,
 });
 
 /** A well-formed http(s) URL within the length cap. The one check for every
