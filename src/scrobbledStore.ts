@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { safeSetItem } from "./storageQuota";
+import type { ScrobbleService } from "./scrobbleConn";
 
 // ---------------------------------------------------------------------------
 // scrobbledStore — a local record of which History entries have already been
@@ -34,8 +35,6 @@ import { safeSetItem } from "./storageQuota";
 const STORAGE_KEY_PREFIX = "aura:scrobbled:";
 const CHANGE_EVENT = "aura:scrobbled-changed";
 const MAX_KEYS = 3000;
-
-export type ScrobbleService = "trakt" | "anilist";
 
 let _scope = "guest";
 let _keys: Set<string> = new Set();

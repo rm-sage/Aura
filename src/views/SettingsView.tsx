@@ -45,6 +45,13 @@ import { showAppToast } from "../AppToast";
 import { openExternalUrl } from "../externalUrl";
 import { encodeQr } from "../qrCode";
 import {
+  SCROBBLE_LABELS,
+  summaryFor,
+  type ScrobbleAuthStatus,
+  type ScrobbleAuthSummary,
+  type ScrobbleService,
+} from "../scrobbleConn";
+import {
   DndContext,
   closestCenter,
   PointerSensor,
@@ -3980,17 +3987,25 @@ function MouseBindRow({
 // stored token regardless of which Stremio account is signed in.
 // ---------------------------------------------------------------------------
 
-interface ScrobbleAuthSummary {
-  username: string | null;
-  expires_at: number | null;
-  /** Token is approaching expiry (provider-specific window: 7d for
-   *  AniList, 24h for Trakt). Soft warning. */
-  stale: boolean;
-  /** Token has already lapsed. Hard reconnect required: AniList
-   *  cannot refresh, Trakt's refresh endpoint is not yet wired
-   *  through the proxy. */
-  expired: boolean;
-}
+/** Which services sign in with OAuth device flow (RFC 8628). Every other one
+ *  takes the authorize-URL path (browser + loopback, popup fallback). A Record
+ *  rather than `service === "trakt"`, so a new service has to choose. */
+const USES_DEVICE_FLOW: Record<ScrobbleService, boolean> = {
+  trakt: true,
+  anilist: false,
+};
+
+/** The row's line for a lapsed token. */
+const EXPIRED_COPY: Record<ScrobbleService, string> = {
+  trakt: "Trakt token expired. Click Connect to re-authorize.",
+  anilist: "AniList token expired. AniList does not support refresh, so click Connect to re-authorize.",
+};
+
+/** The row's line for a token inside its provider's stale window. */
+const STALE_COPY: Record<ScrobbleService, string> = {
+  trakt: "Token expires soon. Aura renews it automatically on the next scrobble; reconnect only if it lapses first.",
+  anilist: "AniList token expires within a week. Reconnect to extend (no automatic renewal).",
+};
 
 /** Format a Unix-seconds expiry into a "Mon DD, YYYY · HH:MM" string in
  *  the user's locale + timezone. Returns `null` if the timestamp is
@@ -4041,18 +4056,18 @@ function expiryTickMs(diffMs: number): number {
 function ScrobbleAuthRow({
   service, authKey, description,
 }: {
-  service: "trakt" | "anilist";
+  service: ScrobbleService;
   authKey: string | null;
   description: string;
 }) {
   const scope = authKey ? authKey.slice(0, 12) : "guest";
-  const label = service === "trakt" ? "Trakt" : "AniList";
+  const label = SCROBBLE_LABELS[service];
   // Trakt supports OAuth 2.0 device flow (RFC 8628), which sidesteps
   // the browser → custom-URL-scheme → OS handler chain that broke on
   // Firefox + Aura's dev build. AniList doesn't expose device-flow
   // endpoints, so it stays on the legacy authorize-URL + deep-link
   // path until upstream changes.
-  const useDeviceFlow = service === "trakt";
+  const useDeviceFlow = USES_DEVICE_FLOW[service];
 
   const [status, setStatus] = useState<ScrobbleAuthSummary | null>(null);
   const [busy, setBusy] = useState(false);
@@ -4100,18 +4115,16 @@ function ScrobbleAuthRow({
   }, [service]);
 
   const refresh = useCallback(() => {
-    invoke<{ trakt: ScrobbleAuthSummary | null; anilist: ScrobbleAuthSummary | null }>(
-      "get_scrobble_auth_status",
-      { scope },
-    )
-      .then((s) => setStatus(service === "trakt" ? s.trakt : s.anilist))
+    invoke<ScrobbleAuthStatus>("get_scrobble_auth_status", { scope })
+      .then((s) => setStatus(summaryFor(s, service)))
       .catch(() => {
         // Deliberately does NOT clear `status`. This now also runs on a 60 s
         // poll, and a transient IPC hiccup must not flash "not connected" over
         // a live account once a minute. A genuine disconnect is not an error:
-        // it arrives as a SUCCESSFUL response carrying a null summary, handled
-        // by the `then` branch above. On the very first fetch `status` is
-        // already null, so leaving it alone matches the old behaviour exactly.
+        // it arrives as a SUCCESSFUL response with no summary for this
+        // service, handled by the `then` branch above. On the very first
+        // fetch `status` is already null, so leaving it alone matches the old
+        // behaviour exactly.
       });
   }, [scope, service]);
 
@@ -4658,16 +4671,12 @@ function ScrobbleAuthRow({
       )}
       {status?.expired && !pending && !deviceFlow && (
         <p className="text-rose-400/90 text-xs">
-          {service === "anilist"
-            ? "AniList token expired. AniList does not support refresh, so click Connect to re-authorize."
-            : "Trakt token expired. Click Connect to re-authorize."}
+          {EXPIRED_COPY[service]}
         </p>
       )}
       {status?.stale && !status?.expired && !pending && !deviceFlow && (
         <p className="text-amber-400/80 text-xs">
-          {service === "anilist"
-            ? "AniList token expires within a week. Reconnect to extend (no automatic renewal)."
-            : "Token expires soon. Aura renews it automatically on the next scrobble; reconnect only if it lapses first."}
+          {STALE_COPY[service]}
         </p>
       )}
     </div>

@@ -3,7 +3,13 @@
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { useScrobbleConnections } from "../scrobbleConn";
+import {
+  HISTORY_COMMAND,
+  SCROBBLE_SERVICES,
+  useScrobbleConnections,
+  type ScrobbleConn,
+  type ScrobbleService,
+} from "../scrobbleConn";
 import type { MetaPreview } from "../types";
 import {
   getHistory,
@@ -19,7 +25,6 @@ import {
   markIneligible,
   markScrobbled,
   onScrobbledChange,
-  type ScrobbleService,
 } from "../scrobbledStore";
 import {
   cleanFailureMessage,
@@ -41,12 +46,8 @@ import { typeLabel, isAnimeMeta } from "../aiometadata";
 // actions. We never render an action for a service the user hasn't
 // linked. Sourced from the same `get_scrobble_auth_status` command the
 // Settings + notification surfaces use, so there is one source of truth
-// for "connected".
-interface ScrobbleConnState {
-  scope: string;
-  trakt: boolean;
-  anilist: boolean;
-}
+// for "connected". One flag per service, derived from the shared type.
+type ScrobbleConnState = Pick<ScrobbleConn, "scope" | ScrobbleService>;
 
 // ---------------------------------------------------------------------------
 // HistoryView — Trakt-style detailed feed of completions.
@@ -167,7 +168,7 @@ function HistoryViewBody({ onSelectMeta }: Props) {
     return [...days.entries()].sort((a, b) => b[0].localeCompare(a[0]));
   }, [entries]);
 
-  const anyService = conn.trakt || conn.anilist;
+  const anyService = SCROBBLE_SERVICES.some((service) => conn[service]);
   const selectedEntries = useMemo(
     () => entries.filter((e) => selected.has(keyOf(e))),
     [entries, selected],
@@ -200,9 +201,11 @@ function HistoryViewBody({ onSelectMeta }: Props) {
         return;
       }
 
-      // Everything eligible and not already done, split by service.
-      const traktWork: ScrobbleWorkItem[] = [];
-      const anilistPending: HistoryEntry[] = [];
+      // Everything eligible and not already done, split by service. Keyed by
+      // service rather than `trakt ? ... : anilist`, so a new service is a
+      // compile error here instead of silently landing in AniList's
+      // per-season collapse below.
+      const pendingBy: Record<ScrobbleService, HistoryEntry[]> = { trakt: [], anilist: [] };
       const items = new Set<string>();
       let alreadyDone = 0;
       let retired = 0;
@@ -220,10 +223,16 @@ function HistoryViewBody({ onSelectMeta }: Props) {
             continue;
           }
           items.add(keyOf(entry));
-          if (service === "trakt") traktWork.push({ entry, service });
-          else anilistPending.push(entry);
+          pendingBy[service].push(entry);
         }
       }
+
+      // Trakt records each play separately, keyed on watched_at, so every row
+      // is its own push.
+      const traktWork: ScrobbleWorkItem[] = pendingBy.trakt.map(
+        (entry) => ({ entry, service: "trakt" }),
+      );
+      const anilistPending = pendingBy.anilist;
 
       // COLLAPSE THE ANILIST SIDE. AniList keeps ONE progress number per entry, so
       // only the highest episode of a given (series, season) actually writes
@@ -829,7 +838,7 @@ const HistoryCard = memo(function HistoryCard({
   // null = idle; otherwise the service whose push is in flight. Blocks
   // both buttons while either is running so a double-click can't fire two
   // overlapping writes for the same row.
-  const [busy, setBusy] = useState<"trakt" | "anilist" | null>(null);
+  const [busy, setBusy] = useState<ScrobbleService | null>(null);
 
   const eligible = servicesFor(entry, conn);
   const showTrakt = eligible.includes("trakt");
@@ -839,12 +848,9 @@ const HistoryCard = memo(function HistoryCard({
     if (busy) return;
     setBusy(service);
     try {
-      const command = service === "trakt"
-        ? "scrobble_history_trakt"
-        : "scrobble_history_anilist";
       // Tauri maps these camelCase keys onto the Rust command's
       // snake_case params (parent_id, media_type, played_at, ...).
-      const message = await invoke<string>(command, {
+      const message = await invoke<string>(HISTORY_COMMAND[service], {
         id:        entry.id,
         parentId:  entry.parent_id ?? null,
         mediaType: entry.media_type,

@@ -49,6 +49,8 @@
 //!   • Never silently retry on 401/403 — that's a signal the user
 //!     must intervene, not a transient blip.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Runtime, Url, WebviewUrl,
@@ -56,6 +58,23 @@ use tauri::{
 use tauri::webview::WebviewBuilder;
 
 const KEYRING_SERVICE: &str = "aura";
+
+/// Every scrobble service this module stores tokens for, in display order.
+/// The ONE allowlist: every command that takes a `service` from the frontend
+/// goes through `validate_service`, so a keyring entry name or a proxy URL can
+/// only ever be built from a value listed here. Mirrored by
+/// `SCROBBLE_SERVICES` in src/scrobbleConn.ts.
+pub const SCROBBLE_SERVICES: &[&str] = &["trakt", "anilist"];
+
+/// Reject a service name that is not in `SCROBBLE_SERVICES`. The error text is
+/// the one every command returned before this was centralised.
+fn validate_service(service: &str) -> Result<(), String> {
+    if SCROBBLE_SERVICES.contains(&service) {
+        Ok(())
+    } else {
+        Err(format!("unknown scrobble service: {service}"))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Log redaction
@@ -108,11 +127,12 @@ pub struct ScrobbleAuthToken {
     pub username:      Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct ScrobbleAuthStatus {
-    pub trakt:   Option<ScrobbleAuthSummary>,
-    pub anilist: Option<ScrobbleAuthSummary>,
-}
+/// Connection summary per service, keyed by service name, holding an entry
+/// ONLY for a connected service. This used to be a struct with one `Option`
+/// field per provider, which serialized a disconnected one as an explicit
+/// `null`; the map omits the key instead, and every frontend reader treats
+/// absent and `null` alike. A `BTreeMap` so the wire order is deterministic.
+pub type ScrobbleAuthStatus = BTreeMap<String, ScrobbleAuthSummary>;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ScrobbleAuthSummary {
@@ -186,16 +206,19 @@ fn summarise(service: &str, token: Option<ScrobbleAuthToken>) -> Option<Scrobble
 // Tauri commands
 // ---------------------------------------------------------------------------
 
-/// Read the connection summary for both providers in one call. Used by
+/// Read the connection summary for every provider in one call. Used by
 /// the Settings UI to render the Trakt + AniList rows without firing
-/// two separate IPC round-trips. `scope` is the first 12 chars of the
+/// one IPC round-trip per provider. `scope` is the first 12 chars of the
 /// active Stremio auth_key (or the literal "guest" when signed out).
 #[tauri::command]
 pub async fn get_scrobble_auth_status(scope: String) -> Result<ScrobbleAuthStatus, String> {
-    Ok(ScrobbleAuthStatus {
-        trakt:   summarise("trakt",   read_token("trakt",   &scope)),
-        anilist: summarise("anilist", read_token("anilist", &scope)),
-    })
+    Ok(SCROBBLE_SERVICES
+        .iter()
+        .filter_map(|&service| {
+            summarise(service, read_token(service, &scope))
+                .map(|summary| (service.to_string(), summary))
+        })
+        .collect())
 }
 
 /// Persist a token coming back from the VPS OAuth proxy. Called by
@@ -210,9 +233,7 @@ pub async fn set_scrobble_auth_token(
     expires_at:    Option<u64>,
     username:      Option<String>,
 ) -> Result<(), String> {
-    if !["trakt", "anilist"].contains(&service.as_str()) {
-        return Err(format!("unknown scrobble service: {service}"));
-    }
+    validate_service(&service)?;
     let token = ScrobbleAuthToken { access_token, refresh_token, expires_at, username };
     let json = serde_json::to_string(&token).map_err(|e| e.to_string())?;
     entry(&service, &scope)?
@@ -233,21 +254,16 @@ pub async fn clear_scrobble_auth_token(
     service: String,
     scope:   String,
 ) -> Result<(), String> {
-    if !["trakt", "anilist"].contains(&service.as_str()) {
-        return Err(format!("unknown scrobble service: {service}"));
-    }
+    validate_service(&service)?;
 
     // Best-effort server-side revoke BEFORE dropping the local entry so
     // Trakt invalidates the token on their side too — otherwise a
     // "disconnected" token stays live on Trakt until its 90-day TTL.
-    // Trakt-only: AniList exposes no revoke endpoint. Every failure is
-    // swallowed inside `revoke_trakt_token`; the local clear below runs
-    // regardless of whether the proxy/Trakt was reachable.
-    if service == "trakt" {
-        if let Some(tok) = read_token("trakt", &scope) {
-            revoke_trakt_token(&tok.access_token).await;
-        }
-    }
+    // Trakt-only: AniList exposes no revoke endpoint, so its arm in
+    // `revoke_access_token` does nothing. Every failure is swallowed
+    // inside `revoke_trakt_token`; the local clear below runs regardless
+    // of whether the proxy/Trakt was reachable.
+    revoke_access_token(&service, &scope).await;
 
     let e = entry(&service, &scope)?;
     match e.delete_credential() {
@@ -360,9 +376,7 @@ pub fn scrobble_oauth_authorize_url(
     service:  String,
     loopback: Option<bool>,
 ) -> Result<String, String> {
-    if !["trakt", "anilist"].contains(&service.as_str()) {
-        return Err(format!("unknown scrobble service: {service}"));
-    }
+    validate_service(&service)?;
     let base = format!("{REDIRECT_BASE}/{service}/start");
     if loopback != Some(true) {
         return Ok(base);
@@ -460,9 +474,7 @@ fn device_flow_client() -> Result<reqwest::Client, String> {
 /// verification URL plus the opaque device_code Aura uses to poll.
 #[tauri::command]
 pub async fn scrobble_oauth_device_begin(service: String) -> Result<DeviceFlowBegin, String> {
-    if !["trakt", "anilist"].contains(&service.as_str()) {
-        return Err(format!("unknown scrobble service: {service}"));
-    }
+    validate_service(&service)?;
     let url = format!("{REDIRECT_BASE}/{service}/device/code");
     let client = device_flow_client()?;
     let resp = client.post(&url).send().await.map_err(|e| e.to_string())?;
@@ -488,9 +500,7 @@ pub async fn scrobble_oauth_device_poll(
     scope:       String,
     device_code: String,
 ) -> Result<DeviceFlowPoll, String> {
-    if !["trakt", "anilist"].contains(&service.as_str()) {
-        return Err(format!("unknown scrobble service: {service}"));
-    }
+    validate_service(&service)?;
     let url = format!("{REDIRECT_BASE}/{service}/device/token");
     let client = device_flow_client()?;
     let resp = client
@@ -659,6 +669,47 @@ pub(crate) struct RefreshOutcome {
     pub access_token: String,
 }
 
+/// Refresh the stored access token for `(service, scope)`. The per-service
+/// entry point: scrobble.rs calls this rather than a provider-named helper,
+/// so a provider that gains a refresh path is one more arm here.
+///
+/// Only Trakt has one. AniList issues no refresh token and exposes no
+/// refresh endpoint (see the module docs), so it reports `NoRefreshToken`,
+/// the same answer a Trakt token stored without a `refresh_token` gets, and
+/// nothing is sent anywhere.
+pub(crate) async fn refresh_access_token(
+    service: &str,
+    scope: &str,
+    failing_access_token: Option<&str>,
+) -> Result<RefreshOutcome, RefreshError> {
+    match service {
+        "trakt" => refresh_trakt_token(scope, failing_access_token).await,
+        // No refresh path at all; renewal is a full re-auth.
+        "anilist" => Err(RefreshError::NoRefreshToken),
+        // Not a service this module stores tokens for.
+        _ => Err(RefreshError::NoRefreshToken),
+    }
+}
+
+/// Best-effort server-side revoke of the stored token for `(service, scope)`,
+/// run by the Disconnect path before the local keyring entry is dropped.
+/// Only Trakt exposes a revoke endpoint; for AniList there is nothing to call,
+/// so its arm does nothing (and does not even read the keyring), exactly as
+/// the old `service == "trakt"` gate behaved.
+pub(crate) async fn revoke_access_token(service: &str, scope: &str) {
+    match service {
+        "trakt" => {
+            if let Some(tok) = read_token("trakt", scope) {
+                revoke_trakt_token(&tok.access_token).await;
+            }
+        }
+        // No revoke endpoint; the caller's local keyring clear is all there is.
+        "anilist" => {}
+        // Not a service this module stores tokens for.
+        _ => {}
+    }
+}
+
 /// Attempt to refresh the stored Trakt access token for `scope` using
 /// its rotating `refresh_token` against the proxy.
 ///
@@ -670,9 +721,9 @@ pub(crate) struct RefreshOutcome {
 /// the (now-rotated) refresh_token a second time. Pass `None` to skip
 /// the short-circuit and always attempt a refresh.
 ///
-/// Not a `#[tauri::command]` — called from Rust (scrobble.rs), so no
-/// command registration is needed.
-pub(crate) async fn refresh_trakt_token(
+/// Not a `#[tauri::command]`: called from Rust (scrobble.rs, through
+/// `refresh_access_token`), so no command registration is needed.
+async fn refresh_trakt_token(
     scope: &str,
     failing_access_token: Option<&str>,
 ) -> Result<RefreshOutcome, RefreshError> {
@@ -837,8 +888,8 @@ pub(crate) async fn refresh_trakt_token(
 /// dropped so Trakt invalidates the token on their side too. Every
 /// failure is swallowed — the disconnect must succeed regardless of
 /// whether the proxy/Trakt is reachable. Trakt-only; AniList has no
-/// revoke endpoint.
-pub(crate) async fn revoke_trakt_token(access_token: &str) {
+/// revoke endpoint. Reached through `revoke_access_token`.
+async fn revoke_trakt_token(access_token: &str) {
     let client = match device_flow_client() {
         Ok(c) => c,
         Err(e) => {

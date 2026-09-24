@@ -36,6 +36,7 @@ import { getManualWatchedState, setManualWatchedMany } from "./manualWatched";
 import { isSkipped, setSkipped } from "./skipMarks";
 import { addHistoryEntries, type HistoryEntry } from "./historyStore";
 import { markScrobbled } from "./scrobbledStore";
+import { HISTORY_COMMAND, type ScrobbleService } from "./scrobbleConn";
 
 /** One episode being marked skipped, with everything History and the scrobble
  *  services need. Callers assemble these from a VideoEntry plus the series. */
@@ -64,7 +65,7 @@ export interface SkipOptions {
   /** Active scrobble scope, or null when not signed in to anything. */
   scrobbleScope: string | null;
   /** Services with a live connection. Empty means nothing to push to. */
-  services?: ("trakt" | "anilist")[];
+  services?: ScrobbleService[];
 }
 
 /**
@@ -170,12 +171,9 @@ export async function markEpisodesSkipped(
     return;
   }
 
-  const push = async (t: SkipTarget, service: "trakt" | "anilist") => {
-    const command = service === "trakt"
-      ? "scrobble_history_trakt"
-      : "scrobble_history_anilist";
+  const push = async (t: SkipTarget, service: ScrobbleService) => {
     try {
-      await invoke<string>(command, {
+      await invoke<string>(HISTORY_COMMAND[service], {
         id: t.id,
         parentId: t.parentId,
         mediaType: t.mediaType,

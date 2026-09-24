@@ -670,7 +670,7 @@ async fn trakt_sync_history(
             .unwrap_or(0);
         const PROACTIVE_WINDOW: u64 = 30 * 60;
         if exp.saturating_sub(now) < PROACTIVE_WINDOW && proactive_refresh_allowed(scope) {
-            match scrobble_auth::refresh_trakt_token(scope, Some(&token.access_token)).await {
+            match scrobble_auth::refresh_access_token("trakt", scope, Some(&token.access_token)).await {
                 Ok(_) => {
                     // Re-read so the dispatch below uses the rotated token.
                     match scrobble_auth::read_token_for("trakt", scope) {
@@ -757,7 +757,7 @@ async fn trakt_sync_history(
         // refresh_trakt_token collapses concurrent 401s onto a single
         // refresh so the rotating refresh_token isn't double-spent.
         if let TraktSyncOutcome::Unauthorized = outcome {
-            match scrobble_auth::refresh_trakt_token(scope, Some(&token.access_token)).await {
+            match scrobble_auth::refresh_access_token("trakt", scope, Some(&token.access_token)).await {
                 Ok(refreshed) => {
                     crate::devlog!(
                         info, "scrobble",
@@ -830,6 +830,148 @@ async fn trakt_sync_history(
         total,
     );
     TraktSyncResult::NotFound
+}
+
+// ---------------------------------------------------------------------------
+// Provider fan-out
+//
+// An automatic push goes to every provider in `Provider::ALL`. scrobble_end,
+// scrobble_test_fire and shutdown_blocking used to spell out the same Trakt
+// call and AniList call by hand, each in its own shape (sequential,
+// sequential-with-results, tokio::join!), so a provider wired into one of
+// them could be missing from another with nothing to say so. All three now
+// iterate the slice and route through `dispatch`, whose match is exhaustive
+// over (provider, push): a new variant does not compile until `dispatch`
+// handles it for both kinds of push. `ALL` is still listed by hand and nothing
+// checks it against the enum, so a variant left out of it compiles clean and
+// is never dispatched. Each caller keeps its own concurrency: the two command
+// paths run the slice in order, the shutdown flush joins it.
+//
+// A closed enum rather than a trait: each arm is a direct call into that
+// provider's module and nothing here needs dynamic dispatch.
+// ---------------------------------------------------------------------------
+
+/// A provider an automatic scrobble push fans out to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Provider {
+    Trakt,
+    Anilist,
+}
+
+impl Provider {
+    /// Every provider, in dispatch order. The sequential callers run them in
+    /// exactly this order: Trakt, then AniList.
+    const ALL: &'static [Provider] = &[Provider::Trakt, Provider::Anilist];
+}
+
+/// Which kind of push `dispatch` is making.
+#[derive(Clone, Copy, Debug)]
+enum Push {
+    /// End of playback, or the DevConsole test: each provider's full path
+    /// (Trakt's refresh + fallback-candidate walk, AniList's resolver), with
+    /// the outcome handed back to the caller.
+    Completion { time: f64, duration: f64 },
+    /// The window-close flush: a hard ~2 s budget and nobody left to report
+    /// to, so each provider takes a cheaper fire-and-forget path.
+    Shutdown { progress_pct: f64 },
+}
+
+/// What one provider did with a push.
+enum ProviderOutcome {
+    Trakt(TraktSyncResult),
+    /// A 401 in here has already been handled (token cleared) by `dispatch`.
+    Anilist(Result<crate::scrobble_anilist::SaveOutcome, crate::scrobble_anilist::AnilistError>),
+    /// A `Push::Shutdown` flush. Fire-and-forget, so there is nothing to report.
+    Flushed,
+}
+
+async fn dispatch<R: Runtime>(
+    provider: Provider,
+    push:     Push,
+    app:      &AppHandle<R>,
+    scope:    &str,
+    sess:     &ScrobbleSession,
+) -> ProviderOutcome {
+    use crate::scrobble_anilist::{save_progress, AnilistError};
+    match (provider, push) {
+        // Trakt: covers movies + IMDB-id'd series (most of the catalogue).
+        (Provider::Trakt, Push::Completion { time, duration }) => {
+            ProviderOutcome::Trakt(trakt_sync_history(scope, sess, time, duration, None).await)
+        }
+        // AniList: separate provider, separate keyring entry, separate
+        // failure mode. Internally no-ops when sess.is_anime is false or
+        // no AniList token is stored, so calling it unconditionally is
+        // cheap. We treat its outcome as best-effort the same way Trakt
+        // does: a 401 clears the keyring entry so Settings reflects
+        // "expired, reconnect" on next refresh.
+        (Provider::Anilist, Push::Completion { .. }) => {
+            let outcome = save_progress(app, scope, sess, None).await;
+            if let Err(AnilistError::Unauthorized) = outcome {
+                crate::devlog!(
+                    warn, "scrobble",
+                    "AniList 401/403 - clearing token for scope={scope} (user must reconnect)",
+                );
+                scrobble_auth::clear_token_for("anilist", scope);
+            }
+            ProviderOutcome::Anilist(outcome)
+        }
+        // Trakt uses the highest-priority trakt_targets candidate (VideoEntry's
+        // authoritative season/episode over the ID-parsed / absolute fallback),
+        // fire-and-forget with no not_found retry: the shutdown path can't wait
+        // on a body parse + a second round-trip. The client is built locally
+        // with a 2 s timeout, tighter than the 8 s runtime default.
+        (Provider::Trakt, Push::Shutdown { progress_pct }) => {
+            let primary_target = trakt_targets(sess).into_iter().next();
+            let trakt_token = scrobble_auth::read_token_for("trakt", scope);
+            let (Some(target), Some(token)) = (primary_target, trakt_token) else {
+                return ProviderOutcome::Flushed;
+            };
+            crate::devlog!(
+                info, "scrobble",
+                "shutdown_blocking flushing Trakt /sync/history for {} ({:.0}%)",
+                sess.imdb_id, progress_pct,
+            );
+            let body = build_history_body(&target, None);
+            let Ok(cli) = reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .https_only(true)
+                .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " scrobble"))
+                .build()
+            else {
+                return ProviderOutcome::Flushed;
+            };
+            let _ = cli
+                .post(format!("{TRAKT_API}/sync/history"))
+                .header("Authorization", format!("Bearer {}", token.access_token))
+                .header("Content-Type", "application/json")
+                .header("trakt-api-version", "2")
+                .header("trakt-api-key", scrobble_auth::TRAKT_CLIENT_ID)
+                .json(&body)
+                .send()
+                .await;
+            ProviderOutcome::Flushed
+        }
+        // AniList reuses save_progress under a 2 s cap. Skipped outright for
+        // a non-anime session or when no AniList token is stored.
+        (Provider::Anilist, Push::Shutdown { .. }) => {
+            let linked =
+                sess.is_anime && scrobble_auth::read_token_for("anilist", scope).is_some();
+            if !linked {
+                return ProviderOutcome::Flushed;
+            }
+            crate::devlog!(
+                info, "scrobble",
+                "shutdown_blocking flushing AniList progress for \"{}\"",
+                sess.title,
+            );
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                save_progress(app, scope, sess, None),
+            )
+            .await;
+            ProviderOutcome::Flushed
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -930,29 +1072,25 @@ pub async fn scrobble_end<R: Runtime>(
         "scrobble_end: id={} progress={:.0}% anime={} scope={} - dispatching to providers",
         sess.imdb_id, progress, sess.is_anime, scope,
     );
-    // Trakt: covers movies + IMDB-id'd series (most of the catalogue).
-    trakt_sync_history(&scope, &sess, time, duration, None).await;
-    // AniList: separate provider, separate keyring entry, separate
-    // failure mode. Internally no-ops when sess.is_anime is false or
-    // no AniList token is stored, so calling it unconditionally is
-    // cheap. We treat its outcome as best-effort the same way Trakt
-    // does — a 401 clears the keyring entry so Settings reflects
-    // "expired, reconnect" on next refresh.
-    match crate::scrobble_anilist::save_progress(&app, &scope, &sess, None).await {
-        Ok(_) => {}
-        Err(crate::scrobble_anilist::AnilistError::Unauthorized) => {
-            crate::devlog!(
-                warn, "scrobble",
-                "AniList 401/403 - clearing token for scope={scope} (user must reconnect)",
-            );
-            crate::scrobble_auth::clear_token_for("anilist", &scope);
-        }
-        Err(crate::scrobble_anilist::AnilistError::NotFound) => {
-            // Anime not on AniList, or search returned no candidates.
-            // Common; not actionable.
-        }
-        Err(e) => {
-            crate::devlog!(warn, "scrobble", "AniList save failed: {e}");
+    // In order, one after the other, exactly as before: Trakt, then AniList.
+    use crate::scrobble_anilist::AnilistError;
+    let push = Push::Completion { time, duration };
+    for &provider in Provider::ALL {
+        match dispatch(provider, push, &app, &scope, &sess).await {
+            // trakt_sync_history logs its own outcome.
+            ProviderOutcome::Trakt(_) => {}
+            // Saved / already ahead, or a 401 `dispatch` has already handled.
+            ProviderOutcome::Anilist(Ok(_))
+            | ProviderOutcome::Anilist(Err(AnilistError::Unauthorized)) => {}
+            ProviderOutcome::Anilist(Err(AnilistError::NotFound)) => {
+                // Anime not on AniList, or search returned no candidates.
+                // Common; not actionable.
+            }
+            ProviderOutcome::Anilist(Err(e)) => {
+                crate::devlog!(warn, "scrobble", "AniList save failed: {e}");
+            }
+            // Only a Push::Shutdown flush reports this.
+            ProviderOutcome::Flushed => {}
         }
     }
     Ok(())
@@ -1066,47 +1204,58 @@ pub async fn scrobble_test_fire<R: Runtime>(
         sess.season, sess.episode_num,
     );
 
-    let trakt_result = trakt_sync_history(&scope, &sess, test_time, test_duration, None).await;
-    let anilist_outcome = crate::scrobble_anilist::save_progress(&app, &scope, &sess, None).await;
-    if let Err(crate::scrobble_anilist::AnilistError::Unauthorized) = anilist_outcome {
-        crate::devlog!(
-            warn, "scrobble",
-            "AniList 401/403 - clearing token for scope={scope} (user must reconnect)",
-        );
-        crate::scrobble_auth::clear_token_for("anilist", &scope);
-    }
-
-    let trakt_msg = match trakt_result {
-        TraktSyncResult::Fired    => "fired".to_string(),
-        TraktSyncResult::NotFound => "not_found (S/E mismatch with Trakt catalog)".to_string(),
-        TraktSyncResult::Skipped  => "skipped (no token or unsupported id)".to_string(),
-        TraktSyncResult::Failed   => "failed (network or HTTP error)".to_string(),
-    };
-    let anilist_msg = if anilist_will_fire {
-        match &anilist_outcome {
-            Ok(_) => "fired".to_string(),
-            Err(crate::scrobble_anilist::AnilistError::NotFound)
-                => "skipped (not on AniList)".to_string(),
-            Err(e) => format!("failed: {e}"),
+    // Same order as scrobble_end (Trakt, then AniList), one after the other.
+    // Each provider contributes its `*_fired` flag and one "<Name>: <outcome>"
+    // leg of the message, which joins to the exact text this always printed.
+    let push = Push::Completion { time: test_time, duration: test_duration };
+    let mut trakt_fired = false;
+    let mut anilist_fired = false;
+    let mut legs: Vec<String> = Vec::with_capacity(Provider::ALL.len());
+    for &provider in Provider::ALL {
+        match dispatch(provider, push, &app, &scope, &sess).await {
+            ProviderOutcome::Trakt(trakt_result) => {
+                trakt_fired = trakt_result == TraktSyncResult::Fired;
+                let trakt_msg = match trakt_result {
+                    TraktSyncResult::Fired    => "fired".to_string(),
+                    TraktSyncResult::NotFound => "not_found (S/E mismatch with Trakt catalog)".to_string(),
+                    TraktSyncResult::Skipped  => "skipped (no token or unsupported id)".to_string(),
+                    TraktSyncResult::Failed   => "failed (network or HTTP error)".to_string(),
+                };
+                legs.push(format!("Trakt: {trakt_msg}"));
+            }
+            ProviderOutcome::Anilist(anilist_outcome) => {
+                anilist_fired = anilist_will_fire && anilist_outcome.is_ok();
+                let anilist_msg = if anilist_will_fire {
+                    match &anilist_outcome {
+                        Ok(_) => "fired".to_string(),
+                        Err(crate::scrobble_anilist::AnilistError::NotFound)
+                            => "skipped (not on AniList)".to_string(),
+                        Err(e) => format!("failed: {e}"),
+                    }
+                } else if !sess.is_anime {
+                    "skipped (session not flagged as anime)".to_string()
+                } else {
+                    "skipped (no AniList token)".to_string()
+                };
+                legs.push(format!("AniList: {anilist_msg}"));
+            }
+            // Only a Push::Shutdown flush reports this.
+            ProviderOutcome::Flushed => {}
         }
-    } else if !sess.is_anime {
-        "skipped (session not flagged as anime)".to_string()
-    } else {
-        "skipped (no AniList token)".to_string()
-    };
+    }
     let message = format!(
-        "test scrobble fired for \"{}\" ({} {}). Trakt: {}, AniList: {}",
+        "test scrobble fired for \"{}\" ({} {}). {}",
         sess.title, sess.media_type,
         sess.episode.as_deref().unwrap_or(""),
-        trakt_msg, anilist_msg,
+        legs.join(", "),
     );
     Ok(ScrobbleTestResult {
         session_active: true,
         id: Some(sess.imdb_id),
         media_type: Some(sess.media_type),
         is_anime: sess.is_anime,
-        trakt_fired: trakt_result == TraktSyncResult::Fired,
-        anilist_fired: anilist_will_fire && anilist_outcome.is_ok(),
+        trakt_fired,
+        anilist_fired,
         message,
     })
 }
@@ -1344,69 +1493,20 @@ pub fn shutdown_blocking<R: Runtime>(app: &AppHandle<R>) {
 
     // ── Flush Trakt + AniList CONCURRENTLY ─────────────────────────
     // Both are best-effort network writes each capped at 2 s. They used to run
-    // as two SEQUENTIAL `block_on`s — up to 4 s on an anime title linked to
-    // both services — serializing app shutdown (and a slow exit widens the
+    // as two SEQUENTIAL `block_on`s (up to 4 s on an anime title linked to
+    // both services), serializing app shutdown (and a slow exit widens the
     // Windows self-update file-lock window). Joining them in ONE runtime entry
     // caps the pair at ~2 s. Each still no-ops when its service isn't linked.
     //
-    // Trakt uses the highest-priority trakt_targets candidate (VideoEntry's
-    // authoritative season/episode over the ID-parsed / absolute fallback),
-    // fire-and-forget with no not_found retry — the shutdown path can't wait on
-    // a body parse + a second round-trip. AniList reuses save_progress (which
-    // self-no-ops for non-anime / no token). Clients are built locally with a
-    // 2 s timeout, tighter than the 8 s runtime default.
-    let primary_target = trakt_targets(&sess).into_iter().next();
-    let trakt_token = scrobble_auth::read_token_for("trakt", &scope);
-    let anilist_linked =
-        sess.is_anime && scrobble_auth::read_token_for("anilist", &scope).is_some();
-    let imdb_id = sess.imdb_id.clone();
-    let title = sess.title.clone();
-    let app = app.clone();
-
-    tauri::async_runtime::block_on(async move {
-        let trakt = async {
-            let (Some(target), Some(token)) = (primary_target, trakt_token) else {
-                return;
-            };
-            crate::devlog!(
-                info, "scrobble",
-                "shutdown_blocking flushing Trakt /sync/history for {} ({:.0}%)",
-                imdb_id, progress_pct,
-            );
-            let body = build_history_body(&target, None);
-            let Ok(cli) = reqwest::Client::builder()
-                .timeout(Duration::from_secs(2))
-                .https_only(true)
-                .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " scrobble"))
-                .build()
-            else {
-                return;
-            };
-            let _ = cli
-                .post(format!("{TRAKT_API}/sync/history"))
-                .header("Authorization", format!("Bearer {}", token.access_token))
-                .header("Content-Type", "application/json")
-                .header("trakt-api-version", "2")
-                .header("trakt-api-key", scrobble_auth::TRAKT_CLIENT_ID)
-                .json(&body)
-                .send()
-                .await;
-        };
-        let anilist = async {
-            if !anilist_linked {
-                return;
-            }
-            crate::devlog!(
-                info, "scrobble",
-                "shutdown_blocking flushing AniList progress for \"{}\"",
-                title,
-            );
-            let _ = tokio::time::timeout(
-                Duration::from_secs(2),
-                crate::scrobble_anilist::save_progress(&app, &scope, &sess, None),
-            )
-            .await;
-        };
-        tokio::join!(trakt, anilist);
-    });
+    // `join_all` over `Provider::ALL` rather than a fixed `tokio::join!`, so a
+    // provider added to the slice is flushed alongside the others instead of
+    // needing its own slot here. The per-provider shutdown paths (Trakt's
+    // single-candidate fast path, AniList's capped save_progress) live in the
+    // `Push::Shutdown` arms of `dispatch`.
+    let push = Push::Shutdown { progress_pct };
+    tauri::async_runtime::block_on(futures_util::future::join_all(
+        Provider::ALL
+            .iter()
+            .map(|&provider| dispatch(provider, push, app, &scope, &sess)),
+    ));
 }

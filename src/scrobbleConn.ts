@@ -17,12 +17,89 @@
 import { useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
-export type ScrobbleService = "trakt" | "anilist";
+// ---------------------------------------------------------------------------
+// The provider list, and everything keyed by it.
+//
+// ONE tuple, and the union is derived from it. Per-provider CONSTANTS (the
+// labels and history command below, the alert and Settings copy, the sign-in
+// flow choice, the bulk runner's pacing) are Records keyed by ScrobbleService
+// rather than a `service === "trakt" ? a : b` ternary: with a ternary, a third
+// member compiled clean and silently took the AniList branch, whereas a Record
+// missing a key is a tsc error.
+//
+// That does NOT cover per-provider BEHAVIOUR. It is still written out by hand
+// because it genuinely differs, and a new member compiles clean there and is
+// then silently left out. Extend each of these explicitly:
+//   - HistoryView: `servicesFor` (eligibility; AniList is anime-only), the
+//     bulk runner's `work` merge, and HistoryCard's per-service row buttons.
+//   - skipActions: `markEpisodesSkipped` (Trakt is pushed per episode, AniList
+//     collapsed per media).
+//   - SettingsView: one hand-placed ScrobbleAuthRow per service.
+//   - NotificationsPanel: the reconnect button (AniList only).
+// Mirrors `SCROBBLE_SERVICES` in scrobble_auth.rs, in the same order.
+// ---------------------------------------------------------------------------
 
-export interface ScrobbleConn {
+export const SCROBBLE_SERVICES = ["trakt", "anilist"] as const;
+export type ScrobbleService = typeof SCROBBLE_SERVICES[number];
+
+/** Narrow an untrusted string (a deep-link path, say) to a known service. */
+export function isScrobbleService(value: string): value is ScrobbleService {
+  return (SCROBBLE_SERVICES as readonly string[]).includes(value);
+}
+
+/** Display name per service. */
+export const SCROBBLE_LABELS: Record<ScrobbleService, string> = {
+  trakt: "Trakt",
+  anilist: "AniList",
+};
+
+/** The Tauri command that pushes ONE History row to a service. Every caller
+ *  (the History tab's row buttons, the bulk runner, skip actions) looks it up
+ *  here, so they cannot disagree about which command a service maps to. */
+export const HISTORY_COMMAND: Record<ScrobbleService, string> = {
+  trakt: "scrobble_history_trakt",
+  anilist: "scrobble_history_anilist",
+};
+
+/** One connected service's token summary, as `get_scrobble_auth_status`
+ *  returns it. */
+export interface ScrobbleAuthSummary {
+  username: string | null;
+  expires_at: number | null;
+  /** Token is approaching expiry (provider-specific window: 7d for
+   *  AniList, 24h for Trakt). Soft warning. */
+  stale: boolean;
+  /** Token has already lapsed. Rendered as a hard "reconnect now"
+   *  prompt (AniList cannot refresh at all). */
+  expired: boolean;
+}
+
+/** `get_scrobble_auth_status`'s payload: a map keyed by service name holding
+ *  an entry ONLY for a connected service. Earlier builds sent a disconnected
+ *  service as an explicit `null` instead of omitting it, so the value type
+ *  admits both. Read it through `summaryFor`, never by `Object.keys`: an
+ *  unknown key from a newer backend must be ignored, not rendered. */
+export type ScrobbleAuthStatus = Partial<Record<string, ScrobbleAuthSummary | null>>;
+
+/** The summary for one service, with absent and `null` both meaning "not
+ *  connected". */
+export function summaryFor(
+  status: ScrobbleAuthStatus | null | undefined,
+  service: ScrobbleService,
+): ScrobbleAuthSummary | null {
+  return status?.[service] ?? null;
+}
+
+/** Build a per-service Record by asking `pick` about each service in turn. */
+function perService<T>(pick: (service: ScrobbleService) => T): Record<ScrobbleService, T> {
+  const out = {} as Record<ScrobbleService, T>;
+  for (const service of SCROBBLE_SERVICES) out[service] = pick(service);
+  return out;
+}
+
+/** One flag per service ("has a live token"), plus the account context. */
+export interface ScrobbleConn extends Record<ScrobbleService, boolean> {
   scope: string;
-  trakt: boolean;
-  anilist: boolean;
   /** "Aura may scrobble automatically right now": the MASTER `scrobble_enabled`
    *  switch AND the `auto_scrobble_enabled` preference, not the latter alone.
    *  Gates every push the user did not explicitly ask for by pressing a
@@ -32,15 +109,13 @@ export interface ScrobbleConn {
 }
 
 const EMPTY: ScrobbleConn = {
-  scope: "guest", trakt: false, anilist: false, autoScrobbleEnabled: false,
+  scope: "guest", ...perService(() => false), autoScrobbleEnabled: false,
 };
 
-/** Services with a live token, as the array `markEpisodesSkipped` expects. */
+/** Services with a live token, as the array `markEpisodesSkipped` expects.
+ *  In SCROBBLE_SERVICES order. */
 export function connectedServices(conn: ScrobbleConn): ScrobbleService[] {
-  const out: ScrobbleService[] = [];
-  if (conn.trakt) out.push("trakt");
-  if (conn.anilist) out.push("anilist");
-  return out;
+  return SCROBBLE_SERVICES.filter((service) => conn[service]);
 }
 
 // ---------------------------------------------------------------------------
@@ -82,8 +157,7 @@ function emit(): void {
 function commit(next: ScrobbleConn): void {
   if (
     current.scope === next.scope
-    && current.trakt === next.trakt
-    && current.anilist === next.anilist
+    && SCROBBLE_SERVICES.every((service) => current[service] === next[service])
     && current.autoScrobbleEnabled === next.autoScrobbleEnabled
   ) return;
   current = next;
@@ -120,13 +194,10 @@ async function resolve(): Promise<void> {
   } catch { /* treat unknown as OFF: never push on a guess */ }
 
   try {
-    const status = await invoke<{ trakt: unknown | null; anilist: unknown | null }>(
-      "get_scrobble_auth_status", { scope },
-    );
+    const status = await invoke<ScrobbleAuthStatus>("get_scrobble_auth_status", { scope });
     commit({
       scope,
-      trakt: status.trakt != null,
-      anilist: status.anilist != null,
+      ...perService((service) => summaryFor(status, service) !== null),
       autoScrobbleEnabled,
     });
   } catch {

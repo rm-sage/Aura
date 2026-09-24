@@ -138,7 +138,7 @@ import { getTitleState, titleStateKey } from "./titleState";
 import { isAnimeMeta, markAnimeId } from "./aiometadata";
 import { setSkipMarksScope } from "./skipMarks";
 import { markEpisodesSkipped } from "./skipActions";
-import { connectedServices, useScrobbleConnections } from "./scrobbleConn";
+import { connectedServices, isScrobbleService, useScrobbleConnections } from "./scrobbleConn";
 import type { AnimeTheme, AnimeThemes } from "./animeExtras";
 import type {
   AddonEntry,
@@ -9192,7 +9192,7 @@ export default function App() {
         // surface a toast so the user knows the connection landed.
         if (url.hostname === "oauth") {
           const service = url.pathname.replace(/^\//, "").toLowerCase();
-          if (service !== "trakt" && service !== "anilist") return;
+          if (!isScrobbleService(service)) return;
           const access_token  = url.searchParams.get("token");
           const refresh_token = url.searchParams.get("refresh");
           const expiresStr    = url.searchParams.get("expires");

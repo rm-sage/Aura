@@ -4,6 +4,13 @@
 import { useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useNotifications } from "./NotificationsContext";
+import {
+  SCROBBLE_LABELS,
+  SCROBBLE_SERVICES,
+  summaryFor,
+  type ScrobbleAuthStatus,
+  type ScrobbleService,
+} from "./scrobbleConn";
 
 // ---------------------------------------------------------------------------
 // useScrobbleAuthAlerts — surfaces expired Trakt / AniList tokens in the
@@ -22,26 +29,13 @@ import { useNotifications } from "./NotificationsContext";
 // matching expired-notification is removed.
 // ---------------------------------------------------------------------------
 
-interface ScrobbleAuthSummary {
-  username:   string | null;
-  expires_at: number | null;
-  stale:      boolean;
-  expired:    boolean;
-}
-
-interface ScrobbleAuthStatus {
-  trakt:   ScrobbleAuthSummary | null;
-  anilist: ScrobbleAuthSummary | null;
-}
-
-type Provider = "trakt" | "anilist";
-
-const LABELS: Record<Provider, string> = {
-  trakt:   "Trakt",
-  anilist: "AniList",
+/** The alert's second line, per provider. */
+const EXPIRED_SUBTITLE: Record<ScrobbleService, string> = {
+  trakt:   "Open Settings and reconnect to keep scrobbling.",
+  anilist: "AniList does not support refresh. Open Settings and reconnect to keep scrobbling.",
 };
 
-function alertId(provider: Provider, scope: string) {
+function alertId(provider: ScrobbleService, scope: string) {
   return `scrobble-auth-expired:${provider}:${scope}`;
 }
 
@@ -52,7 +46,7 @@ export function useScrobbleAuthAlerts(authKey: string | null) {
    *  re-fire addNotification on every refresh — addNotification dedupes
    *  by id, but it also nudges the bell pulse + popup, which is too
    *  loud for a poll-driven check. */
-  const seen = useRef<Record<Provider, boolean>>({ trakt: false, anilist: false });
+  const seen = useRef<Partial<Record<ScrobbleService, boolean>>>({});
 
   const check = useCallback(async () => {
     let status: ScrobbleAuthStatus;
@@ -61,18 +55,19 @@ export function useScrobbleAuthAlerts(authKey: string | null) {
     } catch {
       return;
     }
-    for (const provider of ["trakt", "anilist"] as const) {
-      const summary = status[provider];
+    // Walk the KNOWN providers, not the payload's keys: a disconnected one is
+    // absent (or null, from an older backend) and reads as not expired, and a
+    // key this build does not know about is ignored rather than alerted on.
+    for (const provider of SCROBBLE_SERVICES) {
+      const summary = summaryFor(status, provider);
       const isExpired = !!summary?.expired;
-      const wasExpired = seen.current[provider];
+      const wasExpired = seen.current[provider] === true;
       if (isExpired && !wasExpired) {
         addNotification({
           id:       alertId(provider, scope),
           kind:     "warning",
-          title:    `${LABELS[provider]} token expired`,
-          subtitle: provider === "anilist"
-            ? "AniList does not support refresh. Open Settings and reconnect to keep scrobbling."
-            : "Open Settings and reconnect to keep scrobbling.",
+          title:    `${SCROBBLE_LABELS[provider]} token expired`,
+          subtitle: EXPIRED_SUBTITLE[provider],
           data:     { provider, scope, kind: "scrobble-auth-expired", settingsSection: "sec-scrobble" },
         });
       } else if (!isExpired && wasExpired) {
@@ -86,7 +81,7 @@ export function useScrobbleAuthAlerts(authKey: string | null) {
     // Reset the "seen" ledger when scope changes (different Stremio
     // account → different keyring entries). Without this, switching
     // accounts could carry over a stale "already notified" flag.
-    seen.current = { trakt: false, anilist: false };
+    seen.current = {};
     void check();
     const onChanged = () => { void check(); };
     const onFocus   = () => { void check(); };

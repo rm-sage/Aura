@@ -3,7 +3,8 @@
 
 import { useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { markIneligible, markScrobbledMany, type ScrobbleService } from "./scrobbledStore";
+import { markIneligible, markScrobbledMany } from "./scrobbledStore";
+import { HISTORY_COMMAND, type ScrobbleService } from "./scrobbleConn";
 import type { HistoryEntry } from "./historyStore";
 
 // ---------------------------------------------------------------------------
@@ -206,7 +207,7 @@ export async function startScrobbleRun(
           // Tauri maps these camelCase keys onto the Rust command's snake_case
           // params (parent_id, media_type, played_at, ...).
           await invoke<string>(
-            service === "trakt" ? "scrobble_history_trakt" : "scrobble_history_anilist",
+            HISTORY_COMMAND[service],
             {
               id:        entry.id,
               parentId:  entry.parent_id ?? null,
