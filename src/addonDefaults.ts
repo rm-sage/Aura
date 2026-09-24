@@ -13,8 +13,9 @@
 // USAGE PATTERN
 //   const homeUrls = resolveDefaultUrls(addons, DEFAULT_HOME_ORDER);
 //
-// Meta is NOT defaulted here any more: who answers meta is decided by addon
-// order in addonElection.ts (electMetaAddons), with no manifest-id table.
+// Meta and search are NOT defaulted here any more: who answers either is
+// decided by addon order in addonElection.ts (electMetaAddons,
+// electSearchAddons), with no manifest-id table.
 //
 // Each `*_ORDER` constant is a ranked list of manifest.id values. The
 // resolver walks the list, finds the first installed addon for each id,
@@ -42,22 +43,6 @@ export const DEFAULT_HOME_ORDER: readonly string[] = [
   CINEMETA_MANIFEST_ID,
 ] as const;
 
-/** Default search providers for FULL searches. AI search included
- *  here (it's worth the latency for a deliberate Enter-search). */
-export const DEFAULT_SEARCH_ORDER: readonly string[] = [
-  "community.aiosearch",
-  "community.aisearch",
-  AIOMETADATA_MANIFEST_ID,
-  CINEMETA_MANIFEST_ID,
-] as const;
-
-/** Default stream providers — empty means "all installed stream addons
- *  are queried" (the existing null-default semantics). We don't bake
- *  preferred stream addons into the default since the user's preferred
- *  set tends to depend on their debrid/account configuration, which is
- *  more variable than catalog/meta preferences. */
-export const DEFAULT_STREAM_ORDER: readonly string[] = [] as const;
-
 /**
  * Walk the manifest-id list in order; for each id, find the first
  * installed addon whose manifest_id matches. Emits the URL of each
@@ -82,26 +67,4 @@ export function resolveDefaultUrls(
     }
   }
   return out;
-}
-
-/**
- * Resolve a stored manifest-id-keyed list back to URLs, falling back to
- * the install-order default when the stored list is null. Used by
- * settings consumers that want a concrete URL list to feed downstream.
- *
- * `storedManifestIds` is the user's saved preference; `defaultOrder` is
- * the fallback ordering when nothing is stored. Returns a deduped URL
- * list, walking stored ids first, then default ids — that way a user
- * who has explicitly committed an order keeps it, and missing ids
- * auto-fill from defaults rather than vanishing.
- */
-export function resolveStoredOrDefault(
-  addons: AddonEntry[],
-  storedManifestIds: readonly string[] | null,
-  defaultOrder: readonly string[],
-): string[] {
-  if (storedManifestIds === null) {
-    return resolveDefaultUrls(addons, defaultOrder);
-  }
-  return resolveDefaultUrls(addons, storedManifestIds);
 }

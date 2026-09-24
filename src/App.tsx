@@ -92,6 +92,7 @@ import { arcPositionOf, fetchStoryArcs, loadArcMode } from "./storyArcs";
 import { getMetaDetailFallback, getRichestMetaDetail, peekCachedDetailById, peekRichestCachedDetailById, peekFreshestPostersByIds } from "./metaCache";
 import { PersistentCache } from "./persistentCache";
 import { applyReducedMotionAttribute, loadAuraSettings, streamQueryAddons } from "./auraSettings";
+import { electAddons } from "./addonElection";
 
 interface AniSkipResult {
   found: boolean;
@@ -3952,8 +3953,8 @@ export default function App() {
 
   // ── External subtitles fetch ──────────────────────────────────────────
   // Fires once per activeTarget after MPV has produced a duration. We
-  // capture the raw addon list and surface it to PlayerOverlay so the
-  // subtitle dropdown can merge external entries with MPV's track-list.
+  // ask the elected subtitle addons and surface the result to PlayerOverlay
+  // so the subtitle dropdown can merge external entries with MPV's track-list.
   // We DO NOT auto-`sub-add` every track up front any more — that storm
   // crashed playback in earlier phases. The user picks one from the menu;
   // PlayerOverlay calls `add_subtitle_to_mpv` lazily for the chosen URL.
@@ -3984,8 +3985,22 @@ export default function App() {
     // double-advance): without this the loser of that race overwrites the
     // winner and the menu lists an episode the user is no longer watching.
     let cancelled = false;
+    // Only the addons that can answer this id, in addon order: the resource
+    // and id-prefix gates (an episode id like `tt0434665:1:1` matches a `tt`
+    // prefix). The Rust side still checks the live manifest for the subtitles
+    // resource; this stops asking addons that cannot answer at all, e.g. a
+    // `tt`-only subtitle addon for a `kitsu:` id.
+    //
+    // No TYPE gate, deliberately. Aura types many titles `anime`, which has no
+    // Stremio counterpart, and subtitle addons key on the id: OpenSubtitles PRO
+    // declares only movie + series, so gating on type would silently stop
+    // asking it for every anime-typed title, which it answered before.
+    const subtitleAddons = electAddons(addons, {
+      resource: "subtitles",
+      id:       activeTarget.id,
+    }).map((e) => e.addon);
     invoke<ExternalSubtitle[]>("fetch_external_subtitles", {
-      addons,
+      addons:    subtitleAddons,
       mediaType: activeTarget.media_type,
       id:        activeTarget.id,
     })
@@ -8982,7 +8997,6 @@ export default function App() {
     <LibraryProvider library={library}>
     <NotificationsProvider>
     <NotificationsBridge
-      addons={addons}
       library={library}
       authKey={session?.auth_key ?? null}
       // Suppress the floating popup bubble while the user is in
@@ -9902,10 +9916,9 @@ export default function App() {
 // ---------------------------------------------------------------------------
 
 function NotificationsBridge({
-  addons, library, authKey, popupSuppressed,
+  library, authKey, popupSuppressed,
   onOpenMeta,
 }: {
-  addons: AddonEntry[];
   library: LibraryItem[];
   /** First-12-char prefix is derived inside the alerts hook; pass the
    *  raw auth_key (or null when signed out / guest). */
@@ -10086,7 +10099,6 @@ function NotificationsBridge({
 
   return (
     <NotificationsScanner
-      addons={addons}
       library={library}
     />
   );

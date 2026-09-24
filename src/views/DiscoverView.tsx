@@ -14,6 +14,7 @@ import { useHoverCardActivation } from "../useHoverCardActivation";
 import { closeHoverNow } from "../catalogHoverStore";
 import { useRowWindow } from "../useRowWindow";
 import { PAGE_CONTENT_MAX_W } from "../pageLayout";
+import { mayServe } from "../addonElection";
 
 // ---------------------------------------------------------------------------
 // DiscoverView — browse any addon's catalogs, including ones the addon has
@@ -109,10 +110,12 @@ export default function DiscoverView(props: Props) {
 }
 
 function DiscoverBody({ addons, onSelectMeta }: Props) {
-  // Only addons whose `resources` advertise `catalog` belong in the picker.
-  // Stream-only addons (Torrentio etc.) have no catalogs to discover.
+  // Only addons that can serve the `catalog` resource belong in the picker.
+  // Stream-only addons (Torrentio etc.) have no catalogs to discover. The
+  // shared gate matches case-insensitively and keeps an entry with no
+  // recorded resources (a stale cache, not a proof of absence).
   const catalogAddons = useMemo(
-    () => addons.filter((a) => (a.resources ?? []).includes("catalog")),
+    () => addons.filter((a) => mayServe(a, "catalog")),
     [addons],
   );
 
@@ -144,7 +147,7 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
   }, [catalogAddons, selectedAddonUrl, restored.addonUrl]);
 
   // Fetch the manifest whenever the addon changes. Cached on the Rust
-  // side (5 min TTL via stremio.rs::MANIFEST_CACHE) so flipping back
+  // side (24 h TTL via stremio.rs::MANIFEST_CACHE) so flipping back
   // between two addons within the cache window never re-hits the wire.
   useEffect(() => {
     if (!selectedAddonUrl) {

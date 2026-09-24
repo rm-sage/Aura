@@ -44,12 +44,12 @@ const CATALOG_ID_DENYLIST = new Set<string>([
 import SearchBar from "../SearchBar";
 import SearchView from "./SearchView";
 import { findAIOMetadataAddon, withTypeSuffix } from "../aiometadata";
-import { loadAuraSettings, type AuraSettings, HOME_RELEVANT_SETTING_KEYS, settingsChangeIncludes } from "../auraSettings";
+import { loadAuraSettings, type AuraSettings, HOME_RELEVANT_SETTING_KEYS, SEARCH_RELEVANT_SETTING_KEYS, settingsChangeIncludes } from "../auraSettings";
 import {
   resolveDefaultUrls,
   DEFAULT_HOME_ORDER,
-  DEFAULT_SEARCH_ORDER,
 } from "../addonDefaults";
+import { electSearchAddons } from "../addonElection";
 // FilterBar moved to per-view sidebars (CatalogPageView, LibraryView,
 // QueueView, DiscoverView) — Home now only emits the unfiltered row list.
 
@@ -137,45 +137,6 @@ function resolveHomeAddons(addons: AddonEntry[], settings: AuraSettings): AddonE
   return result;
 }
 
-/** True when the addon advertises a search-capable catalog. The
- *  AddonEntry's `has_search` flag is precomputed at install/sync time
- *  by the manifest probe, so this is a flat boolean read rather than
- *  a deep walk. */
-function isSearchProvider(addon: AddonEntry): boolean {
-  return addon.has_search === true;
-}
-
-/** Filter the addon list down to those allowed for a given search
- *  surface. An explicit URL list (override) wins; null means
- *  "manifest-id defaults if a search-capable addon matches the
- *  ordering, otherwise all installed search-capable addons". The
- *  manifest-id pass lets fresh-install users get the user's preferred
- *  ordering automatically without having to re-pick in Settings. */
-function resolveSearchAddons(
-  addons: AddonEntry[],
-  override: string[] | null,
-  defaultOrder: readonly string[],
-): AddonEntry[] {
-  const searchable = addons.filter(isSearchProvider);
-  if (override) {
-    const byUrl = new Map(searchable.map((a) => [a.url, a]));
-    const out: AddonEntry[] = [];
-    for (const u of override) {
-      const a = byUrl.get(u);
-      if (a) out.push(a);
-    }
-    return out;
-  }
-  // No explicit override: try manifest-id defaults first.
-  const ranked = resolveDefaultUrls(searchable, defaultOrder);
-  if (ranked.length > 0) {
-    return ranked
-      .map((u) => searchable.find((a) => a.url === u))
-      .filter((a): a is AddonEntry => !!a);
-  }
-  return searchable;
-}
-
 // ---------------------------------------------------------------------------
 // HomeView — Cinema Flow
 // ---------------------------------------------------------------------------
@@ -236,6 +197,8 @@ export default function HomeView({
   const homeReadyFiredRef = useRef(false);
   /** Lets us re-derive the active source list when settings change in another tab. */
   const [settingsTick, setSettingsTick] = useState(0);
+  /** Bumped only by a Search Providers change; see the listener below. */
+  const [searchTick, setSearchTick] = useState(0);
   // Per-row filtering moved off the home grid; see FilterBar comment above.
 
   // Signal App.tsx that the home view has fully settled so the boot splash
@@ -265,8 +228,14 @@ export default function HomeView({
   // catalog re-firing on subtitle-style saves and similar idle
   // events). Legacy emitters that don't carry detail.keys still
   // trigger via the settingsChangeIncludes default-to-true guard.
+  // Search Providers bumps its own searchTick instead, so a cloud pull
+  // that changes only the search list leaves the grid and hero alone.
   useEffect(() => {
     const onChange = (e: Event) => {
+      if (e.type === "aura:settings-changed"
+          && settingsChangeIncludes(e, SEARCH_RELEVANT_SETTING_KEYS)) {
+        setSearchTick((t) => t + 1);
+      }
       if (e.type === "aura:settings-changed"
           && !settingsChangeIncludes(e, HOME_RELEVANT_SETTING_KEYS)) {
         return;
@@ -413,7 +382,7 @@ export default function HomeView({
     return () => { cancelled = true; };
   }, [addons, settingsTick]);
 
-  // Memoize search-addon resolution. resolveSearchAddons() builds a fresh
+  // Memoize search-addon resolution. electSearchAddons() builds a fresh
   // array every call, and these were previously inlined into the JSX
   // (passed straight to SearchBar / SearchView). Each parent render produced
   // a new array reference, which retriggered SearchView's
@@ -423,14 +392,10 @@ export default function HomeView({
   // the player overlay), eventually crashing with React's
   // "Maximum update depth exceeded". Recompute only when the addon list
   // actually changes or the user mutates search-provider settings
-  // (settingsTick).
+  // (searchTick; settingsTick still covers storage and key-less events).
   const submitSearchAddons = useMemo(
-    () => resolveSearchAddons(
-      addons,
-      loadAuraSettings().searchAddonUrls,
-      DEFAULT_SEARCH_ORDER,
-    ),
-    [addons, settingsTick],
+    () => electSearchAddons(addons),
+    [addons, settingsTick, searchTick],
   );
 
   // User-chosen hero catalog override. When set, the hero band fetches

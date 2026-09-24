@@ -32,6 +32,9 @@
 // no tiers, no exemption. The stream-list invariants in CLAUDE.md depend on
 // that.
 //
+// SEARCH is not a gate here. It is a precomputed `has_search` flag that the
+// Rust side enforces, so it fails CLOSED instead (see electSearchAddons).
+//
 // Meta is ranked in tiers, with array order deciding WITHIN each tier:
 //   1 declared        declares meta, has id prefixes, and one matches the id
 //   2 primary-exempt  the PRIMARY, kept even though its prefixes miss this
@@ -89,7 +92,10 @@ export interface Elected {
   reason: ElectReason;
 }
 
-type Gate = "resource" | "type" | "prefix";
+/** `override` is not a capability gate: it marks a capable addon that the
+ *  user's provider list in Settings leaves out, so a narrowed fan-out shows
+ *  up in the log instead of reading as a missing capability. */
+type Gate = "resource" | "type" | "prefix" | "override";
 
 interface Rejected {
   addon: AddonEntry;
@@ -231,11 +237,21 @@ export function electAddons(addons: readonly AddonEntry[], q: ElectQuery): Elect
 
 /** An explicit provider list from Settings. `null` passes the election
  *  through untouched; an array keeps only the elected addons it names, in
- *  the array's order, so an uninstalled or incapable URL simply drops out. */
-export function applyOverride(elected: Elected[], urls: readonly string[] | null): Elected[] {
+ *  the array's order, so an uninstalled or incapable URL simply drops out,
+ *  and `[]` keeps none. Generic over the entry so streamQueryAddons can hand
+ *  it an unelected list (the Rust stream gate does that filtering). */
+export function applyOverride<T extends Pick<Elected, "addon">>(
+  elected: T[],
+  urls: readonly string[] | null,
+): T[] {
   if (urls === null) return elected;
-  const byUrl = new Map(elected.map((e) => [e.addon.url, e] as const));
-  const out: Elected[] = [];
+  const byUrl = new Map<string, T>();
+  for (const e of elected) {
+    // First wins: array order is the priority, so a URL listed twice in the
+    // addons array resolves to the entry the user sees first.
+    if (!byUrl.has(e.addon.url)) byUrl.set(e.addon.url, e);
+  }
+  const out: T[] = [];
   for (const url of urls) {
     const e = byUrl.get(url);
     if (!e) continue;
@@ -279,18 +295,80 @@ export function electMetaAddons(
   return final.map((e) => e.addon);
 }
 
+/** The addons a deliberate (Enter) search fans out to: every search
+ *  provider in addon-array order, then the user's Search Providers list
+ *  (`searchAddonUrls`) through applyOverride. Fails CLOSED, unlike the gates
+ *  above: `has_search` is computed from the live manifest at install/sync,
+ *  and `search_addon_grouped` returns nothing for an addon without it, so
+ *  keeping one here could only add an empty slot to the results. */
+export function electSearchAddons(addons: readonly AddonEntry[]): AddonEntry[] {
+  const elected: Elected[] = [];
+  const rejected: Rejected[] = [];
+  addons.forEach((addon, rank) => {
+    if (isSearchProvider(addon)) elected.push({ addon, rank, reason: "declared" });
+    else rejected.push({ addon, rank, gate: "resource" });
+  });
+  const final = applyOverride(elected, loadAuraSettings().searchAddonUrls);
+  for (const e of elected) {
+    if (!final.includes(e)) rejected.push({ addon: e.addon, rank: e.rank, gate: "override" });
+  }
+  logElection({ resource: "search" }, addons, final, rejected, null);
+  return final.map((e) => e.addon);
+}
+
+// ── Capability predicates ─────────────────────────────────────────────────
+// "Can this addon do X at all", for the lists that are not a per-title
+// election: Discover's addon picker and the three Settings provider pickers.
+// Each view used to carry a private copy, and they disagreed on casing.
+// Resource matching is case-insensitive here, like the gates above.
+
+/** True when the cached `resources` names any of `resources`. Strict: an
+ *  empty list declares nothing, so a stale entry is not listed under every
+ *  provider heading in Settings. */
+function declaresResource(addon: AddonEntry, ...resources: ElectResource[]): boolean {
+  const list = listOf(addon.resources);
+  return resources.some((r) => hasCi(list, r));
+}
+
+/** The resource gate on its own, failing open on an empty list like every
+ *  gate here: could this addon serve `resource`? */
+export function mayServe(addon: AddonEntry, resource: ElectResource): boolean {
+  const list = listOf(addon.resources);
+  return list.length === 0 || hasCi(list, resource);
+}
+
+/** Settings' Catalog Providers picker: addons that surface metadata or wrap
+ *  other addons, i.e. what can reasonably feed Home. Keyed on `meta` and
+ *  `addon_catalog`, NOT `catalog`: a pure stream addon that ships a catalog
+ *  (AIOStreams does) does not belong in it. */
+export function isCatalogProvider(addon: AddonEntry): boolean {
+  return declaresResource(addon, "meta", "addon_catalog");
+}
+
+/** Settings' Stream Providers picker. Strict like the Rust stream gate,
+ *  which also refuses an addon whose `resources` does not name `stream`. */
+export function isStreamProvider(addon: AddonEntry): boolean {
+  return declaresResource(addon, "stream");
+}
+
+/** Search capability: the flat `has_search` flag the manifest probe set at
+ *  install/sync time. Fail-closed; see electSearchAddons. */
+export function isSearchProvider(addon: AddonEntry): boolean {
+  return addon.has_search === true;
+}
+
 // ── Observability ─────────────────────────────────────────────────────────
 // The CW poster warm, the hover cards and Calendar elect meta for dozens of
 // titles in a burst, and re-elect the same ones on every re-render (Calendar
 // and Airing re-walk the WHOLE library on every revisit). The same
-// (resource, type, id, addon list, pin) is therefore logged at most once per
-// LOG_WINDOW_MS, for up to LOG_CAP distinct keys inside one window. The cap
-// sits well above a realistic library, because a cyclic pass over more keys
-// than the cap evicts each one before its next use and re-logs all of them.
-// Expired keys are pruned first, so the map stays small in steady state; a
-// burst of more than LOG_CAP distinct keys falls back to oldest-first
-// eviction and can re-log. Keys are short strings plus a hash, so even a
-// full map is a few hundred KB at most.
+// (resource, type, id, addon list, pin, outcome) is therefore logged at most
+// once per LOG_WINDOW_MS, for up to LOG_CAP distinct keys inside one window.
+// The cap sits well above a realistic library, because a cyclic pass over
+// more keys than the cap evicts each one before its next use and re-logs all
+// of them. Expired keys are pruned first, so the map stays small in steady
+// state; a burst of more than LOG_CAP distinct keys falls back to
+// oldest-first eviction and can re-log. Keys are short strings plus a hash,
+// so even a full map is a few hundred KB at most.
 
 const LOG_WINDOW_MS = 60_000;
 const LOG_CAP = 2000;
@@ -333,16 +411,23 @@ function nameOf(a: AddonEntry): string {
   return a.name || "(unnamed addon)";
 }
 
+/** What an election line is about. Search is not an ElectResource (it is
+ *  never gated like one) but logs through the same line. */
+type LogSubject = Omit<ElectQuery, "resource"> & { resource: ElectResource | "search" };
+
 function logElection(
-  q: ElectQuery,
+  q: LogSubject,
   addons: readonly AddonEntry[],
   final: Elected[],
   rejected: Rejected[],
   pin: string | null,
 ): void {
+  // The outcome is part of the key, so a Settings override that changes the
+  // answer (search) logs again inside the window instead of being deduped.
   const key = [
     q.resource, q.type ?? "", q.id ?? "",
     hashOf(`${addons.map((a) => a.url).join("\n")}\n${pin ?? ""}`),
+    final.map((e) => e.rank).join(","),
   ].join("|");
   if (!shouldLog(key)) return;
 
@@ -351,7 +436,7 @@ function logElection(
   const [winner, ...rest] = final;
   const parts = [winner ? `-> ${describe(winner)}` : "-> none"];
   if (rest.length > 0) parts.push(`then ${rest.map(describe).join(", ")}`);
-  for (const gate of ["resource", "type", "prefix"] as const) {
+  for (const gate of ["resource", "type", "prefix", "override"] as const) {
     const hit = rejected.filter((r) => r.gate === gate);
     if (hit.length === 0) continue;
     parts.push(`rejected by ${gate}: ${hit.map((r) => `${nameOf(r.addon)} #${r.rank}${pinTag(r.addon)}`).join(", ")}`);

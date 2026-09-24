@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useRef, useState } from "react";
-import type { AddonEntry, LibraryItem } from "./types";
+import type { LibraryItem } from "./types";
 import { loadAuraSettings } from "./auraSettings";
 import { useNotifications } from "./NotificationsContext";
 import {
@@ -233,7 +233,6 @@ function librarySaysSeen(item: LibraryItem, target: ReleaseAired): boolean {
 }
 
 interface Props {
-  addons: AddonEntry[];
   library: LibraryItem[];
 }
 
@@ -248,7 +247,7 @@ interface Props {
  *  `[notif-scan]` trail. */
 export const FORCE_SCAN_EVENT = "aura:notifications-force-scan";
 
-export default function NotificationsScanner({ addons, library }: Props) {
+export default function NotificationsScanner({ library }: Props) {
   const { addNotification } = useNotifications();
   const version = useReleaseSignalsVersion();
   // Bumps any time a `aura:notifications-force-scan` event fires.
@@ -271,8 +270,8 @@ export default function NotificationsScanner({ addons, library }: Props) {
     maybeMigrateScannerState();
   }, []);
 
-  const propsRef = useRef({ addons, library });
-  useEffect(() => { propsRef.current = { addons, library }; }, [addons, library]);
+  const propsRef = useRef({ library });
+  useEffect(() => { propsRef.current = { library }; }, [library]);
 
   const scanningRef = useRef(false);
 

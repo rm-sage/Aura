@@ -15,6 +15,9 @@
 
 import { safeSetItem } from "./storageQuota";
 import type { AddonEntry } from "./types";
+// Circular (addonElection reads loadAuraSettings), and safe: neither module
+// calls into the other at load time, only from inside functions.
+import { applyOverride } from "./addonElection";
 
 const SETTINGS_KEY = "aura:settings:v1";
 const CHANGE_EVENT = "aura:settings-changed";
@@ -560,6 +563,14 @@ export const HOME_RELEVANT_SETTING_KEYS = new Set<keyof AuraSettings>([
   "heroDisabled",
 ]);
 
+/** Keys that feed HomeView's search fan-out (electSearchAddons). Kept out of
+ *  HOME_RELEVANT_SETTING_KEYS on purpose: a Search Providers change pulled
+ *  from the cloud must refresh the search list only, not blank and refetch
+ *  every Home row and the hero. */
+export const SEARCH_RELEVANT_SETTING_KEYS = new Set<keyof AuraSettings>([
+  "searchAddonUrls",
+]);
+
 /** Helper: does a CHANGE_EVENT carry at least one key from the supplied
  *  whitelist? When `detail.keys` is missing (legacy emitters), defaults
  *  to true so we don't silently break unrelated paths. */
@@ -604,7 +615,14 @@ export function applyReducedMotionAttribute(): void {
 /**
  * The addons a stream query should actually be sent to, honouring the user's
  * `streamAddonUrls` choice in Settings. `null` (the default) means "all of
- * them"; a list means "only these, in the order they were installed".
+ * them", returned as the caller's own array; a list means "only these, in the
+ * list's own order", dropping any URL that is no longer installed; `[]` means
+ * none. That is applyOverride (addonElection.ts), so the stream override and
+ * the search override cannot drift apart.
+ *
+ * No capability gate here on purpose: the Rust side (`fetch_streams`) gates
+ * each addon on its cached resources, stream types and id prefixes, and the
+ * order it is handed is the order the switcher shows.
  *
  * Exists because this scoping was open-coded at each fetch site and the
  * Next-Up pre-resolve was missing it, so auto-advance queried addons the user
@@ -614,7 +632,6 @@ export function applyReducedMotionAttribute(): void {
 export function streamQueryAddons(addons: AddonEntry[]): AddonEntry[] {
   const { streamAddonUrls } = loadAuraSettings();
   if (streamAddonUrls === null) return addons;
-  return streamAddonUrls
-    .map((url) => addons.find((a) => a.url === url))
-    .filter((a): a is AddonEntry => !!a);
+  return applyOverride(addons.map((addon) => ({ addon })), streamAddonUrls)
+    .map((e) => e.addon);
 }

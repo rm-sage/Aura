@@ -38,6 +38,7 @@ import {
   saveAuraSettings,
   type AuraSettings,
 } from "../auraSettings";
+import { isCatalogProvider, isSearchProvider, isStreamProvider } from "../addonElection";
 import { showAppToast } from "../AppToast";
 import { openExternalUrl } from "../externalUrl";
 import { encodeQr } from "../qrCode";
@@ -629,37 +630,6 @@ function SortableAddonRow({
       </button>
     </div>
   );
-}
-
-// ---------------------------------------------------------------------------
-// Resource-tag predicates used to filter the addon-picker lists. Match is
-// case-insensitive against the addon's `resources` list - Stremio spec
-// strings are lowercase but we don't want a vendor-side casing tweak to
-// silently empty either picker.
-// ---------------------------------------------------------------------------
-
-function hasResource(addon: AddonEntry, ...needles: string[]): boolean {
-  const set = (addon.resources ?? []).map((r) => r.toLowerCase());
-  return needles.some((n) => set.includes(n.toLowerCase()));
-}
-
-/** Catalog Providers picker - addons that surface metadata or that wrap
- *  other addons (i.e. things you'd reasonably expect to feed Home). Pure
- *  stream / subtitle addons are filtered out. */
-function isCatalogProvider(addon: AddonEntry): boolean {
-  return hasResource(addon, "meta", "addon_catalog");
-}
-
-/** Stream Providers picker - addons declaring the stream resource. */
-function isStreamProvider(addon: AddonEntry): boolean {
-  return hasResource(addon, "stream");
-}
-
-/** Search Providers picker - addons whose manifest probe set the
- *  has_search flag at install/sync time. AddonEntry exposes that as
- *  a flat boolean so we don't need to walk catalogs/extras here. */
-function isSearchProvider(addon: AddonEntry): boolean {
-  return addon.has_search === true;
 }
 
 // ---------------------------------------------------------------------------

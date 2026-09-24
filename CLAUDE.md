@@ -389,6 +389,12 @@ frontend ~40k LOC over ~70 files + ~13 views).
 - **Data / caching**: `metaCache.ts`, `persistentCache.ts`, `libraryNormalize.ts`, `auraSettings.ts`,
   `settingsTransfer.ts`, `sessionRoute.ts`, `catalogHoverStore.ts`, `releaseSignalStore.ts`,
   `historyStore.ts`, `streamMeta.ts`, `aiometadata.ts`. See "Caching boundaries".
+- **Addon election**: `addonElection.ts` owns "which addons can answer this, in what order":
+  Stremio's resource / type / id-prefix gates (failing open on empty cached fields) in plain
+  addon order, except meta, which is tiered (declared prefix match, then the pinned or
+  first-declared provider for ids nobody declares, then prefix-less catch-alls, then stale
+  entries). Also the fail-closed search election, the Settings overrides (`applyOverride`,
+  which `streamQueryAddons` wraps) and the provider-picker predicates.
 
 ## Floating surfaces: use `.aura-float-glass`
 

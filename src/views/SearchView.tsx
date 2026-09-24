@@ -46,6 +46,7 @@ function runDedupedAddonSearch(addon: AddonEntry, query: string): Promise<Search
 // ---------------------------------------------------------------------------
 
 interface Props {
+  /** The addons to search, in order: electSearchAddons' output. */
   addons: AddonEntry[];
   query: string;
   onSelectMeta?: (meta: MetaPreview) => void;
@@ -78,20 +79,23 @@ function SearchViewBody({ addons, query, onSelectMeta }: Props) {
     const trimmed = query.trim();
     lastQueryRef.current = trimmed;
     if (!trimmed) { setSlots(null); return; }
-    const searchAddons = addons.filter((a) => a.has_search);
-    if (searchAddons.length === 0) { setSlots([]); return; }
+    // `addons` IS the search election (electSearchAddons: has_search, then
+    // the user's Search Providers list). No second has_search filter here:
+    // it would make a caller passing the raw addon list look correct while
+    // silently ignoring the Search Providers list.
+    if (addons.length === 0) { setSlots([]); return; }
 
     let cancelled = false;
     // Seed every addon as pending so the user sees the row count
     // immediately — preserves installed-addon order regardless of
     // which addon finishes first.
-    setSlots(searchAddons.map((a) => ({ addon: a, state: "pending", groups: [] })));
+    setSlots(addons.map((a) => ({ addon: a, state: "pending", groups: [] })));
 
     // Fan out — one call per addon. Each settles independently.
     // We update only the slot for the addon that just resolved,
     // leaving every other slot untouched (key by addon.url so
     // identity is stable across re-renders).
-    searchAddons.forEach((addon) => {
+    addons.forEach((addon) => {
       runDedupedAddonSearch(addon, trimmed)
         .then((groups) => {
           if (cancelled || lastQueryRef.current !== trimmed) return;
