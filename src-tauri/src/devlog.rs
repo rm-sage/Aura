@@ -21,6 +21,14 @@ pub fn install(app: &AppHandle) {
     let _ = APP.set(app.clone());
 }
 
+/// Emit a Tauri event to the frontend from code that holds no AppHandle,
+/// through the one captured at setup. A no-op before setup.
+pub fn emit_event<S: Serialize + Clone>(event: &str, payload: S) {
+    if let Some(app) = APP.get() {
+        let _ = app.emit(event, payload);
+    }
+}
+
 #[derive(Serialize, Clone)]
 pub struct DevLogEvent {
     pub level: &'static str,    // "trace" | "debug" | "info" | "warn" | "error"

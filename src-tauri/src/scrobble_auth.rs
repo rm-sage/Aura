@@ -341,9 +341,20 @@ pub fn read_token_for(service: &str, scope: &str) -> Option<ScrobbleAuthToken> {
 /// when an API request comes back 401, so the Settings UI re-prompts
 /// instead of silently failing every subsequent call. Idempotent — a
 /// missing entry is treated as success.
+/// Drop a token the PROVIDER rejected (a 401, a dead refresh token). Every
+/// caller is automatic; the user's own Disconnect goes through
+/// `clear_scrobble_auth_token` instead. So when a token was actually there,
+/// this tells the frontend (`scrobble-signed-out`), which raises a notice with
+/// Reconnect: before, the token just vanished and Settings quietly showed
+/// "not connected", with nothing to say scrobbles had stopped.
 pub fn clear_token_for(service: &str, scope: &str) {
     if let Ok(e) = entry(service, scope) {
-        let _ = e.delete_credential();
+        if e.delete_credential().is_ok() {
+            crate::devlog::emit_event(
+                "scrobble-signed-out",
+                serde_json::json!({ "service": service, "scope": scope }),
+            );
+        }
     }
 }
 

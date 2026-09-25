@@ -3,6 +3,7 @@
 
 import { useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useNotifications } from "./NotificationsContext";
 import {
   SCROBBLE_LABELS,
@@ -36,6 +37,14 @@ import {
 // this build cannot use (Simkl with no client_id) never alerts.
 // ---------------------------------------------------------------------------
 
+/** The second line when the provider rejected the token outright (Rust
+ *  cleared it and emitted `scrobble-signed-out`). */
+const SIGNED_OUT_SUBTITLE: Record<ScrobbleService, string> = {
+  trakt:   "Trakt no longer accepts Aura's sign-in, so scrobbling to it stopped. Reconnect to resume.",
+  anilist: "AniList no longer accepts Aura's sign-in, so scrobbling to it stopped. Reconnect to resume.",
+  simkl:   "Simkl no longer accepts Aura's sign-in, so scrobbling to it stopped. Reconnect to resume.",
+};
+
 /** The alert's second line, per provider. */
 const EXPIRED_SUBTITLE: Record<ScrobbleService, string> = {
   trakt:   "Open Settings and reconnect to keep scrobbling.",
@@ -55,6 +64,12 @@ export function useScrobbleAuthAlerts(authKey: string | null) {
    *  by id, but it also nudges the bell pulse + popup, which is too
    *  loud for a poll-driven check. */
   const seen = useRef<Partial<Record<ScrobbleService, boolean>>>({});
+  /** Providers that signed the user out this session (see
+   *  `scrobble-signed-out`). Their notice shares the expired notice's id,
+   *  so the bell's Reconnect handles both, and it stays until the provider
+   *  is connected again: a cleared token reads as "not expired", which would
+   *  otherwise dismiss it on the next focus check. */
+  const signedOut = useRef<Set<ScrobbleService>>(new Set());
 
   const check = useCallback(async () => {
     let status: ScrobbleAuthStatus;
@@ -69,6 +84,13 @@ export function useScrobbleAuthAlerts(authKey: string | null) {
     // key this build does not know about is ignored rather than alerted on.
     for (const provider of SCROBBLE_SERVICES) {
       const summary = summaryFor(status, provider);
+      if (signedOut.current.has(provider)) {
+        if (!summary) continue;
+        // Connected again: the sign-out notice has done its job.
+        signedOut.current.delete(provider);
+        dismissNotification(alertId(provider, scope));
+        seen.current[provider] = false;
+      }
       const isExpired = available.has(provider) && !!summary?.expired;
       const wasExpired = seen.current[provider] === true;
       if (isExpired && !wasExpired) {
@@ -91,12 +113,32 @@ export function useScrobbleAuthAlerts(authKey: string | null) {
     // account → different keyring entries). Without this, switching
     // accounts could carry over a stale "already notified" flag.
     seen.current = {};
+    signedOut.current.clear();
     void check();
     const onChanged = () => { void check(); };
     const onFocus   = () => { void check(); };
     window.addEventListener("aura:scrobble-auth-changed", onChanged);
     window.addEventListener("focus", onFocus);
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ service: string; scope: string }>("scrobble-signed-out", (e) => {
+      const provider = SCROBBLE_SERVICES.find((s) => s === e.payload?.service);
+      if (!provider || e.payload.scope !== scope) return;
+      signedOut.current.add(provider);
+      seen.current[provider] = true;
+      addNotification({
+        id:       alertId(provider, scope),
+        kind:     "warning",
+        title:    `${SCROBBLE_LABELS[provider]} signed you out`,
+        subtitle: SIGNED_OUT_SUBTITLE[provider],
+        data:     { provider, scope, kind: "scrobble-auth-expired", settingsSection: "sec-scrobble" },
+      });
+      // Settings rows and History re-read the connection state.
+      window.dispatchEvent(new CustomEvent("aura:scrobble-auth-changed"));
+    }).then((fn) => { if (disposed) fn(); else unlisten = fn; });
     return () => {
+      disposed = true;
+      unlisten?.();
       window.removeEventListener("aura:scrobble-auth-changed", onChanged);
       window.removeEventListener("focus", onFocus);
     };
