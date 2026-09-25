@@ -371,19 +371,19 @@ pub(crate) fn store_token_for(
 pub const TRAKT_CLIENT_ID: &str =
     "6005fd2f46b73d6fdf40547c34af33acd2d2aeed1df73c9601fbac4634a40a9c";
 
-/// Simkl client_id. PASTE the public client_id from
-/// https://simkl.com/settings/developer/ here. It is public and safe to
-/// commit (Simkl's docs say so: an AUTH V2 client_id on its own reaches only
-/// public catalog data). There is NO client_secret: Aura is registered as a
-/// public desktop client and proves itself with PKCE instead, so a secret
-/// must never be added here or anywhere in the binary.
+/// Simkl client_id, from https://simkl.com/settings/developer/. It is public
+/// and safe to commit (Simkl's docs say so: an AUTH V2 client_id on its own
+/// reaches only public catalog data). There is NO client_secret: Aura is
+/// registered as a public desktop client and proves itself with PKCE
+/// instead, so a secret must never be added here or anywhere in the binary.
 ///
-/// While this is empty every Simkl path is inert: no request is ever made,
-/// the authorize command returns an error saying sign-in is not set up in
-/// this build, the completion and shutdown pushes return at once, and
+/// Emptying this makes every Simkl path inert: no request is ever made, the
+/// authorize command returns an error saying sign-in is not set up in this
+/// build, the completion and shutdown pushes return at once, and
 /// `scrobble_services_available` leaves "simkl" out so the frontend can tell
 /// "not in this build" from "not connected".
-pub const SIMKL_CLIENT_ID: &str = "";
+pub const SIMKL_CLIENT_ID: &str =
+    "3afb249691920c429719fef8af147e1909434b5b3b748cd82649bbe5ecf79827";
 
 // ---------------------------------------------------------------------------
 // OAuth authorize URL helpers — give the frontend the right URL to
