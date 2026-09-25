@@ -8429,6 +8429,74 @@ export default function App() {
     return () => window.removeEventListener("beforeunload", onUnload);
   }, [session, flushProgress]);
 
+  // ── Reload checkpoint ────────────────────────────────────────────────
+  // The unload flush above is an async IPC that a reload can cut off, and a
+  // reload during playback now ends playback outright (the Rust page-load
+  // hook), so a lost flush lost the resume position of whatever was playing.
+  // While something plays, the honest position (lastLoadedRef, the snapshot
+  // the flush itself trusts) is noted in sessionStorage every 10 s and again,
+  // synchronously, on unload. sessionStorage survives a reload but not an app
+  // close, so only a reload ever sees it. After the reload, once the library
+  // has loaded, the note is replayed once through flushProgress, for the same
+  // account, within 30 minutes, and only when the library record is not newer
+  // than the note and does not already hold that position.
+  const PROGRESS_CHECKPOINT_KEY = "aura:progress-checkpoint";
+  useEffect(() => {
+    if (!session?.auth_key || !activeTarget) return;
+    const scope = session.auth_key.slice(0, 12);
+    const note = () => {
+      const target = writebackTarget.current;
+      const snap = lastLoadedRef.current;
+      if (!target || snap.targetId !== target.id || snap.duration <= 0) return;
+      if (
+        target.media_type === "tv" ||
+        target.id.startsWith("iptv:") ||
+        target.id.startsWith("trailer:")
+      ) return;
+      if (snap.time < PROGRESS_WARMUP_S || snap.watched < MEANINGFUL_WATCH_S) return;
+      try {
+        sessionStorage.setItem(PROGRESS_CHECKPOINT_KEY, JSON.stringify({
+          scope, target, time: snap.time, duration: snap.duration, watched: snap.watched, at: Date.now(),
+        }));
+      } catch { /* quota or disabled storage: the unload flush is still tried */ }
+    };
+    const timer = window.setInterval(note, 10_000);
+    window.addEventListener("beforeunload", note);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("beforeunload", note);
+    };
+  }, [session, activeTarget]);
+
+  const checkpointReplayedRef = useRef(false);
+  useEffect(() => {
+    if (checkpointReplayedRef.current || !libraryLoaded || !session?.auth_key) return;
+    checkpointReplayedRef.current = true;
+    let cp: {
+      scope?: string; target?: ActiveScrobbleTarget; time?: number;
+      duration?: number; watched?: number; at?: number;
+    } | null = null;
+    try {
+      const raw = sessionStorage.getItem(PROGRESS_CHECKPOINT_KEY);
+      sessionStorage.removeItem(PROGRESS_CHECKPOINT_KEY);
+      cp = raw ? JSON.parse(raw) : null;
+    } catch { return; }
+    if (!cp || cp.scope !== session.auth_key.slice(0, 12)) return;
+    const { target, time, duration, at } = cp;
+    if (!target?.id || typeof time !== "number" || typeof duration !== "number" || typeof at !== "number") return;
+    if (!(duration > 0) || !(time > 0) || Date.now() - at > 30 * 60_000) return;
+    const record = libraryRef.current.find((i) => i.id === (target.series_id ?? target.id));
+    if (record?.mtime && Date.parse(record.mtime) >= at) return;
+    const offset = record?.state?.timeOffset;
+    const sameVideo = !target.series_id || target.series_id === target.id
+      || record?.state?.video_id === target.id;
+    if (typeof offset === "number" && Math.abs(offset - time) < 2 && sameVideo) return;
+    console.info(`[library] replaying the progress a reload interrupted id=${target.series_id ?? target.id}`);
+    flushProgress(session, target, {
+      time, duration, watched: typeof cp.watched === "number" ? cp.watched : MEANINGFUL_WATCH_S,
+    });
+  }, [libraryLoaded, session, flushProgress]);
+
   // ── Exit playback ────────────────────────────────────────────────────
   // Flushes progress, stops MPV, clears the active target. Triggered by the
   // PlayerOverlay's "Exit playback" button (and keybinding if configured).
