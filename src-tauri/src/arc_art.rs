@@ -180,6 +180,17 @@ pub fn normalize_arc_name(s: &str) -> String {
 struct ArtEntry {
     fetched_at: u64,
     art: HashMap<String, String>,
+    /// The category path's title probe went unanswered (see
+    /// `resolve_arc_art`), so this map may hold a similarity match where the
+    /// wiki has a page of its own. Honoured for NEGATIVE_TTL like a miss.
+    #[serde(default)]
+    probe_failed: bool,
+}
+
+impl ArtEntry {
+    fn ttl(&self) -> Duration {
+        if self.art.is_empty() || self.probe_failed { NEGATIVE_TTL } else { TTL }
+    }
 }
 
 type ArtCache = HashMap<String, ArtEntry>;
@@ -194,22 +205,25 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// The pre-v2 file, removed once per process by `ensure_cache_loaded`.
-const LEGACY_CACHE_FILE: &str = "arc-art-v1.json";
+/// The files before the current one (see cache_path), removed once per
+/// process by `ensure_cache_loaded`.
+const LEGACY_CACHE_FILES: &[&str] = &["arc-art-v1.json", "arc-art-v2.json"];
 
 fn cache_path<R: Runtime>(app: &AppHandle<R>) -> Option<std::path::PathBuf> {
     let dir = app.path().app_data_dir().ok()?;
     std::fs::create_dir_all(&dir).ok()?;
+    // -v3: bumped with the exact-title pass on the category path (see
+    // `match_arc_pages`), which moves One Piece's "Sky Island Saga" off Drum
+    // Island's art. A hit lives 30 days, so without the bump an
+    // already-cached show would keep the old answer for up to a month. Same
+    // key format. Costs each show one re-probe.
+    //
     // -v2: bumped with the redirect-aware matcher. A v1 hit was computed by a
     // matcher that could not key a renamed redirect back to its arc and had no
-    // shared-image guard on either path, and a hit lives 30 days, so without
-    // the bump an already-cached show would keep that answer for up to a
-    // month. It only re-runs the match: a category-path fuzzy match this
-    // change did not touch comes out the same (see the known false positive
-    // in `resolve_arc_art`). The key format changed too (`cache_key` now
-    // covers the arc names), so no v1 entry could ever be hit again; they
-    // would only sit in CACHE_CAP slots. Costs each show one re-probe.
-    Some(dir.join("arc-art-v2.json"))
+    // shared-image guard on either path. The key format changed too
+    // (`cache_key` now covers the arc names), so no v1 entry could ever be
+    // hit again; they would only sit in CACHE_CAP slots.
+    Some(dir.join("arc-art-v3.json"))
 }
 
 /// The cache key covers the arc NAMES, not just the show. A show can offer
@@ -243,10 +257,12 @@ async fn ensure_cache_loaded<R: Runtime>(app: &AppHandle<R>) {
     }
     let Some(path) = cache_path(app) else { return };
     let loaded = tokio::task::spawn_blocking(move || {
-        // One-time cleanup of the pre-v2 file (see cache_path), which would
+        // One-time cleanup of the older files (see cache_path), which would
         // otherwise linger in app_data forever. Best-effort.
         if let Some(dir) = path.parent() {
-            let _ = std::fs::remove_file(dir.join(LEGACY_CACHE_FILE));
+            for legacy in LEGACY_CACHE_FILES {
+                let _ = std::fs::remove_file(dir.join(legacy));
+            }
         }
         let text = std::fs::read_to_string(&path).ok()?;
         serde_json::from_str::<ArtCache>(&text).ok()
@@ -420,22 +436,27 @@ async fn list_arc_pages(host: &str) -> Vec<String> {
 
 /// Batch-fetch lead images for a set of page titles, keyed by the title as
 /// REQUESTED (see `key_images_to_requested`). MediaWiki accepts up to 50
-/// titles per request, so a 55-arc show costs two requests, not 55.
-async fn fetch_page_images(host: &str, titles: &[String]) -> HashMap<String, String> {
+/// titles per request, so a 55-arc show costs two requests, not 55. The flag
+/// is false when any batch went unanswered (a timeout, a non-2xx, a body with
+/// no `query`), whose titles are then absent exactly like missing pages.
+async fn fetch_page_images(host: &str, titles: &[String]) -> (HashMap<String, String>, bool) {
     let mut out = HashMap::new();
+    let mut answered = true;
     for chunk in titles.chunks(40) {
         let joined = chunk.join("|");
         let url = format!(
             "https://{host}/api.php?action=query&titles={}&prop=pageimages&piprop=original&redirects=1&format=json",
             urlencoding(&joined)
         );
-        let Some(resp) = get_json::<PagesResponse>(&url).await else { continue };
-        let Some(q) = resp.query else { continue };
+        let Some(q) = get_json::<PagesResponse>(&url).await.and_then(|r| r.query) else {
+            answered = false;
+            continue;
+        };
         // Per chunk: each response's `normalized` / `redirects` describe only
         // the titles that request carried.
         out.extend(key_images_to_requested(chunk, &q));
     }
-    out
+    (out, answered)
 }
 
 /// Key a batch's lead images back to the titles that were REQUESTED.
@@ -590,6 +611,96 @@ fn part_family(arc_norm: &str) -> &str {
     }
 }
 
+/// An arc name without a trailing " Arc" / " Saga", ASCII case-insensitive:
+/// "Sky Island Saga" -> "Sky Island". A name with neither comes back trimmed.
+fn arc_name_stem(name: &str) -> &str {
+    let name = name.trim();
+    for suffix in [" arc", " saga"] {
+        if let Some(cut) = name.len().checked_sub(suffix.len()) {
+            if name.is_char_boundary(cut) && name[cut..].eq_ignore_ascii_case(suffix) {
+                return name[..cut].trim_end();
+            }
+        }
+    }
+    name
+}
+
+/// Should the category path ask the wiki for this arc name as a page title?
+/// Only a name that says it is an arc or saga page ("Sky Island Saga") and
+/// that the category does not already list. A bare name is never asked: on
+/// One Piece "Skypiea" or "Water 7" is the ISLAND's page, whose lead image
+/// is a location infobox, while the category's "Skypiea Arc" is the art.
+fn wants_title_probe(name: &str, pages: &[String]) -> bool {
+    let name = name.trim();
+    arc_name_stem(name) != name && !pages.iter().any(|p| p.eq_ignore_ascii_case(name))
+}
+
+/// A category page that IS this arc's page by title, before any similarity:
+/// the name as given, then its stem bare or with " Arc" / " Saga", then the
+/// same name after `normalize_arc_name` (which drops punctuation and every
+/// arc / saga word). In that order, so a closer spelling wins a tie. `pages`
+/// pairs each category page with its normalized title.
+fn exact_category_page<'a>(name: &str, pages: &[(String, &'a String)]) -> Option<&'a String> {
+    let stem = arc_name_stem(name);
+    let forms = [name.trim().to_string(), stem.to_string(), format!("{stem} Arc"), format!("{stem} Saga")];
+    for form in &forms {
+        if let Some((_, page)) = pages.iter().find(|(_, p)| p.eq_ignore_ascii_case(form)) {
+            return Some(page);
+        }
+    }
+    let want = normalize_arc_name(name);
+    if want.is_empty() {
+        return None;
+    }
+    pages.iter().find(|(np, _)| *np == want).map(|(_, page)| *page)
+}
+
+/// The category path: which page each arc's art comes from, keyed by
+/// normalized arc name. `titled` is the wiki's answer to `wants_title_probe`'s
+/// names, keyed by the name as asked.
+///
+/// Exact titles first, and similarity only for an arc no title matches. A
+/// name the wiki has a page of its own for takes that page, whether or not
+/// the category lists it, then a category page exact by title, then the most
+/// similar category page at or above MIN_NAME_SIMILARITY. Without the exact
+/// passes One Piece's "Sagas" grouping put "Sky Island Saga" on Drum Island's
+/// art: the wiki files the saga outside its arc category, so the fuzzy match
+/// only saw arc pages, and "sky island" scores 0.63 against "Drum Island Arc"
+/// and 0.27 against the right arc, "Skypiea Arc".
+fn match_arc_pages(
+    arc_names: &[String],
+    pages: &[String],
+    titled: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let normalized_pages: Vec<(String, &String)> =
+        pages.iter().map(|p| (normalize_arc_name(p), p)).collect();
+    let mut arc_to_page: HashMap<String, String> = HashMap::new();
+    for name in arc_names {
+        let want = normalize_arc_name(name);
+        if want.is_empty() {
+            continue;
+        }
+        if titled.contains_key(name) {
+            arc_to_page.insert(want, name.clone());
+            continue;
+        }
+        if let Some(page) = exact_category_page(name, &normalized_pages) {
+            arc_to_page.insert(want, page.clone());
+            continue;
+        }
+        let best = normalized_pages
+            .iter()
+            .map(|(np, orig)| (dice_bigram(&want, np), *orig))
+            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some((score, page)) = best {
+            if score >= MIN_NAME_SIMILARITY {
+                arc_to_page.insert(want, page.clone());
+            }
+        }
+    }
+    arc_to_page
+}
+
 /// Percent-encode a MediaWiki query parameter. Kept local and minimal rather
 /// than pulling a crate in for two call sites: MediaWiki titles only need
 /// spaces, pipes, and the usual reserved punctuation escaped.
@@ -645,8 +756,7 @@ pub async fn resolve_arc_art<R: Runtime>(
     ensure_cache_loaded(app).await;
     if let Ok(lock) = cache().lock() {
         if let Some(entry) = lock.get(&key) {
-            let ttl = if entry.art.is_empty() { NEGATIVE_TTL } else { TTL };
-            if now_secs().saturating_sub(entry.fetched_at) < ttl.as_secs() {
+            if now_secs().saturating_sub(entry.fetched_at) < entry.ttl().as_secs() {
                 return entry.art.clone();
             }
         }
@@ -654,6 +764,7 @@ pub async fn resolve_arc_art<R: Runtime>(
 
     let pages = list_arc_pages(host).await;
     let mut art: HashMap<String, String> = HashMap::new();
+    let mut probe_failed = false;
 
     if pages.is_empty() {
         // ── Direct title probe ──
@@ -682,49 +793,45 @@ pub async fn resolve_arc_art<R: Runtime>(
         // Every key is a name we asked for, so no stray entry (a redirect
         // target's own title, say) can make a miss non-empty and earn it the
         // 30-day hit TTL.
-        for (name, url) in fetch_page_images(host, &probe).await {
+        for (name, url) in fetch_page_images(host, &probe).await.0 {
             art.insert(normalize_arc_name(&name), url);
         }
     }
 
     if !pages.is_empty() {
-        // Match each TMDB arc name to its best Fandom page.
-        let normalized_pages: Vec<(String, &String)> =
-            pages.iter().map(|p| (normalize_arc_name(p), p)).collect();
+        // Match each TMDB arc name to its Fandom page, exact titles first
+        // (see `match_arc_pages`). The names `wants_title_probe` picks are
+        // asked for as titles, batched like any page fetch, and there is no
+        // request at all when it picks none. An unanswered probe reads as "no
+        // page of its own", which sends exactly those names back to the
+        // similarity match this pass replaces (Sky Island Saga -> Drum Island
+        // Arc), so that answer is cached for a day, not a month.
+        let probe: Vec<String> = arc_names
+            .iter()
+            .filter(|n| wants_title_probe(n, &pages))
+            .cloned()
+            .collect();
+        let titled = if probe.is_empty() {
+            HashMap::new()
+        } else {
+            let (titled, answered) = fetch_page_images(host, &probe).await;
+            probe_failed = !answered;
+            titled
+        };
+        let arc_to_page = match_arc_pages(arc_names, &pages, &titled);
 
-        let mut wanted: Vec<String> = Vec::new();
-        let mut arc_to_page: HashMap<String, String> = HashMap::new();
-
-        for name in arc_names {
-            let want = normalize_arc_name(name);
-            if want.is_empty() {
-                continue;
-            }
-            // Known false positive, left for the maintainer: in One Piece's
-            // "Sagas" grouping "sky island" scores 0.63 against "Drum Island
-            // Arc" and 0.27 against the right page, "Skypiea Arc", so that
-            // saga shows Drum Island's art. The wiki has a "Sky Island Saga"
-            // page, so trying each arc name as an exact title before this
-            // match would fix it (and would need its own cache bump).
-            let best = normalized_pages
-                .iter()
-                .map(|(np, orig)| (dice_bigram(&want, np), *orig))
-                .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-            if let Some((score, page)) = best {
-                if score >= MIN_NAME_SIMILARITY {
-                    arc_to_page.insert(want, page.clone());
-                    wanted.push(page.clone());
-                }
-            }
-        }
-
+        let mut wanted: Vec<String> = arc_to_page
+            .values()
+            .filter(|page| !titled.contains_key(*page))
+            .cloned()
+            .collect();
         wanted.sort();
         wanted.dedup();
         // Keyed by the page title we asked for, however MediaWiki normalized
         // or redirected it on the way (see `key_images_to_requested`).
-        let images = fetch_page_images(host, &wanted).await;
+        let (images, _) = fetch_page_images(host, &wanted).await;
         for (arc_norm, page) in arc_to_page {
-            if let Some(url) = images.get(&page) {
+            if let Some(url) = titled.get(&page).or_else(|| images.get(&page)) {
                 art.insert(arc_norm, url.clone());
             }
         }
@@ -752,9 +859,15 @@ pub async fn resolve_arc_art<R: Runtime>(
             "{host}: matched art for {}/{} arcs", art.len(), arc_names.len()
         );
     }
+    if probe_failed {
+        crate::devlog!(
+            info, "arcs",
+            "{host}: the arc title probe went unanswered; keeping this answer for a day"
+        );
+    }
 
     if let Ok(mut lock) = cache().lock() {
-        lock.insert(key, ArtEntry { fetched_at: now_secs(), art: art.clone() });
+        lock.insert(key, ArtEntry { fetched_at: now_secs(), art: art.clone(), probe_failed });
     }
     // We only reach here on a cache MISS (a hit returned above), so a write is
     // always warranted; persist once, off the runtime.
@@ -1093,6 +1206,98 @@ mod tests {
         assert_eq!(part_family("x part 2 the separation"), "x part 2 the separation");
     }
 
+    // ---------------------------------------------------------- match_arc_pages
+
+    /// A trimmed `Category:Story Arcs` from onepiece.fandom.com (recorded
+    /// 2026-09-24). The real category lists arc pages only; the saga pages
+    /// live outside it.
+    fn one_piece_arc_pages() -> Vec<String> {
+        titles(&[
+            "Arabasta Arc",
+            "Drum Island Arc",
+            "Enies Lobby Arc",
+            "Jaya Arc",
+            "Skypiea Arc",
+            "Water 7 Arc",
+        ])
+    }
+
+    fn page<'a>(out: &'a HashMap<String, String>, arc: &str) -> Option<&'a str> {
+        out.get(&normalize_arc_name(arc)).map(String::as_str)
+    }
+
+    #[test]
+    fn sky_island_saga_takes_its_own_page_not_drum_island() {
+        // The bug: with similarity alone, the saga lands on Drum Island.
+        let pages = one_piece_arc_pages();
+        assert!(dice_bigram("sky island", &normalize_arc_name("Drum Island Arc")) >= MIN_NAME_SIMILARITY);
+        assert!(dice_bigram("sky island", &normalize_arc_name("Skypiea Arc")) < MIN_NAME_SIMILARITY);
+        let sagas = titles(&["Sky Island Saga", "Alabasta"]);
+        let fuzzy_only = match_arc_pages(&sagas, &pages, &HashMap::new());
+        assert_eq!(page(&fuzzy_only, "Sky Island Saga"), Some("Drum Island Arc"));
+
+        // The saga is not in the category, so it is asked for as a title,
+        // and the wiki's page for it wins. "Alabasta" is bare, is never
+        // asked, has no exact page, and still fuzzy-matches as before.
+        let probe: Vec<&String> = sagas.iter().filter(|n| wants_title_probe(n, &pages)).collect();
+        assert_eq!(probe, ["Sky Island Saga"]);
+        let titled: HashMap<String, String> =
+            [("Sky Island Saga".to_string(), "https://img/sky-island-saga.png".to_string())].into();
+        let out = match_arc_pages(&sagas, &pages, &titled);
+        assert_eq!(page(&out, "Sky Island Saga"), Some("Sky Island Saga"));
+        assert_eq!(page(&out, "Alabasta"), Some("Arabasta Arc"));
+        assert_eq!(out.len(), 2);
+
+        // Listed in the category, the saga page matches there by title, and
+        // nothing needs asking.
+        let mut with_saga = pages.clone();
+        with_saga.push("Sky Island Saga".to_string());
+        assert!(!wants_title_probe("Sky Island Saga", &with_saga));
+        let out = match_arc_pages(&sagas, &with_saga, &HashMap::new());
+        assert_eq!(page(&out, "Sky Island Saga"), Some("Sky Island Saga"));
+    }
+
+    #[test]
+    fn exact_titles_win_in_order_before_similarity() {
+        let pages = one_piece_arc_pages();
+        // A saga the wiki has a page for takes it over the arc page it
+        // normalizes equal to.
+        let titled: HashMap<String, String> =
+            [("Water 7 Saga".to_string(), "https://img/water7-saga.png".to_string())].into();
+        let out = match_arc_pages(&titles(&["Water 7 Saga"]), &pages, &titled);
+        assert_eq!(page(&out, "Water 7 Saga"), Some("Water 7 Saga"));
+        // Not found as a title: the arc page, its stem with " Arc".
+        let out = match_arc_pages(&titles(&["Water 7 Saga"]), &pages, &HashMap::new());
+        assert_eq!(page(&out, "Water 7 Saga"), Some("Water 7 Arc"));
+        // A bare name takes its "<name> Arc" page, and the island's own page
+        // is never asked for.
+        assert!(!wants_title_probe("Water 7", &pages));
+        let out = match_arc_pages(&titles(&["Water 7", "jaya arc"]), &pages, &HashMap::new());
+        assert_eq!(page(&out, "Water 7"), Some("Water 7 Arc"));
+        assert!(!wants_title_probe("jaya arc", &pages), "listed, in any case");
+        assert_eq!(page(&out, "jaya arc"), Some("Jaya Arc"));
+        // Each tier directly: the stem with the other suffix, then the
+        // normalized title, and a prefix of a title is not a title.
+        let normalized: Vec<(String, &String)> = pages.iter().map(|p| (normalize_arc_name(p), p)).collect();
+        let exact = |name: &str| exact_category_page(name, &normalized).map(String::as_str);
+        assert_eq!(exact("Enies Lobby Saga"), Some("Enies Lobby Arc"));
+        assert_eq!(exact("enies_lobby"), Some("Enies Lobby Arc"));
+        assert_eq!(exact("Drum"), None);
+        // Below the bar is still no match.
+        let out = match_arc_pages(&titles(&["Specials"]), &pages, &HashMap::new());
+        assert!(out.is_empty(), "got {out:?}");
+    }
+
+    #[test]
+    fn arc_name_stem_strips_one_trailing_marker() {
+        assert_eq!(arc_name_stem("Sky Island Saga"), "Sky Island");
+        assert_eq!(arc_name_stem("jaya ARC "), "jaya");
+        assert_eq!(arc_name_stem("Skypiea"), "Skypiea");
+        assert_eq!(arc_name_stem("Monarc"), "Monarc");
+        assert_eq!(arc_name_stem("Saga"), "Saga");
+        assert_eq!(arc_name_stem("Café Saga"), "Café");
+    }
+
     // ---------------------------------------------------------------- cache_key
 
     #[test]
@@ -1104,5 +1309,20 @@ mod tests {
         assert_ne!(a, cache_key(37854, &titles(&["Alabasta Saga", "Water 7 Saga"])));
         assert_ne!(a, cache_key(46260, &titles(&["Alabasta", "Water 7"])));
         assert!(a.starts_with("art:37854:"));
+    }
+
+    #[test]
+    fn a_hit_behind_an_unanswered_probe_lives_like_a_miss() {
+        // Written before the flag existed: still parses, still a hit.
+        let old: ArtCache =
+            serde_json::from_str(r#"{"k": {"fetched_at": 1, "art": {"sky island": "https://img/a.png"}}}"#)
+                .expect("an entry without probe_failed must parse");
+        assert_eq!(old["k"].ttl(), TTL);
+        let mut entry = old["k"].clone();
+        entry.probe_failed = true;
+        assert_eq!(entry.ttl(), NEGATIVE_TTL);
+        entry.art.clear();
+        entry.probe_failed = false;
+        assert_eq!(entry.ttl(), NEGATIVE_TTL);
     }
 }

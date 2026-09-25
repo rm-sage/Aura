@@ -37,17 +37,32 @@ export const MAX_BACKDROP_CANDIDATES = 24;
  *  go through clearHeroBackdrops rather than a bare removeItem. */
 export const HERO_BACKDROP_STORAGE_KEY = "aura:hero-backdrop:v1";
 
-/** Keyed by the detail page's meta id; the value is the chosen URL only.
- *  Mirrors arcModeCache: a year's TTL and a cap, so a big library cannot grow
- *  it without limit. NOT reclaimable: these are the user's choices, not data
- *  that re-fetches, and a quota squeeze elsewhere must not quietly undo half
- *  of them for the few KB they hold. */
-const heroBackdropCache = new PersistentCache<string>({
+/** A stored choice while a failed load is being counted: `fails` is how many
+ *  consecutive opens its image did not load on (see noteHeroBackdropFailed).
+ *  A choice with no failure against it is stored as the bare URL string, the
+ *  only shape written before the count existed. */
+interface CountedBackdrop {
+  url: string;
+  fails: number;
+}
+
+/** Keyed by the detail page's meta id; the value is the chosen URL, or a
+ *  CountedBackdrop. Mirrors arcModeCache: a year's TTL and a cap, so a big
+ *  library cannot grow it without limit. NOT reclaimable: these are the
+ *  user's choices, not data that re-fetches, and a quota squeeze elsewhere
+ *  must not quietly undo half of them for the few KB they hold. */
+const heroBackdropCache = new PersistentCache<string | CountedBackdrop>({
   storageKey: HERO_BACKDROP_STORAGE_KEY,
   ttlMs: 365 * 24 * 60 * 60 * 1000,
   maxEntries: 300,
   reclaimable: false,
 });
+
+/** Consecutive failed opens that forget a stored choice. One failure may be
+ *  transient, so the choice gets another try; a URL that is permanently dead
+ *  (an addon rotated its art path) would otherwise make every later open
+ *  wait out ImageLoader's retries before automatic art shows. */
+const FORGET_AFTER_FAILED_OPENS = 2;
 
 /** A well-formed http(s) URL within the length cap. The one check for every
  *  backdrop this module stores, reads back or offers. */
@@ -55,21 +70,58 @@ export function isArtUrl(url: unknown): url is string {
   return typeof url === "string" && url.length <= MAX_ART_URL_LEN && isSafeExternalUrl(url);
 }
 
+/** The stored choice in either shape, or null. The URL is validated exactly
+ *  as before the count existed; a count that is not a positive integer reads
+ *  as no failures. */
+function readStored(id: string): CountedBackdrop | null {
+  const v: unknown = heroBackdropCache.get(id);
+  if (isArtUrl(v)) return { url: v, fails: 0 };
+  if (!v || typeof v !== "object") return null;
+  const { url, fails } = v as { url?: unknown; fails?: unknown };
+  if (!isArtUrl(url)) return null;
+  return { url, fails: typeof fails === "number" && Number.isInteger(fails) && fails > 0 ? fails : 0 };
+}
+
 /** The stored backdrop for a title, or null for "automatic". A stored value
  *  that fails validation (a hand-edited or corrupt blob) reads as no override
  *  rather than reaching an <img>. */
 export function loadHeroBackdrop(id: string): string | null {
   if (!id) return null;
-  const v = heroBackdropCache.get(id);
-  return isArtUrl(v) ? v : null;
+  return readStored(id)?.url ?? null;
 }
 
 /** Remember a backdrop for a title; null (or anything invalid) clears it, so
- *  the title goes back to following its addon's art. */
+ *  the title goes back to following its addon's art. A choice starts with no
+ *  failures against it. */
 export function saveHeroBackdrop(id: string, url: string | null): void {
   if (!id) return;
   if (url && isArtUrl(url)) heroBackdropCache.set(id, url);
   else heroBackdropCache.delete(id);
+}
+
+/** The stored `url` did not load on this open (ImageLoader spent its
+ *  retries). Counts the failure, and forgets the choice once
+ *  FORGET_AFTER_FAILED_OPENS opens in a row have failed. Returns true when it
+ *  forgot. A no-op when `url` is no longer the stored choice. Call at most
+ *  once per open, and only for the choice the open latched from storage: a
+ *  pick that fails in front of the user is not a failed open. */
+export function noteHeroBackdropFailed(id: string, url: string): boolean {
+  const stored = id ? readStored(id) : null;
+  if (!stored || stored.url !== url) return false;
+  const fails = stored.fails + 1;
+  if (fails >= FORGET_AFTER_FAILED_OPENS) {
+    heroBackdropCache.delete(id);
+    return true;
+  }
+  heroBackdropCache.set(id, { url, fails });
+  return false;
+}
+
+/** The stored `url` loaded, so any failure counted against it was transient.
+ *  Writes only when there was a count to clear. */
+export function noteHeroBackdropLoaded(id: string, url: string): void {
+  const stored = id ? readStored(id) : null;
+  if (stored && stored.url === url && stored.fails > 0) heroBackdropCache.set(id, url);
 }
 
 /** Settings > Storage "Chosen backdrops" clear. Removing the localStorage key

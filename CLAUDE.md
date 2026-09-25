@@ -672,15 +672,18 @@ Bound every cache (see Performance & memory).
 - **Story arcs**: `aura:story-arcs:v8` (24 h TTL, cap 60) holds the joined arcs per series; the TTL is
   short deliberately because an ongoing show gains an episode weekly and a stale arc would be missing
   it. `aura:arc-mode:v1` (cap 200) remembers the Seasons/Arcs choice per series. Rust side:
-  `arcs-cache-v1.json` (TMDB payloads, 24 h, cap 40) and `arc-art-v2.json` (Fandom art, cap 60, keyed
+  `arcs-cache-v1.json` (TMDB payloads, 24 h, cap 40) and `arc-art-v3.json` (Fandom art, cap 60, keyed
   per show AND arc-name set so each grouping gets its own map; a hit lives 30 d, an empty map is a
   cached MISS honoured for only 24 h, because it is ambiguous between "this wiki has no arc art" and
-  "Fandom was down when we asked"). A show in the curated wiki table is not proof it HAS arc art.
+  "Fandom was down when we asked"; so is a hit whose arc-title probe went unanswered, since that
+  falls back to the similarity match the probe replaces). A show in the curated wiki table is not
+  proof it HAS arc art.
   Bleach was removed from the table for that reason: it never produced any (no arc category, and 9
   of 21 arc names redirect to one generic Episodes page), and the names that do reach a real page
   land on event pages whose lead images are episode screenshots, some of them spoilers.
 - **Hero backdrop choice**: `aura:hero-backdrop:v1` (365 d TTL, cap 300) holds the backdrop URL the
-  user picked for a title's detail hero (`heroBackdrop.ts`), validated on read. Device-local like
+  user picked for a title's detail hero (`heroBackdrop.ts`), validated on read, and forgets one whose
+  image failed to load on two opens in a row (the count is stored with it). Device-local like
   `aura:arc-mode:v1`: not cloud-synced, not in settings export/import. Settings > Storage clears it
   through `clearHeroBackdrops`, because a bare `removeItem` under a live `PersistentCache` is written
   back, cleared entries included, by the cache's next save.

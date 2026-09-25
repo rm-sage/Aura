@@ -3208,6 +3208,10 @@ fn extract_videos(meta: &serde_json::Value, addon_name: &str) -> Vec<VideoEntry>
         return Vec::new();
     };
     let mut repaired_count: usize = 0;
+    // What is left of EMBEDDED_STREAMS_TOTAL_CAP, spent in video order, and
+    // how many videos it cut short or left out.
+    let mut embed_budget: usize = EMBEDDED_STREAMS_TOTAL_CAP;
+    let mut embeds_cut: usize = 0;
     let videos: Vec<VideoEntry> = arr.iter()
         .take(2000) // generous cap; long-running anime can have 1000+ episodes
         .filter_map(|v| {
@@ -3271,6 +3275,10 @@ fn extract_videos(meta: &serde_json::Value, addon_name: &str) -> Vec<VideoEntry>
                 .find_map(|k| v.get(*k).and_then(|x| x.as_i64()))
                 .filter(|&n| n > 0);
 
+            let (streams, cut) = extract_embedded_streams(v, addon_name, embed_budget);
+            embed_budget -= streams.len();
+            if cut { embeds_cut += 1; }
+
             Some(VideoEntry {
                 id,
                 title,
@@ -3284,7 +3292,7 @@ fn extract_videos(meta: &serde_json::Value, addon_name: &str) -> Vec<VideoEntry>
                 is_recap,
                 anilist_id,
                 anilist_episode,
-                streams: extract_embedded_streams(v, addon_name),
+                streams,
             })
         })
         .collect();
@@ -3321,6 +3329,14 @@ fn extract_videos(meta: &serde_json::Value, addon_name: &str) -> Vec<VideoEntry>
                 "extract_videos: {embedding} video(s) embed their own streams, shown instead of the addon fan-out",
             );
         }
+        if embeds_cut > 0 {
+            crate::devlog!(
+                info, "meta",
+                "extract_videos: {addon_name}'s embedded streams reached the per-title cap of \
+                 {EMBEDDED_STREAMS_TOTAL_CAP}; kept {}, {embeds_cut} later video(s) cut short or left to the addon fan-out",
+                EMBEDDED_STREAMS_TOTAL_CAP - embed_budget,
+            );
+        }
         if repaired_count > 0 {
             crate::devlog!(
                 warn, "meta",
@@ -3335,6 +3351,14 @@ fn extract_videos(meta: &serde_json::Value, addon_name: &str) -> Vec<VideoEntry>
 /// Per-video cap on embedded streams: the same raw cap `fetch_streams`
 /// applies to one addon's stream response.
 const EMBEDDED_STREAMS_CAP: usize = 80;
+
+/// Per-meta cap on embedded streams, across all of its videos. Real addons
+/// embed one to three per video, but the per-video cap alone lets a long
+/// series that embeds on every episode hold episodes x 80 entries, here and
+/// again in the frontend's meta cache. Spent in video order: once it runs out,
+/// later videos carry no embedded streams and take the addon fan-out, as a
+/// video that embeds nothing already does.
+const EMBEDDED_STREAMS_TOTAL_CAP: usize = 2000;
 
 /// The streams a meta addon embedded in one Video object (Stremio parity).
 ///
@@ -3359,22 +3383,41 @@ const EMBEDDED_STREAMS_CAP: usize = 80;
 /// playable debrid rows, with no way back (Refresh takes the same branch). An
 /// embed of magnets only therefore yields an empty list, and the fan-out runs
 /// as it would without one.
-fn extract_embedded_streams(v: &serde_json::Value, addon_name: &str) -> Vec<StreamEntry> {
+///
+/// `budget` is what is left of EMBEDDED_STREAMS_TOTAL_CAP for this meta. The
+/// list is cut to it, and with none left nothing is kept. The flag says the
+/// budget dropped at least one playable stream from this video's embed, so an
+/// embed that would have kept nothing anyway (magnets only) is not counted.
+fn extract_embedded_streams(
+    v: &serde_json::Value,
+    addon_name: &str,
+    budget: usize,
+) -> (Vec<StreamEntry>, bool) {
     let raw = ["streams", "stream"]
         .iter()
         .find_map(|k| v.get(*k).filter(|x| x.is_array() || x.is_object()));
     let list: &[serde_json::Value] = match raw {
         Some(serde_json::Value::Array(arr)) => arr,
         Some(obj) => std::slice::from_ref(obj),
-        None => return Vec::new(),
+        None => return (Vec::new(), false),
     };
+    if budget == 0 {
+        let would_keep = list.iter()
+            .take(EMBEDDED_STREAMS_CAP)
+            .filter_map(|s| sanitize_stream(s, addon_name))
+            .any(|s| s.url.is_some());
+        return (Vec::new(), would_keep);
+    }
     let mut seen: HashSet<String> = HashSet::new();
-    list.iter()
+    let mut streams: Vec<StreamEntry> = list.iter()
         .take(EMBEDDED_STREAMS_CAP)
         .filter_map(|s| sanitize_stream(s, addon_name))
         .filter(|s| s.url.is_some())
         .filter(|s| seen.insert(stream_dedup_key(s)))
-        .collect()
+        .collect();
+    let cut = streams.len() > budget;
+    streams.truncate(budget);
+    (streams, cut)
 }
 
 /// Helper — pull a string array from arbitrary serde_json::Value, capping
@@ -5192,6 +5235,63 @@ mod tests {
         let json = serde_json::to_value(&videos[4]).expect("serializes");
         assert!(json.get("streams").is_none());
         assert!(serde_json::to_value(&videos[0]).expect("serializes").get("streams").is_some());
+    }
+
+    /// The per-meta total cap, spent in video order. 40 episodes embedding a
+    /// full 80 each: the first 25 fill EMBEDDED_STREAMS_TOTAL_CAP exactly and
+    /// every later one carries nothing, so it takes the fan-out. A video that
+    /// straddles the cap keeps only what is left of it.
+    #[test]
+    fn embedded_streams_total_cap_truncates_later_videos() {
+        let video = |ep: usize, n: usize| {
+            let streams: Vec<serde_json::Value> = (0..n)
+                .map(|i| serde_json::json!({ "url": format!("https://cdn.example.invalid/{ep}/{i}.mkv") }))
+                .collect();
+            serde_json::json!({ "id": format!("tt1:1:{ep}"), "streams": streams })
+        };
+        let full = EMBEDDED_STREAMS_TOTAL_CAP / EMBEDDED_STREAMS_CAP;
+        assert_eq!(full, 25);
+
+        let meta = serde_json::json!({
+            "id": "tt1",
+            "videos": (1..=40).map(|ep| video(ep, EMBEDDED_STREAMS_CAP)).collect::<Vec<_>>(),
+        });
+        let videos = extract_videos(&meta, "Meta Addon");
+        assert_eq!(videos.len(), 40);
+        assert!(videos[..full].iter().all(|v| v.streams.len() == EMBEDDED_STREAMS_CAP));
+        assert!(videos[full..].iter().all(|v| v.streams.is_empty()));
+        let total: usize = videos.iter().map(|v| v.streams.len()).sum();
+        assert_eq!(total, EMBEDDED_STREAMS_TOTAL_CAP);
+        // A later video with nothing embedded stays off the wire, exactly
+        // like one that never embedded anything.
+        assert!(serde_json::to_value(&videos[full]).expect("serializes").get("streams").is_none());
+
+        // 30 first moves the boundary into the middle of a video.
+        let mut shifted = vec![video(0, 30)];
+        shifted.extend((1..=40).map(|ep| video(ep, EMBEDDED_STREAMS_CAP)));
+        let videos = extract_videos(&serde_json::json!({ "id": "tt1", "videos": shifted }), "Meta Addon");
+        let left = EMBEDDED_STREAMS_TOTAL_CAP - 30;
+        let whole = left / EMBEDDED_STREAMS_CAP;
+        assert_eq!(videos[0].streams.len(), 30);
+        assert!(videos[1..=whole].iter().all(|v| v.streams.len() == EMBEDDED_STREAMS_CAP));
+        let straddle = &videos[whole + 1].streams;
+        assert_eq!(straddle.len(), left % EMBEDDED_STREAMS_CAP);
+        assert!(!straddle.is_empty() && straddle.len() < EMBEDDED_STREAMS_CAP);
+        // The first entries are the ones kept.
+        assert_eq!(
+            straddle[0].url.as_deref(),
+            Some(format!("https://cdn.example.invalid/{}/0.mkv", whole + 1).as_str()),
+        );
+        assert!(videos[whole + 2..].iter().all(|v| v.streams.is_empty()));
+        assert_eq!(videos.iter().map(|v| v.streams.len()).sum::<usize>(), EMBEDDED_STREAMS_TOTAL_CAP);
+
+        // With the budget spent, only an embed that would have kept something
+        // counts as cut: magnets only take the fan-out whatever the budget.
+        let magnets = serde_json::json!({ "id": "tt1:1:41", "streams": [{ "infoHash": "abc" }] });
+        let (kept, cut) = extract_embedded_streams(&magnets, "Meta Addon", 0);
+        assert!(kept.is_empty() && !cut);
+        let (kept, cut) = extract_embedded_streams(&video(41, 3), "Meta Addon", 0);
+        assert!(kept.is_empty() && cut);
     }
 
     const SUB_BASE: &str = "https://subs.example.invalid/cfg";

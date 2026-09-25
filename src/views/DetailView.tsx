@@ -114,7 +114,14 @@ import { showFlyUpToast } from "../FlyUpToast";
 import ImageLoader from "../ImageLoader";
 import { closeDownloadsPanel } from "../downloadsPanel";
 import HeroBackdropPicker from "../HeroBackdropPicker";
-import { collectBackdropCandidates, loadHeroBackdrop, saveHeroBackdrop, type BackdropCandidate } from "../heroBackdrop";
+import {
+  collectBackdropCandidates,
+  loadHeroBackdrop,
+  noteHeroBackdropFailed,
+  noteHeroBackdropLoaded,
+  saveHeroBackdrop,
+  type BackdropCandidate,
+} from "../heroBackdrop";
 import { shrinkPoster, screenWidthHint } from "../posterSize";
 import ErrorBoundary from "../ErrorBoundary";
 import { parseStream, chipStyleFor, looksLikeTamTaro, type ChipKind } from "../streamMeta";
@@ -889,6 +896,10 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // The dead-override fallback runs at most once per open, so an image that
   // keeps failing can never bounce the hero between two sources.
   const overrideFallbackUsedRef = useRef(false);
+  // True once a picker choice has been made this open. From then on the
+  // override on screen is that pick, not the one the open latched from
+  // storage, so a failure of it is not counted as a failed open.
+  const backdropPickedRef = useRef(false);
   // Backdrop picker: open at the right-click, or closed.
   const [backdropPicker, setBackdropPicker] = useState<{
     x: number;
@@ -937,6 +948,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     heroKeyRef.current = meta.id;
     heroSettledRef.current = null;
     overrideFallbackUsedRef.current = false;
+    backdropPickedRef.current = false;
     setHeroArtLatch(heroHoldRef.current ? null : seedHeroArt(meta, heroResumeRef.current));
     setBgReady(false);
     setLogoReady(false);
@@ -1841,6 +1853,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     // to the addon's art still flows through instead of being frozen by a
     // choice that changed nothing.
     const stored = chosen && chosen !== auto ? chosen : null;
+    backdropPickedRef.current = true;
     saveHeroBackdrop(meta.id, stored);
     setBackdropPicker((p) => (p ? { ...p, current: stored } : p));
     const nextBg = stored ?? auto;
@@ -1856,9 +1869,10 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // ImageLoader has already spent its retries when this fires. A stored
   // choice that will not load falls back to automatic art for THIS open,
   // silently and at most once (a second failure is an ordinary dead backdrop),
-  // and the stored choice is KEPT: the failure may be transient, and the next
-  // open tries it again. If automatic resolves to the same URL there is
-  // nothing to fall back to.
+  // and the stored choice is KEPT for one more try: the failure may be
+  // transient. The second open in a row on which it fails forgets it
+  // (noteHeroBackdropFailed); a load in between clears the count. If
+  // automatic resolves to the same URL there is nothing to fall back to.
   //
   // A pick that fails MID-CROSSFADE (its predecessor still mounted underneath)
   // goes back to that predecessor instead, whatever the fallback budget: the
@@ -1885,13 +1899,25 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     }
     if (heroArtLatch?.overridden && !overrideFallbackUsedRef.current) {
       overrideFallbackUsedRef.current = true;
+      const failed = heroArtLatch.background;
+      const forgotten = !backdropPickedRef.current && !!failed && noteHeroBackdropFailed(meta.id, failed);
+      if (forgotten) {
+        console.info("[meta] stored hero backdrop did not load on two opens in a row; forgot it");
+        setBackdropPicker((p) => (p ? { ...p, current: null } : p));
+      }
       const auto = automaticHeroArt().background;
-      if (auto !== heroArtLatch.background) {
-        console.info("[meta] stored hero backdrop did not load; using automatic art for this open");
+      if (auto !== failed) {
+        if (!forgotten) console.info("[meta] stored hero backdrop did not load; using automatic art for this open");
         swapHeroBackground(auto, false);
         return;
       }
     }
+    setBgReady(true);
+  };
+
+  // A stored choice that loads clears any failed opens counted against it.
+  const onHeroBackdropLoad = () => {
+    if (heroArtLatch?.overridden && heroArt) noteHeroBackdropLoaded(meta.id, heroArt);
     setBgReady(true);
   };
 
@@ -2100,7 +2126,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
             // The ambient base above already covers the box; a second opaque
             // skeleton stacked on top of it was the "blank screen" flash.
             skeletonClassName="detail-backdrop-idle"
-            onLoad={top ? () => setBgReady(true) : undefined}
+            onLoad={top ? onHeroBackdropLoad : undefined}
             onError={top ? onHeroBackdropError : undefined}
           />
         );
