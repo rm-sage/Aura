@@ -199,15 +199,34 @@ function imdbRootOf(seriesId: string): string | null {
   return head.startsWith("tt") ? head : null;
 }
 
-export async function fetchStoryArcs(
+/** Requests in flight, by the same key as `arcCache`. The detail page and its
+ *  episode panel both ask on mount, before either answer can land in the
+ *  cache, so without this one detail open ran the TMDB fetch and the whole
+ *  alignment twice. An entry lives only until its request settles. */
+const arcsInFlight = new Map<string, Promise<ArcResult | null>>();
+
+export function fetchStoryArcs(
   detail: MetaDetail,
   seriesId: string,
   groupingId?: string,
 ): Promise<ArcResult | null> {
   const key = `${seriesId}::${groupingId ?? "default"}`;
   const cached = arcCache.get(key);
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) return Promise.resolve(cached);
+  const pending = arcsInFlight.get(key);
+  if (pending) return pending;
+  const run = requestStoryArcs(detail, seriesId, groupingId, key)
+    .finally(() => arcsInFlight.delete(key));
+  arcsInFlight.set(key, run);
+  return run;
+}
 
+async function requestStoryArcs(
+  detail: MetaDetail,
+  seriesId: string,
+  groupingId: string | undefined,
+  key: string,
+): Promise<ArcResult | null> {
   // Pass Aura's REAL videos. The Rust side maps arcs onto these exact ids, so
   // what comes back is directly playable — never reconstruct an episode id.
   const videos = detail.videos.map((v: VideoEntry) => ({
