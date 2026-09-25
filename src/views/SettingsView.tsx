@@ -5191,13 +5191,15 @@ export default function SettingsView({ addons, session }: Props) {
             sits at exact grid centre, and mx-auto on the grid centres the
             whole thing on the viewport. maxWidth is bumped from 1100 →
             1340 to absorb the extra 240 px (200 mirror + 40 gap) without
-            shrinking the content column. */}
+            shrinking the content column.
+            Below a 1200 px window the mirror is dropped: centring is not
+            worth a quarter of a narrow window, and at the 900 px minimum
+            the two fixed 200 px columns left the content column only
+            about 140 px wide, every row wrapping word by word. */}
         <div
-          className="mx-auto my-auto px-8 py-6 grid gap-10 w-full"
-          style={{
-            maxWidth: "min(1340px, 95%)",
-            gridTemplateColumns: "200px minmax(0, 1fr) 200px",
-          }}
+          className="mx-auto my-auto px-8 py-6 grid gap-10 w-full
+                     grid-cols-[200px_minmax(0,1fr)] min-[1200px]:grid-cols-[200px_minmax(0,1fr)_200px]"
+          style={{ maxWidth: "min(1340px, 95%)" }}
         >
           {/* TOC - sticky so it stays in view while the user scrolls.
               The search input now lives at the BOTTOM of this sidebar
