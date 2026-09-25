@@ -110,9 +110,7 @@ export const REVOKE_BEFORE_RECONNECT: Record<ScrobbleService, boolean> = {
  *  Such a sign-in has no `aura://oauth/<svc>` hop for the in-app popup to
  *  intercept (the popup just follows the redirect to the listener, like any
  *  browser), and nothing to fall back to when the listener is down: the
- *  authorize URL itself fails then, inside Aura or out. Its sign-in state
- *  lives in Rust for 15 minutes, so the Settings row keeps its scope stash
- *  past the row's own 2-minute waiting timeout. */
+ *  authorize URL itself fails then, inside Aura or out. */
 export const LOOPBACK_ONLY_SIGN_IN: Record<ScrobbleService, boolean> = {
   trakt: false,
   anilist: false,

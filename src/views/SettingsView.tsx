@@ -4282,15 +4282,13 @@ function ScrobbleAuthRow({
     timeoutRef.current = window.setTimeout(() => {
       timeoutRef.current = null;
       setPending(false);
-      // Only the waiting UI times out for a loopback-only sign-in (Simkl).
-      // Its PKCE state lives in Rust for 15 minutes (NONCE_TTL in
-      // oauth_callback.rs), so an approval can still land after this and
-      // deliver a token: the scope stash stays for it, or App.tsx would file
-      // that token under "guest". Cancel, the token's arrival and the next
-      // Connect still clear or replace it.
-      if (!LOOPBACK_ONLY_SIGN_IN[service]) {
-        sessionStorage.removeItem(`aura:oauth:pending:${service}`);
-      }
+      // Only the waiting UI times out. The sign-in itself stays redeemable in
+      // Rust for 15 minutes (NONCE_TTL in oauth_callback.rs, for AniList's
+      // proxy nonce and Simkl's PKCE state alike), so an approval can still
+      // land after this and deliver a token: the scope stash stays for it,
+      // or App.tsx would file that token under "guest" instead of the
+      // signed-in account. Cancel, the token's arrival and the next Connect
+      // still clear or replace it.
       showAppToast(
         `${label} authorization didn't complete. Try again.`,
         { duration: 6000 },

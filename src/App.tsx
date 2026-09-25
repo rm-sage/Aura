@@ -138,7 +138,7 @@ import { getTitleState, titleStateKey } from "./titleState";
 import { isAnimeMeta, markAnimeId } from "./aiometadata";
 import { setSkipMarksScope } from "./skipMarks";
 import { markEpisodesSkipped } from "./skipActions";
-import { connectedServices, isScrobbleService, useScrobbleConnections } from "./scrobbleConn";
+import { SCROBBLE_LABELS, connectedServices, isScrobbleService, useScrobbleConnections } from "./scrobbleConn";
 import type { AnimeTheme, AnimeThemes } from "./animeExtras";
 import type {
   AddonEntry,
@@ -9243,7 +9243,7 @@ export default function App() {
           })
             .then(() => {
               showAppToast(
-                `Connected to ${service.charAt(0).toUpperCase() + service.slice(1)}` +
+                `Connected to ${SCROBBLE_LABELS[service]}` +
                 (username ? ` as ${username}` : ""),
                 { duration: 4000 },
               );
