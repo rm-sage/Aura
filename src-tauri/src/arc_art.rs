@@ -73,7 +73,7 @@ const MAX_TITLE_HOPS: usize = 8;
 /// Leveling, Oshi no Ko, Overlord, D.Gray-man, Claymore, Monster, Berserk,
 /// Beastars, Parasyte, Toriko, Ranking of Kings, Sakamoto Days, Wind Breaker,
 /// Dandadan, Black Butler, Fate/Zero, Shield Hero, and Fullmetal Alchemist
-/// (2003) - the last of which is why only Brotherhood is listed below.
+/// (2003).
 ///
 /// Two were near misses on `score_grouping`'s 0.85 coverage bar rather than on
 /// the group's existence: Tokyo Revengers (4 arcs, 37/50 episodes = 74%) and
@@ -94,6 +94,28 @@ const MAX_TITLE_HOPS: usize = 8;
 /// on event pages ("Gotei 13 Invading Army" -> "Reigai Uprising") whose lead
 /// images are episode screenshots, some of them final-arc spoilers. None of
 /// that is key art, so the show stays on episode stills.
+///
+/// Four more were listed and REMOVED for the same reason after a live replay
+/// of this module on 2026-09-25 (exact-title pass included) found no art for
+/// any arc of any viable grouping. Each wiki has no arc category, so every
+/// name went to the title probe, and none of them is a page there:
+/// - Fullmetal Alchemist: Brotherhood (31911, fma): the only grouping,
+///   "Story/Chapters", names its 6 arcs "Chapter 1 - Hunt for the Stone" style.
+/// - Death Note (13916, deathnote): the only grouping, "Story arcs", has 2
+///   arcs, "Part I - L arc" and "Part II - Near and Mello arc".
+/// - Sword Art Online (45782, swordartonline): the only grouping, "Story Arcs
+///   [ENG]", uses 14 decorated names ("ARC 1://  Aincrad", "~ SPECIALS ~").
+/// - Code Geass (31724, codegeass): the only grouping, "故事线", has 3 Chinese
+///   season names ("第一季 R1", "第二季 R2", "特别篇").
+///
+/// Jujutsu Kaisen (95479) was checked in the same pass and deliberately KEPT,
+/// although it yields no art today. Its wiki is a good one: TMDB's English
+/// "Story Arcs" grouping (7 arcs) gets real key art for 5 of them through
+/// `Category:Story Arcs`. But that grouping covers 48 episodes, under the
+/// 0.85 bar against a ~59-episode main run, so `arcs.rs` elects "Saga
+/// Española" instead, whose Spanish names match nothing. The art returns as
+/// soon as TMDB's English grouping covers the run (or for an addon that lists
+/// 56 main-run episodes or fewer), at the cost of a one-day cached miss.
 const WIKI_BY_TMDB: &[(i64, &str)] = &[
     (37854,  "onepiece.fandom.com"),
     (46260,  "naruto.fandom.com"),          // Naruto
@@ -109,12 +131,9 @@ const WIKI_BY_TMDB: &[(i64, &str)] = &[
     (65930,  "myheroacademia.fandom.com"),
     (46261,  "fairytail.fandom.com"),
     (73223,  "blackclover.fandom.com"),
-    (31911,  "fma.fandom.com"),
-    (13916,  "deathnote.fandom.com"),
     (57041,  "gintama.fandom.com"),
     (45790,  "jojo.fandom.com"),
     (30983,  "detectiveconan.fandom.com"),
-    (45782,  "swordartonline.fandom.com"),
     (65942,  "rezero.fandom.com"),
     (67075,  "mob-psycho-100.fandom.com"),
     (114410, "chainsaw-man.fandom.com"),
@@ -124,7 +143,6 @@ const WIKI_BY_TMDB: &[(i64, &str)] = &[
     (131041, "blue-lock.fandom.com"),
     (86031,  "dr-stone.fandom.com"),
     (63926,  "onepunchman.fandom.com"),
-    (31724,  "codegeass.fandom.com"),
 ];
 
 /// Wikis do not agree on what the arc category is called. Probed in order.
@@ -773,7 +791,8 @@ pub async fn resolve_arc_art<R: Runtime>(
         // simply do not have one. Measured across this table: 7 of 27 hosts
         // returned zero members for ALL SIX category candidates: fma,
         // deathnote, swordartonline, mob-psycho-100, haikyuu, codegeass, and
-        // bleach before it was removed. No amount of adding category names
+        // bleach (all but mob-psycho-100 and haikyuu since removed, see
+        // WIKI_BY_TMDB). No amount of adding category names
         // fixes that, because those wikis do not model arcs as a category in
         // the first place.
         //
