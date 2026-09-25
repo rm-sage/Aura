@@ -14,6 +14,7 @@ import { useEffect, useState } from "react";
 import {
   ensureRuntimeDep,
   runtimeDepPresent,
+  ytdlpStaleness,
   type RuntimeDepName,
   type RuntimeDepProgress,
 } from "./runtimeDeps";
@@ -38,6 +39,9 @@ export default function RuntimeComponentsSection() {
   const [busy, setBusy] = useState<RuntimeDepName | null>(null);
   const [progress, setProgress] = useState<RuntimeDepProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // yt-dlp rots as YouTube changes; this is informational only (the pin can
+  // only move with an Aura update). Null = not behind, or the check failed.
+  const [ytdlpBehind, setYtdlpBehind] = useState<{ pinned: string; latest: string } | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -46,6 +50,11 @@ export default function RuntimeComponentsSection() {
         .then((ok) => { if (alive) setPresent((p) => ({ ...p, [d.name]: ok })); })
         .catch(() => {});
     }
+    ytdlpStaleness()
+      .then((s) => {
+        if (alive && s.behind && s.latest) setYtdlpBehind({ pinned: s.pinned, latest: s.latest });
+      })
+      .catch(() => {});
     return () => { alive = false; };
   }, []);
 
@@ -97,6 +106,12 @@ export default function RuntimeComponentsSection() {
                   )}
                 </div>
                 <p className="text-white/45 text-[11.5px] leading-snug mt-0.5">{d.purpose}</p>
+                {d.name === "yt-dlp.exe" && ytdlpBehind && (
+                  <p className="text-white/45 text-[11.5px] leading-snug mt-1">
+                    yt-dlp {ytdlpBehind.pinned} is behind the latest release ({ytdlpBehind.latest}).
+                    If trailers stop playing, an Aura update will bring the newer one.
+                  </p>
+                )}
                 {downloading && (
                   <div className="mt-2">
                     <div className="h-1.5 rounded-full bg-white/10 overflow-hidden">

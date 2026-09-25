@@ -235,3 +235,164 @@ pub async fn ensure_runtime_dep<R: Runtime>(
     crate::devlog!(info, "runtime", "installed {} ({} bytes)", dep.name, downloaded);
     Ok(target.to_string_lossy().into_owned())
 }
+
+// ---------------------------------------------------------------------------
+// yt-dlp staleness signal.
+//
+// yt-dlp is the one dep that rots (see its `DEPS` entry), and a user cannot
+// update it: the pin (URL + SHA) is baked into each build, so only an Aura
+// release that bumps it helps. The signal is therefore informational only: it
+// explains a trailer failure to the user and tells the maintainer the pin
+// needs a bump. The pinned version is DERIVED from the versioned asset name
+// (`yt-dlp-<version>.exe`) so the bump procedure stays "update both lines" and
+// the other deps are untouched.
+// ---------------------------------------------------------------------------
+
+const YTDLP_LATEST_URL: &str = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest";
+/// A successful answer is reused for 24 h.
+const YTDLP_CHECK_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+/// A failed check (offline, rate-limited, bad JSON) is remembered for 1 h.
+const YTDLP_CHECK_FAIL_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Last answer: when it was fetched plus the latest tag (`None` = the check
+/// failed). A tokio mutex held across the fetch, so concurrent callers share
+/// one request instead of racing several. One entry, so bounded by shape.
+static YTDLP_LATEST: tokio::sync::Mutex<Option<(std::time::Instant, Option<String>)>> =
+    tokio::sync::Mutex::const_new(None);
+
+/// The version encoded in the pinned yt-dlp asset name, e.g. `2026.08.19`.
+fn ytdlp_pinned_version() -> Option<&'static str> {
+    let dep = dep_for("yt-dlp.exe")?;
+    let file = dep.url.rsplit('/').next()?;
+    file.strip_prefix("yt-dlp-")?.strip_suffix(".exe")
+}
+
+/// Parse a date-shaped yt-dlp version (`2026.08.19`, hotfix `2026.08.19.1`,
+/// optional leading `v`) into numeric parts, so `2026.9.2` and `2026.09.02`
+/// compare equal. `None` for anything not purely dot-separated digits.
+fn parse_ytdlp_version(v: &str) -> Option<Vec<u32>> {
+    let v = v.trim();
+    let v = v.strip_prefix('v').unwrap_or(v);
+    if v.is_empty() {
+        return None;
+    }
+    v.split('.').map(|p| p.parse::<u32>().ok()).collect()
+}
+
+/// True only when both versions parse and `latest` is strictly newer.
+fn ytdlp_is_behind(pinned: &str, latest: &str) -> bool {
+    match (parse_ytdlp_version(pinned), parse_ytdlp_version(latest)) {
+        (Some(p), Some(l)) => l > p,
+        _ => false,
+    }
+}
+
+async fn fetch_ytdlp_latest_tag() -> Result<String, String> {
+    #[derive(serde::Deserialize)]
+    struct Release {
+        tag_name: String,
+    }
+    let client = reqwest::Client::builder()
+        .https_only(true)
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " runtime-deps"))
+        .build()
+        .map_err(|e| format!("client: {e}"))?;
+    let resp = client
+        .get(YTDLP_LATEST_URL)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("request failed ({})", if e.is_timeout() { "timeout" } else { "network" }))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status().as_u16()));
+    }
+    let rel: Release = resp.json().await.map_err(|_| "bad JSON".to_string())?;
+    let tag = rel.tag_name.trim().to_string();
+    if parse_ytdlp_version(&tag).is_none() {
+        return Err("unrecognised tag shape".to_string());
+    }
+    Ok(tag)
+}
+
+#[derive(serde::Serialize)]
+pub struct YtdlpStaleness {
+    /// Version baked into this build's pin.
+    pinned: String,
+    /// Latest upstream release tag, or `None` when the check failed.
+    latest: Option<String>,
+    /// `latest` is numerically newer than `pinned`.
+    behind: bool,
+}
+
+/// Compare the pinned yt-dlp against upstream's latest release. At most one
+/// request per 24 h (1 h after a failure) per process; never errors, a failed
+/// check just reports `latest: None, behind: false`.
+#[tauri::command]
+pub async fn ytdlp_staleness() -> Result<YtdlpStaleness, String> {
+    let pinned = ytdlp_pinned_version()
+        .ok_or_else(|| "yt-dlp pin has no version in its asset name".to_string())?;
+
+    let latest = {
+        let mut slot = YTDLP_LATEST.lock().await;
+        let fresh = slot.as_ref().filter(|(at, tag)| {
+            let ttl = if tag.is_some() { YTDLP_CHECK_TTL } else { YTDLP_CHECK_FAIL_TTL };
+            at.elapsed() < ttl
+        });
+        match fresh {
+            Some((_, tag)) => tag.clone(),
+            None => {
+                let tag = match fetch_ytdlp_latest_tag().await {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        crate::devlog!(warn, "runtime", "yt-dlp latest-release check (api.github.com) failed: {e}");
+                        None
+                    }
+                };
+                let behind = tag.as_deref().is_some_and(|t| ytdlp_is_behind(pinned, t));
+                if behind {
+                    crate::devlog!(
+                        info, "runtime",
+                        "yt-dlp pin {pinned} is behind the latest release {} (api.github.com); the pin needs a bump",
+                        tag.as_deref().unwrap_or("")
+                    );
+                }
+                *slot = Some((std::time::Instant::now(), tag.clone()));
+                tag
+            }
+        }
+    };
+
+    let behind = latest.as_deref().is_some_and(|t| ytdlp_is_behind(pinned, t));
+    Ok(YtdlpStaleness { pinned: pinned.to_string(), latest, behind })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ytdlp_pinned_version_comes_from_asset_name() {
+        let v = ytdlp_pinned_version().expect("pinned version");
+        assert!(parse_ytdlp_version(v).is_some(), "unparseable pin {v}");
+    }
+
+    #[test]
+    fn ytdlp_version_compare_is_numeric() {
+        assert!(ytdlp_is_behind("2026.08.19", "2026.09.20"));
+        assert!(ytdlp_is_behind("2026.08.19", "2026.8.20"));
+        assert!(ytdlp_is_behind("2026.09.02", "2026.9.10"));
+        assert!(!ytdlp_is_behind("2026.9.2", "2026.09.02"));
+        assert!(!ytdlp_is_behind("2026.08.19", "2026.08.19"));
+        assert!(!ytdlp_is_behind("2026.09.20", "2026.08.19"));
+        // Hotfix suffix is newer than the base date, older than the next date.
+        assert!(ytdlp_is_behind("2026.08.19", "2026.08.19.1"));
+        assert!(!ytdlp_is_behind("2026.08.19.1", "2026.08.19"));
+        assert!(ytdlp_is_behind("2026.08.19.1", "2026.08.20"));
+        assert!(ytdlp_is_behind("2026.08.19", "v2026.09.01"));
+        // Unparseable never claims "behind".
+        assert!(!ytdlp_is_behind("2026.08.19", "nightly"));
+        assert!(!ytdlp_is_behind("2026.08.19", ""));
+        assert!(!ytdlp_is_behind("2026.08.19", "2026..01"));
+    }
+}

@@ -2420,6 +2420,7 @@ pub fn run() {
             cast::cast_ffmpeg_present,
             runtime_deps::ensure_runtime_dep,
             runtime_deps::runtime_dep_present,
+            runtime_deps::ytdlp_staleness,
             trailer::resolve_trailer_url,
             playback_engine_ready,
             ensure_playback_engine,

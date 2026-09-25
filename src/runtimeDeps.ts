@@ -81,3 +81,20 @@ export function ensureRuntimeDepOnce(
   });
   return p;
 }
+
+export interface YtdlpStaleness {
+  /** Version baked into this build's yt-dlp pin, e.g. "2026.08.19". */
+  pinned: string;
+  /** Latest upstream release tag, or null when the check failed. */
+  latest: string | null;
+  /** Upstream is numerically newer than the pin. */
+  behind: boolean;
+}
+
+/** Compare the pinned yt-dlp against upstream's latest release. Rust caches
+ *  the answer (24 h, 1 h after a failure), so calling it on every mount is
+ *  cheap. Informational only: a user cannot update yt-dlp themselves, only an
+ *  Aura release that bumps the pin can. */
+export function ytdlpStaleness(): Promise<YtdlpStaleness> {
+  return invoke<YtdlpStaleness>("ytdlp_staleness");
+}
