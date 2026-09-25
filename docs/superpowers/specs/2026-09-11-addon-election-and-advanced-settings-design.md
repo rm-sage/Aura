@@ -766,12 +766,22 @@ As built (Phase 4b):
   (the rest are numbered around the pins), and a synthetic row id is a hash of the url
   rather than its index, so the optimistic selection cannot move to another row.
 - **No skip gate**, as decided above.
-- **Known follow-up, not a regression.** PlayerOverlay's external-sub fallback on a
-  sub-less file sub-adds the first preferred-language external as soon as the track list
-  shows no embedded subs. If that read beats request 1, it picks from request 0's list,
-  which is the list it has always picked from; it simply misses request 1's ranking for
-  that file. Holding the fallback until request 1 settles (with a cap) would fix it at
-  the cost of a delay on every sub-less file, and is left for a measured decision.
+- **Fallback waits for the ranked list (was the known follow-up).** PlayerOverlay's
+  external-sub fallback on a sub-less file used to sub-add the first preferred-language
+  external as soon as the track list showed no embedded subs, so a read that beat
+  request 1 picked from request 0's unranked list and missed the hash-matched answer.
+  App now derives `externalSubsSettled` from the session state (no polling): true for
+  live / trailer, with no subtitle addon elected, with no stream url, once request 1 has
+  answered or failed for the CURRENT session (compared by session object, so a source
+  round-trip A -> B -> A does not reuse the first A session's answer), or when request 1
+  can never go out (no filename, and the url is unhashable or its hash failed); false
+  while the hash is computing or request 1 is in flight or about to be sent. The
+  fallback waits while it is false, capped at 3 s from the moment the track list shows
+  no embedded subs (the cap's start is held per file, so an effect re-run never restarts
+  it), then picks from whatever list exists. Settled first means no delay: files with no
+  subtitle addon, no possible extras, or a request 1 that already landed pick at once,
+  and files with embedded subs never reach the fallback. The one-shot per file guard
+  and the title pins are unchanged.
 
 ## Cleanup in the same pass
 

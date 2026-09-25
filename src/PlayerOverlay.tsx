@@ -1138,6 +1138,10 @@ interface Props {
    *  MPV's track-list in the subtitle dropdown. Already sorted by addon
    *  order with the preferred-language priority applied. */
   externalSubs: ExternalSubtitle[];
+  /** False while App still expects the extras-carrying subtitle request to
+   *  re-rank `externalSubs` for this file (its hash is computing, or the
+   *  request is in flight). The external-sub fallback waits on it, capped. */
+  externalSubsSettled?: boolean;
   /** 2-letter ISO language code for the user's preferred subtitle
    *  language — drives the "selected lang first" ordering. */
   preferredSubLang?: string | null;
@@ -1332,7 +1336,7 @@ export default function PlayerOverlay({
   onExitPlayback,
   subsOpen, setSubsOpen, downloadsOpen = false,
   isFullscreen, onToggleFullscreen,
-  streamUrl, streamHash = null, externalSubs, preferredSubLang, preferredAudioLang,
+  streamUrl, streamHash = null, externalSubs, externalSubsSettled = true, preferredSubLang, preferredAudioLang,
   selectableSubLangs,
   scoringMeta, audioPriority, avoidDubs, userRegion,
   silentWakeCodes,
@@ -1746,6 +1750,15 @@ export default function PlayerOverlay({
   // lit up another url's row, that url could never be added, and the real row
   // added the same file a second time.
   const extTitleByUrlRef = useRef(new Map<string, string>());
+  // The fallback's capped wait for `externalSubsSettled`: when the wait began
+  // for this file (so re-running its timer effect never restarts the 3 s),
+  // and which file's wait has run out. The expiry is stamped with a per-file
+  // generation rather than a boolean reset per file: a reset through state
+  // would still read "expired" in the effects of the very commit that
+  // switched files, and let the fallback skip the wait for the new one.
+  const extSubFileGenRef = useRef(0);
+  const extSubWaitStartRef = useRef<number | null>(null);
+  const [extSubWaitExpiredGen, setExtSubWaitExpiredGen] = useState(-1);
   // Reset per file: on episode change AND on a source switch (streamUrl change).
   // A source switch swaps the stream WITHOUT unmounting PlayerOverlay, so
   // without re-arming these one-shot pickers they keep the PREVIOUS source's
@@ -1760,6 +1773,8 @@ export default function PlayerOverlay({
     extSubFallbackRef.current = false;
     // A loadfile drops every sub-added track, so nothing holds a title any more.
     extTitleByUrlRef.current = new Map();
+    extSubFileGenRef.current += 1;
+    extSubWaitStartRef.current = null;
     // `reloadNonce`: an in-place reload re-runs loadfile, which drops the
     // sub-add'd external track and reverts aid / sid to the file's defaults.
     // These guards have to re-arm for it too, or the user's language picks are
@@ -1845,6 +1860,32 @@ export default function PlayerOverlay({
   // result (`tracks.length > 0` — any video has at least one track) AND
   // there are zero embedded sub rows. Runs once per FILE
   // (`extSubFallbackRef`, re-armed by the per-file reset effect above).
+  //
+  // It also waits for `externalSubsSettled`: App's second addon request (with
+  // filename / videoHash / videoSize) re-ranks the list, and an addon that
+  // matches on the hash puts the exact-match file first only in that answer.
+  // Picking from the first, unranked list could sub-add a subtitle timed for
+  // another release. The wait is capped at EXT_SUB_SETTLE_CAP_MS from the
+  // moment the track list shows no embedded subs, so a slow addon costs at
+  // most that much, after which whatever list exists is used. Settled first
+  // (no subtitle addon, no extras possible, request 1 already answered) means
+  // no wait at all. Pure timers on props: no mpv reads (landmine 3).
+  const EXT_SUB_SETTLE_CAP_MS = 3000;
+  const extSubWaiting =
+    !isLive && !isTrailer && tracks.length > 0 && embeddedSubTracks.length === 0 && !externalSubsSettled;
+  useEffect(() => {
+    if (!extSubWaiting || extSubFallbackRef.current) return;
+    const gen = extSubFileGenRef.current;
+    if (extSubWaitExpiredGen === gen) return;
+    const now = Date.now();
+    if (extSubWaitStartRef.current === null) extSubWaitStartRef.current = now;
+    const remaining = Math.max(0, EXT_SUB_SETTLE_CAP_MS - (now - extSubWaitStartRef.current));
+    const timer = window.setTimeout(() => {
+      // A file switch since arming makes this expiry some other file's.
+      if (extSubFileGenRef.current === gen) setExtSubWaitExpiredGen(gen);
+    }, remaining);
+    return () => window.clearTimeout(timer);
+  }, [extSubWaiting, extSubWaitExpiredGen, activeTarget?.id, streamUrl, reloadNonce]);
   useEffect(() => {
     if (extSubFallbackRef.current) return;
     // Live TV / trailers have no persistent subtitles — never auto-load one
@@ -1855,6 +1896,9 @@ export default function PlayerOverlay({
     // list is a real "no subs" answer rather than "we haven't fetched yet".
     if (tracks.length === 0) return;
     if (embeddedSubTracks.length > 0) return;
+    // The ranked answer may still be coming (see above); the timer effect
+    // re-runs this through `extSubWaitExpiredGen` once the cap is hit.
+    if (!externalSubsSettled && extSubWaitExpiredGen !== extSubFileGenRef.current) return;
     if (externalSubs.length === 0) return;
 
     const pref = (preferredSubLang ?? "").toLowerCase();
@@ -1876,7 +1920,7 @@ export default function PlayerOverlay({
     })
       .then(() => window.dispatchEvent(new Event("aura:tracks-refresh")))
       .catch(() => { if (pins.get(target.url) === title) pins.delete(target.url); });
-  }, [tracks.length, embeddedSubTracks.length, externalSubs, preferredSubLang, isLive, isTrailer]);
+  }, [tracks.length, embeddedSubTracks.length, externalSubs, externalSubsSettled, extSubWaitExpiredGen, preferredSubLang, isLive, isTrailer]);
 
   // ── Audio auto-select ─────────────────────────────────────────────
   // Replaces the old simple lang-prefix match with the full scoring

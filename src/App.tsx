@@ -4125,6 +4125,13 @@ export default function App() {
     extrasSent: boolean;
     answers: [AddonSubtitleAnswer[] | null, AddonSubtitleAnswer[] | null];
   } | null>(null);
+  // The session whose request 1 has finished (answered OR failed). With
+  // `externalSubsSettled` below, this is how PlayerOverlay's external-sub
+  // fallback knows whether the list can still be re-ranked under it. The
+  // session OBJECT, not its key: a source switch A -> B -> A mints a fresh
+  // session for A whose request 1 has not landed, and a key would read the
+  // first A session's answer as this one's.
+  const [subsExtrasDone, setSubsExtrasDone] = useState<typeof subsFetchedFor.current>(null);
   useEffect(() => {
     if (!activeTarget) return;
     // Live TV / trailers have no IMDb id / episode / Stremio meta to match —
@@ -4209,10 +4216,16 @@ export default function App() {
           // One slot per addon, in the order they were passed.
           session.answers[rank] = subtitleAddons.map((a, i) => ({ addonUrl: a.url, subs: slots?.[i] ?? [] }));
           setActiveExternalSubs(mergeSubtitleAnswers(session.answers[0], session.answers[1]));
+          // Same batch as the list itself, so the fallback never sees "settled"
+          // with request 1's answer still missing from the list.
+          if (rank === 1) setSubsExtrasDone(session);
         })
         // A failed request leaves the list as it is: the other one may have
-        // filled it, and a new session starts from empty anyway.
-        .catch(() => {});
+        // filled it, and a new session starts from empty anyway. A failed
+        // request 1 still settles the list: nothing better is coming.
+        .catch(() => {
+          if (rank === 1 && subsFetchedFor.current === session) setSubsExtrasDone(session);
+        });
     };
     if (isNew) request(0, {});
     if (extras) {
@@ -4220,6 +4233,34 @@ export default function App() {
       request(1, extras);
     }
   }, [activeTarget, activeStreamUrl, currentStream, subsSourceKey, streamHash, addons, isLivePlayback, isTrailerPlayback]);
+
+  // Whether `activeExternalSubs` is final for this (target, source), i.e. no
+  // request 1 answer is still to come that would re-rank it. Read by
+  // PlayerOverlay's external-sub fallback, which otherwise auto-adds from
+  // request 0's UNRANKED list (addons reading `videoHash` put the exact match
+  // first only in request 1). Derived from the same inputs the effect above
+  // decides request 1 from, so it needs no polling:
+  //   - nothing to wait for: live / trailer, no subtitle addon elected (no
+  //     request 1 is ever sent: the hash is not even computed), no stream;
+  //   - request 1 finished for the CURRENT session (answered or failed). The
+  //     ref read is safe in render: every session change in the effect also
+  //     sets the list state, so a render always follows it. On the render
+  //     before a new session exists, the ref still holds the outgoing one,
+  //     whose key no longer matches, so that render reads "not settled";
+  //   - request 1 can never go out: no filename, and the url is not hashable
+  //     or its hash already failed. Otherwise it is in flight or imminent (a
+  //     hash being computed, or a filename-only request the effect sends
+  //     after this render).
+  const externalSubsSettled = (() => {
+    if (!activeTarget || isLivePlayback || isTrailerPlayback) return true;
+    if (!hasSubtitleAddons || !subsSourceKey || !activeStreamUrl) return true;
+    const liveSession = subsFetchedFor.current;
+    if (subsExtrasDone && subsExtrasDone === liveSession && liveSession.key === subsSourceKey) return true;
+    const hash = streamHash && streamHash.url === activeStreamUrl ? streamHash : null;
+    const hashPendingOrKnown = isHashableStreamUrl(activeStreamUrl) && hash?.hash !== null;
+    const request1Expected = hashPendingOrKnown || !!playingFilename(currentStream, activeStreamUrl);
+    return !request1Expected;
+  })();
 
   // ── Keybindings + preferred subtitle language ──
   // Both come from the backend `AppSettings`. The preferred subs lang
@@ -10145,6 +10186,7 @@ export default function App() {
           streamUrl={activeStreamUrl}
           streamHash={streamHash}
           externalSubs={activeExternalSubs}
+          externalSubsSettled={externalSubsSettled}
           preferredAudioLang={
             // Per-title override is the ONLY thing that should pre-empt
             // the user's audio_priority list. Global / anime defaults
