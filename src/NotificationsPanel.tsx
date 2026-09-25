@@ -12,6 +12,13 @@ import {
 import Tooltip from "./Tooltip";
 import { openExternalUrl } from "./externalUrl";
 import { useIdleGatedInterval } from "./useIdleGate";
+import { showAppToast } from "./AppToast";
+import {
+  LOOPBACK_ONLY_SIGN_IN,
+  SCROBBLE_LABELS,
+  isScrobbleService,
+  type ScrobbleService,
+} from "./scrobbleConn";
 
 // ---------------------------------------------------------------------------
 // NotificationsPanel — anchored ABOVE the bell (bottom-12 left-3 in absolute
@@ -287,29 +294,47 @@ function toneFor(kind: NotificationKind) {
   }
 }
 
+/** Which expired-token alerts carry an inline Reconnect: the browser sign-ins.
+ *  Trakt's device flow needs its code on screen, which only the Settings row
+ *  shows, so its alert routes through Settings instead. */
+const INLINE_RECONNECT: Record<ScrobbleService, boolean> = {
+  trakt: false,
+  anilist: true,
+  simkl: true,
+};
+
 function NotificationRow({ notification, onActivate, onDismiss }: RowProps) {
   const { id, kind, title, subtitle, createdAt, read } = notification;
   const tone = toneFor(kind);
 
-  // Inline action surface — currently scoped to AniList token-expiry
-  // notifications so the user can re-auth without leaving the panel.
+  // Inline action surface: scoped to the AniList and Simkl token-expiry
+  // notifications (INLINE_RECONNECT) so the user can re-auth without leaving
+  // the panel.
   // Trakt has refresh tokens and a device-flow that requires UI to
   // display the user_code, so its alerts still route through Settings
   // (the user clicks the row to dismiss + opens Settings → Trakt
   // section manually). AniList's authorize-URL flow fits a single
   // button: open the OAuth popup, which intercepts the redirect and
-  // re-emits the deep-link that scrobble_auth picks up.
+  // re-emits the deep-link that scrobble_auth picks up. Simkl's sign-in fits
+  // the same button, in the browser only (LOOPBACK_ONLY_SIGN_IN).
   const expiredProvider =
     notification.data?.kind === "scrobble-auth-expired"
       ? (notification.data?.provider as string | undefined)
       : undefined;
   const expiredScope = notification.data?.scope as string | undefined;
-  const showReconnect = expiredProvider === "anilist" && !!expiredScope;
+  const reconnectService =
+    expiredProvider !== undefined && isScrobbleService(expiredProvider)
+      && INLINE_RECONNECT[expiredProvider]
+      ? expiredProvider
+      : null;
+  const showReconnect = reconnectService !== null && !!expiredScope;
   const [reconnecting, setReconnecting] = useState(false);
 
   const handleReconnect = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (reconnecting || !expiredScope) return;
+    if (reconnecting || !expiredScope || !reconnectService) return;
+    const service = reconnectService;
+    const label = SCROBBLE_LABELS[service];
     setReconnecting(true);
     try {
       // Mirrors the SettingsView → ScrobbleAuthRow → AniList branch:
@@ -324,30 +349,46 @@ function NotificationRow({ notification, onActivate, onDismiss }: RowProps) {
       // Reconnecting is the ONE thing this notification exists to make
       // easy, so a loopback failure falls back to the in-app popup
       // rather than leaving the button inert.
-      sessionStorage.setItem(`aura:oauth:pending:anilist`, expiredScope);
+      //
+      // No disconnect first for Simkl here, unlike its Settings row
+      // (REVOKE_BEFORE_RECONNECT). A cleared token reads as not connected,
+      // so the watcher would dismiss this notice the moment the button was
+      // pressed, and a declined or abandoned sign-in (which sends nothing
+      // back) would leave no reminder at all. The notice only exists for a
+      // lapsed grant, and the new token replaces the stored one on arrival.
+      sessionStorage.setItem(`aura:oauth:pending:${service}`, expiredScope);
       let url: string;
       let loopback = true;
       try {
         url = await invoke<string>("scrobble_oauth_authorize_url", {
-          service: "anilist", loopback: true,
+          service, loopback: true,
         });
       } catch (loopbackErr) {
+        // Simkl can only land on the loopback listener, so there is no
+        // in-app route to fall back to.
+        if (LOOPBACK_ONLY_SIGN_IN[service]) throw loopbackErr;
         console.warn("[notifications] loopback unavailable:", loopbackErr);
         loopback = false;
         url = await invoke<string>("scrobble_oauth_authorize_url", {
-          service: "anilist", loopback: false,
+          service, loopback: false,
         });
       }
       if (loopback) {
         openExternalUrl(url);
       } else {
         const { openOAuthPopup } = await import("./SourcePopup");
-        openOAuthPopup(url, "Reconnect AniList", {
-          interceptPrefix: `aura://oauth/anilist`,
+        openOAuthPopup(url, `Reconnect ${label}`, {
+          interceptPrefix: `aura://oauth/${service}`,
         });
       }
     } catch (err) {
-      console.warn("[notifications] AniList reconnect failed:", err);
+      console.warn(`[notifications] ${label} reconnect failed:`, err);
+      // With no fallback tried, the button would otherwise just return to
+      // rest with nothing said.
+      if (LOOPBACK_ONLY_SIGN_IN[service]) {
+        sessionStorage.removeItem(`aura:oauth:pending:${service}`);
+        showAppToast(`Couldn't start ${label} sign-in: ${String(err)}`, { duration: 6000 });
+      }
     } finally {
       setReconnecting(false);
     }
@@ -409,7 +450,7 @@ function NotificationRow({ notification, onActivate, onDismiss }: RowProps) {
                        border border-amber-400/35 hover:border-amber-400/55
                        transition-colors disabled:opacity-50"
           >
-            {reconnecting ? "Opening…" : "Reconnect AniList"}
+            {reconnecting ? "Opening…" : `Reconnect ${reconnectService ? SCROBBLE_LABELS[reconnectService] : ""}`}
           </button>
         )}
         <div className="text-[10px] text-white/35 mt-1.5 uppercase tracking-wider">

@@ -357,6 +357,11 @@ frontend ~40k LOC over ~70 files + ~13 views).
   returns a result per row. All of it is inert while
   `SIMKL_CLIENT_ID` (beside `TRAKT_CLIENT_ID` in `scrobble_auth.rs`) is empty;
   `scrobble_services_available` is how the frontend tells "not in this build" from "not connected".
+  Frontend: `src/scrobbleConn.ts` owns the provider list, its per-provider Records and the cached
+  availability ask (an unavailable Simkl is muted in Settings and never offered in History),
+  `src/scrobbleSimkl.ts` the batch call plus the id-eligibility mirror of Rust's `targets`, and
+  `src/scrobbleRun.ts` sends a bulk run's Simkl rows as ONE call after the per-row loop, mapping
+  the per-row results back by index.
 - **Subtitles + media**: `subtitles.rs` (OpenSubtitles v1: search incl. moviehash, download,
   add-to-mpv), `subsync.rs` (Live Sync cue lists: SRT / WebVTT / ASS parsing for external tracks,
   WINDOWED ffmpeg extraction for embedded ones), `media_controls.rs` (SMTC via souvlaki),

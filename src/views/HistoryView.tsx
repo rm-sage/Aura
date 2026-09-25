@@ -6,10 +6,13 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   HISTORY_COMMAND,
   SCROBBLE_SERVICES,
+  knownScrobbleServicesAvailable,
   useScrobbleConnections,
+  type RowHistoryService,
   type ScrobbleConn,
   type ScrobbleService,
 } from "../scrobbleConn";
+import { pushSimklHistory, simklCanIdentify, simklItemFromEntry } from "../scrobbleSimkl";
 import type { MetaPreview } from "../types";
 import {
   getHistory,
@@ -62,10 +65,11 @@ type ScrobbleConnState = Pick<ScrobbleConn, "scope" | ScrobbleService>;
 // Layout: grouped by day (Today / Yesterday / "Friday May 1, 2026") with
 // a running total runtime per day in the header and one row per entry.
 //
-// SCROBBLING — three ways in, all funnelling through the SAME two Tauri
-// commands (`scrobble_history_trakt` / `scrobble_history_anilist`) so every
-// path inherits their gates identically:
-//   1. per-row Trakt / AniList buttons (hover),
+// SCROBBLING: three ways in, all funnelling through the SAME Tauri commands
+// (`scrobble_history_trakt` / `scrobble_history_anilist` per row,
+// `scrobble_history_simkl` as one batch) so every path inherits their gates
+// identically:
+//   1. per-row Trakt / AniList / Simkl buttons (hover),
 //   2. a multi-selection (per-row checkbox, or a whole day via the day header),
 //   3. "Scrobble All" over the entire history.
 // See `runScrobble` for how duplicates are prevented.
@@ -79,7 +83,12 @@ const keyOf = (e: HistoryEntry) => `${e.id}::${e.played_at}`;
  *  has connected. AniList is anime-only: `isAnimeMeta` reads id-prefix + the
  *  localStorage anime cache + media_type, the same detector the rest of the app
  *  uses — we do not invent a new signal here. The series root id is used when
- *  present so an episode id resolves against the show. */
+ *  present so an episode id resolves against the show.
+ *
+ *  Simkl takes movies, series and anime alike, so it supplements both: an
+ *  anime row is offered to AniList AND Simkl, a movie or series row to Trakt
+ *  AND Simkl. Its gate is only "is there an id Simkl can key on", the same
+ *  test its Rust command applies (see scrobbleSimkl.ts). */
 function servicesFor(entry: HistoryEntry, conn: ScrobbleConnState): ScrobbleService[] {
   const out: ScrobbleService[] = [];
   if (conn.trakt) out.push("trakt");
@@ -89,6 +98,7 @@ function servicesFor(entry: HistoryEntry, conn: ScrobbleConnState): ScrobbleServ
     genres: [],
   });
   if (conn.anilist && isAnime) out.push("anilist");
+  if (conn.simkl && simklCanIdentify(simklItemFromEntry(entry))) out.push("simkl");
   return out;
 }
 
@@ -107,7 +117,7 @@ export default function HistoryView(props: Props) {
 function HistoryViewBody({ onSelectMeta }: Props) {
   const [entries, setEntries] = useState<HistoryEntry[]>(() => getHistory());
   const [conn, setConn] = useState<ScrobbleConnState>({
-    scope: "guest", trakt: false, anilist: false,
+    scope: "guest", trakt: false, anilist: false, simkl: false,
   });
   /** Selected (id::played_at) keys. Empty = not in selection mode. */
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -139,8 +149,13 @@ function HistoryViewBody({ onSelectMeta }: Props) {
   // actions so both surfaces resolve "can we push, and to what" identically.
   const sharedConn = useScrobbleConnections();
   useEffect(() => {
-    setConn({ scope: sharedConn.scope, trakt: sharedConn.trakt, anilist: sharedConn.anilist });
-  }, [sharedConn.scope, sharedConn.trakt, sharedConn.anilist]);
+    setConn({
+      scope: sharedConn.scope,
+      trakt: sharedConn.trakt,
+      anilist: sharedConn.anilist,
+      simkl: sharedConn.simkl,
+    });
+  }, [sharedConn.scope, sharedConn.trakt, sharedConn.anilist, sharedConn.simkl]);
 
   // Drop selections whose entries no longer exist (removed here or by a sync).
   useEffect(() => {
@@ -185,7 +200,8 @@ function HistoryViewBody({ onSelectMeta }: Props) {
   //      per-row buttons use: Trakt's /sync/history is idempotent on the
   //      `watched_at` we send (the entry's exact played_at), and AniList's
   //      save_progress no-ops with AlreadyAhead when it is already past this
-  //      episode. So even a stale/absent local record cannot produce a dupe.
+  //      episode. Simkl answers a re-sent row with a no-op. So even a
+  //      stale/absent local record cannot produce a dupe.
   //   3. AniList is only ever offered for anime, and each service only when the
   //      account has it connected (`servicesFor`).
   //
@@ -197,7 +213,11 @@ function HistoryViewBody({ onSelectMeta }: Props) {
     async (list: HistoryEntry[], what: string) => {
       if (busy) return;
       if (!anyService) {
-        showAppToast("Connect Trakt or AniList in Settings > Scrobbling first.", { tone: "danger" });
+        // Simkl is named only in a build that can sign in to it.
+        const names = knownScrobbleServicesAvailable()?.has("simkl")
+          ? "Trakt, AniList or Simkl"
+          : "Trakt or AniList";
+        showAppToast(`Connect ${names} in Settings > Scrobbling first.`, { tone: "danger" });
         return;
       }
 
@@ -205,7 +225,9 @@ function HistoryViewBody({ onSelectMeta }: Props) {
       // service rather than `trakt ? ... : anilist`, so a new service is a
       // compile error here instead of silently landing in AniList's
       // per-season collapse below.
-      const pendingBy: Record<ScrobbleService, HistoryEntry[]> = { trakt: [], anilist: [] };
+      const pendingBy: Record<ScrobbleService, HistoryEntry[]> = {
+        trakt: [], anilist: [], simkl: [],
+      };
       const items = new Set<string>();
       let alreadyDone = 0;
       let retired = 0;
@@ -269,13 +291,22 @@ function HistoryViewBody({ onSelectMeta }: Props) {
       }
 
       const anilistCollapsed = anilistPending.length - anilistWork.length;
-      const work: ScrobbleWorkItem[] = [...traktWork, ...anilistWork];
+
+      // Simkl logs each play separately like Trakt, so nothing collapses, but
+      // the runner sends all of these in ONE batched call after the per-row
+      // pushes (see scrobbleRun.ts) rather than one call each.
+      const simklWork: ScrobbleWorkItem[] = pendingBy.simkl.map(
+        (entry) => ({ entry, service: "simkl" }),
+      );
+      const work: ScrobbleWorkItem[] = [...traktWork, ...anilistWork, ...simklWork];
 
       if (work.length === 0) {
         const why =
           alreadyDone > 0
             ? `Nothing to do — all ${alreadyDone} eligible push${alreadyDone === 1 ? "" : "es"} in ${what} are already scrobbled.`
-            : `Nothing in ${what} is eligible (AniList only takes anime; Trakt needs an IMDb id).`;
+            : `Nothing in ${what} is eligible (AniList only takes anime; Trakt needs an IMDb id${
+              conn.simkl ? "; Simkl needs an IMDb, TMDB, TVDB or anime id, plus an episode number on an episode" : ""
+            }).`;
         showAppToast(
           retired > 0
             ? `${why} ${retired} item${retired === 1 ? " was" : "s were"} refused by the service and won't be retried.`
@@ -284,14 +315,15 @@ function HistoryViewBody({ onSelectMeta }: Props) {
         return;
       }
 
-      // ITEMS vs PUSHES. One item can produce TWO pushes: every eligible row goes
-      // to Trakt, and the anime subset ALSO goes to AniList. So "118 items" and
-      // "217 pushes" are both true of the same run, and the dialog has to say so
-      // outright -- quoting only the push count next to a header that counts
-      // items reads like a bug.
+      // ITEMS vs PUSHES. One item can produce up to THREE pushes: every eligible
+      // row goes to Trakt and Simkl, and the anime subset ALSO goes to AniList.
+      // So "118 items" and "217 pushes" are both true of the same run, and the
+      // dialog has to say so outright -- quoting only the push count next to a
+      // header that counts items reads like a bug.
       const legs: string[] = [];
       if (traktWork.length > 0) legs.push(`${traktWork.length} to Trakt`);
       if (anilistWork.length > 0) legs.push(`${anilistWork.length} to AniList`);
+      if (simklWork.length > 0) legs.push(`${simklWork.length} to Simkl (sent as one batch)`);
       const n = items.size;
       const detail =
         `${work.length} push${work.length === 1 ? "" : "es"} in total: ${legs.join(", ")}.` +
@@ -843,8 +875,9 @@ const HistoryCard = memo(function HistoryCard({
   const eligible = servicesFor(entry, conn);
   const showTrakt = eligible.includes("trakt");
   const showAnilist = eligible.includes("anilist");
+  const showSimkl = eligible.includes("simkl");
 
-  const scrobble = async (service: ScrobbleService) => {
+  const scrobble = async (service: RowHistoryService) => {
     if (busy) return;
     setBusy(service);
     try {
@@ -872,6 +905,31 @@ const HistoryCard = memo(function HistoryCard({
         markIneligible(conn.scope, service, entry.id);
       }
       showAppToast(cleanFailureMessage(raw), { tone: "danger", duration: 6000 });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // Simkl's command takes a batch (see scrobbleSimkl.ts), so the row button
+  // sends a batch of ONE and reads its single answer, with the same marking
+  // rules as the bulk runner: added is scrobbled, not_found / skipped retire
+  // the row, failed is left for a retry.
+  const scrobbleSimkl = async () => {
+    if (busy) return;
+    setBusy("simkl");
+    try {
+      const [result] = await pushSimklHistory(conn.scope, [simklItemFromEntry(entry)]);
+      if (result.status === "added") {
+        markScrobbled(conn.scope, "simkl", entry.id, entry.played_at);
+        showAppToast(result.message, { tone: "success" });
+        return;
+      }
+      if (result.status === "not_found" || result.status === "skipped") {
+        markIneligible(conn.scope, "simkl", entry.id);
+      }
+      showAppToast(result.message, { tone: "danger", duration: 6000 });
+    } catch (err) {
+      showAppToast(String(err), { tone: "danger", duration: 6000 });
     } finally {
       setBusy(null);
     }
@@ -976,7 +1034,7 @@ const HistoryCard = memo(function HistoryCard({
           a live button — the service would no-op the write anyway, so there is
           nothing to gain from firing it again. Suppressed entirely while a
           selection is active, so the checkboxes own the hover surface. */}
-      {(showTrakt || showAnilist) && !selectionActive && (
+      {(showTrakt || showAnilist || showSimkl) && !selectionActive && (
         <div
           className="absolute bottom-0 inset-x-0 flex items-center justify-end gap-1.5
                      px-2 py-1.5 bg-gradient-to-t from-black/80 to-transparent
@@ -1002,6 +1060,16 @@ const HistoryCard = memo(function HistoryCard({
               done={isScrobbled(conn.scope, "anilist", entry.id, entry.played_at)}
               unavailable={isIneligible(conn.scope, "anilist", entry.id)}
               onClick={() => scrobble("anilist")}
+            />
+          )}
+          {showSimkl && (
+            <ScrobbleButton
+              label="Simkl"
+              busy={busy === "simkl"}
+              disabled={busy !== null || runActive}
+              done={isScrobbled(conn.scope, "simkl", entry.id, entry.played_at)}
+              unavailable={isIneligible(conn.scope, "simkl", entry.id)}
+              onClick={() => void scrobbleSimkl()}
             />
           )}
         </div>
@@ -1037,7 +1105,7 @@ const HistoryCard = memo(function HistoryCard({
 });
 
 // ---------------------------------------------------------------------------
-// Scrobble action pill, shared by the Trakt / AniList buttons on a card.
+// Scrobble action pill, shared by the Trakt / AniList / Simkl buttons on a card.
 // Shows a spinner while its push is in flight; disabled while EITHER
 // service on the row is running. `done` renders the already-scrobbled state.
 // ---------------------------------------------------------------------------

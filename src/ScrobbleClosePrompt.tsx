@@ -138,6 +138,11 @@ export default function ScrobbleClosePrompt({
               style={{ width: `${pct}%` }}
             />
           </div>
+          {/* A single long step (Simkl's batch) in flight: the count above
+              sits still until it answers, so say what it is waiting on. */}
+          {run.step && (
+            <p className="text-white/55 text-xs font-mono">{run.step}</p>
+          )}
         </div>
 
         <div className="flex items-center justify-end gap-2.5 flex-wrap">

@@ -30,16 +30,22 @@ import { invoke } from "@tauri-apps/api/core";
 // That does NOT cover per-provider BEHAVIOUR. It is still written out by hand
 // because it genuinely differs, and a new member compiles clean there and is
 // then silently left out. Extend each of these explicitly:
-//   - HistoryView: `servicesFor` (eligibility; AniList is anime-only), the
-//     bulk runner's `work` merge, and HistoryCard's per-service row buttons.
+//   - HistoryView: `servicesFor` (eligibility; AniList is anime-only, Simkl
+//     needs an id `simklCanIdentify` accepts), the bulk runner's `work`
+//     merge, and HistoryCard's per-service row buttons (Simkl's sends a
+//     batch of one).
+//   - scrobbleRun: the Simkl step after the per-row loop (one batched call
+//     for every Simkl row of the run, results mapped back by index).
 //   - skipActions: `markEpisodesSkipped` (Trakt is pushed per episode, AniList
-//     collapsed per media).
+//     collapsed per media, Simkl per episode but in one batched call).
 //   - SettingsView: one hand-placed ScrobbleAuthRow per service.
-//   - NotificationsPanel: the reconnect button (AniList only).
+//   - NotificationsPanel: the reconnect button (AniList and Simkl; Trakt's
+//     device flow needs the Settings row to show its code).
+//   - App.tsx: the DevConsole test fire's per-service `*_fired` flags.
 // Mirrors `SCROBBLE_SERVICES` in scrobble_auth.rs, in the same order.
 // ---------------------------------------------------------------------------
 
-export const SCROBBLE_SERVICES = ["trakt", "anilist"] as const;
+export const SCROBBLE_SERVICES = ["trakt", "anilist", "simkl"] as const;
 export type ScrobbleService = typeof SCROBBLE_SERVICES[number];
 
 /** Narrow an untrusted string (a deep-link path, say) to a known service. */
@@ -51,23 +57,79 @@ export function isScrobbleService(value: string): value is ScrobbleService {
 export const SCROBBLE_LABELS: Record<ScrobbleService, string> = {
   trakt: "Trakt",
   anilist: "AniList",
+  simkl: "Simkl",
 };
 
-/** The Tauri command that pushes ONE History row to a service. Every caller
+/** The Tauri command that pushes History rows to a service. Every caller
  *  (the History tab's row buttons, the bulk runner, skip actions) looks it up
  *  here, so they cannot disagree about which command a service maps to. */
 export const HISTORY_COMMAND: Record<ScrobbleService, string> = {
   trakt: "scrobble_history_trakt",
   anilist: "scrobble_history_anilist",
+  simkl: "scrobble_history_simkl",
+};
+
+/** What each service's History command takes. "row" is ONE row per call, as
+ *  named params (`id`, `parentId`, `playedAt`, ...). "batch" is
+ *  `{ scope, items }` with one result per item back: Simkl allows about one
+ *  POST per second, so a call per row is unsafe for a bulk run, and its
+ *  command only has the batch shape (see scrobbleSimkl.ts). */
+export const HISTORY_SHAPE = {
+  trakt: "row",
+  anilist: "row",
+  simkl: "batch",
+} as const satisfies Record<ScrobbleService, "row" | "batch">;
+
+/** A service whose History command takes one row per call. The per-row call
+ *  sites (the runner's loop, the row buttons, skip pushes) are typed to this,
+ *  so a batched service cannot reach them with the per-row argument shape. */
+export type RowHistoryService = {
+  [S in ScrobbleService]: (typeof HISTORY_SHAPE)[S] extends "row" ? S : never;
+}[ScrobbleService];
+
+export function isRowHistoryService(service: ScrobbleService): service is RowHistoryService {
+  return HISTORY_SHAPE[service] === "row";
+}
+
+/** Disconnect (which revokes the grant on the provider) before a Reconnect.
+ *  Simkl mints a fresh grant on every sign-in without retiring the previous
+ *  one, and its loopback callback cannot revoke the old one there because it
+ *  does not know which account scope the flow belongs to. Without this, every
+ *  reconnect would leave one more live grant on the user's Simkl account.
+ *  Applied by the Settings row's Reconnect only. The bell's Reconnect skips
+ *  it: clearing the token first would dismiss that notice before any sign-in
+ *  had happened (see NotificationsPanel). */
+export const REVOKE_BEFORE_RECONNECT: Record<ScrobbleService, boolean> = {
+  trakt: false,
+  anilist: false,
+  simkl: true,
+};
+
+/** The provider redirects STRAIGHT to Aura's loopback listener (Simkl, a
+ *  public PKCE client with no proxy in between) rather than through the proxy.
+ *  Such a sign-in has no `aura://oauth/<svc>` hop for the in-app popup to
+ *  intercept (the popup just follows the redirect to the listener, like any
+ *  browser), and nothing to fall back to when the listener is down: the
+ *  authorize URL itself fails then, inside Aura or out. Its sign-in state
+ *  lives in Rust for 15 minutes, so the Settings row keeps its scope stash
+ *  past the row's own 2-minute waiting timeout. */
+export const LOOPBACK_ONLY_SIGN_IN: Record<ScrobbleService, boolean> = {
+  trakt: false,
+  anilist: false,
+  simkl: true,
 };
 
 /** One connected service's token summary, as `get_scrobble_auth_status`
  *  returns it. */
 export interface ScrobbleAuthSummary {
   username: string | null;
+  /** When the connection lapses, unix seconds. For Simkl this is the
+   *  RENEWAL DEADLINE (180 days after the last silent refresh), not the
+   *  7-day access token, which renews itself on the next push. */
   expires_at: number | null;
   /** Token is approaching expiry (provider-specific window: 7d for
-   *  AniList, 24h for Trakt). Soft warning. */
+   *  AniList, 24h for Trakt, the last 7d before Simkl's renewal
+   *  deadline). Soft warning. */
   stale: boolean;
   /** Token has already lapsed. Rendered as a hard "reconnect now"
    *  prompt (AniList cannot refresh at all). */
@@ -97,7 +159,46 @@ function perService<T>(pick: (service: ScrobbleService) => T): Record<ScrobbleSe
   return out;
 }
 
-/** One flag per service ("has a live token"), plus the account context. */
+// ---------------------------------------------------------------------------
+// Which services THIS BUILD can sign in to.
+//
+// Not the same question as "connected". Simkl is in SCROBBLE_SERVICES even in a
+// build with no Simkl client_id, where every Simkl path is inert, so a surface
+// that offered it there would offer a Connect button that can only fail and a
+// History button that can only error. `scrobble_services_available` answers
+// this; the answer is fixed for the life of the process, so it is asked once
+// and kept (one small Set, never grows). A FAILED ask is not kept, and reads
+// as "everything available" meanwhile: an IPC hiccup must never hide Trakt or
+// AniList, and an unconfigured Simkl then just says so when Connect is pressed.
+// ---------------------------------------------------------------------------
+
+let availableAsk: Promise<ReadonlySet<ScrobbleService>> | null = null;
+let availableKnown: ReadonlySet<ScrobbleService> | null = null;
+
+/** The services this build can sign in to, in a Set. */
+export function scrobbleServicesAvailable(): Promise<ReadonlySet<ScrobbleService>> {
+  if (!availableAsk) {
+    availableAsk = invoke<string[]>("scrobble_services_available")
+      .then((list) => {
+        availableKnown = new Set(list.filter(isScrobbleService));
+        return availableKnown;
+      })
+      .catch(() => {
+        availableAsk = null;
+        return new Set<ScrobbleService>(SCROBBLE_SERVICES);
+      });
+  }
+  return availableAsk;
+}
+
+/** The same answer synchronously, once it has arrived (null before), so a
+ *  surface mounted later can render the right state on its first frame. */
+export function knownScrobbleServicesAvailable(): ReadonlySet<ScrobbleService> | null {
+  return availableKnown;
+}
+
+/** One flag per service ("has a live token, in a build that can use it"),
+ *  plus the account context. */
 export interface ScrobbleConn extends Record<ScrobbleService, boolean> {
   scope: string;
   /** "Aura may scrobble automatically right now": the MASTER `scrobble_enabled`
@@ -193,11 +294,16 @@ async function resolve(): Promise<void> {
       settings?.scrobble_enabled === true && settings?.auto_scrobble_enabled === true;
   } catch { /* treat unknown as OFF: never push on a guess */ }
 
+  // A token for a service this build cannot use (a Simkl sign-in kept from a
+  // build that had a client_id) is not a connection: every push to it would
+  // fail with "not set up in this build".
+  const available = await scrobbleServicesAvailable();
+
   try {
     const status = await invoke<ScrobbleAuthStatus>("get_scrobble_auth_status", { scope });
     commit({
       scope,
-      ...perService((service) => summaryFor(status, service) !== null),
+      ...perService((service) => available.has(service) && summaryFor(status, service) !== null),
       autoScrobbleEnabled,
     });
   } catch {

@@ -33,7 +33,9 @@ export default function ScrobbleRunBar({ suppressed = false }: { suppressed?: bo
       aria-live="polite"
     >
       <span className="text-white/85 text-xs font-mono tabular-nums whitespace-nowrap">
-        {run.backingOff
+        {/* A single long step (Simkl's batch) names itself instead of a count
+            that would sit still for its whole duration. */}
+        {run.step ? run.step : run.backingOff
           ? `Rate limited — retrying ${run.done}/${run.total}`
           : `Scrobbling ${run.done}/${run.total}`}
       </span>
@@ -51,15 +53,19 @@ export default function ScrobbleRunBar({ suppressed = false }: { suppressed?: bo
         </span>
       )}
 
-      <button
-        type="button"
-        onClick={cancelScrobbleRun}
-        className="px-3 py-1 rounded-full text-xs font-medium border transition-colors
-                   bg-white/5 text-white/70 border-white/15
-                   hover:bg-rose-500/20 hover:text-rose-200 hover:border-rose-300/40"
-      >
-        Cancel
-      </button>
+      {/* Not offered during that single step: the batch in flight cannot be
+          recalled, so a Cancel there would be a button that does nothing. */}
+      {!run.step && (
+        <button
+          type="button"
+          onClick={cancelScrobbleRun}
+          className="px-3 py-1 rounded-full text-xs font-medium border transition-colors
+                     bg-white/5 text-white/70 border-white/15
+                     hover:bg-rose-500/20 hover:text-rose-200 hover:border-rose-300/40"
+        >
+          Cancel
+        </button>
+      )}
     </div>
   );
 }

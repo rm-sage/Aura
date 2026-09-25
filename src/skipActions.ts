@@ -35,8 +35,9 @@ import { isAnimeMeta } from "./aiometadata";
 import { getManualWatchedState, setManualWatchedMany } from "./manualWatched";
 import { isSkipped, setSkipped } from "./skipMarks";
 import { addHistoryEntries, type HistoryEntry } from "./historyStore";
-import { markScrobbled } from "./scrobbledStore";
-import { HISTORY_COMMAND, type ScrobbleService } from "./scrobbleConn";
+import { markScrobbled, markScrobbledMany } from "./scrobbledStore";
+import { HISTORY_COMMAND, type RowHistoryService, type ScrobbleService } from "./scrobbleConn";
+import { pushSimklHistory, simklCanIdentify, type SimklHistoryItem } from "./scrobbleSimkl";
 
 /** One episode being marked skipped, with everything History and the scrobble
  *  services need. Callers assemble these from a VideoEntry plus the series. */
@@ -171,7 +172,7 @@ export async function markEpisodesSkipped(
     return;
   }
 
-  const push = async (t: SkipTarget, service: ScrobbleService) => {
+  const push = async (t: SkipTarget, service: RowHistoryService) => {
     try {
       await invoke<string>(HISTORY_COMMAND[service], {
         id: t.id,
@@ -201,6 +202,44 @@ export async function markEpisodesSkipped(
       // Recorded so the History row reads as pushed and a later bulk run does
       // not send it a second time.
       if (await push(t, "trakt")) markScrobbled(opts.scrobbleScope!, "trakt", t.id, playedAt);
+    }
+  }
+
+  // SIMKL logs one play per episode, like Trakt, so nothing is collapsed; but
+  // its command takes the whole set in ONE call (Simkl allows about one POST
+  // per second, and Rust sends up to 100 rows per request), not one per
+  // episode. Movies, series and anime alike, so no anime gate: only rows with
+  // an id Simkl can key on are sent. Placed before AniList, whose anime-only
+  // gate returns early. A failure never aborts the AniList push below.
+  if (services.includes("simkl")) {
+    const sendable = targets
+      .map((t): SimklHistoryItem => ({
+        id: t.id,
+        parentId: t.parentId,
+        mediaType: t.mediaType,
+        season: t.season,
+        episode: t.episode,
+        name: t.name,
+        playedAt,
+        anilistId: t.anilistId,
+        anilistEpisode: t.anilistEpisode,
+      }))
+      .filter(simklCanIdentify);
+    try {
+      const results = await pushSimklHistory(opts.scrobbleScope, sendable);
+      const added: Array<{ service: ScrobbleService; id: string; playedAt: string }> = [];
+      results.forEach((r, i) => {
+        if (r.status === "added") {
+          added.push({ service: "simkl", id: sendable[i].id, playedAt });
+        } else {
+          console.warn(`[skip] simkl scrobble ${r.status} for ${sendable[i].id}: ${r.message}`);
+        }
+      });
+      // The whole answer arrives at once, so it is recorded with one persist
+      // and one change event, as the bulk runner does, not one per episode.
+      markScrobbledMany(opts.scrobbleScope, added);
+    } catch (e) {
+      console.warn(`[skip] simkl scrobble failed for ${sendable.length} episode(s): ${String(e)}`);
     }
   }
 

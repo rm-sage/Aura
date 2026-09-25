@@ -3,8 +3,14 @@
 
 import { useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { markIneligible, markScrobbledMany } from "./scrobbledStore";
-import { HISTORY_COMMAND, type ScrobbleService } from "./scrobbleConn";
+import { markIneligible, markIneligibleMany, markScrobbledMany } from "./scrobbledStore";
+import {
+  HISTORY_COMMAND,
+  isRowHistoryService,
+  type RowHistoryService,
+  type ScrobbleService,
+} from "./scrobbleConn";
+import { pushSimklHistory, simklItemFromEntry } from "./scrobbleSimkl";
 import type { HistoryEntry } from "./historyStore";
 
 // ---------------------------------------------------------------------------
@@ -24,6 +30,13 @@ import type { HistoryEntry } from "./historyStore";
 // transient failure the item is retried with exponential backoff, and the run
 // permanently slows down for the rest of the job (see `throttle`) so a rate limit
 // is backed away from rather than hammered.
+//
+// SIMKL IS ONE STEP, after the per-row loop. Its command takes every Simkl row
+// of the run in a single call and paces the requests itself on the Rust side
+// (chunks of 100, at least 1.1 s apart), so the loop's per-row spacing, retry
+// and throttle do not apply to it. The call is one long await with no progress
+// of its own to report, so the run shows it as one labelled step (`step`) and
+// credits its rows only when the answer arrives, rather than inventing ticks.
 // ---------------------------------------------------------------------------
 
 export interface ScrobbleRunState {
@@ -35,6 +48,9 @@ export interface ScrobbleRunState {
   failed: number;
   /** True while sleeping off a backoff — the UI says "retrying" not "stuck". */
   backingOff: boolean;
+  /** A single long step in flight (Simkl's batch), shown in place of the
+   *  count while it runs. Empty otherwise. */
+  step: string;
   /** What is being scrobbled, for the bar's label. */
   label: string;
 }
@@ -48,6 +64,8 @@ export interface ScrobbleRunSummary {
 
 export interface ScrobbleWorkItem {
   entry: HistoryEntry;
+  /** A batched service (Simkl) is gathered out of the list and sent in one
+   *  call; every other item is one push of the per-row loop. */
   service: ScrobbleService;
   /** History rows this single push SUBSUMES. They are marked scrobbled alongside
    *  it on success, and never pushed themselves.
@@ -63,7 +81,7 @@ export interface ScrobbleWorkItem {
   covers?: Array<{ id: string; playedAt: string }>;
 }
 
-/** Base spacing between pushes. Trakt's budget is roughly 1000 calls / 5 min.
+/** Base spacing between per-row pushes. Trakt's budget is roughly 1000 calls / 5 min.
  *
  *  AniList's is far tighter (~90/min) AND one "push" there is not one call: the
  *  resolve query, then the save mutation, and on a cold cache a search + a SEQUEL
@@ -73,8 +91,9 @@ export interface ScrobbleWorkItem {
  *  since the AniList side is now collapsed to one push per season (see
  *  ScrobbleWorkItem.covers) there are far fewer of them to pace anyway.
  *
- *  These are the FLOOR: `throttle` only ever widens them. */
-const BASE_DELAY_MS: Record<ScrobbleService, number> = {
+ *  These are the FLOOR: `throttle` only ever widens them. Simkl has no entry
+ *  because it is not paced here: its one batched call is paced in Rust. */
+const BASE_DELAY_MS: Record<RowHistoryService, number> = {
   trakt: 350,
   anilist: 1200,
 };
@@ -89,7 +108,7 @@ const THROTTLE_STEP = 1.6;
 const THROTTLE_MAX = 8;
 
 const IDLE: ScrobbleRunState = {
-  running: false, done: 0, total: 0, ok: 0, failed: 0, backingOff: false, label: "",
+  running: false, done: 0, total: 0, ok: 0, failed: 0, backingOff: false, step: "", label: "",
 };
 
 let state: ScrobbleRunState = IDLE;
@@ -160,8 +179,9 @@ function isRateLimit(message: string): boolean {
  * is the hard guarantee that two jobs can never overlap.
  *
  * Duplicate protection is unchanged and lives BELOW this layer: these are the
- * same two commands the single-row buttons call, and Trakt (idempotent on
- * `watched_at`) plus AniList (`AlreadyAhead`) are the real gates.
+ * same commands the single-row buttons call, and Trakt (idempotent on
+ * `watched_at`), AniList (`AlreadyAhead`) and Simkl (a re-sent row is a no-op)
+ * are the real gates.
  */
 export async function startScrobbleRun(
   scope: string,
@@ -170,9 +190,21 @@ export async function startScrobbleRun(
 ): Promise<ScrobbleRunSummary | null> {
   if (state.running || work.length === 0) return null;
 
+  // Per-row pushes and Simkl's batch, split once up front. The loop below only
+  // ever sees per-row services, so it cannot invoke the batched command with
+  // the per-row argument shape.
+  const rowWork: Array<ScrobbleWorkItem & { service: RowHistoryService }> = [];
+  const simklWork: Array<ScrobbleWorkItem & { service: "simkl" }> = [];
+  for (const item of work) {
+    const { service } = item;
+    // A second batched service would not type-check here: it needs its own step.
+    if (isRowHistoryService(service)) rowWork.push({ ...item, service });
+    else simklWork.push({ ...item, service });
+  }
+
   cancelRequested = false;
   setState({
-    running: true, done: 0, total: work.length, ok: 0, failed: 0, backingOff: false, label,
+    running: true, done: 0, total: work.length, ok: 0, failed: 0, backingOff: false, step: "", label,
   });
   // Mirror into Rust so the window-close handler knows to ask the user instead of
   // killing the run mid-flight. Cleared in the `finally` below, without which the
@@ -197,9 +229,9 @@ export async function startScrobbleRun(
 
   let cancelled = false;
   try {
-    for (let i = 0; i < work.length; i++) {
+    for (let i = 0; i < rowWork.length; i++) {
       if (cancelRequested) break;
-      const { entry, service } = work[i];
+      const { entry, service } = rowWork[i];
 
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         if (cancelRequested) break;
@@ -227,7 +259,7 @@ export async function startScrobbleRun(
           // is retried by the next run. Rows this push subsumes (see `covers`)
           // are marked with it -- their state IS now on the service.
           pending.push({ service, id: entry.id, playedAt: entry.played_at });
-          for (const c of work[i].covers ?? []) {
+          for (const c of rowWork[i].covers ?? []) {
             pending.push({ service, id: c.id, playedAt: c.playedAt });
           }
           if (pending.length >= CHUNK) flush();
@@ -259,16 +291,55 @@ export async function startScrobbleRun(
       }
 
       setState({ done: i + 1, ok, failed });
-      if (i < work.length - 1 && !cancelRequested) {
+      if (i < rowWork.length - 1 && !cancelRequested) {
         await sleep(BASE_DELAY_MS[service] * throttle);
       }
+    }
+
+    // The last point a cancel can still leave work unsent, so the summary's
+    // `cancelled` is read HERE and not after the step below: a press during
+    // that step changes nothing, and must not be reported as a cancel.
+    cancelled = cancelRequested;
+
+    // Simkl: every row in ONE call, answers mapped back by index. Not started
+    // after a cancel; once started it cannot be recalled (the bar hides its
+    // Cancel meanwhile), so its answers are still recorded, since those
+    // writes did happen.
+    if (simklWork.length > 0 && !cancelled) {
+      const n = simklWork.length;
+      setState({ step: `Simkl: sending ${n} item${n === 1 ? "" : "s"}` });
+      try {
+        const results = await pushSimklHistory(
+          scope, simklWork.map((w) => simklItemFromEntry(w.entry)),
+        );
+        const refused: string[] = [];
+        results.forEach((r, i) => {
+          const { entry } = simklWork[i];
+          if (r.status === "added") {
+            pending.push({ service: "simkl", id: entry.id, playedAt: entry.played_at });
+            ok++;
+            return;
+          }
+          // Same rule as a PERMANENT_PREFIX failure: a verdict about the item
+          // retires it, so it is not re-sent and re-reported on every run.
+          if (r.status === "not_found" || r.status === "skipped") refused.push(entry.id);
+          failed++;
+          if (!firstError) firstError = `${entry.name}: ${r.message}`;
+        });
+        markIneligibleMany(scope, "simkl", refused);
+      } catch (err) {
+        // Whole-batch refusal (not set up, not connected, sign-in gone): every
+        // row stays unmarked for the next run.
+        failed += n;
+        if (!firstError) firstError = String(err);
+      }
+      setState({ step: "", done: rowWork.length + n, ok, failed });
     }
   } finally {
     // Cancelled, threw, or ran to completion: keep the marks we earned and ALWAYS
     // release the lock, or every future run would be blocked by `running`. No
     // `return` in here -- that would swallow a genuine throw.
     flush();
-    cancelled = cancelRequested;
     cancelRequested = false;
     setState({ ...IDLE });
     void invoke("set_scrobble_run_active", { active: false }).catch(() => {});

@@ -45,7 +45,11 @@ import { showAppToast } from "../AppToast";
 import { openExternalUrl } from "../externalUrl";
 import { encodeQr } from "../qrCode";
 import {
+  LOOPBACK_ONLY_SIGN_IN,
+  REVOKE_BEFORE_RECONNECT,
   SCROBBLE_LABELS,
+  knownScrobbleServicesAvailable,
+  scrobbleServicesAvailable,
   summaryFor,
   type ScrobbleAuthStatus,
   type ScrobbleAuthSummary,
@@ -3535,7 +3539,7 @@ const TOC_GROUPS: TocGroup[] = [
     label: "Integrations",
     sections: [
       { id: "sec-discord",         label: "Discord Rich Presence" },
-      { id: "sec-scrobble",        label: "Trakt & AniList" },
+      { id: "sec-scrobble",        label: "Scrobbling" },
       { id: "sec-cloud-sync",      label: "Cloud Sync" },
       { id: "sec-api-keys",        label: "API Keys", advanced: true },
       { id: "sec-crash-reporting", label: "Crash Reporting", advanced: true },
@@ -3972,7 +3976,7 @@ function MouseBindRow({
 }
 
 // ---------------------------------------------------------------------------
-// ScrobbleAuthRow - one row in the new Trakt + AniList Settings section.
+// ScrobbleAuthRow - one row in the Scrobbling section (Trakt, AniList, Simkl).
 // Shows connection state ("Not connected" or "Connected as <user>"), a
 // Connect button that opens the OAuth authorize URL in the user's
 // default browser, and a Disconnect button when authenticated. The
@@ -3985,6 +3989,10 @@ function MouseBindRow({
 // matching the keyring layout in scrobble_auth.rs. Sharing a scope
 // across components keeps the displayed status in sync with the
 // stored token regardless of which Stremio account is signed in.
+//
+// A service this BUILD cannot sign in to (`scrobble_services_available`
+// leaves it out: Simkl until its client_id is filled in) renders muted with
+// no Connect button, rather than a button that can only fail.
 // ---------------------------------------------------------------------------
 
 /** Which services sign in with OAuth device flow (RFC 8628). Every other one
@@ -3993,18 +4001,23 @@ function MouseBindRow({
 const USES_DEVICE_FLOW: Record<ScrobbleService, boolean> = {
   trakt: true,
   anilist: false,
+  simkl: false,
 };
 
-/** The row's line for a lapsed token. */
+/** The row's line for a lapsed token. Simkl's "expired" is its renewal
+ *  deadline passing (180 days with no silent refresh), not its 7-day access
+ *  token, which renews itself. */
 const EXPIRED_COPY: Record<ScrobbleService, string> = {
   trakt: "Trakt token expired. Click Connect to re-authorize.",
   anilist: "AniList token expired. AniList does not support refresh, so click Connect to re-authorize.",
+  simkl: "Simkl sign-in has lapsed after months without a scrobble. Click Reconnect to sign in again.",
 };
 
 /** The row's line for a token inside its provider's stale window. */
 const STALE_COPY: Record<ScrobbleService, string> = {
   trakt: "Token expires soon. Aura renews it automatically on the next scrobble; reconnect only if it lapses first.",
   anilist: "AniList token expires within a week. Reconnect to extend (no automatic renewal).",
+  simkl: "Simkl will ask you to sign in again within a week. Finishing anything with scrobbling on renews it; otherwise reconnect when convenient.",
 };
 
 /** Format a Unix-seconds expiry into a "Mon DD, YYYY · HH:MM" string in
@@ -4071,7 +4084,24 @@ function ScrobbleAuthRow({
 
   const [status, setStatus] = useState<ScrobbleAuthSummary | null>(null);
   const [busy, setBusy] = useState(false);
-  // Auth-code (deep-link) waiting state - only used by AniList now.
+  // Can this build sign in to the service at all? Asked once per process (see
+  // scrobbleConn.ts); null until the answer arrives, which reads as available.
+  const [available, setAvailable] = useState<boolean | null>(() => {
+    const known = knownScrobbleServicesAvailable();
+    return known ? known.has(service) : null;
+  });
+  useEffect(() => {
+    let live = true;
+    void scrobbleServicesAvailable().then((set) => {
+      if (live) setAvailable(set.has(service));
+    });
+    return () => { live = false; };
+  }, [service]);
+  // Read through a ref so the answer arriving does not re-create `refresh`
+  // and re-run the mount fetch below for every row.
+  const unavailableRef = useRef(false);
+  unavailableRef.current = available === false;
+  // Auth-code (deep-link) waiting state - AniList and Simkl.
   const [pending, setPending] = useState(false);
   const timeoutRef = useRef<number | null>(null);
   // Tick driving the "expires in N days" relative qualifier. Without it the
@@ -4115,6 +4145,8 @@ function ScrobbleAuthRow({
   }, [service]);
 
   const refresh = useCallback(() => {
+    // Nothing to show for a service this build cannot use, so no keyring read.
+    if (unavailableRef.current) return;
     invoke<ScrobbleAuthStatus>("get_scrobble_auth_status", { scope })
       .then((s) => setStatus(summaryFor(s, service)))
       .catch(() => {
@@ -4133,8 +4165,13 @@ function ScrobbleAuthRow({
     // Deep-link arrival (AniList path): App.tsx persists the token,
     // then dispatches this event. Device-flow polling dispatches the
     // same event after a successful poll.
-    const onChanged = () => {
+    const onChanged = (e: Event) => {
       refresh();
+      // Another provider's disconnect-before-reconnect names itself in
+      // `detail`, and must not cancel THIS row's sign-in in flight (its
+      // scope stash or its device flow). Untagged events clear every row.
+      const from = (e as CustomEvent<{ service?: ScrobbleService } | null>).detail?.service;
+      if (from && from !== service) return;
       clearWaiting();
       setDeviceFlow(null);
     };
@@ -4234,16 +4271,26 @@ function ScrobbleAuthRow({
     };
   }, [deviceFlow, service, scope, label]);
 
-  // AniList has no device flow, so nothing polls on its behalf: if the
-  // user closes the browser tab without authorizing, the row would sit on
-  // "Connecting…" forever. Two minutes, then reset. Shared by the browser
-  // and in-app paths so both behave identically.
-  const armAniListTimeout = useCallback(() => {
+  // AniList and Simkl have no device flow, so nothing polls on their behalf:
+  // if the user closes the browser tab without authorizing, the row would sit
+  // on "Connecting…" forever. Two minutes, then reset. Shared by the browser
+  // and in-app paths so both behave identically. It is also the only way out
+  // of a DECLINED Simkl consent, which sends nothing back to Aura at all
+  // (Simkl's "You declined" page is the whole answer).
+  const armBrowserTimeout = useCallback(() => {
     if (timeoutRef.current !== null) window.clearTimeout(timeoutRef.current);
     timeoutRef.current = window.setTimeout(() => {
       timeoutRef.current = null;
       setPending(false);
-      sessionStorage.removeItem(`aura:oauth:pending:${service}`);
+      // Only the waiting UI times out for a loopback-only sign-in (Simkl).
+      // Its PKCE state lives in Rust for 15 minutes (NONCE_TTL in
+      // oauth_callback.rs), so an approval can still land after this and
+      // deliver a token: the scope stash stays for it, or App.tsx would file
+      // that token under "guest". Cancel, the token's arrival and the next
+      // Connect still clear or replace it.
+      if (!LOOPBACK_ONLY_SIGN_IN[service]) {
+        sessionStorage.removeItem(`aura:oauth:pending:${service}`);
+      }
       showAppToast(
         `${label} authorization didn't complete. Try again.`,
         { duration: 6000 },
@@ -4279,24 +4326,43 @@ function ScrobbleAuthRow({
       // loopback URL here would work too, but routing it through the
       // interceptor keeps the popup's trust check (prior host must be the
       // proxy) on the path it was written for.
+      //
+      // A loopback-only provider (Simkl) has no such hop: the popup simply
+      // follows its redirect to the loopback listener, which exchanges the
+      // code and emits the deep-link itself, so there is nothing to intercept.
       const url = await invoke<string>("scrobble_oauth_authorize_url", {
         service, loopback: false,
       });
-      openOAuthPopup(url, `Connect to ${label}`, {
+      openOAuthPopup(url, `Connect to ${label}`, LOOPBACK_ONLY_SIGN_IN[service] ? {} : {
         interceptPrefix: `aura://oauth/${service}`,
       });
       setPending(true);
-      armAniListTimeout();
+      armBrowserTimeout();
     } catch (e) {
       sessionStorage.removeItem(`aura:oauth:pending:${service}`);
       showAppToast(`Couldn't start ${label} auth: ${String(e)}`, { duration: 5000 });
     }
-  }, [useDeviceFlow, deviceFlow, service, scope, label, armAniListTimeout]);
+  }, [useDeviceFlow, deviceFlow, service, scope, label, armBrowserTimeout]);
 
   const connect = useCallback(async () => {
     if (busy || pending || deviceFlow) return;
     setBusy(true);
     try {
+      // Reconnecting over a stored token (the Expired row's Reconnect): Simkl
+      // disconnects first, which revokes the old grant, so the new sign-in
+      // does not leave a second live one behind (see REVOKE_BEFORE_RECONNECT).
+      // Best effort: a failed revoke must not block the sign-in. Before the
+      // scope stash below, because the auth-changed event clears it. The
+      // event names this service, so another row's sign-in in flight keeps
+      // its own stash.
+      if (status && REVOKE_BEFORE_RECONNECT[service]) {
+        try {
+          await invoke("clear_scrobble_auth_token", { service, scope });
+          window.dispatchEvent(new CustomEvent("aura:scrobble-auth-changed", { detail: { service } }));
+        } catch (e) {
+          console.warn(`[scrobble-auth] ${label} disconnect before reconnect failed:`, e);
+        }
+      }
       // Both providers now start in the user's DEFAULT BROWSER, which is
       // what RFC 8252 ("OAuth 2.0 for Native Apps") recommends for native
       // clients - not for purity, but because the system browser already
@@ -4356,6 +4422,9 @@ function ScrobbleAuthRow({
             service, loopback: true,
           });
         } catch (loopbackErr) {
+          // Simkl can only ever land on the loopback listener, so the popup
+          // would fail the same way: report the reason instead.
+          if (LOOPBACK_ONLY_SIGN_IN[service]) throw loopbackErr;
           console.warn("[scrobble-auth] loopback unavailable:", loopbackErr);
           showAppToast(
             "Opening sign-in inside Aura (the local callback port is unavailable).",
@@ -4366,7 +4435,7 @@ function ScrobbleAuthRow({
         }
         openExternalUrl(url);
         setPending(true);
-        armAniListTimeout();
+        armBrowserTimeout();
       }
     } catch (e) {
       sessionStorage.removeItem(`aura:oauth:pending:${service}`);
@@ -4375,8 +4444,8 @@ function ScrobbleAuthRow({
       setBusy(false);
     }
   }, [
-    busy, pending, deviceFlow, service, scope, useDeviceFlow, label,
-    connectInApp, armAniListTimeout,
+    busy, pending, deviceFlow, service, scope, useDeviceFlow, label, status,
+    connectInApp, armBrowserTimeout,
   ]);
 
   const cancelPending = useCallback(() => {
@@ -4434,6 +4503,17 @@ function ScrobbleAuthRow({
   }, [busy, service, scope]);
 
   const connected = !!status;
+
+  // Not in this build: muted, no Connect, one line saying so. Checked here,
+  // after every hook, so the hook order never depends on the answer.
+  if (available === false) {
+    return (
+      <div className="min-w-0">
+        <p className="text-white/45 text-sm font-medium">{label}</p>
+        <p className="text-white/35 text-xs leading-relaxed">Not set up in this build yet.</p>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-2">
@@ -4649,8 +4729,8 @@ function ScrobbleAuthRow({
           )}
         </div>
       )}
-      {/* AniList waiting state. Device flow gives Trakt a code to display;
-          AniList's authorization-code flow has nothing to show, so without
+      {/* AniList / Simkl waiting state. Device flow gives Trakt a code to
+          display; an authorization-code flow has nothing to show, so without
           this the row just sat on a disabled button with no explanation of
           what the user was supposed to do next in the browser. */}
       {pending && !deviceFlow && (
@@ -5841,7 +5921,7 @@ export default function SettingsView({ addons, session }: Props) {
                   filter becomes a no-op (every candidate passes). */}
               <SettingDropdown
                 label="Auto-skip filler / recap during autoplay"
-                description="Decides which button an UNATTENDED countdown presses when the next episode is filler or recap. Off, it counts down on Play next and the filler plays. Set to filler, recap or both, it counts down on Skip instead and jumps to the next canon episode. Either way the buttons are always both there, so you can override it for any single episode. Skipping marks every episode it jumped as Skipped and logs them to History; if you pressed Skip yourself and automatic scrobbling is on they are also sent to Trakt and AniList as watched, since neither service can represent a skip. An unattended skip marks locally and sends nothing. Requires AIOMetadata per-episode filler and recap flags; without them nothing is ever flagged and no skip button appears."
+                description="Decides which button an UNATTENDED countdown presses when the next episode is filler or recap. Off, it counts down on Play next and the filler plays. Set to filler, recap or both, it counts down on Skip instead and jumps to the next canon episode. Either way the buttons are always both there, so you can override it for any single episode. Skipping marks every episode it jumped as Skipped and logs them to History; if you pressed Skip yourself and automatic scrobbling is on they are also sent to your connected scrobbling services as watched, since none of them can represent a skip. An unattended skip marks locally and sends nothing. Requires AIOMetadata per-episode filler and recap flags; without them nothing is ever flagged and no skip button appears."
                 value={aura.nextUpSkipFillerRecap}
                 required
                 options={[
@@ -6032,16 +6112,23 @@ export default function SettingsView({ addons, session }: Props) {
             </Section>
           )}
 
-          {/* Scrobbling - direct Trakt + AniList OAuth.
+          {/* Scrobbling - direct Trakt + AniList + Simkl OAuth.
               Replaces the AIOMetadata-addon scrobble path with a
               direct connection to each provider. Tokens are stored in
               the OS keyring per Stremio account so signing out and
               back in keeps the connection. Connect opens the user's
               default browser; the VPS proxy at aura.animasec.dev
               completes the OAuth dance and deep-links the token back
-              into Aura. */}
+              into Aura (Simkl needs no proxy: it redirects straight to
+              the loopback listener, which does the exchange itself).
+              The ScrobbleAuthRows (Simkl included) add no AppSettings /
+              AuraSettings field: the connections live in the keyring, per
+              account, so export/import and cloud sync carry nothing for
+              them. The two toggles below (scrobble_enabled,
+              auto_scrobble_enabled) ARE backend settings, listed in
+              PORTABLE_BACKEND_FIELDS. */}
           {backend && (
-            <Section id="sec-scrobble" title="Trakt & AniList">
+            <Section id="sec-scrobble" title="Scrobbling">
               <ScrobbleAuthRow
                 service="trakt"
                 authKey={session?.auth_key ?? null}
@@ -6054,9 +6141,15 @@ export default function SettingsView({ addons, session }: Props) {
                 description="AniList tracks anime episode progress. When connected, Aura updates your AniList list as you finish episodes; anime detection is automatic. AniList is additional to Trakt, not instead of it: an anime episode with an IMDb id is sent to both connected services."
               />
               <div className="h-px bg-white/6" />
+              <ScrobbleAuthRow
+                service="simkl"
+                authKey={session?.auth_key ?? null}
+                description="Simkl keeps a history of the movies, series and anime you finish. Like Trakt, nothing is sent while you watch: Aura adds each item to your Simkl history once, on completion, and an episode you mark Skipped is sent straight away. Simkl is additional to the others, not instead of them: an anime episode goes to both AniList and Simkl, and a movie or series to both Trakt and Simkl."
+              />
+              <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Enable scrobbling"
-                description="Master switch. When off, Aura sends nothing automatically to either provider, useful for pausing without disconnecting your accounts. The History page's per-row and bulk scrobble buttons still send when you press them."
+                description="Master switch. When off, Aura sends nothing automatically to any provider, useful for pausing without disconnecting your accounts. The History page's per-row and bulk scrobble buttons still send when you press them."
                 value={backend.scrobble_enabled}
                 onChange={(v) => patchBackend({ scrobble_enabled: v })}
               />

@@ -7233,6 +7233,7 @@ export default function App() {
       session_active: boolean;
       trakt_fired: boolean;
       anilist_fired: boolean;
+      simkl_fired: boolean;
       message: string;
     }
     const handler = async (e: Event) => {
@@ -7286,9 +7287,11 @@ export default function App() {
           time,
           duration,
         });
+        // Any provider firing is a pass; `message` carries each one's leg.
+        const fired = r.trakt_fired || r.anilist_fired || r.simkl_fired;
         detail.respond({
-          ok: r.trakt_fired || r.anilist_fired,
-          level: r.trakt_fired || r.anilist_fired ? "info" : "warn",
+          ok: fired,
+          level: fired ? "info" : "warn",
           message: r.message,
         });
       } catch (err) {
@@ -9203,6 +9206,10 @@ export default function App() {
         // with the token + refresh + expires + username in query
         // params. We persist the token via the Tauri command and
         // surface a toast so the user knows the connection landed.
+        // Simkl arrives here too, as `aura://oauth/simkl?...`, re-emitted
+        // by the loopback listener after IT exchanged the code (PKCE, no
+        // proxy). Its `expires` is absolute unix seconds, the same unit
+        // the proxy sends for Trakt / AniList, so it is stored as is.
         if (url.hostname === "oauth") {
           const service = url.pathname.replace(/^\//, "").toLowerCase();
           if (!isScrobbleService(service)) return;

@@ -7,32 +7,40 @@ import { useNotifications } from "./NotificationsContext";
 import {
   SCROBBLE_LABELS,
   SCROBBLE_SERVICES,
+  scrobbleServicesAvailable,
   summaryFor,
   type ScrobbleAuthStatus,
   type ScrobbleService,
 } from "./scrobbleConn";
 
 // ---------------------------------------------------------------------------
-// useScrobbleAuthAlerts — surfaces expired Trakt / AniList tokens in the
-// notification bell so users notice without having to open Settings.
+// useScrobbleAuthAlerts: surfaces expired Trakt / AniList / Simkl tokens in
+// the notification bell so users notice without having to open Settings.
 //
 // Trigger sources:
 //   • mount (covers the case where the user opens Aura with a token that
 //     lapsed while the app was closed)
 //   • `aura:scrobble-auth-changed` window events (fires after deep-link
 //     persistence or manual disconnect)
-//   • window focus (catches mid-session expiries — token went 401 from
-//     scrobble.rs's clear-on-401 path while user was outside the app)
+//   • window focus (catches a STORED token whose expiry passed while the
+//     user was outside the app; a token cleared on a 401 or invalid_grant
+//     is not connected and raises nothing, see below)
 //
 // Notification ids are stable per (provider, scope) so re-firing produces
 // no duplicates. When a provider's token is renewed (post-reconnect), the
 // matching expired-notification is removed.
+//
+// What fires is a STORED token past its expiry. A token Rust has already
+// cleared (AniList's 401, Simkl's invalid_grant) reads as not connected, not
+// expired, so it raises nothing here, the same for every provider. A service
+// this build cannot use (Simkl with no client_id) never alerts.
 // ---------------------------------------------------------------------------
 
 /** The alert's second line, per provider. */
 const EXPIRED_SUBTITLE: Record<ScrobbleService, string> = {
   trakt:   "Open Settings and reconnect to keep scrobbling.",
   anilist: "AniList does not support refresh. Open Settings and reconnect to keep scrobbling.",
+  simkl:   "Simkl sign-in lapsed after months without a scrobble. Reconnect to keep scrobbling.",
 };
 
 function alertId(provider: ScrobbleService, scope: string) {
@@ -55,12 +63,13 @@ export function useScrobbleAuthAlerts(authKey: string | null) {
     } catch {
       return;
     }
+    const available = await scrobbleServicesAvailable();
     // Walk the KNOWN providers, not the payload's keys: a disconnected one is
     // absent (or null, from an older backend) and reads as not expired, and a
     // key this build does not know about is ignored rather than alerted on.
     for (const provider of SCROBBLE_SERVICES) {
       const summary = summaryFor(status, provider);
-      const isExpired = !!summary?.expired;
+      const isExpired = available.has(provider) && !!summary?.expired;
       const wasExpired = seen.current[provider] === true;
       if (isExpired && !wasExpired) {
         addNotification({

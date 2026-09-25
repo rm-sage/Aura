@@ -34,7 +34,10 @@ import type { ScrobbleService } from "./scrobbleConn";
 
 const STORAGE_KEY_PREFIX = "aura:scrobbled:";
 const CHANGE_EVENT = "aura:scrobbled-changed";
-const MAX_KEYS = 3000;
+/** 1.5x the most marks a full 1000-row history can need (one per row per
+ *  service, three services), so a history that is all scrobbled still leaves
+ *  room for re-watches before a live row's mark is evicted. */
+const MAX_KEYS = 4500;
 
 let _scope = "guest";
 let _keys: Set<string> = new Set();
@@ -104,7 +107,7 @@ export function markScrobbled(
  *
  *  `markScrobbled` serializes the whole key set and re-renders the History view
  *  on every call, so a bulk run that marked each row individually would do one
- *  localStorage write and one full re-render PER PUSH (up to 1000 rows x 2
+ *  localStorage write and one full re-render PER PUSH (up to 1000 rows x 3
  *  services). The bulk runner therefore accumulates its successes and flushes
  *  them through here in chunks. */
 export function markScrobbledMany(
@@ -185,10 +188,17 @@ export function isIneligible(scope: string, service: ScrobbleService, id: string
 
 /** Retire an item for a service after a PERMANENT_PREFIX failure. */
 export function markIneligible(scope: string, service: ScrobbleService, id: string): void {
+  markIneligibleMany(scope, service, [id]);
+}
+
+/** Retire MANY items with ONE persist and ONE change event. Simkl's batch
+ *  answers a whole bulk run at once, and retiring its refusals one call at a
+ *  time would re-serialise this map and re-render History once per row. */
+export function markIneligibleMany(scope: string, service: ScrobbleService, ids: string[]): void {
+  if (ids.length === 0) return;
   hydrateIneligible(scope);
-  const key = `${service}::${id}`;
   const now = Date.now();
-  _ineligible[key] = now;
+  for (const id of ids) _ineligible[`${service}::${id}`] = now;
   const keys = Object.keys(_ineligible);
   if (keys.length > MAX_INELIGIBLE) {
     // Drop the oldest marks (and anything already expired) back under the cap.

@@ -145,13 +145,13 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
   {
     prefix:      "aura:scrobble-ineligible:",
     label:       "Refused-scrobble record",
-    description: "History items Trakt or AniList has definitively refused (no catalog match for the episode under this numbering, or an unresolvable title), so bulk runs stop re-sending them and re-reporting the same failure. Expires after 30 days in case the catalog gains the entry. Clearing it just means those items get retried once more.",
+    description: "History items Trakt, AniList or Simkl has definitively refused (no catalog match for the episode under this numbering, or an unresolvable title), so bulk runs stop re-sending them and re-reporting the same failure. Expires after 30 days in case the catalog gains the entry. Clearing it just means those items get retried once more.",
     destructive: false,
   },
   {
     prefix:      "aura:scrobbled:",
     label:       "Scrobbled-history record",
-    description: "Which History rows you have already pushed to Trakt / AniList, so a bulk 'Scrobble All' can skip them instead of re-sending. Not the duplicate guard itself: Trakt ignores a repeat of the same watched_at and AniList won't move progress backwards, so clearing this only costs a few redundant calls on the next bulk run. Safe to clear.",
+    description: "Which History rows you have already pushed to Trakt / AniList / Simkl, so a bulk 'Scrobble All' can skip them instead of re-sending. Not the duplicate guard itself: Trakt ignores a repeat of the same watched_at, AniList won't move progress backwards and Simkl ignores a row it already has, so clearing this only costs a few redundant calls on the next bulk run. Safe to clear.",
     destructive: false,
   },
 ];
