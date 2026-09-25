@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import {
   DndContext,
   PointerSensor,
@@ -22,6 +22,7 @@ import { CSS } from "@dnd-kit/utilities";
 import { invoke } from "@tauri-apps/api/core";
 import { openExternalUrl } from "../externalUrl";
 import type { AddonEntry } from "../types";
+import { ADDON_LIST_NOT_LOADED, COLLECTION_CHANGED, accountChangedCopy } from "../types";
 import type { UserSession } from "../LoginView";
 import LoginView from "../LoginView";
 import { openContextMenu } from "../ContextMenu";
@@ -72,6 +73,39 @@ const OVERRIDE_LINKS: Record<OverridableJob, { label: string; section: string }>
 // Types
 // ---------------------------------------------------------------------------
 
+/** What a signed-in refresh's write to the Stremio collection did
+ *  (`CollectionWrite` in stremio.rs). Only "written" changed the account;
+ *  "unchanged" means the account already holds this manifest, so the
+ *  refresh persists anyway; every other outcome leaves the refresh for this
+ *  session only. "account_changed" means the account's read was empty or
+ *  no longer held every addon this page shows, so nothing was pushed from
+ *  what may be a partial read; the Refresh button then has App reload the
+ *  list, as the other account writes do on COLLECTION_CHANGED. */
+type CollectionWrite =
+  | {
+      outcome:
+        | "written" | "unchanged" | "not_in_collection" | "protected"
+        | "account_changed" | "failed" | "session_expired";
+    }
+  | { outcome: "refused"; reason: string };
+
+/** The notice an explicit Refresh shows when the account was not updated
+ *  for a reason the user can act on or should know. Null when there is
+ *  nothing to say: written, unchanged, a protected or local-only addon
+ *  (Stremio never lets a client update a protected one, such as Cinemeta),
+ *  or a guest; and for "account_changed", whose notice waits on App's
+ *  reload of the list (see handleRefresh). */
+function collectionWriteNotice(name: string, write: CollectionWrite | null | undefined): string | null {
+  if (!write) return null;
+  if (write.outcome === "refused") {
+    return `${name} was not saved to your Stremio account: ${write.reason}. The refresh applies to this session only.`;
+  }
+  if (write.outcome === "failed") {
+    return `Couldn't save ${name} to your Stremio account. The refresh applies to this session only.`;
+  }
+  return null;
+}
+
 interface Props {
   addons: AddonEntry[];
   session: UserSession | null;
@@ -85,6 +119,20 @@ interface Props {
    *  state — this callback fires the cloud / local invoke and is
    *  expected to swallow + toast on failure. */
   onReorder: (urls: string[]) => void;
+  /** Reload the signed-in list from the Stremio account after a write came
+   *  back COLLECTION_CHANGED (App.handleAccountChanged). Resolves whether
+   *  the list was reloaded. */
+  onAccountChanged: () => Promise<boolean>;
+  /** Whether this auth key's list has loaded from the Stremio account this
+   *  session (App.isAddonListSynced). Until it has, no account write is
+   *  issued from this page: add and remove say ADDON_LIST_NOT_LOADED, and a
+   *  refresh applies for the session without writing the account. A `false`
+   *  also has App start a sync of the list, so the next press can write. */
+  isAddonListSynced: (authKey: string) => boolean;
+  /** The session as it is at call time, from App: the silent refresh after
+   *  Configure fires long after the click, possibly after its row has
+   *  unmounted, so it cannot trust a prop captured earlier. */
+  currentSession: () => UserSession | null;
   onLoginSuccess: (sess: UserSession) => void;
   onLogout: () => void;
   onSessionExpired: () => void;
@@ -207,11 +255,20 @@ function AuthCard({
 
 function AddAddonForm({
   session,
+  shownUrls,
   onAdd,
+  onAccountChanged,
+  isAddonListSynced,
   onSessionExpired,
 }: {
   session: UserSession | null;
+  /** The url of every addon the list shows. A cloud write refuses when its
+   *  fresh read of the account lacks any of them (a partial read would
+   *  delete the rest), so every account write on this page sends them. */
+  shownUrls: string[];
   onAdd: (entry: AddonEntry) => void;
+  onAccountChanged: () => Promise<boolean>;
+  isAddonListSynced: (authKey: string) => boolean;
   onSessionExpired: () => void;
 }) {
   const [url, setUrl] = useState("");
@@ -221,12 +278,22 @@ function AddAddonForm({
   const handleAdd = async () => {
     const trimmed = url.trim();
     if (!trimmed) return;
+    // No account write until the list `shownUrls` comes from has loaded
+    // from that account (App.isAddonListSynced).
+    if (session?.auth_key && !isAddonListSynced(session.auth_key)) {
+      setError(ADDON_LIST_NOT_LOADED);
+      return;
+    }
     setAdding(true);
     setError(null);
     try {
       let entry: AddonEntry;
       if (session?.auth_key) {
-        entry = await invoke<AddonEntry>("cloud_add_addon", { authKey: session.auth_key, url: trimmed });
+        entry = await invoke<AddonEntry>("cloud_add_addon", {
+          authKey: session.auth_key,
+          url: trimmed,
+          expectedUrls: shownUrls,
+        });
       } else {
         entry = await invoke<AddonEntry>("add_addon", { url: trimmed });
       }
@@ -235,6 +302,11 @@ function AddAddonForm({
     } catch (e) {
       const msg = String(e);
       if (msg === "SESSION_EXPIRED") { onSessionExpired(); return; }
+      // The url stays in the field, so trying again is one press.
+      if (msg === COLLECTION_CHANGED) {
+        setError(accountChangedCopy(await onAccountChanged(), "Try again."));
+        return;
+      }
       setError(msg);
     } finally {
       setAdding(false);
@@ -288,21 +360,31 @@ function AddAddonForm({
 function AddonRow({
   addon,
   session,
+  shownUrls,
   onRemove,
   onRefreshed,
+  onAccountChanged,
+  isAddonListSynced,
+  currentSession,
   onSessionExpired,
   reorderEnabled,
 }: {
   addon: AddonEntry;
   session: UserSession | null;
+  /** Every url the list shows; see AddAddonForm. */
+  shownUrls: string[];
   onRemove: (url: string) => void;
   onRefreshed: (url: string, entry: AddonEntry) => void;
+  onAccountChanged: () => Promise<boolean>;
+  isAddonListSynced: (authKey: string) => boolean;
+  currentSession: () => UserSession | null;
   onSessionExpired: () => void;
   /** False collapses the drag handle to a non-interactive spacer so
    *  single-addon lists keep a stable leading-edge width. */
   reorderEnabled: boolean;
 }) {
   const [removing, setRemoving] = useState(false);
+  const removingRef = useRef(false);
   const [refreshing, setRefreshing] = useState(false);
   const [copied, setCopied] = useState(false);
 
@@ -337,17 +419,42 @@ function AddonRow({
     : `${addon.url.replace(/\/$/, "")}/configure`;
 
   const handleRemove = async () => {
+    // One remove per row at a time. The button is disabled while one runs,
+    // but the context menu's item is not, and a menu opened earlier holds a
+    // closure whose `removing` is still false, hence a ref. A second remove
+    // queued behind the first would reach an account that no longer holds
+    // this entry.
+    if (removingRef.current) return;
+    // No account write until the list has loaded from it (see AddAddonForm).
+    if (session?.auth_key && !isAddonListSynced(session.auth_key)) {
+      showAppToast(ADDON_LIST_NOT_LOADED, { duration: 5000 });
+      return;
+    }
+    removingRef.current = true;
     setRemoving(true);
     try {
       if (session?.auth_key) {
-        await invoke("cloud_remove_addon", { authKey: session.auth_key, url: addon.url });
+        await invoke("cloud_remove_addon", {
+          authKey: session.auth_key,
+          url: addon.url,
+          expectedUrls: shownUrls,
+        });
       } else {
         await invoke("remove_addon", { url: addon.url });
       }
       onRemove(addon.url);
     } catch (e) {
-      if (String(e) === "SESSION_EXPIRED") onSessionExpired();
+      // Rust's refusals are complete UI copy ("Cinemeta is a built-in
+      // Stremio addon and can't be removed from your account."), so show
+      // the text as is, the way the add form does, rather than just
+      // re-enabling the button. An account that changed under this list
+      // has App reload it first, then says so.
+      removingRef.current = false;
       setRemoving(false);
+      if (String(e) === "SESSION_EXPIRED") onSessionExpired();
+      else if (String(e) === COLLECTION_CHANGED) {
+        showAppToast(accountChangedCopy(await onAccountChanged(), "Try again."), { duration: 5000 });
+      } else showAppToast(String(e), { duration: 5000 });
     }
   };
 
@@ -362,13 +469,39 @@ function AddonRow({
   // fields. Dispatches `aura:addon-manifest-refreshed` so HomeView
   // re-bootstraps its catalog rows against the new manifest without
   // waiting for an unrelated settings change to bump its settingsTick.
-  const handleRefresh = async (silent = false) => {
+  // Signed in, the auth key goes along and Rust also writes the fresh
+  // manifest to the user's Stremio collection, under guards that can refuse
+  // it (one checks the account still holds every url this list shows). That
+  // write never fails the refresh: its outcome comes back as `collection`,
+  // and only the explicit button reports a refusal or failure, as a second
+  // toast after the usual one. The silent post-Configure refresh passes
+  // `report: false`, so Rust hands the entry back without waiting on the
+  // account write, which then runs (and logs) on its own; `accountKey` is
+  // the account it may write to, or null for none. Until that account's
+  // list has loaded this session (App.isAddonListSynced, which then starts
+  // a sync of it) no auth key goes along at all: the refresh applies to this
+  // session only, and the button says so.
+  const handleRefresh = async (
+    silent = false,
+    accountKey: string | null = session?.auth_key ?? null,
+  ) => {
     if (refreshing) return;
+    const writeKey = accountKey && isAddonListSynced(accountKey) ? accountKey : null;
     setRefreshing(true);
     try {
-      const manifest = await invoke<{ catalogs: unknown[]; name?: string; entry: AddonEntry }>(
+      const manifest = await invoke<{
+        catalogs: unknown[];
+        name?: string;
+        entry: AddonEntry;
+        collection?: CollectionWrite | null;
+      }>(
         "refresh_addon_manifest",
-        { addonUrl: addon.url },
+        {
+          addonUrl: addon.url,
+          authKey: writeKey,
+          expectedUrls: writeKey ? shownUrls : null,
+          report: !silent,
+        },
       );
       const count = Array.isArray(manifest.catalogs) ? manifest.catalogs.length : 0;
       if (manifest.entry) onRefreshed(addon.url, manifest.entry);
@@ -377,6 +510,22 @@ function AddonRow({
       }));
       if (!silent) {
         showAppToast(`Refreshed ${addon.name} — ${count} catalog${count === 1 ? "" : "s"}`, { duration: 2500 });
+        const notice = accountKey && !writeKey
+          ? `${addon.name} was not saved to your Stremio account: your addon list hasn't loaded from Stremio yet (Aura is loading it now). The refresh applies to this session only; refresh again in a moment to save it.`
+          : collectionWriteNotice(addon.name, manifest.collection);
+        if (notice) showAppToast(notice, { duration: 5000 });
+        // Every other account action on this page signs out on an expired
+        // session; the silent refresh does not, since nobody asked for it.
+        if (manifest.collection?.outcome === "session_expired") onSessionExpired();
+        // The reload replaces this row's refreshed fields with the account's
+        // stored snapshot, so a second Refresh is what saves it.
+        if (manifest.collection?.outcome === "account_changed") {
+          const reloaded = await onAccountChanged();
+          showAppToast(
+            accountChangedCopy(reloaded, `Refresh ${addon.name} again to save it to your account.`),
+            { duration: 5000 },
+          );
+        }
       }
     } catch (e) {
       if (!silent) {
@@ -387,33 +536,64 @@ function AddonRow({
     }
   };
 
-  // Configure handler — opens the addon's /configure page in the user's
+  // The silent refresh after Configure fires long after the click that
+  // armed it, so it reads the session from App at fire time
+  // (`currentSession`) and calls the refresh through a ref updated every
+  // render. A closure from the click would carry that moment's session, and
+  // could write to an account the user has since signed out of or switched
+  // away from.
+  const refreshRef = useRef(handleRefresh);
+  refreshRef.current = handleRefresh;
+  // The armed post-Configure refresh: `disarm` tears all of it down (its
+  // focus listener, its expiry and a pending fire), for the next Configure
+  // click; `unlisten` only the listener and expiry, for unmount. A fire
+  // already scheduled when the row unmounts still runs (the user came back
+  // by clicking straight onto another page, and Home must still get the new
+  // catalogs), while a listener never outlives its row.
+  const armedConfigureRef = useRef<{ disarm: () => void; unlisten: () => void } | null>(null);
+  useEffect(() => () => armedConfigureRef.current?.unlisten(), []);
+
+  // Configure handler: opens the addon's /configure page in the user's
   // default browser, then schedules a silent manifest refresh on the
   // next window-focus event (capped at 30 min). This is the "user
   // toggles catalogs on AIOMetadata's UI, comes back to Aura, expects
   // to see them" workflow: without auto-refresh, Aura would hold the
   // pre-configure manifest until the 24h TTL elapses or the user
-  // manually clicks Refresh. The focus-listener is one-shot per
-  // configure click so it can't accumulate across rapid re-clicks.
+  // manually clicks Refresh. One refresh is armed at a time: a second
+  // click replaces the first, so listeners never accumulate.
   const handleConfigure = () => {
     openExternalUrl(configureUrl);
-    let fired = false;
-    const cleanup = () => {
+    armedConfigureRef.current?.disarm();
+    // The only account the refresh may write to: the one signed in now.
+    const armedKey = currentSession()?.auth_key ?? null;
+    let pending: ReturnType<typeof setTimeout> | undefined;
+    const unlisten = () => {
       window.removeEventListener("focus", onFocus);
       clearTimeout(expiry);
     };
+    const disarm = () => {
+      unlisten();
+      clearTimeout(pending);
+      if (armedConfigureRef.current === armed) armedConfigureRef.current = null;
+    };
     const onFocus = () => {
-      if (fired) return;
-      fired = true;
-      cleanup();
+      unlisten();
       // Brief delay so the manifest fetch doesn't race with whatever
       // tail-end network requests the addon's configure submit kicked
       // off (AIOMetadata persists config server-side before the page
       // re-renders).
-      setTimeout(() => { void handleRefresh(true); }, 750);
+      pending = setTimeout(() => {
+        disarm();
+        // Signed out, or signed in to another account, since the click:
+        // refresh this session's view but write to no account.
+        const key = currentSession()?.auth_key ?? null;
+        void refreshRef.current(true, key !== null && key === armedKey ? key : null);
+      }, 750);
     };
-    const expiry = setTimeout(cleanup, 30 * 60 * 1000);
+    const expiry = setTimeout(disarm, 30 * 60 * 1000);
     window.addEventListener("focus", onFocus);
+    const armed = { disarm, unlisten };
+    armedConfigureRef.current = armed;
   };
 
   const handleCopyManifest = async () => {
@@ -716,6 +896,9 @@ export default function AddonsView({
   onRemove,
   onRefreshed,
   onReorder,
+  onAccountChanged,
+  isAddonListSynced,
+  currentSession,
   onLoginSuccess,
   onLogout,
   onSessionExpired,
@@ -754,6 +937,8 @@ export default function AddonsView({
     return () => window.removeEventListener("aura:settings-changed", onChange);
   }, []);
   const overridden = overriddenJobs(addons);
+  // Every url the list shows, sent with each account write (see AddAddonForm).
+  const shownUrls = addons.map((a) => a.url);
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
@@ -812,7 +997,10 @@ export default function AddonsView({
           </div>
           <AddAddonForm
             session={session}
+            shownUrls={shownUrls}
             onAdd={onAdd}
+            onAccountChanged={onAccountChanged}
+            isAddonListSynced={isAddonListSynced}
             onSessionExpired={onSessionExpired}
           />
         </section>
@@ -871,8 +1059,12 @@ export default function AddonsView({
                       key={addon.url}
                       addon={addon}
                       session={session}
+                      shownUrls={shownUrls}
                       onRemove={onRemove}
                       onRefreshed={onRefreshed}
+                      onAccountChanged={onAccountChanged}
+                      isAddonListSynced={isAddonListSynced}
+                      currentSession={currentSession}
                       onSessionExpired={onSessionExpired}
                       reorderEnabled={addons.length > 1}
                     />

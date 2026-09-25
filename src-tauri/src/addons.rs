@@ -19,11 +19,14 @@ use tauri::Manager;
 ///   heal whenever the addon is refreshed (the Refresh button, or the
 ///   silent refresh after Configure).
 /// - `cloud_add_addon` and `auth.rs::get_synced_addons` build from the
-///   manifest SNAPSHOT stored in the user's Stremio addon collection, and
-///   Aura never rewrites that snapshot (a refresh does not write the
-///   collection). For a signed-in user a refresh therefore heals the fields
-///   for the running session only: the next launch or sign-in rebuilds the
-///   entry from the snapshot again.
+///   manifest SNAPSHOT stored in the user's Stremio addon collection. A
+///   signed-in refresh also writes the manifest it fetched, verbatim, into
+///   that addon's collection entry, under the guards listed on
+///   `stremio.rs::refresh_addon_manifest`, so the next launch or sign-in
+///   rebuilds the entry from the fresh snapshot. When that write is refused
+///   or fails, the refresh heals the fields for the running session only,
+///   and the next launch or sign-in rebuilds the entry from the old snapshot
+///   again.
 ///
 /// The two builders differ in one cap. The live-manifest one keeps the
 /// first 16 manifest-level `id_prefixes`; the cloud one keeps them all. The

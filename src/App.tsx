@@ -149,7 +149,7 @@ import type {
   StreamFetchResult,
   VideoEntry,
 } from "./types";
-import { isVideoAired } from "./types";
+import { ACCOUNT_HAS_NO_ADDONS, ADDON_LIST_NOT_LOADED, COLLECTION_CHANGED, accountChangedCopy, isVideoAired } from "./types";
 import { nextAiringEpisode } from "./releaseCountdown";
 import type { UserSession, StremioAccount } from "./LoginView";
 import "./App.css";
@@ -2181,6 +2181,16 @@ function withRefreshedAddon(
   return changed ? next : null;
 }
 
+/** `current` put back in `order`'s order: an entry `order` lists takes its
+ *  place from it, and one it does not (added since) trails in its own
+ *  order. Undoes a failed drag without undoing what happened meanwhile, so
+ *  an addon removed while the reorder waited stays removed. */
+function withOrderOf(current: readonly AddonEntry[], order: readonly AddonEntry[]): AddonEntry[] {
+  const rank = new Map(order.map((a, i) => [a.url, i] as const));
+  const at = (a: AddonEntry) => rank.get(a.url) ?? order.length;
+  return [...current].sort((a, b) => at(a) - at(b));
+}
+
 export default function App() {
   // ── Nav state ──
   // Restore the route from sessionStorage on a webview reload (Ctrl+R / F5)
@@ -2237,6 +2247,22 @@ export default function App() {
   // depending on cache age at the moment of the reload (Bleach: orange
   // fanart.tv art vs a black TMDB lineup). Monotonic: never reset.
   const [addonsSettled, setAddonsSettled] = useState(false);
+  // The signed-in addon list's account bookkeeping, for the writes to the
+  // Stremio collection (see handleAccountChanged and isAddonListSynced).
+  // `addonsRef` is the list as last rendered, for async work that outlives
+  // the render it started in. `addonsGenRef` moves on every local change to
+  // the list (add, remove, reorder, refresh, an Onboarding install, a sign-in
+  // or sign-out), so a sync or reload can tell that the list changed under
+  // its read. `reorderInFlightRef` counts drags whose account write has not
+  // settled: the drag's order is already shown but may not be in the account
+  // yet, so a read taken meanwhile can hold the order it replaces.
+  // `syncedAccountRef` is the auth key whose list a `get_synced_addons` has
+  // loaded this session, or null.
+  const addonsRef = useRef<AddonEntry[]>(addons);
+  addonsRef.current = addons;
+  const addonsGenRef = useRef(0);
+  const reorderInFlightRef = useRef(0);
+  const syncedAccountRef = useRef<string | null>(null);
 
   // ── Library (Continue Watching + Calendar source) ──
   const [library, setLibrary] = useState<LibraryItem[]>([]);
@@ -5697,8 +5723,15 @@ export default function App() {
     } catch (err) {
       if (String(err) === SESSION_EXPIRED) {
         await invoke("logout").catch(() => {});
+        syncedAccountRef.current = null;
+        refreshedAddonsRef.current.clear();
+        addonsGenRef.current += 1;
         setSession(null);
         setLibrary([]); setRawLibrary([]);
+        // Back to the guest's own list, as handleSessionExpired does (declared
+        // below, so not called from here): signed out while still showing the
+        // account's addons, a guest's add or reorder would work from them.
+        await invoke<AddonEntry[]>("list_addons").then(setAddons).catch(() => setAddons([]));
       }
       // Other errors silently leave library empty — calendar/Continue Watching
       // will just show empty states.
@@ -5798,6 +5831,9 @@ export default function App() {
   // ── Session expired ──
   const handleSessionExpired = useCallback(async () => {
     await invoke("logout").catch(() => {});
+    syncedAccountRef.current = null;
+    refreshedAddonsRef.current.clear();
+    addonsGenRef.current += 1;
     setSession(null);
     setLibrary([]); setRawLibrary([]);
     // Awaited so callers resume only once the local list has LANDED.
@@ -6750,16 +6786,152 @@ export default function App() {
     (authKey: string) => `aura:cloud-addons-cache:${authKey.slice(0, 12)}`,
     [],
   );
-  const loadSyncedAddons = useCallback(async (sess: UserSession) => {
-    const key = cloudAddonCacheKey(sess.auth_key);
-    let cached: AddonEntry[] | null = null;
+  /** `authKey`'s warm-start addon list, or null (none, or corrupt). */
+  const readCloudAddonCache = useCallback((authKey: string): AddonEntry[] | null => {
     try {
-      const raw = localStorage.getItem(key);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) cached = parsed as AddonEntry[];
+      const raw = localStorage.getItem(cloudAddonCacheKey(authKey));
+      const parsed: unknown = raw ? JSON.parse(raw) : null;
+      return Array.isArray(parsed) ? (parsed as AddonEntry[]) : null;
+    } catch {
+      return null;
+    }
+  }, [cloudAddonCacheKey]);
+
+  /** Sync `sess`'s addon list from the Stremio account, for the sign-in /
+   *  restore load (loadSyncedAddons) and for the re-sync a write starts while
+   *  the list has not loaded (isAddonListSynced). `shown` is the list on
+   *  screen for this account as the sync starts: its warm cache, or empty.
+   *  What this adopts becomes every later write's `expectedUrls`, the only
+   *  thing Rust's partial-read guard checks against, so it never lets one
+   *  read shrink the list, the same rule handleAccountChanged follows:
+   *
+   *  - Nothing shown: the read is adopted as it is (it drops nothing).
+   *  - Under half of two or more shown: the shown list stays, with a toast.
+   *    A second device's sign-in has returned such a short list from
+   *    addonCollectionGet (see the cache note above).
+   *  - Every shown url held (the same list or more): adopted at once.
+   *  - Any shown url lacking: adopted only when a second read 1.5 s later is
+   *    non-empty and identical (the same urls in the same order); a partial
+   *    read seldom repeats exactly, while a real removal made elsewhere
+   *    does. Otherwise the shown list stays.
+   *
+   *  Account writes open (`syncedAccountRef`) once the account has answered
+   *  and a non-empty list is shown, adopted or kept: every write sends that
+   *  list as `expectedUrls`, so a kept list only makes Rust's guard
+   *  stricter, and a real change made elsewhere comes back as the first
+   *  write's COLLECTION_CHANGED, which handleAccountChanged then confirms.
+   *  Nothing is adopted or opened if the list changed here while reading
+   *  (`addonsGenRef`, which a sign-in or sign-out also moves) or a drag's
+   *  write is in flight, and a failed read opens nothing; the next write
+   *  pressed starts another sync. One sync per account and list runs at a
+   *  time. Never rejects. */
+  const addonSyncRef = useRef<{ key: string; generation: number; run: Promise<void> } | null>(null);
+  /** Entries a manifest refresh rebuilt this session, keyed by url, each with
+   *  the refresh sequence it landed at. A refresh changes no url and no
+   *  order, so it does NOT move `addonsGenRef` (it used to, and a Refresh
+   *  pressed while the list had not loaded cancelled the very sync it had
+   *  started, so "refresh again" looped). Instead an adopted read re-applies
+   *  them: the account may still hold the older manifest snapshot (the write
+   *  can be refused, or not have been made), and adopting it would silently
+   *  undo the refresh. syncAddonList re-applies every one made this session;
+   *  handleAccountChanged only those since its read began, since it runs
+   *  because the account changed and means to take what it holds. One entry
+   *  per addon url, cleared on sign-in and sign-out. */
+  const refreshedAddonsRef = useRef<Map<string, { entry: AddonEntry; seq: number }>>(new Map());
+  const refreshSeqRef = useRef(0);
+  const withRefreshesSince = useCallback((list: AddonEntry[], since: number): AddonEntry[] => {
+    let out = list;
+    for (const [url, r] of refreshedAddonsRef.current) {
+      if (r.seq > since) out = withRefreshedAddon(out, url, r.entry) ?? out;
+    }
+    return out;
+  }, []);
+  const syncAddonList = useCallback((sess: UserSession, shown: AddonEntry[]): Promise<void> => {
+    const generation = addonsGenRef.current;
+    const inFlight = addonSyncRef.current;
+    if (inFlight && inFlight.key === sess.auth_key && inFlight.generation === generation) {
+      return inFlight.run;
+    }
+    const read = () => invoke<AddonEntry[]>("get_synced_addons", { authKey: sess.auth_key });
+    // Still the account, and the list, this sync started from.
+    const unchanged = () => addonsGenRef.current === generation && reorderInFlightRef.current === 0;
+    const open = () => { syncedAccountRef.current = sess.auth_key; };
+    const adopt = (read: AddonEntry[]) => {
+      const synced = withRefreshesSince(read, 0);
+      setAddons(synced);
+      if (synced.length > 0) open();
+      // An account that answers with NO addons is not one Aura will write
+      // to (every real Stremio collection keeps its built-in addons, so an
+      // empty read is refused by every writer as a likely glitch). Say so,
+      // rather than leaving each press to report "loading" forever.
+      else showAppToast(ACCOUNT_HAS_NO_ADDONS, { duration: 8000 });
+      // Persist the latest healthy fetch so future sessions on this
+      // device have a fallback. JSON.stringify is cheap for the typical
+      // <30 addons most users have.
+      try {
+        localStorage.setItem(cloudAddonCacheKey(sess.auth_key), JSON.stringify(synced));
+      } catch { /* quota */ }
+    };
+    const run = (async () => {
+      try {
+        const synced = await read();
+        if (!unchanged()) return;
+        if (shown.length === 0) {
+          adopt(synced);
+          return;
+        }
+        if (shown.length >= 2 && synced.length < Math.floor(shown.length / 2)) {
+          console.warn(
+            `[addons] cloud sync returned ${synced.length} addons; cache had ${shown.length}. ` +
+            `Keeping cached list to avoid a destructive wipe.`,
+          );
+          showAppToast(
+            `Cloud sync returned ${synced.length} addons (${shown.length} cached). ` +
+            `Showing cached list to be safe.`,
+            { duration: 5000 },
+          );
+          open();
+          return;
+        }
+        const held = new Set(synced.map((a) => a.url));
+        if (shown.every((a) => held.has(a.url))) {
+          adopt(synced);
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        const again = await read();
+        if (!unchanged()) return;
+        const same = synced.length > 0
+          && again.length === synced.length
+          && again.every((a, i) => a.url === synced[i].url);
+        if (same) {
+          adopt(again);
+          return;
+        }
+        console.warn(
+          `[addons] cloud sync reads disagreed and lacked addons the list shows; ` +
+          `keeping the cached list (${shown.length} addons).`,
+        );
+        open();
+      } catch (err) {
+        if (String(err) === SESSION_EXPIRED) {
+          await handleSessionExpired();
+        } else {
+          // Network failure: the list shown (the cache, when there is one)
+          // stays, so the Addons tab and home rows aren't empty while the
+          // user troubleshoots. Writes stay closed until a sync answers.
+          console.warn(`[addons] cloud sync failed; keeping the cached list (${shown.length} addons).`);
+        }
       }
-    } catch { /* corrupt cache — ignore */ }
+    })().finally(() => {
+      if (addonSyncRef.current?.run === run) addonSyncRef.current = null;
+    });
+    addonSyncRef.current = { key: sess.auth_key, generation, run };
+    return run;
+  }, [cloudAddonCacheKey, handleSessionExpired, withRefreshesSince]);
+
+  const loadSyncedAddons = useCallback(async (sess: UserSession) => {
+    const cached = readCloudAddonCache(sess.auth_key);
 
     // Warm-start: paint the cached list IMMEDIATELY so home / addons
     // tab populate on the first frame, then refetch in the background
@@ -6771,49 +6943,111 @@ export default function App() {
     if (cached) setAddons(cached);
 
     try {
-      try {
-        const synced = await invoke<AddonEntry[]>("get_synced_addons", { authKey: sess.auth_key });
-        // Suspicion check: a fresh fetch returning empty OR fewer than half
-        // the previously-cached count is almost always a sync glitch
-        // rather than a real user-driven wipe. Treat it as transient and
-        // keep the cache; the user can manually refresh to re-attempt.
-        if (
-          cached
-          && cached.length >= 2
-          && synced.length < Math.floor(cached.length / 2)
-        ) {
-          console.warn(
-            `[addons] cloud sync returned ${synced.length} addons; cache had ${cached.length}. ` +
-            `Keeping cached list to avoid a destructive wipe; re-open the Addons tab to retry.`,
-          );
-          showAppToast(
-            `Cloud sync returned ${synced.length} addons (${cached.length} cached). ` +
-            `Showing cached list to be safe.`,
-            { duration: 5000 },
-          );
-          setAddons(cached);
-          return;
-        }
-        setAddons(synced);
-        // Persist the latest healthy fetch so future sessions on this
-        // device have a fallback. JSON.stringify is cheap for the typical
-        // <30 addons most users have.
-        try { localStorage.setItem(key, JSON.stringify(synced)); } catch { /* quota */ }
-      } catch (err) {
-        if (String(err) === SESSION_EXPIRED) {
-          await handleSessionExpired();
-        } else if (cached) {
-          // Network failure during initial sync: fall back to whatever
-          // we cached last time so the Addons tab and home rows aren't
-          // empty while the user troubleshoots.
-          console.warn(`[addons] cloud sync failed; falling back to cache (${cached.length} addons).`);
-          setAddons(cached);
-        }
-      }
+      await syncAddonList(sess, cached ?? []);
     } finally {
       setAddonsSettled(true);
     }
-  }, [cloudAddonCacheKey, handleSessionExpired]);
+  }, [readCloudAddonCache, syncAddonList]);
+
+  /** Reload the signed-in addon list from the Stremio account after a write
+   *  came back COLLECTION_CHANGED: the account's fresh read was empty or no
+   *  longer held every addon this list shows, because another device
+   *  changed it, because syncAddonList above kept the shown list over a
+   *  short or unconfirmed read, or because the read itself was partial (the
+   *  glitch that refusal exists for). Once a sync has answered, nothing
+   *  else re-reads the account mid-session, and a relaunch syncs under the
+   *  same rules, so without this every write would be refused until
+   *  sign-out.
+   *
+   *  The list this adopts becomes every later write's `expectedUrls`, the
+   *  only thing Rust's partial-read guard checks against, so it must never
+   *  be shrunk by an unconfirmed read. The rule: an empty read is never
+   *  adopted. A read holding every url the list shows (the same list or
+   *  more) is adopted at once, since it drops nothing. A read lacking any
+   *  shown url is adopted only when a second read 1.5 s later is identical
+   *  (the same urls in the same order); a partial read seldom repeats
+   *  exactly, while a real removal made elsewhere does. Nothing is adopted
+   *  either when the list changed here while reading (`addonsGenRef`: an
+   *  add, remove or drag that landed meanwhile must not be put back), when
+   *  a drag's account write has not settled (`reorderInFlightRef`: the read
+   *  may predate its push and hold the order it replaces), or when the
+   *  session moved to another account. Adopting changes only what
+   *  Aura shows and sends; nothing is pushed, every write still pushes from
+   *  its own fresh read, and the refused write is never retried here.
+   *  Concurrent callers share one reload. Resolves whether a list was
+   *  adopted, which is what `accountChangedCopy` tells the user. */
+  const accountReloadRef = useRef<Promise<boolean> | null>(null);
+  const handleAccountChanged = useCallback((): Promise<boolean> => {
+    if (accountReloadRef.current) return accountReloadRef.current;
+    const reload = async (): Promise<boolean> => {
+      const sess = sessionRef.current;
+      if (!sess?.auth_key) return false;
+      const generation = addonsGenRef.current;
+      const refreshSeq = refreshSeqRef.current;
+      const shown = addonsRef.current.map((a) => a.url);
+      const read = () => invoke<AddonEntry[]>("get_synced_addons", { authKey: sess.auth_key });
+      try {
+        const first = await read();
+        if (first.length === 0) return false;
+        const held = new Set(first.map((a) => a.url));
+        let synced = first;
+        if (!shown.every((u) => held.has(u))) {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          const again = await read();
+          const same = again.length === first.length
+            && again.every((a, i) => a.url === first[i].url);
+          if (!same) return false;
+          synced = again;
+        }
+        // Signed out, or into another account, while reading.
+        if (sessionRef.current?.auth_key !== sess.auth_key) return false;
+        if (addonsGenRef.current !== generation || reorderInFlightRef.current > 0) return false;
+        const adopted = withRefreshesSince(synced, refreshSeq);
+        setAddons(adopted);
+        syncedAccountRef.current = sess.auth_key;
+        try {
+          localStorage.setItem(cloudAddonCacheKey(sess.auth_key), JSON.stringify(adopted));
+        } catch { /* quota */ }
+        return true;
+      } catch (err) {
+        if (String(err) === SESSION_EXPIRED) await handleSessionExpired();
+        return false;
+      }
+    };
+    const pending = reload().finally(() => { accountReloadRef.current = null; });
+    accountReloadRef.current = pending;
+    return pending;
+  }, [cloudAddonCacheKey, handleSessionExpired, withRefreshesSince]);
+
+  /** Whether `authKey`'s addon list has been loaded from the Stremio account
+   *  this session (by syncAddonList or an adopting handleAccountChanged).
+   *  Until it has, no signed-in collection write is issued: add, remove and
+   *  reorder say ADDON_LIST_NOT_LOADED instead, and a manifest refresh runs
+   *  for this session without writing the account. Every write sends the
+   *  list as shown as `expectedUrls`, and a list that never loaded (an empty
+   *  one after a failed first sync, or the warm cache before the sync lands)
+   *  gives Rust's partial-read guard a list it cannot trust. Keyed on the
+   *  auth key, so a sign-out or an account switch closes it too.
+   *
+   *  Only a write about to be issued asks, so a `false` also starts a sync
+   *  of that account's list (joining one already running) from its warm
+   *  cache: without it, a first sync that failed (offline at launch, a VPN
+   *  still connecting) would keep every write closed until a relaunch, since
+   *  nothing else re-reads the account. The next press then goes through
+   *  once that sync has answered. */
+  const isAddonListSynced = useCallback((authKey: string) => {
+    if (syncedAccountRef.current === authKey) return true;
+    const sess = sessionRef.current;
+    if (sess?.auth_key === authKey) {
+      void syncAddonList(sess, readCloudAddonCache(authKey) ?? []);
+    }
+    return false;
+  }, [syncAddonList, readCloudAddonCache]);
+
+  /** The session as it is now, for work that runs long after the click that
+   *  started it (the Addons page's silent refresh after Configure), even
+   *  once the component that scheduled it has unmounted. */
+  const currentSession = useCallback(() => sessionRef.current, []);
 
   const loadLocalAddons = useCallback(() => {
     invoke<AddonEntry[]>("list_addons")
@@ -7011,6 +7245,9 @@ export default function App() {
 
   // ── Auth handlers ──
   const handleLoginSuccess = useCallback(async (sess: UserSession) => {
+    syncedAccountRef.current = null;
+    refreshedAddonsRef.current.clear();
+    addonsGenRef.current += 1;
     await applySettingsScope(sess);
     setSession(sess);
     setLandingDismissed(true);
@@ -7024,6 +7261,9 @@ export default function App() {
 
   const handleLogout = useCallback(async () => {
     await invoke("logout").catch(() => {});
+    syncedAccountRef.current = null;
+    refreshedAddonsRef.current.clear();
+    addonsGenRef.current += 1;
     await applySettingsScope(null);
     setSession(null);
     setLibrary([]); setRawLibrary([]);
@@ -7032,69 +7272,130 @@ export default function App() {
 
 
   // ── Addon list handlers (passed to AddonsView) ──
+  // Every local change to the list's urls or order moves `addonsGenRef`, so
+  // a sync or handleAccountChanged read in flight never puts back what it
+  // changed. A manifest refresh changes neither and does not move it (see
+  // refreshedAddonsRef).
+  //
+  // Each change is also written into the signed-in account's warm cache, in
+  // the cache's own terms (so two changes in flight cannot drop each
+  // other's). The cache is what the next launch shows and sends as
+  // `expectedUrls` until its sync lands; left stale, an addon removed here
+  // came back on the next launch and made its first write refuse as
+  // COLLECTION_CHANGED.
+  const patchCloudAddonCache = useCallback((change: (cached: AddonEntry[]) => AddonEntry[] | null) => {
+    const authKey = sessionRef.current?.auth_key;
+    if (!authKey) return;
+    const cached = readCloudAddonCache(authKey);
+    if (!cached) return;
+    const next = change(cached);
+    if (!next) return;
+    try {
+      localStorage.setItem(cloudAddonCacheKey(authKey), JSON.stringify(next));
+    } catch { /* quota */ }
+  }, [readCloudAddonCache, cloudAddonCacheKey]);
+
   const handleAddonAdded = useCallback((entry: AddonEntry) => {
+    addonsGenRef.current += 1;
     setAddons((prev) => [...prev, entry]);
-  }, []);
+    patchCloudAddonCache((cached) =>
+      cached.some((a) => a.url === entry.url) ? null : [...cached, entry]);
+  }, [patchCloudAddonCache]);
 
   const handleAddonRemoved = useCallback((url: string) => {
+    addonsGenRef.current += 1;
     setAddons((prev) => prev.filter((a) => a.url !== url));
-  }, []);
+    patchCloudAddonCache((cached) =>
+      cached.some((a) => a.url === url) ? cached.filter((a) => a.url !== url) : null);
+  }, [patchCloudAddonCache]);
 
   /** A manifest refresh rebuilt one addon's entry. Swap it in by url so
    *  order is untouched. A guest's entry is already saved to addons.json
-   *  by Rust. A signed-in user's is not written anywhere upstream: Aura
-   *  does not write the Stremio cloud collection (an outward write to the
-   *  account the official Stremio apps share), so the fresh fields live in
-   *  state plus the warm cache below until the next launch or sign-in,
-   *  when get_synced_addons returns the collection's stored manifest
-   *  snapshot and overwrites both. The cache is patched in its own terms
-   *  rather than from state, so two refreshes in flight cannot drop each
-   *  other's update. */
+   *  by Rust. For a signed-in user Rust also writes the fresh manifest to
+   *  the Stremio collection, under guards that can refuse it
+   *  (`refresh_addon_manifest`). Either way the fresh fields live in state
+   *  plus the warm cache below; when that write was refused or failed they
+   *  last until the next launch or sign-in, when get_synced_addons returns
+   *  the collection's stored manifest snapshot and overwrites both. The
+   *  cache is patched in its own terms rather than from state, so two
+   *  refreshes in flight cannot drop each other's update. */
   const handleAddonRefreshed = useCallback((url: string, entry: AddonEntry) => {
+    refreshSeqRef.current += 1;
+    refreshedAddonsRef.current.set(url, { entry, seq: refreshSeqRef.current });
     setAddons((prev) => withRefreshedAddon(prev, url, entry) ?? prev);
-    if (!session?.auth_key) return;
-    const key = cloudAddonCacheKey(session.auth_key);
-    try {
-      const raw = localStorage.getItem(key);
-      const cached: unknown = raw ? JSON.parse(raw) : null;
-      if (!Array.isArray(cached)) return;
-      const next = withRefreshedAddon(cached as AddonEntry[], url, entry);
-      if (next) localStorage.setItem(key, JSON.stringify(next));
-    } catch { /* corrupt cache or quota */ }
-  }, [session, cloudAddonCacheKey]);
+    patchCloudAddonCache((cached) => withRefreshedAddon(cached, url, entry));
+  }, [patchCloudAddonCache]);
 
   /** Persist the new addon order to disk (guest) or to the Stremio cloud
    *  (logged-in). Optimistically updates local state immediately so the
    *  drag-drop feels instant; reverts on failure and surfaces a toast.
    *  Mirrors the new ordering into the warm-start cloud cache so the
-   *  next launch paints the reordered list on the first frame. */
+   *  next launch paints the reordered list on the first frame.
+   *
+   *  `reordered` is rebuilt row by row, each url claiming the first row not
+   *  yet claimed whose url it is EXACTLY (AddonsView sends the list's own
+   *  urls), and only failing that the first whose normalized url matches.
+   *  Two rows whose urls normalize alike (an entry at
+   *  `.../manifest.json/manifest.json` shows as `.../manifest.json`, beside
+   *  its sibling at `...`) therefore both stay: keyed by the normalized url
+   *  alone, one of them vanished from the list and the cache, and with it
+   *  from every later write's `expectedUrls`. */
   const handleAddonsReorder = useCallback(async (urls: string[]) => {
+    // Signed in, nothing moves until the list has loaded from the account.
+    if (session?.auth_key && !isAddonListSynced(session.auth_key)) {
+      showAppToast(ADDON_LIST_NOT_LOADED, { duration: 5000 });
+      return;
+    }
     const previous = addons;
     const norm = (s: string) =>
       s.trim().replace(/\/manifest\.json$/, "").replace(/\/+$/, "").toLowerCase();
-    const byUrl = new Map(previous.map((a) => [norm(a.url), a] as const));
+    const claimed = new Set<number>();
+    const claim = (match: (a: AddonEntry) => boolean): AddonEntry | null => {
+      const i = previous.findIndex((a, j) => !claimed.has(j) && match(a));
+      if (i < 0) return null;
+      claimed.add(i);
+      return previous[i];
+    };
     const reordered: AddonEntry[] = [];
     for (const u of urls) {
-      const hit = byUrl.get(norm(u));
-      if (hit) { reordered.push(hit); byUrl.delete(norm(hit.url)); }
+      const hit = claim((a) => a.url === u) ?? claim((a) => norm(a.url) === norm(u));
+      if (hit) reordered.push(hit);
     }
-    for (const leftover of byUrl.values()) reordered.push(leftover);
+    previous.forEach((a, j) => { if (!claimed.has(j)) reordered.push(a); });
     if (reordered.length === 0) return;
 
+    addonsGenRef.current += 1;
     setAddons(reordered);
 
     try {
       if (session?.auth_key) {
-        await invoke("cloud_reorder_addons", {
-          authKey: session.auth_key,
-          urls: reordered.map((a) => a.url),
-        });
+        // `expectedUrls` is the list as shown before the drag: Rust refuses
+        // the push when its fresh read of the account lacks any of them, or
+        // when a url in `urls` matches nothing, since pushing a permutation
+        // of a partial read would delete the rest from the account.
+        //
+        // The drag's order is shown already but reaches the account only
+        // with this push, which may wait on another write's lock, so a
+        // reload reading meanwhile can hold the order it replaces. Counted
+        // in flight until it settles, then the generation moves, so neither
+        // a reload adopting mid-flight nor one whose read predates the push
+        // puts the old order back (handleAccountChanged, syncAddonList). The
+        // count drops before the catch below starts this drag's own reload.
+        reorderInFlightRef.current += 1;
         try {
-          localStorage.setItem(
-            cloudAddonCacheKey(session.auth_key),
-            JSON.stringify(reordered),
-          );
-        } catch { /* quota */ }
+          await invoke("cloud_reorder_addons", {
+            authKey: session.auth_key,
+            urls: reordered.map((a) => a.url),
+            expectedUrls: previous.map((a) => a.url),
+          });
+        } finally {
+          reorderInFlightRef.current -= 1;
+          addonsGenRef.current += 1;
+        }
+        // The new order, applied to the cache in its own terms: writing the
+        // drag-time list wholesale put back an addon a remove had taken out
+        // of the cache while this push waited on the account lock.
+        patchCloudAddonCache((cached) => withOrderOf(cached, reordered));
       } else {
         await invoke("reorder_addons", { urls: reordered.map((a) => a.url) });
       }
@@ -7103,10 +7404,20 @@ export default function App() {
         await handleSessionExpired();
         return;
       }
-      setAddons(previous);
+      // Back to the pre-drag order over the list as it is NOW, not to
+      // `previous` itself: an addon removed while this reorder waited on
+      // the account must not come back (every later write would then list
+      // it and be refused).
+      addonsGenRef.current += 1;
+      setAddons((cur) => withOrderOf(cur, previous));
+      if (String(err) === COLLECTION_CHANGED) {
+        const reloaded = await handleAccountChanged();
+        showAppToast(accountChangedCopy(reloaded, "Drag again to reorder."), { duration: 5000 });
+        return;
+      }
       showAppToast(`Couldn't save addon order: ${String(err)}`, { duration: 4000 });
     }
-  }, [addons, session, cloudAddonCacheKey, handleSessionExpired]);
+  }, [addons, session, patchCloudAddonCache, handleSessionExpired, handleAccountChanged, isAddonListSynced]);
 
   // ── Absolute-episode patch effect ──
   // Computes activeTarget.absolute_episode_num asynchronously after
@@ -9450,11 +9761,16 @@ export default function App() {
         <OnboardingView
           session={session}
           addons={addons}
+          onAccountChanged={handleAccountChanged}
+          isAddonListSynced={isAddonListSynced}
           startAtAddons={onboardingStartAddons}
           onAddonInstalled={(entry) => {
+            addonsGenRef.current += 1;
             setAddons((prev) =>
               prev.some((a) => a.url === entry.url) ? prev : [...prev, entry]
             );
+            patchCloudAddonCache((cached) =>
+              cached.some((a) => a.url === entry.url) ? null : [...cached, entry]);
           }}
           onComplete={() => {
             setOnboardingActive(false);
@@ -9531,6 +9847,9 @@ export default function App() {
             onRemove={handleAddonRemoved}
             onRefreshed={handleAddonRefreshed}
             onReorder={handleAddonsReorder}
+            onAccountChanged={handleAccountChanged}
+            isAddonListSynced={isAddonListSynced}
+            currentSession={currentSession}
             onLoginSuccess={handleLoginSuccess}
             onLogout={handleLogout}
             onSessionExpired={handleSessionExpired}

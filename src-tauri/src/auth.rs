@@ -851,8 +851,12 @@ pub async fn get_synced_addons(auth_key: String) -> Result<Vec<AddonEntry>, Stri
     let json: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| format!("JSON parse error: {e}\nRaw: {raw}"))?;
 
-    if let Some(err) = json.get("error").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-        return Err(stremio_error(err.to_string()));
+    // Both error shapes: the API refuses with HTTP 200 and an OBJECT
+    // (`{"error":{"code":1,"message":"Session does not exist"}}` for an
+    // expired session), which a string-only check missed, so the frontend
+    // never signed out and kept its addon writes waiting on this sync.
+    if let Some(err) = crate::stremio::account_api_error(&json, "Addon collection request refused") {
+        return Err(err);
     }
 
     let addons_arr = json

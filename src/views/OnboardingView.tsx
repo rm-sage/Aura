@@ -17,6 +17,7 @@ import {
 import { parseImportInput, type SettingsBlob } from "../settingsTransfer";
 import type { UserSession } from "../LoginView";
 import type { AddonEntry, ThemeId } from "../types";
+import { ADDON_LIST_NOT_LOADED, COLLECTION_CHANGED, accountChangedCopy } from "../types";
 import { THEME_LABELS, THEME_DESCRIPTIONS, useTheme } from "../ThemeEngine";
 
 // ---------------------------------------------------------------------------
@@ -49,6 +50,15 @@ interface Props {
   /** Called when an addon install completes successfully so App.tsx
    *  can refresh its addon list. */
   onAddonInstalled: (entry: AddonEntry) => void;
+  /** App's reload of the signed-in list from the Stremio account, run when
+   *  an install is refused as COLLECTION_CHANGED (see AddonsView). */
+  onAccountChanged?: () => Promise<boolean>;
+  /** Whether this auth key's list has loaded from the Stremio account this
+   *  session (App.isAddonListSynced). A signed-in install waits for it (the
+   *  wizard can open before the sync lands) and says ADDON_LIST_NOT_LOADED
+   *  instead, while App starts a sync so the next press can install;
+   *  without it, every signed-in install does. */
+  isAddonListSynced?: (authKey: string) => boolean;
   /** Called when the wizard finishes (Finish or fully-skipped).
    *  Persists the completion flag and unmounts the wizard. */
   onComplete: () => void;
@@ -95,7 +105,7 @@ const RECOMMENDED_ADDONS: RecommendedAddon[] = [
 ];
 
 export default function OnboardingView({
-  session, addons, onAddonInstalled, onComplete, startAtAddons,
+  session, addons, onAddonInstalled, onAccountChanged, isAddonListSynced, onComplete, startAtAddons,
 }: Props) {
   // Hydrate progress from localStorage on mount so a relaunch picks
   // up at the saved step. startAtAddons (from AddonsView's reopen
@@ -214,6 +224,8 @@ export default function OnboardingView({
               addons={addons}
               installedInThisSession={progress.installedAddons ?? []}
               session={session}
+              onAccountChanged={onAccountChanged}
+              isAddonListSynced={isAddonListSynced}
               onMarkInstalled={(url, entry) => {
                 setProgress((p) => ({
                   ...p,
@@ -577,11 +589,13 @@ function LangPicker({
 // ---------------------------------------------------------------------------
 
 function AddonsStep({
-  addons, installedInThisSession, session, onMarkInstalled, onBack, onFinish,
+  addons, installedInThisSession, session, onAccountChanged, isAddonListSynced, onMarkInstalled, onBack, onFinish,
 }: {
   addons: AddonEntry[];
   installedInThisSession: string[];
   session: UserSession | null;
+  onAccountChanged?: () => Promise<boolean>;
+  isAddonListSynced?: (authKey: string) => boolean;
   onMarkInstalled: (url: string, entry: AddonEntry) => void;
   onBack: () => void;
   onFinish: () => void;
@@ -591,41 +605,68 @@ function AddonsStep({
   const [error, setError] = useState<string | null>(null);
   const [installing, setInstalling] = useState(false);
 
+  // Signed in, an install sends the list as shown as `expectedUrls`, which
+  // guards nothing until that list has loaded from the account; until then
+  // nothing is written. A guest installs locally at any time.
+  const listNotLoaded = useCallback(() => {
+    const key = session?.auth_key;
+    return !!key && !isAddonListSynced?.(key);
+  }, [session, isAddonListSynced]);
+
+  // A cloud install refused because the account no longer holds the list
+  // shown: App reloads it, and the message says whether it could.
+  const installFailed = useCallback(async (e: unknown) => {
+    if (String(e) === COLLECTION_CHANGED && onAccountChanged) {
+      setError(accountChangedCopy(await onAccountChanged(), "Try the install again."));
+    } else {
+      setError(`Install failed: ${String(e)}`);
+    }
+  }, [onAccountChanged]);
+
   const handleQuickInstall = useCallback(async (entry: RecommendedAddon) => {
     if (!entry.fixedManifestUrl) return;
+    if (listNotLoaded()) { setError(ADDON_LIST_NOT_LOADED); return; }
     setInstalling(true);
     setError(null);
     try {
       const cmd = session?.auth_key ? "cloud_add_addon" : "add_addon";
       const args: Record<string, unknown> = { url: entry.fixedManifestUrl };
-      if (session?.auth_key) args.authKey = session.auth_key;
+      if (session?.auth_key) {
+        args.authKey = session.auth_key;
+        // The list as shown: Rust refuses to push from a read that lacks any.
+        args.expectedUrls = addons.map((a) => a.url);
+      }
       const result = await invoke<AddonEntry>(cmd, args);
       onMarkInstalled(entry.fixedManifestUrl, result);
     } catch (e) {
-      setError(`Install failed: ${String(e)}`);
+      await installFailed(e);
     } finally {
       setInstalling(false);
     }
-  }, [session, onMarkInstalled]);
+  }, [session, addons, onMarkInstalled, installFailed, listNotLoaded]);
 
   const handlePasteInstall = useCallback(async () => {
     if (!pasteFor || !pasteText.trim() || installing) return;
+    if (listNotLoaded()) { setError(ADDON_LIST_NOT_LOADED); return; }
     setInstalling(true);
     setError(null);
     try {
       const cmd = session?.auth_key ? "cloud_add_addon" : "add_addon";
       const args: Record<string, unknown> = { url: pasteText.trim() };
-      if (session?.auth_key) args.authKey = session.auth_key;
+      if (session?.auth_key) {
+        args.authKey = session.auth_key;
+        args.expectedUrls = addons.map((a) => a.url);
+      }
       const result = await invoke<AddonEntry>(cmd, args);
       onMarkInstalled(pasteText.trim(), result);
       setPasteFor(null);
       setPasteText("");
     } catch (e) {
-      setError(`Install failed: ${String(e)}`);
+      await installFailed(e);
     } finally {
       setInstalling(false);
     }
-  }, [pasteFor, pasteText, session, installing, onMarkInstalled]);
+  }, [pasteFor, pasteText, session, addons, installing, onMarkInstalled, installFailed, listNotLoaded]);
 
   return (
     <>

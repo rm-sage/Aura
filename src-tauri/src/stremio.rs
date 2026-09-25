@@ -1226,7 +1226,49 @@ async fn fetch_manifest(base: &str) -> Result<(WireManifest, bool), String> {
         wire.catalogs.iter().map(|c| c.extra.as_slice()),
         &wire.resources,
     );
+    remember_manifest(base, &wire, has_search);
 
+    Ok((wire, has_search))
+}
+
+/// `fetch_manifest` for `refresh_addon_manifest`: always the network, and the
+/// manifest comes back RAW as well as typed. One GET, parsed once into a
+/// `Value`, with the `WireManifest` deserialized from that same value, so the
+/// JSON the refresh may write to the Stremio collection and the fields Aura
+/// reads from it can never disagree. Cached exactly as `fetch_manifest`
+/// caches, under `base`. `url` is the literal address fetched (the caller
+/// keeps it, because the collection write compares an entry's transportUrl
+/// against exactly that string). Its errors go through `reqwest_err_for_log`
+/// because the manifest URL carries the addon's config; `fetch_manifest`
+/// keeps its own error text for its callers.
+async fn fetch_manifest_fresh(base: &str, url: &str) -> Result<(serde_json::Value, WireManifest, bool), String> {
+    let resp = client()
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Manifest fetch failed: {}", reqwest_err_for_log(&e)))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("Manifest HTTP error: {status}"));
+    }
+    let raw: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Manifest parse error: {}", reqwest_err_for_log(&e)))?;
+    let wire = WireManifest::deserialize(&raw)
+        .map_err(|e| format!("Manifest parse error: {e}"))?;
+
+    let has_search = manifest_declares_search(
+        wire.catalogs.iter().map(|c| c.extra.as_slice()),
+        &wire.resources,
+    );
+    remember_manifest(base, &wire, has_search);
+
+    Ok((raw, wire, has_search))
+}
+
+/// Cache a manifest just fetched from the network, in memory and on disk.
+fn remember_manifest(base: &str, wire: &WireManifest, has_search: bool) {
     {
         let mut cache = manifest_cache().lock().unwrap();
         cache.insert(base.to_string(), ManifestCacheEntry {
@@ -1239,8 +1281,177 @@ async fn fetch_manifest(base: &str) -> Result<(WireManifest, bool), String> {
     // serve the addon's capability list from local storage instead of
     // refetching N manifests in parallel.
     save_manifest_cache_to_disk();
+}
 
-    Ok((wire, has_search))
+/// One writer at a time for the Stremio addon collection. Every
+/// read-modify-write of it (`cloud_add_addon`, `cloud_remove_addon`,
+/// `cloud_reorder_addons` and the signed-in write in
+/// `refresh_addon_manifest`) holds this from its `fetch_raw_collection` to its
+/// `push_collection`, and no longer (the refresh's read-back runs after it is
+/// released). `addonCollectionSet` replaces the WHOLE array, so two
+/// Aura writes that overlapped would each push the collection they read and
+/// the later push would silently undo the earlier one.
+///
+/// It cannot cover another device: the Stremio API has no conditional write,
+/// so a change made elsewhere between our read and our push is still lost.
+/// That window is why each writer re-reads immediately before it pushes and
+/// does nothing slow in between (an addon's own manifest fetch always happens
+/// BEFORE the lock is taken).
+static COLLECTION_WRITE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+fn collection_write_lock() -> &'static tokio::sync::Mutex<()> {
+    COLLECTION_WRITE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// What a collection writer returns when its fresh read does not hold what
+/// the frontend showed the user (`check_collection_read`). Shown as is by
+/// every caller, and never a sign-out: the session is fine, the list is not.
+const COLLECTION_CHANGED: &str = "Your Stremio account changed; reload the addon list and try again";
+
+/// Why `check_collection_read` refused. Either way nothing was written.
+#[derive(Debug, PartialEq)]
+enum CollectionDrift {
+    /// The read came back empty although the frontend showed addons, or
+    /// (add, remove and reorder) at all: a real collection keeps Stremio's
+    /// protected defaults, which no client can remove.
+    Empty,
+    /// This many addons the frontend showed are not in the read.
+    Missing(usize),
+}
+
+/// Addons `cloud_remove_addon` has just taken out of an account, so the
+/// writers queued behind it on `COLLECTION_WRITE_LOCK` do not read their
+/// absence as a partial read. The frontend drops a row only once its remove
+/// resolves, so an add, remove, refresh or drag the user starts during that
+/// half second still lists the removed addon in `expected_urls`, and would
+/// otherwise be refused as "account changed" for a change Aura itself made.
+/// Each record is (a hash of the auth key, never the key itself; the entry's
+/// collection key, `normalize_addon_url` of its transportUrl; when), bounded
+/// to `RECENT_REMOVALS_CAP` records and dropped after `RECENT_REMOVAL_TTL`.
+static RECENT_REMOVALS: OnceLock<Mutex<std::collections::VecDeque<(u64, String, Instant)>>> = OnceLock::new();
+const RECENT_REMOVALS_CAP: usize = 32;
+const RECENT_REMOVAL_TTL: Duration = Duration::from_secs(60);
+
+/// Which account a `RECENT_REMOVALS` record belongs to, without keeping the
+/// auth key itself.
+fn account_tag(auth_key: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    auth_key.hash(&mut h);
+    h.finish()
+}
+
+/// Record `keys` (collection keys) as just removed from `auth_key`'s
+/// account. Called under `COLLECTION_WRITE_LOCK`, after the push landed.
+fn note_recent_removals(auth_key: &str, keys: Vec<String>) {
+    let (tag, now) = (account_tag(auth_key), Instant::now());
+    let Ok(mut recent) = RECENT_REMOVALS.get_or_init(Default::default).lock() else { return; };
+    recent.retain(|(_, _, at)| now.duration_since(*at) < RECENT_REMOVAL_TTL);
+    recent.extend(keys.into_iter().map(|k| (tag, k, now)));
+    while recent.len() > RECENT_REMOVALS_CAP {
+        recent.pop_front();
+    }
+}
+
+/// Drop `key` from `auth_key`'s recent removals: Aura has just added it
+/// back, so its absence from a read would be news again.
+fn forget_recent_removal(auth_key: &str, key: &str) {
+    let tag = account_tag(auth_key);
+    if let Ok(mut recent) = RECENT_REMOVALS.get_or_init(Default::default).lock() {
+        recent.retain(|(t, k, _)| !(*t == tag && k == key));
+    }
+}
+
+/// The collection keys Aura removed from `auth_key`'s account within
+/// `RECENT_REMOVAL_TTL`. Read by each writer AFTER it takes the lock, so a
+/// remove that just finished is always in it.
+fn recent_removals(auth_key: &str) -> Vec<String> {
+    let (tag, now) = (account_tag(auth_key), Instant::now());
+    let Ok(mut recent) = RECENT_REMOVALS.get_or_init(Default::default).lock() else { return Vec::new(); };
+    recent.retain(|(_, _, at)| now.duration_since(*at) < RECENT_REMOVAL_TTL);
+    recent.iter().filter(|(t, ..)| *t == tag).map(|(_, k, _)| k.clone()).collect()
+}
+
+/// The read-side guard every collection writer runs under
+/// `COLLECTION_WRITE_LOCK`, on the read it is about to push from, before it
+/// changes anything. `addonCollectionSet` replaces the WHOLE array, so a
+/// partial read (which `addonCollectionGet` has returned during a
+/// near-simultaneous write on another device; see the suspicion check in
+/// App.tsx `syncAddonList`) would permanently delete every addon it left
+/// out, on every device. `expected` is the url of every addon the frontend
+/// currently shows; the read must hold each one, and must not be empty while
+/// the frontend showed any. `excused` is left out of the check: the url
+/// `cloud_add_addon` is about to add, which is naturally absent, and the
+/// addons Aura itself just removed (`recent_removals`).
+///
+/// An expected url is compared exactly as Rust handed it to the frontend,
+/// trailing slashes trimmed, against each entry's `normalize_addon_url`
+/// (both lowercased when `fold_case`, the reorder's matching): that is
+/// precisely how `get_synced_addons` and `cloud_add_addon` derive the url the
+/// frontend holds. Normalizing it AGAIN would strip a second `/manifest.json`
+/// from an entry at `.../manifest.json/manifest.json`, whose frontend url
+/// then never matched, and every write was refused because of that one
+/// entry. `None` is an
+/// older caller that sent no list: no check here, and each command applies
+/// its own rule for an empty read instead. An empty url in `expected`
+/// carries no expectation and is skipped.
+fn check_collection_read(
+    collection: &[serde_json::Value],
+    expected: Option<&[String]>,
+    excused: &[String],
+    fold_case: bool,
+) -> Result<(), CollectionDrift> {
+    let Some(expected) = expected else { return Ok(()); };
+    let fold = |k: &str| if fold_case { k.to_ascii_lowercase() } else { k.to_string() };
+    let key = |u: &str| fold(u.trim_end_matches('/'));
+    let excused: HashSet<String> = excused.iter().map(|u| key(u)).collect();
+    let wanted: Vec<String> = expected
+        .iter()
+        .filter(|u| !u.trim().is_empty())
+        .map(|u| key(u))
+        .filter(|k| !excused.contains(k))
+        .collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    if collection.is_empty() {
+        return Err(CollectionDrift::Empty);
+    }
+    let held: HashSet<String> = collection
+        .iter()
+        .filter_map(|a| a.get("transportUrl").and_then(|v| v.as_str()))
+        .map(|t| fold(normalize_addon_url(t)))
+        .collect();
+    let missing = wanted.iter().filter(|k| !held.contains(*k)).count();
+    if missing > 0 {
+        return Err(CollectionDrift::Missing(missing));
+    }
+    Ok(())
+}
+
+/// Log one refusal by `check_collection_read` ("{action} refused: ...") and
+/// return the error the command hands the frontend. Counts only, never a url.
+fn collection_drift_error(action: &str, drift: CollectionDrift) -> String {
+    match drift {
+        CollectionDrift::Empty => crate::devlog!(
+            warn, "catalog",
+            "{} refused: the Stremio collection read came back empty; nothing was written",
+            action,
+        ),
+        CollectionDrift::Missing(n) => crate::devlog!(
+            warn, "catalog",
+            "{} refused: {} addon(s) the addon list shows are missing from the Stremio collection read; nothing was written",
+            action, n,
+        ),
+    }
+    COLLECTION_CHANGED.to_string()
+}
+
+/// A collection entry the official apps refuse to upgrade or uninstall
+/// (stremio-core `AddonIsProtected`): Cinemeta and the other defaults.
+/// Anything but an absent or `false` flag counts, so an odd value refuses.
+fn entry_is_protected(entry: &serde_json::Value) -> bool {
+    !matches!(entry.pointer("/flags/protected"), None | Some(serde_json::Value::Bool(false)))
 }
 
 /// Read the full addon collection from the Stremio account API.
@@ -1266,8 +1477,8 @@ async fn fetch_raw_collection(auth_key: &str) -> Result<Vec<serde_json::Value>, 
     let json: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("JSON parse error: {e}"))?;
 
-    if let Some(err) = json.get("error").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-        return Err(map_api_error(err));
+    if let Some(err) = account_api_error(&json, "the Stremio API refused the read") {
+        return Err(err);
     }
 
     json.pointer("/result/addons")
@@ -1297,11 +1508,38 @@ async fn push_collection(auth_key: &str, addons: Vec<serde_json::Value>) -> Resu
     let json: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("JSON parse error: {e}"))?;
 
-    if let Some(err) = json.get("error").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-        return Err(map_api_error(err));
+    // Missing the object form here would report a refused write as done.
+    if let Some(err) = account_api_error(&json, "the Stremio API refused the write") {
+        return Err(err);
     }
 
     Ok(())
+}
+
+/// The error an account API answer carries, mapped for the frontend, or
+/// `None` when it carries none. The API refuses with HTTP 200 and
+/// `{ "error": { "message", "code" } }` (stremio-core `APIResult` /
+/// `APIError`); a bare string is the older shape, and both are recognised.
+/// An invalid session answers `{"error":{"code":1,"message":"Session does
+/// not exist"}}`, which `map_api_error` turns into `SESSION_EXPIRED` so the
+/// frontend signs out; any other message passes through unchanged, and an
+/// object with no message becomes `fallback`. Shared by `fetch_raw_collection`
+/// and `push_collection`, so every collection writer sees an expired session
+/// at its first call, the read, and by the two account READS the app starts
+/// with (`auth::get_synced_addons`, `library_get`): a string-only check there
+/// read an expired session as an ordinary failure, so Aura never signed out
+/// and its addon writes stayed gated behind a sync that could never succeed.
+pub(crate) fn account_api_error(json: &serde_json::Value, fallback: &str) -> Option<String> {
+    let err = match json.get("error") {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => s.as_str(),
+        Some(e @ serde_json::Value::Object(_)) => e
+            .get("message")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(fallback),
+        _ => return None,
+    };
+    Some(map_api_error(err))
 }
 
 fn map_api_error(err: &str) -> String {
@@ -1614,12 +1852,1063 @@ fn segment_looks_opaque(seg: &str) -> bool {
 /// What `refresh_addon_manifest` returns: exactly what `get_addon_manifest`
 /// returns, flattened so `name` / `catalogs` / `has_search` stay top-level,
 /// plus `entry`, the `AddonEntry` rebuilt from the fresh manifest (with the
-/// complete idPrefixes list, see the command).
+/// complete idPrefixes list, see the command), and `collection`, what became
+/// of the signed-in write (`None` for a guest, who has no collection, and for
+/// an unreported refresh, whose write runs on after the command returns).
 #[derive(Serialize)]
 pub struct RefreshedAddonManifest {
     #[serde(flatten)]
     pub manifest: AddonManifest,
     pub entry: AddonEntry,
+    pub collection: Option<CollectionWrite>,
+}
+
+/// The outcome of writing a refreshed manifest to the user's Stremio
+/// collection, for the frontend. Serialize-only, so the tag and variant
+/// names are exactly the wire strings AddonsView matches on. Only
+/// `Written` changed the account. `Unchanged` wrote nothing because the
+/// account already holds this manifest (guard e), so the refresh persists
+/// anyway. Every other outcome means the refresh lasts this session only,
+/// as before.
+#[derive(Debug, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum CollectionWrite {
+    Written,
+    Unchanged,
+    /// No collection entry has this url (an addon only in addons.json).
+    NotInCollection,
+    /// The entry is flagged `protected` (Cinemeta and the other official
+    /// defaults), which Stremio never lets a client upgrade. Expected and
+    /// permanent, so nothing the user can act on: the UI stays silent.
+    Protected,
+    /// A guard refused the write. `reason` is short UI copy, never a URL.
+    Refused { reason: String },
+    /// The collection read does not hold what the addon list shows
+    /// (`check_collection_read`), so it may be partial and nothing was
+    /// pushed. The UI says to reload the list (`COLLECTION_CHANGED`).
+    AccountChanged,
+    /// The account API failed (network, HTTP, a malformed response).
+    Failed,
+    SessionExpired,
+}
+
+/// Why `apply_refreshed_manifest` wrote nothing. Every variant leaves the
+/// collection exactly as it was read.
+#[derive(Debug, PartialEq)]
+enum ManifestWriteSkip {
+    /// Guard c: no entry has this transportUrl.
+    NotInCollection,
+    /// Guard c: this many entries share it, so which one is meant is a guess.
+    Ambiguous(usize),
+    /// The one match's transportUrl is not literally the url the manifest
+    /// was fetched from, so the official apps load it from elsewhere.
+    OtherAddress,
+    /// Guard a: the official apps could not parse it (see
+    /// `check_collection_manifest`).
+    Invalid(&'static str),
+    /// Guard b: the url now answers as a different addon (`stored` is `None`
+    /// when the stored entry has no readable id to compare against).
+    IdChanged { stored: Option<String>, fresh: String },
+    /// Guard e: the entry already holds the fresh manifest, deep-equal as
+    /// served or equal in stremio-core terms on both sides
+    /// (`stremio_core_manifest`).
+    Unchanged,
+    /// Guard d: the fresh manifest declares `configurationRequired`.
+    ConfigurationRequired,
+    /// The entry is flagged `protected`, which the official apps refuse to
+    /// upgrade (stremio-core `UpgradeAddon`), so Aura does not either.
+    Protected,
+    /// The fresh manifest offers LESS than the stored one (see
+    /// `manifest_reduction`): an addon that wraps others, such as
+    /// AIOStreams, answers 200 with the same id and simply leaves out an
+    /// upstream that is down, and writing that would strip its catalogs from
+    /// every official app until the next refresh.
+    Reduced { lost: ManifestReduction, stored_version: String, fresh_version: String },
+    /// The stored manifest does not parse in stremio-core terms, so what the
+    /// fresh one would remove cannot be proved to be nothing.
+    StoredUnreadable,
+}
+
+/// What a fresh manifest would take away from the stored one, compared in
+/// stremio-core terms (`manifest_reduction`). Counts only, so it can be
+/// logged and shown without naming an addon's configured catalogs.
+#[derive(Debug, Default, PartialEq)]
+struct ManifestReduction {
+    resources:      usize,
+    types:          usize,
+    catalogs:       usize,
+    addon_catalogs: usize,
+    id_prefixes:    usize,
+    /// Resources still offered whose types or ids the fresh manifest
+    /// narrows, read the way stremio-core gates a request on one (counted
+    /// by name; a resource dropped outright is in `resources` instead).
+    narrowed_resources: usize,
+    /// Catalogs and addon catalogs still offered (by id and type) whose
+    /// extras the fresh manifest narrows, read the way stremio-core gates a
+    /// catalog request on them: an extra name dropped, an extra newly
+    /// required, or a required extra's options emptied (see
+    /// `manifest_reduction`).
+    narrowed_catalogs: usize,
+    /// The manifest-level `idPrefixes` go from every id (null or []) to a
+    /// list.
+    narrowed_ids:   bool,
+    /// The fresh `version` has LOWER semver precedence than the stored one.
+    older_version:  bool,
+}
+
+impl ManifestReduction {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// "remove 1 resource and 2 catalogs, narrow what 1 resource serves,
+    /// narrow 1 catalog's filters, and lower its version", for the log line
+    /// and the Refresh notice.
+    fn describe(&self) -> String {
+        let counted = [
+            (self.resources, "resource", "resources"),
+            (self.types, "type", "types"),
+            (self.catalogs, "catalog", "catalogs"),
+            (self.addon_catalogs, "addon catalog", "addon catalogs"),
+            (self.id_prefixes, "id prefix", "id prefixes"),
+        ];
+        let parts: Vec<String> = counted
+            .iter()
+            .filter(|(n, ..)| *n > 0)
+            .map(|(n, one, many)| format!("{n} {}", if *n == 1 { one } else { many }))
+            .collect();
+        let mut clauses: Vec<String> = Vec::new();
+        match parts.as_slice() {
+            [] => {}
+            [only] => clauses.push(format!("remove {only}")),
+            [head @ .., last] => clauses.push(format!("remove {} and {last}", head.join(", "))),
+        }
+        match self.narrowed_resources {
+            0 => {}
+            1 => clauses.push("narrow what 1 resource serves".to_string()),
+            n => clauses.push(format!("narrow what {n} resources serve")),
+        }
+        match self.narrowed_catalogs {
+            0 => {}
+            1 => clauses.push("narrow 1 catalog's filters".to_string()),
+            n => clauses.push(format!("narrow {n} catalogs' filters")),
+        }
+        if self.narrowed_ids {
+            clauses.push("narrow the ids it serves".to_string());
+        }
+        if self.older_version {
+            clauses.push("lower its version".to_string());
+        }
+        match clauses.as_slice() {
+            [] => String::new(),
+            [only] => only.clone(),
+            [head @ .., last] => format!("{}, and {last}", head.join(", ")),
+        }
+    }
+}
+
+/// The largest manifest Aura will write into a collection entry, serialized.
+/// Real manifests are well under 100 KiB even with dozens of catalogs; this
+/// only stops a runaway or hostile response from bloating the account.
+const MAX_COLLECTION_MANIFEST_BYTES: usize = 1 << 20;
+
+/// The deepest a manifest Aura writes into a collection entry may nest,
+/// counting the manifest object itself as level 1. Real manifests nest about
+/// 6 deep. stremio-core (and Aura's own `fetch_raw_collection` /
+/// `get_synced_addons`) parse the WHOLE collection under serde_json's
+/// 128-level recursion limit, with the manifest 4 levels down
+/// (result, addons, entry, manifest), and buffer unknown keys inside a
+/// catalog or resource through a depth-checked path. A manifest that passes
+/// every field check but nests 120-odd levels deep would therefore fail
+/// every client's collection parse: locked in the official apps, unreadable
+/// in Aura, and unrepairable by any client that reads before it writes.
+const MAX_COLLECTION_MANIFEST_DEPTH: usize = 32;
+
+/// Whether any array or object in `v` sits deeper than `max`, counting `v`
+/// itself as level 1. An explicit stack rather than recursion, so no value
+/// can overflow the stack here.
+fn json_nests_deeper_than(v: &serde_json::Value, max: usize) -> bool {
+    use serde_json::Value;
+    let mut stack: Vec<(&Value, usize)> = vec![(v, 1)];
+    while let Some((v, depth)) = stack.pop() {
+        match v {
+            Value::Array(a) => {
+                if depth > max { return true; }
+                stack.extend(a.iter().map(|c| (c, depth + 1)));
+            }
+            Value::Object(o) => {
+                if depth > max { return true; }
+                stack.extend(o.values().map(|c| (c, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Guard a: `m` is a manifest the official Stremio apps can parse. stremio-core
+/// reads the collection as one `Vec<Descriptor>`, so a SINGLE entry that fails
+/// to deserialize fails the whole pull, and the apps then fall back to the
+/// default addons and lock the user's list (`addons_locked`). Aura writes the
+/// addon's own JSON, not a struct it controls, so this mirrors every field
+/// stremio-core's `Manifest` parses strictly (src/types/addon/manifest.rs) and
+/// refuses whatever it would reject. It is stricter where that costs nothing:
+/// `name` non-empty, `types` and `resources` non-empty, `catalogs` present
+/// (the Stremio SDK's minimum, and what `WireManifest` already requires),
+/// `logo` / `background` strings (stremio-core ignores a bad one; an older
+/// build may not), and a catalog's short-form extras well-formed even when its
+/// `extra` array alone would parse. It also bounds what no field check can
+/// see: nesting (`MAX_COLLECTION_MANIFEST_DEPTH`, checked first, before
+/// anything recursive touches the value) and size. Used by the refresh write
+/// and by `cloud_add_addon` (`check_addable_manifest`).
+fn check_collection_manifest(m: &serde_json::Value) -> Result<(), &'static str> {
+    use serde_json::Value;
+    fn absent_or(o: &serde_json::Map<String, Value>, key: &str, ok: impl Fn(&Value) -> bool) -> bool {
+        match o.get(key) {
+            None => true,
+            Some(v) => ok(v),
+        }
+    }
+    fn nullable_str(v: &Value) -> bool { v.is_null() || v.is_string() }
+    fn str_array(v: &Value) -> bool {
+        v.as_array().is_some_and(|a| a.iter().all(Value::is_string))
+    }
+    fn nullable_str_array(v: &Value) -> bool { v.is_null() || str_array(v) }
+    fn non_empty_str(o: &serde_json::Map<String, Value>, key: &str) -> bool {
+        o.get(key).and_then(Value::as_str).is_some_and(|s| !s.is_empty())
+    }
+    fn catalog_ok(c: &Value) -> bool {
+        let Some(c) = c.as_object() else { return false; };
+        c.get("id").is_some_and(Value::is_string)
+            && c.get("type").is_some_and(Value::is_string)
+            && absent_or(c, "name", nullable_str)
+            && absent_or(c, "extraRequired", str_array)
+            && absent_or(c, "extraSupported", str_array)
+    }
+    fn catalogs_ok(v: &Value) -> bool {
+        v.as_array().is_some_and(|a| a.iter().all(catalog_ok))
+    }
+    fn resource_ok(r: &Value) -> bool {
+        match r {
+            Value::String(_) => true,
+            Value::Object(o) => {
+                o.get("name").is_some_and(Value::is_string)
+                    && absent_or(o, "types", nullable_str_array)
+                    && absent_or(o, "idPrefixes", nullable_str_array)
+            }
+            _ => false,
+        }
+    }
+    fn hints_ok(v: &Value) -> bool {
+        let Some(h) = v.as_object() else { return false; };
+        ["adult", "p2p", "configurable", "configurationRequired", "epgProvider"]
+            .iter()
+            .all(|k| absent_or(h, k, Value::is_boolean))
+    }
+
+    let Some(o) = m.as_object() else { return Err("the manifest is not a JSON object"); };
+    if json_nests_deeper_than(m, MAX_COLLECTION_MANIFEST_DEPTH) {
+        return Err("the manifest nests more than 32 levels deep");
+    }
+    if !non_empty_str(o, "id") { return Err("the manifest has no id"); }
+    if !non_empty_str(o, "name") { return Err("the manifest has no name"); }
+    if !o.get("version").and_then(Value::as_str).is_some_and(is_semver) {
+        return Err("the manifest version is not a valid semver string");
+    }
+    let non_empty = |key: &str| o.get(key).and_then(Value::as_array).is_some_and(|a| !a.is_empty());
+    if !non_empty("types") || !o.get("types").is_some_and(str_array) {
+        return Err("the manifest has no valid types list");
+    }
+    if !non_empty("resources")
+        || !o.get("resources").and_then(Value::as_array).is_some_and(|a| a.iter().all(resource_ok))
+    {
+        return Err("the manifest has no valid resources list");
+    }
+    if !o.get("catalogs").is_some_and(catalogs_ok) || !absent_or(o, "addonCatalogs", catalogs_ok) {
+        return Err("the manifest has a malformed catalog");
+    }
+    let optional_ok = absent_or(o, "idPrefixes", nullable_str_array)
+        && absent_or(o, "contactEmail", nullable_str)
+        && absent_or(o, "description", nullable_str)
+        && absent_or(o, "logo", nullable_str)
+        && absent_or(o, "background", nullable_str)
+        && absent_or(o, "behaviorHints", hints_ok);
+    if !optional_ok {
+        return Err("the manifest has a malformed optional field");
+    }
+    let size = serde_json::to_vec(m).map(|b| b.len()).unwrap_or(usize::MAX);
+    if size > MAX_COLLECTION_MANIFEST_BYTES {
+        return Err("the manifest is larger than 1 MiB");
+    }
+    Ok(())
+}
+
+/// A version string the `semver` crate (1.0) accepts, which is what
+/// stremio-core deserializes `Manifest::version` with: MAJOR.MINOR.PATCH as
+/// u64s without leading zeros, then optional `-pre` and `+build` made of
+/// non-empty dot-separated [0-9A-Za-z-] identifiers, where a numeric `pre`
+/// identifier may not have a leading zero either. No `v` prefix, no spaces.
+fn is_semver(s: &str) -> bool {
+    fn numeric(p: &str) -> bool {
+        !p.is_empty()
+            && p.bytes().all(|b| b.is_ascii_digit())
+            && (p == "0" || !p.starts_with('0'))
+            && p.parse::<u64>().is_ok()
+    }
+    fn identifiers(s: &str, pre: bool) -> bool {
+        s.split('.').all(|id| {
+            !id.is_empty()
+                && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !(pre && id.len() > 1 && id.starts_with('0') && id.bytes().all(|b| b.is_ascii_digit()))
+        })
+    }
+    let (rest, build) = match s.split_once('+') {
+        Some((rest, build)) => (rest, Some(build)),
+        None => (s, None),
+    };
+    let (core, pre) = match rest.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (rest, None),
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|p| numeric(p))
+        && pre.map_or(true, |p| identifiers(p, true))
+        && build.map_or(true, |b| identifiers(b, false))
+}
+
+/// SemVer 2.0 precedence of `a` against `b`, or `None` unless both pass
+/// `is_semver`. MAJOR, MINOR, PATCH numerically; then a version with a
+/// pre-release sorts BEFORE the same version without one, and two
+/// pre-releases compare identifier by identifier (numeric ones by value and
+/// below any alphanumeric one, alphanumeric ones in ASCII order, and a longer
+/// run wins when every shared identifier ties). Build metadata is ignored,
+/// so `1.0.0+a` and `1.0.0+b` are equal.
+fn semver_precedence(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    fn split(s: &str) -> Option<([u64; 3], Option<&str>)> {
+        if !is_semver(s) {
+            return None;
+        }
+        let rest = s.split_once('+').map_or(s, |(rest, _)| rest);
+        let (core, pre) = match rest.split_once('-') {
+            Some((core, pre)) => (core, Some(pre)),
+            None => (rest, None),
+        };
+        let mut n = [0u64; 3];
+        for (slot, part) in n.iter_mut().zip(core.split('.')) {
+            *slot = part.parse().ok()?;
+        }
+        Some((n, pre))
+    }
+    fn identifier(x: &str, y: &str) -> Ordering {
+        let numeric = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+        match (numeric(x), numeric(y)) {
+            // No leading zeros (`is_semver`), so length then digits is value
+            // order, with no overflow on a very long identifier.
+            (true, true) => x.len().cmp(&y.len()).then_with(|| x.cmp(y)),
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => x.cmp(y),
+        }
+    }
+    let (an, ap) = split(a)?;
+    let (bn, bp) = split(b)?;
+    Some(an.cmp(&bn).then_with(|| match (ap, bp) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(x), Some(y)) => {
+            let (mut xs, mut ys) = (x.split('.'), y.split('.'));
+            loop {
+                match (xs.next(), ys.next()) {
+                    (None, None) => break Ordering::Equal,
+                    (None, Some(_)) => break Ordering::Less,
+                    (Some(_), None) => break Ordering::Greater,
+                    (Some(p), Some(q)) => match identifier(p, q) {
+                        Ordering::Equal => continue,
+                        o => break o,
+                    },
+                }
+            }
+        }
+    }))
+}
+
+/// `m` exactly as the official Stremio apps store it in the collection, or
+/// `None` when stremio-core could not parse it. They push the collection as
+/// stremio-core's typed `Vec<Descriptor>` (src/types/addon/manifest.rs on the
+/// development branch), so an entry an official app last wrote never holds
+/// the raw manifest, even when nothing changed: it holds only the fields
+/// `Manifest` models, every `Option` written out as its value or null,
+/// `addonCatalogs` defaulted to [], all five behaviorHints bools, each catalog
+/// extra with its defaults filled in (a `skip` extra becomes stremio-core's own
+/// `SKIP_EXTRA_PROP`), catalogs unique by (id, type) and extras unique by name,
+/// and a logo / background re-serialized as a parsed URL (empty or unparseable
+/// becomes null). Everything else, catalog `genres` and unknown behaviorHints
+/// included, is dropped.
+///
+/// The refresh write compares the stored and the fresh manifest through this,
+/// on BOTH sides: guard e (unchanged, so no write) and `manifest_reduction`
+/// (what the fresh one would take away). A stored entry may be raw (written
+/// by Aura) or re-serialized (written by an official app), and a raw
+/// manifest may carry per-request noise such as AIOMetadata's `_timestamp`
+/// and `_debug`; in this form all of those compare alike, so an unchanged
+/// addon is never rewritten. What it drops is only what stremio-core does
+/// not model, so no official app reads it, and every field
+/// `get_synced_addons` reads is one this keeps. A value copied here is never
+/// altered beyond stremio-core's own defaults, and the function is
+/// idempotent (this of a stored stremio-core form is that form).
+fn stremio_core_manifest(m: &serde_json::Value) -> Option<serde_json::Value> {
+    use serde_json::{json, Value};
+    fn nullable_str(v: Option<&Value>) -> Option<Value> {
+        match v {
+            None | Some(Value::Null) => Some(Value::Null),
+            Some(Value::String(s)) => Some(Value::String(s.clone())),
+            Some(_) => None,
+        }
+    }
+    fn str_array(v: &Value) -> Option<Value> {
+        let a = v.as_array()?;
+        a.iter().all(Value::is_string).then(|| Value::Array(a.clone()))
+    }
+    fn nullable_str_array(v: Option<&Value>) -> Option<Value> {
+        match v {
+            None | Some(Value::Null) => Some(Value::Null),
+            Some(v) => str_array(v),
+        }
+    }
+    /// `#[serde(default)]` Vec<String> read through `UniqueVec`: absent is
+    /// [], repeats after the first are dropped, null fails.
+    fn unique_strs(v: Option<&Value>) -> Option<Value> {
+        let Some(v) = v else { return Some(json!([])); };
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for s in v.as_array()? {
+            let s = s.as_str()?;
+            if seen.insert(s) {
+                out.push(Value::String(s.to_owned()));
+            }
+        }
+        Some(Value::Array(out))
+    }
+    /// `DefaultOnError<NoneAsEmptyString>` over `Option<Url>`.
+    fn url_or_null(v: Option<&Value>) -> Value {
+        v.and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .and_then(|s| url::Url::parse(s).ok())
+            .map_or(Value::Null, |u| Value::String(u.into()))
+    }
+    /// `ManifestExtra::Full`: `None` when `extra` is absent or not a valid
+    /// `Vec<ExtraProp>`, in which case the untagged enum falls back to `Short`.
+    fn full_extra(v: Option<&Value>) -> Option<Vec<Value>> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for p in v?.as_array()? {
+            let p = p.as_object()?;
+            let name = p.get("name")?.as_str()?;
+            let is_required = match p.get("isRequired") {
+                None => false,
+                Some(v) => v.as_bool()?,
+            };
+            let options = match p.get("options") {
+                None | Some(Value::Null) => json!([]),
+                Some(v) => str_array(v)?,
+            };
+            let options_limit = match p.get("optionsLimit") {
+                None => 1,
+                Some(v) => v.as_u64()?,
+            };
+            if !seen.insert(name) {
+                continue;
+            }
+            out.push(if name == "skip" {
+                json!({ "name": "skip", "isRequired": false, "options": [], "optionsLimit": 1 })
+            } else {
+                json!({ "name": name, "isRequired": is_required, "options": options, "optionsLimit": options_limit })
+            });
+        }
+        Some(out)
+    }
+    fn catalogs(v: Option<&Value>) -> Option<Value> {
+        let Some(v) = v else { return Some(json!([])); };
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for c in v.as_array()? {
+            let c = c.as_object()?;
+            let id = c.get("id")?.as_str()?;
+            let kind = c.get("type")?.as_str()?;
+            let mut view = json!({ "id": id, "type": kind, "name": nullable_str(c.get("name"))? });
+            match full_extra(c.get("extra")) {
+                Some(props) => view["extra"] = Value::Array(props),
+                None => {
+                    view["extraRequired"] = unique_strs(c.get("extraRequired"))?;
+                    view["extraSupported"] = unique_strs(c.get("extraSupported"))?;
+                }
+            }
+            if seen.insert((id, kind)) {
+                out.push(view);
+            }
+        }
+        Some(Value::Array(out))
+    }
+    fn resource(r: &Value) -> Option<Value> {
+        match r {
+            Value::String(s) => Some(Value::String(s.clone())),
+            Value::Object(o) => Some(json!({
+                "name": o.get("name")?.as_str()?,
+                "types": nullable_str_array(o.get("types"))?,
+                "idPrefixes": nullable_str_array(o.get("idPrefixes"))?,
+            })),
+            _ => None,
+        }
+    }
+
+    let o = m.as_object()?;
+    let version = o.get("version")?.as_str().filter(|v| is_semver(v))?;
+    let resources = o.get("resources")?.as_array()?.iter().map(resource).collect::<Option<Vec<_>>>()?;
+    let hints = match o.get("behaviorHints") {
+        None => serde_json::Map::new(),
+        Some(v) => v.as_object()?.clone(),
+    };
+    let hint = |key: &str| match hints.get(key) {
+        None => Some(false),
+        Some(v) => v.as_bool(),
+    };
+    Some(json!({
+        "id": o.get("id")?.as_str()?,
+        "version": version,
+        "name": o.get("name")?.as_str()?,
+        "contactEmail": nullable_str(o.get("contactEmail"))?,
+        "description": nullable_str(o.get("description"))?,
+        "logo": url_or_null(o.get("logo")),
+        "background": url_or_null(o.get("background")),
+        "types": str_array(o.get("types")?)?,
+        "resources": resources,
+        "idPrefixes": nullable_str_array(o.get("idPrefixes"))?,
+        "catalogs": catalogs(o.get("catalogs"))?,
+        "addonCatalogs": catalogs(o.get("addonCatalogs"))?,
+        "behaviorHints": {
+            "adult": hint("adult")?,
+            "p2p": hint("p2p")?,
+            "configurable": hint("configurable")?,
+            "configurationRequired": hint("configurationRequired")?,
+            "epgProvider": hint("epgProvider")?,
+        },
+    }))
+}
+
+/// What `fresh` would take away from `stored`, both already in stremio-core
+/// form (`stremio_core_manifest`): a resource name, a type, a catalog or an
+/// addon catalog (by id and type), or a manifest-level idPrefix that `stored`
+/// declares and `fresh` does not; a resource still offered that serves fewer
+/// types or ids; a catalog or addon catalog still offered whose extras
+/// narrow; manifest-level ids narrowed from every id to a list; and a LOWER
+/// semver `version`. An empty result means the change only adds or keeps (a
+/// new catalog or resource, a renamed one, an extra added, given options or
+/// no longer required, wider types or ids, a higher version), which is all
+/// the refresh ever writes.
+///
+/// A catalog offered on both sides is read the way stremio-core's
+/// `is_extra_supported` and `default_required_extra` gate a request on it,
+/// through its extras as `ManifestExtra::iter` yields them (a short-form
+/// catalog yields its `extraSupported` names, each required when
+/// `extraRequired` also names it, with no options). It is narrowed when an
+/// extra name the stored one declares is gone (a request carrying it, such as
+/// a search, is no longer sent to it), when an extra is required where it was
+/// not (a request without it is no longer sent), or when a required extra's
+/// options go from some to none (`default_required_extra` then has no value
+/// to send, so the Board cannot request the catalog and it disappears). An
+/// addon that derives its extras from an upstream (a genre list) can do any
+/// of those while the upstream is down, keeping every catalog's id and type.
+///
+/// A resource is read the way stremio-core's `is_resource_supported` gates a
+/// meta, stream or subtitles request on it (`catalog` and `addon_catalog`
+/// are gated on the catalog lists instead): a short-form resource serves the
+/// manifest's `types` and `idPrefixes`, a full one ONLY its own `types` (none
+/// when absent) and its own `idPrefixes`, where null, absent or [] means
+/// every id. Wrapping addons such as AIOStreams declare everything per
+/// resource and nothing at manifest level, so a degraded answer that drops
+/// an upstream narrows a stream resource's `idPrefixes` while every name,
+/// type and catalog stays; that is the case this catches. stremio-core
+/// consults only the FIRST resource of a name, so every stored resource of
+/// that name must fit inside the first fresh one, which holds whichever of
+/// a repeated name a client reads. An id prefix covers another when the
+/// other starts with it (`tt` covers `tt1`), since every id matching the
+/// longer one matches the shorter.
+///
+/// A manifest-level `idPrefixes` of null or [] also means every id, so a
+/// fresh list there narrows the addon (`narrowed_ids`); a fresh null against
+/// a stored list counts every stored prefix as lost although stremio-core
+/// reads it as wider, because it drops what the stored manifest declares and
+/// the write goes ahead only when nothing it declares is taken away.
+fn manifest_reduction(stored: &serde_json::Value, fresh: &serde_json::Value) -> ManifestReduction {
+    use serde_json::Value;
+    fn strs(v: Option<&Value>) -> HashSet<&str> {
+        v.and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default()
+    }
+    fn resource_name(r: &Value) -> Option<&str> {
+        r.as_str().or_else(|| r.get("name").and_then(Value::as_str))
+    }
+    fn resources(m: &Value) -> &[Value] {
+        m.get("resources").and_then(Value::as_array).map_or(&[][..], Vec::as_slice)
+    }
+    fn resource_names(m: &Value) -> HashSet<&str> {
+        resources(m).iter().filter_map(resource_name).collect()
+    }
+    /// The ids a prefix list admits: `None` for every id (null, absent or
+    /// []), else the prefixes.
+    fn id_scope(v: Option<&Value>) -> Option<Vec<&str>> {
+        let prefixes: Vec<&str> = v.and_then(Value::as_array)?.iter().filter_map(Value::as_str).collect();
+        (!prefixes.is_empty()).then_some(prefixes)
+    }
+    /// The types and ids resource `r` of manifest `m` serves (see above).
+    fn serves<'a>(m: &'a Value, r: &'a Value) -> (HashSet<&'a str>, Option<Vec<&'a str>>) {
+        match r {
+            Value::String(_) => (strs(m.get("types")), id_scope(m.get("idPrefixes"))),
+            _ => (strs(r.get("types")), id_scope(r.get("idPrefixes"))),
+        }
+    }
+    /// Every id `inner` admits is one `outer` admits.
+    fn ids_cover(outer: &Option<Vec<&str>>, inner: &Option<Vec<&str>>) -> bool {
+        match (outer, inner) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(o), Some(i)) => i.iter().all(|p| o.iter().any(|q| p.starts_with(q))),
+        }
+    }
+    let narrowed_resources: HashSet<&str> = resources(stored)
+        .iter()
+        .filter_map(|r| {
+            let name = resource_name(r)?;
+            // stremio-core gates these on the catalog lists, compared by
+            // (id, type) below, never on the resource's types or ids.
+            if name == "catalog" || name == "addon_catalog" {
+                return None;
+            }
+            // Gone outright: counted in `resources`, not here.
+            let first_fresh = resources(fresh).iter().find(|f| resource_name(f) == Some(name))?;
+            let (stored_types, stored_ids) = serves(stored, r);
+            let (fresh_types, fresh_ids) = serves(fresh, first_fresh);
+            // A resource that serves no type serves nothing to lose.
+            let kept = stored_types.is_empty()
+                || (stored_types.is_subset(&fresh_types) && ids_cover(&fresh_ids, &stored_ids));
+            (!kept).then_some(name)
+        })
+        .collect();
+    fn catalog_keys<'a>(m: &'a Value, key: &str) -> HashSet<(&'a str, &'a str)> {
+        m.get(key)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| Some((c.get("id")?.as_str()?, c.get("type")?.as_str()?)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn lost<T: Eq + std::hash::Hash>(stored: HashSet<T>, fresh: HashSet<T>) -> usize {
+        stored.difference(&fresh).count()
+    }
+    fn catalog_list<'a>(m: &'a Value, key: &str) -> &'a [Value] {
+        m.get(key).and_then(Value::as_array).map_or(&[][..], Vec::as_slice)
+    }
+    fn catalog_key(c: &Value) -> Option<(&str, &str)> {
+        Some((c.get("id")?.as_str()?, c.get("type")?.as_str()?))
+    }
+    /// A catalog's extras as stremio-core's `ManifestExtra::iter` yields
+    /// them (see above): name to (required, has options). Names are unique in
+    /// stremio-core form.
+    fn extras(c: &Value) -> HashMap<&str, (bool, bool)> {
+        if let Some(props) = c.get("extra").and_then(Value::as_array) {
+            return props
+                .iter()
+                .filter_map(|p| {
+                    let required = p.get("isRequired").and_then(Value::as_bool).unwrap_or(false);
+                    let options = p.get("options").and_then(Value::as_array).is_some_and(|o| !o.is_empty());
+                    Some((p.get("name")?.as_str()?, (required, options)))
+                })
+                .collect();
+        }
+        let required = strs(c.get("extraRequired"));
+        c.get("extraSupported")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(|n| (n, (required.contains(n), false))).collect())
+            .unwrap_or_default()
+    }
+    /// How many catalogs under `key` both manifests offer (by id and type)
+    /// whose extras `fresh` narrows (see above).
+    fn narrowed_catalogs(stored: &Value, fresh: &Value, key: &str) -> usize {
+        catalog_list(stored, key)
+            .iter()
+            .filter(|s| {
+                let Some(k) = catalog_key(s) else { return false; };
+                // Gone outright: counted in `catalogs` or `addon_catalogs`.
+                let Some(f) = catalog_list(fresh, key).iter().find(|f| catalog_key(f) == Some(k)) else {
+                    return false;
+                };
+                let (was, now) = (extras(s), extras(f));
+                was.keys().any(|name| !now.contains_key(name))
+                    || now.iter().any(|(name, &(required, options))| {
+                        let before = was.get(name);
+                        (required && !before.is_some_and(|&(r, _)| r))
+                            || (required && !options && before.is_some_and(|&(_, o)| o))
+                    })
+            })
+            .count()
+    }
+    let version = |m: &Value| m.get("version").and_then(Value::as_str).unwrap_or_default().to_string();
+    ManifestReduction {
+        resources:      lost(resource_names(stored), resource_names(fresh)),
+        types:          lost(strs(stored.get("types")), strs(fresh.get("types"))),
+        catalogs:       lost(catalog_keys(stored, "catalogs"), catalog_keys(fresh, "catalogs")),
+        addon_catalogs: lost(catalog_keys(stored, "addonCatalogs"), catalog_keys(fresh, "addonCatalogs")),
+        id_prefixes:    lost(strs(stored.get("idPrefixes")), strs(fresh.get("idPrefixes"))),
+        narrowed_resources: narrowed_resources.len(),
+        narrowed_catalogs: narrowed_catalogs(stored, fresh, "catalogs")
+            + narrowed_catalogs(stored, fresh, "addonCatalogs"),
+        narrowed_ids:   id_scope(stored.get("idPrefixes")).is_none() && id_scope(fresh.get("idPrefixes")).is_some(),
+        older_version:  semver_precedence(&version(fresh), &version(stored)) == Some(std::cmp::Ordering::Less),
+    }
+}
+
+/// The manifest declares `behaviorHints.configurationRequired: true`, which
+/// stremio-core refuses to install or upgrade to.
+fn requires_configuration(m: &serde_json::Value) -> bool {
+    m.pointer("/behaviorHints/configurationRequired") == Some(&serde_json::Value::Bool(true))
+}
+
+/// What `cloud_add_addon` requires of a manifest before it may go into the
+/// collection, checked BEFORE the lock is taken: everything
+/// `check_collection_manifest` requires of the refresh write (ONE entry
+/// stremio-core cannot parse locks the user's addon list in every official
+/// app), and no `configurationRequired` (stremio-core refuses to install such
+/// a manifest; the addon's configure page gives the link to add instead).
+/// The error is the copy AddAddonForm shows.
+fn check_addable_manifest(m: &serde_json::Value) -> Result<(), String> {
+    const REFUSED: &str = "This addon's manifest can't be added to your Stremio account";
+    check_collection_manifest(m).map_err(|why| format!("{REFUSED}: {why}"))?;
+    if requires_configuration(m) {
+        return Err(format!("{REFUSED}: the addon needs configuring first"));
+    }
+    Ok(())
+}
+
+/// The pure half of the signed-in collection write: put `fresh` into the one
+/// collection entry whose normalized transportUrl is `target`, or say why not.
+/// On `Ok` the ONLY change is that entry's `manifest`, now `fresh` verbatim;
+/// its `transportUrl` string (not re-normalized), `flags`, any other keys,
+/// every other entry and the order are exactly as read. On `Err` nothing
+/// changed at all. `target` is the refreshed addon's collection key
+/// (`normalize_addon_url` of its base), `fetched_url` is the literal address
+/// `fresh` was served from, and the
+/// guards run in this order: exactly one match, not protected, that entry's
+/// transportUrl is `fetched_url`, `fresh` would parse in stremio-core, same
+/// manifest id, not already held, no `configurationRequired`, and nothing the
+/// stored manifest offers taken away (`manifest_reduction`).
+fn apply_refreshed_manifest(
+    collection: &mut [serde_json::Value],
+    target: &str,
+    fetched_url: &str,
+    fresh: &serde_json::Value,
+) -> Result<usize, ManifestWriteSkip> {
+    let hits: Vec<usize> = collection
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| {
+            a.get("transportUrl")
+                .and_then(|v| v.as_str())
+                .map(|t| normalize_addon_url(t) == target)
+                .unwrap_or(false)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let index = match hits.as_slice() {
+        [] => return Err(ManifestWriteSkip::NotInCollection),
+        [i] => *i,
+        many => return Err(ManifestWriteSkip::Ambiguous(many.len())),
+    };
+    // A protected entry is never written, whatever it holds or serves, so it
+    // is checked first: nothing below may report it as a refusal the user
+    // could act on.
+    if entry_is_protected(&collection[index]) {
+        return Err(ManifestWriteSkip::Protected);
+    }
+    // The official apps fetch the entry's transportUrl as written, so
+    // anything but the very url Aura fetched (a legacy `/stremio/v1`
+    // transport, a doubled or trailing slash) means what Aura fetched is not
+    // provably what this entry serves. Compared against the literal url, not
+    // one re-derived from `target`, which two different addresses can share.
+    if collection[index].get("transportUrl").and_then(|v| v.as_str()) != Some(fetched_url) {
+        return Err(ManifestWriteSkip::OtherAddress);
+    }
+    check_collection_manifest(fresh).map_err(ManifestWriteSkip::Invalid)?;
+
+    let entry = &collection[index];
+    let stored = entry.get("manifest");
+    let stored_id = stored.and_then(|m| m.get("id")).and_then(|v| v.as_str());
+    // `check_collection_manifest` has proved `id` is a non-empty string.
+    let fresh_id = fresh.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+    if stored_id != Some(fresh_id) {
+        return Err(ManifestWriteSkip::IdChanged {
+            stored: stored_id.map(str::to_string),
+            fresh:  fresh_id.to_string(),
+        });
+    }
+    // Both comparisons below are in stremio-core terms on BOTH sides
+    // (`stremio_core_manifest`), whichever form the stored entry is in.
+    // `check_collection_manifest` has proved the fresh one parses there.
+    let Some(fresh_core) = stremio_core_manifest(fresh) else {
+        return Err(ManifestWriteSkip::Invalid("the manifest would not parse in Stremio"));
+    };
+    let stored_core = stored.and_then(stremio_core_manifest);
+    // Deep-equal as served, or equal in stremio-core terms: the official
+    // apps re-serialize every entry on each push, and AIOMetadata stamps a
+    // per-request `_timestamp` / `_debug` into every manifest, so a raw
+    // compare alone would rewrite the whole collection on every refresh of
+    // an unchanged addon.
+    if stored == Some(fresh) || stored_core.as_ref() == Some(&fresh_core) {
+        return Err(ManifestWriteSkip::Unchanged);
+    }
+    // Refused whenever the fresh manifest asks for configuration, not only
+    // when it newly does: stremio-core refuses to install or upgrade to such
+    // a manifest, and a transient fault that serves the unconfigured
+    // manifest must not make the official apps think a configured addon
+    // needs setting up again.
+    if requires_configuration(fresh) {
+        return Err(ManifestWriteSkip::ConfigurationRequired);
+    }
+    // Only additive or equal-shape changes are written. A same-id 200 that
+    // offers less is as likely a transient upstream fault as a real change,
+    // and writing it strips the account in every official app; reinstalling
+    // the addon is how a user makes a reduction stick on purpose.
+    let Some(stored_core) = stored_core else {
+        return Err(ManifestWriteSkip::StoredUnreadable);
+    };
+    let lost = manifest_reduction(&stored_core, &fresh_core);
+    if !lost.is_empty() {
+        let version = |m: &serde_json::Value| {
+            m.get("version").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+        };
+        return Err(ManifestWriteSkip::Reduced {
+            lost,
+            stored_version: version(&stored_core),
+            fresh_version:  version(&fresh_core),
+        });
+    }
+
+    match collection[index].as_object_mut() {
+        Some(o) => {
+            o.insert("manifest".to_string(), fresh.clone());
+            Ok(index)
+        }
+        // A non-object entry has no transportUrl, so it can never be a hit.
+        None => Err(ManifestWriteSkip::NotInCollection),
+    }
+}
+
+/// The signed-in half of `refresh_addon_manifest`: write the fresh manifest,
+/// verbatim, into this addon's entry of the user's Stremio collection, under
+/// `check_collection_read` (against `expected`, the urls the addon list
+/// shows) and the guards in `apply_refreshed_manifest`. Never an error: the
+/// refresh has already succeeded, so every failure is logged and reported as
+/// an outcome. It waits for the read and the push only; the read-back that
+/// follows runs in the background. `fetched_url` is the literal address
+/// `fresh` came from.
+async fn write_refreshed_manifest(
+    auth_key: &str,
+    base: &str,
+    fetched_url: &str,
+    fresh: serde_json::Value,
+    label: &str,
+    expected: Option<&[String]>,
+) -> CollectionWrite {
+    let target = normalize_addon_url(base);
+    let failed = |step: &str, e: String| {
+        crate::devlog!(
+            warn, "catalog",
+            "[{}] manifest refreshed but the Stremio collection {} failed ({}); the refresh lasts this session only",
+            label, step, cap(redact_urls_in_text(&e).into_owned(), 200),
+        );
+        if e == SESSION_EXPIRED { CollectionWrite::SessionExpired } else { CollectionWrite::Failed }
+    };
+
+    let writer = collection_write_lock().lock().await;
+    // Read under the lock and immediately before the push, never reusing an
+    // earlier read (see `COLLECTION_WRITE_LOCK`).
+    let mut collection = match fetch_raw_collection(auth_key).await {
+        Ok(c) => c,
+        Err(e) => return failed("read", e),
+    };
+    // The push carries the WHOLE array, so a read that lacks an addon the
+    // list shows would delete it from the account, however right the one
+    // entry below is. An addon Aura itself just removed is expected absent.
+    if let Err(drift) = check_collection_read(&collection, expected, &recent_removals(auth_key), false) {
+        let _ = collection_drift_error(&format!("[{label}] collection write (the refresh lasts this session only)"), drift);
+        return CollectionWrite::AccountChanged;
+    }
+    let before = collection.len();
+    // A slice, so the entry count cannot change: the push carries exactly
+    // the entries just read, one manifest replaced.
+    let index = match apply_refreshed_manifest(&mut collection, target, fetched_url, &fresh) {
+        Ok(i) => i,
+        Err(skip) => return collection_write_skipped(label, skip),
+    };
+    if let Err(e) = push_collection(auth_key, collection).await {
+        return failed("write", e);
+    }
+    // The write is done. Release the lock before the read-back, so a queued
+    // add, remove or reorder never waits on what is only a log line. A
+    // writer that runs in between is why the read-back below reports "since
+    // the write" rather than a failed write when it does not find exactly
+    // what was pushed.
+    drop(writer);
+
+    // Read back once to confirm the entry now holds the WHOLE manifest that
+    // was written: a catalog-only change keeps the id and version, so those
+    // alone would "confirm" a write that never landed. In the background,
+    // because the outcome returned below does not depend on it and the
+    // refresh (spinner, catalog rows) should not wait another account round
+    // trip. No retry loop: a mismatch is logged, and the next refresh writes
+    // again if the manifest still differs.
+    let (auth_key, target, label) = (auth_key.to_string(), target.to_string(), label.to_string());
+    tauri::async_runtime::spawn(async move {
+        let version = fresh.get("version").and_then(|v| v.as_str()).unwrap_or_default();
+        match fetch_raw_collection(&auth_key).await {
+            Ok(after) => {
+                let entries: Vec<&serde_json::Value> = after
+                    .iter()
+                    .filter(|a| {
+                        a.get("transportUrl").and_then(|v| v.as_str()).map(normalize_addon_url)
+                            == Some(target.as_str())
+                    })
+                    .collect();
+                let fresh_core = stremio_core_manifest(&fresh);
+                if entries.is_empty() {
+                    crate::devlog!(
+                        info, "catalog",
+                        "[{}] refreshed manifest written to the Stremio collection (version {}); the read-back finds no entry for it, so it was removed or changed since the write",
+                        label, version,
+                    );
+                } else if entries.iter().any(|a| a.get("manifest") == Some(&fresh)) {
+                    crate::devlog!(
+                        info, "catalog",
+                        "[{}] refreshed manifest written to the Stremio collection (entry {} of {}, version {}); read-back confirmed",
+                        label, index + 1, before, version,
+                    );
+                } else if fresh_core.is_some()
+                    && entries.iter().any(|a| a.get("manifest").and_then(stremio_core_manifest) == fresh_core)
+                {
+                    crate::devlog!(
+                        info, "catalog",
+                        "[{}] refreshed manifest written to the Stremio collection (version {}); read-back confirmed, as an official app has since re-saved it",
+                        label, version,
+                    );
+                } else {
+                    crate::devlog!(
+                        warn, "catalog",
+                        "[{}] refreshed manifest written to the Stremio collection (version {}), but the entry has changed since the write: the read-back shows a different manifest",
+                        label, version,
+                    );
+                }
+            }
+            Err(e) => crate::devlog!(
+                warn, "catalog",
+                "[{}] refreshed manifest written to the Stremio collection; the read-back failed ({})",
+                label, cap(redact_urls_in_text(&e).into_owned(), 200),
+            ),
+        }
+    });
+    CollectionWrite::Written
+}
+
+/// Log one refused or skipped collection write and map it to its outcome.
+fn collection_write_skipped(label: &str, skip: ManifestWriteSkip) -> CollectionWrite {
+    let refused = |reason: &str| CollectionWrite::Refused { reason: reason.to_string() };
+    match skip {
+        ManifestWriteSkip::NotInCollection => {
+            crate::devlog!(
+                info, "catalog",
+                "[{}] not in the Stremio collection (a local addon); refreshed for this session only",
+                label,
+            );
+            CollectionWrite::NotInCollection
+        }
+        ManifestWriteSkip::Unchanged => {
+            crate::devlog!(info, "catalog", "[{}] Stremio collection already holds this manifest; nothing written", label);
+            CollectionWrite::Unchanged
+        }
+        ManifestWriteSkip::Ambiguous(n) => {
+            crate::devlog!(
+                warn, "catalog",
+                "[{}] collection write refused: {} entries share this addon's url, so which one to update is ambiguous",
+                label, n,
+            );
+            refused("more than one entry in your list uses this address")
+        }
+        ManifestWriteSkip::OtherAddress => {
+            crate::devlog!(
+                info, "catalog",
+                "[{}] collection write skipped: the entry's transportUrl is not the manifest url Aura fetched (a legacy or unusual address)",
+                label,
+            );
+            refused("Stremio loads this addon from a different address")
+        }
+        ManifestWriteSkip::Invalid(why) => {
+            crate::devlog!(
+                warn, "catalog",
+                "[{}] collection write refused: {}, which would break the addon list in the official Stremio apps",
+                label, why,
+            );
+            refused("the addon's manifest would not load in Stremio")
+        }
+        ManifestWriteSkip::IdChanged { stored, fresh } => {
+            crate::devlog!(
+                warn, "catalog",
+                "[{}] collection write refused: the url now serves addon id '{}' but the collection entry holds '{}'",
+                label, cap(fresh, 100), stored.map_or_else(|| "(no id)".to_string(), |s| cap(s, 100)),
+            );
+            refused("the address now serves a different addon")
+        }
+        ManifestWriteSkip::ConfigurationRequired => {
+            crate::devlog!(
+                warn, "catalog",
+                "[{}] collection write refused: the fresh manifest declares configurationRequired",
+                label,
+            );
+            refused("the addon says it needs configuring")
+        }
+        ManifestWriteSkip::Protected => {
+            crate::devlog!(
+                info, "catalog",
+                "[{}] collection write skipped: the entry is protected, which Stremio does not let clients upgrade",
+                label,
+            );
+            CollectionWrite::Protected
+        }
+        ManifestWriteSkip::Reduced { lost, stored_version, fresh_version } => {
+            let what = lost.describe();
+            crate::devlog!(
+                warn, "catalog",
+                "[{}] collection write refused: the fresh manifest would {} (stored version {}, fresh {}); a same-id answer that offers less can be a transient upstream fault, so the stored manifest is kept",
+                label, what, cap(stored_version, 40), cap(fresh_version, 40),
+            );
+            CollectionWrite::Refused {
+                reason: format!(
+                    "the addon now offers less than before (this would {what}); reinstalling the addon updates your account on purpose"
+                ),
+            }
+        }
+        ManifestWriteSkip::StoredUnreadable => {
+            crate::devlog!(
+                warn, "catalog",
+                "[{}] collection write refused: the stored manifest does not parse in stremio-core terms, so what the fresh one would remove cannot be checked",
+                label,
+            );
+            refused("your account's copy of it could not be compared with the new one")
+        }
+    }
 }
 
 /// Force a fresh manifest fetch, bypassing the 24 h `MANIFEST_TTL`. Used
@@ -1639,17 +2928,47 @@ pub struct RefreshedAddonManifest {
 /// one in one respect only: it keeps every idPrefix, where addons.json
 /// keeps `add_addon`'s first 16 (see the note at the end of the body).
 ///
-/// It deliberately does NOT write the Stremio cloud addon collection: that
-/// is an outward write to the user's account, shared with the official
-/// Stremio apps, and needs the maintainer's explicit decision. For a
-/// signed-in user the rebuilt fields therefore last until the next launch
-/// (or sign-in), when `get_synced_addons` reads the collection's stored
-/// manifest snapshot again and the install-time fields come back.
+/// For a signed-in user (`auth_key` given) it ALSO writes the fresh manifest
+/// into this addon's entry of the Stremio addon collection, the snapshot the
+/// official Stremio apps share and `get_synced_addons` reads at launch. That
+/// is an outward write to the user's account, approved by the maintainer on
+/// the condition that it is definitely accurate and not potentially harmful,
+/// so it is surgical, and whenever a guard is in doubt it refuses (harmless:
+/// the refresh still applies for the session). The guards: under the
+/// one-writer `COLLECTION_WRITE_LOCK` the collection is re-read and must hold
+/// every addon the frontend list shows (`expected_urls`, less any Aura itself
+/// just removed), exactly one entry must match, not `protected` and at the
+/// very url the manifest was fetched from, and the manifest, written verbatim
+/// as served and never as an Aura struct, must parse in stremio-core within
+/// 32 levels of nesting and 1 MiB, keep the stored manifest id, not declare
+/// `configurationRequired`, differ from the stored one in stremio-core terms,
+/// and take nothing away (no resource, type, catalog, addon catalog or
+/// manifest-level idPrefix dropped, no resource serving fewer types or ids as
+/// stremio-core reads it, no catalog losing an extra, gaining a required one
+/// or emptying a required one's options, no manifest-level ids narrowed, no
+/// lower version; `manifest_reduction`). The frontend sends an `auth_key`
+/// only once this session's `get_synced_addons` has loaded the list
+/// `expected_urls` comes from. Only that entry's `manifest` changes; its
+/// `transportUrl`, flags, the other entries and the order stay as read. A
+/// read-back in the background, after the lock is released, confirms the
+/// entry holds the whole manifest written. With `report` true (the default:
+/// the Refresh button) the read and the push are awaited and their outcome
+/// returned in `collection`; false (the silent refresh after Configure)
+/// spawns the write and returns at once with `collection` None, so the fresh
+/// catalogs never wait on the account API. A refused or failed write never
+/// fails the refresh, whose fields then last this session only (until the
+/// next launch or sign-in, when the collection's stored snapshot is read
+/// again).
 #[tauri::command]
 pub async fn refresh_addon_manifest<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     addon_url: String,
+    auth_key: Option<String>,
+    expected_urls: Option<Vec<String>>,
+    report: Option<bool>,
 ) -> Result<RefreshedAddonManifest, String> {
+    let auth_key = auth_key.filter(|k| !k.is_empty());
+    let report = report.unwrap_or(true);
     validate_url(&addon_url)?;
     let base = normalise_addon_base(&addon_url);
     // Drop the cached entry BEFORE the refetch so the very next call
@@ -1664,7 +2983,12 @@ pub async fn refresh_addon_manifest<R: tauri::Runtime>(
     if let Ok(mut ok)   = catalog_ok_cache().lock()   { ok.retain(|k, _| !k.starts_with(&prefix)); }
     if let Ok(mut fail) = addon_fail_cache().lock()   { fail.retain(|k, _| !k.starts_with(&prefix)); }
 
-    let (wire, has_search) = fetch_manifest(&base).await?;
+    // Always the network (the cache entry was just dropped, but a concurrent
+    // fetch could have refilled it), and the raw manifest alongside the typed
+    // one, for the collection write below. `manifest_url` is kept because
+    // that write compares an entry's transportUrl against exactly it.
+    let manifest_url = format!("{base}/manifest.json");
+    let (raw_manifest, wire, has_search) = fetch_manifest_fresh(&base, &manifest_url).await?;
     let label = log_label(&wire.name, &base);
     let entry = addon_entry_from_wire(base.clone(), &wire, has_search);
 
@@ -1682,11 +3006,14 @@ pub async fn refresh_addon_manifest<R: tauri::Runtime>(
                 hits += 1;
             }
             if hits == 0 {
-                crate::devlog!(
-                    info, "catalog",
-                    "[{}] manifest refreshed; not in addons.json (cloud addon), rebuilt fields last this session only",
-                    label,
-                );
+                // Signed in, the collection write below says what happened.
+                if auth_key.is_none() {
+                    crate::devlog!(
+                        info, "catalog",
+                        "[{}] manifest refreshed; not in addons.json, rebuilt fields last this session only",
+                        label,
+                    );
+                }
             } else if let Err(e) = addons::save(&app, &list) {
                 crate::devlog!(
                     warn, "catalog",
@@ -1721,12 +3048,30 @@ pub async fn refresh_addon_manifest<R: tauri::Runtime>(
     // list until the next launch, which only ever accepts more ids.
     let entry = AddonEntry { id_prefixes: collect_wire_id_prefixes_complete(&wire), ..entry };
 
+    // Signed-in persistence, after the fetch and validation succeeded. Like
+    // the guest save above it never fails the refresh. Unreported, the write
+    // runs on its own task (still queued on the lock, still logged) and the
+    // entry goes back now.
+    let collection = match auth_key {
+        Some(key) if report => Some(
+            write_refreshed_manifest(&key, &base, &manifest_url, raw_manifest, &label, expected_urls.as_deref()).await,
+        ),
+        Some(key) => {
+            let (base, label) = (base.clone(), label.clone());
+            tauri::async_runtime::spawn(async move {
+                write_refreshed_manifest(&key, &base, &manifest_url, raw_manifest, &label, expected_urls.as_deref()).await;
+            });
+            None
+        }
+        None => None,
+    };
+
     crate::devlog!(
         info, "manifest",
         "[{}] {} catalogs, has_search={}",
         label, wire.catalogs.len(), has_search,
     );
-    Ok(RefreshedAddonManifest { manifest: addon_manifest_from_wire(wire, has_search), entry })
+    Ok(RefreshedAddonManifest { manifest: addon_manifest_from_wire(wire, has_search), entry, collection })
 }
 
 #[tauri::command]
@@ -2463,8 +3808,15 @@ pub async fn global_search_grouped(
 /// Security: fetches the manifest before writing to the cloud — this validates
 /// the URL is a real Stremio addon and prevents injection of arbitrary JSON
 /// into the user's account. Only http/https URLs are accepted (validate_url).
+/// The manifest must also pass `check_addable_manifest` before the lock is
+/// taken, and the fresh read must pass `add_to_collection`, because the push
+/// replaces the whole array.
 #[tauri::command]
-pub async fn cloud_add_addon(auth_key: String, url: String) -> Result<AddonEntry, String> {
+pub async fn cloud_add_addon(
+    auth_key: String,
+    url: String,
+    expected_urls: Option<Vec<String>>,
+) -> Result<AddonEntry, String> {
     validate_url(&url)?;
     let base = normalise_addon_base(&url);
 
@@ -2481,6 +3833,10 @@ pub async fn cloud_add_addon(auth_key: String, url: String) -> Result<AddonEntry
         .await
         .map_err(|e| format!("Manifest parse error: {e}"))?;
 
+    // The entry goes into the collection verbatim, where one manifest
+    // stremio-core cannot parse fails the official apps' whole addon pull.
+    check_addable_manifest(&manifest_json)?;
+
     let name = manifest_json
         .get("name")
         .and_then(|v| v.as_str())
@@ -2494,26 +3850,21 @@ pub async fn cloud_add_addon(auth_key: String, url: String) -> Result<AddonEntry
 
     let has_search = extract_manifest_has_search(&manifest_json);
 
-    let transport_url = format!("{base}/manifest.json");
-    let base_norm = normalize_addon_url(&base);
-
-    let mut collection = fetch_raw_collection(&auth_key).await?;
-
-    if collection.iter().any(|a| {
-        a.get("transportUrl")
-            .and_then(|v| v.as_str())
-            .map(|t| normalize_addon_url(t) == base_norm)
-            .unwrap_or(false)
-    }) {
-        return Err("Addon already in your Stremio account".into());
-    }
-
-    collection.push(serde_json::json!({
-        "manifest":     manifest_json,
-        "transportUrl": transport_url,
-    }));
-
-    push_collection(&auth_key, collection).await?;
+    // Taken after the manifest fetch, so the addon's own latency never sits
+    // inside the read-to-write window (see `COLLECTION_WRITE_LOCK`).
+    let _writer = collection_write_lock().lock().await;
+    let collection = fetch_raw_collection(&auth_key).await?;
+    let next = add_to_collection(
+        collection,
+        &base,
+        manifest_json.clone(),
+        expected_urls.as_deref(),
+        &recent_removals(&auth_key),
+    )?;
+    push_collection(&auth_key, next).await?;
+    // Back in the account, so a later read that lacks it is a partial read
+    // again, even within a minute of Aura removing it.
+    forget_recent_removal(&auth_key, normalize_addon_url(&base));
 
     let types       = extract_manifest_types(&manifest_json);
     let resources   = extract_manifest_resources(&manifest_json);
@@ -2535,66 +3886,248 @@ pub async fn cloud_add_addon(auth_key: String, url: String) -> Result<AddonEntry
     })
 }
 
-/// Remove an addon from the user's Stremio cloud account by URL.
-#[tauri::command]
-pub async fn cloud_remove_addon(auth_key: String, url: String) -> Result<(), String> {
-    let norm = normalize_addon_url(url.trim_end_matches('/'));
-
-    let mut collection = fetch_raw_collection(&auth_key).await?;
-    let before = collection.len();
-    collection.retain(|a| {
+/// The pure half of `cloud_add_addon`: `collection` with a new entry for the
+/// addon at `base` (`manifest` verbatim, transportUrl `{base}/manifest.json`)
+/// appended, or the error the frontend shows. Refused, with nothing written,
+/// when the read is empty at all, whatever `expected` holds (a real
+/// collection keeps Stremio's protected defaults, which no client can
+/// remove, so an empty read is the glitch, and pushing `[new]` from it would
+/// delete every other addon from the account), when it does not hold every
+/// addon in `expected` other than `excused` (`check_collection_read`; `base`
+/// itself is left out, being naturally absent), and when an entry already
+/// has `base`'s collection key.
+fn add_to_collection(
+    mut collection: Vec<serde_json::Value>,
+    base: &str,
+    manifest: serde_json::Value,
+    expected: Option<&[String]>,
+    excused: &[String],
+) -> Result<Vec<serde_json::Value>, String> {
+    if collection.is_empty() {
+        return Err(collection_drift_error("addon add", CollectionDrift::Empty));
+    }
+    let mut excused = excused.to_vec();
+    excused.push(base.to_string());
+    check_collection_read(&collection, expected, &excused, false)
+        .map_err(|drift| collection_drift_error("addon add", drift))?;
+    let key = normalize_addon_url(base);
+    if collection.iter().any(|a| {
         a.get("transportUrl")
             .and_then(|v| v.as_str())
-            .map(|t| normalize_addon_url(t) != norm)
-            .unwrap_or(true)
-    });
+            .is_some_and(|t| normalize_addon_url(t) == key)
+    }) {
+        return Err("Addon already in your Stremio account".into());
+    }
+    collection.push(serde_json::json!({
+        "manifest":     manifest,
+        "transportUrl": format!("{base}/manifest.json"),
+    }));
+    Ok(collection)
+}
 
-    if collection.len() == before {
+/// Remove an addon from the user's Stremio cloud account by URL. The rules
+/// are `remove_from_collection`'s; `expected_urls` is the list the frontend
+/// shows.
+#[tauri::command]
+pub async fn cloud_remove_addon(
+    auth_key: String,
+    url: String,
+    expected_urls: Option<Vec<String>>,
+) -> Result<(), String> {
+    let _writer = collection_write_lock().lock().await;
+    let collection = fetch_raw_collection(&auth_key).await?;
+    let (next, removed) =
+        remove_from_collection(collection, &url, expected_urls.as_deref(), &recent_removals(&auth_key))?;
+    if removed.is_empty() {
+        // Aura removed this entry itself a moment ago: nothing to write.
+        crate::devlog!(info, "catalog", "addon removal: already removed from the Stremio collection; nothing was written");
+        return Ok(());
+    }
+    push_collection(&auth_key, next).await?;
+    // Still under the lock, so the writer queued behind this one already
+    // knows these are gone on purpose.
+    note_recent_removals(&auth_key, removed);
+    Ok(())
+}
+
+/// The pure half of `cloud_remove_addon`: `collection` without the entries
+/// `url` names, plus the collection keys of the entries removed, or the
+/// error the frontend shows. `url` names the entries whose collection key
+/// (`normalize_addon_url` of the transportUrl) is `url` as Rust handed it to
+/// the frontend, trailing slashes trimmed, and only when none is, the
+/// entries whose key is `url` normalized again: the exact-then-normalized
+/// order `reorder_collection` uses. Normalizing first would strip a second
+/// `/manifest.json` from the row of an entry at
+/// `.../manifest.json/manifest.json` and remove its sibling at
+/// `.../manifest.json` instead, the one the user did not click. Several
+/// entries sharing that one key all go.
+///
+/// When no entry has `url`'s key but `url` is in `excused`, the clicked
+/// entry is one Aura itself removed a moment ago (a second remove of the
+/// same row, queued behind the first), and the result is the read unchanged
+/// with NO keys, which means nothing to push. The normalized fallback is
+/// never tried then: with the entry gone, it could only reach a different
+/// one, the sibling above. With the frontend's lists this is in fact the
+/// only way the fallback can be reached, since `check_collection_read`
+/// already requires every shown url, the clicked row's included, to match
+/// exactly unless it is excused; it stays for an older caller (`None`).
+///
+/// Refused, with nothing
+/// written, when the read does not hold every addon in `expected` other
+/// than `excused` (`check_collection_read`), when it is empty at all (even
+/// for an older caller that sent no list: an empty read never leads to a
+/// push), when no entry matches, and when any matching entry is `protected`
+/// (`entry_is_protected`, the refresh write's predicate): the official apps
+/// refuse to uninstall Cinemeta and the other defaults (stremio-core
+/// `AddonIsProtected`), and a copy re-added from the catalog comes back
+/// unprotected. Every other entry keeps its place.
+fn remove_from_collection(
+    mut collection: Vec<serde_json::Value>,
+    url: &str,
+    expected: Option<&[String]>,
+    excused: &[String],
+) -> Result<(Vec<serde_json::Value>, Vec<String>), String> {
+    check_collection_read(&collection, expected, excused, false)
+        .map_err(|drift| collection_drift_error("addon removal", drift))?;
+    if collection.is_empty() {
+        return Err(collection_drift_error("addon removal", CollectionDrift::Empty));
+    }
+    let has_key = |a: &serde_json::Value, key: &str| {
+        a.get("transportUrl")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| normalize_addon_url(t) == key)
+    };
+    let exact = url.trim_end_matches('/');
+    let key = if collection.iter().any(|a| has_key(a, exact)) {
+        exact
+    } else if excused.iter().any(|k| k.trim_end_matches('/') == exact) {
+        return Ok((collection, Vec::new()));
+    } else {
+        normalize_addon_url(exact)
+    };
+    let matches = |a: &serde_json::Value| has_key(a, key);
+    if !collection.iter().any(|a| matches(a)) {
         return Err("Addon not found in your Stremio account".into());
     }
-
-    push_collection(&auth_key, collection).await
+    if let Some(entry) = collection.iter().find(|a| matches(a) && entry_is_protected(a)) {
+        let name = entry
+            .pointer("/manifest/name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map_or_else(|| "This addon".to_string(), |s| cap(s.trim().to_string(), 80));
+        return Err(format!("{name} is a built-in Stremio addon and can't be removed from your account."));
+    }
+    let removed: Vec<String> = collection
+        .iter()
+        .filter(|a| matches(a))
+        .filter_map(|a| a.get("transportUrl").and_then(|v| v.as_str()))
+        .map(|t| normalize_addon_url(t).to_string())
+        .collect();
+    collection.retain(|a| !matches(a));
+    Ok((collection, removed))
 }
 
 /// Reorder the user's Stremio cloud addon collection to match `urls`.
-/// `urls` is the desired full order; matching is by normalized transportUrl
-/// (the `/manifest.json` suffix and trailing slashes are ignored). Any cloud
-/// entry not present in `urls` is preserved at the tail — defensive against
-/// the cross-device race where device B added an addon between our most
-/// recent get_synced_addons and this reorder call.
+/// `urls` is the desired full order; each url matches an entry's collection
+/// key exactly as the frontend holds it, and only failing that normalized
+/// (case-insensitively either way; see `reorder_collection`). Any cloud
+/// entry not present in `urls` is preserved at the tail, in its original
+/// relative order: defensive against the cross-device race where device B
+/// added an addon between our most recent get_synced_addons and this reorder
+/// call. See `reorder_collection` for the rules; nothing is ever dropped.
+///
+/// Refused, with nothing written, when the fresh read does not hold every
+/// addon in `expected_urls` (the list the frontend showed before the drag;
+/// `check_collection_read`), when the read is empty (even for an older
+/// caller that sent no list), and when any url in `urls` claims no entry: a
+/// read that lacks addons the frontend just listed is a partial read, and
+/// pushing a permutation of it would delete the rest from the account. An
+/// addon Aura itself removed a moment ago (`recent_removals`) is expected
+/// absent from both, since the drag may have started before that remove
+/// resolved.
 #[tauri::command]
-pub async fn cloud_reorder_addons(auth_key: String, urls: Vec<String>) -> Result<(), String> {
+pub async fn cloud_reorder_addons(
+    auth_key: String,
+    urls: Vec<String>,
+    expected_urls: Option<Vec<String>>,
+) -> Result<(), String> {
     if urls.is_empty() {
         return Ok(());
     }
+    let _writer = collection_write_lock().lock().await;
     let collection = fetch_raw_collection(&auth_key).await?;
+    let excused = recent_removals(&auth_key);
+    check_collection_read(&collection, expected_urls.as_deref(), &excused, true)
+        .map_err(|drift| collection_drift_error("addon reorder", drift))?;
+    if collection.is_empty() {
+        return Err(collection_drift_error("addon reorder", CollectionDrift::Empty));
+    }
+    let next = reorder_collection(collection, &urls, &excused)
+        .map_err(|unclaimed| collection_drift_error("addon reorder", CollectionDrift::Missing(unclaimed)))?;
 
-    let target: Vec<String> = urls
+    push_collection(&auth_key, next).await
+}
+
+/// The pure half of `cloud_reorder_addons`: `collection` rearranged so the
+/// entries `urls` names come first, in that order, followed by every entry
+/// no url claimed, in its ORIGINAL relative order. Matching is by
+/// lowercased collection key (`normalize_addon_url` of the transportUrl),
+/// and each url claims the FIRST still-unclaimed entry with that key, so two
+/// entries sharing a url are both kept (a repeat of the url claims the
+/// second; otherwise it trails with the rest). A url is tried as Rust handed
+/// it to the frontend (trailing slashes trimmed; see `check_collection_read`)
+/// and only then normalized, so an entry at `.../manifest.json/manifest.json`
+/// is claimed by its own frontend url. An entry without a transportUrl is
+/// never claimed. On `Ok` the result is always a permutation of the input:
+/// no entry is dropped, duplicated or modified. `Err` carries how many urls
+/// claimed no entry (unknown, or repeated more often than the read holds
+/// them), and then nothing may be pushed: the read lacks what the frontend
+/// listed. A url in `excused` (an addon Aura just removed) that claims
+/// nothing is skipped instead of counted.
+///
+/// This replaced a HashMap keyed by that url, which collapsed two entries
+/// with the same key into one, so the push DROPPED the other from the
+/// user's account, and which returned the leftovers in random order.
+fn reorder_collection(
+    collection: Vec<serde_json::Value>,
+    urls: &[String],
+    excused: &[String],
+) -> Result<Vec<serde_json::Value>, usize> {
+    let keys: Vec<Option<String>> = collection
         .iter()
-        .map(|u| normalize_addon_url(u.trim_end_matches('/')).to_ascii_lowercase())
-        .collect();
-
-    let mut by_url: std::collections::HashMap<String, serde_json::Value> = collection
-        .into_iter()
         .map(|entry| {
-            let key = entry
+            entry
                 .get("transportUrl")
                 .and_then(|v| v.as_str())
                 .map(|t| normalize_addon_url(t).to_ascii_lowercase())
-                .unwrap_or_default();
-            (key, entry)
         })
         .collect();
-
-    let mut next: Vec<serde_json::Value> = Vec::with_capacity(by_url.len());
-    for tn in &target {
-        if let Some(entry) = by_url.remove(tn) {
-            next.push(entry);
+    let excused: HashSet<String> =
+        excused.iter().map(|k| k.trim_end_matches('/').to_ascii_lowercase()).collect();
+    let mut claimed = vec![false; collection.len()];
+    let mut order: Vec<usize> = Vec::with_capacity(collection.len());
+    let mut unclaimed = 0usize;
+    for u in urls {
+        let exact = u.trim_end_matches('/').to_ascii_lowercase();
+        let normalized = normalize_addon_url(&exact).to_string();
+        let free = |want: &str| (0..keys.len()).find(|&i| !claimed[i] && keys[i].as_deref() == Some(want));
+        let hit = free(&exact).or_else(|| free(&normalized));
+        match hit {
+            Some(i) => {
+                claimed[i] = true;
+                order.push(i);
+            }
+            None if excused.contains(&exact) || excused.contains(&normalized) => {}
+            None => unclaimed += 1,
         }
     }
-    next.extend(by_url.into_values());
+    if unclaimed > 0 {
+        return Err(unclaimed);
+    }
+    order.extend((0..collection.len()).filter(|&i| !claimed[i]));
 
-    push_collection(&auth_key, next).await
+    let mut slots: Vec<Option<serde_json::Value>> = collection.into_iter().map(Some).collect();
+    Ok(order.into_iter().filter_map(|i| slots[i].take()).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -3567,8 +5100,8 @@ pub async fn library_get(auth_key: String) -> Result<Vec<LibraryItem>, String> {
     let json: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("JSON parse error: {e}"))?;
 
-    if let Some(err) = json.get("error").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-        return Err(map_api_error(err));
+    if let Some(err) = account_api_error(&json, "Library request refused") {
+        return Err(err);
     }
 
     let items = json
@@ -5650,5 +7183,1076 @@ mod tests {
         let line = reqwest_err_for_log(&err);
         assert!(line.starts_with("decode failed: ") && line.contains("line 1"), "{line}");
         assert!(!line.contains(CONFIG_UUID), "{line}");
+    }
+
+    // ---- Stremio collection writes -----------------------------------------
+
+    /// A manifest `check_collection_manifest` accepts, for `id` at `version`.
+    fn collection_manifest(id: &str, version: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "version": version,
+            "name": "Test Addon",
+            "description": "for tests",
+            "resources": ["catalog", { "name": "stream", "types": ["movie"], "idPrefixes": ["tt"] }],
+            "types": ["movie", "series"],
+            "catalogs": [{ "type": "movie", "id": "top", "name": "Top", "extra": [{ "name": "skip" }] }],
+            "behaviorHints": { "configurable": true },
+            "logo": "https://example.com/logo.png",
+        })
+    }
+
+    /// A collection entry as the Stremio API returns one, with an extra key
+    /// Aura does not model so the tests can prove it survives.
+    fn collection_entry(url: &str, manifest: serde_json::Value, protected: bool) -> serde_json::Value {
+        serde_json::json!({
+            "transportUrl": url,
+            "manifest": manifest,
+            "flags": { "official": false, "protected": protected },
+            "installedAt": 1_700_000_000,
+        })
+    }
+
+    fn sample_collection() -> Vec<serde_json::Value> {
+        vec![
+            collection_entry("https://a.example/manifest.json", collection_manifest("a.addon", "1.0.0"), false),
+            collection_entry("https://b.example/cfg/manifest.json", collection_manifest("b.addon", "2.0.0"), false),
+            collection_entry("https://c.example/manifest.json", collection_manifest("c.addon", "3.0.0"), false),
+        ]
+    }
+
+    /// `apply_refreshed_manifest` as the refresh calls it for `target`: the
+    /// manifest fetched from `{target}/manifest.json`, literally.
+    fn apply(
+        collection: &mut [serde_json::Value],
+        target: &str,
+        fresh: &serde_json::Value,
+    ) -> Result<usize, ManifestWriteSkip> {
+        apply_refreshed_manifest(collection, target, &format!("{target}/manifest.json"), fresh)
+    }
+
+    #[test]
+    fn refresh_merge_replaces_only_the_matching_manifest() {
+        let mut collection = sample_collection();
+        let original = collection.clone();
+        let mut fresh = collection_manifest("b.addon", "2.1.0");
+        fresh["catalogs"].as_array_mut().unwrap().push(serde_json::json!({ "type": "series", "id": "new" }));
+        // A field Aura does not model must travel verbatim too.
+        fresh["contactEmail"] = serde_json::json!("dev@example.com");
+
+        let index = apply(&mut collection, "https://b.example/cfg", &fresh);
+        assert_eq!(index, Ok(1));
+        assert_eq!(collection.len(), original.len());
+        assert_eq!(collection[0], original[0]);
+        assert_eq!(collection[2], original[2]);
+        assert_eq!(collection[1]["manifest"], fresh);
+        // Everything else on the entry, byte for byte: the un-normalized
+        // transportUrl string, the flags, the unmodelled key.
+        assert_eq!(collection[1]["transportUrl"], "https://b.example/cfg/manifest.json");
+        assert_eq!(collection[1]["flags"], original[1]["flags"]);
+        assert_eq!(collection[1]["installedAt"], original[1]["installedAt"]);
+        assert_eq!(collection[1].as_object().unwrap().len(), original[1].as_object().unwrap().len());
+    }
+
+    #[test]
+    fn refresh_merge_refuses_an_invalid_manifest() {
+        let bad: Vec<(&str, Box<dyn Fn(&mut serde_json::Value)>)> = vec![
+            ("not an object", Box::new(|m| *m = serde_json::json!("nope"))),
+            ("missing id", Box::new(|m| { m.as_object_mut().unwrap().remove("id"); })),
+            ("empty name", Box::new(|m| m["name"] = serde_json::json!(""))),
+            ("missing version", Box::new(|m| { m.as_object_mut().unwrap().remove("version"); })),
+            ("non-semver version", Box::new(|m| m["version"] = serde_json::json!("1.0"))),
+            ("numeric version", Box::new(|m| m["version"] = serde_json::json!(1))),
+            ("empty resources", Box::new(|m| m["resources"] = serde_json::json!([]))),
+            ("resource without a name", Box::new(|m| m["resources"] = serde_json::json!([{ "types": ["movie"] }]))),
+            ("empty types", Box::new(|m| m["types"] = serde_json::json!([]))),
+            ("non-string type", Box::new(|m| m["types"] = serde_json::json!(["movie", 3]))),
+            ("missing catalogs", Box::new(|m| { m.as_object_mut().unwrap().remove("catalogs"); })),
+            ("catalog without a type", Box::new(|m| m["catalogs"] = serde_json::json!([{ "id": "x" }]))),
+            ("null behaviorHints", Box::new(|m| m["behaviorHints"] = serde_json::Value::Null)),
+            ("string hint", Box::new(|m| m["behaviorHints"]["configurable"] = serde_json::json!("yes"))),
+            ("numeric description", Box::new(|m| m["description"] = serde_json::json!(5))),
+            ("over 1 MiB", Box::new(|m| m["description"] = serde_json::json!("x".repeat(MAX_COLLECTION_MANIFEST_BYTES)))),
+        ];
+        for (what, spoil) in bad {
+            let mut collection = sample_collection();
+            let original = collection.clone();
+            let mut fresh = collection_manifest("b.addon", "2.1.0");
+            spoil(&mut fresh);
+            let out = apply(&mut collection, "https://b.example/cfg", &fresh);
+            assert!(matches!(out, Err(ManifestWriteSkip::Invalid(_))), "{what}: {out:?}");
+            assert_eq!(collection, original, "{what}: collection changed");
+        }
+    }
+
+    #[test]
+    fn refresh_merge_refuses_a_different_addon_id() {
+        let mut collection = sample_collection();
+        let original = collection.clone();
+        let out = apply(&mut collection, "https://b.example/cfg", &collection_manifest("someone.else", "9.0.0"));
+        assert_eq!(out, Err(ManifestWriteSkip::IdChanged {
+            stored: Some("b.addon".into()),
+            fresh:  "someone.else".into(),
+        }));
+        assert_eq!(collection, original);
+
+        // A stored entry with no readable id cannot be proved the same addon.
+        let mut collection = sample_collection();
+        collection[1]["manifest"].as_object_mut().unwrap().remove("id");
+        let original = collection.clone();
+        let out = apply(&mut collection, "https://b.example/cfg", &collection_manifest("b.addon", "2.1.0"));
+        assert!(matches!(out, Err(ManifestWriteSkip::IdChanged { stored: None, .. })), "{out:?}");
+        assert_eq!(collection, original);
+    }
+
+    #[test]
+    fn refresh_merge_needs_exactly_one_matching_entry() {
+        let mut collection = sample_collection();
+        let original = collection.clone();
+        let out = apply(&mut collection, "https://z.example", &collection_manifest("z.addon", "1.0.0"));
+        assert_eq!(out, Err(ManifestWriteSkip::NotInCollection));
+        assert_eq!(collection, original);
+
+        // The same url twice, once with the suffix and once without.
+        let mut collection = sample_collection();
+        collection.push(collection_entry("https://b.example/cfg/", collection_manifest("b.addon", "2.0.0"), false));
+        let original = collection.clone();
+        let out = apply(&mut collection, "https://b.example/cfg", &collection_manifest("b.addon", "2.1.0"));
+        assert_eq!(out, Err(ManifestWriteSkip::Ambiguous(2)));
+        assert_eq!(collection, original);
+    }
+
+    /// One match is not enough: its transportUrl must be the very url the
+    /// manifest was fetched from, since that is what the official apps load.
+    #[test]
+    fn refresh_merge_needs_the_exact_manifest_address() {
+        for stored_url in ["https://b.example/cfg", "https://b.example/cfg/", "https://b.example/cfg//manifest.json"] {
+            let mut collection = sample_collection();
+            collection[1]["transportUrl"] = serde_json::json!(stored_url);
+            let original = collection.clone();
+            let out = apply(&mut collection, "https://b.example/cfg", &collection_manifest("b.addon", "2.1.0"));
+            assert_eq!(out, Err(ManifestWriteSkip::OtherAddress), "{stored_url}");
+            assert_eq!(collection, original, "{stored_url}");
+        }
+    }
+
+    #[test]
+    fn refresh_merge_refuses_configuration_required() {
+        let mut fresh = collection_manifest("b.addon", "2.1.0");
+        fresh["behaviorHints"]["configurationRequired"] = serde_json::json!(true);
+
+        // Newly declared: the case a transient server fault produces.
+        let mut collection = sample_collection();
+        let original = collection.clone();
+        let out = apply(&mut collection, "https://b.example/cfg", &fresh);
+        assert_eq!(out, Err(ManifestWriteSkip::ConfigurationRequired));
+        assert_eq!(collection, original);
+
+        // Already declared by the stored manifest: still refused, as
+        // stremio-core refuses to upgrade to such a manifest at all.
+        let mut collection = sample_collection();
+        collection[1]["manifest"]["behaviorHints"]["configurationRequired"] = serde_json::json!(true);
+        let original = collection.clone();
+        let out = apply(&mut collection, "https://b.example/cfg", &fresh);
+        assert_eq!(out, Err(ManifestWriteSkip::ConfigurationRequired));
+        assert_eq!(collection, original);
+    }
+
+    #[test]
+    fn refresh_merge_skips_an_unchanged_manifest() {
+        let mut collection = sample_collection();
+        let original = collection.clone();
+        // Deep-equal, not byte-equal: key order does not count as a change.
+        let stored = collection[1]["manifest"].as_object().unwrap().clone();
+        let reversed: serde_json::Map<String, serde_json::Value> =
+            stored.into_iter().rev().collect();
+        let out = apply(&mut collection, "https://b.example/cfg", &serde_json::Value::Object(reversed));
+        assert_eq!(out, Err(ManifestWriteSkip::Unchanged));
+        assert_eq!(collection, original);
+    }
+
+    #[test]
+    fn refresh_merge_refuses_a_protected_entry() {
+        let mut collection = sample_collection();
+        collection[1]["flags"]["protected"] = serde_json::json!(true);
+        let original = collection.clone();
+        let out = apply(&mut collection, "https://b.example/cfg", &collection_manifest("b.addon", "2.1.0"));
+        assert_eq!(out, Err(ManifestWriteSkip::Protected));
+        assert_eq!(collection, original);
+    }
+
+    /// A protected entry (Cinemeta) is never written, so it must never
+    /// surface as a refusal the UI would report: Protected wins over every
+    /// other guard.
+    #[test]
+    fn refresh_merge_reports_protected_before_any_other_guard() {
+        let cases: Vec<(&str, Box<dyn Fn(&mut Vec<serde_json::Value>, &mut serde_json::Value)>)> = vec![
+            ("unchanged", Box::new(|c, f| *f = c[1]["manifest"].clone())),
+            ("other address", Box::new(|c, _| c[1]["transportUrl"] = serde_json::json!("https://b.example/cfg/"))),
+            ("invalid", Box::new(|_, f| f["version"] = serde_json::json!("1.0"))),
+            ("different id", Box::new(|_, f| f["id"] = serde_json::json!("someone.else"))),
+            ("configuration required", Box::new(|_, f| f["behaviorHints"]["configurationRequired"] = serde_json::json!(true))),
+        ];
+        for (what, set_up) in cases {
+            let mut collection = sample_collection();
+            collection[1]["flags"]["protected"] = serde_json::json!(true);
+            let mut fresh = collection_manifest("b.addon", "2.1.0");
+            set_up(&mut collection, &mut fresh);
+            let original = collection.clone();
+            let out = apply(&mut collection, "https://b.example/cfg", &fresh);
+            assert_eq!(out, Err(ManifestWriteSkip::Protected), "{what}");
+            assert_eq!(collection, original, "{what}");
+        }
+    }
+
+    /// `collection_manifest("b.addon", "2.0.0")` written out BY HAND as
+    /// stremio-core's `Manifest` serializes it, i.e. what the entry holds once
+    /// an official app has pushed the collection. Hand-written, not computed,
+    /// so the tests below check `stremio_core_manifest` against an
+    /// independent statement of that serialization.
+    fn stremio_core_stored_manifest() -> serde_json::Value {
+        serde_json::json!({
+            "id": "b.addon",
+            "version": "2.0.0",
+            "name": "Test Addon",
+            "contactEmail": null,
+            "description": "for tests",
+            "logo": "https://example.com/logo.png",
+            "background": null,
+            "types": ["movie", "series"],
+            "resources": ["catalog", { "name": "stream", "types": ["movie"], "idPrefixes": ["tt"] }],
+            "idPrefixes": null,
+            "catalogs": [{
+                "id": "top", "type": "movie", "name": "Top",
+                "extra": [{ "name": "skip", "isRequired": false, "options": [], "optionsLimit": 1 }],
+            }],
+            "addonCatalogs": [],
+            "behaviorHints": {
+                "adult": false, "p2p": false, "configurable": true,
+                "configurationRequired": false, "epgProvider": false,
+            },
+        })
+    }
+
+    /// The common case guard e exists for: an official app last wrote the
+    /// collection, so the stored entry is stremio-core's serialization and
+    /// never deep-equal to the raw manifest, yet nothing changed.
+    #[test]
+    fn refresh_merge_skips_a_manifest_an_official_app_stored() {
+        let mut collection = sample_collection();
+        collection[1]["manifest"] = stremio_core_stored_manifest();
+        let original = collection.clone();
+        let fresh = collection_manifest("b.addon", "2.0.0");
+        assert_ne!(collection[1]["manifest"], fresh, "the fixture must differ as raw JSON");
+        let out = apply(&mut collection, "https://b.example/cfg", &fresh);
+        assert_eq!(out, Err(ManifestWriteSkip::Unchanged));
+        assert_eq!(collection, original);
+
+        // A real change against the same stored form still writes, verbatim.
+        let mut fresh = collection_manifest("b.addon", "2.0.0");
+        fresh["catalogs"].as_array_mut().unwrap().push(serde_json::json!({ "type": "series", "id": "new" }));
+        let out = apply(&mut collection, "https://b.example/cfg", &fresh);
+        assert_eq!(out, Ok(1));
+        assert_eq!(collection[1]["manifest"], fresh);
+        assert_eq!(collection[0], original[0]);
+        assert_eq!(collection[2], original[2]);
+
+        // So does a change to a field stremio-core keeps but Aura never
+        // reads (an extra's options), since the official apps read it.
+        let mut collection = original.clone();
+        let mut fresh = collection_manifest("b.addon", "2.0.0");
+        fresh["catalogs"][0]["extra"] = serde_json::json!([{ "name": "skip" }, { "name": "genre", "options": ["Drama"] }]);
+        assert_eq!(apply(&mut collection, "https://b.example/cfg", &fresh), Ok(1));
+    }
+
+    #[test]
+    fn stremio_core_manifest_matches_the_stremio_core_serialization() {
+        assert_eq!(stremio_core_manifest(&collection_manifest("b.addon", "2.0.0")), Some(stremio_core_stored_manifest()));
+
+        // Every normalization at once: unmodelled keys dropped (top level,
+        // catalog, behaviorHints), a catalog repeated by (id, type) dropped,
+        // an extra repeated by name dropped, extra defaults filled (null
+        // options is []), a short-form catalog defaulted, a resource's
+        // missing lists as null, an empty logo as null, a background URL
+        // re-serialized as parsed.
+        let raw = serde_json::json!({
+            "id": "x.addon", "version": "1.2.3-beta.1+build", "name": "X",
+            "logo": "", "background": "https://Example.com",
+            "types": ["movie"],
+            "resources": [{ "name": "meta" }, "stream"],
+            "idPrefixes": ["tt", "tt"],
+            "stremioAddonsConfig": { "issuer": "x" },
+            "catalogs": [
+                { "type": "movie", "id": "a", "genres": ["Drama"], "showInHome": true,
+                  "extra": [{ "name": "genre", "options": null, "isRequired": true },
+                            { "name": "genre", "options": ["Ignored"] },
+                            { "name": "search", "optionsLimit": 3 }] },
+                { "type": "movie", "id": "a", "name": "Repeat" },
+                { "type": "series", "id": "a", "extraSupported": ["search", "search"] },
+                { "type": "movie", "id": "b", "extra": null, "extraRequired": ["genre"] },
+            ],
+            "behaviorHints": { "newEpisodeNotifications": true, "p2p": true },
+        });
+        let expected = serde_json::json!({
+            "id": "x.addon", "version": "1.2.3-beta.1+build", "name": "X",
+            "contactEmail": null, "description": null,
+            "logo": null, "background": "https://example.com/",
+            "types": ["movie"],
+            "resources": [{ "name": "meta", "types": null, "idPrefixes": null }, "stream"],
+            "idPrefixes": ["tt", "tt"],
+            "catalogs": [
+                { "id": "a", "type": "movie", "name": null,
+                  "extra": [{ "name": "genre", "isRequired": true, "options": [], "optionsLimit": 1 },
+                            { "name": "search", "isRequired": false, "options": [], "optionsLimit": 3 }] },
+                { "id": "a", "type": "series", "name": null, "extraRequired": [], "extraSupported": ["search"] },
+                { "id": "b", "type": "movie", "name": null, "extraRequired": ["genre"], "extraSupported": [] },
+            ],
+            "addonCatalogs": [],
+            "behaviorHints": {
+                "adult": false, "p2p": true, "configurable": false,
+                "configurationRequired": false, "epgProvider": false,
+            },
+        });
+        assert_eq!(stremio_core_manifest(&raw), Some(expected));
+
+        // What stremio-core cannot parse has no stored form, so guard e can
+        // never match it.
+        for bad in [
+            serde_json::json!({ "id": "x", "version": "1.0", "name": "X", "types": [], "resources": [] }),
+            serde_json::json!({ "id": "x", "version": "1.0.0", "name": "X", "types": [], "resources": [], "behaviorHints": null }),
+            serde_json::json!({ "id": "x", "version": "1.0.0", "name": "X", "types": [], "resources": [],
+                                "catalogs": [{ "id": "a", "type": "movie", "extraRequired": null }] }),
+        ] {
+            assert_eq!(stremio_core_manifest(&bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn semver_check_matches_the_semver_crate() {
+        for ok in ["0.0.1", "1.2.3", "10.20.30", "1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-0.3.7",
+                   "1.0.0-x-y-z.--", "1.0.0+001", "1.0.0-beta+exp.sha.5114f85", "1.0.0-rc.1+build.1"] {
+            assert!(is_semver(ok), "{ok} should pass");
+        }
+        for bad in ["", "1", "1.0", "1.0.0.0", "v1.0.0", " 1.0.0", "1.0.0 ", "01.0.0", "1.00.0",
+                    "1.0.0-", "1.0.0+", "1.0.0-01", "1.0.0-a..b", "1.0.0+a..b", "1.0.0-a+b+c",
+                    "1.0.0-alpha_1", "99999999999999999999.0.0", "1.x.0"] {
+            assert!(!is_semver(bad), "{bad:?} should fail");
+        }
+    }
+
+    fn urls_of(collection: &[serde_json::Value]) -> Vec<&str> {
+        collection.iter().map(|e| e["transportUrl"].as_str().unwrap_or("-")).collect()
+    }
+
+    #[test]
+    fn reorder_keeps_duplicate_urls() {
+        let collection = vec![
+            collection_entry("https://a.example/manifest.json", collection_manifest("a.addon", "1.0.0"), false),
+            collection_entry("https://b.example/manifest.json", collection_manifest("b.addon", "1.0.0"), false),
+            collection_entry("https://B.example/", collection_manifest("b.addon", "1.0.1"), false),
+            collection_entry("https://c.example/manifest.json", collection_manifest("c.addon", "1.0.0"), false),
+        ];
+        let urls = vec!["https://c.example".to_string(), "https://b.example".to_string(), "https://a.example".to_string()];
+        let next = reorder_collection(collection.clone(), &urls, &[]).unwrap();
+        assert_eq!(next.len(), collection.len());
+        // `b` claims the FIRST b entry; the second trails with the leftovers.
+        assert_eq!(urls_of(&next), vec![
+            "https://c.example/manifest.json",
+            "https://b.example/manifest.json",
+            "https://a.example/manifest.json",
+            "https://B.example/",
+        ]);
+        // A repeated url claims the second duplicate.
+        let urls = vec!["https://b.example".to_string(), "https://b.example".to_string()];
+        let next = reorder_collection(collection, &urls, &[]).unwrap();
+        assert_eq!(urls_of(&next), vec![
+            "https://b.example/manifest.json",
+            "https://B.example/",
+            "https://a.example/manifest.json",
+            "https://c.example/manifest.json",
+        ]);
+    }
+
+    #[test]
+    fn reorder_leftovers_keep_their_original_order() {
+        let collection: Vec<serde_json::Value> = ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|n| collection_entry(&format!("https://{n}.example/manifest.json"), collection_manifest(&format!("{n}.addon"), "1.0.0"), false))
+            .collect();
+        let next = reorder_collection(collection, &["https://d.example/".to_string()], &[]).unwrap();
+        assert_eq!(urls_of(&next), vec![
+            "https://d.example/manifest.json",
+            "https://a.example/manifest.json",
+            "https://b.example/manifest.json",
+            "https://c.example/manifest.json",
+            "https://e.example/manifest.json",
+            "https://f.example/manifest.json",
+        ]);
+    }
+
+    #[test]
+    fn reorder_preserves_every_entry_including_one_without_a_url() {
+        let mut collection = sample_collection();
+        // An entry with no transportUrl is never claimed, and never dropped.
+        collection.insert(1, serde_json::json!({ "manifest": collection_manifest("x.addon", "1.0.0") }));
+        let urls = vec!["https://c.example/manifest.json".to_string()];
+        let next = reorder_collection(collection.clone(), &urls, &[]).unwrap();
+        assert_eq!(next.len(), collection.len());
+        assert_eq!(urls_of(&next), vec![
+            "https://c.example/manifest.json",
+            "https://a.example/manifest.json",
+            "-",
+            "https://b.example/cfg/manifest.json",
+        ]);
+        // A permutation: every entry is still there, unmodified.
+        for e in &collection {
+            assert_eq!(next.iter().filter(|n| *n == e).count(), 1);
+        }
+    }
+
+    /// A url the read cannot satisfy means the read lacks what the frontend
+    /// listed (a partial read): refused, since pushing a permutation of it
+    /// would delete the rest from the account.
+    #[test]
+    fn reorder_refuses_a_url_that_claims_no_entry() {
+        let cases: Vec<(&str, Vec<&str>, usize)> = vec![
+            ("unknown", vec!["https://nowhere.example", "https://c.example"], 1),
+            ("empty", vec!["https://c.example", ""], 1),
+            ("repeated past the entries held", vec!["https://a.example", "https://a.example/"], 1),
+            ("every url unknown", vec!["https://x.example", "https://y.example"], 2),
+        ];
+        for (what, urls, unclaimed) in cases {
+            let urls: Vec<String> = urls.into_iter().map(str::to_string).collect();
+            assert_eq!(reorder_collection(sample_collection(), &urls, &[]), Err(unclaimed), "{what}");
+        }
+        // An empty read claims nothing, so it can never push [].
+        assert_eq!(reorder_collection(Vec::new(), &["https://a.example".to_string()], &[]), Err(1));
+
+        // A url for an addon Aura itself just removed claims nothing, and is
+        // skipped rather than counted: the drag began before the remove
+        // resolved. Any other unclaimed url still refuses.
+        let urls: Vec<String> = ["https://c.example", "https://b.example/cfg", "https://a.example"]
+            .iter()
+            .map(|u| u.to_string())
+            .collect();
+        let without_b: Vec<serde_json::Value> = sample_collection().into_iter().filter(|e| e["transportUrl"] != "https://b.example/cfg/manifest.json").collect();
+        let excused = vec!["https://b.example/cfg".to_string()];
+        let next = reorder_collection(without_b.clone(), &urls, &excused).unwrap();
+        assert_eq!(urls_of(&next), vec!["https://c.example/manifest.json", "https://a.example/manifest.json"]);
+        let mut with_unknown = urls.clone();
+        with_unknown.push("https://nowhere.example".to_string());
+        assert_eq!(reorder_collection(without_b, &with_unknown, &excused), Err(1));
+    }
+
+    #[test]
+    fn collection_read_guard_needs_every_shown_addon() {
+        let collection = sample_collection();
+        let shown = |urls: &[&str]| urls.iter().map(|u| u.to_string()).collect::<Vec<_>>();
+
+        // No list (an older caller): nothing to check, even on an empty read.
+        assert_eq!(check_collection_read(&collection, None, &[], false), Ok(()));
+        assert_eq!(check_collection_read(&[], None, &[], false), Ok(()));
+
+        // Every shown addon present, as Rust hands the url to the frontend
+        // (a trailing slash aside).
+        let all = shown(&["https://a.example", "https://b.example/cfg/", "https://c.example"]);
+        assert_eq!(check_collection_read(&collection, Some(&all), &[], false), Ok(()));
+        // A subset is fine: the read may hold more (added on another device).
+        assert_eq!(check_collection_read(&collection, Some(&shown(&["https://a.example"])), &[], false), Ok(()));
+
+        // A partial read.
+        let partial = &collection[..1];
+        assert_eq!(check_collection_read(partial, Some(&all), &[], false), Err(CollectionDrift::Missing(2)));
+        // An empty read while the list showed addons.
+        assert_eq!(check_collection_read(&[], Some(&all), &[], false), Err(CollectionDrift::Empty));
+        // An empty list expects nothing, and empty urls carry no expectation.
+        assert_eq!(check_collection_read(&[], Some(&[]), &[], false), Ok(()));
+        assert_eq!(check_collection_read(&collection, Some(&shown(&["", "https://a.example"])), &[], false), Ok(()));
+
+        // The url being added is naturally absent, so it is left out.
+        let new = shown(&["https://new.example"]);
+        let with_new = shown(&["https://a.example", "https://new.example"]);
+        assert_eq!(check_collection_read(&collection, Some(&with_new), &[], false), Err(CollectionDrift::Missing(1)));
+        assert_eq!(check_collection_read(&collection, Some(&with_new), &new, false), Ok(()));
+        // Excluding it does not excuse an empty read of everything else.
+        assert_eq!(check_collection_read(&[], Some(&with_new), &new, false), Err(CollectionDrift::Empty));
+        assert_eq!(check_collection_read(&[], Some(&shown(&["https://new.example"])), &new, false), Ok(()));
+
+        // So is an addon Aura itself just removed (a collection key, as
+        // `note_recent_removals` records it), and only that one.
+        let removed_b = shown(&["https://b.example/cfg"]);
+        let without_b: Vec<serde_json::Value> = collection.iter().filter(|e| e["transportUrl"] != "https://b.example/cfg/manifest.json").cloned().collect();
+        assert_eq!(check_collection_read(&without_b, Some(&all), &[], false), Err(CollectionDrift::Missing(1)));
+        assert_eq!(check_collection_read(&without_b, Some(&all), &removed_b, false), Ok(()));
+        assert_eq!(check_collection_read(&collection[..1], Some(&all), &removed_b, false), Err(CollectionDrift::Missing(1)));
+
+        // Case matters unless the command matches case-insensitively.
+        let upper = shown(&["https://A.example"]);
+        assert_eq!(check_collection_read(&collection, Some(&upper), &[], false), Err(CollectionDrift::Missing(1)));
+        assert_eq!(check_collection_read(&collection, Some(&upper), &[], true), Ok(()));
+    }
+
+    /// An entry an official app stored at `.../manifest.json/manifest.json`
+    /// reaches the frontend as `.../manifest.json` (`get_synced_addons`
+    /// strips one suffix). The guard must match that url as it is, not
+    /// normalize it a second time, or the one entry refuses every write.
+    #[test]
+    fn collection_read_guard_matches_a_doubled_manifest_address() {
+        let mut collection = sample_collection();
+        collection.push(collection_entry(
+            "https://d.example/x/manifest.json/manifest.json",
+            collection_manifest("d.addon", "1.0.0"),
+            false,
+        ));
+        let shown: Vec<String> = ["https://a.example", "https://b.example/cfg", "https://c.example", "https://d.example/x/manifest.json"]
+            .iter()
+            .map(|u| u.to_string())
+            .collect();
+        assert_eq!(check_collection_read(&collection, Some(&shown), &[], false), Ok(()));
+        assert_eq!(check_collection_read(&collection, Some(&shown), &[], true), Ok(()));
+        // And a reorder claims it by that same url, so nothing is unclaimed.
+        let urls: Vec<String> = shown.iter().rev().cloned().collect();
+        let next = reorder_collection(collection, &urls, &[]).unwrap();
+        assert_eq!(urls_of(&next)[0], "https://d.example/x/manifest.json/manifest.json");
+    }
+
+    #[test]
+    fn remove_refuses_a_protected_entry() {
+        let mut collection = sample_collection();
+        collection[1]["flags"]["protected"] = serde_json::json!(true);
+        collection[1]["manifest"]["name"] = serde_json::json!("Cinemeta");
+        assert_eq!(
+            remove_from_collection(collection.clone(), "https://b.example/cfg", None, &[]),
+            Err("Cinemeta is a built-in Stremio addon and can't be removed from your account.".to_string()),
+        );
+        // Any value but false counts, and a nameless entry still gets a sentence.
+        collection[1]["flags"]["protected"] = serde_json::json!("yes");
+        collection[1]["manifest"].as_object_mut().unwrap().remove("name");
+        assert_eq!(
+            remove_from_collection(collection, "https://b.example/cfg/manifest.json", None, &[]),
+            Err("This addon is a built-in Stremio addon and can't be removed from your account.".to_string()),
+        );
+    }
+
+    #[test]
+    fn remove_drops_only_the_matching_entries() {
+        let mut collection = sample_collection();
+        // Two forms of one url both go; the rest keep their order.
+        collection.push(collection_entry("https://b.example/cfg/", collection_manifest("b.addon", "2.0.0"), false));
+        let shown: Vec<String> = ["https://a.example", "https://b.example/cfg", "https://c.example"]
+            .iter()
+            .map(|u| u.to_string())
+            .collect();
+        let (next, removed) = remove_from_collection(collection, "https://b.example/cfg/", Some(&shown), &[]).unwrap();
+        assert_eq!(urls_of(&next), vec!["https://a.example/manifest.json", "https://c.example/manifest.json"]);
+        // Reported by collection key, for `note_recent_removals`.
+        assert_eq!(removed, vec!["https://b.example/cfg".to_string(), "https://b.example/cfg".to_string()]);
+
+        assert_eq!(
+            remove_from_collection(sample_collection(), "https://z.example", None, &[]),
+            Err("Addon not found in your Stremio account".to_string()),
+        );
+    }
+
+    #[test]
+    fn remove_never_pushes_from_a_short_read() {
+        // An empty read, with or without a list, is never pushed.
+        assert_eq!(remove_from_collection(Vec::new(), "https://a.example", None, &[]), Err(COLLECTION_CHANGED.to_string()));
+        // A read missing an addon the list shows would delete it too.
+        let shown: Vec<String> = ["https://a.example", "https://c.example"].iter().map(|u| u.to_string()).collect();
+        let partial = vec![sample_collection().remove(0)];
+        assert_eq!(remove_from_collection(partial.clone(), "https://a.example", Some(&shown), &[]), Err(COLLECTION_CHANGED.to_string()));
+        // Unless the missing one is an addon Aura itself just removed: a
+        // second remove queued behind the first still lists it.
+        let excused = vec!["https://c.example".to_string()];
+        let (next, _) = remove_from_collection(partial, "https://a.example", Some(&shown), &excused).unwrap();
+        assert!(next.is_empty());
+    }
+
+    /// An entry an official app stored at `.../manifest.json/manifest.json`
+    /// (P) reaches the frontend as `.../manifest.json`, the very address of
+    /// its sibling Q's transportUrl. Each row removes its own entry.
+    #[test]
+    fn remove_takes_the_clicked_entry_not_its_sibling() {
+        let q = "https://h/x/manifest.json";
+        let p = "https://h/x/manifest.json/manifest.json";
+        let collection = vec![
+            collection_entry(q, collection_manifest("q.addon", "1.0.0"), false),
+            collection_entry(p, collection_manifest("p.addon", "1.0.0"), false),
+        ];
+        // The two rows, as `get_synced_addons` derives them.
+        let (q_row, p_row) = ("https://h/x", "https://h/x/manifest.json");
+        let shown: Vec<String> = vec![q_row.to_string(), p_row.to_string()];
+
+        let (next, removed) = remove_from_collection(collection.clone(), p_row, Some(&shown), &[]).unwrap();
+        assert_eq!(urls_of(&next), vec![q]);
+        assert_eq!(removed, vec![p_row.to_string()]);
+
+        let (next, removed) = remove_from_collection(collection.clone(), q_row, Some(&shown), &[]).unwrap();
+        assert_eq!(urls_of(&next), vec![p]);
+        assert_eq!(removed, vec![q_row.to_string()]);
+
+        // P alone is removable by its own row too.
+        let (next, _) = remove_from_collection(vec![collection[1].clone()], p_row, Some(&shown[1..]), &[]).unwrap();
+        assert!(next.is_empty());
+        // A second remove of P's row, queued behind the one that took P out
+        // (so P's key is excused and its row still listed), must not fall
+        // back to the normalized key, which is Q's: nothing to push, Q kept.
+        let other = collection_entry("https://c.example/manifest.json", collection_manifest("c.addon", "1.0.0"), false);
+        let after_p = vec![collection[0].clone(), other];
+        let mut shown_c = shown.clone();
+        shown_c.push("https://c.example".to_string());
+        let excused = vec![p_row.to_string()];
+        let (next, removed) = remove_from_collection(after_p.clone(), p_row, Some(&shown_c), &excused).unwrap();
+        assert!(removed.is_empty());
+        assert_eq!(next, after_p);
+        // Likewise for an older caller that sent no list.
+        let (next, removed) = remove_from_collection(after_p.clone(), p_row, None, &excused).unwrap();
+        assert!(removed.is_empty());
+        assert_eq!(next, after_p);
+        // Q's own row still removes Q while P is excused.
+        let (next, removed) = remove_from_collection(after_p, q_row, Some(&shown_c), &excused).unwrap();
+        assert_eq!(urls_of(&next), vec!["https://c.example/manifest.json"]);
+        assert_eq!(removed, vec![q_row.to_string()]);
+        // And a url that matches no key exactly still falls back to the
+        // normalized form, as before.
+        let (next, _) = remove_from_collection(sample_collection(), "https://a.example/manifest.json", None, &[]).unwrap();
+        assert_eq!(urls_of(&next), vec!["https://b.example/cfg/manifest.json", "https://c.example/manifest.json"]);
+    }
+
+    #[test]
+    fn add_never_pushes_from_an_empty_or_short_read() {
+        let manifest = collection_manifest("new.addon", "1.0.0");
+        let add = |collection: Vec<serde_json::Value>, expected: Option<&[String]>, excused: &[String]| {
+            add_to_collection(collection, "https://new.example", manifest.clone(), expected, excused)
+        };
+        // An empty read is refused whatever the list held, even an empty
+        // list (the list never loaded) or none at all (an older caller):
+        // pushing [new] from it would delete every other addon.
+        let none: &[String] = &[];
+        assert_eq!(add(Vec::new(), None, &[]), Err(COLLECTION_CHANGED.to_string()));
+        assert_eq!(add(Vec::new(), Some(none), &[]), Err(COLLECTION_CHANGED.to_string()));
+        let shown: Vec<String> = ["https://a.example", "https://b.example/cfg", "https://c.example"]
+            .iter()
+            .map(|u| u.to_string())
+            .collect();
+        assert_eq!(add(Vec::new(), Some(&shown), &[]), Err(COLLECTION_CHANGED.to_string()));
+        // A read missing a shown addon, unless Aura itself just removed it.
+        let partial: Vec<serde_json::Value> = sample_collection().into_iter().take(2).collect();
+        assert_eq!(add(partial.clone(), Some(&shown), &[]), Err(COLLECTION_CHANGED.to_string()));
+        assert!(add(partial, Some(&shown), &["https://c.example".to_string()]).is_ok());
+
+        // A full read gains exactly the new entry, at the end, and the new
+        // url may already be in the list without being refused as missing.
+        let mut with_new = shown.clone();
+        with_new.push("https://new.example".to_string());
+        let next = add(sample_collection(), Some(&with_new), &[]).unwrap();
+        assert_eq!(next.len(), 4);
+        assert_eq!(&next[..3], &sample_collection()[..]);
+        assert_eq!(next[3], serde_json::json!({ "manifest": manifest, "transportUrl": "https://new.example/manifest.json" }));
+
+        // Already there under any form of its url.
+        let mut held = sample_collection();
+        held.push(collection_entry("https://new.example/", collection_manifest("new.addon", "1.0.0"), false));
+        assert_eq!(add(held, Some(&shown), &[]), Err("Addon already in your Stremio account".to_string()));
+    }
+
+    /// The writers queued behind a remove read its record, for that account
+    /// only, and the record is bounded.
+    #[test]
+    fn recent_removals_are_per_account_and_bounded() {
+        let (one, two) = ("test-account-one-7f3a", "test-account-two-7f3a");
+        note_recent_removals(one, vec!["https://gone.example".to_string(), "https://back.example".to_string()]);
+        assert!(recent_removals(one).contains(&"https://gone.example".to_string()));
+        assert!(!recent_removals(two).contains(&"https://gone.example".to_string()));
+        // Added back by Aura: its absence is news again.
+        forget_recent_removal(one, "https://back.example");
+        assert!(!recent_removals(one).contains(&"https://back.example".to_string()));
+        assert!(recent_removals(one).contains(&"https://gone.example".to_string()));
+        note_recent_removals(two, (0..RECENT_REMOVALS_CAP + 5).map(|i| format!("https://{i}.example")).collect());
+        assert!(RECENT_REMOVALS.get().unwrap().lock().unwrap().len() <= RECENT_REMOVALS_CAP);
+        assert!(!recent_removals(one).contains(&"https://gone.example".to_string()), "evicted by the cap");
+    }
+
+    #[test]
+    fn add_refuses_a_manifest_stremio_could_not_load() {
+        assert_eq!(check_addable_manifest(&collection_manifest("a.addon", "1.0.0")), Ok(()));
+        let refused = |m: serde_json::Value| {
+            let err = check_addable_manifest(&m).unwrap_err();
+            assert!(err.starts_with("This addon's manifest can't be added to your Stremio account: "), "{err}");
+            err
+        };
+        // stremio-addon-linter accepts a `v` prefix; stremio-core does not.
+        let mut m = collection_manifest("a.addon", "1.0.0");
+        m["version"] = serde_json::json!("v1.0.0");
+        refused(m);
+        let mut m = collection_manifest("a.addon", "1.0.0");
+        m["behaviorHints"] = serde_json::Value::Null;
+        refused(m);
+        let mut m = collection_manifest("a.addon", "1.0.0");
+        m["behaviorHints"]["configurationRequired"] = serde_json::json!(true);
+        assert!(refused(m).ends_with("the addon needs configuring first"));
+        let mut m = collection_manifest("a.addon", "1.0.0");
+        m["resources"][1]["x"] = nested_arrays(30);
+        assert!(refused(m).ends_with("the manifest nests more than 32 levels deep"));
+    }
+
+    /// `k` arrays nested inside each other, `[[[...]]]`.
+    fn nested_arrays(k: usize) -> serde_json::Value {
+        let mut v = serde_json::json!([]);
+        for _ in 1..k {
+            v = serde_json::json!([v]);
+        }
+        v
+    }
+
+    #[test]
+    fn nesting_bound_is_32_levels() {
+        // manifest (1) > resources (2) > resource object (3) > k arrays.
+        let mut ok = collection_manifest("b.addon", "2.1.0");
+        ok["resources"][1]["x"] = nested_arrays(29);
+        assert_eq!(check_collection_manifest(&ok), Ok(()));
+        let mut deep = collection_manifest("b.addon", "2.1.0");
+        deep["resources"][1]["x"] = nested_arrays(30);
+        assert_eq!(check_collection_manifest(&deep), Err("the manifest nests more than 32 levels deep"));
+        // Well past serde_json's own 128-level parse limit, walked without
+        // recursion.
+        assert!(json_nests_deeper_than(&nested_arrays(500), MAX_COLLECTION_MANIFEST_DEPTH));
+        assert!(!json_nests_deeper_than(&serde_json::json!({ "a": { "b": [1, 2] } }), 3));
+        assert!(json_nests_deeper_than(&serde_json::json!({ "a": { "b": [1, 2] } }), 2));
+        assert!(!json_nests_deeper_than(&serde_json::json!("scalar"), 0));
+
+        // And through the refresh write, which must not push it.
+        let mut collection = sample_collection();
+        let original = collection.clone();
+        let out = apply(&mut collection, "https://b.example/cfg", &deep);
+        assert_eq!(out, Err(ManifestWriteSkip::Invalid("the manifest nests more than 32 levels deep")));
+        assert_eq!(collection, original);
+    }
+
+    /// AIOMetadata stamps `_timestamp` and `_debug` into every response, so
+    /// once the stored entry is raw a raw compare never matches. In
+    /// stremio-core terms on both sides it does.
+    #[test]
+    fn refresh_merge_ignores_fields_stremio_core_drops() {
+        let mut collection = sample_collection();
+        collection[1]["manifest"]["_timestamp"] = serde_json::json!(1_700_000_000_000u64);
+        collection[1]["manifest"]["_debug"] = serde_json::json!({ "timestamp": "2026-09-01T00:00:00Z" });
+        collection[1]["manifest"]["catalogs"][0]["genres"] = serde_json::json!(["Drama"]);
+        let original = collection.clone();
+        let mut fresh = collection_manifest("b.addon", "2.0.0");
+        fresh["_timestamp"] = serde_json::json!(1_800_000_000_000u64);
+        fresh["_debug"] = serde_json::json!({ "timestamp": "2026-09-25T00:00:00Z" });
+        fresh["catalogs"][0]["genres"] = serde_json::json!(["Comedy"]);
+        assert_eq!(apply(&mut collection, "https://b.example/cfg", &fresh), Err(ManifestWriteSkip::Unchanged));
+        assert_eq!(collection, original);
+    }
+
+    #[test]
+    fn stremio_core_manifest_is_idempotent() {
+        let stored = stremio_core_stored_manifest();
+        assert_eq!(stremio_core_manifest(&stored), Some(stored));
+    }
+
+    #[test]
+    fn refresh_merge_refuses_a_manifest_that_offers_less() {
+        type Change = Box<dyn Fn(&mut serde_json::Value, &mut serde_json::Value)>;
+        let cases: Vec<(&str, Change, ManifestReduction)> = vec![
+            ("a catalog", Box::new(|_, f| { f["catalogs"].as_array_mut().unwrap().remove(0); }),
+                ManifestReduction { catalogs: 1, ..Default::default() }),
+            ("a catalog of another type", Box::new(|_, f| f["catalogs"][0]["type"] = serde_json::json!("series")),
+                ManifestReduction { catalogs: 1, ..Default::default() }),
+            ("a resource", Box::new(|_, f| f["resources"] = serde_json::json!(["catalog"])),
+                ManifestReduction { resources: 1, ..Default::default() }),
+            ("a type", Box::new(|_, f| f["types"] = serde_json::json!(["movie"])),
+                ManifestReduction { types: 1, ..Default::default() }),
+            ("an addon catalog", Box::new(|s, _| s["addonCatalogs"] = serde_json::json!([{ "type": "other", "id": "x" }])),
+                ManifestReduction { addon_catalogs: 1, ..Default::default() }),
+            ("an idPrefix", Box::new(|s, f| {
+                s["idPrefixes"] = serde_json::json!(["tt", "kitsu"]);
+                f["idPrefixes"] = serde_json::json!(["tt"]);
+            }), ManifestReduction { id_prefixes: 1, ..Default::default() }),
+            ("idPrefixes nulled", Box::new(|s, _| s["idPrefixes"] = serde_json::json!(["tt", "kitsu"])),
+                ManifestReduction { id_prefixes: 2, ..Default::default() }),
+            ("a lower version", Box::new(|_, f| f["version"] = serde_json::json!("1.9.9")),
+                ManifestReduction { older_version: true, ..Default::default() }),
+            ("a pre-release of the same version", Box::new(|_, f| f["version"] = serde_json::json!("2.0.0-beta.1")),
+                ManifestReduction { older_version: true, ..Default::default() }),
+            ("several at once", Box::new(|_, f| {
+                f["catalogs"].as_array_mut().unwrap().remove(0);
+                f["resources"] = serde_json::json!(["catalog"]);
+                f["version"] = serde_json::json!("1.0.0");
+            }), ManifestReduction { catalogs: 1, resources: 1, older_version: true, ..Default::default() }),
+            // Every id (no manifest-level list) narrowed to a list.
+            ("idPrefixes declared where none were", Box::new(|_, f| f["idPrefixes"] = serde_json::json!(["tt"])),
+                ManifestReduction { narrowed_ids: true, ..Default::default() }),
+            // AIOStreams-shaped: types and ids live on the full-form stream
+            // resource only, and an upstream that failed simply leaves its
+            // part out while every name, type and catalog stays.
+            ("a stream resource's id prefix", Box::new(|s, f| {
+                s["resources"][1]["idPrefixes"] = serde_json::json!(["tt", "kitsu", "tmdb:"]);
+                f["resources"][1]["idPrefixes"] = serde_json::json!(["tt", "kitsu"]);
+            }), ManifestReduction { narrowed_resources: 1, ..Default::default() }),
+            ("a stream resource from every id to a list", Box::new(|s, _| {
+                s["resources"][1].as_object_mut().unwrap().remove("idPrefixes");
+            }), ManifestReduction { narrowed_resources: 1, ..Default::default() }),
+            ("a stream resource's empty id list (every id) to a list", Box::new(|s, _| {
+                s["resources"][1]["idPrefixes"] = serde_json::json!([]);
+            }), ManifestReduction { narrowed_resources: 1, ..Default::default() }),
+            ("a stream resource's type, the manifest's types unchanged", Box::new(|s, _| {
+                s["resources"][1]["types"] = serde_json::json!(["movie", "series"]);
+            }), ManifestReduction { narrowed_resources: 1, ..Default::default() }),
+            ("a stream resource's types dropped (none served)", Box::new(|_, f| {
+                f["resources"][1].as_object_mut().unwrap().remove("types");
+            }), ManifestReduction { narrowed_resources: 1, ..Default::default() }),
+            ("a short-form stream narrowed by the manifest's idPrefixes", Box::new(|s, f| {
+                s["resources"] = serde_json::json!(["catalog", "stream"]);
+                f["resources"] = serde_json::json!(["catalog", "stream"]);
+                f["idPrefixes"] = serde_json::json!(["tt"]);
+            }), ManifestReduction { narrowed_resources: 1, narrowed_ids: true, ..Default::default() }),
+            ("a short-form stream losing a manifest type", Box::new(|s, f| {
+                s["resources"] = serde_json::json!(["catalog", "stream"]);
+                f["resources"] = serde_json::json!(["catalog", "stream"]);
+                f["types"] = serde_json::json!(["movie"]);
+            }), ManifestReduction { types: 1, narrowed_resources: 1, ..Default::default() }),
+            // stremio-core reads only the FIRST resource of a name, so a
+            // second one that still offers everything does not help.
+            ("a first stream resource narrowed behind a wide second one", Box::new(|_, f| {
+                f["resources"][1]["idPrefixes"] = serde_json::json!(["kitsu"]);
+                f["resources"].as_array_mut().unwrap().push(serde_json::json!({ "name": "stream", "types": ["movie"] }));
+            }), ManifestReduction { narrowed_resources: 1, ..Default::default() }),
+            // A catalog kept by id and type whose extras narrow: stremio-core
+            // stops sending it a search, or the Board can no longer request it.
+            ("a catalog's search extra", Box::new(|s, _| {
+                s["catalogs"][0]["extra"] = serde_json::json!([{ "name": "skip" }, { "name": "search" }]);
+            }), ManifestReduction { narrowed_catalogs: 1, ..Default::default() }),
+            ("an extra newly required", Box::new(|s, f| {
+                s["catalogs"][0]["extra"] = serde_json::json!([{ "name": "genre", "options": ["Drama"] }]);
+                f["catalogs"][0]["extra"] = serde_json::json!([{ "name": "genre", "isRequired": true, "options": ["Drama"] }]);
+            }), ManifestReduction { narrowed_catalogs: 1, ..Default::default() }),
+            ("a new required extra", Box::new(|_, f| {
+                f["catalogs"][0]["extra"].as_array_mut().unwrap()
+                    .push(serde_json::json!({ "name": "genre", "isRequired": true, "options": ["Drama"] }));
+            }), ManifestReduction { narrowed_catalogs: 1, ..Default::default() }),
+            ("a required extra's options emptied", Box::new(|s, f| {
+                s["catalogs"][0]["extra"] = serde_json::json!([{ "name": "genre", "isRequired": true, "options": ["Drama"] }]);
+                f["catalogs"][0]["extra"] = serde_json::json!([{ "name": "genre", "isRequired": true, "options": [] }]);
+            }), ManifestReduction { narrowed_catalogs: 1, ..Default::default() }),
+            // The degraded genre upstream: required and optionless at once,
+            // one catalog narrowed.
+            ("an extra newly required with no options", Box::new(|s, f| {
+                s["catalogs"][0]["extra"] = serde_json::json!([{ "name": "genre", "options": ["Drama"] }]);
+                f["catalogs"][0]["extra"] = serde_json::json!([{ "name": "genre", "isRequired": true, "options": null }]);
+            }), ManifestReduction { narrowed_catalogs: 1, ..Default::default() }),
+            // Short form (`extraSupported` / `extraRequired`) reads the same.
+            ("a short-form extra name", Box::new(|s, f| {
+                s["catalogs"][0] = serde_json::json!({ "type": "movie", "id": "top", "extraSupported": ["search", "skip"] });
+                f["catalogs"][0] = serde_json::json!({ "type": "movie", "id": "top", "extraSupported": ["skip"] });
+            }), ManifestReduction { narrowed_catalogs: 1, ..Default::default() }),
+            ("a short-form extra newly required", Box::new(|s, f| {
+                s["catalogs"][0] = serde_json::json!({ "type": "movie", "id": "top", "extraSupported": ["genre"] });
+                f["catalogs"][0] = serde_json::json!({ "type": "movie", "id": "top", "extraSupported": ["genre"], "extraRequired": ["genre"] });
+            }), ManifestReduction { narrowed_catalogs: 1, ..Default::default() }),
+            // A short-form extra carries no options, so a required one with
+            // options that turns short form loses them.
+            ("a required extra's options lost to the short form", Box::new(|s, f| {
+                s["catalogs"][0]["extra"] = serde_json::json!([{ "name": "genre", "isRequired": true, "options": ["Drama"] }]);
+                f["catalogs"][0] = serde_json::json!({ "type": "movie", "id": "top", "extraSupported": ["genre"], "extraRequired": ["genre"] });
+            }), ManifestReduction { narrowed_catalogs: 1, ..Default::default() }),
+            ("an addon catalog's extra", Box::new(|s, f| {
+                s["addonCatalogs"] = serde_json::json!([{ "type": "other", "id": "x", "extra": [{ "name": "search" }] }]);
+                f["addonCatalogs"] = serde_json::json!([{ "type": "other", "id": "x" }]);
+            }), ManifestReduction { narrowed_catalogs: 1, ..Default::default() }),
+        ];
+        for (what, change, expected) in cases {
+            let mut collection = sample_collection();
+            let mut fresh = collection_manifest("b.addon", "2.0.0");
+            // Something real must change, or guard e would answer first.
+            fresh["catalogs"].as_array_mut().unwrap().push(serde_json::json!({ "type": "series", "id": "extra" }));
+            change(&mut collection[1]["manifest"], &mut fresh);
+            let original = collection.clone();
+            let out = apply(&mut collection, "https://b.example/cfg", &fresh);
+            match out {
+                Err(ManifestWriteSkip::Reduced { lost, .. }) => assert_eq!(lost, expected, "{what}"),
+                other => panic!("{what}: {other:?}"),
+            }
+            assert_eq!(collection, original, "{what}: collection changed");
+        }
+    }
+
+    #[test]
+    fn refresh_merge_writes_additive_and_equal_shape_changes() {
+        type Change = Box<dyn Fn(&mut serde_json::Value, &mut serde_json::Value)>;
+        let cases: Vec<(&str, Change)> = vec![
+            ("a new catalog", Box::new(|_, f| {
+                f["catalogs"].as_array_mut().unwrap().push(serde_json::json!({ "type": "series", "id": "new" }));
+            })),
+            ("a renamed catalog", Box::new(|_, f| f["catalogs"][0]["name"] = serde_json::json!("Popular"))),
+            ("a new resource and type", Box::new(|_, f| {
+                f["resources"].as_array_mut().unwrap().push(serde_json::json!("meta"));
+                f["types"].as_array_mut().unwrap().push(serde_json::json!("anime"));
+            })),
+            ("an optional extra added", Box::new(|_, f| {
+                f["catalogs"][0]["extra"] = serde_json::json!([{ "name": "skip" }, { "name": "genre", "options": ["Drama"] }]);
+            })),
+            ("an extra's options added", Box::new(|s, f| {
+                s["catalogs"][0]["extra"] = serde_json::json!([{ "name": "skip" }, { "name": "genre" }]);
+                f["catalogs"][0]["extra"] = serde_json::json!([{ "name": "skip" }, { "name": "genre", "options": ["Drama"] }]);
+            })),
+            ("a required extra given options", Box::new(|s, f| {
+                s["catalogs"][0]["extra"] = serde_json::json!([{ "name": "genre", "isRequired": true, "options": [] }]);
+                f["catalogs"][0]["extra"] = serde_json::json!([{ "name": "genre", "isRequired": true, "options": ["Drama"] }]);
+            })),
+            ("isRequired relaxed", Box::new(|s, f| {
+                s["catalogs"][0]["extra"] = serde_json::json!([{ "name": "genre", "isRequired": true, "options": ["Drama"] }]);
+                f["catalogs"][0]["extra"] = serde_json::json!([{ "name": "genre", "options": ["Drama"] }]);
+            })),
+            ("a short-form catalog written in full form", Box::new(|s, f| {
+                s["catalogs"][0] = serde_json::json!({ "type": "movie", "id": "top", "extraSupported": ["search"] });
+                f["catalogs"][0] = serde_json::json!({ "type": "movie", "id": "top", "extra": [{ "name": "search" }] });
+            })),
+            // stremio-core yields only `extraSupported` names, so a name only
+            // in `extraRequired` was never an extra to lose.
+            ("a short-form required-only name dropped", Box::new(|s, f| {
+                s["catalogs"][0] = serde_json::json!({ "type": "movie", "id": "top", "extraSupported": ["skip"], "extraRequired": ["genre"] });
+                f["catalogs"][0] = serde_json::json!({ "type": "movie", "id": "top", "extraSupported": ["skip"], "name": "Top" });
+            })),
+            ("a higher version only", Box::new(|_, f| f["version"] = serde_json::json!("2.0.1"))),
+            ("idPrefixes widened", Box::new(|s, f| {
+                s["idPrefixes"] = serde_json::json!(["tt"]);
+                f["idPrefixes"] = serde_json::json!(["tt", "kitsu"]);
+            })),
+            ("a release of a stored pre-release", Box::new(|s, _| s["version"] = serde_json::json!("2.0.0-rc.1"))),
+            ("a stream resource's id prefixes widened", Box::new(|_, f| {
+                f["resources"][1]["idPrefixes"] = serde_json::json!(["tt", "kitsu"]);
+            })),
+            ("a stream resource opened to every id", Box::new(|_, f| {
+                f["resources"][1].as_object_mut().unwrap().remove("idPrefixes");
+            })),
+            ("a stream resource's prefix generalized", Box::new(|s, f| {
+                s["resources"][1]["idPrefixes"] = serde_json::json!(["tmdb:movie"]);
+                f["resources"][1]["idPrefixes"] = serde_json::json!(["tmdb:"]);
+            })),
+            ("a stream resource's types widened", Box::new(|_, f| {
+                f["resources"][1]["types"] = serde_json::json!(["movie", "series"]);
+            })),
+            // A resource that served no type (full form, no `types`) had
+            // nothing to lose.
+            ("a typeless resource narrowed", Box::new(|s, f| {
+                s["resources"].as_array_mut().unwrap().push(serde_json::json!({ "name": "meta" }));
+                f["resources"].as_array_mut().unwrap().push(serde_json::json!({ "name": "meta", "idPrefixes": ["tt"] }));
+            })),
+            // Catalog resources are gated on the catalog lists, which are
+            // unchanged here.
+            ("a catalog resource's types narrowed", Box::new(|s, f| {
+                s["resources"][0] = serde_json::json!({ "name": "catalog", "types": ["movie", "series"] });
+                f["resources"][0] = serde_json::json!({ "name": "catalog", "types": ["movie"] });
+            })),
+        ];
+        for (what, change) in cases {
+            let mut collection = sample_collection();
+            let mut fresh = collection_manifest("b.addon", "2.0.0");
+            change(&mut collection[1]["manifest"], &mut fresh);
+            let original = collection.clone();
+            assert_eq!(apply(&mut collection, "https://b.example/cfg", &fresh), Ok(1), "{what}");
+            assert_eq!(collection[1]["manifest"], fresh, "{what}");
+            assert_eq!(collection[0], original[0], "{what}");
+            assert_eq!(collection[2], original[2], "{what}");
+        }
+    }
+
+    /// A stored manifest stremio-core cannot parse gives nothing to prove a
+    /// reduction against, so the write is refused rather than guessed.
+    #[test]
+    fn refresh_merge_refuses_when_the_stored_manifest_is_unreadable() {
+        let mut collection = sample_collection();
+        collection[1]["manifest"]["version"] = serde_json::json!("2.0");
+        let original = collection.clone();
+        let out = apply(&mut collection, "https://b.example/cfg", &collection_manifest("b.addon", "2.1.0"));
+        assert_eq!(out, Err(ManifestWriteSkip::StoredUnreadable));
+        assert_eq!(collection, original);
+    }
+
+    #[test]
+    fn reduction_is_described_by_counts() {
+        let r = |lost: ManifestReduction| lost.describe();
+        assert_eq!(r(ManifestReduction { catalogs: 1, ..Default::default() }), "remove 1 catalog");
+        assert_eq!(r(ManifestReduction { catalogs: 2, resources: 1, ..Default::default() }), "remove 1 resource and 2 catalogs");
+        assert_eq!(
+            r(ManifestReduction { resources: 2, types: 1, catalogs: 3, id_prefixes: 1, ..Default::default() }),
+            "remove 2 resources, 1 type, 3 catalogs and 1 id prefix",
+        );
+        assert_eq!(r(ManifestReduction { older_version: true, ..Default::default() }), "lower its version");
+        assert_eq!(
+            r(ManifestReduction { addon_catalogs: 2, older_version: true, ..Default::default() }),
+            "remove 2 addon catalogs, and lower its version",
+        );
+        assert_eq!(r(ManifestReduction { narrowed_resources: 1, ..Default::default() }), "narrow what 1 resource serves");
+        assert_eq!(r(ManifestReduction { narrowed_ids: true, ..Default::default() }), "narrow the ids it serves");
+        assert_eq!(r(ManifestReduction { narrowed_catalogs: 1, ..Default::default() }), "narrow 1 catalog's filters");
+        assert_eq!(r(ManifestReduction { narrowed_catalogs: 2, ..Default::default() }), "narrow 2 catalogs' filters");
+        assert_eq!(
+            r(ManifestReduction { narrowed_resources: 1, narrowed_catalogs: 3, older_version: true, ..Default::default() }),
+            "narrow what 1 resource serves, narrow 3 catalogs' filters, and lower its version",
+        );
+        assert_eq!(
+            r(ManifestReduction { catalogs: 1, narrowed_resources: 2, narrowed_ids: true, older_version: true, ..Default::default() }),
+            "remove 1 catalog, narrow what 2 resources serve, narrow the ids it serves, and lower its version",
+        );
+        assert!(ManifestReduction::default().is_empty());
+    }
+
+    /// The literal fetched url is what counts: an address whose base itself
+    /// ends in `/manifest.json` normalizes like the plain one, yet the
+    /// official apps load a different url.
+    #[test]
+    fn refresh_merge_compares_the_literal_fetched_url() {
+        let mut collection = sample_collection();
+        let original = collection.clone();
+        let out = apply_refreshed_manifest(
+            &mut collection,
+            "https://a.example",
+            "https://a.example/manifest.json/manifest.json",
+            &collection_manifest("a.addon", "1.0.1"),
+        );
+        assert_eq!(out, Err(ManifestWriteSkip::OtherAddress));
+        assert_eq!(collection, original);
+    }
+
+    #[test]
+    fn semver_precedence_follows_the_spec() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        // The chain from semver.org section 11, plus the core numbers.
+        let chain = [
+            "1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-alpha.beta", "1.0.0-beta", "1.0.0-beta.2",
+            "1.0.0-beta.11", "1.0.0-rc.1", "1.0.0", "1.0.1", "1.1.0", "1.10.0", "2.0.0",
+        ];
+        for pair in chain.windows(2) {
+            assert_eq!(semver_precedence(pair[0], pair[1]), Some(Less), "{} < {}", pair[0], pair[1]);
+            assert_eq!(semver_precedence(pair[1], pair[0]), Some(Greater), "{} > {}", pair[1], pair[0]);
+        }
+        assert_eq!(semver_precedence("1.0.0+a", "1.0.0+b"), Some(Equal));
+        assert_eq!(semver_precedence("1.0.0-99999999999999999999999", "1.0.0-100000000000000000000000"), Some(Less));
+        assert_eq!(semver_precedence("1.0", "1.0.0"), None);
+        assert_eq!(semver_precedence("1.0.0", "v1.0.0"), None);
+    }
+
+    #[test]
+    fn account_api_errors_are_recognised_in_both_shapes() {
+        let err = |v: serde_json::Value| account_api_error(&v, "refused");
+        // The live API's answer to an invalid session.
+        assert_eq!(
+            err(serde_json::json!({ "error": { "code": 1, "message": "Session does not exist" } })),
+            Some(SESSION_EXPIRED.to_string()),
+        );
+        assert_eq!(err(serde_json::json!({ "error": "session expired" })), Some(SESSION_EXPIRED.to_string()));
+        assert_eq!(
+            err(serde_json::json!({ "error": { "code": 7, "message": "Addon collection too large" } })),
+            Some("Addon collection too large".to_string()),
+        );
+        assert_eq!(err(serde_json::json!({ "error": { "code": 7 } })), Some("refused".to_string()));
+        assert_eq!(err(serde_json::json!({ "error": "" })), None);
+        assert_eq!(err(serde_json::json!({ "error": null, "result": { "addons": [] } })), None);
+        assert_eq!(err(serde_json::json!({ "result": { "success": true } })), None);
     }
 }

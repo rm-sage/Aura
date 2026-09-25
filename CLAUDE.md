@@ -691,9 +691,65 @@ Bound every cache (see Performance & memory).
   `stream_types`, `stream_id_prefixes`, `has_search`) are populated at install/sync time and REBUILT
   by a manifest refresh (`refresh_addon_manifest`: the Refresh button, or the silent refresh after
   Configure), with the same builder `add_addon` uses. The rebuild is persisted to `addons.json` for
-  guests; for a signed-in user it lasts the session only, because Aura does not write the Stremio
-  cloud collection, so the collection's stored manifest snapshot wins again at the next launch or
-  sign-in. One cap differs between the builders: the live one keeps the first 16 manifest-level
+  guests. For a signed-in user (AddonsView passes `authKey`) the refresh also writes the manifest,
+  VERBATIM as the addon served it (never an Aura struct), into that addon's entry of the Stremio
+  collection, the snapshot the official apps and `get_synced_addons` read. The maintainer's condition
+  is "definitely accurate and not potentially harmful", so a guard in doubt refuses (harmless: the
+  rebuild then lasts the session only, and the stored snapshot wins again at the next launch). The
+  guards (`write_refreshed_manifest`, `apply_refreshed_manifest`): the collection is re-read under the
+  lock and must hold every url the addon list shows, exactly one entry must match, not `protected` and
+  at the literal url fetched, and the manifest must parse in stremio-core within 32 levels of nesting
+  and 1 MiB (`check_collection_manifest`; ONE unparseable entry locks the user's list in every
+  official app), keep the stored `id`, not declare `configurationRequired`, differ from the stored
+  one, and take nothing away (`manifest_reduction`: no resource, type, catalog, addon catalog or
+  manifest-level idPrefix dropped, no resource serving fewer types or ids, no catalog or addon
+  catalog kept by id and type that loses an extra name, gains a required extra or empties a required
+  extra's options, no manifest-level ids narrowed from every id to a list, no lower semver), with
+  both of those last compares made in stremio-core terms on BOTH sides (`stremio_core_manifest`),
+  because the official apps store entries re-serialized and AIOMetadata stamps a per-request
+  `_timestamp` into every manifest. A resource is read as stremio-core's `is_resource_supported`
+  reads it: short form takes the manifest's `types` / `idPrefixes`, full form only its own (no
+  `types` is none; null or [] ids is every id), and only the FIRST resource of a name counts. A
+  catalog's extras are read as `ManifestExtra::iter` yields them (short form: the `extraSupported`
+  names, required when `extraRequired` also names them, no options), because `is_extra_supported`
+  stops sending a request whose extra is gone or whose required extra is missing, and a required
+  extra with no options leaves `default_required_extra` nothing to send, so the Board drops the
+  catalog. The no-reduction rule exists because an addon that wraps others (AIOStreams) answers 200
+  with the same id while an upstream is down, and it declares types and ids per resource only, so
+  the loss often shows up nowhere but a stream resource's `idPrefixes` (or, for an addon deriving
+  its extras from an upstream, a catalog's extras); reinstalling the addon is how a user makes a
+  reduction stick. Only that entry's `manifest` changes, and the silent post-Configure refresh
+  passes `report: false` so it never waits for the write. All four collection writers (add, remove,
+  reorder, this one) hold one `COLLECTION_WRITE_LOCK` from read to push and refuse with "Your
+  Stremio account changed; reload the addon list and try again" when the read lacks a url the
+  frontend shows (`check_collection_read`: a partial read pushed back deletes the rest on every
+  device, and `addonCollectionGet` has returned one); add, remove and reorder also refuse an EMPTY
+  read whatever the list says (a real collection keeps Stremio's protected defaults). An expected
+  url is compared exactly as Rust handed it to the frontend, never normalized a second time, and an
+  addon Aura itself removed in the last 60 s (`RECENT_REMOVALS`) is excused, so a write queued
+  behind Aura's own remove is not refused. Remove and reorder likewise match a url EXACTLY before
+  normalizing it (an entry at `.../manifest.json/manifest.json` reaches the frontend as
+  `.../manifest.json`, its sibling's address), and so does the frontend's reorder, so neither
+  entry of such a pair is removed, merged or dropped in the other's place; remove never tries the
+  normalized form for an entry Aura itself just removed (a second remove of that row writes
+  nothing, where the fallback would have reached the sibling). The partial-read guard
+  is only as good as the list the frontend sends, so THAT LIST IS NEVER SHRUNK BY AN UNCONFIRMED
+  READ: no signed-in collection write is issued until a `get_synced_addons` has answered this
+  session and left a non-empty list shown (`App.isAddonListSynced`; before that add, remove and
+  reorder say so and do nothing, a refresh writes no account, and the check itself starts a
+  re-sync so a later press goes through), and both paths that replace the list from a read, the
+  sign-in / restore sync (`App.syncAddonList`) and the reload that answers a refusal
+  (`App.handleAccountChanged`), follow one rule: never adopt an empty read over a shown list,
+  adopt a read holding every shown url at once, adopt one lacking any only when a second read
+  1.5 s later is non-empty and identical, and adopt nothing if the list changed locally meanwhile
+  (`addonsGenRef`, which sign-in and sign-out also move) or a drag's write has not settled
+  (`reorderInFlightRef`); otherwise the shown list stays, which only makes the guard stricter. The
+  reload exists because nothing else re-reads the account mid-session. Add also runs the parse guard and refuses
+  `configurationRequired`, remove refuses a `protected` entry, and reorder is a pure permutation
+  that refuses a url matching nothing.
+  `account_api_error` reads the API's object-shaped `{ error: { message, code } }` as well as a bare
+  string, so "Session does not exist" signs out instead of reading as a failed write.
+  One cap differs between the builders: the live one keeps the first 16 manifest-level
   `id_prefixes` (`GUEST_ID_PREFIXES_CAP`), the cloud ones keep all of them. The entry a refresh
   hands back keeps all of them, so a refresh never SHORTENS a signed-in user's list (the prefix gates
   treat a non-empty list as complete, so a cut list rejects real ids); only what it saves for a guest

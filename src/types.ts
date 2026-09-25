@@ -28,6 +28,44 @@ export interface AddonEntry {
   configurable?: boolean;
 }
 
+/** The error every signed-in addon write (`cloud_add_addon`,
+ *  `cloud_remove_addon`, `cloud_reorder_addons`) returns when its fresh
+ *  read of the Stremio account is empty or does not hold every addon the
+ *  list shows, so nothing was pushed from what may be a partial read.
+ *  Exactly `COLLECTION_CHANGED` in stremio.rs. The caller then asks App to
+ *  reload the list from the account (`onAccountChanged`) and shows
+ *  `accountChangedCopy`, so "reload the addon list" is something Aura does
+ *  rather than something the user has no control for. */
+export const COLLECTION_CHANGED = "Your Stremio account changed; reload the addon list and try again";
+
+/** What to tell the user after a write was refused as COLLECTION_CHANGED and
+ *  App tried to reload the list. `reloaded` is whether App adopted a list;
+ *  when it did not, the account answered with an empty read, two reads that
+ *  disagreed, or while the list changed here, so nothing was changed and
+ *  claiming the account changed would be a guess. `retry` is the next step
+ *  after a reload, e.g. "Try again." */
+export function accountChangedCopy(reloaded: boolean, retry: string): string {
+  return reloaded
+    ? `Your Stremio account changed; the addon list was reloaded from it. ${retry}`
+    : "Your Stremio account didn't answer consistently, so nothing was changed. Try again in a minute.";
+}
+
+/** What an addon add, remove or reorder says, without calling the command,
+ *  while this session's `get_synced_addons` has not yet loaded the signed-in
+ *  list (App's `isAddonListSynced`). Every account write sends the list as
+ *  shown as `expectedUrls`, and Rust refuses to push from a read that lacks
+ *  one of them; a list that never loaded (an empty list, or only the warm
+ *  cache) would make that guard vacuous or stale. Asking also starts a sync
+ *  of the list, so trying again once it has answered goes through. */
+export const ADDON_LIST_NOT_LOADED =
+  "Your addon list hasn't loaded from Stremio yet, so nothing was changed. Aura is loading it now; try again in a moment.";
+
+/** A sync answered, with no addons at all. Every real Stremio collection
+ *  keeps the built-in addons, so Aura treats an empty read as a likely glitch
+ *  and will not write the account from it. */
+export const ACCOUNT_HAS_NO_ADDONS =
+  "Your Stremio account returned no addons, so Aura won't change it. Open the official Stremio app to check your addons, then come back.";
+
 /** One cast / producer entry with optional character pairing + photo.
  *  Sourced from AIOMetadata's `app_extras.cast` shape. The frontend
  *  pairs name with character ("Actor as Role") when both are present

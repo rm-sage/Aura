@@ -783,6 +783,40 @@ As built (Phase 4b):
 - `refresh_addon_manifest` (`stremio.rs:1382`) starts persisting a rebuilt `AddonEntry`
   through `addons::save`. Capability fields become load-bearing under this model and are
   currently frozen at install forever.
+  As built, later: `addons::save` only reaches a guest. For a signed-in user the rebuild
+  first lasted the session only, because writing the Stremio collection (an outward write
+  to the account the official apps share) waited on the maintainer's decision. It was
+  approved on the condition that the write is "definitely accurate and not potentially
+  harmful", so a signed-in refresh now writes the addon's raw manifest, exactly as served,
+  into its one collection entry, and refuses whenever a guard is in doubt. The guards: the
+  collection is re-read under one lock shared by every collection writer and must hold
+  every url the addon list shows, exactly one entry must match, not `protected` and at the
+  literal url fetched, and the manifest must parse as stremio-core's `Manifest` within 32
+  levels of nesting and 1 MiB, keep the stored `id`, declare no `configurationRequired`,
+  differ from the stored one, and take nothing away (no resource, type, catalog, addon
+  catalog or manifest-level idPrefix dropped, no resource serving fewer types or ids as
+  stremio-core gates a request on it, no catalog kept by id and type that loses an extra
+  name, gains a required extra or empties a required extra's options, no manifest-level ids
+  narrowed, no lower version), those last two compared in stremio-core terms on both sides.
+  Nothing else in the collection moves. The review of that write also hardened the three
+  older writers: each now refuses to push from a read that is empty (whatever the list
+  says) or lacks a url the frontend shows (a partial read would delete the rest; an addon
+  Aura itself just removed is excused), `cloud_add_addon` runs the same parse guard and
+  refuses `configurationRequired`, `cloud_remove_addon` refuses a `protected` entry and
+  matches the clicked url exactly before normalizing it (and never normalizes for an entry
+  Aura itself just removed, so a second remove of that row writes nothing rather than
+  reaching its sibling), and `cloud_reorder_addons` was
+  rewritten as a pure permutation that can never drop an entry sharing its url with another
+  and refuses a url that matches nothing. Because that guard is only as good as the list
+  the frontend sends, the list is never shrunk by an unconfirmed read: no signed-in write
+  is issued until `get_synced_addons` has answered this session with a non-empty list
+  shown (a write pressed before that starts a re-sync, so a later press goes through), and
+  both paths that replace the list from a read, the sign-in / restore sync and the reload
+  that answers a refusal, never adopt an empty read over a shown list, adopt a read holding
+  every shown url at once, adopt one lacking any only when a second read 1.5 s later is
+  identical, and adopt nothing if the list changed locally meanwhile or a drag's write has
+  not settled. The `refresh_addon_manifest` doc comment, `App.syncAddonList` and
+  `App.handleAccountChanged` have the detail.
 - Unify the `has_search` rule. `add_addon` (`stremio.rs:1181-1191`) ORs a catalogs-extra
   check with a `resources` scan; `cloud_add_addon` and `get_synced_addons`
   (`stremio.rs:2141-2154`, `auth.rs:875-889`) check catalogs only, so an addon declaring
