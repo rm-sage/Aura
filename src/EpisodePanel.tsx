@@ -43,7 +43,7 @@ import ArcGrid, { ArcGridSkeleton } from "./ArcGrid";
 import GroupingToggle from "./EpisodeGroupingToggle";
 import {
   useStoryArcs, loadArcMode, saveArcMode, preferredGroupingId,
-  arcPositionOf, absoluteEpisodeMap, arcsLikelyAvailable, formatAbsoluteEpisode,
+  arcPositionOf, absoluteEpisodeMap, arcsLikelyAvailable, absoluteEpisodeHint,
   type EpisodeGrouping, type StoryArc,
 } from "./storyArcs";
 
@@ -430,7 +430,7 @@ function EpisodePanel({
               const isPending = pendingPlayId === v.id;
               // Season-mode absolute annotation ("(E88)") on a saga show; empty
               // otherwise. Arc mode shows the absolute number itself, so skip.
-              const absTag = arcMode ? "" : formatAbsoluteEpisode(seriesId, v.episode, absoluteById.get(v.id));
+              const absHint = arcMode ? null : absoluteEpisodeHint(seriesId, v.episode, absoluteById.get(v.id));
               // Unaired = parseable FUTURE air date (undated specials count
               // as aired). The next-to-air row gets the live chip; later
               // unaired rows a static date. Both dim the thumbnail.
@@ -519,14 +519,18 @@ function EpisodePanel({
                   </div>
                   <div className="flex-1 min-w-0 py-0.5">
                     <div className="flex items-center gap-2">
-                      <span className="text-white/45 text-[10.5px] font-mono uppercase tracking-[0.14em]">
+                      <span
+                        className={`text-white/45 text-[10.5px] font-mono uppercase tracking-[0.14em]${
+                          absHint ? " underline decoration-dotted decoration-white/30 underline-offset-2 cursor-help" : ""}`}
+                        title={absHint ?? undefined}
+                      >
                         {/* Arc mode: absolute whole-series number, so a
                             cross-season arc's rows agree with the arc's range.
-                            Season mode: the addon's per-season tag, plus the
-                            absolute number in parens on a saga show. */}
+                            Season mode: the addon's per-season tag; on a saga
+                            show the absolute number is in the hover text. */}
                         {arcMode
                           ? `E${String(absoluteById.get(v.id) ?? "").padStart(2, "0")}`
-                          : `${formatEpisodeTag(v)}${absTag ? ` ${absTag}` : ""}`}
+                          : formatEpisodeTag(v)}
                       </span>
                       {isCurrent && (
                         <span className="text-ln-accent text-[9.5px] font-semibold uppercase tracking-wider">

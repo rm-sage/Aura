@@ -133,7 +133,7 @@ import { hasUsableRating } from "../ratingValue";
 import ArcGrid, { ArcGridSkeleton } from "../ArcGrid";
 import GroupingToggle from "../EpisodeGroupingToggle";
 import {
-  absoluteEpisodeMap, arcArtFor, arcPositionOf, arcsLikelyAvailable, arcYearRange, formatAbsoluteEpisode, loadArcMode, peekCachedArcs, preferredGroupingId, saveArcMode, useStoryArcs,
+  absoluteEpisodeMap, arcArtFor, arcPositionOf, arcsLikelyAvailable, arcYearRange, absoluteEpisodeHint, formatAbsoluteEpisode, loadArcMode, peekCachedArcs, preferredGroupingId, saveArcMode, useStoryArcs,
   type EpisodeGrouping, type StoryArc,
 } from "../storyArcs";
 
@@ -4272,19 +4272,19 @@ const EpisodeRow = ({
       </div>
       <div className="flex-1 min-w-0 flex flex-col py-1 justify-center gap-1.5">
         <p className="flex items-baseline gap-3 font-mono text-[14px] tracking-[0.16em] uppercase">
-          <span className={isActive ? "text-ln-accent" : "text-white/65"}>
+          <span
+            className={`${isActive ? "text-ln-accent" : "text-white/65"}${
+              absoluteNumber == null && absoluteTag
+                ? " underline decoration-dotted decoration-white/30 underline-offset-4 cursor-help"
+                : ""}`}
+            title={absoluteNumber == null && absoluteTag ? absoluteTag : undefined}
+          >
             {absoluteNumber != null
               ? `E${String(absoluteNumber).padStart(2, "0")}`
               : video.episode != null
               ? `E${String(video.episode).padStart(2, "0")}`
               : "EP"}
           </span>
-          {/* Absolute-episode annotation in season mode (arc mode already shows
-              the absolute number itself). Empty for non-saga / already-absolute
-              shows. */}
-          {absoluteNumber == null && absoluteTag && (
-            <span className="text-white/35 tracking-wide">{absoluteTag}</span>
-          )}
           {unaired && airMs != null ? (
             <span className="text-white/45 tracking-wide whitespace-nowrap">
               Airs {new Date(airMs).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}
@@ -5073,7 +5073,7 @@ function EpisodesPanel({
                     seasonVideos={visibleEpisodes}
                     groupLabel={arcMode ? "arc" : "season"}
                     absoluteNumber={arcMode ? absoluteById.get(v.id) ?? null : null}
-                    absoluteTag={arcMode ? "" : formatAbsoluteEpisode(seriesId, v.episode, absoluteById.get(v.id))}
+                    absoluteTag={arcMode ? "" : absoluteEpisodeHint(seriesId, v.episode, absoluteById.get(v.id)) ?? ""}
                     isNextAiring={v.id === nextAiringId}
                     isDeepLinked={v.id === highlightId}
                     seriesArt={seriesArt}

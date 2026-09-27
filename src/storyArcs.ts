@@ -156,6 +156,20 @@ export function formatAbsoluteEpisode(
   return `(E${absoluteEpisode})`;
 }
 
+/** The hover text that explains a season-mode episode's second number, or
+ *  null when there is none (same gate as formatAbsoluteEpisode). Episode
+ *  LISTS show only the per-season number and put the overall one here: two
+ *  numbers per row pushed long lists into horizontal scrolling. */
+export function absoluteEpisodeHint(
+  seriesId: string | null,
+  perSeasonEpisode: number | null | undefined,
+  absoluteEpisode: number | null | undefined,
+): string | null {
+  if (!formatAbsoluteEpisode(seriesId, perSeasonEpisode, absoluteEpisode)) return null;
+  return `Episode ${absoluteEpisode} overall. Seasons view numbers episodes within each season, `
+    + `as your metadata addon does; Arcs view and most anime sites count every episode in order.`;
+}
+
 export type EpisodeGrouping = "seasons" | "arcs";
 
 export function loadArcMode(seriesId: string): { mode: EpisodeGrouping; groupingId?: string } {
@@ -260,8 +274,53 @@ async function requestStoryArcs(
   }
 }
 
+/** The id of the synthetic trailing arc (see withNewerEpisodes). */
+export const NEWER_EPISODES_ARC_ID = "aura:newer-episodes";
+
+/** Append the main-run episodes that come AFTER the last episode any arc
+ *  covers as one clearly named trailing group. TMDB's arc lists are
+ *  community-maintained and lag an ongoing show: One Piece's "Sagas" list
+ *  stopped at episode 1163 while 1179 had aired, so Arcs view hid every newer
+ *  episode. Stretching the last arc over them would be wrong whenever a new
+ *  arc has begun that TMDB has not listed yet (fail visible, never fail
+ *  off-by-one), so they get their own group instead. Episodes inside the
+ *  covered range that no arc claims are left alone: those are the aligner's
+ *  deliberate drops. Computed per render from the page's own videos, never
+ *  cached, so it grows with the show. */
+export function withNewerEpisodes(result: ArcResult | null, videos: VideoEntry[]): ArcResult | null {
+  if (!result || result.arcs.length === 0) return result;
+  if (result.arcs.some((a) => a.id === NEWER_EPISODES_ARC_ID)) return result;
+  const mapped = new Set(result.arcs.flatMap((a) => a.episode_ids));
+  const mainRun = videos
+    .filter((v) => (v.season ?? 0) > 0 && v.episode != null)
+    .sort((a, b) => (a.season! - b.season!) || (a.episode! - b.episode!));
+  let lastMapped = -1;
+  mainRun.forEach((v, i) => { if (mapped.has(v.id)) lastMapped = i; });
+  if (lastMapped < 0) return result;
+  const newer = mainRun.slice(lastMapped + 1).filter((v) => !mapped.has(v.id));
+  if (newer.length === 0) return result;
+  const years = newer
+    .map((v) => (v.released ? new Date(v.released).getUTCFullYear() : NaN))
+    .filter((y) => Number.isFinite(y));
+  return {
+    ...result,
+    arcs: [...result.arcs, {
+      id: NEWER_EPISODES_ARC_ID,
+      name: "Newer episodes (not in an arc yet)",
+      order: Math.max(...result.arcs.map((a) => a.order)) + 1,
+      episode_ids: newer.map((v) => v.id),
+      image: null,
+      image_source: "none",
+      year_start: years.length ? Math.min(...years) : null,
+      year_end: years.length ? Math.max(...years) : null,
+      dropped: 0,
+    }],
+  };
+}
+
 /** Load arcs for an anime detail page. Returns `null` for anything that is not
- *  an anime series with arc data, which is most of the library. */
+ *  an anime series with arc data, which is most of the library. The result
+ *  carries the trailing newer-episodes group (withNewerEpisodes). */
 export function useStoryArcs(
   detail: MetaDetail | null,
   seriesId: string | null,
@@ -299,7 +358,7 @@ export function useStoryArcs(
       }
       const result = await fetchStoryArcs(detail, seriesId, groupingId);
       if (!cancelled) {
-        setArcs(result);
+        setArcs(withNewerEpisodes(result, detail.videos));
         setLoading(false);
       }
     })();
