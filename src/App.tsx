@@ -5075,6 +5075,7 @@ export default function App() {
           season,
           episode,
           episode_title: activeTarget.episode_title ?? null,
+          episode_released: activeTarget.episode_released ?? null,
           played_at:     new Date().toISOString(),
           duration:      dur || undefined,
           watched_seconds: watched,
@@ -6277,6 +6278,7 @@ export default function App() {
           season,
           episode,
           episode_title: at.episode_title ?? null,
+          episode_released: at.episode_released ?? null,
           played_at:     new Date().toISOString(),
           duration:      dur || undefined,
           watched_seconds: watched || undefined,
@@ -7493,7 +7495,10 @@ export default function App() {
     // non-AIOMetadata sources, where the resolver falls back to the Fribb id-map
     // / SEQUEL-walk / title search.
     const needAnilist = activeTarget.anilist_id == null && e != null;
-    if (!needAbsolute && !needAnilist) return;
+    // Air date (and the title when the target lacks one) for Trakt's title +
+    // air-date fallback. Stamped once: `null` records "the VideoEntry has none".
+    const needRelease = activeTarget.episode_released === undefined && e != null;
+    if (!needAbsolute && !needAnilist && !needRelease) return;
     const targetId = activeTarget.id;
     const mediaType = activeTarget.media_type;
     const seriesId = activeTarget.series_id ?? targetId;
@@ -7511,9 +7516,13 @@ export default function App() {
         absoluteEp = priorCourEps + e;
       }
       // Embedded AniList pair from the VideoEntry the user is actually playing.
-      const vid = needAnilist ? detail.videos.find((v) => v.id === targetId) : undefined;
-      const aid = vid?.anilist_id ?? null;
-      const aep = vid?.anilist_episode ?? null;
+      const vid = needAnilist || needRelease
+        ? detail.videos.find((v) => v.id === targetId)
+        : undefined;
+      const aid = needAnilist ? vid?.anilist_id ?? null : null;
+      const aep = needAnilist ? vid?.anilist_episode ?? null : null;
+      const released = needRelease ? (vid?.released ?? null) : undefined;
+      const vidTitle = needRelease ? (vid?.title || undefined) : undefined;
       // Patch via functional setState — if the user has already swapped to a
       // different episode by the time the meta resolves, the id check refuses
       // to overwrite the new target with stale data.
@@ -7528,6 +7537,12 @@ export default function App() {
           (prev.anilist_id !== aid || prev.anilist_episode !== aep)
         ) {
           next = { ...next, anilist_id: aid, anilist_episode: aep };
+        }
+        if (released !== undefined && prev.episode_released === undefined) {
+          next = { ...next, episode_released: released };
+          if (!prev.episode_title && vidTitle) {
+            next = { ...next, episode_title: vidTitle };
+          }
         }
         return next;
       });
@@ -7633,6 +7648,8 @@ export default function App() {
           // directly so DevConsole test runs cover the same retry
           // path as live playback.
           absolute_episode_num: activeTarget.absolute_episode_num ?? null,
+          episode_title:    activeTarget.episode_title ?? null,
+          episode_released: activeTarget.episode_released ?? null,
         };
         const r = await invoke<RustResult>("scrobble_test_fire", {
           session,
@@ -8583,6 +8600,7 @@ export default function App() {
           season,
           episode,
           episode_title: activeTarget.episode_title ?? null,
+          episode_released: activeTarget.episode_released ?? null,
           played_at:     new Date().toISOString(),
           duration:      dur || undefined,
           watched_seconds: watched,

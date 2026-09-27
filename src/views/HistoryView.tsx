@@ -894,6 +894,9 @@ const HistoryCard = memo(function HistoryCard({
         playedAt:  entry.played_at,
         anilistId:      entry.anilist_id ?? null,
         anilistEpisode: entry.anilist_episode ?? null,
+        // Trakt's title + air-date fallback; the other commands ignore them.
+        episodeTitle:    entry.episode_title ?? null,
+        episodeReleased: entry.episode_released ?? null,
       });
       markScrobbled(conn.scope, service, entry.id, entry.played_at);
       showAppToast(message, { tone: "success" });

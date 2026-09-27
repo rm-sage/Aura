@@ -47,6 +47,10 @@ export interface HistoryEntry {
   episode?: number | null;
   /** Optional episode title (when the addon shipped one). */
   episode_title?: string | null;
+  /** The episode's air date (VideoEntry `released`), captured at play time.
+   *  With `episode_title` it lets a later Trakt scrobble of this row fall back
+   *  to Trakt's title + air-date lookup. Absent on older rows. */
+  episode_released?: string | null;
   /** ISO 8601 — when the user finished watching (or exited playback).
    *  Acts as the secondary key for removal. */
   played_at: string;

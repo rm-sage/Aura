@@ -181,6 +181,18 @@ pub struct ScrobbleSession {
     /// Paired with `anilist_id`; ignored without it.
     #[serde(default)]
     pub anilist_episode: Option<u32>,
+    /// The episode's own title from the VideoEntry (e.g. "Foundation Stones").
+    /// Feeds the last-resort Trakt title + air-date search, for an episode whose
+    /// show Trakt files under a DIFFERENT show id than the addon does (Bleach:
+    /// Thousand-Year Blood War is its own IMDb title, but Trakt keeps its
+    /// episodes in Bleach season 2). Optional: older callers omit it.
+    #[serde(default)]
+    pub episode_title: Option<String>,
+    /// The episode's air date from the VideoEntry (`released`, ISO 8601; only
+    /// the date part is read). Paired with `episode_title`: the search result
+    /// is accepted only when BOTH agree.
+    #[serde(default)]
+    pub episode_released: Option<String>,
 }
 
 static SESSION: OnceLock<Mutex<Option<ScrobbleSession>>> = OnceLock::new();
@@ -233,6 +245,10 @@ fn record_playback(time: f64, duration: f64) {
 enum TraktTarget {
     Movie { imdb: String },
     Episode { show_imdb: String, season: u32, number: u32 },
+    /// An episode keyed by Trakt's own episode id. Only the title + air-date
+    /// fallback produces this (never `trakt_targets`): it is the one path that
+    /// finds the episode without knowing which show Trakt files it under.
+    EpisodeByTraktId { trakt: u64 },
 }
 
 fn parse_trakt_target(id: &str, media_type: &str) -> Option<TraktTarget> {
@@ -398,6 +414,15 @@ fn build_history_body(target: &TraktTarget, watched_at: Option<&str>) -> serde_j
                     }],
                 }],
             })
+        }
+        // Trakt's /sync/history takes a top-level `episodes` array keyed by
+        // episode ids, with the same optional per-item `watched_at`.
+        TraktTarget::EpisodeByTraktId { trakt } => {
+            let mut episode = serde_json::json!({ "ids": { "trakt": trakt } });
+            if let Some(ts) = watched_at {
+                episode["watched_at"] = serde_json::Value::String(ts.to_string());
+            }
+            serde_json::json!({ "episodes": [episode] })
         }
     }
 }
@@ -752,85 +777,54 @@ async fn trakt_sync_history(
         if idx > 0 {
             crate::devlog!(
                 info, "scrobble",
-                "Trakt not_found on attempt {} — retrying with candidate {}/{}",
+                "Trakt not_found on attempt {} - retrying with candidate {}/{}",
                 idx, idx + 1, total,
             );
         }
-        let mut outcome = trakt_sync_history_once(
-            &token.access_token, target, sess, progress_pct, watched_at,
-        ).await;
+        match post_target_with_refresh(scope, &mut token, target, sess, progress_pct, watched_at).await {
+            PostStep::Added => return TraktSyncResult::Fired,
+            PostStep::Final(result) => return result,
+            // Try the next candidate.
+            PostStep::NotFound => continue,
+        }
+    }
 
-        // ── Reactive refresh on 401 ────────────────────────────────
-        // The token 401'd mid-flight (expired since the proactive
-        // check, or there was no proactive check). Try to refresh and
-        // retry this exact request ONCE. The per-scope async mutex in
-        // refresh_trakt_token collapses concurrent 401s onto a single
-        // refresh so the rotating refresh_token isn't double-spent.
-        if let TraktSyncOutcome::Unauthorized = outcome {
-            match scrobble_auth::refresh_access_token("trakt", scope, Some(&token.access_token)).await {
-                Ok(refreshed) => {
-                    crate::devlog!(
-                        info, "scrobble",
-                        "Trakt 401 — token refreshed, retrying /sync/history once",
-                    );
-                    // Re-read the persisted token so any later candidate
-                    // iteration also uses the fresh access_token.
-                    if let Some(fresh) = scrobble_auth::read_token_for("trakt", scope) {
-                        token = fresh;
-                    } else {
-                        token.access_token = refreshed.access_token.clone();
-                    }
-                    outcome = trakt_sync_history_once(
-                        &token.access_token, target, sess, progress_pct, watched_at,
-                    ).await;
-                    if let TraktSyncOutcome::Unauthorized = outcome {
-                        // Refreshed token still 401s — give up, clear,
-                        // surface the reconnect prompt. Do NOT loop.
-                        crate::devlog!(
-                            warn, "scrobble",
-                            "Trakt /sync/history 401 even after refresh — clearing token",
-                        );
-                        scrobble_auth::clear_token_for("trakt", scope);
-                        return TraktSyncResult::Failed;
-                    }
-                }
-                Err(scrobble_auth::RefreshError::Rejected) => {
-                    // refresh_token dead — refresh_trakt_token already
-                    // cleared the keyring. Same outcome as the old
-                    // clear-on-401 path; the notification fires.
-                    return TraktSyncResult::Failed;
-                }
-                Err(scrobble_auth::RefreshError::Transient(reason)) => {
-                    // Transient refresh failure — do NOT clear; the
-                    // token is left intact for a later retry.
-                    crate::devlog!(
-                        warn, "scrobble",
-                        "Trakt 401 + transient refresh failure: {reason} — leaving token intact, failing this sync",
-                    );
-                    return TraktSyncResult::Failed;
-                }
-                Err(scrobble_auth::RefreshError::NoRefreshToken) => {
-                    // Nothing to refresh with — fall back to the legacy
-                    // clear-token-and-re-auth behaviour.
-                    scrobble_auth::clear_token_for("trakt", scope);
-                    return TraktSyncResult::Failed;
-                }
+    // ── Fallbacks past the candidate list ──────────────────────────
+    // Only episodes reach here. Each fallback asks Trakt's own catalog where
+    // the episode lives rather than guessing a numbering, and each one gives
+    // up (rather than guessing) when the answer is not unique.
+    if sess.media_type != "movie" {
+        // A. Season-aware absolute resolve (One Piece: the addon files it as
+        //    one 1100-episode season, Trakt splits it into 23).
+        if let Some((show_imdb, season, number, abs)) = resolve_via_season_list(sess, &candidates).await {
+            crate::devlog!(
+                info, "scrobble",
+                "Trakt fallback matched (season list, absolute {}): \"{}\" S{}E{}",
+                abs, sess.title, season, number,
+            );
+            let target = TraktTarget::Episode { show_imdb, season, number };
+            match post_target_with_refresh(scope, &mut token, &target, sess, progress_pct, watched_at).await {
+                PostStep::Added => return TraktSyncResult::Fired,
+                PostStep::Final(result) => return result,
+                PostStep::NotFound => {}
             }
         }
-
-        match outcome {
-            TraktSyncOutcome::Added => return TraktSyncResult::Fired,
-            TraktSyncOutcome::Unauthorized => {
-                // Reached only when the reactive block above didn't run
-                // (it always resolves Unauthorized to a return or a
-                // non-401 outcome) — defensive, mirrors legacy behaviour.
-                scrobble_auth::clear_token_for("trakt", scope);
-                return TraktSyncResult::Failed;
-            }
-            TraktSyncOutcome::HttpError => return TraktSyncResult::Failed,
-            TraktSyncOutcome::NotFound => {
-                // Try the next candidate.
-                continue;
+        // B. Title + air-date search (Bleach TYBW: the addon's show id is a
+        //    stub on Trakt; the real episode lives under another show).
+        if let Some(hit) = resolve_via_title_search(sess).await {
+            crate::devlog!(
+                info, "scrobble",
+                "Trakt fallback matched (episode title + air date): \"{}\" -> \"{}\" S{}E{}",
+                sess.title,
+                hit.show_title.as_deref().unwrap_or("?"),
+                hit.season.map(|s| s.to_string()).unwrap_or_else(|| "?".into()),
+                hit.number.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+            );
+            let target = TraktTarget::EpisodeByTraktId { trakt: hit.trakt_id };
+            match post_target_with_refresh(scope, &mut token, &target, sess, progress_pct, watched_at).await {
+                PostStep::Added => return TraktSyncResult::Fired,
+                PostStep::Final(result) => return result,
+                PostStep::NotFound => {}
             }
         }
     }
@@ -840,6 +834,434 @@ async fn trakt_sync_history(
         total,
     );
     TraktSyncResult::NotFound
+}
+
+/// Result of one target POST once the reactive 401 refresh has been applied.
+enum PostStep {
+    Added,
+    NotFound,
+    /// Stop walking: the sync ends with this result (401 after refresh,
+    /// transient HTTP failure, ...).
+    Final(TraktSyncResult),
+}
+
+/// POST one target, refreshing the token ONCE on a 401 and retrying the same
+/// request. `token` is updated in place so later targets use the fresh one.
+async fn post_target_with_refresh(
+    scope: &str,
+    token: &mut scrobble_auth::ScrobbleAuthToken,
+    target: &TraktTarget,
+    sess: &ScrobbleSession,
+    progress_pct: f64,
+    watched_at: Option<&str>,
+) -> PostStep {
+    let mut outcome = trakt_sync_history_once(
+        &token.access_token, target, sess, progress_pct, watched_at,
+    ).await;
+
+    // ── Reactive refresh on 401 ────────────────────────────────
+    // The token 401'd mid-flight (expired since the proactive
+    // check, or there was no proactive check). Try to refresh and
+    // retry this exact request ONCE. The per-scope async mutex in
+    // refresh_trakt_token collapses concurrent 401s onto a single
+    // refresh so the rotating refresh_token isn't double-spent.
+    if let TraktSyncOutcome::Unauthorized = outcome {
+        match scrobble_auth::refresh_access_token("trakt", scope, Some(&token.access_token)).await {
+            Ok(refreshed) => {
+                crate::devlog!(
+                    info, "scrobble",
+                    "Trakt 401 - token refreshed, retrying /sync/history once",
+                );
+                // Re-read the persisted token so any later candidate
+                // iteration also uses the fresh access_token.
+                if let Some(fresh) = scrobble_auth::read_token_for("trakt", scope) {
+                    *token = fresh;
+                } else {
+                    token.access_token = refreshed.access_token.clone();
+                }
+                outcome = trakt_sync_history_once(
+                    &token.access_token, target, sess, progress_pct, watched_at,
+                ).await;
+                if let TraktSyncOutcome::Unauthorized = outcome {
+                    // Refreshed token still 401s - give up, clear,
+                    // surface the reconnect prompt. Do NOT loop.
+                    crate::devlog!(
+                        warn, "scrobble",
+                        "Trakt /sync/history 401 even after refresh - clearing token",
+                    );
+                    scrobble_auth::clear_token_for("trakt", scope);
+                    return PostStep::Final(TraktSyncResult::Failed);
+                }
+            }
+            Err(scrobble_auth::RefreshError::Rejected) => {
+                // refresh_token dead - refresh_trakt_token already
+                // cleared the keyring. Same outcome as the old
+                // clear-on-401 path; the notification fires.
+                return PostStep::Final(TraktSyncResult::Failed);
+            }
+            Err(scrobble_auth::RefreshError::Transient(reason)) => {
+                // Transient refresh failure - do NOT clear; the
+                // token is left intact for a later retry.
+                crate::devlog!(
+                    warn, "scrobble",
+                    "Trakt 401 + transient refresh failure: {reason} - leaving token intact, failing this sync",
+                );
+                return PostStep::Final(TraktSyncResult::Failed);
+            }
+            Err(scrobble_auth::RefreshError::NoRefreshToken) => {
+                // Nothing to refresh with - fall back to the legacy
+                // clear-token-and-re-auth behaviour.
+                scrobble_auth::clear_token_for("trakt", scope);
+                return PostStep::Final(TraktSyncResult::Failed);
+            }
+        }
+    }
+
+    match outcome {
+        TraktSyncOutcome::Added => PostStep::Added,
+        TraktSyncOutcome::Unauthorized => {
+            // Reached only when the reactive block above didn't run
+            // (it always resolves Unauthorized to a return or a
+            // non-401 outcome) - defensive, mirrors legacy behaviour.
+            scrobble_auth::clear_token_for("trakt", scope);
+            PostStep::Final(TraktSyncResult::Failed)
+        }
+        TraktSyncOutcome::HttpError => PostStep::Final(TraktSyncResult::Failed),
+        TraktSyncOutcome::NotFound => PostStep::NotFound,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trakt catalog fallbacks
+//
+// Past the candidate list, two read-only lookups ask Trakt where an episode
+// actually lives. Both are precision-first: an ambiguous answer is no answer,
+// because a wrong history row on the user's account is worse than a miss.
+// Both are public data, sent with the client id and never the user's token.
+//
+//   A. Season list: GET /shows/{imdb}/seasons?extended=full,episodes gives
+//      every episode's (season, number, number_abs). Trakt splits One Piece
+//      into 23 seasons whose episodes are numbered ABSOLUTELY (S21 runs
+//      892..1088), while the addon files it as one season, so the addon's
+//      S1E894 is Trakt's S21E894. Found from Trakt's list, never from an
+//      offset. (`extended=episodes` alone omits `number_abs`.)
+//   B. Title + air date: GET /search/episode?query=<title>&fields=title.
+//      Accepted only on an exact (case-insensitive, trimmed) title AND an
+//      air date within one day, with exactly one result satisfying both.
+// ---------------------------------------------------------------------------
+
+/// One Trakt episode, reduced to what the absolute resolve needs:
+/// (season, number, number_abs). One Piece has ~1200 of these, so the cache
+/// keeps only this, never the payload.
+type EpTriple = (u32, u32, Option<u32>);
+
+const SEASON_CACHE_CAP: usize = 20;
+const SEASON_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+type SeasonCache =
+    std::collections::HashMap<String, (std::time::Instant, std::sync::Arc<Vec<EpTriple>>)>;
+static SEASON_CACHE: OnceLock<Mutex<SeasonCache>> = OnceLock::new();
+
+fn season_cache() -> &'static Mutex<SeasonCache> {
+    SEASON_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn season_cache_get(show_imdb: &str) -> Option<std::sync::Arc<Vec<EpTriple>>> {
+    let guard = season_cache().lock().ok()?;
+    let (at, eps) = guard.get(show_imdb)?;
+    (at.elapsed() < SEASON_CACHE_TTL).then(|| eps.clone())
+}
+
+fn season_cache_put(show_imdb: &str, eps: std::sync::Arc<Vec<EpTriple>>) {
+    let Ok(mut guard) = season_cache().lock() else { return };
+    guard.retain(|_, (at, _)| at.elapsed() < SEASON_CACHE_TTL);
+    while guard.len() >= SEASON_CACHE_CAP && !guard.contains_key(show_imdb) {
+        let oldest = guard.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone());
+        match oldest {
+            Some(k) => { guard.remove(&k); }
+            None => break,
+        }
+    }
+    guard.insert(show_imdb.to_string(), (std::time::Instant::now(), eps));
+}
+
+#[derive(Deserialize)]
+struct TraktSeasonDto {
+    #[serde(default)] number: Option<u32>,
+    #[serde(default)] episodes: Option<Vec<TraktSeasonEpisodeDto>>,
+}
+#[derive(Deserialize)]
+struct TraktSeasonEpisodeDto {
+    #[serde(default)] number: Option<u32>,
+    #[serde(default)] number_abs: Option<u32>,
+}
+
+/// Category of a failed reqwest call, for a log line that never carries the
+/// URL (reqwest's Display appends it).
+fn req_err_category(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() { "timeout" }
+    else if e.is_connect() { "connect" }
+    else if e.is_decode() { "decode" }
+    else { "send" }
+}
+
+/// True for a bare IMDb id (`tt` + digits), the only shape spliced into a
+/// Trakt URL path here.
+fn is_bare_imdb_id(id: &str) -> bool {
+    id.len() <= 16
+        && id.strip_prefix("tt").is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Trakt's episode list for a show as (season, number, number_abs) triples,
+/// cached per show.
+async fn trakt_season_list(show_imdb: &str) -> Option<std::sync::Arc<Vec<EpTriple>>> {
+    if let Some(hit) = season_cache_get(show_imdb) {
+        return Some(hit);
+    }
+    if !is_bare_imdb_id(show_imdb) {
+        return None;
+    }
+    let res = client()
+        .get(format!("{TRAKT_API}/shows/{show_imdb}/seasons"))
+        .query(&[("extended", "full,episodes")])
+        .header("trakt-api-version", "2")
+        .header("trakt-api-key", scrobble_auth::TRAKT_CLIENT_ID)
+        .send()
+        .await;
+    let seasons: Vec<TraktSeasonDto> = match res {
+        Ok(r) if r.status().is_success() => match r.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                crate::devlog!(warn, "scrobble", "Trakt season list for {show_imdb}: {}", req_err_category(&e));
+                return None;
+            }
+        },
+        Ok(r) => {
+            crate::devlog!(warn, "scrobble", "Trakt season list for {show_imdb}: status {}", r.status().as_u16());
+            return None;
+        }
+        Err(e) => {
+            crate::devlog!(warn, "scrobble", "Trakt season list for {show_imdb}: {}", req_err_category(&e));
+            return None;
+        }
+    };
+    let mut eps: Vec<EpTriple> = Vec::new();
+    for s in seasons {
+        let Some(season) = s.number else { continue };
+        for e in s.episodes.unwrap_or_default() {
+            if let Some(number) = e.number {
+                eps.push((season, number, e.number_abs));
+            }
+        }
+    }
+    eps.shrink_to_fit();
+    let eps = std::sync::Arc::new(eps);
+    season_cache_put(show_imdb, eps.clone());
+    Some(eps)
+}
+
+/// The absolute episode Aura holds for this session: the frontend's computed
+/// value, else the addon's episode number when the addon's season is 1 and
+/// that number runs past Trakt's season 1 (so on Trakt's side it can only be
+/// an absolute number). `None` means fallback A has nothing to look up.
+fn absolute_episode_for(
+    sess_abs: Option<u32>, addon_season: Option<u32>, addon_episode: Option<u32>, trakt_s1_count: usize,
+) -> Option<u32> {
+    if let Some(abs) = sess_abs.filter(|a| *a > 0) {
+        return Some(abs);
+    }
+    match (addon_season, addon_episode) {
+        (Some(1), Some(ep)) if ep as usize > trakt_s1_count => Some(ep),
+        _ => None,
+    }
+}
+
+/// Find the unique Trakt (season, number) whose absolute number is `abs`.
+/// Season 0 (specials) never matches. `number_abs` decides when Trakt supplies
+/// it; an episode without one matches on `number` only inside a season Trakt
+/// numbers absolutely (its first episode is not 1, or it is the first regular
+/// season, where number and absolute coincide). More than one match is no
+/// match.
+fn resolve_absolute(eps: &[EpTriple], abs: u32) -> Option<(u32, u32)> {
+    let regular = || eps.iter().filter(|(s, _, _)| *s > 0);
+    let by_abs: Vec<(u32, u32)> = regular()
+        .filter(|(_, _, a)| *a == Some(abs))
+        .map(|(s, n, _)| (*s, *n))
+        .collect();
+    match by_abs.len() {
+        1 => return Some(by_abs[0]),
+        0 => {}
+        _ => return None,
+    }
+    let first_season = regular().map(|(s, _, _)| *s).min()?;
+    let absolute_season = |season: u32| {
+        season == first_season
+            || regular()
+                .filter(|(s, _, _)| *s == season)
+                .map(|(_, n, _)| *n)
+                .min()
+                .is_some_and(|m| m > 1)
+    };
+    let by_number: Vec<(u32, u32)> = regular()
+        .filter(|(s, n, a)| a.is_none() && *n == abs && absolute_season(*s))
+        .map(|(s, n, _)| (*s, *n))
+        .collect();
+    (by_number.len() == 1).then(|| by_number[0])
+}
+
+/// Fallback A. Returns (show_imdb, season, number, absolute) when Trakt's own
+/// season list places the episode somewhere not already tried.
+async fn resolve_via_season_list(
+    sess: &ScrobbleSession, tried: &[TraktTarget],
+) -> Option<(String, u32, u32, u32)> {
+    // The addon's view of the episode: the first (highest-priority) episode
+    // candidate carries the show anchor and the VideoEntry's S/E.
+    let (show_imdb, addon_season, addon_episode) = tried.iter().find_map(|t| match t {
+        TraktTarget::Episode { show_imdb, season, number } => Some((show_imdb.clone(), *season, *number)),
+        _ => None,
+    })?;
+    // No absolute number from the frontend and not a one-season addon layout:
+    // there is nothing to look up, so skip the fetch.
+    if sess.absolute_episode_num.is_none() && addon_season != 1 {
+        return None;
+    }
+    let eps = trakt_season_list(&show_imdb).await?;
+    let s1_count = eps.iter().filter(|(s, _, _)| *s == 1).count();
+    let abs = absolute_episode_for(sess.absolute_episode_num, Some(addon_season), Some(addon_episode), s1_count)?;
+    let (season, number) = resolve_absolute(&eps, abs)?;
+    let target = TraktTarget::Episode { show_imdb: show_imdb.clone(), season, number };
+    if tried.contains(&target) {
+        return None;
+    }
+    Some((show_imdb, season, number, abs))
+}
+
+/// One `/search/episode` result, reduced to what the acceptance rule and the
+/// log line need.
+#[derive(Clone, Debug, PartialEq)]
+struct EpisodeSearchHit {
+    trakt_id: u64,
+    title: Option<String>,
+    first_aired: Option<String>,
+    season: Option<u32>,
+    number: Option<u32>,
+    show_title: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TraktSearchResultDto {
+    #[serde(default)] show: Option<TraktSearchShowDto>,
+    #[serde(default)] episode: Option<TraktSearchEpisodeDto>,
+}
+#[derive(Deserialize)]
+struct TraktSearchShowDto {
+    #[serde(default)] title: Option<String>,
+}
+#[derive(Deserialize)]
+struct TraktSearchEpisodeDto {
+    #[serde(default)] title: Option<String>,
+    #[serde(default)] first_aired: Option<String>,
+    #[serde(default)] season: Option<u32>,
+    #[serde(default)] number: Option<u32>,
+    #[serde(default)] ids: Option<TraktSearchIdsDto>,
+}
+#[derive(Deserialize)]
+struct TraktSearchIdsDto {
+    #[serde(default)] trakt: Option<u64>,
+}
+
+/// Days since 1970-01-01 for the `YYYY-MM-DD` prefix of an ISO 8601 string
+/// (Howard Hinnant's days_from_civil). `None` for anything not date-shaped.
+fn iso_date_days(iso: &str) -> Option<i64> {
+    let date = iso.trim().get(0..10)?;
+    let b = date.as_bytes();
+    if b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let y: i64 = date[0..4].parse().ok()?;
+    let m: i64 = date[5..7].parse().ok()?;
+    let d: i64 = date[8..10].parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146097 + doe - 719468)
+}
+
+/// The acceptance rule for fallback B: exactly one hit whose title equals
+/// `title` (trimmed, case-insensitive) and whose first-aired UTC date is within
+/// one day of `released` (the addon's date may be the local broadcast day).
+fn pick_title_date_match<'a>(
+    hits: &'a [EpisodeSearchHit], title: &str, released: &str,
+) -> Option<&'a EpisodeSearchHit> {
+    let want_title = title.trim().to_lowercase();
+    if want_title.is_empty() {
+        return None;
+    }
+    let want_day = iso_date_days(released)?;
+    let mut matching = hits.iter().filter(|h| {
+        let title_ok = h.title.as_deref().is_some_and(|t| t.trim().to_lowercase() == want_title);
+        let date_ok = h.first_aired.as_deref()
+            .and_then(iso_date_days)
+            .is_some_and(|day| (day - want_day).abs() <= 1);
+        title_ok && date_ok
+    });
+    let first = matching.next()?;
+    matching.next().is_none().then_some(first)
+}
+
+/// Fallback B. Needs both the episode title and the air date on the session.
+async fn resolve_via_title_search(sess: &ScrobbleSession) -> Option<EpisodeSearchHit> {
+    let title = sess.episode_title.as_deref().map(str::trim).filter(|t| !t.is_empty())?;
+    let released = sess.episode_released.as_deref().filter(|r| iso_date_days(r).is_some())?;
+    // A title is free text from the addon; keep the query bounded.
+    if title.chars().count() > 200 {
+        return None;
+    }
+    let res = client()
+        .get(format!("{TRAKT_API}/search/episode"))
+        .query(&[("query", title), ("fields", "title"), ("extended", "full"), ("limit", "30")])
+        .header("trakt-api-version", "2")
+        .header("trakt-api-key", scrobble_auth::TRAKT_CLIENT_ID)
+        .send()
+        .await;
+    let results: Vec<TraktSearchResultDto> = match res {
+        Ok(r) if r.status().is_success() => match r.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                crate::devlog!(warn, "scrobble", "Trakt episode search: {}", req_err_category(&e));
+                return None;
+            }
+        },
+        Ok(r) => {
+            crate::devlog!(warn, "scrobble", "Trakt episode search: status {}", r.status().as_u16());
+            return None;
+        }
+        Err(e) => {
+            crate::devlog!(warn, "scrobble", "Trakt episode search: {}", req_err_category(&e));
+            return None;
+        }
+    };
+    let hits: Vec<EpisodeSearchHit> = results
+        .into_iter()
+        .filter_map(|r| {
+            let ep = r.episode?;
+            Some(EpisodeSearchHit {
+                trakt_id: ep.ids?.trakt?,
+                title: ep.title,
+                first_aired: ep.first_aired,
+                season: ep.season,
+                number: ep.number,
+                show_title: r.show.and_then(|s| s.title),
+            })
+        })
+        .collect();
+    pick_title_date_match(&hits, title, released).cloned()
 }
 
 // ---------------------------------------------------------------------------
@@ -1366,6 +1788,9 @@ pub(crate) fn session_from_history(
         // passed these; history simply never stored them.
         anilist_id,
         anilist_episode,
+        // Set by the caller that has them (scrobble_history_trakt).
+        episode_title: None,
+        episode_released: None,
     }
 }
 
@@ -1387,6 +1812,10 @@ pub async fn scrobble_history_trakt<R: Runtime>(
     played_at:       String,
     anilist_id:      Option<u64>,
     anilist_episode: Option<u32>,
+    // The row's episode title and air date, for the title + air-date
+    // fallback. Optional: rows written before they were recorded omit them.
+    episode_title:    Option<String>,
+    episode_released: Option<String>,
 ) -> Result<String, String> {
     // Trakt never reads the AniList fields; accepted only so both history
     // commands take the identical payload from the frontend.
@@ -1394,7 +1823,9 @@ pub async fn scrobble_history_trakt<R: Runtime>(
     if scrobble_auth::read_token_for("trakt", &scope).is_none() {
         return Err("Trakt is not connected. Connect it in Settings > Scrobbling.".into());
     }
-    let sess = session_from_history(id, parent_id, media_type, season, episode, name, false, scope.clone(), None, None);
+    let mut sess = session_from_history(id, parent_id, media_type, season, episode, name, false, scope.clone(), None, None);
+    sess.episode_title = episode_title;
+    sess.episode_released = episode_released;
     let trimmed = played_at.trim();
     let watched_at = if trimmed.is_empty() { None } else { Some(trimmed) };
     crate::devlog!(
@@ -1579,4 +2010,150 @@ pub fn shutdown_blocking<R: Runtime>(app: &AppHandle<R>) {
             .iter()
             .map(|&provider| dispatch(provider, push, app, &scope, &sess)),
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One Piece shape: specials, then seasons numbered ABSOLUTELY (S2 starts
+    /// at 62, S21 runs 892..1088). Built without number_abs, as the seasons
+    /// endpoint without `full` returns it, so the number fallback is exercised.
+    fn one_piece_like(with_abs: bool) -> Vec<EpTriple> {
+        let mut eps = Vec::new();
+        for n in 1..=39 { eps.push((0, n, None)); }
+        let seasons: [(u32, u32, u32); 4] = [(1, 1, 61), (2, 62, 77), (20, 878, 891), (21, 892, 1088)];
+        for (s, lo, hi) in seasons {
+            for n in lo..=hi { eps.push((s, n, with_abs.then_some(n))); }
+        }
+        eps
+    }
+
+    /// Bleach shape: S1 1..366 and S2 restarting at 1 with number_abs 367+.
+    fn bleach_like() -> Vec<EpTriple> {
+        let mut eps = Vec::new();
+        for n in 1..=4 { eps.push((0, n, None)); }
+        for n in 1..=366 { eps.push((1, n, Some(n))); }
+        for n in 1..=50 { eps.push((2, n, Some(366 + n))); }
+        eps
+    }
+
+    #[test]
+    fn absolute_resolves_one_piece_to_season_21() {
+        assert_eq!(resolve_absolute(&one_piece_like(true), 894), Some((21, 894)));
+        // Same answer from `number` alone when number_abs is missing.
+        assert_eq!(resolve_absolute(&one_piece_like(false), 894), Some((21, 894)));
+        assert_eq!(resolve_absolute(&one_piece_like(false), 70), Some((2, 70)));
+        // Past the end of Trakt's list: no match.
+        assert_eq!(resolve_absolute(&one_piece_like(true), 5000), None);
+    }
+
+    #[test]
+    fn absolute_resolves_bleach_season_2_by_number_abs() {
+        assert_eq!(resolve_absolute(&bleach_like(), 368), Some((2, 2)));
+        assert_eq!(resolve_absolute(&bleach_like(), 366), Some((1, 366)));
+        // Season 2 restarts at 1, so without number_abs its `number` never
+        // stands in for an absolute one.
+        let no_abs: Vec<EpTriple> = bleach_like().into_iter().map(|(s, n, _)| (s, n, None)).collect();
+        assert_eq!(resolve_absolute(&no_abs, 2), Some((1, 2)));
+        assert_eq!(resolve_absolute(&no_abs, 368), None);
+    }
+
+    #[test]
+    fn absolute_never_matches_specials_and_rejects_ambiguity() {
+        let only_specials: Vec<EpTriple> = (1..=10).map(|n| (0, n, Some(n))).collect();
+        assert_eq!(resolve_absolute(&only_specials, 5), None);
+        let dup = vec![(1, 5, Some(5)), (2, 5, Some(5))];
+        assert_eq!(resolve_absolute(&dup, 5), None);
+    }
+
+    #[test]
+    fn absolute_episode_source() {
+        // The frontend's value wins.
+        assert_eq!(absolute_episode_for(Some(37), Some(2), Some(9), 28), Some(37));
+        // Addon season 1 past Trakt's season 1: the number is absolute.
+        assert_eq!(absolute_episode_for(None, Some(1), Some(894), 61), Some(894));
+        // Within Trakt's season 1 it was already tried as S1E<n>.
+        assert_eq!(absolute_episode_for(None, Some(1), Some(40), 61), None);
+        // Any other addon season without a computed value: nothing to look up.
+        assert_eq!(absolute_episode_for(None, Some(3), Some(894), 61), None);
+    }
+
+    fn hit(id: u64, title: &str, aired: &str) -> EpisodeSearchHit {
+        EpisodeSearchHit {
+            trakt_id: id,
+            title: Some(title.to_string()),
+            first_aired: Some(aired.to_string()),
+            season: Some(2),
+            number: Some(2),
+            show_title: Some("Bleach".to_string()),
+        }
+    }
+
+    #[test]
+    fn title_date_accepts_the_single_exact_match() {
+        let hits = vec![
+            hit(6784680, "Foundation Stones", "2022-10-18T14:00:00.000Z"),
+            hit(1, "Foundation Stones", "2015-03-02T01:00:00.000Z"),
+            hit(2, "Foundation Stones Part 2", "2022-10-18T14:00:00.000Z"),
+        ];
+        let got = pick_title_date_match(&hits, "  foundation stones ", "2022-10-18T00:00:00.000Z");
+        assert_eq!(got.map(|h| h.trakt_id), Some(6784680));
+    }
+
+    #[test]
+    fn title_date_rejects_two_matches() {
+        let hits = vec![
+            hit(10, "Foundation Stones", "2022-10-18T14:00:00.000Z"),
+            hit(11, "Foundation Stones", "2022-10-19T02:00:00.000Z"),
+        ];
+        assert_eq!(pick_title_date_match(&hits, "Foundation Stones", "2022-10-18"), None);
+    }
+
+    #[test]
+    fn title_date_rejects_wrong_date() {
+        let hits = vec![hit(10, "Foundation Stones", "2022-10-18T14:00:00.000Z")];
+        assert_eq!(pick_title_date_match(&hits, "Foundation Stones", "2022-10-20"), None);
+        assert_eq!(pick_title_date_match(&hits, "Foundation Stones", "not a date"), None);
+    }
+
+    #[test]
+    fn title_date_allows_one_day_either_way() {
+        let hits = vec![hit(10, "Foundation Stones", "2022-10-18T14:00:00.000Z")];
+        assert!(pick_title_date_match(&hits, "Foundation Stones", "2022-10-17").is_some());
+        assert!(pick_title_date_match(&hits, "Foundation Stones", "2022-10-19").is_some());
+        // Across a month and a year boundary.
+        let hits = vec![hit(10, "X", "2023-01-01T00:30:00.000Z")];
+        assert!(pick_title_date_match(&hits, "x", "2022-12-31").is_some());
+    }
+
+    #[test]
+    fn title_date_rejects_non_exact_title() {
+        let hits = vec![hit(10, "Foundation Stones", "2022-10-18T14:00:00.000Z")];
+        assert_eq!(pick_title_date_match(&hits, "Foundation", "2022-10-18"), None);
+        assert_eq!(pick_title_date_match(&hits, "", "2022-10-18"), None);
+    }
+
+    #[test]
+    fn trakt_id_body_shape() {
+        let body = build_history_body(
+            &TraktTarget::EpisodeByTraktId { trakt: 6784680 },
+            Some("2026-09-27T12:00:00.000Z"),
+        );
+        assert_eq!(
+            body,
+            serde_json::json!({ "episodes": [{
+                "ids": { "trakt": 6784680 },
+                "watched_at": "2026-09-27T12:00:00.000Z",
+            }] }),
+        );
+    }
+
+    #[test]
+    fn imdb_id_guard() {
+        assert!(is_bare_imdb_id("tt0388629"));
+        assert!(!is_bare_imdb_id("tt"));
+        assert!(!is_bare_imdb_id("tt123/../x"));
+        assert!(!is_bare_imdb_id("kitsu:12"));
+    }
 }

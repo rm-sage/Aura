@@ -1595,6 +1595,8 @@ mod tests {
             absolute_episode_num: None,
             anilist_id: None,
             anilist_episode: None,
+            episode_title: None,
+            episode_released: None,
         }
     }
 

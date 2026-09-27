@@ -253,6 +253,9 @@ export async function startScrobbleRun(
               // Without it, split-cour anime resolve to the wrong entry.
               anilistId:      entry.anilist_id ?? null,
               anilistEpisode: entry.anilist_episode ?? null,
+              // Trakt's title + air-date fallback; the other commands ignore them.
+              episodeTitle:    entry.episode_title ?? null,
+              episodeReleased: entry.episode_released ?? null,
             },
           );
           // Only a resolved command marks the row; a failure stays un-marked and

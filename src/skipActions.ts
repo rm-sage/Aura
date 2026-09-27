@@ -49,6 +49,9 @@ export interface SkipTarget {
   season: number | null;
   episode: number | null;
   episodeTitle: string | null;
+  /** VideoEntry `released`, kept on the History row for Trakt's title +
+   *  air-date fallback. Optional so older callers need not supply it. */
+  episodeReleased?: string | null;
   poster: string | null;
   background: string | null;
   anilistId: number | null;
@@ -152,6 +155,7 @@ export async function markEpisodesSkipped(
       season: t.season,
       episode: t.episode,
       episode_title: t.episodeTitle,
+      episode_released: t.episodeReleased ?? null,
       played_at: playedAt,
       // No watched_seconds on purpose. Nothing was played, and the stats
       // surfaces sum that field: a fabricated duration would inflate lifetime

@@ -87,6 +87,11 @@ export interface ActiveScrobbleTarget {
   /** The episode's own title (separate field so the OSD can render
    *  S01E05 — "The Big Heist" cleanly). */
   episode_title?: string;
+  /** The episode's air date (VideoEntry `released`, ISO 8601). With
+   *  `episode_title` it feeds Trakt's last-resort title + air-date lookup in
+   *  scrobble.rs. `undefined` = not looked up yet; `null` = the VideoEntry has
+   *  none (so App's enrichment effect does not look again). */
+  episode_released?: string | null;
   /** Authoritative numeric season from the VideoEntry the user clicked.
    *  Passed through to scrobble.rs so Trakt's /sync/history receives
    *  the picker's numbering directly instead of relying on the ID
@@ -380,6 +385,10 @@ export function useScrobble({
           // heuristics (Aura<->AIOMetadata contract).
           anilist_id:      active.anilist_id ?? null,
           anilist_episode: active.anilist_episode ?? null,
+          // Episode title + air date for Trakt's last-resort lookup (an
+          // episode Trakt files under a different show than the addon does).
+          episode_title:    active.episode_title ?? null,
+          episode_released: active.episode_released ?? null,
         },
         duration: playback.duration,
       }).catch(() => {});
