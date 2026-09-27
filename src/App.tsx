@@ -91,6 +91,10 @@ import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPre
 import { arcPositionOf, fetchStoryArcs, loadArcMode } from "./storyArcs";
 import { getMetaDetailFallback, getRichestMetaDetail, peekCachedDetailById, peekRichestCachedDetailById, peekFreshestPostersByIds } from "./metaCache";
 import { PersistentCache } from "./persistentCache";
+import {
+  INTRODB_SINGLE_SOURCE, fetchIntroDbWindows, fitIntroDbToDuration, introDbImdbRoot,
+  introDbNumberings,
+} from "./introdb";
 import { applyReducedMotionAttribute, loadAuraSettings, streamQueryAddons } from "./auraSettings";
 import { electAddons } from "./addonElection";
 import {
@@ -349,11 +353,19 @@ function dedupeSkipWindows(windows: PreparedWindow[]): PreparedWindow[] {
   // episodes (see fetch_neighbour_skip_profile) - real crowd data, but not for
   // this episode, so it ranks under every source that describes this file and
   // over Aura's own signal-processing guesses.
+  // IntroDB is split by trust in introdb.rs: "introdb" (>= 2 submissions at
+  // >= 0.9 confidence) ranks WITH AniSkip, "introdb-single" (everything else)
+  // sits between publicmetadb and the neighbour borrow. Renumbered to make room
+  // without changing the relative order of any existing source.
   const PRIO: Record<string, number> = {
-    chapter: 6, aniskip: 5, publicmetadb: 4, "aniskip-neighbour": 3,
-    "chapter-heuristic": 2, silencedetect: 1,
+    chapter: 7, aniskip: 6, introdb: 6, publicmetadb: 5, "introdb-single": 4,
+    "aniskip-neighbour": 3, "chapter-heuristic": 2, silencedetect: 1,
   };
   const prio = (src: string) => PRIO[src] ?? 0;
+  // Last tie-break between equal-priority sources (AniSkip vs trusted IntroDB),
+  // applied after opCloseness: AniSkip describes a MAL-keyed episode and has
+  // per-row votes, so it keeps a genuine tie.
+  const tieBreak = (src: string) => (src === "aniskip" ? 1 : 0);
   // An OP whose LENGTH is plausible outranks one whose length is not, ABOVE
   // source priority. Source trust only tells us who is usually right; a 15 s
   // or a 158 s "opening" is self-evidently not one, whoever supplied it. This
@@ -385,6 +397,7 @@ function dedupeSkipWindows(windows: PreparedWindow[]): PreparedWindow[] {
     (a, b) => opPlausible(b) - opPlausible(a)
            || prio(b.source) - prio(a.source)
            || opCloseness(b) - opCloseness(a)
+           || tieBreak(b.source) - tieBreak(a.source)
            || a.start - b.start,
   );
   const kept: PreparedWindow[] = [];
@@ -424,6 +437,12 @@ function dedupeSkipWindows(windows: PreparedWindow[]): PreparedWindow[] {
 const GUESS_SKIP_SOURCES = new Set([
   "chapter-heuristic", "silencedetect", "aniskip-neighbour",
 ]);
+
+/** Sources that are real crowd data for THIS episode but too thinly backed to
+ *  seek on their own: an IntroDB segment with a single submission (or under
+ *  0.9 confidence). Prompt-only, like a guess, but kept separate because it is
+ *  not one. */
+const LOW_TRUST_SKIP_SOURCES = new Set([INTRODB_SINGLE_SOURCE]);
 
 /**
  * Name the song playing in each OP/ED window, from the MAL theme list.
@@ -487,7 +506,7 @@ function applySkipModes(
   return windows
     .filter((w) => modeFor(w.type) !== "off")
     .map((w) => {
-      const auto = GUESS_SKIP_SOURCES.has(w.source)
+      const auto = GUESS_SKIP_SOURCES.has(w.source) || LOW_TRUST_SKIP_SOURCES.has(w.source)
         ? false
         : modeFor(w.type) === "auto";
       return auto === w.auto ? w : { ...w, auto };
@@ -604,6 +623,10 @@ async function mergeChapterSkipWindows(
       emptyReads = 0;
     }
   }
+  // IntroDB rows are fetched before the file's duration is known, and a row
+  // recorded against a different cut must not land on this one. The duration
+  // is in hand now; every publish below goes out through this filtered list.
+  existing = fitIntroDbToDuration(existing, duration);
   if (!chapters || chapters.length === 0) return publish(existing, "no chapters in file");
 
   // Sort by start time so adjacent-chapter end derivation is stable.
@@ -766,6 +789,23 @@ async function fetchPublicmetadbWindows(
     console.warn(`[publicmetadb] lookup failed: ${String(e)}`);
     return [];
   }
+}
+
+// Longest the skip chain waits for IntroDB before stamping without it. The
+// fetch starts alongside the MAL cascade, so on a warm cache or a first-try hit
+// it is long done by the time it is awaited; this only bounds the worst case
+// (up to three sequential 8 s lookups), because the one stamp per load is what
+// arms auto-skip and must not sit behind a slow host. A late answer still lands
+// in the caches for the next load.
+const INTRODB_WAIT_MS = 5000;
+
+/** Resolve with `fallback` if `p` has not settled within `ms` of the call. */
+function withDeadline<T>(p: Promise<T>, ms: number, fallback: T, onTimeout: () => void): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<T>((resolve) => {
+    timer = setTimeout(() => { onTimeout(); resolve(fallback); }, ms);
+  });
+  return Promise.race([p.finally(() => clearTimeout(timer)), deadline]);
 }
 
 // ---------------------------------------------------------------------------
@@ -3192,6 +3232,9 @@ export default function App() {
             // Skip windows are a SERIES concept (anime via AniSkip +
             // chapters; live-action via chapters / the positional
             // heuristic). Movies and live-TV have no OP/ED structure.
+            // IntroDB also serves movie outro / post-credits rows, but Aura
+            // has no movie ED slot (Next-Up and the ED trigger are episode
+            // concepts), so movies are deliberately not queried.
             const mtLower = (target.media_type ?? "").toLowerCase();
             if (mtLower === "movie" || mtLower === "channel" || mtLower === "channels" || mtLower === "tv" || mtLower === "trailer") {
               return;
@@ -3620,6 +3663,36 @@ export default function App() {
             // already warm by the time we get here.
             const seriesId = target.series_id ?? target.id;
             const detail = await getMetaDetailFallback(addons, target.media_type, seriesId);
+            // IntroDB is IMDb-keyed, not MAL-keyed, so unlike AniSkip it is not
+            // gated to anime: any series episode with an IMDb root asks it.
+            // Started HERE so it runs concurrently with the MAL cascade below,
+            // and merged into whichever list each exit hands finishWithChapters.
+            // Trust ("introdb" vs "introdb-single") is decided in Rust; ranking
+            // against every other source is dedupeSkipWindows' job.
+            const introDbImdb = introDbImdbRoot(target);
+            const introDbPromise: Promise<PreparedWindow[]> = introDbImdb == null
+              ? Promise.resolve([])
+              : withDeadline(
+                  fetchIntroDbWindows(introDbImdb, introDbNumberings(target, detail ?? null))
+                    .then(({ windows }) => windows
+                      .filter((w) => modeFor(w.kind) !== "off")
+                      .map((w): PreparedWindow => ({
+                        type:   w.kind,
+                        start:  w.start,
+                        end:    w.end,
+                        source: w.source,
+                        // Final value comes from applySkipModes at publish,
+                        // which keeps "introdb-single" prompt-only.
+                        auto:   modeFor(w.kind) === "auto",
+                      }))),
+                  INTRODB_WAIT_MS,
+                  [],
+                  () => console.info(`[introdb] no answer within ${INTRODB_WAIT_MS} ms; stamping without it`),
+                );
+            const withIntroDb = async (base: PreparedWindow[]): Promise<PreparedWindow[]> => {
+              const idb = await introDbPromise;
+              return idb.length === 0 ? base : dedupeSkipWindows([...base, ...idb]);
+            };
             // Resolution cascade — first id-based via yuna.moe, then a
             // title-based Jikan lookup as a last resort. The id-based
             // path is preferred because it's exact and free of false
@@ -3773,7 +3846,7 @@ export default function App() {
                   `(tmdb=${laTmdb} season=${laSeason} episode=${laEpisode}); chapter-only`,
                 );
               }
-              await finishWithChapters(pmdbWindows, { silenceUrl: stream.url ?? null });
+              await finishWithChapters(await withIntroDb(pmdbWindows), { silenceUrl: stream.url ?? null });
               return;
             }
             // Mal-id was resolved → this is an anime; mark for future
@@ -3805,7 +3878,7 @@ export default function App() {
               // Can't index AniSkip without an episode number, but a
               // chaptered file can still yield skip windows.
               console.info(`[aniskip] couldn't parse episode from ${target.id} — chapter-only`);
-              await finishWithChapters([], { silenceUrl: stream.url ?? null });
+              await finishWithChapters(await withIntroDb([]), { silenceUrl: stream.url ?? null });
               return;
             }
             console.info(
@@ -3908,7 +3981,7 @@ export default function App() {
             // this (MAL-resolved) path only — the no-mal / no-episode
             // exits above intentionally don't, to avoid a heavy ffmpeg
             // scan on every live-action open.
-            await finishWithChapters(prepared, {
+            await finishWithChapters(await withIntroDb(prepared), {
               silenceUrl: stream.url ?? null,
               // Anime path only: lets the neighbour profile fill an OP/ED gap
               // from this series' other episodes before any ffmpeg pass runs.

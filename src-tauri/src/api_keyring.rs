@@ -32,7 +32,10 @@ const KEYRING_SERVICE: &str = "aura-api-keys";
 /// `AURA_TMDB_KEY` when the keyring has no entry, so a user only needs to set
 /// one to override the shared app key (or to make arcs work in a build that
 /// was compiled without a baked key).
-pub const SUPPORTED_KEYS: &[&str] = &["opensubtitles", "tmdb"];
+/// `introdb` is the user's personal IntroDB key. It is only ever used to
+/// SUBMIT a segment the user entered (`introdb.rs`); reading IntroDB needs no
+/// key, so an empty slot costs nothing but the submit path.
+pub const SUPPORTED_KEYS: &[&str] = &["opensubtitles", "tmdb", "introdb"];
 
 fn entry(name: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEYRING_SERVICE, name).map_err(|e| e.to_string())

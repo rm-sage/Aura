@@ -25,11 +25,22 @@
 // portion (`kitsu:49240:9` → kitsu 49240 → yuna.moe → MAL 59978). We
 // resolve once on mount and reuse for both submission and metadata
 // display.
+//
+// IntroDB: when the user has stored a personal IntroDB key (Settings > API
+// Keys) and the title is IMDb-rooted, a submission here ALSO goes to IntroDB,
+// filed under the addon's exact numbering. That is what makes the form useful
+// on non-anime titles, where no MAL id exists: with a key it submits to IntroDB
+// alone. Only ever user-initiated, never from Aura's own guesses.
 // ---------------------------------------------------------------------------
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ActiveScrobbleTarget } from "./useScrobble";
+import {
+  INTRODB_SINGLE_SOURCE, INTRODB_SOURCE, introDbHasKey, introDbImdbRoot,
+  introDbPrimaryNumbering, submitToIntroDb,
+} from "./introdb";
+import { peekCachedDetailById } from "./metaCache";
 
 /** Mirrors PlayerOverlay's AuraSkipWindow shape so this module can be
  *  imported without a circular dep. Local copy is intentional. */
@@ -103,6 +114,21 @@ function parseTimeInput(input: string): number | null {
   if (nums.some((n) => !Number.isFinite(n) || n < 0)) return null;
   if (colonSegs.length === 2) return nums[0] * 60 + nums[1];
   return nums[0] * 3600 + nums[1] * 60 + nums[2];
+}
+
+/** Where a window came from, as shown under its row. */
+function sourceLabel(source: string): string {
+  switch (source) {
+    case "aniskip":             return "AniSkip";
+    case INTRODB_SOURCE:        return "IntroDB";
+    case INTRODB_SINGLE_SOURCE: return "IntroDB (single submission)";
+    case "publicmetadb":        return "PublicMetaDB";
+    case "chapter":             return "Chapter";
+    case "chapter-heuristic":   return "Chapter guess";
+    case "silencedetect":       return "Detected";
+    case "aniskip-neighbour":   return "Other episodes";
+    default:                    return source;
+  }
 }
 
 function skipLabel(kind: string): string {
@@ -181,6 +207,26 @@ export default function AniSkipMenu({
     return () => { cancelled = true; };
   }, [open, activeTarget]);
 
+  // ── IntroDB availability ─────────────────────────────────────────
+  // Submission needs a stored key, an IMDb root and the addon's numbering.
+  // Only the key's PRESENCE is asked for; the key never leaves Rust.
+  const [idbHasKey, setIdbHasKey] = useState(false);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    introDbHasKey().then((has) => { if (!cancelled) setIdbHasKey(has); });
+    return () => { cancelled = true; };
+  }, [open]);
+  const idbImdb = useMemo(
+    () => (activeTarget ? introDbImdbRoot(activeTarget) : null),
+    [activeTarget],
+  );
+  const idbNumbering = useMemo(
+    () => (activeTarget ? introDbPrimaryNumbering(activeTarget) : null),
+    [activeTarget],
+  );
+  const idbAvailable = idbHasKey && idbImdb != null && idbNumbering != null;
+
   // ── Mode toggles (op / ed / recap) ────────────────────────────────
   const [opMode, setOpMode]       = useState<SkipMode>("auto");
   const [edMode, setEdMode]       = useState<SkipMode>("prompt");
@@ -226,8 +272,13 @@ export default function AniSkipMenu({
   };
 
   const handleSubmit = useCallback(async () => {
-    if (malId == null || courEpisode == null) {
-      showFlash("MAL id not resolvable for this episode");
+    const aniskipOk = malId != null && courEpisode != null;
+    // IntroDB has no mixed-op type; that kind goes to AniSkip only.
+    const idbOk = idbAvailable && formType !== "mixed-op";
+    if (!aniskipOk && !idbOk) {
+      showFlash(idbAvailable
+        ? "IntroDB has no mixed opening type, and no MAL id resolved for AniSkip"
+        : "MAL id not resolvable for this episode");
       return;
     }
     const start = parseTimeInput(startInput);
@@ -241,31 +292,71 @@ export default function AniSkipMenu({
       return;
     }
     setSubmitting(true);
+    const notes: string[] = [];
+    let anyOk = false;
     try {
-      const result = await invoke<{ success: boolean; skip_id: string | null; message: string }>(
-        "submit_skip_time",
-        {
-          malId, episode: courEpisode, skipType: formType,
-          startTime: start, endTime: end, episodeLength: Math.max(0, duration),
-        },
-      );
-      showFlash(result.message || (result.success ? "Submitted!" : "Submit failed"));
-      if (result.success) {
+      if (aniskipOk) {
+        try {
+          const result = await invoke<{ success: boolean; skip_id: string | null; message: string }>(
+            "submit_skip_time",
+            {
+              malId, episode: courEpisode, skipType: formType,
+              startTime: start, endTime: end, episodeLength: Math.max(0, duration),
+            },
+          );
+          notes.push(`AniSkip: ${result.message || (result.success ? "Submitted" : "Submit failed")}`);
+          if (result.success) {
+            anyOk = true;
+            // Drop the locally cached windows for this episode so the next load
+            // picks the submission up. Rust invalidates its own entry inside the
+            // command; this covers the 3-day frontend cache.
+            window.dispatchEvent(new CustomEvent("aura:aniskip-invalidate", {
+              detail: { malId, episode: courEpisode },
+            }));
+          }
+        } catch (err) {
+          notes.push(`AniSkip: ${String(err) || "Submit error"}`);
+        }
+      }
+      if (idbOk && idbImdb && idbNumbering && activeTarget) {
+        const seriesId = activeTarget.series_id ?? activeTarget.id;
+        const res = await submitToIntroDb({
+          imdb:    idbImdb,
+          season:  idbNumbering.season,
+          episode: idbNumbering.episode,
+          kind:    formType,
+          start,
+          end,
+          // TMDB id from the already-cached meta detail (no fetch here). Aura
+          // has no TVDB id for a series, so that optional field is left out.
+          tmdbId:  peekCachedDetailById(seriesId)?.tmdb_id ?? null,
+        });
+        if (res.outcome === "ok") {
+          anyOk = true;
+          notes.push("IntroDB: Submitted");
+        } else if (res.outcome === "rate_limited") {
+          // Not an error: this segment was sent in the last five minutes.
+          anyOk = true;
+          notes.push("IntroDB: already submitted recently");
+        } else if (res.outcome === "key_rejected") {
+          notes.push("IntroDB: key rejected");
+          window.dispatchEvent(new CustomEvent("aura:player-toast", {
+            detail: { message: "IntroDB rejected your API key. Check it in Settings > API Keys." },
+          }));
+        } else {
+          notes.push(`IntroDB: ${res.message}`);
+        }
+      }
+      showFlash(notes.join(" · ") || "Nothing submitted");
+      if (anyOk) {
         setStartInput("");
         setEndInput("");
-        // Drop the locally cached windows for this episode so the next load
-        // picks the submission up. Rust invalidates its own entry inside the
-        // command; this covers the 3-day frontend cache.
-        window.dispatchEvent(new CustomEvent("aura:aniskip-invalidate", {
-          detail: { malId, episode: courEpisode },
-        }));
       }
-    } catch (err) {
-      showFlash(String(err) || "Submit error");
     } finally {
       setSubmitting(false);
     }
-  }, [malId, courEpisode, formType, startInput, endInput, duration]);
+  }, [malId, courEpisode, formType, startInput, endInput, duration,
+      idbAvailable, idbImdb, idbNumbering, activeTarget]);
 
   // Per-skip vote state: tracks the user's last vote direction so the
   // button styling can highlight it AND so the cooldown disables both
@@ -393,9 +484,10 @@ export default function AniSkipMenu({
                   <p className="text-white/55 text-[10.5px] font-mono mt-0.5">
                     {fmtTime(w.start)} – {fmtTime(w.end)}
                   </p>
-                  {w.auto && (
-                    <p className="text-amber-300/80 text-[10px] mt-0.5">auto-skip</p>
-                  )}
+                  <p className="text-white/40 text-[10px] mt-0.5">
+                    {sourceLabel(w.source)}
+                    {w.auto && <span className="text-amber-300/80"> · auto-skip</span>}
+                  </p>
                 </div>
                 {w.source === "aniskip" && w.skip_id && (() => {
                   const vs = voteState[w.skip_id];
@@ -525,7 +617,7 @@ export default function AniSkipMenu({
           <button
             type="button"
             onClick={handleSubmit}
-            disabled={submitting || malId == null || courEpisode == null}
+            disabled={submitting || ((malId == null || courEpisode == null) && !idbAvailable)}
             className="w-full mt-1 px-3 py-1.5 rounded-lg border border-ln-accent/40
                        bg-ln-accent/15 text-ln-accent text-[12px] font-semibold
                        hover:bg-ln-accent/25 transition-colors
@@ -539,14 +631,24 @@ export default function AniSkipMenu({
               Resolving MAL id…
             </p>
           )}
-          {!malResolving && malId == null && (
+          {!malResolving && malId == null && !idbAvailable && (
             <p className="text-amber-300/75 text-[10.5px] italic">
-              MAL id not resolvable for this episode — submission unavailable.
+              MAL id not resolvable for this episode: submission unavailable.
+            </p>
+          )}
+          {!malResolving && malId == null && idbAvailable && (
+            <p className="text-white/40 text-[10.5px] italic">
+              No MAL id for AniSkip: submits to IntroDB only.
             </p>
           )}
           {!malResolving && malId != null && (
             <p className="text-white/35 text-[10.5px] font-mono">
               mal={malId} · ep={courEpisode}
+            </p>
+          )}
+          {idbAvailable && idbNumbering && (
+            <p className="text-white/35 text-[10.5px] font-mono">
+              introdb={idbImdb} · s{idbNumbering.season}e{idbNumbering.episode}
             </p>
           )}
         </div>

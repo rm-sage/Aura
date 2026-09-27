@@ -340,7 +340,17 @@ frontend ~40k LOC over ~70 files + ~13 views).
   display-string parser, has `#[cfg(test)]` tests),
   `publicmetadb.rs` (OP/ED skip source + TMDB id resolution), `anime_id_map.rs`, `silencedetect.rs`
   (outro boundary via ffmpeg), `trailer.rs` (YouTube trailer resolve).
-- **Skip / scrobble**: `aniskip.rs` (OP/ED timing, vote/submit, id resolution), `scrobble.rs` +
+- **Skip / scrobble**: `aniskip.rs` (OP/ED timing, vote/submit, id resolution), `introdb.rs` +
+  `src/introdb.ts` (IntroDB: IMDb-keyed intro / recap / outro segments for ANY series with a `tt`
+  root, not gated to anime; one `introdb` command with a tagged `fetch` / `submit` / `status`
+  action. Rows are keyed by the SUBMITTER's numbering, so the frontend asks the addon's own pair
+  first, then the id-string pair, then absolute-under-S1, and uses only the first answer with a
+  usable segment; it never invents an offset. Trust split in Rust: `introdb` (>= 2 submissions
+  at >= 0.9 confidence) ranks with AniSkip in `dedupeSkipWindows`, `introdb-single` sits between
+  publicmetadb and `aniskip-neighbour` and is prompt-only. Submission is user-initiated from the
+  AuraSkip menu, needs the user's own key (`api_keyring` name `introdb`), maps op/ed/recap to
+  intro/outro/recap, and treats 429 as "already submitted recently". Movies are not queried:
+  Aura has no movie ED slot), `scrobble.rs` +
   `scrobble_auth.rs` + `scrobble_anilist.rs` (Trakt + AniList OAuth, heartbeat). `scrobble.rs` also
   exposes the manual `scrobble_history_trakt` / `scrobble_history_anilist` commands (the per-row
   buttons on the History tab in `src/views/HistoryView.tsx`), which backdate the mark to the original
@@ -664,6 +674,12 @@ Bound every cache (see Performance & memory).
   their own streams lives 3 min (`TTL_EMBEDDED_STREAMS_MS`) and is never persisted.
 - **persistentCache.ts**: generic TTL + size-capped store (AniSkip uses it at 3 days / 600 entries,
   dropping the oldest 25% on overflow; negative misses are never cached).
+- **IntroDB** (`aura:introdb-cache:v1`, `src/introdb.ts`): positive answers only, 3 days / 600
+  entries, keyed `${imdb}:${season}:${episode}` per numbering asked. Rust (`introdb.rs`) keeps an
+  in-memory map capped at 400 (oldest quarter evicted): hits 3 days, "no data" 30 minutes,
+  network / 429 / 5xx never cached. A successful submit drops that key on both sides. Segments are
+  cached WITHOUT the per-file duration check; `fitIntroDbToDuration` applies it inside
+  `mergeChapterSkipWindows` once the duration is known.
 - **Calendar meta**: 24-hour module-level `Map` keyed by `${addonUrl}::${type}::${id}`.
 - **sessionRoute.ts** (`sessionStorage`): active nav tab + open detail target so Ctrl+R/F5 restores
   the page you were on; cleared on app close (cold start opens Home).
@@ -803,7 +819,10 @@ creep degrades the experience. When adding ANY feature:
 - "Ratings missing/sparse" -> `ratings.rs`: the MDBList branch needs a `tt`-prefixed IMDb id and a
   non-empty `AURA_MDBLIST_KEY` (baked from `.env.local`); the MAL/AniList branch needs a resolvable
   anime id. Non-tt non-anime ids get only addon-supplied `detail.ratings`. OMDb is fully removed.
-- "Skip windows missing" -> `aniskip.rs` / `publicmetadb.rs`; `AURA_PUBLICMETADB_KEY` must be baked.
+- "Skip windows missing" -> `aniskip.rs` / `publicmetadb.rs` / `introdb.rs`; `AURA_PUBLICMETADB_KEY`
+  must be baked. IntroDB needs an IMDb (`tt`) root and a season/episode >= 1; DevConsole `[introdb]`
+  logs which numbering matched (or every numbering that missed), a window dropped for not fitting
+  the file's duration, and a lookup that missed the 5 s wait (`INTRODB_WAIT_MS`).
 - "No Seasons/Arcs toggle on an anime" -> `arcs.rs`. In order: `AURA_TMDB_KEY` baked (or a user key in
   the keyring), a resolvable TMDB id (`MetaDetail.tmdb_id`, else the `/find` by IMDb id), and a TMDB
   episode group of `type == 5` that clears the coverage bar. Most shows have no arcs at all: arcs are
@@ -887,7 +906,7 @@ old-format and new-format samples and diff the field sets. Node runs the `.ts` f
 - Rust log labels to grep in the DevConsole or `aura-mpv.log`: `[bridge]`, `[player]`, `[streams]`,
   `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[ratings]`, `[rpc]`, `[win32]`, `[smtc]`,
   `[scrobble]`, `[publicmetadb]`, `[mpv]` (the playback engine), `[cast]`, `[iptv]`, `[sync]`,
-  `[aniskip]`, `[arcs]`, `[subsync]`, `[downloads]`, `[tenrai]` (the MyAnimeList client), `[extras]` (frontend,
+  `[aniskip]`, `[introdb]`, `[arcs]`, `[subsync]`, `[downloads]`, `[tenrai]` (the MyAnimeList client), `[extras]` (frontend,
   the anime metadata tabs on the detail page).
 - libmpv writes its own verbose log to `%USERPROFILE%\aura-mpv.log` (truncated each MPV init, rotated
   to `.old` past 50 MB). The last few lines usually pinpoint a STATUS_ACCESS_VIOLATION.

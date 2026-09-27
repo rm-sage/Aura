@@ -546,7 +546,7 @@ interface SettingsSyncBlob {
  *  `src-tauri/src/api_keyring.rs`. If you add a key on the Rust side,
  *  list it here too — the encryption layer just sees the JSON shape
  *  but the read/write paths use this list explicitly. */
-const SYNCED_API_KEYS = ["opensubtitles", "tmdb"] as const;
+const SYNCED_API_KEYS = ["opensubtitles", "tmdb", "introdb"] as const;
 type SyncedApiKeyName = typeof SYNCED_API_KEYS[number];
 
 interface ApiKeysPlaintext {
@@ -555,6 +555,14 @@ interface ApiKeysPlaintext {
    *  so this is only set when the user chose to spend their own quota; syncing
    *  it means they set it once, not once per device. */
   tmdb?: string;
+  /** Optional personal IntroDB key, used only to submit skip times the user
+   *  entered. Synced for the same reason as the TMDB key. */
+  introdb?: string;
+  /** Every key name the SENDING build syncs. A key absent from the bundle is
+   *  cleared locally only when the sender knew it (see writeApiKeyBundle);
+   *  a bundle with no list comes from a build that knew only the two
+   *  original keys. */
+  _keys?: string[];
 }
 
 /** Pull the user_id off the keyring-resident session. Returns null
@@ -571,7 +579,7 @@ async function activeUserId(): Promise<string | null> {
 }
 
 async function readApiKeyBundle(): Promise<ApiKeysPlaintext> {
-  const out: ApiKeysPlaintext = {};
+  const out: ApiKeysPlaintext = { _keys: [...SYNCED_API_KEYS] };
   for (const name of SYNCED_API_KEYS) {
     try {
       const v = await invoke<string>("get_api_key", { name });
@@ -583,11 +591,19 @@ async function readApiKeyBundle(): Promise<ApiKeysPlaintext> {
   return out;
 }
 
+/** The keys a bundle without `_keys` (an older build's) can speak for. */
+const LEGACY_SYNCED_API_KEYS: readonly string[] = ["opensubtitles", "tmdb"];
+
 async function writeApiKeyBundle(plain: ApiKeysPlaintext): Promise<void> {
+  const senderKnows = Array.isArray(plain._keys) ? plain._keys : LEGACY_SYNCED_API_KEYS;
   for (const name of SYNCED_API_KEYS) {
     const v = plain[name as SyncedApiKeyName];
-    // Empty / undefined → clear the local keyring entry so a cross-
-    // device "deleted on the other side" survives the round-trip.
+    // Empty / undefined clears the local keyring entry so a cross-device
+    // "deleted on the other side" survives the round-trip, but ONLY for a
+    // key the sender syncs: a bundle from a build that has never heard of a
+    // key says nothing about it, and treating its absence as a deletion
+    // wiped that key here on every push from the older device.
+    if (!v && !senderKnows.includes(name)) continue;
     try {
       await invoke("set_api_key", { name, value: v ?? "" });
     } catch (e) {
@@ -632,7 +648,7 @@ async function readSettingsBlob(): Promise<SettingsSyncBlob> {
   // derivation input) AND at least one API key set locally. Guests
   // and pre-backfill sessions ride along with api_keys omitted —
   // the local keyring stays the source of truth on this device.
-  if (userId && apiKeys.opensubtitles) {
+  if (userId && SYNCED_API_KEYS.some((k) => apiKeys[k])) {
     try {
       api_keys = await encryptForCloud(JSON.stringify(apiKeys), userId);
     } catch (e) {

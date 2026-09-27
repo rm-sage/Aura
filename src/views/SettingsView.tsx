@@ -1138,15 +1138,15 @@ function BackupRestoreSection({
     // API keys are OS-keyring CREDENTIALS. The export string is designed to be
     // shared (it pastes into a messenger), so by default we do NOT bake them in:
     // a user swapping configs with a friend would otherwise hand over their
-    // OpenSubtitles + TMDB keys. Only include them when the user explicitly opts
+    // OpenSubtitles, TMDB + IntroDB keys. Only include them when the user explicitly opts
     // in (moving to their own second machine).
     if (!includeKeys) {
-      for (const name of ["opensubtitles", "tmdb"] as const) {
+      for (const name of ["opensubtitles", "tmdb", "introdb"] as const) {
         delete merged[`${name}_api_key`];
       }
       return merged;
     }
-    for (const name of ["opensubtitles", "tmdb"] as const) {
+    for (const name of ["opensubtitles", "tmdb", "introdb"] as const) {
       try {
         const v = await invoke<string>("get_api_key", { name });
         if (v && v.trim()) {
@@ -1208,7 +1208,7 @@ function BackupRestoreSection({
       // backend patch sent to onApply has the key fields stripped.
       const backendPatch = { ...(blob.backend as Record<string, unknown>) };
       const importedKeys: [string, string][] = [];
-      for (const name of ["opensubtitles", "tmdb"] as const) {
+      for (const name of ["opensubtitles", "tmdb", "introdb"] as const) {
         const field = `${name}_api_key`;
         const value = typeof backendPatch[field] === "string"
           ? backendPatch[field] as string : "";
@@ -2051,12 +2051,15 @@ function AutoAdvanceDelayRow({
 // ---------------------------------------------------------------------------
 
 function KeyringApiKeyInput({
-  name, label, description, placeholder,
+  name, label, description, placeholder, link,
 }: {
-  name: "opensubtitles" | "tmdb";
+  name: "opensubtitles" | "tmdb" | "introdb";
   label: string;
   description: string;
   placeholder?: string;
+  /** Optional "get a key" link under the description, opened in the system
+   *  browser through the http(s)-only gate. */
+  link?: { label: string; url: string };
 }) {
   const [value, setValue] = useState<string>("");
   const [persisted, setPersisted] = useState<string>("");
@@ -2118,6 +2121,15 @@ function KeyringApiKeyInput({
         </span>
       </div>
       <p className="text-white/35 text-xs -mt-1">{description}</p>
+      {link && (
+        <button
+          type="button"
+          onClick={() => openExternalUrl(link.url)}
+          className="text-ln-accent/85 hover:text-ln-accent text-xs underline underline-offset-2 -mt-1"
+        >
+          {link.label}
+        </button>
+      )}
       <div className="relative">
         <input
           type={revealed ? "text" : "password"}
@@ -6209,6 +6221,13 @@ export default function SettingsView({ addons, session }: Props) {
                 label="TMDB API key (optional)"
                 description="Powers the Seasons / Arcs toggle on anime that have story arcs (One Piece, Naruto, Bleach, and roughly thirty others). Aura ships with its own key, so you only need this if you would rather spend your own quota. Get a free one at themoviedb.org under Settings → API. Stored securely in the OS keyring."
                 placeholder="e.g. 8a1b2c3d4e5f…"
+              />
+              <KeyringApiKeyInput
+                name="introdb"
+                label="IntroDB API key (optional)"
+                description="Lets the AuraSkip menu in the player also send the intro, recap and ending times you enter to IntroDB, a shared skip database that works for any show with an IMDb id. Reading IntroDB needs no key, so skip times from it work without this. Stored securely in the OS keyring."
+                placeholder="e.g. idb_…"
+                link={{ label: "Get a key at introdb.app", url: "https://introdb.app" }}
               />
             </Section>
           )}

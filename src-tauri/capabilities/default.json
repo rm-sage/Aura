@@ -63,6 +63,7 @@
     "allow-storage-management",
     "allow-aniskip",
     "allow-publicmetadb",
+    "allow-introdb",
     "allow-dev-tools",
     "allow-debug-panel",
     "allow-popup-nav",

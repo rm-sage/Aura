@@ -182,6 +182,12 @@ identifier = "allow-publicmetadb"
 description = "Allows the frontend to fetch crowd-sourced OP/ED skip windows from publicmetadb and to resolve an anime TMDB id for that lookup"
 commands.allow = ["fetch_publicmetadb_skips", "resolve_anime_tmdb_id"]
 
+# ── IntroDB (IMDb-keyed skip segments; user-initiated submissions) ─────────
+[[permission]]
+identifier = "allow-introdb"
+description = "Allows the frontend to read IntroDB skip segments and to submit a user-entered segment with the user's own IntroDB key"
+commands.allow = ["introdb"]
+
 # ── Phase 4: OpenSubtitles ────────────────────────────────────────────────────
 [[permission]]
 identifier = "allow-subtitles"

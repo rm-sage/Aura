@@ -51,6 +51,7 @@ mod media_controls;
 mod debug_panel;
 mod img_proxy;
 // IPTV (Live TV) network hop — see src/iptv/ for the TS parsers.
+mod introdb;
 mod iptv;
 mod mpv;
 mod oauth_callback;
@@ -2505,6 +2506,8 @@ pub fn run() {
             // ── publicmetadb (OP/ED skip source: live-action + anime) ──
             publicmetadb::fetch_publicmetadb_skips,
             publicmetadb::resolve_anime_tmdb_id,
+            // ── IntroDB (IMDb-keyed skip source + user submissions) ──
+            introdb::introdb,
             // ── Phase 3C: scrobbling ──────────────────────────────────────────
             scrobble::scrobble_start,
             scrobble::scrobble_heartbeat,

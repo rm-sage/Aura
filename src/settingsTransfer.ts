@@ -80,6 +80,9 @@ const PORTABLE_BACKEND_FIELDS = [
   // like the OpenSubtitles key. It has to be listed here anyway, because the
   // exporter FILTERS the blob down to this list and would otherwise drop it.
   "tmdb_api_key",
+  // Same arrangement as the TMDB key: keyring-resident, hydrated into the blob
+  // only when the user opts in to exporting keys, stripped back out on import.
+  "introdb_api_key",
   "hdr_enabled",
   "hdr_mode",
   "hdr_target_peak_nits",
