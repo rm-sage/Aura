@@ -4735,6 +4735,43 @@ fn repair_broken_video_id(raw_id: &str, parent_id: &str, video: &serde_json::Val
 ///
 /// `addon_name` is the meta addon's display name, stamped on any streams a
 /// video embeds (`extract_embedded_streams`).
+/// Drop the UNDATED regular episodes that come after the last DATED one.
+///
+/// Some metadata addons pad an ongoing show with placeholders for episodes
+/// that have not aired: AIOMetadata sent One Piece 230 of them ("Episode 1181"
+/// to "Episode 1410") after 1179, the newest real episode, all without an air
+/// date. The frontend counts an undated episode as aired (older episodes and
+/// specials often carry no date), so every placeholder rendered as an ordinary,
+/// playable row, and each one went on to feed Next-Up, notifications and the
+/// arcs view's newer-episodes group.
+///
+/// Only that trailing run goes: specials (season 0) are untouched, an undated
+/// episode BETWEEN dated ones is kept, a future-DATED episode is kept (it is a
+/// real upcoming one, shown with its date), and a show with no dated episodes
+/// at all keeps everything, since there is no evidence of what is real.
+fn drop_undated_placeholder_tail(videos: Vec<VideoEntry>, addon_name: &str) -> Vec<VideoEntry> {
+    let is_main = |v: &VideoEntry| v.season.unwrap_or(0) > 0 && v.episode.is_some();
+    let dated = |v: &VideoEntry| v.released.as_deref().is_some_and(|r| !r.trim().is_empty());
+    let key = |v: &VideoEntry| (v.season.unwrap_or(0), v.episode.unwrap_or(0));
+    let Some(last_dated) = videos.iter().filter(|v| is_main(v) && dated(v)).map(key).max() else {
+        return videos;
+    };
+    let before = videos.len();
+    let kept: Vec<VideoEntry> = videos
+        .into_iter()
+        .filter(|v| !is_main(v) || dated(v) || key(v) <= last_dated)
+        .collect();
+    let dropped = before - kept.len();
+    if dropped > 0 {
+        crate::devlog!(
+            info, "meta",
+            "extract_videos: {addon_name}: dropped {dropped} undated placeholder episode(s) after the last dated episode S{}E{}",
+            last_dated.0, last_dated.1,
+        );
+    }
+    kept
+}
+
 fn extract_videos(meta: &serde_json::Value, addon_name: &str) -> Vec<VideoEntry> {
     let parent_id = meta.get("id").and_then(|x| x.as_str()).unwrap_or("");
     let Some(arr) = meta.get("videos").and_then(|v| v.as_array()) else {
@@ -4838,6 +4875,7 @@ fn extract_videos(meta: &serde_json::Value, addon_name: &str) -> Vec<VideoEntry>
     // absence of the canonical field names so a wire-shape mismatch
     // is diagnosable without the per-episode noise the previous log
     // produced.
+    let videos = drop_undated_placeholder_tail(videos, addon_name);
     if !videos.is_empty() {
         let filler_count = videos.iter().filter(|v| v.episode_kind.as_deref() == Some("filler")).count();
         let recap_count  = videos.iter().filter(|v| v.episode_kind.as_deref() == Some("recap")).count();
@@ -6774,6 +6812,37 @@ mod tests {
     /// full 80 each: the first 25 fill EMBEDDED_STREAMS_TOTAL_CAP exactly and
     /// every later one carries nothing, so it takes the fan-out. A video that
     /// straddles the cap keeps only what is left of it.
+    #[test]
+    fn undated_placeholder_tail_is_dropped_and_nothing_else() {
+        let v = |s: i64, e: i64, r: Option<&str>| serde_json::json!({
+            "id": format!("tt1:{s}:{e}"), "title": format!("E{e}"), "season": s, "episode": e,
+            "released": r,
+        });
+        // Dated 1-3, an undated gap at 2, placeholders 4-6, an undated special.
+        let meta = serde_json::json!({ "id": "tt1", "videos": [
+            v(1, 1, Some("2020-01-01T00:00:00.000Z")),
+            v(1, 2, None),
+            v(1, 3, Some("2020-01-15T00:00:00.000Z")),
+            v(1, 4, None), v(1, 5, None), v(1, 6, None),
+            v(0, 1, None),
+        ]});
+        let ids: Vec<String> = extract_videos(&meta, "Meta Addon").into_iter().map(|x| x.id).collect();
+        assert_eq!(ids, vec!["tt1:1:1", "tt1:1:2", "tt1:1:3", "tt1:0:1"]);
+
+        // A future-DATED episode is real and stays, with placeholders after it gone.
+        let meta = serde_json::json!({ "id": "tt1", "videos": [
+            v(1, 1, Some("2020-01-01T00:00:00.000Z")),
+            v(1, 2, Some("2099-01-01T00:00:00.000Z")),
+            v(1, 3, None),
+        ]});
+        let ids: Vec<String> = extract_videos(&meta, "Meta Addon").into_iter().map(|x| x.id).collect();
+        assert_eq!(ids, vec!["tt1:1:1", "tt1:1:2"]);
+
+        // No dates anywhere: nothing is dropped.
+        let meta = serde_json::json!({ "id": "tt1", "videos": [v(1, 1, None), v(1, 2, None)] });
+        assert_eq!(extract_videos(&meta, "Meta Addon").len(), 2);
+    }
+
     #[test]
     fn embedded_streams_total_cap_truncates_later_videos() {
         let video = |ep: usize, n: usize| {
