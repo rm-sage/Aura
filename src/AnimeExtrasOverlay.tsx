@@ -430,27 +430,40 @@ export function StaffTab({ cours, compact = false, onSearchName }: {
 // was part of why it read as filler.
 // ---------------------------------------------------------------------------
 
-export function FactList({ items }: { items: [string, string][] }) {
+/** A label-value row, with optional hover text for the value. */
+export type FactRow = [label: string, value: string, title?: string];
+
+export function FactList({ items }: { items: FactRow[] }) {
   if (!items.length) return null;
   return (
     <dl className="grid gap-x-6 gap-y-2 grid-cols-[auto_1fr]">
-      {items.map(([k, v]) => (
+      {items.map(([k, v, title]) => (
         <div key={k} className="contents">
           <dt className="text-white/35 text-[10px] font-mono uppercase tracking-[0.16em] pt-0.5">
             {k}
           </dt>
-          <dd className="text-white/80 text-[12.5px] leading-snug min-w-0">{v}</dd>
+          <dd
+            className={`text-white/80 text-[12.5px] leading-snug min-w-0${title ? " cursor-help" : ""}`}
+            title={title}
+          >
+            {v}
+          </dd>
         </div>
       ))}
     </dl>
   );
 }
 
-export function FactsBlock({ cours, leading = [] }: {
+export function FactsBlock({ cours, leading = [], manga = null }: {
   cours: CourRef[];
   /** Rows prepended before the MAL facts. Genres arrive this way: they come
    *  from the addon, not MAL, but belong in the same list. */
-  leading?: [string, string][];
+  leading?: FactRow[];
+  /** The manga-chapter row (mangaChapters.ts mangaFact), placed under Source.
+   *  A real figure always shows; "Checking" / "Not available" only when MAL
+   *  names a manga-type source, so a light novel or an original never reads
+   *  as missing data it could not have had. */
+  manga?: { value: string; title: string; available: boolean } | null;
 }) {
   // The SERIES-root entry only. A per-cour fact list would repeat "Manga",
   // "Shounen" and the studio three times for a three-season show.
@@ -460,8 +473,11 @@ export function FactsBlock({ cours, leading = [] }: {
   // and stay put when MAL's answer lands underneath them.
   if (!f) return <FactList items={leading} />;
 
-  const items: [string, string][] = [...leading];
+  const items: FactRow[] = [...leading];
   if (f.source)    items.push(["Source", f.source]);
+  if (manga && (manga.available || /manga|manhwa|manhua/i.test(f.source ?? ""))) {
+    items.push(["Manga", manga.value, manga.title]);
+  }
   if (f.status)    items.push(["Status", f.status]);
   if (f.premiered) items.push(["Premiered", f.premiered]);
   if (f.aired)     items.push(["Aired", f.aired]);

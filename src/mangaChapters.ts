@@ -51,7 +51,7 @@ export interface ChapterRange {
   end: number;
 }
 
-interface SeriesState {
+export interface SeriesState {
   /** undefined = not asked yet; null = asked, nothing to show. */
   series?: MangaSeries | null;
   /** Aura video id -> chapters. An empty list is the wiki saying "adapts
@@ -106,6 +106,12 @@ function once(key: string, run: () => Promise<void>): void {
   if (inFlight.has(key)) return;
   const p = run().catch((e) => console.warn("[manga]", key, e)).finally(() => inFlight.delete(key));
   inFlight.set(key, p);
+}
+
+/** Whether a title gets any manga-chapter lookup at all: an anime series
+ *  with an episode list. */
+export function mangaEligible(detail: MetaDetail | null | undefined): detail is MetaDetail {
+  return eligible(detail);
 }
 
 function eligible(detail: MetaDetail | null | undefined): detail is MetaDetail {
@@ -360,11 +366,13 @@ export function seriesChapterLine(s: MangaSeries | null): string | null {
     ? `adapts from chapter ${formatChapter(s.adapts_from)}`
     : null;
   if (s.reach == null) {
-    return from ? `The anime ${from}.` : null;
+    return s.adapts_from != null && s.adapts_from > 1
+      ? `Adapts from chapter ${formatChapter(s.adapts_from)}`
+      : null;
   }
   const reached = s.reach_partial
-    ? `The anime reaches partway into chapter ${formatChapter(s.reach)}`
-    : `The anime reaches chapter ${formatChapter(s.reach)}`;
+    ? `Reaches partway into chapter ${formatChapter(s.reach)}`
+    : `Reaches chapter ${formatChapter(s.reach)}`;
   const next = s.reach_partial ? s.reach : s.reach + 1;
   // Without a latest chapter past the reach, a finished manga may have been
   // adapted to its end, so "continue from" would point past the last page.
@@ -397,8 +405,50 @@ export function wikiChapterLine(
   }
   if (reach <= 0) return null;
   const latest = s?.latest != null && s.latest > reach ? s.latest : null;
-  return `The anime reaches chapter ${formatChapter(reach)} · continue from ${formatChapter(reach + 1)}`
+  return `Reaches chapter ${formatChapter(reach)} · continue from ${formatChapter(reach + 1)}`
     + (latest != null ? ` (latest: ${formatChapter(latest)})` : "");
+}
+
+/** The Details list's "Manga" row. Always an answer once asked, so the row
+ *  can say "Not available" rather than silently vanish: MangaUpdates first,
+ *  then the fan wiki's per-episode chapters, then "Checking" while either
+ *  source is still out, then "Not available" with the reason on hover. */
+export interface MangaFact {
+  value: string;
+  /** Hover text: where the figure came from, or why there is none. */
+  title: string;
+  /** A real figure, as opposed to Checking / Not available. */
+  available: boolean;
+}
+
+export function mangaFact(state: SeriesState, videos: VideoEntry[]): MangaFact {
+  const s = state.series ?? null;
+  const fromMu = seriesChapterLine(s);
+  if (fromMu && s) {
+    return {
+      value: fromMu,
+      title: `From MangaUpdates (${s.title}), as of the anime's position it last recorded.`,
+      available: true,
+    };
+  }
+  const fromWiki = wikiChapterLine(state.episodes, videos, s);
+  if (fromWiki) {
+    return {
+      value: fromWiki,
+      title: "From the fan wiki's episode pages: the furthest chapter any aired episode adapts.",
+      available: true,
+    };
+  }
+  if (state.series === undefined || state.episodes === undefined) {
+    return { value: "Checking…", title: "Looking up the manga chapters this anime adapts.", available: false };
+  }
+  return {
+    value: "Not available",
+    title: s
+      ? `MangaUpdates (${s.title}) does not record how far the anime has adapted, and no fan wiki Aura reads lists its chapters per episode.`
+      : "No chapter data was found: MangaUpdates has no matching manga for this anime, and no fan wiki Aura reads lists its chapters per episode.",
+    available: false,
+  };
 }
 
 /** Synchronous lookup for the player: the label for an episode, from

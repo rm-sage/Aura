@@ -28,7 +28,7 @@ import { dedupedInvoke } from "../invokeDedupe";
 import { buildStreamMenu, type StreamMenuContext } from "../downloadsMenu";
 import { getMetaDetail, keptWithoutStreams, peekRichestCachedDetailById, TTL_EMBEDDED_STREAMS_MS } from "../metaCache";
 import DetailHud from "../DetailHud";
-import { FactList, FactsBlock } from "../AnimeExtrasOverlay";
+import { FactList, FactsBlock, type FactRow } from "../AnimeExtrasOverlay";
 import { resolveCourMalIds, type CourRef } from "../animeExtras";
 import { PersistentCache } from "../persistentCache";
 import { BarTooltip, episodeTag, formatProgressPct, type BarTip } from "../progressBar";
@@ -133,7 +133,7 @@ import { hasUsableRating } from "../ratingValue";
 import ArcGrid, { ArcGridSkeleton } from "../ArcGrid";
 import {
   arcChapterRange, derivedRange, episodeChapterHint, formatRange, hasMangaData, isLastRealArc,
-  seriesChapterLine, wikiChapterLine, useArcChapterRanges, useEpisodeChapters, useMangaSeries, useMangaState,
+  mangaEligible, mangaFact, useArcChapterRanges, useEpisodeChapters, useMangaSeries, useMangaState,
 } from "../mangaChapters";
 import GroupingToggle from "../EpisodeGroupingToggle";
 import {
@@ -1102,13 +1102,16 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // "Continue in the manga", from MangaUpdates (mangaChapters.ts). Anime
   // series only (the hook re-checks isAnimeMeta), and only once MAL has
   // settled so the lookup can name the source manga.
-  const mangaSeries = useMangaSeries(detail, meta.id, extrasCours[0]?.malId ?? null, coursReady);
-  // MangaUpdates first; the fan wiki's per-episode chapters when it has no
-  // usable figure (see wikiChapterLine). The episode list fills that data.
+  useMangaSeries(detail, meta.id, extrasCours[0]?.malId ?? null, coursReady);
+  // The wiki's per-episode chapters are the fallback when MangaUpdates has no
+  // usable figure (Bleach), so they are asked for here as well as by the
+  // episode list; the store dedupes the two.
+  useEpisodeChapters(detail ?? null, meta.id);
   const mangaState = useMangaState(meta.id);
-  const mangaUpdatesLine = seriesChapterLine(mangaSeries);
-  const mangaLine = mangaUpdatesLine
-    ?? wikiChapterLine(mangaState.episodes, detail?.videos ?? [], mangaSeries);
+  // The Details list's "Manga" row: a figure, "Checking", or "Not available"
+  // with the reason on hover (mangaFact). Nothing for a title that gets no
+  // lookup at all (not an anime series).
+  const mangaRow = mangaEligible(detail) ? mangaFact(mangaState, detail.videos) : null;
   // Library-tab clicks pass `ignoreResumeHint`, which suppresses the
   // CW resume behaviour: from Library, opening a series should drop
   // the user on the episode list at S01E01 regardless of where they
@@ -2600,17 +2603,6 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                   : (detail?.description ?? meta.description) ?? null;
               })()}
               activeVideo={activeVideo}
-              footer={mangaLine ? (
-                <p
-                  className="mt-3 max-w-[68ch] text-white/55 text-[12.5px] leading-snug"
-                  title={mangaUpdatesLine
-                    ? `Manga chapters from MangaUpdates (${mangaSeries?.title ?? "manga"}). The anime's position is as MangaUpdates last recorded it.`
-                    : "Manga chapters from the fan wiki's episode pages: the furthest chapter any aired episode adapts."}
-                >
-                  <span className="text-white/35 uppercase tracking-[0.14em] text-[10.5px] font-semibold mr-2">Manga</span>
-                  {mangaLine}
-                </p>
-              ) : null}
               isWatched={
                 activeVideo ? getManualWatchedState(activeVideo.id) === "watched" : false
               }
@@ -2644,7 +2636,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                 fills the space the tall fact list leaves below itself. */}
             <div className="flex flex-col gap-5 min-w-0">
             {(() => {
-              const leading: [string, string][] = [];
+              const leading: FactRow[] = [];
               if (detail?.genres?.length) {
                 leading.push(["Genres", detail.genres.join(", ")]);
               }
@@ -2662,7 +2654,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                 <section>
                   <HudSectionLabel>Details</HudSectionLabel>
                   {extrasCours.length > 0
-                    ? <FactsBlock cours={extrasCours} leading={leading} />
+                    ? <FactsBlock cours={extrasCours} leading={leading} manga={mangaRow} />
                     : <FactList items={leading} />}
                 </section>
               );

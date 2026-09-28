@@ -394,7 +394,9 @@ frontend ~40k LOC over ~70 files + ~13 views).
   (the One Piece 590 landmine again). One Piece's episode pages carry no Japanese air date, so it
   gets arc ranges only, and an episode's hover shows its ARC's range, never an interpolated guess.
   Devlog label `[manga]`. Frontend: `src/mangaChapters.ts` (bounded in-memory store + hooks +
-  formatting), shown under the detail synopsis, on arc tiles and the open arc's breadcrumb, beside
+  formatting), shown as the "Manga" row of the detail page's Details list (under
+  Source; "Checking" / "Not available" with the reason on hover rather than no row, for a manga-type
+  source), on arc tiles and the open arc's breadcrumb, beside
   the season picker (only where per-episode data covers the season), in episode rows' HOVER text
   only, and next to the episode title in the player (read from the store, never fetched there).
 - **Casting + live TV**: `cast/mod.rs` + `cast/castv2.rs` + `cast/dlna.rs` + `cast/hls.rs` +
