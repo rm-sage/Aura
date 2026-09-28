@@ -287,7 +287,11 @@ export const NEWER_EPISODES_ARC_ID = "aura:newer-episodes";
  *  covered range that no arc claims are left alone: those are the aligner's
  *  deliberate drops. Computed per render from the page's own videos, never
  *  cached, so it grows with the show. */
-export function withNewerEpisodes(result: ArcResult | null, videos: VideoEntry[]): ArcResult | null {
+export function withNewerEpisodes(
+  result: ArcResult | null,
+  videos: VideoEntry[],
+  showArt: string | null = null,
+): ArcResult | null {
   if (!result || result.arcs.length === 0) return result;
   if (result.arcs.some((a) => a.id === NEWER_EPISODES_ARC_ID)) return result;
   const mapped = new Set(result.arcs.flatMap((a) => a.episode_ids));
@@ -309,8 +313,13 @@ export function withNewerEpisodes(result: ArcResult | null, videos: VideoEntry[]
       name: "Newer episodes (not in an arc yet)",
       order: Math.max(...result.arcs.map((a) => a.order)) + 1,
       episode_ids: newer.map((v) => v.id),
-      image: null,
-      image_source: "none",
+      // The show's own landscape backdrop (the same image a Continue
+      // Watching card falls back to), not a newer episode's thumbnail: that
+      // is a frame from an episode the user may not have seen. Tagged "show"
+      // so nothing that wants real arc key art (arcArtFor, the Fandom credit)
+      // mistakes it for some.
+      image: showArt,
+      image_source: showArt ? "show" : "none",
       year_start: years.length ? Math.min(...years) : null,
       year_end: years.length ? Math.max(...years) : null,
       dropped: 0,
@@ -358,7 +367,7 @@ export function useStoryArcs(
       }
       const result = await fetchStoryArcs(detail, seriesId, groupingId);
       if (!cancelled) {
-        setArcs(withNewerEpisodes(result, detail.videos));
+        setArcs(withNewerEpisodes(result, detail.videos, detail.background ?? null));
         setLoading(false);
       }
     })();
