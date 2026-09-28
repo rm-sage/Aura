@@ -1091,7 +1091,7 @@ fn describe_reqwest_err(e: &reqwest::Error) -> &'static str {
 /// and column) tells two failures of one class apart. reqwest gives the URL
 /// to the top-level error only, and a cause that carries one anyway is
 /// dropped rather than printed.
-fn reqwest_err_for_log(e: &reqwest::Error) -> String {
+pub(crate) fn reqwest_err_for_log(e: &reqwest::Error) -> String {
     let class = describe_reqwest_err(e);
     let mut root = None;
     let mut next = std::error::Error::source(e);

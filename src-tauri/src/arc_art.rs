@@ -87,7 +87,8 @@ const MAX_TITLE_HOPS: usize = 8;
 /// Fandom page names this module fuzzy-matches on, so it would yield no art
 /// either way. Passing a gate is not the same as being right.
 ///
-/// Bleach (30984) was listed and is deliberately REMOVED. Its wiki has no arc
+/// Bleach (30984) was listed and is deliberately kept OFF the art path (it is
+/// back in the table as `chapters_only`, for its episode pages). Its wiki has no arc
 /// category, and its arc names land on the wrong kind of page: 9 of the 21 in
 /// TMDB's "Arcs" grouping redirect into sections of one generic "Episodes"
 /// page (episode 1's title card), and the names that reach a real page land
@@ -116,34 +117,103 @@ const MAX_TITLE_HOPS: usize = 8;
 /// Española" instead, whose Spanish names match nothing. The art returns as
 /// soon as TMDB's English grouping covers the run (or for an addon that lists
 /// 56 main-run episodes or fewer), at the cost of a one-day cached miss.
-const WIKI_BY_TMDB: &[(i64, &str)] = &[
-    (37854,  "onepiece.fandom.com"),
-    (46260,  "naruto.fandom.com"),          // Naruto
-    (31910,  "naruto.fandom.com"),          // Naruto Shippuden
-    (70881,  "naruto.fandom.com"),          // Boruto
-    (12609,  "dragonball.fandom.com"),      // Dragon Ball
-    (12971,  "dragonball.fandom.com"),      // Dragon Ball Z
-    (62715,  "dragonball.fandom.com"),      // Dragon Ball Super
-    (46298,  "hunterxhunter.fandom.com"),
-    (1429,   "attackontitan.fandom.com"),
-    (85937,  "kimetsu-no-yaiba.fandom.com"),
-    (95479,  "jujutsu-kaisen.fandom.com"),
-    (65930,  "myheroacademia.fandom.com"),
-    (46261,  "fairytail.fandom.com"),
-    (73223,  "blackclover.fandom.com"),
-    (57041,  "gintama.fandom.com"),
-    (45790,  "jojo.fandom.com"),
-    (30983,  "detectiveconan.fandom.com"),
-    (65942,  "rezero.fandom.com"),
-    (67075,  "mob-psycho-100.fandom.com"),
-    (114410, "chainsaw-man.fandom.com"),
-    (120089, "spy-x-family.fandom.com"),
-    (209867, "frieren.fandom.com"),
-    (60863,  "haikyuu.fandom.com"),
-    (131041, "blue-lock.fandom.com"),
-    (86031,  "dr-stone.fandom.com"),
-    (63926,  "onepunchman.fandom.com"),
+const WIKI_BY_TMDB: &[Wiki] = &[
+    Wiki::art(37854,  "onepiece.fandom.com"),
+    Wiki::art(46260,  "naruto.fandom.com"),          // Naruto
+    Wiki::art(31910,  "naruto.fandom.com"),          // Naruto Shippuden
+    Wiki::art(70881,  "naruto.fandom.com"),          // Boruto
+    Wiki::art(12609,  "dragonball.fandom.com"),      // Dragon Ball
+    Wiki::art(12971,  "dragonball.fandom.com"),      // Dragon Ball Z
+    Wiki::art(62715,  "dragonball.fandom.com"),      // Dragon Ball Super
+    Wiki::art(46298,  "hunterxhunter.fandom.com")
+        .episodes(EpisodeFields { chapters: "Adapted", airdate: "Air Date", title: None }),
+    Wiki::art(1429,   "attackontitan.fandom.com"),
+    Wiki::art(85937,  "kimetsu-no-yaiba.fandom.com")
+        .episodes(EpisodeFields { chapters: "chapters", airdate: "air_date", title: None }),
+    Wiki::art(95479,  "jujutsu-kaisen.fandom.com")
+        .episodes(EpisodeFields { chapters: "adapted from", airdate: "jp air date", title: Some("ep title") }),
+    Wiki::art(65930,  "myheroacademia.fandom.com")
+        .episodes(EpisodeFields { chapters: "adapted from", airdate: "jp air date", title: None }),
+    Wiki::art(46261,  "fairytail.fandom.com"),
+    Wiki::art(73223,  "blackclover.fandom.com")
+        .episodes(EpisodeFields { chapters: "chapter", airdate: "airdate", title: None }),
+    Wiki::art(57041,  "gintama.fandom.com"),
+    Wiki::art(45790,  "jojo.fandom.com"),
+    Wiki::art(30983,  "detectiveconan.fandom.com"),
+    Wiki::art(65942,  "rezero.fandom.com"),
+    Wiki::art(67075,  "mob-psycho-100.fandom.com"),
+    Wiki::art(114410, "chainsaw-man.fandom.com")
+        .episodes(EpisodeFields { chapters: "adapted from", airdate: "air date", title: None }),
+    Wiki::art(120089, "spy-x-family.fandom.com")
+        .episodes(EpisodeFields { chapters: "Chapters", airdate: "Japan Air Date", title: None }),
+    Wiki::art(209867, "frieren.fandom.com")
+        .episodes(EpisodeFields { chapters: "manga", airdate: "air_date", title: None }),
+    Wiki::art(60863,  "haikyuu.fandom.com"),
+    Wiki::art(131041, "blue-lock.fandom.com")
+        .episodes(EpisodeFields { chapters: "adapted from", airdate: "air date", title: None }),
+    Wiki::art(86031,  "dr-stone.fandom.com")
+        .episodes(EpisodeFields { chapters: "adapted from", airdate: "jp air date", title: None }),
+    Wiki::art(63926,  "onepunchman.fandom.com")
+        .episodes(EpisodeFields { chapters: "Chapters", airdate: "Japan Air Date", title: None }),
+    // NOT an art wiki (see the Bleach note above: no arc category, and its arc
+    // names land on overview pages whose lead images are episode stills). It
+    // is listed for its EPISODE pages, which carry per-episode chapters.
+    Wiki::chapters_only(30984, "bleach.fandom.com")
+        .episodes(EpisodeFields { chapters: "chapters", airdate: "japair", title: None }),
 ];
+
+/// One curated wiki. `art` gates `resolve_arc_art`; `episodes` names the
+/// episode-infobox fields `manga_chapters.rs` reads, or `None` when the wiki's
+/// episode pages carry no usable chapter field (or no Japanese air date to
+/// join on, which is One Piece's case: see `manga_chapters.rs`).
+///
+/// Every `episodes` entry was read off two live episode pages ("Episode 1" and
+/// "Episode 10", which redirect to a titled page on some wikis) on 2026-09-27.
+/// Checked and left at `None`: onepiece (a `chapter` field on SOME pages, but
+/// no Japanese broadcast date anywhere, only the 2012 remaster's, so nothing
+/// to join on), naruto / dragonball / haikyuu / detectiveconan (no "Episode N"
+/// pages), attackontitan (chapters are linked by chapter NAME, not number),
+/// gintama ("Lesson N"), jojo (bare ranges and a date field named per page),
+/// fairytail (numbered "Adapted 2/3" fields; readable, but not verified past
+/// two pages), mob-psycho-100 (no air date), rezero (no chapter field; it
+/// adapts a light novel).
+#[derive(Clone, Copy, Debug)]
+pub struct Wiki {
+    pub tmdb_id: i64,
+    pub host: &'static str,
+    pub art: bool,
+    pub episodes: Option<EpisodeFields>,
+}
+
+/// Field names in a wiki's episode infobox. `chapters` also matches numbered
+/// continuations of itself ("Adapted", "Adapted 2", ...). `title` is the
+/// episode-title field; `None` uses the page title, which on these wikis is
+/// either the episode's title or "Episode N" (useless as a tie-break, and
+/// treated as absent).
+#[derive(Clone, Copy, Debug)]
+pub struct EpisodeFields {
+    pub chapters: &'static str,
+    pub airdate: &'static str,
+    pub title: Option<&'static str>,
+}
+
+impl Wiki {
+    const fn art(tmdb_id: i64, host: &'static str) -> Self {
+        Wiki { tmdb_id, host, art: true, episodes: None }
+    }
+    const fn chapters_only(tmdb_id: i64, host: &'static str) -> Self {
+        Wiki { tmdb_id, host, art: false, episodes: None }
+    }
+    const fn episodes(mut self, f: EpisodeFields) -> Self {
+        self.episodes = Some(f);
+        self
+    }
+}
+
+/// The curated wiki for a TMDB show, art or not.
+pub fn wiki_for(tmdb_id: i64) -> Option<&'static Wiki> {
+    WIKI_BY_TMDB.iter().find(|w| w.tmdb_id == tmdb_id)
+}
 
 /// Wikis do not agree on what the arc category is called. Probed in order.
 const CATEGORY_CANDIDATES: &[&str] = &[
@@ -198,16 +268,24 @@ pub fn normalize_arc_name(s: &str) -> String {
 struct ArtEntry {
     fetched_at: u64,
     art: HashMap<String, String>,
-    /// The category path's title probe went unanswered (see
-    /// `resolve_arc_art`), so this map may hold a similarity match where the
-    /// wiki has a page of its own. Honoured for NEGATIVE_TTL like a miss.
+    /// A request on the category path went unanswered: the title probe (so
+    /// this map may hold a similarity match where the wiki has a page of its
+    /// own) or the image fetch (so it is short of art). Honoured for
+    /// NEGATIVE_TTL like a miss.
     #[serde(default)]
     probe_failed: bool,
+    /// normalized arc name -> the wiki PAGE that arc resolved to, for
+    /// `resolve_arc_pages` (manga chapter ranges live in that page's
+    /// infobox). `None` on an entry written before this existed, which a page
+    /// lookup then recomputes rather than reading as "no pages".
+    #[serde(default)]
+    pages: Option<HashMap<String, String>>,
 }
 
 impl ArtEntry {
     fn ttl(&self) -> Duration {
-        if self.art.is_empty() || self.probe_failed { NEGATIVE_TTL } else { TTL }
+        let no_pages = self.pages.as_ref().map_or(true, |p| p.is_empty());
+        if (self.art.is_empty() && no_pages) || self.probe_failed { NEGATIVE_TTL } else { TTL }
     }
 }
 
@@ -410,6 +488,9 @@ struct PageEntry {
     title: String,
     #[serde(default)]
     original: Option<PageImage>,
+    /// Present (as `""`) on a title that does not exist.
+    #[serde(default)]
+    missing: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -458,7 +539,18 @@ async fn list_arc_pages(host: &str) -> Vec<String> {
 /// is false when any batch went unanswered (a timeout, a non-2xx, a body with
 /// no `query`), whose titles are then absent exactly like missing pages.
 async fn fetch_page_images(host: &str, titles: &[String]) -> (HashMap<String, String>, bool) {
+    let (images, _, answered) = fetch_page_info(host, titles).await;
+    (images, answered)
+}
+
+/// `fetch_page_images`, plus the page each requested title LANDS on (see
+/// `key_pages_to_requested`) from the same requests.
+async fn fetch_page_info(
+    host: &str,
+    titles: &[String],
+) -> (HashMap<String, String>, HashMap<String, String>, bool) {
     let mut out = HashMap::new();
+    let mut landed = HashMap::new();
     let mut answered = true;
     for chunk in titles.chunks(40) {
         let joined = chunk.join("|");
@@ -473,8 +565,46 @@ async fn fetch_page_images(host: &str, titles: &[String]) -> (HashMap<String, St
         // Per chunk: each response's `normalized` / `redirects` describe only
         // the titles that request carried.
         out.extend(key_images_to_requested(chunk, &q));
+        landed.extend(key_pages_to_requested(chunk, &q));
     }
-    (out, answered)
+    (out, landed, answered)
+}
+
+/// Requested title -> the title of the page MediaWiki landed it on, for pages
+/// that exist. The same walk as `key_images_to_requested` (normalization, then
+/// redirects), and the same refusals: a redirect into a SECTION and a single
+/// chapter or episode page are not an arc's page. No similarity fallback: a
+/// page that cannot be traced is not claimed for anybody.
+fn key_pages_to_requested(requested: &[String], q: &PagesQuery) -> HashMap<String, String> {
+    let normalized: HashMap<String, &str> =
+        q.normalized.iter().map(|m| (m.requested_form(), m.to.as_str())).collect();
+    let redirects: HashMap<&str, &TitleMap> =
+        q.redirects.iter().map(|m| (m.from.as_str(), m)).collect();
+    let existing: Vec<&str> = q
+        .pages
+        .values()
+        .filter(|p| p.missing.is_none())
+        .map(|p| p.title.as_str())
+        .collect();
+    let mut out = HashMap::new();
+    for req in requested {
+        let mut title = req.as_str();
+        for _ in 0..MAX_TITLE_HOPS {
+            let Some(to) = normalized.get(title) else { break };
+            title = to;
+        }
+        let mut into_section = false;
+        for _ in 0..MAX_TITLE_HOPS {
+            let Some(hop) = redirects.get(title) else { break };
+            into_section |= hop.tofragment.as_deref().is_some_and(|f| !f.is_empty());
+            title = hop.to.as_str();
+        }
+        if into_section || is_unit_page(title) || !existing.contains(&title) {
+            continue;
+        }
+        out.insert(req.clone(), title.to_string());
+    }
+    out
 }
 
 /// Key a batch's lead images back to the titles that were REQUESTED.
@@ -616,7 +746,7 @@ fn drop_shared_images(art: &mut HashMap<String, String>) -> usize {
 /// part 2" and "compilation 15 part ii" (fairytail) -> "wano country",
 /// "compilation 15". Only a TRAILING marker with a stem before it counts, so
 /// deathnote's "part i l" (Part I - L arc) is a whole arc of its own.
-fn part_family(arc_norm: &str) -> &str {
+pub(crate) fn part_family(arc_norm: &str) -> &str {
     match arc_norm.rsplit_once(" part ") {
         Some((stem, n))
             if !n.is_empty()
@@ -763,25 +893,80 @@ pub async fn resolve_arc_art<R: Runtime>(
     tmdb_id: i64,
     arc_names: &[String],
 ) -> HashMap<String, String> {
-    let Some((_, host)) = WIKI_BY_TMDB.iter().find(|(id, _)| *id == tmdb_id) else {
-        return HashMap::new();
-    };
+    match wiki_for(tmdb_id) {
+        Some(w) if w.art => resolve_entry(app, w, arc_names, false).await.art,
+        _ => HashMap::new(),
+    }
+}
+
+/// Resolve each arc to its wiki PAGE: `normalized arc name -> page title`.
+/// Same matching as the art (exact titles first, then similarity, redirects
+/// followed, sections and single chapter / episode pages refused), from the
+/// same cached pass, and for every curated wiki including the ones that are
+/// not used for art. `manga_chapters.rs` reads each page's infobox for the
+/// arc's chapter range. Never errors.
+pub async fn resolve_arc_pages<R: Runtime>(
+    app: &AppHandle<R>,
+    tmdb_id: i64,
+    arc_names: &[String],
+) -> HashMap<String, String> {
+    match wiki_for(tmdb_id) {
+        Some(w) => resolve_entry(app, w, arc_names, true).await.pages.unwrap_or_default(),
+        None => HashMap::new(),
+    }
+}
+
+/// The cached art + page pass for one show and arc-name set. `need_pages`
+/// treats an entry written before pages were recorded as stale.
+async fn resolve_entry<R: Runtime>(
+    app: &AppHandle<R>,
+    wiki: &Wiki,
+    arc_names: &[String],
+    need_pages: bool,
+) -> ArtEntry {
     if arc_names.is_empty() || arc_names.len() > MAX_ARCS {
-        return HashMap::new();
+        return ArtEntry {
+            fetched_at: now_secs(),
+            art: HashMap::new(),
+            probe_failed: false,
+            pages: Some(HashMap::new()),
+        };
     }
 
-    let key = cache_key(tmdb_id, arc_names);
+    let key = cache_key(wiki.tmdb_id, arc_names);
     ensure_cache_loaded(app).await;
     if let Ok(lock) = cache().lock() {
         if let Some(entry) = lock.get(&key) {
-            if now_secs().saturating_sub(entry.fetched_at) < entry.ttl().as_secs() {
-                return entry.art.clone();
+            let fresh = now_secs().saturating_sub(entry.fetched_at) < entry.ttl().as_secs();
+            if fresh && (!need_pages || entry.pages.is_some()) {
+                return entry.clone();
             }
         }
     }
 
+    let entry = compute_entry(wiki, arc_names).await;
+    if let Ok(mut lock) = cache().lock() {
+        lock.insert(key, entry.clone());
+    }
+    // We only reach here on a cache MISS (a hit returned above), so a write is
+    // always warranted; persist once, off the runtime.
+    persist_cache(app).await;
+    entry
+}
+
+/// `compute_entry`'s arc pages alone, uncached, for the live tests.
+#[cfg(test)]
+pub(crate) async fn compute_pages(wiki: &Wiki, arc_names: &[String]) -> HashMap<String, String> {
+    compute_entry(wiki, arc_names).await.pages.unwrap_or_default()
+}
+
+/// The network half of `resolve_entry`: no cache and no app handle. Art is
+/// only kept for a wiki with `art`.
+async fn compute_entry(wiki: &Wiki, arc_names: &[String]) -> ArtEntry {
+    let host = wiki.host;
     let pages = list_arc_pages(host).await;
     let mut art: HashMap<String, String> = HashMap::new();
+    let mut arc_pages: HashMap<String, String> = HashMap::new();
     let mut probe_failed = false;
 
     if pages.is_empty() {
@@ -791,18 +976,18 @@ pub async fn resolve_arc_art<R: Runtime>(
         // simply do not have one. Measured across this table: 7 of 27 hosts
         // returned zero members for ALL SIX category candidates: fma,
         // deathnote, swordartonline, mob-psycho-100, haikyuu, codegeass, and
-        // bleach (all but mob-psycho-100 and haikyuu since removed, see
-        // WIKI_BY_TMDB). No amount of adding category names
-        // fixes that, because those wikis do not model arcs as a category in
-        // the first place.
+        // bleach (all but mob-psycho-100, haikyuu and bleach since removed or
+        // taken off the art path, see WIKI_BY_TMDB). No amount of adding
+        // category names fixes that, because those wikis do not model arcs as
+        // a category in the first place.
         //
         // So ask for the arc names as page titles directly and let MediaWiki
         // resolve them (`redirects=1`). An arc a wiki files under another name
-        // is a RENAMED redirect, and `fetch_page_images` keys the target's
-        // image back to the name we asked for through the response's redirect
-        // map. A redirect into a section, or onto a single chapter or episode
-        // page, yields no art (see `key_images_to_requested`). Costs one
-        // batched request (40 titles each), and only on hosts where the
+        // is a RENAMED redirect, and `fetch_page_info` keys the target's image
+        // and title back to the name we asked for through the response's
+        // redirect map. A redirect into a section, or onto a single chapter or
+        // episode page, yields neither (see `key_images_to_requested`). Costs
+        // one batched request (40 titles each), and only on hosts where the
         // category path already found nothing.
         let probe: Vec<String> = arc_names
             .iter()
@@ -812,8 +997,12 @@ pub async fn resolve_arc_art<R: Runtime>(
         // Every key is a name we asked for, so no stray entry (a redirect
         // target's own title, say) can make a miss non-empty and earn it the
         // 30-day hit TTL.
-        for (name, url) in fetch_page_images(host, &probe).await.0 {
+        let (images, landed, _) = fetch_page_info(host, &probe).await;
+        for (name, url) in images {
             art.insert(normalize_arc_name(&name), url);
+        }
+        for (name, page) in landed {
+            arc_pages.insert(normalize_arc_name(&name), page);
         }
     }
 
@@ -830,29 +1019,43 @@ pub async fn resolve_arc_art<R: Runtime>(
             .filter(|n| wants_title_probe(n, &pages))
             .cloned()
             .collect();
-        let titled = if probe.is_empty() {
-            HashMap::new()
+        let (titled, titled_pages) = if probe.is_empty() {
+            (HashMap::new(), HashMap::new())
         } else {
-            let (titled, answered) = fetch_page_images(host, &probe).await;
+            let (titled, landed, answered) = fetch_page_info(host, &probe).await;
             probe_failed = !answered;
-            titled
+            (titled, landed)
         };
         let arc_to_page = match_arc_pages(arc_names, &pages, &titled);
 
-        let mut wanted: Vec<String> = arc_to_page
-            .values()
-            .filter(|page| !titled.contains_key(*page))
-            .cloned()
-            .collect();
-        wanted.sort();
-        wanted.dedup();
-        // Keyed by the page title we asked for, however MediaWiki normalized
-        // or redirected it on the way (see `key_images_to_requested`).
-        let (images, _) = fetch_page_images(host, &wanted).await;
-        for (arc_norm, page) in arc_to_page {
-            if let Some(url) = titled.get(&page).or_else(|| images.get(&page)) {
-                art.insert(arc_norm, url.clone());
+        if wiki.art {
+            let mut wanted: Vec<String> = arc_to_page
+                .values()
+                .filter(|page| !titled.contains_key(*page))
+                .cloned()
+                .collect();
+            wanted.sort();
+            wanted.dedup();
+            // Keyed by the page title we asked for, however MediaWiki
+            // normalized or redirected it on the way (see
+            // `key_images_to_requested`).
+            let (images, answered) = fetch_page_images(host, &wanted).await;
+            // Unanswered, the map below is short of art it should have, and
+            // the pages it DID find would otherwise earn it the 30-day TTL.
+            probe_failed |= !answered;
+            for (arc_norm, page) in arc_to_page {
+                if let Some(url) = titled.get(&page).or_else(|| images.get(&page)) {
+                    art.insert(arc_norm, url.clone());
+                }
             }
+        }
+
+        // Pages: the same exact-then-similar match, except that a name which
+        // is a page of its own counts whether or not that page has a lead
+        // image, and is recorded as the page it LANDS on (a renamed redirect).
+        for (arc_norm, page) in match_arc_pages(arc_names, &pages, &titled_pages) {
+            let landed = titled_pages.get(&page).cloned().unwrap_or(page);
+            arc_pages.insert(arc_norm, landed);
         }
     }
 
@@ -866,16 +1069,24 @@ pub async fn resolve_arc_art<R: Runtime>(
             "{host}: dropped {shared} arcs that share one image with a different arc (not arc art)"
         );
     }
+    // Several DIFFERENT arcs on one page is a generic page, not an arc's own
+    // (the same test as the images, on titles). Parts of one arc keep their
+    // shared page; `manga_chapters.rs` decides what a part may show.
+    drop_shared_images(&mut arc_pages);
+    if !wiki.art {
+        art.clear();
+    }
     if pages.is_empty() {
         crate::devlog!(
             info, "arcs",
-            "{host}: no arc category, title probe matched {}/{} arcs",
-            art.len(), arc_names.len()
+            "{host}: no arc category, title probe matched {}/{} arcs (pages for {})",
+            art.len(), arc_names.len(), arc_pages.len()
         );
     } else {
         crate::devlog!(
             info, "arcs",
-            "{host}: matched art for {}/{} arcs", art.len(), arc_names.len()
+            "{host}: matched art for {}/{} arcs (pages for {})",
+            art.len(), arc_names.len(), arc_pages.len()
         );
     }
     if probe_failed {
@@ -885,13 +1096,7 @@ pub async fn resolve_arc_art<R: Runtime>(
         );
     }
 
-    if let Ok(mut lock) = cache().lock() {
-        lock.insert(key, ArtEntry { fetched_at: now_secs(), art: art.clone(), probe_failed });
-    }
-    // We only reach here on a cache MISS (a hit returned above), so a write is
-    // always warranted; persist once, off the runtime.
-    persist_cache(app).await;
-    art
+    ArtEntry { fetched_at: now_secs(), art, probe_failed, pages: Some(arc_pages) }
 }
 
 #[cfg(test)]
@@ -1087,6 +1292,35 @@ mod tests {
         );
         let out = key_images_to_requested(&titles(&["Urban Legend", "Chapter 5"]), &q);
         assert!(out.is_empty(), "got {out:?}");
+    }
+
+    #[test]
+    fn pages_key_back_to_the_request_and_refuse_what_art_refuses() {
+        // The same recorded Bleach shapes as above: a renamed redirect lands
+        // on its page, a redirect into a section and a missing title land
+        // nowhere, and a page with no lead image still counts as a page.
+        let q = query(
+            r#"{
+                "normalized": [{"from": "soul_Society arc", "to": "Soul Society arc"}],
+                "redirects": [
+                    {"from": "Soul Society arc", "to": "Ryoka Invasion"},
+                    {"from": "The Past", "to": "Timeline of Events", "tofragment": "Historical Timeline"},
+                    {"from": "Urban Legend", "to": "Chapter 53"}
+                ],
+                "pages": {
+                    "17143": {"title": "Ryoka Invasion"},
+                    "88": {"title": "Timeline of Events"},
+                    "2725": {"title": "Chapter 53"},
+                    "-1": {"title": "Nope", "missing": ""}
+                }
+            }"#,
+        );
+        let out = key_pages_to_requested(
+            &titles(&["soul_Society arc", "The Past", "Urban Legend", "Nope"]),
+            &q,
+        );
+        assert_eq!(out.get("soul_Society arc").map(String::as_str), Some("Ryoka Invasion"));
+        assert_eq!(out.len(), 1, "got {out:?}");
     }
 
     #[test]

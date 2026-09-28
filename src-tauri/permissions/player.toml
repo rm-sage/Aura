@@ -188,6 +188,12 @@ identifier = "allow-introdb"
 description = "Allows the frontend to read IntroDB skip segments and to submit a user-entered segment with the user's own IntroDB key"
 commands.allow = ["introdb"]
 
+# ── Manga chapters (which chapters an anime adapts; MangaUpdates + Fandom) ──
+[[permission]]
+identifier = "allow-manga-chapters"
+description = "Allows the frontend to read which manga chapters an anime series, its story arcs and its episodes adapt"
+commands.allow = ["manga_chapters"]
+
 # ── Phase 4: OpenSubtitles ────────────────────────────────────────────────────
 [[permission]]
 identifier = "allow-subtitles"

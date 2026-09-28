@@ -378,7 +378,25 @@ frontend ~40k LOC over ~70 files + ~13 views).
   `per_title.rs` (per-id volume / shader / track memory).
 - **Story arcs**: `arcs.rs` (TMDB episode groups -> arcs, grouping selection, the command),
   `arc_align.rs` (the join; see the landmine below), `arc_art.rs` (Fandom arc key art, curated
-  TMDB-id -> wiki table). Devlog label `[arcs]`.
+  TMDB-id -> wiki table). Devlog label `[arcs]`. The wiki table is a struct per show: `art` gates
+  the key art (Bleach is listed `chapters_only`), `episodes` names the episode-infobox fields the
+  manga-chapter feature reads (verified per wiki; `None` where unverified or unusable).
+- **Manga chapters**: `manga_chapters.rs`, one tagged command `manga_chapters` (`series` / `arcs` /
+  `episodes`). Series line from MangaUpdates' public API (`anime.start` / `anime.end`, parsed
+  strictly: an unreadable string shows nothing, never the raw text), matched through MAL's
+  "Adaptation" relation (tenrai) and an EXACT normalized title, earliest year, type Manga / Manhwa /
+  Manhua. Arc ranges from the RENDERED infobox of the arc's Fandom page (`action=parse&section=0`),
+  the arc reaching its page through `arc_art::resolve_arc_pages` (by page, never by episode
+  number); a part ("Wano Country Part 2"), a combined name ("Water 7 & Enies Lobby Arc") or a
+  one-chapter infobox never takes a range. Per-episode chapters from episode pages fetched 50 per
+  request (`rvsection=0`), joined to Aura's episodes by AIR DATE with a title tie-break
+  (`join_by_air_date`), never by number: wikis number episodes officially, Aura's addon may not
+  (the One Piece 590 landmine again). One Piece's episode pages carry no Japanese air date, so it
+  gets arc ranges only, and an episode's hover shows its ARC's range, never an interpolated guess.
+  Devlog label `[manga]`. Frontend: `src/mangaChapters.ts` (bounded in-memory store + hooks +
+  formatting), shown under the detail synopsis, on arc tiles and the open arc's breadcrumb, beside
+  the season picker (only where per-episode data covers the season), in episode rows' HOVER text
+  only, and next to the episode title in the player (read from the store, never fetched there).
 - **Casting + live TV**: `cast/mod.rs` + `cast/castv2.rs` + `cast/dlna.rs` + `cast/hls.rs` +
   `cast/media_server.rs` (Chromecast via hand-rolled CASTV2 + DLNA + on-the-fly HLS transcode),
   `iptv.rs` (EPG fetch + Xtream password keyring).
@@ -421,7 +439,7 @@ frontend ~40k LOC over ~70 files + ~13 views).
   `DownloadsClosePrompt.tsx`, `DownloadsRelinkBridge.tsx`.
 - **Data / caching**: `metaCache.ts`, `persistentCache.ts`, `libraryNormalize.ts`, `auraSettings.ts`,
   `settingsTransfer.ts`, `sessionRoute.ts`, `catalogHoverStore.ts`, `releaseSignalStore.ts`,
-  `historyStore.ts`, `streamMeta.ts`, `aiometadata.ts`. See "Caching boundaries".
+  `historyStore.ts`, `streamMeta.ts`, `aiometadata.ts`, `mangaChapters.ts`. See "Caching boundaries".
 - **Addon election**: `addonElection.ts` owns "which addons can answer this, in what order":
   Stremio's resource / type / id-prefix gates (failing open on empty cached fields) in plain
   addon order, except meta, which is tiered (declared prefix match, then the pinned or
@@ -694,9 +712,17 @@ Bound every cache (see Performance & memory).
   "Fandom was down when we asked"; so is a hit whose arc-title probe went unanswered, since that
   falls back to the similarity match the probe replaces). A show in the curated wiki table is not
   proof it HAS arc art.
-  Bleach was removed from the table for that reason: it never produced any (no arc category, and 9
-  of 21 arc names redirect to one generic Episodes page), and the names that do reach a real page
-  land on event pages whose lead images are episode screenshots, some of them spoilers.
+  Bleach was taken off the art path for that reason (it is back in the table as `chapters_only`,
+  for its episode pages): it never produced any art (no arc category, and 9 of 21 arc names
+  redirect to one generic Episodes page), and the names that do reach a real page land on event
+  pages whose lead images are episode screenshots, some of them spoilers. `arc-art-v3.json` entries
+  also carry each arc's resolved PAGE (`pages`, for manga chapter ranges); an entry written before
+  that field existed is recomputed on the first page lookup.
+- **Manga chapters**: `manga-chapters-v1.json` (Rust, one file, per-entry TTL, cap 5000, oldest
+  first): MangaUpdates series matches 7 d (misses 1 d), arc-page infobox ranges and episode pages
+  30 d (misses 1 d; an episode that aired in the last 60 days is kept only a day, because new pages
+  are created before their chapter field is filled). Frontend `mangaChapters.ts` holds at most 24
+  series in memory for the session and nothing on disk.
 - **Hero backdrop choice**: `aura:hero-backdrop:v1` (365 d TTL, cap 300) holds the backdrop URL the
   user picked for a title's detail hero (`heroBackdrop.ts`), validated on read, and forgets one whose
   image failed to load on two opens in a row (the count is stored with it). Device-local like
@@ -835,6 +861,15 @@ creep degrades the experience. When adding ANY feature:
 - "Arc shows the wrong episodes" / "arc is off by one" -> read the story-arcs section above. This is
   the failure the aligner exists to prevent; check the `[arcs]` min-score log before touching
   anything else.
+- "Manga chapters missing" -> `manga_chapters.rs`, DevConsole `[manga]`. By grain: the detail line
+  needs an anime series, a MangaUpdates series matched EXACTLY (MAL's "Adaptation" title first) and
+  an `anime` field that parses; it is withheld on purpose when a part has started without an end
+  (Bleach: TYBW part 4 at 661), and nothing is shown for a light-novel or original source. Arc
+  ranges need the show in `arc_art.rs`'s wiki table, the arc resolved to its own page (`[arcs]`
+  logs "pages for N"), and a closed range in that page's infobox (an ongoing arc has none). Episode
+  hover chapters need an `episodes` entry for that wiki AND air dates on both sides: `[manga]` logs
+  pages fetched, joined by air date, and with chapter data. A low join count means the addon's
+  dates are off by more than a day; do NOT "fix" that with a number join.
 - "Live Sync cue list is empty / will not scroll" -> `subsync.rs` for the cue source (bitmap PGS /
   VobSub tracks can never yield text and are a deliberate disabled state), and the non-passive wheel
   handler in the panel: the overlay's volume-wheel handler steals wheel events without it.
@@ -906,7 +941,7 @@ old-format and new-format samples and diff the field sets. Node runs the `.ts` f
 - Rust log labels to grep in the DevConsole or `aura-mpv.log`: `[bridge]`, `[player]`, `[streams]`,
   `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[ratings]`, `[rpc]`, `[win32]`, `[smtc]`,
   `[scrobble]`, `[publicmetadb]`, `[mpv]` (the playback engine), `[cast]`, `[iptv]`, `[sync]`,
-  `[aniskip]`, `[introdb]`, `[arcs]`, `[subsync]`, `[downloads]`, `[tenrai]` (the MyAnimeList client), `[extras]` (frontend,
+  `[aniskip]`, `[introdb]`, `[arcs]`, `[subsync]`, `[downloads]`, `[tenrai]` (the MyAnimeList client), `[manga]` (manga chapters: MangaUpdates + Fandom), `[extras]` (frontend,
   the anime metadata tabs on the detail page).
 - libmpv writes its own verbose log to `%USERPROFILE%\aura-mpv.log` (truncated each MPV init, rotated
   to `.old` past 50 MB). The last few lines usually pinpoint a STATUS_ACCESS_VIOLATION.

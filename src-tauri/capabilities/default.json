@@ -64,6 +64,7 @@
     "allow-aniskip",
     "allow-publicmetadb",
     "allow-introdb",
+    "allow-manga-chapters",
     "allow-dev-tools",
     "allow-debug-panel",
     "allow-popup-nav",

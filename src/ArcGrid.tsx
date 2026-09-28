@@ -70,6 +70,9 @@ interface ArcGridProps {
    *  episode in it; the caller owns the menu because it owns the series
    *  identity and the scrobble connection. */
   onArcContextMenu?: (arc: StoryArc, x: number, y: number) => void;
+  /** The manga chapters an arc adapts, already formatted ("Ch. 1,058-1,125"),
+   *  or null. From mangaChapters.ts; absent for shows with no chapter data. */
+  chapterLabelFor?: (arc: StoryArc) => string | null;
 }
 
 /** Episodes in this arc the user has finished. Mirrors LibraryContext's
@@ -105,10 +108,13 @@ function ArcCard({
   absoluteById,
   resumeId,
   kind,
+  chapters,
   onSelect,
   onArcContextMenu,
 }: {
   arc: StoryArc;
+  /** "Ch. 1,058-1,125", or null. */
+  chapters: string | null;
   perRow: 1 | 2;
   absoluteById: Map<string, number>;
   resumeId: string | null;
@@ -229,8 +235,9 @@ function ArcCard({
             is its longest WORD, so the spans collapsed to word width and
             wrapped their own text internally ("20" over "episodes"). The real
             guards are `whitespace-nowrap` so no item may break inside itself,
-            `shrink-0` so the fixed facts hold full size, and exactly ONE item
-            allowed to give, which truncates rather than pushing.
+            `shrink-0` so the fixed facts hold full size, and only the optional
+            trailing items (the manga chapters and the filler count) allowed
+            to give, which truncate rather than pushing.
 
             "Completed" is gone. It was triplicated: the emerald check pinned
             top-right (which carries the accessible name, so nothing is lost to
@@ -261,6 +268,17 @@ function ArcCard({
               <span className="shrink-0 font-mono">{years}</span>
             </>
           )}
+          {/* Manga chapters. Quiet, and allowed to truncate like the filler
+              count: at two-up the line has about 200px, and the arc name
+              plus the episode count already say which arc this is. */}
+          {chapters && (
+            <>
+              <span className="shrink-0 text-white/30" aria-hidden>&middot;</span>
+              <span className="min-w-0 truncate font-mono text-white/55" title="Manga chapters this arc adapts">
+                {chapters}
+              </span>
+            </>
+          )}
           {kind.known && kind.filler > 0 && (
             <>
               <span className="shrink-0 text-white/30" aria-hidden>&middot;</span>
@@ -278,8 +296,9 @@ function ArcCard({
                   filler, or an arc where only a few ids mapped would claim to be
                   filler outright.
 
-                  The only item allowed to truncate: the rose still carries the
-                  meaning when it clips. */}
+                  One of the two items allowed to truncate (the chapter range
+                  is the other): the rose still carries the meaning when it
+                  clips. */}
               <span className="min-w-0 truncate text-rose-300 font-medium">
                 {kind.filler === kind.total && kind.resolved === kind.total
                   ? "Filler"
@@ -392,7 +411,7 @@ export function ArcGridSkeleton({ perRow = 1, count }: { perRow?: 1 | 2; count?:
 
 export default function ArcGrid({
   result, seriesId, videos, cloudKinds, loading, activeGroupingId, onSelect, onGroupingChange,
-  onArcContextMenu,
+  onArcContextMenu, chapterLabelFor,
 }: ArcGridProps) {
   const resumeId = useResumeVideoId(seriesId);
   // Re-render when a manual mark lands anywhere, so the progress bars stay
@@ -470,6 +489,7 @@ export default function ArcGrid({
                 }
               }
               resumeId={resumeId}
+              chapters={chapterLabelFor ? chapterLabelFor(arc) : null}
               onSelect={onSelect}
               onArcContextMenu={onArcContextMenu}
             />

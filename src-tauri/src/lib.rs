@@ -42,6 +42,7 @@ mod devlog;
 mod download_path;
 mod downloads;
 mod log_export;
+mod manga_chapters;
 mod anime_id_map;
 mod api_keyring;
 mod media_controls;
@@ -2508,6 +2509,8 @@ pub fn run() {
             publicmetadb::resolve_anime_tmdb_id,
             // ── IntroDB (IMDb-keyed skip source + user submissions) ──
             introdb::introdb,
+            // ── Manga chapters (MangaUpdates + Fandom, one tagged command) ──
+            manga_chapters::manga_chapters,
             // ── Phase 3C: scrobbling ──────────────────────────────────────────
             scrobble::scrobble_start,
             scrobble::scrobble_heartbeat,

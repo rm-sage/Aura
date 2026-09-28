@@ -532,6 +532,29 @@ async fn find_tmdb_by_imdb<R: Runtime>(
     Ok(parsed.tv_results.first().and_then(|t| t.id))
 }
 
+/// The TMDB tv id for a show, the way `fetch_story_arcs` resolves it: the
+/// addon's own `tmdb_id` when it stamped one, else TMDB's `/find` by IMDb id
+/// (through this module's cache). `Ok(None)` when there is no key or no match;
+/// an `Err` is a failure to ASK. Used by `manga_chapters.rs` to reach the
+/// curated wiki table, which is keyed by TMDB id.
+pub async fn resolve_tv_id<R: Runtime>(
+    app: &AppHandle<R>,
+    tmdb_id: Option<i64>,
+    imdb_id: Option<&str>,
+) -> Result<Option<i64>, String> {
+    if let Some(id) = tmdb_id.filter(|id| *id > 0) {
+        return Ok(Some(id));
+    }
+    let Some(imdb) = imdb_id.filter(|i| i.starts_with("tt")) else { return Ok(None) };
+    let Some(key) = tmdb_key() else { return Ok(None) };
+    ensure_cache_loaded(app).await;
+    let out = find_tmdb_by_imdb(app, imdb, &key).await;
+    if CACHE_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        persist_cache(app).await;
+    }
+    out
+}
+
 #[tauri::command]
 pub async fn fetch_story_arcs<R: Runtime>(
     app: AppHandle<R>,

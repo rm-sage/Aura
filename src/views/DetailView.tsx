@@ -131,9 +131,13 @@ import Tooltip from "../Tooltip";
 import { BrandLogo, ratingDomain, groupRatingsByBrand } from "../logodev";
 import { hasUsableRating } from "../ratingValue";
 import ArcGrid, { ArcGridSkeleton } from "../ArcGrid";
+import {
+  arcChapterRange, derivedRange, episodeChapterHint, formatRange, hasMangaData, isLastRealArc,
+  seriesChapterLine, useArcChapterRanges, useEpisodeChapters, useMangaSeries, useMangaState,
+} from "../mangaChapters";
 import GroupingToggle from "../EpisodeGroupingToggle";
 import {
-  absoluteEpisodeMap, arcArtFor, arcPositionOf, arcsLikelyAvailable, arcYearRange, absoluteEpisodeHint, formatAbsoluteEpisode, loadArcMode, peekCachedArcs, preferredGroupingId, saveArcMode, useStoryArcs,
+  absoluteEpisodeMap, arcArtFor, arcPositionOf, arcsLikelyAvailable, arcYearRange, absoluteEpisodeHint, formatAbsoluteEpisode, loadArcMode, peekCachedArcs, preferredGroupingId, saveArcMode, stripArcKindSuffix, useStoryArcs,
   type EpisodeGrouping, type StoryArc,
 } from "../storyArcs";
 
@@ -1052,6 +1056,10 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // there is nothing to show for live action. An empty result means the
   // trigger never renders, so the button is absent rather than dead.
   const [extrasCours, setExtrasCours] = useState<CourRef[]>([]);
+  // Set once the MAL resolution below has SETTLED (found or not), so the
+  // manga-chapter lookup can wait for MAL's "Adaptation" relation, the
+  // safest name for the source manga, instead of racing it.
+  const [coursReady, setCoursReady] = useState(false);
   // The FULL heuristic, over the resolved detail as well as the preview.
   //
   // The previous form was `isAnimeMeta(meta) || detail.media_type === "anime"`,
@@ -1078,16 +1086,24 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     [meta, detail],
   );
   useEffect(() => {
-    if (!isAnimeDetail || !detail) { setExtrasCours([]); return; }
+    if (!isAnimeDetail || !detail) { setExtrasCours([]); setCoursReady(false); return; }
     let cancelled = false;
     (async () => {
       const cours = await resolveCourMalIds(
         detail, detail.videos ?? [], detail.name ?? meta.name,
-      );
-      if (!cancelled) setExtrasCours(cours);
+      ).catch(() => [] as CourRef[]);
+      if (!cancelled) {
+        setExtrasCours(cours);
+        setCoursReady(true);
+      }
     })();
     return () => { cancelled = true; };
   }, [isAnimeDetail, detail, meta.name]);
+  // "Continue in the manga", from MangaUpdates (mangaChapters.ts). Anime
+  // series only (the hook re-checks isAnimeMeta), and only once MAL has
+  // settled so the lookup can name the source manga.
+  const mangaSeries = useMangaSeries(detail, meta.id, extrasCours[0]?.malId ?? null, coursReady);
+  const mangaLine = seriesChapterLine(mangaSeries);
   // Library-tab clicks pass `ignoreResumeHint`, which suppresses the
   // CW resume behaviour: from Library, opening a series should drop
   // the user on the episode list at S01E01 regardless of where they
@@ -2579,6 +2595,15 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                   : (detail?.description ?? meta.description) ?? null;
               })()}
               activeVideo={activeVideo}
+              footer={mangaLine ? (
+                <p
+                  className="mt-3 max-w-[68ch] text-white/55 text-[12.5px] leading-snug"
+                  title={`Manga chapters from MangaUpdates (${mangaSeries?.title ?? "manga"}). The anime's position is as MangaUpdates last recorded it.`}
+                >
+                  <span className="text-white/35 uppercase tracking-[0.14em] text-[10.5px] font-semibold mr-2">Manga</span>
+                  {mangaLine}
+                </p>
+              ) : null}
               isWatched={
                 activeVideo ? getManualWatchedState(activeVideo.id) === "watched" : false
               }
@@ -3125,9 +3150,12 @@ function hasAnyCredits(detail: MetaDetail | null): boolean {
  * enough not to be a nuisance on every episode click.
  */
 function SynopsisSection({
-  showText, activeVideo, isWatched, revealed, onReveal,
+  showText, activeVideo, isWatched, revealed, onReveal, footer,
 }: {
   showText: string | null;
+  /** Show-level extra under the synopsis (the manga-chapter line). Only in
+   *  show mode: a selected episode's synopsis replaces the whole slot. */
+  footer?: React.ReactNode;
   activeVideo: VideoEntry | null;
   isWatched: boolean;
   revealed: boolean;
@@ -3191,6 +3219,7 @@ function SynopsisSection({
             />
           )}
         </div>
+        {!isEpisode && footer}
       </div>
     </section>
   );
@@ -3754,7 +3783,7 @@ function UnifiedPanel({
 // ---------------------------------------------------------------------------
 
 const EpisodeRow = ({
-  video, seriesId, seriesMediaType, isActive, onPick, seasonVideos, isNextAiring, isDeepLinked, seriesArt, seriesName, groupLabel = "season", absoluteNumber = null, absoluteTag = "",
+  video, seriesId, seriesMediaType, isActive, onPick, seasonVideos, isNextAiring, isDeepLinked, seriesArt, seriesName, groupLabel = "season", absoluteNumber = null, absoluteTag = "", chapterHint = "",
 }: {
   video: VideoEntry;
   seriesId: string;
@@ -3776,6 +3805,10 @@ const EpisodeRow = ({
    *  season mode on a saga show; empty otherwise. In arc mode the row already
    *  shows the absolute number itself, so this is ignored there. */
   absoluteTag?: string;
+  /** Manga chapters this episode adapts, for the HOVER text of the episode
+   *  number only (never a visible column: rows must not widen). Empty when
+   *  the show has no chapter data. */
+  chapterHint?: string;
   /** What `seasonVideos` actually IS, for the confirmation toast. In Arcs mode
    *  the visible list is a story arc, not a season, and "Marked watched · all in
    *  season" would be a lie about what the user just did. */
@@ -3792,6 +3825,9 @@ const EpisodeRow = ({
   seriesName?: string | null;
 }) => {
   const progress = useEpisodeProgress(seriesId, video.id);
+  // One hover for the episode number: the absolute-episode note (season mode
+  // only; arc mode already shows the absolute number) and the manga chapters.
+  const numberHover = [absoluteNumber == null ? absoluteTag : "", chapterHint].filter(Boolean).join("\n\n");
   // Scrobble target for skips fired from this row's menu.
   const scrobbleConn = useScrobbleConnections();
   const watchedVariant = useWatchedVariant(video.id);
@@ -4274,10 +4310,10 @@ const EpisodeRow = ({
         <p className="flex items-baseline gap-3 font-mono text-[14px] tracking-[0.16em] uppercase">
           <span
             className={`${isActive ? "text-ln-accent" : "text-white/65"}${
-              absoluteNumber == null && absoluteTag
+              numberHover
                 ? " underline decoration-dotted decoration-white/30 underline-offset-4 cursor-help"
                 : ""}`}
-            title={absoluteNumber == null && absoluteTag ? absoluteTag : undefined}
+            title={numberHover || undefined}
           >
             {absoluteNumber != null
               ? `E${String(absoluteNumber).padStart(2, "0")}`
@@ -4706,6 +4742,38 @@ function EpisodesPanel({
   }, [videos, seriesId, seriesMediaType, detail, arcScrobbleConn, cloudSignal]);
   const { arcs: arcResult, loading: arcsLoading } = useStoryArcs(detail ?? null, seriesId, groupingId);
 
+  // Manga chapters (mangaChapters.ts). Per-episode data is fetched here
+  // because this is where the episode list is on screen; arc ranges for the
+  // grouping the arcs view holds. Both are no-ops for a show with no data.
+  useEpisodeChapters(detail ?? null, seriesId);
+  useArcChapterRanges(detail ?? null, seriesId, arcResult);
+  const mangaState = useMangaState(seriesId);
+  const mangaKnown = hasMangaData(mangaState);
+  const arcChapterLabel = useCallback(
+    (arc: StoryArc): string | null => {
+      const r = arcResult ? arcChapterRange(arc, mangaState, isLastRealArc(arcResult, arc)) : null;
+      return r ? `Ch. ${formatRange(r)}` : null;
+    },
+    [arcResult, mangaState],
+  );
+  /** An episode row's chapter hover text: the wiki's per-episode chapters,
+   *  else "anime original" for a filler, else the ARC's range (One Piece has
+   *  no per-episode chapters, and an interpolated guess is never shown). */
+  const chapterHintFor = useCallback(
+    (v: VideoEntry): string => {
+      if (!mangaKnown) return "";
+      const own = episodeChapterHint(mangaState.episodes?.[v.id]);
+      if (own) return own;
+      if (mergedKindFlags(v, cloudSignal?.episode_kinds ?? []).filler) {
+        return "Anime original: filler, not adapted from the manga.";
+      }
+      const pos = arcResult ? arcPositionOf(arcResult, v.id) : null;
+      const r = pos && arcResult ? arcChapterRange(pos.arc, mangaState, isLastRealArc(arcResult, pos.arc)) : null;
+      return pos && r ? `${stripArcKindSuffix(pos.arc.name)}: manga chapters ${formatRange(r)}.` : "";
+    },
+    [mangaKnown, mangaState, cloudSignal, arcResult],
+  );
+
   // A remembered grouping always wins. Captured once at mount so the auto-default
   // below cannot fight a choice the user made in this same session.
   const storedGroupingIdRef = useRef(loadArcMode(seriesId).groupingId);
@@ -4834,6 +4902,12 @@ function EpisodesPanel({
     () => countFillerRecap(inArc, cloudSignal?.episode_kinds ?? []),
     [inArc, cloudSignal],
   );
+  // The selected season's chapters, only where per-episode data covers it.
+  const seasonChapters = useMemo(
+    () => derivedRange(inSeason.map((v) => v.id), mangaState.episodes),
+    [inSeason, mangaState],
+  );
+  const openArcChapters = openArc ? arcChapterLabel(openArc) : null;
   // Only anime with any filler/recap get the hover breakdown; live-action shows
   // (zero of both show-wide) render the plain chip with no tooltip.
   const showHasFillerRecap = fillerCount > 0 || recapCount > 0;
@@ -4996,6 +5070,7 @@ function EpisodesPanel({
               onSelect={(arc) => setOpenArcId(arc.id)}
               onGroupingChange={switchArcGrouping}
               onArcContextMenu={openArcMenu}
+              chapterLabelFor={arcChapterLabel}
             />
           </div>
         ) : (
@@ -5024,6 +5099,11 @@ function EpisodesPanel({
                 {arcYearRange(openArc) && (
                   <span className="text-[12px] text-white/40">{arcYearRange(openArc)}</span>
                 )}
+                {openArcChapters && (
+                  <span className="text-[12px] text-white/40 font-mono tabular-nums whitespace-nowrap" title="Manga chapters this arc adapts">
+                    {openArcChapters}
+                  </span>
+                )}
               </div>
             )}
 
@@ -5049,6 +5129,11 @@ function EpisodesPanel({
                   recap={seasonRecap}
                   scope="this season"
                 />
+                {seasonChapters && (
+                  <span className="text-[12px] text-white/40 font-mono tabular-nums whitespace-nowrap" title="Manga chapters this season adapts">
+                    Ch. {formatRange(seasonChapters)}
+                  </span>
+                )}
               </div>
             )}
 
@@ -5074,6 +5159,7 @@ function EpisodesPanel({
                     groupLabel={arcMode ? "arc" : "season"}
                     absoluteNumber={arcMode ? absoluteById.get(v.id) ?? null : null}
                     absoluteTag={arcMode ? "" : absoluteEpisodeHint(seriesId, v.episode, absoluteById.get(v.id)) ?? ""}
+                    chapterHint={chapterHintFor(v)}
                     isNextAiring={v.id === nextAiringId}
                     isDeepLinked={v.id === highlightId}
                     seriesArt={seriesArt}

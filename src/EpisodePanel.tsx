@@ -46,6 +46,10 @@ import {
   arcPositionOf, absoluteEpisodeMap, arcsLikelyAvailable, absoluteEpisodeHint,
   type EpisodeGrouping, type StoryArc,
 } from "./storyArcs";
+import {
+  arcChapterRange, episodeChapterHint, formatRange, hasMangaData, isLastRealArc,
+  useArcChapterRanges, useEpisodeChapters, useMangaState,
+} from "./mangaChapters";
 
 interface Props {
   open: boolean;
@@ -146,6 +150,20 @@ function EpisodePanel({
   const [groupingId, setGroupingId] = useState<string | undefined>(undefined);
   const [openArcId, setOpenArcId] = useState<string | null>(null);
   const { arcs: arcResult, loading: arcsLoading } = useStoryArcs(detail, seriesId, groupingId);
+
+  // Manga chapters, same data as the Detail page (mangaChapters.ts), fetched
+  // only while this drawer is open, i.e. while its episode list is on screen.
+  useEpisodeChapters(open ? detail : null, seriesId);
+  useArcChapterRanges(open ? detail : null, seriesId, arcResult);
+  const mangaState = useMangaState(seriesId);
+  const mangaKnown = hasMangaData(mangaState);
+  const arcChapterLabel = useCallback(
+    (arc: StoryArc): string | null => {
+      const r = arcResult ? arcChapterRange(arc, mangaState, isLastRealArc(arcResult, arc)) : null;
+      return r ? `Ch. ${formatRange(r)}` : null;
+    },
+    [arcResult, mangaState],
+  );
 
   // Restore the remembered Seasons/Arcs choice + grouping whenever the panel
   // (re)opens or the series changes.
@@ -397,6 +415,7 @@ function EpisodePanel({
                 activeGroupingId={groupingId}
                 onSelect={(arc) => setOpenArcId(arc.id)}
                 onGroupingChange={switchGroupingId}
+                chapterLabelFor={arcChapterLabel}
               />
             )
           ) : arcPending || arcsLikelyPending ? (
@@ -431,6 +450,12 @@ function EpisodePanel({
               // Season-mode absolute annotation ("(E88)") on a saga show; empty
               // otherwise. Arc mode shows the absolute number itself, so skip.
               const absHint = arcMode ? null : absoluteEpisodeHint(seriesId, v.episode, absoluteById.get(v.id));
+              // Manga chapters in the same hover, never a visible column.
+              const chapterHint = mangaKnown
+                ? episodeChapterHint(mangaState.episodes?.[v.id])
+                  ?? (showFiller ? "Anime original: filler, not adapted from the manga." : null)
+                : null;
+              const numberHover = [absHint, chapterHint].filter(Boolean).join("\n\n");
               // Unaired = parseable FUTURE air date (undated specials count
               // as aired). The next-to-air row gets the live chip; later
               // unaired rows a static date. Both dim the thumbnail.
@@ -521,8 +546,8 @@ function EpisodePanel({
                     <div className="flex items-center gap-2">
                       <span
                         className={`text-white/45 text-[10.5px] font-mono uppercase tracking-[0.14em]${
-                          absHint ? " underline decoration-dotted decoration-white/30 underline-offset-2 cursor-help" : ""}`}
-                        title={absHint ?? undefined}
+                          numberHover ? " underline decoration-dotted decoration-white/30 underline-offset-2 cursor-help" : ""}`}
+                        title={numberHover || undefined}
                       >
                         {/* Arc mode: absolute whole-series number, so a
                             cross-season arc's rows agree with the arc's range.

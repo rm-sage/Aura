@@ -20,6 +20,7 @@ import type { ActiveScrobbleTarget } from "./useScrobble";
 import type { AddonEntry, ExternalSubtitle, LibraryItem, TrackEntry, VideoEntry } from "./types";
 import EpisodePanel from "./EpisodePanel";
 import { formatAbsoluteEpisode } from "./storyArcs";
+import { useEpisodeChapterLabel } from "./mangaChapters";
 import { setTitleState, titleStateKey } from "./titleState";
 import { pickDefaultAudio, toLang2, type ScoringMeta } from "./audioScoring";
 import { prettyBinding } from "./useKeybindings";
@@ -1342,6 +1343,10 @@ export default function PlayerOverlay({
   silentWakeCodes,
   episodePanel,
 }: Props) {
+  // Manga chapters for the playing episode ("Ch. 590"), read from what the
+  // detail page or the episode drawer already fetched (mangaChapters.ts). The
+  // player never fetches it: no data, no label.
+  const chapterLabel = useEpisodeChapterLabel(activeTarget?.series_id ?? activeTarget?.id, activeTarget?.id);
   // ── Open-menu tracker ──────────────────────────────────────────────
   // Each child menu (TrackMenu, SpeedMenu, ShaderPicker, MoreMenu,
   // VolumeControl) calls `useMenuOpenSync(open)` which adjusts this
@@ -2432,6 +2437,11 @@ export default function PlayerOverlay({
                 )}
                 {activeTarget.episode_title && (
                   <span className="text-white/85">{activeTarget.episode_title}</span>
+                )}
+                {chapterLabel && (
+                  <span className="font-mono text-white/50 text-[12px] ml-2.5" title="Manga chapters this episode adapts">
+                    {chapterLabel}
+                  </span>
                 )}
               </p>
             )}
