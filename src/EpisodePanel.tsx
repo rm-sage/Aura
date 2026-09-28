@@ -421,7 +421,7 @@ function EpisodePanel({
           ) : arcPending || arcsLikelyPending ? (
             // Arcs requested (or known to exist) but not resolved yet: show the
             // grid skeleton so the panel does not flash the season list first.
-            <ArcGridSkeleton perRow={1} />
+            <ArcGridSkeleton />
           ) : loading && visibleEpisodes.length === 0 ? (
             Array.from({ length: 6 }).map((_, i) => (
               <div key={i} className="h-[84px] rounded-xl bg-white/[0.04] animate-pulse" />

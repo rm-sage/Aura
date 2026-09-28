@@ -12,15 +12,8 @@
 // bottom edge. An arc is a "chunk of show you can sit down and watch", so it
 // gets a card that reads like one.
 //
-// TILES PER ROW is derived from how many arcs the active grouping has:
-//   • <= ARC_DENSE_THRESHOLD (Sagas, Combos: One Piece has 12 / 14) -> ONE
-//     full-width banner per row. There are few of them and each is a big
-//     commitment, so they earn the width.
-//   • >  ARC_DENSE_THRESHOLD (Story Arcs: One Piece has 55) -> TWO per row,
-//     same design shrunk down, so a 55-arc show does not become an endless
-//     single column.
-// The count comes from the grouping's own `arc_count` (not the loaded arcs),
-// so the skeleton shown WHILE a grouping loads already has the right shape.
+// ONE full-width banner per row, for every grouping (see TILE_ASPECT for why
+// the two-up density was dropped).
 //
 // Watched state is derived from the SAME two sources every other Aura surface
 // reads (manual marks, then position-implied progress against the library's
@@ -42,10 +35,6 @@ import {
   groupingDisplayName,} from "./storyArcs";
 import type { VideoEntry } from "./types";
 
-/** Above this arc count a grouping is "dense" and switches to two tiles per
- *  row. 20 sits comfortably above the coarse groupings (One Piece: 12 sagas,
- *  14 combos; Naruto: 5) and well below the fine-grained ones (One Piece: 55). */
-const ARC_DENSE_THRESHOLD = 20;
 
 interface ArcGridProps {
   result: ArcResult;
@@ -92,19 +81,21 @@ function watchedCount(episodeIds: string[], resumeId: string | null): number {
   return n;
 }
 
-/** Geometry for the two tile densities. The wide banner is deliberately NOT
- *  16:9: a full-panel-width 16:9 box would be ~450 px tall and only two arcs
- *  would fit on screen. 32:9 keeps the same landscape feel at a height close to
- *  the half-width 16:9 tile, so the two densities read as the same component. */
-function tileGeometry(perRow: 1 | 2): { aspect: string; artWidth: number } {
-  return perRow === 1
-    ? { aspect: "32 / 9", artWidth: 960 }
-    : { aspect: "16 / 9", artWidth: 640 };
-}
+/** Tile geometry: one full-width banner per row, for every grouping. The
+ *  banner is deliberately NOT 16:9: a full-panel-width 16:9 box would be
+ *  ~450 px tall and only two arcs would fit on screen.
+ *
+ *  There used to be a second, two-up 16:9 density for groupings of more than
+ *  20 arcs (One Piece's 55). At half width its meta line had about 200px, so
+ *  once manga chapters joined the episode count and years, the filler count
+ *  was pushed off the tile (Bleach, 21 arcs, sat just over the line). One
+ *  density costs a longer scroll on the fine groupings and keeps every tile's
+ *  facts readable. */
+const TILE_ASPECT = "32 / 9";
+const TILE_ART_WIDTH = 960;
 
 function ArcCard({
   arc,
-  perRow,
   absoluteById,
   resumeId,
   kind,
@@ -115,7 +106,6 @@ function ArcCard({
   arc: StoryArc;
   /** "Ch. 1,058-1,125", or null. */
   chapters: string | null;
-  perRow: 1 | 2;
   absoluteById: Map<string, number>;
   resumeId: string | null;
   /** Aura's own reading of this arc's composition. Replaces the filler marker
@@ -131,11 +121,10 @@ function ArcCard({
   const complete = total > 0 && watched === total;
   const years = arcYearRange(arc);
   const range = arcEpisodeRange(arc, absoluteById);
-  const { aspect, artWidth } = tileGeometry(perRow);
 
   // Server-resize hint sized to the tile, never a full-size master pulled into
   // a banner (memory discipline: the wide tile is ~2x the half-width one).
-  const art = shrinkPoster(arc.image, artWidth);
+  const art = shrinkPoster(arc.image, TILE_ART_WIDTH);
 
   return (
     <button
@@ -154,7 +143,7 @@ function ArcCard({
       className="group relative block w-full text-left overflow-hidden rounded-xl
                  bg-white/5 border border-white/10 hover:border-ln-accent/40
                  transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ln-accent/60"
-      style={{ aspectRatio: aspect }}
+      style={{ aspectRatio: TILE_ASPECT }}
     >
       {art ? (
         <ImageLoader
@@ -167,7 +156,7 @@ function ArcCard({
         />
       ) : (
         // Deliberately EMPTY. The placeholder used to read "no art", centred
-        // in the tile, which at two-up is exactly where the title block starts:
+        // in the tile, which on the old two-up tile was where the title started:
         // the words rendered through the arc name as an unreadable smudge, and
         // there is no collision-free band left on a 16/9 tile once the badges
         // own the top and the title owns the bottom. The button's own tinted
@@ -208,17 +197,16 @@ function ArcCard({
       ) : null}
 
       {/* Overlaid title block. Bottom padding clears the progress bar. */}
-      <div className={`absolute inset-x-0 bottom-0 ${perRow === 1 ? "px-4 pb-3.5" : "px-3 pb-3"}`}>
+      <div className={`absolute inset-x-0 bottom-0 px-4 pb-3.5`}>
         <div
           className={[
             "font-semibold text-white leading-tight",
             "drop-shadow-[0_2px_4px_rgba(0,0,0,0.85)]",
             // Two lines need about 70px of block, and the corner badges end at
-            // 34px, so a narrow window cannot fit both. Aura's own minimum is
-            // 900px wide, where a two-up tile is only 90px tall and the title's
-            // first line would sit ON the badges. One line below 1080px.
+            // 34px, so a short tile cannot fit both: in a narrow window the
+            // title's first line would sit ON the badges. One line below 1080px.
             "line-clamp-2 max-[1080px]:line-clamp-1",
-            perRow === 1 ? "text-[19px]" : "text-[15px]",
+            "text-[19px]",
           ].join(" ")}
         >
           {kind.name}
@@ -247,20 +235,12 @@ function ArcCard({
           className={[
             "mt-1 flex items-center gap-2 overflow-hidden whitespace-nowrap leading-tight",
             "text-white/70 tabular-nums",
-            perRow === 1 ? "text-[12px]" : "text-[11px]",
+            "text-[12px]",
           ].join(" ")}
         >
-          {/* Spelled out on the full-width banner, abbreviated at two-up where
-              the whole line has about 200px. The size ternary right above does
-              the same thing, so adapting the copy to the density too is
-              consistent within the component, and "ep"/"eps" is already Aura's
-              wording for an arc's length: it is what the count chip on the
-              breadcrumb THIS tile opens into says. */}
           <span className="shrink-0 font-medium">
             {total}{" "}
-            {perRow === 1
-              ? total === 1 ? "episode" : "episodes"
-              : total === 1 ? "ep" : "eps"}
+            {total === 1 ? "episode" : "episodes"}
           </span>
           {years && (
             <>
@@ -269,8 +249,8 @@ function ArcCard({
             </>
           )}
           {/* Manga chapters. Quiet, and allowed to truncate like the filler
-              count: at two-up the line has about 200px, and the arc name
-              plus the episode count already say which arc this is. */}
+              count: the arc name plus the episode count already say which
+              arc this is. */}
           {chapters && (
             <>
               <span className="shrink-0 text-white/30" aria-hidden>&middot;</span>
@@ -387,22 +367,21 @@ function GroupingSelect({
 /** Shimmering tiles in the arc grid's own shape. Rendered while arcs resolve:
  *  the TMDB join takes a beat and the panel used to just sit there, so a first
  *  open (or a Sagas -> Story Arc switch) looked like nothing had happened. */
-export function ArcGridSkeleton({ perRow = 1, count }: { perRow?: 1 | 2; count?: number }) {
-  const { aspect } = tileGeometry(perRow);
+export function ArcGridSkeleton({ count }: { count?: number }) {
   // Enough tiles to fill the panel without dominating it, same intent as the
   // episode-list skeleton's five rows.
-  const n = count ?? (perRow === 1 ? 3 : 6);
+  const n = count ?? 3;
   return (
     <div
       role="status"
       aria-label="Loading story arcs"
-      className={`grid gap-3 ${perRow === 1 ? "grid-cols-1" : "grid-cols-2"}`}
+      className="grid gap-3 grid-cols-1"
     >
       {Array.from({ length: n }, (_, i) => (
         <div
           key={i}
           className="rounded-xl bg-white/8 border border-white/8 animate-pulse"
-          style={{ aspectRatio: aspect }}
+          style={{ aspectRatio: TILE_ASPECT }}
         />
       ))}
     </div>
@@ -441,10 +420,6 @@ export default function ArcGrid({
   }, [result.arcs, videos, cloudKinds]);
 
   const active = activeGroupingId ?? result.grouping_id;
-  // Tile density follows the grouping the user asked for, so a switch to a
-  // 55-arc grouping already skeletons as a 2-up grid.
-  const activeCount = result.groupings.find((g) => g.id === active)?.arc_count ?? arcs.length;
-  const perRow: 1 | 2 = activeCount > ARC_DENSE_THRESHOLD ? 2 : 1;
 
   // Fandom art is CC-BY-SA and the licence requires attribution. Only credit it
   // when we actually used it.
@@ -470,14 +445,13 @@ export default function ArcGrid({
       </div>
 
       {loading ? (
-        <ArcGridSkeleton perRow={perRow} />
+        <ArcGridSkeleton />
       ) : (
-        <div className={`grid gap-3 ${perRow === 1 ? "grid-cols-1" : "grid-cols-2"}`}>
+        <div className="grid gap-3 grid-cols-1">
           {arcs.map((arc) => (
             <ArcCard
               key={arc.id}
               arc={arc}
-              perRow={perRow}
               absoluteById={absoluteById}
               kind={
                 kindByArc.get(arc.id) ?? {
