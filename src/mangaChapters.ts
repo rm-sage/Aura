@@ -375,6 +375,32 @@ export function seriesChapterLine(s: MangaSeries | null): string | null {
   return `${reached}${cont}${from ? ` · ${from}` : ""}`;
 }
 
+/** The detail line's FALLBACK, from the fan wiki's per-episode chapters,
+ *  for when MangaUpdates has no usable figure (Bleach: its last part is
+ *  recorded as started with no end). The reach is the highest chapter any
+ *  already-aired episode adapts; "continue from" follows it, and MangaUpdates'
+ *  latest chapter is added when it has one past that reach. Null when the
+ *  wiki has no per-episode data or no aired episode adapts anything. */
+export function wikiChapterLine(
+  episodes: Record<string, number[]> | null | undefined,
+  videos: VideoEntry[],
+  s: MangaSeries | null,
+): string | null {
+  if (!episodes) return null;
+  const now = Date.now();
+  let reach = 0;
+  for (const v of videos) {
+    if ((v.season ?? 0) <= 0) continue;
+    const t = v.released ? Date.parse(v.released) : NaN;
+    if (!Number.isFinite(t) || t > now) continue;
+    for (const c of episodes[v.id] ?? []) if (c > reach) reach = c;
+  }
+  if (reach <= 0) return null;
+  const latest = s?.latest != null && s.latest > reach ? s.latest : null;
+  return `The anime reaches chapter ${formatChapter(reach)} · continue from ${formatChapter(reach + 1)}`
+    + (latest != null ? ` (latest: ${formatChapter(latest)})` : "");
+}
+
 /** Synchronous lookup for the player: the label for an episode, from
  *  whatever the detail page or the episode drawer already fetched. */
 export function useEpisodeChapterLabel(seriesId: string | null | undefined, episodeId: string | null | undefined): string | null {

@@ -133,7 +133,7 @@ import { hasUsableRating } from "../ratingValue";
 import ArcGrid, { ArcGridSkeleton } from "../ArcGrid";
 import {
   arcChapterRange, derivedRange, episodeChapterHint, formatRange, hasMangaData, isLastRealArc,
-  seriesChapterLine, useArcChapterRanges, useEpisodeChapters, useMangaSeries, useMangaState,
+  seriesChapterLine, wikiChapterLine, useArcChapterRanges, useEpisodeChapters, useMangaSeries, useMangaState,
 } from "../mangaChapters";
 import GroupingToggle from "../EpisodeGroupingToggle";
 import {
@@ -1103,7 +1103,12 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // series only (the hook re-checks isAnimeMeta), and only once MAL has
   // settled so the lookup can name the source manga.
   const mangaSeries = useMangaSeries(detail, meta.id, extrasCours[0]?.malId ?? null, coursReady);
-  const mangaLine = seriesChapterLine(mangaSeries);
+  // MangaUpdates first; the fan wiki's per-episode chapters when it has no
+  // usable figure (see wikiChapterLine). The episode list fills that data.
+  const mangaState = useMangaState(meta.id);
+  const mangaUpdatesLine = seriesChapterLine(mangaSeries);
+  const mangaLine = mangaUpdatesLine
+    ?? wikiChapterLine(mangaState.episodes, detail?.videos ?? [], mangaSeries);
   // Library-tab clicks pass `ignoreResumeHint`, which suppresses the
   // CW resume behaviour: from Library, opening a series should drop
   // the user on the episode list at S01E01 regardless of where they
@@ -2598,7 +2603,9 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
               footer={mangaLine ? (
                 <p
                   className="mt-3 max-w-[68ch] text-white/55 text-[12.5px] leading-snug"
-                  title={`Manga chapters from MangaUpdates (${mangaSeries?.title ?? "manga"}). The anime's position is as MangaUpdates last recorded it.`}
+                  title={mangaUpdatesLine
+                    ? `Manga chapters from MangaUpdates (${mangaSeries?.title ?? "manga"}). The anime's position is as MangaUpdates last recorded it.`
+                    : "Manga chapters from the fan wiki's episode pages: the furthest chapter any aired episode adapts."}
                 >
                   <span className="text-white/35 uppercase tracking-[0.14em] text-[10.5px] font-semibold mr-2">Manga</span>
                   {mangaLine}
