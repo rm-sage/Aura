@@ -5,6 +5,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   HISTORY_COMMAND,
+  SCROBBLE_LABELS,
   SCROBBLE_SERVICES,
   knownScrobbleServicesAvailable,
   useScrobbleConnections,
@@ -38,6 +39,7 @@ import {
 } from "../scrobbleRun";
 import ImageLoader from "../ImageLoader";
 import Tooltip from "../Tooltip";
+import { openContextMenu } from "../ContextMenu";
 import { shrinkPoster } from "../posterSize";
 import ErrorBoundary from "../ErrorBoundary";
 import { showAppToast } from "../AppToast";
@@ -183,7 +185,11 @@ function HistoryViewBody({ onSelectMeta }: Props) {
     return [...days.entries()].sort((a, b) => b[0].localeCompare(a[0]));
   }, [entries]);
 
-  const anyService = SCROBBLE_SERVICES.some((service) => conn[service]);
+  const connectedList = useMemo(
+    () => SCROBBLE_SERVICES.filter((service) => conn[service]),
+    [conn],
+  );
+  const anyService = connectedList.length > 0;
   const selectedEntries = useMemo(
     () => entries.filter((e) => selected.has(keyOf(e))),
     [entries, selected],
@@ -210,7 +216,10 @@ function HistoryViewBody({ onSelectMeta }: Props) {
   // decides WHAT to push and asks the user.
   // -------------------------------------------------------------------------
   const runScrobble = useCallback(
-    async (list: HistoryEntry[], what: string) => {
+    // `only` narrows the run to one service ("Scrobble All to Simkl"); every
+    // other rule below is unchanged, so a narrowed run is exactly the slice of
+    // the full run that would have gone to that service.
+    async (list: HistoryEntry[], what: string, only?: ScrobbleService) => {
       if (busy) return;
       if (!anyService) {
         // Simkl is named only in a build that can sign in to it.
@@ -233,6 +242,7 @@ function HistoryViewBody({ onSelectMeta }: Props) {
       let retired = 0;
       for (const entry of list) {
         for (const service of servicesFor(entry, conn)) {
+          if (only && service !== only) continue;
           if (isScrobbled(conn.scope, service, entry.id, entry.played_at)) {
             alreadyDone++;
             continue;
@@ -301,12 +311,19 @@ function HistoryViewBody({ onSelectMeta }: Props) {
       const work: ScrobbleWorkItem[] = [...traktWork, ...anilistWork, ...simklWork];
 
       if (work.length === 0) {
+        const onlyWhy: Record<ScrobbleService, string> = {
+          trakt: "Trakt needs an IMDb id",
+          anilist: "AniList only takes anime",
+          simkl: "Simkl needs an IMDb, TMDB, TVDB or anime id, plus an episode number on an episode",
+        };
         const why =
           alreadyDone > 0
-            ? `Nothing to do — all ${alreadyDone} eligible push${alreadyDone === 1 ? "" : "es"} in ${what} are already scrobbled.`
-            : `Nothing in ${what} is eligible (AniList only takes anime; Trakt needs an IMDb id${
-              conn.simkl ? "; Simkl needs an IMDb, TMDB, TVDB or anime id, plus an episode number on an episode" : ""
-            }).`;
+            ? `Nothing to do: all ${alreadyDone} eligible push${alreadyDone === 1 ? "" : "es"} in ${what}${only ? ` for ${SCROBBLE_LABELS[only]}` : ""} are already scrobbled.`
+            : only
+              ? `Nothing in ${what} can go to ${SCROBBLE_LABELS[only]} (${onlyWhy[only]}).`
+              : `Nothing in ${what} is eligible (AniList only takes anime; Trakt needs an IMDb id${
+                conn.simkl ? "; Simkl needs an IMDb, TMDB, TVDB or anime id, plus an episode number on an episode" : ""
+              }).`;
         showAppToast(
           retired > 0
             ? `${why} ${retired} item${retired === 1 ? " was" : "s were"} refused by the service and won't be retried.`
@@ -339,7 +356,7 @@ function HistoryViewBody({ onSelectMeta }: Props) {
 
       const confirmed = await ask({
         title: "Scrobble history",
-        message: `Scrobble ${n} item${n === 1 ? "" : "s"} from ${what}?`,
+        message: `Scrobble ${n} item${n === 1 ? "" : "s"} from ${what}${only ? ` to ${SCROBBLE_LABELS[only]}` : ""}?`,
         detail,
         confirmLabel: "Scrobble",
         tone: "accent",
@@ -456,13 +473,14 @@ function HistoryViewBody({ onSelectMeta }: Props) {
             total={entries.length}
             selectedCount={selected.size}
             stuck={stuck}
-            anyService={anyService}
+            services={connectedList}
             busy={busy}
-            onScrobbleAll={() => void runScrobble(entries, "your entire history")}
+            onScrobbleAll={(only) => void runScrobble(entries, "your entire history", only)}
             onClearHistory={() => void clearAll()}
-            onScrobbleSelected={() => void runScrobble(
+            onScrobbleSelected={(only) => void runScrobble(
               selectedEntries,
               `${selected.size} selected item${selected.size === 1 ? "" : "s"}`,
+              only,
             )}
             onRemoveSelected={() => void removeSelected()}
             onCancelSelection={() => setSelected(new Set())}
@@ -516,6 +534,69 @@ const PILL = "px-3.5 py-1.5 rounded-full text-xs font-medium border transition-c
   + "disabled:opacity-40 disabled:cursor-default";
 
 /**
+ * A scrobble pill with a menu half. The main half runs every connected
+ * service; the arrow opens "<label> to Trakt / AniList / Simkl", one row per
+ * connected service. With a single service connected the two would be the
+ * same action, so the arrow is left off and it is a plain pill.
+ */
+function ScrobbleSplitButton({
+  label, services, busy, strong = false, onRun,
+}: {
+  label: string;
+  services: ScrobbleService[];
+  busy: boolean;
+  /** Selection mode's slightly stronger accent. */
+  strong?: boolean;
+  onRun: (only?: ScrobbleService) => void;
+}) {
+  const tone = strong
+    ? "bg-ln-accent/20 text-ln-accent border-ln-accent/45 hover:bg-ln-accent/30 hover:text-white"
+    : "bg-ln-accent/15 text-ln-accent border-ln-accent/35 hover:bg-ln-accent/25 hover:text-white";
+  const base = "py-1.5 text-xs font-medium border transition-colors "
+    + "disabled:opacity-40 disabled:cursor-default";
+  if (services.length < 2) {
+    return (
+      <button type="button" disabled={busy} onClick={() => onRun()} className={`${PILL} ${tone}`}>
+        {label}
+      </button>
+    );
+  }
+  return (
+    <div className="flex items-stretch">
+      <button
+        type="button"
+        disabled={busy}
+        onClick={() => onRun()}
+        className={`${base} ${tone} pl-3.5 pr-3 rounded-l-full`}
+      >
+        {label}
+      </button>
+      <Tooltip text="Scrobble to one service" pos="bottom">
+        <button
+          type="button"
+          disabled={busy}
+          aria-label={`${label} to one service`}
+          aria-haspopup="menu"
+          onClick={(e) => {
+            const r = e.currentTarget.getBoundingClientRect();
+            openContextMenu(r.left, r.bottom + 4, services.map((service) => ({
+              label: `${label} to ${SCROBBLE_LABELS[service]}`,
+              onClick: () => onRun(service),
+            })));
+          }}
+          className={`${base} ${tone} pl-2 pr-2.5 rounded-r-full border-l-0 h-full grid place-items-center`}
+        >
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <path d="M6 9l6 6 6-6" />
+          </svg>
+        </button>
+      </Tooltip>
+    </div>
+  );
+}
+
+/**
  * The page header, which BECOMES the selection toolbar while anything is
  * selected. One slot, two states, so the global actions (Scrobble All, Clear
  * history) and the selection actions (Scrobble N, Remove N, Cancel) are never
@@ -534,22 +615,25 @@ const PILL = "px-3.5 py-1.5 rounded-full text-xs font-medium border transition-c
  * selecting), and a separate accent layer marks selection mode itself.
  */
 function HistoryHeader({
-  total, selectedCount, stuck, anyService, busy,
+  total, selectedCount, stuck, services, busy,
   onScrobbleAll, onClearHistory, onScrobbleSelected, onRemoveSelected, onCancelSelection,
 }: {
   total: number;
   selectedCount: number;
   stuck: boolean;
-  anyService: boolean;
+  /** Connected scrobble services, in display order. */
+  services: ScrobbleService[];
   /** A bulk scrobble job is running (module-level, see scrobbleRun.ts). */
   busy: boolean;
-  onScrobbleAll: () => void;
+  /** No argument: every connected service. A service: that one only. */
+  onScrobbleAll: (only?: ScrobbleService) => void;
   onClearHistory: () => void;
-  onScrobbleSelected: () => void;
+  onScrobbleSelected: (only?: ScrobbleService) => void;
   onRemoveSelected: () => void;
   onCancelSelection: () => void;
 }) {
   const selecting = selectedCount > 0;
+  const anyService = services.length > 0;
 
   // Leaving selection mode puts "Clear history" (rest state) where a selection
   // control just was. Cancel now lives on the LEFT, so a double-click on it
@@ -647,15 +731,13 @@ function HistoryHeader({
             </div>
             <div className="flex items-center gap-2">
               {anyService && (
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={onScrobbleSelected}
-                  className={`${PILL} bg-ln-accent/20 text-ln-accent border-ln-accent/45
-                              hover:bg-ln-accent/30 hover:text-white`}
-                >
-                  Scrobble {selectedCount}
-                </button>
+                <ScrobbleSplitButton
+                  label={`Scrobble ${selectedCount}`}
+                  services={services}
+                  busy={busy}
+                  strong
+                  onRun={onScrobbleSelected}
+                />
               )}
               <button
                 type="button"
@@ -687,15 +769,12 @@ function HistoryHeader({
             {total > 0 && (
               <div className="flex items-center gap-2">
                 {anyService && (
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={onScrobbleAll}
-                    className={`${PILL} bg-ln-accent/15 text-ln-accent border-ln-accent/35
-                                hover:bg-ln-accent/25 hover:text-white`}
-                  >
-                    Scrobble All
-                  </button>
+                  <ScrobbleSplitButton
+                    label="Scrobble All"
+                    services={services}
+                    busy={busy}
+                    onRun={onScrobbleAll}
+                  />
                 )}
                 <button
                   type="button"
