@@ -2221,7 +2221,12 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             let in_fs = crate::win32::is_in_native_fullscreen();
             let y_off = if in_fs { 0 } else { TITLE_BAR_H };
             let mut parent_rc = RECT::default();
-            let rect_ok = GetClientRect(parent, &mut parent_rc).is_ok()
+            // Never while minimized: the iconic client rect is 160x28, and
+            // following it shrank the host (and mpv's child) to 160x1, which
+            // restore then had to undo. Holding last_geom keeps the full-size
+            // surface for the restore animation, like the webview.
+            let rect_ok = !IsIconic(parent).as_bool()
+                && GetClientRect(parent, &mut parent_rc).is_ok()
                 && parent_rc.right > parent_rc.left
                 && parent_rc.bottom > parent_rc.top;
             let (target_w, target_h) = if rect_ok {

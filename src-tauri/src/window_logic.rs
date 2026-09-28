@@ -427,6 +427,35 @@ pub fn cancel_quit() {
     FORCE_QUIT.store(false, Ordering::SeqCst);
 }
 
+/// Size the main webview to the window's client area, at (0, 0).
+///
+/// Aura does this itself instead of leaving it to Tauri's auto-resize. The
+/// `unstable` feature (needed for `add_child`, the OAuth popup) builds every
+/// window's webview as a CHILD webview, so wry never attaches its own parent
+/// resize handler and Tauri's auto-resize is the only thing sizing the page.
+/// That auto-resize runs on EVERY Resized event, the minimize one included,
+/// and a minimized borderless window reports its iconic 160x28 rect as its
+/// client area: the whole page was re-laid out at 160x28 while minimized, and
+/// the restore animation flew that tiny stale surface (the title bar alone)
+/// across the screen before the real window appeared. Measured with the
+/// win_probe: WRY_WEBVIEW 3440x1392 -> 160x28 inside the SIZE_MINIMIZED
+/// WM_SIZE. Setup turns auto-resize off and calls this once; the Resized arm
+/// calls it for every resize EXCEPT a minimize, so the page keeps its real
+/// size while minimized and the OS animates the actual content.
+pub fn fit_main_webview<R: Runtime>(app: &AppHandle<R>, size: tauri::PhysicalSize<u32>) {
+    if size.width == 0 || size.height == 0 {
+        return;
+    }
+    let Some(webview) = app.get_webview("main") else { return };
+    let bounds = tauri::Rect {
+        position: tauri::PhysicalPosition::new(0, 0).into(),
+        size: size.into(),
+    };
+    if let Err(e) = webview.set_bounds(bounds) {
+        crate::devlog!(warn, "win", "main webview resize failed: {e}");
+    }
+}
+
 /// Install the window-event handler. Call from Tauri `setup`.
 pub fn install<R: Runtime>(app: &AppHandle<R>) {
     let Some(window) = app.get_webview_window("main") else { return };
@@ -479,7 +508,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
             // (long fetch, heavy render, …) the child can lag the parent.
             // Resyncing in Rust costs nothing and guarantees the child
             // tracks the parent's client area.
-            WindowEvent::Resized(_) => {
+            WindowEvent::Resized(size) => {
                 #[cfg(all(target_os = "windows", debug_assertions))]
                 let t_arm = std::time::Instant::now();
                 // Minimised path — pause MPV (if configured) and BAIL
@@ -519,6 +548,8 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     LAST_MINIMIZED.store(true, Ordering::Relaxed);
                     return;
                 }
+                // Past the minimize bail-out on purpose: see fit_main_webview.
+                fit_main_webview(&handle, *size);
                 // Restored from minimize: tray click, taskbar button, Win+D, or
                 // a second instance raising this one. Wake the engine pump. It
                 // is asleep on a 150 ms HIDDEN_TICK, and its geometry pass is

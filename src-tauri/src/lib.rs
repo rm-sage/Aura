@@ -1952,6 +1952,21 @@ pub fn run() {
                     #[cfg(debug_assertions)]
                     win_probe::install(parent_hwnd);
                 }
+
+                // Aura sizes the main webview itself, skipping minimize (see
+                // window_logic::fit_main_webview for why). Turn Tauri's
+                // auto-resize off, then fit once, since the window may
+                // already be maximized from the saved window state.
+                if let Some(webview) = app.get_webview("main") {
+                    if let Err(e) = webview.set_auto_resize(false) {
+                        crate::devlog!(warn, "win", "main webview auto-resize off failed: {e}");
+                    }
+                }
+                if let Ok(size) = window.inner_size() {
+                    if !matches!(window.is_minimized(), Ok(true)) {
+                        window_logic::fit_main_webview(app.handle(), size);
+                    }
+                }
             }
 
             #[cfg(target_os = "macos")]
