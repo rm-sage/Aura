@@ -619,18 +619,27 @@ fullscreen would require a render rewrite and is deferred.
 
 ## Restore from minimize / tray: the animation runs, the content is just late
 
-**Update, found later: the "tiny box flies to the corner" restore WAS an Aura bug, and it is
-fixed.** The `unstable` Tauri feature (needed for `add_child`) builds the main webview as a CHILD
-webview, so wry attaches no parent resize handler and Tauri's auto-resize is the only thing sizing
-the page. That auto-resize runs on every `Resized` event INCLUDING the minimize one, and a
-minimized borderless window reports its iconic 160x28 rect as its client area: the whole page was
-re-laid out at 160x28 while minimized (measured: `WRY_WEBVIEW` 3440x1392 -> 160x28 inside the
-`SIZE_MINIMIZED` `WM_SIZE`), and DWM animated that stale 160x28 surface, the title bar alone.
-Setup now turns auto-resize off for the main webview and `window_logic::fit_main_webview` sizes
-it on every resize EXCEPT a minimize; the engine pump likewise holds its geometry while the parent
-`IsIconic`. Do not re-enable auto-resize on the main webview. The findings below (late first
-frame, dwell-dependent latency) still stand; they were measured with this bug present, so
-re-measure before relying on the exact numbers.
+**Update, found later: the "tiny box flies to the corner" restore WAS an Aura bug, in three parts,
+all fixed and runtime-confirmed (taskbar and tray both animate the real window now).**
+1. The page shrank while minimized. The `unstable` Tauri feature (needed for `add_child`) builds the
+   main webview as a CHILD webview, so wry attaches no parent resize handler and Tauri's auto-resize
+   is the only thing sizing the page; it ran on the minimize `Resized` too, and a minimized
+   borderless window reports its iconic 160x28 rect as client area (measured: `WRY_WEBVIEW`
+   3440x1392 -> 160x28 inside the `SIZE_MINIMIZED` `WM_SIZE`). Setup turns auto-resize off and
+   `window_logic::fit_main_webview` sizes the page on every resize EXCEPT a minimize.
+2. A minimized window had a 160x28 CLIENT area, because tao's borderless `WM_NCCALCSIZE` also
+   answers while iconic. `win32::install_iconic_frame_guard` hands `WM_NCCALCSIZE` to
+   `DefWindowProc` while `IsIconic`, so a minimized Aura has no client area like any window.
+3. THE ONE THAT MADE THE ANIMATION WORK: the restore stalled on the mpv engine thread. Its host
+   window is a child of the main window owned by that thread, and a restore/show SENDS the child
+   synchronous messages. The pump slept in `park_timeout` (150 ms `HIDDEN_TICK`), which does not
+   wake for messages, so each send waited up to a tick; the OS animation then started with no
+   restored frame and flew the minimized caption, and a tray restore took about a second. The pump
+   now waits in `MsgWaitForMultipleObjects(QS_ALLINPUT)` and `wake_and_resync` posts `WM_NULL`.
+   Cross-process `SW_RESTORE` dropped to 13-25 ms at both 1 s and 20 s dwell (was 60-125 ms).
+   NEVER make a thread that owns a child of the main window sleep without a message wait.
+The engine pump also holds its geometry while the parent `IsIconic`. The findings below were
+measured with all three bugs present; the latency and "no hotspot" conclusions are superseded.
 
 Symptom, and it is real: restoring from the taskbar button or the tray icon looks sudden and
 jarring, with no visible zoom. It is NOT a missing animation. Frame capture through a real restore:
@@ -892,9 +901,10 @@ creep degrades the experience. When adding ANY feature:
   `app_data_dir()/subtitles` and `add_subtitle_to_mpv` enforces containment.
 - "A Tailwind class has no effect" -> check the theme-scale gotchas; confirm against
   `dist/assets/index-*.css`.
-- "Restore from minimize / tray has no animation" / "a tiny box flies to the corner" -> first check
-  the main webview still keeps its size while minimized (`fit_main_webview`, auto-resize off; see
-  the Update at the top of the restore section). Otherwise read that section BEFORE investigating, and note that the nearby restore-latency cost is
+- "Restore from minimize / tray has no animation" / "a tiny box flies to the corner" -> read the
+  Update at the top of the restore section: in order, a thread that owns a child window sleeping
+  without a message wait, the main webview following the minimize resize, tao's iconic
+  `WM_NCCALCSIZE`. Otherwise read that section BEFORE investigating, and note that the nearby restore-latency cost is
   not in Aura's code either. Instrument with `AURA_WIN_PROBE=1 pnpm tauri dev` (`wintiming` label).
 - "Next Up / auto-advance plays a different source than the top of the switcher list" -> read the two
   stream-list invariants above. In order: `sanitize_stream` emitting an unplayable entry,

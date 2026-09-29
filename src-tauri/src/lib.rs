@@ -1949,6 +1949,11 @@ pub fn run() {
                     // Restore-latency probe (dev only). Subclasses the
                     // main wndproc so we can see exactly which message
                     // a cross-process SW_RESTORE is blocking on.
+                    // No client area while minimized (see the guard's
+                    // block comment in win32.rs): the restore animation
+                    // otherwise flies a 160x28 crop of the page.
+                    win32::install_iconic_frame_guard(parent_hwnd);
+
                     #[cfg(debug_assertions)]
                     win_probe::install(parent_hwnd);
                 }

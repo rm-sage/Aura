@@ -1472,3 +1472,54 @@ pub fn set_high_timer_resolution(on: bool) {
         if on { "timeBeginPeriod" } else { "timeEndPeriod" }, r);
 }
 
+
+// ---------------------------------------------------------------------------
+// Minimized frame: give a minimized window NO client area
+//
+// tao answers WM_NCCALCSIZE for an undecorated window by making the WHOLE
+// window rect client area, and it does that while minimized too, so the
+// iconic window keeps a live 160x28 client surface. DWM's restore animation
+// flies that surface (a 160x28 crop of the page) from the taskbar and only
+// then shows the real window. A standard window has no client area while
+// minimized, which is what lets the OS animate its restored snapshot. So
+// while the window is iconic, WM_NCCALCSIZE goes to DefWindowProc instead of
+// tao; every other state keeps tao's borderless frame untouched.
+//
+// Installed after tao's own subclass, so it runs first (subclass procs run
+// most-recent first).
+// ---------------------------------------------------------------------------
+
+const ICONIC_FRAME_SUBCLASS_ID: usize = 0xA0_9A_72;
+
+pub fn install_iconic_frame_guard(hwnd: isize) {
+    use windows::Win32::UI::Shell::SetWindowSubclass;
+    let ok = unsafe {
+        SetWindowSubclass(
+            HWND(hwnd as *mut c_void),
+            Some(iconic_frame_proc),
+            ICONIC_FRAME_SUBCLASS_ID,
+            0,
+        )
+    };
+    if !ok.as_bool() {
+        crate::devlog!(warn, "win32", "minimized-frame guard failed to install");
+    }
+}
+
+unsafe extern "system" fn iconic_frame_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+    _id: usize,
+    _ref_data: usize,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::Shell::DefSubclassProc;
+    use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, IsIconic, WM_NCCALCSIZE};
+    unsafe {
+        if msg == WM_NCCALCSIZE && IsIconic(hwnd).as_bool() {
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        DefSubclassProc(hwnd, msg, wparam, lparam)
+    }
+}

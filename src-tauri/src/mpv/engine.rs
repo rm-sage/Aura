@@ -605,6 +605,11 @@ pub fn set_display_awake_desired(awake: bool) {
 /// rather than an unpark aimed at a dead thread.
 static PUMP_THREAD: Mutex<Option<thread::Thread>> = Mutex::new(None);
 
+/// The engine's host window, so `wake_and_resync` can post it a no-op
+/// message: the pump waits in `MsgWaitForMultipleObjects`, which an unpark
+/// does not end. 0 while the engine is not running.
+static PUMP_HWND: AtomicIsize = AtomicIsize::new(0);
+
 /// Set by [`wake_and_resync`], consumed once per pump iteration. Forces BOTH
 /// the parent-visibility re-detect and the geometry pass, which are otherwise
 /// rate-limited / edge-triggered and would sleep through a restore.
@@ -636,6 +641,19 @@ pub fn wake_and_resync() {
     if let Ok(guard) = PUMP_THREAD.lock() {
         if let Some(t) = guard.as_ref() {
             t.unpark();
+        }
+    }
+    // The pump's wait is a message wait (see the end of its loop), so a
+    // posted WM_NULL is what actually cuts it short.
+    let raw = PUMP_HWND.load(Ordering::Acquire);
+    if raw != 0 {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                Some(HWND(raw as *mut c_void)),
+                windows::Win32::UI::WindowsAndMessaging::WM_NULL,
+                windows::Win32::Foundation::WPARAM(0),
+                windows::Win32::Foundation::LPARAM(0),
+            );
         }
     }
 }
@@ -1939,6 +1957,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         if let Ok(mut g) = PUMP_THREAD.lock() {
             *g = Some(thread::current());
         }
+        PUMP_HWND.store(hwnd.0 as isize, Ordering::Release);
         loop {
             let tick_start = Instant::now();
 
@@ -2577,12 +2596,21 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             };
             let elapsed = tick_start.elapsed();
             if elapsed < tick_target {
-                // park_timeout, not sleep: `wake_and_resync` unparks this
-                // thread, so a restore cuts a 150 ms HIDDEN_TICK short instead
-                // of waiting it out. A spurious early return costs one extra
-                // loop iteration and nothing else. Same OS wait as sleep
-                // otherwise, so frame pacing at the 5 ms TICK is unchanged.
-                thread::park_timeout(tick_target - elapsed);
+                // A MESSAGE wait, not park_timeout or sleep. The host window
+                // is a child of Aura's main window but belongs to THIS thread,
+                // and Windows sends a child synchronous messages while it
+                // restores or shows the parent (paint, erase, position),
+                // blocking the main thread until this thread answers. Parked
+                // on a 150 ms HIDDEN_TICK, it answered each one up to a tick
+                // late, which stalled the restore: the OS animation started
+                // with no restored frame and flew the minimized window's
+                // 160x28 caption instead, and a tray restore took about a
+                // second. This wakes as soon as a message arrives (the loop's
+                // PeekMessage drain then answers it), and `wake_and_resync`
+                // posts WM_NULL to end it early. Otherwise the same timed
+                // wait, so frame pacing at the 5 ms TICK is unchanged.
+                let ms = (tick_target - elapsed).as_millis().clamp(1, u32::MAX as u128) as u32;
+                let _ = MsgWaitForMultipleObjects(None, false, ms, QS_ALLINPUT);
             }
         }
 
@@ -2612,6 +2640,7 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         if let Ok(mut g) = PUMP_THREAD.lock() {
             *g = None;
         }
+        PUMP_HWND.store(0, Ordering::Release);
         FORCE_RESYNC.store(false, Ordering::Release);
         crate::devlog!(info, "mpv", "engine torn down cleanly");
     }
