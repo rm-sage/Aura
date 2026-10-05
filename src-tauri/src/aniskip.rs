@@ -1115,6 +1115,14 @@ pub struct PreparedWindow {
     pub song_title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub song_artist: Option<String>,
+    /// `"{mal_id}:{episode}"`: the AniSkip entry and LOCAL episode an
+    /// "aniskip" window was fetched for. The AuraSkip menu offers vote arrows
+    /// only when this matches its own resolution, because a vote goes to
+    /// AniSkip by `skip_id` alone: a window fetched for another cour would
+    /// otherwise let a downvote land on that cour's (correct) row. Omitted
+    /// from the wire when absent, like the fields above.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub skip_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1444,11 +1452,14 @@ pub async fn resolve_mal_for_aniskip(
 
     // Step 3 + 4 — Fribb fallback via the cour-aware anime_id_map.
     if let Some(imdb) = series_imdb.as_deref() {
-        if let Some(mal) = crate::anime_id_map::lookup_mal(imdb, season) {
+        // The STRICT season lookups: a lone Fribb row is accepted for a later
+        // season only when it is tagged with that season (see
+        // anime_id_map::lookup_mal_for_season).
+        if let Some(mal) = crate::anime_id_map::lookup_mal_for_season(imdb, season) {
             crate::devlog!(info, "aniskip", "step 3: fribb mal {imdb}/{season:?} → {mal}");
             return Some(mal);
         }
-        if let Some(anilist) = crate::anime_id_map::lookup(imdb, season) {
+        if let Some(anilist) = crate::anime_id_map::lookup_for_season(imdb, season) {
             crate::devlog!(
                 info, "aniskip",
                 "step 4: fribb anilist {imdb}/{season:?} → {anilist} → AniList idMal",

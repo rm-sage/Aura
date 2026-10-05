@@ -285,6 +285,11 @@ export interface VideoEntry {
    *  movies, and addons without the patch. */
   anilist_id?: number | null;
   anilist_episode?: number | null;
+  /** AIOMetadata-embedded MyAnimeList id for this episode's cour/season and
+   *  the episode number LOCAL to it. The AniSkip lookup prefers this pair
+   *  over the series-level `mal_id`, which is the FIRST cour's. */
+  mal_id?: number | null;
+  mal_episode?: number | null;
   /** Streams the meta addon embedded in this video (Stremio parity). When
    *  present, the detail page and Next-Up show these INSTEAD of the addon
    *  stream fan-out, and the in-player source switcher lists them first.

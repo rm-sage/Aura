@@ -26,6 +26,7 @@ import { pickDefaultAudio, toLang2, type ScoringMeta } from "./audioScoring";
 import { prettyBinding } from "./useKeybindings";
 import { loadAuraSettings, saveAuraSettings } from "./auraSettings";
 import AniSkipMenu from "./AniSkipMenu";
+import { skipSourceLabel } from "./skipSource";
 import SubtitleSyncPanel, { type SyncAnchorPair } from "./SubtitleSyncPanel";
 import { MenuTrackerCtx, useMenuOpenSync, type MenuTracker } from "./menuTracker";
 import { copyTextToClipboard } from "./clipboard";
@@ -3462,8 +3463,8 @@ function Scrubber({
               </div>
               <div className="text-white/45 text-[10px] mt-0.5">
                 {(hoveredSegment.seg.end - hoveredSegment.seg.start).toFixed(1)}s
-                {hoveredSegment.seg.source && hoveredSegment.seg.source !== "aniskip" && (
-                  <span className="ml-2">· source: {hoveredSegment.seg.source}</span>
+                {hoveredSegment.seg.source && (
+                  <span className="ml-2">· {skipSourceLabel(hoveredSegment.seg.source)}</span>
                 )}
                 {hoveredSegment.seg.auto && (
                   <span className="ml-2 text-amber-300/80">· auto-skip</span>
@@ -4511,6 +4512,9 @@ interface AuraSkipWindow {
    *  "aniskip". Threaded through so the AniSkipMenu can call
    *  vote_skip_time without re-fetching. */
   skip_id?: string | null;
+  /** `"{malId}:{episode}"` the AniSkip window was fetched for (see Rust
+   *  PreparedWindow::skip_ref). The menu votes only when it matches. */
+  skip_ref?: string | null;
   /** Opening / ending song for this window, when it was identified with
    *  certainty. Absent is the normal case for non-anime and for any
    *  ambiguous match, and the UI falls back to its generic label. */

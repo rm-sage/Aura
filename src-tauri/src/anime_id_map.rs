@@ -346,12 +346,39 @@ pub fn lookup_mal(imdb_id: &str, season: Option<u32>) -> Option<u64> {
     lookup_row(imdb_id, season).and_then(|r| r.mal_id)
 }
 
+/// STRICT season variants for AniSkip, whose timings belong to one MAL entry
+/// and one LOCAL episode. They differ from `lookup` / `lookup_mal` only for a
+/// season > 1 on a show with a single Fribb row: the lenient lookup returns
+/// that row for ANY season (One Piece, Naruto Shippuden: one absolute-numbered
+/// entry), and pairing it with a later season's LOCAL episode fetches another
+/// episode's opening. Here the lone row must be a main-run row tagged with
+/// that season, as for multi-row shows. The scrobblers keep the lenient
+/// lookup (their offset handling expects it).
+pub fn lookup_mal_for_season(imdb_id: &str, season: Option<u32>) -> Option<u64> {
+    lookup_row_with(imdb_id, season, true).and_then(|r| r.mal_id)
+}
+
+/// AniList slot of [`lookup_mal_for_season`].
+pub fn lookup_for_season(imdb_id: &str, season: Option<u32>) -> Option<u64> {
+    lookup_row_with(imdb_id, season, true).and_then(|r| r.anilist_id)
+}
+
 fn lookup_row(imdb_id: &str, season: Option<u32>) -> Option<AnimeIdRow> {
+    lookup_row_with(imdb_id, season, false)
+}
+
+fn lookup_row_with(imdb_id: &str, season: Option<u32>, strict: bool) -> Option<AnimeIdRow> {
     let g = map_slot().lock().ok()?;
-    let entries = g.get(imdb_id)?;
+    pick_row(g.get(imdb_id)?, season, strict)
+}
+
+/// The row choice behind every lookup, kept pure so it can be tested.
+fn pick_row(entries: &[AnimeIdRow], season: Option<u32>, strict: bool) -> Option<AnimeIdRow> {
     if entries.is_empty() { return None; }
-    // Unambiguous single-row show — no season disambiguation needed.
-    if entries.len() == 1 {
+    // Unambiguous single-row show: no season disambiguation needed, except
+    // in strict mode for a later season (see lookup_mal_for_season).
+    let later_season = matches!(season, Some(s) if s > 1);
+    if entries.len() == 1 && !(strict && later_season) {
         return entries.first().cloned();
     }
     match season {
@@ -417,4 +444,45 @@ pub fn resolve_cour_anilist_id(imdb_id: String, season: Option<u32>) -> Option<u
 #[allow(dead_code)]
 pub fn entry_count() -> usize {
     map_slot().lock().map(|g| g.len()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(mal: u64, season: Option<u32>, main: bool) -> AnimeIdRow {
+        AnimeIdRow { anilist_id: Some(mal + 100_000), mal_id: Some(mal), season_tvdb: season, season_tmdb: None, is_main: main }
+    }
+
+    #[test]
+    fn lenient_single_row_answers_every_season() {
+        let one = [row(21, None, true)];
+        assert_eq!(pick_row(&one, Some(3), false).and_then(|r| r.mal_id), Some(21));
+    }
+
+    #[test]
+    fn strict_single_row_needs_the_season_tag_for_later_seasons() {
+        // One Piece / Naruto Shippuden shape: one untagged absolute entry.
+        let untagged = [row(21, None, true)];
+        assert_eq!(pick_row(&untagged, Some(3), true).and_then(|r| r.mal_id), None);
+        // A lone row tagged for another season is another cour.
+        let other = [row(500, Some(1), true)];
+        assert_eq!(pick_row(&other, Some(2), true).and_then(|r| r.mal_id), None);
+        // Tagged for the requested season: accepted.
+        let tagged = [row(600, Some(2), true)];
+        assert_eq!(pick_row(&tagged, Some(2), true).and_then(|r| r.mal_id), Some(600));
+        // Season 1 / unknown behave as before.
+        assert_eq!(pick_row(&untagged, Some(1), true).and_then(|r| r.mal_id), Some(21));
+        assert_eq!(pick_row(&untagged, None, true).and_then(|r| r.mal_id), Some(21));
+    }
+
+    #[test]
+    fn multi_row_season_match_is_unchanged_by_strict() {
+        let rows = [row(1, Some(1), true), row(2, None, false), row(3, Some(2), true)];
+        for strict in [false, true] {
+            assert_eq!(pick_row(&rows, Some(2), strict).and_then(|r| r.mal_id), Some(3));
+            assert_eq!(pick_row(&rows, Some(1), strict).and_then(|r| r.mal_id), Some(1));
+            assert_eq!(pick_row(&rows, Some(4), strict).and_then(|r| r.mal_id), None);
+        }
+    }
 }

@@ -873,6 +873,18 @@ creep degrades the experience. When adding ANY feature:
   must be baked. IntroDB needs an IMDb (`tt`) root and a season/episode >= 1; DevConsole `[introdb]`
   logs which numbering matched (or every numbering that missed), a window dropped for not fitting
   the file's duration, and a lookup that missed the 5 s wait (`INTRODB_WAIT_MS`).
+- "Skip markers off by tens of seconds on a later season of an anime" -> the AniSkip MAL id paired
+  with the wrong episode. AniSkip timings belong to ONE MAL entry and its LOCAL episode, and a
+  multi-season show's series-level ids (`detail.mal_id`, kitsu/anidb/anilist, the title search) all
+  name the FIRST cour: Bleach TYBW S3E7 was stamped with part 1 ep 7's opening. The pipeline
+  (`App.tsx`, "Step 0") now prefers the playing video's own pair from the addon (`mal_id` +
+  `mal_episode` from AIOMetadata's `_malId` / `_malEpisode`, else `anilist_id` + `anilist_episode`),
+  used only whole; for a tt-keyed season > 1 it NEVER falls back to series-level ids
+  (`laterSeasonTt`), and the Fribb resolver uses the strict `lookup_mal_for_season`. Keep two
+  numbers: MAL-local `episodeNum` for AniSkip, addon-season `seasonEpisodeNum` for PublicMetaDB
+  (TMDB-keyed). Each AniSkip window carries `skip_ref` ("mal:episode"); the AuraSkip menu adopts
+  it and shows vote arrows only on a matching window, because a vote goes to AniSkip by `skip_id`
+  alone. DevConsole `[aniskip]` logs which step resolved the id.
 - "No Seasons/Arcs toggle on an anime" -> `arcs.rs`. In order: `AURA_TMDB_KEY` baked (or a user key in
   the keyring), a resolvable TMDB id (`MetaDetail.tmdb_id`, else the `/find` by IMDb id), and a TMDB
   episode group of `type == 5` that clears the coverage bar. Most shows have no arcs at all: arcs are

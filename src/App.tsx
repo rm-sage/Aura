@@ -247,6 +247,9 @@ interface PreparedWindow {
    *  their own copies of this shape and must change with it. */
   song_title?:  string | null;
   song_artist?: string | null;
+  /** "aniskip" windows only: `"{malId}:{episode}"`, the AniSkip entry the
+   *  window was fetched for. Mirrors Rust's PreparedWindow::skip_ref. */
+  skip_ref?: string | null;
 }
 
 // Kai-derived chapter heuristics (live-action + anime where AniSkip
@@ -3710,6 +3713,9 @@ export default function App() {
             // returns the correct timings.
             //
             // Resolution priority:
+            //   0. The playing video's own cour ids from the addon
+            //      (mal_id/mal_episode, else anilist_id/anilist_episode),
+            //      used only as a whole pair.
             //   1. Anime-prefix video id (kitsu/mal/anidb/anilist) →
             //      extract the cour-specific show id from target.id
             //      and resolve via yuna.moe. AIOMetadata's cour-
@@ -3720,12 +3726,9 @@ export default function App() {
             //      meta detail. These are typically cour 1's ids for
             //      multi-cour shows, so they only match for cour 1
             //      playback.
-            //   3. Title-based Jikan search — last-resort fuzzy match.
-            //
-            // AIOMetadata may also stamp the cour-specific malId
-            // directly on the video as `mal_id` — we'd accept that
-            // if AIOMetadata starts emitting it, but the wire shape
-            // is parsed off the video id below.
+            //   3. Title-based search: last-resort exact-title match.
+            // 2 and 3 never run for a tt-keyed season > 1 (laterSeasonTt):
+            // they name the first cour.
             let malId: number | null = null;
             const tryResolve = async (src: "kitsu" | "anidb" | "anilist", id: number | null | undefined) => {
               if (!id) return null;
@@ -3733,11 +3736,59 @@ export default function App() {
                 return await invoke<number | null>("resolve_mal_id", { source: src, id });
               } catch { return null; }
             };
+            // TMDB id for PublicMetaDB on an anime: the detail's own, else
+            // resolved through yuna.moe from whichever anime id the detail
+            // has (AIOMetadata's anime `_tmdbId` is unreliable). Shared by the
+            // no-MAL branch and the anime gap-fill below.
+            const resolveAnimeTmdb = async (): Promise<number | null> => {
+              let tmdb: number | null = detail?.tmdb_id ?? null;
+              const tmdbSources: ["kitsu" | "anidb" | "anilist", number | null | undefined][] = [
+                ["kitsu",   detail?.kitsu_id],
+                ["anidb",   detail?.anidb_id],
+                ["anilist", (detail as { anilist_id?: number | null } | null)?.anilist_id],
+              ];
+              for (const [src, sid] of tmdbSources) {
+                if (tmdb != null) break;
+                if (sid == null) continue;
+                try {
+                  tmdb = await invoke<number | null>(
+                    "resolve_anime_tmdb_id", { source: src, id: sid },
+                  );
+                } catch { /* best-effort, leave null */ }
+              }
+              return tmdb;
+            };
+            // Step 0: the playing episode's OWN cour ids, from the addon.
+            // AIOMetadata stamps every video with the MAL entry of its cour
+            // (`_malId` / `_malEpisode`, parsed as mal_id / mal_episode) and
+            // the AniList one (anilistId / anilistEpisode). Either pair names
+            // the exact AniSkip entry and its LOCAL episode, so it beats every
+            // step below. A pair is used only whole: a cour id with some other
+            // episode number is the very mis-pairing this exists to prevent.
+            // Read from detail.videos, not `target`: the enrichment effect
+            // stamps the AniList pair onto activeTarget only later.
+            let courEpisode: number | null = null;
+            const playingVideo = detail?.videos?.find((v) => v.id === target.id) ?? null;
+            if (playingVideo?.mal_id && playingVideo.mal_episode) {
+              malId = playingVideo.mal_id;
+              courEpisode = playingVideo.mal_episode;
+            } else if (playingVideo?.anilist_id && playingVideo.anilist_episode) {
+              const viaAnilist = await tryResolve("anilist", playingVideo.anilist_id);
+              if (viaAnilist) {
+                malId = viaAnilist;
+                courEpisode = playingVideo.anilist_episode;
+              }
+            }
+            if (malId) {
+              console.info(
+                `[aniskip] per-episode ids from the addon -> mal=${malId} ep=${courEpisode}`,
+              );
+            }
             // Step 1 — parse cour-specific show id from target.id.
             // `kitsu:49240:9` → ("kitsu", 49240); `mal:59978:9` is
             // already the MAL id (no round-trip needed).
             const idSegments = target.id.split(":");
-            if (idSegments.length === 3) {
+            if (!malId && idSegments.length === 3) {
               const provider = idSegments[0].toLowerCase();
               const showId = Number(idSegments[1]);
               if (Number.isFinite(showId)) {
@@ -3759,10 +3810,12 @@ export default function App() {
             // AniSkip menu already uses, which is why the menu showed the correct
             // mal=55825 for Hell's Paradise S2 while this auto-stamp used 46569
             // (S1). Gated to tt-style ids with season > 1: season 1 and anime-
-            // prefix ids (Step 1) already resolve correctly. On failure it falls
-            // through to Step 2, so this can only improve resolution.
-            if (!malId && target.id.startsWith("tt")
-                && Number.isFinite(target.season as number) && (target.season as number) > 1) {
+            // prefix ids (Step 1) already resolve correctly. When it fails, the
+            // series-level steps below are SKIPPED for these ids (see
+            // laterSeasonTt): every one of them names the first cour.
+            const laterSeasonTt = target.id.startsWith("tt")
+              && Number.isFinite(target.season as number) && (target.season as number) > 1;
+            if (!malId && laterSeasonTt) {
               const seriesImdb = target.series_id?.startsWith("tt")
                 ? target.series_id
                 : target.id.split(":")[0];
@@ -3780,21 +3833,32 @@ export default function App() {
                   );
                 }
               } catch (e) {
-                console.warn(`[aniskip] season-aware resolve threw: ${String(e)} — falling back to detail.mal_id`);
+                console.warn(`[aniskip] season-aware resolve threw: ${String(e)}`);
+              }
+              if (!malId) {
+                console.info(
+                  `[aniskip] no cour-specific MAL id for ${target.id} (season ${target.season}); ` +
+                  `not borrowing the series-level id, which names the first cour`,
+                );
               }
             }
-            // Step 2 — meta-detail anime ids. Only hit when step 1
-            // didn't resolve (legacy tt-style ids or unrecognised
-            // prefix).
-            if (!malId) {
+            // Step 2: meta-detail anime ids. Only hit when nothing above
+            // resolved (legacy tt-style ids or unrecognised prefix), and
+            // NEVER for a tt-keyed season > 1: every id here (mal, kitsu,
+            // anidb, anilist, and the title search) is the SERIES entry,
+            // which MAL treats as the first cour, and pairing it with a later
+            // season's local episode fetched another cour's timings. Bleach
+            // TYBW S3E7 (part 3) was stamped with part 1 ep 7's opening, tens
+            // of seconds off. No window beats a wrong auto-skip.
+            if (!malId && !laterSeasonTt) {
               malId = detail?.mal_id ?? null;
             }
-            if (!malId) {
+            if (!malId && !laterSeasonTt) {
               malId = await tryResolve("kitsu",   detail?.kitsu_id)
                    ?? await tryResolve("anidb",   detail?.anidb_id)
                    ?? await tryResolve("anilist", (detail as { anilist_id?: number | null } | null)?.anilist_id);
             }
-            if (!malId && detail?.name) {
+            if (!malId && !laterSeasonTt && detail?.name) {
               // Year hint from `release_info` ("2023" or "2023-2024").
               // Jikan's TV-only filter plus exact-title scoring keeps
               // false positives at bay; we never accept a fuzzy match.
@@ -3817,7 +3881,28 @@ export default function App() {
               // chapter path still runs so chaptered live-action keeps
               // producing windows.
               let pmdbWindows: PreparedWindow[] = [];
-              const laTmdb = detail?.tmdb_id ?? null;
+              let laTmdb = detail?.tmdb_id ?? null;
+              // A tt-keyed later season of an ANIME lands here when no cour-
+              // specific MAL id was found (the series-level ids are skipped on
+              // purpose, see laterSeasonTt). It is still an anime: mark it,
+              // and resolve its TMDB id the way the anime gap-fill does, so
+              // PublicMetaDB can still answer for it.
+              const animeIds = !!(detail?.mal_id || detail?.kitsu_id || detail?.anidb_id
+                || (detail as { anilist_id?: number | null } | null)?.anilist_id);
+              // Also Aura's general anime check: a Cinemeta-only detail often
+              // carries no anime ids at all, and the title search that used to
+              // mark it from here is skipped for later seasons.
+              const isAnime = animeIds || (!!detail && isAnimeMeta({
+                media_type: detail.media_type,
+                id: detail.id,
+                genres: detail.genres,
+                original_language: detail.original_language,
+                production_countries: detail.production_countries,
+              }));
+              if (laterSeasonTt && isAnime) {
+                markAnimeId(seriesId);
+                if (animeIds && laTmdb == null) laTmdb = await resolveAnimeTmdb();
+              }
               const laSegs = target.id.split(":");
               // The segment fallback is for IMDb-style episode ids
               // (tt…:S:E). An anime-prefix id (kitsu:N:M, mal:N:M, …)
@@ -3871,9 +3956,17 @@ export default function App() {
             // field.
             const idParts = target.id.split(":");
             const idEpisode = Number(idParts[idParts.length - 1]);
-            const episodeNum = Number.isFinite(target.episode_num as number)
+            // Two numbers, never mixed. `seasonEpisodeNum` is the addon's own,
+            // within its season (TVDB / TMDB shaped): PublicMetaDB is keyed by
+            // it. `episodeNum` is LOCAL to the MAL entry: AniSkip, its cache
+            // key, skip_ref, the neighbour profile and theme songs are keyed by
+            // it, and the addon's cour-local number (Step 0) wins when used.
+            // They differ whenever one season spans several MAL entries
+            // (Spy x Family 1:15 is MAL Part 2 ep 3).
+            const seasonEpisodeNum = Number.isFinite(target.episode_num as number)
               ? (target.episode_num as number)
               : idEpisode;
+            const episodeNum = courEpisode != null ? courEpisode : seasonEpisodeNum;
             if (!Number.isFinite(episodeNum)) {
               // Can't index AniSkip without an episode number, but a
               // chaptered file can still yield skip windows.
@@ -3922,6 +4015,7 @@ export default function App() {
                     source:  w.source,
                     auto:    modeFor(w.kind) === "auto",
                     skip_id: w.skip_id ?? null,
+                    skip_ref: `${malId}:${episodeNum}`,
                   }));
               }
             } catch (err) {
@@ -3930,35 +4024,18 @@ export default function App() {
               console.warn(`[aniskip] lookup failed: ${String(err)}`);
             }
             // publicmetadb anime fallback — best-effort SECONDARY source.
-            // Fires only when AniSkip left an OP or ED gap. The TMDB id
-            // is resolved from yuna.moe's `themoviedb` (anime `_tmdbId`
-            // from AIOMetadata is unreliable) using whichever anime id
-            // we have. Fills ONLY the kinds AniSkip didn't supply. NOTE:
-            // for multi-cour anime the MAL-local episode may not align
-            // with TMDB numbering — that mis-key is the accepted
-            // "best-effort" cost (AniSkip remains anime's primary source).
+            // Fires only when AniSkip left an OP or ED gap. Fills ONLY the
+            // kinds AniSkip didn't supply. Keyed by TMDB season + episode, so
+            // it is asked with the addon's season-relative number
+            // (seasonEpisodeNum), never the MAL-local one.
             try {
               const haveOp = prepared.some((w) => w.type === "op" || w.type === "mixed-op");
               const haveEd = prepared.some((w) => w.type === "ed");
-              if ((!haveOp || !haveEd) && Number.isFinite(episodeNum)) {
-                let animeTmdb: number | null = detail?.tmdb_id ?? null;
-                const tmdbSources: ["kitsu" | "anidb" | "anilist", number | null | undefined][] = [
-                  ["kitsu",   detail?.kitsu_id],
-                  ["anidb",   detail?.anidb_id],
-                  ["anilist", (detail as { anilist_id?: number | null } | null)?.anilist_id],
-                ];
-                for (const [src, sid] of tmdbSources) {
-                  if (animeTmdb != null) break;
-                  if (sid == null) continue;
-                  try {
-                    animeTmdb = await invoke<number | null>(
-                      "resolve_anime_tmdb_id", { source: src, id: sid },
-                    );
-                  } catch { /* best-effort — leave null */ }
-                }
+              if ((!haveOp || !haveEd) && Number.isFinite(seasonEpisodeNum)) {
+                const animeTmdb = await resolveAnimeTmdb();
                 if (animeTmdb != null) {
                   const pmdb = await fetchPublicmetadbWindows(
-                    animeTmdb, "tv", target.season ?? 1, episodeNum, modeFor,
+                    animeTmdb, "tv", target.season ?? 1, seasonEpisodeNum, modeFor,
                   );
                   for (const w of pmdb) {
                     if (w.type === "op" && !haveOp) prepared.push(w);

@@ -37,10 +37,11 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ActiveScrobbleTarget } from "./useScrobble";
 import {
-  INTRODB_SINGLE_SOURCE, INTRODB_SOURCE, introDbHasKey, introDbImdbRoot,
+  introDbHasKey, introDbImdbRoot,
   introDbPrimaryNumbering, submitToIntroDb,
 } from "./introdb";
 import { peekCachedDetailById } from "./metaCache";
+import { skipSourceLabel } from "./skipSource";
 
 /** Mirrors PlayerOverlay's AuraSkipWindow shape so this module can be
  *  imported without a circular dep. Local copy is intentional. */
@@ -51,6 +52,9 @@ export interface AniSkipMenuWindow {
   source: string;
   auto: boolean;
   skip_id?: string | null;
+  /** `"{malId}:{episode}"` an "aniskip" window was fetched for. Votes are
+   *  offered only when it matches this menu's own resolution. */
+  skip_ref?: string | null;
   /** Opening / ending song, when identified. This local copy of the window
    *  shape is deliberate (it avoids a circular import with PlayerOverlay);
    *  keep it in step with that file and with App.tsx. */
@@ -116,21 +120,6 @@ function parseTimeInput(input: string): number | null {
   return nums[0] * 3600 + nums[1] * 60 + nums[2];
 }
 
-/** Where a window came from, as shown under its row. */
-function sourceLabel(source: string): string {
-  switch (source) {
-    case "aniskip":             return "AniSkip";
-    case INTRODB_SOURCE:        return "IntroDB";
-    case INTRODB_SINGLE_SOURCE: return "IntroDB (single submission)";
-    case "publicmetadb":        return "PublicMetaDB";
-    case "chapter":             return "Chapter";
-    case "chapter-heuristic":   return "Chapter guess";
-    case "silencedetect":       return "Detected";
-    case "aniskip-neighbour":   return "Other episodes";
-    default:                    return source;
-  }
-}
-
 function skipLabel(kind: string): string {
   switch (kind) {
     case "op":       return "Opening";
@@ -156,7 +145,7 @@ export default function AniSkipMenu({
   // entry indexing wants (e.g. Frieren cour 2 ep 9 → MAL 59978 ep 9,
   // NOT absolute 37). Reads from activeTarget.episode_num set by
   // handlePlayStream from the VideoEntry.
-  const courEpisode = useMemo(() => {
+  const targetEpisode = useMemo(() => {
     if (!activeTarget) return null;
     if (Number.isFinite(activeTarget.episode_num as number)) {
       return activeTarget.episode_num as number;
@@ -168,12 +157,60 @@ export default function AniSkipMenu({
     return Number.isFinite(last) ? last : null;
   }, [activeTarget]);
 
+  // The AniSkip episode once a per-episode id pair from the addon resolved
+  // it (see the effect below); null means "use targetEpisode".
+  const [pairEpisode, setPairEpisode] = useState<number | null>(null);
+  const courEpisode = pairEpisode ?? targetEpisode;
+  // The AniSkip entry the skip pipeline ACTUALLY fetched this episode's
+  // windows from (`skip_ref` on its "aniskip" windows). When present it is
+  // authoritative: re-deriving it here could disagree (a meta cache entry that
+  // expired mid-episode, another addon's detail), which would hide the vote
+  // arrows on a correct window and point a submission at another entry.
+  const stampedRef = useMemo(() => {
+    const ref = windows.find((w) => w.source === "aniskip" && w.skip_ref)?.skip_ref ?? null;
+    const m = ref ? /^(\d+):(\d+)$/.exec(ref) : null;
+    return m ? { mal: Number(m[1]), episode: Number(m[2]) } : null;
+  }, [windows]);
+
   useEffect(() => {
     if (!open || !activeTarget) return;
     let cancelled = false;
     setMalResolving(true);
     setMalId(null);
+    setPairEpisode(null);
+    if (stampedRef) {
+      setMalId(stampedRef.mal);
+      setPairEpisode(stampedRef.episode);
+      setMalResolving(false);
+      return;
+    }
     (async () => {
+      // The same order as the skip pipeline in App.tsx (its Step 0): the
+      // playing episode's OWN cour ids from the addon come first, used only
+      // as a whole pair. Without this the menu and the stamped windows could
+      // name different AniSkip entries for a tt-keyed later season.
+      const seriesKey = activeTarget.series_id ?? activeTarget.id;
+      const video = peekCachedDetailById(seriesKey)?.videos?.find((v) => v.id === activeTarget.id) ?? null;
+      const anilistId = video?.anilist_id ?? activeTarget.anilist_id ?? null;
+      const anilistEpisode = video?.anilist_episode ?? activeTarget.anilist_episode ?? null;
+      let pair: { mal: number; episode: number } | null = null;
+      if (video?.mal_id && video.mal_episode) {
+        pair = { mal: video.mal_id, episode: video.mal_episode };
+      } else if (anilistId && anilistEpisode) {
+        try {
+          const m = await invoke<number | null>("resolve_mal_id", { source: "anilist", id: anilistId });
+          if (typeof m === "number") pair = { mal: m, episode: anilistEpisode };
+        } catch { /* fall through to the chain below */ }
+      }
+      if (pair) {
+        console.info(`[aniskip] menu: per-episode ids from the addon -> mal=${pair.mal} ep=${pair.episode}`);
+        if (!cancelled) {
+          setMalId(pair.mal);
+          setPairEpisode(pair.episode);
+          setMalResolving(false);
+        }
+        return;
+      }
       // Single server-side call walks the entire resolution chain
       // (anime-prefix → yuna.moe mal/anilist → Fribb mal/anilist →
       // AniList idMal → title search). Per-step diagnostics live in
@@ -205,7 +242,7 @@ export default function AniSkipMenu({
       }
     })();
     return () => { cancelled = true; };
-  }, [open, activeTarget]);
+  }, [open, activeTarget, stampedRef?.mal, stampedRef?.episode]);
 
   // ── IntroDB availability ─────────────────────────────────────────
   // Submission needs a stored key, an IMDb root and the addon's numbering.
@@ -485,11 +522,17 @@ export default function AniSkipMenu({
                     {fmtTime(w.start)} – {fmtTime(w.end)}
                   </p>
                   <p className="text-white/40 text-[10px] mt-0.5">
-                    {sourceLabel(w.source)}
+                    {skipSourceLabel(w.source)}
                     {w.auto && <span className="text-amber-300/80"> · auto-skip</span>}
                   </p>
                 </div>
-                {w.source === "aniskip" && w.skip_id && (() => {
+                {/* Votes go to AniSkip by skip_id alone, so they are offered
+                    only for a window fetched for the very entry and episode
+                    this menu resolved. A window borrowed from another cour
+                    would otherwise let a downvote land on that cour's row. */}
+                {w.source === "aniskip" && w.skip_id
+                  && malId != null && courEpisode != null
+                  && w.skip_ref === `${malId}:${courEpisode}` && (() => {
                   const vs = voteState[w.skip_id];
                   const onCooldown = vs ? Date.now() < vs.cooldownUntil : false;
                   const lastUp   = vs?.last === "upvote";

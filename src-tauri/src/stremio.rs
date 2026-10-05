@@ -828,6 +828,17 @@ pub struct VideoEntry {
     /// meaningful alongside `anilist_id`.
     #[serde(default)]
     pub anilist_episode: Option<i64>,
+    /// AIOMetadata-embedded MyAnimeList id for THIS episode's cour/season
+    /// (`_malId` on the wire), paired with `mal_episode` (`_malEpisode`), the
+    /// episode number LOCAL to that MAL entry. The AniSkip lookup prefers this
+    /// pair: a tt-keyed multi-season anime's series-level `mal_id` is the
+    /// FIRST cour's, and pairing it with a later season's local episode
+    /// fetched another cour's timings (Bleach TYBW S3E7 got part 1 ep 7's
+    /// opening). `None` where the addon does not send it.
+    #[serde(default)]
+    pub mal_id: Option<i64>,
+    #[serde(default)]
+    pub mal_episode: Option<i64>,
     /// Streams the meta addon embedded in this Video object (Stremio parity,
     /// see `extract_embedded_streams`). When non-empty, the detail page and
     /// Next-Up show these INSTEAD of the addon stream fan-out for this video.
@@ -4836,14 +4847,21 @@ fn extract_videos(meta: &serde_json::Value, addon_name: &str) -> Vec<VideoEntry>
             // Canonical wire key is camelCase (`anilistId` / `anilistEpisode`),
             // matching the addon's `episodeKind` convention; snake_case aliases
             // accepted for safety. Positive-only (a 0 / negative id is bogus).
-            let anilist_id = ["anilistId", "anilist_id"]
-                .iter()
-                .find_map(|k| v.get(*k).and_then(|x| x.as_i64()))
-                .filter(|&n| n > 0);
-            let anilist_episode = ["anilistEpisode", "anilist_episode"]
-                .iter()
-                .find_map(|k| v.get(*k).and_then(|x| x.as_i64()))
-                .filter(|&n| n > 0);
+            // Numbers OR numeric strings: AIOMetadata sends `_malId` as a
+            // string ("56784"), so an `as_i64` read alone silently yields None.
+            let positive_id = |keys: &[&str]| -> Option<i64> {
+                keys.iter()
+                    .find_map(|k| {
+                        let x = v.get(*k)?;
+                        x.as_i64().or_else(|| x.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+                    })
+                    .filter(|&n| n > 0)
+            };
+            let anilist_id = positive_id(&["anilistId", "anilist_id"]);
+            let anilist_episode = positive_id(&["anilistEpisode", "anilist_episode"]);
+            // Per-episode MAL pair (see VideoEntry::mal_id).
+            let mal_id = positive_id(&["_malId", "malId", "mal_id"]);
+            let mal_episode = positive_id(&["_malEpisode", "malEpisode", "mal_episode"]);
 
             let (streams, cut) = extract_embedded_streams(v, addon_name, embed_budget);
             embed_budget -= streams.len();
@@ -4862,6 +4880,8 @@ fn extract_videos(meta: &serde_json::Value, addon_name: &str) -> Vec<VideoEntry>
                 is_recap,
                 anilist_id,
                 anilist_episode,
+                mal_id,
+                mal_episode,
                 streams,
             })
         })
