@@ -196,6 +196,11 @@ async fn load_video(
     // internally). The engine is spawned at setup; if it isn't running
     // (thread-spawn or HWND-resolution failure) this returns a clear
     // "engine not running" error instead of crashing.
+    //
+    // Marked loaded BEFORE the submit, so a close-to-tray racing the load
+    // never parks the webview under a file that is about to play (see
+    // window_logic "Tray webview parking"). Cleared by stop_video.
+    window_logic::set_media_loaded(true);
     #[cfg(target_os = "windows")]
     return mpv::engine::submit_load_file(normalised, start_seconds, http_proxy, content_hdr_hint, audio_url);
     #[cfg(not(target_os = "windows"))]
@@ -206,8 +211,12 @@ async fn load_video(
 }
 
 #[tauri::command]
-async fn stop_video() -> Result<(), String> {
+async fn stop_video(app: tauri::AppHandle) -> Result<(), String> {
     crate::devlog!(info, "player", "stop_video");
+    window_logic::set_media_loaded(false);
+    // Playback ended while the window sits in the tray: the webview can now
+    // stop producing frames (see window_logic "Tray webview parking").
+    window_logic::repark_if_tray_hidden(&app);
     // Tear down the warm headless thumbnail instance when leaving playback so
     // its libmpv core + open stream + demuxer cache don't sit resident while
     // idle. The next play's pre-warm (App.tsx) re-spawns it. Fire-and-forget,
@@ -1755,9 +1764,16 @@ pub fn run() {
                 argv.len(), redacted,
             );
             if let Some(win) = app.get_webview_window("main") {
+                // Unpark the webview before the window comes back (a no-op
+                // unless it was hidden to the tray), then the load-bearing
+                // show() THEN unminimize() order (see tray::show_main_window).
+                window_logic::unpark_main_webview(app);
                 let _ = win.show();
                 let _ = win.unminimize();
                 let _ = win.set_focus();
+                // The window is on screen again, so the tray icon's job is
+                // done (it is shown only while the window sits in the tray).
+                tray::set_tray_visible(app, false);
             }
         }))
         .plugin(tauri_plugin_deep_link::init())
@@ -1820,6 +1836,8 @@ pub fn run() {
             }
             #[cfg(target_os = "windows")]
             {
+                // A reloaded page restores no playback, so nothing is loaded.
+                window_logic::set_media_loaded(false);
                 if mpv::engine::is_running() {
                     crate::devlog!(info, "player", "main page reloaded: ending playback");
                     let _ = tauri::async_runtime::spawn_blocking(crate::mpv::thumb::shutdown);

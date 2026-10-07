@@ -41,8 +41,8 @@ import {
   introDbPrimaryNumbering, submitToIntroDb,
 } from "./introdb";
 import { peekCachedDetailById } from "./metaCache";
-import { skipKindLabel, skipSourceLabel } from "./skipSource";
-import { skipModeForKind } from "./skipWindows";
+import { skipHeldReason, skipKindLabel, skipSourceHint, skipSourceLabel } from "./skipSource";
+import Tooltip from "./Tooltip";
 
 /** Mirrors PlayerOverlay's AuraSkipWindow shape so this module can be
  *  imported without a circular dep. Local copy is intentional. */
@@ -98,7 +98,7 @@ function normalizeMode(raw: string | undefined, fallback: SkipMode): SkipMode {
 }
 
 function fmtTime(sec: number): string {
-  if (!Number.isFinite(sec)) return "—";
+  if (!Number.isFinite(sec)) return "--:--";
   const s = Math.max(0, Math.floor(sec));
   const ms = Math.max(0, Math.floor((sec - s) * 1000));
   const h = Math.floor(s / 3600);
@@ -515,10 +515,22 @@ export default function AniSkipMenu({
           </p>
           {orderedWindows.length === 0 && (
             <p className="text-white/40 text-[12px] italic">
-              No segments yet — submit one on the right.
+              No segments yet: submit one on the right.
             </p>
           )}
-          {orderedWindows.map((w, i) => (
+          {orderedWindows.map((w, i) => {
+            // Votes go to AniSkip by skip_id alone, so they are offered only
+            // for a window fetched for the very entry and episode this menu
+            // resolved. A window borrowed from another cour would otherwise
+            // let a downvote land on that cour's row.
+            const canVote = w.source === "aniskip" && !!w.skip_id
+              && malId != null && courEpisode != null
+              && w.skip_ref === `${malId}:${courEpisode}`;
+            const sourceHint = skipSourceHint(w.source);
+            // The kind is on Auto but this window may only prompt (a guess, a
+            // preview, an AniSkip ending, ...): say so, and why on hover.
+            const held = !w.superseded && !w.auto ? skipHeldReason(w, modes) : null;
+            return (
             <div
               key={`${w.type}:${w.start}:${i}`}
               className="rounded-lg bg-white/[0.05] border border-white/8 p-2.5"
@@ -529,27 +541,43 @@ export default function AniSkipMenu({
                     {skipLabel(w.type)}
                   </p>
                   <p className="text-white/55 text-[10.5px] font-mono mt-0.5">
-                    {fmtTime(w.start)} – {fmtTime(w.end)}
+                    {fmtTime(w.start)} - {fmtTime(w.end)}
                   </p>
                   <p className="text-white/40 text-[10px] mt-0.5">
-                    {skipSourceLabel(w.source)}
+                    {sourceHint
+                      ? (
+                        <Tooltip pos="top" text={sourceHint}>
+                          <span className="cursor-help">{skipSourceLabel(w.source)}</span>
+                        </Tooltip>
+                      )
+                      : skipSourceLabel(w.source)}
                     {w.superseded
-                      ? <span className="text-white/50"> · replaced by theme match</span>
+                      ? (
+                        <>
+                          <span className="text-white/50"> · </span>
+                          <Tooltip
+                            pos="top"
+                            text={canVote
+                              ? "Not used: the theme match replaced it. You can still vote on it"
+                              : "Not used: the theme match replaced it"}
+                          >
+                            <span className="text-white/50 cursor-help">replaced by theme match</span>
+                          </Tooltip>
+                        </>
+                      )
                       : w.auto
                         ? <span className="text-amber-300/80"> · auto-skip</span>
-                        // The kind is on auto but this source may only prompt
-                        // (a guess, a preview, an AniSkip ending): say so.
-                        : skipModeForKind(w.type, modes) === "auto"
-                          && <span className="text-white/50"> · prompt only</span>}
+                        : held && (
+                          <>
+                            <span className="text-white/50"> · </span>
+                            <Tooltip pos="top" text={held.hint}>
+                              <span className="text-white/50 cursor-help">prompt only</span>
+                            </Tooltip>
+                          </>
+                        )}
                   </p>
                 </div>
-                {/* Votes go to AniSkip by skip_id alone, so they are offered
-                    only for a window fetched for the very entry and episode
-                    this menu resolved. A window borrowed from another cour
-                    would otherwise let a downvote land on that cour's row. */}
-                {w.source === "aniskip" && w.skip_id
-                  && malId != null && courEpisode != null
-                  && w.skip_ref === `${malId}:${courEpisode}` && (() => {
+                {canVote && w.skip_id && (() => {
                   const vs = voteState[w.skip_id];
                   const onCooldown = vs ? Date.now() < vs.cooldownUntil : false;
                   const lastUp   = vs?.last === "upvote";
@@ -597,7 +625,8 @@ export default function AniSkipMenu({
                 })()}
               </div>
             </div>
-          ))}
+            );
+          })}
         </div>
 
         {/* ── Right column: submit form ──────────────────────────── */}
@@ -693,12 +722,14 @@ export default function AniSkipMenu({
           )}
           {!malResolving && malId == null && !idbAvailable && (
             <p className="text-amber-300/75 text-[10.5px] italic">
-              MAL id not resolvable for this episode: submission unavailable.
+              No MyAnimeList entry found for this episode. AniSkip and theme
+              matching need one, so submission is unavailable.
             </p>
           )}
           {!malResolving && malId == null && idbAvailable && (
             <p className="text-white/40 text-[10.5px] italic">
-              No MAL id for AniSkip: submits to IntroDB only.
+              No MyAnimeList entry found for this episode (AniSkip and theme
+              matching need one): submits to IntroDB only.
             </p>
           )}
           {!malResolving && malId != null && (
@@ -744,8 +775,10 @@ export default function AniSkipMenu({
             one case that can't apply live is re-enabling a segment turned fully
             off, because its window was dropped from the active payload. */}
         <p className="text-white/40 text-[10px] leading-snug mt-2 text-center px-2">
-          Applies to the current episode instantly. Turning a segment fully off
-          then back on takes effect from the next stream load.
+          Some segments always ask first, even on Auto: hover "prompt only"
+          for why. Ending Off also hides previews. Applies to the current
+          episode instantly. Turning a segment fully off then back on takes
+          effect from the next stream load.
         </p>
       </div>
 

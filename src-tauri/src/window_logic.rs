@@ -313,9 +313,24 @@ static PARTY_KEEP_ALIVE: AtomicBool = AtomicBool::new(false);
 
 /// Frontend -> Rust: are we a connected, in-sync watch-party member (leader or
 /// follower) right now? Drives the pause-on-minimize / tray exemption below.
+///
+/// `in_room` is the wider "connected to (or joining) any room at all" state,
+/// in sync or not. It is optional only so an older caller that omits it reads
+/// as "unchanged"; it gates the tray webview parking below, never the pause.
 #[tauri::command]
-pub fn set_party_keep_alive(active: bool) {
+pub fn set_party_keep_alive(app: AppHandle, active: bool, in_room: Option<bool>) {
+    store_party_flags(active, in_room);
+    // Leaving a room while the window sits in the tray clears a park blocker.
+    repark_if_tray_hidden(&app);
+}
+
+/// The flag half of `set_party_keep_alive`, separate so the tests can drive it
+/// without an AppHandle.
+fn store_party_flags(active: bool, in_room: Option<bool>) {
     PARTY_KEEP_ALIVE.store(active, Ordering::Release);
+    if let Some(in_room) = in_room {
+        PARTY_IN_ROOM.store(in_room, Ordering::Release);
+    }
 }
 
 /// Whether the minimize / tray pause should be SKIPPED to keep an in-sync party
@@ -324,6 +339,173 @@ pub fn set_party_keep_alive(active: bool) {
 /// keeps the fast tick + cache poll instead of powering down).
 pub fn party_keep_alive() -> bool {
     PARTY_KEEP_ALIVE.load(Ordering::Acquire)
+}
+
+// ---------------------------------------------------------------------------
+// Tray webview parking
+//
+// Hiding the window to the tray hides only the NATIVE window. Nothing told
+// WebView2, so Chromium still believed the page was visible and kept producing
+// frames for every running animation at the display's refresh rate: measured
+// in the tray on a detail page, the WebView2 GPU process used 174% of one core
+// and the renderer 76% (aura.exe itself 0.1%), and on Home the renderer still
+// used 45%. WebView2 does not infer visibility from its host window; the host
+// has to say so through ICoreWebView2Controller::put_IsVisible.
+//
+// So the close-to-tray path PARKS the webview (IsVisible = false) and every
+// path that brings the window back UNPARKS it before the window is shown.
+// Only the controller's visibility is changed, deliberately not wry's
+// `set_visible` (Webview::hide), which also SW_HIDEs the WRY_WEBVIEW container
+// window: the restore animation depends on the window tree being intact
+// (see the restore section of CLAUDE.md), and the container's own visibility
+// buys nothing, since the parent is already hidden while in the tray.
+//
+// A hidden page has its timers clamped by Chromium (at most once a second,
+// and once a minute for chained timers after about five minutes hidden). So
+// the webview is parked ONLY when nothing in the page needs live timers:
+// no file loaded (playing OR paused: the progress checkpoint, the scrobble
+// heartbeat and the stats timer run from the page), not in a watch-together
+// room (its WebSocket keepalive and the leader's drift tick are page timers),
+// not casting, and no bulk History scrobble run in flight. Background audio
+// is never affected because mpv is native, and Tauri events still reach a
+// hidden page.
+// ---------------------------------------------------------------------------
+
+/// Connected to (or joining) a watch-together room, in sync or not. Set with
+/// `set_party_keep_alive`'s `in_room`.
+static PARTY_IN_ROOM: AtomicBool = AtomicBool::new(false);
+
+/// A file is loaded in mpv: set by `load_video` and the debug panel's
+/// `debug_load_test_pattern`, cleared by `stop_video`, the debug panel's
+/// `debug_stop_playback` and the page-reload teardown. Errs toward true (a
+/// failed load leaves it set until the player is exited), which only ever
+/// means "do not park".
+static MEDIA_LOADED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the main webview is currently parked (IsVisible = false). Makes the
+/// unpark a no-op on every restore that did not follow a park. Read and
+/// written on the main thread only (the close handler, the tray, the
+/// single-instance handler, the OAuth landing and the re-park all run there).
+static WEBVIEW_PARKED: AtomicBool = AtomicBool::new(false);
+
+/// The main window is hidden to the tray: set by the close-to-tray path, cleared
+/// by `unpark_main_webview`, which every path that shows the window calls
+/// first. Lets a park blocker that clears while in the tray (playback stopped,
+/// room left, bulk scrobble done) park the webview after all.
+static TRAY_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// Record whether mpv has a file loaded. See `MEDIA_LOADED`.
+pub fn set_media_loaded(loaded: bool) {
+    MEDIA_LOADED.store(loaded, Ordering::Release);
+}
+
+/// Whether a re-park is due: hidden to the tray, not parked yet, and nothing
+/// blocks a park. Pure over the flags, so the gating can be tested.
+fn repark_due() -> bool {
+    TRAY_HIDDEN.load(Ordering::Acquire)
+        && !WEBVIEW_PARKED.load(Ordering::Acquire)
+        && park_blocker().is_none()
+}
+
+/// Park the webview now if the window sits in the tray and the blocker that
+/// kept it visible at hide time has since cleared. Call after clearing any
+/// park blocker. Cheap and a no-op in every other state. The decision is
+/// re-made on the main thread, so a restore racing it always wins: the restore
+/// clears TRAY_HIDDEN first, and the window must still be hidden.
+pub fn repark_if_tray_hidden<R: Runtime>(app: &AppHandle<R>) {
+    if !repark_due() {
+        return;
+    }
+    let h = app.clone();
+    let queued = app.run_on_main_thread(move || {
+        if !repark_due() {
+            return;
+        }
+        // Belt and braces: never park a page that is on screen, whatever path
+        // showed the window.
+        if let Some(win) = h.get_webview_window("main") {
+            if !matches!(win.is_visible(), Ok(false)) {
+                return;
+            }
+        }
+        park_main_webview(&h);
+    });
+    if let Err(e) = queued {
+        crate::devlog!(warn, "win", "tray: re-park could not be queued: {e}");
+    }
+}
+
+/// Why the webview must stay visible in the tray, or None when it may park.
+fn park_blocker() -> Option<&'static str> {
+    if MEDIA_LOADED.load(Ordering::Acquire) {
+        return Some("a file is loaded");
+    }
+    if party_keep_alive() || PARTY_IN_ROOM.load(Ordering::Acquire) {
+        return Some("in a watch-together room");
+    }
+    if crate::cast::has_active_session() {
+        return Some("casting");
+    }
+    if crate::scrobble::scrobble_run_active() {
+        return Some("a History scrobble run is in progress");
+    }
+    None
+}
+
+/// Set the main webview's WebView2 visibility (the controller's IsVisible
+/// only; see the section comment). `with_webview` runs inline when called on
+/// the main thread and is queued IN ORDER with the window's own messages
+/// otherwise, so a following show() never overtakes it.
+fn set_main_webview_visible<R: Runtime>(app: &AppHandle<R>, visible: bool) -> bool {
+    let Some(webview) = app.get_webview("main") else { return false };
+    #[cfg(target_os = "windows")]
+    {
+        let queued = webview.with_webview(move |pw| {
+            let controller = pw.controller();
+            // SAFETY: a plain COM property write on the controller wry owns,
+            // made on the thread wry runs webview messages on.
+            if let Err(e) = unsafe { controller.SetIsVisible(visible) } {
+                crate::devlog!(warn, "win", "webview IsVisible={visible} failed: {e}");
+            }
+        });
+        queued.is_ok()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (webview, visible);
+        false
+    }
+}
+
+/// Close-to-tray: tell WebView2 the page is hidden, unless something in the
+/// page needs live timers. Call after the window itself is hidden.
+fn park_main_webview<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(why) = park_blocker() {
+        crate::devlog!(info, "win", "tray: webview left visible ({why})");
+        return;
+    }
+    if set_main_webview_visible(app, false) {
+        WEBVIEW_PARKED.store(true, Ordering::Release);
+        crate::devlog!(info, "win", "tray: webview parked (IsVisible=false)");
+    }
+}
+
+/// Bring a parked webview back. EVERY path that shows the main window must
+/// call this BEFORE `show()` / `unminimize()`, so the page is already visible
+/// (and producing its first frame) when the restore animation starts. A
+/// no-op when the webview was not parked. Main thread only, like every other
+/// reader and writer of the parking flags, so a park can never interleave.
+pub fn unpark_main_webview<R: Runtime>(app: &AppHandle<R>) {
+    // The window is about to be shown: no re-park may follow from here on.
+    TRAY_HIDDEN.store(false, Ordering::Release);
+    if !WEBVIEW_PARKED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    if !set_main_webview_visible(app, true) {
+        crate::devlog!(warn, "win", "tray: webview unpark could not be queued");
+        return;
+    }
+    crate::devlog!(info, "win", "tray: webview unparked (IsVisible=true)");
 }
 
 fn pause_mpv<R: Runtime>(app: &AppHandle<R>) {
@@ -740,6 +922,13 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     // already-hidden window.
                     let _ = win.minimize();
                     let _ = win.hide();
+                    // Then tell WebView2 the page is hidden, so it stops
+                    // producing frames in the tray (see "Tray webview
+                    // parking"). Undone before the window is shown again.
+                    // TRAY_HIDDEN lets a blocker that clears while in the tray
+                    // park it later (repark_if_tray_hidden).
+                    TRAY_HIDDEN.store(true, Ordering::Release);
+                    park_main_webview(&handle);
                     // Window is now hidden to the tray — surface the tray icon,
                     // which is its only route back. Hidden again on restore
                     // (tray::show_main_window).
@@ -820,4 +1009,58 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
             _ => {}
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tray parks the webview only when nothing in the page needs live
+    /// timers. One test, run in sequence, because the flags are process-wide
+    /// statics and parallel tests would race on them.
+    #[test]
+    fn park_blocker_follows_media_and_room_flags() {
+        set_media_loaded(false);
+        store_party_flags(false, Some(false));
+        assert_eq!(park_blocker(), None, "idle app parks");
+
+        set_media_loaded(true);
+        assert_eq!(park_blocker(), Some("a file is loaded"));
+        set_media_loaded(false);
+
+        // Joined a room but not (yet) in sync: still no park.
+        store_party_flags(false, Some(true));
+        assert_eq!(park_blocker(), Some("in a watch-together room"));
+        // An older caller that omits in_room leaves it unchanged.
+        store_party_flags(false, None);
+        assert_eq!(park_blocker(), Some("in a watch-together room"));
+        store_party_flags(false, Some(false));
+        assert_eq!(park_blocker(), None);
+
+        // In-sync member: the keep-alive alone also blocks.
+        store_party_flags(true, None);
+        assert_eq!(park_blocker(), Some("in a watch-together room"));
+        store_party_flags(false, Some(false));
+        assert_eq!(park_blocker(), None);
+
+        // Re-park gating: only while hidden to the tray, not yet parked, and
+        // with nothing blocking.
+        TRAY_HIDDEN.store(false, Ordering::Release);
+        WEBVIEW_PARKED.store(false, Ordering::Release);
+        assert!(!repark_due(), "a visible window never re-parks");
+        TRAY_HIDDEN.store(true, Ordering::Release);
+        set_media_loaded(true);
+        assert!(!repark_due(), "still blocked: a file is loaded");
+        set_media_loaded(false);
+        assert!(repark_due(), "blocker cleared while in the tray");
+        WEBVIEW_PARKED.store(true, Ordering::Release);
+        assert!(!repark_due(), "already parked");
+        WEBVIEW_PARKED.store(false, Ordering::Release);
+        store_party_flags(false, Some(true));
+        assert!(!repark_due(), "still blocked: in a room");
+        store_party_flags(false, Some(false));
+        assert!(repark_due());
+        TRAY_HIDDEN.store(false, Ordering::Release);
+        assert!(!repark_due(), "a restore clears the tray state");
+    }
 }

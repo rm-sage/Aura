@@ -116,7 +116,8 @@ import {
 interface SkipDetectWindow {
   start: number;
   end: number;
-  /** "animethemes" (Layer 1) or "continuity" (Layer 3). */
+  /** "animethemes" (Layer 1), "animethemes-early" (the provisional opening,
+   *  prompt-only until the full match replaces it) or "continuity" (Layer 3). */
   source: string;
   auto_eligible: boolean;
   theme?: string | null;
@@ -138,7 +139,8 @@ interface SkipDetectSnapshot {
 type SkipDetectReply =
   | { result: "detected"; snapshot: SkipDetectSnapshot; superseded: boolean }
   | { result: "cancelled"; generation: number }
-  | { result: "status"; snapshot: SkipDetectSnapshot | null };
+  | { result: "status"; snapshot: SkipDetectSnapshot | null }
+  | { result: "prefetch"; started: boolean };
 
 interface AniSkipResult {
   found: boolean;
@@ -305,16 +307,24 @@ function stampThemeSongs(
 }
 
 async function mergeChapterSkipWindows(
-  existing: PreparedWindow[],
+  /** The crowd / authored windows (AniSkip, IntroDB, PublicMetaDB). May still
+   *  be in flight: the poll below runs CONCURRENTLY with those fetches and
+   *  awaits them only once it has read the chapters, so the first stamp waits
+   *  for the slower of the two instead of their sum. */
+  existingIn: PreparedWindow[] | Promise<PreparedWindow[]>,
+  /** The load's first positive duration, from the `playback-update` events
+   *  (`watchLoadDuration`, never a get_property poll). Resolves 0 when none
+   *  arrives in time. */
+  durationIn: Promise<number>,
   modeFor: (kind: string) => SkipMode,
-  /** Per-load token check from handlePlayStream. The poll below runs up to
-   *  ~6 s, which is long enough for the file to have been replaced. Without
-   *  it the chapters read belong to the NEW file and get merged with the OLD
-   *  file's windows. A stale merge resolves to null. */
+  /** Per-load token check from handlePlayStream. The wait and poll below run
+   *  for seconds, which is long enough for the file to have been replaced.
+   *  Without it the chapters read belong to the NEW file and get merged with
+   *  the OLD file's windows. A stale merge resolves to null. */
   isStale?: () => boolean,
-  /** Called once, the first time the poll reads a positive duration. The skip
-   *  chain starts the layered detector from here, so the detector does not
-   *  wait for the rest of the chapter poll. */
+  /** Called once, when the duration is first known. The skip chain starts the
+   *  layered detector from here too (it also watches `durationIn` itself), so
+   *  the detector does not wait for the rest of the chapter poll. */
   onDuration?: (duration: number) => void,
 ): Promise<ChapterMerge | null> {
   // Wait for chapter-list to land. Demuxer parse can be slightly behind
@@ -334,22 +344,39 @@ async function mergeChapterSkipWindows(
   // the fault is a STATUS_ACCESS_VIOLATION inside the FFI call, not a JS
   // exception. The string format goes through a different code path that's
   // safe to call even while libmpv is still processing loadfile.
+  //
+  // Landmine 3(a): the poll does not touch mpv before `duration > 0`. The
+  // duration comes from the playback-update events (`durationIn`), awaited up
+  // to DURATION_WAIT_MS before the first tick, and the loop only reads
+  // `chapter-list` once it is known. The one exception is the LAST tick of a
+  // load whose duration never arrived: a single read there keeps a
+  // duration-less container's chapters (accepted on that tick, as before)
+  // instead of dropping them, where the old poll read mpv on every tick from
+  // the start of the load.
   const CONFIRM_EMPTY_READS = 3;
   const POLL_TICKS = 10;
+  const DURATION_WAIT_MS = 6000;
   let chapters: MpvChapter[] | null = null;
   let duration = 0;
   let emptyReads = 0;
   let durationAnnounced = false;
+  // A duration that lands after the deadline below (during the poll) is
+  // still picked up on the next tick.
+  let eventDuration = 0;
+  void durationIn.then((d) => { eventDuration = d; });
+  const announce = (d: number): void => {
+    if (durationAnnounced || !(d > 0)) return;
+    durationAnnounced = true;
+    duration = d;
+    try { onDuration?.(d); } catch { /* the detector start is best-effort */ }
+  };
+  announce(await withDeadline(durationIn, DURATION_WAIT_MS, 0, () => {}));
+  if (isStale?.()) return null;
   for (let i = 0; i < POLL_TICKS; i += 1) {
     await new Promise((r) => setTimeout(r, 600));
     if (isStale?.()) return null;
-    try {
-      duration = (await invoke<number | null>("get_property", { name: "duration", format: "double" })) ?? 0;
-    } catch {}
-    if (!durationAnnounced && duration > 0) {
-      durationAnnounced = true;
-      try { onDuration?.(duration); } catch { /* the detector start is best-effort */ }
-    }
+    announce(eventDuration);
+    if (!(duration > 0) && i < POLL_TICKS - 1) continue;
     try {
       const raw = await invoke<string | null>("get_property", { name: "chapter-list", format: "string" });
       if (typeof raw === "string" && raw.trim().length > 0) {
@@ -380,6 +407,8 @@ async function mergeChapterSkipWindows(
       emptyReads = 0;
     }
   }
+  if (isStale?.()) return null;
+  let existing = await existingIn;
   if (isStale?.()) return null;
   // IntroDB rows are fetched before the file's duration is known, and a row
   // recorded against a different cut must not land on this one.
@@ -555,6 +584,42 @@ async function fetchPublicmetadbWindows(
 // arms auto-skip and must not sit behind a slow host. A late answer still lands
 // in the caches for the next load.
 const INTRODB_WAIT_MS = 5000;
+
+/** The first positive mpv `duration` of the CURRENT load, read from the
+ *  `playback-update` events (never a get_property poll: landmine 3). `known`
+ *  is consulted once the listener is live, for a duration that landed before
+ *  it (the caller passes a value reset at every load, so it never belongs to
+ *  the previous file). Resolves 0 on `maxMs` or once `stale()` turns true, and
+ *  always unlistens: no caller has to clean it up on any of its exits. */
+function watchLoadDuration(known: () => number, stale: () => boolean, maxMs: number): Promise<number> {
+  return new Promise((resolve) => {
+    let done = false;
+    let unlisten: (() => void) | null = null;
+    let timer = 0;
+    let tick = 0;
+    const finish = (d: number): void => {
+      if (done) return;
+      done = true;
+      window.clearTimeout(timer);
+      window.clearInterval(tick);
+      unlisten?.();
+      resolve(d);
+    };
+    timer = window.setTimeout(() => finish(0), maxMs);
+    tick = window.setInterval(() => { if (stale()) finish(0); }, 1000);
+    listen<PlaybackPayload>("playback-update", ({ payload }) => {
+      const d = payload?.duration;
+      if (typeof d === "number" && Number.isFinite(d) && d > 0) finish(d);
+    })
+      .then((fn) => {
+        if (done) { fn(); return; }
+        unlisten = fn;
+        const k = known();
+        if (Number.isFinite(k) && k > 0) finish(k);
+      })
+      .catch(() => { /* no events: the timeout or the stale check ends it */ });
+  });
+}
 
 /** Resolve with `fallback` if `p` has not settled within `ms` of the call. */
 function withDeadline<T>(p: Promise<T>, ms: number, fallback: T, onTimeout: () => void): Promise<T> {
@@ -2166,6 +2231,16 @@ export default function App() {
   const skipModesRef = useRef<{ op: "off" | "prompt" | "auto"; ed: "off" | "prompt" | "auto"; recap: "off" | "prompt" | "auto" }>(
     { op: "auto", ed: "prompt", recap: "prompt" },
   );
+  /** The MAL cour the skip chain resolved for the playing episode (and that
+   *  episode's addon season / number), for the Next-Up theme prefetch. Null
+   *  until resolved, and reset by every load. */
+  const skipCourRef = useRef<{
+    targetId: string;
+    malId: number;
+    courEpisode: number | null;
+    season: number | null;
+    episodeNum: number | null;
+  } | null>(null);
   /** The DIRECT (un-proxied) URL of the playing stream, kept for the
    *  PlayerOverlay's Copy / Download / External-player utilities. Cleared
    *  when playback exits. */
@@ -2362,9 +2437,16 @@ export default function App() {
   // User-chosen policy: both roles keep playing while minimized.
   const partyKeepAlive =
     reactiveParty.status === "connected" && reactiveParty.inSync;
+  // Wider than keep-alive: in (or joining, or reconnecting to) ANY room, in sync
+  // or not. Rust keeps the page visible in the tray while this is true, because
+  // the room's WebSocket keepalive, reconnect backoff and drift ticks are page
+  // timers that a hidden page would have clamped (window_logic "Tray webview
+  // parking"). "error" and "not-found" are terminal: no socket, no timers.
+  const partyInRoom =
+    reactiveParty.status === "connecting" || reactiveParty.status === "connected";
   useEffect(() => {
-    invoke("set_party_keep_alive", { active: partyKeepAlive }).catch(() => {});
-  }, [partyKeepAlive]);
+    invoke("set_party_keep_alive", { active: partyKeepAlive, inRoom: partyInRoom }).catch(() => {});
+  }, [partyKeepAlive, partyInRoom]);
   // Leave any watch party when the signed-in identity CHANGES (sign-out or
   // account switch). Otherwise the party WebSocket + our cid survive into the
   // next account — leaking the old identity (and its leader crown) into a fresh
@@ -2984,6 +3066,7 @@ export default function App() {
           skipChainSeqRef.current += 1;
           const skipSeq = skipChainSeqRef.current;
           const stale = () => skipChainSeqRef.current !== skipSeq;
+          skipCourRef.current = null;
           // The ED end and the media end belong to the FILE, not to the target
           // id. The next-up reset effect is keyed on `activeTarget?.id` on
           // purpose (see its comment), so an EOS Replay, a recovery reload or an
@@ -3029,6 +3112,13 @@ export default function App() {
               console.info(`[auraskip] skip — all modes off`);
               return;
             }
+            // The file's duration, the moment mpv reports it. Watched from HERE
+            // (not from the chapter poll) so the detector can start as soon as
+            // the MAL id and the duration are both known, instead of after the
+            // AniSkip / PublicMetaDB / IntroDB fetches and the first 600 ms
+            // poll tick. Bounded and self-cleaning (see watchLoadDuration).
+            const LATE_DURATION_WAIT_MS = 90_000;
+            const loadDuration = watchLoadDuration(() => durationRef.current, stale, LATE_DURATION_WAIT_MS);
             // Modes are read through a REF, not captured. This chain now spans
             // the whole chapter poll (and the layered detector after it), and
             // the AniSkip menu's mode pills are reachable that entire time. A
@@ -3048,7 +3138,10 @@ export default function App() {
             // every stamp of the load. This is what extends skip from
             // anime-only to any series.
             const finishWithChapters = async (
-              prepared: PreparedWindow[],
+              /** The crowd / authored windows; may still be in flight (the
+               *  chapter poll runs beside those fetches, see
+               *  mergeChapterSkipWindows). */
+              preparedIn: PreparedWindow[] | Promise<PreparedWindow[]>,
               opts: {
                 streamUrl: string | null;
                 /** The title is anime (drives the detector's "no MAL id"
@@ -3066,44 +3159,11 @@ export default function App() {
               },
             ): Promise<void> => {
               // A duration mpv reports only AFTER the chapter poll gave up (a
-              // slow debrid open can outlast its ~6 s): without it the detector
-              // never started. Read from the playback-update events, never a
-              // get_property poll, and registered BEFORE the poll so a value that
-              // lands between the poll's last read and the wait below is kept.
-              // Bounded by LATE_DURATION_WAIT_MS and always unlistened.
-              const LATE_DURATION_WAIT_MS = 75_000;
-              let lateDuration = 0;
-              let wakeOnDuration: (() => void) | null = null;
-              let stopDurationWatch: (() => void) | null = null;
-              try {
-                stopDurationWatch = await listen<PlaybackPayload>("playback-update", ({ payload }) => {
-                  const d = payload?.duration;
-                  if (typeof d === "number" && Number.isFinite(d) && d > 0) {
-                    lateDuration = d;
-                    wakeOnDuration?.();
-                  }
-                });
-              } catch { /* no late duration then: the wait below just ends */ }
-              const endDurationWatch = (): void => {
-                const stop = stopDurationWatch;
-                stopDurationWatch = null;
-                wakeOnDuration?.();
-                stop?.();
-              };
-              const waitForLateDuration = (): Promise<number> => new Promise((resolve) => {
-                if (lateDuration > 0 || stopDurationWatch == null) { resolve(lateDuration); return; }
-                let timer = 0;
-                let staleTick = 0;
-                const done = (): void => {
-                  window.clearTimeout(timer);
-                  window.clearInterval(staleTick);
-                  wakeOnDuration = null;
-                  resolve(lateDuration);
-                };
-                wakeOnDuration = done;
-                timer = window.setTimeout(done, LATE_DURATION_WAIT_MS);
-                staleTick = window.setInterval(() => { if (stale()) done(); }, 1000);
-              });
+              // slow debrid open can outlast its ~6 s) still starts the
+              // detector: `loadDuration` is the chain's one watch of the
+              // playback-update events, registered when the chain started, so
+              // a value landing at any point of this load is kept. Bounded by
+              // LATE_DURATION_WAIT_MS and self-cleaning.
               try {
                 // Theme songs for this cour, fetched at most once per load and
                 // only for anime (`opts.malId` is set on the anime path only,
@@ -3309,6 +3369,15 @@ export default function App() {
                       });
                     } catch {
                       // Couldn't fetch it: skip_detect reports "unavailable".
+                      // Say so, since the setup toast above promised it: with
+                      // no ffmpeg there is no theme match, no cross-check of
+                      // crowd timings, no guess and no media-end read. Not
+                      // remembered (ensureRuntimeDepOnce retries), so this
+                      // can repeat once per episode while the problem lasts,
+                      // which "for this episode" keeps true.
+                      if (!present && !stale()) {
+                        toast("Couldn't download FFmpeg, so automatic skip detection is off for this episode");
+                      }
                     }
                     if (stale()) return;
                   }
@@ -3375,11 +3444,22 @@ export default function App() {
                   }
                 };
 
-                // Anime with a MAL id: start the detector the moment the chapter
-                // poll sees a duration, for every kind the user has not switched
-                // off, regardless of what AniSkip or the chapters supplied.
+                // Anime with a MAL id: start the detector the moment the
+                // duration is known, for every kind the user has not switched
+                // off, regardless of what AniSkip or the chapters supplied. It
+                // does not wait for those: nothing is STAMPED before the chapter
+                // poll settles (`base`), but the detector's probe and HEAD read
+                // start now. The chapter poll's `onDuration` (fed by the same
+                // event-sourced duration) stays as a fallback trigger.
+                if (opts.malId != null) {
+                  void loadDuration.then((d) => {
+                    if (!(d > 0) || stale() || detectRun) return;
+                    console.info(`[skipdetect] duration ${d.toFixed(1)}s known: starting the detector now`);
+                    detectRun = runDetect(d, modeFor("op") !== "off", modeFor("ed") !== "off");
+                  });
+                }
                 const merge = await mergeChapterSkipWindows(
-                  prepared, modeFor, stale,
+                  preparedIn, loadDuration, modeFor, stale,
                   (duration) => {
                     if (opts.malId == null || detectRun) return;
                     detectRun = runDetect(
@@ -3396,7 +3476,7 @@ export default function App() {
                 // for the first playback-update that carries one, then start the
                 // detector exactly as the poll would have.
                 if (!(fileDuration > 0) && !detectRun && url) {
-                  const late = await waitForLateDuration();
+                  const late = await loadDuration;
                   if (stale()) return;
                   if (late > 0) {
                     fileDuration = late;
@@ -3410,7 +3490,6 @@ export default function App() {
                     );
                   }
                 }
-                endDurationWatch();
 
                 // ── Gap fill: this series' OTHER episodes, OPENING only ──
                 // AniSkip coverage is per-episode and patchy, but an opening
@@ -3476,8 +3555,6 @@ export default function App() {
                 if (detectRun) await detectRun;
               } catch (err) {
                 console.warn(`[auraskip] finish/chapter merge failed: ${String(err)}`);
-              } finally {
-                endDurationWatch();
               }
             };
 
@@ -3706,7 +3783,6 @@ export default function App() {
               // supply. No publicmetadb data → empty list, and the
               // chapter path still runs so chaptered live-action keeps
               // producing windows.
-              let pmdbWindows: PreparedWindow[] = [];
               let laTmdb = detail?.tmdb_id ?? null;
               // A tt-keyed later season of an ANIME lands here when no cour-
               // specific MAL id was found (the series-level ids are skipped on
@@ -3725,10 +3801,7 @@ export default function App() {
                 original_language: detail.original_language,
                 production_countries: detail.production_countries,
               }));
-              if (laterSeasonTt && isAnime) {
-                markAnimeId(seriesId);
-                if (animeIds && laTmdb == null) laTmdb = await resolveAnimeTmdb();
-              }
+              if (laterSeasonTt && isAnime) markAnimeId(seriesId);
               const laSegs = target.id.split(":");
               // The segment fallback is for IMDb-style episode ids
               // (tt…:S:E). An anime-prefix id (kitsu:N:M, mal:N:M, …)
@@ -3743,21 +3816,30 @@ export default function App() {
               const laEpisode = Number.isFinite(target.episode_num as number)
                 ? (target.episode_num as number)
                 : laImdbId ? Number(laSegs[2]) : NaN;
-              if (laTmdb != null && Number.isFinite(laSeason) && Number.isFinite(laEpisode)) {
-                pmdbWindows = await fetchPublicmetadbWindows(
-                  laTmdb, "tv", laSeason, laEpisode, modeFor,
-                );
-                console.info(
-                  `[publicmetadb] no mal_id for ${seriesId} — ` +
-                  `tmdb=${laTmdb} s${laSeason}e${laEpisode} → ${pmdbWindows.length} window(s)`,
-                );
-              } else {
-                console.info(
-                  `[publicmetadb] no mal_id for ${seriesId} — skipped ` +
-                  `(tmdb=${laTmdb} season=${laSeason} episode=${laEpisode}); chapter-only`,
-                );
-              }
-              await finishWithChapters(await withIntroDb(pmdbWindows), {
+              // In flight while the chapter poll runs (see mergeChapterSkipWindows).
+              const pmdbPrepared = (async (): Promise<PreparedWindow[]> => {
+                if (laterSeasonTt && isAnime && animeIds && laTmdb == null) laTmdb = await resolveAnimeTmdb();
+                let pmdbWindows: PreparedWindow[] = [];
+                if (laTmdb != null && Number.isFinite(laSeason) && Number.isFinite(laEpisode)) {
+                  pmdbWindows = await fetchPublicmetadbWindows(
+                    laTmdb, "tv", laSeason, laEpisode, modeFor,
+                  );
+                  console.info(
+                    `[publicmetadb] no mal_id for ${seriesId}: ` +
+                    `tmdb=${laTmdb} s${laSeason}e${laEpisode} → ${pmdbWindows.length} window(s)`,
+                  );
+                } else {
+                  console.info(
+                    `[publicmetadb] no mal_id for ${seriesId}: skipped ` +
+                    `(tmdb=${laTmdb} season=${laSeason} episode=${laEpisode}); chapter-only`,
+                  );
+                }
+                return withIntroDb(pmdbWindows);
+              })().catch((e): PreparedWindow[] => {
+                console.warn(`[publicmetadb] lookup failed: ${String(e)}`);
+                return [];
+              });
+              await finishWithChapters(pmdbPrepared, {
                 streamUrl: stream.url ?? null,
                 isAnime,
               });
@@ -3796,13 +3878,20 @@ export default function App() {
               ? (target.episode_num as number)
               : idEpisode;
             const episodeNum = courEpisode != null ? courEpisode : seasonEpisodeNum;
+            skipCourRef.current = {
+              targetId: target.id,
+              malId,
+              courEpisode: Number.isFinite(episodeNum) ? episodeNum : null,
+              season: Number.isFinite(target.season as number) ? (target.season as number) : null,
+              episodeNum: Number.isFinite(seasonEpisodeNum) ? seasonEpisodeNum : null,
+            };
             if (!Number.isFinite(episodeNum)) {
               // Can't index AniSkip without an episode number, but a
               // chaptered file can still yield skip windows.
               // The MAL id still drives the detector's theme match (the episode
               // number only ORDERS themes there, it is never a gate).
               console.info(`[aniskip] couldn't parse episode from ${target.id}; no AniSkip lookup`);
-              await finishWithChapters(await withIntroDb([]), {
+              await finishWithChapters(withIntroDb([]), {
                 streamUrl: stream.url ?? null,
                 isAnime: true,
                 malId,
@@ -3821,79 +3910,90 @@ export default function App() {
             // up top). On found → build prepared windows; on
             // not-found / network failure → prepared stays empty and
             // we still fall through to the chapter augment.
-            let prepared: PreparedWindow[] = [];
-            try {
-              const cacheKey = `${malId}:${episodeNum}:${treatMixed ? 1 : 0}`;
-              let result = aniskipCache.get(cacheKey);
-              if (!result) {
-                result = await invoke<AniSkipResult>(
-                  "fetch_skip_windows",
-                  {
-                    malId,
-                    episode: episodeNum,
-                    episodeLength: 0,
-                    treatMixedOpAsOp: treatMixed,
-                  },
-                );
-                // Cache only successful resolutions — not-found can flip
-                // to found after community contribution lands.
-                if (result.found && result.windows.length > 0) {
-                  aniskipCache.set(cacheKey, result);
-                }
-              } else {
-                console.info(`[aniskip] cache hit mal=${malId} ep=${episodeNum}`);
-              }
-              if (result.found && result.windows.length > 0) {
-                prepared = result.windows
-                  .filter((w) => modeFor(w.kind) !== "off")
-                  .map((w) => ({
-                    type:    w.kind,
-                    start:   w.start,
-                    end:     w.end,
-                    source:  w.source,
-                    auto:    modeFor(w.kind) === "auto",
-                    skip_id: w.skip_id ?? null,
-                    skip_ref: `${malId}:${episodeNum}`,
-                  }));
-              }
-            } catch (err) {
-              // AniSkip network/parse failure is non-fatal — chapter +
-              // heuristic windows still run via finishWithChapters.
-              console.warn(`[aniskip] lookup failed: ${String(err)}`);
-            }
-            // publicmetadb anime fallback — best-effort SECONDARY source.
-            // Fires only when AniSkip left an OP or ED gap. Fills ONLY the
-            // kinds AniSkip didn't supply. Keyed by TMDB season + episode, so
-            // it is asked with the addon's season-relative number
-            // (seasonEpisodeNum), never the MAL-local one.
-            try {
-              const haveOp = prepared.some((w) => w.type === "op" || w.type === "mixed-op");
-              const haveEd = prepared.some((w) => w.type === "ed");
-              if ((!haveOp || !haveEd) && Number.isFinite(seasonEpisodeNum)) {
-                const animeTmdb = await resolveAnimeTmdb();
-                if (animeTmdb != null) {
-                  const pmdb = await fetchPublicmetadbWindows(
-                    animeTmdb, "tv", target.season ?? 1, seasonEpisodeNum, modeFor,
+            // AniSkip, then PublicMetaDB for a kind it left open, then IntroDB:
+            // in flight while finishWithChapters starts the detector and the
+            // chapter poll.
+            const crowdPrepared = (async (): Promise<PreparedWindow[]> => {
+              let prepared: PreparedWindow[] = [];
+              try {
+                const cacheKey = `${malId}:${episodeNum}:${treatMixed ? 1 : 0}`;
+                let result = aniskipCache.get(cacheKey);
+                if (!result) {
+                  result = await invoke<AniSkipResult>(
+                    "fetch_skip_windows",
+                    {
+                      malId,
+                      episode: episodeNum,
+                      episodeLength: 0,
+                      treatMixedOpAsOp: treatMixed,
+                    },
                   );
-                  for (const w of pmdb) {
-                    if (w.type === "op" && !haveOp) prepared.push(w);
-                    if (w.type === "ed" && !haveEd) prepared.push(w);
+                  // Cache only successful resolutions: not-found can flip
+                  // to found after community contribution lands.
+                  if (result.found && result.windows.length > 0) {
+                    aniskipCache.set(cacheKey, result);
                   }
-                  if (pmdb.length > 0) {
-                    console.info(
-                      `[publicmetadb] anime fallback: tmdb=${animeTmdb} → ${pmdb.length} window(s)`,
+                } else {
+                  console.info(`[aniskip] cache hit mal=${malId} ep=${episodeNum}`);
+                }
+                if (result.found && result.windows.length > 0) {
+                  prepared = result.windows
+                    .filter((w) => modeFor(w.kind) !== "off")
+                    .map((w) => ({
+                      type:    w.kind,
+                      start:   w.start,
+                      end:     w.end,
+                      source:  w.source,
+                      auto:    modeFor(w.kind) === "auto",
+                      skip_id: w.skip_id ?? null,
+                      skip_ref: `${malId}:${episodeNum}`,
+                    }));
+                }
+              } catch (err) {
+                // AniSkip network/parse failure is non-fatal: chapter +
+                // heuristic windows still run via finishWithChapters.
+                console.warn(`[aniskip] lookup failed: ${String(err)}`);
+              }
+              // publicmetadb anime fallback: best-effort SECONDARY source.
+              // Fires only when AniSkip left an OP or ED gap. Fills ONLY the
+              // kinds AniSkip didn't supply. Keyed by TMDB season + episode, so
+              // it is asked with the addon's season-relative number
+              // (seasonEpisodeNum), never the MAL-local one.
+              try {
+                const haveOp = prepared.some((w) => w.type === "op" || w.type === "mixed-op");
+                const haveEd = prepared.some((w) => w.type === "ed");
+                if ((!haveOp || !haveEd) && Number.isFinite(seasonEpisodeNum)) {
+                  const animeTmdb = await resolveAnimeTmdb();
+                  if (animeTmdb != null) {
+                    const pmdb = await fetchPublicmetadbWindows(
+                      animeTmdb, "tv", target.season ?? 1, seasonEpisodeNum, modeFor,
                     );
+                    for (const w of pmdb) {
+                      if (w.type === "op" && !haveOp) prepared.push(w);
+                      if (w.type === "ed" && !haveEd) prepared.push(w);
+                    }
+                    if (pmdb.length > 0) {
+                      console.info(
+                        `[publicmetadb] anime fallback: tmdb=${animeTmdb} → ${pmdb.length} window(s)`,
+                      );
+                    }
                   }
                 }
+              } catch (e) {
+                console.warn(`[publicmetadb] anime fallback failed: ${String(e)}`);
               }
-            } catch (e) {
-              console.warn(`[publicmetadb] anime fallback failed: ${String(e)}`);
-            }
+              return withIntroDb(prepared);
+            })().catch((e): PreparedWindow[] => {
+              console.warn(`[aniskip] crowd lookups failed: ${String(e)}`);
+              return [];
+            });
             // ALWAYS augment with chapters (even on an empty AniSkip
             // result): anime with no AniSkip data gets the same chapter /
             // heuristic treatment as live-action. With the MAL id, the layered
-            // detector runs on this episode whatever AniSkip supplied.
-            await finishWithChapters(await withIntroDb(prepared), {
+            // detector runs on this episode whatever AniSkip supplied, and it
+            // starts as soon as the duration is known: the crowd lookups above
+            // ride `crowdPrepared` and are awaited by the chapter merge only.
+            await finishWithChapters(crowdPrepared, {
               streamUrl: stream.url ?? null,
               isAnime: true,
               malId,
@@ -4831,6 +4931,60 @@ export default function App() {
   // Network round-trips can take 5–30 s depending on the addon set
   // — kicking it off mid-episode means data is ready by the time
   // the display gate trips.
+  // Theme prefetch for the episode Next-Up pre-resolved: the AnimeThemes list
+  // and the top-ranked theme fingerprint of each kind for ITS cour (never any
+  // episode audio), so the next episode's theme match needs no theme download
+  // and can prompt within seconds. The cour is the next video's own MAL pair
+  // (AIOMetadata), else the playing cour when the next video is simply the
+  // following episode of the same season. Skipped with detection off, with
+  // both kinds off, or without ffmpeg (it never triggers the ffmpeg download).
+  // Typical cost: one paced AnimeThemes GET when the list is not cached and
+  // about 2 MB per theme not already fingerprinted; the audio is dropped.
+  const prefetchNextThemes = useCallback((nextVideo: VideoEntry, currentId: string): void => {
+    if (loadAuraSettings().autoSkipDetect === false) return;
+    const modes = skipModesRef.current;
+    const wantOp = modes.op !== "off";
+    const wantEd = modes.ed !== "off";
+    if (!wantOp && !wantEd) return;
+    let malId: number | null = null;
+    let malEpisode: number | null = null;
+    let how = "";
+    if (nextVideo.mal_id && nextVideo.mal_episode) {
+      malId = nextVideo.mal_id;
+      malEpisode = nextVideo.mal_episode;
+      how = "its own MAL pair";
+    } else {
+      const cur = skipCourRef.current;
+      if (
+        cur && cur.targetId === currentId && cur.courEpisode != null && cur.episodeNum != null
+        && nextVideo.season === cur.season && nextVideo.episode === cur.episodeNum + 1
+      ) {
+        malId = cur.malId;
+        malEpisode = cur.courEpisode + 1;
+        how = "the playing cour";
+      }
+    }
+    if (malId == null) return;
+    void (async () => {
+      const present = await runtimeDepPresent("ffmpeg.exe").catch(() => false);
+      if (!present) return;
+      const r = await invoke<SkipDetectReply>("skip_detect", {
+        action: {
+          op: "prefetch",
+          mal_id: malId,
+          mal_episode: malEpisode,
+          // Not `op` / `ed`: the action is tagged `op`.
+          detect_op: wantOp,
+          detect_ed: wantEd,
+        },
+      });
+      console.info(
+        `[skipdetect] next-episode theme prefetch mal=${malId} ep=${malEpisode} (${how}): `
+        + `${r.result === "prefetch" && r.started ? "started" : "not started"}`,
+      );
+    })().catch((e) => console.warn(`[skipdetect] next-episode theme prefetch failed: ${String(e)}`));
+  }, []);
+
   useEffect(() => {
     if (!activeTarget) return;
     if (nextUpLeadSeconds <= 0) return; // user disabled the feature
@@ -4880,6 +5034,7 @@ export default function App() {
         // navigates to a different episode.
         return;
       }
+      if (nextUpResolvedFor.current === currentId) prefetchNextThemes(next.next, currentId);
       // Pre-fetch the first stream so the user's click feels instant.
       // If this returns null we still show the CTA but with a
       // "no stream found" hint rather than a play button. In parallel,
@@ -4897,7 +5052,7 @@ export default function App() {
         setNextUpInfo({ episode: next.next, stream, canon });
       }
     })();
-  }, [activeTarget, time, duration, addons, nextUpLeadSeconds]);
+  }, [activeTarget, time, duration, addons, nextUpLeadSeconds, prefetchNextThemes]);
 
   // DISPLAY-GATE effect. ONE expression, in nextUpGate.ts: with a TRUSTED
   // ending (Layer 1) the card appears at max(ED end, end - lead), so never
@@ -10392,7 +10547,14 @@ export default function App() {
           skipCount={nextUpInfo.canon?.skipped.length ?? 0}
           onPlay={onEosPlayNext}
           onDismiss={onNextUpDismiss}
+          // The same predicate the Spotlight gets, so the card's "Autoplay"
+          // line agrees with whether the end screen will count down.
+          autoSkipsToCanon={
+            !!nextUpInfo.canon
+            && autoSkipApplies(loadAuraSettings().nextUpSkipFillerRecap, nextUpInfo.episode)
+          }
           arcNote={arcNote}
+          autoAdvanceStreak={autoAdvanceStreakRef.current}
         />
       )}
 

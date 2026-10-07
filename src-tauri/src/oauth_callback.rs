@@ -311,7 +311,7 @@ fn deliver(service: &str, pairs: &[(&str, &str)]) -> Response {
             let _ = app.emit("deep-link", deep_link);
             // The user's attention is in the browser right now; pull Aura
             // forward so the "Connected as <user>" toast is actually seen.
-            if let Some(win) = app.get_webview_window("main") {
+            {
                 // show() first for the same reason as tray::show_main_window:
                 // a tray-hidden window is hidden AND minimized, and a bare
                 // unminimize() on it would SW_RESTORE then be re-hidden in the
@@ -321,10 +321,26 @@ fn deliver(service: &str, pairs: &[(&str, &str)]) -> Response {
                 // tray::show_main_window: that also emits
                 // aura:window-restored-from-tray, whose refresh_video nudge has
                 // a documented expand-then-shrink flicker, and an OAuth
-                // completion can land mid-playback.
-                let _ = win.show();
-                let _ = win.unminimize();
-                let _ = win.set_focus();
+                // completion can land mid-playback. The webview is unparked
+                // first (a no-op unless the window was hidden to the tray).
+                //
+                // All of it runs as ONE main-thread closure: this handler is on
+                // a tokio worker, and a close-to-tray landing between the
+                // unpark and the show() would otherwise park the webview of a
+                // window we then show (blank page, no tray icon).
+                let h = app.clone();
+                let queued = app.run_on_main_thread(move || {
+                    if let Some(win) = h.get_webview_window("main") {
+                        crate::window_logic::unpark_main_webview(&h);
+                        let _ = win.show();
+                        let _ = win.unminimize();
+                        let _ = win.set_focus();
+                        crate::tray::set_tray_visible(&h, false);
+                    }
+                });
+                if let Err(e) = queued {
+                    crate::devlog!(warn, "scrobble", "oauth loopback: could not bring the window forward: {e}");
+                }
             }
         }
         None => {

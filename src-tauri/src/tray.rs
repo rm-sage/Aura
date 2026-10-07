@@ -97,6 +97,11 @@ fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
         // SW_RESTORE and immediately re-hide, leaving a cleared WS_MINIMIZE for
         // the following show() to reveal with no animation. Matches the
         // single-instance handler in lib.rs.
+        //
+        // The webview is made visible again FIRST (it was parked when the
+        // window went to the tray), so the page is already producing its
+        // first frame when the restore animation starts.
+        crate::window_logic::unpark_main_webview(app);
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();

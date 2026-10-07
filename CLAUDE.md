@@ -241,7 +241,7 @@ no flags at all and an arc-level check would misread that as "no data".
 ### Skip detection: layered, and an ED end is never EOF
 
 `src-tauri/src/skipdetect/` (Rust, one tagged command `skip_detect` with `detect` / `cancel` /
-`status`, events `skipdetect-update`) plus the pure frontend half in `src/skipWindows.ts` (chapter
+`status` / `prefetch`, events `skipdetect-update`) plus the pure frontend half in `src/skipWindows.ts` (chapter
 titles, ranking, modes, media-end clamp) and `src/nextUpGate.ts` (when the Next-Up card may appear,
 and the detected media end the end-of-stream detectors use). Both TS modules are import-free so a
 node check can load them. Devlog label `[skipdetect]`. It was designed against a 31-episode corpus
@@ -267,9 +267,35 @@ after-credits scene on 10 of the 11 episodes that have one.
 - **TAIL never waits for the OP decision.** When HEAD ran to its end, the OP's theme search, sibling
   lookup and Layer 3 run beside the TAIL pass on a forked `Decider` (job.rs) and publish the moment
   they resolve; still one detector ffmpeg at a time.
+- **Early provisional opening (`animethemes-early`, HEAD only).** The full gate needs ~75-77 s of
+  the theme decoded (30 s run + soft42 coverage), so a 0:00 OP used to prompt 10-34 s into the
+  song. `matcher::EarlyTracker` publishes a PROMPT once >= 12 s of a run that starts within 5 s of
+  the theme's audible lead clears BER 0.35 and margin 0.15 on the global best placement. Corpus
+  (`skipdetect_early_rule_corpus`): every OP fires 12.3-14.1 s into the song (0:00 ones at 13.0 s),
+  windows within 0.05 s of the final Layer 1 window, 0 false fires over all 6,696 theme x region
+  pairings with no horizon. Do NOT go below 12 s (8 s let the Bleach "Over" insert through, 10 s had
+  a thin margin), and never offer it an "Over" theme (the one corpus fire left is exactly that).
+  Its own source: prompt-only, NOT Layer 1 (no 3 s conflict drop, so withdrawing it loses nothing),
+  ranked 4.5 (below every auto-capable source, above every guess), never cached, never in the final
+  snapshot. Replaced by the full match (the tracker stops), withdrawn when the best placement moves,
+  the margin drops, the run stops short of 30 s, the whole theme decoded without a full accept, or
+  HEAD ends without one. It fires only while HEAD has decoded < 300 s (`EARLY_HORIZON_S`); the curve
+  is folded incrementally (same total work as ONE full match) and run detection is skipped while
+  the margin is under the floor. An auto window entered past its midpoint (a late full match, a
+  resume) now becomes a prompt in `SkipController` instead of nothing.
+- **Start latency.** The frontend starts `skip_detect` the moment the MAL id and the duration are
+  both known (`watchLoadDuration`: the playback-update events, never a poll), not after AniSkip /
+  PublicMetaDB / IntroDB; those ride a promise that the chapter poll awaits only after reading the
+  chapters, so the first stamp waits for the slower of the two. Nothing is stamped before the chapter
+  poll settles (the Hell's Paradise rule stands). The probe stays: it is the DURATION-tag source of
+  the probe-only path. The `prefetch` action warms the AnimeThemes list and the top-ranked theme
+  fingerprint per kind for the episode Next-Up pre-resolved (its own MAL pair, else the playing cour
+  when it is the next episode of the same season); never episode audio, never with detection off or
+  without ffmpeg, one at a time.
 - **Layer 2 (blind pairing) is not shipped**; the `pairing` source and its priority slot are reserved.
 - **Merge (`dedupeSkipWindows`)**: animethemes 8 > chapter 7 > aniskip = introdb 6 > pairing =
-  publicmetadb 5 > introdb-single 4 > aniskip-neighbour 3 > chapter-heuristic 2 > continuity 1. When
+  publicmetadb 5 > animethemes-early 4.5 > introdb-single 4 > aniskip-neighbour 3 >
+  chapter-heuristic 2 > continuity 1. When
   a Layer 1 window exists for a kind, every other window of that kind whose start OR end is more than
   3 s away is DROPPED (TYBW 3:9-3:11 AniSkip ED rows were 32-38 s early with a matching
   episodeLength). AniSkip ED rows are prompt-only even with the ED mode on auto; IntroDB keeps its
@@ -306,8 +332,8 @@ after-credits scene on 10 of the 11 episodes that have one.
   otherwise shifts every window about 2 s early.
 - **Cancellation**: a module-level generation counter in Rust; the frontend cancels on every load, on
   exit playback and before each Detect, and applies only `skipdetect-update` events of its own
-  generation. The Detect action's kind switches travel as `detect_op` / `detect_ed`, because the
-  action enum is tagged `op`.
+  generation. The Detect (and Prefetch) action's kind switches travel as `detect_op` / `detect_ed`,
+  because the action enum is tagged `op`. A Prefetch is not cancelled by a Detect.
 
 ### Downloads: two landmines and one governing rule
 
@@ -716,6 +742,26 @@ all fixed and runtime-confirmed (taskbar and tray both animate the real window n
    NEVER make a thread that owns a child of the main window sleep without a message wait.
 The engine pump also holds its geometry while the parent `IsIconic`. The findings below were
 measured with all three bugs present; the latency and "no hotspot" conclusions are superseded.
+
+**Tray webview parking: every path that shows the main window must call
+`window_logic::unpark_main_webview` BEFORE `show()` / `unminimize()`.** Hiding the window to the
+tray hides only the native window, and WebView2 does not infer visibility from its host, so the
+page kept producing frames for every running animation at the display refresh: measured in the
+tray on Home, 48.5% of one core (renderer 45%); after parking, 0.2%. The close-to-tray branch sets
+the controller's `IsVisible = false` through `with_webview` (NOT wry's `set_visible`, which also
+`SW_HIDE`s the WRY_WEBVIEW container and would disturb the window tree the restore animation
+relies on). It parks only when nothing in the page needs live timers (a hidden page's timers are
+clamped): no file loaded (`set_media_loaded`, from `load_video` / `stop_video`), not in a
+watch-together room (`set_party_keep_alive`'s `in_room`), not casting, no History scrobble run.
+The restore sites today: `tray::show_main_window`, the single-instance handler in `lib.rs`, and
+the OAuth landing in `oauth_callback.rs`. A new one that skips the unpark restores a window with a
+page Chromium still thinks is hidden. Every park, unpark and re-park runs on the MAIN thread (the
+OAuth landing is a tokio handler, so it does its whole unpark-show sequence in one
+`run_on_main_thread` closure; otherwise a close-to-tray could park between its unpark and its
+show and leave a blank window with no tray icon). A blocker that clears while the window is in
+the tray (`stop_video`, leaving a room, the bulk scrobble run ending) calls
+`repark_if_tray_hidden`, which parks then; `TRAY_HIDDEN` is cleared by the unpark, so a restore
+always wins. Runtime-checked: each of those three re-parks drops the tray to 0.0-0.2% of a core.
 
 Symptom, and it is real: restoring from the taskbar button or the tray icon looks sudden and
 jarring, with no visible zoom. It is NOT a missing animation. Frame capture through a real restore:

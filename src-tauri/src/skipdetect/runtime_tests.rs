@@ -27,7 +27,10 @@
 //   skipdetect_runtime_detect  the whole job (result cache, probe, HEAD with
 //       early exit, TAIL, AnimeThemes over the network, caches in a temp dir)
 //       vs eval within 0.15 s, then a second run that must come from the
-//       result cache.
+//       result cache. It reports when the early provisional opening and the
+//       final OP were published (seconds since the detect started), checks
+//       the provisional window against the final one, and that it never
+//       reaches the final snapshot or the result cache.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -42,7 +45,7 @@ use super::audio::{self, RegionPass};
 use super::cache::ThemeFp;
 use super::corpus_tests::{bench, load_json, pair, read_wav, tag_of};
 use super::fingerprint::{fingerprint, SR};
-use super::job::{self, Ctx, JobState, Request, Snapshot};
+use super::job::{self, Ctx, JobState, Request, Snapshot, EARLY_SOURCE};
 use super::matcher;
 use super::probe;
 use super::themes::{self, Kind, Step};
@@ -409,7 +412,26 @@ async fn skipdetect_runtime_detect() {
             };
             let s = job::run(&ctx, &req).await;
             let wall = t.elapsed().as_secs_f64();
-            let first_op = seen.lock().unwrap().iter().find(|(_, s)| s.op.is_some()).map(|(t, s)| (*t, s.ed.is_some()));
+            let is_early = |s: &Snapshot| s.op.as_ref().is_some_and(|w| w.source == EARLY_SOURCE);
+            let first_op = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(_, s)| s.op.is_some() && !is_early(s))
+                .map(|(t, s)| (*t, s.ed.is_some()));
+            // The early provisional opening: first publish, its window, and
+            // how often it was withdrawn (op went from early to none).
+            let (early, withdrawn) = {
+                let v = seen.lock().unwrap();
+                let early = v.iter().find(|(_, s)| is_early(s)).map(|(t, s)| (*t, s.op.clone().unwrap()));
+                let mut withdrawn = 0;
+                for w in v.windows(2) {
+                    if is_early(&w[0].1) && w[1].1.op.is_none() {
+                        withdrawn += 1;
+                    }
+                }
+                (early, withdrawn)
+            };
             let me = s.media_end.unwrap_or(f64::NAN);
             println!(
                 "[rt-job] {id} round {round}: {:.1}s, cache {}, op {:?} ed {:?} media_end {me:.3} final {} notes {:?}/{:?}; first OP publish {:?}",
@@ -422,6 +444,40 @@ async fn skipdetect_runtime_detect() {
                 s.ed_note,
                 first_op
             );
+            println!(
+                "[rt-job] {id} round {round}: early prompt {}; final OP {}; withdrawn {withdrawn} time(s)",
+                early.as_ref().map_or("none".to_string(), |(t, w)| format!(
+                    "at {t:.1}s [{:.2}, {:.2}] {} run {:?}",
+                    w.start,
+                    w.end,
+                    w.theme.as_deref().unwrap_or("?"),
+                    w.run_s
+                )),
+                first_op.map_or("none".to_string(), |(t, _)| format!("at {t:.1}s"))
+            );
+            if is_early(&s) || s.ed.as_ref().is_some_and(|w| w.source == EARLY_SOURCE) {
+                fails.push(format!("{id} round {round}: the final snapshot holds the provisional window"));
+            }
+            if let Some((te, w)) = &early {
+                if w.auto_eligible {
+                    fails.push(format!("{id}: provisional window marked auto-eligible"));
+                }
+                if round == 1 {
+                    fails.push(format!("{id}: a result-cache hit published a provisional window"));
+                }
+                match (&s.op, first_op) {
+                    (Some(fin), Some((tf, _))) => {
+                        let d = (fin.start - w.start).abs().max((fin.end - w.end).abs());
+                        if d > 0.5 {
+                            fails.push(format!("{id}: provisional [{:.2}, {:.2}] vs final [{:.2}, {:.2}]", w.start, w.end, fin.start, fin.end));
+                        }
+                        if *te > tf {
+                            fails.push(format!("{id}: provisional published after the final window"));
+                        }
+                    }
+                    _ => println!("[rt-job] {id}: provisional window with no final OP (withdrawn {withdrawn})"),
+                }
+            }
             if s.state != JobState::Done {
                 fails.push(format!("{id} round {round}: state {:?}", s.state));
             }
@@ -520,4 +576,40 @@ async fn skipdetect_runtime_detect() {
         println!("[rt-job] FAIL {f}");
     }
     assert!(fails.is_empty(), "{} runtime detect failure(s)", fails.len());
+}
+
+/// The Next-Up theme prefetch against the real AnimeThemes API (GET only,
+/// paced; no stream involved): the list and the top-ranked theme of each kind
+/// land in a temp cache, and a second prefetch finds them all cached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs network (AnimeThemes GETs) and ffmpeg"]
+async fn skipdetect_runtime_prefetch() {
+    let ff = ffmpeg();
+    let dir = std::env::temp_dir().join(format!("aura-skipdetect-prefetch-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let req: job::PrefetchRequest =
+        serde_json::from_value(serde_json::json!({"mal_id": 56784, "mal_episode": 2})).unwrap();
+    let req = req.validate().unwrap();
+    let t = Instant::now();
+    let first = job::prefetch(&ff, &dir, &req).await;
+    println!("[rt-prefetch] first: {:?} in {:.1}s", first, t.elapsed().as_secs_f64());
+    let t = Instant::now();
+    let second = job::prefetch(&ff, &dir, &req).await;
+    println!("[rt-prefetch] second: {:?} in {:.1}s", second, t.elapsed().as_secs_f64());
+    let fps = std::fs::read_dir(dir.join(super::cache::THEME_FP_DIR)).map(|d| d.count()).unwrap_or(0);
+    let tmp_left = std::fs::read_dir(&dir)
+        .unwrap()
+        .chain(std::fs::read_dir(dir.join(super::cache::THEME_FP_DIR)).unwrap())
+        .filter_map(|e| e.ok())
+        .any(|e| e.path().extension().is_some_and(|x| x == "tmp"));
+    let bytes = super::cache::total_bytes(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(first.themes.len(), 2, "one OP and one ED: {first:?}");
+    assert!(first.themes.iter().all(|(_, downloaded)| *downloaded), "{first:?}");
+    assert_eq!(second.themes.len(), 2);
+    assert!(second.themes.iter().all(|(_, downloaded)| !*downloaded), "the second prefetch must be all cache: {second:?}");
+    assert_eq!(fps, 2, "two fingerprints cached");
+    assert!(!tmp_left, "a .tmp was left behind");
+    println!("[rt-prefetch] cache {bytes} bytes (fingerprints only, no audio)");
+    assert!(bytes < 200_000, "the cache holds fingerprints, never audio ({bytes} bytes)");
 }

@@ -74,12 +74,14 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    {
+    let written = (|| {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path).inspect_err(|_| {
+        f.sync_all()
+    })();
+    // A failed write (disk full, a scanner holding the file) must not leave a
+    // stray `.tmp` behind: nothing would ever clean it up.
+    written.and_then(|()| std::fs::rename(&tmp, path)).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
 }
@@ -413,6 +415,22 @@ mod tests {
         assert_eq!(get_theme_list::<Vec<u32>>(&d, 6), Some(Some(vec![3])));
         clear_all(&d).unwrap();
         assert!(!d.join(THEME_LIST_FILE).exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn failed_write_leaves_no_tmp() {
+        let d = tmp();
+        // The target is a non-empty directory: the final rename fails.
+        let target = d.join("blocked.json");
+        std::fs::create_dir_all(target.join("inner")).unwrap();
+        assert!(write_atomic(&target, b"{}").is_err());
+        assert!(!d.join("blocked.json.tmp").exists(), "stray .tmp after a failed write");
+        // A JSON cache write that fails the same way leaves nothing behind either.
+        let p = d.join(RESULT_FILE);
+        std::fs::create_dir_all(p.join("inner")).unwrap();
+        put_entry(&p, "a", 1u32, 100, 3, 1000);
+        assert!(!d.join(format!("{RESULT_FILE}.tmp")).exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 

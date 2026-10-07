@@ -633,8 +633,13 @@ pub fn scrobble_run_active() -> bool {
 /// Mirror the frontend's bulk-run state into Rust. The frontend MUST clear this
 /// (in a `finally`) or the window could never be closed again.
 #[tauri::command]
-pub fn set_scrobble_run_active(active: bool) {
+pub fn set_scrobble_run_active(app: tauri::AppHandle, active: bool) {
     SCROBBLE_RUN_ACTIVE.store(active, std::sync::atomic::Ordering::Release);
+    if !active {
+        // A run that finished while the window sits in the tray no longer
+        // keeps the webview visible.
+        crate::window_logic::repark_if_tray_hidden(&app);
+    }
 }
 
 /// Last time a PROACTIVE Trakt refresh was attempted, per scope.

@@ -108,12 +108,11 @@ export interface AuraSettings {
    *  when the OS asked for reduce (useful for users who set OS reduce
    *  for a specific app but want Aura's atmosphere). */
   reduceMotion: "auto" | "always" | "never";
-  /** When true, the Next-Up CTA auto-fires `playNext` after
-   *  `autoAdvanceDelaySeconds` of inactivity once the card surfaces.
-   *  Default false — auto-advance is opt-in to avoid the "I was
-   *  reading the credits and it skipped" friction class. Mouse
-   *  movement inside the player, the Escape key, or explicit dismiss
-   *  cancels the countdown. */
+  /** When true, the end-of-episode screen (EosSpotlight) starts the next
+   *  episode after `autoAdvanceDelaySeconds`. The Next-Up card never counts
+   *  down, so after-credits scenes and previews always play. Default false.
+   *  Mouse movement, a key press, scrolling, or dismissing the Next-Up card
+   *  cancels it. */
   autoAdvanceNextEpisode: boolean;
   /** Countdown in seconds before silent auto-advance fires (when
    *  `autoAdvanceNextEpisode === true`). Clamped to [5, 30] on load
@@ -144,7 +143,9 @@ export interface AuraSettings {
    *  ffmpeg is fetched on demand (a one-time ~97 MB download) the first time it
    *  is needed. Default true; turn off to avoid that download / the background
    *  reads. (Per-kind auto vs prompt vs off is still governed by the Skip
-   *  OP/ED/Recap mode settings.) */
+   *  OP/ED/Recap mode settings.) With this off, a series load still runs one
+   *  probe-only detect (no HEAD / TAIL) when ffmpeg is already installed, for
+   *  the end-of-stream media end. */
   autoSkipDetect: boolean;
   /** Blur the selected episode's per-episode synopsis on the detail
    *  page until the user clicks to reveal. Spoiler protection for
@@ -226,7 +227,7 @@ export interface AuraSettings {
    *  Settings since it's a stylistic cousin of "skip the boring
    *  bits".
    *
-   *  SCOPE: this decides WHICH BUTTON AN UNATTENDED COUNTDOWN PRESSES, and
+   *  SCOPE: this decides WHICH BUTTON THE END-OF-EPISODE COUNTDOWN PRESSES, and
    *  nothing else. It used to be fed to `resolveNextEpisode`, where it changed
    *  what "the next episode" was: the card said "Play next episode" and played
    *  a different one, the user could not see what was being jumped or opt out

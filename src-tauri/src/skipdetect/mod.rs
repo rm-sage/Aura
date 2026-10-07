@@ -23,7 +23,7 @@
 //   job          one detect end to end (probe -> HEAD -> TAIL).
 //
 // One Tauri command, `skip_detect`, takes a tagged action (detect / cancel /
-// status) so the three registration sites cover the whole feature. Detect
+// status / prefetch) so the three registration sites cover the whole feature. Detect
 // awaits the final result; every intermediate change (an OP accepted while
 // HEAD is still decoding, the media end at TAIL EOF) is also emitted as a
 // `skipdetect-update` event and readable through Status. A module-level
@@ -66,7 +66,7 @@ mod corpus_tests;
 mod runtime_tests;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -113,6 +113,10 @@ pub enum SkipDetectAction {
     Cancel,
     /// The current detect's latest snapshot.
     Status,
+    /// Warm the theme caches for the cour of the episode Next-Up pre-resolved
+    /// (theme list + top-ranked fingerprints, never episode audio). Returns at
+    /// once; at most one runs at a time and it is not cancelled by a Detect.
+    Prefetch(job::PrefetchRequest),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,6 +127,9 @@ pub enum SkipDetectReply {
     Detected { snapshot: Snapshot, superseded: bool },
     Cancelled { generation: u64 },
     Status { snapshot: Option<Snapshot> },
+    /// `started` false: another prefetch is running, no ffmpeg, or the
+    /// request was invalid (nothing to do; never an error for the caller).
+    Prefetch { started: bool },
 }
 
 /// `app_data_dir()`, created on demand.
@@ -148,7 +155,70 @@ pub async fn skip_detect(app: AppHandle, action: SkipDetectAction) -> Result<Ski
             Ok(SkipDetectReply::Cancelled { generation })
         }
         SkipDetectAction::Detect(req) => detect(app, req).await,
+        SkipDetectAction::Prefetch(req) => Ok(SkipDetectReply::Prefetch { started: start_prefetch(app, req).await }),
     }
+}
+
+/// One prefetch at a time, process-wide (they are rare: one per Next-Up
+/// pre-resolve). A detect does not wait for it: theme downloads go to
+/// AnimeThemes, never the stream host, and are paced there.
+static PREFETCHING: AtomicBool = AtomicBool::new(false);
+
+/// Releases `PREFETCHING` when dropped: on normal completion and on unwind.
+struct PrefetchLatch;
+
+impl Drop for PrefetchLatch {
+    fn drop(&mut self) {
+        PREFETCHING.store(false, Ordering::SeqCst);
+    }
+}
+
+async fn start_prefetch(app: AppHandle, req: job::PrefetchRequest) -> bool {
+    let req = match req.validate() {
+        Ok(r) => r,
+        Err(e) => {
+            crate::devlog!(debug, "skipdetect", "prefetch skipped: {e}");
+            return false;
+        }
+    };
+    let Some(dir) = data_dir(&app) else { return false };
+    // Never downloads ffmpeg for this: without it a detect is inert anyway.
+    if !crate::silencedetect::ffmpeg_is_available(&app).await {
+        return false;
+    }
+    if PREFETCHING.swap(true, Ordering::SeqCst) {
+        crate::devlog!(debug, "skipdetect", "prefetch mal {} skipped: another is running", req.mal_id);
+        return false;
+    }
+    // Owns the PREFETCHING claim from here on and releases it on drop, so a
+    // panic anywhere below (the spawned task included) cannot leave the latch
+    // set and disable prefetch for the rest of the process.
+    let latch = PrefetchLatch;
+    let ff = crate::silencedetect::ffmpeg_bin(&app);
+    tokio::spawn(async move {
+        let latch = latch;
+        let t = std::time::Instant::now();
+        let out = job::prefetch(&ff, &dir, &req).await;
+        drop(latch);
+        crate::devlog!(
+            info, "skipdetect",
+            "prefetch mal {} ep {}: {}{} in {:.1}s",
+            req.mal_id,
+            req.mal_episode.map_or("-".to_string(), |e| e.to_string()),
+            if out.themes.is_empty() {
+                "no theme".to_string()
+            } else {
+                out.themes
+                    .iter()
+                    .map(|(l, d)| format!("{l} {}", if *d { "downloaded" } else { "already cached" }))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+            out.note.map(|n| format!(" ({n})")).unwrap_or_default(),
+            t.elapsed().as_secs_f64()
+        );
+    });
+    true
 }
 
 async fn detect(app: AppHandle, req: Request) -> Result<SkipDetectReply, String> {
@@ -286,5 +356,22 @@ mod tests {
         assert!(matches!(c, SkipDetectAction::Cancel));
         let r = serde_json::to_value(SkipDetectReply::Cancelled { generation: 4 }).unwrap();
         assert_eq!(r, serde_json::json!({"result": "cancelled", "generation": 4}));
+        // Prefetch: same kind switches as Detect, validated before anything runs.
+        let p: SkipDetectAction = serde_json::from_value(serde_json::json!({
+            "op": "prefetch", "mal_id": 56784, "mal_episode": 3, "detect_op": true, "detect_ed": false
+        }))
+        .unwrap();
+        let SkipDetectAction::Prefetch(p) = p else { panic!("not a prefetch") };
+        let p = p.validate().unwrap();
+        assert!(p.op && !p.ed && p.mal_episode == Some(3));
+        let bad: SkipDetectAction = serde_json::from_value(serde_json::json!({"op": "prefetch", "mal_id": 0})).unwrap();
+        let SkipDetectAction::Prefetch(bad) = bad else { panic!() };
+        assert!(bad.validate().is_err());
+        let none: SkipDetectAction =
+            serde_json::from_value(serde_json::json!({"op": "prefetch", "mal_id": 5, "detect_op": false, "detect_ed": false})).unwrap();
+        let SkipDetectAction::Prefetch(none) = none else { panic!() };
+        assert!(none.validate().is_err());
+        let r = serde_json::to_value(SkipDetectReply::Prefetch { started: true }).unwrap();
+        assert_eq!(r, serde_json::json!({"result": "prefetch", "started": true}));
     }
 }

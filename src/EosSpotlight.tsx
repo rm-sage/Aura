@@ -577,7 +577,7 @@ function EosSpotlight({
                           <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                             <path d="M8 5v14l11-7z" />
                           </svg>
-                          Play next in {remaining}s — move to cancel
+                          Play next in {remaining}s, move to cancel
                         </span>
                       ) : (
                         <span className="relative flex items-center gap-2">
@@ -691,7 +691,7 @@ function EosSpotlight({
                 <NextAirCountdown targetMs={nextAirTargetMs} />
               ) : (
                 <p className="text-white/60 text-[13.5px] leading-relaxed mb-6 max-w-[42ch]">
-                  You’re all caught up — the next episode hasn’t been scheduled yet.
+                  You’re all caught up: the next episode hasn’t been scheduled yet.
                 </p>
               )
             ) : (

@@ -47,7 +47,7 @@ use super::audio::{self, RegionPass};
 use super::cache::{self, ThemeFp};
 use super::continuity::{self, Region, RmsMeter, Silence};
 use super::fingerprint::{Fingerprint, Fingerprinter, SR};
-use super::matcher::{self, MatchSchedule, ThemeMatch};
+use super::matcher::{self, EarlyEvent, EarlyRef, EarlyTracker, MatchSchedule, ThemeMatch};
 use super::probe;
 use super::themes::{self, Kind, Step, ThemeMeta};
 
@@ -167,6 +167,83 @@ impl Request {
     }
 }
 
+/// Warm the theme caches for a cour BEFORE it plays: the episode Next-Up
+/// pre-resolved. Fetches the AnimeThemes list and the top-ranked theme of each
+/// wanted kind (exactly what a detect prefetches first), so the next episode's
+/// match needs no theme download. Never touches the episode's stream.
+#[derive(Clone, Debug, Deserialize)]
+pub struct PrefetchRequest {
+    pub mal_id: u32,
+    /// Episode within the MAL cour (orders themes; never a gate).
+    #[serde(default)]
+    pub mal_episode: Option<u32>,
+    /// Same wire names as Detect (the action enum is tagged `op`).
+    #[serde(default = "yes", rename = "detect_op")]
+    pub op: bool,
+    #[serde(default = "yes", rename = "detect_ed")]
+    pub ed: bool,
+}
+
+impl PrefetchRequest {
+    pub fn validate(mut self) -> Result<Self, String> {
+        if self.mal_id == 0 {
+            return Err("missing MAL id".into());
+        }
+        if !(self.op || self.ed) {
+            return Err("no kind wanted".into());
+        }
+        self.mal_episode = self.mal_episode.filter(|&e| e > 0 && e < 100_000);
+        Ok(self)
+    }
+}
+
+/// What a prefetch did, per wanted kind: the theme label and whether it was
+/// downloaded (false = already cached), or why there was none.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PrefetchOutcome {
+    pub themes: Vec<(String, bool)>,
+    pub note: Option<String>,
+}
+
+/// The theme indices a detect for `(list, ep)` would prefetch first: the
+/// top-ranked candidate of each wanted kind.
+pub fn prefetch_targets(list: &[ThemeRec], mal: u32, ep: Option<u32>, op: bool, ed: bool) -> Vec<usize> {
+    let metas: Vec<ThemeMeta> = list.iter().map(|r| r.meta(mal)).collect();
+    let mut out = Vec::new();
+    for (want, kind) in [(op, Kind::Op), (ed, Kind::Ed)] {
+        if want {
+            if let Some(&i) = themes::candidate_order(&metas, kind, ep).first() {
+                out.push(i);
+            }
+        }
+    }
+    out
+}
+
+/// Run one prefetch (theme list + fingerprints; the audio is never kept).
+pub async fn prefetch(ffmpeg: &std::ffi::OsStr, data_dir: &std::path::Path, req: &PrefetchRequest) -> PrefetchOutcome {
+    let mut out = PrefetchOutcome::default();
+    let list = match animethemes::theme_list(Some(data_dir), req.mal_id).await {
+        Ok(l) => l,
+        Err(e) => {
+            out.note = Some(format!("animethemes unavailable ({})", e.0));
+            return out;
+        }
+    };
+    if list.is_empty() {
+        out.note = Some("no themes listed".into());
+        return out;
+    }
+    for i in prefetch_targets(&list, req.mal_id, req.mal_episode, req.op, req.ed) {
+        let rec = &list[i];
+        match animethemes::load_theme_fp(ffmpeg, Some(data_dir), rec).await {
+            Ok((_, downloaded)) => out.themes.push((rec.label(), downloaded)),
+            Err(e) => out.note = Some(format!("{}: {e}", rec.label())),
+        }
+    }
+    out
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
@@ -179,12 +256,19 @@ pub enum JobState {
     Unavailable,
 }
 
+/// Source of the early provisional opening: a PROMPT published once the theme's
+/// first 12 s matched, replaced by the full match or withdrawn. Never
+/// auto-eligible, never cached, and (frontend) never Layer 1: it does not drop
+/// other sources' windows.
+pub const EARLY_SOURCE: &str = "animethemes-early";
+
 /// A published window. Field names are the wire names (no serde renames).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WindowOut {
     pub start: f64,
     pub end: f64,
-    /// "animethemes" (Layer 1) or "continuity" (Layer 3).
+    /// "animethemes" (Layer 1), "animethemes-early" (the provisional opening,
+    /// EARLY_SOURCE) or "continuity" (Layer 3).
     pub source: String,
     /// False for Layer 3 and for an "Over" OP theme.
     pub auto_eligible: bool,
@@ -429,24 +513,38 @@ impl Loader {
 
 // ── region pass ─────────────────────────────────────────────────────────────
 
+/// A loaded candidate theme handed to the region worker. `early` = the early
+/// provisional rule may fire on it (never an "Over" theme, never a Transition
+/// version while its full version is a candidate).
+struct StreamTheme {
+    idx: usize,
+    t: Arc<ThemeFp>,
+    early: bool,
+}
+
 enum WCmd {
     Pcm(Vec<i16>),
     T0(f64),
-    Themes(Vec<(usize, Arc<ThemeFp>)>),
+    Themes(Vec<StreamTheme>),
+    /// The full gate accepted: the early tracker has nothing left to do.
+    EarlyStop,
     Finish,
 }
 
 enum WEvt {
     Matched { decoded_s: f64, results: Vec<(usize, ThemeMatch)> },
+    Early { decoded_s: f64, event: EarlyEvent },
     Finished { fp: Fingerprint, levels: Vec<f32> },
 }
 
-/// The blocking-pool half of a region: fingerprint + RMS + incremental match.
-fn worker_loop(mut rx: mpsc::Receiver<WCmd>, tx: mpsc::UnboundedSender<WEvt>, t0: f64) {
+/// The blocking-pool half of a region: fingerprint + RMS + incremental match,
+/// and (HEAD only, `early`) the early provisional-opening tracker.
+fn worker_loop(mut rx: mpsc::Receiver<WCmd>, tx: mpsc::UnboundedSender<WEvt>, t0: f64, early: bool) {
     let mut fpr = Fingerprinter::new(t0);
     let mut rms = RmsMeter::new();
     let mut sched = MatchSchedule::default();
-    let mut themes: Vec<(usize, Arc<ThemeFp>)> = Vec::new();
+    let mut themes: Vec<StreamTheme> = Vec::new();
+    let mut tracker = early.then(EarlyTracker::new);
     let mut origin = false;
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
@@ -459,6 +557,7 @@ fn worker_loop(mut rx: mpsc::Receiver<WCmd>, tx: mpsc::UnboundedSender<WEvt>, t0
                 origin = true;
             }
             WCmd::Themes(t) => themes = t,
+            WCmd::EarlyStop => tracker = None,
             WCmd::Finish => {
                 let _ = tx.send(WEvt::Finished { fp: fpr.finish(), levels: rms.into_levels() });
                 return;
@@ -470,9 +569,21 @@ fn worker_loop(mut rx: mpsc::Receiver<WCmd>, tx: mpsc::UnboundedSender<WEvt>, t0
             let decoded_s = fpr.samples() as f64 / SR as f64;
             if sched.due(decoded_s, false) {
                 let q = fpr.fingerprint();
-                let results = themes.iter().map(|(i, t)| (*i, matcher::evaluate_theme(&t.fp, t.audible, q))).collect();
+                let results = themes.iter().map(|s| (s.idx, matcher::evaluate_theme(&s.t.fp, s.t.audible, q))).collect();
                 if tx.send(WEvt::Matched { decoded_s, results }).is_err() {
                     return;
+                }
+            }
+            if let Some(tr) = tracker.as_mut() {
+                let refs: Vec<EarlyRef> = themes
+                    .iter()
+                    .filter(|s| s.early)
+                    .map(|s| EarlyRef { idx: s.idx, fp: &s.t.fp, audible: s.t.audible })
+                    .collect();
+                if let Some(event) = tr.step(decoded_s, fpr.fingerprint(), &refs) {
+                    if tx.send(WEvt::Early { decoded_s, event }).is_err() {
+                        return;
+                    }
                 }
             }
         }
@@ -841,6 +952,8 @@ impl<'a> Decider<'a> {
 struct Job<'a> {
     d: Decider<'a>,
     snap: Snapshot,
+    /// When the detect started (log timings only).
+    started: std::time::Instant,
     /// Early media-end estimate (mapped DURATION tag, else container, else
     /// mpv's duration).
     media_est: f64,
@@ -923,8 +1036,16 @@ pub async fn run(ctx: &Ctx, req: &Request) -> Snapshot {
         },
         media_est: req.duration,
         tag_known: false,
+        started: std::time::Instant::now(),
     };
     job.run().await;
+    // Every OP path ends in `apply`, which replaces a provisional window; this
+    // only makes sure one can never reach the result cache or the final reply.
+    for w in [&mut job.snap.op, &mut job.snap.ed] {
+        if w.as_ref().is_some_and(|w| w.source == EARLY_SOURCE) {
+            *w = None;
+        }
+    }
     job.snap.state = JobState::Done;
     (ctx.publish)(&job.snap);
     if job.d.cacheable {
@@ -1135,13 +1256,66 @@ impl<'a> Job<'a> {
     }
 
     /// The kind's candidates usable while streaming: loaded themes in order.
-    fn streaming_themes(&self, kind: Kind) -> Vec<(usize, Arc<ThemeFp>)> {
+    /// `early` (HEAD) marks the ones the early provisional rule may fire on.
+    fn streaming_themes(&self, kind: Kind, early: bool) -> Vec<StreamTheme> {
         self.d
             .cat
             .order(kind)
             .into_iter()
-            .filter_map(|i| self.d.loader.loaded.get(&i).map(|t| (i, t.clone())))
+            .filter_map(|i| {
+                let t = self.d.loader.loaded.get(&i)?.clone();
+                let early = early && !self.d.cat.metas[i].over && !self.transition_blocked(kind, i);
+                Some(StreamTheme { idx: i, t, early })
+            })
             .collect()
+    }
+
+    /// Publish the early provisional window (prompt-only, its own source).
+    fn publish_early(&mut self, kind: Kind, idx: usize, run: &matcher::Run, margin: f64, window: (f64, f64), decoded_s: f64) {
+        let Some((s, e)) = super::clamp_to_media_end(window.0, window.1, self.media_end_now()) else { return };
+        let label = self.d.cat.recs[idx].label();
+        crate::devlog!(
+            info, "skipdetect",
+            "{} {} early prompt {} after {decoded_s:.1}s of region (t+{:.1}s): [{s:.2}, {e:.2}] run {:.1}s ber {:.3} margin {:.3}",
+            self.d.who,
+            kind_name(kind),
+            label,
+            self.started.elapsed().as_secs_f64(),
+            run.len_s,
+            run.ber,
+            margin
+        );
+        let out = WindowOut {
+            start: s,
+            end: e,
+            source: EARLY_SOURCE.into(),
+            auto_eligible: false,
+            theme: Some(label),
+            run_s: Some(run.len_s),
+            ber: Some(run.ber),
+            margin: Some(margin),
+            soft42: None,
+            q35: None,
+            mrel: None,
+        };
+        self.set_window(kind, Some(out));
+        self.publish();
+    }
+
+    /// Withdraw the early provisional window, if that is what the kind holds.
+    fn withdraw_early(&mut self, kind: Kind, why: &str) {
+        if !self.holds_early(kind) {
+            return;
+        }
+        crate::devlog!(
+            info, "skipdetect",
+            "{} {} early prompt withdrawn (t+{:.1}s): {why}",
+            self.d.who,
+            kind_name(kind),
+            self.started.elapsed().as_secs_f64()
+        );
+        self.set_window(kind, None);
+        self.publish();
     }
 
     /// A Transition version must not stop the search while a full version of
@@ -1156,6 +1330,15 @@ impl<'a> Job<'a> {
         self.snap.media_end.unwrap_or(self.media_est)
     }
 
+    /// The kind currently holds the early provisional window.
+    fn holds_early(&self, kind: Kind) -> bool {
+        match kind {
+            Kind::Op => self.snap.op.as_ref(),
+            Kind::Ed => self.snap.ed.as_ref(),
+        }
+        .is_some_and(|w| w.source == EARLY_SOURCE)
+    }
+
     /// Publish (or refine) a streaming acceptance. Returns the window.
     fn accept_streaming(&mut self, kind: Kind, a: &Accepted, decoded_s: f64, first: bool) -> Option<(f64, f64)> {
         let w = matcher::layer1_window(&a.m, self.media_end_now())?;
@@ -1164,7 +1347,11 @@ impl<'a> Job<'a> {
             Kind::Op => self.snap.op.clone(),
             Kind::Ed => self.snap.ed.clone(),
         };
-        let changed = prev.as_ref().map_or(true, |p| (p.start - out.start).abs() > 0.005 || (p.end - out.end).abs() > 0.005);
+        // A provisional window with the very same edges must still be
+        // replaced: the source (and auto-eligibility) is what changes.
+        let changed = prev.as_ref().map_or(true, |p| {
+            p.source != out.source || (p.start - out.start).abs() > 0.005 || (p.end - out.end).abs() > 0.005
+        });
         if first {
             crate::devlog!(
                 info, "skipdetect",
@@ -1224,7 +1411,10 @@ impl<'a> Job<'a> {
         };
         let (cmd_tx, cmd_rx) = mpsc::channel::<WCmd>(32);
         let (evt_tx, mut evt_rx) = mpsc::unbounded_channel::<WEvt>();
-        let worker = tokio::task::spawn_blocking(move || worker_loop(cmd_rx, evt_tx, expect_origin));
+        // The early provisional opening is a HEAD feature: TAIL decodes far
+        // ahead of the playhead, so its full gate is in time on its own.
+        let early = which == Which::Head;
+        let worker = tokio::task::spawn_blocking(move || worker_loop(cmd_rx, evt_tx, expect_origin, early));
         let mut sent_themes: Vec<usize> = Vec::new();
         let mut origin: Option<f64> = None;
         // HEAD exits once decoded >= the accepted OP's end + 10 s.
@@ -1241,8 +1431,8 @@ impl<'a> Job<'a> {
 
         loop {
             // Theme set for incremental matching.
-            let now: Vec<(usize, Arc<ThemeFp>)> = self.streaming_themes(kind);
-            let ids: Vec<usize> = now.iter().map(|(i, _)| *i).collect();
+            let now: Vec<StreamTheme> = self.streaming_themes(kind, early);
+            let ids: Vec<usize> = now.iter().map(|s| s.idx).collect();
             if ids != sent_themes {
                 sent_themes = ids;
                 let _ = cmd_tx.send(WCmd::Themes(now)).await;
@@ -1288,14 +1478,38 @@ impl<'a> Job<'a> {
                         results.into_iter().find(|(i, m)| m.accepted && !self.transition_blocked(kind, *i))
                     {
                         let a = Accepted { idx, m };
+                        let had_early = self.holds_early(kind);
                         if let Some(w) = self.accept_streaming(kind, &a, decoded_s, true) {
                             if which == Which::Head {
                                 op_end = Some(w.1);
                             }
                             accepted = Some(a);
+                            if early {
+                                // The full gate settled it: the early tracker stops.
+                                let _ = cmd_tx.send(WCmd::EarlyStop).await;
+                                if had_early {
+                                    crate::devlog!(
+                                        info, "skipdetect",
+                                        "{} {} early prompt replaced by the full match (t+{:.1}s)",
+                                        self.d.who,
+                                        kind_name(kind),
+                                        self.started.elapsed().as_secs_f64()
+                                    );
+                                }
+                            }
                         }
                     }
                 }
+                Ev::Evt(Some(WEvt::Early { decoded_s, event })) => match event {
+                    // A full acceptance always wins over the provisional rule.
+                    EarlyEvent::Fire { idx, run, margin, window } if accepted.is_none() => {
+                        self.publish_early(kind, idx, &run, margin, window, decoded_s);
+                    }
+                    EarlyEvent::Fire { .. } => {}
+                    EarlyEvent::Retract { why, .. } => {
+                        self.withdraw_early(kind, why.as_str());
+                    }
+                },
                 Ev::Evt(Some(WEvt::Finished { .. })) | Ev::Evt(None) => {
                     out.failed = Some("analysis worker stopped".into());
                     break;
@@ -1322,6 +1536,10 @@ impl<'a> Job<'a> {
                 }
             }
         }
+        // A provisional window the full gate never confirmed while streaming
+        // goes now; the region's own decision (published right after) is the
+        // answer.
+        self.withdraw_early(kind, "region ended without a full match");
         let samples = pass.samples();
         let end = if killed || out.failed.is_some() { pass.kill().await } else { pass.finish().await };
         // A first-PTS line that arrived after the last PCM byte still counts.
@@ -1560,6 +1778,122 @@ mod tests {
         assert_eq!(c.order(Kind::Ed), vec![0], "the sibling ED is still a Layer 1 candidate");
         assert_eq!(c.primary_themes_of_kind(Kind::Ed), 0);
         assert!(super::super::layer3_allowed(c.primary_themes_of_kind(Kind::Ed)));
+    }
+
+    /// Broadband seeded "music" (noise under a beat envelope plus a chirp), as
+    /// in the matcher tests: every fingerprint bit carries signal.
+    fn tone(secs: f64, seed: u64) -> Vec<f64> {
+        let sr = SR as f64;
+        let mut x = seed;
+        let mut ph = 0.0f64;
+        (0..(secs * sr) as usize)
+            .map(|i| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let r = (x >> 11) as f64 / (1u64 << 53) as f64;
+                let t = i as f64 / sr;
+                let f = 300.0 * 10f64.powf((t % 2.3) / 2.3);
+                ph += 2.0 * std::f64::consts::PI * f / sr;
+                let env = 0.6 + 0.4 * (2.0 * std::f64::consts::PI * t / 0.45).sin();
+                0.5 * env * (r * 2.0 - 1.0) + 0.3 * ph.sin()
+            })
+            .collect()
+    }
+
+    fn pcm(x: &[f64], gain: f64) -> Vec<i16> {
+        x.iter().map(|v| (v * gain * 32767.0).clamp(-32768.0, 32767.0) as i16).collect()
+    }
+
+    /// Drive the real region worker with an opening at 0:00 and collect what it
+    /// reports. `stop_after_s` = decoded seconds after which the job would
+    /// send EarlyStop (its full gate accepted).
+    fn run_worker(early_region: bool, early_theme: bool, stop_after_s: Option<f64>) -> Vec<(f64, EarlyEvent)> {
+        let th = tone(70.0, 5);
+        let th_pcm = pcm(&th, 0.8);
+        let fp = Arc::new(animethemes::theme_fp_from_pcm(&rec("OP1", true, false, false), &th_pcm));
+        let mut ep: Vec<f64> = tone(160.0, 9).iter().map(|v| v * 0.1).collect();
+        for (i, v) in th.iter().enumerate() {
+            ep[i] += v * 0.8;
+        }
+        let ep = pcm(&ep, 0.9);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<WCmd>(4);
+        let (evt_tx, mut evt_rx) = mpsc::unbounded_channel::<WEvt>();
+        let worker = std::thread::spawn(move || worker_loop(cmd_rx, evt_tx, 0.0, early_region));
+        cmd_tx.blocking_send(WCmd::T0(0.0)).unwrap();
+        cmd_tx.blocking_send(WCmd::Themes(vec![StreamTheme { idx: 0, t: fp, early: early_theme }])).unwrap();
+        let chunk = SR as usize / 2;
+        let mut stopped = false;
+        for (k, c) in ep.chunks(chunk).enumerate() {
+            cmd_tx.blocking_send(WCmd::Pcm(c.to_vec())).unwrap();
+            // Let the worker drain the queue so it analyses (it only matches
+            // with the queue empty), like a decoder slower than the analysis.
+            while cmd_tx.capacity() < cmd_tx.max_capacity() {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let decoded = ((k + 1) * chunk) as f64 / SR as f64;
+            if !stopped && stop_after_s.is_some_and(|s| decoded >= s) {
+                cmd_tx.blocking_send(WCmd::EarlyStop).unwrap();
+                stopped = true;
+            }
+        }
+        cmd_tx.blocking_send(WCmd::Finish).unwrap();
+        worker.join().unwrap();
+        let mut out = Vec::new();
+        while let Ok(e) = evt_rx.try_recv() {
+            if let WEvt::Early { decoded_s, event } = e {
+                out.push((decoded_s, event));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn region_worker_publishes_the_early_opening_and_stops_on_request() {
+        // HEAD with an eligible theme: fires about 12 s in.
+        let ev = run_worker(true, true, Some(60.0));
+        let Some(&(at, EarlyEvent::Fire { window, .. })) = ev.first() else { panic!("no early fire: {ev:?}") };
+        // Never before EARLY_RUN_S of matched audio, and before the full gate
+        // accepts at 60 s. HOW soon after 12 s depends on how far the worker
+        // thread lags the feeder, which is scheduler timing under a parallel
+        // test run (a 4 s bound failed 2 runs in 8 with all tests running,
+        // firing at 16.5 and 19.5 s). Exact fire times under a lagging
+        // analysis are covered deterministically by the ignored corpus test
+        // skipdetect_early_rule_lagging_analysis.
+        assert!((matcher::EARLY_RUN_S..60.0).contains(&at), "fired after {at} s");
+        assert!(window.0 < 0.1, "{window:?}");
+        // The full gate "accepted" at 60 s: nothing after it, no withdrawal.
+        assert!(ev.iter().all(|(s, e)| matches!(e, EarlyEvent::Fire { .. }) || *s < 60.0), "{ev:?}");
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        // Never told to stop: the whole theme decodes without a full accept
+        // reaching the tracker, so it withdraws itself.
+        let ev = run_worker(true, true, None);
+        assert!(matches!(ev.last(), Some((_, EarlyEvent::Retract { why: matcher::EarlyRetract::Unconfirmed, .. }))), "{ev:?}");
+        // TAIL (no tracker) and an ineligible theme ("Over"): nothing at all.
+        assert!(run_worker(false, true, None).is_empty());
+        assert!(run_worker(true, false, None).is_empty());
+    }
+
+    #[test]
+    fn prefetch_targets_match_what_a_detect_loads_first() {
+        let mut op1 = rec("OP1", true, false, false);
+        op1.episodes = Some("1-12".into());
+        let mut op2 = rec("OP2", true, false, false);
+        op2.episodes = Some("13-24".into());
+        let ed_over = rec("ED2", false, true, false);
+        let mut ed1 = rec("ED1", false, false, false);
+        ed1.episodes = Some("1-24".into());
+        let list = vec![op1, op2, ed_over, ed1];
+        // Episode 14: OP2 by range proximity, and ED1 (an Over ED is never a candidate).
+        assert_eq!(prefetch_targets(&list, 7, Some(14), true, true), vec![1, 3]);
+        assert_eq!(prefetch_targets(&list, 7, Some(2), true, false), vec![0]);
+        assert_eq!(prefetch_targets(&list, 7, Some(2), false, true), vec![3]);
+        // The same pick as the job's own prefetch (Catalog::order on the cour's list).
+        let mut c = catalog(Some(14));
+        c.push_list(7, list.clone());
+        c.primary_len = c.recs.len();
+        assert_eq!(c.order(Kind::Op).first(), Some(&1));
+        assert_eq!(c.order(Kind::Ed).first(), Some(&3));
+        assert!(prefetch_targets(&[], 7, Some(1), true, true).is_empty());
     }
 
     fn stored(op: bool, ed: bool, mal: Option<u32>) -> Snapshot {

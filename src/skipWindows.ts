@@ -13,7 +13,7 @@
 // This module has NO runtime imports on purpose, so a node check can load it
 // directly (`node scratch-check.ts`) without a bundler or the Tauri runtime.
 //
-// The layered detector (Rust `skipdetect/`) stamps three sources:
+// The layered detector (Rust `skipdetect/`) stamps four sources:
 //   "animethemes"       Layer 1, an AnimeThemes theme located in the episode's
 //                       audio. HIGH trust: it outranks every other source and,
 //                       for its kind, removes any window that disagrees with
@@ -21,6 +21,11 @@
 //   "animethemes-over"  Layer 1 for an opening whose theme overlaps the scene
 //                       ("Over" in AnimeThemes): same location trust, but
 //                       prompt-only (never auto-eligible).
+//   "animethemes-early" the PROVISIONAL opening: the first 12 s of the theme
+//                       matched while the rest is still decoding. Prompt-only,
+//                       NOT Layer 1 (it never drops another source's window,
+//                       so withdrawing it loses nothing), and replaced by the
+//                       full match or withdrawn within about a minute.
 //   "continuity"        Layer 3, loudness continuity between silences. LOW
 //                       trust: prompt-only and never a Next-Up trigger.
 // "pairing" (Layer 2) is reserved in the priority table and not produced yet.
@@ -28,6 +33,9 @@
 
 export const LAYER1_SOURCE = "animethemes";
 export const LAYER1_PROMPT_SOURCE = "animethemes-over";
+/** The provisional opening (Rust EARLY_SOURCE). Deliberately not in
+ *  `isLayer1Source`: it must not trigger the conflict drop. */
+export const LAYER1_EARLY_SOURCE = "animethemes-early";
 export const PAIRING_SOURCE = "pairing";
 export const CONTINUITY_SOURCE = "continuity";
 /** IntroDB's two trust tiers (decided in introdb.rs). Defined here so this
@@ -165,6 +173,9 @@ export const SKIP_SOURCE_PRIORITY: Readonly<Record<string, number>> = {
   chapter: 7,
   aniskip: 6, [INTRODB_SOURCE]: 6,
   [PAIRING_SOURCE]: 5, publicmetadb: 5,
+  // Below every source that may auto-skip, so a crowd or chapter opening keeps
+  // working while the theme match is still confirming; above every guess.
+  [LAYER1_EARLY_SOURCE]: 4.5,
   [INTRODB_SINGLE_SOURCE]: 4,
   "aniskip-neighbour": 3,
   "chapter-heuristic": 2,
@@ -289,13 +300,22 @@ export const LOW_TRUST_SKIP_SOURCES: ReadonlySet<string> = new Set([
   INTRODB_SINGLE_SOURCE, LAYER1_PROMPT_SOURCE,
 ]);
 
+/** Windows that are still being confirmed: the provisional opening. They only
+ *  prompt until the source that confirms them replaces them. */
+export const PROVISIONAL_SKIP_SOURCES: ReadonlySet<string> = new Set([
+  LAYER1_EARLY_SOURCE,
+]);
+
 /** Whether a window may only ever prompt, whatever the user's mode says.
- *  Beyond the guess / low-trust sources: every preview, and AniSkip ENDING rows
+ *  Beyond the guess / low-trust / provisional sources: every preview, and AniSkip ENDING rows
  *  (TYBW 3:9-3:11 rows were 32-38 s early with a matching episodeLength, so an
  *  AniSkip ED auto-seek would cut into the episode; when Layer 1 found the
  *  ending it has already replaced the row). IntroDB keeps its own tiers. */
-export function isPromptOnly(w: PreparedWindow): boolean {
-  if (GUESS_SKIP_SOURCES.has(w.source) || LOW_TRUST_SKIP_SOURCES.has(w.source)) return true;
+export function isPromptOnly(w: Pick<PreparedWindow, "type" | "source">): boolean {
+  if (
+    GUESS_SKIP_SOURCES.has(w.source) || LOW_TRUST_SKIP_SOURCES.has(w.source)
+    || PROVISIONAL_SKIP_SOURCES.has(w.source)
+  ) return true;
   const g = skipKindGroup(w.type);
   if (g === "preview") return true;
   if (g === "ed" && w.source === "aniskip") return true;

@@ -895,6 +895,11 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // mounted UNDER the new one until that has decoded and faded in, so a swap
   // is a crossfade rather than a trip through the ambient base.
   const [bgUnderlay, setBgUnderlay]         = useState<string | null>(null);
+  // The backdrop URL whose load FAILED for good. A failure counts as ready
+  // (see above), so bgReady alone cannot say whether an image is actually
+  // covering the ambient base; this can. Reads only as "this src", so a later
+  // latch of a different image needs no reset.
+  const [bgFailedSrc, setBgFailedSrc]       = useState<string | null>(null);
   // Where the meta probe settled, for a latch that was held past it.
   const heroSettledRef = useRef<{ id: string; detail: MetaDetail | null } | null>(null);
   // The dead-override fallback runs at most once per open, so an image that
@@ -1826,6 +1831,16 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // the backdrop under a page that is already showing; it does not replay the
   // entrance (the backdrop layer gates its own fade on bgReady instead).
   const revealed = heroShown || firstReveal;
+  // An opaque image fills the hero: the backdrop has decoded and is revealed
+  // (not merely "ready" because it failed), or a crossfade's outgoing image,
+  // which is fully opaque unless it is the image that failed, is still
+  // mounted. The ambient base under it is then invisible, so its drift is
+  // frozen (.is-covered in App.css): left running, it repainted a blurred
+  // full-viewport layer every display frame for the whole time a detail page
+  // was open.
+  const heroCovered =
+    (bgUnderlay !== null && bgUnderlay !== bgFailedSrc) ||
+    (heroArt !== null && revealed && bgReady && bgFailedSrc !== heroArt);
   useEffect(() => {
     if (firstReveal) setHeroShown(true);
   }, [firstReveal]);
@@ -1936,6 +1951,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
         return;
       }
     }
+    setBgFailedSrc(heroArt);
     setBgReady(true);
   };
 
@@ -2117,7 +2133,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
           still let a rim of Home through at the frame edge. The flat fill
           underneath makes the base opaque edge to edge. */}
       <div aria-hidden className="absolute inset-0" style={{ background: "rgb(8 10 14)" }} />
-      <div aria-hidden className="detail-backdrop-skeleton" />
+      <div aria-hidden className={heroCovered ? "detail-backdrop-skeleton is-covered" : "detail-backdrop-skeleton"} />
       {/* Full-bleed backdrop. Mounted only once the art has latched, and
           KEYED by its URL, so each element's `src` is fixed for its whole
           life. `loading="eager"` skips the IntersectionObserver round-trip:

@@ -100,7 +100,7 @@ pub async fn get_storage_report(app: tauri::AppHandle) -> Result<StorageReport, 
     out.push(StorageEntry {
         id: SKIPDETECT_ID.to_string(),
         label: "Skip detection cache".to_string(),
-        description: "AnimeThemes theme lists, theme audio fingerprints (never the audio) and per-file opening / ending results. Bounded; rebuilt on the next play.".to_string(),
+        description: "Theme song lists from AnimeThemes, fingerprints of those songs (never the audio) and the opening / ending found in each file, so a replay skips without scanning again. Capped. Clearing it means the next play of each episode scans its audio again. Safe to clear.".to_string(),
         path: dir,
         bytes,
         exists: bytes > 0,

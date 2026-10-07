@@ -25,7 +25,7 @@ use serde_json::Value;
 
 use super::continuity::{self, Region, Silence};
 use super::fingerprint::{fingerprint, theme_audible, Fingerprint, SR};
-use super::matcher::{evaluate_theme, ThemeMatch};
+use super::matcher::{evaluate_theme, EarlyEvent, EarlyRef, EarlyRetract, EarlyTracker, MatchSchedule, ThemeMatch, EARLY_HORIZON_S, EARLY_RUN_S};
 use super::themes::{candidate_order, next_step, Kind, Step, ThemeMeta};
 
 const HEAD_SAMPLES: usize = 600 * SR as usize;
@@ -643,4 +643,532 @@ fn skipdetect_layer3_parity() {
     println!("[layer3] max edge deviation {max_dev:.3} s over {} episodes", res.len());
     assert!(totals_ok, "Layer 3 totals differ from eval_continuity.json");
     assert!(fails.is_empty(), "{} Layer 3 deviations:\n{}", fails.len(), fails.join("\n"));
+}
+
+// ── early provisional opening (matcher::EarlyTracker) ───────────────────────
+//
+// The early rule over the WHOLE corpus, through the production tracker:
+//   * every Layer 1 slot (truth window + a strict eval theme): the rule must
+//     fire at the truth location, within a few seconds of the theme's start,
+//     with a window matching eval's final Layer 1 window; and once it fired it
+//     must not be withdrawn before the full gate (simulated at the production
+//     cadence) accepts, so a correct prompt never flickers;
+//   * every theme of the corpus (108) against every head and tail, with NO
+//     horizon (stricter than production): zero fires away from a truth
+//     location, "Over" themes reported separately (production never offers
+//     them to the early rule), plus the named traps;
+//   * the decode-phase robustness of every zero-start opening (384 samples);
+//   * the CPU cost of the tracker next to the streaming full matcher.
+
+struct CorpusTheme {
+    mal: u64,
+    base: String,
+    meta: ThemeMeta,
+    fp: Fingerprint,
+    audible: (f64, f64),
+}
+
+fn all_corpus_themes(root: &Path) -> Vec<CorpusTheme> {
+    let mut mals: Vec<u64> = std::fs::read_dir(root.join("themes"))
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .collect();
+    mals.sort();
+    let rows: Vec<(u64, ThemeRow)> = mals.iter().flat_map(|&m| themes_of(root, m).into_iter().map(move |t| (m, t))).collect();
+    par_map(rows.len(), |k| {
+        let (mal, t) = &rows[k];
+        let pcm = read_wav(&root.join("themes").join(mal.to_string()).join(format!("{}.11k.wav", t.base)));
+        CorpusTheme { mal: *mal, base: t.base.clone(), meta: t.meta.clone(), fp: fingerprint(&pcm, 0.0), audible: theme_audible(&pcm) }
+    })
+}
+
+/// Codes of a fingerprint that exist once `decoded_s` of its region decoded
+/// (frame f needs samples up to f * HOP + FRAME; code i needs frame i + 1).
+fn codes_at(decoded_s: f64) -> usize {
+    use super::fingerprint::{FRAME, HOP};
+    let samples = (decoded_s * SR as f64).round() as i64;
+    ((samples - FRAME as i64).max(0) / HOP as i64) as usize
+}
+
+/// Feed a region's fingerprint to an early tracker as it would decode, one
+/// step per second of audio. Returns the events and the tracker CPU time.
+fn simulate_early(full: &Fingerprint, region_s: f64, refs: &[EarlyRef], horizon: f64) -> (Vec<(f64, EarlyEvent)>, std::time::Duration) {
+    simulate_early_every(full, region_s, refs, horizon, 1.0)
+}
+
+/// `simulate_early` with the worker getting a turn only every `every`
+/// seconds of decoded audio (a decoder far faster than the analysis: the
+/// worker matches only with its queue drained).
+fn simulate_early_every(
+    full: &Fingerprint,
+    region_s: f64,
+    refs: &[EarlyRef],
+    horizon: f64,
+    every: f64,
+) -> (Vec<(f64, EarlyEvent)>, std::time::Duration) {
+    let mut q = Fingerprint { codes: Vec::with_capacity(full.len()), valid: Vec::with_capacity(full.len()), t0: full.t0 };
+    let mut tr = EarlyTracker::with_horizon(horizon);
+    let mut out = Vec::new();
+    let mut spent = std::time::Duration::ZERO;
+    let mut s = every.max(1.0);
+    while s <= region_s + 1e-9 {
+        let n = codes_at(s).min(full.len());
+        let have = q.len();
+        q.codes.extend_from_slice(&full.codes[have..n.max(have)]);
+        q.valid.extend_from_slice(&full.valid[have..n.max(have)]);
+        let t = std::time::Instant::now();
+        let e = tr.step(s, &q, refs);
+        spent += t.elapsed();
+        if let Some(e) = e {
+            out.push((s, e));
+        }
+        s += every;
+    }
+    (out, spent)
+}
+
+/// Decoded seconds at which the streaming full gate (MatchSchedule cadence)
+/// first accepts theme `r` in this region. None = never.
+fn full_gate_accept(r: &Fingerprint, aud: (f64, f64), full: &Fingerprint, region_s: f64) -> Option<f64> {
+    let mut sched = MatchSchedule::default();
+    let mut s = 1.0;
+    while s <= region_s + 1e-9 {
+        if sched.due(s, false) {
+            let n = codes_at(s).min(full.len());
+            let q = Fingerprint { codes: full.codes[..n].to_vec(), valid: full.valid[..n].to_vec(), t0: full.t0 };
+            if evaluate_theme(r, aud, &q).accepted {
+                return Some(s);
+            }
+        }
+        s += 1.0;
+    }
+    None
+}
+
+const FRANCHISES: [&[u64]; 4] = [&[41467, 53998, 56784], &[40748, 51009], &[50265, 50602], &[38000, 47778]];
+
+fn same_family(a: u64, b: u64) -> bool {
+    a == b || FRANCHISES.iter().any(|f| f.contains(&a) && f.contains(&b))
+}
+
+struct EarlyReg {
+    id: String,
+    which: &'static str,
+    fp: Fingerprint,
+    pcm: Vec<i16>,
+    secs: f64,
+}
+
+/// One early fire at a truth location: decoded s, absolute time, theme index,
+/// window, and the withdrawal that followed (if any).
+type TrueFire = (f64, f64, usize, (f64, f64), Option<(f64, EarlyRetract)>);
+
+#[test]
+#[ignore = "needs AURA_SKIPBENCH_DIR (skipbench corpus)"]
+fn skipdetect_early_rule_corpus() {
+    let root = bench();
+    let eval = load_json(&root.join("eval_animethemes.json"));
+    let mut truth: HashMap<String, Value> = HashMap::new();
+    for e in std::fs::read_dir(root.join("truth")).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().is_some_and(|x| x == "json") {
+            if let Value::Object(m) = load_json(&p) {
+                truth.extend(m);
+            }
+        }
+    }
+    let rows = eval["rows"].as_array().unwrap().clone();
+    let num = |v: &Value| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()));
+    let themes = all_corpus_themes(&root);
+    println!("[early] {} episodes, {} themes", rows.len(), themes.len());
+
+    let regs: Vec<EarlyReg> = par_map(rows.len() * 2, |k| {
+        let r = &rows[k / 2];
+        let id = r["id"].as_str().unwrap().to_string();
+        let cdir = root.join("cache").join(tag_of(&id));
+        let info = load_json(&cdir.join("info.json"));
+        let (which, mut pcm, t0) = if k % 2 == 0 {
+            ("head", read_wav(&cdir.join("head.wav")), info["passes"]["head"]["t0"].as_f64().unwrap())
+        } else {
+            ("tail", read_wav(&cdir.join("tail.wav")), info["passes"]["tail"]["t0"].as_f64().unwrap())
+        };
+        if which == "head" {
+            pcm.truncate(HEAD_SAMPLES);
+        }
+        let secs = pcm.len() as f64 / SR as f64;
+        EarlyReg { id, which, fp: fingerprint(&pcm, t0), pcm, secs }
+    });
+
+    // ── 1. every theme x every region, no horizon ──
+    let jobs: Vec<(usize, usize)> = (0..regs.len()).flat_map(|g| (0..themes.len()).map(move |t| (g, t))).collect();
+    let t_sweep = std::time::Instant::now();
+    let sweep = par_map(jobs.len(), |k| {
+        let (g, t) = jobs[k];
+        let th = &themes[t];
+        let refs = [EarlyRef { idx: t, fp: &th.fp, audible: th.audible }];
+        simulate_early(&regs[g].fp, regs[g].secs, &refs, f64::INFINITY)
+    });
+    let slot_kind = |which: &str| if which == "head" { Kind::Op } else { Kind::Ed };
+    let slot_name = |which: &str| if which == "head" { "op" } else { "ed" };
+    let mut false_fires = Vec::new();
+    let mut over_fires = Vec::new();
+    let mut true_fires: HashMap<(String, &'static str), Vec<TrueFire>> = HashMap::new();
+    let mut cpu_total = std::time::Duration::ZERO;
+    for (k, (events, spent)) in sweep.iter().enumerate() {
+        cpu_total += *spent;
+        let (g, t) = jobs[k];
+        let (reg, th) = (&regs[g], &themes[t]);
+        let tr = &truth[&reg.id];
+        let slot = slot_name(reg.which);
+        for (i, &(s, e)) in events.iter().enumerate() {
+            let EarlyEvent::Fire { window, run, .. } = e else { continue };
+            let retract = events.get(i + 1).and_then(|(rs, re)| match re {
+                EarlyEvent::Retract { why, .. } => Some((*rs, *why)),
+                _ => None,
+            });
+            let ref0 = run.ref0_s;
+            let at_truth = th.meta.kind == slot_kind(reg.which)
+                && pair(&tr[slot]).is_some_and(|w| (ref0.max(0.0) - w.0).abs() <= 4.0 || (ref0 + th.audible.0 - w.0).abs() <= 4.0);
+            let abs = reg.fp.t0 + s;
+            let line = format!(
+                "{:18} {} {:42} fired at {:7.2}s (window [{:.2}, {:.2}], run {:.1}s ber {:.3}) {}",
+                reg.id,
+                reg.which,
+                th.base,
+                abs,
+                window.0,
+                window.1,
+                run.len_s,
+                run.ber,
+                retract.map_or("never withdrawn".to_string(), |(rs, why)| format!(
+                    "withdrawn at {:.2}s ({})",
+                    reg.fp.t0 + rs,
+                    why.as_str()
+                ))
+            );
+            if at_truth {
+                true_fires.entry((reg.id.clone(), slot)).or_default().push((s, abs, t, window, retract));
+            } else if th.meta.over {
+                over_fires.push(line);
+            } else {
+                false_fires.push(line);
+            }
+        }
+    }
+    println!(
+        "[early] sweep: {} theme x region pairings in {:.0}s, {} fires at a truth location, {} false (non-Over), {} Over-theme fires; tracker CPU {:.1}s total",
+        jobs.len(),
+        t_sweep.elapsed().as_secs_f64(),
+        true_fires.values().map(Vec::len).sum::<usize>(),
+        false_fires.len(),
+        over_fires.len(),
+        cpu_total.as_secs_f64()
+    );
+    for l in &over_fires {
+        println!("[early] OVER (production never offers it to the early rule): {l}");
+    }
+    for l in &false_fires {
+        println!("[early] FALSE FIRE {l}");
+    }
+
+    // Named traps, reported one by one (all are inside the sweep above).
+    let theme_idx = |base: &str| themes.iter().position(|t| t.base == base).unwrap_or_else(|| panic!("theme {base}"));
+    let traps: [(&str, &str, &str, &str); 7] = [
+        ("tt14986406:1:13", "tail", "Bleach2022-ED3.ogg", "Over insert song (fired at 8 s in research)"),
+        ("tt14986406:1:1", "head", "Bleach2022-ED3.ogg", "the ED song heard inside the HEAD at 359 s"),
+        ("tt13293588:2:3", "tail", "MushokuTenseiS2-ED2.ogg", "Over ending of the same cour"),
+        ("tt22248376:1:2", "tail", "SousouNoFrieren-ED1-TV-NCBD1080.ogg", "TV version of the ending"),
+        ("tt22248376:1:20", "tail", "SousouNoFrieren-ED1v3.ogg", "Transition version of the ending"),
+        ("tt12343534:2:10", "head", "JujutsuKaisenS2-OP2-NCBD1080.ogg", "OP at 183 s after a cold open (crowd said 0-90)"),
+        ("tt9335498:1:2", "tail", "KimetsuNoYaiba-ED2.ogg", "Transition version of the ending"),
+    ];
+    for (id, which, base, what) in traps {
+        let t = theme_idx(base);
+        let g = regs.iter().position(|r| r.id == id && r.which == which).unwrap();
+        let ev = &sweep[g * themes.len() + t].0;
+        let desc = if ev.is_empty() {
+            "no fire".to_string()
+        } else {
+            ev.iter()
+                .map(|(s, e)| match e {
+                    EarlyEvent::Fire { window, .. } => format!("fire at {:.1}s [{:.2}, {:.2}]", regs[g].fp.t0 + s, window.0, window.1),
+                    EarlyEvent::Retract { why, .. } => format!("withdrawn at {:.1}s ({})", regs[g].fp.t0 + s, why.as_str()),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!("[early] trap {id} {which} {base} ({what}): {desc}");
+    }
+
+    // ── 2. every Layer 1 slot ──
+    let mut fails = Vec::new();
+    let mut rel_op = Vec::new();
+    let mut rel_ed = Vec::new();
+    let mut zero_op_abs = Vec::new();
+    let mut gains = Vec::new();
+    let mut max_win_dev: f64 = 0.0;
+    let mut missed = Vec::new();
+    let mut app_level = (0, 0);
+    for r in &rows {
+        let id = r["id"].as_str().unwrap().to_string();
+        let mal = num(&r["mal"]);
+        let mal_ep = num(&r["mal_ep"]).map(|x| x as u32);
+        let tr = &truth[&id];
+        for (slot, which) in [("op", "head"), ("ed", "tail")] {
+            let Some(tw) = pair(&tr[slot]) else { continue };
+            let Some(strict) = r["eval"]["strict"][slot]["theme"].as_str() else { continue };
+            let eval_win = pair(&r["eval"]["strict"][slot]["pred"]["A_full"]).unwrap();
+            let reg = regs.iter().find(|x| x.id == id && x.which == which).unwrap();
+            // Rule level: an own-family theme of the kind fired at the truth
+            // (the earliest; the strict theme first on a tie).
+            let fires: Vec<TrueFire> = true_fires
+                .get(&(id.clone(), slot))
+                .map(|v| v.iter().filter(|f| mal.is_some_and(|m| same_family(themes[f.2].mal, m))).cloned().collect())
+                .unwrap_or_default();
+            let Some(&(s, abs, t, window, retract)) =
+                fires.iter().min_by(|a, b| a.0.total_cmp(&b.0).then((themes[a.2].base != strict).cmp(&(themes[b.2].base != strict))))
+            else {
+                missed.push(format!("{id} {slot}"));
+                println!("[early] {id:18} {slot} NO EARLY FIRE (strict theme {strict})");
+                continue;
+            };
+            let rel = abs - tw.0;
+            let media_end = reg.fp.t0 + reg.secs;
+            let cap = if slot == "ed" { media_end } else { f64::INFINITY };
+            let win = (window.0, window.1.min(cap));
+            let ev_win = (eval_win.0.max(0.0), eval_win.1.min(cap));
+            let dev = (win.0 - ev_win.0).abs().max((win.1 - ev_win.1).abs());
+            if themes[t].base == strict {
+                max_win_dev = max_win_dev.max(dev);
+            }
+            let outcome = classify(Some(win), tr, slot);
+            // The full gate at the production cadence, same theme.
+            let th = &themes[t];
+            let full = full_gate_accept(&th.fp, th.audible, &reg.fp, reg.secs);
+            let mut line = format!(
+                "[early] {id:18} {slot} {:40} fired {rel:5.2}s after the truth start (at {abs:.2}s), window [{:.2}, {:.2}] {outcome} (eval [{:.2}, {:.2}] dev {dev:.3}); full gate {}",
+                th.base,
+                win.0,
+                win.1,
+                ev_win.0,
+                ev_win.1,
+                full.map_or("never".into(), |fs| format!("at {:.2}s ({:.1}s later)", reg.fp.t0 + fs, fs - s))
+            );
+            if let Some(fs) = full {
+                gains.push(fs - s);
+            }
+            if slot == "op" {
+                rel_op.push(rel);
+                if tw.0 <= 0.5 {
+                    zero_op_abs.push(abs);
+                }
+            } else {
+                rel_ed.push(rel);
+            }
+            let mut bad = false;
+            if !(0.0..=EARLY_RUN_S + 6.0).contains(&rel) {
+                bad = true;
+                line += " LATE OR EARLY FIRE";
+            }
+            if outcome == "wrong" {
+                bad = true;
+                line += " WRONG WINDOW";
+            }
+            if themes[t].base == strict && dev > 0.5 {
+                bad = true;
+                line += " WINDOW DEV vs eval";
+            }
+            if let Some((rs, why)) = retract {
+                line += &format!(" withdrawn at {:.2}s ({})", reg.fp.t0 + rs, why.as_str());
+                if full.is_none_or(|fs| rs < fs) {
+                    bad = true;
+                    line += " WITHDRAWN BEFORE THE FULL GATE";
+                }
+            }
+            println!("{line}");
+            if bad {
+                fails.push(line);
+            }
+            // Production level: the top-ranked own-cour candidate (the theme
+            // the job prefetches, so the one loaded while HEAD streams).
+            if let Some(m) = mal {
+                let own: Vec<usize> = (0..themes.len()).filter(|&i| themes[i].mal == m).collect();
+                let metas: Vec<ThemeMeta> = own.iter().map(|&i| themes[i].meta.clone()).collect();
+                let kind = if slot == "op" { Kind::Op } else { Kind::Ed };
+                if let Some(&top) = candidate_order(&metas, kind, mal_ep).first() {
+                    let ti = own[top];
+                    app_level.1 += 1;
+                    if fires.iter().any(|f| f.2 == ti) && !themes[ti].meta.over {
+                        app_level.0 += 1;
+                    } else {
+                        println!("[early] {id} {slot}: the top-ranked candidate {} does not fire early (the full gate still decides)", themes[ti].base);
+                    }
+                }
+            }
+        }
+    }
+    let stats = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        if v.is_empty() {
+            return "none".to_string();
+        }
+        format!("n {} min {:.2} median {:.2} max {:.2}", v.len(), v[0], v[v.len() / 2], v[v.len() - 1])
+    };
+    println!("[early] OP fire, seconds of the theme decoded: {}", stats(&mut rel_op));
+    println!("[early] ED fire, seconds of the theme decoded: {}", stats(&mut rel_ed));
+    println!("[early] zero-start openings fire at absolute {zero_op_abs:?}");
+    println!("[early] the full gate accepts this much later (decoded seconds): {}", stats(&mut gains));
+    println!(
+        "[early] max window deviation vs eval (same theme): {max_win_dev:.3}s; top-ranked candidate fires on {}/{} slots",
+        app_level.0, app_level.1
+    );
+    println!("[early] slots with no early fire: {missed:?}");
+
+    // ── 3. decode phase: every zero-start opening shifted by 384 samples ──
+    for r in &rows {
+        let id = r["id"].as_str().unwrap();
+        let Some(tw) = pair(&truth[id]["op"]) else { continue };
+        if tw.0 > 0.5 {
+            continue;
+        }
+        let Some(strict) = r["eval"]["strict"]["op"]["theme"].as_str() else { continue };
+        let reg = regs.iter().find(|x| x.id == id && x.which == "head").unwrap();
+        let th = &themes[theme_idx(strict)];
+        let q2 = fingerprint(&reg.pcm[384..], reg.fp.t0 + 384.0 / SR as f64);
+        let refs = [EarlyRef { idx: 0, fp: &th.fp, audible: th.audible }];
+        let (ev, _) = simulate_early(&q2, reg.secs - 384.0 / SR as f64, &refs, EARLY_HORIZON_S);
+        let fire = ev.iter().find_map(|(s, e)| match e {
+            EarlyEvent::Fire { window, .. } => Some((*s, *window)),
+            _ => None,
+        });
+        println!("[early] phase 384 {id} {}: {:?}", th.base, fire);
+        match fire {
+            Some((s, w)) if s <= EARLY_RUN_S + 6.0 && w.0 <= 1.0 => {}
+            other => fails.push(format!("{id}: phase-shifted zero-start opening {other:?}")),
+        }
+    }
+
+    // ── 4. CPU: the tracker next to the streaming full matcher ──
+    // Per 600 s HEAD: (a) a theme that is NOT in the episode (the common
+    // case, run detection mostly skipped), (b) the episode's own opening (the
+    // tracker fires, then follows that one theme to the full gate).
+    let mut cpu = [std::time::Duration::ZERO; 3];
+    let mut n_cpu = 0u32;
+    for r in rows.iter().take(31) {
+        let id = r["id"].as_str().unwrap();
+        let Some(strict) = r["eval"]["strict"]["op"]["theme"].as_str() else { continue };
+        let reg = regs.iter().find(|x| x.id == id && x.which == "head").unwrap();
+        let own = &themes[theme_idx(strict)];
+        let other = themes.iter().find(|t| t.meta.kind == Kind::Op && !same_family(t.mal, own.mal)).unwrap();
+        cpu[0] += simulate_early(&reg.fp, reg.secs, &[EarlyRef { idx: 0, fp: &other.fp, audible: other.audible }], EARLY_HORIZON_S).1;
+        cpu[1] += simulate_early(&reg.fp, reg.secs, &[EarlyRef { idx: 0, fp: &own.fp, audible: own.audible }], EARLY_HORIZON_S).1;
+        let mut sched = MatchSchedule::default();
+        let mut s = 1.0;
+        while s <= reg.secs + 1e-9 {
+            if sched.due(s, false) {
+                let n = codes_at(s).min(reg.fp.len());
+                let q = Fingerprint { codes: reg.fp.codes[..n].to_vec(), valid: reg.fp.valid[..n].to_vec(), t0: reg.fp.t0 };
+                let t = std::time::Instant::now();
+                let _ = evaluate_theme(&own.fp, own.audible, &q);
+                cpu[2] += t.elapsed();
+            }
+            s += 1.0;
+        }
+        n_cpu += 1;
+    }
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / n_cpu.max(1) as f64;
+    println!(
+        "[early] CPU per 600 s HEAD and theme, this (unoptimised test) build, {n_cpu} heads: early tracker {:.0} ms (absent theme) / {:.0} ms (own opening, followed to the end), streaming full matcher {:.0} ms",
+        ms(cpu[0]),
+        ms(cpu[1]),
+        ms(cpu[2])
+    );
+
+    assert!(false_fires.is_empty(), "{} false early fires:\n{}", false_fires.len(), false_fires.join("\n"));
+    // Research: 28/28 openings, 27/28 endings (JJK S1E3's ending, the PTS-gap release, is the miss).
+    assert_eq!(rel_op.len(), 28, "every corpus opening must fire early");
+    assert!(rel_ed.len() >= 27, "endings that fire early: {}", rel_ed.len());
+    assert!(missed.iter().all(|m| m == "tt12343534:1:3 ed"), "unexpected misses {missed:?}");
+    assert!(fails.is_empty(), "{} early-rule failures:\n{}", fails.len(), fails.join("\n"));
+    // The timing the matcher.rs comment quotes (OP 12.3-14.1 s, ED 12.4-14.6 s
+    // after the theme starts), with a little headroom, so the comment and the
+    // implementation cannot drift apart silently.
+    let max_of = |v: &[f64]| v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    assert!(max_of(&rel_op) <= 14.5, "an opening fired late: {rel_op:?}");
+    assert!(max_of(&rel_ed) <= 15.0, "an ending fired late: {rel_ed:?}");
+    assert!(app_level.0 == app_level.1, "top-ranked candidate fires on {}/{} slots", app_level.0, app_level.1);
+}
+
+/// The early rule when the analysis lags the decoder: the region worker only
+/// analyses with its queue drained, so on a fast link it may get a turn only
+/// every few seconds of audio. Every corpus opening and ending (own theme, at
+/// its truth) must still fire with the same window, and never be withdrawn
+/// before the streaming full gate accepts it.
+#[test]
+#[ignore = "needs AURA_SKIPBENCH_DIR (skipbench corpus)"]
+fn skipdetect_early_rule_lagging_analysis() {
+    let root = bench();
+    let eval = load_json(&root.join("eval_animethemes.json"));
+    let rows = eval["rows"].as_array().unwrap().clone();
+    let themes = all_corpus_themes(&root);
+    let mut jobs = Vec::new();
+    for r in &rows {
+        let id = r["id"].as_str().unwrap().to_string();
+        for (slot, which) in [("op", "head"), ("ed", "tail")] {
+            let Some(strict) = r["eval"]["strict"][slot]["theme"].as_str() else { continue };
+            let win = pair(&r["eval"]["strict"][slot]["pred"]["A_full"]).unwrap();
+            jobs.push((id.clone(), which, strict.to_string(), win));
+        }
+    }
+    let res = par_map(jobs.len(), |k| {
+        let (id, which, strict, win) = &jobs[k];
+        let cdir = root.join("cache").join(tag_of(id));
+        let info = load_json(&cdir.join("info.json"));
+        let mut pcm = read_wav(&cdir.join(format!("{which}.wav")));
+        if *which == "head" {
+            pcm.truncate(HEAD_SAMPLES);
+        }
+        let t0 = info["passes"][*which]["t0"].as_f64().unwrap();
+        let fp = fingerprint(&pcm, t0);
+        let secs = pcm.len() as f64 / SR as f64;
+        let th = themes.iter().find(|t| &t.base == strict).unwrap();
+        let refs = [EarlyRef { idx: 0, fp: &th.fp, audible: th.audible }];
+        let full = full_gate_accept(&th.fp, th.audible, &fp, secs);
+        let mut lines = Vec::new();
+        let mut bad = Vec::new();
+        for every in [2.5, 4.0, 7.0] {
+            let (ev, _) = simulate_early_every(&fp, secs, &refs, f64::INFINITY, every);
+            let fire = ev.iter().find_map(|(s, e)| match e {
+                EarlyEvent::Fire { window, .. } => Some((*s, *window)),
+                _ => None,
+            });
+            let retract = ev.iter().find_map(|(s, e)| match e {
+                EarlyEvent::Retract { why, .. } => Some((*s, *why)),
+                _ => None,
+            });
+            lines.push(format!("every {every}s: fire {fire:?} retract {retract:?}"));
+            match fire {
+                None if id == "tt12343534:1:3" && *which == "tail" => {}
+                None => bad.push(format!("{id} {which} every {every}s: no fire")),
+                Some((_, w)) => {
+                    let d = (w.0 - win.0.max(0.0)).abs().max((w.1 - win.1).abs());
+                    if d > 0.5 && !(*which == "tail" && w.1 > t0 + secs) {
+                        bad.push(format!("{id} {which} every {every}s: window {w:?} vs eval {win:?}"));
+                    }
+                }
+            }
+            if let (Some((rs, why)), Some(fs)) = (retract, full) {
+                if rs < fs {
+                    bad.push(format!("{id} {which} every {every}s: withdrawn at {rs} ({}) before the full gate at {fs}", why.as_str()));
+                }
+            }
+        }
+        (format!("[early-lag] {id:18} {which} {strict}: {}", lines.join("; ")), bad)
+    });
+    let mut fails = Vec::new();
+    for (line, bad) in res {
+        println!("{line}");
+        fails.extend(bad);
+    }
+    assert!(fails.is_empty(), "{} lagging-analysis failures:\n{}", fails.len(), fails.join("\n"));
 }

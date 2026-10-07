@@ -564,6 +564,417 @@ pub fn head_exit_ready(decoded_pos_s: f64, op_window_end: f64) -> bool {
     decoded_pos_s >= op_window_end + HEAD_EXIT_MARGIN_S
 }
 
+// ── early provisional opening ───────────────────────────────────────────────
+//
+// The accept rule above needs a 30 s run AND 85% of the theme covered, so a
+// 0:00 opening is accepted only after about 75-77 s of it has decoded, and the
+// prompt landed 10-34 s into the opening in the app. The EARLY rule publishes a
+// PROMPT (never an auto-skip) once the theme's own beginning has matched:
+//
+//   * a run of at least EARLY_RUN_S (12 s) with mean BER <= ACCEPT_BER;
+//   * that starts within EARLY_NEAR_S (5 s) of the theme's audible lead, i.e.
+//     it is the start of the song, not a chorus heard later;
+//   * on the GLOBAL best placement (the run's diagonal within MERGE_DRIFT codes
+//     of the best full-overlap offset);
+//   * with the same margin floor as the full gate (MARGIN_MIN).
+//
+// Measured on the skipbench corpus (Python prototype followups/early_accept.py
+// + rules.py: 12.2-13.7 s; this Rust implementation in
+// `skipdetect_early_rule_corpus`: every opening fires 12.3-14.1 s after the
+// theme starts, 0:00 ones at 13.0 s, 27 of 28 endings at 12.4-14.6 s, the
+// top-ranked candidate on 55/55 slots), with zero false fires across 6,696
+// theme x region pairings once "Over" themes are left out. 8 s let the Bleach
+// "Over" insert song through and 10 s had a thin margin, so do NOT go below
+// 12 s. The ignored corpus test `skipdetect_early_rule_corpus` checks zero
+// false fires, every opening firing, at least 27 endings, window accuracy, the
+// top-ranked candidate firing on every slot, and the fire timing with a little
+// headroom (OP <= 14.5 s, ED <= 15.0 s after the theme starts).
+//
+// The provisional window is withdrawn when it is contradicted: the best
+// placement moves, the margin falls below the floor, or the run stops short of
+// the 30 s accept floor. The full gate replaces it as soon as it accepts.
+//
+// Cost: the curve is folded INCREMENTALLY (each new query code adds K
+// reference comparisons, the same total work as ONE full match), so a check is
+// a scan of the curve plus run detection on 5 diagonals, and run detection is
+// skipped outright while the margin is below the floor (no theme present). The
+// early rule only fires while the region's decoded audio is under
+// EARLY_HORIZON_S; after that only an already published provisional theme is
+// tracked, until the full gate settles it.
+
+/// Early rule: shortest run that may publish a provisional window. Do not lower.
+pub const EARLY_RUN_S: f64 = 12.0;
+/// Early rule: the run must start this close to the theme's audible lead.
+pub const EARLY_NEAR_S: f64 = 5.0;
+/// Early rule cadence, in decoded seconds of the region.
+pub const EARLY_EVERY_S: f64 = 1.0;
+/// The early rule fires only while the region's decoded audio is shorter than
+/// this (an opening that starts later is far behind the decoder by the time
+/// the playhead gets there, so the full gate is in time on its own).
+pub const EARLY_HORIZON_S: f64 = 300.0;
+/// Retract once the provisional run has visibly stopped (the decoded frontier
+/// is this far past its end) without reaching ACCEPT_LEN_S.
+pub const EARLY_STOP_S: f64 = 4.0;
+/// Retract when the best placement moves further than this from the
+/// provisional diagonal.
+pub const EARLY_MOVE_S: f64 = 2.0;
+
+/// `ber_by_offset` folded incrementally over a GROWING query: push the query
+/// prefix as it decodes and read the curve at any time. Identical, value for
+/// value, to `ber_by_offset(r, q_prefix, MIN_OVERLAP_S)` (integer sums, same
+/// formula).
+#[derive(Clone, Debug, Default)]
+pub struct EarlyCurve {
+    k: usize,
+    /// Query codes folded so far.
+    n: usize,
+    /// Hamming sum and valid-pair count per offset, index `off + k - 1`.
+    ham: Vec<u64>,
+    cnt: Vec<u32>,
+}
+
+impl EarlyCurve {
+    pub fn new(r: &Fingerprint) -> Self {
+        Self { k: r.len(), n: 0, ham: Vec::new(), cnt: Vec::new() }
+    }
+
+    /// Fold the query codes not seen yet (`q` must be the same growing
+    /// fingerprint every call; codes never change once emitted).
+    pub fn extend(&mut self, r: &Fingerprint, q: &Fingerprint) {
+        let k = self.k;
+        if k == 0 || q.len() <= self.n {
+            return;
+        }
+        let total = k - 1 + q.len();
+        self.ham.resize(total, 0);
+        self.cnt.resize(total, 0);
+        for j in self.n..q.len() {
+            if !q.valid[j] {
+                continue;
+            }
+            let qc = q.codes[j];
+            // off = j - i, index = off + k - 1 = j + (k - 1 - i).
+            for i in 0..k {
+                if r.valid[i] {
+                    let idx = j + k - 1 - i;
+                    self.ham[idx] += (r.codes[i] ^ qc).count_ones() as u64;
+                    self.cnt[idx] += 1;
+                }
+            }
+        }
+        self.n = q.len();
+    }
+
+    /// The full-overlap BER curve of the folded prefix.
+    pub fn curve(&self) -> BerCurve {
+        if self.k == 0 || self.n == 0 {
+            return BerCurve::default();
+        }
+        let min_cnt = MIN_OVERLAP_S * FPS;
+        let ber = self
+            .ham
+            .iter()
+            .zip(&self.cnt)
+            .map(|(&h, &c)| {
+                if (c as f64) >= min_cnt {
+                    let dot = 32.0 * c as f64 - 2.0 * h as f64;
+                    0.5 - dot / (64.0 * c as f64)
+                } else {
+                    0.5
+                }
+            })
+            .collect();
+        BerCurve { first_off: -(self.k as i64 - 1), ber }
+    }
+}
+
+/// What the early rule sees on one prefix.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EarlyCheck {
+    /// Best full-overlap offset (codes) and its BER.
+    pub best_off: i64,
+    pub best_ber: f64,
+    /// round(second - best, 4), as the full gate computes it.
+    pub margin: f64,
+    /// The longest run (BER <= ACCEPT_BER) on the best diagonal (+- MERGE_DRIFT)
+    /// that starts within EARLY_NEAR_S of the theme's audible lead. Only
+    /// computed while the margin clears the floor (None otherwise).
+    pub run: Option<Run>,
+}
+
+impl EarlyCheck {
+    /// The early rule: the opening of the theme matched, unambiguously.
+    pub fn fires(&self) -> bool {
+        self.margin >= MARGIN_MIN && self.run.is_some_and(|r| r.len_s >= EARLY_RUN_S)
+    }
+}
+
+/// Best offset (first minimum, as numpy's argmin) and the second-best BER more
+/// than SECOND_EXCL_S away, rounded like `match_reference`.
+fn best_and_second(curve: &BerCurve) -> Option<(i64, f64, f64)> {
+    if curve.ber.is_empty() {
+        return None;
+    }
+    let mut o = 0;
+    for (i, &b) in curve.ber.iter().enumerate() {
+        if b < curve.ber[o] {
+            o = i;
+        }
+    }
+    let excl = (SECOND_EXCL_S * FPS) as i64;
+    let best_off = curve.off(o);
+    let mut second = f64::INFINITY;
+    for (i, &b) in curve.ber.iter().enumerate() {
+        if (curve.off(i) - best_off).abs() > excl && b < second {
+            second = b;
+        }
+    }
+    if !second.is_finite() {
+        second = 0.5;
+    }
+    Some((best_off, round_to(curve.ber[o], 4), round_to(second, 4)))
+}
+
+/// Matcher-faithful runs (smooth, threshold, refine, collinear merge) on the
+/// diagonals `center - MERGE_DRIFT ..= center + MERGE_DRIFT`, rounded like
+/// `match_reference`, longest first.
+fn runs_near(r: &Fingerprint, q: &Fingerprint, center: i64) -> Vec<Run> {
+    let min_len = MIN_RUN_S * FPS;
+    let mut raw = Vec::new();
+    for off in center - MERGE_DRIFT..=center + MERGE_DRIFT {
+        let (r0, b) = per_code_ber(r, q, off);
+        if b.is_empty() {
+            continue;
+        }
+        let sm = smooth(&b, (SMOOTH_S * FPS) as usize, 0.5);
+        let mask: Vec<bool> = sm.iter().map(|&x| x < RUN_THR).collect();
+        for (s, e) in true_runs(&mask) {
+            if ((e - s) as f64) < min_len {
+                continue;
+            }
+            let (s, e) = refine(&b, s, e);
+            let mean = b[s..e].iter().sum::<f64>() / (e - s) as f64;
+            raw.push(RawRun { q: r0 as i64 + s as i64 + off, r: r0 as i64 + s as i64, len: (e - s) as i64, ber: mean, off });
+        }
+    }
+    let mut merged = merge_collinear(raw);
+    merged.sort_by(|a, b| b.len.cmp(&a.len));
+    merged
+        .iter()
+        .map(|m| Run {
+            q_start_s: round_to(q.t0 + m.q as f64 / FPS, 3),
+            r_start_s: round_to(r.t0 + m.r as f64 / FPS, 3),
+            len_s: round_to(m.len as f64 / FPS, 3),
+            ber: round_to(m.ber, 4),
+            ref0_s: round_to(q.t0 - r.t0 + m.off as f64 / FPS, 3),
+            off: m.off,
+        })
+        .collect()
+}
+
+/// Evaluate the early rule on the current prefix `q` (with `curve` its folded
+/// BER curve against `r`). `audible` = the theme's audible lead / trail.
+pub fn early_check(r: &Fingerprint, audible: (f64, f64), q: &Fingerprint, curve: &BerCurve) -> Option<EarlyCheck> {
+    let (best_off, best_ber, second) = best_and_second(curve)?;
+    let margin = round_to(second - best_ber, 4);
+    let mut out = EarlyCheck { best_off, best_ber, margin, run: None };
+    if margin < MARGIN_MIN {
+        // No unambiguous placement: run detection would be wasted work.
+        return Some(out);
+    }
+    out.run = runs_near(r, q, best_off)
+        .into_iter()
+        .find(|run| run.ber <= ACCEPT_BER && run.r_start_s <= audible.0 + EARLY_NEAR_S);
+    Some(out)
+}
+
+/// The provisional window of a fired early check: the reference mapped through
+/// the run's diagonal, `[ref0, ref0 + reference length]` rounded like the full
+/// gate's mapping (clamping to the media end is the caller's).
+pub fn early_window(run: &Run, ref_len_s: f64) -> (f64, f64) {
+    (round_to(run.ref0_s, 2).max(0.0), round_to(run.ref0_s + ref_len_s, 2))
+}
+
+/// Once the decoded frontier is this far past the provisional theme's audible
+/// end, the full gate has had its chance (it matches every MATCH_EVERY_S): a
+/// provisional window it has not confirmed by then is withdrawn.
+pub const EARLY_SETTLE_S: f64 = 2.0 * MATCH_EVERY_S;
+
+/// Why a provisional window was withdrawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EarlyRetract {
+    /// The best placement moved away from the provisional diagonal.
+    Moved,
+    /// The second-best placement came within the margin floor.
+    Margin,
+    /// The run stopped before reaching the 30 s accept floor.
+    Stopped,
+    /// The whole theme has decoded and the full gate did not accept it (a
+    /// theme cut short in the episode, or TV-edited).
+    Unconfirmed,
+}
+
+impl EarlyRetract {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EarlyRetract::Moved => "best placement moved",
+            EarlyRetract::Margin => "margin < 0.15",
+            EarlyRetract::Stopped => "run stopped short of 30 s",
+            EarlyRetract::Unconfirmed => "the whole theme decoded without passing the full checks",
+        }
+    }
+}
+
+/// Re-check a published provisional window (`fired` = the run it fired on)
+/// against a longer prefix. `frontier_s` = absolute time of the decoded
+/// frontier; `audible_trail_s` = the theme's audible end in the reference.
+/// None = it still stands. The caller stops asking once the full gate has
+/// accepted, so `Unconfirmed` means the full gate had its chance and passed.
+pub fn early_retract(
+    r: &Fingerprint,
+    q: &Fingerprint,
+    curve: &BerCurve,
+    fired: &Run,
+    frontier_s: f64,
+    audible_trail_s: f64,
+) -> Option<EarlyRetract> {
+    if frontier_s >= fired.ref0_s + audible_trail_s + EARLY_SETTLE_S {
+        return Some(EarlyRetract::Unconfirmed);
+    }
+    let Some((best_off, best_ber, second)) = best_and_second(curve) else {
+        return Some(EarlyRetract::Moved);
+    };
+    if ((best_off - fired.off).abs() as f64) > EARLY_MOVE_S * FPS {
+        return Some(EarlyRetract::Moved);
+    }
+    if round_to(second - best_ber, 4) < MARGIN_MIN {
+        return Some(EarlyRetract::Margin);
+    }
+    // The run that continues the fired one (same placement, overlapping it).
+    let cont = runs_near(r, q, fired.off).into_iter().find(|run| {
+        run.ber <= ACCEPT_BER
+            && (run.off - fired.off).abs() <= MERGE_DRIFT
+            && run.q_start_s <= fired.q_start_s + fired.len_s
+            && run.q_start_s + run.len_s >= fired.q_start_s
+    });
+    match cont {
+        Some(run) if run.len_s >= ACCEPT_LEN_S => None,
+        Some(run) if frontier_s < run.q_start_s + run.len_s + EARLY_STOP_S => None,
+        _ => Some(EarlyRetract::Stopped),
+    }
+}
+
+/// One theme the early rule may fire on (the caller leaves out "Over" themes
+/// and a Transition version while its full version is a candidate). In
+/// candidate order: the first theme that fires wins.
+pub struct EarlyRef<'a> {
+    pub idx: usize,
+    pub fp: &'a Fingerprint,
+    /// Audible lead / trail (s) of the theme file.
+    pub audible: (f64, f64),
+}
+
+/// What the early tracker reports.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EarlyEvent {
+    /// Publish a provisional window for theme `idx`.
+    Fire { idx: usize, run: Run, margin: f64, window: (f64, f64) },
+    /// Withdraw it.
+    Retract { idx: usize, why: EarlyRetract },
+}
+
+/// The early rule over one streaming region: fires at most once, then watches
+/// the fired theme until the caller reports the full gate's acceptance
+/// (`stop`) or a contradiction withdraws it. After a withdrawal it stays quiet
+/// for the rest of the region (the full gate still decides).
+#[derive(Clone, Debug)]
+pub struct EarlyTracker {
+    curves: Vec<(usize, EarlyCurve)>,
+    last_s: Option<f64>,
+    /// The theme it fired on, the run, and the theme's audible trail.
+    fired: Option<(usize, Run, f64)>,
+    done: bool,
+    /// Decoded seconds after which it no longer fires (EARLY_HORIZON_S).
+    horizon_s: f64,
+}
+
+impl Default for EarlyTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EarlyTracker {
+    pub fn new() -> Self {
+        Self::with_horizon(EARLY_HORIZON_S)
+    }
+
+    /// A tracker with another firing horizon (the corpus test measures the
+    /// RULE on endings deep inside TAIL, which production never asks for).
+    pub fn with_horizon(horizon_s: f64) -> Self {
+        Self { curves: Vec::new(), last_s: None, fired: None, done: false, horizon_s }
+    }
+
+    /// The full gate accepted (or the region ended): stop tracking.
+    pub fn stop(&mut self) {
+        self.done = true;
+        self.fired = None;
+        self.curves = Vec::new();
+    }
+
+    fn curve_for(&mut self, t: &EarlyRef, q: &Fingerprint) -> BerCurve {
+        let pos = match self.curves.iter().position(|(i, _)| *i == t.idx) {
+            Some(p) => p,
+            None => {
+                self.curves.push((t.idx, EarlyCurve::new(t.fp)));
+                self.curves.len() - 1
+            }
+        };
+        let c = &mut self.curves[pos].1;
+        c.extend(t.fp, q);
+        c.curve()
+    }
+
+    /// One step on the prefix `q` (`decoded_s` seconds of the region decoded).
+    /// Runs at most every EARLY_EVERY_S of decoded audio.
+    pub fn step(&mut self, decoded_s: f64, q: &Fingerprint, themes: &[EarlyRef]) -> Option<EarlyEvent> {
+        if self.done {
+            return None;
+        }
+        if self.last_s.is_some_and(|l| decoded_s - l < EARLY_EVERY_S) {
+            return None;
+        }
+        self.last_s = Some(decoded_s);
+        if let Some((idx, run, trail)) = self.fired {
+            let t = themes.iter().find(|t| t.idx == idx)?;
+            let curve = self.curve_for(t, q);
+            let why = early_retract(t.fp, q, &curve, &run, q.t0 + decoded_s, trail)?;
+            self.stop();
+            return Some(EarlyEvent::Retract { idx, why });
+        }
+        if decoded_s > self.horizon_s {
+            self.stop();
+            return None;
+        }
+        if decoded_s < EARLY_RUN_S {
+            return None;
+        }
+        for t in themes {
+            let curve = self.curve_for(t, q);
+            let Some(chk) = early_check(t.fp, t.audible, q, &curve) else { continue };
+            if !chk.fires() {
+                continue;
+            }
+            let run = chk.run.expect("fires() implies a run");
+            self.fired = Some((t.idx, run, t.audible.1));
+            // Only the fired theme is tracked from here on.
+            self.curves.retain(|(i, _)| *i == t.idx);
+            return Some(EarlyEvent::Fire { idx: t.idx, run, margin: chk.margin, window: early_window(&run, t.fp.duration_s()) });
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::fingerprint::{fingerprint, theme_audible, SR};
@@ -732,6 +1143,160 @@ mod tests {
         let w = layer1_window(&m, media_end).unwrap();
         assert!(w.1 <= media_end && w.1 < container);
         assert!((w.0 - (1000.0 + at)).abs() <= 1.0 / FPS);
+    }
+
+    // ── early provisional opening ──
+
+    /// Stream `pcm` through the early tracker the way the region worker does
+    /// (chunks of 0.25 s, a step after each), returning every event with the
+    /// decoded seconds it came at. `stop_at` = decoded seconds at which the
+    /// "full gate" accepts and stops the tracker.
+    fn stream_early(r: &Fingerprint, aud: (f64, f64), pcm: &[i16], t0: f64, stop_at: Option<f64>) -> Vec<(f64, EarlyEvent)> {
+        let mut fpr = super::super::fingerprint::Fingerprinter::new(t0);
+        let mut tr = EarlyTracker::new();
+        let refs = [EarlyRef { idx: 0, fp: r, audible: aud }];
+        let mut out = Vec::new();
+        for chunk in pcm.chunks(SR as usize / 4) {
+            fpr.push(chunk);
+            let decoded_s = fpr.samples() as f64 / SR as f64;
+            if stop_at.is_some_and(|s| decoded_s >= s) {
+                tr.stop();
+            }
+            if let Some(e) = tr.step(decoded_s, fpr.fingerprint(), &refs) {
+                out.push((decoded_s, e));
+            }
+        }
+        out
+    }
+
+    fn random_fp(n: usize, seed: u64) -> Fingerprint {
+        let mut rng = Rng(seed);
+        Fingerprint {
+            codes: (0..n).map(|_| (rng.next() * u32::MAX as f64) as u32).collect(),
+            valid: (0..n).map(|_| rng.next() > 0.1).collect(),
+            t0: 0.0,
+        }
+    }
+
+    #[test]
+    fn early_curve_equals_ber_by_offset_on_every_prefix() {
+        let r = random_fp(300, 21);
+        let full = random_fp(900, 22);
+        let mut c = EarlyCurve::new(&r);
+        // Uneven growth, including a prefix shorter than the overlap floor.
+        for n in [0usize, 7, 150, 151, 400, 655, 900] {
+            let q = Fingerprint { codes: full.codes[..n].to_vec(), valid: full.valid[..n].to_vec(), t0: 0.0 };
+            c.extend(&r, &q);
+            let inc = c.curve();
+            let direct = ber_by_offset(&r, &q, MIN_OVERLAP_S);
+            assert_eq!(inc.first_off, direct.first_off, "prefix {n}");
+            assert_eq!(inc.ber, direct.ber, "prefix {n}: incremental curve must be value-identical");
+        }
+    }
+
+    #[test]
+    fn early_prompt_fires_12_s_into_an_opening_at_zero_and_stands() {
+        let th = song(90.0, 31);
+        let (r, aud) = theme_fp(&th);
+        let pcm = episode(240.0, &th, 0.0, 41);
+        let ev = stream_early(&r, aud, &pcm, 0.0, None);
+        let (at, first) = ev.first().copied().expect("the early rule fires");
+        let EarlyEvent::Fire { window, run, margin, .. } = first else { panic!("{first:?}") };
+        assert!((EARLY_RUN_S..EARLY_RUN_S + 3.0).contains(&at), "fired after {at} s of audio");
+        assert!(run.len_s >= EARLY_RUN_S && run.ber <= ACCEPT_BER && margin >= MARGIN_MIN, "{run:?} {margin}");
+        assert!(window.0.abs() <= 1.0 / FPS && (window.1 - r.duration_s()).abs() <= 1.0 / FPS, "{window:?}");
+        // No full gate here: it stands for the whole theme, then is withdrawn
+        // as unconfirmed (never before the theme has finished decoding).
+        let retracts: Vec<_> = ev.iter().filter(|(_, e)| matches!(e, EarlyEvent::Retract { .. })).collect();
+        assert_eq!(retracts.len(), 1, "{ev:?}");
+        let (t_ret, e) = retracts[0];
+        assert!(matches!(e, EarlyEvent::Retract { why: EarlyRetract::Unconfirmed, .. }), "{e:?}");
+        assert!(*t_ret >= aud.1 + EARLY_SETTLE_S - 0.5, "withdrawn at {t_ret} before the theme decoded");
+    }
+
+    #[test]
+    fn early_prompt_never_withdrawn_once_the_full_gate_accepts() {
+        let th = song(90.0, 32);
+        let (r, aud) = theme_fp(&th);
+        let at = 57.3;
+        let pcm = episode(260.0, &th, at, 42);
+        // The full gate accepts this theme at about at + 77 s; the caller stops
+        // the tracker then.
+        let ev = stream_early(&r, aud, &pcm, 0.0, Some(at + 80.0));
+        assert_eq!(ev.len(), 1, "fire only: {ev:?}");
+        let (t, EarlyEvent::Fire { window, .. }) = ev[0] else { panic!() };
+        assert!(t >= at + EARLY_RUN_S && t <= at + EARLY_RUN_S + 3.0, "fired at {t}");
+        assert!((window.0 - at).abs() <= 1.0 / FPS, "{window:?}");
+    }
+
+    #[test]
+    fn early_rule_ignores_short_snippets_and_mid_song_entries() {
+        let th = song(90.0, 33);
+        let (r, aud) = theme_fp(&th);
+        // 8 s of the theme's start: below EARLY_RUN_S.
+        let pcm = episode(200.0, &th[..8 * SR as usize], 30.0, 43);
+        assert!(stream_early(&r, aud, &pcm, 0.0, None).is_empty());
+        // 40 s of the theme heard from its middle (a chorus as an insert song):
+        // long enough, but it is not the song's beginning.
+        let mid = &th[40 * SR as usize..80 * SR as usize];
+        let pcm = episode(200.0, mid, 30.0, 44);
+        assert!(stream_early(&r, aud, &pcm, 0.0, None).is_empty());
+    }
+
+    #[test]
+    fn early_prompt_withdrawn_when_the_run_dies_young() {
+        let th = song(90.0, 34);
+        let (r, aud) = theme_fp(&th);
+        // 20 s of the theme's beginning, then different music.
+        let mut ins = th[..20 * SR as usize].to_vec();
+        ins.extend(song(60.0, 77));
+        let pcm = episode(220.0, &ins, 10.0, 45);
+        let ev = stream_early(&r, aud, &pcm, 0.0, None);
+        assert!(matches!(ev.first(), Some((_, EarlyEvent::Fire { .. }))), "{ev:?}");
+        let (t, e) = ev.get(1).copied().expect("withdrawn");
+        assert!(matches!(e, EarlyEvent::Retract { .. }), "{e:?}");
+        // Withdrawn within a few seconds of the run's end (10 + 20 s).
+        assert!(t <= 30.0 + EARLY_STOP_S + 3.0, "withdrawn only at {t}");
+        assert_eq!(ev.len(), 2, "quiet after a withdrawal: {ev:?}");
+    }
+
+    #[test]
+    fn early_prompt_withdrawn_for_truncated_and_tv_edited_themes() {
+        let th = song(90.0, 35);
+        let (r, aud) = theme_fp(&th);
+        // 60% of the theme then other music: the full gate's coverage check
+        // rejects it, so the provisional window must not outlive the theme.
+        let cut = (0.6 * th.len() as f64) as usize;
+        let mut ins = th[..cut].to_vec();
+        ins.extend(song(36.0, 99));
+        let pcm = episode(260.0, &ins, 40.0, 46);
+        let ev = stream_early(&r, aud, &pcm, 0.0, None);
+        assert!(matches!(ev.first(), Some((_, EarlyEvent::Fire { .. }))), "{ev:?}");
+        let (t, e) = ev.get(1).copied().expect("withdrawn");
+        assert!(matches!(e, EarlyEvent::Retract { .. }), "{e:?}");
+        assert!(t <= 40.0 + aud.1 + EARLY_SETTLE_S + 2.0, "withdrawn at {t}");
+        // A TV edit (20 s cut from the middle): the second half sits on another
+        // diagonal; the provisional window goes when that becomes visible.
+        let mid = th.len() / 2;
+        let half = (10.0 * SR as f64) as usize;
+        let mut tv = th[..mid - half].to_vec();
+        tv.extend_from_slice(&th[mid + half..]);
+        let pcm = episode(260.0, &tv, 50.0, 47);
+        let ev = stream_early(&r, aud, &pcm, 0.0, None);
+        assert!(matches!(ev.first(), Some((_, EarlyEvent::Fire { .. }))), "{ev:?}");
+        let (t, e) = ev.get(1).copied().expect("withdrawn");
+        assert!(matches!(e, EarlyEvent::Retract { .. }), "{e:?}");
+        assert!(t <= 50.0 + 90.0, "withdrawn at {t}, after the edited theme ended");
+    }
+
+    #[test]
+    fn early_rule_respects_its_horizon() {
+        let th = song(60.0, 36);
+        let (r, aud) = theme_fp(&th);
+        // Starts after the horizon: the full gate alone handles it.
+        let at = EARLY_HORIZON_S + 5.0;
+        let pcm = episode(at + 90.0, &th, at, 48);
+        assert!(stream_early(&r, aud, &pcm, 0.0, None).is_empty());
     }
 
     #[test]

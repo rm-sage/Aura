@@ -26,7 +26,8 @@ import { pickDefaultAudio, toLang2, type ScoringMeta } from "./audioScoring";
 import { prettyBinding } from "./useKeybindings";
 import { loadAuraSettings, saveAuraSettings } from "./auraSettings";
 import AniSkipMenu from "./AniSkipMenu";
-import { skipKindLabel, skipSourceLabel } from "./skipSource";
+import { skipHeldReason, skipKindLabel, skipSourceLabel } from "./skipSource";
+import type { SkipMode, SkipModes } from "./skipWindows";
 import SubtitleSyncPanel, { type SyncAnchorPair } from "./SubtitleSyncPanel";
 import { MenuTrackerCtx, useMenuOpenSync, type MenuTracker } from "./menuTracker";
 import { copyTextToClipboard } from "./clipboard";
@@ -530,7 +531,7 @@ function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | n
       // Surface the actual reason (first line, capped) so a failure is
       // actionable instead of a generic toast — e.g. "Shader file not found …".
       const reason = String(e).replace(/^Error:\s*/i, "").split("\n")[0].trim().slice(0, 90);
-      fireToast(reason ? `Upscaler failed — ${reason}` : "Upscaler failed");
+      fireToast(reason ? `Upscaler failed: ${reason}` : "Upscaler failed");
     }
     setOpen(false);
   }, [profiles, activeTarget]);
@@ -1428,6 +1429,10 @@ export default function PlayerOverlay({
   // for the SkipWindowButton + auto-skip logic — single source of
   // truth, no duplicate fetch.
   const skipWindowsForScrub = useSkipWindows();
+  // The per-kind skip modes, so the scrubber's hover card and the skip prompt
+  // can say when a window only prompts although its kind is on Auto. Re-read
+  // whenever the stamped windows change (a mode change re-stamps them).
+  const skipModes = useSkipModes(skipWindowsForScrub);
 
   // Track lists: read on demand because we trimmed `track-list / aid / sid`
   // out of the property-observer set in Phase 6.0.2 (those formats broke the
@@ -2368,6 +2373,7 @@ export default function PlayerOverlay({
         loadKey={loadKey}
         controlsVisible={controlsVisible}
         ready={tracksReady}
+        skipModes={skipModes}
       />
 
       {/* ── Top scrim — gradient fade from black to transparent so the
@@ -2490,6 +2496,7 @@ export default function PlayerOverlay({
                 }}
                 progressPct={progress}
                 segments={skipWindowsForScrub}
+                skipModes={skipModes}
                 thumbnailAt={
                   // Trailers play off a googlevideo CDN URL that ffmpeg can't
                   // reliably seek/range-probe for hover frames — skip thumbs.
@@ -3131,7 +3138,7 @@ function fmtBehind(seconds: number): string {
  *  loading animation until the underlying image actually loads. */
 function Scrubber({
   value, max, progressPct, onScrubStart, onScrub, onScrubEnd, segments,
-  thumbnailAt,
+  skipModes, thumbnailAt,
 }: {
   value: number;
   max: number;
@@ -3143,6 +3150,9 @@ function Scrubber({
    *  amber bands overlaid on the scrub fill so the user can see where
    *  skip boundaries land. Hovering shows the kind + timestamps. */
   segments?: AuraSkipWindow[];
+  /** The user's per-kind skip modes (null until read). Only used to mark a
+   *  window that prompts although its kind is on Auto. */
+  skipModes?: SkipModes | null;
   /** Async resolver: returns the data URL + the ACTUAL `playback-time`
    *  at which mpv produced the frame, or null when none is available
    *  (extraction failed / no engine). Optional — when absent the
@@ -3459,7 +3469,7 @@ function Scrubber({
                 </div>
               )}
               <div className="text-white/75 font-mono tabular-nums mt-0.5">
-                {fmtTime(hoveredSegment.seg.start)} – {fmtTime(hoveredSegment.seg.end)}
+                {fmtTime(hoveredSegment.seg.start)} - {fmtTime(hoveredSegment.seg.end)}
               </div>
               <div className="text-white/45 text-[10px] mt-0.5">
                 {(hoveredSegment.seg.end - hoveredSegment.seg.start).toFixed(1)}s
@@ -3468,6 +3478,13 @@ function Scrubber({
                 )}
                 {hoveredSegment.seg.auto && (
                   <span className="ml-2 text-amber-300/80">· auto-skip</span>
+                )}
+                {/* On Auto, but this window may only prompt. No tooltip here:
+                    the card is pointer-events-none. The AuraSkip menu and the
+                    prompt itself say why. */}
+                {!hoveredSegment.seg.auto && skipModes
+                  && skipHeldReason(hoveredSegment.seg, skipModes) && (
+                  <span className="ml-2 text-white/50">· prompt only</span>
                 )}
               </div>
             </div>
@@ -4287,7 +4304,7 @@ function MoreMenu({
             title={
               isAnime
                 ? undefined
-                : "Anime only — interpolation adds judder/drops on live-action"
+                : "Anime only: interpolation adds judder/drops on live-action"
             }
             className={`w-full flex items-center gap-3 px-4 py-2 text-left text-[13px]
                        transition-colors
@@ -4593,6 +4610,42 @@ function useSupersededSkipWindows(): AuraSkipWindow[] {
   return rows;
 }
 
+function normalizeSkipMode(raw: string | undefined, fallback: SkipMode): SkipMode {
+  return raw === "off" || raw === "prompt" || raw === "auto" ? raw : fallback;
+}
+
+/** The user's per-kind skip modes from the backend settings, re-read whenever
+ *  `refreshKey` changes (pass the stamped windows: a mode change re-stamps
+ *  them) and on `aura:settings-changed`. Null until the first read lands, so
+ *  nothing claims a window is held back before the modes are known. */
+function useSkipModes(refreshKey: unknown): SkipModes | null {
+  const [modes, setModes] = useState<SkipModes | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const read = () => {
+      invoke<{ skip_op_mode?: string; skip_ed_mode?: string; skip_recap_mode?: string }>("get_settings")
+        .then((st) => {
+          if (cancelled) return;
+          const next: SkipModes = {
+            op: normalizeSkipMode(st?.skip_op_mode, "auto"),
+            ed: normalizeSkipMode(st?.skip_ed_mode, "prompt"),
+            recap: normalizeSkipMode(st?.skip_recap_mode, "prompt"),
+          };
+          setModes((prev) => (prev && prev.op === next.op && prev.ed === next.ed
+            && prev.recap === next.recap ? prev : next));
+        })
+        .catch(() => {});
+    };
+    read();
+    window.addEventListener("aura:settings-changed", read);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("aura:settings-changed", read);
+    };
+  }, [refreshKey]);
+  return modes;
+}
+
 /** Seconds of headroom kept between a skip target and the end of the file. */
 const SKIP_EOS_MARGIN_SECONDS = 1;
 /** Where a skip actually seeks to. A window that ends AT the duration seeks
@@ -4638,10 +4691,15 @@ function SkipPromptToast({
   window: w,
   isFullscreen,
   visible,
+  heldLine,
 }: {
   window: AuraSkipWindow;
   isFullscreen: boolean;
   visible: boolean;
+  /** Set when the kind is on Auto but this window may only prompt: completes
+   *  "Auto-skip is on, but ...", so a prompt here does not look like Auto is
+   *  broken. */
+  heldLine?: string | null;
 }) {
   const kindLabel = skipKindLabel(w.type);
   const song = songLine(w);
@@ -4692,6 +4750,9 @@ function SkipPromptToast({
       {song && (
         <div className="text-[13px] text-white/50 mt-1.5 truncate">{song}</div>
       )}
+      {heldLine && (
+        <div className="text-[13px] text-white/50 mt-1.5">Auto-skip is on, but {heldLine}.</div>
+      )}
     </div>
   );
 }
@@ -4713,7 +4774,7 @@ function songLine(w: AuraSkipWindow): string | null {
  *  top of PlayerOverlay so its `keydown` listeners stay alive even
  *  when the bottom control bar is hidden by the auto-fade timer. */
 function SkipController({
-  time, duration, seekAbsolute, isFullscreen, loadKey, controlsVisible, ready,
+  time, duration, seekAbsolute, isFullscreen, loadKey, controlsVisible, ready, skipModes,
 }: {
   time: number;
   /** Only used to keep a skip from seeking onto the last frame - see
@@ -4741,6 +4802,9 @@ function SkipController({
    *  NOT keyed on first-frame-seen: that flag is set by the cross-boundary
    *  tick this guard exists to ignore. */
   ready: boolean;
+  /** Per-kind skip modes (null until read), for the prompt's "Auto-skip is
+   *  on, but ..." line. */
+  skipModes: SkipModes | null;
 }) {
   const windows = useSkipWindows();
   const active   = ready ? (windows.find((w) => time >= w.start && time < w.end) ?? null) : null;
@@ -4751,6 +4815,12 @@ function SkipController({
   // prompt; that's why we key by start+end and reset per load.
   const firedRef = useRef<Set<string>>(new Set());
   const firedKeyRef = useRef<string>("");
+  // Auto windows entered past their midpoint: not seeked, offered as a PROMPT
+  // instead (a theme match confirmed late, a resume into the middle of an
+  // opening). Same key and lifetime as `firedRef`; the state copy only exists
+  // to re-render when a window is demoted.
+  const demotedRef = useRef<Set<string>>(new Set());
+  const [demotedTick, setDemotedTick] = useState(0);
   useEffect(() => {
     // Guarded rather than reset-on-every-run so React StrictMode's double
     // effect invocation cannot wipe a window this mount has already fired
@@ -4758,7 +4828,14 @@ function SkipController({
     if (firedKeyRef.current === loadKey) return;
     firedKeyRef.current = loadKey;
     firedRef.current = new Set();
+    demotedRef.current = new Set();
   }, [loadKey]);
+  const activeKey = active ? `${active.start}-${active.end}` : null;
+  // `demotedTick` is read so a demotion re-renders this value.
+  const demoted = demotedTick >= 0 && activeKey != null && demotedRef.current.has(activeKey);
+  /** The active window asks rather than seeks: a prompt window, or an auto
+   *  window that was demoted past its midpoint. */
+  const promptMode = !!active && (!active.auto || demoted);
 
   // Refs that the always-on Shift+X listener reads. The listener is
   // installed once and never re-bound — capturing `active` / `upcoming`
@@ -4781,7 +4858,9 @@ function SkipController({
   useEffect(() => {
     if (!active || !active.auto) return;
     const key = `${active.start}-${active.end}`;
-    if (firedRef.current.has(key)) return;
+    // A demoted window stays a prompt for the rest of the load: seeking back
+    // into its first half must not turn it into an auto-skip after all.
+    if (firedRef.current.has(key) || demotedRef.current.has(key)) return;
     const span = active.end - active.start;
     // One line per decision: the auto-skip used to leave no trace anywhere
     // but a transient toast, so a wrong seek could only be reconstructed
@@ -4789,9 +4868,15 @@ function SkipController({
     const desc = `${active.type} ${Math.round(active.start)}-${Math.round(active.end)}s `
                + `(source: ${active.source}) at ${time.toFixed(1)}s`;
     if (time - active.start > span * 0.5) {
-      // Don't yank, but mark fired so we don't re-evaluate every tick.
-      firedRef.current.add(key);
-      console.info(`[auraskip] auto-skip declined, entered past midpoint: ${desc}`);
+      // Don't yank: past the midpoint the user is watching it, or the window
+      // only arrived now (a theme match confirmed late). It used to be marked
+      // fired and offered NOTHING; it becomes a prompt instead, so X still
+      // skips it.
+      if (!demotedRef.current.has(key)) {
+        demotedRef.current.add(key);
+        setDemotedTick((n) => n + 1);
+      }
+      console.info(`[auraskip] auto-skip past midpoint, offered as a prompt: ${desc}`);
       return;
     }
     firedRef.current.add(key);
@@ -4812,9 +4897,10 @@ function SkipController({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active?.start, active?.end, active?.auto, loadKey]);
 
-  // Prompt-mode key 'x' — only bound while in a prompt window.
+  // Prompt-mode key 'x': only bound while in a prompt window (or an auto
+  // window demoted past its midpoint).
   useEffect(() => {
-    if (!active || active.auto) return;
+    if (!active || !promptMode) return;
     const key = `${active.start}-${active.end}`;
     const onKey = (e: KeyboardEvent) => {
       if (e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return;
@@ -4836,7 +4922,7 @@ function SkipController({
     // `duration` / `time` are read through refs inside the handler, so they
     // are deliberately not dependencies: re-installing a capture-phase
     // keydown listener on every time tick would be absurd.
-  }, [active?.start, active?.end, active?.auto, seekAbsolute]);
+  }, [active?.start, active?.end, active?.auto, promptMode, seekAbsolute]);
 
   // Force-skip Shift+X — always active, anywhere in playback. Inside a
   // window: skip it. Within 30 s of the next window's start: pre-skip.
@@ -4873,7 +4959,7 @@ function SkipController({
   // unhide it again whenever the player chrome reappears. The 'x'
   // keybind above is bound to `active`, not the toast's visibility,
   // so the skip still works while the prompt is hidden.
-  const promptKey = active && !active.auto ? `${active.start}-${active.end}` : null;
+  const promptKey = promptMode ? activeKey : null;
   const [autoHidden, setAutoHidden] = useState(false);
   useEffect(() => {
     setAutoHidden(false);
@@ -4882,12 +4968,22 @@ function SkipController({
     return () => clearTimeout(t);
   }, [promptKey]);
 
-  if (!active || active.auto) return null;
+  if (!active || !promptMode) return null;
   // Suppress the toast briefly after firing — `firedRef.has(key)` is
   // the cleanest way to know "user already accepted, hide the prompt".
   if (firedRef.current.has(`${active.start}-${active.end}`)) return null;
   const visible = !autoHidden || controlsVisible;
-  return <SkipPromptToast window={active} isFullscreen={isFullscreen} visible={visible} />;
+  const held = demoted
+    ? { line: "you are already past the halfway point" }
+    : skipModes ? skipHeldReason(active, skipModes) : null;
+  return (
+    <SkipPromptToast
+      window={active}
+      isFullscreen={isFullscreen}
+      visible={visible}
+      heldLine={held?.line ?? null}
+    />
+  );
 }
 
 function SkipWindowButton({

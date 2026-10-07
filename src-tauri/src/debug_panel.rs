@@ -226,6 +226,9 @@ pub async fn debug_load_test_pattern() -> Result<(), String> {
         crate::devlog!(info, "debug-panel", "loading lavfi test pattern: {url}");
         // (start, http_proxy, hdr_hint, audio_url) all None — the test pattern
         // is a local lavfi source: no resume, no proxy, SDR output, no DASH audio.
+        // Marked loaded before the submit, like load_video, so a close-to-tray
+        // racing the load never parks the webview under a playing file.
+        crate::window_logic::set_media_loaded(true);
         submit_load_file(url, None, None, None, None)
     }
     #[cfg(not(target_os = "windows"))]
@@ -249,6 +252,8 @@ pub fn debug_stop_playback() -> Result<(), String> {
         if !is_running() {
             return Err("debug_stop_playback: mpv engine not running.".into());
         }
+        // Mirrors stop_video: this does stop mpv, whichever path loaded it.
+        crate::window_logic::set_media_loaded(false);
         submit_command(vec!["stop".into()])
     }
     #[cfg(not(target_os = "windows"))]

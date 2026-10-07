@@ -38,6 +38,8 @@ import type { LibraryItem, VideoEntry } from "./types";
 import { formatEpisodeTag, episodeKindFlags, episodeKindNoun } from "./nextUp";
 import { loadAuraSettings } from "./auraSettings";
 import { shouldBlurThumbnail } from "./episodeSpoilers";
+import { getWatchState } from "./watchTogether/store";
+import Tooltip from "./Tooltip";
 
 interface Props {
   /** The next episode metadata. Provides the title + thumbnail + tag. */
@@ -75,11 +77,20 @@ interface Props {
    *  playing the next one crosses an arc boundary. Purely informational.
    *  `next` is null on the final arc. */
   arcNote?: { ending: string; next: string | null } | null;
+  /** Consecutive unattended auto-advances (App's still-watching streak). Only
+   *  read to tell whether the end screen will count down at all, using the
+   *  same test as EosSpotlight, so the "Autoplay" line is never a promise the
+   *  end screen then breaks. */
+  autoAdvanceStreak?: number;
+  /** Whether the end screen's countdown would skip to the canon episode
+   *  rather than play the literal next one. The same value App hands
+   *  EosSpotlight, read only to decide whether autoplay will happen at all. */
+  autoSkipsToCanon?: boolean;
 }
 
 export default function NextUpCta({
   episode, libraryById, loading, noStream, skipTag, onSkipToCanon, canonEpisode,
-  skipCount, onPlay, onDismiss, arcNote,
+  skipCount, onPlay, onDismiss, arcNote, autoAdvanceStreak = 0, autoSkipsToCanon,
 }: Props) {
   // Hover preview state: which episode's identity the card is showing.
   const [previewCanon, setPreviewCanon] = useState(false);
@@ -99,6 +110,25 @@ export default function NextUpCta({
   // the canon episode) cannot relabel a button that still plays the filler.
   const playKindNoun = episodeKindNoun(episode);
 
+  // Whether the end-of-episode screen will count down into the next episode.
+  // This card has no countdown of its own, so without saying so a user with
+  // autoplay on sees a card that just sits there. Mirrors EosSpotlight's
+  // `autoArmed` minus the stream-resolution part: never for an in-sync party
+  // follower, never once the still-watching gate has tripped, and never when
+  // the countdown would have nothing to play: it skips to canon only when
+  // `autoSkipsToCanon` says so (EosSpotlight's `skipMode`), and otherwise
+  // needs the literal next episode's stream (`stream != null` there). An
+  // OFFERED skip alone is not enough: with the filler preference off the
+  // countdown plays the literal next episode, which may have no stream.
+  const settings = loadAuraSettings();
+  const party = getWatchState();
+  const isPartyFollower = party.status === "connected" && !party.isLeader && party.inSync;
+  const gatedByStillWatching = settings.stillWatchingGate !== false && autoAdvanceStreak >= 2;
+  const skipMode = canSkip && autoSkipsToCanon === true;
+  const autoplayAhead = settings.autoAdvanceNextEpisode
+    && !isPartyFollower && !gatedByStillWatching && (skipMode || !noStream);
+  const dismissLabel = autoplayAhead ? "Hide and cancel autoplay for this episode" : "Hide";
+
   // The identity shown in the body. Hovering Skip fades in the canon episode
   // so the two are directly comparable before committing.
   const shown = previewCanon && canonEpisode ? canonEpisode : episode;
@@ -106,7 +136,7 @@ export default function NextUpCta({
   const shownTitle = (shown.title ?? "").trim() || "Untitled episode";
   const shownKinds = episodeKindFlags(shown);
   const shownBlur = shouldBlurThumbnail(
-    libraryById, shown.id, loadAuraSettings().blurUnwatchedThumbnails === true,
+    libraryById, shown.id, settings.blurUnwatchedThumbnails === true,
   );
 
   const PlayIcon = () => (
@@ -184,17 +214,23 @@ export default function NextUpCta({
               previewCanon && canonEpisode ? "text-purple-300/80" : "text-white/45"}`}>
               {previewCanon && canonEpisode ? "Skips to" : "Next up"} · {shownTag}
             </span>
-            <button
-              type="button"
-              onClick={onDismiss}
-              aria-label="Dismiss next-up suggestion"
-              className="w-5 h-5 rounded-full text-white/45 hover:text-white/85
-                         hover:bg-white/10 transition-colors flex items-center justify-center"
-            >
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
-              </svg>
-            </button>
+            {/* A tooltip here, unlike on the action buttons below: this is a
+                20px corner button, so a tip above it covers nothing the user
+                is deciding about, and closing the card ALSO cancels autoplay
+                for this episode, which nothing else on the card says. */}
+            <Tooltip pos="top" text={dismissLabel}>
+              <button
+                type="button"
+                onClick={onDismiss}
+                aria-label={dismissLabel}
+                className="w-5 h-5 rounded-full text-white/45 hover:text-white/85
+                           hover:bg-white/10 transition-colors flex items-center justify-center"
+              >
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                  <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
+                </svg>
+              </button>
+            </Tooltip>
           </div>
           <p
             key={shown.id}
@@ -224,6 +260,13 @@ export default function NextUpCta({
                 ? <p className="line-clamp-1">Next arc: {arcNote.next}</p>
                 : <p>Final arc</p>}
             </div>
+          )}
+          {/* Neutral on purpose: it stays true whichever button (Play or
+              Skip) the end screen's countdown presses. */}
+          {autoplayAhead && (
+            <p className="text-white/45 text-[11px] leading-tight mt-1">
+              Autoplay starts when this episode ends
+            </p>
           )}
         </div>
 

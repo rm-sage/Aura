@@ -5570,7 +5570,7 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Auto-advance to next episode"
-                description="At the end of an episode, start the next one automatically after a short countdown on the end-of-episode screen. After-credits scenes and previews always play first. Mouse movement, any key press, scrolling or the dismiss button cancels the countdown. Default off."
+                description="At the end of an episode, start the next one automatically after a short countdown on the end-of-episode screen. After-credits scenes and previews always play first. Mouse movement, any key press or scrolling cancels the countdown, and closing the Next Up card turns it off for that episode. Default off."
                 value={aura.autoAdvanceNextEpisode}
                 onChange={(v) => setLocal({ autoAdvanceNextEpisode: v })}
               />
@@ -5880,34 +5880,45 @@ export default function SettingsView({ addons, session }: Props) {
             <Section id="sec-anime-skip" title="Anime OP / ED Skip">
               <p className="text-white/40 text-xs">
                 Aura sources opening / ending / recap timestamps from the
-                AniSkip community database (anime with a MyAnimeList id), the
-                PublicMetaDB skip database, the file's own chapters, and an
-                on-device audio scan. The modes below apply on anime and
-                live-action alike, except that guessed windows, previews and
-                AniSkip endings only ever prompt (AniSkip endings can run early;
-                an ending confirmed by the theme match can auto-skip).
+                AniSkip community database (anime with a MyAnimeList id),
+                IntroDB, the PublicMetaDB skip database, the file's own
+                chapters, and an on-device audio scan. For anime the scan
+                matches the show's theme songs (the "theme match"), and other
+                timings for that segment that disagree with a match are
+                dropped. A missing auto-skip beats a wrong one, so anything
+                Aura is not sure of only ever asks first. The modes below apply on anime and
+                live-action alike, except that some segments only ever prompt:
+                next-episode previews, Aura's own guesses, timings borrowed
+                from other episodes, openings that play over story scenes,
+                IntroDB timings not yet confirmed by several submissions, and
+                AniSkip endings (their timing can be off by about half a
+                minute). A theme-matched ending stops where the song does, so
+                an after-credits scene still plays. The audio scan is the
+                Automatic skip detection switch below (turn on Show advanced
+                settings to see it).
                 Per-type modes: <span className="text-white/65">off</span> offers
                 no skip for that segment, <span className="text-white/65">prompt</span> shows
                 a "Press X to skip" toast, <span className="text-white/65">auto</span> skips
-                without asking.
+                without asking (once you are past a segment's halfway point, it
+                asks instead).
               </p>
               <SkipModeRow
                 label="Openings (OP)"
-                description="The opening theme. Prompt by default."
+                description="The opening theme. Prompt by default. On Auto, an opening that plays over story scenes, is borrowed from other episodes, is a guess, or comes from IntroDB timings not yet confirmed by several submissions still only prompts."
                 value={backend.skip_op_mode}
                 onChange={(v) => patchBackend({ skip_op_mode: v })}
               />
               <div className="h-px bg-white/6" />
               <SkipModeRow
                 label="Endings (ED)"
-                description="Endings often contain next-episode previews; prompt by default. Auto applies to endings confirmed by the theme match or an authored chapter; AniSkip endings alone only prompt."
+                description="Endings often contain next-episode previews; prompt by default. On Auto, an ending skips by itself when it comes from the theme match, a chapter named as the ending, IntroDB or PublicMetaDB; AniSkip endings, guesses and IntroDB timings not yet confirmed by several submissions only prompt. A theme-matched ending stops where the song does, so an after-credits scene still plays. When the file's chapters mark a next-episode preview, it gets its own Skip Preview prompt, never skips by itself, and is hidden while this is Off."
                 value={backend.skip_ed_mode}
                 onChange={(v) => patchBackend({ skip_ed_mode: v })}
               />
               <div className="h-px bg-white/6" />
               <SkipModeRow
                 label="Recaps"
-                description="Pure recap segments at episode start. Prompt by default for first-time viewers."
+                description="Pure recap segments at episode start. Prompt by default for first-time viewers. On Auto, a recap from IntroDB timings not yet confirmed by several submissions still only prompts."
                 value={backend.skip_recap_mode}
                 onChange={(v) => patchBackend({ skip_recap_mode: v })}
               />
@@ -5924,7 +5935,7 @@ export default function SettingsView({ addons, session }: Props) {
                 <div className="h-px bg-white/6" />
                 <SettingToggle
                   label="Automatic skip detection"
-                  description="Find the opening and ending in the episode's own audio. For anime, Aura matches the show's theme songs on every episode and drops crowd-sourced timings that disagree with the match. For other series it only looks for a part nothing else covered, and only offers it as a prompt. Reads the first ten minutes and the last eight of the stream; ffmpeg downloads once (~97 MB) the first time it is needed. Turn off to disable the scan and that download. Per-type auto / prompt / off is still set above."
+                  description="Find the opening and ending in the episode's own audio. For anime Aura can identify on MyAnimeList, it matches the show's theme songs from AnimeThemes on every episode: a match can auto-skip, and other timings more than 3 seconds away from it are dropped. Each theme song is downloaded once and only a fingerprint of it is kept. Where there is no theme song to match (most other series, or a season AnimeThemes does not list), Aura guesses a part nothing else covered from the audio, and a guess only ever prompts. Reads up to the first ten minutes and the last eight of the stream, leaving out a part you set to Off. On a first play the full match needs most of the song read first; before that, as soon as the song's first seconds match, an opening shows a Skip prompt, and it only skips by itself once the whole song is confirmed. Replays use the cache. When Aura looks up the next episode, it also fetches that episode's theme songs ahead of time (about 2 MB each; only the fingerprint is kept). ffmpeg downloads once (~97 MB) the first time it is needed. Turned off, Aura still reads the stream's header once when ffmpeg is already installed, to find where the episode really ends for autoplay. Per-type auto / prompt / off is still set above."
                   value={aura.autoSkipDetect}
                   onChange={(v) => setLocal({ autoSkipDetect: v })}
                 />
@@ -5938,7 +5949,7 @@ export default function SettingsView({ addons, session }: Props) {
                   filter becomes a no-op (every candidate passes). */}
               <SettingDropdown
                 label="Auto-skip filler / recap during autoplay"
-                description="Decides which button an UNATTENDED countdown presses when the next episode is filler or recap. Off, it counts down on Play next and the filler plays. Set to filler, recap or both, it counts down on Skip instead and jumps to the next canon episode. Either way the buttons are always both there, so you can override it for any single episode. Skipping marks every episode it jumped as Skipped and logs them to History; if you pressed Skip yourself and automatic scrobbling is on they are also sent to your connected scrobbling services as watched, since none of them can represent a skip. An unattended skip marks locally and sends nothing. Requires AIOMetadata per-episode filler and recap flags; without them nothing is ever flagged and no skip button appears."
+                description="Decides which button the end-of-episode countdown presses when the next episode is filler or recap. Off, it counts down on Play next and the filler plays. Set to filler, recap or both, it counts down on Skip instead and jumps to the next canon episode. Either way the buttons are always both there, so you can override it for any single episode. Skipping marks every episode it jumped as Skipped and logs them to History; if you pressed Skip yourself and automatic scrobbling is on they are also sent to your connected scrobbling services as watched, since none of them can represent a skip. An unattended skip marks locally and sends nothing. Requires AIOMetadata per-episode filler and recap flags; without them nothing is ever flagged and no skip button appears."
                 value={aura.nextUpSkipFillerRecap}
                 required
                 options={[

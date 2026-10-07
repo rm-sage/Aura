@@ -969,6 +969,17 @@ select,
     animation: detail-backdrop-drift 14s ease-in-out infinite alternate;
   }
 
+  /* Freeze the drift once an opaque backdrop image covers the base
+   * (DetailView adds .is-covered). The drift animates background-position,
+   * so it REPAINTS a blurred full-viewport layer every display frame (239 Hz
+   * on a high-refresh monitor) even when nothing of it is visible: it was
+   * measured as most of the renderer's CPU on an idle detail page, focused,
+   * unfocused and in the tray alike. Paused rather than removed so a picker
+   * swap that uncovers it resumes from the same spot, with no jump. */
+  .detail-backdrop-skeleton.is-covered {
+    animation-play-state: paused;
+  }
+
   /* Transparent stand-in for ImageLoader's built-in skeleton inside the
    * detail hero. The hero mounts its own always-on ambient base (the
    * .detail-backdrop-skeleton div) underneath the backdrop, so the loader
@@ -2298,7 +2309,9 @@ select option:hover {
 html[data-reduced-motion="true"] .aura-sweep,
 html[data-reduced-motion="true"] .aura-sweep::after,
 html[data-reduced-motion="true"] .aura-ambient,
+html[data-reduced-motion="true"] .aura-ambient::before,
 html[data-reduced-motion="true"] .aura-ambient::after,
+html[data-reduced-motion="true"] .detail-backdrop-skeleton,
 html[data-reduced-motion="true"] .aura-glow,
 html[data-reduced-motion="true"] .aura-bell-ringing,
 html[data-reduced-motion="true"] .aura-bell-badge-bouncing,
@@ -2384,7 +2397,8 @@ html[data-aura-idle="true"] .aura-glow,
 html[data-aura-idle="true"] .aura-bell-ringing,
 html[data-aura-idle="true"] .aura-bell-badge-bouncing,
 html[data-aura-idle="true"] .hover-glow:hover,
-html[data-aura-idle="true"] .detail-backdrop-skeleton::after,
+html[data-aura-idle="true"] .detail-backdrop-skeleton,
+html[data-aura-idle="true"] .aura-popup-breathe,
 html[data-aura-idle="true"] .aura-popup-card-breathe,
 html[data-aura-idle="true"] .aura-popup-card-pulse,
 html[data-aura-idle="true"] .aura-latest-aired-caret,
@@ -2402,6 +2416,22 @@ html[data-aura-idle="true"] .aura-buffering-pulse {
      canvas, and an unfocused borderless WebView2 is not throttled by
      Chromium.) */
   will-change: auto !important;
+}
+
+/* The two remaining decorative loops, each in a rule of its own. The download
+   button's failure glow is a box-shadow PAINT loop like .aura-pill-alert,
+   which is gated above. The slider fill shimmer repaints the track every
+   frame, and the player's volume slider is mounted for the whole of playback.
+   The slider's track is a vendor pseudo-element, and a selector list holding
+   one Chromium does not know is dropped WHOLE, so it never shares a list. */
+html[data-aura-idle="true"] .aura-dl-alert {
+  animation-play-state: paused !important;
+}
+html[data-aura-idle="true"] .aura-slider::-webkit-slider-runnable-track {
+  animation-play-state: paused !important;
+}
+html[data-reduced-motion="true"] .aura-slider::-webkit-slider-runnable-track {
+  animation: none !important;
 }
 
 /* ---------------------------------------------------------------- */
@@ -2426,7 +2456,8 @@ html[data-aura-user-idle="true"] .aura-ambient::after,
 html[data-aura-user-idle="true"] .aura-title,
 html[data-aura-user-idle="true"] .aura-row-title,
 html[data-aura-user-idle="true"] .aura-logo-a,
-html[data-aura-user-idle="true"] .aura-hero-title {
+html[data-aura-user-idle="true"] .aura-hero-title,
+html[data-aura-user-idle="true"] .detail-backdrop-skeleton {
   animation-play-state: paused !important;
   /* Same compositor-layer release as the away tier. */
   will-change: auto !important;

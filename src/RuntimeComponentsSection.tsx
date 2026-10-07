@@ -27,7 +27,7 @@ interface DepUi {
 }
 
 const DEPS: DepUi[] = [
-  { name: "ffmpeg.exe",  label: "FFmpeg",  approxMb: 97,  purpose: "Automatic OP/ED skip detection, Live Subtitle Sync on embedded subtitle tracks, and casting transmux." },
+  { name: "ffmpeg.exe",  label: "FFmpeg",  approxMb: 97,  purpose: "Automatic OP/ED skip detection (theme song matching), finding where an episode really ends so autoplay reaches the end screen, Live Subtitle Sync on embedded subtitle tracks, and casting transmux." },
   { name: "ffprobe.exe", label: "FFprobe", approxMb: 97,  purpose: "Casting transmux (files a Chromecast can't natively decode, e.g. some MKVs) and Live Subtitle Sync's embedded-track probe." },
   { name: "yt-dlp.exe",  label: "yt-dlp",  approxMb: 18,  purpose: "Watch Trailer - resolves a title's YouTube trailer to a direct stream for Aura's player (downloaded automatically on first use)." },
 ];

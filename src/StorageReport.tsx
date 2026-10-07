@@ -67,7 +67,7 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
   {
     prefix:      "aura:manual-state:",
     label:       "Manual watched + queue",
-    description: "Per-account watched, in-progress, and planned marks plus the Queue tab's order. Synced to Aura Cloud when you're signed in, so a signed-in device can re-merge the server copy after a clear; on a guest install this is the only copy. Skip annotations live in their own entry below and are NOT cleared with this one, so clear both together or skipped episodes keep their tag without a watched mark behind it. Skip annotations live in their own entry below and are NOT cleared with this one, so clear both together or skipped episodes keep their tag without a watched mark behind it.",
+    description: "Per-account watched, in-progress, and planned marks plus the Queue tab's order. Synced to Aura Cloud when you're signed in, so a signed-in device can re-merge the server copy after a clear; on a guest install this is the only copy. Skip annotations live in their own entry below and are NOT cleared with this one, so clear both together or skipped episodes keep their tag without a watched mark behind it.",
     destructive: true,
   },
   {
