@@ -17,7 +17,10 @@
 //      after-credits scene and preview (TYBW 3:1 has 169 s of story after its
 //      ending).
 //   2. One trigger expression. With a TRUSTED ending (Layer 1, the AnimeThemes
-//      match; agreed Layer 2 once it ships) the card appears at
+//      match, including a Transition-only match, whose END is trusted even
+//      though its start is the song's; the published ending that replaced a
+//      match counts when its end agrees with the match's; agreed Layer 2 once
+//      it ships) the card appears at
 //      max(ed_end, end - lead): never inside the ending, and when story follows
 //      the ending it waits for the plain lead time instead of covering that
 //      story. When the ending is the last thing in the file (nothing follows
@@ -49,7 +52,8 @@ export function playableEnd(duration: number, mediaEnd: number | null | undefine
 }
 
 export interface NextUpTiming {
-  /** End of a TRUSTED ending (Layer 1), or null. */
+  /** End of a TRUSTED ending (Layer 1, a Transition-only match included), or
+   *  null. */
   trustedEdEnd: number | null;
   /** The detector's media end (final or early estimate), or null. */
   mediaEnd: number | null;

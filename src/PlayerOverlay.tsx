@@ -27,7 +27,7 @@ import { prettyBinding } from "./useKeybindings";
 import { loadAuraSettings, saveAuraSettings } from "./auraSettings";
 import AniSkipMenu from "./AniSkipMenu";
 import { skipHeldReason, skipKindLabel, skipSourceLabel } from "./skipSource";
-import type { SkipMode, SkipModes } from "./skipWindows";
+import type { SkipHold, SkipMode, SkipModes } from "./skipWindows";
 import SubtitleSyncPanel, { type SyncAnchorPair } from "./SubtitleSyncPanel";
 import { MenuTrackerCtx, useMenuOpenSync, type MenuTracker } from "./menuTracker";
 import { copyTextToClipboard } from "./clipboard";
@@ -4541,6 +4541,8 @@ interface AuraSkipWindow {
    *  ambiguous match, and the UI falls back to its generic label. */
   song_title?:  string | null;
   song_artist?: string | null;
+  /** Why this window may only prompt (skipWindows.ts SkipHold). */
+  hold?: SkipHold | null;
 }
 
 /** Reactive skip-windows store. The Rust side owns the canonical

@@ -3,8 +3,8 @@
 
 import {
   CONTINUITY_SOURCE, INTRODB_SINGLE_SOURCE, INTRODB_SOURCE, LAYER1_EARLY_SOURCE,
-  LAYER1_PROMPT_SOURCE, LAYER1_SOURCE, PAIRING_SOURCE, isPromptOnly, skipKindGroup, skipModeForKind,
-  type SkipModes,
+  LAYER1_PROMPT_SOURCE, LAYER1_SOURCE, LAYER1_TRANSITION_SOURCE, PAIRING_SOURCE, isPromptOnly,
+  skipKindGroup, skipModeForKind, type SkipHold, type SkipModes,
 } from "./skipWindows";
 
 /** Where a skip window came from, in words. Shared by the AuraSkip menu's
@@ -14,6 +14,7 @@ export function skipSourceLabel(source: string): string {
   switch (source) {
     case LAYER1_SOURCE:         return "Theme match";
     case LAYER1_PROMPT_SOURCE:  return "Theme match (over story)";
+    case LAYER1_TRANSITION_SOURCE: return "Theme match (starts in story)";
     case LAYER1_EARLY_SOURCE:   return "Theme match (confirming)";
     case PAIRING_SOURCE:        return "Other episodes (audio)";
     case CONTINUITY_SOURCE:     return "Detected";
@@ -37,6 +38,7 @@ export function skipSourceHint(source: string): string {
   switch (source) {
     case LAYER1_SOURCE:         return "Found by matching the show's theme song in this audio";
     case LAYER1_PROMPT_SOURCE:  return "Theme song found, but it plays over story scenes";
+    case LAYER1_TRANSITION_SOURCE: return "Ending song found; it starts while the story is still playing";
     case LAYER1_EARLY_SOURCE:   return "The theme song's start matched; the rest is still being checked";
     case PAIRING_SOURCE:        return "Matched against other episodes' audio";
     case CONTINUITY_SOURCE:     return "Guessed from this episode's audio";
@@ -58,11 +60,40 @@ export function skipSourceHint(source: string): string {
 export interface SkipPromptOnlyReason { hint: string; line: string }
 
 export function skipPromptOnlyReason(
-  w: { type: string; source: string },
+  w: { type: string; source: string; hold?: SkipHold | null },
 ): SkipPromptOnlyReason | null {
   if (!isPromptOnly(w)) return null;
   if (skipKindGroup(w.type) === "preview") {
     return { hint: "Next-episode previews always ask first", line: "previews always ask" };
+  }
+  switch (w.hold) {
+    case "l1-pending":
+      return {
+        hint: "Asks until the theme song match has checked these times",
+        line: "the theme song match is still checking these times",
+      };
+    case "l1-abstain":
+      return {
+        hint: "The theme song is not where these times put it, so it asks first",
+        line: "the theme song is not where these times put it",
+      };
+    case "other-cut":
+      return {
+        hint: "Timed on a different cut of this episode, so it asks first",
+        line: "these times were made for a different cut of the episode",
+      };
+    case "weak-title":
+      return {
+        hint: "The chapter is only named Intro or Outro, so it asks first",
+        line: "the chapter is only named Intro or Outro",
+      };
+    case "uncorroborated":
+      return {
+        hint: "Nothing else confirms these times, so it asks first",
+        line: "nothing else confirms these times",
+      };
+    default:
+      break;
   }
   switch (w.source) {
     case CONTINUITY_SOURCE:
@@ -74,7 +105,12 @@ export function skipPromptOnlyReason(
     case INTRODB_SINGLE_SOURCE:
       return { hint: "Not yet confirmed on IntroDB, so it asks first", line: "IntroDB has not confirmed it yet" };
     case LAYER1_PROMPT_SOURCE:
-      return { hint: "This opening plays over story, so it asks first", line: "this opening plays over story" };
+      return { hint: "This song plays over story, so it asks first", line: "this song plays over story" };
+    case LAYER1_TRANSITION_SOURCE:
+      return {
+        hint: "The ending song starts while the story is still playing, so it asks first",
+        line: "the ending song starts while the story is still playing",
+      };
     case LAYER1_EARLY_SOURCE:
       return {
         hint: "Asks until the whole theme song is confirmed",
@@ -94,7 +130,7 @@ export function skipPromptOnlyReason(
  *  menu, the scrubber's hover card and the in-player prompt, so the three
  *  can never disagree. */
 export function skipHeldReason(
-  w: { type: string; source: string },
+  w: { type: string; source: string; hold?: SkipHold | null },
   modes: SkipModes,
 ): SkipPromptOnlyReason | null {
   const mode = skipKindGroup(w.type) === "preview" ? modes.ed : skipModeForKind(w.type, modes);

@@ -667,9 +667,13 @@ async function readSettingsBlob(): Promise<SettingsSyncBlob> {
   // user never chose, and a screenshot folder is the same problem. Stripping
   // outbound as well as inbound means the cloud blob never even carries them,
   // so an older client that predates the inbound guard cannot apply one either.
+  // `gpu_acceleration` is machine-local too: it is a per-machine GPU
+  // workaround (Rust keeps it in render.json), and a laptop's "off" synced to
+  // a desktop would silently drop that machine to software rendering.
   const backendShared: BackendSettingsLite = { ...backend };
   delete (backendShared as Record<string, unknown>).download_dir;
   delete (backendShared as Record<string, unknown>).screenshot_dir;
+  delete (backendShared as Record<string, unknown>).gpu_acceleration;
   return { backend: backendShared, frontend, updated_at: getSettingsUpdatedAt(), api_keys };
 }
 
@@ -705,6 +709,7 @@ async function writeSettingsBlob(blob: Partial<SettingsSyncBlob>): Promise<void>
       ...blob.backend,
       download_dir: localBackend.download_dir,
       screenshot_dir: localBackend.screenshot_dir,
+      gpu_acceleration: localBackend.gpu_acceleration,
     });
   }
   // Decrypt the API-keys blob (if present) and persist the

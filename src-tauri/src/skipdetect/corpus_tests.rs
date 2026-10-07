@@ -212,6 +212,7 @@ fn themes_of(root: &Path, mal: u64) -> Vec<ThemeRow> {
                     kind,
                     episodes: t["episodes"].as_str().map(String::from),
                     over: overlap == "Over",
+                    over_partial: false,
                     transition: overlap == "Transition",
                 },
                 over_str: overlap == "Over",

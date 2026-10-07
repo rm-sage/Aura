@@ -1606,11 +1606,9 @@ pub fn run() {
         .and_then(|guard| sentry_rust_minidump::init(guard).ok());
 
     // ── WebView2 launch args ──────────────────────────────────────────────
-
-    // ── WebView2 launch args ──────────────────────────────────────────────
     // Read the persisted `gpu_acceleration` setting BEFORE Tauri builds the
-    // window — WebView2 only consumes WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
-    // at spawn time, so changing the setting requires an app restart.
+    // window: WebView2 only takes browser arguments when its environment is
+    // created, so changing the setting requires an app restart.
     // Surfaced to the user as "Hardware acceleration" in Settings →
     // Performance. When off, we pass `--disable-gpu` so WebView2 falls
     // back to software rendering — useful when GPU compositing of a
@@ -1620,21 +1618,22 @@ pub fn run() {
     // the canonical signature of compositor-thread contention rather
     // than render-thread saturation).
     //
-    // We also read the setting via the same `settings::load` path the
-    // Tauri command handlers use later, so both surfaces share one
-    // source of truth. Failure here is non-fatal — fall through to
-    // GPU-on (the default).
-    if let Ok(s) = settings::load_pre_init() {
-        if !s.gpu_acceleration {
-            // The env var is read on EVERY WebView2 process spawn,
-            // including child renderers, so setting it here covers
-            // the whole webview lifecycle.
-            std::env::set_var(
-                "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
-                "--disable-gpu --disable-gpu-compositing",
-            );
-        }
-    }
+    // The value is machine-local and has one home, `render.json` (see
+    // `settings::load_pre_init`): every settings save writes it and every
+    // scope load reads it back, so the switch the user sees is what this
+    // read returns. Failure here is non-fatal: fall through to GPU-on (the
+    // default).
+    //
+    // NOT the WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS environment variable:
+    // wry always passes AdditionalBrowserArguments in the environment
+    // options, and WebView2 ignores the variable whenever the options carry
+    // a value, so the switch used to do nothing (measured: the browser
+    // process ran with wry's arguments only). The arguments go through the
+    // webview builders instead (`webview_browser_args`).
+    let gpu_off = settings::load_pre_init().map(|s| !s.gpu_acceleration).unwrap_or(false);
+    let _ = WEBVIEW_BROWSER_ARGS.set(
+        gpu_off.then(|| format!("{WRY_DEFAULT_BROWSER_ARGS} --disable-gpu --disable-gpu-compositing")),
+    );
 
     // ── Panic hook ────────────────────────────────────────────────────────
     // Capture every unhandled panic to %USERPROFILE%\aura-panic.log so a
@@ -2629,6 +2628,36 @@ pub fn run() {
             downloads::commands::downloads_plan_path,
             downloads::commands::downloads_set_root,
         ])
-        .run(tauri::generate_context!())
+        .run({
+            let mut context = tauri::generate_context!();
+            // The windows declared in tauri.conf.json (the main window) take
+            // the same browser arguments as every other webview.
+            if let Some(args) = webview_browser_args() {
+                for w in context.config_mut().app.windows.iter_mut() {
+                    w.additional_browser_args = Some(args.to_string());
+                }
+            }
+            context
+        })
         .expect("error while running tauri application");
+}
+
+/// wry's own WebView2 browser arguments (wry 0.55 `create_environment`: its
+/// default `autoplay: true`, no proxy, which is how Aura builds every
+/// webview). Passing ANY value replaces them, so a custom value must repeat
+/// them: they switch off the mini menu and SmartScreen and keep autoplay.
+/// Measured on the browser process of a default launch.
+const WRY_DEFAULT_BROWSER_ARGS: &str =
+    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --autoplay-policy=no-user-gesture-required";
+
+/// Browser arguments for EVERY webview Aura creates, decided once at startup:
+/// None = wry's defaults; Some when "Hardware acceleration" is off. Every
+/// webview must get the same value: WebView2 refuses a second environment on
+/// the same user data folder with different options, so a webview built
+/// without them (the OAuth popup) would fail to open.
+static WEBVIEW_BROWSER_ARGS: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// See `WEBVIEW_BROWSER_ARGS`.
+pub(crate) fn webview_browser_args() -> Option<&'static str> {
+    WEBVIEW_BROWSER_ARGS.get().and_then(|a| a.as_deref())
 }

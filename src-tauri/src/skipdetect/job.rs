@@ -256,6 +256,38 @@ pub enum JobState {
     Unavailable,
 }
 
+/// What Layer 1 (the AnimeThemes theme match) concluded for one kind. The
+/// frontend reads it to decide how far to trust the CROWD windows of that kind
+/// (AniSkip, IntroDB, PublicMetaDB): it holds them prompt-only while Layer 1 is
+/// still `Pending` (a crowd opening at 0-90 s auto-skipped 89 s of JJK S2E10's
+/// cold open before the theme match, which placed the real opening at 183 s,
+/// could drop it) and keeps them prompt-only after an `Informative` abstain.
+/// Structured so no consumer ever parses a note string.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum L1State {
+    /// A cached result written before this field existed. Such an entry
+    /// answers no request (`cached_serves`): it may also predate the
+    /// Transition-only ED rule, so it is detected again instead.
+    #[default]
+    Unknown,
+    /// The kind was not asked for (or the result answers a narrower request).
+    NotRequested,
+    /// The detect is running and has not decided this kind yet.
+    Pending,
+    /// A Layer 1 window (any of its sources) stands for the kind.
+    Matched,
+    /// The cour HAS themes of this kind and none matched this file: the kind's
+    /// crowd windows stay prompt-only, guesses of the kind are dropped.
+    Informative,
+    /// No theme of this kind to look for (no MAL id, or the cour lists none):
+    /// Layer 1 cannot judge the crowd, so it is trusted as before.
+    NoThemes,
+    /// Layer 1 could not decide (AnimeThemes down, download cap, a failed or
+    /// cancelled region, no audio): the crowd is trusted as before.
+    Unavailable,
+}
+
 /// Source of the early provisional opening: a PROMPT published once the theme's
 /// first 12 s matched, replaced by the full match or withdrawn. Never
 /// auto-eligible, never cached, and (frontend) never Layer 1: it does not drop
@@ -270,8 +302,17 @@ pub struct WindowOut {
     /// "animethemes" (Layer 1), "animethemes-early" (the provisional opening,
     /// EARLY_SOURCE) or "continuity" (Layer 3).
     pub source: String,
-    /// False for Layer 3 and for an "Over" OP theme.
+    /// False for Layer 3, for an "Over" theme (an OP, or an ED whose audio
+    /// also has a clean video) and for a Transition-only ED (see `transition`).
     pub auto_eligible: bool,
+    /// Layer 1 ED whose theme is Transition-only in AnimeThemes (every video
+    /// using its audio starts over episode content): the matched START is the
+    /// song's start, not necessarily the ending's (Cowboy Bebop 13's "Space
+    /// Lion" starts 280 s inside the story). The END is trusted. The frontend
+    /// stamps it under its own prompt-only source and lets a chapter or crowd
+    /// ED whose end agrees outrank it.
+    #[serde(default)]
+    pub transition: bool,
     #[serde(default)]
     pub theme: Option<String>,
     #[serde(default)]
@@ -299,6 +340,21 @@ pub struct Snapshot {
     /// Why a kind has no window (abstentions are precision, not errors).
     pub op_note: Option<String>,
     pub ed_note: Option<String>,
+    /// What Layer 1 concluded per kind (see `L1State`).
+    #[serde(default)]
+    pub op_l1: L1State,
+    #[serde(default)]
+    pub ed_l1: L1State,
+    /// The audio Layer 1 actually searched for each kind, in media seconds:
+    /// HEAD from 0 to the end it decoded (origin + samples / 11025, capped at
+    /// `HEAD_SECS`), TAIL from its origin to the final media end. None until
+    /// that region has run. The frontend applies a Layer 1 abstain (or a
+    /// pending hold) only to crowd rows that overlap this audio: a theme
+    /// outside it was never looked for.
+    #[serde(default)]
+    pub op_region: Option<(f64, f64)>,
+    #[serde(default)]
+    pub ed_region: Option<(f64, f64)>,
     /// Last decoded audio: TAIL origin + samples / 11025 once TAIL reached EOF
     /// (`media_end_final`), before that the mapped track's DURATION tag, else
     /// the container duration. Never ffmpeg's `time=` line.
@@ -335,8 +391,8 @@ impl Snapshot {
 /// Layer 1 themes). A result computed WITH a MAL id may answer a request
 /// without one: it only knows more.
 fn cached_serves(stored: &Snapshot, req: &Request) -> bool {
-    (!req.op || stored.requested_op)
-        && (!req.ed || stored.requested_ed)
+    (!req.op || (stored.requested_op && stored.op_l1 != L1State::Unknown))
+        && (!req.ed || (stored.requested_ed && stored.ed_l1 != L1State::Unknown))
         && (req.mal_id.is_none() || stored.requested_mal == req.mal_id)
 }
 
@@ -361,6 +417,60 @@ pub struct Ctx {
     pub generation: u64,
     /// Called with every changed snapshot (the host filters stale generations).
     pub publish: Arc<dyn Fn(&Snapshot) + Send + Sync>,
+    /// Tests only: replay cached PCM and a recorded probe instead of running
+    /// ffmpeg on a stream (`replay.rs`). Everything else is the real job.
+    #[cfg(test)]
+    pub replay: Option<Arc<super::replay::Replay>>,
+}
+
+/// A region's PCM source: an ffmpeg pass, or (tests only) a replay of cached
+/// PCM through the very same streaming loop.
+enum Source {
+    Ff(RegionPass),
+    #[cfg(test)]
+    Replay(super::replay::ReplayPass),
+}
+
+impl Source {
+    fn samples(&self) -> u64 {
+        match self {
+            Source::Ff(p) => p.samples(),
+            #[cfg(test)]
+            Source::Replay(p) => p.samples(),
+        }
+    }
+
+    fn first_pts(&self) -> Option<f64> {
+        match self {
+            Source::Ff(p) => p.first_pts(),
+            #[cfg(test)]
+            Source::Replay(p) => p.first_pts(),
+        }
+    }
+
+    async fn next_pcm(&mut self) -> std::io::Result<Option<Vec<i16>>> {
+        match self {
+            Source::Ff(p) => p.next_pcm().await,
+            #[cfg(test)]
+            Source::Replay(p) => p.next_pcm().await,
+        }
+    }
+
+    async fn finish(self) -> audio::RegionEnd {
+        match self {
+            Source::Ff(p) => p.finish().await,
+            #[cfg(test)]
+            Source::Replay(p) => p.end(false),
+        }
+    }
+
+    async fn kill(self) -> audio::RegionEnd {
+        match self {
+            Source::Ff(p) => p.kill().await,
+            #[cfg(test)]
+            Source::Replay(p) => p.end(true),
+        }
+    }
 }
 
 // ── theme catalogue ─────────────────────────────────────────────────────────
@@ -587,6 +697,9 @@ fn worker_loop(mut rx: mpsc::Receiver<WCmd>, tx: mpsc::UnboundedSender<WEvt>, t0
                 }
             }
         }
+        // Tests only: a replay paces its PCM on what the analysis consumed.
+        #[cfg(test)]
+        super::replay::worker_progress(fpr.samples());
     }
 }
 
@@ -636,7 +749,8 @@ struct RegionOut {
 enum Decision {
     Window(WindowOut),
     /// No window; `cacheable` false when the abstain is not a stable fact.
-    Abstain { note: String, cacheable: bool },
+    /// `l1` is what the abstain says about Layer 1 (published per kind).
+    Abstain { note: String, cacheable: bool, l1: L1State },
     /// Layer 1 has no theme of this kind at all: Layer 3 may run.
     NoThemes { note: String },
 }
@@ -759,7 +873,11 @@ impl<'a> Decider<'a> {
         match &self.cat.state {
             ListState::NoMal => return Decision::NoThemes { note: "no MAL id".into() },
             ListState::Unavailable(e) => {
-                return Decision::Abstain { note: format!("animethemes unavailable ({e})"), cacheable: false }
+                return Decision::Abstain {
+                    note: format!("animethemes unavailable ({e})"),
+                    cacheable: false,
+                    l1: L1State::Unavailable,
+                }
             }
             ListState::Loaded => {}
         }
@@ -809,7 +927,11 @@ impl<'a> Decider<'a> {
                 Step::Accept(i) => {
                     let m = &matches[&i];
                     let Some(w) = matcher::layer1_window(m, media_end) else {
-                        return Decision::Abstain { note: "matched window empty after clamping".into(), cacheable: true };
+                        return Decision::Abstain {
+                            note: "matched window empty after clamping".into(),
+                            cacheable: true,
+                            l1: L1State::Unavailable,
+                        };
                     };
                     return Decision::Window(layer1_out(m, &self.cat.recs[i], w, &self.cat.metas[i]));
                 }
@@ -817,6 +939,7 @@ impl<'a> Decider<'a> {
                     return Decision::Abstain {
                         note: format!("theme download cap ({}) reached", themes::MAX_DOWNLOADS_PER_KIND),
                         cacheable: false,
+                        l1: L1State::Unavailable,
                     }
                 }
                 Step::Exhausted => {
@@ -851,6 +974,7 @@ impl<'a> Decider<'a> {
                 "themes exist but none matched (informative abstain)".into()
             },
             cacheable: !uncertain && !incomplete,
+            l1: L1State::Informative,
         }
     }
 
@@ -863,11 +987,16 @@ impl<'a> Decider<'a> {
                 // HEAD killed after acceptance: the streaming window stands.
                 Some(a) => match matcher::layer1_window(&a.m, media_end) {
                     Some(w) => Decision::Window(layer1_out(&a.m, &self.cat.recs[a.idx], w, &self.cat.metas[a.idx])),
-                    None => Decision::Abstain { note: "matched window empty after clamping".into(), cacheable: true },
+                    None => Decision::Abstain {
+                        note: "matched window empty after clamping".into(),
+                        cacheable: true,
+                        l1: L1State::Unavailable,
+                    },
                 },
                 None => Decision::Abstain {
                     note: region.failed.clone().unwrap_or_else(|| "region incomplete".into()),
                     cacheable: false,
+                    l1: L1State::Unavailable,
                 },
             }
         } else {
@@ -900,7 +1029,11 @@ impl<'a> Decider<'a> {
     /// Layer 3 (prompt-only) over a complete region.
     async fn layer3(&mut self, kind: Kind, region: &RegionOut, why: &str) -> Decision {
         let Some(t0) = region.origin.filter(|_| region.complete) else {
-            return Decision::Abstain { note: format!("{why}; region incomplete for continuity"), cacheable: false };
+            return Decision::Abstain {
+                note: format!("{why}; region incomplete for continuity"),
+                cacheable: false,
+                l1: L1State::NoThemes,
+            };
         };
         let levels = region.levels.clone();
         let sil = region.silences.clone();
@@ -913,7 +1046,7 @@ impl<'a> Decider<'a> {
         })
         .await;
         let Ok(o) = outcome else {
-            return Decision::Abstain { note: format!("{why}; continuity failed"), cacheable: false };
+            return Decision::Abstain { note: format!("{why}; continuity failed"), cacheable: false, l1: L1State::NoThemes };
         };
         crate::devlog!(
             info, "skipdetect",
@@ -931,6 +1064,7 @@ impl<'a> Decider<'a> {
                 end: e,
                 source: "continuity".into(),
                 auto_eligible: false,
+                transition: false,
                 theme: None,
                 run_s: None,
                 ber: None,
@@ -942,6 +1076,7 @@ impl<'a> Decider<'a> {
             _ => Decision::Abstain {
                 note: format!("{why}; continuity abstains ({})", o.abstain.map_or("no candidate", |a| a.as_str())),
                 cacheable: true,
+                l1: L1State::NoThemes,
             },
         }
     }
@@ -984,10 +1119,14 @@ pub async fn run(ctx: &Ctx, req: &Request) -> Snapshot {
                 if !req.op {
                     s.op = None;
                     s.op_note = None;
+                    s.op_l1 = L1State::NotRequested;
+                    s.op_region = None;
                 }
                 if !req.ed {
                     s.ed = None;
                     s.ed_note = None;
+                    s.ed_l1 = L1State::NotRequested;
+                    s.ed_region = None;
                 }
                 s.generation = ctx.generation;
                 s.from_cache = true;
@@ -1032,6 +1171,8 @@ pub async fn run(ctx: &Ctx, req: &Request) -> Snapshot {
             requested_op: req.op,
             requested_ed: req.ed,
             requested_mal: req.mal_id,
+            op_l1: if req.op { L1State::Pending } else { L1State::NotRequested },
+            ed_l1: if req.ed { L1State::Pending } else { L1State::NotRequested },
             ..Default::default()
         },
         media_est: req.duration,
@@ -1044,6 +1185,15 @@ pub async fn run(ctx: &Ctx, req: &Request) -> Snapshot {
     for w in [&mut job.snap.op, &mut job.snap.ed] {
         if w.as_ref().is_some_and(|w| w.source == EARLY_SOURCE) {
             *w = None;
+        }
+    }
+    // A kind the run never decided (the probe failed, no audio track, the
+    // region failed before a decision) ends Unavailable, never Pending: the
+    // frontend holds a crowd window while Layer 1 is pending, and a final
+    // snapshot must release it.
+    for l1 in [&mut job.snap.op_l1, &mut job.snap.ed_l1] {
+        if *l1 == L1State::Pending {
+            *l1 = L1State::Unavailable;
         }
     }
     job.snap.state = JobState::Done;
@@ -1086,6 +1236,7 @@ fn layer1_out(m: &ThemeMatch, rec: &ThemeRec, window: (f64, f64), meta: &ThemeMe
         end: window.1,
         source: "animethemes".into(),
         auto_eligible: themes::auto_eligible(meta),
+        transition: meta.transition_ed(),
         theme: Some(rec.label()),
         run_s: Some(m.longest_run_s),
         ber: m.run_ber,
@@ -1094,6 +1245,15 @@ fn layer1_out(m: &ThemeMatch, rec: &ThemeRec, window: (f64, f64), meta: &ThemeMe
         q35: None,
         mrel: None,
     }
+}
+
+/// `Some(withdraw_the_opening_too)` when a continuity ENDING overlaps the
+/// published opening (see `Job::no_ed_inside_the_opening`), else None.
+fn continuity_ed_clash(ed: &WindowOut, op: &WindowOut) -> Option<bool> {
+    if ed.source != "continuity" || ed.start.max(op.start) >= ed.end.min(op.end) {
+        return None;
+    }
+    Some(op.source == "continuity")
 }
 
 fn kind_name(kind: Kind) -> &'static str {
@@ -1116,9 +1276,21 @@ impl<'a> Job<'a> {
     }
 
     fn set_window(&mut self, kind: Kind, w: Option<WindowOut>) {
+        // A full Layer 1 window (a streaming acceptance or a final decision)
+        // settles the kind; the early provisional window does not.
+        if w.as_ref().is_some_and(|w| w.source == "animethemes") {
+            self.set_l1(kind, L1State::Matched);
+        }
         match kind {
             Kind::Op => self.snap.op = w,
             Kind::Ed => self.snap.ed = w,
+        }
+    }
+
+    fn set_l1(&mut self, kind: Kind, l1: L1State) {
+        match kind {
+            Kind::Op => self.snap.op_l1 = l1,
+            Kind::Ed => self.snap.ed_l1 = l1,
         }
     }
 
@@ -1128,6 +1300,10 @@ impl<'a> Job<'a> {
         let input = req.audio_url.clone().unwrap_or_else(|| req.url.clone());
         // Probe and theme list in parallel.
         let probe_fut = async {
+            #[cfg(test)]
+            if let Some(r) = &ctx.replay {
+                return Some(Ok(r.probe.clone()));
+            }
             let _permit = PASS_GATE.acquire().await.ok()?;
             Some(audio::run_probe(&ctx.ffmpeg, &input).await)
         };
@@ -1205,6 +1381,10 @@ impl<'a> Job<'a> {
             let args = probe::head_args(&input, n);
             let region = self.stream_region(Which::Head, args, 0.0, 0.0, &mut side).await;
             let media_end = self.media_end_now();
+            if let Some(o) = region.origin.filter(|_| region.failed.is_none()) {
+                let end = (o + region.samples as f64 / SR as f64).min(probe::HEAD_SECS);
+                self.snap.op_region = Some((0.0, end));
+            }
             if region.complete && req.ed {
                 self.d.drain_finished_loads();
                 let mut fork = self.d.fork();
@@ -1236,6 +1416,7 @@ impl<'a> Job<'a> {
                     );
                     self.snap.media_end = Some(end);
                     self.snap.media_end_final = true;
+                    self.snap.ed_region = Some((o, end));
                 }
             }
             // The OP decision, if it is still running, finishes first: the ED
@@ -1246,6 +1427,43 @@ impl<'a> Job<'a> {
             }
             let d = self.d.decide_kind(Kind::Ed, &region, self.media_end_now()).await;
             self.apply(Kind::Ed, d);
+        }
+    }
+
+    /// An ending can never share audio with the opening. On a file shorter
+    /// than TAIL's 480 s, TAIL re-reads HEAD's audio (S clamps to 0), and Layer
+    /// 3 then found the SAME in-story block as both kinds (Kaiju No. 8's 224 s
+    /// Narumi special: 34.8-117 s as OP and as ED). A continuity ED that
+    /// overlaps the published opening is withdrawn; when that opening is a
+    /// continuity window too, it goes as well, since one loudness block
+    /// claimed by both kinds is evidence for neither (precision first). A
+    /// Layer 1 opening stands. Runs on the ED decision, after the OP's.
+    fn no_ed_inside_the_opening(&mut self, kind: Kind, decision: Decision) -> Decision {
+        let Decision::Window(w) = &decision else { return decision };
+        if kind != Kind::Ed {
+            return decision;
+        }
+        let Some(op) = self.snap.op.clone() else { return decision };
+        let Some(with_op) = continuity_ed_clash(w, &op) else { return decision };
+        crate::devlog!(
+            info, "skipdetect",
+            "{} ED continuity [{:.2}, {:.2}] overlaps the opening [{:.2}, {:.2}] {}: withdrawn{}",
+            self.d.who,
+            w.start,
+            w.end,
+            op.start,
+            op.end,
+            op.source,
+            if with_op { " with the opening" } else { "" }
+        );
+        if with_op {
+            self.set_window(Kind::Op, None);
+            self.set_note(Kind::Op, "continuity window shared with the ending's; withdrawn".into());
+        }
+        Decision::Abstain {
+            note: "continuity ending overlaps the opening; withdrawn".into(),
+            cacheable: true,
+            l1: L1State::NoThemes,
         }
     }
 
@@ -1264,7 +1482,7 @@ impl<'a> Job<'a> {
             .into_iter()
             .filter_map(|i| {
                 let t = self.d.loader.loaded.get(&i)?.clone();
-                let early = early && !self.d.cat.metas[i].over && !self.transition_blocked(kind, i);
+                let early = early && !self.d.cat.metas[i].any_over() && !self.transition_blocked(kind, i);
                 Some(StreamTheme { idx: i, t, early })
             })
             .collect()
@@ -1290,6 +1508,7 @@ impl<'a> Job<'a> {
             end: e,
             source: EARLY_SOURCE.into(),
             auto_eligible: false,
+            transition: false,
             theme: Some(label),
             run_s: Some(run.len_s),
             ber: Some(run.ber),
@@ -1402,7 +1621,20 @@ impl<'a> Job<'a> {
             return out;
         };
         let started = std::time::Instant::now();
-        let mut pass = match RegionPass::spawn(&self.d.ctx.ffmpeg, &args, rebase) {
+        let spawned = {
+            #[cfg(test)]
+            {
+                match &self.d.ctx.replay {
+                    Some(r) => Ok(Source::Replay(r.pass(which == Which::Head, &args))),
+                    None => RegionPass::spawn(&self.d.ctx.ffmpeg, &args, rebase).map(Source::Ff),
+                }
+            }
+            #[cfg(not(test))]
+            {
+                RegionPass::spawn(&self.d.ctx.ffmpeg, &args, rebase).map(Source::Ff)
+            }
+        };
+        let mut pass = match spawned {
             Ok(p) => p,
             Err(e) => {
                 out.failed = Some(format!("{} spawn failed: {}", which.name(), e.kind()));
@@ -1621,6 +1853,7 @@ impl<'a> Job<'a> {
     /// Apply one kind's decision to the snapshot and publish it.
     fn apply(&mut self, kind: Kind, decision: Decision) {
         let name = kind_name(kind);
+        let decision = self.no_ed_inside_the_opening(kind, decision);
         match decision {
             Decision::Window(mut w) => {
                 // Rule 1: a window ends at the matched end clamped to the MEDIA
@@ -1629,20 +1862,27 @@ impl<'a> Job<'a> {
                     Some((_, e)) => w.end = e,
                     None => {
                         self.set_window(kind, None);
+                        self.set_l1(kind, L1State::Unavailable);
                         self.set_note(kind, "window empty after clamping to media end".into());
                         self.publish();
                         return;
                     }
                 }
                 crate::devlog!(info, "skipdetect", "{} {name} final {}", self.d.who, fmt_win(&Some(w.clone())));
+                // A continuity window is Layer 3: it only runs when Layer 1 had
+                // no theme of the kind.
+                if w.source != "animethemes" {
+                    self.set_l1(kind, L1State::NoThemes);
+                }
                 self.set_window(kind, Some(w));
                 match kind {
                     Kind::Op => self.snap.op_note = None,
                     Kind::Ed => self.snap.ed_note = None,
                 }
             }
-            Decision::Abstain { note, cacheable } => {
+            Decision::Abstain { note, cacheable, l1 } => {
                 crate::devlog!(info, "skipdetect", "{} {name} abstains: {note}", self.d.who);
+                self.set_l1(kind, l1);
                 if !cacheable {
                     self.d.cacheable = false;
                 }
@@ -1653,6 +1893,7 @@ impl<'a> Job<'a> {
             }
             Decision::NoThemes { note } => {
                 self.set_window(kind, None);
+                self.set_l1(kind, L1State::NoThemes);
                 self.set_note(kind, note);
             }
         }
@@ -1724,6 +1965,7 @@ mod tests {
             version: None,
             episodes: None,
             over,
+            over_partial: false,
             transition,
         }
     }
@@ -1897,7 +2139,15 @@ mod tests {
     }
 
     fn stored(op: bool, ed: bool, mal: Option<u32>) -> Snapshot {
-        Snapshot { requested_op: op, requested_ed: ed, requested_mal: mal, ..Default::default() }
+        let l1 = |asked: bool| if asked { L1State::Matched } else { L1State::NotRequested };
+        Snapshot {
+            requested_op: op,
+            requested_ed: ed,
+            requested_mal: mal,
+            op_l1: l1(op),
+            ed_l1: l1(ed),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1936,6 +2186,30 @@ mod tests {
         .unwrap();
         assert!(!cached_serves(&legacy, &full) && !cached_serves(&legacy, &ed_only));
         assert_eq!(legacy.media_end_probe, None);
+        // Written with the request fields but before the Layer 1 states: it
+        // may predate the Transition-only ED rule, so it answers no kind (a
+        // probe-only request still takes it).
+        let mut pre_l1 = stored(true, true, Some(56784));
+        pre_l1.op_l1 = L1State::Unknown;
+        pre_l1.ed_l1 = L1State::Unknown;
+        assert!(!cached_serves(&pre_l1, &full) && !cached_serves(&pre_l1, &op_only) && !cached_serves(&pre_l1, &ed_only));
+        assert!(cached_serves(&pre_l1, &probe_only));
+        let back: Snapshot = serde_json::from_str(&serde_json::to_string(&stored(true, true, None)).unwrap()).unwrap();
+        assert_eq!((back.op_l1, back.ed_l1), (L1State::Matched, L1State::Matched), "the states survive the cache");
+    }
+
+    #[test]
+    fn a_continuity_ending_never_shares_the_openings_audio() {
+        let w = |s: f64, e: f64, src: &str| WindowOut { start: s, end: e, source: src.into(), ..Default::default() };
+        // Kaiju No. 8 Narumi (224 s): TAIL re-read HEAD, one block as both kinds.
+        assert_eq!(continuity_ed_clash(&w(34.8, 117.0, "continuity"), &w(34.8, 117.0, "continuity")), Some(true));
+        // A Layer 1 opening stands; only the ending goes.
+        assert_eq!(continuity_ed_clash(&w(60.0, 120.0, "continuity"), &w(0.0, 89.0, "animethemes")), Some(false));
+        // Apart (touching edges included): no clash.
+        assert_eq!(continuity_ed_clash(&w(1300.0, 1390.0, "continuity"), &w(0.0, 89.0, "continuity")), None);
+        assert_eq!(continuity_ed_clash(&w(89.0, 150.0, "continuity"), &w(0.0, 89.0, "continuity")), None);
+        // A Layer 1 ending is never withdrawn by this rule.
+        assert_eq!(continuity_ed_clash(&w(34.8, 117.0, "animethemes"), &w(34.8, 117.0, "continuity")), None);
     }
 
     #[test]

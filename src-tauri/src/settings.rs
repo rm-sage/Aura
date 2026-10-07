@@ -282,15 +282,15 @@ pub struct AppSettings {
     pub trailer_quality: String,
 
     // ── Rendering ──────────────────────────────────────────────────────────
-    /// When false, WebView2 launches with `--disable-gpu` via the
-    /// WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS env var (read at process
-    /// startup in `lib.rs::run`). Default true (GPU on). Surfaced as
+    /// When false, WebView2 launches with `--disable-gpu` through the
+    /// webview builders' browser arguments (decided once at process startup
+    /// in `lib.rs::run`, see `webview_browser_args`). Default true (GPU on). Surfaced as
     /// a user-facing toggle in Settings → Performance because some
     /// systems show better scroll perf with GPU compositing off
     /// (driver-level frame-pacing issues, transparent-window DWM
-    /// interaction, etc.). Restart required to take effect — settings
-    /// persistence path writes the value, but the env var has to be
-    /// set BEFORE the WebView spawns.
+    /// interaction, etc.). Restart required to take effect: settings
+    /// persistence path writes the value, but the arguments are fixed
+    /// when the WebView2 environment is created.
     #[serde(default = "default_true")]
     pub gpu_acceleration: bool,
 
@@ -543,17 +543,25 @@ pub fn scope_from_auth_key(auth_key: &str) -> String {
 
 // ---------------------------------------------------------------------------
 // Pre-init load — reads settings WITHOUT an AppHandle. Used by `lib.rs::run`
-// before the Tauri builder runs (e.g. to pick up the `gpu_acceleration`
-// flag and stamp the WebView2 launch env var). Falls back to defaults on
-// any error since we're running before our normal logging is up — losing a
-// pre-init read here just means the app starts with default settings,
-// which is the same as a fresh install.
+// before the Tauri builder runs, to pick up the `gpu_acceleration` flag for
+// the WebView2 browser arguments (`lib.rs::webview_browser_args`). Falls
+// back to defaults on any error since we're running before our normal
+// logging is up: losing a pre-init read here just means the app starts with
+// default settings, which is the same as a fresh install.
 //
-// Walks every scope file under `%APPDATA%\com.aura.app\settings\*.json`
-// and OR's the gpu_acceleration flag across them: if ANY scope has it
-// off, treat the launch as off. GPU acceleration is a hardware-level
-// setting that doesn't make sense to vary per Stremio account, so a
-// conservative "any-user-said-no" approach is appropriate.
+// GPU acceleration is a per-machine GPU workaround, not an account
+// preference, so it has ONE machine-local home: `render.json` beside the
+// settings dir (`%APPDATA%\com.aura.app\render.json`). Every settings save
+// writes it, every scope load reads it back over the scope file's value, and
+// the launch reads only it, so the switch the user sees is always what the
+// next launch does. It is also kept out of the cloud blob and settings
+// export (sync.ts, settingsTransfer.ts).
+//
+// Only when `render.json` is absent (the first launch after an upgrade) does
+// the launch fall back, once, to the legacy scan: walk every scope file
+// under `%APPDATA%\com.aura.app\settings\*.json` and treat the launch as off
+// when ANY scope has the flag off. That answer is written to `render.json`
+// straight away.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "windows")]
@@ -577,15 +585,54 @@ fn pre_init_settings_root() -> Option<PathBuf> {
     }
 }
 
-/// Load the most permissive settings snapshot we can without an
-/// AppHandle. Walks every *.json under the settings dir; if ANY
-/// declares gpu_acceleration=false, returns a snapshot with that
-/// flag off. Used for pre-WebView env var setup only — runtime
-/// reads still go through the AppHandle-aware `load()`.
+/// The machine-local `render.json` (see the block comment above).
+fn render_pref_path() -> Option<PathBuf> {
+    Some(pre_init_settings_root()?.parent()?.join("render.json"))
+}
+
+#[derive(Serialize, Deserialize)]
+struct RenderPref {
+    gpu_acceleration: bool,
+}
+
+/// The machine-local `gpu_acceleration`; None when `render.json` is absent or
+/// unreadable.
+fn read_render_pref() -> Option<bool> {
+    let text = std::fs::read_to_string(render_pref_path()?).ok()?;
+    serde_json::from_str::<RenderPref>(&text).ok().map(|p| p.gpu_acceleration)
+}
+
+/// Atomic write of `render.json` (tmp, fsync, rename), like `save`.
+fn write_render_pref(gpu_acceleration: bool) -> Result<(), String> {
+    let path = render_pref_path().ok_or("render.json path unresolvable")?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let text = serde_json::to_string(&RenderPref { gpu_acceleration }).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        f.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+}
+
+/// The launch's settings without an AppHandle: defaults, with
+/// `gpu_acceleration` from `render.json`, else (absent: an upgrade) from the
+/// legacy any-scope-off scan, whose answer is then written to `render.json`.
+/// Used for the pre-WebView browser arguments only; runtime reads still go
+/// through the AppHandle-aware `load()`.
 pub fn load_pre_init() -> Result<AppSettings, String> {
+    let mut s = AppSettings::default();
+    if let Some(gpu) = read_render_pref() {
+        s.gpu_acceleration = gpu;
+        return Ok(s);
+    }
     let root = pre_init_settings_root().ok_or("settings dir unresolvable")?;
     if !root.exists() {
-        return Ok(AppSettings::default());
+        return Ok(s);
     }
     let mut any_gpu_off = false;
     if let Ok(entries) = std::fs::read_dir(&root) {
@@ -604,10 +651,10 @@ pub fn load_pre_init() -> Result<AppSettings, String> {
             }
         }
     }
-    let mut s = AppSettings::default();
     if any_gpu_off {
         s.gpu_acceleration = false;
     }
+    let _ = write_render_pref(s.gpu_acceleration);
     Ok(s)
 }
 
@@ -683,6 +730,11 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> AppSettings {
 
     match serde_json::from_str::<AppSettings>(&raw) {
         Ok(mut parsed) => {
+            // Machine-local: render.json wins over the scope file's value
+            // (see the "Pre-init load" block comment).
+            if let Some(gpu) = read_render_pref() {
+                parsed.gpu_acceleration = gpu;
+            }
             // Merge any newly-added default keybinding actions into
             // the user's saved map. `#[serde(default = ...)]` only
             // applies when the field is MISSING from JSON; if the
@@ -782,6 +834,12 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &AppSettings) -> Result<()
     }
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
     *cache().lock().unwrap() = settings.clone();
+    // The machine-local render switch, read by the next launch.
+    if read_render_pref() != Some(settings.gpu_acceleration) {
+        if let Err(e) = write_render_pref(settings.gpu_acceleration) {
+            crate::devlog!(warn, "settings", "render.json write failed: {e}");
+        }
+    }
     Ok(())
 }
 

@@ -1129,6 +1129,11 @@ pub async fn open_oauth_popup_webview(
 
     let mut builder = WebviewBuilder::new(label.clone(), WebviewUrl::External(parsed))
         .user_agent(POPUP_USER_AGENT);
+    // Same browser arguments as the main webview (they share one user data
+    // folder, and WebView2 refuses mismatched environment options there).
+    if let Some(args) = crate::webview_browser_args() {
+        builder = builder.additional_browser_args(args);
+    }
 
     // Emit the start host immediately so the JS-side popup header has
     // something to render before the first navigation event fires —

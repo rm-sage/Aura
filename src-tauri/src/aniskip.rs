@@ -86,6 +86,13 @@ pub struct SkipWindow {
     /// vote against.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skip_id: Option<String>,
+    /// The episode length (seconds) the AniSkip submitter recorded with this
+    /// row; 0 when unknown (and for the neighbour profile's synthetic rows).
+    /// The frontend compares it with the playing file's duration: a row
+    /// recorded against another cut (Re:Zero S3E1's opening came from a
+    /// 1770 s cut of a 5430 s file, Gintama's OAD row from a 1454 s cut of a
+    /// 1556 s one) is demoted to prompt-only, never auto.
+    pub episode_length: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -300,6 +307,11 @@ pub async fn fetch_skip_windows(
                     end:     r.interval.end_time,
                     source:  "aniskip".into(),
                     skip_id: r.skip_id,
+                    episode_length: if r.episode_length.is_finite() && r.episode_length > 0.0 {
+                        r.episode_length
+                    } else {
+                        0.0
+                    },
                 }
             })
             .collect();
@@ -498,6 +510,7 @@ fn infer_profile_windows(
             end,
             source: "aniskip-neighbour".into(),
             skip_id: None,
+            episode_length: 0.0,
         });
     }
     windows
@@ -1123,6 +1136,14 @@ pub struct PreparedWindow {
     /// from the wire when absent, like the fields above.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub skip_ref: Option<String>,
+    /// Why this window may only PROMPT although its source and kind would
+    /// allow auto ("l1-pending", "l1-abstain", "other-cut", "weak-title",
+    /// "uncorroborated"; see `SkipHold` in src/skipWindows.ts). Carried
+    /// through the payload so the mid-play re-stamp, which recomputes `auto`
+    /// from what `get_skip_windows` returns, can never re-arm it. Omitted
+    /// from the wire when absent, like the fields above.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub hold: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

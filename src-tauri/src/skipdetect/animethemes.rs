@@ -104,8 +104,15 @@ pub struct ThemeRec {
     pub version: Option<u32>,
     #[serde(default)]
     pub episodes: Option<String>,
-    /// ANY video of its entry, or any video using this audio, is `Over`.
+    /// EVERY video using this audio is `Over`. A list cached before the
+    /// per-audio rule set this when ANY video of the entry was Over, which
+    /// only errs toward excluding an ED (and it re-fetches within a week).
     pub over: bool,
+    /// SOME videos using this audio, or another audio of its entry, are
+    /// `Over`, and not all of this audio's own (prompt-only, still a
+    /// candidate). Absent in lists cached before it existed.
+    #[serde(default)]
+    pub over_partial: bool,
     /// Every video using this audio is `Transition`.
     pub transition: bool,
 }
@@ -135,6 +142,7 @@ impl ThemeRec {
             kind: self.kind(),
             episodes: self.episodes.clone(),
             over: self.over,
+            over_partial: self.over_partial,
             transition: self.transition,
         }
     }
@@ -255,6 +263,12 @@ pub fn parse_theme_list(body: &str) -> Result<Vec<ThemeRec>, String> {
                         continue;
                     }
                     let ov = overlaps.get(&id).map(Vec::as_slice).unwrap_or(&[]);
+                    // Over is judged PER AUDIO: fully Over only when every
+                    // video using this audio is Over. One clean video (or an
+                    // Over video of ANOTHER audio in the entry) makes it
+                    // partial: kept, prompt-only.
+                    let all_over = !ov.is_empty() && ov.iter().all(|o| o == "Over");
+                    let any_over = ov.iter().any(|o| o == "Over") || entry_over.contains(&id);
                     out.push(ThemeRec {
                         audio_id: id,
                         basename: a.basename.clone().unwrap_or_default().chars().take(120).collect(),
@@ -264,7 +278,8 @@ pub fn parse_theme_list(body: &str) -> Result<Vec<ThemeRec>, String> {
                         op,
                         version: en.version,
                         episodes: en.episodes.clone().map(|e| e.chars().take(64).collect()),
-                        over: entry_over.contains(&id) || ov.iter().any(|o| o == "Over"),
+                        over: all_over,
+                        over_partial: any_over && !all_over,
                         transition: !ov.is_empty() && ov.iter().all(|o| o == "Transition"),
                     });
                     if out.len() >= MAX_THEMES {
@@ -437,8 +452,11 @@ mod tests {
         assert!(!l[1].op && !l[1].over && !l[1].transition);
         assert!(l[2].transition && !l[2].over && l[2].version == Some(3));
         assert_eq!(l[2].label(), "ED1v3");
-        // The entry has an Over video: BOTH of its audios are Over.
-        assert!(l[3].over && l[4].over);
+        // The entry has an Over video: the audio used only by it is fully
+        // Over (excluded as an ED), the clean audio of the same entry is
+        // partial (prompt-only, still a candidate).
+        assert!(l[4].over && !l[4].over_partial);
+        assert!(!l[3].over && l[3].over_partial);
         let m = l[2].meta(56784);
         assert_eq!(m.slug, "56784:ED1");
         assert_eq!(m.kind, Kind::Ed);
@@ -448,6 +466,29 @@ mod tests {
         // be Unavailable, never cached as a one-day miss).
         assert!(parse_theme_list("{}").is_err());
         assert!(parse_theme_list("{\"message\":\"Server Error\"}").is_err());
+    }
+
+    #[test]
+    fn over_is_per_audio() {
+        // Pop Team Epic ED3: ONE audio used by an NCBD "None" video and a TV
+        // "Over" video. TYBW 1:13 ED3: one audio, only an Over video.
+        let body = r#"{"anime":[{"animethemes":[
+          {"slug":"ED3","type":"ED","animethemeentries":[{"episodes":"5","videos":[
+            {"overlap":"None","audio":{"id":50,"link":"https://a.animethemes.moe/p-ED3.ogg"}},
+            {"overlap":"Over","audio":{"id":50,"link":"https://a.animethemes.moe/p-ED3.ogg"}}]}]},
+          {"slug":"ED4","type":"ED","animethemeentries":[{"episodes":"13","videos":[
+            {"overlap":"Over","audio":{"id":60,"link":"https://a.animethemes.moe/t-ED3.ogg"}}]}]}]}]}"#;
+        let l = parse_theme_list(body).unwrap();
+        assert_eq!(l.len(), 2);
+        assert!(!l[0].over && l[0].over_partial, "a clean video of the same audio makes it partial");
+        assert!(l[1].over && !l[1].over_partial, "only Over videos: fully Over");
+        // A list cached before the field existed reads it as false.
+        let old: ThemeRec = serde_json::from_value(serde_json::json!({
+            "audio_id": 1, "basename": "x.ogg", "link": "https://a.animethemes.moe/x.ogg", "size": 0,
+            "slug": "ED1", "op": false, "over": true, "transition": false
+        }))
+        .unwrap();
+        assert!(old.over && !old.over_partial);
     }
 
     #[test]

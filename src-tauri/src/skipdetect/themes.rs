@@ -7,11 +7,18 @@
 // "Candidate lists" and "Fetch and stop policy", decision 12). Pure: the
 // caller supplies theme metadata and the gate verdicts it has computed.
 //
-//   * ED list: every theme with ANY video `overlap == "Over"` (an insert song
-//     over story) is removed BEFORE ordering. It can match at full coverage, so
-//     no other gate stops it.
-//   * OP list: "Over" themes stay, sort after every non-Over theme, and are
-//     never auto-eligible (prompt-only at most).
+//   * ED list: a theme whose audio is used ONLY by `overlap == "Over"` videos
+//     (an insert song over story) is removed BEFORE ordering. It can match at
+//     full coverage, so no other gate stops it. A PARTIALLY Over audio (one
+//     clean video, one Over: Pop Team Epic ED3 / ED4 ship an NCBD "None" and a
+//     TV "Over" video of the same audio) stays a candidate, sorted after every
+//     clean theme and prompt-only: its location is still Layer 1 evidence.
+//   * OP list: "Over" themes (fully or partially) stay, sort after every
+//     non-Over theme, and are never auto-eligible (prompt-only at most).
+//   * A Transition-only ED (every video of its audio starts over episode
+//     content) is never auto-eligible: its matched start is the SONG's start,
+//     which can sit minutes inside the story (Cowboy Bebop 13). Its end is
+//     trusted; the frontend decides how far.
 //   * Order by episode-range distance from the MAL episode number (0 inside a
 //     listed range, else the distance to the nearest range edge; no range sorts
 //     last; ties keep API order). ORDER only, never a gate: ranges were wrong
@@ -36,8 +43,13 @@ pub struct ThemeMeta {
     pub kind: Kind,
     /// The entry's `episodes` string ("1-12", "2-6, 8-12", "13", "1-").
     pub episodes: Option<String>,
-    /// ANY video of the entry has `overlap == "Over"`.
+    /// EVERY video using this audio is `overlap == "Over"` (a theme list
+    /// cached before the per-audio rule set it when ANY video of the entry was
+    /// Over, which only errs toward excluding an ED).
     pub over: bool,
+    /// SOME but not all videos using this audio are `Over`, or another audio
+    /// of the same entry is: prompt-only, never removed.
+    pub over_partial: bool,
     /// The video's `overlap == "Transition"`.
     pub transition: bool,
 }
@@ -91,15 +103,30 @@ pub fn candidate_order(themes: &[ThemeMeta], kind: Kind, ep: Option<u32>) -> Vec
     idx.sort_by_key(|&i| {
         let t = &themes[i];
         let dist = ep.map_or(0, |e| episode_distance(t.episodes.as_deref(), e));
-        (t.over, dist, i)
+        (t.any_over(), dist, i)
     });
     idx
 }
 
-/// Whether an accepted theme may auto-skip. An "Over" OP is prompt-only; an
-/// "Over" ED never gets this far (it is not a candidate).
+impl ThemeMeta {
+    /// Fully or partially Over.
+    pub fn any_over(&self) -> bool {
+        self.over || self.over_partial
+    }
+
+    /// A Transition-only ED whose matched start is not trusted (see the
+    /// header). Never set for an Over theme: that one is prompt-only already.
+    pub fn transition_ed(&self) -> bool {
+        self.kind == Kind::Ed && self.transition && !self.any_over()
+    }
+}
+
+/// Whether an accepted theme may auto-skip. An "Over" OP or a partially Over
+/// ED is prompt-only; a fully Over ED never gets this far (it is not a
+/// candidate); a Transition-only ED is prompt-only until the frontend finds a
+/// chapter or crowd ending that starts with it.
 pub fn auto_eligible(t: &ThemeMeta) -> bool {
-    !t.over
+    !t.any_over() && !t.transition_ed()
 }
 
 /// The next thing to do for a kind.
@@ -160,7 +187,7 @@ mod tests {
     use super::*;
 
     fn t(slug: &str, kind: Kind, eps: Option<&str>, over: bool, transition: bool) -> ThemeMeta {
-        ThemeMeta { slug: slug.into(), kind, episodes: eps.map(Into::into), over, transition }
+        ThemeMeta { slug: slug.into(), kind, episodes: eps.map(Into::into), over, over_partial: false, transition }
     }
 
     #[test]
@@ -218,6 +245,31 @@ mod tests {
         assert_eq!(candidate_order(&th, Kind::Op, Some(5)), vec![1, 0]);
         assert!(!auto_eligible(&th[0]));
         assert!(auto_eligible(&th[1]));
+    }
+
+    #[test]
+    fn partially_over_ed_is_a_prompt_only_candidate_sorted_last() {
+        // Pop Team Epic 5: ED3 / ED4 each have an NCBD "None" video and a TV
+        // "Over" video of the same audio; ED1 is clean.
+        let mut ed3 = t("ED3", Kind::Ed, Some("5"), false, false);
+        ed3.over_partial = true;
+        let th = vec![ed3, t("ED1", Kind::Ed, Some("1-3"), false, false), t("ED9", Kind::Ed, Some("5"), true, false)];
+        let o = candidate_order(&th, Kind::Ed, Some(5));
+        assert_eq!(o, vec![1, 0], "clean first, partial kept, fully Over removed");
+        assert!(!auto_eligible(&th[0]) && auto_eligible(&th[1]));
+        assert!(th[0].any_over() && !th[0].transition_ed());
+    }
+
+    #[test]
+    fn transition_only_ed_is_prompt_only_but_a_transition_op_is_not() {
+        // Cowboy Bebop 13's ED2 "Space Lion": every video is Transition.
+        let ed = t("ED2", Kind::Ed, Some("13"), false, true);
+        assert!(ed.transition_ed() && !auto_eligible(&ed));
+        let op = t("OP1", Kind::Op, None, false, true);
+        assert!(!op.transition_ed() && auto_eligible(&op), "the rule is about endings only");
+        // Over AND Transition: prompt-only through the Over rule, not flagged twice.
+        let both = t("ED3", Kind::Ed, None, true, true);
+        assert!(!both.transition_ed() && !auto_eligible(&both));
     }
 
     #[test]

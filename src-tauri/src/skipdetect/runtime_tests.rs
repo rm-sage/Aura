@@ -18,7 +18,10 @@
 //
 //   skipdetect_runtime_parity  probe -> full HEAD -> TAIL with the production
 //       argv: track pick vs info.json, HEAD origin 0 and PCM bit-identical to
-//       the cached head.wav (the first-PTS branch must not change the PCM),
+//       the cached head.wav (the first-PTS branch must not change the PCM;
+//       the PTS-gap release within GAP_CASE_PCM_MISMATCH_MAX samples, plus a
+//       second plain-`aresample` decode that reports whether that release
+//       still HAS gaps),
 //       TAIL origin == S (except the seek-origin case), media end vs the mapped
 //       DURATION tag and the cached read, TAIL PCM bit-identical where the
 //       production S equals the cached start, theme decode through stdin
@@ -31,6 +34,14 @@
 //       final OP were published (seconds since the detect started), checks
 //       the provisional window against the final one, and that it never
 //       reaches the final snapshot or the result cache.
+//
+// One test here is NOT ignored and needs no stream:
+//   skipdetect_region_graph_fills_pts_gaps  a synthetic local file with a 1 s
+//       PTS hole, decoded through the production region graph: with
+//       `async=1` the hole is filled (sample index == PTS), without it the
+//       audio after the hole lands 1 s early. It is the PTS-gap coverage that
+//       no longer depends on what a host serves (see GAP_CASE). Skipped, with
+//       a note, when no ffmpeg is installed.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -63,6 +74,24 @@ const GAP_CASE: &str = "tt12343534:1:3";
 const GAP_CASE_FIRST_GAP_S: f64 = 127.4;
 const GAP_CASE_TOL: f64 = 2.0;
 const GAP_CASE_RESIDUAL_S: f64 = 0.2;
+/// The gap release's HEAD PCM is compared up to its first gap within this many
+/// differing samples, not bit-identically. Since 2026-10-07 the host serves a
+/// slightly different copy of the same release: the first 600 s now decode to
+/// exactly 600.000 s (599.846 s when the corpus was captured) and 159 of the
+/// 1,404,034 compared samples differ, with the probe, the argv and the ffmpeg
+/// build unchanged and the full detect on the same stream still correct. The
+/// cached head.wav is NOT re-captured: the corpus parity tests and both evals
+/// were computed from it. 0.1% of the compared span still catches a wrong
+/// origin or a different track, each of which changes most samples.
+///
+/// It CANNOT catch a missing `async=1`: the compare stops at the first gap,
+/// and before it the two filters agree sample for sample. Worse, the served
+/// copy has no PTS gaps at all any more (2026-10-07: ffprobe finds none over
+/// 5 ms in the first 600 s, and HEAD is 600.000 s with or without `async=1`),
+/// so this case now only checks the origin and the track. The second decode
+/// below says so on every run; the gap path itself is covered by the local
+/// `skipdetect_region_graph_fills_pts_gaps`.
+const GAP_CASE_PCM_MISMATCH_MAX: usize = 1404;
 /// The HEAD cut edge: the corpus head was cut with input `-t`, production
 /// with output `-to`, so the resampler flush of the last ~1 ms differs.
 const CUT_EDGE_S: f64 = 0.05;
@@ -156,6 +185,7 @@ async fn corpus_themes(root: &Path, mal: u32, ff: &OsString, fails: &mut Vec<Str
             version: t["version"].as_u64().map(|v| v as u32),
             episodes: t["episodes"].as_str().map(String::from),
             over: overlap == "Over",
+            over_partial: false,
             transition: overlap == "Transition",
         };
         let bytes = std::fs::read(dir.join(&base)).unwrap();
@@ -221,6 +251,68 @@ fn mismatches(a: &[i16], b: &[i16]) -> usize {
     a.iter().zip(b).filter(|(x, y)| x != y).count()
 }
 
+/// Zero crossings per second and RMS of `pcm[from_s..to_s]` (11025 Hz).
+fn tone_at(pcm: &[i16], from_s: f64, to_s: f64) -> (f64, f64) {
+    let (a, b) = ((from_s * SR as f64) as usize, ((to_s * SR as f64) as usize).min(pcm.len()));
+    let w = &pcm[a.min(b)..b];
+    let zc = w.windows(2).filter(|p| (p[0] < 0) != (p[1] < 0)).count() as f64;
+    let rms = (w.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / w.len().max(1) as f64).sqrt();
+    (zc / (to_s - from_s), rms)
+}
+
+/// The PTS-gap path of the region graph, on a synthetic local file: 10 s of
+/// audio (440 Hz to 5 s, then a 1000 Hz marker) with every frame from 5 s on
+/// shifted 1 s later, so the track has a 1 s PTS hole at 5-6 s. Through the
+/// production graph (`aresample=11025:async=1`) the decode is ~11 s and the
+/// marker sits at its PTS (6 s on); with plain `aresample` it is ~10 s and the
+/// marker lands at 5 s, 1 s early, which is how JJK S1E3's OP and ED were once
+/// placed 1.75 s and 2.2 s early.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skipdetect_region_graph_fills_pts_gaps() {
+    let ff = ffmpeg();
+    if !Path::new(&ff).exists() {
+        println!("skipped: no ffmpeg at {} (set AURA_FFMPEG)", Path::new(&ff).display());
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("aura-gap-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("gap.mka");
+    let made = std::process::Command::new(&ff)
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "lavfi", "-i"])
+        .arg(r"aevalsrc=exprs=if(lt(t\,5)\,0.5*sin(2*PI*440*t)\,0.5*sin(2*PI*1000*t)):s=48000:d=10:n=1000")
+        .args(["-af", r"asetpts=PTS+if(gte(T\,5)\,1/TB\,0)", "-c:a", "pcm_s16le"])
+        .arg(&file)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(made.success(), "could not build the synthetic gap file");
+    // The production argv, reading a local file (the protocol whitelist is the
+    // only change: production never opens one).
+    let local = |graph: &dyn Fn(String) -> String| -> Vec<String> {
+        probe::head_args(file.to_str().unwrap(), 0)
+            .into_iter()
+            .map(|a| if a.starts_with("http,") { format!("file,{a}") } else { graph(a) })
+            .collect()
+    };
+    let fixed = read_pass(&ff, &local(&|a| a), 0.0).await;
+    let plain = read_pass(&ff, &local(&|a| a.replace(":async=1", "")), 0.0).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(fixed.success && plain.success, "decode failed");
+    let secs = |p: &Pass| p.pcm.len() as f64 / SR as f64;
+    println!("[gap] async=1 {:.3}s origin {:?}; plain {:.3}s", secs(&fixed), fixed.origin, secs(&plain));
+    assert!(fixed.origin.is_some_and(|o| o.abs() < 0.01), "origin {:?}", fixed.origin);
+    assert!((secs(&fixed) - 11.0).abs() < 0.1, "async=1 must fill the 1 s hole: {:.3}s", secs(&fixed));
+    assert!((secs(&plain) - 10.0).abs() < 0.1, "plain aresample keeps the hole out: {:.3}s", secs(&plain));
+    // 440 Hz = ~880 crossings/s, 1000 Hz = ~2000/s.
+    let (zc, _) = tone_at(&fixed.pcm, 4.0, 4.8);
+    assert!((zc - 880.0).abs() < 60.0, "440 Hz before the hole: {zc:.0}/s");
+    let (_, rms) = tone_at(&fixed.pcm, 5.2, 5.8);
+    assert!(rms < 50.0, "the hole is silence at its PTS: rms {rms:.0}");
+    let (zc, _) = tone_at(&fixed.pcm, 6.2, 7.0);
+    assert!((zc - 2000.0).abs() < 100.0, "marker at its PTS (6 s on): {zc:.0}/s");
+    let (zc, _) = tone_at(&plain.pcm, 5.2, 5.8);
+    assert!((zc - 2000.0).abs() < 100.0, "without async=1 the marker lands 1 s early: {zc:.0}/s");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs AURA_SKIPBENCH_DIR + AURA_SKIPDETECT_RT_STREAMS (real streams)"]
 async fn skipdetect_runtime_parity() {
@@ -281,8 +373,28 @@ async fn skipdetect_runtime_parity() {
             o => fails.push(format!("{id}: HEAD origin {o:?}, expected 0")),
         }
         let len_tol = if id == GAP_CASE { GAP_CASE_RESIDUAL_S } else { CUT_EDGE_S };
-        if mm != 0 || (head.pcm.len() as i64 - (600 * SR) as i64).abs() > (len_tol * SR as f64) as i64 {
+        let mm_max = if id == GAP_CASE { GAP_CASE_PCM_MISMATCH_MAX } else { 0 };
+        if mm > mm_max || (head.pcm.len() as i64 - (600 * SR) as i64).abs() > (len_tol * SR as f64) as i64 {
             fails.push(format!("{id}: HEAD PCM not bit-identical ({mm} samples differ, {} vs {lim})", head.pcm.len()));
+        }
+        if id == GAP_CASE {
+            // Does the served copy still have PTS gaps? Without `async=1` a
+            // gapped track decodes SHORTER (the holes are not filled). The
+            // gap-free copy is accepted (the host decides what it serves), so
+            // this is a note, not a failure: the gap path is covered by
+            // `skipdetect_region_graph_fills_pts_gaps` instead.
+            let plain: Vec<String> =
+                probe::head_args(&url, n).into_iter().map(|a| a.replace(":async=1", "")).collect();
+            let head_plain = read_pass(&ff, &plain, 0.0).await;
+            let (a, b) = (head.pcm.len() as f64 / SR as f64, head_plain.pcm.len() as f64 / SR as f64);
+            if (a - b).abs() <= 0.1 {
+                println!(
+                    "[rt] {id} NOTE: GAP_CASE no longer has PTS gaps ({a:.3}s with async=1, {b:.3}s without): \
+                     this case covers origin and track only; re-select a gap release to test gaps on a real stream"
+                );
+            } else {
+                println!("[rt] {id} PTS gaps present: {a:.3}s with async=1, {b:.3}s without");
+            }
         }
 
         // TAIL: production S.
@@ -409,6 +521,7 @@ async fn skipdetect_runtime_detect() {
                 data_dir: Some(dir.clone()),
                 generation: 1 + round,
                 publish: Arc::new(move |s: &Snapshot| seen2.lock().unwrap().push((t.elapsed().as_secs_f64(), s.clone()))),
+                replay: None,
             };
             let s = job::run(&ctx, &req).await;
             let wall = t.elapsed().as_secs_f64();
@@ -481,6 +594,16 @@ async fn skipdetect_runtime_detect() {
             if s.state != JobState::Done {
                 fails.push(format!("{id} round {round}: state {:?}", s.state));
             }
+            // The final snapshot settles every kind it was asked for, and a
+            // Layer 1 window always reads as matched.
+            for (slot, l1, w) in [("op", s.op_l1, &s.op), ("ed", s.ed_l1, &s.ed)] {
+                if matches!(l1, super::job::L1State::Pending | super::job::L1State::Unknown) {
+                    fails.push(format!("{id} round {round} {slot}: layer 1 state {l1:?} in the final snapshot"));
+                }
+                if w.as_ref().is_some_and(|w| w.source == "animethemes") && l1 != super::job::L1State::Matched {
+                    fails.push(format!("{id} round {round} {slot}: Layer 1 window but state {l1:?}"));
+                }
+            }
             if round == 1 && !s.from_cache {
                 fails.push(format!("{id}: second run did not come from the result cache"));
             }
@@ -495,7 +618,8 @@ async fn skipdetect_runtime_detect() {
                     fails.push(format!("{id} round {round} {slot}: {got:?} vs {what} {want:?} (dev {d:.3})"));
                 }
                 if let Some(w) = w {
-                    if w.source == "animethemes" && !w.auto_eligible {
+                    // A Transition-only ending is prompt-only by design.
+                    if w.source == "animethemes" && !w.auto_eligible && !w.transition {
                         fails.push(format!("{id} {slot}: Layer 1 window not auto-eligible"));
                     }
                 }
@@ -539,7 +663,7 @@ async fn skipdetect_runtime_detect() {
         }))
         .unwrap();
         let req = req.validate().unwrap();
-        let ctx = Ctx { ffmpeg: ff.clone(), data_dir: Some(dir.clone()), generation: 9, publish: Arc::new(|_: &Snapshot| {}) };
+        let ctx = Ctx { ffmpeg: ff.clone(), data_dir: Some(dir.clone()), generation: 9, publish: Arc::new(|_: &Snapshot| {}), replay: None };
         let t = Instant::now();
         let s = job::run(&ctx, &req).await;
         let row = cont["episodes"].as_array().unwrap().iter().find(|r| r["id"] == id.as_str()).cloned().unwrap_or(Value::Null);

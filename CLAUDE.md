@@ -259,11 +259,22 @@ after-credits scene on 10 of the 11 episodes that have one.
   It runs on EVERY anime episode with a MAL id while `autoSkipDetect` is on, because its 3 s conflict
   drop is what removes a wrong crowd window. Themes existed but none matched = an informative
   abstain: Layer 3 is NOT run for that kind.
+  Theme flags are judged PER AUDIO (`animethemes.rs`): an ED whose audio only "Over" videos use is
+  not a candidate (TYBW 1:13's insert song); a PARTIALLY Over audio (Pop Team Epic ED3 / ED4 ship an
+  NCBD "None" and a TV "Over" video of one audio) is a candidate, sorted last, prompt-only
+  (`animethemes-over`). A Transition-only ED (every video of its audio starts over the episode) is
+  prompt-only too, under `animethemes-transition`: its matched START is the song's, which can sit
+  minutes inside the story (Cowboy Bebop 13's 402 s "Space Lion" passed every gate and would have
+  auto-skipped 280 s of story). Its END is trusted. Theme lists cached before `over_partial` existed
+  read the old entry-wide flag, which only errs toward excluding.
 - **Layer 3 (low trust): loudness continuity** between silences. Only when the cour's OWN AnimeThemes
   list has no theme of the kind ("Over" themes count; a sibling cour's themes that did not match do
   not), or there is no MAL id. Prompt-only, never auto, never a Next-Up trigger, and dropped at stamp
   time for any kind AniSkip, IntroDB, PublicMetaDB or a chapter already supplied. Live action and
-  MAL-less anime run the detector only for a kind NOTHING else supplied.
+  MAL-less anime run the detector only for a kind NOTHING else supplied. A continuity ED that
+  overlaps the published opening is withdrawn (with the opening too when that is continuity as
+  well): on a file shorter than 480 s TAIL re-reads HEAD's audio, and Kaiju No. 8's 224 s Narumi
+  special got one in-story block as both kinds.
 - **TAIL never waits for the OP decision.** When HEAD ran to its end, the OP's theme search, sibling
   lookup and Layer 3 run beside the TAIL pass on a forked `Decider` (job.rs) and publish the moment
   they resolve; still one detector ffmpeg at a time.
@@ -293,9 +304,69 @@ after-credits scene on 10 of the 11 episodes that have one.
   when it is the next episode of the same season); never episode audio, never with detection off or
   without ffmpeg, one at a time.
 - **Layer 2 (blind pairing) is not shipped**; the `pairing` source and its priority slot are reserved.
+- **Layer 1's verdict holds the crowd (`op_l1` / `ed_l1`).** Every snapshot carries a STRUCTURED
+  per-kind state (`L1State`: pending, matched, informative, no_themes, unavailable, not_requested;
+  never parse a note string). The frontend starts a kind "pending" when the detector will decide it
+  (MAL id, detection on, a stream, kind not off) and `composeSkipWindows` (`src/skipWindows.ts`, the
+  ONE stamp function App.tsx and the e2e harness share) applies holds that ride the window as
+  `hold`, so the re-stamp cannot re-arm them: pending = crowd rows (AniSkip, IntroDB, PublicMetaDB)
+  of that kind only PROMPT ("l1-pending"), unless the provisional opening already starts within 3 s
+  of the row; matched = the conflict drop decides as before; informative = auto-capable crowd rows
+  prompt ("l1-abstain") and the kind's guesses plus prompt-only crowd rows (introdb-single, AniSkip
+  ED) are DROPPED; no_themes / unavailable / a detect that ends or never runs = trusted as before.
+  Strongly titled chapters are exempt (a weak-title one is dropped, see Chapters). Both HOLDS apply only to rows overlapping the audio Layer 1 actually
+  SEARCHED for the kind by at least 30 s (its minimum accepted run; all of a shorter row): the
+  snapshot's `op_region` (0 to the end HEAD decoded) and `ed_region` (TAIL origin to the final media
+  end), defaulting to 0-600 s and the last 480 s before the media end. A row outside it (an opening
+  at 640 s, past HEAD) was never looked for, so it is not held. The informative DROP of guesses and
+  prompt-only crowd rows still applies outside it (judgement call, measured: Spy x Family E2's
+  single-submission IntroDB "ending" at 905-995 s of an episode with no ending came back as a wrong
+  prompt when the drop was scoped to the region too). Why: before the theme match lands, a crowd opening at 0-90 s
+  auto-skipped 89 s of JJK S2E10's cold open (the Hell's Paradise rule again, reopened by the
+  mid-play re-stamp); after an informative abstain, Solo Leveling E1, Re:Zero S3E1 and Gintama's OAD
+  each auto-skipped ~90 s of story on AniSkip's word. Cost: a correct crowd 0:00 opening is skipped
+  once the provisional opening confirms it (~13 s into the song) instead of instantly. Result-cache
+  entries written before the states existed answer no request (detected once more).
+- **Crowd rows are checked against THIS file** (`fitCrowdToDuration`, once the duration is known,
+  before anything counts as "supplied"): a row that starts past the end is dropped for every crowd
+  source (House of the Dragon S2E1's two endings started past the end and kept the detector from
+  ever looking); IntroDB keeps its stricter end rule; an AniSkip row whose `episode_length` (now
+  carried from Rust) differs from the file by more than 15 s is held prompt-only ("other-cut"):
+  10 / 15 / 20 s all catch the same 20 of 36 wrong rows over both corpora, including every one that
+  auto-skipped story, and the 6 correct rows they demote are each replaced by a theme match or a
+  chapter. Without a MAL id (live action) a crowd OPENING auto-skips only when a second independent
+  source agrees within 3 s at both edges (IntroDB vs PublicMetaDB, or a strongly titled chapter),
+  else it prompts ("uncorroborated"): 5 of the 9 lone live-action crowd openings cut into story.
+  Endings keep their trust. A crowd RECAP (anime or not) needs the same second source; identical
+  rows (to 0.05 s) are one submitter, not two (JJK S1E3's AniSkip and IntroDB "recap" 0.5-41.6 are
+  the same numbers, and frames show 30 s of it is the episode's own dorm scene). The opening Layer 1
+  (or the provisional opening) located in the file also corroborates a recap whose END is within 3 s
+  of that opening's start: evidence from the file itself. Trade-off, measured: without it the rule
+  rescued one episode (JJK S1E3) and held every correct automatic recap in the corpora (Black Clover
+  2:1 recap end 178.0 vs theme 176.05, DBZ Kai 26 40.13 vs 39.01); with it all three come out right
+  and Bleach 266 / One Piece 8 stay held by other-cut. Cost: the theme match lands some 10-17 s into
+  a load, so such a recap at 0 s turns auto only then; the SkipController skips the rest of it
+  while that is before its midpoint and offers it as a prompt after. The PublicMetaDB
+  anime fallback for an id with no season of its own (`kitsu:N:E`) maps the cour's local episode to
+  TMDB's through its Fribb row (`season.tmdb` + `episode_offset.tmdb`) and is not asked at all for an
+  OVA / special / movie or an entry Fribb does not map: their TMDB id is the parent show's (the Mob
+  Psycho 100 OVA was stamped with TV episode 1's opening). It reads a MAL-keyed index of EVERY Fribb
+  row (`anime_id_map.rs` `MAL_TMDB`), not the imdb-keyed one: Fribb lists many TV cours without an
+  imdb_id, and the imdb index silently skipped every one of them.
 - **Merge (`dedupeSkipWindows`)**: animethemes 8 > chapter 7 > aniskip = introdb 6 > pairing =
-  publicmetadb 5 > animethemes-early 4.5 > introdb-single 4 > aniskip-neighbour 3 >
-  chapter-heuristic 2 > continuity 1. When
+  publicmetadb 5 > animethemes-transition 4.75 > animethemes-early 4.5 > introdb-single 4 >
+  aniskip-neighbour 3 > chapter-heuristic 2 > continuity 1. `base` reaches the stamp UNDEDUPED (the
+  chapter merge and the IntroDB join no longer dedupe), so a corroborating second source is still
+  there to be read. A Transition-only ending keeps another ending only when that ending's END agrees
+  within 3 s AND it starts no earlier than the song (a real ending cannot start before its song; a
+  crowd ending fitted to the file's end that starts in story before it was outranking the match), and
+  such an ending then outranks it; one whose START a strong chapter or crowd ending confirms within
+  3 s becomes plain `animethemes` (Bebop 26, Bocchi 12). The Transition match itself stays
+  prompt-only even when it is right (Solo Leveling E1 loses an automatic ED skip): the accepted cost
+  of the Bebop 13 rule, since its start can sit minutes inside the story. A weak-title chapter
+  ("weak-title" hold) ranks below every unheld window of its kind, so it never wins the one-opening
+  election over a crowd opening it disagrees with; with nothing else of its kind it still prompts. An ending never overlaps the opening: the
+  better-ranked one stays, a tie or two continuity windows both go. When
   a Layer 1 window exists for a kind, every other window of that kind whose start OR end is more than
   3 s away is DROPPED (TYBW 3:9-3:11 AniSkip ED rows were 32-38 s early with a matching
   episodeLength). AniSkip ED rows are prompt-only even with the ED mode on auto; IntroDB keeps its
@@ -303,9 +374,20 @@ after-credits scene on 10 of the 11 episodes that have one.
   `superseded` list (`dedupeSkipWindowsDetailed`): the AuraSkip menu lists them for their vote arrows,
   and nothing that seeks or prompts reads it (mpv's property gets `windows` only).
 - **Chapters**: "epilogue" is NOT an ending. Preview / next episode / next time / coming up chapters
-  are their own `preview` kind (so is a combined "ED + Preview" title). No ED is derived from an
-  untitled LAST chapter that runs to EOF (it can hold the ending, an after-credits scene and a
-  preview).
+  are their own `preview` kind (so is a combined "ED + Preview" title, and the localized adelanto /
+  avance / avant-premiere / prochain episode / vorschau / anteprima / proximo episodio / yokoku);
+  only one in the outro region counts (Steins;Gate 24's FIRST chapter, its cold open, is titled
+  "Preview"). No ED is derived from an untitled LAST chapter that runs to EOF (it can hold the
+  ending, an after-credits scene and a preview). "Intro" / "Introduction" / "Outro" are WEAK titles
+  (9 of 11 such chapters in both corpora were cold opens, previews or story: Re:Zero S4E5's pair
+  alone is 372 s of story): dropped when the file also has a strongly titled chapter of the kind,
+  otherwise prompt-only ("weak-title") unless a fitting crowd row agrees within 3 s at both edges,
+  and DROPPED while Layer 1 is pending for its kind or after an informative abstain (Re:Zero S4E5's
+  "Intro" prompt was on screen at 0.6 s; over all 89 corpus episodes this changes that episode
+  only).
+  Prologue / avant / cold open / teaser / pre-title chapters are STORY and never feed the
+  untitled-chapter heuristics (TYBW 1:1's "Prologue" became an 80 s opening on an episode with
+  none).
 - **`preview` kind**: no Settings row; hard-coded in `skipModeForKind` (used by BOTH the chain's
   `modeFor` and the re-stamp's `modeForKind`): prompt, never auto, off when the ED mode is off.
 - **THE RULE: an ED window end is NEVER the file / container duration.** It ends where the matched
@@ -318,7 +400,9 @@ after-credits scene on 10 of the 11 episodes that have one.
 - **Next-Up**: the corner card (`NextUpCta.tsx`) has NO countdown. Unattended advance happens only
   at end of stream, through the EOS Spotlight, so after-credits scenes and previews always play. The
   card appears at `max(trusted ED end, end - lead)` (at the ED end when nothing follows it), else at
-  `end - lead`; only a Layer 1 ED is trusted, and an ED START never triggers it. "end" is the
+  `end - lead`; only a Layer 1 ED END is trusted (a Transition-only match's end counts, and so does
+  the end of the published ending that replaced a match when the two ends agree within 3 s: Solo
+  Leveling E1, Cowboy Bebop 13), and an ED START never triggers it. "end" is the
   detector's media end when known. The keep-open, stale-heartbeat and eof EOS detectors test against
   `eosEnd(duration)` (the FINAL media end, else the probe's mapped-track DURATION tag, never the
   container duration), so a container longer than its media still reaches the end card instead of a
@@ -397,7 +481,13 @@ plus 10 for the HLS parser and relink guard.
 directions in `sync.ts`. Being absent from `PORTABLE_*_FIELDS` is NOT sufficient:
 those gate file export/import, while `update_settings` shallow-merges whatever
 the cloud sends. The `screenshot_dir` comment used to claim an exclusion it did
-not have; it does now.
+not have; it does now. `gpu_acceleration` ("Hardware acceleration") is
+machine-local the same way and is not exported either: its one home is
+`render.json` beside the settings dir (`settings.rs`), which every save writes,
+every scope load reads back and the launch alone reads, so the switch shown is
+what the next launch does. It reaches WebView2 as browser arguments on the
+webview builders (`lib.rs::webview_browser_args`); wry ignores the
+`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` variable.
 
 Full design: `docs/superpowers/specs/2026-09-05-download-manager-design.md`.
 
@@ -842,8 +932,10 @@ Bound every cache (see Performance & memory).
   entries, keyed `${imdb}:${season}:${episode}` per numbering asked. Rust (`introdb.rs`) keeps an
   in-memory map capped at 400 (oldest quarter evicted): hits 3 days, "no data" 30 minutes,
   network / 429 / 5xx never cached. A successful submit drops that key on both sides. Segments are
-  cached WITHOUT the per-file duration check; `fitIntroDbToDuration` applies it inside
-  `mergeChapterSkipWindows` once the duration is known.
+  cached WITHOUT the per-file duration check; `fitCrowdToDuration` (`src/skipWindows.ts`) applies it to every crowd source inside
+  `mergeChapterSkipWindows` once the duration is known (and again in `finishWithChapters` when mpv
+  reports the duration only after the chapter poll gave up: the crowd rows are re-fitted and the
+  chapter windows re-derived against it).
 - **Skip detection** (Rust, under `app_data_dir()`, atomic writes, oldest first, one process lock):
   `animethemes-v1.json` (MAL -> theme list; hits 7 d, misses 1 d, network errors never cached, cap
   300), `theme-fp/<audio_id>.bin` (fingerprint + valid mask + length + audible lead / trail, never
@@ -1005,6 +1097,11 @@ creep degrades the experience. When adding ANY feature:
   one episode match (the margin and soft42 thresholds are measured, see "Skip detection").
 - "Next-Up card appears / auto-advances too early" -> `src/nextUpGate.ts`. The card has no
   countdown; an advance before EOS means a countdown was put back into `NextUpCta.tsx`.
+- "A skip only PROMPTS although its kind is on Auto" -> the `[auraskip]` stamp line prints each
+  window's `hold` and the theme match's per-kind state; `skipPromptOnlyReason` (`src/skipSource.ts`)
+  words it in the AuraSkip menu and the prompt. Read "Layer 1's verdict holds the crowd" and "Crowd
+  rows are checked against THIS file" before loosening any of them: each was measured against both
+  corpora.
 - "Skip windows missing" -> `aniskip.rs` / `publicmetadb.rs` / `introdb.rs`; `AURA_PUBLICMETADB_KEY`
   must be baked. IntroDB needs an IMDb (`tt`) root and a season/episode >= 1; DevConsole `[introdb]`
   logs which numbering matched (or every numbering that missed), a window dropped for not fitting

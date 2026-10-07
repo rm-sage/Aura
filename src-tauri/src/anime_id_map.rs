@@ -82,6 +82,17 @@ struct FribbEntry {
     season: Option<FribbSeason>,
     #[serde(rename = "type", default)]
     kind: Option<String>,
+    /// Where this entry's episode 1 sits inside its TMDB season (Frieren's
+    /// second cour is TMDB season 1 from episode 29: `{"tmdb": 28}`).
+    #[serde(default)]
+    episode_offset: Option<FribbOffset>,
+}
+
+/// The `episode_offset` sub-object of a full-dataset Fribb row.
+#[derive(Deserialize, Default)]
+struct FribbOffset {
+    #[serde(default)]
+    tmdb: Option<u32>,
 }
 
 /// The `season` sub-object of a full-dataset Fribb row (`{tvdb, tmdb}`).
@@ -145,6 +156,24 @@ fn map_slot() -> &'static Mutex<HashMap<String, Vec<AnimeIdRow>>> {
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Where a MAL entry sits in TMDB's numbering, for EVERY Fribb row with a
+/// mal_id, whether or not it carries an imdb_id (`MAP` keeps only rows with
+/// one, and Fribb lists many TV cours without: the `kitsu:` / `mal:`
+/// PublicMetaDB fallback needs those). A few bytes per entry, ~13k entries.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct MalTmdb {
+    season_tmdb: Option<u32>,
+    offset_tmdb: Option<u32>,
+    /// TV / ONA (see `AnimeIdRow::is_main`).
+    is_main: bool,
+}
+
+static MAL_TMDB: OnceLock<Mutex<HashMap<u64, MalTmdb>>> = OnceLock::new();
+
+fn mal_tmdb_slot() -> &'static Mutex<HashMap<u64, MalTmdb>> {
+    MAL_TMDB.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn cache_path<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
     let dir = app.path().app_data_dir().ok()?;
     if std::fs::create_dir_all(&dir).is_err() {
@@ -199,9 +228,26 @@ fn build_index(entries: &[FribbEntry]) -> HashMap<String, Vec<AnimeIdRow>> {
             mal_id:     e.mal_id,
             season_tvdb: e.season.as_ref().and_then(|s| s.tvdb),
             season_tmdb: e.season.as_ref().and_then(|s| s.tmdb),
-            is_main: e.kind.as_deref()
-                .map(|k| k.eq_ignore_ascii_case("TV") || k.eq_ignore_ascii_case("ONA"))
-                .unwrap_or(false),
+            is_main: is_main_kind(e.kind.as_deref()),
+        });
+    }
+    m
+}
+
+fn is_main_kind(kind: Option<&str>) -> bool {
+    kind.map(|k| k.eq_ignore_ascii_case("TV") || k.eq_ignore_ascii_case("ONA")).unwrap_or(false)
+}
+
+/// The `MAL_TMDB` index: every row with a mal_id (the first row wins when
+/// Fribb lists one twice).
+fn build_mal_index(entries: &[FribbEntry]) -> HashMap<u64, MalTmdb> {
+    let mut m: HashMap<u64, MalTmdb> = HashMap::with_capacity(entries.len());
+    for e in entries {
+        let Some(mal) = e.mal_id else { continue };
+        m.entry(mal).or_insert(MalTmdb {
+            offset_tmdb: e.episode_offset.as_ref().and_then(|o| o.tmdb),
+            season_tmdb: e.season.as_ref().and_then(|s| s.tmdb),
+            is_main: is_main_kind(e.kind.as_deref()),
         });
     }
     m
@@ -212,10 +258,13 @@ fn install(entries: Vec<FribbEntry>) {
     // Fribb rows) BEFORE taking the map lock — so the transient overlap of
     // {parse Vec + new index + old index under lock} is trimmed at startup.
     let next = build_index(&entries);
+    let next_mal = build_mal_index(&entries);
     drop(entries);
     let count = next.len();
-    if let Ok(mut g) = map_slot().lock() {
+    // Both indexes are replaced together, never one without the other.
+    if let (Ok(mut g), Ok(mut gm)) = (map_slot().lock(), mal_tmdb_slot().lock()) {
         *g = next;
+        *gm = next_mal;
     }
     crate::devlog!(info, "anime-id-map", "installed {count} imdb->anime-ids entries");
 }
@@ -405,6 +454,35 @@ fn pick_row(entries: &[AnimeIdRow], season: Option<u32>, strict: bool) -> Option
     }
 }
 
+/// Where a cour's LOCAL episode sits in TMDB's numbering, for a skip source
+/// keyed by TMDB season + episode (PublicMetaDB) when the playing id carries
+/// no season of its own (`kitsu:42416:1`). Only a main-run (TV / ONA) entry
+/// with a mapped TMDB season answers: an OVA, special or movie hangs off its
+/// parent show's TMDB id, and asking that show's S1E{n} put the TV episode 1
+/// opening 476-566 s into the Mob Psycho 100 OVA. `Err` says why not.
+///
+/// Reads the `MAL_TMDB` index, which holds every Fribb row with a mal_id
+/// (imdb-less TV cours included). A mal id still missing from a loaded map
+/// stays skipped, which keeps the OVA protection.
+pub fn tmdb_episode_for_mal(mal_id: u64, episode: u32) -> Result<(u32, u32), &'static str> {
+    let g = mal_tmdb_slot().lock().map_err(|_| "id map unavailable")?;
+    if g.is_empty() {
+        return Err("id map not loaded");
+    }
+    let row = g.get(&mal_id).copied();
+    drop(g);
+    tmdb_episode_for_row(row.as_ref(), episode)
+}
+
+fn tmdb_episode_for_row(row: Option<&MalTmdb>, episode: u32) -> Result<(u32, u32), &'static str> {
+    let row = row.ok_or("not in the id map")?;
+    if !row.is_main {
+        return Err("not a TV / ONA entry");
+    }
+    let season = row.season_tmdb.filter(|s| *s > 0).ok_or("no TMDB season mapped")?;
+    Ok((season, episode.saturating_add(row.offset_tmdb.unwrap_or(0))))
+}
+
 /// Tauri command — surface `lookup_mal` to the frontend so the
 /// AniSkipMenu's submission path can resolve cour-specific MAL ids
 /// for tt-style video ids (where the cour-specific anime id isn't
@@ -446,9 +524,58 @@ pub fn entry_count() -> usize {
     map_slot().lock().map(|g| g.len()).unwrap_or(0)
 }
 
+/// Tests only: install a Fribb snapshot (the `anime-id-map-v2.json` the app
+/// writes) without an AppHandle, so a test can drive the resolvers that read
+/// the map. Returns the number of indexed imdb ids.
+#[cfg(test)]
+pub(crate) fn install_snapshot_for_test(text: &str) -> usize {
+    if let Some(entries) = parse_entries(text) {
+        install(entries);
+    }
+    entry_count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tmdb_episode_only_for_a_mapped_main_run_entry() {
+        let tv = MalTmdb { season_tmdb: Some(1), offset_tmdb: Some(28), is_main: true };
+        assert_eq!(tmdb_episode_for_row(Some(&tv), 9), Ok((1, 37)), "Frieren cour 2 ep 9 is TMDB S1E37");
+        let plain = MalTmdb { season_tmdb: Some(2), is_main: true, ..Default::default() };
+        assert_eq!(tmdb_episode_for_row(Some(&plain), 4), Ok((2, 4)));
+        // Mob Psycho 100 OVA: TMDB season 0 under the TV show's id.
+        let ova = MalTmdb { season_tmdb: Some(0), offset_tmdb: Some(7), is_main: false };
+        assert!(tmdb_episode_for_row(Some(&ova), 1).is_err());
+        let unmapped = MalTmdb { is_main: true, ..Default::default() };
+        assert!(tmdb_episode_for_row(Some(&unmapped), 1).is_err(), "Doraemon: TV, no TMDB season");
+        assert!(tmdb_episode_for_row(None, 1).is_err());
+        let rows = parse_entries(r#"[{"type":"OVA","mal_id":39651,"imdb_id":["tt5897304"],"season":{"tvdb":0,"tmdb":0},"episode_offset":{"tvdb":7,"tmdb":7}},
+            {"type":"TV","mal_id":59978,"imdb_id":["tt22248376"],"season":{"tvdb":2,"tmdb":1},"episode_offset":{"tmdb":28}}]"#).unwrap();
+        let idx = build_index(&rows);
+        let f = idx.get("tt22248376").unwrap()[0].clone();
+        assert_eq!((f.season_tmdb, f.is_main), (Some(1), true));
+        assert!(!idx.get("tt5897304").unwrap()[0].is_main);
+        let mal = build_mal_index(&rows);
+        assert_eq!(mal.get(&59978), Some(&MalTmdb { season_tmdb: Some(1), offset_tmdb: Some(28), is_main: true }));
+        assert_eq!(tmdb_episode_for_row(mal.get(&59978), 9), Ok((1, 37)));
+        assert!(tmdb_episode_for_row(mal.get(&39651), 1).is_err());
+    }
+
+    #[test]
+    fn mal_index_keeps_rows_without_an_imdb_id() {
+        // A TV cour Fribb lists with a TMDB season but no imdb_id: absent from
+        // the imdb index, present in the MAL one, so the kitsu: / mal:
+        // PublicMetaDB fallback can still map it.
+        let rows = parse_entries(r#"[{"type":"TV","mal_id":337,"season":{"tmdb":1},"themoviedb_id":{"tv":115967}},
+            {"type":"OVA","mal_id":39651,"imdb_id":["tt5897304"],"season":{"tvdb":0,"tmdb":0},"episode_offset":{"tmdb":7}}]"#).unwrap();
+        assert!(build_index(&rows).values().flatten().all(|r| r.mal_id != Some(337)));
+        let mal = build_mal_index(&rows);
+        assert_eq!(tmdb_episode_for_row(mal.get(&337), 5), Ok((1, 5)));
+        assert!(tmdb_episode_for_row(mal.get(&39651), 1).is_err(), "the OVA stays skipped");
+        assert!(tmdb_episode_for_row(mal.get(&1), 1).is_err(), "absent from a loaded map");
+    }
 
     fn row(mal: u64, season: Option<u32>, main: bool) -> AnimeIdRow {
         AnimeIdRow { anilist_id: Some(mal + 100_000), mal_id: Some(mal), season_tvdb: season, season_tmdb: None, is_main: main }

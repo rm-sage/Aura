@@ -31,10 +31,6 @@ import { INTRODB_SINGLE_SOURCE, INTRODB_SOURCE } from "./skipWindows";
 // Defined in skipWindows.ts (kept import-free so a node check can load it).
 export { INTRODB_SINGLE_SOURCE, INTRODB_SOURCE };
 
-export function isIntroDbSource(source: string | null | undefined): boolean {
-  return source === INTRODB_SOURCE || source === INTRODB_SINGLE_SOURCE;
-}
-
 /** One validated window from Rust. `kind` is "op" | "recap" | "ed". */
 export interface IntroDbWindow {
   kind:             string;
@@ -171,36 +167,6 @@ export async function fetchIntroDbWindows(
     );
   }
   return { windows: [], matched: null };
-}
-
-/** Slack when checking a segment against the file, mirroring Rust's
- *  `DURATION_SLACK_SEC` in introdb.rs. */
-const DURATION_SLACK_SEC = 2;
-
-/** Drop IntroDB windows that do not fit THIS file, the same rule as Rust's
- *  `fit_to_duration`: must start inside the file, an end that overshoots by
- *  more than the slack is a different cut (dropped, never clamped onto the
- *  wrong edit), a smaller overshoot is clamped. Other sources pass through.
- *  Applied once the duration is known, which in the skip chain is after the
- *  fetch has already happened. */
-export function fitIntroDbToDuration<T extends { source: string; start: number; end: number }>(
-  windows: T[],
-  duration: number,
-): T[] {
-  if (!(duration > 0)) return windows;
-  const out: T[] = [];
-  for (const w of windows) {
-    if (!isIntroDbSource(w.source)) { out.push(w); continue; }
-    if (w.start >= duration || w.end > duration + DURATION_SLACK_SEC) {
-      console.info(
-        `[introdb] dropped ${Math.round(w.start)}-${Math.round(w.end)}s: `
-        + `does not fit this ${Math.round(duration)}s file`,
-      );
-      continue;
-    }
-    out.push(w.end > duration ? { ...w, end: duration } : w);
-  }
-  return out;
 }
 
 /** Whether a personal IntroDB key is stored. The key itself never leaves Rust

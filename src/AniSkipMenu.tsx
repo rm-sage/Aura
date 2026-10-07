@@ -42,6 +42,7 @@ import {
 } from "./introdb";
 import { peekCachedDetailById } from "./metaCache";
 import { skipHeldReason, skipKindLabel, skipSourceHint, skipSourceLabel } from "./skipSource";
+import type { SkipHold } from "./skipWindows";
 import Tooltip from "./Tooltip";
 
 /** Mirrors PlayerOverlay's AuraSkipWindow shape so this module can be
@@ -61,6 +62,8 @@ export interface AniSkipMenuWindow {
    *  keep it in step with that file and with App.tsx. */
   song_title?:  string | null;
   song_artist?: string | null;
+  /** Why this window may only prompt (skipWindows.ts SkipHold). */
+  hold?: SkipHold | null;
 }
 
 interface Props {

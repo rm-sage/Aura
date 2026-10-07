@@ -92,14 +92,13 @@ import { arcPositionOf, fetchStoryArcs, loadArcMode } from "./storyArcs";
 import { getMetaDetailFallback, getRichestMetaDetail, peekCachedDetailById, peekRichestCachedDetailById, peekFreshestPostersByIds } from "./metaCache";
 import { PersistentCache } from "./persistentCache";
 import {
-  fetchIntroDbWindows, fitIntroDbToDuration, introDbImdbRoot, introDbNumberings,
+  fetchIntroDbWindows, introDbImdbRoot, introDbNumberings,
 } from "./introdb";
 import {
-  CONTINUITY_SOURCE, ED_MAX_SECONDS, INTRO_FRACTION, LAYER1_PROMPT_SOURCE, LAYER1_SOURCE,
-  MIN_WINDOW_SECONDS, OP_MAX_SECONDS, OP_MIN_SECONDS, OUTRO_FRACTION, TARGET_OP_SECONDS,
-  TITLED_OP_MAX_SECONDS, applySkipModes, clampWindowsToMediaEnd, classifyChapterTitle,
-  dedupeSkipWindows, dedupeSkipWindowsDetailed, skipKindGroup, skipModeForKind, windowOverlapFraction,
-  type PreparedWindow, type SkipMode,
+  CONTINUITY_SOURCE, LAYER1_PROMPT_SOURCE, LAYER1_SOURCE, LAYER1_TRANSITION_SOURCE,
+  applySkipModes, composeSkipWindows, fitCrowdToDuration, layer1StateFrom, releasePendingLayer1,
+  skipKindGroup, skipModeForKind, trustedEndingEnd, windowsFromChapters,
+  type Layer1Status, type PreparedWindow, type SkipMode,
 } from "./skipWindows";
 import {
   eosEnd, nextUpShouldHide, nextUpShouldShow, setDetectedMediaEnd, type NextUpTiming,
@@ -120,6 +119,9 @@ interface SkipDetectWindow {
    *  prompt-only until the full match replaces it) or "continuity" (Layer 3). */
   source: string;
   auto_eligible: boolean;
+  /** A Layer 1 ending whose theme is Transition-only (its start is the
+   *  song's, not the ending's). */
+  transition?: boolean;
   theme?: string | null;
 }
 interface SkipDetectSnapshot {
@@ -130,6 +132,15 @@ interface SkipDetectSnapshot {
   ed: SkipDetectWindow | null;
   op_note: string | null;
   ed_note: string | null;
+  /** What Layer 1 concluded per kind (Rust `L1State`): "pending", "matched",
+   *  "informative", "no_themes", "unavailable", "not_requested", "unknown". */
+  op_l1?: string | null;
+  ed_l1?: string | null;
+  /** The audio Layer 1 searched per kind, media seconds (HEAD: 0 to the end
+   *  it decoded; TAIL: its origin to the final media end). Absent until that
+   *  region has run. */
+  op_region?: [number, number] | null;
+  ed_region?: [number, number] | null;
   media_end: number | null;
   media_end_final: boolean;
   /** The mapped audio track's DURATION tag from the probe (absent without
@@ -144,7 +155,12 @@ type SkipDetectReply =
 
 interface AniSkipResult {
   found: boolean;
-  windows: { kind: string; start: number; end: number; source: string; skip_id?: string | null }[];
+  windows: {
+    kind: string; start: number; end: number; source: string; skip_id?: string | null;
+    /** The submitter's episode length (s), 0 when unknown. Absent in entries
+     *  cached before it was carried, which are refetched. */
+    episode_length?: number;
+  }[];
 }
 
 // 3-day cache for AniSkip windows. Still skips the network round-trip
@@ -250,11 +266,18 @@ interface MpvChapter {
 }
 
 interface ChapterMerge {
-  /** Raw merged list (existing + chapter-derived), deduped, NOT mode-applied. */
+  /** Raw list (existing fitted to the file + chapter-derived), UNDEDUPED and
+   *  NOT mode-applied: every stamp elects over all sources at once. */
   windows:  PreparedWindow[];
   /** mpv's container duration as read by the poll (0 when it never came). */
   duration: number;
   note:     string;
+  /** The crowd rows as fetched (NOT fitted to the file) and the chapters the
+   *  poll read: kept so a duration that arrives only after the poll can
+   *  rebuild `windows` against the real duration (the other-cut and
+   *  past-the-end checks, the last chapter's span, the preview region). */
+  crowd:    PreparedWindow[];
+  chapters: MpvChapter[] | null;
 }
 
 /**
@@ -408,132 +431,15 @@ async function mergeChapterSkipWindows(
     }
   }
   if (isStale?.()) return null;
-  let existing = await existingIn;
+  const existing = await existingIn;
   if (isStale?.()) return null;
-  // IntroDB rows are fetched before the file's duration is known, and a row
-  // recorded against a different cut must not land on this one.
-  existing = fitIntroDbToDuration(existing, duration);
-  if (!chapters || chapters.length === 0) {
-    return { windows: existing, duration, note: "no chapters in file" };
-  }
-
-  // Sort by start time so adjacent-chapter end derivation is stable.
-  const sorted = [...chapters]
-    .filter((c) => typeof c.time === "number")
-    .sort((a, b) => (a.time ?? 0) - (b.time ?? 0));
-
-  // Derive [start,end) for every chapter once (end = next chapter's start, or
-  // duration for the last). Drop sub-MIN_WINDOW_SECONDS slivers.
-  const spans = sorted
-    .map((c, i) => {
-      const start = c.time ?? 0;
-      const end   = ((sorted[i + 1]?.time) ?? (duration || start)) - 0.001;
-      return { title: (c.title ?? "").toString(), start, end };
-    })
-    .filter((s) => s.end > s.start + MIN_WINDOW_SECONDS);
-
-  const derived: PreparedWindow[] = [];
-  // Any-overlap guard (vs `existing` AND already-derived), used for the
-  // heuristic windows so a guess can never double-stamp a region a precise
-  // source already owns.
-  const free = (start: number, end: number): boolean =>
-    !existing.some((e) => windowOverlapFraction(start, end, e.start, e.end) > 0.0001) &&
-    !derived.some((d) => windowOverlapFraction(start, end, d.start, d.end) > 0.0001);
-
-  // 1. TITLED chapters: honour the user's per-kind mode (may be auto, except
-  //    a preview, which is prompt-only by construction). Length-capped so a
-  //    mis-titled monster chapter can't nuke real content. A "Preview" /
-  //    "Next episode" chapter only counts when it actually sits in the outro
-  //    region (an EARLY "Preview" chapter is story, not a preview).
-  for (const s of spans) {
-    const kind = classifyChapterTitle(s.title);
-    if (!kind) continue;
-    if (modeFor(kind) === "off") continue;
-    const len = s.end - s.start;
-    if (len > (kind === "ed" ? ED_MAX_SECONDS : TITLED_OP_MAX_SECONDS)) continue;
-    if (
-      kind === "preview" && duration > 0 &&
-      s.start < duration * (1 - OUTRO_FRACTION) - 1
-    ) continue;
-    // Always add the titled chapter: cross-source overlap (incl. vs AniSkip)
-    // is resolved centrally by dedupeSkipWindows, which PREFERS the
-    // encoder-set chapter over every crowd source (and Layer 1 over it).
-    derived.push({
-      type:   kind,
-      start:  s.start,
-      end:    s.end,
-      source: "chapter",
-      auto:   modeFor(kind) === "auto",
-    });
-  }
-
-  // 2. PROLOGUE FIX: when nothing gave us an OP, pick the untitled chapter in
-  //    the leading INTRO_FRACTION whose length is closest to the ~90 s
-  //    industry-standard OP (tie -> the LATER chapter, so a short cold-open
-  //    prologue loses to the real OP). Prompt-only: never auto-skip a guess.
-  if (duration > 0 && modeFor("op") !== "off") {
-    const hasOp =
-      existing.some((e) => skipKindGroup(e.type) === "op") ||
-      derived.some((d) => d.type === "op");
-    if (!hasOp) {
-      const introLimit = duration * INTRO_FRACTION;
-      const cands = spans
-        .filter((s) => classifyChapterTitle(s.title) === null && s.start < introLimit)
-        .map((s) => ({ s, len: s.end - s.start }))
-        .filter(({ len }) => len >= OP_MIN_SECONDS && len <= OP_MAX_SECONDS)
-        .sort((a, b) => {
-          const da = Math.abs(a.len - TARGET_OP_SECONDS);
-          const db = Math.abs(b.len - TARGET_OP_SECONDS);
-          return Math.abs(da - db) <= 5 ? b.s.start - a.s.start : da - db;
-        });
-      const pick = cands[0]?.s;
-      if (pick && free(pick.start, pick.end)) {
-        derived.push({
-          type: "op", start: pick.start, end: pick.end,
-          source: "chapter-heuristic", auto: false,
-        });
-      }
-    }
-  }
-
-  // 3. Untitled OUTRO: exactly one untitled chapter wholly inside the
-  //    trailing OUTRO_FRACTION, >= 20 s, when nothing else gave an ED.
-  //    Prompt-only. NEVER the last chapter when it runs to the end of the
-  //    file: an untitled final chapter can hold the ending AND an
-  //    after-credits scene AND a preview, and an ED ending at EOF is exactly
-  //    how those were skipped.
-  if (duration > 0 && modeFor("ed") !== "off") {
-    const hasEd =
-      existing.some((e) => skipKindGroup(e.type) === "ed") || derived.some((d) => d.type === "ed");
-    if (!hasEd) {
-      const outroStart = duration * (1 - OUTRO_FRACTION);
-      const outroCands = spans.filter(
-        (s) =>
-          classifyChapterTitle(s.title) === null &&
-          s.start >= outroStart &&
-          s.end < duration - 1 &&
-          s.end - s.start >= 20 &&
-          s.end - s.start <= ED_MAX_SECONDS,
-      );
-      if (outroCands.length === 1 && free(outroCands[0].start, outroCands[0].end)) {
-        const o = outroCands[0];
-        derived.push({
-          type: "ed", start: o.start, end: o.end,
-          source: "chapter-heuristic", auto: false,
-        });
-      }
-    }
-  }
-
-  if (derived.length === 0) {
-    return { windows: existing, duration, note: "chapters yielded no windows" };
-  }
-  const merged = dedupeSkipWindows([...existing, ...derived]);
-  return {
-    windows: merged,
-    duration,
-    note: `merged ${derived.length} chapter window(s), total ${merged.length}`,
-  };
+  // Crowd rows are fetched before the file's duration is known: a row recorded
+  // against a different cut must not land on this one (or count as supplying
+  // its kind).
+  const fit = fitCrowdToDuration(existing, duration);
+  for (const n of fit.notes) console.info(`[auraskip] ${n}`);
+  const merged = windowsFromChapters(fit.windows, chapters, duration, modeFor);
+  return { windows: merged.windows, duration, note: merged.note, crowd: existing, chapters };
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +456,11 @@ async function fetchPublicmetadbWindows(
   season:    number,
   episode:   number,
   modeFor:   (kind: string) => "off" | "prompt" | "auto",
+  /** The anime fallback for an id with NO season of its own (kitsu:N:E):
+   *  `season` / `episode` are then the cour's local numbering, and Rust maps
+   *  them to TMDB's through Fribb, or does not ask at all for an entry that is
+   *  not a mapped TV / ONA cour (an OVA inherits its parent show's TMDB id). */
+  courMalId?: number | null,
 ): Promise<PreparedWindow[]> {
   try {
     const res = await invoke<{
@@ -560,6 +471,7 @@ async function fetchPublicmetadbWindows(
       mediaType,
       season,
       episode,
+      courMalId: courMalId ?? null,
     });
     if (!res.found || res.windows.length === 0) return [];
     return res.windows
@@ -3108,10 +3020,13 @@ export default function App() {
             const edMode    = normalizeMode(settings?.skip_ed_mode,    "prompt");
             const recapMode = normalizeMode(settings?.skip_recap_mode, "prompt");
             const treatMixed = settings?.skip_treat_mixed_op_as_op ?? true;
-            if (opMode === "off" && edMode === "off" && recapMode === "off") {
-              console.info(`[auraskip] skip — all modes off`);
-              return;
-            }
+            // Every kind off: no lookups and no windows, but the probe-only
+            // detect still runs (finishWithChapters with `probeOnly`, below):
+            // the end-of-stream detectors need the media end whatever the skip
+            // modes say, or a container that runs past its media misses the
+            // end card for exactly these users.
+            const allModesOff = opMode === "off" && edMode === "off" && recapMode === "off";
+            if (allModesOff) console.info(`[auraskip] skip - all modes off; reading the media end only`);
             // The file's duration, the moment mpv reports it. Watched from HERE
             // (not from the chapter poll) so the detector can start as soon as
             // the MAL id and the duration are both known, instead of after the
@@ -3156,6 +3071,9 @@ export default function App() {
                 malSource?: string | null;
                 episodeNum?: number | null;
                 treatMixed?: boolean;
+                /** Every skip mode is off: no chapter poll and no window, only
+                 *  the probe-only detect for the media end. */
+                probeOnly?: boolean;
               },
             ): Promise<void> => {
               // A duration mpv reports only AFTER the chapter poll gave up (a
@@ -3213,15 +3131,20 @@ export default function App() {
                 } = { op: null, ed: null, mediaEnd: null };
                 let published: PreparedWindow[] = [];
                 let lastTiming = "";
+                // What Layer 1 concluded per kind, from the detector's
+                // snapshots. "pending" from the start of the load for every
+                // kind the detector will decide (set below, once it is known
+                // whether it runs): crowd windows of that kind only prompt
+                // until it settles (composeSkipWindows).
+                let layer1: Layer1Status = { op: "off", ed: "off" };
                 // The Next-Up gate's inputs: a TRUSTED ending's end (Layer 1
                 // only; never a crowd, chapter or Layer 3 window) and the media
                 // end. Announced after every stamp, only when they changed.
+                // The trusted end rule (a Transition-only match's end counts)
+                // is `trustedEndingEnd`, shared with the e2e harness.
                 const announceTiming = (): void => {
-                  const l1Ed = published.find(
-                    (w) => skipKindGroup(w.type) === "ed" && w.source === LAYER1_SOURCE,
-                  );
                   const timing: NextUpTiming = {
-                    trustedEdEnd: l1Ed ? l1Ed.end : null,
+                    trustedEdEnd: trustedEndingEnd(published, det.ed),
                     mediaEnd: det.mediaEnd,
                   };
                   const key = `${timing.trustedEdEnd}|${timing.mediaEnd}`;
@@ -3247,19 +3170,21 @@ export default function App() {
                 const stamp = (note: string): Promise<void> => {
                   stampQueue = stampQueue.then(async () => {
                     if (stale() || base == null) return;
-                    // Layer 3 is a last resort: a continuity window never joins a
-                    // kind AniSkip, IntroDB, PublicMetaDB or a chapter already
-                    // supplied (computed here, so a later neighbour-profile OP in
-                    // `base` suppresses a continuity OP too). Layer 1 always
-                    // passes, so its 3 s conflict drop keeps working.
-                    const covered = new Set(base.map((w) => skipKindGroup(w.type)));
-                    const detected = [det.op, det.ed].filter(
-                      (w): w is PreparedWindow => w != null
-                        && !(w.source === CONTINUITY_SOURCE && covered.has(skipKindGroup(w.type))),
-                    );
-                    const deduped = dedupeSkipWindowsDetailed([...base, ...detected]);
-                    const merged = clampWindowsToMediaEnd(deduped.kept, det.mediaEnd);
-                    const windows = await nameSongs(applySkipModes(merged, modeFor));
+                    // Every rule that weighs one source against another lives
+                    // in composeSkipWindows (shared with the e2e harness):
+                    // Layer 3 only for a kind nothing else supplied, crowd
+                    // rows held while Layer 1 decides or after it found the
+                    // theme elsewhere, a lone live-action crowd opening held,
+                    // the Layer 1 conflict drop, one opening, no ending over
+                    // the opening, then the media end clamp.
+                    const deduped = composeSkipWindows({
+                      base,
+                      detected: [det.op, det.ed].filter((w): w is PreparedWindow => w != null),
+                      mediaEnd: det.mediaEnd,
+                      layer1,
+                      hasMal: opts.malId != null,
+                    });
+                    const windows = await nameSongs(applySkipModes(deduped.kept, modeFor));
                     // AniSkip rows a Layer 1 window replaced: shown in the AuraSkip
                     // menu for voting only. They travel in `superseded`, which the
                     // Lua script and the SkipController never read, so they can
@@ -3282,7 +3207,9 @@ export default function App() {
                         ? "no windows"
                         : windows.map((w) =>
                             `${w.type} ${Math.round(w.start)}-${Math.round(w.end)}s `
-                            + `${w.source}${w.auto ? " auto" : " prompt"}`).join(", ")),
+                            + `${w.source}${w.auto ? " auto" : " prompt"}${w.hold ? ` (${w.hold})` : ""}`).join(", "))
+                      + (layer1.op !== "off" || layer1.ed !== "off"
+                        ? ` | theme match op ${layer1.op}, ed ${layer1.ed}` : ""),
                     );
                     announceTiming();
                   });
@@ -3300,6 +3227,22 @@ export default function App() {
                 const url = opts.streamUrl;
                 const autoDetect = loadAuraSettings().autoSkipDetect !== false;
                 let detectRun: Promise<void> | null = null;
+                // Layer 1 decides a kind on this load when the cour's MAL id is
+                // known, detection is on, there is a stream and the kind is
+                // not off (the same conditions runDetect asks it under). The
+                // hold this sets is released when the detect settles the kind
+                // or ends without deciding it (below, and at the chain's end).
+                if (opts.malId != null && autoDetect && url && !opts.probeOnly) {
+                  layer1 = {
+                    op: modeFor("op") !== "off" ? "pending" : "off",
+                    ed: modeFor("ed") !== "off" ? "pending" : "off",
+                  };
+                }
+                const releaseLayer1 = (why: string): void => {
+                  if (layer1.op !== "pending" && layer1.ed !== "pending") return;
+                  layer1 = releasePendingLayer1(layer1);
+                  void stamp(`theme match released (${why})`);
+                };
                 const toWindow = (
                   kind: "op" | "ed",
                   w: SkipDetectWindow,
@@ -3311,8 +3254,11 @@ export default function App() {
                   // theme overlaps the scene) keeps its location trust but is
                   // stamped under a prompt-only source, so the mid-play
                   // re-stamp cannot re-arm it either.
+                  // A Transition-only ending is stamped under its own source:
+                  // its start is the song's (see LAYER1_TRANSITION_SOURCE).
                   source: w.source === LAYER1_SOURCE
-                    ? (w.auto_eligible ? LAYER1_SOURCE : LAYER1_PROMPT_SOURCE)
+                    ? (w.transition ? LAYER1_TRANSITION_SOURCE
+                      : w.auto_eligible ? LAYER1_SOURCE : LAYER1_PROMPT_SOURCE)
                     : w.source === CONTINUITY_SOURCE ? CONTINUITY_SOURCE : w.source,
                   auto: modeFor(kind) === "auto",
                 });
@@ -3320,6 +3266,12 @@ export default function App() {
                   if (stale()) return;
                   det.op = s.op ? toWindow("op", s.op) : null;
                   det.ed = s.ed ? toWindow("ed", s.ed) : null;
+                  layer1 = {
+                    op: layer1StateFrom(s.op_l1, layer1.op),
+                    ed: layer1StateFrom(s.ed_l1, layer1.ed),
+                    opRegion: s.op_region ?? layer1.opRegion ?? null,
+                    edRegion: s.ed_region ?? layer1.edRegion ?? null,
+                  };
                   if (s.media_end != null && Number.isFinite(s.media_end) && s.media_end > 0) {
                     det.mediaEnd = s.media_end;
                   }
@@ -3334,7 +3286,19 @@ export default function App() {
                   }
                   void stamp(note);
                 };
+                // Every exit of a detect releases a kind it left undecided (no
+                // ffmpeg, a failed cancel, a superseded or failed detect): a
+                // crowd window must never stay held for the rest of the load.
                 const runDetect = async (
+                  duration: number, wantOpIn: boolean, wantEdIn: boolean,
+                ): Promise<void> => {
+                  try {
+                    await runDetectInner(duration, wantOpIn, wantEdIn);
+                  } finally {
+                    if (!stale()) releaseLayer1("detect ended");
+                  }
+                };
+                const runDetectInner = async (
                   duration: number, wantOpIn: boolean, wantEdIn: boolean,
                 ): Promise<void> => {
                   if (!url || !(duration > 0)) return;
@@ -3458,30 +3422,49 @@ export default function App() {
                     detectRun = runDetect(d, modeFor("op") !== "off", modeFor("ed") !== "off");
                   });
                 }
-                const merge = await mergeChapterSkipWindows(
-                  preparedIn, loadDuration, modeFor, stale,
-                  (duration) => {
-                    if (opts.malId == null || detectRun) return;
-                    detectRun = runDetect(
-                      duration, modeFor("op") !== "off", modeFor("ed") !== "off",
-                    );
-                  },
-                );
+                const merge = opts.probeOnly
+                  ? {
+                    windows: [] as PreparedWindow[], duration: await loadDuration,
+                    note: "all skip modes off", crowd: [] as PreparedWindow[], chapters: null,
+                  }
+                  : await mergeChapterSkipWindows(
+                    preparedIn, loadDuration, modeFor, stale,
+                    (duration) => {
+                      if (opts.malId == null || detectRun) return;
+                      detectRun = runDetect(
+                        duration, modeFor("op") !== "off", modeFor("ed") !== "off",
+                      );
+                    },
+                  );
                 if (!merge || stale()) return;
                 base = merge.windows;
                 let fileDuration = merge.duration;
                 await stamp(merge.note);
                 if (stale()) return;
                 // mpv had no duration for the whole chapter poll: wait (bounded)
-                // for the first playback-update that carries one, then start the
-                // detector exactly as the poll would have.
-                if (!(fileDuration > 0) && !detectRun && url) {
+                // for the first playback-update that carries one, then fit the
+                // crowd rows to it and start the detector exactly as the poll
+                // would have. Not gated on the detector: on the anime path the
+                // duration watch above may already have started it (the same
+                // late value), and the crowd rows still need fitting then.
+                if (!(fileDuration > 0)) {
                   const late = await loadDuration;
                   if (stale()) return;
                   if (late > 0) {
                     fileDuration = late;
                     console.info(`[skipdetect] container duration ${late.toFixed(1)}s arrived after the chapter poll`);
-                    if (opts.malId != null) {
+                    // The poll fitted nothing (no duration): fit the crowd rows
+                    // now (a row timed on another cut is held, one past the end
+                    // dropped) and re-derive the chapter windows, whose last
+                    // span and preview region need the real duration.
+                    if (merge.crowd.length > 0 || (merge.chapters?.length ?? 0) > 0) {
+                      const fit = fitCrowdToDuration(merge.crowd, late);
+                      for (const n of fit.notes) console.info(`[auraskip] ${n}`);
+                      base = windowsFromChapters(fit.windows, merge.chapters, late, modeFor).windows;
+                      await stamp(`crowd rows and chapters fitted to the late duration ${late.toFixed(1)}s`);
+                      if (stale()) return;
+                    }
+                    if (opts.malId != null && !detectRun) {
                       detectRun = runDetect(late, modeFor("op") !== "off", modeFor("ed") !== "off");
                     }
                   } else {
@@ -3553,10 +3536,19 @@ export default function App() {
                   detectRun = runDetect(fileDuration, false, false);
                 }
                 if (detectRun) await detectRun;
+                // No detect ever ran for a kind it was holding (no duration).
+                if (!stale()) releaseLayer1("no detect ran");
               } catch (err) {
                 console.warn(`[auraskip] finish/chapter merge failed: ${String(err)}`);
               }
             };
+
+            if (allModesOff) {
+              // No lookups and nothing stamped beyond the empty list: only the
+              // probe-only detect (runDetect with no kind) for the media end.
+              await finishWithChapters([], { streamUrl: stream.url ?? null, isAnime: false, probeOnly: true });
+              return;
+            }
 
             // Resolve mal_id via the meta-detail cache. The detail
             // fetch is shared with the buffering-overlay path so it's
@@ -3589,9 +3581,11 @@ export default function App() {
                   [],
                   () => console.info(`[introdb] no answer within ${INTRODB_WAIT_MS} ms; stamping without it`),
                 );
+            // Undeduped: the stamp elects over every source at once, and a
+            // second provider agreeing with the first is evidence it reads.
             const withIntroDb = async (base: PreparedWindow[]): Promise<PreparedWindow[]> => {
               const idb = await introDbPromise;
-              return idb.length === 0 ? base : dedupeSkipWindows([...base, ...idb]);
+              return idb.length === 0 ? base : [...base, ...idb];
             };
             // Resolution cascade — first id-based via yuna.moe, then a
             // title-based Jikan lookup as a last resort. The id-based
@@ -3918,6 +3912,9 @@ export default function App() {
               try {
                 const cacheKey = `${malId}:${episodeNum}:${treatMixed ? 1 : 0}`;
                 let result = aniskipCache.get(cacheKey);
+                // Cached before rows carried the submitter's episode length:
+                // refetch, or the other-cut check could never run on it.
+                if (result && result.windows.some((w) => w.episode_length === undefined)) result = undefined;
                 if (!result) {
                   result = await invoke<AniSkipResult>(
                     "fetch_skip_windows",
@@ -3947,6 +3944,7 @@ export default function App() {
                       auto:    modeFor(w.kind) === "auto",
                       skip_id: w.skip_id ?? null,
                       skip_ref: `${malId}:${episodeNum}`,
+                      episode_length: w.episode_length ?? 0,
                     }));
                 }
               } catch (err) {
@@ -3964,10 +3962,21 @@ export default function App() {
                 const haveEd = prepared.some((w) => w.type === "ed");
                 if ((!haveOp || !haveEd) && Number.isFinite(seasonEpisodeNum)) {
                   const animeTmdb = await resolveAnimeTmdb();
+                  // An id with no season of its own (kitsu:N:E, mal:N:E) names
+                  // only the cour and its LOCAL episode: Rust maps that onto
+                  // TMDB's numbering through the cour's Fribb row, and skips an
+                  // OVA / special / movie, whose TMDB id is the parent show's
+                  // (the Mob Psycho 100 OVA was stamped with TV episode 1's
+                  // opening, 90 s of story on auto).
+                  const idHasSeason = /^tt\d/i.test(idParts[0]) && idParts.length === 3;
                   if (animeTmdb != null) {
-                    const pmdb = await fetchPublicmetadbWindows(
-                      animeTmdb, "tv", target.season ?? 1, seasonEpisodeNum, modeFor,
-                    );
+                    const pmdb = idHasSeason
+                      ? await fetchPublicmetadbWindows(
+                        animeTmdb, "tv", target.season ?? 1, seasonEpisodeNum, modeFor,
+                      )
+                      : await fetchPublicmetadbWindows(
+                        animeTmdb, "tv", 1, episodeNum, modeFor, malId,
+                      );
                     for (const w of pmdb) {
                       if (w.type === "op" && !haveOp) prepared.push(w);
                       if (w.type === "ed" && !haveEd) prepared.push(w);

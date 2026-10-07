@@ -95,7 +95,9 @@ const PORTABLE_BACKEND_FIELDS = [
   "skip_recap_mode",
   "skip_treat_mixed_op_as_op",
   "trailer_quality",
-  "gpu_acceleration",
+  // `gpu_acceleration` deliberately does NOT travel: it is a per-machine GPU
+  // workaround (Rust keeps it in a machine-local render.json), and it is
+  // stripped from the cloud blob in sync.ts for the same reason.
   "cache_secs",
   "demuxer_readahead_secs",
   "demuxer_max_mib",

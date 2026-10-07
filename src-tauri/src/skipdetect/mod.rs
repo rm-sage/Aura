@@ -63,6 +63,10 @@ pub mod themes;
 #[cfg(test)]
 mod corpus_tests;
 #[cfg(test)]
+mod e2e_tests;
+#[cfg(test)]
+pub(crate) mod replay;
+#[cfg(test)]
 mod runtime_tests;
 
 use std::path::PathBuf;
@@ -258,6 +262,8 @@ async fn detect(app: AppHandle, req: Request) -> Result<SkipDetectReply, String>
             store_latest(s);
             let _ = publish_app.emit(UPDATE_EVENT, s);
         }),
+        #[cfg(test)]
+        replay: None,
     };
     let task = tokio::spawn(async move { job::run(&ctx, &req).await });
     if let Ok(mut r) = RUNNING.lock() {

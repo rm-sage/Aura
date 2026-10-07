@@ -151,8 +151,28 @@ pub async fn fetch_publicmetadb_skips(
     media_type: String,
     season:     u32,
     episode:    u32,
+    // Set by the ANIME fallback when the playing id carries no season of its
+    // own (`kitsu:N:E`): `season` / `episode` are then only the cour's local
+    // numbering, and TMDB's are read from the Fribb row of this MAL entry. An
+    // entry that is not a mapped TV / ONA cour (an OVA, a special, a movie, or
+    // one Fribb does not know) is not asked at all: its TMDB id is the parent
+    // show's, so its S1E{n} is another episode's timing.
+    cour_mal_id: Option<u32>,
 ) -> Result<PublicmetadbSkips, String> {
     let empty = PublicmetadbSkips { found: false, windows: vec![] };
+    let (season, episode) = match cour_mal_id {
+        None => (season, episode),
+        Some(mal) => match crate::anime_id_map::tmdb_episode_for_mal(mal as u64, episode) {
+            Ok(pair) => pair,
+            Err(why) => {
+                crate::devlog!(
+                    info, "publicmetadb",
+                    "anime fallback skipped for mal {mal} (local ep {episode}): {why}",
+                );
+                return Ok(empty);
+            }
+        },
+    };
 
     // No key baked → feature inert (the mdblist.key pattern).
     if AURA_PUBLICMETADB_KEY.trim().is_empty() {
