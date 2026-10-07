@@ -14,6 +14,8 @@
 // Things tracked:
 //   • aura-mpv.log + aura-mpv.log.old             (verbose MPV log)
 //   • aura-panic.log + aura-panic.log.old         (panic dumps)
+//   • skipdetect caches under app_data_dir         (AnimeThemes theme lists,
+//     theme fingerprints, per-file OP/ED results; see skipdetect/cache.rs)
 //
 // In-memory caches (Rust-side AniSkip, mal-resolve, inflight searches)
 // aren't tracked here since they vanish on restart anyway. localStorage
@@ -66,8 +68,12 @@ fn entries() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
     ]
 }
 
+/// Id of the skipdetect cache entry (a set of files under app_data_dir, not a
+/// home-dir file, so it is handled beside the static catalogue).
+const SKIPDETECT_ID: &str = "skipdetect-cache";
+
 #[tauri::command]
-pub async fn get_storage_report() -> Result<StorageReport, String> {
+pub async fn get_storage_report(app: tauri::AppHandle) -> Result<StorageReport, String> {
     let home = home_dir().ok_or("no HOME / USERPROFILE")?;
     let mut total: u64 = 0;
     let mut out = Vec::new();
@@ -87,11 +93,28 @@ pub async fn get_storage_report() -> Result<StorageReport, String> {
             exists,
         });
     }
+    let (dir, bytes) = tauri::async_runtime::spawn_blocking(move || crate::skipdetect::storage_usage(&app))
+        .await
+        .map_err(|e| e.to_string())?;
+    total += bytes;
+    out.push(StorageEntry {
+        id: SKIPDETECT_ID.to_string(),
+        label: "Skip detection cache".to_string(),
+        description: "AnimeThemes theme lists, theme audio fingerprints (never the audio) and per-file opening / ending results. Bounded; rebuilt on the next play.".to_string(),
+        path: dir,
+        bytes,
+        exists: bytes > 0,
+    });
     Ok(StorageReport { entries: out, total_bytes: total })
 }
 
 #[tauri::command]
-pub async fn clear_storage_item(id: String) -> Result<(), String> {
+pub async fn clear_storage_item(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    if id == SKIPDETECT_ID {
+        return tauri::async_runtime::spawn_blocking(move || crate::skipdetect::storage_clear(&app))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     let home = home_dir().ok_or("no HOME / USERPROFILE")?;
     for (entry_id, _label, _description, file) in entries() {
         if entry_id == id {

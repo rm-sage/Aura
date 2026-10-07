@@ -300,8 +300,9 @@ pub async fn anime_full(mal_id: u32) -> Option<AnimeFull> {
 }
 
 /// Same as `anime_full` but preserves the ask-failed vs no-answer distinction
-/// for the commands, which must not let the frontend cache an outage.
-async fn anime_full_checked(mal_id: u32) -> Result<Option<AnimeFull>, String> {
+/// for the commands, which must not let the frontend cache an outage (and for
+/// skipdetect's sibling-cour lookup, which must not cache one either).
+pub(crate) async fn anime_full_checked(mal_id: u32) -> Result<Option<AnimeFull>, String> {
     if mal_id == 0 {
         return Ok(None);
     }

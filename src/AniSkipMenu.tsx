@@ -41,7 +41,8 @@ import {
   introDbPrimaryNumbering, submitToIntroDb,
 } from "./introdb";
 import { peekCachedDetailById } from "./metaCache";
-import { skipSourceLabel } from "./skipSource";
+import { skipKindLabel, skipSourceLabel } from "./skipSource";
+import { skipModeForKind } from "./skipWindows";
 
 /** Mirrors PlayerOverlay's AuraSkipWindow shape so this module can be
  *  imported without a circular dep. Local copy is intentional. */
@@ -77,6 +78,9 @@ interface Props {
   /** Existing skip windows for this episode. Driven by useSkipWindows
    *  upstream, threaded down so this component doesn't double-fetch. */
   windows: AniSkipMenuWindow[];
+  /** AniSkip rows a theme match (Layer 1) replaced for their kind. Listed for
+   *  their vote arrows only: they never auto-skip or prompt. */
+  superseded?: AniSkipMenuWindow[];
 }
 
 type SkipMode = "off" | "prompt" | "auto";
@@ -121,17 +125,13 @@ function parseTimeInput(input: string): number | null {
 }
 
 function skipLabel(kind: string): string {
-  switch (kind) {
-    case "op":       return "Opening";
-    case "mixed-op": return "Opening (mixed)";
-    case "ed":       return "Ending";
-    case "recap":    return "Recap";
-    default:         return "Segment";
-  }
+  // "Opening (mixed)" is this menu's own wording (it is also the submit form's
+  // type picker); every other kind reads the shared label.
+  return kind === "mixed-op" ? "Opening (mixed)" : skipKindLabel(kind);
 }
 
 export default function AniSkipMenu({
-  open, onClose, activeTarget, time, duration, windows,
+  open, onClose, activeTarget, time, duration, windows, superseded = [],
 }: Props) {
   // ── MAL resolution ───────────────────────────────────────────────
   // Cour-specific id derived from the video id when it's anime-prefix
@@ -166,11 +166,14 @@ export default function AniSkipMenu({
   // authoritative: re-deriving it here could disagree (a meta cache entry that
   // expired mid-episode, another addon's detail), which would hide the vote
   // arrows on a correct window and point a submission at another entry.
+  // Superseded rows count too: when the theme match replaced every AniSkip
+  // row, they are the only record of which entry was fetched.
   const stampedRef = useMemo(() => {
-    const ref = windows.find((w) => w.source === "aniskip" && w.skip_ref)?.skip_ref ?? null;
+    const ref = [...windows, ...superseded]
+      .find((w) => w.source === "aniskip" && w.skip_ref)?.skip_ref ?? null;
     const m = ref ? /^(\d+):(\d+)$/.exec(ref) : null;
     return m ? { mal: Number(m[1]), episode: Number(m[2]) } : null;
-  }, [windows]);
+  }, [windows, superseded]);
 
   useEffect(() => {
     if (!open || !activeTarget) return;
@@ -456,11 +459,18 @@ export default function AniSkipMenu({
 
   if (!open) return null;
 
-  // Sort windows for display: OP first, then mixed-op, ED, recap.
-  const orderedWindows = [...windows].sort((a, b) => {
-    const order: Record<string, number> = { op: 0, "mixed-op": 1, ed: 2, recap: 3 };
-    return (order[a.type] ?? 9) - (order[b.type] ?? 9);
+  // Sort windows for display: OP first, then mixed-op, ED, preview, recap.
+  // A superseded AniSkip row sits right after the window that replaced it.
+  const listed: Array<AniSkipMenuWindow & { superseded?: boolean }> = [
+    ...windows,
+    ...superseded.map((w) => ({ ...w, auto: false, superseded: true })),
+  ];
+  const orderedWindows = listed.sort((a, b) => {
+    const order: Record<string, number> = { op: 0, "mixed-op": 1, ed: 2, "mixed-ed": 2, preview: 3, recap: 4 };
+    return (order[a.type] ?? 9) - (order[b.type] ?? 9)
+      || Number(a.superseded ?? false) - Number(b.superseded ?? false);
   });
+  const modes = { op: opMode, ed: edMode, recap: recapMode };
 
   return (
     <div
@@ -523,7 +533,14 @@ export default function AniSkipMenu({
                   </p>
                   <p className="text-white/40 text-[10px] mt-0.5">
                     {skipSourceLabel(w.source)}
-                    {w.auto && <span className="text-amber-300/80"> · auto-skip</span>}
+                    {w.superseded
+                      ? <span className="text-white/50"> · replaced by theme match</span>
+                      : w.auto
+                        ? <span className="text-amber-300/80"> · auto-skip</span>
+                        // The kind is on auto but this source may only prompt
+                        // (a guess, a preview, an AniSkip ending): say so.
+                        : skipModeForKind(w.type, modes) === "auto"
+                          && <span className="text-white/50"> · prompt only</span>}
                   </p>
                 </div>
                 {/* Votes go to AniSkip by skip_id alone, so they are offered

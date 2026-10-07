@@ -111,6 +111,10 @@ url = "2"
 # across sessions so AniSkip's anti-spam dedupe sees a stable
 # identity per Aura install.
 uuid = { version = "1", features = ["v4"] }
+# Real-input FFT for skipdetect's audio fingerprint (skipdetect/fingerprint.rs:
+# a 2048-point Hann-windowed spectrum per 512-sample hop, 33 log bands).
+# MIT OR Apache-2.0, pure Rust (wraps rustfft), no native code.
+realfft = "3"
 
 # Crash & error reporting (opt-in via consent dialog at first run; see
 # CrashReportingConsent.tsx + crash_reporting.rs).
@@ -193,6 +197,15 @@ windows = { version = "0.61", features = [
 [profile.dev]
 split-debuginfo = "packed"
 debug = "line-tables-only"
+
+# The FFT crates are pure number crunching and unoptimised rustfft is ~20x
+# slower; skipdetect fingerprints minutes of audio per episode, so a dev
+# build (and `cargo test`) gets them optimised. Only these two crates change.
+[profile.dev.package.rustfft]
+opt-level = 3
+
+[profile.dev.package.realfft]
+opt-level = 3
 
 # Release-profile debug info — needed for Sentry to symbolicate the
 # minidumps captured by `sentry-rust-minidump`. Without this the PDB

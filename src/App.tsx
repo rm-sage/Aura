@@ -92,15 +92,53 @@ import { arcPositionOf, fetchStoryArcs, loadArcMode } from "./storyArcs";
 import { getMetaDetailFallback, getRichestMetaDetail, peekCachedDetailById, peekRichestCachedDetailById, peekFreshestPostersByIds } from "./metaCache";
 import { PersistentCache } from "./persistentCache";
 import {
-  INTRODB_SINGLE_SOURCE, fetchIntroDbWindows, fitIntroDbToDuration, introDbImdbRoot,
-  introDbNumberings,
+  fetchIntroDbWindows, fitIntroDbToDuration, introDbImdbRoot, introDbNumberings,
 } from "./introdb";
+import {
+  CONTINUITY_SOURCE, ED_MAX_SECONDS, INTRO_FRACTION, LAYER1_PROMPT_SOURCE, LAYER1_SOURCE,
+  MIN_WINDOW_SECONDS, OP_MAX_SECONDS, OP_MIN_SECONDS, OUTRO_FRACTION, TARGET_OP_SECONDS,
+  TITLED_OP_MAX_SECONDS, applySkipModes, clampWindowsToMediaEnd, classifyChapterTitle,
+  dedupeSkipWindows, dedupeSkipWindowsDetailed, skipKindGroup, skipModeForKind, windowOverlapFraction,
+  type PreparedWindow, type SkipMode,
+} from "./skipWindows";
+import {
+  eosEnd, nextUpShouldHide, nextUpShouldShow, setDetectedMediaEnd, type NextUpTiming,
+} from "./nextUpGate";
 import { applyReducedMotionAttribute, loadAuraSettings, streamQueryAddons } from "./auraSettings";
 import { electAddons } from "./addonElection";
 import {
   isHashableStreamUrl, mergeSubtitleAnswers, playingFilename, streamSourceKey,
   type AddonSubtitleAnswer, type StreamHash, type SubtitleRequestExtras,
 } from "./subtitleExtras";
+
+/** skip_detect wire shapes (Rust skipdetect/job.rs; no serde renames, so the
+ *  names are the Rust field names). */
+interface SkipDetectWindow {
+  start: number;
+  end: number;
+  /** "animethemes" (Layer 1) or "continuity" (Layer 3). */
+  source: string;
+  auto_eligible: boolean;
+  theme?: string | null;
+}
+interface SkipDetectSnapshot {
+  generation: number;
+  state: "idle" | "running" | "done" | "cancelled" | "unavailable";
+  from_cache: boolean;
+  op: SkipDetectWindow | null;
+  ed: SkipDetectWindow | null;
+  op_note: string | null;
+  ed_note: string | null;
+  media_end: number | null;
+  media_end_final: boolean;
+  /** The mapped audio track's DURATION tag from the probe (absent without
+   *  one): a measured media end, usable before or without a TAIL read. */
+  media_end_probe?: number | null;
+}
+type SkipDetectReply =
+  | { result: "detected"; snapshot: SkipDetectSnapshot; superseded: boolean }
+  | { result: "cancelled"; generation: number }
+  | { result: "status"; snapshot: SkipDetectSnapshot | null };
 
 interface AniSkipResult {
   found: boolean;
@@ -187,22 +225,21 @@ const UPDATE_DISMISSED_KEY = "aura:update:dismissed-version";
 const UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
-// Chapter-driven skip windows (anime OP/ED detection from embedded
-// chapters). Many anime releases ship chapter markers titled "Opening",
-// "OP", "Ending", "ED", "Recap", etc. We complement AniSkip data by
-// reading MPV's chapter-list a few seconds after load and merging any
-// matching chapters as additional skip windows.
+// Chapter-driven skip windows (OP/ED from embedded chapters). Many releases
+// ship chapter markers titled "Opening", "OP", "Ending", "ED", "Recap",
+// "Preview", etc. We complement AniSkip / IntroDB / PublicMetaDB / the layered
+// detector by reading MPV's chapter-list a few seconds after load and merging
+// any matching chapters as additional skip windows.
 //
-// `existing` is the AniSkip / publicmetadb window list for this load. It
-// is NOT yet stamped to MPV: this function owns the single stamp for the
-// load and publishes on every exit that still holds the load token.
-// `modeFor(kind)` returns the user's "off"/"prompt"/"auto" preference
-// per window kind so a chapter-detected OP picks up the same OP mode
-// the user configured for AniSkip's OP windows.
+// The pure half (what a title means, ranking, modes, the media-end clamp)
+// lives in skipWindows.ts so a node check can exercise it. This function only
+// polls mpv and DERIVES windows: it does not stamp. The skip chain in
+// handlePlayStream owns every stamp of the load (see `stamp` there).
 //
-// Chapter titles are matched case-insensitively. We trim the chapter
-// at the next chapter's start (or duration) to derive an end time —
-// MPV chapters store start only.
+// `modeFor(kind)` returns the user's "off"/"prompt"/"auto" preference per
+// window kind, so a chapter OP picks up the OP mode the user configured.
+// Chapter titles are matched case-insensitively. A chapter's end is the next
+// chapter's start (or the duration): MPV chapters store start only.
 // ---------------------------------------------------------------------------
 
 interface MpvChapter {
@@ -210,242 +247,13 @@ interface MpvChapter {
   time?:  number | null;
 }
 
-function classifyChapterTitle(title: string): "op" | "ed" | "recap" | null {
-  const t = title.toLowerCase().trim();
-  if (!t) return null;
-  // Recap first — "Previously on…" / "recap" / "summary" intros
-  // sometimes precede an opening, so the recap match wins.
-  if (/\b(recap|previously|previously on|last time|story so far|summary)\b/.test(t)) return "recap";
-  // Opening / intro / theme — generic enough to also catch live-action
-  // title sequences (not anime-only). "Cold open" / "teaser" are
-  // DELIBERATELY excluded: those are usually real story content, and
-  // skipping them would eat the episode.
-  if (
-    /^op(\b|\d| |$)/.test(t) ||
-    /\b(opening|intro|introduction|theme song|main theme|title sequence)\b/.test(t)
-  ) return "op";
-  // Ending / outro / credits / next-episode preview. "Preview" /
-  // "next episode" are end-of-episode content; the positional guard in
-  // mergeChapterSkipWindows stops a stray EARLY "Preview" chapter from
-  // being treated as an outro.
-  if (
-    /^ed(\b|\d| |$)/.test(t) ||
-    /\b(ending|outro|closing|end credits|credits|epilogue|end theme|closing theme|preview|next episode|next time|coming up)\b/.test(t)
-  ) return "ed";
-  return null;
+interface ChapterMerge {
+  /** Raw merged list (existing + chapter-derived), deduped, NOT mode-applied. */
+  windows:  PreparedWindow[];
+  /** mpv's container duration as read by the poll (0 when it never came). */
+  duration: number;
+  note:     string;
 }
-
-interface PreparedWindow {
-  type:   string;
-  start:  number;
-  end:    number;
-  source: string;
-  auto:   boolean;
-  /** The song playing in this window, stamped below from the MAL theme
-   *  list. Absent whenever the join was not certain: see stampThemeSongs.
-   *  Mirrors Rust's PreparedWindow; PlayerOverlay and AniSkipMenu carry
-   *  their own copies of this shape and must change with it. */
-  song_title?:  string | null;
-  song_artist?: string | null;
-  /** "aniskip" windows only: `"{malId}:{episode}"`, the AniSkip entry the
-   *  window was fetched for. Mirrors Rust's PreparedWindow::skip_ref. */
-  skip_ref?: string | null;
-}
-
-// Kai-derived chapter heuristics (live-action + anime where AniSkip
-// has no data). Industry-standard OP length is ~90 s; an UNTITLED
-// chapter inside the leading INTRO_FRACTION whose length is closest to
-// that (within OP_MIN..OP_MAX) is treated as the opening — prompt-only
-// (never auto: it's a guess). AniSkip windows and titled chapters
-// always take precedence over the positional heuristic.
-const INTRO_FRACTION       = 0.20;
-const OUTRO_FRACTION       = 0.20;
-const TARGET_OP_SECONDS    = 90;
-const OP_MIN_SECONDS       = 30;
-const OP_MAX_SECONDS       = 130;
-// Sanity caps so a mis-titled / coarse chapter can't nuke real content.
-// A real opening is ~90 s (OP_MAX_SECONDS is 130); a titled "Opening"
-// chapter much longer than that is a coarse marker that runs until the
-// NEXT marker (e.g. The Punisher S01E13 shipped an "Opening" chapter
-// spanning 4:53-9:37 = ~284 s, which skipped whole scenes). Reject those
-// here so silencedetect's precise window wins instead. ED can legitimately
-// run long (a full credits roll), so it keeps a generous cap.
-const TITLED_OP_MAX_SECONDS = 150;
-const ED_MAX_SECONDS        = 900;
-const MIN_WINDOW_SECONDS    = 2;
-// Plausible length band for an OP window, used ONLY to rank competing OP
-// candidates against each other in dedupeSkipWindows (never to drop one).
-// Below the floor is a title card / eyecatch: Vodes' Hell's Paradise S02
-// files ship a 15 s "Intro" chapter at 0:00 alongside the real "Opening"
-// chapter, and the earliest-start tie-break handed the OP slot to the
-// title card. Above the ceiling is a coarse marker that swallowed the cold
-// open: AniSkip's crowd-sourced window for that same episode is 0-158 s
-// against a real OP of 0:59-2:38.
-const OP_PLAUSIBLE_MIN_SECONDS = 20;
-const OP_PLAUSIBLE_MAX_SECONDS = TITLED_OP_MAX_SECONDS;
-// Plausible band for an ENDING, measured BACK from the end of the file. A TV
-// ending theme runs ~90 s and a next-episode preview adds ~30 s, so the credits
-// begin somewhere in the last few minutes; anything claiming to start earlier
-// than that is a mid-episode act break, not the ending. This is what decides
-// which ED window times the Next-Up card, and it is the sanity gate on an
-// INFERRED ed start - the Hell's Paradise S02E11 report (card a minute or two
-// early, nothing drawn on the scrubber) was an ffmpeg tail-scan boundary from
-// the middle of the final act, and the only check it had to pass was
-// `start >= duration * 0.5`.
-// Observed real endings, for calibration: Hell's Paradise S02 starts its ED
-// 89 s before the end of a 1465 s episode, Frieren 100 s before the end of a
-// 1470 s one, and live-action credits are usually shorter still. 240 s is
-// generous against all of them, and it is also the tail the ffmpeg outro scan
-// is given, so the two cannot drift apart.
-const ED_TAIL_MIN_SECONDS = 20;
-const ED_TAIL_MAX_SECONDS = 240;
-
-/** Playback position that means "the ending has started" - the EARLIEST ED
- *  window start inside the plausible outro band, or null when no ED window
- *  qualifies. Drives the Next-Up CTA, and doubles as the acceptance test for an
- *  inferred ED before it is stamped.
- *
- *  Earliest, not latest: a release that ships both an "Ending" and a "Preview"
- *  chapter produces two ED windows (classifyChapterTitle maps preview /
- *  next episode / next time / coming up to "ed"), and taking the last one timed
- *  the card off the preview - by which point the fixed lead time had usually
- *  fired anyway, so the precise trigger silently did nothing. The band is what
- *  makes earliest safe: a bogus early ED cannot qualify in the first place.
- *
- *  With no container duration there is no band to test against, so it falls
- *  back to the old last-ED behaviour rather than dropping the feature. */
-function edTriggerStart(windows: PreparedWindow[], duration: number): number | null {
-  const eds = windows.filter((w) => w.type === "ed");
-  if (eds.length === 0) return null;
-  if (!(duration > 0)) {
-    return eds.reduce<number | null>((acc, w) => (acc == null || w.start > acc ? w.start : acc), null);
-  }
-  const inBand = eds
-    .map((w) => w.start)
-    .filter((s) => duration - s >= ED_TAIL_MIN_SECONDS && duration - s <= ED_TAIL_MAX_SECONDS);
-  return inBand.length > 0 ? Math.min(...inBand) : null;
-}
-
-/** Fraction of [aStart,aEnd) that overlaps [bStart,bEnd). */
-function windowOverlapFraction(
-  aStart: number, aEnd: number, bStart: number, bEnd: number,
-): number {
-  const inter = Math.max(0, Math.min(aEnd, bEnd) - Math.max(aStart, bStart));
-  return inter / Math.max(0.001, aEnd - aStart);
-}
-
-/** Collapse overlapping skip windows of the SAME kind across sources so a
- *  region never gets two segments (e.g. an AniSkip OP + a chapter OP that
- *  only partially overlap — the per-source guards in mergeChapterSkipWindows
- *  let those slip through, which surfaced as the reported "chapter + no-source
- *  overlap"). The higher-trust source wins the region; the loser is dropped
- *  WHOLE, never merged into a union (a coarse chapter must not extend a precise
- *  AniSkip window). `mixed-op` shares the OP group.
- *
- *  The single OP slot is elected on plausible-length FIRST and source trust
- *  second - see `opLengthScore` below for why. */
-function dedupeSkipWindows(windows: PreparedWindow[]): PreparedWindow[] {
-  const group = (t: string) => (t === "mixed-op" ? "op" : t);
-  // Trust order. A release group's EXPLICIT titled chapter ("Opening") beats
-  // AniSkip: the chapter is a direct, encoder-set boundary (and the ≤150 s cap
-  // in mergeChapterSkipWindows already drops coarse markers), whereas AniSkip's
-  // crowd-sourced timings can be wrong for a given episode — observed on
-  // Dr. STONE S04E18, where the file's chapter OP was right and AniSkip's was
-  // off. Aura's own guesses (positional heuristic / silencedetect) rank lowest.
-  // "aniskip-neighbour" is a window borrowed from the SAME series' other
-  // episodes (see fetch_neighbour_skip_profile) - real crowd data, but not for
-  // this episode, so it ranks under every source that describes this file and
-  // over Aura's own signal-processing guesses.
-  // IntroDB is split by trust in introdb.rs: "introdb" (>= 2 submissions at
-  // >= 0.9 confidence) ranks WITH AniSkip, "introdb-single" (everything else)
-  // sits between publicmetadb and the neighbour borrow. Renumbered to make room
-  // without changing the relative order of any existing source.
-  const PRIO: Record<string, number> = {
-    chapter: 7, aniskip: 6, introdb: 6, publicmetadb: 5, "introdb-single": 4,
-    "aniskip-neighbour": 3, "chapter-heuristic": 2, silencedetect: 1,
-  };
-  const prio = (src: string) => PRIO[src] ?? 0;
-  // Last tie-break between equal-priority sources (AniSkip vs trusted IntroDB),
-  // applied after opCloseness: AniSkip describes a MAL-keyed episode and has
-  // per-row votes, so it keeps a genuine tie.
-  const tieBreak = (src: string) => (src === "aniskip" ? 1 : 0);
-  // An OP whose LENGTH is plausible outranks one whose length is not, ABOVE
-  // source priority. Source trust only tells us who is usually right; a 15 s
-  // or a 158 s "opening" is self-evidently not one, whoever supplied it. This
-  // is a ranking key, never a filter: when no candidate is plausible the old
-  // (priority, start) order still elects one, so `hasOp` downstream and the
-  // shape of the payload are unchanged. 0 for every non-OP window, so the
-  // relative order of the ed / recap groups is untouched.
-  const opPlausible = (w: PreparedWindow): number => {
-    if (group(w.type) !== "op") return 0;
-    const len = w.end - w.start;
-    return len >= OP_PLAUSIBLE_MIN_SECONDS && len <= OP_PLAUSIBLE_MAX_SECONDS ? 1 : 0;
-  };
-  // Closeness to the industry-standard length, bucketed to 20 s so near-ties
-  // (85 vs 90) are not decided by a couple of seconds. Ranks BELOW source
-  // priority, so it only ever separates candidates the trust order cannot: two
-  // chapters from the same release, where a 25 s title card and a 90 s opening
-  // are equally "plausible" on a yes/no test and the earliest-start tie-break
-  // would hand the OP slot to the title card. Above source priority it would
-  // invert the documented trust order and let a crowd-sourced AniSkip window
-  // beat a release group's own "Opening" chapter, which is the Dr. STONE case
-  // that order exists for.
-  const opCloseness = (w: PreparedWindow): number => {
-    if (group(w.type) !== "op") return 0;
-    return -Math.round(Math.abs((w.end - w.start) - TARGET_OP_SECONDS) / 20);
-  };
-  // Plausible OP first, then highest-priority source (it survives a conflict),
-  // then closest to a real opening's length, stable by start.
-  const ordered = [...windows].sort(
-    (a, b) => opPlausible(b) - opPlausible(a)
-           || prio(b.source) - prio(a.source)
-           || opCloseness(b) - opCloseness(a)
-           || tieBreak(b.source) - tieBreak(a.source)
-           || a.start - b.start,
-  );
-  const kept: PreparedWindow[] = [];
-  let opTaken = false;
-  for (const w of ordered) {
-    const g = group(w.type);
-    // An episode has exactly ONE opening. When two sources disagree on WHERE
-    // it is (e.g. AniSkip 2:34-4:04 vs a chapter "Opening" 0:55-2:24 on
-    // Dr. STONE — NON-overlapping, so the overlap test below can't catch
-    // them), keep only the single best-ranked OP and drop the rest.
-    // ED / recap are NOT collapsed this way: a real ED plus a next-episode
-    // "preview" are both legitimately skippable, so those get only the
-    // same-region overlap dedup below.
-    if (g === "op") {
-      if (opTaken) continue;
-      opTaken = true;
-      kept.push(w);
-      continue;
-    }
-    const wLen = Math.max(0.001, w.end - w.start);
-    const clashes = kept.some((k) => {
-      if (group(k.type) !== g) return false;
-      const inter = Math.max(0, Math.min(k.end, w.end) - Math.max(k.start, w.start));
-      const kLen = Math.max(0.001, k.end - k.start);
-      // Overlap past ~a quarter of the SHORTER window = the same region.
-      return inter / Math.min(wLen, kLen) > 0.25;
-    });
-    if (!clashes) kept.push(w);
-  }
-  return kept.sort((a, b) => a.start - b.start);
-}
-
-/** Sources whose windows are INFERRED rather than authored. They are stamped
- *  `auto: false` at construction on purpose (a wrong guess must never yank the
- *  playhead) and the per-kind mode does not override that: "auto" means "trust
- *  a real OP/ED marker", not "trust anything Aura guessed". */
-const GUESS_SKIP_SOURCES = new Set([
-  "chapter-heuristic", "silencedetect", "aniskip-neighbour",
-]);
-
-/** Sources that are real crowd data for THIS episode but too thinly backed to
- *  seek on their own: an IntroDB segment with a single submission (or under
- *  0.9 confidence). Prompt-only, like a guess, but kept separate because it is
- *  not one. */
-const LOW_TRUST_SKIP_SOURCES = new Set([INTRODB_SINGLE_SOURCE]);
 
 /**
  * Name the song playing in each OP/ED window, from the MAL theme list.
@@ -496,102 +304,52 @@ function stampThemeSongs(
   });
 }
 
-/** Re-apply the user's CURRENT per-kind modes to a window list on its way
- *  out to `set_skip_windows`: drop kinds now switched off, recompute `auto`.
- *  Windows are built with the modes that were live when they were derived,
- *  which can be seconds earlier. Unknown kinds resolve to "off" and are
- *  dropped, but nothing upstream produces one (classifyChapterTitle and the
- *  AniSkip map both filter to op / mixed-op / ed / recap first). */
-function applySkipModes(
-  windows: PreparedWindow[],
-  modeFor: (kind: string) => "off" | "prompt" | "auto",
-): PreparedWindow[] {
-  return windows
-    .filter((w) => modeFor(w.type) !== "off")
-    .map((w) => {
-      const auto = GUESS_SKIP_SOURCES.has(w.source) || LOW_TRUST_SKIP_SOURCES.has(w.source)
-        ? false
-        : modeFor(w.type) === "auto";
-      return auto === w.auto ? w : { ...w, auto };
-    });
-}
-
 async function mergeChapterSkipWindows(
   existing: PreparedWindow[],
-  modeFor: (kind: string) => "off" | "prompt" | "auto",
+  modeFor: (kind: string) => SkipMode,
   /** Per-load token check from handlePlayStream. The poll below runs up to
    *  ~6 s, which is long enough for the file to have been replaced. Without
-   *  it the chapters read belong to the NEW file, get merged with the OLD
-   *  file's windows, and the result is stamped over the new file's own. */
+   *  it the chapters read belong to the NEW file and get merged with the OLD
+   *  file's windows. A stale merge resolves to null. */
   isStale?: () => boolean,
-  /** Last-mile decoration applied INSIDE `publish`, so it rides the one stamp
-   *  rather than needing a second write. Used to name the OP/ED song. It runs
-   *  after `applySkipModes` because a window dropped by a mode change must not
-   *  be looked up at all. */
-  decorate?: (windows: PreparedWindow[]) => Promise<PreparedWindow[]>,
-): Promise<PreparedWindow[]> {
-  // The ONE stamp per load (see the comment in finishWithChapters). Every
-  // exit below that still owns the load token has to go through here: the
-  // "no chapters" and "no derived windows" paths used to return without
-  // stamping, which with a single-stamp chain would leave a file with no
-  // chapters holding no windows at all.
-  const publish = async (
-    raw: PreparedWindow[],
-    note: string,
-  ): Promise<PreparedWindow[]> => {
-    if (isStale?.()) return raw;
-    // Modes are re-applied HERE, not at derivation time, so a mode change
-    // made while the chapter poll was running lands in the payload instead
-    // of being reverted by it.
-    const windows = decorate
-      ? await decorate(applySkipModes(raw, modeFor))
-      : applySkipModes(raw, modeFor);
-    if (isStale?.()) return raw;
-    try {
-      await invoke("set_skip_windows", { payload: { windows } });
-      const detail = windows.length === 0
-        ? "no windows"
-        : windows
-            .map((w) => `${w.type} ${Math.round(w.start)}-${Math.round(w.end)}s `
-                      + `${w.source}${w.auto ? " auto" : " prompt"}`)
-            .join(", ");
-      console.info(`[auraskip] ${note}: ${detail}`);
-    } catch (err) {
-      console.warn(`[auraskip] stamp failed (${note}): ${String(err)}`);
-    }
-    return windows;
-  };
-
+  /** Called once, the first time the poll reads a positive duration. The skip
+   *  chain starts the layered detector from here, so the detector does not
+   *  wait for the rest of the chapter poll. */
+  onDuration?: (duration: number) => void,
+): Promise<ChapterMerge | null> {
   // Wait for chapter-list to land. Demuxer parse can be slightly behind
   // duration; bail early once we see chapters, or after CONFIRM_EMPTY_READS
   // consecutive well-formed EMPTY lists once duration is known, or after ~6 s
-  // of attempts. The empty-list exit matters because this poll now gates the
-  // ONLY stamp of the load: a file with no chapters used to burn all ten
-  // ticks, and that idle time is auto-skip latency now, not free time. An
-  // empty read is only trusted once `duration > 0` (mpv has parsed headers,
-  // which is when chapters appear too) and only after a confirmation tick, so
-  // a container whose Chapters element trails duration slightly is still
-  // caught.
+  // of attempts. The empty-list exit matters because this poll gates the
+  // first stamp of the load: a file with no chapters used to burn all ten
+  // ticks. An empty read is only trusted once `duration > 0` (mpv has parsed
+  // headers, which is when chapters appear too) and only after a confirmation
+  // tick, so a container whose Chapters element trails duration slightly is
+  // still caught.
   //
   // CRITICAL: only read with `string` format. The earlier `node`-format
-  // attempt crashes the wrapper at `mpv_wrapper_get_property+0xa71` —
+  // attempt crashes the wrapper at `mpv_wrapper_get_property+0xa71`, the
   // same dispatch-table fault as the original `track-list/node` crash
-  // documented in lib.rs:591 (CLAUDE.md landmine #3 family). The
-  // try/catch here can't recover because the fault is a STATUS_ACCESS_
-  // VIOLATION inside the FFI call, not a JS exception. The string
-  // format goes through a different code path that's safe to call
-  // even while libmpv is still processing loadfile.
+  // (CLAUDE.md landmine #3 family). The try/catch here can't recover because
+  // the fault is a STATUS_ACCESS_VIOLATION inside the FFI call, not a JS
+  // exception. The string format goes through a different code path that's
+  // safe to call even while libmpv is still processing loadfile.
   const CONFIRM_EMPTY_READS = 3;
   const POLL_TICKS = 10;
   let chapters: MpvChapter[] | null = null;
   let duration = 0;
   let emptyReads = 0;
+  let durationAnnounced = false;
   for (let i = 0; i < POLL_TICKS; i += 1) {
     await new Promise((r) => setTimeout(r, 600));
-    if (isStale?.()) return existing;
+    if (isStale?.()) return null;
     try {
       duration = (await invoke<number | null>("get_property", { name: "duration", format: "double" })) ?? 0;
     } catch {}
+    if (!durationAnnounced && duration > 0) {
+      durationAnnounced = true;
+      try { onDuration?.(duration); } catch { /* the detector start is best-effort */ }
+    }
     try {
       const raw = await invoke<string | null>("get_property", { name: "chapter-list", format: "string" });
       if (typeof raw === "string" && raw.trim().length > 0) {
@@ -600,17 +358,13 @@ async function mergeChapterSkipWindows(
           chapters = parsed as MpvChapter[];
           // Chapters WITHOUT a duration are worse than waiting one more tick:
           // the span derivation below ends the last chapter at `duration || start`,
-          // so a duration of 0 collapses the final span (usually the Ending) to
-          // zero length and it is filtered out - the ED disappears and both
-          // positional heuristics, which are gated on `duration > 0`, sit out
-          // entirely. Keep polling for the duration, but accept chapters
-          // regardless on the last tick so a duration-less container is no
-          // worse off than before.
+          // so a duration of 0 collapses the final span to zero length. Keep
+          // polling for the duration, but accept chapters regardless on the
+          // last tick so a duration-less container is no worse off than before.
           if (chapters.length > 0 && (duration > 0 || i === POLL_TICKS - 1)) break;
           // Counted ONLY here, so a thrown invoke, a null / blank string or a
-          // parse failure never passes for "this file has no chapters". Reset
-          // on anything that is not a clean empty read so the three have to be
-          // CONSECUTIVE, which is what the early exit assumes.
+          // parse failure never passes for "this file has no chapters", and
+          // reset on anything else so the reads have to be CONSECUTIVE.
           if (chapters.length === 0 && duration > 0) {
             if ((emptyReads += 1) >= CONFIRM_EMPTY_READS) break;
           } else {
@@ -626,20 +380,21 @@ async function mergeChapterSkipWindows(
       emptyReads = 0;
     }
   }
+  if (isStale?.()) return null;
   // IntroDB rows are fetched before the file's duration is known, and a row
-  // recorded against a different cut must not land on this one. The duration
-  // is in hand now; every publish below goes out through this filtered list.
+  // recorded against a different cut must not land on this one.
   existing = fitIntroDbToDuration(existing, duration);
-  if (!chapters || chapters.length === 0) return publish(existing, "no chapters in file");
+  if (!chapters || chapters.length === 0) {
+    return { windows: existing, duration, note: "no chapters in file" };
+  }
 
   // Sort by start time so adjacent-chapter end derivation is stable.
   const sorted = [...chapters]
     .filter((c) => typeof c.time === "number")
     .sort((a, b) => (a.time ?? 0) - (b.time ?? 0));
 
-  // Derive [start,end) for every chapter once (MPV stores start only;
-  // end = next chapter's start, or duration for the last). Drop sub-
-  // MIN_WINDOW_SECONDS slivers (chapter-marker noise).
+  // Derive [start,end) for every chapter once (end = next chapter's start, or
+  // duration for the last). Drop sub-MIN_WINDOW_SECONDS slivers.
   const spans = sorted
     .map((c, i) => {
       const start = c.time ?? 0;
@@ -649,36 +404,31 @@ async function mergeChapterSkipWindows(
     .filter((s) => s.end > s.start + MIN_WINDOW_SECONDS);
 
   const derived: PreparedWindow[] = [];
-  // Any-overlap guard (vs AniSkip `existing` AND already-derived) —
-  // used for the heuristic windows so a guess can never double-stamp
-  // a region a precise source already owns.
+  // Any-overlap guard (vs `existing` AND already-derived), used for the
+  // heuristic windows so a guess can never double-stamp a region a precise
+  // source already owns.
   const free = (start: number, end: number): boolean =>
     !existing.some((e) => windowOverlapFraction(start, end, e.start, e.end) > 0.0001) &&
     !derived.some((d) => windowOverlapFraction(start, end, d.start, d.end) > 0.0001);
 
-  // 1. TITLED chapters — honour the user's per-kind mode (may be auto).
-  //    Length-capped so a mis-titled monster chapter can't nuke real
-  //    content. A "Preview"/"Next episode" chapter only counts as an
-  //    ending when it actually sits in the outro region.
+  // 1. TITLED chapters: honour the user's per-kind mode (may be auto, except
+  //    a preview, which is prompt-only by construction). Length-capped so a
+  //    mis-titled monster chapter can't nuke real content. A "Preview" /
+  //    "Next episode" chapter only counts when it actually sits in the outro
+  //    region (an EARLY "Preview" chapter is story, not a preview).
   for (const s of spans) {
     const kind = classifyChapterTitle(s.title);
     if (!kind) continue;
     if (modeFor(kind) === "off") continue;
     const len = s.end - s.start;
     if (len > (kind === "ed" ? ED_MAX_SECONDS : TITLED_OP_MAX_SECONDS)) continue;
-    const lower = s.title.toLowerCase();
-    const isPreviewish =
-      /\b(preview|next episode|next time|coming up)\b/.test(lower) &&
-      !/\b(ending|outro|closing|credits|epilogue)\b/.test(lower);
     if (
-      kind === "ed" && isPreviewish && duration > 0 &&
+      kind === "preview" && duration > 0 &&
       s.start < duration * (1 - OUTRO_FRACTION) - 1
-    ) continue; // a stray EARLY "Preview" is not an outro
-    // Always add the titled chapter — cross-source overlap (incl. vs AniSkip)
-    // is resolved centrally by dedupeSkipWindows, which now PREFERS the
-    // encoder-set chapter. The old "drop the chapter when AniSkip covers this
-    // region" guard here contradicted that (it kept the less-reliable AniSkip
-    // window), so it's gone.
+    ) continue;
+    // Always add the titled chapter: cross-source overlap (incl. vs AniSkip)
+    // is resolved centrally by dedupeSkipWindows, which PREFERS the
+    // encoder-set chapter over every crowd source (and Layer 1 over it).
     derived.push({
       type:   kind,
       start:  s.start,
@@ -688,14 +438,13 @@ async function mergeChapterSkipWindows(
     });
   }
 
-  // 2. PROLOGUE FIX — when nothing (AniSkip or titled chapter) gave us
-  //    an OP, pick the untitled chapter in the leading INTRO_FRACTION
-  //    whose length is closest to the ~90 s industry-standard OP
-  //    (tie → the LATER chapter, so a short cold-open prologue loses
-  //    to the real OP). Prompt-only — never auto-skip a guess.
+  // 2. PROLOGUE FIX: when nothing gave us an OP, pick the untitled chapter in
+  //    the leading INTRO_FRACTION whose length is closest to the ~90 s
+  //    industry-standard OP (tie -> the LATER chapter, so a short cold-open
+  //    prologue loses to the real OP). Prompt-only: never auto-skip a guess.
   if (duration > 0 && modeFor("op") !== "off") {
     const hasOp =
-      existing.some((e) => e.type === "op" || e.type === "mixed-op") ||
+      existing.some((e) => skipKindGroup(e.type) === "op") ||
       derived.some((d) => d.type === "op");
     if (!hasOp) {
       const introLimit = duration * INTRO_FRACTION;
@@ -718,19 +467,22 @@ async function mergeChapterSkipWindows(
     }
   }
 
-  // 3. Untitled OUTRO — exactly one untitled chapter wholly inside the
-  //    trailing OUTRO_FRACTION, ≥20 s, when nothing else gave an ED.
-  //    Prompt-only. The "exactly one" gate keeps multi-part credits /
-  //    post-credit scenes from being mis-skipped.
+  // 3. Untitled OUTRO: exactly one untitled chapter wholly inside the
+  //    trailing OUTRO_FRACTION, >= 20 s, when nothing else gave an ED.
+  //    Prompt-only. NEVER the last chapter when it runs to the end of the
+  //    file: an untitled final chapter can hold the ending AND an
+  //    after-credits scene AND a preview, and an ED ending at EOF is exactly
+  //    how those were skipped.
   if (duration > 0 && modeFor("ed") !== "off") {
     const hasEd =
-      existing.some((e) => e.type === "ed") || derived.some((d) => d.type === "ed");
+      existing.some((e) => skipKindGroup(e.type) === "ed") || derived.some((d) => d.type === "ed");
     if (!hasEd) {
       const outroStart = duration * (1 - OUTRO_FRACTION);
       const outroCands = spans.filter(
         (s) =>
           classifyChapterTitle(s.title) === null &&
           s.start >= outroStart &&
+          s.end < duration - 1 &&
           s.end - s.start >= 20 &&
           s.end - s.start <= ED_MAX_SECONDS,
       );
@@ -744,13 +496,15 @@ async function mergeChapterSkipWindows(
     }
   }
 
-  if (derived.length === 0) return publish(existing, "chapters yielded no windows");
-
+  if (derived.length === 0) {
+    return { windows: existing, duration, note: "chapters yielded no windows" };
+  }
   const merged = dedupeSkipWindows([...existing, ...derived]);
-  return publish(
-    merged,
-    `merged ${derived.length} chapter window(s) → total ${merged.length}`,
-  );
+  return {
+    windows: merged,
+    duration,
+    note: `merged ${derived.length} chapter window(s), total ${merged.length}`,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -759,7 +513,7 @@ async function mergeChapterSkipWindows(
 // for live-action series; a best-effort fallback for anime. Maps the
 // Rust `PublicmetadbSkips` payload into `PreparedWindow`s, dropping any
 // kind the user has switched off. Network / parse failure → empty list
-// (the caller falls through to chapters / silencedetect).
+// (the caller falls through to chapters / the skip detector).
 // ---------------------------------------------------------------------------
 async function fetchPublicmetadbWindows(
   tmdbId:    number,
@@ -1579,10 +1333,15 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
       // no way to pause in the last EOS_TAIL_SECONDS at all.
       const userAskedToPause =
         Date.now() - pauseRequestedAtRef.current < USER_PAUSE_GRACE_MS;
+      // Against the MEDIA end when the detector read one (nextUpGate.ts
+      // `eosEnd`): a container can run ~29 s past its media (Spy x Family E2),
+      // and keep-open then stops far outside this tail of `duration`. Only
+      // here and in the stale / eof detectors, which need playback to have
+      // STOPPED; the live near-end tick above keeps the container duration.
       const pausedNearEnd =
         _isPaused && !prevPayloadPaused &&
         lastKnownT > 0 && lastKnownD > 0 &&
-        lastKnownD - lastKnownT <= EOS_TAIL_SECONDS;
+        eosEnd(lastKnownD) - lastKnownT <= EOS_TAIL_SECONDS;
       if (pausedNearEnd && userAskedToPause) {
         // Hand the decision to the latch: the stale-time detector in the 1 s
         // poll fires ~1.5 s later, long after this timestamp grace expires.
@@ -1748,7 +1507,10 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
       if (!firstFrameSeen) return;
       const staleFor = Date.now() - last;
       const { time: t, duration: d } = lastPosRef.current;
-      const nearEnd = t > 0 && d > 0 && d - t <= EOS_TAIL_SECONDS;
+      // The detected media end when known (see the keep-open branch): with a
+      // container longer than its media the heartbeat stops ~29 s short of
+      // `duration`, which used to read as a broken stream.
+      const nearEnd = t > 0 && d > 0 && eosEnd(d) - t <= EOS_TAIL_SECONDS;
       // Truncated stream whose heartbeat has stopped: the cached runway is
       // spent. This is the TERMINAL state of the failure - mpv played out
       // everything it had, hit its latched EOF, and `keep-open-pause=yes`
@@ -1915,7 +1677,7 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
         // keep-open changes or the playlist gains a second entry - and an
         // ungated one is exactly how a premature EOF would fake an end card.
         const { time: eofT, duration: eofD } = lastPosRef.current;
-        if (eofD > 0 && eofD - eofT > EOS_TAIL_SECONDS) {
+        if (eofD > 0 && eosEnd(eofD) - eofT > EOS_TAIL_SECONDS) {
           console.warn(
             `[eos] ignoring end-file eof at ${eofT.toFixed(0)}s of ${eofD.toFixed(0)}s `
             + `- too far from the end to be a completion`,
@@ -2035,6 +1797,8 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
     lastCachePctAtRef.current = 0;
     nearEndEosFiredRef.current = false;
     userPausedNearEndRef.current = false;
+    // The previous file's detected media end must not shorten this one's.
+    setDetectedMediaEnd(null);
     watchedElapsedRef.current = 0;
     watchedElapsedLastTimeRef.current = 0;
     // A fresh loadfile is the ONLY thing that can clear a truncation: mpv
@@ -3220,13 +2984,18 @@ export default function App() {
           skipChainSeqRef.current += 1;
           const skipSeq = skipChainSeqRef.current;
           const stale = () => skipChainSeqRef.current !== skipSeq;
-          // The ED start belongs to the FILE, not to the target id. The
-          // next-up reset effect is keyed on `activeTarget?.id` on purpose (see
-          // its comment), so an EOS Replay, a recovery reload or an in-player
-          // source switch all re-run loadfile without clearing it and the
-          // previous release's credits position would keep timing the card.
-          // The load token is the right lifetime, so clear it here.
-          nextUpEdStartRef.current = null;
+          // The ED end and the media end belong to the FILE, not to the target
+          // id. The next-up reset effect is keyed on `activeTarget?.id` on
+          // purpose (see its comment), so an EOS Replay, a recovery reload or an
+          // in-player source switch all re-run loadfile without clearing them
+          // and the previous release's credits position would keep timing the
+          // card. The load token is the right lifetime, so clear them here.
+          nextUpTimingRef.current = { trustedEdEnd: null, mediaEnd: null };
+          setDetectedMediaEnd(null);
+          // A detector still reading the PREVIOUS file must stop now (its
+          // ffmpeg is killed and anything it would still publish is dropped).
+          // Every load, including a movie or a channel, which run no detector.
+          void invoke("skip_detect", { action: { op: "cancel" } }).catch(() => {});
           (async () => {
             // Reset first so non-anime / no-data cases don't leave
             // stale windows from the previous load.
@@ -3261,63 +3030,81 @@ export default function App() {
               return;
             }
             // Modes are read through a REF, not captured. This chain now spans
-            // the whole chapter poll (and a silencedetect pass after it), and
+            // the whole chapter poll (and the layered detector after it), and
             // the AniSkip menu's mode pills are reachable that entire time. A
             // snapshot meant `restampSkipModes` applied the user's change to
             // the cached payload and the chain's own stamp then silently
             // reverted it. Both writers read the same ref, so the last write
             // wins with the CURRENT settings either way.
             skipModesRef.current = { op: opMode, ed: edMode, recap: recapMode };
-            const modeFor = (kind: string): "off" | "prompt" | "auto" => {
-              const m = skipModesRef.current;
-              return kind === "op" || kind === "mixed-op" ? m.op
-                : kind === "ed"    ? m.ed
-                : kind === "recap" ? m.recap
-                : "off";
-            };
+            // `preview` is hard-coded inside skipModeForKind (prompt, or off
+            // when the ED mode is off); the re-stamp effect uses the same one.
+            const modeFor = (kind: string): SkipMode =>
+              skipModeForKind(kind, skipModesRef.current);
 
-            // Tail used by EVERY exit below: stamp any AniSkip windows
-            // (empty for live-action / AniSkip-miss), then ALWAYS run
-            // the chapter augment so titled chapters + the positional
-            // heuristic still produce skip windows, then surface the
-            // ED start for the Next-Up CTA. This is what extends skip
-            // from anime-only to any series.
+            // Tail used by EVERY exit below: merge the crowd / authored windows
+            // (AniSkip, IntroDB, PublicMetaDB; empty for a miss) with the
+            // file's chapters, run the layered detector (skip_detect), and own
+            // every stamp of the load. This is what extends skip from
+            // anime-only to any series.
             const finishWithChapters = async (
               prepared: PreparedWindow[],
-              opts?: {
-                silenceUrl?: string | null;
-                /** Set on the anime path only - lets the ED/OP gap be filled
-                 *  from this series' OTHER episodes before any ffmpeg runs. */
+              opts: {
+                streamUrl: string | null;
+                /** The title is anime (drives the detector's "no MAL id"
+                 *  counter and nothing else). */
+                isAnime: boolean;
+                /** Set on the anime path only: the cour's MAL id. With it the
+                 *  detector runs on EVERY episode (Layer 1, the AnimeThemes
+                 *  match), not only when another source left a gap, so its
+                 *  3 s conflict drop can remove a wrong crowd window. */
                 malId?: number | null;
+                /** Where the MAL id came from, for the detector's log. */
+                malSource?: string | null;
                 episodeNum?: number | null;
                 treatMixed?: boolean;
               },
             ): Promise<void> => {
+              // A duration mpv reports only AFTER the chapter poll gave up (a
+              // slow debrid open can outlast its ~6 s): without it the detector
+              // never started. Read from the playback-update events, never a
+              // get_property poll, and registered BEFORE the poll so a value that
+              // lands between the poll's last read and the wait below is kept.
+              // Bounded by LATE_DURATION_WAIT_MS and always unlistened.
+              const LATE_DURATION_WAIT_MS = 75_000;
+              let lateDuration = 0;
+              let wakeOnDuration: (() => void) | null = null;
+              let stopDurationWatch: (() => void) | null = null;
               try {
-                // ONE stamp per load, and it happens inside
-                // mergeChapterSkipWindows. There used to be a pre-merge stamp
-                // of `prepared` here, and it was live for the seconds the
-                // chapter poll takes - long enough to auto-seek against a
-                // window a higher-trust source was about to discard. Hell's
-                // Paradise S02E06: AniSkip's op 0-158 s was stamped at t+0.6 s,
-                // SkipController's `ready` gate (duration > 0) opened at t+4.5 s
-                // with the playhead still at 0 and auto-skipped to 2:38, and the
-                // chapter merge replaced that window 112 ms later. The user was
-                // yanked past a 59 s cold open by a window the UI never showed.
-                // Publishing only the final list makes displayed == skipped by
-                // construction. The stamp it replaced was also the one write in
-                // this chain with no `stale()` guard, so a slow chain could put
-                // the previous episode's windows on the current file.
-                //
-                // Cost: auto-skip waits for the chapter poll to settle. Both
-                // of its exits key on the demuxer having parsed headers, which
-                // is the same event that opens SkipController's `ready` gate:
-                // a chaptered file settles within one 600 ms tick of it, a
-                // chapterless one within CONFIRM_EMPTY_READS ticks (~1.8 s),
-                // and the hard ceiling is the poll's own 10 x 600 ms. So the
-                // worst case is a couple of seconds of opening before the
-                // seek, against the old worst case of instantly seeking to
-                // the wrong place.
+                stopDurationWatch = await listen<PlaybackPayload>("playback-update", ({ payload }) => {
+                  const d = payload?.duration;
+                  if (typeof d === "number" && Number.isFinite(d) && d > 0) {
+                    lateDuration = d;
+                    wakeOnDuration?.();
+                  }
+                });
+              } catch { /* no late duration then: the wait below just ends */ }
+              const endDurationWatch = (): void => {
+                const stop = stopDurationWatch;
+                stopDurationWatch = null;
+                wakeOnDuration?.();
+                stop?.();
+              };
+              const waitForLateDuration = (): Promise<number> => new Promise((resolve) => {
+                if (lateDuration > 0 || stopDurationWatch == null) { resolve(lateDuration); return; }
+                let timer = 0;
+                let staleTick = 0;
+                const done = (): void => {
+                  window.clearTimeout(timer);
+                  window.clearInterval(staleTick);
+                  wakeOnDuration = null;
+                  resolve(lateDuration);
+                };
+                wakeOnDuration = done;
+                timer = window.setTimeout(done, LATE_DURATION_WAIT_MS);
+                staleTick = window.setInterval(() => { if (stale()) done(); }, 1000);
+              });
+              try {
                 // Theme songs for this cour, fetched at most once per load and
                 // only for anime (`opts.malId` is set on the anime path only,
                 // so live action never pays for it). It rides the cached
@@ -3329,7 +3116,7 @@ export default function App() {
                 const ensureThemes = async (): Promise<AnimeThemes | null> => {
                   if (themesFetched) return themes;
                   themesFetched = true;
-                  if (!opts?.malId) return null;
+                  if (!opts.malId) return null;
                   try {
                     themes = await invoke<AnimeThemes | null>(
                       "fetch_anime_themes", { malId: opts.malId },
@@ -3339,117 +3126,303 @@ export default function App() {
                   }
                   return themes;
                 };
-                // Passed INTO the merge so the song names ride the one stamp.
-                // They used to be applied only in `republish` below, which was
-                // wrong in a way that made the feature look like it worked:
-                // all three republish call sites are gated on a MISSING window
-                // (neighbour fill, silencedetect OP, outro scan), so an episode
-                // where AniSkip supplied both an OP and an in-band ED reached
-                // none of them and never got a name. The feature was live only
-                // where the skip data was WORST.
                 const nameSongs = async (
                   windows: PreparedWindow[],
                 ): Promise<PreparedWindow[]> => {
-                  if (!opts?.malId) return windows;
+                  if (!opts.malId) return windows;
                   return stampThemeSongs(
-                    windows, await ensureThemes(), opts?.episodeNum ?? null,
+                    windows, await ensureThemes(), opts.episodeNum ?? null,
                   );
                 };
-                // Warm it NOW, concurrently with the chapter poll, rather than
-                // letting `nameSongs` be the first caller. That await sits
-                // directly in front of the one `set_skip_windows` write, and
-                // that write is what arms auto-skip, so a cold fetch there
-                // would push the skip later by a whole round-trip for no
-                // reason. The chapter poll takes ~0.6-6 s and this is a cached
-                // lookup, so by the time publish runs it has almost always
-                // already resolved. Fire-and-forget: `ensureThemes` memoises
-                // and swallows its own errors, and nothing downstream needs
-                // this promise.
+                // Warm it NOW, concurrently with the chapter poll: the first
+                // stamp awaits it, and that stamp is what arms auto-skip.
                 void ensureThemes();
 
-                // `published` is the list currently stamped on the file. Every
-                // later writer below extends THIS, never `merged`: the ED
-                // fallback used to be the only other writer and it did not
-                // stamp at all, so rebuilding from the merge result was
-                // harmless. Now that both fallbacks stamp, building either
-                // from the pre-fallback list would silently drop the other's
-                // window.
-                let published = await mergeChapterSkipWindows(
-                  prepared, modeFor, stale, nameSongs,
-                );
-                if (stale()) return;
-                // The container duration, which the chapter poll has already
-                // waited for. Needed to decide whether an ED window sits in the
-                // plausible outro band, and to give an inferred ED an END.
-                let fileDuration = 0;
-                try {
-                  fileDuration = (await invoke<number | null>(
-                    "get_property", { name: "duration", format: "double" },
-                  )) ?? 0;
-                } catch {}
-                if (stale()) return;
-                // Publish + report in one place so every writer below leaves
-                // the same trace, and `published` can never drift from what is
-                // actually stamped.
-                // Every writer below is on the far side of a network call or an
-                // ffmpeg pass, so the stale check belongs HERE rather than at
-                // each call site: one place that cannot be forgotten, and the
-                // one thing this chain must never do is stamp the previous
-                // episode's windows onto the current file.
-                const republish = async (
-                  next: PreparedWindow[], note: string,
-                ): Promise<void> => {
-                  if (stale()) return;
-                  const songs = await ensureThemes();
-                  if (stale()) return;
-                  const windows = stampThemeSongs(
-                    applySkipModes(dedupeSkipWindows(next), modeFor),
-                    songs,
-                    opts?.episodeNum ?? null,
+                // ── State for this load ──
+                // `base` is the crowd / authored / chapter list (null until the
+                // chapter poll settles); `det` holds the detector's current
+                // windows and media end. Every stamp is computed from both, so
+                // a detector refinement replaces its own window instead of
+                // stacking a second one, and a window Layer 1 dropped is not
+                // lost for good if Layer 1 changes its mind.
+                let base: PreparedWindow[] | null = null;
+                const det: {
+                  op: PreparedWindow | null;
+                  ed: PreparedWindow | null;
+                  mediaEnd: number | null;
+                } = { op: null, ed: null, mediaEnd: null };
+                let published: PreparedWindow[] = [];
+                let lastTiming = "";
+                // The Next-Up gate's inputs: a TRUSTED ending's end (Layer 1
+                // only; never a crowd, chapter or Layer 3 window) and the media
+                // end. Announced after every stamp, only when they changed.
+                const announceTiming = (): void => {
+                  const l1Ed = published.find(
+                    (w) => skipKindGroup(w.type) === "ed" && w.source === LAYER1_SOURCE,
                   );
-                  await invoke("set_skip_windows", { payload: { windows } });
-                  published = windows;
-                  // Report what is now STAMPED, not what was handed in: dedupe
-                  // can drop the very window the note is announcing, and a log
-                  // line claiming a window the scrubber is not drawing is the
-                  // same class of mismatch this whole chain exists to remove.
-                  console.info(
-                    `[auraskip] ${note} | now: ` + (windows.length === 0
-                      ? "no windows"
-                      : windows.map((w) =>
-                          `${w.type} ${Math.round(w.start)}-${Math.round(w.end)}s `
-                          + `${w.source}${w.auto ? " auto" : " prompt"}`).join(", ")),
-                  );
-                };
-                // Start of the ending → precisely-timed Next-Up CTA. Re-derived
-                // after every writer below, so the card is always timed off a
-                // window the scrubber is actually drawing.
-                let edStart = edTriggerStart(published, fileDuration);
-                const announceEd = (): void => {
-                  const next = edTriggerStart(published, fileDuration);
-                  if (next == null || next === edStart) return;
-                  edStart = next;
-                  window.dispatchEvent(new CustomEvent<number>("aura:ed-start-time", { detail: next }));
-                };
-                if (edStart != null) {
-                  window.dispatchEvent(new CustomEvent<number>("aura:ed-start-time", {
-                    detail: edStart,
+                  const timing: NextUpTiming = {
+                    trustedEdEnd: l1Ed ? l1Ed.end : null,
+                    mediaEnd: det.mediaEnd,
+                  };
+                  const key = `${timing.trustedEdEnd}|${timing.mediaEnd}`;
+                  if (key === lastTiming) return;
+                  lastTiming = key;
+                  window.dispatchEvent(new CustomEvent<NextUpTiming>("aura:next-up-timing", {
+                    detail: timing,
                   }));
-                }
+                };
+                // THE stamp. Serialised, so two detector updates landing
+                // together cannot interleave their writes, and gated on the
+                // load token: the one thing this chain must never do is stamp
+                // the previous episode's windows onto the current file. Modes
+                // are re-applied HERE (through the ref), so a mode change made
+                // while the chain was running lands instead of being reverted.
+                //
+                // Nothing is stamped before the chapter poll settles. A
+                // pre-merge stamp was once live for the seconds the poll takes,
+                // long enough to auto-seek against a window a higher-trust
+                // source was about to discard (Hell's Paradise S02E06: AniSkip's
+                // op 0-158 s yanked the user past a 59 s cold open).
+                let stampQueue: Promise<void> = Promise.resolve();
+                const stamp = (note: string): Promise<void> => {
+                  stampQueue = stampQueue.then(async () => {
+                    if (stale() || base == null) return;
+                    // Layer 3 is a last resort: a continuity window never joins a
+                    // kind AniSkip, IntroDB, PublicMetaDB or a chapter already
+                    // supplied (computed here, so a later neighbour-profile OP in
+                    // `base` suppresses a continuity OP too). Layer 1 always
+                    // passes, so its 3 s conflict drop keeps working.
+                    const covered = new Set(base.map((w) => skipKindGroup(w.type)));
+                    const detected = [det.op, det.ed].filter(
+                      (w): w is PreparedWindow => w != null
+                        && !(w.source === CONTINUITY_SOURCE && covered.has(skipKindGroup(w.type))),
+                    );
+                    const deduped = dedupeSkipWindowsDetailed([...base, ...detected]);
+                    const merged = clampWindowsToMediaEnd(deduped.kept, det.mediaEnd);
+                    const windows = await nameSongs(applySkipModes(merged, modeFor));
+                    // AniSkip rows a Layer 1 window replaced: shown in the AuraSkip
+                    // menu for voting only. They travel in `superseded`, which the
+                    // Lua script and the SkipController never read, so they can
+                    // never seek or prompt.
+                    const superseded = deduped.superseded
+                      .filter((w) => modeFor(w.type) !== "off")
+                      .map((w) => ({ ...w, auto: false }));
+                    if (stale()) return;
+                    try {
+                      await invoke("set_skip_windows", { payload: { windows, superseded } });
+                    } catch (err) {
+                      console.warn(`[auraskip] stamp failed (${note}): ${String(err)}`);
+                      return;
+                    }
+                    published = windows;
+                    // Report what is now STAMPED, not what was handed in: dedupe
+                    // can drop the very window the note is announcing.
+                    console.info(
+                      `[auraskip] ${note} | now: ` + (windows.length === 0
+                        ? "no windows"
+                        : windows.map((w) =>
+                            `${w.type} ${Math.round(w.start)}-${Math.round(w.end)}s `
+                            + `${w.source}${w.auto ? " auto" : " prompt"}`).join(", ")),
+                    );
+                    announceTiming();
+                  });
+                  return stampQueue;
+                };
 
-                // ── Gap fill #1: this series' OTHER episodes ──
-                // AniSkip coverage is per-episode and patchy (Hell's Paradise
-                // S02 has an ED on 6 of 13 episodes), but an ending does not
-                // move between episodes of one cour. Borrowing the neighbours'
-                // median is both more accurate and far cheaper than the ffmpeg
-                // passes below, so it runs FIRST and can spare them entirely.
-                // Prompt-only by construction (`aniskip-neighbour` is in
-                // GUESS_SKIP_SOURCES) and drawn on the scrubber like anything
-                // else, so the inference is visible rather than implied.
+                // ── The layered detector (Rust skipdetect/) ──
+                // Probe, then ONE sequential HEAD pass (0-600 s), then TAIL (the
+                // last 480 s of media), one detector ffmpeg at a time, all off
+                // the engine thread. Layer 1 (AnimeThemes theme match, high
+                // trust) publishes an OP the moment it is accepted, usually
+                // while HEAD is still decoding; Layer 3 (loudness continuity)
+                // is prompt-only. A per-file result cache makes a repeat play
+                // instant. Gated by the autoSkipDetect setting (default on).
+                const url = opts.streamUrl;
+                const autoDetect = loadAuraSettings().autoSkipDetect !== false;
+                let detectRun: Promise<void> | null = null;
+                const toWindow = (
+                  kind: "op" | "ed",
+                  w: SkipDetectWindow,
+                ): PreparedWindow => ({
+                  type: kind,
+                  start: w.start,
+                  end: w.end,
+                  // A Layer 1 match that is not auto-eligible (an opening whose
+                  // theme overlaps the scene) keeps its location trust but is
+                  // stamped under a prompt-only source, so the mid-play
+                  // re-stamp cannot re-arm it either.
+                  source: w.source === LAYER1_SOURCE
+                    ? (w.auto_eligible ? LAYER1_SOURCE : LAYER1_PROMPT_SOURCE)
+                    : w.source === CONTINUITY_SOURCE ? CONTINUITY_SOURCE : w.source,
+                  auto: modeFor(kind) === "auto",
+                });
+                const applySnapshot = (s: SkipDetectSnapshot, note: string): void => {
+                  if (stale()) return;
+                  det.op = s.op ? toWindow("op", s.op) : null;
+                  det.ed = s.ed ? toWindow("ed", s.ed) : null;
+                  if (s.media_end != null && Number.isFinite(s.media_end) && s.media_end > 0) {
+                    det.mediaEnd = s.media_end;
+                  }
+                  // The end-of-stream detectors take the value read at TAIL EOF,
+                  // else the probe's mapped-track DURATION tag; never the
+                  // container duration (a container can run ~29 s past its
+                  // media, and keep-open then stops outside the EOS tail).
+                  if (s.media_end_final && s.media_end != null) {
+                    setDetectedMediaEnd(s.media_end);
+                  } else if (s.media_end_probe != null) {
+                    setDetectedMediaEnd(s.media_end_probe);
+                  }
+                  void stamp(note);
+                };
+                const runDetect = async (
+                  duration: number, wantOpIn: boolean, wantEdIn: boolean,
+                ): Promise<void> => {
+                  if (!url || !(duration > 0)) return;
+                  // With detection switched off, or no kind left to detect, the
+                  // detect still runs PROBE-ONLY: one bounded ffmpeg probe (no
+                  // HEAD, no TAIL) for the mapped track's DURATION tag, which the
+                  // end-of-stream detectors need when the container runs past the
+                  // media (otherwise auto-advance stops on the last frame). It
+                  // never downloads ffmpeg for that.
+                  const wantOp = autoDetect && wantOpIn;
+                  const wantEd = autoDetect && wantEdIn;
+                  const probeOnly = !wantOp && !wantEd;
+                  const present = await runtimeDepPresent("ffmpeg.exe").catch(() => false);
+                  if (stale()) return;
+                  if (probeOnly) {
+                    if (!present) return;
+                  } else {
+                    // ffmpeg is an on-demand dep: ensure it ONCE (a one-time
+                    // ~97 MB download with a toast) before the detector runs, or
+                    // it would no-op for anyone who never fetched ffmpeg. Ensured,
+                    // not just checked for, so a bumped pin reaches everyone.
+                    const toast = (message: string) => window.dispatchEvent(
+                      new CustomEvent("aura:player-toast", { detail: { message } }),
+                    );
+                    if (!present) toast("Setting up automatic skip detection (one-time FFmpeg download)");
+                    let announced = !present;
+                    try {
+                      await ensureRuntimeDepOnce("ffmpeg.exe", () => {
+                        if (announced) return;
+                        announced = true;
+                        toast("Updating FFmpeg for automatic skip detection");
+                      });
+                    } catch {
+                      // Couldn't fetch it: skip_detect reports "unavailable".
+                    }
+                    if (stale()) return;
+                  }
+                  // Which generation is ours: a Cancel answers with the current
+                  // generation G and our Detect becomes G + 1. Intermediate
+                  // events are applied only for exactly that generation; the
+                  // Detect reply itself is authoritative either way (unless
+                  // superseded), so a raced generation only costs the early
+                  // publishes, never correctness.
+                  let expected = -1;
+                  try {
+                    const c = await invoke<SkipDetectReply>("skip_detect", { action: { op: "cancel" } });
+                    if (c.result === "cancelled") expected = c.generation + 1;
+                  } catch (e) {
+                    console.warn(`[skipdetect] cancel failed: ${String(e)}`);
+                    return;
+                  }
+                  if (stale()) return;
+                  const unlisten = await listen<SkipDetectSnapshot>("skipdetect-update", (ev) => {
+                    if (ev.payload?.generation !== expected) return;
+                    applySnapshot(ev.payload, "skip_detect update");
+                  });
+                  try {
+                    if (stale()) return;
+                    console.info(
+                      `[skipdetect] detect ${target.media_type ?? "?"}/${target.id} `
+                      + `op=${wantOp} ed=${wantEd}${probeOnly ? " (probe only: media end for end of stream)" : ""} `
+                      + `mal=${opts.malId ?? "none"}`
+                      + `${opts.malSource ? ` (${opts.malSource})` : ""} dur=${duration.toFixed(1)}`,
+                    );
+                    const reply = await invoke<SkipDetectReply>("skip_detect", {
+                      action: {
+                        op: "detect",
+                        url,
+                        stremio_id: target.id,
+                        media_type: target.media_type ?? null,
+                        addon: stream.addon_name || null,
+                        release: stream.filename ?? null,
+                        duration,
+                        mal_id: opts.malId ?? null,
+                        mal_source: opts.malSource ?? null,
+                        mal_episode: opts.episodeNum != null && Number.isFinite(opts.episodeNum)
+                          ? opts.episodeNum : null,
+                        anime: opts.isAnime,
+                        // Not `op` / `ed`: the action is tagged `op`.
+                        detect_op: wantOp,
+                        detect_ed: wantEd,
+                      },
+                    });
+                    if (reply.result !== "detected" || reply.superseded) return;
+                    const s = reply.snapshot;
+                    console.info(
+                      `[skipdetect] ${s.state}${s.from_cache ? " (cached)" : ""}: `
+                      + `op ${s.op ? `${s.op.start.toFixed(2)}-${s.op.end.toFixed(2)} ${s.op.source}` : `none (${s.op_note ?? "-"})`}, `
+                      + `ed ${s.ed ? `${s.ed.start.toFixed(2)}-${s.ed.end.toFixed(2)} ${s.ed.source}` : `none (${s.ed_note ?? "-"})`}, `
+                      + `media end ${s.media_end != null ? s.media_end.toFixed(2) : "?"}`
+                      + `${s.media_end_final ? "" : " (estimate)"}`,
+                    );
+                    applySnapshot(s, "skip_detect final");
+                  } catch (e) {
+                    console.warn(`[skipdetect] detect failed: ${String(e)}`);
+                  } finally {
+                    unlisten();
+                  }
+                };
+
+                // Anime with a MAL id: start the detector the moment the chapter
+                // poll sees a duration, for every kind the user has not switched
+                // off, regardless of what AniSkip or the chapters supplied.
+                const merge = await mergeChapterSkipWindows(
+                  prepared, modeFor, stale,
+                  (duration) => {
+                    if (opts.malId == null || detectRun) return;
+                    detectRun = runDetect(
+                      duration, modeFor("op") !== "off", modeFor("ed") !== "off",
+                    );
+                  },
+                );
+                if (!merge || stale()) return;
+                base = merge.windows;
+                let fileDuration = merge.duration;
+                await stamp(merge.note);
+                if (stale()) return;
+                // mpv had no duration for the whole chapter poll: wait (bounded)
+                // for the first playback-update that carries one, then start the
+                // detector exactly as the poll would have.
+                if (!(fileDuration > 0) && !detectRun && url) {
+                  const late = await waitForLateDuration();
+                  if (stale()) return;
+                  if (late > 0) {
+                    fileDuration = late;
+                    console.info(`[skipdetect] container duration ${late.toFixed(1)}s arrived after the chapter poll`);
+                    if (opts.malId != null) {
+                      detectRun = runDetect(late, modeFor("op") !== "off", modeFor("ed") !== "off");
+                    }
+                  } else {
+                    console.info(
+                      `[skipdetect] skipped: no container duration within ${LATE_DURATION_WAIT_MS / 1000}s`,
+                    );
+                  }
+                }
+                endDurationWatch();
+
+                // ── Gap fill: this series' OTHER episodes, OPENING only ──
+                // AniSkip coverage is per-episode and patchy, but an opening
+                // does not move much between episodes of one cour. Prompt-only
+                // (`aniskip-neighbour` is a guess source) and drawn on the
+                // scrubber. The ENDING borrow is retired: it created the phantom
+                // 1325-1414 ED inside TYBW 3:10's after-credits scene.
+                const hasKind = (g: string) =>
+                  (base ?? []).some((w) => skipKindGroup(w.type) === g);
                 if (
-                  opts?.malId != null && opts?.episodeNum != null
-                  && fileDuration > 0
-                  && (edStart == null || !published.some((w) => w.type === "op" || w.type === "mixed-op"))
+                  opts.malId != null && opts.episodeNum != null && Number.isFinite(opts.episodeNum)
+                  && fileDuration > 0 && !hasKind("op") && modeFor("op") !== "off"
                 ) {
                   try {
                     const profile = await invoke<{
@@ -3464,26 +3437,16 @@ export default function App() {
                     });
                     if (stale()) return;
                     const fill = profile.windows
-                      .filter((w) => modeFor(w.kind) !== "off")
-                      // Only fill genuine gaps: a window this file already has
-                      // from a source that describes THIS episode always wins.
-                      .filter((w) => (w.kind === "ed"
-                        ? edStart == null
-                        : !published.some((p) => p.type === "op" || p.type === "mixed-op")))
-                      // An inferred ED still has to land in the outro band.
-                      .filter((w) => w.kind !== "ed"
-                        || (fileDuration - w.start >= ED_TAIL_MIN_SECONDS
-                          && fileDuration - w.start <= ED_TAIL_MAX_SECONDS))
+                      .filter((w) => skipKindGroup(w.kind) === "op" && modeFor(w.kind) !== "off")
                       .map((w): PreparedWindow => ({
                         type: w.kind, start: w.start, end: Math.min(w.end, fileDuration),
                         source: w.source, auto: false,
                       }));
-                    if (fill.length > 0) {
-                      await republish(
-                        [...published, ...fill],
-                        `neighbour profile → ${fill.map((w) => `${w.type} ${Math.round(w.start)}-${Math.round(w.end)}s`).join(", ")} (${profile.note})`,
+                    if (fill.length > 0 && !hasKind("op")) {
+                      base = [...(base ?? []), ...fill];
+                      await stamp(
+                        `neighbour profile: ${fill.map((w) => `${w.type} ${Math.round(w.start)}-${Math.round(w.end)}s`).join(", ")} (${profile.note})`,
                       );
-                      announceEd();
                     } else {
                       console.info(`[auraskip] neighbour profile: nothing usable (${profile.note})`);
                     }
@@ -3491,173 +3454,30 @@ export default function App() {
                     console.warn(`[auraskip] neighbour profile failed: ${String(e)}`);
                   }
                 }
-                // Hybrid-mode auto OP fallback. Every series path passes
-                // `silenceUrl` (anime AND live-action): when NOTHING upstream
-                // produced an OP (no AniSkip data AND no titled/heuristic
-                // chapter OP), one bounded ffmpeg silencedetect pass infers the
-                // OP->dialogue boundary. Prompt-mode (auto:false): never
-                // auto-seek a guess. ffmpeg is ensured just below.
-                const url = opts?.silenceUrl ?? null;
-                const hasOp = published.some((w) => w.type === "op" || w.type === "mixed-op");
-                // Automatic skip detection (replaces the old manual "Detect Skip"
-                // button). When AniSkip + chapters miss the OP and/or the ED, a
-                // bounded ffmpeg silencedetect pass infers ONLY the missing
-                // segment (OP scan when no OP; ED tail-scan when no ED). ffmpeg is
-                // an on-demand dep, so ensure it ONCE (a one-time ~97 MB download
-                // with a toast) before either pass runs, otherwise the fallback
-                // silently no-ops for anyone who never fetched ffmpeg. Gated by
-                // the autoSkipDetect setting (default on).
-                const autoDetect = loadAuraSettings().autoSkipDetect !== false;
-                // Must mirror the two branch conditions below exactly, or the
-                // one-time ~97 MB download gets pulled for a pass that then
-                // does not run. The ED branch additionally needs a container
-                // duration, since that is what bounds its scan.
-                const willDetect = autoDetect && url != null
-                  && ((!hasOp && modeFor("op") !== "off")
-                    || (edStart == null && fileDuration > 0 && modeFor("ed") !== "off"));
-                // Ensured, not just checked for: a presence check let a copy
-                // from an older pin pass forever, so a bumped ffmpeg pin never
-                // reached anyone who already had one. Once per session, since
-                // ensuring re-hashes ~97 MB. The toast names a first download
-                // up front; a stale copy being replaced says so on its first
-                // progress event instead.
-                if (willDetect) {
-                  const present = await runtimeDepPresent("ffmpeg.exe").catch(() => false);
-                  const toast = (message: string) => window.dispatchEvent(
-                    new CustomEvent("aura:player-toast", { detail: { message } }),
-                  );
-                  if (!present) toast("Setting up automatic skip detection (one-time FFmpeg download)");
-                  let announced = !present;
-                  try {
-                    await ensureRuntimeDepOnce("ffmpeg.exe", () => {
-                      if (announced) return;
-                      announced = true;
-                      toast("Updating FFmpeg for automatic skip detection");
-                    });
-                  } catch {
-                    // Couldn't fetch it: the detect calls below no-op cleanly.
+                if (stale()) return;
+
+                // Everything else (live action, or anime with no MAL id): the
+                // detector runs only for a kind NOTHING else supplied, and what
+                // it finds there is Layer 3 (prompt-only), since Layer 1 needs
+                // the cour's MAL id.
+                if (opts.malId == null && !detectRun) {
+                  const wantOp = !hasKind("op") && modeFor("op") !== "off";
+                  const wantEd = !hasKind("ed") && modeFor("ed") !== "off";
+                  if ((wantOp || wantEd) && fileDuration > 0) {
+                    detectRun = runDetect(fileDuration, wantOp, wantEd);
                   }
                 }
-                if (autoDetect && url && !hasOp && modeFor("op") !== "off") {
-                  try {
-                    // Parallel, early-exit OP scan (Rust silencedetect).
-                    // Splits the first ~10 min into overlapping chunks, fans
-                    // out audio-only ffmpeg passes (bounded concurrency) and
-                    // returns the inferred OP / title-sequence window. This
-                    // replaces the old single 180 s pass + JS "dominant
-                    // silence in 30-180 s, OP-always-from-0" heuristic, which
-                    // could neither REACH nor REPRESENT a title card that
-                    // only lands 5-6 min in (e.g. The Punisher's cold-open-
-                    // then-credits structure). The window is stamped
-                    // auto:false (a detected guess never auto-seeks — Lua
-                    // shows an ignorable "Press X to skip" prompt instead),
-                    // so a wrong guess can't yank real content.
-                    const sd = await invoke<{
-                      available: boolean;
-                      intervals: { start: number; end: number; duration: number }[];
-                      op_window: { start: number; end: number } | null;
-                      note: string;
-                    }>("detect_silence_intervals", { url, maxSecs: 600 });
-                    if (stale()) return;
-                    if (sd.available && sd.op_window) {
-                      const opWin: PreparedWindow = {
-                        type: "op",
-                        start: Math.max(0, sd.op_window.start),
-                        end: sd.op_window.end,
-                        source: "silencedetect",
-                        auto: false,
-                      };
-                      // MERGE (not replace) so chapter ED windows already
-                      // stamped above survive. Modes are re-applied for the
-                      // same reason publish() does it: this write can land a
-                      // long way (an ffmpeg fetch + a 600 s scan) after the
-                      // modes were read.
-                      await republish(
-                        [...published, opWin],
-                        `silencedetect → OP ${Math.round(opWin.start)}-${Math.round(opWin.end)}s (${sd.note})`,
-                      );
-                    } else if (sd.available) {
-                      console.info(`[auraskip] silencedetect: no OP boundary (${sd.note})`);
-                    } else {
-                      console.info(`[auraskip] silencedetect unavailable (ffmpeg not on PATH)`);
-                    }
-                  } catch (e) {
-                    console.warn(`[auraskip] silencedetect scan failed: ${String(e)}`);
-                  }
+                // Nothing to detect (ED off, every kind already supplied, or
+                // detection switched off): still read the media end with a
+                // probe-only detect, for the end-of-stream detectors.
+                if (!detectRun && fileDuration > 0) {
+                  detectRun = runDetect(fileDuration, false, false);
                 }
-                // Hybrid-mode ED fallback, and the LAST resort. When nothing
-                // above produced an ending - no AniSkip ED, no titled or
-                // heuristic chapter ED, no usable neighbour - tail-scan the
-                // stream's last few minutes for the credits boundary (one
-                // bounded ffmpeg pass, blackdetect + silencedetect, NO 90x scan).
-                //
-                // Its result is now STAMPED as a prompt-only window instead of
-                // only timing the Next-Up card. The old behaviour is what the
-                // Hell's Paradise S02E11 report came down to: a boundary from
-                // the middle of the final act moved a visible card, and because
-                // nothing was drawn on the scrubber there was no way to see
-                // where the number had come from or that it was wrong. If it is
-                // trusted enough to change the UI it is trusted enough to show
-                // - the same rule the skip windows themselves now follow. The
-                // container duration gives it the end it used to lack.
-                if (autoDetect && url && edStart == null && modeFor("ed") !== "off"
-                    && !(fileDuration > 0)) {
-                  // Say so rather than going quiet: without a duration there is
-                  // nothing to anchor the scan window to and nothing to give
-                  // the stamped window as an end, so the Next-Up card falls back
-                  // to its fixed lead time.
-                  console.info("[auraskip] outro tail-scan skipped: no container duration");
-                }
-                if (
-                  autoDetect && url && edStart == null
-                  && fileDuration > 0 && modeFor("ed") !== "off"
-                ) {
-                  try {
-                    const ob = await invoke<{
-                      available: boolean;
-                      ed_start: number | null;
-                      note: string;
-                    }>("detect_outro_boundary", {
-                      url,
-                      // The scan window IS the acceptance band: 420 s reached
-                      // three minutes back into the final act and only ever
-                      // added false candidates for the check below to throw
-                      // away. Deriving it from the same constant keeps a scan
-                      // from producing answers the gate must reject.
-                      tailSecs: ED_TAIL_MAX_SECONDS,
-                      duration: fileDuration,
-                    });
-                    if (stale()) return;
-                    const tail = ob.ed_start != null ? fileDuration - ob.ed_start : null;
-                    if (
-                      ob.available && ob.ed_start != null && tail != null
-                      && tail >= ED_TAIL_MIN_SECONDS && tail <= ED_TAIL_MAX_SECONDS
-                    ) {
-                      await republish(
-                        [...published, {
-                          type: "ed", start: ob.ed_start, end: fileDuration,
-                          source: "silencedetect", auto: false,
-                        }],
-                        `outro tail-scan → ED ${Math.round(ob.ed_start)}-${Math.round(fileDuration)}s (${ob.note})`,
-                      );
-                      announceEd();
-                    } else if (ob.ed_start != null) {
-                      // Rejected rather than trusted: the Next-Up card falls
-                      // back to its fixed lead time, which is late but right.
-                      console.info(
-                        `[auraskip] outro tail-scan rejected ED≈${Math.round(ob.ed_start)}s, `
-                        + `${Math.round(tail ?? 0)}s before the end is outside `
-                        + `${ED_TAIL_MIN_SECONDS}-${ED_TAIL_MAX_SECONDS}s (${ob.note})`,
-                      );
-                    } else {
-                      console.info(`[auraskip] outro tail-scan: ${ob.note}`);
-                    }
-                  } catch (e) {
-                    console.warn(`[auraskip] outro tail-scan failed: ${String(e)}`);
-                  }
-                }
+                if (detectRun) await detectRun;
               } catch (err) {
                 console.warn(`[auraskip] finish/chapter merge failed: ${String(err)}`);
+              } finally {
+                endDurationWatch();
               }
             };
 
@@ -3769,14 +3589,20 @@ export default function App() {
             // stamps the AniList pair onto activeTarget only later.
             let courEpisode: number | null = null;
             const playingVideo = detail?.videos?.find((v) => v.id === target.id) ?? null;
+            // Where the cour MAL id came from, for the detector's log:
+            // "aiometadata" (the video's own pair), "anilist" (its AniList pair
+            // resolved), else "aniskip" (this pipeline's AniSkip resolution).
+            let malSource: string | null = null;
             if (playingVideo?.mal_id && playingVideo.mal_episode) {
               malId = playingVideo.mal_id;
               courEpisode = playingVideo.mal_episode;
+              malSource = "aiometadata";
             } else if (playingVideo?.anilist_id && playingVideo.anilist_episode) {
               const viaAnilist = await tryResolve("anilist", playingVideo.anilist_id);
               if (viaAnilist) {
                 malId = viaAnilist;
                 courEpisode = playingVideo.anilist_episode;
+                malSource = "anilist";
               }
             }
             if (malId) {
@@ -3876,7 +3702,7 @@ export default function App() {
               // publicmetadb is the PRIMARY skip source here — keyed by
               // the show's TMDB id + season/episode. It feeds
               // finishWithChapters as `prepared`, so chapters and the
-              // silencedetect heuristic only fill kinds it did not
+              // skip detector (Layer 3 here) only fill kinds it did not
               // supply. No publicmetadb data → empty list, and the
               // chapter path still runs so chaptered live-action keeps
               // producing windows.
@@ -3931,7 +3757,10 @@ export default function App() {
                   `(tmdb=${laTmdb} season=${laSeason} episode=${laEpisode}); chapter-only`,
                 );
               }
-              await finishWithChapters(await withIntroDb(pmdbWindows), { silenceUrl: stream.url ?? null });
+              await finishWithChapters(await withIntroDb(pmdbWindows), {
+                streamUrl: stream.url ?? null,
+                isAnime,
+              });
               return;
             }
             // Mal-id was resolved → this is an anime; mark for future
@@ -3970,8 +3799,17 @@ export default function App() {
             if (!Number.isFinite(episodeNum)) {
               // Can't index AniSkip without an episode number, but a
               // chaptered file can still yield skip windows.
-              console.info(`[aniskip] couldn't parse episode from ${target.id} — chapter-only`);
-              await finishWithChapters(await withIntroDb([]), { silenceUrl: stream.url ?? null });
+              // The MAL id still drives the detector's theme match (the episode
+              // number only ORDERS themes there, it is never a gate).
+              console.info(`[aniskip] couldn't parse episode from ${target.id}; no AniSkip lookup`);
+              await finishWithChapters(await withIntroDb([]), {
+                streamUrl: stream.url ?? null,
+                isAnime: true,
+                malId,
+                malSource: malSource ?? "aniskip",
+                episodeNum: null,
+                treatMixed,
+              });
               return;
             }
             console.info(
@@ -4052,17 +3890,14 @@ export default function App() {
               console.warn(`[publicmetadb] anime fallback failed: ${String(e)}`);
             }
             // ALWAYS augment with chapters (even on an empty AniSkip
-            // result): anime with no AniSkip data gets the same
-            // chapter / heuristic treatment as live-action. Passing
-            // `silenceUrl` arms the auto silencedetect OP fallback for
-            // this (MAL-resolved) path only — the no-mal / no-episode
-            // exits above intentionally don't, to avoid a heavy ffmpeg
-            // scan on every live-action open.
+            // result): anime with no AniSkip data gets the same chapter /
+            // heuristic treatment as live-action. With the MAL id, the layered
+            // detector runs on this episode whatever AniSkip supplied.
             await finishWithChapters(await withIntroDb(prepared), {
-              silenceUrl: stream.url ?? null,
-              // Anime path only: lets the neighbour profile fill an OP/ED gap
-              // from this series' other episodes before any ffmpeg pass runs.
+              streamUrl: stream.url ?? null,
+              isAnime: true,
               malId,
+              malSource: malSource ?? "aniskip",
               episodeNum,
               treatMixed,
             });
@@ -4498,7 +4333,10 @@ export default function App() {
         // below is exactly the case this has to survive. Ordering this after
         // it meant the chain's final stamp reverted the change every time.
         skipModesRef.current = { op: opMode, ed: edMode, recap: recapMode };
-        const cur = await invoke<{ windows?: Array<PreparedWindow & { skip_id?: string | null }> } | null>(
+        const cur = await invoke<{
+          windows?: Array<PreparedWindow & { skip_id?: string | null }>;
+          superseded?: Array<PreparedWindow & { skip_id?: string | null }>;
+        } | null>(
           "get_skip_windows",
         );
         const windows = Array.isArray(cur?.windows) ? cur!.windows! : [];
@@ -4506,14 +4344,13 @@ export default function App() {
         // The SAME helper the skip chain stamps through, so the two writers
         // cannot disagree about what a mode means. The inline map this replaced
         // recomputed `auto` from the kind alone, which re-armed auto-seek on
-        // every INFERRED window (chapter-heuristic, silencedetect,
+        // every INFERRED window (chapter-heuristic, continuity,
         // aniskip-neighbour) the moment any setting changed - undoing, on the
         // live payload, the rule that a guess never yanks the playhead.
-        const modeForKind = (kind: string): "off" | "prompt" | "auto" =>
-          kind === "op" || kind === "mixed-op" ? opMode
-          : kind === "ed"    ? edMode
-          : kind === "recap" ? recapMode
-          : "off";
+        // The SAME resolver as the chain's `modeFor`, so `preview` stays
+        // hard-coded (prompt, off with the ED) here too.
+        const modeForKind = (kind: string): SkipMode =>
+          skipModeForKind(kind, { op: opMode, ed: edMode, recap: recapMode });
         const remapped = applySkipModes(windows, modeForKind) as
           Array<PreparedWindow & { skip_id?: string | null }>;
         // Only re-push when the flags/count actually changed, so a theme or
@@ -4526,7 +4363,11 @@ export default function App() {
                return !prev || prev.auto !== w.auto;
              });
         if (!changed) return;
-        await invoke("set_skip_windows", { payload: { windows: remapped } });
+        // The AniSkip rows a Layer 1 window replaced ride along unchanged
+        // (display-only, never auto), minus kinds now switched off.
+        const superseded = (Array.isArray(cur?.superseded) ? cur!.superseded! : [])
+          .filter((w) => modeForKind(w.type) !== "off");
+        await invoke("set_skip_windows", { payload: { windows: remapped, superseded } });
         console.info(`[auraskip] re-stamped ${remapped.length} window(s) after skip-mode change`);
       } catch { /* best-effort — the next episode stamps fresh from settings anyway */ }
     };
@@ -4856,12 +4697,11 @@ export default function App() {
    *  (or determined there isn't one) for the active target, don't keep
    *  poking the addons every tick. Reset on activeTarget change. */
   const nextUpResolvedFor = useRef<string | null>(null);
-  /** ED-chapter START time in seconds, captured by the AniSkip /
-   *  chapter-merge flow inside handlePlayStream. When set, the
-   *  display gate fires the moment playback time crosses this value
-   *  — same instant the in-player "Skip ending? Press X" prompt
-   *  appears. Reset on activeTarget change. */
-  const nextUpEdStartRef = useRef<number | null>(null);
+  /** The Next-Up gate's inputs for the loaded FILE, announced by the skip
+   *  chain inside handlePlayStream (`aura:next-up-timing`): the end of a
+   *  TRUSTED ending (Layer 1 only) and the detector's media end. Read by the
+   *  display gate through nextUpGate.ts. Reset per load and on target change. */
+  const nextUpTimingRef = useRef<NextUpTiming>({ trustedEdEnd: null, mediaEnd: null });
   /** Display flag derived from the conditions above. Driving this
    *  through state (rather than computing inline at render) lets us
    *  log the transition once for debugging without spamming the
@@ -4937,17 +4777,20 @@ export default function App() {
     return () => window.removeEventListener("aura:eos-detected", onEos);
   }, [togglePause, isTrailerPlayback, isLivePlayback, setStreamBroken]);
 
-  // Listen for ED-start updates from the AniSkip pipeline. The event
-  // is dispatched from inside handlePlayStream's lookup IIFE.
+  // Listen for Next-Up timing from the skip chain. The event is dispatched
+  // from inside handlePlayStream's lookup IIFE after every stamp that changed it.
   useEffect(() => {
-    const onEdStart = (e: Event) => {
-      const detail = (e as CustomEvent<number>).detail;
-      if (typeof detail === "number" && Number.isFinite(detail) && detail > 0) {
-        nextUpEdStartRef.current = detail;
-      }
+    const finite = (v: unknown): number | null =>
+      typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+    const onTiming = (e: Event) => {
+      const d = (e as CustomEvent<NextUpTiming>).detail;
+      nextUpTimingRef.current = {
+        trustedEdEnd: finite(d?.trustedEdEnd),
+        mediaEnd: finite(d?.mediaEnd),
+      };
     };
-    window.addEventListener("aura:ed-start-time", onEdStart);
-    return () => window.removeEventListener("aura:ed-start-time", onEdStart);
+    window.addEventListener("aura:next-up-timing", onTiming);
+    return () => window.removeEventListener("aura:next-up-timing", onTiming);
   }, []);
 
   // Reset CTA state whenever the active EPISODE changes (new playback).
@@ -4955,8 +4798,8 @@ export default function App() {
   // absolute_episode_num enrichment below patches activeTarget in place
   // (same id, new object) AFTER load — for season>=2 anime — and an
   // in-player stream switch re-uses the same id too. Keying on the object
-  // would re-run this reset on those, wiping the just-dispatched ED-start
-  // (nextUpEdStartRef) and forcing a redundant next-up re-resolve, which
+  // would re-run this reset on those, wiping the just-dispatched ED timing
+  // (nextUpTimingRef) and forcing a redundant next-up re-resolve, which
   // made the Next-Up CTA fall back to the fixed lead-time instead of firing
   // at the detected ED in anime. It's still the canonical "new load"
   // boundary for the EOS Spotlight: every genuine new episode changes the id.
@@ -4966,7 +4809,7 @@ export default function App() {
     setEosActive(false);
     setAutoAdvanceCancelled(false);
     nextUpResolvedFor.current = null;
-    nextUpEdStartRef.current = null;
+    nextUpTimingRef.current = { trustedEdEnd: null, mediaEnd: null };
     // Don't reset nextUpDismissedFor here — App.tsx unmounts the
     // PlayerOverlay on exit which clears activeTarget; clearing the
     // dismiss ref on EVERY target change would re-show the CTA after
@@ -5056,12 +4899,14 @@ export default function App() {
     })();
   }, [activeTarget, time, duration, addons, nextUpLeadSeconds]);
 
-  // DISPLAY-GATE effect: flips the CTA on once the user has reached either
-  // the ED START mark (when one is known) or the lead-time window. Note START,
-  // not end: the card is meant to appear as the credits begin, which is the
-  // same instant the "Skip ending? Press X" prompt does. Waiting for the ED to
-  // END would put it on the last few seconds of the file, after the point where
-  // the plain lead time has already fired.
+  // DISPLAY-GATE effect. ONE expression, in nextUpGate.ts: with a TRUSTED
+  // ending (Layer 1) the card appears at max(ED end, end - lead), so never
+  // inside the ending and never over the story that follows it; without one,
+  // at end - lead. "end" is the detector's media end when known. A crowd,
+  // chapter or Layer 3 ED START is never a trigger: the card used to appear as
+  // the credits began and, with auto-advance on, left 5-30 s later, skipping
+  // every after-credits scene and preview. The card itself has NO countdown
+  // (NextUpCta.tsx); an unattended advance only happens at end of stream.
   useEffect(() => {
     if (!activeTarget) {
       if (nextUpVisible) setNextUpVisible(false);
@@ -5069,39 +4914,24 @@ export default function App() {
     }
     if (!nextUpInfo) return;
     if (nextUpDismissedFor.current === activeTarget.id) return;
-    const remaining = duration - time;
-    const edStart = nextUpEdStartRef.current;
-    // Sanity-gate the ED start against the SAME outro band the producer used
-    // (App.tsx `edTriggerStart`). Two independent checks rather than one: this
-    // gate used to be `edStart >= duration * 0.5`, which on a 24-minute episode
-    // accepts anything past 12 minutes and could not reject a single value the
-    // ffmpeg tail-scan was capable of producing.
-    const edTail = edStart != null ? duration - edStart : null;
-    const edTriggered =
-      edStart != null && edTail != null && duration > 0
-      && edTail >= ED_TAIL_MIN_SECONDS && edTail <= ED_TAIL_MAX_SECONDS
-      && time >= edStart && remaining > 0;
-    const leadTriggered =
-      nextUpLeadSeconds > 0 && duration > 0 && remaining <= nextUpLeadSeconds && remaining > 0;
-    // A truncated stream must not offer "next episode" either. `fireEos` gates
-    // the EOS Spotlight, but this card is an independent surface with its own
-    // unattended countdown, and `eosActive` is false here precisely BECAUSE
-    // the Spotlight was suppressed - so the mutual-exclusion gate in the JSX
-    // does not cover it. mpv's keep-open teleport parks the playhead a
-    // fraction of a second short of `duration`, which satisfies
-    // `leadTriggered` outright, and with auto-advance enabled the card would
-    // then skip to the next episode and cancel the recovery.
-    const shouldShow = (edTriggered || leadTriggered) && !streamTruncatedRef.current;
+    const timing = nextUpTimingRef.current;
+    // A truncated stream must not offer "next episode" either: `eosActive` is
+    // false precisely BECAUSE the Spotlight was suppressed, and mpv's keep-open
+    // teleport parks the playhead a fraction of a second short of `duration`,
+    // which satisfies the lead trigger outright.
+    const shouldShow = !streamTruncatedRef.current
+      && nextUpShouldShow(time, timing, duration, nextUpLeadSeconds);
     if (shouldShow) {
       if (!nextUpVisible) setNextUpVisible(true);
       return;
     }
     // Recoverable: seeking back out of the trigger region takes the card away
-    // again. It used to latch on for the rest of the episode, so a card that
-    // fired at the wrong moment could only be got rid of by dismissing it -
-    // which suppressed the real one at the end too. The margin keeps a scrub
-    // that lands a second short of the trigger from flickering it.
-    if (nextUpVisible && duration > 0 && remaining > nextUpLeadSeconds + 5) {
+    // again, but only past a margin BEFORE the trigger point, so a card raised
+    // at the ED end is never taken down by the lead-time arithmetic.
+    if (
+      nextUpVisible
+      && (streamTruncatedRef.current || nextUpShouldHide(time, timing, duration, nextUpLeadSeconds))
+    ) {
       setNextUpVisible(false);
     }
   }, [activeTarget, time, duration, nextUpInfo, nextUpLeadSeconds, nextUpVisible,
@@ -8669,6 +8499,12 @@ export default function App() {
   // PlayerOverlay's "Exit playback" button (and keybinding if configured).
   const handleExitPlayback = useCallback(async () => {
     autoAdvanceStreakRef.current = 0; // fresh start: reset the still-watching streak (#5)
+    // Stop the skip detector with the playback: retire this load's skip chain
+    // (its token) so nothing it still has in flight stamps, and cancel the
+    // detect so its ffmpeg passes stop reading the stream.
+    skipChainSeqRef.current += 1;
+    setDetectedMediaEnd(null);
+    void invoke("skip_detect", { action: { op: "cancel" } }).catch(() => {});
 
     flushProgress(session, writebackTarget.current);
     // Capture which episode the user just played BEFORE we clear
@@ -10545,29 +10381,17 @@ export default function App() {
           loading={false}
           noStream={nextUpInfo.stream == null}
           skipTag={nextUpInfo.canon ? formatEpisodeTag(nextUpInfo.canon.episode) : null}
-          // Routed through the EOS handlers, not the raw onNextUp* ones, so the
-          // still-watching streak has a writer on the path that actually fires
-          // during a binge. This card triggers a lead-time before the end of
-          // the file, so an unattended chain never reaches EOF and the
-          // Spotlight (previously the only surface that incremented the
-          // streak) never got a turn: the gate was dead code in exactly the
-          // scenario it exists for.
+          // Routed through the EOS handlers, not the raw onNextUp* ones, so a
+          // click here and a click on the Spotlight run the same path (and
+          // reset the still-watching streak the same way). This card has no
+          // countdown: the unattended advance is the Spotlight's, at EOS.
           onSkipToCanon={nextUpInfo.canon ? onEosSkipToCanon : undefined}
           // The canon episode itself, so the card can preview what a skip
           // would jump to on hover.
           canonEpisode={nextUpInfo.canon?.episode ?? null}
           skipCount={nextUpInfo.canon?.skipped.length ?? 0}
-          // WHICH BUTTON THE UNATTENDED COUNTDOWN AIMS AT. This is the only
-          // thing the filler / recap preference decides now. Kind-specific, so
-          // "filler" does not silently jump a recap.
-          autoSkipsToCanon={
-            !!nextUpInfo.canon
-            && autoSkipApplies(loadAuraSettings().nextUpSkipFillerRecap, nextUpInfo.episode)
-          }
           onPlay={onEosPlayNext}
           onDismiss={onNextUpDismiss}
-          autoAdvanceStreak={autoAdvanceStreakRef.current}
-          autoAdvanceCancelled={autoAdvanceCancelled}
           arcNote={arcNote}
         />
       )}

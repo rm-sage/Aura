@@ -26,7 +26,7 @@ import { pickDefaultAudio, toLang2, type ScoringMeta } from "./audioScoring";
 import { prettyBinding } from "./useKeybindings";
 import { loadAuraSettings, saveAuraSettings } from "./auraSettings";
 import AniSkipMenu from "./AniSkipMenu";
-import { skipSourceLabel } from "./skipSource";
+import { skipKindLabel, skipSourceLabel } from "./skipSource";
 import SubtitleSyncPanel, { type SyncAnchorPair } from "./SubtitleSyncPanel";
 import { MenuTrackerCtx, useMenuOpenSync, type MenuTracker } from "./menuTracker";
 import { copyTextToClipboard } from "./clipboard";
@@ -2614,7 +2614,7 @@ export default function PlayerOverlay({
                 one-click manual skip in addition to the Lua script's auto /
                 prompt behaviour. The old "Detect" affordance was removed: skip
                 detection is now fully automatic (App.tsx finishWithChapters runs
-                a silencedetect fallback for any missing OP/ED). */}
+                the layered skip detector). */}
             {!isLive && !isTrailer && (
               <div className={partyFollower ? "pointer-events-none opacity-[0.45]" : ""}>
                 <SkipWindowButton time={time} duration={duration} seekAbsolute={seekAbsolute} />
@@ -4059,6 +4059,9 @@ function MoreMenu({
 }) {
   const [open, setOpen] = useState(false);
   const [aniskipOpen, setAniskipOpen] = useState(false);
+  // AniSkip rows a theme match replaced: listed (with vote arrows) by the
+  // AuraSkip menu only, never handed to the scrubber or the SkipController.
+  const supersededSkipWindows = useSupersededSkipWindows();
   const [flash, setFlash] = useState<string | null>(null);
   // Mirror loudnessNormalization from auraSettings. Read fresh on mount
   // + every aura:settings-changed so flipping in Settings updates the
@@ -4179,6 +4182,7 @@ function MoreMenu({
         time={time}
         duration={duration}
         windows={skipWindows}
+        superseded={supersededSkipWindows}
       />
 
       {open && (
@@ -4491,8 +4495,8 @@ function BufferingOverlay({
 // Components:
 //   • SkipWindowButton — inline pill in the bottom control bar; offers
 //     a one-click manual skip ONLY while inside a known OP/ED/Recap window.
-//     (Skip detection is automatic now: App.tsx finishWithChapters runs a
-//     silencedetect fallback for any missing OP/ED, so there's no manual probe.)
+//     (Skip detection is automatic now: App.tsx finishWithChapters runs the
+//     layered skip detector, so there's no manual probe.)
 //   • SkipPromptToast — large top-left toast rendered when the active
 //     window is in `prompt` mode (auto: false). Shows kind + the hotkey.
 //   • SkipController — invisible component that owns the auto-skip
@@ -4560,6 +4564,35 @@ function useSkipWindows(): AuraSkipWindow[] {
   return windows;
 }
 
+/** The payload's `superseded` list: AniSkip rows a Layer 1 (theme match)
+ *  window replaced for their kind. Display-only, for the AuraSkip menu's vote
+ *  arrows; kept out of `useSkipWindows` so nothing that seeks or prompts can
+ *  ever see them. */
+function useSupersededSkipWindows(): AuraSkipWindow[] {
+  const [rows, setRows] = useState<AuraSkipWindow[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    invoke<{ superseded?: AuraSkipWindow[] } | null>("get_skip_windows")
+      .then((p) => {
+        if (cancelled) return;
+        setRows(Array.isArray(p?.superseded) ? p!.superseded! : []);
+      })
+      .catch(() => {});
+    const unlistenP = listen<{ superseded?: AuraSkipWindow[] }>(
+      "aura:skip-windows",
+      (e) => {
+        if (cancelled) return;
+        setRows(Array.isArray(e.payload?.superseded) ? e.payload.superseded! : []);
+      },
+    );
+    return () => {
+      cancelled = true;
+      unlistenP.then((un) => un()).catch(() => {});
+    };
+  }, []);
+  return rows;
+}
+
 /** Seconds of headroom kept between a skip target and the end of the file. */
 const SKIP_EOS_MARGIN_SECONDS = 1;
 /** Where a skip actually seeks to. A window that ends AT the duration seeks
@@ -4593,16 +4626,6 @@ function performSkip(
   }
   seek(target);
   return true;
-}
-
-function skipKindLabel(kind: string): string {
-  switch (kind) {
-    case "op":       return "Opening";
-    case "mixed-op": return "Opening";
-    case "ed":       return "Ending";
-    case "recap":    return "Recap";
-    default:         return "Segment";
-  }
 }
 
 /** Top-left prompt toast rendered when in a prompt-mode window.
@@ -4884,6 +4907,10 @@ function SkipWindowButton({
       ed:    "Skip ED",
       recap: "Skip Recap",
       "mixed-op": "Skip OP",
+      "mixed-ed": "Skip ED",
+      // A next-episode preview: prompt-only by construction (skipWindows.ts),
+      // so this pill is the explicit press that is the only way past one.
+      preview: "Skip Preview",
     };
     const label = labelByKind[active.type] ?? "Skip";
     // Don't offer a control that cannot act: inside the end-of-stream margin

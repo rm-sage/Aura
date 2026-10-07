@@ -24,6 +24,13 @@
 // keys MUST first invoke `create_user_backup` so the user has a
 // rollback. The corresponding TS-side warning lives in
 // src/userDataBackup.ts; check both.
+//
+// EXCLUDED BY CONSTRUCTION: a backup is only ever the payload the frontend
+// hands in. Machine-local caches under app_data_dir (skipdetect's
+// animethemes-v1.json, theme-fp/ and skipdetect-v1.json, the arcs / manga
+// caches) are never read here and must never be added to a payload: they
+// are rebuildable, and the skipdetect result cache records what the user
+// played.
 // ---------------------------------------------------------------------------
 
 use std::path::{Path, PathBuf};

@@ -1,17 +1,19 @@
-// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// Aura - © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // ---------------------------------------------------------------------------
-// NextUpCta — floating "Next Up" card rendered over the player's bottom-
-// right corner. Appears in the final stretch of an episode (configurable
-// lead time, or the moment the ending BEGINS when Aura knows where that is,
-// whichever comes first) and offers a one-click jump to the next episode's
-// first available stream.
+// NextUpCta - floating "Next Up" card rendered over the player's bottom-
+// right corner. Appears in the final stretch of an episode and offers a
+// one-click jump to the next episode's first available stream. WHEN it appears
+// is decided by `nextUpGate.ts` (the lead time before the media end, or the
+// END of a trusted ending, never inside it and never its start).
 //
-// The ED trigger is the ED window's START, not its end: the card is meant to
-// appear as the credits roll, which is the same instant the "Skip ending?
-// Press X" prompt does. Waiting for the ED to END would put it in the last few
-// seconds of the file, by which point the plain lead time has already fired.
+// NO COUNTDOWN. This card never advances on its own: an unattended advance
+// happens only at end of stream, through the EOS Spotlight. The countdown that
+// used to live here armed as the credits began and fired 5-30 s later, which
+// skipped every after-credits scene and next-episode preview (TYBW 3:1 has
+// 169 s of story after its ending). After-credits content always plays unless
+// the user presses something.
 //
 // Design notes:
 //   • Card geometry mirrors a Continue Watching tile: thumbnail on the
@@ -28,8 +30,7 @@
 //     bar.
 // ---------------------------------------------------------------------------
 
-import { useEffect, useRef, useState } from "react";
-import { useWindowHidden } from "./windowVisibility";
+import { useState } from "react";
 import ImageLoader from "./ImageLoader";
 import { shrinkPoster } from "./posterSize";
 import FillerRecapTags from "./FillerRecapTags";
@@ -37,7 +38,6 @@ import type { LibraryItem, VideoEntry } from "./types";
 import { formatEpisodeTag, episodeKindFlags, episodeKindNoun } from "./nextUp";
 import { loadAuraSettings } from "./auraSettings";
 import { shouldBlurThumbnail } from "./episodeSpoilers";
-import { getWatchState } from "./watchTogether/store";
 
 interface Props {
   /** The next episode metadata. Provides the title + thumbnail + tag. */
@@ -51,12 +51,12 @@ interface Props {
   /** True when no playable stream resolved for the (literal) next episode. */
   noStream: boolean;
   /** When the next episode is filler/recap and a later canon episode was
-   *  pre-resolved (with a stream), its SxxEyy tag — presence flips the card
+   *  pre-resolved (with a stream), its SxxEyy tag - presence flips the card
    *  into "skip to canon primary" mode. null otherwise. */
   skipTag?: string | null;
   /** Skip past all upcoming filler/recap into the next canon episode. Wired
-   *  by App only when `skipTag` is set. `auto` is true when the countdown
-   *  fired it unattended, false on a click. Mirrors EosSpotlight's contract. */
+   *  by App only when `skipTag` is set. Always called with `auto = false` here
+   *  (a click): this card has no countdown. Mirrors EosSpotlight's contract. */
   onSkipToCanon?: (auto: boolean) => void;
   /** The canon episode a skip would land on. Drives the hover preview, so the
    *  user can see WHAT they are skipping to before committing. */
@@ -64,39 +64,22 @@ interface Props {
   /** How many episodes a skip would jump. Turns the tooltip from a vague
    *  promise into a countable one. */
   skipCount?: number;
-  /** Should an UNATTENDED countdown press Skip rather than Play next? This is
-   *  the entirety of what the filler / recap preference now decides. Both
-   *  buttons are always offered either way. */
-  autoSkipsToCanon?: boolean;
   /** Play the (literal) next episode. In skip mode this is the "Play this
-   *  anyway" fallback; otherwise the primary action. `auto` as above. */
+   *  anyway" fallback; otherwise the primary action. Always `auto = false`. */
   onPlay: (auto: boolean) => void;
-  /** Consecutive unattended auto-advances so far. At 2 or more (with the
-   *  stillWatchingGate setting on) the countdown stands down and the user has
-   *  to click, which is what stops an all-night chain. This card needs the
-   *  same gate EosSpotlight has, because this is the surface that actually
-   *  fires during a binge: it appears a lead-time BEFORE the end of the file,
-   *  so the end-of-stream Spotlight never gets a turn. */
-  autoAdvanceStreak: number;
-  /** Hide the CTA for the rest of the current playback session. */
+  /** Hide the CTA for the rest of the current playback session. App also
+   *  records this as a refusal of auto-advance, which the EOS Spotlight then
+   *  honours instead of arming its own countdown. */
   onDismiss: () => void;
-  /** True when the user has EXPLICITLY refused an auto-advance for this episode
-   *  (they dismissed this card). Owned by App so the refusal survives this card
-   *  being replaced by the end-of-stream Spotlight, which would otherwise arm a
-   *  fresh countdown and advance anyway. Ambient activity - a mouse move, a
-   *  keypress - only cancels the countdown LOCALLY: it is attention, not a
-   *  decision, and the end card is a new decision point. */
-  autoAdvanceCancelled: boolean;
   /** Set only when the episode just finished was the LAST of its story arc, so
-   *  playing the next one crosses an arc boundary. Purely informational: the
-   *  countdown still rolls into the next arc. `next` is null on the final arc. */
+   *  playing the next one crosses an arc boundary. Purely informational.
+   *  `next` is null on the final arc. */
   arcNote?: { ending: string; next: string | null } | null;
 }
 
 export default function NextUpCta({
   episode, libraryById, loading, noStream, skipTag, onSkipToCanon, canonEpisode,
-  skipCount, autoSkipsToCanon, onPlay, onDismiss, arcNote,
-  autoAdvanceStreak, autoAdvanceCancelled,
+  skipCount, onPlay, onDismiss, arcNote,
 }: Props) {
   // Hover preview state: which episode's identity the card is showing.
   const [previewCanon, setPreviewCanon] = useState(false);
@@ -111,10 +94,6 @@ export default function NextUpCta({
   // preference: the button is always there so any single episode can be
   // overridden either way.
   const canSkip = !!(skipTag && onSkipToCanon);
-  // Which button an unattended countdown presses. Previously this was `canSkip`
-  // itself, so merely HAVING a canon target meant the countdown skipped, and
-  // the user had no say per episode.
-  const skipMode = canSkip && autoSkipsToCanon === true;
   // Kind of the LITERAL next episode, for the fallback button's label. Read off
   // `episode` and never off `shown`, so hovering Skip (which swaps the body to
   // the canon episode) cannot relabel a button that still plays the filler.
@@ -129,99 +108,6 @@ export default function NextUpCta({
   const shownBlur = shouldBlurThumbnail(
     libraryById, shown.id, loadAuraSettings().blurUnwatchedThumbnails === true,
   );
-
-  // ── Opt-in auto-advance ─────────────────────────────────────────────
-  // When the user has flipped `autoAdvanceNextEpisode` ON in Settings,
-  // arm a countdown the moment the CTA mounts with a resolved playable
-  // primary action. In skip mode the countdown targets the skip (the canon
-  // stream is always resolved), so we don't gate it on the filler's
-  // `noStream`; otherwise it needs the literal next stream. Any cancel
-  // signal (mouse move, key, wheel, hover) clears the timer.
-  const settings = loadAuraSettings();
-  const initialSeconds = Math.max(5, Math.min(30, Math.round(settings.autoAdvanceDelaySeconds)));
-  // Still-watching binge gate, mirroring EosSpotlight: after 2 consecutive
-  // unattended auto-advances the countdown stands down and the user has to
-  // click through. Opt out via the stillWatchingGate setting (default on).
-  const gatedByStillWatching =
-    settings.stillWatchingGate !== false && autoAdvanceStreak >= 2;
-  // Never auto-advance an in-sync party FOLLOWER. Same rule (and the same
-  // reasoning) as EosSpotlight: advancing independently changes our local
-  // videoKey, drops us off the party title, and leaves us watching ahead of the
-  // room alone with no way back. This card is the surface that actually fires
-  // during a binge - it appears a lead time BEFORE the end of the file, so the
-  // Spotlight, which HAD the guard, never gets a turn.
-  const party = getWatchState();
-  const isPartyFollower =
-    party.status === "connected" && !party.isLeader && party.inSync;
-  const autoArmed =
-    settings.autoAdvanceNextEpisode && !loading && (skipMode || !noStream)
-    && !isPartyFollower && !gatedByStillWatching;
-
-  const [remaining, setRemaining] = useState<number | null>(
-    autoArmed && !autoAdvanceCancelled ? initialSeconds : null,
-  );
-  // `cancelled` latches once the user has expressed any cancel intent
-  // so we don't restart the countdown if `autoArmed` flickers true again.
-  // Seeded from App so a refusal made on an earlier surface still holds.
-  const cancelledRef = useRef(autoAdvanceCancelled);
-  const windowHidden = useWindowHidden();
-
-  useEffect(() => {
-    if (!autoArmed) return;
-    if (cancelledRef.current) return;
-    // Freeze the auto-play countdown while the window is hidden so there is no
-    // surprise auto-advance while the user is in another app; resumes on show.
-    if (windowHidden) return;
-    if (remaining === null) {
-      setRemaining(initialSeconds);
-      return;
-    }
-    if (remaining <= 0) {
-      // Fire whatever the primary button does: skip-to-canon in skip mode,
-      // otherwise play the literal next episode.
-      (skipMode ? onSkipToCanon! : onPlay)(true);
-      return;
-    }
-    const id = window.setTimeout(() => setRemaining((s) => (s === null ? null : s - 1)), 1000);
-    return () => window.clearTimeout(id);
-  }, [autoArmed, remaining, initialSeconds, onPlay, onSkipToCanon, skipMode, windowHidden]);
-
-  // Cancel signals: any pointer move on the document, any keydown, wheel, or
-  // the explicit dismiss button. Local only - see `autoAdvanceCancelled`.
-  //
-  // Bound for the WHOLE lifetime, not just while a countdown is ticking. The
-  // card mounts with the countdown disarmed while the next stream resolves, and
-  // binding on `remaining !== null` meant every bit of activity during that
-  // phase was discarded - the countdown then armed underneath a user who had
-  // already been moving the mouse.
-  //
-  // CAPTURE phase, because SkipController's x / Shift+X handlers are themselves
-  // window-capture listeners that call stopPropagation(). That stops the event
-  // dead at the capture step, so a bubble-phase listener on window never runs
-  // and pressing the skip key - unambiguous attention - could not cancel an
-  // auto-advance. Same-node, same-phase listeners all still fire, so capture
-  // sidesteps it without changing the skip handlers.
-  useEffect(() => {
-    const cancel = () => {
-      if (cancelledRef.current) return;
-      cancelledRef.current = true;
-      setRemaining(null);
-    };
-    const opts = { capture: true, passive: true } as const;
-    window.addEventListener("pointermove", cancel, opts);
-    window.addEventListener("keydown", cancel, { capture: true });
-    window.addEventListener("wheel", cancel, opts);
-    return () => {
-      window.removeEventListener("pointermove", cancel, opts);
-      window.removeEventListener("keydown", cancel, { capture: true });
-      window.removeEventListener("wheel", cancel, opts);
-    };
-  }, []);
-
-  const countdownActive = remaining !== null && remaining > 0;
-  const fillPct = countdownActive
-    ? Math.max(0, Math.min(100, ((initialSeconds - remaining) / initialSeconds) * 100))
-    : 0;
 
   const PlayIcon = () => (
     <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
@@ -285,7 +171,7 @@ export default function NextUpCta({
             </svg>
           </div>
         )}
-        {/* Filler / recap tag — top-right of the thumbnail (mirrors the
+        {/* Filler / recap tag - top-right of the thumbnail (mirrors the
             episode list). Shows what's actually next even in skip mode. */}
         <FillerRecapTags filler={shownKinds.filler} recap={shownKinds.recap} className="absolute top-1.5 right-1.5 z-10" />
       </div>
@@ -350,8 +236,8 @@ export default function NextUpCta({
           // BOTH ACTIONS, ALWAYS, whenever a skip is available. The card used
           // to show one primary whose meaning flipped based on a setting, so
           // the user could neither see what would be skipped nor choose per
-          // episode. Now Skip and Play sit side by side and the preference only
-          // decides which one an unattended countdown presses.
+          // episode. Now Skip and Play sit side by side (the preference decides
+          // which one the EOS Spotlight's unattended countdown presses).
           // NO TOOLTIPS on either button, and no native `title` either. This
           // card is pinned to the bottom-right corner over live video, and a
           // `pos="top"` tooltip on a 420px-wide button covered the thumbnail,
@@ -377,18 +263,9 @@ export default function NextUpCta({
                            hover:bg-purple-500/30 transition-colors
                            flex items-center justify-center gap-2"
               >
-                {countdownActive && skipMode && (
-                  <span
-                    aria-hidden
-                    className="absolute inset-y-0 left-0 bg-purple-400/25 transition-[width] duration-1000 ease-linear"
-                    style={{ width: `${fillPct}%` }}
-                  />
-                )}
                 <span className="relative flex items-center gap-2">
                   <SkipIcon />
-                  {countdownActive && skipMode
-                    ? `Skipping in ${remaining}s, move to cancel`
-                    : `Skip to ${skipTag}`}
+                  {`Skip to ${skipTag}`}
                 </span>
               </button>
             )}
@@ -408,13 +285,6 @@ export default function NextUpCta({
                     : "border-ln-accent/45 bg-ln-accent/20 text-ln-accent hover:bg-ln-accent/30"
                 }`}
               >
-                {countdownActive && !skipMode && (
-                  <span
-                    aria-hidden
-                    className="absolute inset-y-0 left-0 bg-ln-accent/25 transition-[width] duration-1000 ease-linear"
-                    style={{ width: `${fillPct}%` }}
-                  />
-                )}
                 {loading ? (
                   <>
                     <svg className="animate-spin" width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden>
@@ -422,11 +292,6 @@ export default function NextUpCta({
                     </svg>
                     Resolving stream...
                   </>
-                ) : countdownActive && !skipMode ? (
-                  <span className="relative flex items-center gap-2">
-                    <PlayIcon />
-                    Playing next in {remaining}s, move to cancel
-                  </span>
                 ) : (
                   <>
                     <PlayIcon />

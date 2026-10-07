@@ -68,6 +68,7 @@ mod scrobble_simkl;
 mod per_title;
 mod settings;
 mod silencedetect;
+mod skipdetect;
 mod stats;
 mod storage;
 mod streaming;
@@ -2522,8 +2523,7 @@ pub fn run() {
             tenrai::fetch_anime_posters,
             tenrai::fetch_anime_recommendations,
             tenrai::fetch_anime_trailers,
-            silencedetect::detect_silence_intervals,
-            silencedetect::detect_outro_boundary,
+            skipdetect::skip_detect,
             // ── publicmetadb (OP/ED skip source: live-action + anime) ──
             publicmetadb::fetch_publicmetadb_skips,
             publicmetadb::resolve_anime_tmdb_id,

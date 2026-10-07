@@ -1923,15 +1923,17 @@ function NextUpLeadTimeRow({
       className="space-y-2"
       data-settings-row=""
       data-settings-label="Next-Up lead time"
-      data-settings-description="Seconds before an episode ends to surface the Next Up card during series / anime playback. On anime where an ending theme was detected, the card appears when the ending starts instead, which can be earlier than this. Set to 0 to disable the prompt entirely. The card never appears for movies or for the last aired episode of a series."
+      data-settings-description="Seconds before an episode ends to surface the Next Up card during series / anime playback. On anime where the ending theme was matched, the card waits until the ending is over (never during it), at this lead time or the ending's end, whichever is later. Set to 0 to disable the prompt entirely. The card never appears for movies or for the last aired episode of a series."
     >
       <div>
         <p className="text-white/75 text-sm font-medium">Next-Up lead time</p>
         <p className="text-white/35 text-xs mt-0.5">
           Seconds before an episode ends to surface the "Next Up" card
-          during series / anime playback. Set to 0 to disable the prompt
-          entirely. The card never appears for movies or for the last
-          aired episode of a series.
+          during series / anime playback. On anime where the ending theme
+          was matched, the card waits until the ending is over (never
+          during it), at this lead time or the ending's end, whichever is
+          later. Set to 0 to disable the prompt entirely. The card never
+          appears for movies or for the last aired episode of a series.
         </p>
       </div>
       <div className="flex items-center gap-2 flex-wrap">
@@ -1975,12 +1977,14 @@ function NextUpLeadTimeRow({
   );
 }
 
-/** Countdown-seconds selector for the Auto-advance toggle. Same chip
- *  + number-input pattern as NextUpLeadTimeRow, but a tighter range
- *  ([5, 30]) since the user has consciously opted into auto-advance -
- *  zero would be "skip immediately" (not useful), >30 would be no
- *  better than the standard manual CTA. Default 10 is a comfortable
- *  middle ground that gives time to grab the remote / mouse. */
+/** Countdown-seconds selector for the Auto-advance toggle: how long the
+ *  end-of-episode screen counts down before starting the next episode (the
+ *  Next-Up card itself never counts down; nothing advances before the end of
+ *  the stream). Same chip + number-input pattern as NextUpLeadTimeRow, but a
+ *  tighter range ([5, 30]) since the user has consciously opted into
+ *  auto-advance: zero would be "skip immediately" (not useful), >30 would be
+ *  no better than pressing play. Default 10 is a comfortable middle ground
+ *  that gives time to grab the remote / mouse. */
 function AutoAdvanceDelayRow({
   value, onChange,
 }: { value: number; onChange: (v: number) => void }) {
@@ -1991,15 +1995,14 @@ function AutoAdvanceDelayRow({
       className="space-y-2"
       data-settings-row=""
       data-settings-label="Auto-advance delay"
-      data-settings-description="Seconds the Next-Up card waits before auto-firing. Any mouse / keyboard / scroll input cancels the countdown."
+      data-settings-description="Seconds the end-of-episode screen counts down before starting the next episode. Any mouse / keyboard / scroll input cancels the countdown."
     >
       <div>
         <p className="text-white/75 text-sm font-medium">Auto-advance delay</p>
         <p className="text-white/35 text-xs mt-0.5">
-          Seconds the Next-Up card waits before auto-firing. Any
-          mouse / keyboard / scroll input cancels the countdown so
-          you only get auto-advance when you're genuinely away from
-          the player.
+          Seconds the end-of-episode screen counts down before
+          starting the next episode. Any mouse / keyboard / scroll
+          input cancels the countdown.
         </p>
       </div>
       <div className="flex items-center gap-2 flex-wrap">
@@ -5567,7 +5570,7 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Auto-advance to next episode"
-                description="When the Next-Up card surfaces, automatically start the next episode after a short countdown. Mouse movement, any key press, scrolling, or the dismiss button cancels the countdown - you only get the auto-jump when you're genuinely afk during the credits. Default off."
+                description="At the end of an episode, start the next one automatically after a short countdown on the end-of-episode screen. After-credits scenes and previews always play first. Mouse movement, any key press, scrolling or the dismiss button cancels the countdown. Default off."
                 value={aura.autoAdvanceNextEpisode}
                 onChange={(v) => setLocal({ autoAdvanceNextEpisode: v })}
               />
@@ -5879,8 +5882,10 @@ export default function SettingsView({ addons, session }: Props) {
                 Aura sources opening / ending / recap timestamps from the
                 AniSkip community database (anime with a MyAnimeList id), the
                 PublicMetaDB skip database, the file's own chapters, and an
-                on-device audio scan. The modes below apply to whichever source
-                produced the window, on anime and live-action alike.
+                on-device audio scan. The modes below apply on anime and
+                live-action alike, except that guessed windows, previews and
+                AniSkip endings only ever prompt (AniSkip endings can run early;
+                an ending confirmed by the theme match can auto-skip).
                 Per-type modes: <span className="text-white/65">off</span> offers
                 no skip for that segment, <span className="text-white/65">prompt</span> shows
                 a "Press X to skip" toast, <span className="text-white/65">auto</span> skips
@@ -5895,7 +5900,7 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SkipModeRow
                 label="Endings (ED)"
-                description="Endings often contain next-episode previews; prompt by default."
+                description="Endings often contain next-episode previews; prompt by default. Auto applies to endings confirmed by the theme match or an authored chapter; AniSkip endings alone only prompt."
                 value={backend.skip_ed_mode}
                 onChange={(v) => patchBackend({ skip_ed_mode: v })}
               />
@@ -5919,7 +5924,7 @@ export default function SettingsView({ addons, session }: Props) {
                 <div className="h-px bg-white/6" />
                 <SettingToggle
                   label="Automatic skip detection"
-                  description="When AniSkip and chapters don't cover a series, infer the missing opening / ending with a quick on-device audio scan (ffmpeg silencedetect). It only scans the part that wasn't already detected (opening if no opening, ending if no ending). ffmpeg downloads once (~97 MB) the first time a series needs it. Turn off to disable the scan and that download. Per-type auto / prompt / off is still set above."
+                  description="Find the opening and ending in the episode's own audio. For anime, Aura matches the show's theme songs on every episode and drops crowd-sourced timings that disagree with the match. For other series it only looks for a part nothing else covered, and only offers it as a prompt. Reads the first ten minutes and the last eight of the stream; ffmpeg downloads once (~97 MB) the first time it is needed. Turn off to disable the scan and that download. Per-type auto / prompt / off is still set above."
                   value={aura.autoSkipDetect}
                   onChange={(v) => setLocal({ autoSkipDetect: v })}
                 />

@@ -1128,6 +1128,13 @@ pub struct PreparedWindow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkipWindowsPayload {
     pub windows: Vec<PreparedWindow>,
+    /// AniSkip rows a Layer 1 (AnimeThemes) window replaced for their kind.
+    /// DISPLAY-ONLY: the AuraSkip menu lists them so their vote arrows stay
+    /// reachable (a wrong row is the one that most needs a downvote). Never
+    /// written to mpv's property, so the Lua script cannot seek on them, and
+    /// the in-player SkipController reads `windows` only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded: Vec<PreparedWindow>,
 }
 
 // Aura-side cache of the most recently set skip-windows payload.
@@ -1140,7 +1147,7 @@ pub struct SkipWindowsPayload {
 static SKIP_WINDOWS_CACHE: OnceLock<Mutex<SkipWindowsPayload>> = OnceLock::new();
 
 fn skip_windows_cache() -> &'static Mutex<SkipWindowsPayload> {
-    SKIP_WINDOWS_CACHE.get_or_init(|| Mutex::new(SkipWindowsPayload { windows: Vec::new() }))
+    SKIP_WINDOWS_CACHE.get_or_init(|| Mutex::new(SkipWindowsPayload { windows: Vec::new(), superseded: Vec::new() }))
 }
 
 /// Read the last payload Aura sent to MPV. Cheap — no libmpv call.
@@ -1165,12 +1172,15 @@ pub async fn set_skip_windows<R: Runtime>(
     // Serialize ourselves so MPV stores the value as a STRING — the
     // Lua script handles both `string` (parse_json) and native-table
     // shapes, but writing a string is the most predictable across
-    // libmpv builds.
-    let json = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    // libmpv builds. Only `windows` goes to mpv: the superseded rows are
+    // for the menu and must never reach the script that seeks.
+    let json = serde_json::to_string(&serde_json::json!({ "windows": &payload.windows }))
+        .map_err(|e| e.to_string())?;
     crate::devlog!(
         info, "auraskip",
-        "set_skip_windows ({} window(s))",
-        payload.windows.len()
+        "set_skip_windows ({} window(s), {} superseded)",
+        payload.windows.len(),
+        payload.superseded.len()
     );
     {
         let mut cache = skip_windows_cache().lock().unwrap();

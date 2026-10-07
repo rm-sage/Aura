@@ -26,8 +26,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { PersistentCache } from "./persistentCache";
 import type { MetaDetail } from "./types";
 
-export const INTRODB_SOURCE = "introdb";
-export const INTRODB_SINGLE_SOURCE = "introdb-single";
+import { INTRODB_SINGLE_SOURCE, INTRODB_SOURCE } from "./skipWindows";
+
+// Defined in skipWindows.ts (kept import-free so a node check can load it).
+export { INTRODB_SINGLE_SOURCE, INTRODB_SOURCE };
 
 export function isIntroDbSource(source: string | null | undefined): boolean {
   return source === INTRODB_SOURCE || source === INTRODB_SINGLE_SOURCE;

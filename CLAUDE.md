@@ -44,6 +44,7 @@ emitted), `dist/assets/index-*.css` is the artifact. It is git-ignored, so build
 | Area | Constraint |
 |------|------------|
 | MAL API | `api.tenrai.org/v1` via `tenrai.rs`, NOT Jikan (shut down permanently in 2026). Same response envelope and field names, but the version segment is `/v1`, not `/v4`. Public tier is 4 req/s, 120/min, 40k/day. There is exactly ONE base-URL const; do not inline a second host. |
+| AnimeThemes API | `https://api.animethemes.moe` via `skipdetect/animethemes.rs` (the skip detector's theme list and theme audio). Exactly ONE base-URL const, rustls client with `https_only(true)`, GET only, request starts paced at least 1 s apart (the API allows 90/min). Theme audio is accepted only over https from animethemes.moe or a subdomain (no userinfo, no port); it is decoded through ffmpeg stdin to a fingerprint and DISCARDED. Only fingerprints are cached. |
 | HTTP client | `reqwest 0.12`, default-features off, `rustls-tls` backend. Auth / account clients enforce `https_only(true)`. Do not add a plaintext-HTTP fallback: every one removed was the result of a real wire-capture incident. |
 | TLS exception | Casting (`cast/`) uses `native-tls` (SChannel) on purpose, to accept self-signed CASTV2 device certs on the LAN. This is the only deliberate divergence from the rustls posture. |
 | Credentials | Platform-native keyring (`keyring 3`, `windows-native` / `apple-native` / `linux-native-sync-persistent`). Native backends are MANDATORY (an in-memory mock silently lost OpenSubtitles keys between launches). Passwords wrapped in `Zeroizing<String>` (`zeroize 1`). |
@@ -237,6 +238,77 @@ with none, TMDB's marker is the only signal and is kept. That check is made at
 SHOW level, because a fully-canon arc inside a show that does have data carries
 no flags at all and an arc-level check would misread that as "no data".
 
+### Skip detection: layered, and an ED end is never EOF
+
+`src-tauri/src/skipdetect/` (Rust, one tagged command `skip_detect` with `detect` / `cancel` /
+`status`, events `skipdetect-update`) plus the pure frontend half in `src/skipWindows.ts` (chapter
+titles, ranking, modes, media-end clamp) and `src/nextUpGate.ts` (when the Next-Up card may appear,
+and the detected media end the end-of-stream detectors use). Both TS modules are import-free so a
+node check can load them. Devlog label `[skipdetect]`. It was designed against a 31-episode corpus
+with frame-verified truth. It REPLACED the old ffmpeg silencedetect OP scan and outro tail scan
+(`detect_silence_intervals`, `detect_outro_boundary`, both gone from all three registration sites),
+which scored OP 10 correct / 7 wrong / 2 false positives and ED 0 correct, skipping the
+after-credits scene on 10 of the 11 episodes that have one.
+
+- **Layer 1 (high trust): AnimeThemes reference match.** The cour's themes (MAL id from AIOMetadata's
+  per-video `_malId`, else the AniList pair, else the AniSkip resolution) are fingerprinted and
+  located in the episode's audio. Accept gates: 30 s run, BER <= 0.35, margin >= 0.15 (do not raise
+  it: it is the gate that rejects TV-edited themes), soft42 coverage >= 0.85. Window = chained runs,
+  theme start to theme end, clamped to the MEDIA end. No silence snapping (every snap variant pushed
+  ED ends into after-credits scenes). Corpus: OP 26/2/0 wrong, ED 23/5/0 wrong, 0 false positives.
+  It runs on EVERY anime episode with a MAL id while `autoSkipDetect` is on, because its 3 s conflict
+  drop is what removes a wrong crowd window. Themes existed but none matched = an informative
+  abstain: Layer 3 is NOT run for that kind.
+- **Layer 3 (low trust): loudness continuity** between silences. Only when the cour's OWN AnimeThemes
+  list has no theme of the kind ("Over" themes count; a sibling cour's themes that did not match do
+  not), or there is no MAL id. Prompt-only, never auto, never a Next-Up trigger, and dropped at stamp
+  time for any kind AniSkip, IntroDB, PublicMetaDB or a chapter already supplied. Live action and
+  MAL-less anime run the detector only for a kind NOTHING else supplied.
+- **TAIL never waits for the OP decision.** When HEAD ran to its end, the OP's theme search, sibling
+  lookup and Layer 3 run beside the TAIL pass on a forked `Decider` (job.rs) and publish the moment
+  they resolve; still one detector ffmpeg at a time.
+- **Layer 2 (blind pairing) is not shipped**; the `pairing` source and its priority slot are reserved.
+- **Merge (`dedupeSkipWindows`)**: animethemes 8 > chapter 7 > aniskip = introdb 6 > pairing =
+  publicmetadb 5 > introdb-single 4 > aniskip-neighbour 3 > chapter-heuristic 2 > continuity 1. When
+  a Layer 1 window exists for a kind, every other window of that kind whose start OR end is more than
+  3 s away is DROPPED (TYBW 3:9-3:11 AniSkip ED rows were 32-38 s early with a matching
+  episodeLength). AniSkip ED rows are prompt-only even with the ED mode on auto; IntroDB keeps its
+  own tiers. The AniSkip rows a Layer 1 window replaced ride the `set_skip_windows` payload's
+  `superseded` list (`dedupeSkipWindowsDetailed`): the AuraSkip menu lists them for their vote arrows,
+  and nothing that seeks or prompts reads it (mpv's property gets `windows` only).
+- **Chapters**: "epilogue" is NOT an ending. Preview / next episode / next time / coming up chapters
+  are their own `preview` kind (so is a combined "ED + Preview" title). No ED is derived from an
+  untitled LAST chapter that runs to EOF (it can hold the ending, an after-credits scene and a
+  preview).
+- **`preview` kind**: no Settings row; hard-coded in `skipModeForKind` (used by BOTH the chain's
+  `modeFor` and the re-stamp's `modeForKind`): prompt, never auto, off when the ED mode is off.
+- **THE RULE: an ED window end is NEVER the file / container duration.** It ends where the matched
+  theme ends (Layer 1) or at a trailing silence (Layer 3), and every window is clamped to the MEDIA
+  end (TAIL origin + decoded samples at TAIL EOF), which can be ~29 s shorter than the container
+  duration (Spy x Family E2, Demon Slayer S1E2, TYBW 3:14). Never stamp `[ed_start, duration]`,
+  never borrow an ED from neighbour episodes (that borrow put a phantom ED inside TYBW 3:10's
+  after-credits scene and is retired; the OP borrow remains), and never gate an ED's existence on a
+  "last N seconds" band (TYBW 3:14's ED starts 418 s before EOF, 3:1's 290 s).
+- **Next-Up**: the corner card (`NextUpCta.tsx`) has NO countdown. Unattended advance happens only
+  at end of stream, through the EOS Spotlight, so after-credits scenes and previews always play. The
+  card appears at `max(trusted ED end, end - lead)` (at the ED end when nothing follows it), else at
+  `end - lead`; only a Layer 1 ED is trusted, and an ED START never triggers it. "end" is the
+  detector's media end when known. The keep-open, stale-heartbeat and eof EOS detectors test against
+  `eosEnd(duration)` (the FINAL media end, else the probe's mapped-track DURATION tag, never the
+  container duration), so a container longer than its media still reaches the end card instead of a
+  false "stream lost". A series load that detects no kind (ED off, everything supplied, detection
+  switched off) still runs a PROBE-ONLY detect for that tag when ffmpeg is present.
+- **ffmpeg passes**: probe, then ONE sequential HEAD pass (0-600 s, output-side `-to 600`, no `-ss`,
+  no `-copyts`, no `-t`), then TAIL (`-ss S -copyts` to EOF, no `-t` / `-to`, `S = min(container,
+  mapped track DURATION tag) - 480`). At most one detector ffmpeg at a time, all CPU work on the
+  blocking pool, nothing on the engine thread. Region origin = the FIRST DECODED PTS, never the `-ss`
+  value. The resampler is `aresample=11025:async=1`: a DTS track with timestamp gaps (JJK S1E3)
+  otherwise shifts every window about 2 s early.
+- **Cancellation**: a module-level generation counter in Rust; the frontend cancels on every load, on
+  exit playback and before each Detect, and applies only `skipdetect-update` events of its own
+  generation. The Detect action's kind switches travel as `detect_op` / `detect_ed`, because the
+  action enum is tagged `op`.
+
 ### Downloads: two landmines and one governing rule
 
 `src-tauri/src/downloads/` (engine) plus `src-tauri/src/download_path.rs` (path
@@ -339,8 +411,12 @@ frontend ~40k LOC over ~70 files + ~13 views).
   ratings and theme songs, plus the five on-demand extras commands), `theme_parse.rs` (MAL theme
   display-string parser, has `#[cfg(test)]` tests),
   `publicmetadb.rs` (OP/ED skip source + TMDB id resolution), `anime_id_map.rs`, `silencedetect.rs`
-  (outro boundary via ffmpeg), `trailer.rs` (YouTube trailer resolve).
-- **Skip / scrobble**: `aniskip.rs` (OP/ED timing, vote/submit, id resolution), `introdb.rs` +
+  (now only the shared ffmpeg resolver; its old detectors are retired), `trailer.rs` (YouTube
+  trailer resolve).
+- **Skip / scrobble**: `skipdetect/` (the layered OP/ED detector, see "Skip detection" above:
+  `fingerprint`, `matcher` (Layer 1 gates), `themes`, `continuity` (Layer 3), `probe` (argv +
+  stderr parsers), `audio` (ffmpeg processes), `animethemes`, `cache`, `job`; ignored corpus and
+  runtime parity tests), `aniskip.rs` (OP/ED timing, vote/submit, id resolution), `introdb.rs` +
   `src/introdb.ts` (IntroDB: IMDb-keyed intro / recap / outro segments for ANY series with a `tt`
   root, not gated to anime; one `introdb` command with a tagged `fetch` / `submit` / `status`
   action. Rows are keyed by the SUBMITTER's numbering, so the frontend asks the addon's own pair
@@ -722,6 +798,14 @@ Bound every cache (see Performance & memory).
   network / 429 / 5xx never cached. A successful submit drops that key on both sides. Segments are
   cached WITHOUT the per-file duration check; `fitIntroDbToDuration` applies it inside
   `mergeChapterSkipWindows` once the duration is known.
+- **Skip detection** (Rust, under `app_data_dir()`, atomic writes, oldest first, one process lock):
+  `animethemes-v1.json` (MAL -> theme list; hits 7 d, misses 1 d, network errors never cached, cap
+  300), `theme-fp/<audio_id>.bin` (fingerprint + valid mask + length + audible lead / trail, never
+  the audio; 90 d, cap 400) and `skipdetect-v1.json` (the final per-file result keyed by Stremio id,
+  release identity and duration to 0.1 s; 30 d, an abstention 24 h, and so is a Layer 3 window that
+  stood in for a theme-list miss; cap 2000). An entry records the kinds and MAL id it was computed
+  for and answers only a request it covers. The result cache is the only fix for a slow link. No in-memory mirror, so Settings > Storage's "Skip detection cache"
+  clear cannot be undone by a stale copy. Excluded from backups by construction.
 - **Calendar meta**: 24-hour module-level `Map` keyed by `${addonUrl}::${type}::${id}`.
 - **sessionRoute.ts** (`sessionStorage`): active nav tab + open detail target so Ctrl+R/F5 restores
   the page you were on; cleared on app close (cold start opens Home).
@@ -869,6 +953,12 @@ creep degrades the experience. When adding ANY feature:
 - "Ratings missing/sparse" -> `ratings.rs`: the MDBList branch needs a `tt`-prefixed IMDb id and a
   non-empty `AURA_MDBLIST_KEY` (baked from `.env.local`); the MAL/AniList branch needs a resolvable
   anime id. Non-tt non-anime ids get only addon-supplied `detail.ratings`. OMDb is fully removed.
+- "Detected OP/ED missing or wrong" -> DevConsole `[skipdetect]`: the cour MAL id and its source,
+  the mapped audio track, S and the read origin, the media end, and every theme tried (run, BER,
+  margin, soft42, verdict). An abstain is usually a gate doing its job; do not loosen a gate to make
+  one episode match (the margin and soft42 thresholds are measured, see "Skip detection").
+- "Next-Up card appears / auto-advances too early" -> `src/nextUpGate.ts`. The card has no
+  countdown; an advance before EOS means a countdown was put back into `NextUpCta.tsx`.
 - "Skip windows missing" -> `aniskip.rs` / `publicmetadb.rs` / `introdb.rs`; `AURA_PUBLICMETADB_KEY`
   must be baked. IntroDB needs an IMDb (`tt`) root and a season/episode >= 1; DevConsole `[introdb]`
   logs which numbering matched (or every numbering that missed), a window dropped for not fitting
@@ -979,7 +1069,7 @@ old-format and new-format samples and diff the field sets. Node runs the `.ts` f
 - Rust log labels to grep in the DevConsole or `aura-mpv.log`: `[bridge]`, `[player]`, `[streams]`,
   `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[ratings]`, `[rpc]`, `[win32]`, `[smtc]`,
   `[scrobble]`, `[publicmetadb]`, `[mpv]` (the playback engine), `[cast]`, `[iptv]`, `[sync]`,
-  `[aniskip]`, `[introdb]`, `[arcs]`, `[subsync]`, `[downloads]`, `[tenrai]` (the MyAnimeList client), `[manga]` (manga chapters: MangaUpdates + Fandom), `[extras]` (frontend,
+  `[aniskip]`, `[introdb]`, `[skipdetect]` (the layered OP/ED detector), `[arcs]`, `[subsync]`, `[downloads]`, `[tenrai]` (the MyAnimeList client), `[manga]` (manga chapters: MangaUpdates + Fandom), `[extras]` (frontend,
   the anime metadata tabs on the detail page).
 - libmpv writes its own verbose log to `%USERPROFILE%\aura-mpv.log` (truncated each MPV init, rotated
   to `.old` past 50 MB). The last few lines usually pinpoint a STATUS_ACCESS_VIOLATION.
@@ -1019,11 +1109,13 @@ silently behaves like `-to`. `-ss 330 -copyts -t 300` therefore means "stop once
 reaches 300", which is already in the past at the seek point: ffmpeg writes ZERO bytes and the
 feature fails silently. Use `-to (start + window)`. This was measured against the bundled
 `ffmpeg.exe`, and it had silently broken TWO features: `subsync.rs` (Live Sync on embedded tracks was
-dead for any playhead past ~7m30s) and `silencedetect.rs` (every chunk past the first decoded
-nothing, so only the head of a file was ever scanned, and the `-sseof` outro scan decoded nothing at
-all on a real episode). `-sseof` already bounds a read to the tail, so it needs no output limit.
+dead for any playhead past ~7m30s) and the old `silencedetect.rs` detectors, since retired (every
+chunk past the first decoded nothing, so only the head of a file was ever scanned, and the `-sseof`
+outro scan decoded nothing at all on a real episode). `-sseof` already bounds a read to the tail, so
+it needs no output limit; `skipdetect` does not use it at all (both `-sseof` forms count back from
+the CONTAINER duration, and plain `-sseof` restarts timestamps at 0).
 
-- `ffmpeg` (silencedetect + subsync + cast HLS transcode), `ffprobe` (subsync + cast), and `yt-dlp`
+- `ffmpeg` (skip detection + subsync + cast HLS transcode), `ffprobe` (subsync + cast), and `yt-dlp`
   (trailers) are NOT bundled. They are fetched on demand from a GitHub `runtime-deps` prerelease, SHA-verified
   (`runtime_deps.rs`). Absent -> the dependent feature ships inert rather than crashing.
 

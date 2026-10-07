@@ -137,12 +137,14 @@ export interface AuraSettings {
    *  continue / exit. Default true (opt-out). Only meaningful when
    *  autoAdvanceNextEpisode is on. */
   stillWatchingGate: boolean;
-  /** Automatic skip detection (Hybrid). When AniSkip + chapters miss the OP
-   *  and/or ED for a series, run a bounded ffmpeg silencedetect fallback that
-   *  infers ONLY the missing segment. ffmpeg is fetched on demand (a one-time
-   *  ~97 MB download) the first time a series needs it. Default true; turn off
-   *  to avoid that download / the background scan. (Per-kind auto vs prompt vs
-   *  off is still governed by the Skip OP/ED/Recap mode settings.) */
+  /** Automatic skip detection: the layered detector (Rust `skipdetect/`).
+   *  For anime with a MAL id it runs on EVERY episode (AnimeThemes theme match,
+   *  which also removes crowd windows that disagree with it); for other series
+   *  only for a kind nothing else supplied, and there it is prompt-only.
+   *  ffmpeg is fetched on demand (a one-time ~97 MB download) the first time it
+   *  is needed. Default true; turn off to avoid that download / the background
+   *  reads. (Per-kind auto vs prompt vs off is still governed by the Skip
+   *  OP/ED/Recap mode settings.) */
   autoSkipDetect: boolean;
   /** Blur the selected episode's per-episode synopsis on the detail
    *  page until the user clicks to reveal. Spoiler protection for
