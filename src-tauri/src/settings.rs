@@ -501,7 +501,23 @@ impl Default for AppSettings {
 static CACHE: OnceLock<Arc<Mutex<AppSettings>>> = OnceLock::new();
 
 fn cache() -> &'static Arc<Mutex<AppSettings>> {
-    CACHE.get_or_init(|| Arc::new(Mutex::new(AppSettings::default())))
+    CACHE.get_or_init(|| Arc::new(Mutex::new(initial_cache(read_render_pref()))))
+}
+
+/// The cache's first value: defaults, with the machine-local
+/// `gpu_acceleration` from `render.json` (`render_pref`). The launch read
+/// render.json for the WebView2 arguments (`load_pre_init`), so the cold cache
+/// must say the same: `load()` returns the cache unchanged when the active
+/// scope has no settings file (or an empty or unreadable one), and a cache
+/// left at the default `true` there showed the switch ON for a launch that
+/// ran with it OFF, and the next unrelated `save` rewrote render.json to
+/// `true`. Read once, here, never in `snapshot()` (a hot path).
+fn initial_cache(render_pref: Option<bool>) -> AppSettings {
+    let mut s = AppSettings::default();
+    if let Some(gpu) = render_pref {
+        s.gpu_acceleration = gpu;
+    }
+    s
 }
 
 pub fn snapshot() -> AppSettings {
@@ -987,4 +1003,19 @@ pub async fn set_settings_scope<R: Runtime>(
     };
     crate::devlog!(info, "settings", "switching scope → {scope}");
     set_active_scope(&app, &scope)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cold_cache_follows_render_json() {
+        // The launch ran with Hardware acceleration off: a scope with no
+        // settings file must still show (and later save) it off.
+        assert!(!initial_cache(Some(false)).gpu_acceleration);
+        assert!(initial_cache(Some(true)).gpu_acceleration);
+        // No render.json: the default.
+        assert_eq!(initial_cache(None).gpu_acceleration, AppSettings::default().gpu_acceleration);
+    }
 }

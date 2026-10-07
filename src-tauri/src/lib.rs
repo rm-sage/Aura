@@ -1833,6 +1833,13 @@ pub fn run() {
                     let _ = crate::cast::cast_stop().await;
                 });
             }
+            // The skip detector would otherwise keep reading the stream (HEAD up
+            // to 600 s, then TAIL) with nothing playing, from the very host a
+            // stream-lost Reload is giving up on. An atomic, a mutex and an
+            // abort: nothing blocks this UI thread.
+            if crate::skipdetect::cancel_all() {
+                crate::devlog!(info, "skipdetect", "main page reloaded: cancelling detection");
+            }
             #[cfg(target_os = "windows")]
             {
                 // A reloaded page restores no playback, so nothing is loaded.

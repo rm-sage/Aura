@@ -29,7 +29,8 @@
 //       eval_animethemes.json (strict, A_full) within 0.15 s.
 //   skipdetect_runtime_detect  the whole job (result cache, probe, HEAD with
 //       early exit, TAIL, AnimeThemes over the network, caches in a temp dir)
-//       vs eval within 0.15 s, then a second run that must come from the
+//       vs eval refined by the published edge rule (`published_expected`)
+//       within 0.15 s, then a second run that must come from the
 //       result cache. It reports when the early provisional opening and the
 //       final OP were published (seconds since the detect started), checks
 //       the provisional window against the final one, and that it never
@@ -152,6 +153,44 @@ fn expected(root: &Path, id: &str, ep: &Ep, slot: &str, media_end: f64) -> (Opti
         return (pair(&truth[slot]), GAP_CASE_TOL, "truth");
     }
     (eval_window(ep, slot, media_end), TOL, "eval")
+}
+
+/// The PTS-gap release's PUBLISHED opening (the job's window) against the
+/// truth: the edge rule starts it at the theme's audible start, measured
+/// 2.28 s after the truth's first frame on the served copy (an under-skip,
+/// 0.5 s later than mapping A's 1.78 s), so 2 s no longer holds here.
+const GAP_CASE_PUBLISHED_TOL: f64 = 2.5;
+
+/// What the JOB publishes for a slot: eval's strict A_full window refined by
+/// the published edge rule (`matcher::refine_edges`), with the theme's
+/// audible span from the cached theme decode and the episode's levels from
+/// the cached region PCM, re-gridded to the production region origin
+/// (`origin`: TAIL's from the snapshot's `ed_region`; HEAD's is the cached
+/// one, its PCM is checked bit-identical above). The PTS-gap release is
+/// judged against the truth (see GAP_CASE_PUBLISHED_TOL).
+fn published_expected(root: &Path, id: &str, ep: &Ep, slot: &str, media_end: f64, origin: Option<f64>) -> (Option<(f64, f64)>, f64, &'static str) {
+    if id == GAP_CASE {
+        let (w, _, what) = expected(root, id, ep, slot, media_end);
+        return (w, GAP_CASE_PUBLISHED_TOL, what);
+    }
+    let ev = &ep.row["eval"]["strict"][slot];
+    let (Some(raw), Some(theme), Some(mal)) = (pair(&ev["pred"]["A_full"]), ev["theme"].as_str(), ep.mal) else {
+        return (None, TOL, "eval");
+    };
+    let tpcm = read_wav(&root.join("themes").join(mal.to_string()).join(format!("{theme}.11k.wav")));
+    let reflen = fingerprint(&tpcm, 0.0).duration_s();
+    let aud = super::fingerprint::theme_audible(&tpcm);
+    let cdir = root.join("cache").join(tag_of(id));
+    let which = if slot == "op" { "head" } else { "tail" };
+    let pcm = read_wav(&cdir.join(format!("{which}.wav")));
+    let t0c = ep.info["passes"][which]["t0"].as_f64().unwrap_or(0.0);
+    // Re-grid: the 0.4 s windows start at the production origin.
+    let win = super::continuity::RMS_WIN as i64;
+    let k = origin.map_or(0, |o| ((o - t0c) * SR as f64).round() as i64).rem_euclid(win) as usize;
+    let levels = super::continuity::rms_levels(&pcm[k.min(pcm.len())..]);
+    let lv = matcher::RegionLevels { levels: &levels, t0: t0c + k as f64 / SR as f64 };
+    let today = (raw.0.max(0.0), raw.1.min(media_end));
+    (matcher::refine_edges(raw, today, reflen, true, aud, slot == "ed", Some(lv), media_end), TOL, "eval + edge rule")
 }
 
 fn close(a: Option<(f64, f64)>, b: Option<(f64, f64)>, tol: f64) -> (bool, f64) {
@@ -522,6 +561,7 @@ async fn skipdetect_runtime_detect() {
                 generation: 1 + round,
                 publish: Arc::new(move |s: &Snapshot| seen2.lock().unwrap().push((t.elapsed().as_secs_f64(), s.clone()))),
                 replay: None,
+                fake_theme_load: None,
             };
             let s = job::run(&ctx, &req).await;
             let wall = t.elapsed().as_secs_f64();
@@ -580,7 +620,10 @@ async fn skipdetect_runtime_detect() {
                 }
                 match (&s.op, first_op) {
                     (Some(fin), Some((tf, _))) => {
-                        let d = (fin.start - w.start).abs().max((fin.end - w.end).abs());
+                        // Same start rule; the final END may be cut earlier
+                        // than the provisional one (the edge rule's onset cut
+                        // needs the finished region), never later.
+                        let d = (fin.start - w.start).abs().max(fin.end - w.end);
                         if d > 0.5 {
                             fails.push(format!("{id}: provisional [{:.2}, {:.2}] vs final [{:.2}, {:.2}]", w.start, w.end, fin.start, fin.end));
                         }
@@ -611,7 +654,8 @@ async fn skipdetect_runtime_detect() {
                 fails.push(format!("{id} round {round}: media end not final"));
             }
             for (slot, w) in [("op", &s.op), ("ed", &s.ed)] {
-                let (want, tol, what) = expected(&root, &id, &ep, slot, me);
+                let origin = if slot == "ed" { s.ed_region.map(|r| r.0) } else { None };
+                let (want, tol, what) = published_expected(&root, &id, &ep, slot, me, origin);
                 let got = w.as_ref().map(|w| (w.start, w.end));
                 let (ok, d) = close(got, want, tol);
                 if !ok {
@@ -663,7 +707,7 @@ async fn skipdetect_runtime_detect() {
         }))
         .unwrap();
         let req = req.validate().unwrap();
-        let ctx = Ctx { ffmpeg: ff.clone(), data_dir: Some(dir.clone()), generation: 9, publish: Arc::new(|_: &Snapshot| {}), replay: None };
+        let ctx = Ctx { ffmpeg: ff.clone(), data_dir: Some(dir.clone()), generation: 9, publish: Arc::new(|_: &Snapshot| {}), replay: None, fake_theme_load: None };
         let t = Instant::now();
         let s = job::run(&ctx, &req).await;
         let row = cont["episodes"].as_array().unwrap().iter().find(|r| r["id"] == id.as_str()).cloned().unwrap_or(Value::Null);

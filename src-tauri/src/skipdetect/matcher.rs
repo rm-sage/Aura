@@ -23,8 +23,10 @@
 //   * coverage `soft42` >= 0.85 on the longest run's diagonal (rejects a theme
 //     truncated in the episode).
 // Window = [ref0 of the first chained run, ref0 of the last chained run +
-// reference length], clamped to [0, media_end]. No silence snapping: every
-// snap variant pushed ED ends into after-credits scenes.
+// reference length], clamped to [0, media_end] (mapping A, the research
+// port; the job publishes it refined by `refine_layer1_window`: the audible
+// start and an end gated by the episode's own fade). No silence snapping:
+// every snap variant pushed ED ends into after-credits scenes.
 //
 // BER is computed DIRECTLY (integer Hamming distance and valid-pair count per
 // offset). The reference uses an FFT over the 32 bit planes and then rounds
@@ -528,6 +530,159 @@ pub fn layer1_window(m: &ThemeMatch, media_end: f64) -> Option<(f64, f64)> {
     (e > s).then_some((s, e))
 }
 
+/// A theme whose audible span is shorter than the 30 s run gate can never be
+/// accepted (a run cannot outlast the audible reference): short-form anime
+/// whose OP / ED reference is under 30 s. Such a theme is no evidence either
+/// way, so the job does not count it as "themes exist, none matched".
+pub fn too_short_to_match(audible: (f64, f64)) -> bool {
+    audible.1 - audible.0 < ACCEPT_LEN_S
+}
+
+// ── edge refinement (what the job publishes) ────────────────────────────────
+//
+// `layer1_window` above is mapping A, the research reference's chained
+// mapping, and stays its exact port (the corpus parity tests hold it to the
+// reference within 0.15 s). The job PUBLISHES it refined by two facts the
+// mapping ignores (measured on the 89-episode end-to-end set, 2026-10-07,
+// `scratchpad/e2e/edge_mapping.md`, variant REC):
+//
+//   * START = the theme's AUDIBLE start (`ref0 + lead`), never earlier than
+//     mapping A's. The reference start is usually exact but ran 0.5 to 2.3 s
+//     early into story on 17 windows (the file's lead silence: Steins;Gate 24
+//     2.3 s); the audible start was never more than 0.18 s early.
+//   * END = decided by the EPISODE's own loudness inside the theme file's
+//     trailing fade, `[ref0 + trail + FADE_FROM_S, ref0 + reflen)`, from the
+//     region's 0.4 s RMS levels (windows starting inside it, aligned to the
+//     region origin like `RmsMeter`):
+//       - a window at or above ONSET_DB there is new content starting (a
+//         preview, an omake, the next scene): end = onset - ONSET_CUT_S, both
+//         kinds;
+//       - else an OPENING keeps mapping A's end (an OP quiet trim made Mob
+//         Psycho S3E4 wrong; the openings that overran are all followed by
+//         sound, so the onset rule covers them);
+//       - else an ENDING whose fade is at or above LOUD_FADE_DB is being
+//         talked or played over: end = audible end + LOUD_FADE_PAD_S;
+//       - else (a quiet, held card): end = reference end - QUIET_FADE_TRIM_S.
+//     Never past mapping A's end. The truth cut sat INSIDE the fade on every
+//     one of the 10 endings that overran into a preview or after-credits
+//     scene, and the same theme (TYBW ED1) both overran (3:2, 3:3) and held its
+//     card (3:9 to 3:12), so the theme file alone cannot separate the two; the
+//     episode audio can (a held card is quiet, a preview is loud).
+//
+// Measured against mapping A on the 89 episodes, every mode and both links:
+// every Layer 1 preview / after-credits overrun gone (6.88 s + 1.10 s on 9
+// episodes, fast link), all-auto HARM 9 -> 1 (the one left is not Layer 1),
+// no verdict or class worse anywhere; the cost is three under-skips that
+// cross the 2 s "correct" bar (JJK S1E3 OP start, TYBW 1:1 ED end, Solo
+// Leveling 1 ED end). Thresholds sit mid-plateau: identical results for the
+// loud-fade level -58 to -65 dB, the onset cut 0.75 to 1.25 s, the quiet trim
+// 0.25 to 0.5 s; the onset level is 7 dB clear of both sides. They rest on 6
+// OP and 6 ED onsets: re-validate on new episodes before moving any of them.
+//
+// The fade needs the region's levels, which reach the job when the region
+// worker finishes (HEAD: its early exit, OP end + 10 s; TAIL: EOF). Before
+// that a window is published with the audible start and mapping A's end
+// (`levels` None); measured identical to gating the moment the fade decodes.
+
+/// The fade window begins this far after the theme's audible end.
+pub const FADE_FROM_S: f64 = 0.25;
+/// An episode window this loud inside the fade is new content (an onset).
+pub const ONSET_DB: f32 = -40.0;
+/// The window ends this long before an onset.
+pub const ONSET_CUT_S: f64 = 1.0;
+/// An ending's fade this loud (no onset) is talked or played over.
+pub const LOUD_FADE_DB: f32 = -60.0;
+/// ...and then ends this long after the theme's audible end.
+pub const LOUD_FADE_PAD_S: f64 = 0.5;
+/// A quiet fade (a held card) ends this long before the reference end.
+pub const QUIET_FADE_TRIM_S: f64 = 0.5;
+
+/// A finished region's 0.4 s RMS levels (`RmsMeter`): window i starts at
+/// `t0 + RMS_WIN_S * i`, `t0` = the region origin (first decoded PTS).
+#[derive(Clone, Copy, Debug)]
+pub struct RegionLevels<'a> {
+    pub levels: &'a [f32],
+    pub t0: f64,
+}
+
+/// The published window of an ACCEPTED match: `layer1_window` refined at
+/// both edges (see the block comment above). `audible` = the theme's
+/// audible (lead, trail) in reference seconds; `ending` = an ED (only an
+/// ending takes the loud / quiet fade rules); `levels` = the finished
+/// region's levels, None while the region is still decoding.
+pub fn refine_layer1_window(
+    m: &ThemeMatch,
+    audible: (f64, f64),
+    ending: bool,
+    levels: Option<RegionLevels<'_>>,
+    media_end: f64,
+) -> Option<(f64, f64)> {
+    let today = layer1_window(m, media_end)?;
+    let raw = m.raw_window?;
+    refine_edges(raw, today, m.ref_len_s, m.chained <= 1, audible, ending, levels, media_end)
+}
+
+/// `refine_layer1_window` on a raw chained window (mapping A before
+/// clamping) and its clamped form `today`. `single` = one diagonal (one
+/// chained run): its ref0 is then read from the START (`raw.0`, rounded to
+/// 10 ms like the end), exactly as the measurement did, rather than from
+/// `raw.1 - ref_len_s`, which carries the end's rounding and the reference
+/// length's fraction (up to a few ms: enough to move a fade boundary across
+/// a 0.4 s level window, Demon Slayer 3:5's ED). A start clamped at 0 has no
+/// ref0 left in it, so the end's is used. Public for the corpus tests, which
+/// refine the reference's own A_full windows (single diagonals).
+#[allow(clippy::too_many_arguments)]
+pub fn refine_edges(
+    raw: (f64, f64),
+    today: (f64, f64),
+    ref_len_s: f64,
+    single: bool,
+    audible: (f64, f64),
+    ending: bool,
+    levels: Option<RegionLevels<'_>>,
+    media_end: f64,
+) -> Option<(f64, f64)> {
+    let (first_ref0, ref_end_raw) = raw;
+    // The ref0 the END is measured from: the last chained run's.
+    let last_ref0 = if single && first_ref0 > 0.0 { first_ref0 } else { ref_end_raw - ref_len_s };
+    let ref_end = last_ref0 + ref_len_s;
+    let start = round_to((first_ref0 + audible.0).max(today.0), 2).max(0.0);
+    let aud_end = last_ref0 + audible.1;
+    let mut end = ref_end;
+    if let Some(r) = levels {
+        let from = aud_end + FADE_FROM_S;
+        let mut onset = None;
+        let mut loudest = f32::NEG_INFINITY;
+        // Window starts as sample offsets, and a microsecond of slack at both
+        // bounds: a window starting exactly ON a bound must not flip with the
+        // last bit of a float product.
+        const EPS: f64 = 1e-6;
+        for (i, &db) in r.levels.iter().enumerate() {
+            let t = r.t0 + (i * super::continuity::RMS_WIN) as f64 / super::fingerprint::SR as f64;
+            if t + EPS < from {
+                continue;
+            }
+            // The fade is read up to the published (mapping A) end.
+            if t + EPS >= ref_end_raw {
+                break;
+            }
+            if onset.is_none() && db >= ONSET_DB {
+                onset = Some(t);
+            }
+            loudest = loudest.max(db);
+        }
+        end = match onset {
+            Some(t) => t - ONSET_CUT_S,
+            None if !ending => ref_end,
+            None if loudest >= LOUD_FADE_DB => aud_end + LOUD_FADE_PAD_S,
+            None => ref_end - QUIET_FADE_TRIM_S,
+        }
+        .min(ref_end);
+    }
+    let end = round_to(end.min(today.1), 2).min(media_end);
+    (end > start).then_some((start, end))
+}
+
 /// Incremental matching cadence for one region: match once at least
 /// `MATCH_MIN_S` of the region has decoded, then after every `MATCH_EVERY_S` of
 /// new audio (decision 7). `region_complete` forces a final match at the end.
@@ -793,6 +948,13 @@ pub fn early_check(r: &Fingerprint, audible: (f64, f64), q: &Fingerprint, curve:
 /// gate's mapping (clamping to the media end is the caller's).
 pub fn early_window(run: &Run, ref_len_s: f64) -> (f64, f64) {
     (round_to(run.ref0_s, 2).max(0.0), round_to(run.ref0_s + ref_len_s, 2))
+}
+
+/// The early provisional window's start under the published edge rule: the
+/// theme's audible start on the run's diagonal, never before `early_window`'s
+/// own start (`window_start`).
+pub fn early_audible_start(run: &Run, lead_s: f64, window_start: f64) -> f64 {
+    round_to((run.ref0_s + lead_s).max(window_start), 2).max(0.0)
 }
 
 /// Once the decoded frontier is this far past the provisional theme's audible
@@ -1310,5 +1472,111 @@ mod tests {
         assert!(!s.due(46.0, true));
         assert!(head_exit_ready(110.0, 100.0));
         assert!(!head_exit_ready(109.9, 100.0));
+    }
+
+    #[test]
+    fn a_reference_shorter_than_the_run_gate_is_never_accepted() {
+        // A short-form cour's 20 s theme, present whole in the episode: the
+        // 30 s run floor can never pass (the documented limit the job turns
+        // into an undecided kind, not an informative abstain).
+        let th = song(20.0, 3);
+        let (r, aud) = theme_fp(&th);
+        assert!(too_short_to_match(aud));
+        let q = fingerprint(&episode(120.0, &th, 40.0, 8), 0.0);
+        let m = evaluate_theme(&r, aud, &q);
+        assert!(!m.accepted);
+        assert_eq!(m.reject, Some(Reject::RunTooShort), "{m:?}");
+        assert!(!too_short_to_match((0.4, 89.6)));
+    }
+
+    /// An accepted single-diagonal match at `ref0` with reference length 90.
+    fn accepted_at(ref0: f64) -> ThemeMatch {
+        ThemeMatch {
+            accepted: true,
+            reject: None,
+            longest_run_s: 85.0,
+            run_ber: Some(0.1),
+            best_ber: 0.1,
+            second_ber: 0.45,
+            margin: 0.35,
+            soft42: Some(0.95),
+            chained: 1,
+            raw_window: Some((ref0, ref0 + 90.0)),
+            matched_span: None,
+            ref0_s: Some(ref0),
+            ref_len_s: 90.0,
+        }
+    }
+
+    /// Region levels from t0 = 900: quiet (-80 dB) except `loud` = [(from,
+    /// to, dB)] spans, on the 0.4 s grid.
+    fn levels(loud: &[(f64, f64, f32)]) -> Vec<f32> {
+        (0..1000)
+            .map(|i| {
+                let t = 900.0 + i as f64 * 0.4;
+                loud.iter().find(|(a, b, _)| t >= *a && t < *b).map_or(-80.0, |x| x.2)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn edge_refinement_rules() {
+        // Theme file: 90 s, audible 0.5 to 86.0 s. Matched at 1000: reference
+        // end 1090, audible end 1086, the fade window [1086.25, 1090).
+        let m = accepted_at(1000.0);
+        let aud = (0.5, 86.0);
+        let me = 2000.0;
+        let r = |lv: &Vec<f32>, ending: bool| refine_layer1_window(&m, aud, ending, Some(RegionLevels { levels: lv, t0: 900.0 }), me).unwrap();
+        // Still decoding: the audible start, mapping A's end.
+        assert_eq!(refine_layer1_window(&m, aud, true, None, me), Some((1000.5, 1090.0)));
+        assert_eq!(layer1_window(&m, me), Some((1000.0, 1090.0)), "mapping A is unchanged");
+        // A preview starts inside the fade (window at 1088.0 is -30 dB): both
+        // kinds end ONSET_CUT_S before it.
+        let preview = levels(&[(1088.0, 1200.0, -30.0)]);
+        assert_eq!(r(&preview, true), (1000.5, 1087.0));
+        assert_eq!(r(&preview, false), (1000.5, 1087.0));
+        // A fade talked over (-50 dB, no onset): an ending stops just after
+        // the song, an opening keeps its end.
+        let talked = levels(&[(1086.0, 1095.0, -50.0)]);
+        assert_eq!(r(&talked, true), (1000.5, 1086.5));
+        assert_eq!(r(&talked, false), (1000.5, 1090.0));
+        // A quiet held card: an ending ends QUIET_FADE_TRIM_S early, an
+        // opening keeps its end.
+        let card = levels(&[]);
+        assert_eq!(r(&card, true), (1000.5, 1089.5));
+        assert_eq!(r(&card, false), (1000.5, 1090.0));
+        // Only windows STARTING inside the fade count: loud audio at 1086.0
+        // (before the fade) or from 1090.0 (after the reference end) is not
+        // an onset, and not a loud fade either.
+        let outside = levels(&[(1085.6, 1086.25, -20.0), (1090.0, 1200.0, -20.0)]);
+        assert_eq!(r(&outside, true), (1000.5, 1089.5));
+        // Exactly at the -40 dB onset level counts; just below it is a loud fade.
+        assert_eq!(r(&levels(&[(1088.0, 1090.0, ONSET_DB)]), true).1, 1087.0);
+        assert_eq!(r(&levels(&[(1088.0, 1090.0, ONSET_DB - 0.1)]), true).1, 1086.5);
+        // Never past the media end, never past mapping A.
+        let near_end = refine_layer1_window(&m, aud, true, Some(RegionLevels { levels: &card, t0: 900.0 }), 1088.8).unwrap();
+        assert_eq!(near_end, (1000.5, 1088.8));
+        // An opening at 0:00 whose reference starts before the file: the
+        // audible start on its diagonal, never below 0.
+        let m0 = accepted_at(-1.0);
+        assert_eq!(refine_layer1_window(&m0, (2.0, 86.0), false, None, me), Some((1.0, 89.0)));
+        assert_eq!(refine_layer1_window(&m0, (0.5, 86.0), false, None, me), Some((0.0, 89.0)));
+        // Nothing left: None (the job abstains).
+        let gone = refine_layer1_window(&m, aud, true, Some(RegionLevels { levels: &preview, t0: 900.0 }), 1000.4);
+        assert_eq!(gone, None);
+        // A rejected match publishes nothing.
+        let mut rej = accepted_at(1000.0);
+        rej.accepted = false;
+        assert_eq!(refine_layer1_window(&rej, aud, true, None, me), None);
+    }
+
+    #[test]
+    fn early_window_takes_the_audible_start() {
+        let run = Run { off: 0, q_start_s: 10.0, r_start_s: 2.0, len_s: 12.0, ber: 0.2, ref0_s: 8.0 };
+        let w = early_window(&run, 90.0);
+        assert_eq!(w, (8.0, 98.0));
+        assert_eq!(early_audible_start(&run, 2.3, w.0), 10.3);
+        let run0 = Run { ref0_s: -1.0, ..run };
+        assert_eq!(early_audible_start(&run0, 0.5, early_window(&run0, 90.0).0), 0.0);
     }
 }

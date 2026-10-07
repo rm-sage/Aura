@@ -5904,21 +5904,21 @@ export default function SettingsView({ addons, session }: Props) {
               </p>
               <SkipModeRow
                 label="Openings (OP)"
-                description="The opening theme. Prompt by default. On Auto, an opening that plays over story scenes, is borrowed from other episodes, is a guess, or comes from IntroDB timings not yet confirmed by several submissions still only prompts."
+                description="The opening theme. Prompt by default. On Auto, an opening skips by itself when its timing is trusted. It asks instead when, for example, the opening plays over story scenes, is borrowed from other episodes or guessed, comes from IntroDB timings not yet confirmed by several submissions, was timed on a different cut of the episode, or (on a title with no theme match, such as live action) nothing else confirms it, and while the theme match is still checking it. The prompt says why when it asks."
                 value={backend.skip_op_mode}
                 onChange={(v) => patchBackend({ skip_op_mode: v })}
               />
               <div className="h-px bg-white/6" />
               <SkipModeRow
                 label="Endings (ED)"
-                description="Endings often contain next-episode previews; prompt by default. On Auto, an ending skips by itself when it comes from the theme match, a chapter named as the ending, IntroDB or PublicMetaDB; AniSkip endings, guesses and IntroDB timings not yet confirmed by several submissions only prompt. A theme-matched ending stops where the song does, so an after-credits scene still plays. When the file's chapters mark a next-episode preview, it gets its own Skip Preview prompt, never skips by itself, and is hidden while this is Off."
+                description="Endings often contain next-episode previews; prompt by default. On Auto, an ending skips by itself when it comes from the theme match (unless its song also plays over story), a chapter named as the ending, IntroDB or PublicMetaDB; AniSkip endings, guesses and IntroDB timings not yet confirmed by several submissions are among the cases that only prompt, and the prompt says why. A theme-matched ending stops where the song does, so an after-credits scene still plays. When the file's chapters mark a next-episode preview, it gets its own Skip Preview prompt, never skips by itself, and is hidden while this is Off."
                 value={backend.skip_ed_mode}
                 onChange={(v) => patchBackend({ skip_ed_mode: v })}
               />
               <div className="h-px bg-white/6" />
               <SkipModeRow
                 label="Recaps"
-                description="Pure recap segments at episode start. Prompt by default for first-time viewers. On Auto, a recap from IntroDB timings not yet confirmed by several submissions still only prompts."
+                description="Pure recap segments at episode start. Prompt by default for first-time viewers. On Auto, a recap skips by itself only when a chapter or a second source agrees on it, or it runs right up to a matched opening; otherwise it asks."
                 value={backend.skip_recap_mode}
                 onChange={(v) => patchBackend({ skip_recap_mode: v })}
               />

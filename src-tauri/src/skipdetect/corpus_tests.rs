@@ -525,6 +525,212 @@ fn skipdetect_layer1_parity() {
     assert_eq!(policy_same, policy_total, "proximity policy disagrees with the strict pick");
 }
 
+// ── Layer 1 edge rule ───────────────────────────────────────────────────────
+
+/// The published edge rule (`matcher::refine_layer1_window`, EDGE_RULE 1) on
+/// this corpus, per slot: (id, slot, outcome under mapping A, outcome under
+/// the edge rule, the rule's window). Recorded deliberately when the rule
+/// replaced mapping A as the PUBLISHED window (2026-10-07);
+/// `skipdetect_layer1_parity` above still holds mapping A itself to the
+/// research reference, unchanged. The test prints mapping A's window beside
+/// each row, so old -> new is in its output.
+///
+/// Old -> new on this corpus (56 slots): every start moves to the theme's
+/// audible start, 0.10 to 1.30 s later (Demon Slayer 3:5's OP lands exactly
+/// on the truth). ED ends move 0.49 to 0.51 s earlier (a quiet held card) or
+/// more: a preview starting inside the theme's fade (Demon Slayer 1:2 1.52 s,
+/// TYBW 3:2 1.32 s, TYBW 3:3 1.47 s) or a fade talked over (Demon Slayer 3:5
+/// 1.36 s, TYBW 1:1 4.18 s). OP ends stay within 0.01 s, except Demon Slayer
+/// 1:2's (147.96 -> 146.60, an onset: it ended inside the scene that follows).
+/// The one verdict change is TYBW 1:1's ED, correct -> near: its 1.23 s
+/// preview overrun is gone, and its end is now 2.95 s before the truth cut.
+/// Every window here equals the measurement's own replay of the rule within
+/// 0.01 s, except where the measurement used the real stream (JJK S1E3, whose
+/// served copy sits 2.1 s later, and TYBW 3:14, 0.02 s). The full 89-episode
+/// measurement is
+/// `scratchpad/e2e/edge_mapping.md` (variant REC).
+const EDGE_RULE_EXPECT: &[(&str, &str, &str, &str, f64, f64)] = &[
+    ("tt0388629:1:1100", "ed", "correct", "correct", 1216.31, 1305.02),
+    ("tt0388629:1:1100", "op", "correct", "correct", 11.29, 100.40),
+    ("tt12343534:1:3", "ed", "near", "near", 1275.30, 1364.16),
+    ("tt12343534:1:3", "op", "near", "near", 192.34, 281.70),
+    ("tt12343534:2:10", "ed", "correct", "correct", 1300.48, 1389.25),
+    ("tt12343534:2:10", "op", "correct", "correct", 183.52, 272.74),
+    ("tt13293588:2:3", "ed", "correct", "correct", 1271.01, 1359.44),
+    ("tt13293588:2:3", "op", "correct", "correct", 122.82, 212.00),
+    ("tt13706018:1:16", "ed", "correct", "correct", 1350.91, 1438.51),
+    ("tt13706018:1:16", "op", "correct", "correct", 108.56, 197.88),
+    ("tt13706018:1:2", "op", "correct", "correct", 0.46, 89.68),
+    ("tt14986406:1:1", "ed", "correct", "near", 1198.00, 1412.55),
+    ("tt14986406:1:13", "ed", "correct", "correct", 1395.13, 1483.76),
+    ("tt14986406:1:13", "op", "correct", "correct", 113.11, 202.43),
+    ("tt14986406:1:6", "ed", "correct", "correct", 1326.17, 1414.80),
+    ("tt14986406:1:6", "op", "correct", "correct", 34.12, 123.44),
+    ("tt14986406:2:1", "ed", "correct", "correct", 1326.34, 1414.81),
+    ("tt14986406:2:1", "op", "correct", "correct", 69.05, 158.22),
+    ("tt14986406:2:7", "ed", "correct", "correct", 1207.77, 1296.24),
+    ("tt14986406:2:7", "op", "correct", "correct", 64.50, 153.67),
+    ("tt14986406:3:1", "ed", "correct", "correct", 1146.46, 1234.98),
+    ("tt14986406:3:1", "op", "correct", "correct", 0.59, 89.81),
+    ("tt14986406:3:10", "ed", "correct", "correct", 1262.65, 1351.17),
+    ("tt14986406:3:10", "op", "correct", "correct", 258.52, 347.74),
+    ("tt14986406:3:11", "ed", "near", "near", 1357.71, 1446.23),
+    ("tt14986406:3:11", "op", "correct", "correct", 94.49, 183.71),
+    ("tt14986406:3:12", "ed", "near", "near", 1437.32, 1525.84),
+    ("tt14986406:3:12", "op", "correct", "correct", 48.43, 137.65),
+    ("tt14986406:3:13", "ed", "correct", "correct", 1303.67, 1392.19),
+    ("tt14986406:3:13", "op", "correct", "correct", 40.48, 129.70),
+    ("tt14986406:3:14", "ed", "correct", "correct", 954.68, 1043.20),
+    ("tt14986406:3:14", "op", "correct", "correct", 78.47, 167.69),
+    ("tt14986406:3:2", "ed", "correct", "correct", 1325.10, 1412.80),
+    ("tt14986406:3:2", "op", "correct", "correct", 159.05, 248.27),
+    ("tt14986406:3:3", "ed", "correct", "correct", 1324.79, 1412.34),
+    ("tt14986406:3:3", "op", "correct", "correct", 0.59, 89.81),
+    ("tt14986406:3:4", "ed", "correct", "correct", 1213.46, 1301.98),
+    ("tt14986406:3:4", "op", "correct", "correct", 141.54, 230.76),
+    ("tt14986406:3:5", "ed", "correct", "correct", 1377.34, 1465.86),
+    ("tt14986406:3:5", "op", "correct", "correct", 139.50, 228.72),
+    ("tt14986406:3:6", "ed", "near", "near", 1350.28, 1438.80),
+    ("tt14986406:3:6", "op", "correct", "correct", 97.51, 186.73),
+    ("tt14986406:3:7", "ed", "correct", "correct", 1325.71, 1414.23),
+    ("tt14986406:3:7", "op", "correct", "correct", 82.47, 171.69),
+    ("tt14986406:3:8", "ed", "correct", "correct", 1325.73, 1414.25),
+    ("tt14986406:3:8", "op", "correct", "correct", 136.48, 225.70),
+    ("tt14986406:3:9", "ed", "near", "near", 1357.74, 1446.26),
+    ("tt14986406:3:9", "op", "correct", "correct", 144.51, 233.73),
+    ("tt22248376:1:2", "ed", "correct", "correct", 1460.27, 1549.39),
+    ("tt22248376:1:2", "op", "correct", "correct", 0.75, 89.81),
+    ("tt22248376:1:20", "ed", "correct", "correct", 1370.14, 1459.11),
+    ("tt22248376:1:20", "op", "near", "near", 104.53, 193.79),
+    ("tt9335498:1:2", "ed", "correct", "correct", 1290.63, 1379.40),
+    ("tt9335498:1:2", "op", "correct", "correct", 57.83, 146.60),
+    ("tt9335498:3:5", "ed", "correct", "correct", 1292.05, 1379.50),
+    ("tt9335498:3:5", "op", "correct", "correct", 26.24, 114.85),
+];
+
+/// Severity of a classify() outcome for the "never worse" check.
+fn outcome_rank(o: &str) -> u8 {
+    match o {
+        "correct" | "correct-abstain" => 0,
+        "near" => 1,
+        "abstained" => 2,
+        _ => 3, // wrong, false-positive
+    }
+}
+
+#[test]
+#[ignore = "needs AURA_SKIPBENCH_DIR (skipbench corpus)"]
+fn skipdetect_layer1_edge_rule_corpus() {
+    use super::continuity::rms_levels;
+    use super::matcher::{refine_edges, RegionLevels};
+    let root = bench();
+    let eval = load_json(&root.join("eval_animethemes.json"));
+    let mut truth: HashMap<String, Value> = HashMap::new();
+    for e in std::fs::read_dir(root.join("truth")).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().is_some_and(|x| x == "json") {
+            if let Value::Object(m) = load_json(&p) {
+                truth.extend(m);
+            }
+        }
+    }
+    let rows = eval["rows"].as_array().unwrap().clone();
+    // Per row: [(slot, theme, A window, refined window)].
+    type Slot = (&'static str, String, (f64, f64), Option<(f64, f64)>);
+    let results: Vec<(String, Vec<Slot>)> = par_map(rows.len(), |k| {
+        let r = &rows[k];
+        let id = r["id"].as_str().unwrap().to_string();
+        let mal = r["mal"].as_u64().or_else(|| r["mal"].as_str().and_then(|s| s.parse().ok()));
+        let cdir = root.join("cache").join(tag_of(&id));
+        let info = load_json(&cdir.join("info.json"));
+        let mut head = read_wav(&cdir.join("head.wav"));
+        head.truncate(HEAD_SAMPLES);
+        let tail = read_wav(&cdir.join("tail.wav"));
+        let h0 = info["passes"]["head"]["t0"].as_f64().unwrap();
+        let t0 = info["passes"]["tail"]["t0"].as_f64().unwrap();
+        let (hq, tq) = (fingerprint(&head, h0), fingerprint(&tail, t0));
+        let (hl, tl) = (rms_levels(&head), rms_levels(&tail));
+        let Some(mal) = mal else { return (id, Vec::new()) };
+        let themes = themes_of(&root, mal);
+        let refs: Vec<(Fingerprint, (f64, f64))> = themes
+            .iter()
+            .map(|t| {
+                let pcm = read_wav(&root.join("themes").join(mal.to_string()).join(format!("{}.11k.wav", t.base)));
+                (fingerprint(&pcm, 0.0), theme_audible(&pcm))
+            })
+            .collect();
+        let mut out = Vec::new();
+        for (slot, kind, q, lv, origin) in [("op", Kind::Op, &hq, &hl, h0), ("ed", Kind::Ed, &tq, &tl, t0)] {
+            let idx: Vec<usize> = (0..themes.len())
+                .filter(|&i| themes[i].meta.kind == kind && !(kind == Kind::Ed && themes[i].over_str))
+                .collect();
+            let ms: Vec<(usize, ThemeMatch)> = idx.iter().map(|&i| (i, evaluate_theme(&refs[i].0, refs[i].1, q))).collect();
+            let acc: Vec<(usize, &ThemeMatch)> = ms.iter().filter(|(_, m)| m.accepted).map(|(i, m)| (*i, m)).collect();
+            let Some(p) = pick(&acc) else { continue };
+            let m = acc.iter().find(|(i, _)| *i == p).unwrap().1;
+            let raw = m.raw_window.unwrap();
+            let today = (raw.0.max(0.0), raw.1);
+            let levels = Some(RegionLevels { levels: lv, t0: origin });
+            let rec = refine_edges(raw, today, m.ref_len_s, m.chained <= 1, refs[p].1, kind == Kind::Ed, levels, f64::INFINITY);
+            out.push((slot, themes[p].base.clone(), raw, rec));
+        }
+        (id, out)
+    });
+    let mut got: Vec<(String, &'static str, &'static str, &'static str, f64, f64)> = Vec::new();
+    let mut worse = Vec::new();
+    let (mut moved_s, mut moved_e) = (0.0f64, 0.0f64);
+    for (id, slots) in &results {
+        let tr = &truth[id];
+        for (slot, theme, a, rec) in slots {
+            let oa = classify(Some(*a), tr, slot);
+            let or = classify(*rec, tr, slot);
+            let t = pair(&tr[*slot]);
+            println!(
+                "[edges] {id:18} {slot} {theme:28} A [{:.2}, {:.2}] {oa:8} -> rule {} {or:8} truth {:?}",
+                a.0,
+                a.1,
+                rec.map_or("none".to_string(), |w| format!("[{:.2}, {:.2}]", w.0, w.1)),
+                t
+            );
+            if let Some(w) = rec {
+                moved_s = moved_s.max(w.0 - a.0.max(0.0));
+                moved_e = moved_e.max(a.1 - w.1);
+                assert!(w.0 >= a.0.max(0.0) - 1e-9 && w.1 <= a.1 + 1e-9, "{id} {slot}: the rule widened mapping A");
+            }
+            // The bar: no slot becomes wrong or a false positive, and none
+            // loses its window. A correct edge becoming "near" is the recorded
+            // cost (an under-skip; EDGE_RULE_EXPECT pins each one).
+            if outcome_rank(or) >= 2 && outcome_rank(or) > outcome_rank(oa) {
+                worse.push(format!("{id} {slot}: {oa} -> {or}"));
+            }
+            let w = rec.unwrap_or((f64::NAN, f64::NAN));
+            got.push((id.clone(), slot, oa, or, w.0, w.1));
+        }
+    }
+    println!("[edges] {} slots; start moved up to {moved_s:.2} s later, end up to {moved_e:.2} s earlier", got.len());
+    let changed: Vec<_> = got.iter().filter(|g| g.2 != g.3).collect();
+    for c in &changed {
+        println!("[edges] verdict change {} {}: {} -> {}", c.0, c.1, c.2, c.3);
+    }
+    assert!(worse.is_empty(), "the edge rule made slots worse:\n{}", worse.join("\n"));
+    let key = |a: &(String, &str, &str, &str, f64, f64)| (a.0.clone(), a.1.to_string());
+    let mut want: Vec<(String, &str, &str, &str, f64, f64)> =
+        EDGE_RULE_EXPECT.iter().map(|e| (e.0.to_string(), e.1, e.2, e.3, e.4, e.5)).collect();
+    want.sort_by_key(key);
+    got.sort_by_key(key);
+    let same = want.len() == got.len()
+        && want.iter().zip(&got).all(|(w, g)| {
+            (&w.0, w.1, w.2, w.3) == (&g.0, g.1, g.2, g.3) && (w.4 - g.4).abs() <= 0.02 && (w.5 - g.5).abs() <= 0.02
+        });
+    if !same {
+        let lit: Vec<String> = got
+            .iter()
+            .map(|g| format!("    (\"{}\", \"{}\", \"{}\", \"{}\", {:.2}, {:.2}),", g.0, g.1, g.2, g.3, g.4, g.5))
+            .collect();
+        panic!("edge rule outcomes differ from EDGE_RULE_EXPECT; current:\n{}", lit.join("\n"));
+    }
+}
+
 // ── Layer 3 parity ──────────────────────────────────────────────────────────
 
 /// `cont/method.py judge` outcome (with the truth's recorded slack).

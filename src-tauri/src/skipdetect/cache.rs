@@ -158,11 +158,12 @@ pub fn get_result<T: DeserializeOwned>(dir: &Path, key: &str) -> Option<T> {
     get_entry::<T>(&dir.join(RESULT_FILE), key, now_secs())
 }
 
-/// `has_window` = the result holds at least one window (30 d); otherwise it is
-/// an abstention (24 h).
-pub fn put_result<T: Serialize + DeserializeOwned>(dir: &Path, key: &str, value: T, has_window: bool) {
-    let ttl = if has_window { RESULT_TTL } else { RESULT_ABSTAIN_TTL };
-    put_entry(&dir.join(RESULT_FILE), key, value, ttl, RESULT_CAP, now_secs());
+/// `ttl` in seconds, chosen by the job (`job::result_ttl`): `RESULT_TTL` for
+/// a result holding a window, `RESULT_ABSTAIN_TTL` for an abstention, and no
+/// longer than the theme-list answer for a Layer 3 window standing in for a
+/// theme AnimeThemes does not list. Capped at `RESULT_TTL`.
+pub fn put_result<T: Serialize + DeserializeOwned>(dir: &Path, key: &str, value: T, ttl: u64) {
+    put_entry(&dir.join(RESULT_FILE), key, value, ttl.min(RESULT_TTL), RESULT_CAP, now_secs());
 }
 
 // ── theme fingerprints ──────────────────────────────────────────────────────
@@ -324,9 +325,14 @@ mod tests {
     use super::*;
 
     fn tmp() -> PathBuf {
+        // A per-process counter as well as the clock: two tests running in
+        // parallel can read the same timestamp on Windows, share one folder,
+        // and the cap test's eviction then deletes the other test's files.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let d = std::env::temp_dir().join(format!(
-            "aura-skipdetect-cache-test-{}-{}",
+            "aura-skipdetect-cache-test-{}-{}-{}",
             std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&d).unwrap();
@@ -375,7 +381,15 @@ mod tests {
         let fpd = d.join(THEME_FP_DIR);
         for id in 0..(THEME_FP_CAP as u64 + 5) {
             std::fs::create_dir_all(&fpd).unwrap();
-            std::fs::write(fpd.join(format!("{}.bin", 10_000 + id)), b"x").unwrap();
+            // Retried: a scanner can hold a just-created file for a moment
+            // (seen once in 3 release-profile corpus runs).
+            let f = fpd.join(format!("{}.bin", 10_000 + id));
+            let mut tries = 0;
+            while let Err(e) = std::fs::write(&f, b"x") {
+                tries += 1;
+                assert!(tries < 20, "scratch write kept failing: {e}");
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
         }
         put_theme_fp(&d, &theme(8, 10));
         let n = std::fs::read_dir(&fpd).unwrap().count();

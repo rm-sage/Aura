@@ -37,7 +37,8 @@
 // A `[skipdetect] layer1 counter` line is logged instead.
 //
 // Invariants (spec "Rules that are NOT negotiable"):
-//   * an ED window ends at the matched theme end (Layer 1) or a silence
+//   * an ED window ends at the matched theme end (Layer 1, cut back inside
+//     the theme's trailing fade by the episode's own loudness) or a silence
 //     (Layer 3), clamped to MEDIA end, never the container duration;
 //   * nothing auto-advances before end of stream (the frontend's job; this
 //     module never asks for a "skip to next" of any kind);
@@ -98,13 +99,34 @@ fn store_latest(s: &Snapshot) {
     }
 }
 
-/// Abort the running detect, if any.
-fn abort_running() {
+/// Abort the running detect, if any. True when one was running.
+fn abort_running() -> bool {
     if let Ok(mut r) = RUNNING.lock() {
         if let Some((_, h)) = r.take() {
             h.abort();
+            return true;
         }
     }
+    false
+}
+
+/// Supersede every detect: bump the generation (anything a detect still
+/// publishes is dropped as stale), abort the running one (its ffmpeg dies
+/// with kill_on_drop) and forget the latest snapshot. What the Cancel action
+/// does, and what a main-page reload calls (lib.rs `on_page_load`): a reload
+/// stops playback, so a detect must not keep reading the stream. Returns
+/// whether a detect was running. Never blocks.
+pub fn cancel_all() -> bool {
+    cancel_generation().1
+}
+
+fn cancel_generation() -> (u64, bool) {
+    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let was_running = abort_running();
+    if let Ok(mut l) = LATEST.lock() {
+        *l = None;
+    }
+    (generation, was_running)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -150,11 +172,7 @@ pub async fn skip_detect(app: AppHandle, action: SkipDetectAction) -> Result<Ski
             snapshot: LATEST.lock().ok().and_then(|l| l.clone()).filter(|s| is_current(s.generation)),
         }),
         SkipDetectAction::Cancel => {
-            let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-            abort_running();
-            if let Ok(mut l) = LATEST.lock() {
-                *l = None;
-            }
+            let (generation, _) = cancel_generation();
             crate::devlog!(debug, "skipdetect", "cancel (generation {generation})");
             Ok(SkipDetectReply::Cancelled { generation })
         }
@@ -227,7 +245,7 @@ async fn start_prefetch(app: AppHandle, req: job::PrefetchRequest) -> bool {
 
 async fn detect(app: AppHandle, req: Request) -> Result<SkipDetectReply, String> {
     let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    abort_running();
+    let _ = abort_running();
     let unavailable = |note: String| {
         let s = Snapshot {
             generation,
@@ -264,6 +282,8 @@ async fn detect(app: AppHandle, req: Request) -> Result<SkipDetectReply, String>
         }),
         #[cfg(test)]
         replay: None,
+        #[cfg(test)]
+        fake_theme_load: None,
     };
     let task = tokio::spawn(async move { job::run(&ctx, &req).await });
     if let Ok(mut r) = RUNNING.lock() {
@@ -327,6 +347,28 @@ pub fn clamp_to_media_end(start: f64, end: f64, media_end: f64) -> Option<(f64, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancel_all_supersedes_and_aborts_the_running_detect() {
+        // A detect "running" at the current generation (a parked task).
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let g0 = GENERATION.load(Ordering::SeqCst);
+            let task = tokio::spawn(std::future::pending::<()>());
+            *RUNNING.lock().unwrap() = Some((g0, task.abort_handle()));
+            store_latest(&Snapshot { generation: g0, ..Default::default() });
+            assert!(cancel_all(), "a running detect was reported");
+            assert!(!is_current(g0), "its snapshots are stale from now on");
+            assert!(RUNNING.lock().unwrap().is_none());
+            assert!(LATEST.lock().unwrap().is_none());
+            let err = task.await.unwrap_err();
+            assert!(err.is_cancelled(), "the task was aborted");
+            // Idempotent: nothing running, still a new generation.
+            let g1 = GENERATION.load(Ordering::SeqCst);
+            assert!(!cancel_all());
+            assert!(GENERATION.load(Ordering::SeqCst) > g1);
+        });
+    }
 
     #[test]
     fn layer3_gate() {

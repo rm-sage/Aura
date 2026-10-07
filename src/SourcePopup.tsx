@@ -3,7 +3,6 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Webview } from "@tauri-apps/api/webview";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -31,9 +30,9 @@ import { listen } from "@tauri-apps/api/event";
 // webview is its own browsing context, not an iframe.
 // ---------------------------------------------------------------------------
 
-const POPUP_USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+// The popup's user agent (a desktop Chrome string, which some providers
+// gate consent screens on) is set by the Rust builder,
+// `open_oauth_popup_webview` in scrobble_auth.rs.
 
 const FIRST_POPUP_TOAST_KEY = "aura:popup-first-open-shown";
 const POPUP_FIRST_HINT_EVENT = "aura:popup-first-open-hint";
@@ -258,13 +257,19 @@ export default function SourcePopupHost() {
   // Spawn / tear down the child webview. We do this in a layout effect
   // so the placeholder's geometry is final before we measure.
   //
-  // OAuth mode takes a different spawn path: the JS `new Webview()` API
-  // can't register an `on_navigation` handler, so we delegate to the
-  // Rust `open_oauth_popup_webview` command which builds the child
-  // webview with the navigation interceptor wired up. We then attach a
-  // JS-side handle via `Webview.getByLabel()` so the same
-  // setPosition/setSize/close machinery downstream works for both
-  // spawn paths uniformly.
+  // EVERY popup is built in Rust by `open_oauth_popup_webview`, never by the
+  // JS `new Webview()` API. Two reasons: (1) only a Rust builder can
+  // register the OAuth `on_navigation` interceptor, and (2) only a Rust
+  // builder gets the same WebView2 browser arguments as the main webview
+  // (`webview_browser_args`: Hardware acceleration off adds
+  // --disable-gpu). The popup shares the main webview's user data folder,
+  // and WebView2 refuses a second environment there with different options,
+  // so a JS-spawned popup failed to open (and the panel closed silently)
+  // whenever Hardware acceleration was off. A plain source popup passes no
+  // intercept prefix: navigation is then only reported (`popup-nav:<label>`),
+  // never intercepted. A JS-side handle is adopted with
+  // `Webview.getByLabel()` so the resize / close machinery below is the same
+  // for both kinds.
   useLayoutEffect(() => {
     let cancelled = false;
     if (!active) {
@@ -276,7 +281,6 @@ export default function SourcePopupHost() {
     const placeholder = placeholderRef.current;
     if (!placeholder) return;
 
-    const main = getCurrentWindow();
     const label = `aura-source-popup-${++labelCounterRef.current}-${Date.now()}`;
     activeLabelRef.current = label;
     setNavHost(null);
@@ -288,46 +292,26 @@ export default function SourcePopupHost() {
 
     let captured: Webview | null = null;
 
-    if (active.oauth) {
-      invoke("open_oauth_popup_webview", {
-        label,
-        url: active.url,
-        x,
-        y,
-        width,
-        height,
-        interceptPrefix: active.oauth.interceptPrefix ?? null,
+    invoke("open_oauth_popup_webview", {
+      label,
+      url: active.url,
+      x,
+      y,
+      width,
+      height,
+      interceptPrefix: active.oauth ? (active.oauth.interceptPrefix ?? null) : null,
+    })
+      .then(async () => {
+        if (cancelled) return;
+        const wv = await Webview.getByLabel(label);
+        if (cancelled || !wv) return;
+        webviewRef.current = wv;
+        captured = wv;
       })
-        .then(async () => {
-          if (cancelled) return;
-          // Adopt a JS-side handle so the resize observer + close path
-          // below work the same way as the JS-spawned popup.
-          const wv = await Webview.getByLabel(label);
-          if (cancelled || !wv) return;
-          webviewRef.current = wv;
-          captured = wv;
-        })
-        .catch((err) => {
-          console.warn(`[source-popup] oauth spawn failed: ${String(err)}`);
-          if (!cancelled) setActive(null);
-        });
-    } else {
-      const wv = new Webview(main, label, {
-        url: active.url,
-        x,
-        y,
-        width,
-        height,
-        userAgent: POPUP_USER_AGENT,
-      });
-      webviewRef.current = wv;
-      captured = wv;
-
-      wv.once("tauri://error", (e) => {
-        console.warn(`[source-popup] webview error: ${JSON.stringify(e.payload)}`);
+      .catch((err) => {
+        console.warn(`[source-popup] ${active.oauth ? "oauth " : ""}spawn failed: ${String(err)}`);
         if (!cancelled) setActive(null);
       });
-    }
 
     return () => {
       cancelled = true;

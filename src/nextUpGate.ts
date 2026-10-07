@@ -18,7 +18,8 @@
 //      ending).
 //   2. One trigger expression. With a TRUSTED ending (Layer 1, the AnimeThemes
 //      match, including a Transition-only match, whose END is trusted even
-//      though its start is the song's; the published ending that replaced a
+//      though its start is the song's, and a partially Over match, which is
+//      prompt-only but located by the same evidence; the published ending that replaced a
 //      match counts when its end agrees with the match's; agreed Layer 2 once
 //      it ships) the card appears at
 //      max(ed_end, end - lead): never inside the ending, and when story follows
@@ -52,8 +53,8 @@ export function playableEnd(duration: number, mediaEnd: number | null | undefine
 }
 
 export interface NextUpTiming {
-  /** End of a TRUSTED ending (Layer 1, a Transition-only match included), or
-   *  null. */
+  /** End of a TRUSTED ending (Layer 1, a Transition-only or partially Over
+   *  match included), or null. */
   trustedEdEnd: number | null;
   /** The detector's media end (final or early estimate), or null. */
   mediaEnd: number | null;

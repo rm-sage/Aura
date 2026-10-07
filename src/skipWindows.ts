@@ -381,8 +381,22 @@ export function dedupeSkipWindows(windowsIn: PreparedWindow[]): PreparedWindow[]
     });
     if (!clashes) kept.push(w);
   }
-  return withoutCrossKindOverlap(kept, (w) => l1Rank(w) * 100 + prio(w.source))
+  return withoutRecapUnderMatchedOpening(withoutCrossKindOverlap(kept, (w) => l1Rank(w) * 100 + prio(w.source)))
     .sort((a, b) => a.start - b.start);
+}
+
+/** A recap never plays under the opening theme. A crowd recap lying inside a
+ *  Layer 1 opening (within LAYER1_CONFLICT_SECONDS at its start) is the
+ *  opening's own audio misfiled, so it goes: Spy x Family E2's single IntroDB
+ *  "recap" 0-30 s sits inside the matched opening 0.46-89.68 s, and once the
+ *  opening started at the theme's audible start instead of 0 s, the recap was
+ *  the first window at 0 s and prompted a skip of 21 s of the opening. A
+ *  chapter recap (authored by the release) is left alone. */
+function withoutRecapUnderMatchedOpening(windows: PreparedWindow[]): PreparedWindow[] {
+  const ops = windows.filter((w) => skipKindGroup(w.type) === "op" && isLayer1Source(w.source));
+  if (ops.length === 0) return windows;
+  return windows.filter((w) => skipKindGroup(w.type) !== "recap" || w.source === "chapter"
+    || !ops.some((op) => w.start >= op.start - LAYER1_CONFLICT_SECONDS && w.end <= op.end + LAYER1_CONFLICT_SECONDS));
 }
 
 /** An ending never shares time with the opening. When an OP-group and an
@@ -915,7 +929,10 @@ export function applyCrossSourceHolds(
 }
 
 /** The Next-Up gate's TRUSTED ending end for a published window list, or
- *  null. A published Layer 1 ending's end; else the end of the published
+ *  null. A published Layer 1 ending's end (an auto-eligible match, or a
+ *  partially Over one: prompt-only, but its LOCATION is the same Layer 1
+ *  evidence, so Pop Team Epic 1:5's ED4 holds the card until 1406.26 instead
+ *  of raising it 28 s inside the ending); else the end of the published
  *  ending that took the place of the detector's own Layer 1 ending (a
  *  Transition-only match, published as itself or replaced by a chapter or
  *  crowd ending that outranked it) when the two ends agree within
@@ -928,12 +945,30 @@ export function trustedEndingEnd(
   detectedEd: PreparedWindow | null,
 ): number | null {
   const ends = published.filter((w) => skipKindGroup(w.type) === "ed");
-  const l1 = ends.find((w) => w.source === LAYER1_SOURCE);
+  const l1 = ends.find((w) => w.source === LAYER1_SOURCE || w.source === LAYER1_PROMPT_SOURCE);
   if (l1) return l1.end;
   const d = detectedEd;
-  if (d == null || (d.source !== LAYER1_SOURCE && d.source !== LAYER1_TRANSITION_SOURCE)) return null;
+  if (d == null || (d.source !== LAYER1_SOURCE && d.source !== LAYER1_PROMPT_SOURCE && d.source !== LAYER1_TRANSITION_SOURCE)) return null;
   const agreed = ends.find((w) => Math.abs(w.end - d.end) <= LAYER1_CONFLICT_SECONDS);
   return agreed ? agreed.end : null;
+}
+
+/** A window the SkipController already handled (auto-skipped, demoted to a
+ *  prompt, or skipped with X / Shift+X). */
+export interface HandledWindow { type: string; start: number; end: number }
+
+/** Whether `w` is a window in `handled`: the same kind with BOTH edges within
+ *  LAYER1_CONFLICT_SECONDS. Not exact edges: the detector refines a Layer 1
+ *  window while it decodes (an edge moving by more than 5 ms republishes it),
+ *  and an exact-edge key turned every refinement into a new window, so an
+ *  opening the user had already skipped, or sought back into on purpose,
+ *  was auto-skipped again or re-prompted. Both edges must agree, so a
+ *  genuinely different window of the kind is never swallowed. */
+export function handledIn(handled: readonly HandledWindow[], w: HandledWindow): boolean {
+  const g = skipKindGroup(w.type);
+  return handled.some((h) => skipKindGroup(h.type) === g
+    && Math.abs(h.start - w.start) <= LAYER1_CONFLICT_SECONDS
+    && Math.abs(h.end - w.end) <= LAYER1_CONFLICT_SECONDS);
 }
 
 /** THE stamp's window list: holds, then the dedupe (Layer 1 conflict drop,

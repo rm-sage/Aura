@@ -277,13 +277,15 @@ pub enum L1State {
     Pending,
     /// A Layer 1 window (any of its sources) stands for the kind.
     Matched,
-    /// The cour HAS themes of this kind and none matched this file: the kind's
-    /// crowd windows stay prompt-only, guesses of the kind are dropped.
+    /// The cour HAS themes of this kind and none matched this file (every
+    /// candidate loaded, and one of the cour's own was really compared): the
+    /// kind's crowd windows stay prompt-only, guesses of the kind are dropped.
     Informative,
     /// No theme of this kind to look for (no MAL id, or the cour lists none):
     /// Layer 1 cannot judge the crowd, so it is trusted as before.
     NoThemes,
-    /// Layer 1 could not decide (AnimeThemes down, download cap, a failed or
+    /// Layer 1 could not decide (AnimeThemes down, a theme that failed to
+    /// load, themes too short for the run gate, the download cap, a failed or
     /// cancelled region, no audio): the crowd is trusted as before.
     Unavailable,
 }
@@ -377,7 +379,16 @@ pub struct Snapshot {
     pub requested_ed: bool,
     #[serde(default)]
     pub requested_mal: Option<u32>,
+    /// The Layer 1 edge rule the windows were published under
+    /// (`EDGE_RULE`). A stored result from an older rule answers no kind
+    /// (`cached_serves`): it would replay mapping A's edges for a month.
+    #[serde(default)]
+    pub edge_rule: u32,
 }
+
+/// The current Layer 1 edge rule: 1 = the audible start and the episode-gated
+/// end (`matcher::refine_layer1_window`). 0 (absent) = mapping A.
+pub const EDGE_RULE: u32 = 1;
 
 impl Snapshot {
     fn has_window(&self) -> bool {
@@ -391,22 +402,33 @@ impl Snapshot {
 /// Layer 1 themes). A result computed WITH a MAL id may answer a request
 /// without one: it only knows more.
 fn cached_serves(stored: &Snapshot, req: &Request) -> bool {
-    (!req.op || (stored.requested_op && stored.op_l1 != L1State::Unknown))
+    (!(req.op || req.ed) || stored.edge_rule == EDGE_RULE)
+        && (!req.op || (stored.requested_op && stored.op_l1 != L1State::Unknown))
         && (!req.ed || (stored.requested_ed && stored.ed_l1 != L1State::Unknown))
         && (req.mal_id.is_none() || stored.requested_mal == req.mal_id)
 }
 
-/// Whether a stored result earns the long TTL (`cache::RESULT_TTL`): it holds a
-/// window, and none of its windows is a Layer 3 window decided while the cour's
-/// theme list was a miss (no MAL id, or AnimeThemes listed nothing for the
-/// cour). Such a miss is cached for a day only (`THEME_LIST_MISS_TTL`), so a
-/// continuity window standing in for it must not outlive it: when AnimeThemes
-/// adds the cour, the next play after a day gets Layer 1.
-fn result_lasts(s: &Snapshot, l3_after_miss: &HashSet<Kind>) -> bool {
-    let from_miss = |w: &Option<WindowOut>, k: Kind| {
-        w.as_ref().is_some_and(|w| w.source == "continuity" && l3_after_miss.contains(&k))
+/// How long a stored result lives. `cache::RESULT_TTL` when it holds a
+/// window and none of its windows is a Layer 3 window standing in for a
+/// theme the cour's AnimeThemes list does not have; such a window lives no
+/// longer than that list answer (`l3_list_ttl`, per kind): a day after a
+/// theme-list MISS (no MAL id, or AnimeThemes listed nothing for the cour,
+/// `THEME_LIST_MISS_TTL`), the theme list's own `THEME_LIST_HIT_TTL` when the
+/// cour's list answered but has no theme of THAT kind (an airing cour often
+/// lists its opening weeks before its ending). When AnimeThemes adds the
+/// theme, the next play after that gets Layer 1. No window: the abstention
+/// TTL.
+fn result_ttl(s: &Snapshot, l3_list_ttl: &HashMap<Kind, u64>) -> u64 {
+    if !s.has_window() {
+        return cache::RESULT_ABSTAIN_TTL;
+    }
+    let stand_in = |w: &Option<WindowOut>, k: Kind| {
+        w.as_ref().filter(|w| w.source == "continuity").and_then(|_| l3_list_ttl.get(&k).copied())
     };
-    s.has_window() && !from_miss(&s.op, Kind::Op) && !from_miss(&s.ed, Kind::Ed)
+    [stand_in(&s.op, Kind::Op), stand_in(&s.ed, Kind::Ed)]
+        .into_iter()
+        .flatten()
+        .fold(cache::RESULT_TTL, u64::min)
 }
 
 /// What a detect needs from its host.
@@ -421,7 +443,14 @@ pub struct Ctx {
     /// ffmpeg on a stream (`replay.rs`). Everything else is the real job.
     #[cfg(test)]
     pub replay: Option<Arc<super::replay::Replay>>,
+    /// Tests only: answer theme loads without the network (the result and a
+    /// delay in milliseconds), so the decision's failure paths can be driven.
+    #[cfg(test)]
+    pub fake_theme_load: Option<FakeThemeLoad>,
 }
+
+#[cfg(test)]
+pub type FakeThemeLoad = Arc<dyn Fn(&ThemeRec) -> (Result<(Arc<ThemeFp>, bool), String>, u64) + Send + Sync>;
 
 /// A region's PCM source: an ffmpeg pass, or (tests only) a replay of cached
 /// PCM through the very same streaming loop.
@@ -526,6 +555,21 @@ impl Catalog {
     fn primary_themes_of_kind(&self, kind: Kind) -> usize {
         self.metas[..self.primary_len].iter().filter(|m| m.kind == kind).count()
     }
+
+    /// How long a Layer 3 window decided for a kind this list has no theme
+    /// of may be cached (see `result_ttl`): it stands in for that theme, so
+    /// it lives no longer than the list answer. A day after a miss (no MAL
+    /// id, or AnimeThemes listing nothing for the cour), the list's hit TTL
+    /// when the list answered without a theme of that kind (an airing cour
+    /// listing its opening before its ending). None: the list was never read.
+    fn l3_list_ttl(&self) -> Option<u64> {
+        match self.state {
+            ListState::NoMal => Some(cache::THEME_LIST_MISS_TTL),
+            ListState::Loaded if self.primary_len == 0 => Some(cache::THEME_LIST_MISS_TTL),
+            ListState::Loaded => Some(cache::THEME_LIST_HIT_TTL),
+            ListState::Unavailable(_) => None,
+        }
+    }
 }
 
 // ── theme loader ────────────────────────────────────────────────────────────
@@ -537,8 +581,26 @@ struct Loader {
     pending: HashSet<usize>,
     loaded: HashMap<usize, Arc<ThemeFp>>,
     failed: HashSet<usize>,
+    /// Theme loads that cost a network attempt, per kind: every download and
+    /// every FAILED load (a cache hit costs nothing). Counted against
+    /// `themes::MAX_DOWNLOADS_PER_KIND`: when only successes counted, an
+    /// AnimeThemes audio outage walked every candidate, siblings included,
+    /// at up to 46 s each.
     downloads: HashMap<Kind, usize>,
+    /// Consecutive failed loads per kind (a load that succeeds resets it).
+    /// `FAIL_STREAK_ABSTAIN` of them end the kind's decision as undecided.
+    fail_streak: HashMap<Kind, usize>,
+    /// A fork's `downloads` when it was forked, so `Decider::merge` adds
+    /// only what the fork itself spent (empty on the main loader).
+    downloads_at_fork: HashMap<Kind, usize>,
 }
+
+/// Consecutive theme load failures (download, HTTP error, timeout, decode)
+/// after which a kind's Layer 1 decision stops and abstains as UNDECIDED
+/// (`L1State::Unavailable`, never cached): the theme audio host is down, and
+/// trying every remaining candidate and every sibling cour would hold both
+/// kinds `Pending` for minutes.
+pub const FAIL_STREAK_ABSTAIN: usize = 2;
 
 impl Loader {
     fn new() -> Self {
@@ -548,12 +610,16 @@ impl Loader {
             loaded: HashMap::new(),
             failed: HashSet::new(),
             downloads: HashMap::new(),
+            fail_streak: HashMap::new(),
+            downloads_at_fork: HashMap::new(),
         }
     }
 
     /// A loader for a forked decision: what is loaded or failed so far, and
-    /// the download counts, but no in-flight load (a load still pending here
-    /// is started again by the fork if it needs it).
+    /// the attempt counts, but no in-flight load. The caller settles the
+    /// in-flight loads of the fork's kind first (`Decider::settle_pending`),
+    /// so the fork never starts a second download of a theme the main loader
+    /// is still fetching.
     fn fork(&self) -> Self {
         Self {
             set: JoinSet::new(),
@@ -561,6 +627,8 @@ impl Loader {
             loaded: self.loaded.clone(),
             failed: self.failed.clone(),
             downloads: self.downloads.clone(),
+            fail_streak: self.fail_streak.clone(),
+            downloads_at_fork: self.downloads.clone(),
         }
     }
 
@@ -569,6 +637,15 @@ impl Loader {
             return;
         }
         self.pending.insert(i);
+        #[cfg(test)]
+        if let Some(fake) = &ctx.fake_theme_load {
+            let (res, delay_ms) = fake(rec);
+            self.set.spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                (i, res)
+            });
+            return;
+        }
         let (ff, dir, rec) = (ctx.ffmpeg.clone(), ctx.data_dir.clone(), rec.clone());
         self.set.spawn(async move { (i, animethemes::load_theme_fp(&ff, dir.as_deref(), &rec).await) });
     }
@@ -583,6 +660,7 @@ impl Loader {
                 if downloaded {
                     *self.downloads.entry(rec.kind()).or_default() += 1;
                 }
+                self.fail_streak.insert(rec.kind(), 0);
                 crate::devlog!(
                     debug, "skipdetect",
                     "{who} theme {} ({}) {} {:.1}s",
@@ -597,6 +675,8 @@ impl Loader {
             Err(e) => {
                 crate::devlog!(warn, "skipdetect", "{who} theme {} ({}) failed: {e}", rec.label(), rec.basename);
                 self.failed.insert(i);
+                *self.downloads.entry(rec.kind()).or_default() += 1;
+                *self.fail_streak.entry(rec.kind()).or_default() += 1;
                 None
             }
         }
@@ -618,6 +698,10 @@ impl Loader {
 
     fn downloads(&self, kind: Kind) -> usize {
         self.downloads.get(&kind).copied().unwrap_or(0)
+    }
+
+    fn fail_streak(&self, kind: Kind) -> usize {
+        self.fail_streak.get(&kind).copied().unwrap_or(0)
     }
 }
 
@@ -781,9 +865,9 @@ struct Decider<'a> {
     cat: Catalog,
     loader: Loader,
     cacheable: bool,
-    /// Kinds whose Layer 3 window was decided while the cour's theme list was
-    /// a miss (see `result_lasts`).
-    l3_after_miss: HashSet<Kind>,
+    /// Kinds whose Layer 3 window stands in for a theme the cour's list does
+    /// not have, with the TTL of that list answer (see `result_ttl`).
+    l3_list_ttl: HashMap<Kind, u64>,
 }
 
 impl<'a> Decider<'a> {
@@ -796,6 +880,19 @@ impl<'a> Decider<'a> {
         }
     }
 
+    /// Wait for every in-flight load of `kind` to land (loaded or failed),
+    /// absorbing whatever else finishes meanwhile. Called before a fork, so
+    /// the fork inherits the theme instead of downloading it a second time
+    /// (and counting one download where two happened). At most one theme
+    /// load, which the fork would otherwise have spent re-downloading.
+    async fn settle_pending(&mut self, kind: Kind) {
+        let mine: Vec<usize> = self.loader.pending.iter().copied().filter(|&i| self.cat.recs[i].kind() == kind).collect();
+        let who = self.who.clone();
+        for i in mine {
+            let _ = self.loader.wait_for(i, &self.cat, &who).await;
+        }
+    }
+
     fn fork(&self) -> Decider<'a> {
         Decider {
             ctx: self.ctx,
@@ -804,7 +901,7 @@ impl<'a> Decider<'a> {
             cat: self.cat.clone(),
             loader: self.loader.fork(),
             cacheable: true,
-            l3_after_miss: HashSet::new(),
+            l3_list_ttl: HashMap::new(),
         }
     }
 
@@ -824,12 +921,18 @@ impl<'a> Decider<'a> {
                 self.loader.failed.insert(i);
             }
         }
+        // The fork's OWN attempts are added (the main loader kept counting
+        // its own loads meanwhile), so every real download counts once.
         for (k, n) in fork.loader.downloads {
-            let e = self.loader.downloads.entry(k).or_default();
+            let at_fork = fork.loader.downloads_at_fork.get(&k).copied().unwrap_or(0);
+            *self.loader.downloads.entry(k).or_default() += n.saturating_sub(at_fork);
+        }
+        for (k, n) in fork.loader.fail_streak {
+            let e = self.loader.fail_streak.entry(k).or_default();
             *e = (*e).max(n);
         }
         self.cacheable &= fork.cacheable;
-        self.l3_after_miss.extend(fork.l3_after_miss);
+        self.l3_list_ttl.extend(fork.l3_list_ttl);
     }
 
     async fn load_siblings(&mut self) {
@@ -869,7 +972,7 @@ impl<'a> Decider<'a> {
     }
 
     /// Layer 1 over a COMPLETE region, by the stop policy.
-    async fn decide_complete(&mut self, kind: Kind, q: Arc<Fingerprint>, media_end: f64) -> Decision {
+    async fn decide_complete(&mut self, kind: Kind, region: &RegionOut, media_end: f64) -> Decision {
         match &self.cat.state {
             ListState::NoMal => return Decision::NoThemes { note: "no MAL id".into() },
             ListState::Unavailable(e) => {
@@ -881,9 +984,10 @@ impl<'a> Decider<'a> {
             }
             ListState::Loaded => {}
         }
+        let q = region.fp.clone();
         let mut verdict: HashMap<usize, bool> = HashMap::new();
         let mut matches: HashMap<usize, ThemeMatch> = HashMap::new();
-        let mut uncertain = false;
+        let mut tally = SearchTally::default();
         loop {
             let order = self.cat.order(kind);
             let passed: Vec<Option<bool>> = (0..self.cat.metas.len()).map(|i| verdict.get(&i).copied()).collect();
@@ -892,16 +996,47 @@ impl<'a> Decider<'a> {
                     let rec = self.cat.recs[i].clone();
                     self.loader.start(i, &rec, self.ctx);
                     let who = self.who.clone();
+                    let own = i < self.cat.primary_len;
                     let Some(t) = self.loader.wait_for(i, &self.cat, &who).await else {
-                        uncertain = true;
+                        tally.failed += 1;
                         verdict.insert(i, false);
+                        let streak = self.loader.fail_streak(kind);
+                        if streak >= FAIL_STREAK_ABSTAIN {
+                            // The theme audio host is down (or every file is
+                            // broken): stop here instead of walking every
+                            // candidate and sibling cour at up to 46 s each.
+                            // Undecided, so the crowd keeps its trust.
+                            return Decision::Abstain {
+                                note: format!("theme audio unavailable ({streak} consecutive load failures); layer 1 undecided"),
+                                cacheable: false,
+                                l1: L1State::Unavailable,
+                            };
+                        }
                         continue;
                     };
+                    if matcher::too_short_to_match(t.audible) {
+                        // The 30 s run gate can never pass on a reference this
+                        // short (short-form anime): it is no evidence either way.
+                        crate::devlog!(
+                            info, "skipdetect",
+                            "{} {} theme {} audible for {:.1}s: shorter than the {:.0} s run gate, not evaluated",
+                            self.who,
+                            kind_name(kind),
+                            rec.label(),
+                            t.audible.1 - t.audible.0,
+                            matcher::ACCEPT_LEN_S
+                        );
+                        if own {
+                            tally.short_own += 1;
+                        }
+                        verdict.insert(i, false);
+                        continue;
+                    }
                     let q2 = q.clone();
                     let m = match tokio::task::spawn_blocking(move || matcher::evaluate_theme(&t.fp, t.audible, &q2)).await {
                         Ok(m) => m,
                         Err(_) => {
-                            uncertain = true;
+                            tally.failed += 1;
                             verdict.insert(i, false);
                             continue;
                         }
@@ -921,12 +1056,16 @@ impl<'a> Decider<'a> {
                         m.soft42,
                         m.reject.map_or("accept", |r| r.as_str())
                     );
+                    if own {
+                        tally.evaluated_own += 1;
+                    }
                     verdict.insert(i, m.accepted);
                     matches.insert(i, m);
                 }
                 Step::Accept(i) => {
                     let m = &matches[&i];
-                    let Some(w) = matcher::layer1_window(m, media_end) else {
+                    let audible = self.loader.loaded.get(&i).map(|t| t.audible);
+                    let Some(w) = published_window(m, audible, kind, region, media_end) else {
                         return Decision::Abstain {
                             note: "matched window empty after clamping".into(),
                             cacheable: true,
@@ -966,16 +1105,7 @@ impl<'a> Decider<'a> {
             };
             return Decision::NoThemes { note: note.into() };
         }
-        let incomplete = self.cat.siblings_incomplete;
-        Decision::Abstain {
-            note: if incomplete {
-                "themes exist but none matched (informative abstain; sibling lookup incomplete)".into()
-            } else {
-                "themes exist but none matched (informative abstain)".into()
-            },
-            cacheable: !uncertain && !incomplete,
-            l1: L1State::Informative,
-        }
+        exhausted_abstain(&tally, self.cat.siblings_incomplete)
     }
 
     /// The whole decision for one kind and region: the streaming acceptance
@@ -984,8 +1114,9 @@ impl<'a> Decider<'a> {
     async fn decide_kind(&mut self, kind: Kind, region: &RegionOut, media_end: f64) -> Decision {
         let decision = if !region.complete {
             match &region.early {
-                // HEAD killed after acceptance: the streaming window stands.
-                Some(a) => match matcher::layer1_window(&a.m, media_end) {
+                // HEAD killed after acceptance: the streaming window stands,
+                // its edges refined with the levels decoded up to the kill.
+                Some(a) => match published_window(&a.m, self.loader.loaded.get(&a.idx).map(|t| t.audible), kind, region, media_end) {
                     Some(w) => Decision::Window(layer1_out(&a.m, &self.cat.recs[a.idx], w, &self.cat.metas[a.idx])),
                     None => Decision::Abstain {
                         note: "matched window empty after clamping".into(),
@@ -1000,7 +1131,7 @@ impl<'a> Decider<'a> {
                 },
             }
         } else {
-            self.decide_complete(kind, region.fp.clone(), media_end).await
+            self.decide_complete(kind, region, media_end).await
         };
         match decision {
             Decision::NoThemes { note } => {
@@ -1009,16 +1140,10 @@ impl<'a> Decider<'a> {
                     // anime play had no Layer 1 themes for a kind.
                     crate::devlog!(info, "skipdetect", "{} layer1 counter {}: {note}", self.who, kind_name(kind));
                 }
-                // A theme-list miss (no MAL id, or AnimeThemes listing nothing
-                // for the cour itself) is only cached for a day.
-                let list_miss = match self.cat.state {
-                    ListState::NoMal => true,
-                    ListState::Loaded => self.cat.primary_len == 0,
-                    ListState::Unavailable(_) => false,
-                };
+                let list_ttl = self.cat.l3_list_ttl();
                 let d = self.layer3(kind, region, &note).await;
-                if list_miss && matches!(d, Decision::Window(_)) {
-                    self.l3_after_miss.insert(kind);
+                if let (Some(ttl), Decision::Window(_)) = (list_ttl, &d) {
+                    self.l3_list_ttl.insert(kind, ttl);
                 }
                 d
             }
@@ -1163,7 +1288,7 @@ pub async fn run(ctx: &Ctx, req: &Request) -> Snapshot {
             },
             loader: Loader::new(),
             cacheable: true,
-            l3_after_miss: HashSet::new(),
+            l3_list_ttl: HashMap::new(),
         },
         snap: Snapshot {
             generation: ctx.generation,
@@ -1171,6 +1296,7 @@ pub async fn run(ctx: &Ctx, req: &Request) -> Snapshot {
             requested_op: req.op,
             requested_ed: req.ed,
             requested_mal: req.mal_id,
+            edge_rule: EDGE_RULE,
             op_l1: if req.op { L1State::Pending } else { L1State::NotRequested },
             ed_l1: if req.ed { L1State::Pending } else { L1State::NotRequested },
             ..Default::default()
@@ -1202,15 +1328,16 @@ pub async fn run(ctx: &Ctx, req: &Request) -> Snapshot {
         if let (Some(dir), Some(k)) = (ctx.data_dir.clone(), key) {
             let mut stored = job.snap.clone();
             stored.generation = 0;
-            let lasts = result_lasts(&stored, &job.d.l3_after_miss);
-            if stored.has_window() && !lasts {
+            let ttl = result_ttl(&stored, &job.d.l3_list_ttl);
+            if stored.has_window() && ttl < cache::RESULT_TTL {
                 crate::devlog!(
                     info, "skipdetect",
-                    "{} continuity window after a theme-list miss: result cached for a day only",
-                    job.d.who
+                    "{} continuity window standing in for a theme AnimeThemes does not list: result cached for {} day(s) only",
+                    job.d.who,
+                    ttl / (24 * 3600)
                 );
             }
-            let _ = tokio::task::spawn_blocking(move || cache::put_result(&dir, &k, stored, lasts)).await;
+            let _ = tokio::task::spawn_blocking(move || cache::put_result(&dir, &k, stored, ttl)).await;
         }
     }
     job.snap
@@ -1228,6 +1355,76 @@ fn fmt_win(w: &Option<WindowOut>) -> String {
         ),
         None => "none".to_string(),
     }
+}
+
+/// What an exhausted Layer 1 search (no theme matched, the cour's own list
+/// HAS themes of the kind) says about the kind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SearchTally {
+    /// Candidates whose load (download, HTTP, timeout, decode) or evaluation
+    /// failed, own cour or sibling.
+    failed: usize,
+    /// The cour's own candidates evaluated against the region.
+    evaluated_own: usize,
+    /// The cour's own candidates too short for the 30 s run gate.
+    short_own: usize,
+}
+
+/// The abstain for an exhausted search. `Informative` ("the cour has themes
+/// of this kind and none is in this file") only when it is a fact: every
+/// candidate loaded and at least one of the cour's own was really compared.
+/// A failed load could have been the theme that matches, and a theme too
+/// short for the run gate was never comparable, so either leaves the kind
+/// UNDECIDED (`Unavailable`): the crowd keeps its trust (an informative
+/// abstain holds every crowd opening prompt-only, drops AniSkip endings and
+/// single IntroDB rows, and blocks Layer 3). A failure is not cached (the
+/// next play retries); an all-short cour is (it stays that way).
+fn exhausted_abstain(t: &SearchTally, siblings_incomplete: bool) -> Decision {
+    if t.failed > 0 {
+        return Decision::Abstain {
+            note: format!("themes exist but {} candidate(s) could not be loaded; layer 1 undecided", t.failed),
+            cacheable: false,
+            l1: L1State::Unavailable,
+        };
+    }
+    if t.evaluated_own == 0 && t.short_own > 0 {
+        return Decision::Abstain {
+            note: format!(
+                "every theme of the kind is shorter than the {:.0} s run gate; layer 1 cannot judge",
+                matcher::ACCEPT_LEN_S
+            ),
+            cacheable: !siblings_incomplete,
+            l1: L1State::Unavailable,
+        };
+    }
+    Decision::Abstain {
+        note: if siblings_incomplete {
+            "themes exist but none matched (informative abstain; sibling lookup incomplete)".into()
+        } else {
+            "themes exist but none matched (informative abstain)".into()
+        },
+        cacheable: !siblings_incomplete,
+        l1: L1State::Informative,
+    }
+}
+
+/// The window a Layer 1 match publishes: `matcher::refine_layer1_window`
+/// with the theme's audible span and, once the region has finished, its RMS
+/// levels (the gated end). Without the theme's audible span (never expected:
+/// the theme was loaded to be matched) mapping A stands.
+fn published_window(
+    m: &ThemeMatch,
+    audible: Option<(f64, f64)>,
+    kind: Kind,
+    region: &RegionOut,
+    media_end: f64,
+) -> Option<(f64, f64)> {
+    let Some(audible) = audible else { return matcher::layer1_window(m, media_end) };
+    let levels = region
+        .origin
+        .filter(|_| !region.levels.is_empty())
+        .map(|t0| matcher::RegionLevels { levels: &region.levels, t0 });
+    matcher::refine_layer1_window(m, audible, kind == Kind::Ed, levels, media_end)
 }
 
 fn layer1_out(m: &ThemeMatch, rec: &ThemeRec, window: (f64, f64), meta: &ThemeMeta) -> WindowOut {
@@ -1387,6 +1584,10 @@ impl<'a> Job<'a> {
             }
             if region.complete && req.ed {
                 self.d.drain_finished_loads();
+                // A theme of the OP still downloading (the prefetch, on a
+                // short file or a slow AnimeThemes) lands here first, so the
+                // fork never fetches it a second time.
+                self.d.settle_pending(Kind::Op).await;
                 let mut fork = self.d.fork();
                 side = Some(Box::pin(async move {
                     let d = fork.decide_kind(Kind::Op, &region, media_end).await;
@@ -1490,7 +1691,10 @@ impl<'a> Job<'a> {
 
     /// Publish the early provisional window (prompt-only, its own source).
     fn publish_early(&mut self, kind: Kind, idx: usize, run: &matcher::Run, margin: f64, window: (f64, f64), decoded_s: f64) {
-        let Some((s, e)) = super::clamp_to_media_end(window.0, window.1, self.media_end_now()) else { return };
+        // Same start rule as the full match: the theme's audible start.
+        let lead = self.d.loader.loaded.get(&idx).map_or(0.0, |t| t.audible.0);
+        let start = matcher::early_audible_start(run, lead, window.0);
+        let Some((s, e)) = super::clamp_to_media_end(start, window.1, self.media_end_now()) else { return };
         let label = self.d.cat.recs[idx].label();
         crate::devlog!(
             info, "skipdetect",
@@ -1560,7 +1764,12 @@ impl<'a> Job<'a> {
 
     /// Publish (or refine) a streaming acceptance. Returns the window.
     fn accept_streaming(&mut self, kind: Kind, a: &Accepted, decoded_s: f64, first: bool) -> Option<(f64, f64)> {
-        let w = matcher::layer1_window(&a.m, self.media_end_now())?;
+        // The audible start now; the end stays mapping A's until the region
+        // has finished and its levels can gate it (`published_window`).
+        let w = match self.d.loader.loaded.get(&a.idx) {
+            Some(t) => matcher::refine_layer1_window(&a.m, t.audible, kind == Kind::Ed, None, self.media_end_now())?,
+            None => matcher::layer1_window(&a.m, self.media_end_now())?,
+        };
         let out = layer1_out(&a.m, &self.d.cat.recs[a.idx], w, &self.d.cat.metas[a.idx]);
         let prev = match kind {
             Kind::Op => self.snap.op.clone(),
@@ -2146,6 +2355,7 @@ mod tests {
             requested_mal: mal,
             op_l1: l1(op),
             ed_l1: l1(ed),
+            edge_rule: EDGE_RULE,
             ..Default::default()
         }
     }
@@ -2213,21 +2423,324 @@ mod tests {
     }
 
     #[test]
-    fn continuity_after_list_miss_gets_the_short_ttl() {
+    fn a_stand_in_continuity_window_lives_no_longer_than_the_list_answer() {
         let l3 = WindowOut { start: 0.0, end: 89.0, source: "continuity".into(), ..Default::default() };
         let l1 = WindowOut { start: 0.0, end: 89.0, source: "animethemes".into(), auto_eligible: true, ..Default::default() };
         let snap = |op: Option<WindowOut>, ed: Option<WindowOut>| Snapshot { op, ed, ..Default::default() };
-        let none: HashSet<Kind> = HashSet::new();
-        let op_miss: HashSet<Kind> = [Kind::Op].into_iter().collect();
-        // Layer 3 with themes simply absent for the kind (the list answered):
-        // a stable fact, the long TTL.
-        assert!(result_lasts(&snap(Some(l3.clone()), None), &none));
-        // Layer 3 standing in for a theme-list miss: no longer than the miss.
-        assert!(!result_lasts(&snap(Some(l3.clone()), None), &op_miss));
-        assert!(!result_lasts(&snap(Some(l3.clone()), Some(l1.clone())), &op_miss));
+        let none: HashMap<Kind, u64> = HashMap::new();
+        let op_miss: HashMap<Kind, u64> = [(Kind::Op, cache::THEME_LIST_MISS_TTL)].into_iter().collect();
+        let ed_unlisted: HashMap<Kind, u64> = [(Kind::Ed, cache::THEME_LIST_HIT_TTL)].into_iter().collect();
+        // Layer 3 with no stand-in recorded: the long TTL.
+        assert_eq!(result_ttl(&snap(Some(l3.clone()), None), &none), cache::RESULT_TTL);
+        // Layer 3 standing in for a theme-list miss: a day.
+        assert_eq!(result_ttl(&snap(Some(l3.clone()), None), &op_miss), cache::THEME_LIST_MISS_TTL);
+        assert_eq!(result_ttl(&snap(Some(l3.clone()), Some(l1.clone())), &op_miss), cache::THEME_LIST_MISS_TTL);
+        // An OP-only list (an airing cour) and a continuity ED: never the
+        // 30-day RESULT_TTL, the list's own 7 days, so an ED AnimeThemes adds
+        // later reaches Layer 1 within a week.
+        assert_eq!(result_ttl(&snap(Some(l1.clone()), Some(l3.clone())), &ed_unlisted), cache::THEME_LIST_HIT_TTL);
+        assert!(result_ttl(&snap(None, Some(l3.clone())), &ed_unlisted) < cache::RESULT_TTL);
         // A Layer 1 window is never shortened by another kind's flag.
-        assert!(result_lasts(&snap(Some(l1.clone()), None), &op_miss));
+        assert_eq!(result_ttl(&snap(Some(l1.clone()), None), &op_miss), cache::RESULT_TTL);
         // No window: the abstention TTL as before.
-        assert!(!result_lasts(&snap(None, None), &none));
+        assert_eq!(result_ttl(&snap(None, None), &none), cache::RESULT_ABSTAIN_TTL);
+    }
+
+    #[test]
+    fn the_layer3_list_ttl_is_per_kind() {
+        // The cour's list answered with an OP only: a Layer 3 ED stands in
+        // for an ED AnimeThemes may still add, for the list's 7 days.
+        let mut c = catalog(Some(1));
+        c.push_list(10, vec![rec("OP1", true, false, false)]);
+        c.primary_len = c.recs.len();
+        assert_eq!(c.primary_themes_of_kind(Kind::Ed), 0);
+        assert_eq!(c.l3_list_ttl(), Some(cache::THEME_LIST_HIT_TTL));
+        // AnimeThemes listed nothing for the cour, or no MAL id: a day.
+        let mut empty = catalog(Some(1));
+        empty.primary_len = 0;
+        assert_eq!(empty.l3_list_ttl(), Some(cache::THEME_LIST_MISS_TTL));
+        empty.state = ListState::NoMal;
+        assert_eq!(empty.l3_list_ttl(), Some(cache::THEME_LIST_MISS_TTL));
+        empty.state = ListState::Unavailable("down".into());
+        assert_eq!(empty.l3_list_ttl(), None);
+    }
+
+    #[test]
+    fn a_result_from_an_older_edge_rule_answers_no_kind() {
+        let full = req("https://x/y").validate().unwrap();
+        let mut probe_only = full.clone();
+        probe_only.op = false;
+        probe_only.ed = false;
+        let mut old = stored(true, true, Some(56784));
+        old.edge_rule = 0;
+        assert!(!cached_serves(&old, &full), "mapping A windows must not be replayed");
+        assert!(cached_serves(&old, &probe_only), "its media end still answers a probe-only request");
+        old.edge_rule = EDGE_RULE;
+        assert!(cached_serves(&old, &full));
+        let back: Snapshot = serde_json::from_str(&serde_json::to_string(&stored(true, true, None)).unwrap()).unwrap();
+        assert_eq!(back.edge_rule, EDGE_RULE, "the rule survives the cache");
+    }
+
+    // ── the decision's failure paths, driven through a fake theme loader ──
+
+    /// An episode region (noise, no theme in it) and a matching level track.
+    fn region_without_themes(secs: f64) -> RegionOut {
+        let ep = pcm(&tone(secs, 77), 0.4);
+        RegionOut {
+            fp: Arc::new(super::super::fingerprint::fingerprint(&ep, 0.0)),
+            levels: super::super::continuity::rms_levels(&ep),
+            silences: Vec::new(),
+            origin: Some(0.0),
+            samples: ep.len() as u64,
+            complete: true,
+            failed: None,
+            early: None,
+        }
+    }
+
+    fn theme_of(secs: f64, seed: u64) -> Arc<ThemeFp> {
+        Arc::new(animethemes::theme_fp_from_pcm(&rec("X", true, false, false), &pcm(&tone(secs, seed), 0.8)))
+    }
+
+    struct Harness {
+        ctx: Ctx,
+        req: Request,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// `answer(slug)` = (load result, delay ms). Sibling cours are pinned to
+    /// none, so nothing here touches the network.
+    fn harness(answer: impl Fn(&str) -> (Result<(Arc<ThemeFp>, bool), String>, u64) + Send + Sync + 'static) -> Harness {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = calls.clone();
+        let ctx = Ctx {
+            ffmpeg: OsString::from("ffmpeg-not-used"),
+            data_dir: None,
+            generation: 1,
+            publish: Arc::new(|_: &Snapshot| {}),
+            replay: None,
+            fake_theme_load: Some(Arc::new(move |r: &ThemeRec| {
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                answer(&r.slug)
+            })),
+        };
+        let mut req = req("https://x/y").validate().unwrap();
+        req.sibling_mal_ids = Some(Vec::new());
+        Harness { ctx, req, calls }
+    }
+
+    fn decider<'a>(h: &'a Harness, list: Vec<ThemeRec>) -> Decider<'a> {
+        let mut cat = catalog(None);
+        cat.push_list(56784, list);
+        cat.primary_len = cat.recs.len();
+        Decider {
+            ctx: &h.ctx,
+            req: &h.req,
+            who: "test".into(),
+            cat,
+            loader: Loader::new(),
+            cacheable: true,
+            l3_list_ttl: HashMap::new(),
+        }
+    }
+
+    fn abstain_of(d: Decision) -> (L1State, bool, String) {
+        match d {
+            Decision::Abstain { l1, cacheable, note } => (l1, cacheable, note),
+            Decision::Window(w) => panic!("unexpected window {w:?}"),
+            Decision::NoThemes { note } => panic!("unexpected NoThemes ({note})"),
+        }
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap()
+    }
+
+    #[test]
+    fn a_theme_audio_outage_ends_undecided_after_two_failures() {
+        let h = harness(|_| (Err("HTTP 503".into()), 0));
+        let list = vec![
+            rec("OP1", true, false, false),
+            rec("OP2", true, false, false),
+            rec("OP3", true, false, false),
+            rec("OP4", true, false, false),
+        ];
+        let region = region_without_themes(120.0);
+        let (d, siblings, downloads) = rt().block_on(async {
+            let mut d = decider(&h, list);
+            let out = d.decide_complete(Kind::Op, &region, 1400.0).await;
+            (out, d.cat.siblings_tried, d.loader.downloads(Kind::Op))
+        });
+        let (l1, cacheable, note) = abstain_of(d);
+        assert_eq!(l1, L1State::Unavailable, "{note}");
+        assert!(!cacheable, "an outage is never cached");
+        assert_eq!(h.calls.load(std::sync::atomic::Ordering::SeqCst), FAIL_STREAK_ABSTAIN, "stops after the streak");
+        assert!(!siblings, "no sibling cour is looked up during an outage");
+        assert_eq!(downloads, FAIL_STREAK_ABSTAIN, "every failed attempt counts against the cap");
+    }
+
+    #[test]
+    fn a_failed_candidate_never_makes_an_informative_abstain() {
+        // OP1 (the top candidate, possibly the right one) fails to load; OP2
+        // loads and is rejected. Nothing says the file has no theme.
+        let other = theme_of(70.0, 5);
+        let h = harness(move |slug| if slug == "OP1" { (Err("timed out".into()), 0) } else { (Ok((other.clone(), true)), 0) });
+        let region = region_without_themes(120.0);
+        let d = rt().block_on(async {
+            let mut d = decider(&h, vec![rec("OP1", true, false, false), rec("OP2", true, false, false)]);
+            d.decide_complete(Kind::Op, &region, 1400.0).await
+        });
+        let (l1, cacheable, note) = abstain_of(d);
+        assert_eq!(l1, L1State::Unavailable, "{note}");
+        assert!(!cacheable);
+        assert_eq!(h.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn every_theme_loaded_and_rejected_is_informative() {
+        let other = theme_of(70.0, 5);
+        let h = harness(move |_| (Ok((other.clone(), true)), 0));
+        let region = region_without_themes(120.0);
+        let d = rt().block_on(async {
+            let mut d = decider(&h, vec![rec("OP1", true, false, false), rec("OP2", true, false, false)]);
+            d.decide_complete(Kind::Op, &region, 1400.0).await
+        });
+        let (l1, cacheable, note) = abstain_of(d);
+        assert_eq!(l1, L1State::Informative, "{note}");
+        assert!(cacheable);
+    }
+
+    #[test]
+    fn themes_shorter_than_the_run_gate_leave_the_kind_undecided() {
+        // A short-form cour: its only OP reference is 20 s of audio, and it IS
+        // in the episode. The 30 s run gate can never pass, so it says nothing
+        // about the crowd's windows.
+        let th = tone(20.0, 5);
+        let short = Arc::new(animethemes::theme_fp_from_pcm(&rec("OP1", true, false, false), &pcm(&th, 0.8)));
+        assert!(matcher::too_short_to_match(short.audible));
+        let mut ep: Vec<f64> = tone(120.0, 9).iter().map(|v| v * 0.1).collect();
+        for (i, v) in th.iter().enumerate() {
+            ep[i + 11025 * 10] += v * 0.8;
+        }
+        let ep = pcm(&ep, 0.9);
+        let region = RegionOut {
+            fp: Arc::new(super::super::fingerprint::fingerprint(&ep, 0.0)),
+            levels: super::super::continuity::rms_levels(&ep),
+            silences: Vec::new(),
+            origin: Some(0.0),
+            samples: ep.len() as u64,
+            complete: true,
+            failed: None,
+            early: None,
+        };
+        let s2 = short.clone();
+        let h = harness(move |_| (Ok((s2.clone(), true)), 0));
+        let d = rt().block_on(async {
+            let mut d = decider(&h, vec![rec("OP1", true, false, false)]);
+            d.decide_complete(Kind::Op, &region, 1400.0).await
+        });
+        let (l1, cacheable, note) = abstain_of(d);
+        assert_eq!(l1, L1State::Unavailable, "{note}");
+        assert!(cacheable, "a short theme stays short");
+        // A short theme beside a full one that was really compared: informative.
+        let t = SearchTally { failed: 0, evaluated_own: 1, short_own: 1 };
+        assert!(matches!(exhausted_abstain(&t, false), Decision::Abstain { l1: L1State::Informative, .. }));
+    }
+
+    #[test]
+    fn a_fork_inherits_an_in_flight_theme_instead_of_downloading_it_again() {
+        let th = theme_of(70.0, 5);
+        let h = harness(move |_| (Ok((th.clone(), true)), 150));
+        let list = vec![rec("OP1", true, false, false), rec("ED1", false, false, false)];
+        let (fork_loaded, calls_after, main_dl) = rt().block_on(async {
+            let mut d = decider(&h, list);
+            // The prefetch of the top OP (and the ED) is still downloading
+            // when HEAD completes.
+            let r0 = d.cat.recs[0].clone();
+            let r1 = d.cat.recs[1].clone();
+            d.loader.start(0, &r0, &h.ctx);
+            d.loader.start(1, &r1, &h.ctx);
+            d.drain_finished_loads();
+            assert!(d.loader.pending.contains(&0), "still in flight");
+            d.settle_pending(Kind::Op).await;
+            let mut fork = d.fork();
+            // The fork's decision asks for the same theme: no second download.
+            fork.loader.start(0, &r0, &h.ctx);
+            let loaded = fork.loader.wait_for(0, &fork.cat, "fork").await.is_some();
+            let calls = h.calls.load(std::sync::atomic::Ordering::SeqCst);
+            d.merge(fork);
+            (loaded, calls, d.loader.downloads(Kind::Op))
+        });
+        assert!(fork_loaded);
+        assert_eq!(calls_after, 2, "OP1 and ED1 were each loaded once");
+        assert_eq!(main_dl, 1, "one real OP download, counted once");
+    }
+
+    #[test]
+    fn merge_adds_the_forks_own_attempts() {
+        let h = harness(|_| (Err("x".into()), 0));
+        let mut d = decider(&h, vec![rec("OP1", true, false, false)]);
+        d.loader.downloads.insert(Kind::Op, 1);
+        let mut fork = d.fork();
+        // The main loader keeps counting its own loads while the fork runs.
+        d.loader.downloads.insert(Kind::Op, 2);
+        fork.loader.downloads.insert(Kind::Op, 3);
+        fork.loader.fail_streak.insert(Kind::Op, 2);
+        d.merge(fork);
+        assert_eq!(d.loader.downloads(Kind::Op), 4, "2 (main) + 2 spent by the fork");
+        assert_eq!(d.loader.fail_streak(Kind::Op), 2);
+    }
+
+    #[test]
+    fn published_windows_use_the_audible_start_and_the_gated_end() {
+        // A 70 s ending theme inside a TAIL region, then 3 s of quiet card and
+        // a LOUD preview: the end is cut before the preview's first sound.
+        let th = tone(70.0, 5);
+        let mut th_pcm = pcm(&th, 0.8);
+        // 2 s of lead silence and 4 s of trailing fade in the theme FILE.
+        for v in th_pcm.iter_mut().take(2 * 11025) {
+            *v = 0;
+        }
+        let n = th_pcm.len();
+        for v in th_pcm.iter_mut().skip(n - 4 * 11025) {
+            *v = 0;
+        }
+        let tfp = Arc::new(animethemes::theme_fp_from_pcm(&rec("ED1", false, false, false), &th_pcm));
+        assert!((tfp.audible.0 - 2.0).abs() < 0.06 && (tfp.audible.1 - 66.0).abs() < 0.06, "{:?}", tfp.audible);
+        let origin = 1000.0;
+        let at = 30.0; // the theme file starts 30 s into the region
+        let mut ep: Vec<f64> = vec![0.0; 11025 * 160];
+        for (i, &v) in th_pcm.iter().enumerate() {
+            ep[i + 11025 * at as usize] += v as f64 / 32767.0;
+        }
+        // The preview starts 1.5 s after the theme's audible end (inside the fade).
+        let onset = at + 66.0 + 1.5;
+        for (i, v) in tone(40.0, 11).iter().enumerate() {
+            ep[(onset * 11025.0) as usize + i] += v * 0.5;
+        }
+        let ep = pcm(&ep, 1.0);
+        let q = super::super::fingerprint::fingerprint(&ep, origin);
+        let m = matcher::evaluate_theme(&tfp.fp, tfp.audible, &q);
+        assert!(m.accepted, "{:?}", m.reject);
+        let region = RegionOut {
+            fp: Arc::new(q),
+            levels: super::super::continuity::rms_levels(&ep),
+            silences: Vec::new(),
+            origin: Some(origin),
+            samples: ep.len() as u64,
+            complete: true,
+            failed: None,
+            early: None,
+        };
+        let (s, e) = published_window(&m, Some(tfp.audible), Kind::Ed, &region, 2000.0).unwrap();
+        let (s_a, e_a) = matcher::layer1_window(&m, 2000.0).unwrap();
+        assert!((s - (origin + at + 2.0)).abs() < 0.1, "audible start: {s} (mapping A {s_a})");
+        assert!((e - (origin + onset - matcher::ONSET_CUT_S)).abs() < 0.45, "cut before the onset: {e} (mapping A {e_a})");
+        assert!(e < e_a);
+        // While streaming (no levels yet): mapping A's end, the audible start.
+        let mut streaming = region;
+        streaming.levels.clear();
+        let (s2, e2) = published_window(&m, Some(tfp.audible), Kind::Ed, &streaming, 2000.0).unwrap();
+        assert_eq!((s2, e2), (s, e_a));
     }
 }

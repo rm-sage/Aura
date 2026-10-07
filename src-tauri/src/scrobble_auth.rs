@@ -1082,7 +1082,12 @@ async fn revoke_trakt_token(access_token: &str) {
 // providers, with the intercept arg distinguishing the two flows.
 // ---------------------------------------------------------------------------
 
-/// Spawn a child OAuth popup webview attached to the main window.
+/// Spawn a child popup webview attached to the main window: an OAuth flow,
+/// or (with no `intercept_prefix`) a plain source page. SourcePopup builds
+/// EVERY popup through here, never through the JS `new Webview()` API,
+/// because only a Rust builder applies `webview_browser_args()` (WebView2
+/// refuses a second environment with different options in the shared user
+/// data folder, so a JS popup failed whenever Hardware acceleration was off).
 ///
 /// `label`            — the webview's unique label; the JS side uses
 ///                      `Webview.getByLabel(label)` to resync position
@@ -1119,10 +1124,9 @@ pub async fn open_oauth_popup_webview(
         .get_window("main")
         .ok_or_else(|| "main window not found".to_string())?;
 
-    // Match the user-agent SourcePopup uses for non-OAuth popups, so the
-    // OAuth provider sees the same Chrome string regardless of which
-    // spawn path was taken. Some providers gate consent screens on
-    // recognising a modern desktop UA.
+    // One desktop Chrome user agent for every popup (OAuth or a plain
+    // source page). Some providers gate consent screens on recognising a
+    // modern desktop UA.
     const POPUP_USER_AGENT: &str =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
          (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";

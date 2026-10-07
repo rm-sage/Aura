@@ -38,6 +38,8 @@ pub const ANIMETHEMES_API: &str = "https://api.animethemes.moe";
 /// Minimum spacing between request STARTS (API limit: 90 per minute).
 const PACE: Duration = Duration::from_millis(1000);
 const TIMEOUT: Duration = Duration::from_secs(45);
+/// Connection setup budget (TLS included), well under TIMEOUT.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// More themes than any real cour has (One Piece, every OP and ED: 74).
 const MAX_THEMES: usize = 200;
 /// At most this many sibling cours (sequel / prequel) are tried.
@@ -65,6 +67,9 @@ fn client() -> &'static reqwest::Client {
                 }
             }))
             .timeout(TIMEOUT)
+            // A blackholed host fails here instead of after the whole 45 s
+            // (a slow theme DOWNLOAD keeps the full TIMEOUT).
+            .connect_timeout(CONNECT_TIMEOUT)
             .pool_max_idle_per_host(1)
             .pool_idle_timeout(Duration::from_secs(30))
             .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " skipdetect"))

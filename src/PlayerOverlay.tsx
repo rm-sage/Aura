@@ -27,7 +27,8 @@ import { prettyBinding } from "./useKeybindings";
 import { loadAuraSettings, saveAuraSettings } from "./auraSettings";
 import AniSkipMenu from "./AniSkipMenu";
 import { skipHeldReason, skipKindLabel, skipSourceLabel } from "./skipSource";
-import type { SkipHold, SkipMode, SkipModes } from "./skipWindows";
+import type { HandledWindow, SkipHold, SkipMode, SkipModes } from "./skipWindows";
+import { handledIn } from "./skipWindows";
 import SubtitleSyncPanel, { type SyncAnchorPair } from "./SubtitleSyncPanel";
 import { MenuTrackerCtx, useMenuOpenSync, type MenuTracker } from "./menuTracker";
 import { copyTextToClipboard } from "./clipboard";
@@ -4812,16 +4813,19 @@ function SkipController({
   const active   = ready ? (windows.find((w) => time >= w.start && time < w.end) ?? null) : null;
   const upcoming = ready ? (windows.find((w) => w.start > time && (w.start - time) <= 30) ?? null) : null;
 
-  // Per-window "we already handled this one" set, scoped to the current LOAD.
-  // A backwards seek out of the window then back in should re-trigger the
-  // prompt; that's why we key by start+end and reset per load.
-  const firedRef = useRef<Set<string>>(new Set());
+  // Per-window "we already handled this one" list, scoped to the current
+  // LOAD. Matched by kind with both edges within LAYER1_CONFLICT_SECONDS
+  // (`handledIn`), not by exact edges: the detector refines a Layer 1 window
+  // while it decodes, and an exact-edge key made each refinement a new
+  // window, so a skipped opening was re-prompted, or auto-skipped again
+  // after the user sought back into it on purpose.
+  const firedRef = useRef<HandledWindow[]>([]);
   const firedKeyRef = useRef<string>("");
   // Auto windows entered past their midpoint: not seeked, offered as a PROMPT
   // instead (a theme match confirmed late, a resume into the middle of an
-  // opening). Same key and lifetime as `firedRef`; the state copy only exists
-  // to re-render when a window is demoted.
-  const demotedRef = useRef<Set<string>>(new Set());
+  // opening). Same matching and lifetime as `firedRef`; the state copy only
+  // exists to re-render when a window is demoted.
+  const demotedRef = useRef<HandledWindow[]>([]);
   const [demotedTick, setDemotedTick] = useState(0);
   useEffect(() => {
     // Guarded rather than reset-on-every-run so React StrictMode's double
@@ -4829,12 +4833,15 @@ function SkipController({
     // (which would seek a second time).
     if (firedKeyRef.current === loadKey) return;
     firedKeyRef.current = loadKey;
-    firedRef.current = new Set();
-    demotedRef.current = new Set();
+    firedRef.current = [];
+    demotedRef.current = [];
   }, [loadKey]);
   const activeKey = active ? `${active.start}-${active.end}` : null;
+  const mark = (list: HandledWindow[], w: HandledWindow): void => {
+    if (!handledIn(list, w)) list.push({ type: w.type, start: w.start, end: w.end });
+  };
   // `demotedTick` is read so a demotion re-renders this value.
-  const demoted = demotedTick >= 0 && activeKey != null && demotedRef.current.has(activeKey);
+  const demoted = demotedTick >= 0 && active != null && handledIn(demotedRef.current, active);
   /** The active window asks rather than seeks: a prompt window, or an auto
    *  window that was demoted past its midpoint. */
   const promptMode = !!active && (!active.auto || demoted);
@@ -4859,10 +4866,10 @@ function SkipController({
   // forward would be jarring.
   useEffect(() => {
     if (!active || !active.auto) return;
-    const key = `${active.start}-${active.end}`;
     // A demoted window stays a prompt for the rest of the load: seeking back
-    // into its first half must not turn it into an auto-skip after all.
-    if (firedRef.current.has(key) || demotedRef.current.has(key)) return;
+    // into its first half must not turn it into an auto-skip after all. The
+    // same holds for a refinement of a window already handled.
+    if (handledIn(firedRef.current, active) || handledIn(demotedRef.current, active)) return;
     const span = active.end - active.start;
     // One line per decision: the auto-skip used to leave no trace anywhere
     // but a transient toast, so a wrong seek could only be reconstructed
@@ -4874,14 +4881,14 @@ function SkipController({
       // only arrived now (a theme match confirmed late). It used to be marked
       // fired and offered NOTHING; it becomes a prompt instead, so X still
       // skips it.
-      if (!demotedRef.current.has(key)) {
-        demotedRef.current.add(key);
+      if (!handledIn(demotedRef.current, active)) {
+        mark(demotedRef.current, active);
         setDemotedTick((n) => n + 1);
       }
       console.info(`[auraskip] auto-skip past midpoint, offered as a prompt: ${desc}`);
       return;
     }
-    firedRef.current.add(key);
+    mark(firedRef.current, active);
     const target = skipSeekTarget(active, duration);
     if (target <= time) {
       // The window runs to the end of the file and we are already inside the
@@ -4903,7 +4910,6 @@ function SkipController({
   // window demoted past its midpoint).
   useEffect(() => {
     if (!active || !promptMode) return;
-    const key = `${active.start}-${active.end}`;
     const onKey = (e: KeyboardEvent) => {
       if (e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return;
       if (e.key.toLowerCase() !== "x") return;
@@ -4912,7 +4918,7 @@ function SkipController({
       if (tag === "input" || tag === "textarea") return;
       e.preventDefault();
       e.stopPropagation();
-      firedRef.current.add(key);
+      mark(firedRef.current, active);
       // timeRef / durationRef, not the captured values: this handler outlives
       // the render it was installed in (`time` is deliberately not a dep).
       if (performSkip(active, durationRef.current, timeRef.current, seekAbsolute)) {
@@ -4940,12 +4946,12 @@ function SkipController({
       const a = activeRef.current;
       const u = upcomingRef.current;
       if (a) {
-        firedRef.current.add(`${a.start}-${a.end}`);
+        mark(firedRef.current, a);
         if (performSkip(a, durationRef.current, timeRef.current, seekRef.current)) {
           fireToast(`Skipped ${skipKindLabel(a.type)}`);
         }
       } else if (u) {
-        firedRef.current.add(`${u.start}-${u.end}`);
+        mark(firedRef.current, u);
         if (performSkip(u, durationRef.current, timeRef.current, seekRef.current)) {
           fireToast(`Skipped upcoming ${skipKindLabel(u.type)}`);
         }
@@ -4971,9 +4977,9 @@ function SkipController({
   }, [promptKey]);
 
   if (!active || !promptMode) return null;
-  // Suppress the toast briefly after firing — `firedRef.has(key)` is
+  // Suppress the toast after firing: a handled window (or its refinement) is
   // the cleanest way to know "user already accepted, hide the prompt".
-  if (firedRef.current.has(`${active.start}-${active.end}`)) return null;
+  if (handledIn(firedRef.current, active)) return null;
   const visible = !autoHidden || controlsVisible;
   const held = demoted
     ? { line: "you are already past the halfway point" }

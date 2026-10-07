@@ -168,6 +168,7 @@ async fn detect(args: &Value, data_dir: &PathBuf) -> Result<Value, String> {
             }));
         }),
         replay: replay.as_ref().map(|(r, _)| r.clone()),
+        fake_theme_load: None,
     };
     let fin = job::run(&ctx, &req).await;
     let wall = t.elapsed().as_secs_f64();

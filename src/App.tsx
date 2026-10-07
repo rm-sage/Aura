@@ -1774,8 +1774,14 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
     lastCachePctAtRef.current = 0;
     nearEndEosFiredRef.current = false;
     userPausedNearEndRef.current = false;
-    // The previous file's detected media end must not shorten this one's.
-    setDetectedMediaEnd(null);
+    // The detected media end is NOT cleared here. It belongs to the FILE,
+    // and every path that changes the file clears it (handlePlayStream's
+    // load token block, handleExitPlayback). The paths that call this and
+    // then re-run loadfile on the SAME url (EOS Replay, the VOD auto-retry,
+    // the recovery modal's Reload) never re-run the skip chain, so a clear
+    // here left the end-of-stream detectors on the container duration for
+    // the rest of the load: a release whose container runs past its media
+    // (Spy x Family E2, 29 s) raised "stream connection lost" at its end.
     watchedElapsedRef.current = 0;
     watchedElapsedLastTimeRef.current = 0;
     // A fresh loadfile is the ONLY thing that can clear a truncation: mpv
@@ -2136,6 +2142,11 @@ export default function App() {
    *  the previous one's timings. Claimed synchronously before the first await
    *  and re-checked before every stamp. */
   const skipChainSeqRef = useRef(0);
+  /** The running skip chain's serialised `stamp`, while that chain owns the
+   *  current load (null otherwise). A mid-play skip-mode change re-stamps
+   *  THROUGH it (see restampSkipModes), so it can never race the chain's own
+   *  writes. Cleared with the load token (handlePlayStream) and on exit. */
+  const liveSkipStampRef = useRef<((note: string) => Promise<void>) | null>(null);
   /** Live per-kind skip modes. Written by the skip chain when it reads
    *  settings at load time AND by the `aura:settings-changed` re-stamp, so a
    *  mode change made mid-load is honoured by whichever of the two writes the
@@ -2976,6 +2987,7 @@ export default function App() {
           // been replaced resolves into a no-op instead of writing the
           // previous episode's OP/ED windows onto the current one.
           skipChainSeqRef.current += 1;
+          liveSkipStampRef.current = null;
           const skipSeq = skipChainSeqRef.current;
           const stale = () => skipChainSeqRef.current !== skipSeq;
           skipCourRef.current = null;
@@ -3003,9 +3015,14 @@ export default function App() {
             // has no movie ED slot (Next-Up and the ED trigger are episode
             // concepts), so movies are deliberately not queried.
             const mtLower = (target.media_type ?? "").toLowerCase();
-            if (mtLower === "movie" || mtLower === "channel" || mtLower === "channels" || mtLower === "tv" || mtLower === "trailer") {
+            // Live TV has no duration and a trailer needs no end card: nothing
+            // to do. A MOVIE gets no windows either, but it still reads the
+            // media end (the probe-only detect below), or a movie whose
+            // container runs past its media never reaches the end card.
+            if (mtLower === "channel" || mtLower === "channels" || mtLower === "tv" || mtLower === "trailer") {
               return;
             }
+            const isMovie = mtLower === "movie";
 
             // Settings → per-kind mode. HOISTED above the MAL cascade
             // (was below it) so (a) the chapter path is reachable for
@@ -3140,8 +3157,9 @@ export default function App() {
                 // The Next-Up gate's inputs: a TRUSTED ending's end (Layer 1
                 // only; never a crowd, chapter or Layer 3 window) and the media
                 // end. Announced after every stamp, only when they changed.
-                // The trusted end rule (a Transition-only match's end counts)
-                // is `trustedEndingEnd`, shared with the e2e harness.
+                // The trusted end rule (a Transition-only or partially Over
+                // match's end counts) is `trustedEndingEnd`, shared with the
+                // e2e harness.
                 const announceTiming = (): void => {
                   const timing: NextUpTiming = {
                     trustedEdEnd: trustedEndingEnd(published, det.ed),
@@ -3215,6 +3233,14 @@ export default function App() {
                   });
                   return stampQueue;
                 };
+                // A mid-play skip-mode change re-stamps through this chain's
+                // queue (restampSkipModes): a read-modify-write of the payload
+                // beside it could write back a list the chain had already
+                // replaced (a Layer 1 window lost, a withdrawn early window
+                // or a released hold back). Kept until the next load or exit:
+                // after the chain ends, `base` and `det` are final, and a
+                // stale chain's stamp is a no-op.
+                if (!stale()) liveSkipStampRef.current = stamp;
 
                 // ── The layered detector (Rust skipdetect/) ──
                 // Probe, then ONE sequential HEAD pass (0-600 s), then TAIL (the
@@ -3543,9 +3569,12 @@ export default function App() {
               }
             };
 
-            if (allModesOff) {
+            if (allModesOff || isMovie) {
               // No lookups and nothing stamped beyond the empty list: only the
               // probe-only detect (runDetect with no kind) for the media end.
+              // A movie always takes this path (no OP / ED slot), whatever the
+              // skip modes say.
+              if (isMovie) console.info(`[auraskip] movie: no skip windows; reading the media end only`);
               await finishWithChapters([], { streamUrl: stream.url ?? null, isAnime: false, probeOnly: true });
               return;
             }
@@ -4435,6 +4464,7 @@ export default function App() {
         const opMode    = mode(settings?.skip_op_mode,    "auto");
         const edMode    = mode(settings?.skip_ed_mode,    "prompt");
         const recapMode = mode(settings?.skip_recap_mode, "prompt");
+        const prev = skipModesRef.current;
         // Publish to the ref BEFORE anything can return. A skip chain that is
         // still in flight reads its modes from here on every write, and while
         // it runs the payload is EMPTY (the load resets it and the single
@@ -4442,6 +4472,17 @@ export default function App() {
         // below is exactly the case this has to survive. Ordering this after
         // it meant the chain's final stamp reverted the change every time.
         skipModesRef.current = { op: opMode, ed: edMode, recap: recapMode };
+        // Unrelated settings (theme, ...) leave the payload alone.
+        if (prev.op === opMode && prev.ed === edMode && prev.recap === recapMode) return;
+        // A skip chain owns this load: re-stamp through ITS serialised queue,
+        // which recomposes from the chain's own inputs with the modes above.
+        // The read-modify-write below, run beside the chain, could land
+        // between the chain's read and write and push back a stale list.
+        const live = liveSkipStampRef.current;
+        if (live) {
+          await live("skip-mode change");
+          return;
+        }
         const cur = await invoke<{
           windows?: Array<PreparedWindow & { skip_id?: string | null }>;
           superseded?: Array<PreparedWindow & { skip_id?: string | null }>;
@@ -8662,6 +8703,7 @@ export default function App() {
   // Flushes progress, stops MPV, clears the active target. Triggered by the
   // PlayerOverlay's "Exit playback" button (and keybinding if configured).
   const handleExitPlayback = useCallback(async () => {
+    liveSkipStampRef.current = null;
     autoAdvanceStreakRef.current = 0; // fresh start: reset the still-watching streak (#5)
     // Stop the skip detector with the playback: retire this load's skip chain
     // (its token) so nothing it still has in flight stamps, and cancel the

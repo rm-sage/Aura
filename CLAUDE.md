@@ -253,12 +253,31 @@ after-credits scene on 10 of the 11 episodes that have one.
 - **Layer 1 (high trust): AnimeThemes reference match.** The cour's themes (MAL id from AIOMetadata's
   per-video `_malId`, else the AniList pair, else the AniSkip resolution) are fingerprinted and
   located in the episode's audio. Accept gates: 30 s run, BER <= 0.35, margin >= 0.15 (do not raise
-  it: it is the gate that rejects TV-edited themes), soft42 coverage >= 0.85. Window = chained runs,
-  theme start to theme end, clamped to the MEDIA end. No silence snapping (every snap variant pushed
-  ED ends into after-credits scenes). Corpus: OP 26/2/0 wrong, ED 23/5/0 wrong, 0 false positives.
-  It runs on EVERY anime episode with a MAL id while `autoSkipDetect` is on, because its 3 s conflict
-  drop is what removes a wrong crowd window. Themes existed but none matched = an informative
-  abstain: Layer 3 is NOT run for that kind.
+  it: it is the gate that rejects TV-edited themes), soft42 coverage >= 0.85. Mapping A (chained
+  runs, theme file start to theme file end, `matcher::layer1_window`) is the research port and the
+  corpus parity tests hold it; the PUBLISHED window is that refined by the edge rule
+  (`matcher::refine_layer1_window`, `job::EDGE_RULE` 1): START = the theme's AUDIBLE start (the
+  file's lead silence put Steins;Gate 24's opening 2.3 s into story); END decided by the EPISODE's
+  0.4 s RMS levels inside the theme file's trailing fade, once the region has finished: a window at
+  or above -40 dB there is new content (a preview) and the end becomes onset - 1 s (both kinds);
+  otherwise an OP keeps mapping A's end, and an ED ends at audible end + 0.5 s when the fade is at or
+  above -60 dB (talked over) or reference end - 0.5 s when it is quiet (a held card). Never past
+  mapping A, always clamped to the MEDIA end. Measured on the 89-episode e2e set
+  (`edge_mapping.md`, variant REC): every Layer 1 preview / after-credits overrun gone, no verdict
+  worse; the thresholds rest on 6 OP and 6 ED onsets, so re-validate before moving one. A stored
+  result from an older edge rule answers no kind. No silence snapping (every snap variant pushed ED
+  ends into after-credits scenes). Corpus: OP 26/2/0 wrong, ED 23/5/0 wrong, 0 false positives
+  (mapping A; `skipdetect_layer1_edge_rule_corpus` pins the edge rule's windows: one ED correct ->
+  near, TYBW 1:1). It runs on EVERY anime episode with a MAL id while `autoSkipDetect` is on,
+  because its 3 s conflict drop is what removes a wrong crowd window. Themes existed but none matched
+  = an informative abstain: Layer 3 is NOT run for that kind. Informative ONLY when every candidate
+  loaded and one of the cour's own themes was really compared: a failed theme load (download, HTTP,
+  timeout, decode) or a cour whose themes are all shorter than the 30 s run gate (short-form anime)
+  leaves the kind `Unavailable` (undecided: the crowd keeps its trust). Failed loads count toward the
+  8-per-kind download cap, and two consecutive failures end the kind's search at once (an audio
+  outage used to walk every candidate and sibling cour at up to 46 s each, holding both kinds
+  pending). A theme the main loader is still fetching when HEAD completes is settled before the OP
+  decision forks, so it is never downloaded twice.
   Theme flags are judged PER AUDIO (`animethemes.rs`): an ED whose audio only "Over" videos use is
   not a candidate (TYBW 1:13's insert song); a PARTIALLY Over audio (Pop Team Epic ED3 / ED4 ship an
   NCBD "None" and a TV "Over" video of one audio) is a candidate, sorted last, prompt-only
@@ -373,6 +392,7 @@ after-credits scene on 10 of the 11 episodes that have one.
   own tiers. The AniSkip rows a Layer 1 window replaced ride the `set_skip_windows` payload's
   `superseded` list (`dedupeSkipWindowsDetailed`): the AuraSkip menu lists them for their vote arrows,
   and nothing that seeks or prompts reads it (mpv's property gets `windows` only).
+  A crowd recap lying inside a Layer 1 opening is dropped (a recap never plays under the theme).
 - **Chapters**: "epilogue" is NOT an ending. Preview / next episode / next time / coming up chapters
   are their own `preview` kind (so is a combined "ED + Preview" title, and the localized adelanto /
   avance / avant-premiere / prochain episode / vorschau / anteprima / proximo episodio / yokoku);
@@ -400,14 +420,18 @@ after-credits scene on 10 of the 11 episodes that have one.
 - **Next-Up**: the corner card (`NextUpCta.tsx`) has NO countdown. Unattended advance happens only
   at end of stream, through the EOS Spotlight, so after-credits scenes and previews always play. The
   card appears at `max(trusted ED end, end - lead)` (at the ED end when nothing follows it), else at
-  `end - lead`; only a Layer 1 ED END is trusted (a Transition-only match's end counts, and so does
-  the end of the published ending that replaced a match when the two ends agree within 3 s: Solo
-  Leveling E1, Cowboy Bebop 13), and an ED START never triggers it. "end" is the
+  `end - lead`; only a Layer 1 ED END is trusted (a Transition-only match's end counts, so does a
+  partially Over match's, prompt-only but located by the same evidence: Pop Team Epic 1:5, and so
+  does the end of the published ending that replaced a match when the two ends agree within 3 s:
+  Solo Leveling E1, Cowboy Bebop 13), and an ED START never triggers it. "end" is the
   detector's media end when known. The keep-open, stale-heartbeat and eof EOS detectors test against
   `eosEnd(duration)` (the FINAL media end, else the probe's mapped-track DURATION tag, never the
   container duration), so a container longer than its media still reaches the end card instead of a
   false "stream lost". A series load that detects no kind (ED off, everything supplied, detection
-  switched off) still runs a PROBE-ONLY detect for that tag when ffmpeg is present.
+  switched off) still runs a PROBE-ONLY detect for that tag when ffmpeg is present, and so does every
+  MOVIE load. The detected media end belongs to the FILE: it is cleared with the load token and on
+  exit, never in `notifyNewLoad`, because EOS Replay, the VOD auto-retry and the recovery Reload
+  re-run loadfile on the same url without re-running the skip chain.
 - **ffmpeg passes**: probe, then ONE sequential HEAD pass (0-600 s, output-side `-to 600`, no `-ss`,
   no `-copyts`, no `-t`), then TAIL (`-ss S -copyts` to EOF, no `-t` / `-to`, `S = min(container,
   mapped track DURATION tag) - 480`). At most one detector ffmpeg at a time, all CPU work on the
@@ -416,7 +440,12 @@ after-credits scene on 10 of the 11 episodes that have one.
   otherwise shifts every window about 2 s early.
 - **Cancellation**: a module-level generation counter in Rust; the frontend cancels on every load, on
   exit playback and before each Detect, and applies only `skipdetect-update` events of its own
-  generation. The Detect (and Prefetch) action's kind switches travel as `detect_op` / `detect_ed`,
+  generation. A main-page reload (F5, the stream-lost Reload) cancels too, in Rust
+  (`skipdetect::cancel_all` from `on_page_load`), since the page that would cancel is gone. A
+  mid-play skip-mode change re-stamps through the running chain's serialised `stamp`
+  (`liveSkipStampRef`), never with a read-modify-write beside it. The SkipController matches handled
+  windows by kind with both edges within 3 s (`handledIn`), so a refinement of a skipped opening is
+  not re-prompted or re-skipped. The Detect (and Prefetch) action's kind switches travel as `detect_op` / `detect_ed`,
   because the action enum is tagged `op`. A Prefetch is not cancelled by a Detect.
 
 ### Downloads: two landmines and one governing rule
@@ -485,9 +514,14 @@ not have; it does now. `gpu_acceleration` ("Hardware acceleration") is
 machine-local the same way and is not exported either: its one home is
 `render.json` beside the settings dir (`settings.rs`), which every save writes,
 every scope load reads back and the launch alone reads, so the switch shown is
-what the next launch does. It reaches WebView2 as browser arguments on the
-webview builders (`lib.rs::webview_browser_args`); wry ignores the
-`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` variable.
+what the next launch does (the settings cache starts from render.json too, so a
+scope with no settings file cannot show or save the default). It reaches WebView2
+as browser arguments on the webview builders (`lib.rs::webview_browser_args`);
+wry ignores the `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` variable. Every webview
+sharing the main user data folder needs the SAME arguments (WebView2 refuses a
+second environment with different options), so `SourcePopup.tsx` builds every
+popup, OAuth or not, through the Rust `open_oauth_popup_webview` command, never
+the JS `new Webview()` API.
 
 Full design: `docs/superpowers/specs/2026-09-05-download-manager-design.md`.
 
@@ -940,8 +974,9 @@ Bound every cache (see Performance & memory).
   `animethemes-v1.json` (MAL -> theme list; hits 7 d, misses 1 d, network errors never cached, cap
   300), `theme-fp/<audio_id>.bin` (fingerprint + valid mask + length + audible lead / trail, never
   the audio; 90 d, cap 400) and `skipdetect-v1.json` (the final per-file result keyed by Stremio id,
-  release identity and duration to 0.1 s; 30 d, an abstention 24 h, and so is a Layer 3 window that
-  stood in for a theme-list miss; cap 2000). An entry records the kinds and MAL id it was computed
+  release identity and duration to 0.1 s; 30 d, an abstention 24 h; a Layer 3 window standing in for
+  a theme the cour's list does not have lives no longer than that list answer: 24 h after a list miss,
+  7 d when the list answered without a theme of that kind; cap 2000). An entry records the kinds and MAL id it was computed
   for and answers only a request it covers. The result cache is the only fix for a slow link. No in-memory mirror, so Settings > Storage's "Skip detection cache"
   clear cannot be undone by a stale copy. Excluded from backups by construction.
 - **Calendar meta**: 24-hour module-level `Map` keyed by `${addonUrl}::${type}::${id}`.
