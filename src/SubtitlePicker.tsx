@@ -5,6 +5,7 @@ import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { SubtitleEntry } from "./types";
 import type { StreamHash } from "./subtitleExtras";
+import { PlayerMenuChip } from "./playerMenu";
 
 // ---------------------------------------------------------------------------
 // SubtitlePicker — glass overlay floating over the player
@@ -138,41 +139,42 @@ export default function SubtitlePicker({
         className="aura-sheet-in aura-float-glass rounded-2xl w-full max-w-[42rem]
                    pointer-events-auto flex flex-col max-h-[60vh] overflow-hidden"
       >
-        {/* Header */}
-        <div className="flex items-center justify-between px-5 py-3 border-b border-white/8 flex-shrink-0">
-          <div className="flex items-center gap-2">
-            <span className="text-white/55"><SearchIcon /></span>
-            <h2 className="text-white/85 text-sm font-semibold tracking-wide">External Subtitles</h2>
-            <span className="text-white/30 text-xs">· OpenSubtitles</span>
+        {/* Header. Same title row as the Switch source and AuraSkip dialogs
+            (playerMenu.tsx has the rules): 16 px title, 55% meta, hairline. */}
+        <div className="flex items-center justify-between gap-3 pl-5 pr-3 pt-4 pb-3 border-b border-white/8 flex-shrink-0">
+          <div className="flex items-baseline gap-2 min-w-0">
+            <span className="text-white/70 self-center"><SearchIcon /></span>
+            <h2 className="text-white text-[16px] font-semibold tracking-tight">External Subtitles</h2>
+            <span className="text-white/55 text-[12px] truncate">· OpenSubtitles</span>
           </div>
           <button
             onClick={onClose}
             aria-label="Close"
-            className="w-7 h-7 rounded-full text-white/50 hover:text-white hover:bg-white/8
-                       flex items-center justify-center transition-colors"
+            className="w-7 h-7 rounded-lg text-white/55 hover:text-white hover:bg-white/12
+                       flex items-center justify-center transition-colors flex-shrink-0"
           >
             <CloseIcon />
           </button>
         </div>
 
         {/* Query + language row */}
-        <div className="flex items-center gap-2 px-5 py-3 border-b border-white/6 flex-shrink-0">
+        <div className="flex items-center gap-2 px-5 py-3 border-b border-white/8 flex-shrink-0">
           <input
             type="search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Title, episode, or filename…"
             spellCheck={false}
-            className="flex-1 bg-white/5 border border-white/10 rounded-xl px-3 py-2
-                       text-sm placeholder:text-white/25 outline-none focus:border-white/25
+            className="flex-1 h-9 bg-white/8 border border-white/12 rounded-lg px-3
+                       text-[13.5px] placeholder:text-white/40 outline-none focus:border-white/30
                        transition-colors"
             style={{ color: "var(--text-primary)" }}
           />
           <select
             value={language}
             onChange={(e) => setLanguage(e.target.value)}
-            className="bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-sm
-                       outline-none focus:border-white/25 transition-colors cursor-pointer"
+            className="h-9 bg-white/8 border border-white/12 rounded-lg px-3 text-[13.5px]
+                       outline-none focus:border-white/30 transition-colors cursor-pointer"
             style={{ color: "var(--text-primary)" }}
           >
             {LANG_PRESETS.map((l) => (
@@ -183,8 +185,8 @@ export default function SubtitlePicker({
 
         {/* Status bar */}
         {(loading || error || success) && (
-          <div className="px-5 py-2 flex-shrink-0 text-xs">
-            {loading && <span className="text-white/45">Searching…</span>}
+          <div className="px-5 py-2 flex-shrink-0 text-[12.5px] leading-snug">
+            {loading && <span className="text-white/60">Searching…</span>}
             {error && (
               <span className="text-red-400/85 break-all">{error}</span>
             )}
@@ -194,11 +196,11 @@ export default function SubtitlePicker({
 
         {/* Results */}
         <div
-          className="flex-1 min-h-0 overflow-y-auto px-3 py-2"
+          className="flex-1 min-h-0 overflow-y-auto px-2 py-2"
           style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.1) transparent" }}
         >
           {!loading && !error && results.length === 0 && (
-            <div className="text-white/35 text-xs px-3 py-6 text-center">
+            <div className="text-white/55 text-[13px] px-3 py-8 text-center">
               {query.trim() || initialImdbId
                 ? "No subtitles found."
                 : "Enter a title to search."}
@@ -209,33 +211,35 @@ export default function SubtitlePicker({
               key={r.file_id}
               onClick={() => handleDownload(r)}
               disabled={downloading !== null}
-              className="w-full text-left flex items-center gap-3 px-3 py-2.5 rounded-lg
-                         hover:bg-white/8 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              className="w-full text-left flex items-center gap-3 px-3 py-2.5 mb-1 rounded-xl
+                         text-white/90 hover:bg-white/10 hover:text-white transition-colors
+                         disabled:opacity-40 disabled:cursor-not-allowed"
             >
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 flex-wrap">
-                  <p className="text-white/85 text-sm font-medium truncate leading-tight">
+                  <p className="text-[13.5px] font-medium truncate leading-snug">
                     {r.release || r.feature_title || "Untitled subtitle"}
                   </p>
                   {/* Hash-match badge — OpenSubtitles flagged this
                       entry as a MovieHash match against the played
-                      file. Frame-accurate to that exact release. */}
+                      file. Frame-accurate to that exact release. An
+                      accent chip, not green: green in the player now
+                      means a skip confidence level. */}
                   {r.moviehash_match && (
-                    <span className="flex-shrink-0 px-1.5 py-0.5 rounded text-[9px] font-mono
-                                     font-semibold uppercase tracking-wider
-                                     bg-emerald-500/18 text-emerald-300
-                                     border border-emerald-400/35">
-                      Hash match
+                    <span className="flex-shrink-0">
+                      <PlayerMenuChip tone="accent" title="Timed to this exact release">
+                        Hash match
+                      </PlayerMenuChip>
                     </span>
                   )}
                 </div>
-                <p className="text-white/35 text-xs mt-0.5 truncate">
+                <p className="text-white/60 text-[12px] leading-snug mt-0.5 truncate">
                   {r.language?.toUpperCase()} {r.fps ? `· ${r.fps.toFixed(2)} fps` : ""}
                   {r.download_count ? ` · ${r.download_count.toLocaleString()} downloads` : ""}
                   {r.hearing_impaired ? " · CC" : ""}
                 </p>
               </div>
-              <span className="flex-shrink-0 text-xs text-ln-accent">
+              <span className="flex-shrink-0 text-[12.5px] font-medium text-ln-accent">
                 {downloading === r.file_id ? "Loading…" : "Use"}
               </span>
             </button>

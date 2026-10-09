@@ -8,6 +8,7 @@ import type { TrackEntry } from "./types";
 // the panel. Lives in its own module precisely so a sibling panel like this one
 // can join the counter without importing back into PlayerOverlay.
 import { useMenuOpenSync } from "./menuTracker";
+import { PlayerMenuButton, PlayerMenuChip } from "./playerMenu";
 
 // ---------------------------------------------------------------------------
 // SubtitleSyncPanel - "Live Subtitle Sync"
@@ -671,95 +672,73 @@ export default function SubtitleSyncPanel({
     // of the subtitle menu it was opened from rather than a separate dialog.
     <div className="absolute inset-0 z-40 flex items-end justify-end p-6 pointer-events-none">
       <div
-        className="aura-glass-menu rounded-xl shadow-glass-edge w-full max-w-[34rem]
+        className="aura-glass-menu rounded-2xl shadow-glass-edge w-full max-w-[34rem]
                    pointer-events-auto flex flex-col max-h-[70vh] overflow-hidden"
       >
-        {/* Header. Same mono / uppercase / tracked section-label treatment the
-            track menus use, so this panel belongs to the same family instead of
-            reading as a modal dialog dropped on top of the player. */}
-        <div className="flex items-center justify-between px-4 pt-2.5 pb-1.5 flex-shrink-0">
-          <div className="flex items-center gap-1.5 min-w-0">
-            <span className="text-white/40"><SyncIcon /></span>
-            <span className="text-white/40 text-[10px] font-mono font-semibold tracking-[0.18em] uppercase whitespace-nowrap">
+        {/* Header. The title row of the player menus (playerMenu.tsx): a 14 px
+            title at full white, so this panel reads as a continuation of the
+            subtitle menu rather than a modal dialog dropped on the player. The
+            hint under it closes the row; the delay row's hairline divides. */}
+        <div className="flex items-center justify-between gap-3 pl-4 pr-3 pt-3 pb-1 flex-shrink-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="text-white/70 flex-shrink-0"><SyncIcon /></span>
+            <h3 className="text-white text-[14px] font-semibold tracking-tight truncate">
               Subtitles Live Sync
-            </span>
+            </h3>
           </div>
           <button
             onClick={onClose}
             aria-label="Close"
-            className="w-6 h-6 rounded-full text-white/45 hover:text-white hover:bg-white/12
+            className="w-7 h-7 rounded-lg text-white/55 hover:text-white hover:bg-white/12
                        flex items-center justify-center transition-colors flex-shrink-0"
           >
             <CloseIcon />
           </button>
         </div>
-        <p className="px-4 pb-2 text-white/35 text-[11px] leading-snug flex-shrink-0">
+        <p className="px-4 pb-2.5 text-white/60 text-[12px] leading-snug flex-shrink-0">
           Choose the line you just heard to sync the subtitle delay.
         </p>
 
         {/* Delay readout + manual nudge */}
-        <div className="flex items-center gap-2 px-4 py-2 border-t border-white/8 flex-shrink-0">
-          <span className="text-white/45 text-[10px] font-mono font-semibold uppercase tracking-[0.18em]">
+        <div className="flex items-center gap-2 px-4 py-2.5 border-t border-white/8 flex-shrink-0">
+          <span className="text-white/55 text-[11px] font-semibold uppercase tracking-wider">
             Delay
           </span>
-          <span className="text-ln-accent text-sm font-mono tabular-nums">
+          <span className="text-ln-accent text-[14px] font-mono tabular-nums">
             {`${subDelay.toFixed(2)}s`}
           </span>
           {speedIsSet && (
-            <span
-              className="px-1.5 py-0.5 rounded text-[9px] font-mono font-semibold uppercase
-                         tracking-wider bg-ln-accent/15 text-ln-accent border border-ln-accent/35"
-              title="Subtitle speed multiplier from a two-point drift solve"
-            >
+            <PlayerMenuChip tone="accent" title="Subtitle speed multiplier from a two-point drift solve">
               {`speed x${subSpeed.toFixed(4)}`}
-            </span>
+            </PlayerMenuChip>
           )}
 
           <div className="flex-1" />
 
-          <button
-            type="button"
-            onClick={() => nudgeDelay(-DELAY_STEP)}
-            className="px-2 py-1 rounded-md text-[11px] font-mono tabular-nums
-                       bg-white/8 text-white/85 border border-white/12
-                       hover:bg-white/14 hover:text-white active:scale-95 transition-all"
-          >
+          <PlayerMenuButton onClick={() => nudgeDelay(-DELAY_STEP)} className="font-mono tabular-nums">
             {`-${DELAY_STEP.toFixed(2)}s`}
-          </button>
-          <button
-            type="button"
-            onClick={() => nudgeDelay(+DELAY_STEP)}
-            className="px-2 py-1 rounded-md text-[11px] font-mono tabular-nums
-                       bg-white/8 text-white/85 border border-white/12
-                       hover:bg-white/14 hover:text-white active:scale-95 transition-all"
-          >
+          </PlayerMenuButton>
+          <PlayerMenuButton onClick={() => nudgeDelay(+DELAY_STEP)} className="font-mono tabular-nums">
             {`+${DELAY_STEP.toFixed(2)}s`}
-          </button>
+          </PlayerMenuButton>
+          {/* Undo is the accent button, not amber: amber in the player now
+              means a skip confidence level. */}
           {undo && (
-            <button
-              type="button"
-              onClick={doUndo}
+            <PlayerMenuButton
+              onClick={() => { void doUndo(); }}
+              accent
               title="Restore the delay and speed from before the last change"
-              className="px-2 py-1 rounded-md text-[10.5px] font-medium tracking-wide
-                         bg-amber-400/12 text-amber-200 border border-amber-400/30
-                         hover:bg-amber-400/20 hover:text-amber-100 transition-colors"
             >
               Undo
-            </button>
+            </PlayerMenuButton>
           )}
-          <button
-            type="button"
+          <PlayerMenuButton
             onClick={resetAll}
             disabled={subDelay === 0 && !speedIsSet}
             title="Clear the delay and the speed multiplier"
-            className="px-2 py-1 rounded-md text-[10.5px] font-medium tracking-wide
-                       bg-white/5 text-white/55 border border-white/10
-                       hover:bg-white/10 hover:text-white
-                       disabled:opacity-35 disabled:hover:bg-white/5 disabled:hover:text-white/55
-                       transition-colors"
           >
             Reset
-          </button>
+          </PlayerMenuButton>
         </div>
 
         {/* Search */}
@@ -772,8 +751,8 @@ export default function SubtitleSyncPanel({
               onKeyDown={onSearchKeyDown}
               placeholder="Search the lines… (Enter jumps to the next match)"
               spellCheck={false}
-              className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-1.5
-                         text-sm placeholder:text-white/25 outline-none focus:border-white/25
+              className="w-full h-9 bg-white/8 border border-white/12 rounded-lg px-3
+                         text-[13.5px] placeholder:text-white/55 outline-none focus:border-white/30
                          transition-colors"
               style={{ color: "var(--text-primary)" }}
             />
@@ -784,56 +763,48 @@ export default function SubtitleSyncPanel({
         {canOfferDrift && (
           <div className="px-4 py-2.5 border-t border-white/8 flex-shrink-0 flex items-start gap-3">
             <div className="min-w-0 flex-1">
-              <p className="text-white/75 text-xs font-medium">Still drifting?</p>
-              <p className="text-white/40 text-[11px] leading-snug mt-0.5">
+              <p className="text-white/90 text-[13.5px] font-medium leading-snug">Still drifting?</p>
+              <p className="text-white/60 text-[12px] leading-snug mt-0.5">
                 A single offset cannot fix a framerate mismatch: the subtitles slide
                 further out the longer you watch. Play on to a much later point (at
                 least a minute past your first pick), reopen this panel, then pick the
                 line you hear there.
               </p>
             </div>
-            <button
-              type="button"
+            <PlayerMenuButton
               onClick={() => { setTwoPointArmed(true); setNote(null); }}
-              className="flex-shrink-0 px-2.5 py-1 rounded-md text-[11px] font-medium
-                         bg-ln-accent/15 text-ln-accent border border-ln-accent/35
-                         hover:bg-ln-accent/25 transition-colors"
+              accent
+              className="flex-shrink-0"
             >
               Fix drift
-            </button>
+            </PlayerMenuButton>
           </div>
         )}
         {twoPointArmed && (
           <div className="px-4 py-2 border-t border-white/8 flex-shrink-0 flex items-center gap-3">
-            <p className="text-ln-accent text-[11.5px] flex-1 min-w-0">
+            <p className="text-ln-accent text-[12.5px] leading-snug flex-1 min-w-0">
               Two-point mode: pick the line you just heard. It has to be at least{" "}
               {MIN_ANCHOR_GAP_SECS}s away from your first pick.
             </p>
-            <button
-              type="button"
-              onClick={() => setTwoPointArmed(false)}
-              className="flex-shrink-0 px-2 py-1 rounded-md text-[10.5px] font-medium
-                         bg-white/5 text-white/55 border border-white/10
-                         hover:bg-white/10 hover:text-white transition-colors"
-            >
+            <PlayerMenuButton onClick={() => setTwoPointArmed(false)} className="flex-shrink-0">
               Cancel
-            </button>
+            </PlayerMenuButton>
           </div>
         )}
 
         {/* Note / error */}
         {(note || error) && (
-          <div className="px-4 py-2 flex-shrink-0 text-[11.5px] leading-snug">
+          <div className="px-4 py-2 flex-shrink-0 text-[12.5px] leading-snug">
             {error
               ? <span className="text-red-400/85 break-words">{error}</span>
-              : <span className="text-white/55">{note}</span>}
+              : <span className="text-white/70">{note}</span>}
           </div>
         )}
 
         {/* Cue list */}
         <div
           ref={scrollRef}
-          className="relative flex-1 min-h-0 overflow-y-auto px-3 py-2"
+          className="relative flex-1 min-h-0 overflow-y-auto p-1.5 border-t border-white/8"
           style={{
             overscrollBehavior: "contain",
             scrollbarWidth: "thin",
@@ -841,10 +812,10 @@ export default function SubtitleSyncPanel({
           }}
         >
           {status === "loading" && (
-            <div className="text-white/40 text-xs px-3 py-8 text-center leading-relaxed">
+            <div className="text-white/60 text-[13px] px-3 py-8 text-center leading-relaxed">
               Reading the subtitle track…
               {activeIsEmbedded && (
-                <span className="block mt-2 text-white/30">
+                <span className="block mt-2 text-white/55 text-[12px]">
                   This is an embedded track, which has to be extracted from the video
                   file, so it can take noticeably longer than an external subtitle.
                 </span>
@@ -853,7 +824,7 @@ export default function SubtitleSyncPanel({
           )}
 
           {status === "no-track" && (
-            <div className="text-white/45 text-xs px-3 py-8 text-center leading-relaxed">
+            <div className="text-white/60 text-[13px] px-3 py-8 text-center leading-relaxed">
               No subtitle track is selected.
               <br />
               Pick one from the subtitles menu in the control bar, then reopen Live Sync.
@@ -861,11 +832,11 @@ export default function SubtitleSyncPanel({
           )}
 
           {status === "bitmap" && (
-            <div className="text-white/45 text-xs px-3 py-8 text-center leading-relaxed">
+            <div className="text-white/60 text-[13px] px-3 py-8 text-center leading-relaxed">
               This subtitle track is image-based (PGS). Live Sync needs a text track
               {" "}- pick a different one.
               <br />
-              <span className="text-white/30">
+              <span className="text-white/55 text-[12px]">
                 Image subtitles carry no text to match against. Remuxes ship them often;
                 a text track (SRT / ASS) or an addon subtitle will work.
               </span>
@@ -873,20 +844,20 @@ export default function SubtitleSyncPanel({
           )}
 
           {status === "empty" && (
-            <div className="text-white/45 text-xs px-3 py-8 text-center leading-relaxed">
+            <div className="text-white/60 text-[13px] px-3 py-8 text-center leading-relaxed">
               No subtitle lines around this point. Seek to a spot with dialogue and try
               again.
             </div>
           )}
 
           {status === "error" && (
-            <div className="text-white/45 text-xs px-3 py-8 text-center leading-relaxed">
+            <div className="text-white/60 text-[13px] px-3 py-8 text-center leading-relaxed">
               Could not read the subtitle lines for this track.
             </div>
           )}
 
           {status === "ready" && rows.length === 0 && (
-            <div className="text-white/35 text-xs px-3 py-8 text-center">
+            <div className="text-white/55 text-[13px] px-3 py-8 text-center">
               No line matches that search.
             </div>
           )}
@@ -903,18 +874,21 @@ export default function SubtitleSyncPanel({
                   else rowRefs.current.delete(idx);
                 }}
                 onClick={() => { void onPickCue(idx); }}
-                // Same row idiom as the track menus: full-bleed px-4 py-2 rows at
-                // 13px, accent tint for the active one, white/[0.16] on hover. No
-                // per-row borders or rounding, which is what made this list read
-                // as a list of cards rather than a menu.
-                className={`w-full text-left px-4 py-2 text-[13px] leading-snug transition-colors
+                // Same row as the player menus (playerMenu.tsx PlayerMenuRow):
+                // rounded-xl, 13.5 px at 90% white, white/10 on hover, the
+                // accent fill for the line on screen at the anchor. No per-row
+                // borders, which is what made this list read as a list of cards
+                // rather than a menu. The search match sits a step brighter
+                // than hover so it stays visible under the pointer.
+                className={`w-full text-left rounded-xl px-3 py-2 text-[13.5px] leading-snug
+                            transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-white/30
                             ${isFlash
-                              ? "bg-ln-accent/20 text-ln-accent"
+                              ? "bg-ln-accent/25 text-ln-accent"
                               : isAnchor
-                                ? "bg-ln-accent/10 text-ln-accent"
+                                ? "bg-ln-accent/15 text-ln-accent"
                                 : isMatch
-                                  ? "bg-white/12 text-white"
-                                  : "text-white/70 hover:bg-white/[0.16] hover:text-white"}`}
+                                  ? "bg-white/14 text-white"
+                                  : "text-white/90 hover:bg-white/10 hover:text-white"}`}
               >
                 {/* Cue text only - Rust already stripped every SRT / VTT / ASS
                     markup form, so this is safe to render verbatim. */}

@@ -32,6 +32,10 @@ import type { HandledWindow, SkipBasis, SkipHold, SkipMode, SkipModes } from "./
 import { handledIn } from "./skipWindows";
 import SubtitleSyncPanel, { type SyncAnchorPair } from "./SubtitleSyncPanel";
 import { MenuTrackerCtx, useMenuOpenSync, type MenuTracker } from "./menuTracker";
+import {
+  PlayerMenuButton, PlayerMenuChip, PlayerMenuDivider, PlayerMenuPanel, PlayerMenuRow,
+  PlayerMenuSection, PlayerMenuSlider, PlayerMenuToggle, MenuCheckIcon, useMenuWheelScroll,
+} from "./playerMenu";
 import { copyTextToClipboard } from "./clipboard";
 
 // Max volume the slider / wheel / keys can reach. mpv's `volume-max` init option
@@ -375,9 +379,9 @@ function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | n
   const [active, setActive] = useState(0);
   const [keybindings, setKeybindings] = useState<Record<string, string>>({});
   const [anime4kSubOpen, setAnime4kSubOpen] = useState(false);
-  const [submenuPos, setSubmenuPos] = useState<{ top: number; left: number } | null>(null);
+  const [submenuPos, setSubmenuPos] = useState<{ left: number; bottom: number; maxBody: number } | null>(null);
   const ref = useRef<HTMLDivElement>(null);
-  const anime4kRowRef = useRef<HTMLDivElement>(null);
+  const anime4kRowRef = useRef<HTMLButtonElement>(null);
   // Refs to the portal-rendered Anime4K submenu so the click-outside
   // detector can recognise it as part of the picker even though
   // createPortal places it under document.body, outside `ref.current`.
@@ -389,6 +393,9 @@ function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | n
   // small gap between the parent row and the portal-rendered submenu
   // without triggering mouseleave-driven dismissal.
   const closeTimerRef = useRef<number | null>(null);
+  // True when the submenu opened to the LEFT of the picker: the cursor then
+  // crosses the whole picker to reach it, so the close delay is longer.
+  const submenuLeftRef = useRef(false);
   useMenuOpenSync(open);
 
   const cancelClose = useCallback(() => {
@@ -403,25 +410,32 @@ function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | n
     closeTimerRef.current = window.setTimeout(() => {
       setAnime4kSubOpen(false);
       closeTimerRef.current = null;
-    }, 220);
+    }, submenuLeftRef.current ? 700 : 220);
   }, [cancelClose]);
 
   const openSubmenu = useCallback(() => {
     cancelClose();
-    if (anime4kRowRef.current) {
-      const rect = anime4kRowRef.current.getBoundingClientRect();
-      // Pop to the RIGHT of the parent menu so the popout direction
-      // matches the chevron the user sees on the row. 8 px gap keeps
-      // the submenu visually distinct from the parent without any
-      // dead space the cursor would otherwise have to jump over.
-      // The picker is right-anchored to the upscaler button which
-      // itself sits near the right edge of the control bar, but the
-      // parent menu's right edge stops at the button, so there is
-      // 300 px+ of free screen width to the right at every supported
-      // window size. If the screen is narrow enough that the submenu
-      // would clip, the body's overflow rules will still keep the
-      // important left half (the mode names and chord labels) visible.
-      setSubmenuPos({ top: rect.top, left: rect.right + 8 });
+    const row = anime4kRowRef.current;
+    if (row) {
+      // Beside the Upscaler panel: to its right when the window has room
+      // (matching the row's chevron), else to its left, since the pill sits
+      // near the right end of the bar and a 320 px panel ran off-screen at
+      // 1280 px. Bottom-anchored to the panel so it grows upward like every
+      // docked menu and never runs past the bottom of the window.
+      const panel = row.closest("[data-player-menu-panel]") ?? row;
+      const pr = panel.getBoundingClientRect();
+      const W = 320;
+      const GAP = 8;
+      const fitsRight = pr.right + GAP + W <= window.innerWidth - GAP;
+      submenuLeftRef.current = !fitsRight;
+      const left = fitsRight ? pr.right + GAP : Math.max(GAP, pr.left - GAP - W);
+      const bottomEdge = Math.min(pr.bottom, window.innerHeight - GAP);
+      setSubmenuPos({
+        left,
+        bottom: window.innerHeight - bottomEdge,
+        // The title row is about 46 px; the body takes what is left above.
+        maxBody: Math.max(140, bottomEdge - GAP - 46),
+      });
     }
     setAnime4kSubOpen(true);
   }, [cancelClose]);
@@ -616,99 +630,67 @@ function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | n
         const activeAnime4k = anime4kProfiles.find((p) => p.id === active);
 
         const renderRow = (p: ShaderProfileInfo) => (
-          <button
+          <PlayerMenuRow
             key={p.id}
+            label={p.name}
+            description={p.description}
+            selected={p.id === active}
             onClick={() => select(p.id)}
-            className={`w-full text-left px-3 py-2.5 rounded-md transition-colors
-                        ${p.id === active
-                          ? "bg-ln-accent/10 text-ln-accent"
-                          : "text-white/85 hover:text-white hover:bg-white/[0.16]"}`}
-          >
-            <div className="flex items-baseline justify-between gap-3">
-              <span className="text-[14px] font-semibold">{p.name}</span>
-              {p.id === active && (
-                <span className="text-[10px] font-mono uppercase tracking-[0.18em] opacity-80">
-                  Active
-                </span>
-              )}
-            </div>
-            <p className={`text-[12px] leading-snug mt-0.5
-                          ${p.id === active ? "text-ln-accent/90" : "text-white/65"}`}>
-              {p.description}
-            </p>
-          </button>
+          />
         );
 
         return (
-          <div className="absolute bottom-full mb-2 right-0 w-[340px]
-                          rounded-xl shadow-glass-edge z-50
-                          aura-glass-menu p-2">
-            <p className="text-white/55 text-[10.5px] font-mono uppercase tracking-[0.22em]
-                          px-2 pt-2 pb-1.5">
-              Upscaler
-            </p>
-            <div className="max-h-[60vh] overflow-y-auto">
-              {noneEntry && renderRow(noneEntry)}
+          <PlayerMenuPanel title="Upscaler" meta={activeName} width="w-[340px]">
+            {noneEntry && renderRow(noneEntry)}
 
-              {/* Anime4K parent — hover-only; clicking does nothing.
-                  The submenu pops out to the LEFT of the parent via
-                  a portal so the picker's overflow-y-auto can't clip
-                  it. A short close-delay timer lets the cursor cross
-                  the gap between parent and submenu without dismiss. */}
-              {anime4kProfiles.length > 0 && (
-                <div
-                  ref={anime4kRowRef}
-                  onMouseEnter={openSubmenu}
-                  onMouseLeave={scheduleClose}
-                  role="menuitem"
-                  aria-haspopup="menu"
-                  aria-expanded={anime4kSubOpen}
-                  className={`w-full text-left px-3 py-2.5 rounded-md cursor-default
-                              transition-colors select-none
-                              ${anime4kActive
-                                ? "bg-ln-accent/10 text-ln-accent"
-                                : anime4kSubOpen
-                                  ? "bg-white/8 text-white"
-                                  : "text-white/85 hover:bg-white/[0.16] hover:text-white"
-                              }`}
-                >
-                  <div className="flex items-center justify-between gap-3">
-                    <span className="text-[14px] font-semibold">Anime4K</span>
-                    <div className="flex items-center gap-2">
-                      {anime4kActive && (
-                        <span className="text-[10px] font-mono uppercase tracking-[0.18em] opacity-80">
-                          {activeAnime4k?.name.replace("Anime4K ", "") ?? "Active"}
-                        </span>
-                      )}
-                      <span className="text-white/40 text-[15px] leading-none">›</span>
-                    </div>
-                  </div>
-                  <p className={`text-[12px] leading-snug mt-0.5
-                                ${anime4kActive ? "text-ln-accent/90" : "text-white/65"}`}>
-                    Specialised upscaler for anime / cartoon line art. Preserves edges and reduces ringing far better than general-purpose shaders on animated sources.
-                  </p>
-                </div>
-              )}
+            {/* Anime4K parent: hovering (or clicking) opens the modes submenu,
+                which pops out to the right through a portal so the body's
+                overflow-y-auto cannot clip it. A short close delay lets the
+                cursor cross the gap between parent and submenu. */}
+            {anime4kProfiles.length > 0 && (
+              <PlayerMenuRow
+                rowRef={anime4kRowRef}
+                onMouseEnter={openSubmenu}
+                onMouseLeave={scheduleClose}
+                onClick={openSubmenu}
+                ariaHasPopup
+                ariaExpanded={anime4kSubOpen}
+                selected={anime4kActive}
+                label="Anime4K"
+                description="Specialised upscaler for anime and cartoon line art. Preserves edges and reduces ringing far better than general-purpose shaders on animated sources."
+                trailing={
+                  <span className="flex-shrink-0 flex items-center gap-2">
+                    {anime4kActive && (
+                      <PlayerMenuChip tone="accent">
+                        {activeAnime4k?.name.replace("Anime4K ", "") ?? "Active"}
+                      </PlayerMenuChip>
+                    )}
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                         strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden
+                         className={anime4kActive ? "" : "text-white/60"}>
+                      <path d="M9 6l6 6-6 6" />
+                    </svg>
+                  </span>
+                }
+              />
+            )}
 
-              {otherEntries.map(renderRow)}
-            </div>
-          </div>
+            {otherEntries.map(renderRow)}
+          </PlayerMenuPanel>
         );
       })()}
 
       {anime4kSubOpen && submenuPos && createPortal(
-        <div
-          ref={anime4kPortalRef}
+        <PlayerMenuPanel
+          panelRef={anime4kPortalRef}
           onMouseEnter={cancelClose}
           onMouseLeave={scheduleClose}
-          style={{ position: "fixed", top: submenuPos.top, left: submenuPos.left }}
-          className="w-[300px] rounded-xl shadow-glass-edge z-[10000]
-                     aura-glass-menu p-2"
+          position="fixed z-[10000]"
+          style={{ bottom: submenuPos.bottom, left: submenuPos.left }}
+          width="w-[320px]"
+          title="Anime4K modes"
+          maxBodyHeight={`${submenuPos.maxBody}px`}
         >
-          <p className="text-white/55 text-[10.5px] font-mono uppercase tracking-[0.22em]
-                        px-2 pt-2 pb-1.5">
-            Anime4K · Modes
-          </p>
           {(() => {
             const anime4kProfiles = ANIME4K_DISPLAY_ORDER
               .map((id) => profiles.find((p) => p.id === id))
@@ -719,31 +701,23 @@ function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | n
               const chordLabel = chord ? prettyBinding(chord) : "";
               const modeLabel = p.name.replace(/^Anime4K\s+/, "");
               return (
-                <button
+                <PlayerMenuRow
                   key={p.id}
+                  label={modeLabel}
+                  description={p.description.replace(/^Anime4K v4 — Mode [A-Z+]+\.\s*/, "")}
+                  selected={p.id === active}
                   onClick={() => { select(p.id); setAnime4kSubOpen(false); }}
-                  className={`w-full text-left px-3 py-2 rounded-md transition-colors
-                              ${p.id === active
-                                ? "bg-ln-accent/10 text-ln-accent"
-                                : "text-white/85 hover:text-white hover:bg-white/[0.16]"}`}
-                >
-                  <div className="flex items-baseline justify-between gap-3">
-                    <span className="text-[13px] font-semibold">{modeLabel}</span>
-                    {chordLabel && (
-                      <span className="text-[10px] font-mono text-white/35 tracking-wider">
-                        {chordLabel}
-                      </span>
-                    )}
-                  </div>
-                  <p className={`text-[11.5px] leading-snug mt-0.5
-                                ${p.id === active ? "text-ln-accent/90" : "text-white/65"}`}>
-                    {p.description.replace(/^Anime4K v4 — Mode [A-Z+]+\.\s*/, "")}
-                  </p>
-                </button>
+                  trailing={chordLabel || p.id === active ? (
+                    <span className="flex-shrink-0 flex items-center gap-2">
+                      {chordLabel && <PlayerMenuChip>{chordLabel}</PlayerMenuChip>}
+                      {p.id === active && <MenuCheckIcon />}
+                    </span>
+                  ) : undefined}
+                />
               );
             });
           })()}
-        </div>,
+        </PlayerMenuPanel>,
         document.body,
       )}
     </div>
@@ -873,35 +847,29 @@ function SubtitleStyleMenu() {
       </button>
 
       {open && style && (
-        <div
-          className="absolute bottom-full mb-2 right-0 w-[320px]
-                     rounded-xl shadow-glass-edge z-50
-                     aura-glass-menu p-4
-                     space-y-4"
-        >
-          <p className="text-white/55 text-[10.5px] font-mono uppercase tracking-[0.22em]">
-            Subtitle Style
-          </p>
-
+        <PlayerMenuPanel title="Subtitle style" width="w-[320px]" maxBodyHeight="70vh"
+                         footer="Changes apply instantly and are saved to Settings">
           {/* Range goes 0..150 because MPV's sub-pos accepts up to 150;
               values >100 push subs below the natural frame baseline,
               useful when ASS scripts add their own margin and even
               with `ass-style-override=force` the subs land slightly
               above the true bottom edge. */}
-          <InlineSlider
-            label="Vertical position" value={style.subtitle_position} min={0} max={150} suffix="%"
+          <PlayerMenuSlider
+            label="Vertical position" value={style.subtitle_position} min={0} max={150}
+            display={`${style.subtitle_position}%`}
             onChange={(v) => patch({ subtitle_position: v })}
           />
-          <InlineSlider
+          <PlayerMenuSlider
             label="Font size" value={style.subtitle_font_size} min={20} max={100}
             onChange={(v) => patch({ subtitle_font_size: v })}
           />
-          <InlineSlider
+          <PlayerMenuSlider
             label="Outline" value={style.subtitle_border_size} min={0} max={10}
             onChange={(v) => patch({ subtitle_border_size: v })}
           />
+          <PlayerMenuDivider />
           <InlineHexInput
-            label="Glyph colour"
+            label="Text colour"
             value={style.subtitle_color}
             onChange={(v) => patch({ subtitle_color: v })}
           />
@@ -916,43 +884,8 @@ function SubtitleStyleMenu() {
             placeholder="default"
             onChange={(v) => patch({ subtitle_font: v })}
           />
-        </div>
+        </PlayerMenuPanel>
       )}
-    </div>
-  );
-}
-
-function InlineSlider({
-  label, value, min, max, suffix, onChange,
-}: {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  suffix?: string;
-  onChange: (v: number) => void;
-}) {
-  const span = Math.max(1, max - min);
-  const frac = Math.max(0, Math.min(1, (value - min) / span));
-  return (
-    <div className="space-y-1">
-      <div className="flex items-baseline justify-between gap-2">
-        <span className="text-white/70 text-[12px]">{label}</span>
-        <span className="text-white/55 text-[11px] font-mono tabular-nums">
-          {value}{suffix ?? ""}
-        </span>
-      </div>
-      <input
-        type="range"
-        min={min} max={max} step={1}
-        value={value}
-        onChange={(e) => onChange(parseInt(e.target.value, 10))}
-        className="aura-slider w-full"
-        style={{
-          ["--val" as never]:      `${(frac * 100).toFixed(2)}%`,
-          ["--val-frac" as never]: frac.toFixed(3),
-        }}
-      />
     </div>
   );
 }
@@ -964,12 +897,12 @@ function InlineHexInput({
   useEffect(() => { setDraft(value); }, [value]);
   const valid = /^#[0-9a-fA-F]{6,8}$/.test(draft);
   return (
-    <div className="space-y-1">
-      <div className="flex items-center justify-between gap-2">
-        <span className="text-white/70 text-[12px]">{label}</span>
+    <div className="px-3 py-1.5">
+      <div className="flex items-center justify-between gap-2 mb-1.5">
+        <span className="text-white/85 text-[13px]">{label}</span>
         <span
           aria-hidden
-          className="w-5 h-5 rounded-md border border-white/15"
+          className="w-5 h-5 rounded-md border border-white/20"
           style={{ background: valid ? draft : "transparent" }}
         />
       </div>
@@ -980,8 +913,9 @@ function InlineHexInput({
         onBlur={() => valid && onChange(draft.trim())}
         onKeyDown={(e) => { if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur(); }}
         spellCheck={false}
-        className="w-full bg-white/5 border border-white/10 focus:border-white/25
-                   rounded-md px-2.5 py-1.5 text-[12px] font-mono outline-none"
+        aria-label={label}
+        className="w-full h-8 bg-white/8 border border-white/14 focus:border-white/30
+                   rounded-lg px-2.5 text-[13px] font-mono outline-none transition-colors"
         style={{ color: "var(--text-primary)" }}
       />
     </div>
@@ -994,8 +928,8 @@ function InlineTextInput({
   const [draft, setDraft] = useState(value);
   useEffect(() => { setDraft(value); }, [value]);
   return (
-    <div className="space-y-1">
-      <span className="text-white/70 text-[12px]">{label}</span>
+    <div className="px-3 py-1.5">
+      <span className="block text-white/85 text-[13px] mb-1.5">{label}</span>
       <input
         type="text"
         value={draft}
@@ -1004,9 +938,10 @@ function InlineTextInput({
         onBlur={() => onChange(draft)}
         onKeyDown={(e) => { if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur(); }}
         spellCheck={false}
-        className="w-full bg-white/5 border border-white/10 focus:border-white/25
-                   rounded-md px-2.5 py-1.5 text-[12px] font-mono outline-none
-                   placeholder:text-white/25"
+        aria-label={label}
+        className="w-full h-8 bg-white/8 border border-white/14 focus:border-white/30
+                   rounded-lg px-2.5 text-[13px] font-mono outline-none transition-colors
+                   placeholder:text-white/55"
         style={{ color: "var(--text-primary)" }}
       />
     </div>
@@ -3563,9 +3498,12 @@ function VolumeControl({
   Icon: React.FC;
 }) {
   const [open, setOpen] = useState(false);
-  const wrapRef = useRef<HTMLDivElement>(null);
   const trackRef = useRef<HTMLDivElement>(null);
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // While the thumb is being dragged the slider stays out even if the
+  // pointer wanders off it; it tucks away on release instead.
+  const draggingRef = useRef(false);
+  const hoveredRef = useRef(false);
   useMenuOpenSync(open);
 
   const pctFromEvent = useCallback((clientX: number): number => {
@@ -3575,27 +3513,112 @@ function VolumeControl({
     return Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
   }, []);
 
-  // Hover-open with a small grace period on leave so brief cursor exits
-  // (e.g. crossing the gap between button and popover) don't snap shut.
-  const onEnter = () => {
+  // Hover grows the slider out with a small grace period on leave, so a
+  // brief exit (or a slightly low cursor while dragging) does not snap it
+  // shut.
+  const cancelClose = () => {
     if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
-    setOpen(true);
+    closeTimerRef.current = null;
   };
-  const onLeave = () => {
-    if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
-    closeTimerRef.current = setTimeout(() => setOpen(false), 220);
+  const scheduleClose = () => {
+    cancelClose();
+    closeTimerRef.current = setTimeout(() => {
+      if (!draggingRef.current) setOpen(false);
+    }, 350);
   };
+  useEffect(() => () => cancelClose(), []);
+  // A tucked-away slider must not keep keyboard focus: its arrow keys would
+  // keep changing the volume instead of reaching the seek keybindings.
+  useEffect(() => {
+    if (!open && trackRef.current && trackRef.current === document.activeElement) {
+      trackRef.current.blur();
+    }
+  }, [open]);
+  const onEnter = () => { hoveredRef.current = true; cancelClose(); setOpen(true); };
+  const onLeave = () => { hoveredRef.current = false; scheduleClose(); };
 
-  // The popover sits ABOVE the button (absolute, bottom-full) — that means
-  // expanding it can never push neighbouring buttons. The button itself
-  // stays in flex flow at a fixed 40 px width.
+  const shown = isMuted ? 0 : volume;
+  const pct = Math.max(0, Math.min(1, shown / VOLUME_MAX));
+  const unityPct = (100 / VOLUME_MAX) * 100;
+  const set = (v: number) => onChange(Math.max(0, Math.min(VOLUME_MAX, Math.round(v))));
+
+  // In the control bar: the button stays put and the slider grows out to its
+  // LEFT on its own pill, floating over the spacer between the two clusters
+  // (absolute, so it takes no width: on a narrow bar the spacer can be under
+  // 150 px and an in-flow slider pushed the right cluster off the bar).
+  // Click on the button still mutes.
   return (
     <div
-      ref={wrapRef}
       onMouseEnter={onEnter}
       onMouseLeave={onLeave}
       className="relative flex items-center flex-shrink-0"
     >
+      <div
+        className="absolute right-full top-1/2 -translate-y-1/2 mr-0.5 overflow-hidden rounded-full
+                   aura-glass-menu transition-[width,opacity] duration-200 ease-out"
+        style={{ width: open ? 160 : 0, opacity: open ? 1 : 0, pointerEvents: open ? "auto" : "none" }}
+        aria-hidden={!open}
+      >
+        <div className="w-[160px] h-9 flex items-center gap-2.5 pl-3 pr-3">
+          <span className="w-10 text-right text-[12px] font-mono tabular-nums text-white/85 flex-shrink-0">
+            {isMuted ? "Muted" : `${Math.round(volume)}%`}
+          </span>
+          <div
+            ref={trackRef}
+            role="slider"
+            tabIndex={open ? 0 : -1}
+            aria-label="Volume"
+            aria-valuemin={0}
+            aria-valuemax={VOLUME_MAX}
+            aria-valuenow={Math.round(shown)}
+            aria-valuetext={isMuted ? "Muted" : `${Math.round(volume)}%`}
+            onPointerDown={(e) => {
+              (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+              draggingRef.current = true;
+              set(pctFromEvent(e.clientX) * VOLUME_MAX);
+            }}
+            onPointerMove={(e) => {
+              if (e.buttons & 1) set(pctFromEvent(e.clientX) * VOLUME_MAX);
+            }}
+            // Fires after pointerup AND after a cancelled or lost drag, so the
+            // slider always tucks away (and releases the open-menu counter)
+            // once the pointer is gone.
+            onLostPointerCapture={() => {
+              draggingRef.current = false;
+              if (!hoveredRef.current) scheduleClose();
+            }}
+            onKeyDown={(e) => {
+              if (!open) return;
+              const step = e.shiftKey ? 10 : 5;
+              if (e.key === "ArrowRight" || e.key === "ArrowUp") { e.preventDefault(); e.stopPropagation(); set(volume + step); }
+              else if (e.key === "ArrowLeft" || e.key === "ArrowDown") { e.preventDefault(); e.stopPropagation(); set(volume - step); }
+            }}
+            className="group/vol relative h-6 flex-1 flex items-center cursor-pointer
+                       focus:outline-none focus-visible:ring-1 focus-visible:ring-white/40 rounded"
+          >
+            <div className="absolute inset-x-0 h-1 group-hover/vol:h-1.5 transition-[height] rounded-full bg-white/20" />
+            {/* Tick at the 100% (unity-gain) point so the boost zone is obvious. */}
+            <div
+              aria-hidden
+              className="absolute top-1/2 -translate-y-1/2 w-px h-3 bg-white/45"
+              style={{ left: `${unityPct}%` }}
+            />
+            <div
+              aria-hidden
+              className={`absolute left-0 h-1 group-hover/vol:h-1.5 transition-[height] rounded-full
+                          ${shown > 100 ? "bg-ln-accent" : "bg-white/90"}`}
+              style={{ width: `${pct * 100}%` }}
+            />
+            <div
+              aria-hidden
+              className="absolute w-3 h-3 rounded-full bg-white shadow-[0_2px_4px_rgba(0,0,0,0.5)]
+                         transition-transform group-hover/vol:scale-110"
+              style={{ left: `calc(${pct * 100}% - 6px)` }}
+            />
+          </div>
+        </div>
+      </div>
+
       <Tooltip text={isMuted ? "Unmute (M)" : "Mute (M)"} pos="top">
         <button
           onClick={onMute}
@@ -3606,51 +3629,6 @@ function VolumeControl({
           <Icon />
         </button>
       </Tooltip>
-
-      {open && (
-        <div
-          className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 z-50
-                     aura-glass-menu
-                     rounded-full shadow-glass-edge px-3 py-2"
-          onMouseEnter={onEnter}
-          onMouseLeave={onLeave}
-        >
-          {/* Vertical-ish slider — stays compact; the user requested the
-              wheel/keyboard work too, both wired at the overlay level. */}
-          <div
-            ref={trackRef}
-            onPointerDown={(e) => {
-              (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-              onChange(Math.round(pctFromEvent(e.clientX) * VOLUME_MAX));
-            }}
-            onPointerMove={(e) => {
-              if (e.buttons & 1) onChange(Math.round(pctFromEvent(e.clientX) * VOLUME_MAX));
-            }}
-            className="relative h-5 flex items-center cursor-pointer w-32"
-          >
-            <div className="absolute inset-x-0 h-1 rounded-full bg-white/15" />
-            {/* Tick at the 100% (unity-gain) point so the boost zone is obvious. */}
-            <div
-              aria-hidden
-              className="absolute top-1/2 -translate-y-1/2 w-px h-2.5 bg-white/35"
-              style={{ left: `${(100 / VOLUME_MAX) * 100}%` }}
-            />
-            <div
-              aria-hidden
-              className={`absolute left-0 h-1 rounded-full ${volume > 100 ? "bg-ln-accent" : "bg-white/85"}`}
-              style={{ width: `${(volume / VOLUME_MAX) * 100}%` }}
-            />
-            <div
-              aria-hidden
-              className="absolute w-3 h-3 rounded-full bg-white shadow-[0_2px_4px_rgba(0,0,0,0.5)]"
-              style={{ left: `calc(${(volume / VOLUME_MAX) * 100}% - 6px)` }}
-            />
-          </div>
-          <div className="text-center text-[10px] font-mono text-white/55 tabular-nums mt-1">
-            {Math.round(volume)}
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -3667,7 +3645,9 @@ function SpeedMenu({
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
   useMenuOpenSync(open);
+  useMenuWheelScroll(open, bodyRef);
 
   useEffect(() => {
     if (!open) return;
@@ -3702,34 +3682,30 @@ function SpeedMenu({
       </Tooltip>
 
       {open && (
-        <div className="absolute bottom-full mb-2 right-0 min-w-[110px]
-                        rounded-xl py-1.5 z-50
-                        aura-glass-menu
-                        shadow-glass-edge max-h-[280px] overflow-y-auto">
+        <PlayerMenuPanel
+          title="Speed"
+          meta={label}
+          width="w-[190px]"
+          maxBodyHeight="340px"
+          bodyRef={bodyRef}
+          footer={isCustom ? `Custom speed: ${speed}×` : undefined}
+        >
           {SPEED_OPTIONS.map((s) => (
-            <button
+            <PlayerMenuRow
               key={s}
+              mono
+              label={`${s}×`}
+              selected={s === speed}
+              trailing={s === 1 && s !== speed
+                ? <span className="flex-shrink-0 text-white/60 text-[12px]">Normal</span>
+                : undefined}
               onClick={() => {
                 onChange(s);
                 fireToast(`Speed · ${s}×`);
               }}
-              className={`w-full flex items-center justify-between px-4 py-1.5 text-[13px]
-                          transition-colors font-mono tabular-nums
-                          ${s === speed
-                            ? "text-ln-accent bg-ln-accent/10"
-                            : "text-white/75 hover:text-white hover:bg-white/[0.16]"
-                          }`}
-            >
-              <span>{s}×</span>
-              {s === 1 && <span className="text-[10px] text-white/35">normal</span>}
-            </button>
+            />
           ))}
-          {isCustom && (
-            <div className="px-4 py-1.5 text-[10px] text-white/35 font-mono">
-              custom: {speed}×
-            </div>
-          )}
-        </div>
+        </PlayerMenuPanel>
       )}
     </div>
   );
@@ -3805,27 +3781,24 @@ function TrailerQualityMenu({
       </Tooltip>
 
       {open && (
-        <div className={`absolute bottom-full mb-2 right-0 min-w-[130px]
-                         rounded-xl py-1.5 z-50 aura-glass-menu shadow-glass-edge
-                         ${resolving ? "opacity-50 pointer-events-none" : ""}`}>
-          <div className="px-4 pt-1.5 pb-1 text-white/40 text-[10px] font-mono font-semibold tracking-[0.18em] uppercase">
-            Quality
-          </div>
+        <PlayerMenuPanel
+          title="Trailer quality"
+          width="w-[200px]"
+          className={resolving ? "opacity-50 pointer-events-none" : ""}
+        >
           {options.map((o) => (
-            <button
+            <PlayerMenuRow
               key={o.value}
+              mono
+              label={o.label}
+              selected={o.value === quality}
+              trailing={o.value === "auto" && o.value !== quality
+                ? <span className="flex-shrink-0 text-white/60 text-[12px]">Best</span>
+                : undefined}
               onClick={() => { onSelect(o.value); setOpen(false); }}
-              className={`w-full flex items-center justify-between px-4 py-1.5 text-[13px]
-                          transition-colors font-mono tabular-nums
-                          ${o.value === quality
-                            ? "text-ln-accent bg-ln-accent/10"
-                            : "text-white/75 hover:text-white hover:bg-white/[0.16]"}`}
-            >
-              <span>{o.label}</span>
-              {o.value === "auto" && <span className="text-[10px] text-white/35">best</span>}
-            </button>
+            />
           ))}
-        </div>
+        </PlayerMenuPanel>
       )}
     </div>
   );
@@ -3879,6 +3852,9 @@ function TrackMenu({
   const ref = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   useMenuOpenSync(open);
+  // Mousewheel-over-dropdown: scroll the menu instead of letting the
+  // overlay's volume-wheel handler steal the event.
+  useMenuWheelScroll(open, scrollRef);
 
   useEffect(() => {
     if (!open) return;
@@ -3887,21 +3863,6 @@ function TrackMenu({
     };
     window.addEventListener("mousedown", handler);
     return () => window.removeEventListener("mousedown", handler);
-  }, [open]);
-
-  // Mousewheel-over-dropdown: scroll the menu instead of letting the
-  // overlay's volume-wheel handler steal the event.
-  useEffect(() => {
-    if (!open) return;
-    const el = scrollRef.current;
-    if (!el) return;
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
-      el.scrollBy({ top: e.deltaY, behavior: "auto" });
-    };
-    el.addEventListener("wheel", onWheel, { passive: false });
-    return () => el.removeEventListener("wheel", onWheel);
   }, [open]);
 
   const offIsActive = isOff ?? !tracks.some((t) => t.selected);
@@ -3924,152 +3885,100 @@ function TrackMenu({
       </Tooltip>
 
       {open && (
-        <div
-          ref={scrollRef}
-          className="absolute bottom-full mb-2 right-0 w-[340px]
-                     rounded-xl py-1.5 z-50
-                     aura-glass-menu
-                     shadow-glass-edge max-h-[60vh] overflow-y-auto overflow-x-hidden"
-          style={{ overscrollBehavior: "contain" }}
+        <PlayerMenuPanel
+          title={label}
+          meta={tracks.length > 0 ? `${tracks.length} track${tracks.length === 1 ? "" : "s"}` : undefined}
+          width="w-[360px]"
+          bodyRef={scrollRef}
         >
-          <div className="px-4 pt-1.5 pb-1 text-white/40 text-[10px] font-mono font-semibold tracking-[0.18em] uppercase">
-            {label}
-          </div>
-
           {/* Track-selection menus stay open after a click so the user
               can audit / re-pick without reopening every time. The
               outside-click handler above still closes them, and the
               dedicated dismiss-on-second-trigger-click still works
               because the menu trigger itself is a toggle. */}
           {allowOff && (
-            <button
+            <PlayerMenuRow
+              label="Off"
+              selected={offIsActive}
               onClick={() => {
                 if (onOff) onOff(); else onPick(null);
               }}
-              className={`w-full text-left px-4 py-2 text-[13px] transition-colors
-                          ${offIsActive
-                            ? "text-ln-accent bg-ln-accent/10"
-                            : "text-white/55 hover:text-white hover:bg-white/[0.16]"}`}
-            >
-              Off
-            </button>
+            />
           )}
 
           {tracks.length === 0 ? (
-            <div className="px-4 py-3 text-white/40 text-[12px] italic">
+            <div className="px-3 py-3 text-white/60 text-[12.5px]">
               {emptyHint ?? "No tracks available"}
             </div>
           ) : (
             tracks.map((t) => (
-              <button
+              <PlayerMenuRow
                 key={t.id}
+                label={t.title || t.lang?.toUpperCase() || `Track ${t.id}`}
+                selected={t.selected}
                 onClick={() => { onPick(t.id); }}
-                className={`w-full text-left px-4 py-2 text-[13px] transition-colors
-                            ${t.selected
-                              ? "text-ln-accent bg-ln-accent/10"
-                              : "text-white/90 hover:text-white hover:bg-white/[0.16]"
-                            }`}
-              >
-                <div className="flex items-start gap-2">
-                  <span className="flex-1 min-w-0 leading-snug break-words">
-                    {t.title || t.lang?.toUpperCase() || `Track ${t.id}`}
-                  </span>
-                  <div className="flex-shrink-0 flex items-center gap-1">
-                    {t.lang && (
-                      <span className="text-[10px] font-mono text-white/55 px-1.5 py-0.5 rounded bg-white/8 border border-white/10">
-                        {t.lang.toUpperCase()}
-                      </span>
-                    )}
+                trailing={(t.lang || t.external || t.selected) ? (
+                  <span className="flex-shrink-0 flex items-center gap-1.5">
+                    {t.lang && <PlayerMenuChip>{t.lang.toUpperCase()}</PlayerMenuChip>}
                     {t.external && (
-                      <span className="text-[9px] font-mono text-amber-300/90 px-1.5 py-0.5 rounded bg-amber-400/10 border border-amber-400/30">
-                        EXT
-                      </span>
+                      <PlayerMenuChip title="Loaded from an external subtitle file">External</PlayerMenuChip>
                     )}
-                  </div>
-                </div>
-              </button>
+                    {t.selected && <MenuCheckIcon />}
+                  </span>
+                ) : undefined}
+              />
             ))
           )}
 
           {extraItems && extraItems.length > 0 && (
             <>
-              <div className="my-1 mx-3 h-px bg-white/8" />
+              <PlayerMenuDivider />
               {extraItems.map((it, idx) => (
-                <button
+                <PlayerMenuRow
                   key={idx}
+                  label={it.accent ? <span className="text-ln-accent">{it.label}</span> : it.label}
                   onClick={() => { it.onClick(); setOpen(false); }}
-                  className={`w-full text-left px-4 py-2 text-[13px] transition-colors
-                              ${it.accent
-                                ? "text-ln-accent hover:bg-ln-accent/10"
-                                : "text-white/75 hover:text-white hover:bg-white/[0.16]"}`}
-                >
-                  {it.label}
-                </button>
+                />
               ))}
             </>
           )}
 
           {delay && (
             <>
-              <div className="my-1 mx-3 h-px bg-white/8" />
-              <div className="px-4 py-2 space-y-1.5">
-                <div className="flex items-center justify-between text-[11.5px]">
-                  <span className="text-white/55 font-mono uppercase tracking-[0.16em]">
-                    {delay.label}
-                  </span>
-                  <span className="text-white/70 font-mono tabular-nums">
-                    {delay.value === 0
-                      ? "0.0 s"
-                      : `${delay.value > 0 ? "+" : "−"}${Math.abs(delay.value).toFixed(1)} s`}
-                  </span>
-                </div>
+              <PlayerMenuDivider />
+              <div className="flex items-baseline justify-between pr-3">
+                <PlayerMenuSection>{delay.label}</PlayerMenuSection>
+                <span className="text-white/85 text-[12.5px] font-mono tabular-nums">
+                  {delay.value === 0
+                    ? "0.0 s"
+                    : `${delay.value > 0 ? "+" : "−"}${Math.abs(delay.value).toFixed(1)} s`}
+                </span>
+              </div>
+              <div className="px-3 pb-2 space-y-1.5">
                 <div className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={delay.onMinus}
-                    className="flex-1 px-1.5 py-1 rounded-md text-[11px] font-mono tabular-nums
-                               bg-white/8 text-white/85 border border-white/12
-                               hover:bg-white/14 hover:text-white active:scale-95 transition-all"
-                  >
+                  <PlayerMenuButton onClick={delay.onMinus} className="flex-1 font-mono tabular-nums">
                     −0.1 s
-                  </button>
-                  <button
-                    type="button"
-                    onClick={delay.onPlus}
-                    className="flex-1 px-1.5 py-1 rounded-md text-[11px] font-mono tabular-nums
-                               bg-white/8 text-white/85 border border-white/12
-                               hover:bg-white/14 hover:text-white active:scale-95 transition-all"
-                  >
+                  </PlayerMenuButton>
+                  <PlayerMenuButton onClick={delay.onPlus} className="flex-1 font-mono tabular-nums">
                     +0.1 s
-                  </button>
-                  <button
-                    type="button"
-                    onClick={delay.onReset}
-                    disabled={delay.value === 0}
-                    className="px-2 py-1 ml-auto rounded-md text-[10.5px] font-medium tracking-wide
-                               bg-white/5 text-white/55 border border-white/10
-                               hover:bg-white/10 hover:text-white
-                               disabled:opacity-35 disabled:hover:bg-white/5 disabled:hover:text-white/55
-                               transition-colors"
-                  >
+                  </PlayerMenuButton>
+                  <PlayerMenuButton onClick={delay.onReset} disabled={delay.value === 0}>
                     Reset
-                  </button>
+                  </PlayerMenuButton>
                 </div>
                 {delay.onLiveSync && (
-                  <button
-                    type="button"
+                  <PlayerMenuButton
+                    accent
+                    className="w-full"
                     onClick={() => { setOpen(false); delay.onLiveSync?.(); }}
-                    className="w-full px-1.5 py-1 rounded-md text-[11px] font-medium tracking-wide
-                               bg-ln-accent/15 text-ln-accent border border-ln-accent/35
-                               hover:bg-ln-accent/25 active:scale-95 transition-all"
                   >
                     Live sync · pick the line you heard
-                  </button>
+                  </PlayerMenuButton>
                 )}
               </div>
             </>
           )}
-        </div>
+        </PlayerMenuPanel>
       )}
     </div>
   );
@@ -4220,16 +4129,18 @@ function MoreMenu({
       />
 
       {open && (
-        <div className="absolute bottom-full mb-2 right-0 min-w-[240px]
-                        rounded-xl py-1.5 z-50
-                        aura-glass-menu
-                        shadow-glass-edge">
+        <PlayerMenuPanel
+          title="More"
+          width="w-[300px]"
+          maxBodyHeight="70vh"
+          footer={flash ? <span className="text-ln-accent">{flash}</span> : undefined}
+        >
           <MoreItem
             icon={<MoreIcon />}
             label="AuraSkip"
             onClick={() => { setAniskipOpen(true); setOpen(false); }}
           />
-          <div className="my-1 mx-3 h-px bg-white/8" />
+          <PlayerMenuDivider />
           <MoreItem
             icon={
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -4260,9 +4171,9 @@ function MoreMenu({
               setOpen(false);
             }}
           />
-          {/* Watch Together entry REMOVED — the in-player party pill (presence
+          {/* Watch Together entry REMOVED: the in-player party pill (presence
               cluster) is the sole entry point during playback. */}
-          <div className="my-1 mx-3 h-px bg-white/8" />
+          <PlayerMenuDivider />
           <MoreItem
             icon={<CopyIcon />}
             label="Copy stream link"
@@ -4281,86 +4192,37 @@ function MoreMenu({
             disabled={!streamUrl}
             onClick={() => { openExternal(); setOpen(false); }}
           />
-          <div className="my-1 mx-3 h-px bg-white/8" />
-          {/* Audio loudness normalization — in-player mirror of the
-              Settings → Video & Audio → "Loudness normalization"
+          <PlayerMenuDivider />
+          {/* Audio loudness normalization: in-player mirror of the
+              Settings > Video & Audio > "Loudness normalization"
               toggle. Stays in sync with the Settings UI via the
               auraSettings event bus. */}
-          <button
-            type="button"
-            onClick={toggleLoudness}
-            className="w-full flex items-center gap-3 px-4 py-2 text-left text-[13px]
-                       text-white/85 hover:text-white hover:bg-white/[0.16]
-                       transition-colors"
-            role="switch"
-            aria-checked={loudness}
-          >
-            <span className="text-white/55 flex-shrink-0">
-              <LoudnormIcon />
-            </span>
-            <span className="flex-1">Normalize loudness</span>
-            <span
-              aria-hidden
-              className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0
-                          ${loudness ? "bg-ln-accent/80" : "bg-white/15"}`}
-            >
-              <span
-                className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-md
-                           transition-transform duration-150"
-                style={{ transform: loudness ? "translateX(16px)" : "translateX(0)" }}
-              />
-            </span>
-          </button>
-          {/* SVP Tier 1 motion interpolation — in-player mirror of the
-              Settings → Video & Audio toggle. Same auraSettings event
+          <PlayerMenuToggle
+            icon={<LoudnormIcon />}
+            label="Normalize loudness"
+            on={loudness}
+            onToggle={toggleLoudness}
+          />
+          {/* SVP Tier 1 motion interpolation: in-player mirror of the
+              Settings > Video & Audio toggle. Same auraSettings event
               bus keeps the two surfaces in lock-step. */}
-          <button
-            type="button"
-            onClick={toggleInterp}
-            disabled={!isAnime}
-            title={
-              isAnime
-                ? undefined
-                : "Anime only: interpolation adds judder/drops on live-action"
-            }
-            className={`w-full flex items-center gap-3 px-4 py-2 text-left text-[13px]
-                       transition-colors
-                       ${isAnime
-                         ? "text-white/85 hover:text-white hover:bg-white/[0.16]"
-                         : "text-white/35 cursor-not-allowed"}`}
-            role="switch"
-            aria-checked={interp && isAnime}
-            aria-disabled={!isAnime}
-          >
-            <span className="text-white/55 flex-shrink-0">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+          <PlayerMenuToggle
+            icon={
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                 <path d="M4 4h16a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zm1 3v2h2V7H5zm0 4v2h2v-2H5zm0 4v2h2v-2H5zm12-8v2h2V7h-2zm0 4v2h2v-2h-2zm0 4v2h2v-2h-2zM9 8.5v7l5-3.5-5-3.5z" />
               </svg>
-            </span>
-            <span className="flex-1">Motion interpolation</span>
-            <span
-              aria-hidden
-              className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0
-                          ${interp ? "bg-ln-accent/80" : "bg-white/15"}`}
-            >
-              <span
-                className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-md
-                           transition-transform duration-150"
-                style={{ transform: interp ? "translateX(16px)" : "translateX(0)" }}
-              />
-            </span>
-          </button>
-          {/* Video equalizer — brightness / contrast / saturation / gamma / hue
+            }
+            label={isAnime ? "Motion interpolation" : "Motion interpolation (anime only)"}
+            on={interp}
+            onToggle={toggleInterp}
+            disabled={!isAnime}
+            title={isAnime ? undefined : "Anime only: interpolation adds judder/drops on live-action"}
+          />
+          {/* Video equalizer: brightness / contrast / saturation / gamma / hue
               (display-space VO controls, live, session-scoped). Collapsible. */}
-          <div className="my-1 mx-3 h-px bg-white/8" />
-          <button
-            type="button"
-            onClick={() => setEqOpen((v) => !v)}
-            aria-expanded={eqOpen}
-            className="w-full flex items-center gap-3 px-4 py-2 text-left text-[13px]
-                       text-white/85 hover:text-white hover:bg-white/[0.16] transition-colors"
-          >
-            <span className="text-white/55 flex-shrink-0">
+          <PlayerMenuDivider />
+          <PlayerMenuRow
+            icon={
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                    strokeWidth="2" strokeLinecap="round" aria-hidden>
                 <line x1="4" y1="21" x2="4" y2="14" /><line x1="4" y1="10" x2="4" y2="3" />
@@ -4368,40 +4230,38 @@ function MoreMenu({
                 <line x1="20" y1="21" x2="20" y2="16" /><line x1="20" y1="12" x2="20" y2="3" />
                 <line x1="1" y1="14" x2="7" y2="14" /><line x1="9" y1="8" x2="15" y2="8" /><line x1="17" y1="16" x2="23" y2="16" />
               </svg>
-            </span>
-            <span className="flex-1">Video equalizer</span>
-            <span className="text-white/40 text-[11px]" aria-hidden>{eqOpen ? "▾" : "▸"}</span>
-          </button>
+            }
+            label="Video equalizer"
+            ariaExpanded={eqOpen}
+            onClick={() => setEqOpen((v) => !v)}
+            trailing={
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden
+                   className={`flex-shrink-0 text-white/60 transition-transform ${eqOpen ? "rotate-90" : ""}`}>
+                <path d="M9 6l6 6-6 6" />
+              </svg>
+            }
+          />
           {eqOpen && (
-            <div className="px-4 pt-1 pb-2 space-y-1.5">
+            <div className="pb-1.5">
               {EQ_PROPS.map(([prop, label]) => (
-                <div key={prop} className="flex items-center gap-2">
-                  <span className="text-white/55 text-[11px] w-[68px] flex-shrink-0">{label}</span>
-                  <input
-                    type="range" min={-100} max={100} step={1} value={eq[prop]}
-                    onChange={(e) => setEqProp(prop, Number(e.target.value))}
-                    className="flex-1 h-1 accent-ln-accent cursor-pointer"
-                    aria-label={label}
-                  />
-                  <span className="text-white/45 text-[10px] font-mono w-7 text-right tabular-nums">{eq[prop]}</span>
-                </div>
+                <PlayerMenuSlider
+                  key={prop}
+                  label={label}
+                  value={eq[prop]}
+                  min={-100}
+                  max={100}
+                  onChange={(v) => setEqProp(prop, v)}
+                />
               ))}
-              <button
-                type="button"
-                onClick={resetEq}
-                className="w-full mt-0.5 text-[11px] text-white/55 hover:text-white py-1
-                           rounded-md hover:bg-white/[0.08] transition-colors"
-              >
-                Reset to neutral
-              </button>
+              <div className="px-3 pt-1">
+                <PlayerMenuButton className="w-full" onClick={resetEq}>
+                  Reset to neutral
+                </PlayerMenuButton>
+              </div>
             </div>
           )}
-          {flash && (
-            <div className="px-4 py-1.5 text-[11px] font-mono text-ln-accent/85 border-t border-white/8 mt-1">
-              {flash}
-            </div>
-          )}
-        </div>
+        </PlayerMenuPanel>
       )}
     </div>
   );
@@ -4415,21 +4275,7 @@ function MoreItem({
   onClick: () => void;
   disabled?: boolean;
 }) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      className={`w-full flex items-center gap-3 px-4 py-2 text-left text-[13px]
-                  transition-colors
-                  ${disabled
-                    ? "text-white/30 cursor-not-allowed"
-                    : "text-white/85 hover:text-white hover:bg-white/[0.16]"
-                  }`}
-    >
-      <span className="text-white/55 flex-shrink-0">{icon}</span>
-      <span className="flex-1">{label}</span>
-    </button>
-  );
+  return <PlayerMenuRow icon={icon} label={label} onClick={onClick} disabled={disabled} />;
 }
 
 // ---------------------------------------------------------------------------

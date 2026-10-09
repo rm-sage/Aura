@@ -152,7 +152,7 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
         }}
       />
       <div
-        className="fixed z-[10041] w-[360px] max-w-[92vw] rounded-2xl border border-white/12
+        className="fixed z-[10041] w-[360px] max-w-[92vw] rounded-2xl
                    aura-float-glass p-5 overflow-y-auto"
         style={{
           top: anchor.top,
@@ -173,15 +173,17 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
       >
         {/* No close button, matching the notifications panel and the profile
             popover: all three dismiss on an outside click and on Escape, and a
-            panel offering both plus an X offers three ways to do one thing. */}
-        <div className="mb-3">
-          <h2 className="text-white/95 text-[15px] font-semibold flex items-center gap-2">
+            panel offering both plus an X offers three ways to do one thing.
+            The title row is the player dialogs' (playerMenu.tsx): 16 px at
+            full white over a hairline, bled to the card edges. */}
+        <div className="-mx-5 -mt-1 px-5 pb-3 mb-4 border-b border-white/8">
+          <h2 className="text-white text-[16px] font-semibold tracking-tight flex items-center gap-2">
             <PeopleGlyph /> Watch Together
           </h2>
         </div>
 
         {w.error && (
-          <p className="text-rose-300/90 text-[12px] mb-3 leading-snug">{w.error}</p>
+          <p className="text-rose-300/90 text-[12.5px] mb-3 leading-snug">{w.error}</p>
         )}
 
         {showConfig ? (
@@ -251,10 +253,10 @@ function ConfigNotice({
   return (
     <div className="space-y-3">
       {firstTime && (
-        <p className="text-white/55 text-[12.5px] leading-relaxed">
+        <p className="text-white/60 text-[12.5px] leading-relaxed">
           Aura ships with a default relay, so you normally only need a room
           code. Point this at your own deployed Cloudflare Worker (see{" "}
-          <span className="text-white/75">watch-relay/README.md</span>) if you
+          <span className="text-white/85">watch-relay/README.md</span>) if you
           would rather not use the shared one.
         </p>
       )}
@@ -292,8 +294,8 @@ function Lobby({
   onCreate: () => void; onJoin: () => void; onCreateWithCode: (code: string) => void;
   onEditRelay: () => void;
 }) {
-  // A code is joinable only at 4–16 chars (the relay's accepted shape) — gate
-  // the Join button so a too-short code can't hang on "connecting".
+  // A code is joinable only at 4 to 16 chars (the relay's accepted shape):
+  // gate the Join button so a too-short code can't hang on "connecting".
   const cleaned = joinCode.trim().replace(/[^A-Za-z0-9]/g, "");
   const codeValid = cleaned.length >= 4 && cleaned.length <= 16;
   return (
@@ -306,7 +308,7 @@ function Lobby({
         Create a room
       </button>
 
-      <div className="flex items-center gap-3 text-white/30 text-[11px] uppercase tracking-wider">
+      <div className="flex items-center gap-3 text-white/55 text-[11px] font-semibold uppercase tracking-wider">
         <span className="h-px flex-1 bg-white/10" /> or <span className="h-px flex-1 bg-white/10" />
       </div>
 
@@ -324,7 +326,7 @@ function Lobby({
             Join
           </button>
         </div>
-        <p className="text-white/30 text-[10.5px] leading-snug">4–16 letters or numbers.</p>
+        <p className="text-white/55 text-[11.5px] leading-snug">4 to 16 letters or numbers.</p>
       </div>
 
       {notFoundCode && (
@@ -341,7 +343,7 @@ function Lobby({
       <button
         type="button"
         onClick={onEditRelay}
-        className="text-white/35 hover:text-white/60 text-[11px] transition-colors"
+        className="text-white/55 hover:text-white/85 text-[12px] transition-colors"
       >
         Relay settings
       </button>
@@ -369,7 +371,7 @@ function Room({
       {/* Room code */}
       <div className="flex items-center justify-between gap-3 rounded-xl bg-white/[0.04] border border-white/8 px-3.5 py-2.5">
         <div className="min-w-0">
-          <p className="text-white/40 text-[10px] uppercase tracking-wider">Room code</p>
+          <p className="text-white/55 text-[11px] font-semibold uppercase tracking-wider">Room code</p>
           <p className="text-white text-[20px] font-mono font-semibold tracking-[0.18em] leading-tight">
             {status === "connecting" ? "…" : code}
           </p>
@@ -381,18 +383,18 @@ function Room({
 
       {/* Sync status */}
       {status === "connecting" ? (
-        <p className="text-white/45 text-[12.5px] flex items-center gap-2">
+        <p className="text-white/65 text-[13px] flex items-center gap-2">
           <Spinner /> Connecting…
         </p>
       ) : !roomVideoKey ? (
-        <p className="text-white/45 text-[12.5px]">
+        <p className="text-white/65 text-[13px] leading-snug">
           {isLeader
             ? "You're the host. Play something and it becomes the party's title."
             : "Waiting for the host to start playing."}
         </p>
       ) : inSync ? (
         <div className="rounded-xl bg-emerald-400/[0.07] border border-emerald-400/20 px-3 py-2.5 space-y-1">
-          <p className="text-emerald-300/90 text-[12.5px] flex items-center gap-2">
+          <p className="text-emerald-300/90 text-[13px] flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-emerald-400" />
             {staging ? `Waiting for the party · ${readyHere}/${members.length} here` : "In sync"}
             {isLeader ? " · you're the host" : ""}
@@ -404,7 +406,7 @@ function Room({
         </div>
       ) : (
         <div className="rounded-xl bg-amber-400/[0.08] border border-amber-400/20 px-3 py-2.5">
-          <p className="text-amber-200/90 text-[12px] leading-snug">The party is watching:</p>
+          <p className="text-amber-200/90 text-[12.5px] leading-snug">The party is watching:</p>
           <PartyMediaCard
             metaId={roomMetaId} mediaType={roomMediaType} videoKey={roomVideoKey}
             title={roomTitle} streamLabel={roomStreamLabel}
@@ -421,8 +423,8 @@ function Room({
         <button
           type="button"
           onClick={onClearStream}
-          className="w-full h-8 rounded-xl text-[12px] font-medium text-white/65 border border-white/10
-                     hover:bg-white/[0.06] hover:text-white/90 transition-colors"
+          className="w-full h-8 rounded-xl text-[12.5px] font-medium bg-white/8 text-white/90
+                     border border-white/14 hover:bg-white/14 hover:text-white transition-colors"
         >
           Clear party stream
         </button>
@@ -430,7 +432,7 @@ function Room({
 
       {/* Members */}
       <div>
-        <p className="text-white/40 text-[10px] uppercase tracking-wider mb-1.5">
+        <p className="text-white/55 text-[11px] font-semibold uppercase tracking-wider mb-1.5">
           In the room · {members.length}
         </p>
         <ul className="space-y-0.5">
@@ -446,13 +448,13 @@ function Room({
             return (
               <li
                 key={m.id}
-                className="group flex items-center gap-2 text-[13px] rounded-lg px-1.5 py-1 -mx-1.5 hover:bg-white/[0.04]"
+                className="group flex items-center gap-2 text-[13.5px] rounded-xl px-2 py-1.5 -mx-2 hover:bg-white/6"
               >
                 <span
                   className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${onTitle ? "bg-emerald-400" : "bg-amber-400/70"}`}
                   title={onTitle ? "Watching the party title" : "On a different title"}
                 />
-                <span className="text-white/85 truncate flex items-center gap-1.5 min-w-0">
+                <span className="text-white/90 truncate flex items-center gap-1.5 min-w-0">
                   <span className="truncate">{m.name}{m.id === selfId ? " (you)" : ""}</span>
                   {isHost && (
                     <span title="Host" aria-label="Host" className="text-amber-300 text-[12px] flex-shrink-0 leading-none">♛</span>
@@ -470,8 +472,8 @@ function Room({
                       onClick={() => onTransfer(m.id)}
                       title={`Make ${m.name} the host`}
                       className="flex-shrink-0 hidden group-hover:inline-flex focus:inline-flex
-                                 text-[10.5px] px-1.5 py-0.5 rounded-md text-white/55
-                                 hover:text-amber-200 hover:bg-white/[0.06] border border-white/10"
+                                 text-[11.5px] font-medium px-2 py-0.5 rounded-md bg-white/8 text-white/85
+                                 hover:text-white hover:bg-white/14 border border-white/14"
                     >
                       Make host
                     </button>
@@ -531,8 +533,8 @@ function PartyMediaCard({
         <div className="w-9 h-[54px] rounded-md flex-shrink-0 bg-white/[0.06] border border-white/10" />
       )}
       <div className="min-w-0">
-        <p className="text-white/90 text-[12.5px] font-medium truncate">{title ?? detail?.name ?? "Untitled"}</p>
-        {facts && <p className="text-white/45 text-[11px] truncate">{facts}</p>}
+        <p className="text-white/90 text-[13px] font-medium leading-snug truncate">{title ?? detail?.name ?? "Untitled"}</p>
+        {facts && <p className="text-white/60 text-[11.5px] leading-snug truncate">{facts}</p>}
       </div>
     </div>
   );
@@ -562,7 +564,7 @@ function MemberBuffer({ stat }: { stat: MemberStat | undefined }) {
     return (
       <span
         title="Buffering"
-        className="text-[10px] tabular-nums text-amber-300 flex-shrink-0 whitespace-nowrap"
+        className="text-[10.5px] tabular-nums text-amber-300 flex-shrink-0 whitespace-nowrap"
       >
         buffering{stat.pct != null ? ` ${Math.round(stat.pct)}%` : "…"}
       </span>
@@ -579,7 +581,7 @@ function MemberBuffer({ stat }: { stat: MemberStat | undefined }) {
       <span className="w-8 h-1 rounded-full bg-white/12 overflow-hidden">
         <span className="block h-full rounded-full bg-emerald-400/70" style={{ width: `${frac * 100}%` }} />
       </span>
-      <span className="text-[10px] tabular-nums text-white/45">{stat.seconds.toFixed(0)}s</span>
+      <span className="text-[10.5px] tabular-nums text-white/60">{stat.seconds.toFixed(0)}s</span>
     </span>
   );
 }
@@ -589,23 +591,23 @@ function MemberBuffer({ stat }: { stat: MemberStat | undefined }) {
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="block">
-      <span className="text-white/40 text-[10px] uppercase tracking-wider">{label}</span>
+      <span className="text-white/55 text-[11px] font-semibold uppercase tracking-wider">{label}</span>
       <div className="mt-1">{children}</div>
     </label>
   );
 }
 
 const inputCls =
-  "w-full h-9 px-3 rounded-xl bg-white/5 border border-white/10 text-[13px] text-white/90 " +
-  "placeholder:text-white/30 focus:outline-none focus:border-ln-accent/40";
+  "w-full h-9 px-3 rounded-xl bg-white/8 border border-white/12 text-[13.5px] text-white/90 " +
+  "placeholder:text-white/40 focus:outline-none focus:border-ln-accent/40";
 const primaryBtn =
-  "w-full h-9 rounded-xl text-[13px] font-medium bg-ln-accent/15 text-ln-accent border border-ln-accent/30 " +
+  "w-full h-9 rounded-xl text-[13.5px] font-medium bg-ln-accent/15 text-ln-accent border border-ln-accent/40 " +
   "hover:bg-ln-accent/25 disabled:opacity-40 disabled:cursor-not-allowed transition-colors";
 const secondaryBtn =
-  "px-3.5 h-9 rounded-xl text-[13px] font-medium bg-white/5 text-white/85 border border-white/10 " +
-  "hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex-shrink-0";
+  "px-3.5 h-9 rounded-xl text-[13.5px] font-medium bg-white/8 text-white/90 border border-white/14 " +
+  "hover:bg-white/14 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex-shrink-0";
 const dangerBtn =
-  "w-full h-9 rounded-xl text-[13px] font-medium text-rose-300/85 border border-rose-400/20 " +
+  "w-full h-9 rounded-xl text-[13.5px] font-medium text-rose-300/90 border border-rose-400/25 " +
   "hover:bg-rose-400/10 transition-colors";
 
 function Spinner() {

@@ -39,6 +39,7 @@ import { useReleaseSignal } from "./releaseSignalStore";
 import { isVideoAired } from "./types";
 import { nextAiringEpisode, formatTargetDate } from "./releaseCountdown";
 import EpisodeAirChip from "./EpisodeAirChip";
+import { PlayerMenuChip } from "./playerMenu";
 import ArcGrid, { ArcGridSkeleton } from "./ArcGrid";
 import GroupingToggle from "./EpisodeGroupingToggle";
 import {
@@ -346,8 +347,9 @@ function EpisodePanel({
         onMouseDown={(e) => e.stopPropagation()}
         onDoubleClick={(e) => e.stopPropagation()}
       >
-        {/* Header */}
-        <div className="flex items-center justify-between gap-3 px-5 pt-5 pb-3 flex-shrink-0">
+        {/* Header. The player menus' title row (playerMenu.tsx): 16 px title
+            at full white, 55% meta, a hairline under it. */}
+        <div className="flex items-center justify-between gap-3 pl-5 pr-3 pt-5 pb-3 border-b border-white/8 flex-shrink-0">
           <div className="flex items-center gap-2.5 min-w-0">
             {arcMode && openArc ? (
               // An arc is open: a back affordance to the arc list, labelled with
@@ -355,8 +357,8 @@ function EpisodePanel({
               <button
                 type="button"
                 onClick={() => setOpenArcId(null)}
-                className="flex items-center gap-1.5 min-w-0 text-white/80 hover:text-white
-                           text-[13px] font-medium transition-colors"
+                className="flex items-center gap-1.5 min-w-0 text-white/90 hover:text-white
+                           text-[14px] font-semibold tracking-tight transition-colors"
               >
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden className="flex-shrink-0">
                   <path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z" />
@@ -364,11 +366,11 @@ function EpisodePanel({
                 <span className="truncate">{openArc.name}</span>
               </button>
             ) : arcMode ? (
-              <span className="text-[15px] font-mono tracking-wide text-white/80">Arcs</span>
+              <span className="text-[16px] font-semibold tracking-tight text-white">Arcs</span>
             ) : seasons.length > 1 ? (
               <SeasonSelect seasons={seasons} value={season} onChange={setSeason} />
             ) : (
-              <span className="text-[15px] font-mono tracking-wide text-white/80">Episodes</span>
+              <span className="text-[16px] font-semibold tracking-tight text-white">Episodes</span>
             )}
           </div>
           <div className="flex items-center gap-2.5 flex-shrink-0">
@@ -378,7 +380,7 @@ function EpisodePanel({
             {/* Count reflects the visible list; hidden on the arc GRID (its own
                 cards carry per-arc counts) and while arcs are still resolving. */}
             {!(arcMode && !openArc) && !arcPending && !arcsLikelyPending && (
-              <span className="text-white/45 text-[12px] font-mono tracking-wider whitespace-nowrap">
+              <span className="text-white/55 text-[12px] font-mono tabular-nums whitespace-nowrap">
                 {visibleEpisodes.length} {visibleEpisodes.length === 1 ? "ep" : "eps"}
               </span>
             )}
@@ -386,8 +388,8 @@ function EpisodePanel({
               type="button"
               onClick={onClose}
               aria-label="Close episode list"
-              className="w-7 h-7 rounded-full text-white/55 hover:text-white
-                         hover:bg-white/10 transition-colors flex items-center justify-center"
+              className="w-7 h-7 rounded-lg text-white/55 hover:text-white
+                         hover:bg-white/12 transition-colors flex items-center justify-center"
             >
               <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                 <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
@@ -399,7 +401,7 @@ function EpisodePanel({
         {/* List */}
         <div
           ref={listRef}
-          className="flex-1 min-h-0 overflow-y-auto px-3 pb-4 space-y-1.5"
+          className="flex-1 min-h-0 overflow-y-auto px-3 pt-3 pb-4 space-y-1.5"
           style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.10) transparent" }}
         >
           {arcMode && !openArc ? (
@@ -427,7 +429,7 @@ function EpisodePanel({
               <div key={i} className="h-[84px] rounded-xl bg-white/[0.04] animate-pulse" />
             ))
           ) : visibleEpisodes.length === 0 ? (
-            <p className="text-white/45 text-[13px] italic px-3 py-6 text-center">
+            <p className="text-white/55 text-[13px] px-3 py-8 text-center">
               No episode list available.
             </p>
           ) : (
@@ -474,7 +476,7 @@ function EpisodePanel({
                               disabled:cursor-default
                               ${isCurrent
                                 ? "bg-ln-accent/15 border border-ln-accent/35"
-                                : "border border-transparent hover:bg-white/[0.07]"}`}
+                                : "border border-transparent hover:bg-white/10"}`}
                 >
                   <div
                     className="relative flex-shrink-0 w-[120px] rounded-lg overflow-hidden
@@ -545,8 +547,8 @@ function EpisodePanel({
                   <div className="flex-1 min-w-0 py-0.5">
                     <div className="flex items-center gap-2">
                       <span
-                        className={`text-white/45 text-[10.5px] font-mono uppercase tracking-[0.14em]${
-                          numberHover ? " underline decoration-dotted decoration-white/30 underline-offset-2 cursor-help" : ""}`}
+                        className={`text-white/60 text-[11px] font-mono uppercase tracking-[0.14em]${
+                          numberHover ? " underline decoration-dotted decoration-white/40 underline-offset-2 cursor-help" : ""}`}
                         title={numberHover || undefined}
                       >
                         {/* Arc mode: absolute whole-series number, so a
@@ -557,22 +559,16 @@ function EpisodePanel({
                           ? `E${String(absoluteById.get(v.id) ?? "").padStart(2, "0")}`
                           : formatEpisodeTag(v)}
                       </span>
-                      {isCurrent && (
-                        <span className="text-ln-accent text-[9.5px] font-semibold uppercase tracking-wider">
-                          Now playing
-                        </span>
-                      )}
-                      {isNext && !isCurrent && (
-                        <span className="text-white/70 text-[9.5px] font-semibold uppercase tracking-wider">
-                          Next
-                        </span>
-                      )}
+                      {/* The menus' chips (playerMenu.tsx), the size of the
+                          stream-quality chips, rather than 9.5 px loose text. */}
+                      {isCurrent && <PlayerMenuChip tone="accent">Now playing</PlayerMenuChip>}
+                      {isNext && !isCurrent && <PlayerMenuChip>Next</PlayerMenuChip>}
                     </div>
-                    <p className="text-white/90 text-[13px] font-medium leading-tight mt-0.5 line-clamp-2">
+                    <p className="text-white/90 text-[13.5px] font-medium leading-snug mt-1 line-clamp-2">
                       {(v.title ?? "").trim() || "Untitled episode"}
                     </p>
                     {unaired && airMs != null && (
-                      <p className="text-white/45 text-[11px] mt-1 whitespace-nowrap">
+                      <p className="text-white/60 text-[12px] mt-1 whitespace-nowrap">
                         Airs {formatTargetDate(airMs)}
                       </p>
                     )}
