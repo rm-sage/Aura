@@ -379,8 +379,10 @@ after-credits scene on 10 of the 11 episodes that have one.
   there to be read. A Transition-only ending keeps another ending only when that ending's END agrees
   within 3 s AND it starts no earlier than the song (a real ending cannot start before its song; a
   crowd ending fitted to the file's end that starts in story before it was outranking the match), and
-  such an ending then outranks it; one whose START a strong chapter or crowd ending confirms within
-  3 s becomes plain `animethemes` (Bebop 26, Bocchi 12). The Transition match itself stays
+  such an ending then outranks it; one whose START a strongly titled chapter confirms within 3 s
+  becomes plain `animethemes` (Bebop 26, Bocchi 12). A crowd row no longer promotes one: a single
+  AniSkip row marking where a Bebop-13-style song begins would have made a 280 s story cut a
+  Verified, automatic skip. The Transition match itself stays
   prompt-only even when it is right (Solo Leveling E1 loses an automatic ED skip): the accepted cost
   of the Bebop 13 rule, since its start can sit minutes inside the story. A weak-title chapter
   ("weak-title" hold) ranks below every unheld window of its kind, so it never wins the one-opening
@@ -447,6 +449,28 @@ after-credits scene on 10 of the 11 episodes that have one.
   windows by kind with both edges within 3 s (`handledIn`), so a refinement of a skipped opening is
   not re-prompted or re-skipped. The Detect (and Prefetch) action's kind switches travel as `detect_op` / `detect_ed`,
   because the action enum is tagged `op`. A Prefetch is not cancelled by a Detect.
+- **Confidence levels (Verified / Likely / Risky)** on the skip prompt, the scrubber's hover card,
+  the AuraSkip menu rows, the auto-skip toast and a Settings legend. `composeSkipWindows` stamps a
+  `basis` on every window it publishes (`SkipBasis`, `skipBasisFor`: what the POSITION rests on,
+  judged against everything the stamp weighed, before the media-end clamp); `skipConfidence` maps
+  basis + kind + length to the level and `skipConfidenceInfo` (`src/skipSource.ts`) words it.
+  `basis` rides the Rust payload (`PreparedWindow::basis`) so the mid-play re-stamp keeps it.
+  The table is MEASURED, not guessed (every window of every stamp of the 89-episode corpus against
+  frame truth, scratchpad `confidence/evidence.md` of session 20dd39a5): Verified = a theme match
+  whose edges are refined (`WindowOut::refined`, set when the region's levels gated the edges, and
+  on a result-cache hit) and at most 150 s long, a titled opening chapter of 20-100 s, a titled
+  preview chapter of at most 40 s; measured worst case 1.6 s of story. Likely = an unrefined theme
+  match ("theme-settling": the pre-levels windows are where every 1.8 s overrun was), the early
+  opening, a theme that plays over story in some versions, other titled chapters, a crowd row
+  alone or with an independent second source. Risky = an AniSkip ending, a crowd row shown while
+  the theme match is still checking (7 of 13 cut story, JJK S2E10's 90 s cold open), an ending
+  chapter that runs to the end of the file ("chapter-tail": Blue Box 2:1's "Credits" chapter held a
+  106 s scene after the ending), a Transition-only theme, weak titles, guesses, other cuts, single
+  submissions, lone sources, rows the file contradicts. RISKY IS ALWAYS PROMPT-ONLY (`isPromptOnly`),
+  so a Risky label never sits on an automatic skip. A weak-title chapter is never an independent
+  witness (`weak_title`), and a window with no basis (a payload from before bases) shows no level.
+  Before moving a window into Verified, re-measure: the user's bar is that a Verified skip never
+  cuts story.
 
 ### Downloads: two landmines and one governing rule
 
@@ -1133,7 +1157,8 @@ creep degrades the experience. When adding ANY feature:
 - "Next-Up card appears / auto-advances too early" -> `src/nextUpGate.ts`. The card has no
   countdown; an advance before EOS means a countdown was put back into `NextUpCta.tsx`.
 - "A skip only PROMPTS although its kind is on Auto" -> the `[auraskip]` stamp line prints each
-  window's `hold` and the theme match's per-kind state; `skipPromptOnlyReason` (`src/skipSource.ts`)
+  window's `hold`, its `[basis: level]` (every Risky window only prompts) and the theme match's
+  per-kind state; `skipPromptOnlyReason` (`src/skipSource.ts`)
   words it in the AuraSkip menu and the prompt. Read "Layer 1's verdict holds the crowd" and "Crowd
   rows are checked against THIS file" before loosening any of them: each was measured against both
   corpora.

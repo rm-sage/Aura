@@ -41,8 +41,11 @@ import {
   introDbPrimaryNumbering, submitToIntroDb,
 } from "./introdb";
 import { peekCachedDetailById } from "./metaCache";
-import { skipHeldReason, skipKindLabel, skipSourceHint, skipSourceLabel } from "./skipSource";
-import type { SkipHold } from "./skipWindows";
+import {
+  skipConfidenceInfo, skipHeldReason, skipKindLabel, skipSourceHint, skipSourceLabel,
+} from "./skipSource";
+import type { SkipBasis, SkipHold } from "./skipWindows";
+import SkipConfidenceBadge from "./SkipConfidenceBadge";
 import Tooltip from "./Tooltip";
 import { useMenuOpenSync } from "./menuTracker";
 
@@ -65,6 +68,8 @@ export interface AniSkipMenuWindow {
   song_artist?: string | null;
   /** Why this window may only prompt (skipWindows.ts SkipHold). */
   hold?: SkipHold | null;
+  /** What the window's position rests on (skipWindows.ts SkipBasis). */
+  basis?: SkipBasis | null;
 }
 
 interface Props {
@@ -560,6 +565,8 @@ export default function AniSkipMenu({
             // preview, an AniSkip ending, ...): say so, and why on hover.
             const held = !w.superseded && !w.auto ? skipHeldReason(w, modes) : null;
             const song = [w.song_title, w.song_artist].filter(Boolean).join(" · ");
+            // A replaced row is never skipped, so it carries no level.
+            const conf = w.superseded ? null : skipConfidenceInfo(w);
             return (
               <div
                 key={`${w.type}:${w.start}:${i}`}
@@ -583,6 +590,11 @@ export default function AniSkipMenu({
                     </p>
                   )}
                   <div className="flex flex-wrap items-center gap-1 mt-1">
+                    {conf && (
+                      <Tooltip pos="top" text={conf.meaning}>
+                        <SkipConfidenceBadge level={conf.level} help />
+                      </Tooltip>
+                    )}
                     {sourceHint
                       ? (
                         <Tooltip pos="top" text={sourceHint}>
@@ -602,15 +614,18 @@ export default function AniSkipMenu({
                         </Tooltip>
                       )
                       : w.auto
-                        ? <Chip tone="auto">Auto-skips</Chip>
+                        ? <Chip tone="status">Auto-skips</Chip>
                         : held
                           ? (
                             <Tooltip pos="top" text={held.hint}>
-                              <Chip tone="prompt" help>Prompt only</Chip>
+                              <Chip tone="status" help>Prompt only</Chip>
                             </Tooltip>
                           )
-                          : <Chip tone="prompt">Asks first</Chip>}
+                          : <Chip tone="status">Asks first</Chip>}
                   </div>
+                  {conf && (
+                    <p className="text-white/55 text-[11.5px] leading-snug mt-1">{conf.note}</p>
+                  )}
                 </div>
                 {canVote && w.skip_id && (() => {
                   const vs = voteState[w.skip_id];
@@ -691,9 +706,12 @@ export default function AniSkipMenu({
                 off, because its window was dropped from the active payload. */}
             <p className="text-white/55 text-[12px] leading-relaxed mt-2.5 px-3 pb-1">
               Some segments always ask first, even on Auto: hover "Prompt only"
-              for why. Ending Off also hides previews. Changes apply to this
-              episode instantly, except turning a segment fully off and back on,
-              which takes effect from the next stream load.
+              for why. Only Verified and Likely segments can skip on their own;
+              Risky ones always ask first. A level can change while a prompt is
+              showing, as the theme match finishes checking the episode. Ending
+              Off also hides previews. Changes apply to this episode instantly,
+              except turning a segment fully off and back on, which takes effect
+              from the next stream load.
             </p>
           </div>
 
@@ -792,12 +810,13 @@ function FieldLabel({ children }: { children: ReactNode }) {
   return <span className="block text-white/55 text-[11.5px]">{children}</span>;
 }
 
-type ChipTone = "source" | "auto" | "prompt" | "neutral";
+// Deliberately colourless: green / amber / red on a row means its
+// confidence level (SkipConfidenceBadge), never its skip mode.
+type ChipTone = "source" | "status" | "neutral";
 
 const CHIP_TONES: Record<ChipTone, string> = {
   source:  "bg-white/6 text-white/75 border-white/14",
-  auto:    "bg-emerald-500/12 text-emerald-300 border-emerald-400/30",
-  prompt:  "bg-amber-500/12 text-amber-300 border-amber-400/30",
+  status:  "bg-white/10 text-white/85 border-white/20",
   neutral: "bg-white/4 text-white/55 border-white/12",
 };
 
@@ -850,9 +869,9 @@ function TimeField({
   );
 }
 
-/** One row of the skip-mode toggles: an off / prompt / auto pill group with
- *  the same per-state tones as Settings > Anime OP/ED Skip's `SkipModeRow`
- *  (white off, amber prompt, emerald auto). */
+/** One row of the skip-mode toggles: an off / prompt / auto pill group,
+ *  styled like Settings > Anime OP/ED Skip's `SkipModeRow`. Colourless on
+ *  purpose: green / amber / red in this panel mean confidence levels. */
 function ModeRow({
   label, value, onChange, disabled,
 }: {
@@ -862,9 +881,9 @@ function ModeRow({
   disabled?: boolean;
 }) {
   const opts: { id: SkipMode; label: string; tone: string }[] = [
-    { id: "off",    label: "Off",    tone: "text-white/85" },
-    { id: "prompt", label: "Prompt", tone: "text-amber-300" },
-    { id: "auto",   label: "Auto",   tone: "text-emerald-300" },
+    { id: "off",    label: "Off",    tone: "text-white" },
+    { id: "prompt", label: "Prompt", tone: "text-white" },
+    { id: "auto",   label: "Auto",   tone: "text-white" },
   ];
   return (
     <div className="flex items-center justify-between gap-3">
@@ -888,7 +907,7 @@ function ModeRow({
               className={`px-3.5 py-1 rounded-full text-[12px] font-medium tracking-wide
                           transition-colors duration-150
                           ${active
-                            ? `bg-white/12 ${o.tone}`
+                            ? `bg-ln-accent/25 ${o.tone}`
                             : "text-white/55 hover:text-white/90"}
                           disabled:opacity-50 disabled:cursor-not-allowed`}
             >

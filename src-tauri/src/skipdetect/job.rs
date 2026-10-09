@@ -329,6 +329,14 @@ pub struct WindowOut {
     pub q35: Option<f64>,
     #[serde(default)]
     pub mrel: Option<f64>,
+    /// A Layer 1 window whose edges went through the edge rule WITH its
+    /// region's RMS levels (`published_window` after the region finished, or
+    /// a cached final result). False for a streaming acceptance, whose end is
+    /// still mapping A's: those windows ran up to 1.8 s past the real edge in
+    /// the corpora (Bleach (2004) 266's opening, the preview overruns), so the
+    /// frontend shows them below its top confidence level until refined.
+    #[serde(default)]
+    pub refined: bool,
 }
 
 /// What a detect knows so far; published on every change and returned at the end.
@@ -1072,7 +1080,8 @@ impl<'a> Decider<'a> {
                             l1: L1State::Unavailable,
                         };
                     };
-                    return Decision::Window(layer1_out(m, &self.cat.recs[i], w, &self.cat.metas[i]));
+                    let refined = audible.is_some() && region_refines(region);
+                    return Decision::Window(layer1_out(m, &self.cat.recs[i], w, &self.cat.metas[i], refined));
                 }
                 Step::CapReached => {
                     return Decision::Abstain {
@@ -1117,7 +1126,10 @@ impl<'a> Decider<'a> {
                 // HEAD killed after acceptance: the streaming window stands,
                 // its edges refined with the levels decoded up to the kill.
                 Some(a) => match published_window(&a.m, self.loader.loaded.get(&a.idx).map(|t| t.audible), kind, region, media_end) {
-                    Some(w) => Decision::Window(layer1_out(&a.m, &self.cat.recs[a.idx], w, &self.cat.metas[a.idx])),
+                    Some(w) => Decision::Window(layer1_out(
+                        &a.m, &self.cat.recs[a.idx], w, &self.cat.metas[a.idx],
+                        self.loader.loaded.contains_key(&a.idx) && region_refines(region),
+                    )),
                     None => Decision::Abstain {
                         note: "matched window empty after clamping".into(),
                         cacheable: true,
@@ -1197,6 +1209,7 @@ impl<'a> Decider<'a> {
                 soft42: None,
                 q35: Some(b.q35),
                 mrel: Some(b.mrel),
+                refined: false,
             }),
             _ => Decision::Abstain {
                 note: format!("{why}; continuity abstains ({})", o.abstain.map_or("no candidate", |a| a.as_str())),
@@ -1255,6 +1268,14 @@ pub async fn run(ctx: &Ctx, req: &Request) -> Snapshot {
                 }
                 s.generation = ctx.generation;
                 s.from_cache = true;
+                // Only final decisions are cached, so a stored Layer 1 window's
+                // edges are final (an entry written before `refined` existed
+                // reads false).
+                for w in [s.op.as_mut(), s.ed.as_mut()].into_iter().flatten() {
+                    if w.source == "animethemes" {
+                        w.refined = true;
+                    }
+                }
                 s.state = JobState::Done;
                 crate::devlog!(
                     info, "skipdetect",
@@ -1427,7 +1448,13 @@ fn published_window(
     matcher::refine_layer1_window(m, audible, kind == Kind::Ed, levels, media_end)
 }
 
-fn layer1_out(m: &ThemeMatch, rec: &ThemeRec, window: (f64, f64), meta: &ThemeMeta) -> WindowOut {
+/// Whether `published_window` refines a window in `region` with its RMS
+/// levels (its edges are then final): the same test it applies.
+fn region_refines(region: &RegionOut) -> bool {
+    region.origin.is_some() && !region.levels.is_empty()
+}
+
+fn layer1_out(m: &ThemeMatch, rec: &ThemeRec, window: (f64, f64), meta: &ThemeMeta, refined: bool) -> WindowOut {
     WindowOut {
         start: window.0,
         end: window.1,
@@ -1441,6 +1468,7 @@ fn layer1_out(m: &ThemeMatch, rec: &ThemeRec, window: (f64, f64), meta: &ThemeMe
         soft42: m.soft42,
         q35: None,
         mrel: None,
+        refined,
     }
 }
 
@@ -1720,6 +1748,7 @@ impl<'a> Job<'a> {
             soft42: None,
             q35: None,
             mrel: None,
+            refined: false,
         };
         self.set_window(kind, Some(out));
         self.publish();
@@ -1770,7 +1799,7 @@ impl<'a> Job<'a> {
             Some(t) => matcher::refine_layer1_window(&a.m, t.audible, kind == Kind::Ed, None, self.media_end_now())?,
             None => matcher::layer1_window(&a.m, self.media_end_now())?,
         };
-        let out = layer1_out(&a.m, &self.d.cat.recs[a.idx], w, &self.d.cat.metas[a.idx]);
+        let out = layer1_out(&a.m, &self.d.cat.recs[a.idx], w, &self.d.cat.metas[a.idx], false);
         let prev = match kind {
             Kind::Op => self.snap.op.clone(),
             Kind::Ed => self.snap.ed.clone(),

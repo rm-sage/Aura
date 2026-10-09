@@ -26,8 +26,9 @@ import { pickDefaultAudio, toLang2, type ScoringMeta } from "./audioScoring";
 import { prettyBinding } from "./useKeybindings";
 import { loadAuraSettings, saveAuraSettings } from "./auraSettings";
 import AniSkipMenu from "./AniSkipMenu";
-import { skipHeldReason, skipKindLabel, skipSourceLabel } from "./skipSource";
-import type { HandledWindow, SkipHold, SkipMode, SkipModes } from "./skipWindows";
+import { skipConfidenceInfo, skipHeldReason, skipKindLabel, skipSourceLabel } from "./skipSource";
+import SkipConfidenceBadge, { SKIP_CONFIDENCE_TEXT, SkipConfidenceIcon } from "./SkipConfidenceBadge";
+import type { HandledWindow, SkipBasis, SkipHold, SkipMode, SkipModes } from "./skipWindows";
 import { handledIn } from "./skipWindows";
 import SubtitleSyncPanel, { type SyncAnchorPair } from "./SubtitleSyncPanel";
 import { MenuTrackerCtx, useMenuOpenSync, type MenuTracker } from "./menuTracker";
@@ -3479,7 +3480,7 @@ function Scrubber({
                   <span className="ml-2">· {skipSourceLabel(hoveredSegment.seg.source)}</span>
                 )}
                 {hoveredSegment.seg.auto && (
-                  <span className="ml-2 text-amber-300/80">· auto-skip</span>
+                  <span className="ml-2 text-white/65">· auto-skip</span>
                 )}
                 {/* On Auto, but this window may only prompt. No tooltip here:
                     the card is pointer-events-none. The AuraSkip menu and the
@@ -3489,6 +3490,18 @@ function Scrubber({
                   <span className="ml-2 text-white/50">· prompt only</span>
                 )}
               </div>
+              {/* Confidence: the level, then the note in full (no tooltip
+                  possible on this pointer-events-none card). */}
+              {(() => {
+                const conf = skipConfidenceInfo(hoveredSegment.seg);
+                if (!conf) return null;
+                return (
+                  <div className="mt-1.5 max-w-[260px]">
+                    <SkipConfidenceBadge level={conf.level} />
+                    <div className="text-white/60 text-[10.5px] leading-snug mt-1">{conf.note}</div>
+                  </div>
+                );
+              })()}
             </div>
           )}
           {thumbnailAt && (thumbUrl || thumbBusy) && (
@@ -4547,6 +4560,9 @@ interface AuraSkipWindow {
   song_artist?: string | null;
   /** Why this window may only prompt (skipWindows.ts SkipHold). */
   hold?: SkipHold | null;
+  /** What the window's position rests on (skipWindows.ts SkipBasis): the
+   *  confidence level and note shown on the prompt derive from it. */
+  basis?: SkipBasis | null;
 }
 
 /** Reactive skip-windows store. The Rust side owns the canonical
@@ -4709,6 +4725,9 @@ function SkipPromptToast({
 }) {
   const kindLabel = skipKindLabel(w.type);
   const song = songLine(w);
+  // How far this window can be trusted, and why (skipSource.ts). Absent for a
+  // payload written before bases existed: the prompt then reads as it did.
+  const confidence = skipConfidenceInfo(w);
   // Top offset has to clear the "Exit playback ↗  <Title>" header above.
   // That header sits at top: 16 (fs) / 52 (windowed) and its content is
   // ~64 px tall. 96 / 132 keeps the prompt firmly below it.
@@ -4736,8 +4755,11 @@ function SkipPromptToast({
         maxWidth: "min(30rem, calc(100vw - 3rem))",
       }}
     >
-      <div className="text-[12px] uppercase tracking-[0.22em] text-white/55 mb-1">
-        Skip {kindLabel.toLowerCase()}
+      <div className="flex items-center justify-between gap-4 mb-1">
+        <div className="text-[12px] uppercase tracking-[0.22em] text-white/55">
+          Skip {kindLabel.toLowerCase()}
+        </div>
+        {confidence && <SkipConfidenceBadge level={confidence.level} size="md" />}
       </div>
       <div className="text-[20px] font-medium tracking-wide">
         Press{" "}
@@ -4755,6 +4777,16 @@ function SkipPromptToast({
           ambiguous match, which is the common case. */}
       {song && (
         <div className="text-[13px] text-white/50 mt-1.5 truncate">{song}</div>
+      )}
+      {/* What the position rests on and, below the top level, what could go
+          wrong: the reason a Risky prompt is worth a second look. */}
+      {confidence && (
+        <div className="text-[13px] mt-1.5 flex items-start gap-1.5">
+          <span className={`mt-[3px] flex-shrink-0 ${SKIP_CONFIDENCE_TEXT[confidence.level]}`}>
+            <SkipConfidenceIcon level={confidence.level} size={12} />
+          </span>
+          <span className="text-white/70">{confidence.note}</span>
+        </div>
       )}
       {heldLine && (
         <div className="text-[13px] text-white/50 mt-1.5">Auto-skip is on, but {heldLine}.</div>
@@ -4901,7 +4933,9 @@ function SkipController({
     }
     console.info(`[auraskip] auto-skip ${desc} → ${target.toFixed(1)}s`);
     seekAbsolute(target);
-    fireToast(`Skipped ${skipKindLabel(active.type)}`);
+    // The level rides along so an automatic skip says how sure it was.
+    const conf = skipConfidenceInfo(active);
+    fireToast(`Skipped ${skipKindLabel(active.type)}${conf ? ` · ${conf.label}` : ""}`);
     // Only the start/end+auto matter for the gate; `time` is
     // intentionally excluded so a single firing isn't re-evaluated on
     // every poll tick. The midpoint check above runs once per entry.
@@ -4984,15 +5018,20 @@ function SkipController({
   // the cleanest way to know "user already accepted, hide the prompt".
   if (handledIn(firedRef.current, active)) return null;
   const visible = !autoHidden || controlsVisible;
+  // A Risky window's note already says what could go wrong; the held line
+  // then only says why it asked instead of skipping.
   const held = demoted
     ? { line: "you are already past the halfway point" }
     : skipModes ? skipHeldReason(active, skipModes) : null;
+  const heldLine = held && !demoted && skipConfidenceInfo(active)?.level === "risky"
+    ? "Risky segments always ask first"
+    : held?.line ?? null;
   return (
     <SkipPromptToast
       window={active}
       isFullscreen={isFullscreen}
       visible={visible}
-      heldLine={held?.line ?? null}
+      heldLine={heldLine}
     />
   );
 }
@@ -5035,7 +5074,12 @@ function SkipWindowButton({
                    border border-ln-accent/40
                    text-[12px] font-semibold tracking-wide
                    transition-colors"
-        title={`${label} (${Math.round(active.end - time)} s remaining)`}
+        title={(() => {
+          const conf = skipConfidenceInfo(active);
+          return `${label} (${Math.round(active.end - time)} s remaining)`
+            + (conf ? `
+${conf.label}: ${conf.note}` : "");
+        })()}
       >
         {label}
       </button>

@@ -97,7 +97,7 @@ import {
 import {
   CONTINUITY_SOURCE, LAYER1_PROMPT_SOURCE, LAYER1_SOURCE, LAYER1_TRANSITION_SOURCE,
   applySkipModes, composeSkipWindows, fitCrowdToDuration, layer1StateFrom, releasePendingLayer1,
-  skipKindGroup, skipModeForKind, trustedEndingEnd, windowsFromChapters,
+  skipConfidence, skipKindGroup, skipModeForKind, trustedEndingEnd, windowsFromChapters,
   type Layer1Status, type PreparedWindow, type SkipMode,
 } from "./skipWindows";
 import {
@@ -123,6 +123,10 @@ interface SkipDetectWindow {
    *  song's, not the ending's). */
   transition?: boolean;
   theme?: string | null;
+  /** A Layer 1 window whose edges were refined with its region's levels
+   *  (final). False for a streaming acceptance, whose end is still the theme
+   *  file's: it is shown as Likely, not Verified, until refined. */
+  refined?: boolean;
 }
 interface SkipDetectSnapshot {
   generation: number;
@@ -3225,7 +3229,8 @@ export default function App() {
                         ? "no windows"
                         : windows.map((w) =>
                             `${w.type} ${Math.round(w.start)}-${Math.round(w.end)}s `
-                            + `${w.source}${w.auto ? " auto" : " prompt"}${w.hold ? ` (${w.hold})` : ""}`).join(", "))
+                            + `${w.source}${w.auto ? " auto" : " prompt"}${w.hold ? ` (${w.hold})` : ""}`
+                            + `${w.basis ? ` [${w.basis}: ${skipConfidence(w)}]` : ""}`).join(", "))
                       + (layer1.op !== "off" || layer1.ed !== "off"
                         ? ` | theme match op ${layer1.op}, ed ${layer1.ed}` : ""),
                     );
@@ -3272,6 +3277,7 @@ export default function App() {
                 const toWindow = (
                   kind: "op" | "ed",
                   w: SkipDetectWindow,
+                  fromCache: boolean,
                 ): PreparedWindow => ({
                   type: kind,
                   start: w.start,
@@ -3287,11 +3293,14 @@ export default function App() {
                       : w.auto_eligible ? LAYER1_SOURCE : LAYER1_PROMPT_SOURCE)
                     : w.source === CONTINUITY_SOURCE ? CONTINUITY_SOURCE : w.source,
                   auto: modeFor(kind) === "auto",
+                  // Read by the confidence basis only (a cached result is a
+                  // final one; Rust also marks it).
+                  ...(w.source === LAYER1_SOURCE ? { edges_final: w.refined === true || fromCache } : {}),
                 });
                 const applySnapshot = (s: SkipDetectSnapshot, note: string): void => {
                   if (stale()) return;
-                  det.op = s.op ? toWindow("op", s.op) : null;
-                  det.ed = s.ed ? toWindow("ed", s.ed) : null;
+                  det.op = s.op ? toWindow("op", s.op, s.from_cache) : null;
+                  det.ed = s.ed ? toWindow("ed", s.ed, s.from_cache) : null;
                   layer1 = {
                     op: layer1StateFrom(s.op_l1, layer1.op),
                     ed: layer1StateFrom(s.ed_l1, layer1.ed),

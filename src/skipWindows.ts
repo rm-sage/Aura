@@ -30,9 +30,10 @@
 //                       keeps another ending only when its end agrees AND it
 //                       starts no earlier than the song (a real ending cannot
 //                       start before its song does), and such an ending then
-//                       outranks it. Prompt-only, unless a chapter or crowd
-//                       ending STARTS within LAYER1_CONFLICT_SECONDS of it,
-//                       which promotes it to plain "animethemes". Its end
+//                       outranks it. Prompt-only, unless a strongly titled
+//                       ending chapter STARTS within LAYER1_CONFLICT_SECONDS
+//                       of it, which promotes it to plain "animethemes" (a
+//                       crowd row no longer does: `confirmsEndingStart`). Its end
 //                       counts as the trusted ending end for Next-Up.
 //   "animethemes-early" the PROVISIONAL opening: the first 12 s of the theme
 //                       matched while the rest is still decoding. Prompt-only,
@@ -104,6 +105,226 @@ export interface PreparedWindow {
   /** "aniskip" windows only: the episode length (s) the submitter recorded,
    *  0 or absent when unknown. Read once by `fitCrowdToDuration`. */
   episode_length?: number | null;
+  /** What this window's position rests on (see SkipBasis), stamped by
+   *  `composeSkipWindows` on every window it publishes. The confidence level
+   *  shown to the user is derived from it (`skipConfidence`). Mirrors Rust's
+   *  PreparedWindow::basis. */
+  basis?: SkipBasis | null;
+  /** Detector windows only: a Layer 1 window whose edges were refined with
+   *  its region's levels (Rust WindowOut::refined). Read by the basis only;
+   *  never part of the payload. */
+  edges_final?: boolean;
+  /** Chapter windows only: the chapter runs to the end of the file (it is the
+   *  last one). Read by the basis only; never part of the payload. */
+  reaches_end?: boolean;
+  /** Chapter windows only: titled just "Intro" / "Outro" (isWeakChapterTitle),
+   *  whether or not a crowd row agreeing with it lifted its hold. Read by the
+   *  basis only; never part of the payload. */
+  weak_title?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Confidence: what a published window rests on
+// ---------------------------------------------------------------------------
+
+/** The evidence behind a published window's POSITION, most specific first.
+ *  Stamped once per stamp by `composeSkipWindows`, where every source of the
+ *  load is in view (a second source agreeing is only visible there).
+ *   - "theme"            Layer 1: the theme song located in THIS file's audio,
+ *                        its edges refined with the episode's own levels.
+ *   - "theme-settling"   Layer 1 while its edges are not refined yet (a
+ *                        streaming acceptance: the end is the theme file's).
+ *   - "theme-partial"    Layer 1 on a theme some versions play over the story.
+ *   - "theme-transition" Layer 1 on a theme that starts over the story: the
+ *                        END is the song's, the START can sit inside story.
+ *   - "theme-early"      the provisional opening (12 s of the song matched).
+ *   - "chapter"          a strongly titled chapter of this release.
+ *   - "chapter-tail"     a chapter titled as the ending that runs to the end of
+ *                        the file (Blue Box 2:1's "Credits" 1347-1540 held a
+ *                        106 s scene after the ending; Ranma 3:1 54 s).
+ *   - "chapter-weak"     a chapter titled only "Intro" / "Outro".
+ *   - "chapter-guess"    an untitled chapter picked by length and position.
+ *   - "crowd-agreed"     a crowd row a second, independent source confirms
+ *                        within LAYER1_CONFLICT_SECONDS at both edges (a crowd
+ *                        recap: whose END the matched opening confirms), or a
+ *                        weak-title chapter a crowd row agreed with.
+ *   - "crowd"            one crowd row that fits this file, nothing against it.
+ *   - "crowd-checking"   a crowd row while the theme match is still deciding.
+ *   - "crowd-not-found"  a crowd row where the cour's themes were searched for
+ *                        and none is.
+ *   - "crowd-other-cut"  an AniSkip row recorded on a different episode length.
+ *   - "crowd-lone"       a lone crowd opening with no theme match to check it
+ *                        (live action), or a lone crowd recap.
+ *   - "crowd-single"     an IntroDB segment with a single submission.
+ *   - "neighbour"        an AniSkip opening borrowed from another episode.
+ *   - "loudness"         Layer 3, a guess from the audio's loudness. */
+export type SkipBasis =
+  | "theme" | "theme-settling" | "theme-partial" | "theme-transition" | "theme-early"
+  | "chapter" | "chapter-tail" | "chapter-weak" | "chapter-guess"
+  | "crowd-agreed" | "crowd" | "crowd-checking" | "crowd-not-found"
+  | "crowd-other-cut" | "crowd-lone" | "crowd-single"
+  | "neighbour" | "loudness";
+
+/** The basis of a published window. `all` is every window the stamp weighed
+ *  (held crowd rows, chapters and detector windows, BEFORE the dedupe), so a
+ *  crowd row's corroboration is judged on the same evidence the dedupe saw.
+ *  The hold comes first: it is the more specific statement about THIS file. */
+export function skipBasisFor(
+  w: PreparedWindow,
+  all: readonly PreparedWindow[],
+  mediaEnd: number | null = null,
+): SkipBasis {
+  switch (w.hold) {
+    case "l1-pending":     return "crowd-checking";
+    case "l1-abstain":     return "crowd-not-found";
+    case "other-cut":      return "crowd-other-cut";
+    case "uncorroborated": return "crowd-lone";
+    case "weak-title":     return "chapter-weak";
+    default: break;
+  }
+  switch (w.source) {
+    case LAYER1_SOURCE:
+      // Not refined yet: Likely, unless a titled opening chapter that is
+      // itself Verified agrees within LAYER1_CONFLICT_SECONDS at both edges
+      // (the chapter opening was already shown as Verified, and the dip to
+      // Likely for the seconds until the edges refine read as a downgrade).
+      return w.edges_final === false && !verifiedChapterAgrees(w, all) ? "theme-settling" : "theme";
+    case LAYER1_PROMPT_SOURCE:     return "theme-partial";
+    case LAYER1_TRANSITION_SOURCE: return "theme-transition";
+    case LAYER1_EARLY_SOURCE:      return "theme-early";
+    case "chapter": {
+      const g = skipKindGroup(w.type);
+      const toEnd = w.reaches_end === true
+        || (mediaEnd != null && mediaEnd > 0 && w.end >= mediaEnd - CHAPTER_TAIL_SLACK_SECONDS);
+      // Before the weak-title case: an "Outro" running to the end is no
+      // safer than a "Credits" one.
+      if (g === "ed" && toEnd) return "chapter-tail";
+      // A weak title a crowd row agreed with (its hold lifted) rests on that
+      // crowd row as much as on the title.
+      if (w.weak_title) return "crowd-agreed";
+      return "chapter";
+    }
+    case "chapter-heuristic":      return "chapter-guess";
+    case "aniskip-neighbour":      return "neighbour";
+    case CONTINUITY_SOURCE:        return "loudness";
+    case INTRODB_SINGLE_SOURCE:    return "crowd-single";
+    default: break;
+  }
+  if (!CROWD_SKIP_SOURCES.has(w.source)) return "loudness";
+  return crowdRowAgreed(w, all) ? "crowd-agreed" : "crowd";
+}
+
+/** How far a published window can be trusted to skip ONLY what it names.
+ *   - "verified": located in this file itself and lands within a second or
+ *                 two of the real edges (it may stop short; it does not run
+ *                 into story).
+ *   - "likely":   not checked against this file (one crowd source, two that
+ *                 agree, a chapter that is not an opening), or still being
+ *                 refined; usually right, not guaranteed.
+ *   - "risky":    a guess, a timing from another cut, a source something in
+ *                 the file contradicts or has not checked yet; skipping may
+ *                 cut into the story. Always prompt-only (isPromptOnly).
+ *  Every level is grounded in the frame-verified corpora: see the comments in
+ *  `skipConfidence`. */
+export type SkipConfidence = "verified" | "likely" | "risky";
+
+/** The confidence level of a published window, or null for a window with no
+ *  basis (a payload written before bases existed). A pure function of the
+ *  basis (and kind), so the prompt, the scrubber card and the AuraSkip menu
+ *  can never disagree. */
+export function skipConfidence(
+  w: Pick<PreparedWindow, "type" | "source" | "basis" | "start" | "end">,
+): SkipConfidence | null {
+  const g = skipKindGroup(w.type);
+  const len = w.end - w.start;
+  switch (w.basis) {
+    // 106 refined theme windows met in the replay corpus and 16 on real
+    // streams: none past 1.6 s of story, no preview or after-credits overrun,
+    // no false positive (scratchpad confidence/evidence.md). Over 150 s is
+    // past every opening and most endings, and no window that long was
+    // measured at the top level.
+    case "theme":
+      return len <= THEME_VERIFIED_MAX_SECONDS ? "verified" : "likely";
+    // Titled chapters: openings of 20-100 s (26 windows, at most 1.5 s off)
+    // and previews up to 40 s (30 windows; SPY x FAMILY 2's 40.1 s one ran
+    // 29 s past the preview). Ending chapters are Likely: 4 of 36 ran over
+    // 10 s into other content, and the worst ran to the end of the file
+    // ("chapter-tail", Risky). Recap chapters: one in the corpora.
+    case "chapter":
+      if (g === "op") return len >= 20 && len <= 100 ? "verified" : "likely";
+      if (g === "preview") return len <= 40 ? "verified" : "likely";
+      return "likely";
+    case "theme-settling":
+    case "theme-early":
+    case "theme-partial":
+    case "crowd-agreed":
+      return "likely";
+    // One crowd row: Likely, except AniSkip ENDINGS (13 rows, 8 wrong: TYBW
+    // 3:9-3:11 32-38 s early, Solo Leveling's "ending" at 211 s).
+    case "crowd":
+      return g === "ed" && w.source === "aniskip" ? "risky" : "likely";
+    // Held while the theme match decides: 7 of 13 cut story, and the three a
+    // viewer met all did (JJK S2E10's 0-90 s, 90 s of cold open).
+    case "crowd-checking":
+    case "theme-transition":
+    case "chapter-tail":
+    case "chapter-weak":
+    case "chapter-guess":
+    case "crowd-not-found":
+    case "crowd-other-cut":
+    case "crowd-lone":
+    case "crowd-single":
+    case "neighbour":
+    case "loudness":
+      return "risky";
+    default:
+      return null;
+  }
+}
+
+/** The longest theme window shown as Verified. */
+export const THEME_VERIFIED_MAX_SECONDS = 150;
+
+/** An ending chapter whose end is within this of the media end (or the
+ *  file's duration) runs to the end of the file (judged before the media-end
+ *  clamp). */
+export const CHAPTER_TAIL_SLACK_SECONDS = 2;
+
+/** A titled opening chapter at the Verified level that agrees with `w`
+ *  within LAYER1_CONFLICT_SECONDS at both edges. */
+function verifiedChapterAgrees(w: PreparedWindow, all: readonly PreparedWindow[]): boolean {
+  const g = skipKindGroup(w.type);
+  return all.some((o) => o.source === "chapter" && !o.hold && !o.weak_title
+    && skipKindGroup(o.type) === g
+    && Math.abs(o.start - w.start) <= LAYER1_CONFLICT_SECONDS
+    && Math.abs(o.end - w.end) <= LAYER1_CONFLICT_SECONDS
+    && skipConfidence({ ...o, basis: "chapter" }) === "verified");
+}
+
+/** Whether a crowd row is confirmed by an INDEPENDENT source within
+ *  LAYER1_CONFLICT_SECONDS at both edges: the theme match (in practice the
+ *  provisional opening, since a full match takes the slot itself), a strongly
+ *  titled chapter, or another crowd provider whose numbers are not identical
+ *  to the 0.05 s (identical rows are one submitter filing twice: JJK S1E3's
+ *  AniSkip and IntroDB "recap" 0.5-41.6). A held row never confirms anything. */
+function crowdRowAgreed(w: PreparedWindow, all: readonly PreparedWindow[]): boolean {
+  const provider = (s: string) => (s === INTRODB_SINGLE_SOURCE ? INTRODB_SOURCE : s);
+  const g = skipKindGroup(w.type);
+  // A crowd recap that runs right up to the opening the theme match located
+  // (applyCrossSourceHolds rule 4): the file itself confirms where it ends.
+  if (g === "recap" && all.some((d) => skipKindGroup(d.type) === "op"
+    && (d.source.startsWith(LAYER1_SOURCE) || d.source === LAYER1_EARLY_SOURCE)
+    && Math.abs(d.start - w.end) <= LAYER1_CONFLICT_SECONDS)) return true;
+  return all.some((o) => {
+    // A weak-title chapter is no independent witness: its hold may have been
+    // lifted by this very row.
+    if (o === w || o.hold || o.weak_title || skipKindGroup(o.type) !== g) return false;
+    if (Math.abs(o.start - w.start) > LAYER1_CONFLICT_SECONDS
+      || Math.abs(o.end - w.end) > LAYER1_CONFLICT_SECONDS) return false;
+    if (o.source === "chapter" || o.source === LAYER1_SOURCE || o.source === LAYER1_EARLY_SOURCE) return true;
+    if (!CROWD_SKIP_SOURCES.has(o.source) || provider(o.source) === provider(w.source)) return false;
+    return !(Math.abs(o.start - w.start) < 0.05 && Math.abs(o.end - w.end) < 0.05);
+  });
 }
 
 /** Window kinds collapse into groups: a mixed opening is an opening, a mixed
@@ -422,11 +643,15 @@ function withoutCrossKindOverlap(
   return drop.size === 0 ? windows : windows.filter((w) => !drop.has(w));
 }
 
-/** Sources that may confirm where an ENDING starts: a strongly titled chapter
- *  or a crowd row that fits this cut. */
+/** What may confirm where an ENDING starts: a strongly titled chapter of this
+ *  release. A crowd row no longer does: one AniSkip row marking where a
+ *  Transition-only song begins (Cowboy Bebop 13's starts 280 s inside the
+ *  story) would have made that story cut a Verified, automatic skip. Both
+ *  promotions in the corpora (Cowboy Bebop 26, Bocchi 12) were
+ *  chapter-confirmed. */
 function confirmsEndingStart(w: PreparedWindow): boolean {
-  if (skipKindGroup(w.type) !== "ed" || w.hold === "other-cut" || w.hold === "weak-title") return false;
-  return w.source === "chapter" || (CROWD_SKIP_SOURCES.has(w.source) && w.source !== INTRODB_SINGLE_SOURCE);
+  if (skipKindGroup(w.type) !== "ed" || w.hold || w.weak_title) return false;
+  return w.source === "chapter";
 }
 
 /** A Transition-only ending (prompt-only) whose START an independent source
@@ -489,8 +714,13 @@ export const PROVISIONAL_SKIP_SOURCES: ReadonlySet<string> = new Set([
  *  (TYBW 3:9-3:11 rows were 32-38 s early with a matching episodeLength, so an
  *  AniSkip ED auto-seek would cut into the episode; when Layer 1 found the
  *  ending it has already replaced the row). IntroDB keeps its own tiers. */
-export function isPromptOnly(w: Pick<PreparedWindow, "type" | "source" | "hold">): boolean {
+export function isPromptOnly(
+  w: Pick<PreparedWindow, "type" | "source" | "hold" | "start" | "end"> & { basis?: SkipBasis | null },
+): boolean {
   if (w.hold) return true;
+  // A Risky window never skips by itself, whatever produced it: the level
+  // promises "may cut into the story", and the UI says these always ask.
+  if (w.basis && skipConfidence({ ...w, basis: w.basis }) === "risky") return true;
   if (
     GUESS_SKIP_SOURCES.has(w.source) || LOW_TRUST_SKIP_SOURCES.has(w.source)
     || PROVISIONAL_SKIP_SOURCES.has(w.source)
@@ -611,7 +841,7 @@ export function windowsFromChapters(
     .map((c, i) => {
       const start = c.time ?? 0;
       const end   = ((sorted[i + 1]?.time) ?? (duration || start)) - 0.001;
-      return { title: (c.title ?? "").toString(), start, end };
+      return { title: (c.title ?? "").toString(), start, end, last: i === sorted.length - 1 };
     })
     .filter((s) => s.end > s.start + MIN_WINDOW_SECONDS);
 
@@ -665,6 +895,9 @@ export function windowsFromChapters(
       source: "chapter",
       auto:   hold == null && modeFor(kind) === "auto",
       ...(hold ? { hold } : {}),
+      ...(s.last || (duration > 0 && s.end >= duration - CHAPTER_TAIL_SLACK_SECONDS)
+        ? { reaches_end: true } : {}),
+      ...(isWeakChapterTitle(s.title) ? { weak_title: true } : {}),
     });
   }
 
@@ -983,9 +1216,13 @@ export function composeSkipWindows(inp: SkipComposeInput): SkipDedupe {
     (w) => !(w.source === CONTINUITY_SOURCE && covered.has(skipKindGroup(w.type))),
   );
   const held = applyCrossSourceHolds(inp.base, detected, inp.layer1, inp.hasMal, inp.mediaEnd);
-  const deduped = dedupeSkipWindowsDetailed([...held, ...detected]);
+  const weighed = [...held, ...detected];
+  const deduped = dedupeSkipWindowsDetailed(weighed);
+  // The basis is judged before the media-end clamp, on the edges the dedupe
+  // compared, and against everything it weighed.
+  const kept = deduped.kept.map((w) => ({ ...w, basis: skipBasisFor(w, weighed, inp.mediaEnd) }));
   return {
-    kept: clampWindowsToMediaEnd(deduped.kept, inp.mediaEnd),
+    kept: clampWindowsToMediaEnd(kept, inp.mediaEnd),
     superseded: deduped.superseded,
   };
 }

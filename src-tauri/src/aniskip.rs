@@ -1144,6 +1144,13 @@ pub struct PreparedWindow {
     /// from the wire when absent, like the fields above.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub hold: Option<String>,
+    /// What the window's POSITION rests on ("theme", "chapter", "crowd", ...;
+    /// see `SkipBasis` in src/skipWindows.ts), stamped by the frontend's
+    /// `composeSkipWindows`. The confidence level shown on prompts and in the
+    /// AuraSkip menu is derived from it. Carried through untouched so the
+    /// payload `get_skip_windows` returns still says it; omitted when absent.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub basis: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

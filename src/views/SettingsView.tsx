@@ -73,6 +73,8 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import auraIconAsset from "../assets/aura-icon.png";
+import SkipConfidenceBadge from "../SkipConfidenceBadge";
+import type { SkipConfidence } from "../skipWindows";
 
 /** App version. Sourced from package.json via the `VITE_APP_VERSION`
  *  define in vite.config.ts so a single version bump in package.json
@@ -407,8 +409,48 @@ function SettingToggle({ label, description, value, onChange, disabled = false }
   );
 }
 
+/** The three skip confidence levels, as the player shows them. A plain
+ *  explanation row (searchable like any other), not a control. */
+const SKIP_CONFIDENCE_LEGEND: Record<SkipConfidence, string> = {
+  verified: "Found in this episode itself: its theme song matched in the audio, or the file's own chapters mark an opening or preview of a usual length. It should cut no more than a second or two of the story, but it can stop short of the segment's end (a title card after the song, for example).",
+  likely:   "Usually right, but its exact edges are not confirmed: AniSkip, IntroDB or PublicMetaDB times (one source or two that agree), an ending marked by the file's chapters, or a theme match that is still being measured or runs unusually long. It can be off, occasionally by more than a few seconds. On Auto these skip by themselves.",
+  risky:    "A guess, or times nothing in the episode backs up: AniSkip endings, IntroDB times not yet confirmed, times from a different cut or that the theme match contradicts or has not checked yet, a chapter only named Intro or Outro, a song that starts over the story, or an ending chapter that runs to the end of the file. May cut into the story, so these always ask first, even on Auto.",
+};
+
+const SKIP_CONFIDENCE_DESCRIPTION =
+  "Every skip prompt, the AuraSkip menu and the timeline's hover card show how sure Aura is that a segment holds only what it names. A level can change while a prompt is showing, as the theme match finishes checking the episode. "
+  + `Verified: ${SKIP_CONFIDENCE_LEGEND.verified} Likely: ${SKIP_CONFIDENCE_LEGEND.likely} Risky: ${SKIP_CONFIDENCE_LEGEND.risky}`;
+
+function SkipConfidenceLegend() {
+  const levels: SkipConfidence[] = ["verified", "likely", "risky"];
+  return (
+    <div
+      data-settings-row=""
+      data-settings-label="Skip confidence"
+      data-settings-description={SKIP_CONFIDENCE_DESCRIPTION}
+    >
+      <p className="text-white/75 text-sm font-medium">Skip confidence</p>
+      <p className="text-white/35 text-xs mt-0.5">
+        Every skip prompt, the AuraSkip menu and the timeline's hover card show
+        how sure Aura is that a segment holds only what it names. A level can
+        change while a prompt is showing, as the theme match finishes checking
+        the episode. Rows another source replaced carry no level.
+      </p>
+      <div className="mt-2 space-y-1.5">
+        {levels.map((l) => (
+          <div key={l} className="flex items-start gap-2.5">
+            <span className="w-[86px] flex-shrink-0"><SkipConfidenceBadge level={l} /></span>
+            <span className="text-white/55 text-xs leading-snug">{SKIP_CONFIDENCE_LEGEND[l]}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /** Three-position segmented selector (off / prompt / auto) used by the
- *  AniSkip section. Single row each for OP / ED / recap modes. */
+ *  AniSkip section. Single row each for OP / ED / recap modes. Colourless on
+ *  purpose: green / amber / red in this section mean confidence levels. */
 function SkipModeRow({
   label, description, value, onChange,
 }: {
@@ -418,9 +460,9 @@ function SkipModeRow({
   onChange: (v: string) => void;
 }) {
   const opts: { id: string; label: string; tone: string }[] = [
-    { id: "off",    label: "Off",    tone: "text-white/55" },
-    { id: "prompt", label: "Prompt", tone: "text-amber-300" },
-    { id: "auto",   label: "Auto",   tone: "text-emerald-300" },
+    { id: "off",    label: "Off",    tone: "text-white" },
+    { id: "prompt", label: "Prompt", tone: "text-white" },
+    { id: "auto",   label: "Auto",   tone: "text-white" },
   ];
   return (
     <div
@@ -5902,6 +5944,8 @@ export default function SettingsView({ addons, session }: Props) {
                 without asking (once you are past a segment's halfway point, it
                 asks instead).
               </p>
+              <SkipConfidenceLegend />
+              <div className="h-px bg-white/6" />
               <SkipModeRow
                 label="Openings (OP)"
                 description="The opening theme. Prompt by default. On Auto, an opening skips by itself when its timing is trusted. It asks instead when, for example, the opening plays over story scenes, is borrowed from other episodes or guessed, comes from IntroDB timings not yet confirmed by several submissions, was timed on a different cut of the episode, or (on a title with no theme match, such as live action) nothing else confirms it, and while the theme match is still checking it. The prompt says why when it asks."
@@ -5911,7 +5955,7 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SkipModeRow
                 label="Endings (ED)"
-                description="Endings often contain next-episode previews; prompt by default. On Auto, an ending skips by itself when it comes from the theme match (unless its song also plays over story), a chapter named as the ending, IntroDB or PublicMetaDB; AniSkip endings, guesses and IntroDB timings not yet confirmed by several submissions are among the cases that only prompt, and the prompt says why. A theme-matched ending stops where the song does, so an after-credits scene still plays. When the file's chapters mark a next-episode preview, it gets its own Skip Preview prompt, never skips by itself, and is hidden while this is Off."
+                description="Endings often contain next-episode previews; prompt by default. On Auto, an ending skips by itself when it comes from the theme match (unless its song also plays over story), a chapter named as the ending, IntroDB or PublicMetaDB; AniSkip endings, guesses, IntroDB timings not yet confirmed by several submissions and an ending chapter that runs to the very end of the file (it may hold a scene after the credits) are among the cases that only prompt, and the prompt says why. A theme-matched ending stops where the song does, so an after-credits scene still plays. When the file's chapters mark a next-episode preview, it gets its own Skip Preview prompt, never skips by itself, and is hidden while this is Off."
                 value={backend.skip_ed_mode}
                 onChange={(v) => patchBackend({ skip_ed_mode: v })}
               />
