@@ -2872,6 +2872,7 @@ export default function PlayerOverlay({
               time={time}
               duration={duration}
               skipWindows={skipWindowsForScrub}
+              isFullscreen={isFullscreen}
             />
           </div>
         </div>
@@ -4066,8 +4067,9 @@ function TrackMenu({
 // ---------------------------------------------------------------------------
 
 function MoreMenu({
-  streamUrl, activeTarget, isAnime, time, duration, skipWindows,
+  streamUrl, activeTarget, isAnime, time, duration, skipWindows, isFullscreen,
 }: {
+  isFullscreen: boolean;
   streamUrl: string | null;
   activeTarget: ActiveScrobbleTarget | null;
   isAnime: boolean;
@@ -4201,6 +4203,7 @@ function MoreMenu({
         duration={duration}
         windows={skipWindows}
         superseded={supersededSkipWindows}
+        isFullscreen={isFullscreen}
       />
 
       {open && (

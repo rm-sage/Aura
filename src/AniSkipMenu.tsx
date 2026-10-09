@@ -15,9 +15,8 @@
 //      Skip so users don't have to leave the player to flip a single
 //      knob.
 //
-// Opens from the player's three-dots MoreMenu via the "AniSkip
-// Segments" item. Renders as a glass-styled popover anchored to the
-// bottom-right of the player.
+// Opens from the player's three-dots MoreMenu via the "AuraSkip" item.
+// Renders as a centered dialog styled after the Switch source panel.
 //
 // Cour-aware MAL resolution: AniSkip indexes by MAL anime id + LOCAL
 // per-cour episode (1-N within the entry). For cour-aggregated anime,
@@ -33,7 +32,8 @@
 // alone. Only ever user-initiated, never from Aura's own guesses.
 // ---------------------------------------------------------------------------
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import type { ActiveScrobbleTarget } from "./useScrobble";
 import {
@@ -44,6 +44,7 @@ import { peekCachedDetailById } from "./metaCache";
 import { skipHeldReason, skipKindLabel, skipSourceHint, skipSourceLabel } from "./skipSource";
 import type { SkipHold } from "./skipWindows";
 import Tooltip from "./Tooltip";
+import { useMenuOpenSync } from "./menuTracker";
 
 /** Mirrors PlayerOverlay's AuraSkipWindow shape so this module can be
  *  imported without a circular dep. Local copy is intentional. */
@@ -84,6 +85,9 @@ interface Props {
   /** AniSkip rows a theme match (Layer 1) replaced for their kind. Listed for
    *  their vote arrows only: they never auto-skip or prompt. */
   superseded?: AniSkipMenuWindow[];
+  /** Windowed playback keeps the 36 px Win32 title bar: the dialog's scrim
+   *  starts below it, like the Switch source panel. */
+  isFullscreen?: boolean;
 }
 
 type SkipMode = "off" | "prompt" | "auto";
@@ -134,7 +138,7 @@ function skipLabel(kind: string): string {
 }
 
 export default function AniSkipMenu({
-  open, onClose, activeTarget, time, duration, windows, superseded = [],
+  open, onClose, activeTarget, time, duration, windows, superseded = [], isFullscreen = false,
 }: Props) {
   // ── MAL resolution ───────────────────────────────────────────────
   // Cour-specific id derived from the video id when it's anime-prefix
@@ -460,6 +464,21 @@ export default function AniSkipMenu({
     }
   }, [voteState, malId, courEpisode]);
 
+  // Freeze the control bar's auto-hide while the panel is up, and let the
+  // overlay swallow the click that dismisses it (menuTracker.ts).
+  useMenuOpenSync(open);
+
+  // Esc closes (capture phase so it wins over the player's global keybinds,
+  // which would otherwise also leave fullscreen).
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); onClose(); }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [open, onClose]);
+
   if (!open) return null;
 
   // Sort windows for display: OP first, then mixed-op, ED, preview, recap.
@@ -474,52 +493,59 @@ export default function AniSkipMenu({
       || Number(a.superseded ?? false) - Number(b.superseded ?? false);
   });
   const modes = { op: opMode, ed: edMode, recap: recapMode };
+  const segmentCount = windows.length;
 
-  return (
+  // A centered dialog styled after the Switch source panel (SourceSwitcher):
+  // the same scrim, card, type sizes and row treatment, so the two player
+  // panels read alike. Portalled to <body> so it is not clipped or faded with
+  // the control bar it is opened from; React events still bubble through the
+  // portal, so the root stops them before they reach the overlay.
+  return createPortal(
     <div
-      // Anchored fixed bottom-right of the viewport so the menu sits
-      // OFF TO THE SIDE of the controls bar rather than overlapping
-      // the scrub bar above the three-dots button. `bottom-24` leaves
-      // clearance for the controls bar height; `right-4` keeps the
-      // panel away from the right edge. max-w-[92vw] handles the
-      // narrow-viewport collapse without spilling off-screen.
-      className="fixed bottom-24 right-4 z-50
-                 rounded-xl aura-glass-menu shadow-glass-edge
-                 w-[460px] max-w-[92vw] text-white/85"
-      onClick={(e) => e.stopPropagation()}
+      className="fixed inset-0 z-[10001] flex items-center justify-center"
+      style={{ top: isFullscreen ? 0 : 36 }}
+      onClick={(e) => { e.stopPropagation(); onClose(); }}
+      onMouseDown={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => e.stopPropagation()}
     >
-      {/* Header — title centered with the close button absolute-
-          positioned so its 24 px footprint doesn't shift the title
-          off-center. Letterspacing + uppercase tones match the
-          column subheaders below for visual consistency with the
-          rest of the player's submenus. */}
-      <div className="relative px-4 pt-3 pb-2 border-b border-white/8">
-        <h3 className="text-white/85 text-[11.5px] font-semibold uppercase tracking-[0.18em] text-center">
-          AuraSkip
-        </h3>
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Close AuraSkip menu"
-          className="absolute top-2.5 right-2.5 w-6 h-6 rounded text-white/55 hover:text-white hover:bg-white/12
-                     flex items-center justify-center transition-colors"
-        >
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-            <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
-          </svg>
-        </button>
-      </div>
+      {/* Scrim */}
+      <div className="aura-modal-backdrop-in absolute inset-0 bg-black/55 backdrop-blur-[2px]" />
 
-      <div className="grid grid-cols-2 gap-3 p-4">
-        {/* ── Left column: existing segments ─────────────────────── */}
-        <div className="space-y-2">
-          <p className="text-white/60 text-[11px] font-semibold uppercase tracking-wider">
-            Segments
-          </p>
+      {/* Panel */}
+      <div
+        className="aura-modal-card-in relative w-[min(560px,92vw)] max-h-[82vh] flex flex-col
+                   rounded-2xl aura-glass-menu shadow-glass-edge overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-label="AuraSkip"
+      >
+        <div className="flex items-center justify-between gap-3 pl-5 pr-3 pt-4 pb-3 border-b border-white/8">
+          <h2 className="text-white text-[16px] font-semibold tracking-tight">AuraSkip</h2>
+          <div className="flex items-center gap-2">
+            <span className="text-white/45 text-[12px] font-mono tabular-nums">
+              {`${segmentCount} segment${segmentCount === 1 ? "" : "s"}`}
+            </span>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close AuraSkip menu"
+              className="w-7 h-7 rounded-lg text-white/55 hover:text-white hover:bg-white/12
+                         flex items-center justify-center transition-colors"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <div className="overflow-y-auto px-2 py-2 aura-scroll">
+          {/* ── Segments ─────────────────────────────────────────── */}
+          <SectionLabel>Segments</SectionLabel>
           {orderedWindows.length === 0 && (
-            <p className="text-white/40 text-[12px] italic">
-              No segments yet: submit one on the right.
-            </p>
+            <div className="py-6 text-center text-white/45 text-[13px]">
+              No segments for this episode yet.
+            </div>
           )}
           {orderedWindows.map((w, i) => {
             // Votes go to AniSkip by skip_id alone, so they are offered only
@@ -533,52 +559,58 @@ export default function AniSkipMenu({
             // The kind is on Auto but this window may only prompt (a guess, a
             // preview, an AniSkip ending, ...): say so, and why on hover.
             const held = !w.superseded && !w.auto ? skipHeldReason(w, modes) : null;
+            const song = [w.song_title, w.song_artist].filter(Boolean).join(" · ");
             return (
-            <div
-              key={`${w.type}:${w.start}:${i}`}
-              className="rounded-lg bg-white/[0.05] border border-white/8 p-2.5"
-            >
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0">
-                  <p className="text-[12px] font-semibold leading-tight">
-                    {skipLabel(w.type)}
-                  </p>
-                  <p className="text-white/55 text-[10.5px] font-mono mt-0.5">
-                    {fmtTime(w.start)} - {fmtTime(w.end)}
-                  </p>
-                  <p className="text-white/40 text-[10px] mt-0.5">
+              <div
+                key={`${w.type}:${w.start}:${i}`}
+                className={`rounded-xl px-3 py-2.5 mb-1 flex items-center gap-3
+                            ${w.superseded ? "bg-white/[0.02]" : "bg-white/[0.04]"}`}
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-baseline gap-2.5">
+                    <span className={`text-[13.5px] font-medium leading-snug
+                                      ${w.superseded ? "text-white/60" : "text-white/90"}`}>
+                      {skipLabel(w.type)}
+                    </span>
+                    <span className={`text-[12.5px] font-mono tabular-nums
+                                      ${w.superseded ? "text-white/45" : "text-white/70"}`}>
+                      {fmtTime(w.start)} - {fmtTime(w.end)}
+                    </span>
+                  </div>
+                  {song && (
+                    <p className="text-white/45 text-[11.5px] leading-snug line-clamp-1 mt-0.5" title={song}>
+                      {song}
+                    </p>
+                  )}
+                  <div className="flex flex-wrap items-center gap-1 mt-1">
                     {sourceHint
                       ? (
                         <Tooltip pos="top" text={sourceHint}>
-                          <span className="cursor-help">{skipSourceLabel(w.source)}</span>
+                          <Chip tone="source" help>{skipSourceLabel(w.source)}</Chip>
                         </Tooltip>
                       )
-                      : skipSourceLabel(w.source)}
+                      : <Chip tone="source">{skipSourceLabel(w.source)}</Chip>}
                     {w.superseded
                       ? (
-                        <>
-                          <span className="text-white/50"> · </span>
-                          <Tooltip
-                            pos="top"
-                            text={canVote
-                              ? "Not used: the theme match replaced it. You can still vote on it"
-                              : "Not used: the theme match replaced it"}
-                          >
-                            <span className="text-white/50 cursor-help">replaced by theme match</span>
-                          </Tooltip>
-                        </>
+                        <Tooltip
+                          pos="top"
+                          text={canVote
+                            ? "Not used: the theme match replaced it. You can still vote on it"
+                            : "Not used: the theme match replaced it"}
+                        >
+                          <Chip tone="neutral" help>Replaced by theme match</Chip>
+                        </Tooltip>
                       )
                       : w.auto
-                        ? <span className="text-amber-300/80"> · auto-skip</span>
-                        : held && (
-                          <>
-                            <span className="text-white/50"> · </span>
+                        ? <Chip tone="auto">Auto-skips</Chip>
+                        : held
+                          ? (
                             <Tooltip pos="top" text={held.hint}>
-                              <span className="text-white/50 cursor-help">prompt only</span>
+                              <Chip tone="prompt" help>Prompt only</Chip>
                             </Tooltip>
-                          </>
-                        )}
-                  </p>
+                          )
+                          : <Chip tone="prompt">Asks first</Chip>}
+                  </div>
                 </div>
                 {canVote && w.skip_id && (() => {
                   const vs = voteState[w.skip_id];
@@ -594,14 +626,14 @@ export default function AniSkipMenu({
                         aria-label="Upvote segment"
                         aria-pressed={lastUp}
                         title={onCooldown ? "Cooling down…" : "Upvote segment"}
-                        className={`w-6 h-6 rounded transition-colors flex items-center justify-center
+                        className={`w-7 h-7 rounded-lg transition-colors flex items-center justify-center
                                     ${lastUp
                                       ? "text-ln-accent bg-ln-accent/20"
                                       : "text-ln-accent/85 hover:text-ln-accent hover:bg-ln-accent/15"}
                                     disabled:opacity-45 disabled:cursor-not-allowed
                                     disabled:hover:bg-transparent`}
                       >
-                        <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                           <path d="M7 14l5-5 5 5z" />
                         </svg>
                       </button>
@@ -612,14 +644,14 @@ export default function AniSkipMenu({
                         aria-label="Downvote segment"
                         aria-pressed={lastDown}
                         title={onCooldown ? "Cooling down…" : "Downvote segment"}
-                        className={`w-6 h-6 rounded transition-colors flex items-center justify-center
+                        className={`w-7 h-7 rounded-lg transition-colors flex items-center justify-center
                                     ${lastDown
                                       ? "text-rose-300 bg-rose-500/15"
-                                      : "text-white/55 hover:text-rose-300 hover:bg-rose-500/12"}
+                                      : "text-white/60 hover:text-rose-300 hover:bg-rose-500/12"}
                                     disabled:opacity-45 disabled:cursor-not-allowed
                                     disabled:hover:bg-transparent`}
                       >
-                        <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                           <path d="M7 10l5 5 5-5z" />
                         </svg>
                       </button>
@@ -627,178 +659,200 @@ export default function AniSkipMenu({
                   );
                 })()}
               </div>
-            </div>
             );
           })}
-        </div>
 
-        {/* ── Right column: submit form ──────────────────────────── */}
-        <div className="space-y-2.5">
-          <p className="text-white/60 text-[11px] font-semibold uppercase tracking-wider">
-            Submit new segment
-          </p>
-
-          <div>
-            <label className="text-white/45 text-[10px] uppercase tracking-wider">Type</label>
-            <select
-              value={formType}
-              onChange={(e) => setFormType(e.target.value as SkipType)}
-              className="w-full mt-1 bg-white/8 border border-white/12 rounded-lg px-3 py-1.5
-                         text-[12px] outline-none focus:border-white/25 transition-colors
-                         appearance-none cursor-pointer"
-              style={{
-                backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='rgba(255,255,255,0.4)'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E")`,
-                backgroundRepeat: "no-repeat",
-                backgroundPosition: "right 10px center",
-                paddingRight: "28px",
-              }}
-            >
-              <option value="op">Opening</option>
-              <option value="mixed-op">Opening (mixed-op)</option>
-              <option value="ed">Ending</option>
-              <option value="recap">Recap</option>
-            </select>
+          {/* ── Skip behaviour ───────────────────────────────────── */}
+          <div className="mt-2 pt-2 border-t border-white/8">
+            <SectionLabel>Skip behaviour</SectionLabel>
+            <div className="px-3 space-y-2">
+              <ModeRow
+                label="Opening"
+                value={opMode}
+                disabled={modesLoading}
+                onChange={(v) => { setOpMode(v); patchMode("skip_op_mode", v); showFlash(`Opening skip: ${v}`); }}
+              />
+              <ModeRow
+                label="Ending"
+                value={edMode}
+                disabled={modesLoading}
+                onChange={(v) => { setEdMode(v); patchMode("skip_ed_mode", v); showFlash(`Ending skip: ${v}`); }}
+              />
+              <ModeRow
+                label="Recap"
+                value={recapMode}
+                disabled={modesLoading}
+                onChange={(v) => { setRecapMode(v); patchMode("skip_recap_mode", v); showFlash(`Recap skip: ${v}`); }}
+              />
+            </div>
+            {/* Live-apply feedback. auto<->prompt re-stamps the CURRENT episode's
+                windows instantly (App.tsx listens for aura:settings-changed); the
+                one case that can't apply live is re-enabling a segment turned fully
+                off, because its window was dropped from the active payload. */}
+            <p className="text-white/55 text-[12px] leading-relaxed mt-2.5 px-3 pb-1">
+              Some segments always ask first, even on Auto: hover "Prompt only"
+              for why. Ending Off also hides previews. Changes apply to this
+              episode instantly, except turning a segment fully off and back on,
+              which takes effect from the next stream load.
+            </p>
           </div>
 
-          <div>
-            <label className="text-white/45 text-[10px] uppercase tracking-wider">Start time</label>
-            <div className="mt-1 flex items-stretch gap-1.5">
-              <input
-                value={startInput}
-                onChange={(e) => setStartInput(e.target.value)}
-                placeholder="e.g. 0:00 or 90"
-                className="flex-1 bg-white/8 border border-white/12 rounded-lg px-3
-                           text-[12px] font-mono outline-none focus:border-white/25
-                           placeholder:text-white/30 transition-colors"
-              />
+          {/* ── Submit form ──────────────────────────────────────── */}
+          <div className="mt-2 pt-2 border-t border-white/8">
+            <SectionLabel>Submit a segment</SectionLabel>
+            <div className="px-3 pb-1 space-y-2.5">
+              <div className="grid grid-cols-3 gap-2">
+                <div>
+                  <FieldLabel>Type</FieldLabel>
+                  <select
+                    value={formType}
+                    onChange={(e) => setFormType(e.target.value as SkipType)}
+                    className="w-full h-8 mt-1 bg-white/8 border border-white/12 rounded-lg px-2.5
+                               text-[13px] text-white/90 outline-none focus:border-white/30 transition-colors
+                               appearance-none cursor-pointer"
+                    style={{
+                      backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='rgba(255,255,255,0.5)'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E")`,
+                      backgroundRepeat: "no-repeat",
+                      backgroundPosition: "right 8px center",
+                      paddingRight: "24px",
+                    }}
+                  >
+                    <option value="op">Opening</option>
+                    <option value="mixed-op">Opening (mixed)</option>
+                    <option value="ed">Ending</option>
+                    <option value="recap">Recap</option>
+                  </select>
+                </div>
+                <TimeField label="Start" value={startInput} onChange={setStartInput}
+                           placeholder="0:00" onNow={() => setStartInput(fmtTime(time))} />
+                <TimeField label="End" value={endInput} onChange={setEndInput}
+                           placeholder="1:30" onNow={() => setEndInput(fmtTime(time))} />
+              </div>
+
               <button
                 type="button"
-                onClick={() => setStartInput(fmtTime(time))}
-                title="Use current playback position"
-                className="px-2.5 rounded-lg bg-white/8 border border-white/12
-                           text-[11px] font-semibold hover:bg-white/12 transition-colors"
+                onClick={handleSubmit}
+                disabled={submitting || ((malId == null || courEpisode == null) && !idbAvailable)}
+                className="w-full h-8 px-3 rounded-lg border border-ln-accent/40
+                           bg-ln-accent/15 text-ln-accent text-[13px] font-semibold
+                           hover:bg-ln-accent/25 transition-colors
+                           disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                Now
+                {submitting ? "Submitting…" : "Submit segment"}
               </button>
+
+              {malResolving && (
+                <p className="text-white/50 text-[12px]">Resolving MAL id…</p>
+              )}
+              {!malResolving && malId == null && !idbAvailable && (
+                <p className="text-amber-300/90 text-[12px] leading-snug">
+                  No MyAnimeList entry found for this episode. AniSkip and theme
+                  matching need one, so submission is unavailable.
+                </p>
+              )}
+              {!malResolving && malId == null && idbAvailable && (
+                <p className="text-white/55 text-[12px] leading-snug">
+                  No MyAnimeList entry found for this episode (AniSkip and theme
+                  matching need one): submits to IntroDB only.
+                </p>
+              )}
+              {(!malResolving && malId != null) || (idbAvailable && idbNumbering) ? (
+                <p className="text-white/40 text-[11.5px] font-mono">
+                  {[
+                    !malResolving && malId != null ? `mal ${malId} · ep ${courEpisode}` : null,
+                    idbAvailable && idbNumbering
+                      ? `introdb ${idbImdb} · s${idbNumbering.season}e${idbNumbering.episode}`
+                      : null,
+                  ].filter(Boolean).join("   ")}
+                </p>
+              ) : null}
             </div>
           </div>
+        </div>
 
-          <div>
-            <label className="text-white/45 text-[10px] uppercase tracking-wider">End time</label>
-            <div className="mt-1 flex items-stretch gap-1.5">
-              <input
-                value={endInput}
-                onChange={(e) => setEndInput(e.target.value)}
-                placeholder="e.g. 1:30 or 180"
-                className="flex-1 bg-white/8 border border-white/12 rounded-lg px-3
-                           text-[12px] font-mono outline-none focus:border-white/25
-                           placeholder:text-white/30 transition-colors"
-              />
-              <button
-                type="button"
-                onClick={() => setEndInput(fmtTime(time))}
-                title="Use current playback position"
-                className="px-2.5 rounded-lg bg-white/8 border border-white/12
-                           text-[11px] font-semibold hover:bg-white/12 transition-colors"
-              >
-                Now
-              </button>
-            </div>
-          </div>
-
-          <button
-            type="button"
-            onClick={handleSubmit}
-            disabled={submitting || ((malId == null || courEpisode == null) && !idbAvailable)}
-            className="w-full mt-1 px-3 py-1.5 rounded-lg border border-ln-accent/40
-                       bg-ln-accent/15 text-ln-accent text-[12px] font-semibold
-                       hover:bg-ln-accent/25 transition-colors
-                       disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {submitting ? "Submitting…" : "+ Submit segment"}
-          </button>
-
-          {malResolving && (
-            <p className="text-white/40 text-[10.5px] italic">
-              Resolving MAL id…
-            </p>
-          )}
-          {!malResolving && malId == null && !idbAvailable && (
-            <p className="text-amber-300/75 text-[10.5px] italic">
-              No MyAnimeList entry found for this episode. AniSkip and theme
-              matching need one, so submission is unavailable.
-            </p>
-          )}
-          {!malResolving && malId == null && idbAvailable && (
-            <p className="text-white/40 text-[10.5px] italic">
-              No MyAnimeList entry found for this episode (AniSkip and theme
-              matching need one): submits to IntroDB only.
-            </p>
-          )}
-          {!malResolving && malId != null && (
-            <p className="text-white/35 text-[10.5px] font-mono">
-              mal={malId} · ep={courEpisode}
-            </p>
-          )}
-          {idbAvailable && idbNumbering && (
-            <p className="text-white/35 text-[10.5px] font-mono">
-              introdb={idbImdb} · s{idbNumbering.season}e{idbNumbering.episode}
-            </p>
-          )}
+        <div className={`px-5 py-2.5 border-t border-white/8 text-[12px]
+                         ${flash ? "text-ln-accent" : "text-white/40"}`}>
+          {flash ?? "Esc to close"}
         </div>
       </div>
+    </div>,
+    document.body,
+  );
+}
 
-      {/* ── Skip-mode toggles (full-width row) ───────────────────── */}
-      <div className="px-4 pb-3 pt-1 border-t border-white/8">
-        <p className="text-white/60 text-[11px] font-semibold uppercase tracking-[0.18em] mb-2 text-center">
-          Skip behaviour
-        </p>
-        <div className="space-y-1.5">
-          <ModeRow
-            label="Opening"
-            value={opMode}
-            disabled={modesLoading}
-            onChange={(v) => { setOpMode(v); patchMode("skip_op_mode", v); showFlash(`Opening skip: ${v}`); }}
-          />
-          <ModeRow
-            label="Ending"
-            value={edMode}
-            disabled={modesLoading}
-            onChange={(v) => { setEdMode(v); patchMode("skip_ed_mode", v); showFlash(`Ending skip: ${v}`); }}
-          />
-          <ModeRow
-            label="Recap"
-            value={recapMode}
-            disabled={modesLoading}
-            onChange={(v) => { setRecapMode(v); patchMode("skip_recap_mode", v); showFlash(`Recap skip: ${v}`); }}
-          />
-        </div>
-        {/* Live-apply feedback. auto<->prompt re-stamps the CURRENT episode's
-            windows instantly (App.tsx listens for aura:settings-changed); the
-            one case that can't apply live is re-enabling a segment turned fully
-            off, because its window was dropped from the active payload. */}
-        <p className="text-white/40 text-[10px] leading-snug mt-2 text-center px-2">
-          Some segments always ask first, even on Auto: hover "prompt only"
-          for why. Ending Off also hides previews. Applies to the current
-          episode instantly. Turning a segment fully off then back on takes
-          effect from the next stream load.
-        </p>
+function SectionLabel({ children }: { children: ReactNode }) {
+  return (
+    <p className="px-3 pt-1 pb-1.5 text-white/55 text-[11px] font-semibold uppercase tracking-wider">
+      {children}
+    </p>
+  );
+}
+
+function FieldLabel({ children }: { children: ReactNode }) {
+  return <span className="block text-white/55 text-[11.5px]">{children}</span>;
+}
+
+type ChipTone = "source" | "auto" | "prompt" | "neutral";
+
+const CHIP_TONES: Record<ChipTone, string> = {
+  source:  "bg-white/6 text-white/75 border-white/14",
+  auto:    "bg-emerald-500/12 text-emerald-300 border-emerald-400/30",
+  prompt:  "bg-amber-500/12 text-amber-300 border-amber-400/30",
+  neutral: "bg-white/4 text-white/55 border-white/12",
+};
+
+/** A small status pill, the same size and shape as the stream-quality chips
+ *  in the Switch source panel. */
+function Chip({ tone, help, children }: { tone: ChipTone; help?: boolean; children: ReactNode }) {
+  return (
+    <span
+      className={`inline-block px-1.5 py-[1px] rounded border text-[10.5px] font-medium tracking-wide
+                  ${CHIP_TONES[tone]} ${help ? "cursor-help" : ""}`}
+    >
+      {children}
+    </span>
+  );
+}
+
+function TimeField({
+  label, value, onChange, placeholder, onNow,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder: string;
+  onNow: () => void;
+}) {
+  return (
+    <div>
+      <FieldLabel>{label}</FieldLabel>
+      <div className="mt-1 flex items-stretch h-8 rounded-lg bg-white/8 border border-white/12
+                      focus-within:border-white/30 transition-colors overflow-hidden">
+        <input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder}
+          aria-label={`${label} time`}
+          className="min-w-0 flex-1 bg-transparent px-2.5 text-[13px] font-mono text-white/90
+                     outline-none placeholder:text-white/30"
+        />
+        <button
+          type="button"
+          onClick={onNow}
+          title="Use the current playback position"
+          className="px-2 text-[11.5px] font-semibold text-white/70 border-l border-white/12
+                     hover:bg-white/12 hover:text-white transition-colors"
+        >
+          Now
+        </button>
       </div>
-
-      {flash && (
-        <div className="px-4 py-2 text-[11px] font-mono text-ln-accent/85 border-t border-white/8">
-          {flash}
-        </div>
-      )}
     </div>
   );
 }
 
-/** One row of the skip-mode toggles — off / prompt / auto pill group.
- *  Matches Settings → Anime OP/ED Skip's `SkipModeRow` styling exactly
- *  so the player-side mirror feels visually unified: rounded-full
- *  capsule with per-state tone (white/55 off, amber prompt, emerald
- *  auto) and a soft accent background on the active pill. */
+/** One row of the skip-mode toggles: an off / prompt / auto pill group with
+ *  the same per-state tones as Settings > Anime OP/ED Skip's `SkipModeRow`
+ *  (white off, amber prompt, emerald auto). */
 function ModeRow({
   label, value, onChange, disabled,
 }: {
@@ -808,21 +862,18 @@ function ModeRow({
   disabled?: boolean;
 }) {
   const opts: { id: SkipMode; label: string; tone: string }[] = [
-    { id: "off",    label: "Off",    tone: "text-white/55" },
+    { id: "off",    label: "Off",    tone: "text-white/85" },
     { id: "prompt", label: "Prompt", tone: "text-amber-300" },
     { id: "auto",   label: "Auto",   tone: "text-emerald-300" },
   ];
   return (
-    // Center the label+toggle pair as a unit instead of pinning the
-    // toggle to the right edge — at 460px panel width the previous
-    // justify-between layout left a huge gap between e.g. "Opening"
-    // and the pill group. Fixed-width label keeps the rows aligned
-    // vertically; gap-3 sits the toggle right next to the label.
-    <div className="flex items-center justify-center gap-3">
-      <span className="text-[12px] text-white/85 flex-shrink-0 w-[68px] text-right">{label}</span>
+    <div className="flex items-center justify-between gap-3">
+      <span className="text-[13.5px] text-white/90">{label}</span>
       <div
         className="flex-shrink-0 inline-flex rounded-full overflow-hidden
-                   bg-white/5 border border-white/10 p-0.5 gap-0.5"
+                   bg-white/5 border border-white/12 p-0.5 gap-0.5"
+        role="radiogroup"
+        aria-label={`${label} skip`}
       >
         {opts.map((o) => {
           const active = value === o.id;
@@ -830,13 +881,15 @@ function ModeRow({
             <button
               key={o.id}
               type="button"
+              role="radio"
+              aria-checked={active}
               onClick={() => onChange(o.id)}
               disabled={disabled}
-              className={`px-3 py-1 rounded-full text-[11.5px] font-medium tracking-wide
+              className={`px-3.5 py-1 rounded-full text-[12px] font-medium tracking-wide
                           transition-colors duration-150
                           ${active
-                            ? `bg-ln-accent/20 ${o.tone}`
-                            : "text-white/55 hover:text-white/85"}
+                            ? `bg-white/12 ${o.tone}`
+                            : "text-white/55 hover:text-white/90"}
                           disabled:opacity-50 disabled:cursor-not-allowed`}
             >
               {o.label}
@@ -847,3 +900,4 @@ function ModeRow({
     </div>
   );
 }
+
