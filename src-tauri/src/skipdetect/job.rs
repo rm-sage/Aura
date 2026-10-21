@@ -439,6 +439,23 @@ fn result_ttl(s: &Snapshot, l3_list_ttl: &HashMap<Kind, u64>) -> u64 {
         .fold(cache::RESULT_TTL, u64::min)
 }
 
+/// How far the region being read has decoded, for the player's theme-match
+/// readout. Its own event, never a Snapshot field: every snapshot re-stamps
+/// the skip windows, and this ticks up to a hundred times per region.
+#[derive(Clone, Debug, Serialize)]
+pub struct Progress {
+    pub generation: u64,
+    /// The kind whose region is decoding: "op" (HEAD) or "ed" (TAIL).
+    pub kind: &'static str,
+    /// Share of that region decoded, 0 to 1. 1 only once the region ended
+    /// (an early HEAD exit after the opening matched included).
+    pub fraction: f64,
+    /// Whether the catalogue holds a candidate theme of each kind. A kind with
+    /// none is not being theme matched (Layer 3 or nothing at all).
+    pub op_themes: bool,
+    pub ed_themes: bool,
+}
+
 /// What a detect needs from its host.
 pub struct Ctx {
     pub ffmpeg: OsString,
@@ -447,6 +464,8 @@ pub struct Ctx {
     pub generation: u64,
     /// Called with every changed snapshot (the host filters stale generations).
     pub publish: Arc<dyn Fn(&Snapshot) + Send + Sync>,
+    /// Called as a region decodes (see `Progress`).
+    pub progress: Arc<dyn Fn(&Progress) + Send + Sync>,
     /// Tests only: replay cached PCM and a recorded probe instead of running
     /// ffmpeg on a stream (`replay.rs`). Everything else is the real job.
     #[cfg(test)]
@@ -1493,6 +1512,19 @@ impl<'a> Job<'a> {
         (self.d.ctx.publish)(&self.snap);
     }
 
+    fn report_progress(&self, which: Which, fraction: f64) {
+        (self.d.ctx.progress)(&Progress {
+            generation: self.d.ctx.generation,
+            kind: match which {
+                Which::Head => "op",
+                Which::Tail => "ed",
+            },
+            fraction: fraction.clamp(0.0, 1.0),
+            op_themes: !self.d.cat.order(Kind::Op).is_empty(),
+            ed_themes: !self.d.cat.order(Kind::Ed).is_empty(),
+        });
+    }
+
     fn set_note(&mut self, kind: Kind, note: String) {
         match kind {
             Kind::Op => self.snap.op_note = Some(note),
@@ -1891,6 +1923,16 @@ impl<'a> Job<'a> {
         let mut op_end: Option<f64> = None;
         let mut killed = false;
         let mut accepted: Option<Accepted> = None;
+        // Progress against what the region should hold (the same span the
+        // early-end check below expects), reported per whole percent and held
+        // under 100 until the region has ended.
+        let span = match which {
+            Which::Head => probe::HEAD_SECS.min(self.media_est),
+            Which::Tail => self.media_est - expect_origin,
+        }
+        .max(1.0);
+        let mut reported_pct = 0u32;
+        self.report_progress(which, 0.0);
 
         enum Ev<'s> {
             Evt(Option<WEvt>),
@@ -1998,6 +2040,13 @@ impl<'a> Job<'a> {
                         out.failed = Some("analysis worker stopped".into());
                         break;
                     }
+                    let decoded = pass.samples() as f64 / SR as f64
+                        + if which == Which::Head { origin.unwrap_or(0.0) } else { 0.0 };
+                    let pct = ((decoded / span) * 100.0).clamp(0.0, 99.0) as u32;
+                    if pct > reported_pct {
+                        reported_pct = pct;
+                        self.report_progress(which, pct as f64 / 100.0);
+                    }
                 }
                 Ev::Pcm(Ok(None)) => break,
                 Ev::Pcm(Err(e)) => {
@@ -2010,6 +2059,7 @@ impl<'a> Job<'a> {
         // goes now; the region's own decision (published right after) is the
         // answer.
         self.withdraw_early(kind, "region ended without a full match");
+        self.report_progress(which, 1.0);
         let samples = pass.samples();
         let end = if killed || out.failed.is_some() { pass.kill().await } else { pass.finish().await };
         // A first-PTS line that arrived after the last PCM byte still counts.
@@ -2547,6 +2597,7 @@ mod tests {
             data_dir: None,
             generation: 1,
             publish: Arc::new(|_: &Snapshot| {}),
+            progress: Arc::new(|_: &Progress| {}),
             replay: None,
             fake_theme_load: Some(Arc::new(move |r: &ThemeRec| {
                 c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

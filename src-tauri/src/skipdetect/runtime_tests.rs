@@ -560,6 +560,7 @@ async fn skipdetect_runtime_detect() {
                 data_dir: Some(dir.clone()),
                 generation: 1 + round,
                 publish: Arc::new(move |s: &Snapshot| seen2.lock().unwrap().push((t.elapsed().as_secs_f64(), s.clone()))),
+                progress: Arc::new(|_: &super::job::Progress| {}),
                 replay: None,
                 fake_theme_load: None,
             };
@@ -707,7 +708,7 @@ async fn skipdetect_runtime_detect() {
         }))
         .unwrap();
         let req = req.validate().unwrap();
-        let ctx = Ctx { ffmpeg: ff.clone(), data_dir: Some(dir.clone()), generation: 9, publish: Arc::new(|_: &Snapshot| {}), replay: None, fake_theme_load: None };
+        let ctx = Ctx { ffmpeg: ff.clone(), data_dir: Some(dir.clone()), generation: 9, publish: Arc::new(|_: &Snapshot| {}), progress: Arc::new(|_: &super::job::Progress| {}), replay: None, fake_theme_load: None };
         let t = Instant::now();
         let s = job::run(&ctx, &req).await;
         let row = cont["episodes"].as_array().unwrap().iter().find(|r| r["id"] == id.as_str()).cloned().unwrap_or(Value::Null);

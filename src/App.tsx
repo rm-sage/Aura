@@ -67,7 +67,12 @@ import { reconcileLibraryReleaseSignals, clearReleaseSignalStore, getReleaseSign
 import { syncPullAll, installSyncTriggers, startBackgroundPull, clearSyncEtags, setSyncActiveScope } from "./sync";
 import { setHistoryScope, addHistoryEntry } from "./historyStore";
 import { setAutoBackupScope, startAutoBackup } from "./userDataBackup";
-import NextUpCta from "./NextUpCta";
+import NextUpCta, { NextUpTailPill, StackPresence } from "./NextUpCta";
+import { playerStackTop } from "./playerStack";
+import {
+  beginSkipMatch, endSkipMatch, resetSkipMatch, skipMatchProgress, skipMatchVerdicts,
+  type SkipDetectProgress,
+} from "./skipMatchProgress";
 import EosSpotlight from "./EosSpotlight";
 import EpisodePanel from "./EpisodePanel";
 import SourceSwitcher, { streamKey, sameStreamSource } from "./SourceSwitcher";
@@ -97,11 +102,12 @@ import {
 import {
   CONTINUITY_SOURCE, LAYER1_PROMPT_SOURCE, LAYER1_SOURCE, LAYER1_TRANSITION_SOURCE,
   applySkipModes, composeSkipWindows, fitCrowdToDuration, layer1StateFrom, releasePendingLayer1,
-  skipConfidence, skipKindGroup, skipModeForKind, trustedEndingEnd, windowsFromChapters,
+  nextUpEnding, skipConfidence, skipKindGroup, skipModeForKind, trustedEndingEnd, windowsFromChapters,
   type Layer1Status, type PreparedWindow, type SkipMode,
 } from "./skipWindows";
 import {
-  eosEnd, nextUpShouldHide, nextUpShouldShow, setDetectedMediaEnd, type NextUpTiming,
+  emptyNextUpTiming, eosEnd, nextUpFollowsControls, nextUpShouldHide, nextUpShouldShow, nextUpTailNote,
+  nextUpTriggerAt, setDetectedMediaEnd, type NextUpTiming,
 } from "./nextUpGate";
 import { applyReducedMotionAttribute, loadAuraSettings, streamQueryAddons } from "./auraSettings";
 import { electAddons } from "./addonElection";
@@ -189,6 +195,7 @@ interface BackendSettingsLite {
   skip_ed_mode?: string;
   skip_recap_mode?: string;
   skip_treat_mixed_op_as_op?: boolean;
+  next_up_lead_seconds?: number;
 }
 import type { ContextMenuItem } from "./ContextMenu";
 import { normalizeLibrary } from "./libraryNormalize";
@@ -2992,6 +2999,8 @@ export default function App() {
           // previous episode's OP/ED windows onto the current one.
           skipChainSeqRef.current += 1;
           liveSkipStampRef.current = null;
+          // The previous file's theme-match verdicts may still be lingering.
+          resetSkipMatch();
           const skipSeq = skipChainSeqRef.current;
           const stale = () => skipChainSeqRef.current !== skipSeq;
           skipCourRef.current = null;
@@ -3001,7 +3010,7 @@ export default function App() {
           // in-player source switch all re-run loadfile without clearing them
           // and the previous release's credits position would keep timing the
           // card. The load token is the right lifetime, so clear them here.
-          nextUpTimingRef.current = { trustedEdEnd: null, mediaEnd: null };
+          nextUpTimingRef.current = emptyNextUpTiming();
           setDetectedMediaEnd(null);
           // A detector still reading the PREVIOUS file must stop now (its
           // ffmpeg is killed and anything it would still publish is dropped).
@@ -3041,13 +3050,24 @@ export default function App() {
             const edMode    = normalizeMode(settings?.skip_ed_mode,    "prompt");
             const recapMode = normalizeMode(settings?.skip_recap_mode, "prompt");
             const treatMixed = settings?.skip_treat_mixed_op_as_op ?? true;
-            // Every kind off: no lookups and no windows, but the probe-only
-            // detect still runs (finishWithChapters with `probeOnly`, below):
-            // the end-of-stream detectors need the media end whatever the skip
-            // modes say, or a container that runs past its media misses the
-            // end card for exactly these users.
+            // The Next-Up card is on (a lead time above 0). It times itself
+            // from the ENDING (nextUpGate.ts), so while it is on, endings and
+            // previews are gathered even with Endings set to Off (`gatherFor`
+            // below); the payload still honours Off. Read here, from the
+            // chain's own settings read, because the React state lives below
+            // this callback.
+            const nextUpOn = (settings?.next_up_lead_seconds ?? 45) > 0;
+            // Every kind off with the card off too: no lookups and no
+            // windows, but the probe-only detect still runs
+            // (finishWithChapters with `probeOnly`, below): the end-of-stream
+            // detectors need the media end whatever the skip modes say, or a
+            // container that runs past its media misses the end card for
+            // exactly these users.
             const allModesOff = opMode === "off" && edMode === "off" && recapMode === "off";
-            if (allModesOff) console.info(`[auraskip] skip - all modes off; reading the media end only`);
+            if (allModesOff && !isMovie) {
+              console.info(`[auraskip] skip - all modes off; ${nextUpOn
+                ? "gathering endings for the Next-Up card only" : "reading the media end only"}`);
+            }
             // The file's duration, the moment mpv reports it. Watched from HERE
             // (not from the chapter poll) so the detector can start as soon as
             // the MAL id and the duration are both known, instead of after the
@@ -3067,6 +3087,36 @@ export default function App() {
             // when the ED mode is off); the re-stamp effect uses the same one.
             const modeFor = (kind: string): SkipMode =>
               skipModeForKind(kind, skipModesRef.current);
+            // What to GATHER (fetch, derive, detect), as opposed to what to
+            // publish: the user's mode, except that an ending or preview on
+            // Off is still gathered while the Next-Up card is on, because the
+            // card rises as the ending starts and its banner reads the
+            // preview. Publishing stays on `modeFor` (applySkipModes, the
+            // payload's own compose in `stamp`), so an Off ending is never
+            // prompted, skipped, drawn or listed. Never used for `auto`.
+            const gatherFor = (kind: string): SkipMode => {
+              const m = modeFor(kind);
+              if (m !== "off" || !nextUpOn) return m;
+              const g = skipKindGroup(kind);
+              return g === "ed" || g === "preview" ? "prompt" : "off";
+            };
+            // The ending is gathered for the card alone (its mode is Off).
+            const edCardOnly = (): boolean => modeFor("ed") === "off";
+            // Whether the detector reads the ending. For the card alone, only
+            // on a file long enough that TAIL (the last 480 s, from the
+            // smaller of the container and the track's DURATION tag) cannot
+            // reach HEAD's 600 s: where they overlap, a continuity ending found
+            // over the opening is withdrawn WITH a continuity opening (Rust
+            // `no_ed_inside_the_opening`, at any length: Kaiju No. 8's 224 s
+            // special), so an ending nobody skips could cost the user their
+            // opening. 600 + 480, plus 60 s for a tag below the container (the
+            // gaps measured were at most 29 s; Rust does not bound it, so this
+            // is a margin, not a guarantee). A card-only continuity ending
+            // could never raise the card anyway (Risky).
+            const CARD_ONLY_ED_MIN_DURATION_S = 600 + 480 + 60;
+            const wantEdFor = (duration: number): boolean =>
+              modeFor("ed") !== "off"
+              || (gatherFor("ed") !== "off" && duration >= CARD_ONLY_ED_MIN_DURATION_S);
 
             // Tail used by EVERY exit below: merge the crowd / authored windows
             // (AniSkip, IntroDB, PublicMetaDB; empty for a miss) with the
@@ -3092,8 +3142,9 @@ export default function App() {
                 malSource?: string | null;
                 episodeNum?: number | null;
                 treatMixed?: boolean;
-                /** Every skip mode is off: no chapter poll and no window, only
-                 *  the probe-only detect for the media end. */
+                /** A movie, or every skip mode off with the Next-Up card off
+                 *  too: no chapter poll and no window, only the probe-only
+                 *  detect for the media end. */
                 probeOnly?: boolean;
               },
             ): Promise<void> => {
@@ -3149,8 +3200,14 @@ export default function App() {
                   op: PreparedWindow | null;
                   ed: PreparedWindow | null;
                   mediaEnd: number | null;
-                } = { op: null, ed: null, mediaEnd: null };
-                let published: PreparedWindow[] = [];
+                  /** The media end as measured (TAIL EOF, else the probe's
+                   *  DURATION tag), for the Next-Up banner's tail length. */
+                  mediaEndMeasured: number | null;
+                } = { op: null, ed: null, mediaEnd: null, mediaEndMeasured: null };
+                // The last stamped list BEFORE skip modes, for the Next-Up
+                // gate: the card's timing must not change with whether the
+                // ending is set to skip (an ending on Off is not stamped).
+                let composed: PreparedWindow[] = [];
                 let lastTiming = "";
                 // What Layer 1 concluded per kind, from the detector's
                 // snapshots. "pending" from the start of the load for every
@@ -3159,19 +3216,36 @@ export default function App() {
                 // until it settles (composeSkipWindows).
                 let layer1: Layer1Status = { op: "off", ed: "off" };
                 // The Next-Up gate's inputs: a TRUSTED ending's end (Layer 1
-                // only; never a crowd, chapter or Layer 3 window) and the media
-                // end. Announced after every stamp, only when they changed.
-                // The trusted end rule (a Transition-only or partially Over
-                // match's end counts) is `trustedEndingEnd`, shared with the
-                // e2e harness.
+                // only; never a crowd, chapter or Layer 3 window), the media
+                // end, the ending whose START raises the card (best level
+                // first, `nextUpEnding`) and the preview window. Announced
+                // after every stamp, only when they changed. The trusted end
+                // rule (a Transition-only or partially Over match's end
+                // counts) is `trustedEndingEnd`, shared with the e2e harness.
                 const announceTiming = (): void => {
                   const timing: NextUpTiming = {
-                    trustedEdEnd: trustedEndingEnd(published, det.ed),
+                    trustedEdEnd: trustedEndingEnd(composed, det.ed),
                     mediaEnd: det.mediaEnd,
+                    mediaEndMeasured: det.mediaEndMeasured,
+                    ...nextUpEnding(composed),
                   };
-                  const key = `${timing.trustedEdEnd}|${timing.mediaEnd}`;
+                  const key = JSON.stringify(timing);
                   if (key === lastTiming) return;
                   lastTiming = key;
+                  // The card's inputs, logged because an ending gathered for
+                  // the card alone (Endings Off) never shows in the stamp line.
+                  const fmt = (v: number | null) => (v == null ? "-" : v.toFixed(1));
+                  const elected = composed.find((w) => skipKindGroup(w.type) === "ed"
+                    && w.start === timing.edStart && w.end === timing.edEnd);
+                  const span = (a: number | null, b: number | null) =>
+                    (a == null && b == null ? "none" : `${fmt(a)}-${fmt(b)}`);
+                  console.info(
+                    `[next-up] timing: ending ${span(timing.edStart, timing.edEnd)}`
+                    + (elected ? ` ${elected.source} [${elected.basis ?? "?"}: ${skipConfidence(elected)}]` : "")
+                    + ` | trusted end ${fmt(timing.trustedEdEnd)}`
+                    + ` | preview ${span(timing.previewStart, timing.previewEnd)}`
+                    + ` | media end ${fmt(timing.mediaEnd)}, measured ${fmt(timing.mediaEndMeasured)}`,
+                  );
                   window.dispatchEvent(new CustomEvent<NextUpTiming>("aura:next-up-timing", {
                     detail: timing,
                   }));
@@ -3199,13 +3273,40 @@ export default function App() {
                     // theme elsewhere, a lone live-action crowd opening held,
                     // the Layer 1 conflict drop, one opening, no ending over
                     // the opening, then the media end clamp.
-                    const deduped = composeSkipWindows({
+                    const input = {
                       base,
                       detected: [det.op, det.ed].filter((w): w is PreparedWindow => w != null),
                       mediaEnd: det.mediaEnd,
                       layer1,
                       hasMal: opts.malId != null,
-                    });
+                    };
+                    // Everything gathered, for the Next-Up card (`composed`).
+                    const full = composeSkipWindows(input);
+                    // The PAYLOAD is composed from what the user's modes show
+                    // only. Not `full` with the Off kinds filtered out after:
+                    // an ending gathered for the card alone would still take
+                    // part in the cross-kind rule ("no ending over the
+                    // opening"), and a Layer 1 ending outranks an opening
+                    // there, so it could cost the user the opening they skip.
+                    // With every gathered kind shown (the usual case) the two
+                    // are the same compose.
+                    // Left out up front: an Off ending or preview while the
+                    // card is on (gathered for the card, or turned Off
+                    // mid-episode: the result is then what a load with Endings
+                    // Off gives). Any other kind the user switched off (an
+                    // opening or recap turned Off mid-episode) is composed and
+                    // then dropped by applySkipModes, exactly as before: it
+                    // still counts as the file's evidence there (a matched
+                    // opening corroborates a recap).
+                    const shown = (w: PreparedWindow): boolean =>
+                      modeFor(w.type) !== "off" || gatherFor(w.type) === "off";
+                    const deduped = input.base.every(shown) && input.detected.every(shown)
+                      ? full
+                      : composeSkipWindows({
+                        ...input,
+                        base: input.base.filter(shown),
+                        detected: input.detected.filter(shown),
+                      });
                     const windows = await nameSongs(applySkipModes(deduped.kept, modeFor));
                     // AniSkip rows a Layer 1 window replaced: shown in the AuraSkip
                     // menu for voting only. They travel in `superseded`, which the
@@ -3221,7 +3322,10 @@ export default function App() {
                       console.warn(`[auraskip] stamp failed (${note}): ${String(err)}`);
                       return;
                     }
-                    published = windows;
+                    // A new load during the await has reset the Next-Up timing:
+                    // announcing now would time ITS card by this file's ending.
+                    if (stale()) return;
+                    composed = full.kept;
                     // Report what is now STAMPED, not what was handed in: dedupe
                     // can drop the very window the note is announcing.
                     console.info(
@@ -3232,7 +3336,8 @@ export default function App() {
                             + `${w.source}${w.auto ? " auto" : " prompt"}${w.hold ? ` (${w.hold})` : ""}`
                             + `${w.basis ? ` [${w.basis}: ${skipConfidence(w)}]` : ""}`).join(", "))
                       + (layer1.op !== "off" || layer1.ed !== "off"
-                        ? ` | theme match op ${layer1.op}, ed ${layer1.ed}` : ""),
+                        ? ` | theme match op ${layer1.op}, ed ${layer1.ed}`
+                          + `${layer1.ed !== "off" && edCardOnly() && nextUpOn ? " (next-up only)" : ""}` : ""),
                     );
                     announceTiming();
                   });
@@ -3260,13 +3365,17 @@ export default function App() {
                 let detectRun: Promise<void> | null = null;
                 // Layer 1 decides a kind on this load when the cour's MAL id is
                 // known, detection is on, there is a stream and the kind is
-                // not off (the same conditions runDetect asks it under). The
-                // hold this sets is released when the detect settles the kind
-                // or ends without deciding it (below, and at the chain's end).
+                // gathered (the same conditions runDetect asks it under; an
+                // ending on Off is still gathered for the Next-Up card, so its
+                // crowd rows are held for the card the same way). The hold
+                // this sets is released when the detect settles the kind or
+                // ends without deciding it (below, and at the chain's end); an
+                // ending not asked for after all (a file under 19 minutes, see
+                // wantEdFor) comes back not_requested, which releases it.
                 if (opts.malId != null && autoDetect && url && !opts.probeOnly) {
                   layer1 = {
-                    op: modeFor("op") !== "off" ? "pending" : "off",
-                    ed: modeFor("ed") !== "off" ? "pending" : "off",
+                    op: gatherFor("op") !== "off" ? "pending" : "off",
+                    ed: gatherFor("ed") !== "off" ? "pending" : "off",
                   };
                 }
                 const releaseLayer1 = (why: string): void => {
@@ -3316,9 +3425,12 @@ export default function App() {
                   // media, and keep-open then stops outside the EOS tail).
                   if (s.media_end_final && s.media_end != null) {
                     setDetectedMediaEnd(s.media_end);
+                    det.mediaEndMeasured = s.media_end;
                   } else if (s.media_end_probe != null) {
                     setDetectedMediaEnd(s.media_end_probe);
+                    det.mediaEndMeasured = s.media_end_probe;
                   }
+                  skipMatchVerdicts(s.generation, s.op_l1, s.ed_l1);
                   void stamp(note);
                 };
                 // Every exit of a detect releases a kind it left undecided (no
@@ -3326,15 +3438,18 @@ export default function App() {
                 // crowd window must never stay held for the rest of the load.
                 const runDetect = async (
                   duration: number, wantOpIn: boolean, wantEdIn: boolean,
+                  /** The ending is read for the Next-Up card alone (its mode
+                   *  is Off): never a reason to download ffmpeg. */
+                  edCardOnlyIn: boolean,
                 ): Promise<void> => {
                   try {
-                    await runDetectInner(duration, wantOpIn, wantEdIn);
+                    await runDetectInner(duration, wantOpIn, wantEdIn, edCardOnlyIn);
                   } finally {
                     if (!stale()) releaseLayer1("detect ended");
                   }
                 };
                 const runDetectInner = async (
-                  duration: number, wantOpIn: boolean, wantEdIn: boolean,
+                  duration: number, wantOpIn: boolean, wantEdIn: boolean, edCardOnlyIn: boolean,
                 ): Promise<void> => {
                   if (!url || !(duration > 0)) return;
                   // With detection switched off, or no kind left to detect, the
@@ -3348,7 +3463,12 @@ export default function App() {
                   const probeOnly = !wantOp && !wantEd;
                   const present = await runtimeDepPresent("ffmpeg.exe").catch(() => false);
                   if (stale()) return;
-                  if (probeOnly) {
+                  // An ending read for the Next-Up card alone is no reason to
+                  // download ffmpeg or announce "skip detection" to a user who
+                  // switched those skips off: like the probe, it runs only
+                  // with ffmpeg already there.
+                  const forCardOnly = !wantOp && wantEd && edCardOnlyIn;
+                  if (probeOnly || forCardOnly) {
                     if (!present) return;
                   } else {
                     // ffmpeg is an on-demand dep: ensure it ONCE (a one-time
@@ -3395,15 +3515,23 @@ export default function App() {
                     return;
                   }
                   if (stale()) return;
+                  // The theme match's live readout (skipMatchProgress.ts): not for
+                  // probe-only runs, nor for an ending read only for the card.
+                  beginSkipMatch(expected, { op: wantOp, ed: wantEd && !edCardOnlyIn });
                   const unlisten = await listen<SkipDetectSnapshot>("skipdetect-update", (ev) => {
                     if (ev.payload?.generation !== expected) return;
                     applySnapshot(ev.payload, "skip_detect update");
+                  });
+                  const unlistenProgress = await listen<SkipDetectProgress>("skipdetect-progress", (ev) => {
+                    if (ev.payload?.generation !== expected || stale()) return;
+                    skipMatchProgress(ev.payload);
                   });
                   try {
                     if (stale()) return;
                     console.info(
                       `[skipdetect] detect ${target.media_type ?? "?"}/${target.id} `
-                      + `op=${wantOp} ed=${wantEd}${probeOnly ? " (probe only: media end for end of stream)" : ""} `
+                      + `op=${wantOp} ed=${wantEd}${wantEd && edCardOnlyIn ? " (next-up only)" : ""}`
+                      + `${probeOnly ? " (probe only: media end for end of stream)" : ""} `
                       + `mal=${opts.malId ?? "none"}`
                       + `${opts.malSource ? ` (${opts.malSource})` : ""} dur=${duration.toFixed(1)}`,
                     );
@@ -3440,12 +3568,15 @@ export default function App() {
                     console.warn(`[skipdetect] detect failed: ${String(e)}`);
                   } finally {
                     unlisten();
+                    unlistenProgress();
+                    endSkipMatch(expected, stale());
                   }
                 };
 
                 // Anime with a MAL id: start the detector the moment the
                 // duration is known, for every kind the user has not switched
-                // off, regardless of what AniSkip or the chapters supplied. It
+                // off (and the ending for the Next-Up card, `wantEdFor`),
+                // regardless of what AniSkip or the chapters supplied. It
                 // does not wait for those: nothing is STAMPED before the chapter
                 // poll settles (`base`), but the detector's probe and HEAD read
                 // start now. The chapter poll's `onDuration` (fed by the same
@@ -3454,7 +3585,7 @@ export default function App() {
                   void loadDuration.then((d) => {
                     if (!(d > 0) || stale() || detectRun) return;
                     console.info(`[skipdetect] duration ${d.toFixed(1)}s known: starting the detector now`);
-                    detectRun = runDetect(d, modeFor("op") !== "off", modeFor("ed") !== "off");
+                    detectRun = runDetect(d, modeFor("op") !== "off", wantEdFor(d), edCardOnly());
                   });
                 }
                 const merge = opts.probeOnly
@@ -3463,11 +3594,11 @@ export default function App() {
                     note: "all skip modes off", crowd: [] as PreparedWindow[], chapters: null,
                   }
                   : await mergeChapterSkipWindows(
-                    preparedIn, loadDuration, modeFor, stale,
+                    preparedIn, loadDuration, gatherFor, stale,
                     (duration) => {
                       if (opts.malId == null || detectRun) return;
                       detectRun = runDetect(
-                        duration, modeFor("op") !== "off", modeFor("ed") !== "off",
+                        duration, modeFor("op") !== "off", wantEdFor(duration), edCardOnly(),
                       );
                     },
                   );
@@ -3495,12 +3626,12 @@ export default function App() {
                     if (merge.crowd.length > 0 || (merge.chapters?.length ?? 0) > 0) {
                       const fit = fitCrowdToDuration(merge.crowd, late);
                       for (const n of fit.notes) console.info(`[auraskip] ${n}`);
-                      base = windowsFromChapters(fit.windows, merge.chapters, late, modeFor).windows;
+                      base = windowsFromChapters(fit.windows, merge.chapters, late, gatherFor).windows;
                       await stamp(`crowd rows and chapters fitted to the late duration ${late.toFixed(1)}s`);
                       if (stale()) return;
                     }
                     if (opts.malId != null && !detectRun) {
-                      detectRun = runDetect(late, modeFor("op") !== "off", modeFor("ed") !== "off");
+                      detectRun = runDetect(late, modeFor("op") !== "off", wantEdFor(late), edCardOnly());
                     }
                   } else {
                     console.info(
@@ -3561,14 +3692,17 @@ export default function App() {
                   const wantOp = !hasKind("op") && modeFor("op") !== "off";
                   const wantEd = !hasKind("ed") && modeFor("ed") !== "off";
                   if ((wantOp || wantEd) && fileDuration > 0) {
-                    detectRun = runDetect(fileDuration, wantOp, wantEd);
+                    detectRun = runDetect(fileDuration, wantOp, wantEd, false);
                   }
                 }
-                // Nothing to detect (ED off, every kind already supplied, or
-                // detection switched off): still read the media end with a
-                // probe-only detect, for the end-of-stream detectors.
+                // Nothing to detect (no MAL id with ED off, every kind already
+                // supplied, or detection switched off): still read the media
+                // end with a probe-only detect, for the end-of-stream
+                // detectors. Without a MAL id an ending on Off is not read for
+                // the card: it could only be Layer 3, which is Risky and never
+                // raises it.
                 if (!detectRun && fileDuration > 0) {
-                  detectRun = runDetect(fileDuration, false, false);
+                  detectRun = runDetect(fileDuration, false, false, false);
                 }
                 if (detectRun) await detectRun;
                 // No detect ever ran for a kind it was holding (no duration).
@@ -3578,11 +3712,13 @@ export default function App() {
               }
             };
 
-            if (allModesOff || isMovie) {
+            if (isMovie || (allModesOff && !nextUpOn)) {
               // No lookups and nothing stamped beyond the empty list: only the
               // probe-only detect (runDetect with no kind) for the media end.
               // A movie always takes this path (no OP / ED slot), whatever the
-              // skip modes say.
+              // skip modes say; so does a series with every kind off while the
+              // Next-Up card is off too (with the card on, its ending is still
+              // gathered: `gatherFor`).
               if (isMovie) console.info(`[auraskip] movie: no skip windows; reading the media end only`);
               await finishWithChapters([], { streamUrl: stream.url ?? null, isAnime: false, probeOnly: true });
               return;
@@ -3605,7 +3741,7 @@ export default function App() {
               : withDeadline(
                   fetchIntroDbWindows(introDbImdb, introDbNumberings(target, detail ?? null))
                     .then(({ windows }) => windows
-                      .filter((w) => modeFor(w.kind) !== "off")
+                      .filter((w) => gatherFor(w.kind) !== "off")
                       .map((w): PreparedWindow => ({
                         type:   w.kind,
                         start:  w.start,
@@ -3854,7 +3990,7 @@ export default function App() {
                 let pmdbWindows: PreparedWindow[] = [];
                 if (laTmdb != null && Number.isFinite(laSeason) && Number.isFinite(laEpisode)) {
                   pmdbWindows = await fetchPublicmetadbWindows(
-                    laTmdb, "tv", laSeason, laEpisode, modeFor,
+                    laTmdb, "tv", laSeason, laEpisode, gatherFor,
                   );
                   console.info(
                     `[publicmetadb] no mal_id for ${seriesId}: ` +
@@ -3973,7 +4109,7 @@ export default function App() {
                 }
                 if (result.found && result.windows.length > 0) {
                   prepared = result.windows
-                    .filter((w) => modeFor(w.kind) !== "off")
+                    .filter((w) => gatherFor(w.kind) !== "off")
                     .map((w) => ({
                       type:    w.kind,
                       start:   w.start,
@@ -4010,10 +4146,10 @@ export default function App() {
                   if (animeTmdb != null) {
                     const pmdb = idHasSeason
                       ? await fetchPublicmetadbWindows(
-                        animeTmdb, "tv", target.season ?? 1, seasonEpisodeNum, modeFor,
+                        animeTmdb, "tv", target.season ?? 1, seasonEpisodeNum, gatherFor,
                       )
                       : await fetchPublicmetadbWindows(
-                        animeTmdb, "tv", 1, episodeNum, modeFor, malId,
+                        animeTmdb, "tv", 1, episodeNum, gatherFor, malId,
                       );
                     for (const w of pmdb) {
                       if (w.type === "op" && !haveOp) prepared.push(w);
@@ -4463,6 +4599,11 @@ export default function App() {
   // churn the payload. NOTE: turning a kind OFF drops its window from the
   // cache, so toggling it back ON mid-episode won't restore it until the next
   // load — the common auto<->prompt flip (the reported bug) is fully live.
+  // (Within one load, the chain's live re-stamp recomposes from what it
+  // GATHERED, so a kind that was on at load comes back at once; what cannot
+  // come back is a kind that was Off when the episode started. An ending is
+  // the exception while the Next-Up card was on at load: the chain gathers it
+  // even on Off, `gatherFor`.)
   useEffect(() => {
     const restampSkipModes = async () => {
       try {
@@ -4619,9 +4760,13 @@ export default function App() {
   // We route the user to Settings; the section anchor is consumed by
   // SettingsView's TOC scroll-spy which will scroll the matching
   // section into view on next paint if `section` is non-empty.
+  // Both handlers close an open detail page first: it covers the view, so
+  // without that the page switched UNDER it and the detail page's Back
+  // revealed Settings instead of the page the user came from.
   useEffect(() => {
     const onOpen = (e: Event) => {
       const detail = (e as CustomEvent<{ section?: string }>).detail;
+      closeDetail();
       setActiveCatalog(null);
       setActiveView("settings");
       if (detail?.section && typeof detail.section === "string") {
@@ -4637,6 +4782,7 @@ export default function App() {
     // to when nothing installed can do the job (Settings cannot fix that).
     // Mirrors NavSidebar's onNavigate.
     const onOpenAddons = () => {
+      closeDetail();
       setActiveCatalog(null);
       setActiveView("addons");
     };
@@ -4646,7 +4792,7 @@ export default function App() {
       window.removeEventListener("aura:open-settings", onOpen);
       window.removeEventListener("aura:open-addons", onOpenAddons);
     };
-  }, []);
+  }, [closeDetail]);
 
   // ── Reduced-motion attribute live-updater ──
   // main.tsx runs the initial application synchronously before React
@@ -4858,9 +5004,21 @@ export default function App() {
   const nextUpResolvedFor = useRef<string | null>(null);
   /** The Next-Up gate's inputs for the loaded FILE, announced by the skip
    *  chain inside handlePlayStream (`aura:next-up-timing`): the end of a
-   *  TRUSTED ending (Layer 1 only) and the detector's media end. Read by the
-   *  display gate through nextUpGate.ts. Reset per load and on target change. */
-  const nextUpTimingRef = useRef<NextUpTiming>({ trustedEdEnd: null, mediaEnd: null });
+   *  TRUSTED ending (Layer 1 only), the detector's media end, the ending whose
+   *  start raises the card and the preview window. Read by the display gate,
+   *  the banner and the fade through nextUpGate.ts. Reset per load and on
+   *  target change. */
+  const nextUpTimingRef = useRef<NextUpTiming>(emptyNextUpTiming());
+  /** The earliest trigger the visible card was raised at, or null while it is
+   *  down. A later stamp can withdraw the ending that raised it (the trigger
+   *  falls back to the ED end or the lead time); the hide and fade rules read
+   *  this so the card is neither taken down in the middle of the credits nor
+   *  treated as one raised after them. */
+  const nextUpShownAtRef = useRef<number | null>(null);
+  /** The PLAYHEAD when the visible card went up, or null while it is down.
+   *  The fade reads this, not the trigger: a card first raised past the
+   *  ending's end (a resume, a seek, the fallback) must not be born faded. */
+  const nextUpRaisedTimeRef = useRef<number | null>(null);
   /** Display flag derived from the conditions above. Driving this
    *  through state (rather than computing inline at render) lets us
    *  log the transition once for debugging without spamming the
@@ -4946,6 +5104,12 @@ export default function App() {
       nextUpTimingRef.current = {
         trustedEdEnd: finite(d?.trustedEdEnd),
         mediaEnd: finite(d?.mediaEnd),
+        mediaEndMeasured: finite(d?.mediaEndMeasured),
+        edStart: finite(d?.edStart),
+        edEnd: finite(d?.edEnd),
+        edRisky: d?.edRisky === true,
+        previewStart: finite(d?.previewStart),
+        previewEnd: finite(d?.previewEnd),
       };
     };
     window.addEventListener("aura:next-up-timing", onTiming);
@@ -4968,7 +5132,7 @@ export default function App() {
     setEosActive(false);
     setAutoAdvanceCancelled(false);
     nextUpResolvedFor.current = null;
-    nextUpTimingRef.current = { trustedEdEnd: null, mediaEnd: null };
+    nextUpTimingRef.current = emptyNextUpTiming();
     // Don't reset nextUpDismissedFor here — App.tsx unmounts the
     // PlayerOverlay on exit which clears activeTarget; clearing the
     // dismiss ref on EVERY target change would re-show the CTA after
@@ -4995,16 +5159,18 @@ export default function App() {
   // episode audio), so the next episode's theme match needs no theme download
   // and can prompt within seconds. The cour is the next video's own MAL pair
   // (AIOMetadata), else the playing cour when the next video is simply the
-  // following episode of the same season. Skipped with detection off, with
-  // both kinds off, or without ffmpeg (it never triggers the ffmpeg download).
+  // following episode of the same season. Skipped with detection off or
+  // without ffmpeg (it never triggers the ffmpeg download). The ending is
+  // always warmed: this runs only while the Next-Up card is on (the
+  // pre-resolve effect returns at a lead time of 0), and the card times
+  // itself from the ending even with Endings set to Off.
   // Typical cost: one paced AnimeThemes GET when the list is not cached and
   // about 2 MB per theme not already fingerprinted; the audio is dropped.
   const prefetchNextThemes = useCallback((nextVideo: VideoEntry, currentId: string): void => {
     if (loadAuraSettings().autoSkipDetect === false) return;
     const modes = skipModesRef.current;
     const wantOp = modes.op !== "off";
-    const wantEd = modes.ed !== "off";
-    if (!wantOp && !wantEd) return;
+    const wantEd = true;
     let malId: number | null = null;
     let malEpisode: number | null = null;
     let how = "";
@@ -5113,14 +5279,25 @@ export default function App() {
     })();
   }, [activeTarget, time, duration, addons, nextUpLeadSeconds, prefetchNextThemes]);
 
-  // DISPLAY-GATE effect. ONE expression, in nextUpGate.ts: with a TRUSTED
-  // ending (Layer 1) the card appears at max(ED end, end - lead), so never
-  // inside the ending and never over the story that follows it; without one,
-  // at end - lead. "end" is the detector's media end when known. A crowd,
-  // chapter or Layer 3 ED START is never a trigger: the card used to appear as
-  // the credits began and, with auto-advance on, left 5-30 s later, skipping
-  // every after-credits scene and preview. The card itself has NO countdown
-  // (NextUpCta.tsx); an unattended advance only happens at end of stream.
+  // The latch lives exactly as long as the card is up: every path that takes
+  // it down (seek back, dismissal, a new load, truncation, EOS) clears it.
+  // Declared BEFORE the display gate, so in a commit that both took the card
+  // down and raised it again the clear runs first and the new latch stands.
+  useEffect(() => {
+    if (!nextUpVisible) {
+      nextUpShownAtRef.current = null;
+      nextUpRaisedTimeRef.current = null;
+    }
+  }, [nextUpVisible]);
+
+  // DISPLAY-GATE effect. ONE expression, in nextUpGate.ts: the card appears as
+  // the elected ending STARTS (any source and level, Verified first; a Risky
+  // one raises it together with its prompt); without one, with a TRUSTED ending (Layer 1) at max(ED end, end - lead), else at
+  // end - lead. "end" is the detector's media end when known. The card has NO
+  // countdown (NextUpCta.tsx), so appearing at the ED start costs nothing: an
+  // unattended advance only happens at end of stream, after any after-credits
+  // scene or preview. The countdown that used to start here is what skipped
+  // them.
   useEffect(() => {
     if (!activeTarget) {
       if (nextUpVisible) setNextUpVisible(false);
@@ -5136,6 +5313,10 @@ export default function App() {
     const shouldShow = !streamTruncatedRef.current
       && nextUpShouldShow(time, timing, duration, nextUpLeadSeconds);
     if (shouldShow) {
+      const at = nextUpTriggerAt(timing, duration, nextUpLeadSeconds);
+      const shownAt = nextUpShownAtRef.current;
+      if (at != null) nextUpShownAtRef.current = shownAt == null ? at : Math.min(shownAt, at);
+      if (nextUpRaisedTimeRef.current == null) nextUpRaisedTimeRef.current = time;
       if (!nextUpVisible) setNextUpVisible(true);
       return;
     }
@@ -5144,7 +5325,8 @@ export default function App() {
     // at the ED end is never taken down by the lead-time arithmetic.
     if (
       nextUpVisible
-      && (streamTruncatedRef.current || nextUpShouldHide(time, timing, duration, nextUpLeadSeconds))
+      && (streamTruncatedRef.current
+        || nextUpShouldHide(time, timing, duration, nextUpLeadSeconds, nextUpShownAtRef.current))
     ) {
       setNextUpVisible(false);
     }
@@ -6273,15 +6455,19 @@ export default function App() {
     lastStatsTickRef.current = Date.now();
   }, [activeTarget?.id, activeTarget?.media_type, isLivePlayback, isTrailerPlayback]);
   useEffect(() => {
-    if (!activeTarget || paused || isLivePlayback || isTrailerPlayback) {
+    // A load or mid-play stall (`buffering`) and a lost stream are not
+    // watching: the clock only runs while frames can be advancing.
+    if (!activeTarget || paused || buffering || streamBroken || isLivePlayback || isTrailerPlayback) {
       lastStatsTickRef.current = null;
       return;
     }
-    const id = setInterval(() => {
+    const flush = () => {
       const now = Date.now();
-      const last = lastStatsTickRef.current ?? now;
-      const delta = (now - last) / 1000;
+      const last = lastStatsTickRef.current;
       lastStatsTickRef.current = now;
+      if (last === null) return;
+      const delta = (now - last) / 1000;
+      if (delta <= 0) return;
       // Pick a kind based on media type + anime detection. CRITICAL: use
       // the SERIES-ROOT id (series_id), not activeTarget.id — for series
       // the latter is the EPISODE id (tt…:S:E), which never matches the
@@ -6304,10 +6490,13 @@ export default function App() {
         ? "watched_anime_secs"
         : (activeTarget.media_type === "movie" ? "watched_movie_secs" : "watched_series_secs");
       invoke("bump_stat", { kind, delta }).catch(() => {});
-    }, 5000);
+    };
+    const id = setInterval(flush, 5000);
     lastStatsTickRef.current = Date.now();
-    return () => clearInterval(id);
-  }, [activeTarget, paused, isLivePlayback, isTrailerPlayback]);
+    // Flush the partial interval on the way out: a pause, a stall or a
+    // re-run for a new target used to drop up to 5 s of watch time each.
+    return () => { clearInterval(id); flush(); };
+  }, [activeTarget, paused, buffering, streamBroken, isLivePlayback, isTrailerPlayback]);
 
   // ── Keep the display awake during active playback ──
   // Belt-and-suspenders alongside mpv's own stop-screensaver: assert the
@@ -7881,8 +8070,8 @@ export default function App() {
   // visual feedback they get from the wheel handler — but we DON'T let
   // the keydown wake the auto-hidden control bar. PlayerOverlay's
   // useAutoHide reads `silentWakeKeys` and skips its `wake()` call for
-  // these codes, matching mousewheel behaviour. Step is 2 % (vs 5 % for
-  // mousewheel) so keyboard users have finer-grained control.
+  // these codes, matching mousewheel behaviour. Step is 5 %, the same as
+  // one mousewheel notch, so both inputs move the volume alike.
   const bumpVolumeFromKey = useCallback((delta: number) => {
     const next = Math.max(0, Math.min(VOLUME_MAX, volume + delta));
     commitVolumeAndSave(next);
@@ -7918,8 +8107,8 @@ export default function App() {
       // re-registering the bindings.
       "seek-back":        () => wtSeekRelative(-loadAuraSettings().seekStepSeconds),
       "seek-forward":     () => wtSeekRelative(loadAuraSettings().seekStepSeconds),
-      "volume-up":        () => bumpVolumeFromKey(2),
-      "volume-down":      () => bumpVolumeFromKey(-2),
+      "volume-up":        () => bumpVolumeFromKey(5),
+      "volume-down":      () => bumpVolumeFromKey(-5),
       "toggle-osd":       () => window.dispatchEvent(new CustomEvent("aura:toggle-osd")),
       "cycle-shader":     () => window.dispatchEvent(new CustomEvent("aura:cycle-shader")),
       "toggle-subtitles": () => setSubsOpen((v) => !v),
@@ -8718,6 +8907,7 @@ export default function App() {
     // (its token) so nothing it still has in flight stamps, and cancel the
     // detect so its ffmpeg passes stop reading the stream.
     skipChainSeqRef.current += 1;
+    resetSkipMatch();
     setDetectedMediaEnd(null);
     void invoke("skip_detect", { action: { op: "cancel" } }).catch(() => {});
 
@@ -10494,6 +10684,8 @@ export default function App() {
           avoidDubs={avoidDubs}
           userRegion={userRegion}
           silentWakeCodes={[keybindings["volume-up"], keybindings["volume-down"]]}
+          // Missing until settings load (Rust merges the default in): X.
+          skipKeybinding={keybindings["skip-segment"] ?? "KeyX"}
           episodePanel={(() => {
             // In-playback episode drawer data (EOS Spotlight Phase 4).
             // Series/anime only — null for movies so PlayerOverlay
@@ -10558,6 +10750,7 @@ export default function App() {
           onRescan={cast.rescan}
           onPick={cast.pickDevice}
           connectingId={cast.connectingId}
+          connectingStage={cast.connectingStage}
           error={cast.error}
           isFullscreen={isFullscreen}
         />
@@ -10581,7 +10774,8 @@ export default function App() {
       {/* Next-Up CTA — sibling to PlayerOverlay. The CTA's own root
           uses `fixed` positioning + `z-[10001]` (above PlayerOverlay's
           `z-[9999]`) so its click handlers win over the overlay's
-          invisible "tap to play/pause" layer. Mounts only after the
+          invisible "tap to play/pause" layer. It sits top left, under
+          PlayerOverlay's skip prompt (playerStack.ts). Mounts only after the
           pre-resolve flow has populated `nextUpInfo` AND the display
           gate has tripped (ED-end for anime / lead-time fallback).
           MUTUAL EXCLUSION (EOS Spotlight): suppressed entirely while
@@ -10589,10 +10783,29 @@ export default function App() {
           end-of-stream surface and owns the next-episode decision; a
           small corner CTA underneath it would be redundant + fight for
           the click. */}
+      {/* StackPresence fades the card out instead of dropping it (a Play, a
+          dismiss, the end screen taking over); not when leaving the player. */}
+      <StackPresence animate={isPlayerActive}>
       {!eosActive && isPlayerActive && nextUpInfo && nextUpVisible && (
         <NextUpCta
           episode={nextUpInfo.episode}
           libraryById={libraryById}
+          // What follows the ending, said only as far as it is measured.
+          tailNote={nextUpTailNote(nextUpTimingRef.current, duration, time)}
+          // Past the ending's end the user is watching what follows it: a
+          // card raised before then fades with the player controls instead of
+          // covering it (one first raised after it stays up). A card raised by
+          // a Risky ending shows only with the controls from the start, like
+          // that ending's prompt (nextUpGate rule 5).
+          fadeWithControls={nextUpFollowsControls(
+            nextUpTimingRef.current, duration, time, nextUpRaisedTimeRef.current,
+          )}
+          controlsVisible={playerControlsVisible}
+          top={playerStackTop(isFullscreen)}
+          // Mounted only while the card is up, so the key is bound exactly
+          // then. Missing until settings load (Rust merges the default in).
+          hotkey={keybindings["play-next-episode"] ?? "Shift+KeyX"}
+          holdToSkip={loadAuraSettings().nextUpHoldToSkip}
           loading={false}
           noStream={nextUpInfo.stream == null}
           skipTag={nextUpInfo.canon ? formatEpisodeTag(nextUpInfo.canon.episode) : null}
@@ -10617,6 +10830,33 @@ export default function App() {
           autoAdvanceStreak={autoAdvanceStreakRef.current}
         />
       )}
+      </StackPresence>
+
+      {/* The card's banner on its own, for an episode with no card to carry it
+          (no next episode: the latest aired one, a finale; or the lookup
+          failed). Same gate as the card, so it is not shown with the Next-Up
+          lead time at 0 or after the card was dismissed, and it goes with the
+          note once the ending is over. */}
+      <StackPresence animate={isPlayerActive}>
+      {!eosActive && isPlayerActive && !nextUpInfo && activeTarget
+        && nextUpDismissedFor.current !== activeTarget.id
+        && !streamTruncatedRef.current
+        && nextUpShouldShow(time, nextUpTimingRef.current, duration, nextUpLeadSeconds)
+        && (() => {
+          const note = nextUpTailNote(nextUpTimingRef.current, duration, time);
+          // Under a Risky ending it follows the controls with the prompt above
+          // it. It has no fade point of its own: it goes with the ending.
+          const timing = nextUpTimingRef.current;
+          const withControls = timing.edRisky && nextUpFollowsControls(timing, duration, time, null);
+          return note ? (
+            <NextUpTailPill
+              note={note}
+              top={playerStackTop(isFullscreen)}
+              hidden={withControls && !playerControlsVisible}
+            />
+          ) : null;
+        })()}
+      </StackPresence>
 
       {/* ── EOS Spotlight — full-screen end-of-stream surface (spec
           2026-05-19). App-level sibling like NextUpCta / the recovery

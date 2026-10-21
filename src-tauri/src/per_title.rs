@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -44,7 +45,14 @@ pub struct TitleState {
 // ---------------------------------------------------------------------------
 
 static CACHE: OnceLock<Mutex<HashMap<String, TitleState>>> = OnceLock::new();
-static FILE_LOCK: Mutex<()> = Mutex::new(());
+/// Holds the sequence number of the last snapshot written. Snapshots are
+/// numbered under the CACHE lock but written after it is released, so two
+/// quick writes can reach the file out of order; an older one is skipped.
+static FILE_LOCK: Mutex<u64> = Mutex::new(0);
+static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Set once the map has been read from disk (or replaced by a sync pull).
+/// An empty map is a valid loaded state, so emptiness cannot mean "unread".
+static LOADED: AtomicBool = AtomicBool::new(false);
 
 fn cache() -> &'static Mutex<HashMap<String, TitleState>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -60,14 +68,27 @@ fn load_from_disk<R: Runtime>(app: &AppHandle<R>) -> HashMap<String, TitleState>
     let _guard = FILE_LOCK.lock().ok();
     let Some(p) = path(app) else { return HashMap::new(); };
     let Ok(text) = std::fs::read_to_string(&p) else { return HashMap::new(); };
-    serde_json::from_str(&text).unwrap_or_default()
+    match serde_json::from_str(&text) {
+        Ok(map) => map,
+        Err(e) => {
+            crate::devlog!(warn, "per-title", "per_title.json unparseable, starting empty: {e}");
+            HashMap::new()
+        }
+    }
 }
 
-fn save_to_disk<R: Runtime>(app: &AppHandle<R>, map: &HashMap<String, TitleState>) {
-    let _guard = FILE_LOCK.lock().ok();
+fn save_to_disk<R: Runtime>(app: &AppHandle<R>, map: &HashMap<String, TitleState>, seq: u64) {
+    let Ok(mut last) = FILE_LOCK.lock() else { return; };
+    if seq <= *last { return; }
+    *last = seq;
     let Some(p) = path(app) else { return; };
     if let Ok(text) = serde_json::to_string_pretty(map) {
-        let _ = std::fs::write(p, text);
+        // Temp + rename: a crash mid-write must not leave a truncated
+        // file, which would load as an empty map and be saved over.
+        let tmp = p.with_extension("json.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &p);
+        }
     }
 }
 
@@ -76,10 +97,11 @@ fn ensure_loaded<R: Runtime>(app: &AppHandle<R>) {
         Ok(g) => g,
         Err(_) => return,
     };
-    // Empty cache + first call → pull from disk. After that, the in-mem
-    // map is the source of truth (writes touch both).
-    if guard.is_empty() {
+    // First call → pull from disk. After that, the in-mem map is the
+    // source of truth (writes touch both).
+    if !LOADED.load(Ordering::Acquire) {
         *guard = load_from_disk(app);
+        LOADED.store(true, Ordering::Release);
     }
 }
 
@@ -102,8 +124,8 @@ pub async fn get_title_state<R: Runtime>(
 }
 
 /// Merge `patch` into the saved state for `{media_type}:{id}`. Fields
-/// that are `None` in the patch are left alone; fields that are present
-/// (even with a `null` JSON value) overwrite. Persists to disk.
+/// that are `None` in the patch (omitted or JSON `null`) are left alone;
+/// fields with a value overwrite. Persists to disk.
 #[tauri::command]
 pub async fn set_title_state<R: Runtime>(
     app: AppHandle<R>,
@@ -114,18 +136,18 @@ pub async fn set_title_state<R: Runtime>(
     ensure_loaded(&app);
     let key = format!("{media_type}:{id}");
 
-    let snapshot = {
+    let (snapshot, seq) = {
         let mut guard = cache().lock().map_err(|e| e.to_string())?;
         let entry = guard.entry(key).or_default();
         if patch.volume.is_some()     { entry.volume     = patch.volume; }
         if patch.shader.is_some()     { entry.shader     = patch.shader; }
         if patch.audio_lang.is_some() { entry.audio_lang = patch.audio_lang; }
         if patch.sub_lang.is_some()   { entry.sub_lang   = patch.sub_lang; }
-        guard.clone()
+        (guard.clone(), WRITE_SEQ.fetch_add(1, Ordering::SeqCst) + 1)
     };
 
     // Persist outside the lock so disk I/O doesn't block other readers.
-    save_to_disk(&app, &snapshot);
+    save_to_disk(&app, &snapshot, seq);
     // Fire a JS-side change event for sync.ts to debounce + push.
     use tauri::Emitter;
     let _ = app.emit("title-state-changed", ());
@@ -164,10 +186,12 @@ pub async fn set_all_title_state<R: Runtime>(
     app: AppHandle<R>,
     state: HashMap<String, TitleState>,
 ) -> Result<(), String> {
-    {
+    let seq = {
         let mut guard = cache().lock().map_err(|e| e.to_string())?;
         *guard = state.clone();
-    }
-    save_to_disk(&app, &state);
+        LOADED.store(true, Ordering::Release);
+        WRITE_SEQ.fetch_add(1, Ordering::SeqCst) + 1
+    };
+    save_to_disk(&app, &state, seq);
     Ok(())
 }

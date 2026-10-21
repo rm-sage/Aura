@@ -61,12 +61,9 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
   // scroll overflow).
   const [hover, setHover] = useState<HoverState | null>(null);
   // Window: floor `now` to the hour so the in-progress programme is visible,
-  // spanning WINDOW_HOURS forward. Recomputed only when the hour rolls over.
-  const windowStart = useMemo(() => {
-    const d = new Date(nowMs);
-    d.setMinutes(0, 0, 0);
-    return d.getTime();
-  }, [Math.floor(nowMs / 3_600_000)]); // eslint-disable-line react-hooks/exhaustive-deps
+  // spanning WINDOW_HOURS forward. Changes only when the LOCAL hour rolls over
+  // (a UTC-hour bucket rolls at :30 in half-hour zones such as India).
+  const windowStart = new Date(nowMs).setMinutes(0, 0, 0);
   const windowEnd = windowStart + WINDOW_HOURS * 3_600_000;
   const timelineW = WINDOW_HOURS * 60 * PX_PER_MIN;
 

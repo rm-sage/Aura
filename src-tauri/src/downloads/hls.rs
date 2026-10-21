@@ -860,7 +860,14 @@ async fn passthrough(
             biased;
 
             changed = stop.changed() => {
-                if changed.is_ok() && stop.borrow_and_update().is_some() {
+                // A dropped sender resolves `changed()` at once on every poll,
+                // and `biased` would then spin here without ever reaching the
+                // child poll below. Same answer as the HTTP transport.
+                if changed.is_err() {
+                    kill_tree(&mut child, pid);
+                    return Outcome::Transient("The download was interrupted.".into());
+                }
+                if stop.borrow_and_update().is_some() {
                     kill_tree(&mut child, pid);
                     // Pause is not offered for this kind, so any stop is
                     // effectively a cancel: there is nothing resumable.

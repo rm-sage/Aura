@@ -79,6 +79,10 @@ export function useRowWindow(
   // re-runs the range when the grid MOVES without a scroll (content above
   // it changing height), which a ref alone would not.
   const [gridTop, setGridTop] = useState(0);
+  // Viewport height, for the same reason: a taller window at the same column
+  // count changes no other input, so the rows it uncovers stayed unmounted
+  // until the next scroll.
+  const [viewH, setViewH] = useState(0);
 
   useLayoutEffect(() => {
     const scroll = scrollRef.current;
@@ -103,6 +107,8 @@ export function useRowWindow(
       const top = wrapRect.top - scrollRect.top + scroll.scrollTop;
       gridTopRef.current = top;
       setGridTop((prev) => (Math.abs(prev - top) < 0.5 ? prev : top));
+      const vh = scroll.clientHeight;
+      setViewH((prev) => (prev === vh ? prev : vh));
     };
     measure();
     const ro = new ResizeObserver(measure);
@@ -137,7 +143,7 @@ export function useRowWindow(
     compute();
     scroll.addEventListener("scroll", compute, { passive: true });
     return () => scroll.removeEventListener("scroll", compute);
-  }, [scrollRef, cols, rowStride, itemCount, bufferRows, gridTop]);
+  }, [scrollRef, cols, rowStride, itemCount, bufferRows, gridTop, viewH]);
 
   const totalRows = Math.ceil(itemCount / cols);
   const totalHeight = totalRows > 0 ? totalRows * rowStride - gap : 0;

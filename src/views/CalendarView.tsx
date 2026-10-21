@@ -180,6 +180,8 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
   useEffect(() => {
     if (addons.length === 0 || library.length === 0) {
       setDetails(new Map());
+      // A run this one superseded never reaches its own setLoading(false).
+      setLoading(false);
       return;
     }
     let cancelled = false;
@@ -206,13 +208,22 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
 
     // Throttled flush so cached-item bursts and slow misses both paint
     // progressively without one setState per item (~150 re-renders).
+    // Partial flushes MERGE over what is shown: a library refresh (the focus
+    // refetch) re-runs this scan, and replacing with the partial map would
+    // blank every item not yet re-resolved until the scan finished. The final
+    // write below replaces, which prunes items that left the library.
     const acc = new Map<string, MetaDetail | null>();
     let flushTimer: number | null = null;
     const scheduleFlush = () => {
       if (flushTimer != null) return;
       flushTimer = window.setTimeout(() => {
         flushTimer = null;
-        if (!cancelled) setDetails(new Map(acc));
+        if (cancelled) return;
+        setDetails((prev) => {
+          const next = new Map(prev);
+          for (const [k, v] of acc) next.set(k, v);
+          return next;
+        });
       }, 200);
     };
 

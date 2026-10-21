@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import {
-  createContext, useState, useEffect, useLayoutEffect, useCallback, useContext, useId, useMemo, useRef,
+  createContext, Fragment, useState, useEffect, useLayoutEffect, useCallback, useContext, useId, useMemo,
+  useRef,
 } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
@@ -34,7 +35,7 @@ import type { AddonEntry, ThemeId, KeybindAction } from "../types";
 import type { UserSession } from "../LoginView";
 import { KEYBIND_ACTIONS } from "../types";
 import { useTheme, THEME_LABELS, THEME_DESCRIPTIONS } from "../ThemeEngine";
-import { prettyBinding, formatBinding } from "../useKeybindings";
+import { prettyBinding, formatBinding, parseBinding } from "../useKeybindings";
 import {
   loadAuraSettings,
   saveAuraSettings,
@@ -1965,17 +1966,19 @@ function NextUpLeadTimeRow({
       className="space-y-2"
       data-settings-row=""
       data-settings-label="Next-Up lead time"
-      data-settings-description="Seconds before an episode ends to surface the Next Up card during series / anime playback. On anime where the ending theme was matched, the card waits until the ending is over (never during it), at this lead time or the ending's end, whichever is later. Set to 0 to disable the prompt entirely. The card never appears for movies or for the last aired episode of a series."
+      data-settings-description="Seconds before an episode ends to surface the Next Up card during series / anime playback, when Aura has not located a reliable start of the ending. When it has, the card appears as the ending begins and, when Aura can tell, says what still plays after the credits. When it only knows where a matched ending stops, the card waits for that point or this lead time, whichever is later. Set to 0 to disable the prompt entirely. The card never appears for movies or for the last aired episode of a series."
     >
       <div>
         <p className="text-white/75 text-sm font-medium">Next-Up lead time</p>
         <p className="text-white/35 text-xs mt-0.5">
           Seconds before an episode ends to surface the "Next Up" card
-          during series / anime playback. On anime where the ending theme
-          was matched, the card waits until the ending is over (never
-          during it), at this lead time or the ending's end, whichever is
-          later. Set to 0 to disable the prompt entirely. The card never
-          appears for movies or for the last aired episode of a series.
+          during series / anime playback, when Aura has not located a
+          reliable start of the ending. When it has, the card appears as the
+          ending begins and, when Aura can tell, says what still plays after
+          the credits. When it only knows where a matched ending stops, the
+          card waits for that point or this lead time, whichever is later.
+          Set to 0 to disable the prompt entirely. The card never appears for
+          movies or for the last aired episode of a series.
         </p>
       </div>
       <div className="flex items-center gap-2 flex-wrap">
@@ -3888,9 +3891,12 @@ interface KeybindRowProps {
   description: string;
   code: string;
   onChange: (next: string) => void;
+  /** Label of the action this row's key just moved to: the row glows red,
+   *  and says so, for as long as Settings stays open and the row is unbound. */
+  lostTo?: string;
 }
 
-function KeybindRow({ label, description, code, onChange }: KeybindRowProps) {
+function KeybindRow({ label, description, code, onChange, lostTo }: KeybindRowProps) {
   const [capturing, setCapturing] = useState(false);
   const ref = useRef<HTMLButtonElement>(null);
 
@@ -3930,6 +3936,8 @@ function KeybindRow({ label, description, code, onChange }: KeybindRowProps) {
     return () => window.removeEventListener("keydown", onKey, { capture: true } as any);
   }, [capturing, onChange]);
 
+  // Only while it is still unbound: rebinding it, or a reset, ends the glow.
+  const lost = !capturing && !code && !!lostTo;
   return (
     <button
       ref={ref}
@@ -3938,25 +3946,63 @@ function KeybindRow({ label, description, code, onChange }: KeybindRowProps) {
                   text-left transition-colors
                   ${capturing
                     ? "bg-ln-accent/15 border border-ln-accent/40"
-                    : "hover:bg-white/5 border border-white/8"
+                    : lost
+                      ? "aura-keybind-lost border border-rose-400/55"
+                      : "hover:bg-white/5 border border-white/8"
                   }`}
     >
       <div className="flex-1 min-w-0">
         <p className="text-white/75 text-sm font-medium">{label}</p>
         <p className="text-white/35 text-xs mt-0.5">{description}</p>
+        {lost && (
+          <p className="text-rose-300/90 text-xs mt-1">
+            Its key moved to {lostTo}. Click to bind a new one.
+          </p>
+        )}
       </div>
       <kbd
         className={`flex-shrink-0 min-w-[64px] px-2.5 py-1 rounded-md text-xs font-mono
                     text-center transition-colors
                     ${capturing
                       ? "bg-ln-accent/25 text-ln-accent border border-ln-accent/50"
-                      : "bg-white/8 text-white/75 border border-white/12"
+                      : lost
+                        ? "bg-rose-500/15 text-rose-200 border border-rose-400/45"
+                        : "bg-white/8 text-white/75 border border-white/12"
                     }`}
       >
         {capturing ? "Press a key…" : code ? prettyBinding(code) : "Unbound"}
       </kbd>
     </button>
   );
+}
+
+/** Bind `spec` to `action` and take it off every other action that had it,
+ *  so one key never runs two actions. Returns the labels of the actions that
+ *  lost the key, for a toast and a red row each. Specs are compared in canonical form, so a
+ *  hand-edited "Shift+Ctrl+KeyS" still counts as "Ctrl+Shift+KeyS". Only rows
+ *  Settings shows are cleared: a stale entry has no label to name. */
+function rebindKey(
+  current: Record<string, string>,
+  action: KeybindAction,
+  spec: string,
+): { map: Record<string, string>; moved: { id: KeybindAction; label: string }[] } {
+  const canon = (s: string) => {
+    const chord = parseBinding(s);
+    return chord ? formatBinding(chord) : null;
+  };
+  const target = canon(spec);
+  const map = { ...current, [action]: spec };
+  const moved: { id: KeybindAction; label: string }[] = [];
+  if (target == null) return { map, moved };
+  for (const other of KEYBIND_ACTIONS) {
+    if (other.id === action) continue;
+    const had = current[other.id];
+    if (had && canon(had) === target) {
+      map[other.id] = "";
+      moved.push({ id: other.id, label: other.label });
+    }
+  }
+  return { map, moved };
 }
 
 const MOUSE_BTN_LABELS: Record<number, string> = {
@@ -4847,6 +4893,10 @@ interface CrashReportingConfig {
 export default function SettingsView({ addons, session }: Props) {
   const [aura, setAura] = useState<AuraSettings>(loadAuraSettings);
   const [backend, setBackend] = useState<BackendSettings | null>(null);
+  // Keybinding rows whose key moved to another row this visit, and the label
+  // of the row it went to. Kept here so the red rows clear when Settings is
+  // left (this view unmounts) rather than on a timer the user might miss.
+  const [keysLostTo, setKeysLostTo] = useState<Partial<Record<KeybindAction, string>>>({});
   // Crash reporting consent + DSN live in a global sidecar (not the
   // per-scope AppSettings) so opting in once survives every Stremio
   // login / logout. See src-tauri/src/crash_reporting.rs.
@@ -5942,7 +5992,9 @@ export default function SettingsView({ addons, session }: Props) {
                 no skip for that segment, <span className="text-white/65">prompt</span> shows
                 a "Press X to skip" toast, <span className="text-white/65">auto</span> skips
                 without asking (once you are past a segment's halfway point, it
-                asks instead).
+                asks instead). The Skip Segment key (X by default, under
+                Keybindings) skips any segment playing now, including one
+                already auto-skipped that you went back into.
               </p>
               <SkipConfidenceLegend />
               <div className="h-px bg-white/6" />
@@ -5955,7 +6007,7 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SkipModeRow
                 label="Endings (ED)"
-                description="Endings often contain next-episode previews; prompt by default. On Auto, an ending skips by itself when it comes from the theme match (unless its song also plays over story), a chapter named as the ending, IntroDB or PublicMetaDB; AniSkip endings, guesses, IntroDB timings not yet confirmed by several submissions and an ending chapter that runs to the very end of the file (it may hold a scene after the credits) are among the cases that only prompt, and the prompt says why. A theme-matched ending stops where the song does, so an after-credits scene still plays. When the file's chapters mark a next-episode preview, it gets its own Skip Preview prompt, never skips by itself, and is hidden while this is Off."
+                description="Endings often contain next-episode previews; prompt by default. On Auto, an ending skips by itself when it comes from the theme match (unless its song also plays over story), a chapter named as the ending, IntroDB or PublicMetaDB; AniSkip endings, guesses, IntroDB timings not yet confirmed by several submissions and an ending chapter that runs to the very end of the file (it may hold a scene after the credits) are among the cases that only prompt, and the prompt says why. A theme-matched ending stops where the song does, so an after-credits scene still plays. When the file's chapters mark a next-episode preview, it gets its own Skip Preview prompt, never skips by itself, and is hidden while this is Off. Off never skips or prompts an ending, but while the Next Up card is on Aura still finds it, so the card can appear as the ending begins."
                 value={backend.skip_ed_mode}
                 onChange={(v) => patchBackend({ skip_ed_mode: v })}
               />
@@ -5979,7 +6031,7 @@ export default function SettingsView({ addons, session }: Props) {
                 <div className="h-px bg-white/6" />
                 <SettingToggle
                   label="Automatic skip detection"
-                  description="Find the opening and ending in the episode's own audio. For anime Aura can identify on MyAnimeList, it matches the show's theme songs from AnimeThemes on every episode: a match can auto-skip, and other timings more than 3 seconds away from it are dropped. Each theme song is downloaded once and only a fingerprint of it is kept. Where there is no theme song to match (most other series, or a season AnimeThemes does not list), Aura guesses a part nothing else covered from the audio, and a guess only ever prompts. Reads up to the first ten minutes and the last eight of the stream, leaving out a part you set to Off. On a first play the full match needs most of the song read first; before that, as soon as the song's first seconds match, an opening shows a Skip prompt, and it only skips by itself once the whole song is confirmed. Replays use the cache. When Aura looks up the next episode, it also fetches that episode's theme songs ahead of time (about 2 MB each; only the fingerprint is kept). ffmpeg downloads once (~97 MB) the first time it is needed. Turned off, Aura still reads the stream's header once when ffmpeg is already installed, to find where the episode really ends for autoplay. Per-type auto / prompt / off is still set above."
+                  description="Find the opening and ending in the episode's own audio. For anime Aura can identify on MyAnimeList, it matches the show's theme songs from AnimeThemes on every episode: a match can auto-skip, and other timings more than 3 seconds away from it are dropped. Each theme song is downloaded once and only a fingerprint of it is kept. Where there is no theme song to match (most other series, or a season AnimeThemes does not list), Aura guesses a part nothing else covered from the audio, and a guess only ever prompts. Reads up to the first ten minutes and the last eight of the stream, leaving out an opening you set to Off; an ending set to Off is still read while the Next Up card is on, to time the card (anime Aura can identify on MyAnimeList, episodes of 19 minutes or more, and never a reason to download ffmpeg). On a first play the full match needs most of the song read first; before that, as soon as the song's first seconds match, an opening shows a Skip prompt, and it only skips by itself once the whole song is confirmed. Replays use the cache. When Aura looks up the next episode, it also fetches that episode's theme songs ahead of time (about 2 MB each; only the fingerprint is kept). ffmpeg downloads once (~97 MB) the first time it is needed. Turned off, Aura still reads the stream's header once when ffmpeg is already installed, to find where the episode really ends for autoplay. Per-type auto / prompt / off is still set above."
                   value={aura.autoSkipDetect}
                   onChange={(v) => setLocal({ autoSkipDetect: v })}
                 />
@@ -6015,22 +6067,48 @@ export default function SettingsView({ addons, session }: Props) {
           {backend && (
             <Section id="sec-keybindings" title="Keybindings">
               <p className="text-white/40 text-xs">
-                Click a row, then press a key to bind it. Press Escape to cancel.
+                Click a row, then press a key to bind it. Press Escape to cancel. A key already in use moves to the new row, and the old row is left unbound.
               </p>
               <div className="space-y-1">
                 {KEYBIND_ACTIONS.map((a) => (
+                  <Fragment key={a.id}>
                   <KeybindRow
-                    key={a.id}
                     action={a.id}
                     label={a.label}
                     description={a.description}
                     code={backend.keybindings[a.id] ?? ""}
+                    lostTo={keysLostTo[a.id]}
                     onChange={async (next) => {
-                      const updatedMap = { ...backend.keybindings, [a.id]: next };
+                      const { map: updatedMap, moved } = rebindKey(backend.keybindings, a.id, next);
                       await patchBackend({ keybindings: updatedMap });
                       window.dispatchEvent(new CustomEvent("aura:keybindings-changed"));
+                      setKeysLostTo((prev) => {
+                        const nextLost = { ...prev };
+                        delete nextLost[a.id];
+                        for (const m of moved) nextLost[m.id] = a.label;
+                        return nextLost;
+                      });
+                      for (const { label } of moved) {
+                        showAppToast(
+                          `${prettyBinding(next)} moved from ${label} to ${a.label}. ${label} is now unbound.`,
+                          { duration: 5000 },
+                        );
+                      }
                     }}
                   />
+                  {/* The hold option belongs to this key, so it sits under
+                      its row rather than among the Next Up settings. */}
+                  {a.id === "play-next-episode" && (
+                    <div className="ml-5 rounded-lg border border-white/8 bg-white/[0.02] px-3 py-2.5">
+                      <SettingToggle
+                        label="Hold to skip filler / recap"
+                        description="When the Next Up card offers a skip past filler or recap, this key has to be held for 2 seconds to skip, with the card showing the episode it will land on, so a skip that marks several episodes is never a slip of the finger. Off, one press skips. Default on."
+                        value={aura.nextUpHoldToSkip}
+                        onChange={(v) => setLocal({ nextUpHoldToSkip: v })}
+                      />
+                    </div>
+                  )}
+                  </Fragment>
                 ))}
               </div>
             </Section>

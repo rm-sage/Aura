@@ -94,7 +94,15 @@ function chordMatches(chord: ParsedChord, e: KeyboardEvent): boolean {
       && chord.code === e.code;
 }
 
-function isTypingTarget(t: EventTarget | null): boolean {
+/** Does this keydown / keyup press the binding `spec`? Strict modifiers, as
+ *  everywhere else. For listeners that live outside `useKeybindings` (the
+ *  skip key, the Next Up card's hold-to-skip). An empty spec never matches. */
+export function bindingMatches(spec: string | null | undefined, e: KeyboardEvent): boolean {
+  const chord = spec ? parseBinding(spec) : null;
+  return chord != null && chordMatches(chord, e);
+}
+
+export function isTypingTarget(t: EventTarget | null): boolean {
   if (!(t instanceof HTMLElement)) return false;
   const tag = t.tagName;
   if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
@@ -126,7 +134,10 @@ export function useKeybindings({ bindings, handlers, enabled = true }: Options) 
         if (!chord) continue;
         if (!chordMatches(chord, e)) continue;
         const fn = handlers[action as KeybindAction];
-        if (!fn) return;
+        // An action handled elsewhere (skip-segment, play-next-episode) must
+        // not shadow another action bound to the same chord: the map comes
+        // from a Rust HashMap, so which one is reached first is arbitrary.
+        if (!fn) continue;
         e.preventDefault();
         e.stopPropagation();
         fn();

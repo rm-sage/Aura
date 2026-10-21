@@ -71,6 +71,8 @@ pub(super) async fn register_transcode(
     upstream: &str,
     device_host: &str,
     start_seconds: f64,
+    gen: u64,
+    probed: Option<super::transcode::Codecs>,
 ) -> Result<String, String> {
     // Defence in depth: ffmpeg's `-protocol_whitelist` must include `file`
     // for the HLS muxer to write segments, which would also let a `file://`
@@ -89,18 +91,30 @@ pub(super) async fn register_transcode(
     let ip = super::media_server::reachable_ip_for(device_host)
         .unwrap_or_else(super::media_server::lan_ip_fallback);
 
+    // ffprobe (blocking, network-bound) off the async runtime, unless the
+    // caller already probed this url to choose the route.
+    let codecs = match probed {
+        Some(c) => c,
+        None => {
+            let up = upstream.to_string();
+            tauri::async_runtime::spawn_blocking(move || super::transcode::probe(&up))
+                .await
+                .map_err(|e| e.to_string())?
+        }
+    };
+    if super::load_superseded(gen) {
+        return Err("cast load superseded".into());
+    }
+    // Re-resolved after the probe await (the component can be removed
+    // meanwhile), and before the temp dir exists so no early return leaks it.
+    let ffmpeg = super::transcode::ffmpeg_path()
+        .ok_or("ffmpeg.exe not found: cannot transcode this file for casting")?;
+
     let id = uuid::Uuid::new_v4().to_string();
     let dir = std::env::temp_dir().join(format!("aura-cast-hls-{id}"));
     std::fs::create_dir_all(&dir).map_err(|e| format!("temp dir create failed: {e}"))?;
-
-    let up = upstream.to_string();
     let dir2 = dir.clone();
-    // ffprobe (blocking, network-bound) off the async runtime.
-    let codecs = tauri::async_runtime::spawn_blocking(move || super::transcode::probe(&up))
-        .await
-        .map_err(|e| e.to_string())?;
 
-    let ffmpeg = super::transcode::ffmpeg_path().unwrap();
     let args = super::transcode::build_hls_args(upstream, &codecs, &dir2, start_seconds);
     let child = Command::new(ffmpeg)
         .args(&args)
@@ -132,6 +146,7 @@ pub(super) async fn register_transcode(
     // races the first-segment encode. Bail fast if ffmpeg exited early (bad
     // source / unsupported codec) rather than waiting out the full budget.
     let mut ready = false;
+    let mut superseded = false;
     for i in 0..450 {
         // 45 s ceiling
         if let Ok(body) = std::fs::read(&playlist) {
@@ -140,13 +155,22 @@ pub(super) async fn register_transcode(
                 break;
             }
         }
+        if super::load_superseded(gen) {
+            superseded = true;
+            break;
+        }
         if i % 10 == 9 && child_exited(&id) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     if !ready {
-        evict_one(&id);
+        // evict_one runs the blocking taskkill + rmdir: keep it off this worker.
+        let id2 = id.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || evict_one(&id2)).await;
+        if superseded {
+            return Err("cast load superseded".into());
+        }
         return Err("transcode failed to start (no playable output produced)".into());
     }
 

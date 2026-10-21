@@ -1006,6 +1006,11 @@ export function syncPullAll(): Promise<void> {
             const merger = MERGERS[ns];
             const merged = merger(local, blob.data);
             await writeLocal(ns, merged);
+            // The settings write is fromCloud and schedules no push. When the
+            // merge KEPT this device's newer blob (a change whose push never
+            // landed: app closed inside the debounce, or the push failed),
+            // push it here, or it would wait for the next local change.
+            if (ns === "settings" && merged === local) debouncedPush("settings");
             if (lastEtag.get(ns) !== blob.etag) {
               lastEtag.set(ns, blob.etag);
               etagsMutated = true;
@@ -1222,7 +1227,13 @@ export function installSyncTriggers(): void {
     if (!detail?.fromCloud) bumpSettingsUpdatedAt();
   });
 
-  window.addEventListener("aura:settings-changed",        () => debouncedPush("settings"));
+  // A cloud pull's own write is not a local change: pushing it back would
+  // re-upload the blob just merged (new etag, so the other device pulls
+  // and pushes it again). Same rule as history / skip-marks' silent writes.
+  window.addEventListener("aura:settings-changed", (e) => {
+    const detail = (e as CustomEvent<{ fromCloud?: boolean }>).detail;
+    if (!detail?.fromCloud) debouncedPush("settings");
+  });
   window.addEventListener("aura:keybindings-changed",     () => debouncedPush("settings"));
   window.addEventListener("aura:history-changed",         () => debouncedPush("history"));
   // API-key changes ride along with the settings blob (the

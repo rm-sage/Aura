@@ -129,10 +129,6 @@ export class Room {
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    if (this.state.getWebSockets().length >= MAX_MEMBERS) {
-      return new Response("room full", { status: 503 });
-    }
-
     // Stable per-install id (cid) so a reconnect reclaims the same roster slot +
     // leader-election ordering. The cid is VERIFIED against a per-install secret
     // (a seamless, password-free TOFU bearer capability — see auth.js): a cid
@@ -143,6 +139,7 @@ export class Room {
     // granted but never bound, so it keeps reconnect identity without protection.
     const rawCid = (url.searchParams.get("cid") || "").replace(/[^A-Za-z0-9]/g, "").slice(0, 16);
     let memberId = rawCid || crypto.randomUUID().slice(0, 8);
+    let provenHash = null; // set when the cid is proven by its secret; bound after the room-full check
     if (rawCid) {
       const { grant, hash } = await authorizeCid(
         this.meta.secrets[rawCid] ?? null,
@@ -151,9 +148,31 @@ export class Room {
       if (!grant) {
         memberId = crypto.randomUUID().slice(0, 8); // failed proof of ownership → new identity
       } else if (hash) {
-        this.meta.secrets[rawCid] = hash; // bind on first use (persisted by saveMeta below)
+        provenHash = hash;
       }
     }
+    // A client whose transport half-died (no close frame reached us) reconnects
+    // with the same cid while its old socket is still OPEN here: without this
+    // the roster lists the member twice until the stale socket times out. The
+    // client holds one socket at a time, so a same-cid socket is always stale.
+    // Only a secret-PROVEN cid may evict (a legacy unbound cid could be spoofed
+    // to kick its owner).
+    if (provenHash) {
+      for (const s of this.state.getWebSockets()) {
+        if (s.readyState !== 1 || (s.deserializeAttachment() || {}).id !== memberId) continue;
+        this.rates.delete(s);
+        try { s.close(4000, "replaced by a newer connection"); } catch { /* already closing */ }
+      }
+    }
+
+    // Count OPEN sockets only: a just-departed member's socket can linger in
+    // CLOSING (see roster()) and would otherwise lock a rejoin out of a full room.
+    if (this.state.getWebSockets().filter((s) => s.readyState === 1).length >= MAX_MEMBERS) {
+      return new Response("room full", { status: 503 });
+    }
+    // Bind on first use (persisted by saveMeta below). Only once admitted: a
+    // refused connect never joins `order`, so its secret would escape the GC.
+    if (provenHash) this.meta.secrets[rawCid] = provenHash;
     const member = {
       id: memberId,
       name: str(url.searchParams.get("name"), MAX_NAME) || "Guest",
@@ -442,8 +461,10 @@ export class Room {
   }
 
   async webSocketError(ws) {
-    await this.ensureMeta();
-    this.broadcastMembers();
+    // webSocketClose is not guaranteed to follow an error, so run the same
+    // departure cleanup (rate bucket, votes, staging strand, last-member-out).
+    // Every step is idempotent, so a close that does follow is harmless.
+    await this.webSocketClose(ws);
   }
 
   // ── helpers ──────────────────────────────────────────────────────────────

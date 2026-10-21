@@ -37,6 +37,10 @@ pub(super) struct Codecs {
     /// Video pixel format, e.g. `yuv420p` (8-bit 4:2:0) vs `yuv420p10le`
     /// (10-bit). Only 8-bit 4:2:0 h264 is safe to stream-copy.
     pub video_pix_fmt: Option<String>,
+    /// ffprobe's `format_name` (lowercased), e.g. `matroska,webm` or
+    /// `mov,mp4,m4a,3gp,3g2,mj2`. Read by `route_for_probe` for a url that
+    /// names no container.
+    pub format: Option<String>,
 }
 
 /// Audio codecs the Default Media Receiver plays without re-encoding.
@@ -61,14 +65,88 @@ const TRANSMUX_EXT: &[&str] = &[
     "ogv", "ogm", "divx", "rmvb", "rm", "asf", "3gp",
 ];
 
+/// Extensions that direct-play (or, for `.m3u8`, go to the device as HLS).
+/// With `TRANSMUX_EXT` this is every extension that settles the route on its
+/// own; a url ending in anything else is probed (`names_container`).
+const DIRECT_EXT: &[&str] = &["mp4", "m4v", "mov", "webm", "mp3", "m4a", "aac", "m3u8"];
+
+/// The url's path, lowercased, without its query or fragment.
+pub(super) fn url_path(url: &str) -> String {
+    url.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase()
+}
+
+/// The extension of the url's LAST path segment, if it has one.
+fn url_ext(url: &str) -> Option<String> {
+    let path = url_path(url);
+    let last = path.rsplit('/').next().unwrap_or("");
+    let (_, ext) = last.rsplit_once('.')?;
+    (!ext.is_empty()).then(|| ext.to_string())
+}
+
 /// Extension-based decision (no network probe — kept cheap so the cast
 /// hot path stays snappy; the codec probe runs only once a transmux is
 /// actually chosen). HLS/`.mp4`/`.webm` are NOT here — they direct-play.
 pub(super) fn should_transmux(url: &str) -> bool {
-    let path = url.split('?').next().unwrap_or("").to_ascii_lowercase();
-    match path.rsplit('.').next() {
-        Some(ext) => TRANSMUX_EXT.contains(&ext),
-        None => false,
+    url_ext(url).is_some_and(|ext| TRANSMUX_EXT.contains(&ext.as_str()))
+}
+
+/// Whether the url's extension settles the cast route. False for a debrid
+/// `/download/<id>` link, a `.bin`, or a host name read as an extension:
+/// those are probed before a Chromecast cast, because an MKV served from
+/// one used to go straight to the receiver, which cannot open it.
+pub(super) fn names_container(url: &str) -> bool {
+    url_ext(url).is_some_and(|ext| {
+        TRANSMUX_EXT.contains(&ext.as_str()) || DIRECT_EXT.contains(&ext.as_str())
+    })
+}
+
+/// The cast route a probe settles for a url that names no container.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum ProbedRoute {
+    /// An HLS playlist: handed to the device as is.
+    Hls,
+    /// Direct-play through the LAN proxy with this Content-Type.
+    Direct(&'static str),
+    /// A container the Default Media Receiver cannot open.
+    Transmux,
+    /// The probe read nothing usable: keep the extension-less default.
+    Unknown,
+}
+
+/// Video and audio codecs the receiver plays from a WebM container.
+const WEBM_VIDEO: &[&str] = &["vp8", "vp9", "av1"];
+const WEBM_AUDIO: &[&str] = &["opus", "vorbis"];
+
+pub(super) fn route_for_probe(c: &Codecs) -> ProbedRoute {
+    let Some(format) = c.format.as_deref() else { return ProbedRoute::Unknown };
+    let names: Vec<&str> = format.split(',').collect();
+    if names.contains(&"hls") {
+        return ProbedRoute::Hls;
+    }
+    if names.contains(&"mp4") || names.contains(&"mov") {
+        return ProbedRoute::Direct("video/mp4");
+    }
+    if names.contains(&"matroska") || names.contains(&"webm") {
+        // ffprobe names both containers `matroska,webm`; only the codecs tell
+        // a WebM the receiver opens from an MKV it does not.
+        let webm_video = c.video.as_deref().is_some_and(|v| WEBM_VIDEO.contains(&v));
+        let webm_audio = c.audio.as_deref().is_none_or(|a| WEBM_AUDIO.contains(&a));
+        return if webm_video && webm_audio {
+            ProbedRoute::Direct("video/webm")
+        } else {
+            ProbedRoute::Transmux
+        };
+    }
+    if names.contains(&"mp3") {
+        return ProbedRoute::Direct("audio/mpeg");
+    }
+    // Any other container with a picture (mpegts, avi, flv, asf, mpeg, ...)
+    // needs the transmux, which maps the first video track. Without one the
+    // transmux would fail, so leave it to the default.
+    if c.video.is_some() {
+        ProbedRoute::Transmux
+    } else {
+        ProbedRoute::Unknown
     }
 }
 
@@ -92,6 +170,7 @@ pub(super) fn probe(url: &str) -> Codecs {
             "-protocol_whitelist", "http,https,tcp,tls,crypto",
             "-print_format", "json",
             "-show_streams",
+            "-show_format",
             url,
         ])
         .output();
@@ -103,6 +182,10 @@ pub(super) fn probe(url: &str) -> Codecs {
         return Codecs::default();
     };
     let mut codecs = Codecs::default();
+    codecs.format = json
+        .pointer("/format/format_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase());
     if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
         for s in streams {
             let kind = s.get("codec_type").and_then(|v| v.as_str()).unwrap_or("");
@@ -221,4 +304,51 @@ pub(super) fn build_hls_args(
         playlist.to_string_lossy().into_owned(),
     ]);
     a
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn codecs(format: &str, video: Option<&str>, audio: Option<&str>) -> Codecs {
+        Codecs {
+            video: video.map(str::to_string),
+            audio: audio.map(str::to_string),
+            video_pix_fmt: None,
+            format: Some(format.to_string()),
+        }
+    }
+
+    #[test]
+    fn container_named_by_the_last_segment_only() {
+        assert!(names_container("https://h.example/a/file.MKV?token=x"));
+        assert!(names_container("https://h.example/a/file.mp4#t=10"));
+        assert!(!names_container("https://real-debrid.com/d/ABC123"));
+        assert!(!names_container("https://h.example/download/abc.bin"));
+        assert!(!names_container("https://h.example"));
+        assert!(should_transmux("https://h.example/x.mkv?a=b.mp4"));
+        assert!(!should_transmux("https://h.mkv/download/abc"));
+    }
+
+    #[test]
+    fn probe_routes() {
+        assert_eq!(
+            route_for_probe(&codecs("matroska,webm", Some("h264"), Some("aac"))),
+            ProbedRoute::Transmux,
+        );
+        assert_eq!(
+            route_for_probe(&codecs("matroska,webm", Some("vp9"), Some("opus"))),
+            ProbedRoute::Direct("video/webm"),
+        );
+        assert_eq!(
+            route_for_probe(&codecs("mov,mp4,m4a,3gp,3g2,mj2", Some("h264"), Some("aac"))),
+            ProbedRoute::Direct("video/mp4"),
+        );
+        assert_eq!(route_for_probe(&codecs("hls", Some("h264"), None)), ProbedRoute::Hls);
+        assert_eq!(
+            route_for_probe(&codecs("mpegts", Some("h264"), Some("ac3"))),
+            ProbedRoute::Transmux,
+        );
+        assert_eq!(route_for_probe(&Codecs::default()), ProbedRoute::Unknown);
+    }
 }

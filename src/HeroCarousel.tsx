@@ -119,8 +119,10 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
   // change as rows load), so every read goes through this value instead.
   const index = rawIndex < items.length ? rawIndex : 0;
   const [hovered, setHovered] = useState(false);
-  /** Indices where we've detected a dual-layer fallback (low-res or portrait-only). */
-  const [dualLayer, setDualLayer] = useState<Set<number>>(new Set());
+  /** Item ids where we've detected a dual-layer fallback (low-res or
+   *  portrait-only). Keyed by id, not slide index: the list can change under a
+   *  mounted carousel, and an index mark would then pad a different slide. */
+  const [dualLayer, setDualLayer] = useState<Set<string>>(new Set());
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   // RAM: only the backdrops needed for the cross-fade stay mounted (each full
   // 21:9 art is ~5 MB decoded). `transitionFrom` keeps the OUTGOING slide
@@ -136,11 +138,11 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
     return () => clearTimeout(t);
   }, [index]);
 
-  const reportDualLayer = useCallback((i: number) => {
+  const reportDualLayer = useCallback((id: string) => {
     setDualLayer((prev) => {
-      if (prev.has(i)) return prev;
+      if (prev.has(id)) return prev;
       const next = new Set(prev);
-      next.add(i);
+      next.add(id);
       return next;
     });
   }, []);
@@ -231,7 +233,7 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
             key={item.id}
             item={item}
             active={i === index}
-            onDualLayer={() => reportDualLayer(i)}
+            onDualLayer={() => reportDualLayer(item.id)}
           />
         ) : null
       ))}
@@ -289,7 +291,7 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
         <div
           key={current.id /* re-mount → fade in */}
           className={`pb-4 transition-[padding] duration-500
-                      ${dualLayer.has(index) ? "pl-[420px] pr-10" : "pl-5 pr-10"}`}
+                      ${dualLayer.has(current.id) ? "pl-[420px] pr-10" : "pl-5 pr-10"}`}
           style={{
             animation: "theme-fade-in 600ms ease-out",
             // Fixed comfortable reading column. 1100px holds three

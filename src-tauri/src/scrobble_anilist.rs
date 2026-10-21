@@ -45,6 +45,9 @@ use crate::scrobble_auth;
 const ANILIST_API: &str = "https://graphql.anilist.co";
 const TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RETRIES: u32 = 3;
+/// Longest `Retry-After` a 429 is honoured for. AniList's rate-limit timeout is
+/// about a minute; a retry before it ends is refused again.
+const RETRY_AFTER_CAP: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // HTTP client
@@ -320,7 +323,19 @@ async fn graphql_post<V: Serialize, T: for<'de> Deserialize<'de>>(
                 AnilistError::HttpStatus(status.as_u16())
             };
             if attempt + 1 < MAX_RETRIES {
-                tokio::time::sleep(Duration::from_millis(1000u64 << attempt)).await;
+                let backoff = Duration::from_millis(1000u64 << attempt);
+                // A 429 says how long the timeout lasts; the 1 s / 2 s backoff
+                // alone spent every retry inside it.
+                let wait = if status.as_u16() == 429 {
+                    resp.headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .map_or(backoff, |secs| Duration::from_secs(secs).clamp(backoff, RETRY_AFTER_CAP))
+                } else {
+                    backoff
+                };
+                tokio::time::sleep(wait).await;
                 continue;
             }
             return Err(last_err);

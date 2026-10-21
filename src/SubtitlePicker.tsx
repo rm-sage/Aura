@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { SubtitleEntry } from "./types";
 import type { StreamHash } from "./subtitleExtras";
@@ -85,7 +85,27 @@ export default function SubtitlePicker({
     if (open) setQuery(initialQuery ?? "");
   }, [open, initialQuery]);
 
+  // Only the latest search may write state: a slow answer for an earlier
+  // query or language must not replace the current one's results.
+  const searchGenRef = useRef(0);
+  const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // The post-download auto-close belongs to that open: drop it when the
+  // picker closes or unmounts, so it cannot close a reopened picker.
+  useEffect(() => {
+    if (open) return;
+    if (closeTimerRef.current) {
+      clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+      setSuccess(null);
+    }
+  }, [open]);
+  useEffect(() => () => {
+    if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
+  }, []);
+
   const search = useCallback(async () => {
+    const gen = ++searchGenRef.current;
     setLoading(true);
     setError(null);
     setResults([]);
@@ -98,11 +118,13 @@ export default function SubtitlePicker({
         moviehash: hash?.hash ?? null,
         moviebytesize: hash?.bytesize ?? null,
       });
+      if (gen !== searchGenRef.current) return;
       setResults(r);
     } catch (e) {
+      if (gen !== searchGenRef.current) return;
       setError(String(e));
     } finally {
-      setLoading(false);
+      if (gen === searchGenRef.current) setLoading(false);
     }
   }, [query, language, initialYear, initialImdbId, hash]);
 
@@ -123,7 +145,12 @@ export default function SubtitlePicker({
       await invoke("add_subtitle_to_mpv", { path });
       setSuccess(entry.release || "Subtitle loaded");
       // Auto-close briefly after a successful injection
-      setTimeout(() => { onClose(); setSuccess(null); }, 700);
+      if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = setTimeout(() => {
+        closeTimerRef.current = null;
+        onClose();
+        setSuccess(null);
+      }, 700);
     } catch (e) {
       setError(String(e));
     } finally {

@@ -797,8 +797,26 @@ struct MalResolveEntry {
 
 static MAL_RESOLVE_CACHE: OnceLock<Mutex<HashMap<String, MalResolveEntry>>> = OnceLock::new();
 
+/// Positive entries never expire (and the title resolver keys one per title and
+/// year asked), so the map is capped like `CACHE`: the oldest quarter goes on
+/// overflow.
+const MAL_RESOLVE_CACHE_CAP: usize = 400;
+
 fn mal_resolve_cache() -> &'static Mutex<HashMap<String, MalResolveEntry>> {
     MAL_RESOLVE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn mal_resolve_insert(key: String, mal_id: Option<u32>) {
+    let mut lock = mal_resolve_cache().lock().unwrap();
+    if lock.len() >= MAL_RESOLVE_CACHE_CAP && !lock.contains_key(&key) {
+        let mut ages: Vec<(String, Instant)> =
+            lock.iter().map(|(k, e)| (k.clone(), e.cached_at)).collect();
+        ages.sort_by_key(|(_, at)| *at);
+        for (k, _) in ages.into_iter().take(MAL_RESOLVE_CACHE_CAP / 4) {
+            lock.remove(&k);
+        }
+    }
+    lock.insert(key, MalResolveEntry { mal_id, cached_at: Instant::now() });
 }
 
 /// Convert a kitsu / anidb / anilist id to a MAL id via yuna.moe's
@@ -843,10 +861,7 @@ pub async fn resolve_mal_id(source: String, id: u32) -> Result<Option<u32>, Stri
         Err(e) => {
             crate::devlog!(warn, "aniskip", "resolve_mal_id request failed: {e}");
             // Cache the negative so we don't hammer on transient outages.
-            mal_resolve_cache().lock().unwrap().insert(key, MalResolveEntry {
-                mal_id: None,
-                cached_at: Instant::now(),
-            });
+            mal_resolve_insert(key, None);
             return Ok(None);
         }
     };
@@ -856,10 +871,7 @@ pub async fn resolve_mal_id(source: String, id: u32) -> Result<Option<u32>, Stri
             warn, "aniskip",
             "resolve_mal_id HTTP {} for {src}={id}", resp.status().as_u16()
         );
-        mal_resolve_cache().lock().unwrap().insert(key, MalResolveEntry {
-            mal_id: None,
-            cached_at: Instant::now(),
-        });
+        mal_resolve_insert(key, None);
         return Ok(None);
     }
 
@@ -867,10 +879,7 @@ pub async fn resolve_mal_id(source: String, id: u32) -> Result<Option<u32>, Stri
         Ok(v) => v,
         Err(e) => {
             crate::devlog!(warn, "aniskip", "resolve_mal_id JSON parse error: {e}");
-            mal_resolve_cache().lock().unwrap().insert(key, MalResolveEntry {
-                mal_id: None,
-                cached_at: Instant::now(),
-            });
+            mal_resolve_insert(key, None);
             return Ok(None);
         }
     };
@@ -879,10 +888,7 @@ pub async fn resolve_mal_id(source: String, id: u32) -> Result<Option<u32>, Stri
     // (string id, missing field) we treat as no mapping.
     let mal_id = parsed.mal.and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok());
 
-    mal_resolve_cache().lock().unwrap().insert(key, MalResolveEntry {
-        mal_id,
-        cached_at: Instant::now(),
-    });
+    mal_resolve_insert(key, mal_id);
     crate::devlog!(
         info, "aniskip",
         "resolve_mal_id {src}={id} → {:?}", mal_id
@@ -1005,9 +1011,7 @@ pub async fn resolve_mal_id_by_title(
         Ok(r) => r,
         Err(e) => {
             crate::devlog!(warn, "aniskip", "Tenrai request failed: {e}");
-            mal_resolve_cache().lock().unwrap().insert(key, MalResolveEntry {
-                mal_id: None, cached_at: Instant::now(),
-            });
+            mal_resolve_insert(key, None);
             return Ok(None);
         }
     };
@@ -1016,18 +1020,14 @@ pub async fn resolve_mal_id_by_title(
             warn, "aniskip",
             "Tenrai HTTP {} for '{q}'", resp.status().as_u16()
         );
-        mal_resolve_cache().lock().unwrap().insert(key, MalResolveEntry {
-            mal_id: None, cached_at: Instant::now(),
-        });
+        mal_resolve_insert(key, None);
         return Ok(None);
     }
     let parsed: MalSearchResponse = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
             crate::devlog!(warn, "aniskip", "Tenrai JSON parse error: {e}");
-            mal_resolve_cache().lock().unwrap().insert(key, MalResolveEntry {
-                mal_id: None, cached_at: Instant::now(),
-            });
+            mal_resolve_insert(key, None);
             return Ok(None);
         }
     };
@@ -1076,9 +1076,7 @@ pub async fn resolve_mal_id_by_title(
     }
 
     let mal_id = best.map(|(_, id)| id);
-    mal_resolve_cache().lock().unwrap().insert(key, MalResolveEntry {
-        mal_id, cached_at: Instant::now(),
-    });
+    mal_resolve_insert(key, mal_id);
     // Logged with the winning score so a mis-election is diagnosable from the
     // DevConsole alone: hovering a card and then opening it should produce ONE
     // mal id, not two.

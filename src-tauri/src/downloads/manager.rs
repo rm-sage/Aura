@@ -606,14 +606,20 @@ pub fn control(action: ControlAction) -> Result<DownloadsSnapshot, String> {
         ControlAction::Relink { id, url, headers } => {
             {
                 let mut st = state().lock().unwrap();
-                if let Some(l) = st.live.get_mut(&id) {
-                    l.relink_since = None;
+                // Check the state BEFORE touching `live`. An answer that lands
+                // after the 20 s timeout, once the user has pressed Try again,
+                // finds a RUNNING worker there; removing its entry dropped the
+                // worker's stop sender, so Pause and Cancel could no longer
+                // reach it (Cancel then deleted the row under a live writer).
+                if st
+                    .jobs
+                    .iter()
+                    .any(|j| j.id == id && j.state != DownloadState::Relinking)
+                {
+                    return Err("That download is not waiting for a link.".into());
                 }
                 st.live.remove(&id);
                 if let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) {
-                    if j.state != DownloadState::Relinking {
-                        return Err("That download is not waiting for a link.".into());
-                    }
                     j.url = url;
                     j.headers = headers;
                     j.state = DownloadState::Queued;
@@ -631,6 +637,16 @@ pub fn control(action: ControlAction) -> Result<DownloadsSnapshot, String> {
         }
         ControlAction::RelinkFailed { id, reason } => {
             let mut st = state().lock().unwrap();
+            // Same late-answer rule as Relink: a job that is no longer
+            // Relinking (timed out, then retried and running) is not ours to
+            // fail, and its live entry belongs to the new worker.
+            if st
+                .jobs
+                .iter()
+                .any(|j| j.id == id && j.state != DownloadState::Relinking)
+            {
+                return Ok(build_snapshot(&st));
+            }
             st.live.remove(&id);
             if let Some(j) = st.jobs.iter_mut().find(|j| j.id == id) {
                 j.state = DownloadState::NeedsSource;

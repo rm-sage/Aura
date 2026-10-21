@@ -167,6 +167,7 @@ async fn detect(args: &Value, data_dir: &PathBuf) -> Result<Value, String> {
                 "snap": snap,
             }));
         }),
+        progress: Arc::new(|_: &job::Progress| {}),
         replay: replay.as_ref().map(|(r, _)| r.clone()),
         fake_theme_load: None,
     };

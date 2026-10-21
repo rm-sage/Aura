@@ -216,6 +216,24 @@ export function useScrobble({
    *  progress fidelity. */
   const playbackRef = useRef<PlaybackSnapshot>(playback);
   playbackRef.current = playback;
+  /** Last position seen while a file was genuinely loaded (duration > 0 AND
+   *  time > 0), stamped with the session key it belongs to. handlePlayStream
+   *  zeroes time and duration (notifyNewLoad) well BEFORE it flips the active
+   *  target, so the render that switches items already carries 0/0 for the
+   *  OUTGOING session. scrobble_end treats an unknown duration as "complete",
+   *  so ending with those zeroes marked a half-watched episode watched on
+   *  every provider. Mirrors App's `lastLoadedRef`. */
+  const lastLoaded = useRef<{ time: number; duration: number; key: string | null }>({
+    time: 0, duration: 0, key: null,
+  });
+  /** The position to report for the open session: its last genuine snapshot
+   *  when there is one, else the values given. */
+  const endValues = (time: number, duration: number) => {
+    const snap = lastLoaded.current;
+    return snap.key !== null && snap.key === startedFor.current
+      ? { time: snap.time, duration: snap.duration }
+      : { time, duration };
+  };
 
   const startWarmup = Math.max(
     0,
@@ -229,7 +247,7 @@ export function useScrobble({
   // Helper: signal session end if one is in flight, then forget it.
   const endSession = (time: number, duration: number) => {
     if (!startedFor.current) return;
-    invoke("scrobble_end", { time, duration }).catch(() => {});
+    invoke("scrobble_end", endValues(time, duration)).catch(() => {});
     startedFor.current = null;
     completed.current = false;
   };
@@ -252,10 +270,10 @@ export function useScrobble({
         // see the response, but the Tauri IPC bridge dispatches the
         // command synchronously enough that the Rust side records the
         // intent and the post_event lands via the runtime executor.
-        invoke("scrobble_end", {
-          time:     playbackRef.current.time,
-          duration: playbackRef.current.duration,
-        }).catch(() => {});
+        invoke("scrobble_end", endValues(
+          playbackRef.current.time,
+          playbackRef.current.duration,
+        )).catch(() => {});
         startedFor.current = null;
       }
     };
@@ -265,10 +283,10 @@ export function useScrobble({
       // Component unmount: end any in-flight session using the LIVE
       // playback values (via ref), not the stale closure-captured ones.
       if (startedFor.current) {
-        invoke("scrobble_end", {
-          time:     playbackRef.current.time,
-          duration: playbackRef.current.duration,
-        }).catch(() => {});
+        invoke("scrobble_end", endValues(
+          playbackRef.current.time,
+          playbackRef.current.duration,
+        )).catch(() => {});
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -290,6 +308,9 @@ export function useScrobble({
     // Different item than what we started with → close prior, open new.
     if (startedFor.current && startedFor.current !== sessionKey) {
       endSession(playback.time, playback.duration);
+    }
+    if (playback.duration > 0 && playback.time > 0) {
+      lastLoaded.current = { time: playback.time, duration: playback.duration, key: sessionKey };
     }
 
     // Reset the elapsed counter on session change so a switch to a

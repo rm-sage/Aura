@@ -47,9 +47,13 @@ export default function PlaybackEngineGate() {
       }
       setError("The playback engine couldn't start after downloading. Please try again.");
       setPhase("error");
+      // Browsing "until this finishes" no longer applies: bring the gate back
+      // so the failure and Retry are reachable.
+      setHidden(false);
     } catch (e) {
       setError(String(e).replace(/^Error:\s*/i, "").split("\n")[0].trim().slice(0, 160));
       setPhase("error");
+      setHidden(false);
     }
   };
 

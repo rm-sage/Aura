@@ -133,6 +133,8 @@ const PORTABLE_AURA_FIELDS = [
   "stillWatchingGate",
   "autoSkipDetect",
   "nextUpSkipFillerRecap",
+  "nextUpHoldToSkip",
+  "upscalerRecHighlight",
   "loudnessNormalization",
   "motionInterpolation",
   "interpolationTscale",

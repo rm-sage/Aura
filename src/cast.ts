@@ -30,6 +30,21 @@ export interface CastStatus {
   transcoding: boolean;
 }
 
+/** What `cast_load` reports beyond success (cast/mod.rs CastLoadResult). */
+export interface CastLoadResult {
+  /** A DLNA renderer refused the jump to the resume point twice and is
+   *  playing from the start. */
+  resume_failed: boolean;
+}
+
+/** What a pick is waiting on, from the `cast-load-progress` event. */
+export type CastLoadStage = "probing" | "preparing" | "connecting" | "resuming";
+
+export interface CastLoadProgress {
+  device_id: string;
+  stage: CastLoadStage;
+}
+
 export function discoverCastDevices(): Promise<CastDeviceInfo[]> {
   return invoke<CastDeviceInfo[]>("cast_discover");
 }
@@ -40,8 +55,8 @@ export function castLoad(opts: {
   title?: string | null;
   poster?: string | null;
   startSeconds?: number | null;
-}): Promise<void> {
-  return invoke("cast_load", {
+}): Promise<CastLoadResult> {
+  return invoke<CastLoadResult>("cast_load", {
     device: opts.device,
     url: opts.url,
     title: opts.title ?? null,
@@ -74,8 +89,25 @@ const TRANSMUX_EXTENSIONS = new Set([
  *  Chromecast (non-HLS, extension in the transmux set). Matches the Rust
  *  decision in `cast::cast_load`. */
 export function needsTransmux(url: string): boolean {
-  const path = (url.split("?")[0] ?? "").toLowerCase();
-  if (path.endsWith(".m3u8")) return false;
-  const ext = path.split(".").pop();
+  const ext = urlExt(url);
   return ext ? TRANSMUX_EXTENSIONS.has(ext) : false;
+}
+
+// Mirror of cast/transcode.rs DIRECT_EXT.
+const DIRECT_EXTENSIONS = new Set(["mp4", "m4v", "mov", "webm", "mp3", "m4a", "aac", "m3u8"]);
+
+/** The extension of the url's last path segment (cast/transcode.rs url_ext). */
+function urlExt(url: string): string | null {
+  const path = (url.split(/[?#]/)[0] ?? "").toLowerCase();
+  const last = path.split("/").pop() ?? "";
+  const dot = last.lastIndexOf(".");
+  return dot >= 0 && dot < last.length - 1 ? last.slice(dot + 1) : null;
+}
+
+/** False for a url whose extension does not settle the cast route (a debrid
+ *  `/download/<id>` link): Rust probes those before a Chromecast cast,
+ *  and only when FFmpeg and FFprobe are installed. */
+export function namesContainer(url: string): boolean {
+  const ext = urlExt(url);
+  return ext != null && (TRANSMUX_EXTENSIONS.has(ext) || DIRECT_EXTENSIONS.has(ext));
 }

@@ -32,7 +32,24 @@ export interface ReleaseDates {
 // value (possibly all-null) = fetched, so a movie with no MDBList record
 // isn't re-requested every hover. In-memory only — these are tiny and the
 // metaCache already covers warm re-opens of the heavier detail payload.
-const cache = new Map<string, ReleaseDates>();
+// An all-null answer is held only MISS_TTL_MS: Rust folds a network or
+// HTTP failure into the same empty answer as "no record", so caching it
+// for the session would hide a movie's dates after one blip. Capped at
+// CACHE_MAX, oldest first (Map keeps insertion order).
+const cache = new Map<string, { dates: ReleaseDates; at: number }>();
+const MISS_TTL_MS = 5 * 60_000;
+const CACHE_MAX = 500;
+
+function cachedDates(imdbId: string): ReleaseDates | undefined {
+  const hit = cache.get(imdbId);
+  if (!hit) return undefined;
+  const miss = hit.dates.theatrical === null && hit.dates.digital === null;
+  if (miss && Date.now() - hit.at > MISS_TTL_MS) {
+    cache.delete(imdbId);
+    return undefined;
+  }
+  return hit.dates;
+}
 
 /** Whether a meta id + type denotes a movie we can date via MDBList (IMDb
  *  `tt`-keyed, non-episodic). Series/anime use the per-episode air dates. */
@@ -48,7 +65,7 @@ export function isDatableMovie(
 /** Fetch (and cache) accurate release dates for a movie by IMDb id.
  *  Best-effort: any failure resolves to all-null rather than throwing. */
 export async function getMovieReleaseDates(imdbId: string): Promise<ReleaseDates> {
-  const hit = cache.get(imdbId);
+  const hit = cachedDates(imdbId);
   if (hit) return hit;
   const res = await dedupedInvoke(`release-dates:${imdbId}`, () =>
     invoke<{ theatrical?: string | null; digital?: string | null }>(
@@ -60,7 +77,16 @@ export async function getMovieReleaseDates(imdbId: string): Promise<ReleaseDates
     theatrical: res?.theatrical ?? null,
     digital: res?.digital ?? null,
   };
-  cache.set(imdbId, dates);
+  // A rejected invoke is not an answer: leave it uncached.
+  if (res) {
+    cache.delete(imdbId);
+    cache.set(imdbId, { dates, at: Date.now() });
+    while (cache.size > CACHE_MAX) {
+      const oldest = cache.keys().next().value;
+      if (oldest === undefined) break;
+      cache.delete(oldest);
+    }
+  }
   return dates;
 }
 
@@ -72,14 +98,14 @@ export function useMovieReleaseDates(
 ): ReleaseDates | null {
   const datable = isDatableMovie(id, mediaType);
   const [dates, setDates] = useState<ReleaseDates | null>(
-    () => (datable && id ? cache.get(id) ?? null : null),
+    () => (datable && id ? cachedDates(id) ?? null : null),
   );
   useEffect(() => {
     if (!datable || !id) {
       setDates(null);
       return;
     }
-    const cached = cache.get(id);
+    const cached = cachedDates(id);
     if (cached) {
       setDates(cached);
       return;

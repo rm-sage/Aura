@@ -154,10 +154,22 @@ export default function LinkLoginModal({ provider, onSuccess, onCancel }: Props)
     if (linkCode) openUrl(linkCode.link).catch(() => {});
   }, [linkCode]);
 
+  // One timer, so a second copy is not cut short by the first one's.
+  const copiedTimerRef = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (copiedTimerRef.current != null) window.clearTimeout(copiedTimerRef.current);
+  }, []);
   const copyCode = useCallback(() => {
     if (!linkCode) return;
     navigator.clipboard?.writeText(linkCode.code).then(
-      () => { setCopied(true); window.setTimeout(() => setCopied(false), 1500); },
+      () => {
+        setCopied(true);
+        if (copiedTimerRef.current != null) window.clearTimeout(copiedTimerRef.current);
+        copiedTimerRef.current = window.setTimeout(() => {
+          copiedTimerRef.current = null;
+          setCopied(false);
+        }, 1500);
+      },
       () => {},
     );
   }, [linkCode]);

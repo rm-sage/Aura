@@ -1062,9 +1062,18 @@ export default function DevConsole() {
   // Bulk-export handlers — operate on the FULL entries buffer, not the
   // filtered/rendered subset, so the user always gets a complete log
   // regardless of what's currently visible.
+  // One timer: an earlier flash's timer must not clear a newer status early.
+  const flashTimerRef = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (flashTimerRef.current != null) window.clearTimeout(flashTimerRef.current);
+  }, []);
   const flashStatus = useCallback((kind: "copied" | "saved" | "error") => {
     setExportStatus(kind);
-    window.setTimeout(() => setExportStatus(null), 1400);
+    if (flashTimerRef.current != null) window.clearTimeout(flashTimerRef.current);
+    flashTimerRef.current = window.setTimeout(() => {
+      flashTimerRef.current = null;
+      setExportStatus(null);
+    }, 1400);
   }, []);
 
   const handleCopyLogs = useCallback(async () => {

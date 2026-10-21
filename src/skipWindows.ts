@@ -978,7 +978,8 @@ export function windowsFromChapters(
 
 /** What Layer 1 concluded for a kind on this load (Rust `L1State`, plus "off"
  *  when Layer 1 is not deciding the kind at all: no MAL id, detection off, or
- *  the kind switched off). */
+ *  the kind not gathered: switched off, except an ending while the Next-Up
+ *  card is on). */
 export type Layer1State = "off" | "pending" | "matched" | "informative" | "no_themes" | "unavailable";
 export interface Layer1Status {
   op: Layer1State;
@@ -1161,8 +1162,10 @@ export function applyCrossSourceHolds(
   return out;
 }
 
-/** The Next-Up gate's TRUSTED ending end for a published window list, or
- *  null. A published Layer 1 ending's end (an auto-eligible match, or a
+/** The Next-Up gate's TRUSTED ending end for a stamp's window list, or null.
+ *  App passes the list before skip modes; composeSkipWindows has already
+ *  clamped it to the media end. A published Layer 1 ending's end (an
+ *  auto-eligible match, or a
  *  partially Over one: prompt-only, but its LOCATION is the same Layer 1
  *  evidence, so Pop Team Epic 1:5's ED4 holds the card until 1406.26 instead
  *  of raising it 28 s inside the ending); else the end of the published
@@ -1170,9 +1173,8 @@ export function applyCrossSourceHolds(
  *  Transition-only match, published as itself or replaced by a chapter or
  *  crowd ending that outranked it) when the two ends agree within
  *  LAYER1_CONFLICT_SECONDS: the theme's END is trusted even where its start
- *  is not (Solo Leveling E1, Cowboy Bebop 13). Read from the PUBLISHED window,
- *  so the media-end clamp still applies. Never a crowd, chapter or Layer 3
- *  end on its own. */
+ *  is not (Solo Leveling E1, Cowboy Bebop 13). Never a crowd, chapter or
+ *  Layer 3 end on its own. */
 export function trustedEndingEnd(
   published: PreparedWindow[],
   detectedEd: PreparedWindow | null,
@@ -1186,8 +1188,48 @@ export function trustedEndingEnd(
   return agreed ? agreed.end : null;
 }
 
+/** The Next-Up gate's ending and preview for a stamp's window list (nextUpGate
+ *  rule 2). The ending is the one whose START raises the card: the best
+ *  level first (`skipConfidence`: Verified, then Likely, then Risky), then
+ *  the LATEST (the credits are at the end: a double-episode file's first
+ *  ending, or a wrong crowd row earlier in the file, must not shadow the real
+ *  one; the gate still rejects an elected ending in the first half). A Risky
+ *  ending raises the card too, at the moment its prompt shows: the card has
+ *  no countdown, so one raised early over story only sits there, and like
+ *  the Risky prompt it shows only with the player controls (`edRisky`,
+ *  nextUpGate rule 5). A window with no level (a payload
+ *  from before bases) raises nothing. The preview is the last preview window. App reads it from the
+ *  list BEFORE skip modes, so a skip-mode change made during playback does
+ *  not move the card; with Endings set to Off, the chain still gathers the
+ *  endings and previews this reads while the Next-Up card is on. */
+export function nextUpEnding(windows: readonly PreparedWindow[]): {
+  edStart: number | null;
+  edEnd: number | null;
+  edRisky: boolean;
+  previewStart: number | null;
+  previewEnd: number | null;
+} {
+  const rank = (w: PreparedWindow): number => {
+    const level = skipConfidence(w);
+    return level === "verified" ? 0 : level === "likely" ? 1 : level === "risky" ? 2 : -1;
+  };
+  const ending = windows
+    .filter((w) => skipKindGroup(w.type) === "ed" && rank(w) >= 0)
+    .sort((a, b) => rank(a) - rank(b) || b.start - a.start)[0] ?? null;
+  const preview = windows
+    .filter((w) => skipKindGroup(w.type) === "preview")
+    .sort((a, b) => b.start - a.start)[0] ?? null;
+  return {
+    edStart: ending?.start ?? null,
+    edEnd: ending?.end ?? null,
+    edRisky: ending != null && rank(ending) === 2,
+    previewStart: preview?.start ?? null,
+    previewEnd: preview?.end ?? null,
+  };
+}
+
 /** A window the SkipController already handled (auto-skipped, demoted to a
- *  prompt, or skipped with X / Shift+X). */
+ *  prompt, or skipped with the Skip Segment key). */
 export interface HandledWindow { type: string; start: number; end: number }
 
 /** Whether `w` is a window in `handled`: the same kind with BOTH edges within

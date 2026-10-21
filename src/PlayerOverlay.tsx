@@ -4,6 +4,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -23,19 +24,22 @@ import { formatAbsoluteEpisode } from "./storyArcs";
 import { useEpisodeChapterLabel } from "./mangaChapters";
 import { setTitleState, titleStateKey } from "./titleState";
 import { pickDefaultAudio, toLang2, type ScoringMeta } from "./audioScoring";
-import { prettyBinding } from "./useKeybindings";
-import { loadAuraSettings, saveAuraSettings } from "./auraSettings";
+import { bindingMatches, isTypingTarget, parseBinding, prettyBinding } from "./useKeybindings";
+import { PLAYER_STACK_WIDTH, playerStackBaseTop, publishPlayerStackTop } from "./playerStack";
+import { loadAuraSettings, saveAuraSettings, settingsChangeIncludes, type AuraSettings } from "./auraSettings";
 import AniSkipMenu from "./AniSkipMenu";
 import { skipConfidenceInfo, skipHeldReason, skipKindLabel, skipSourceLabel } from "./skipSource";
 import SkipConfidenceBadge, { SKIP_CONFIDENCE_TEXT, SkipConfidenceIcon } from "./SkipConfidenceBadge";
 import type { HandledWindow, SkipBasis, SkipHold, SkipMode, SkipModes } from "./skipWindows";
-import { handledIn } from "./skipWindows";
+import { handledIn, skipKindGroup } from "./skipWindows";
+import { useSkipMatchRows, type SkipMatchKind, type SkipMatchRow } from "./skipMatchProgress";
 import SubtitleSyncPanel, { type SyncAnchorPair } from "./SubtitleSyncPanel";
 import { MenuTrackerCtx, useMenuOpenSync, type MenuTracker } from "./menuTracker";
 import {
   PlayerMenuButton, PlayerMenuChip, PlayerMenuDivider, PlayerMenuPanel, PlayerMenuRow,
   PlayerMenuSection, PlayerMenuSlider, PlayerMenuToggle, MenuCheckIcon, useMenuWheelScroll,
 } from "./playerMenu";
+import { recommendUpscaler } from "./upscalerRecommend";
 import { copyTextToClipboard } from "./clipboard";
 
 // Max volume the slider / wheel / keys can reach. mpv's `volume-max` init option
@@ -235,11 +239,6 @@ const DownloadIcon = () => (
     <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
   </svg>
 );
-const ExternalIcon = () => (
-  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-    <path d="M14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7zM19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7z" />
-  </svg>
-);
 const LoudnormIcon = () => (
   // Compact audio-level bars — four vertical bars at varying heights
   // suggesting "evened out" levels. Visually distinct from VolumeIcon's
@@ -373,8 +372,55 @@ const HIDDEN_PROFILE_IDS = new Set<number>([1]);
 const SHADER_SWITCH_MIN_INTERVAL_MS = 220;
 let lastShaderSwitchAt = 0;
 
-function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | null }) {
+/** The `.aura-rec-trace` cycle (App.css), in ms. */
+const REC_TRACE_PERIOD_MS = 4800;
+/** A negative delay that puts an element's trace on the shared clock, so the
+ *  pill and the menu's Rec. tags light up together. Taken when the class goes
+ *  on: a CSS animation's clock starts when it is applied. */
+function recTraceDelay(): React.CSSProperties {
+  return { ["--aura-rec-delay" as string]: `${-(performance.now() % REC_TRACE_PERIOD_MS)}ms` };
+}
+const REC_HIGHLIGHT_KEYS = new Set<keyof AuraSettings>(["upscalerRecHighlight"]);
+
+/** A "Recommended" / "Rec." tag, traced while the pill is. The delay is taken
+ *  once when the trace goes on: a new one each render would jump its phase. */
+function RecChip({ traced, title, children }: {
+  traced: boolean; title?: string; children: React.ReactNode;
+}) {
+  const style = useMemo(() => (traced ? recTraceDelay() : undefined), [traced]);
+  return (
+    <PlayerMenuChip tone="good" title={title} className={traced ? "aura-rec-trace" : undefined} style={style}>
+      {children}
+    </PlayerMenuChip>
+  );
+}
+
+function ShaderPicker({ activeTarget, isAnime, readGate }: {
+  activeTarget: ActiveScrobbleTarget | null;
+  /** Anime or live action, for the "Recommended" tag. */
+  isAnime: boolean;
+  /** Safe to read the video's size: duration known, first frame shown, not
+   *  buffering or seeking (the same gate as the stats OSD, landmine 3). */
+  readGate: boolean;
+}) {
   const [open, setOpen] = useState(false);
+  // The playing video's display size (never polled), for the "Recommended"
+  // tag: read once per title as soon as it is safe, so the pill can show a
+  // recommendation before the menu was ever opened, and again on each open,
+  // since a source switch can change it. 0 while unknown.
+  const [videoSize, setVideoSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
+  const sizeKnownRef = useRef(false);
+  // The rainbow trace on a recommendation nobody has taken up yet.
+  const [recHighlightOn, setRecHighlightOn] = useState(() => loadAuraSettings().upscalerRecHighlight);
+  useEffect(() => {
+    const sync = (e: Event) => {
+      if (settingsChangeIncludes(e, REC_HIGHLIGHT_KEYS)) {
+        setRecHighlightOn(loadAuraSettings().upscalerRecHighlight);
+      }
+    };
+    window.addEventListener("aura:settings-changed", sync);
+    return () => window.removeEventListener("aura:settings-changed", sync);
+  }, []);
   const [profiles, setProfiles] = useState<ShaderProfileInfo[]>([]);
   const [active, setActive] = useState(0);
   const [keybindings, setKeybindings] = useState<Record<string, string>>({});
@@ -450,6 +496,26 @@ function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | n
   }, [open, cancelClose]);
 
   useEffect(() => () => cancelClose(), [cancelClose]);
+
+  useEffect(() => {
+    if (!readGate || (!open && sizeKnownRef.current)) return;
+    let cancelled = false;
+    const num = (name: string) =>
+      invoke<number>("get_property", { name, format: "int64" }).catch(() => 0);
+    Promise.all([num("dwidth"), num("dheight")]).then(([w, h]) => {
+      if (cancelled) return;
+      const size = { w: Number(w) || 0, h: Number(h) || 0 };
+      sizeKnownRef.current = size.w > 0 && size.h > 0;
+      setVideoSize(size);
+    });
+    return () => { cancelled = true; };
+  }, [open, readGate]);
+
+  // A new title or stream: the old size says nothing about the next one.
+  useEffect(() => {
+    sizeKnownRef.current = false;
+    setVideoSize({ w: 0, h: 0 });
+  }, [activeTarget?.id]);
 
   useEffect(() => {
     invoke<ShaderProfileInfo[]>("list_shader_profiles").then(setProfiles).catch(() => {});
@@ -586,6 +652,43 @@ function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | n
     return () => window.removeEventListener("aura:set-shader", onSetShader);
   }, [select]);
 
+  // The profile the menu tags "Recommended" for what is playing
+  // (upscalerRecommend.ts). The screen height is in physical pixels, since
+  // that is what the video is scaled to in fullscreen.
+  const recommended = useMemo(() => {
+    const rec = recommendUpscaler({
+      anime: isAnime,
+      videoWidth: videoSize.w,
+      videoHeight: videoSize.h,
+      screenHeight: window.screen.height * (window.devicePixelRatio || 1),
+    });
+    // Only a profile this build lists (a missing id would tag nothing).
+    return rec && profiles.some((p) => p.id === rec.profileId) ? rec : null;
+  }, [isAnime, videoSize, profiles]);
+
+  // A recommendation the user has not taken up: no upscaler is on and one is
+  // recommended. The pill and every Rec. tag then carry the trace, so the
+  // tags read as the reason the pill lit up.
+  const highlightRec = recHighlightOn && active === 0
+    && recommended != null && recommended.profileId !== 0;
+  // Taken when the trace goes on (see recTraceDelay); the menu's tags mount
+  // later and take their own from the same clock.
+  const pillTraceStyle = useMemo(() => (highlightRec ? recTraceDelay() : undefined), [highlightRec]);
+  const recChip = (label: React.ReactNode) => (
+    <RecChip traced={highlightRec} title={recommended?.reason}>{label}</RecChip>
+  );
+  const toggleRecHighlight = () => {
+    saveAuraSettings({ ...loadAuraSettings(), upscalerRecHighlight: !recHighlightOn });
+  };
+
+  const recommendedTrailing = (id: number) =>
+    id === recommended?.profileId ? (
+      <span className="flex-shrink-0 flex items-center gap-2">
+        {recChip("Recommended")}
+        {id === active && <MenuCheckIcon />}
+      </span>
+    ) : undefined;
+
   // Compact label for the upscaler pill on the control bar. For
   // Anime4K profiles (ids 7–12) the pill collapses "Anime4K Mode A+A"
   // → "Anime4K (A+A)" to fit in the limited space without losing the
@@ -602,12 +705,17 @@ function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | n
   })();
 
   return (
-    <div ref={ref} className="relative flex-shrink-0">
+    // mx-2.5: every other control is a 40 px circle whose glyph sits 10 px
+    // inside its edge, so the bar's 6 px gap reads as 26 px between glyphs.
+    // This pill's border IS its visible edge; without the margin it sat
+    // 10 px closer to its neighbours than anything else on the bar.
+    <div ref={ref} className="relative flex-shrink-0 mx-2.5">
       <button
         onClick={() => setOpen((v) => !v)}
-        title="Upscaling / Shader Profile"
+        title={highlightRec ? `Upscaler: ${recommended.reason}` : "Upscaling / Shader Profile"}
+        style={pillTraceStyle}
         className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-xs font-medium
-                    transition-all duration-150 border
+                    transition-all duration-150 border ${highlightRec ? "aura-rec-trace" : ""}
                     ${open || active !== 0
                       ? "bg-ln-accent/20 text-ln-accent border-ln-accent/30"
                       : "bg-white/5 text-white/55 border-white/10 hover:bg-white/10 hover:text-white/85"
@@ -628,6 +736,9 @@ function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | n
           .filter((p): p is ShaderProfileInfo => Boolean(p));
         const anime4kActive = ANIME4K_ID_SET.has(active);
         const activeAnime4k = anime4kProfiles.find((p) => p.id === active);
+        const recAnime4k = recommended != null && ANIME4K_ID_SET.has(recommended.profileId)
+          ? anime4kProfiles.find((p) => p.id === recommended.profileId)
+          : undefined;
 
         const renderRow = (p: ShaderProfileInfo) => (
           <PlayerMenuRow
@@ -636,11 +747,17 @@ function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | n
             description={p.description}
             selected={p.id === active}
             onClick={() => select(p.id)}
+            trailing={recommendedTrailing(p.id)}
           />
         );
 
         return (
-          <PlayerMenuPanel title="Upscaler" meta={activeName} width="w-[340px]">
+          <PlayerMenuPanel
+            title="Upscaler"
+            meta={activeName}
+            width="w-[340px]"
+            footer={recommended?.reason}
+          >
             {noneEntry && renderRow(noneEntry)}
 
             {/* Anime4K parent: hovering (or clicking) opens the modes submenu,
@@ -657,9 +774,11 @@ function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | n
                 ariaExpanded={anime4kSubOpen}
                 selected={anime4kActive}
                 label="Anime4K"
-                description="Specialised upscaler for anime and cartoon line art. Preserves edges and reduces ringing far better than general-purpose shaders on animated sources."
+                description="For anime and cartoons. Match the mode to the video: A for 1080p, B for 720p, C for 480p or DVD."
                 trailing={
                   <span className="flex-shrink-0 flex items-center gap-2">
+                    {recAnime4k && recAnime4k.id !== active
+                      && recChip(recAnime4k.name.replace(/^Anime4K\s+(?:Mode\s+)?/, "Rec. "))}
                     {anime4kActive && (
                       <PlayerMenuChip tone="accent">
                         {activeAnime4k?.name.replace("Anime4K ", "") ?? "Active"}
@@ -676,6 +795,14 @@ function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | n
             )}
 
             {otherEntries.map(renderRow)}
+
+            <PlayerMenuDivider />
+            <PlayerMenuToggle
+              label="Highlight the recommendation"
+              title="While a profile is recommended and no upscaler is on, a light traces the Upscaler button and the Rec. tags. It stays still when reduced motion is on."
+              on={recHighlightOn}
+              onToggle={toggleRecHighlight}
+            />
           </PlayerMenuPanel>
         );
       })()}
@@ -704,11 +831,12 @@ function ShaderPicker({ activeTarget }: { activeTarget: ActiveScrobbleTarget | n
                 <PlayerMenuRow
                   key={p.id}
                   label={modeLabel}
-                  description={p.description.replace(/^Anime4K v4 — Mode [A-Z+]+\.\s*/, "")}
+                  description={p.description}
                   selected={p.id === active}
                   onClick={() => { select(p.id); setAnime4kSubOpen(false); }}
-                  trailing={chordLabel || p.id === active ? (
+                  trailing={chordLabel || p.id === active || p.id === recommended?.profileId ? (
                     <span className="flex-shrink-0 flex items-center gap-2">
+                      {p.id === recommended?.profileId && recChip("Recommended")}
                       {chordLabel && <PlayerMenuChip>{chordLabel}</PlayerMenuChip>}
                       {p.id === active && <MenuCheckIcon />}
                     </span>
@@ -770,12 +898,8 @@ function PanscanButton({ activeTarget }: { activeTarget: ActiveScrobbleTarget | 
         onClick={toggle}
         aria-label={on ? "Disable fill screen" : "Enable fill screen"}
         aria-pressed={on}
-        className={`flex items-center justify-center w-10 h-10 rounded-full
-                    transition-colors duration-150 flex-shrink-0
-                    ${on
-                      ? "bg-ln-accent/25 text-ln-accent"
-                      : "text-white/80 hover:text-white hover:bg-white/12 active:bg-white/20"
-                    }`}
+        data-on={on}
+        className="aura-bar-btn flex items-center justify-center w-10 h-10 rounded-full flex-shrink-0"
       >
         <PanscanIcon />
       </button>
@@ -837,11 +961,8 @@ function SubtitleStyleMenu() {
       <button
         onClick={() => setOpen((v) => !v)}
         title="Subtitle styling"
-        className={`flex items-center justify-center w-10 h-10 rounded-full
-                    transition-colors duration-150 flex-shrink-0
-                    ${open
-                      ? "bg-ln-accent/25 text-ln-accent"
-                      : "bg-white/5 text-white/55 hover:bg-white/10 hover:text-white/85"}`}
+        data-on={open}
+        className="aura-bar-btn flex items-center justify-center w-10 h-10 rounded-full flex-shrink-0"
       >
         <span className="font-bold text-[14px] tracking-tight">Aa</span>
       </button>
@@ -965,12 +1086,8 @@ function IconButton({
     <button
       onClick={onClick}
       aria-label={label}
-      className={`flex items-center justify-center w-10 h-10 rounded-full
-                  transition-colors duration-150 flex-shrink-0
-                  ${active
-                    ? "bg-ln-accent/25 text-ln-accent"
-                    : "text-white/80 hover:text-white hover:bg-white/12 active:bg-white/20"
-                  }`}
+      data-on={!!active}
+      className="aura-bar-btn flex items-center justify-center w-10 h-10 rounded-full flex-shrink-0"
     >
       {children}
     </button>
@@ -1107,6 +1224,10 @@ interface Props {
    *  App passes the user's volume-up / volume-down bindings here so
    *  arrow-key volume bumps stay silent (toast-only) like mousewheel. */
   silentWakeCodes?: readonly string[];
+  /** The user's Skip Segment binding (a useKeybindings spec, "KeyX" by
+   *  default): skips the OP / ED / recap / preview playing now, and is the key
+   *  the skip prompt names. */
+  skipKeybinding?: string;
 
   /** In-playback episode drawer (EOS Spotlight spec 2026-05-19, Phase
    *  4). When supplied (series/anime only), PlayerOverlay renders an
@@ -1280,6 +1401,7 @@ export default function PlayerOverlay({
   selectableSubLangs,
   scoringMeta, audioPriority, avoidDubs, userRegion,
   silentWakeCodes,
+  skipKeybinding = "KeyX",
   episodePanel,
 }: Props) {
   // Manga chapters for the playing episode ("Ch. 590"), read from what the
@@ -2297,7 +2419,7 @@ export default function PlayerOverlay({
       )}
 
       {/* ── Skip-window controller — owns auto-skip, prompt toast, and
-              the global `x` / Shift+X keybinds. Renders nothing when no
+              the Skip Segment key. Renders nothing when no
               skip window is active or when the active window is in
               auto mode. Mounted at the player root (not in the bottom
               control bar) so its keybinds stay alive even when the
@@ -2308,6 +2430,7 @@ export default function PlayerOverlay({
         seekAbsolute={seekAbsolute}
         isFullscreen={isFullscreen}
         loadKey={loadKey}
+        skipKey={skipKeybinding}
         controlsVisible={controlsVisible}
         ready={tracksReady}
         skipModes={skipModes}
@@ -2764,7 +2887,11 @@ export default function PlayerOverlay({
             <SubtitleStyleMenu />
 
             {/* Shader / upscaler */}
-            <ShaderPicker activeTarget={activeTarget} />
+            <ShaderPicker
+              activeTarget={activeTarget}
+              isAnime={isAnime}
+              readGate={duration > 0 && firstFrameSeen && !buffering && !seekLoading}
+            />
 
             {/* Panscan / fill-screen toggle — for ultrawide vs 16:9 mismatches.
                 Sits just left of Fullscreen so the two screen-shape controls
@@ -2776,11 +2903,8 @@ export default function PlayerOverlay({
               <button
                 onClick={onToggleFullscreen}
                 aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
-                className={`flex items-center justify-center w-10 h-10 rounded-full
-                            transition-colors flex-shrink-0
-                            ${isFullscreen
-                              ? "bg-ln-accent/25 text-ln-accent"
-                              : "text-white/80 hover:text-white hover:bg-white/12"}`}
+                data-on={isFullscreen}
+                className="aura-bar-btn flex items-center justify-center w-10 h-10 rounded-full flex-shrink-0"
               >
                 {isFullscreen ? <ExitFullscreenIcon /> : <FullscreenIcon />}
               </button>
@@ -3623,8 +3747,7 @@ function VolumeControl({
         <button
           onClick={onMute}
           aria-label={isMuted ? "Unmute" : "Mute"}
-          className="flex items-center justify-center w-10 h-10 rounded-full
-                     text-white/80 hover:text-white hover:bg-white/12 transition-colors"
+          className="aura-bar-btn flex items-center justify-center w-10 h-10 rounded-full flex-shrink-0"
         >
           <Icon />
         </button>
@@ -3667,12 +3790,8 @@ function SpeedMenu({
         <button
           onClick={() => setOpen((v) => !v)}
           aria-label="Playback speed"
-          className={`flex items-center gap-1.5 px-2.5 h-10 rounded-full
-                      transition-colors
-                      ${open || speed !== 1
-                        ? "bg-ln-accent/20 text-ln-accent"
-                        : "text-white/80 hover:text-white hover:bg-white/12"
-                      }`}
+          data-on={open || speed !== 1}
+          className="aura-bar-btn flex items-center gap-1.5 px-2.5 h-10 rounded-full"
         >
           <SpeedIcon />
           <span className="font-mono text-[12px] tabular-nums tracking-wider">
@@ -3770,10 +3889,8 @@ function TrailerQualityMenu({
         <button
           onClick={() => setOpen((v) => !v)}
           aria-label="Trailer quality"
-          className={`flex items-center gap-1.5 px-2.5 h-10 rounded-full transition-colors
-                      ${active
-                        ? "bg-ln-accent/20 text-ln-accent"
-                        : "text-white/80 hover:text-white hover:bg-white/12"}`}
+          data-on={!!active}
+          className="aura-bar-btn flex items-center gap-1.5 px-2.5 h-10 rounded-full"
         >
           <QualityIcon />
           <span className="font-mono text-[12px] tabular-nums tracking-wider">{btnText}</span>
@@ -3873,12 +3990,8 @@ function TrackMenu({
         <button
           onClick={() => setOpen((v) => !v)}
           aria-label={tooltip}
-          className={`flex items-center justify-center w-10 h-10 rounded-full
-                      transition-colors
-                      ${open
-                        ? "bg-ln-accent/20 text-ln-accent"
-                        : "text-white/80 hover:text-white hover:bg-white/12"
-                      }`}
+          data-on={open}
+          className="aura-bar-btn flex items-center justify-center w-10 h-10 rounded-full flex-shrink-0"
         >
           {icon}
         </button>
@@ -4103,11 +4216,8 @@ function MoreMenu({
         <button
           onClick={() => setOpen((v) => !v)}
           aria-label="More options"
-          className={`flex items-center justify-center w-10 h-10 rounded-full transition-colors
-                      ${open
-                        ? "bg-ln-accent/20 text-ln-accent"
-                        : "text-white/80 hover:text-white hover:bg-white/12"
-                      }`}
+          data-on={open}
+          className="aura-bar-btn flex items-center justify-center w-10 h-10 rounded-full flex-shrink-0"
         >
           <MoreIcon />
         </button>
@@ -4186,12 +4296,9 @@ function MoreMenu({
             disabled={!streamUrl}
             onClick={() => { openExternal(); setOpen(false); }}
           />
-          <MoreItem
-            icon={<ExternalIcon />}
-            label="Open in external player"
-            disabled={!streamUrl}
-            onClick={() => { openExternal(); setOpen(false); }}
-          />
+          {/* No "Open in external player": it ran the exact same call as
+              Download above (the stream URL handed to the OS), and Copy
+              stream link is the way into another player. */}
           <PlayerMenuDivider />
           {/* Audio loudness normalization: in-player mirror of the
               Settings > Video & Audio > "Loudness normalization"
@@ -4362,8 +4469,8 @@ function BufferingOverlay({
 // ---------------------------------------------------------------------------
 // Skip windows — React-side controller.
 //
-// Owns ALL skip behaviour (auto-skip, prompt toast, prompt-key, force-skip
-// Shift+X) so the feature works whether or not the Lua script ever loads
+// Owns ALL skip behaviour (auto-skip, prompt toast, the Skip Segment key)
+// so the feature works whether or not the Lua script ever loads
 // (which on this libmpv build is unreliable — see player.rs comment block
 // above the post-init `load-script` call).
 //
@@ -4380,10 +4487,13 @@ function BufferingOverlay({
 //   • SkipPromptToast — large top-left toast rendered when the active
 //     window is in `prompt` mode (auto: false). Shows kind + the hotkey.
 //   • SkipController — invisible component that owns the auto-skip
-//     timer, the global `x` keybind (only fires while a prompt window is
-//     active), and the always-on Shift+X force-skip keybind. Mounted
-//     once at PlayerOverlay's root so its keybinds stay alive even when
-//     the bottom control bar is hidden.
+//     timer and the Skip Segment key (X by default, rebindable), which
+//     skips whatever window is playing: prompted, already auto-skipped
+//     once and sought back into, or demoted. Mounted once at
+//     PlayerOverlay's root so its key stays alive even when the bottom
+//     control bar is hidden. (The old always-on Shift+X "force skip"
+//     existed only because X answered prompts alone; Shift+X is now the
+//     Next Up card's Play Next Episode default.)
 // ---------------------------------------------------------------------------
 
 interface AuraSkipWindow {
@@ -4549,6 +4659,137 @@ function performSkip(
   return true;
 }
 
+/** The first slot of the player's top-left stack (playerStack.ts): the skip
+ *  prompt, or the theme match's readout when no prompt is up. The Next Up card
+ *  and its tail note stack under it, so it publishes where it ends while it
+ *  holds the slot and withdraws that when it fades or goes, so they move up
+ *  into its place. One that follows the controls (`reserveSlot`) keeps its
+ *  slot while hidden, so showing both again does not slide the card down. */
+function PlayerStackSlot({
+  isFullscreen,
+  visible,
+  reserveSlot = false,
+  children,
+}: {
+  isFullscreen: boolean;
+  visible: boolean;
+  reserveSlot?: boolean;
+  children: React.ReactNode;
+}) {
+  // Top offset has to clear the "Exit playback ↗  <Title>" header above.
+  // That header sits at top: 16 (fs) / 52 (windowed) and its content is
+  // ~64 px tall. 96 / 132 keeps the prompt firmly below it.
+  const top = playerStackBaseTop(isFullscreen);
+  const ref = useRef<HTMLDivElement>(null);
+  const holdsSlot = visible || reserveSlot;
+  // One that mounts hidden skips the rise, whose keyframes end at full
+  // opacity and would flash it on screen for 220 ms.
+  const [mountedHidden] = useState(!visible);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el || !holdsSlot) {
+      publishPlayerStackTop(null);
+      return;
+    }
+    const publish = () => publishPlayerStackTop(top + el.offsetHeight);
+    publish();
+    const ro = new ResizeObserver(publish);
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      publishPlayerStackTop(null);
+    };
+  }, [holdsSlot, top]);
+  return (
+    <div
+      ref={ref}
+      // `.aura-stack-surface` / `.aura-stack-enter` (App.css): the surface
+      // and entry the Next Up card under it shares. The entry is a dedicated
+      // keyframe, NOT the shared `aura-toast-pop`: that one bakes in a
+      // translate(-50%) meant for the centre toast, and this element is
+      // left-anchored with no base transform, so it snapped sideways for the
+      // whole 220 ms.
+      className={`aura-stack-surface ${mountedHidden ? "" : "aura-stack-enter"} fixed left-6 z-[9000]
+                  pointer-events-none px-6 py-4 rounded-2xl text-white`}
+      style={{
+        top,
+        opacity: visible ? 1 : 0,
+        transition: "opacity 400ms ease",
+        textShadow: "0 1px 4px rgba(0,0,0,0.85)",
+        // The stack's shared width (playerStack.ts), so the Next Up card
+        // under it lines up edge for edge. Inline on purpose: tailwind.config
+        // REPLACES the maxWidth scale, so max-w-md and friends emit no CSS.
+        width: PLAYER_STACK_WIDTH,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+const SKIP_MATCH_LABEL: Record<SkipMatchKind, string> = { op: "Opening", ed: "Ending" };
+
+/** One line per kind the theme match is deciding: a bar for how far its
+ *  region has been read, then where it stands. A region read to its end that
+ *  is still deciding (the remaining candidates) shows a full bar. */
+function SkipMatchRows({ rows }: { rows: readonly SkipMatchRow[] }) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      {rows.map((r) => {
+        const pct = Math.round(r.fraction * 100);
+        const status = r.state === "waiting" ? "Queued"
+          : r.state === "running" ? (pct >= 100 ? "Deciding" : `${pct}%`)
+          : r.state === "found" ? "Found"
+          : r.state === "none" ? "No match"
+          : "Unavailable";
+        const done = r.state !== "waiting" && r.state !== "running";
+        return (
+          <div key={r.kind} className="flex items-center gap-3 text-[13px]">
+            <span className="w-[4.5rem] flex-shrink-0 text-white/70">{SKIP_MATCH_LABEL[r.kind]}</span>
+            <span className="relative h-1 flex-1 rounded-full bg-white/15 overflow-hidden">
+              <span
+                className={`absolute inset-y-0 left-0 rounded-full ${
+                  r.state === "found" ? "bg-emerald-400/80" : done ? "bg-white/30" : "bg-white/75"}`}
+                style={{
+                  width: `${done ? 100 : pct}%`,
+                  transition: "width 400ms ease, background-color 300ms ease",
+                }}
+              />
+            </span>
+            <span className={`w-[5rem] flex-shrink-0 text-right tabular-nums text-[12px] ${
+              r.state === "found" ? "text-emerald-300" : "text-white/55"}`}>
+              {status}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** The theme match's readout in the stack's first slot, when no skip prompt
+ *  is up to carry it. Only with the player controls: a match reads the first
+ *  minute or two of an episode, and a box over the cold open for all of that
+ *  would be the very clutter the shared slot avoids. It keeps the slot while
+ *  hidden, so a Next Up card under it does not slide on every controls wake. */
+function SkipMatchStatus({
+  rows, isFullscreen, visible,
+}: {
+  rows: readonly SkipMatchRow[];
+  isFullscreen: boolean;
+  visible: boolean;
+}) {
+  const busy = rows.some((r) => r.state === "waiting" || r.state === "running");
+  return (
+    <PlayerStackSlot isFullscreen={isFullscreen} visible={visible} reserveSlot>
+      <div className="text-[12px] uppercase tracking-[0.22em] text-white/55 mb-2.5">
+        {busy ? "AuraSkip · Checking themes" : "AuraSkip · Theme check done"}
+      </div>
+      <SkipMatchRows rows={rows} />
+    </PlayerStackSlot>
+  );
+}
+
 /** Top-left prompt toast rendered when in a prompt-mode window.
  *  Sized larger than the standard control-feedback toast (which lives
  *  near the centre top); positioned `fixed` at viewport top-left,
@@ -4560,47 +4801,35 @@ function SkipPromptToast({
   isFullscreen,
   visible,
   heldLine,
+  skipKey,
+  withControls = false,
+  matchRows,
 }: {
   window: AuraSkipWindow;
   isFullscreen: boolean;
   visible: boolean;
+  /** The theme match under way, shown under a divider at the bottom so the
+   *  stack carries one box, not two. Empty when none is. */
+  matchRows: readonly SkipMatchRow[];
+  /** Shown only with the player controls (a Risky ending): the slot stays
+   *  reserved while it is hidden, since the Next Up card under it is hidden
+   *  with it, and showing both again must not slide the card down. */
+  withControls?: boolean;
   /** Set when the kind is on Auto but this window may only prompt: completes
    *  "Auto-skip is on, but ...", so a prompt here does not look like Auto is
    *  broken. */
   heldLine?: string | null;
+  /** The Skip Segment binding the prompt names. */
+  skipKey: string;
 }) {
   const kindLabel = skipKindLabel(w.type);
   const song = songLine(w);
   // How far this window can be trusted, and why (skipSource.ts). Absent for a
   // payload written before bases existed: the prompt then reads as it did.
   const confidence = skipConfidenceInfo(w);
-  // Top offset has to clear the "Exit playback ↗  <Title>" header above.
-  // That header sits at top: 16 (fs) / 52 (windowed) and its content is
-  // ~64 px tall. 96 / 132 keeps the prompt firmly below it.
-  const top = isFullscreen ? 96 : 132;
+  const keyLabel = parseBinding(skipKey) ? prettyBinding(skipKey) : null;
   return (
-    <div
-      className="fixed left-6 z-[9000] pointer-events-none
-                 px-7 py-4 rounded-2xl
-                 bg-black/90 backdrop-blur-2xl border border-white/30
-                 text-white shadow-glass-edge"
-      style={{
-        top,
-        opacity: visible ? 1 : 0,
-        transition: "opacity 400ms ease",
-        // Dedicated keyframe, NOT the shared `aura-toast-pop`: that one bakes
-        // in a translate(-50%) meant for the centre toast, and this element is
-        // left-anchored with no base transform, so it snapped sideways for the
-        // whole 220 ms. Invisible at the old width, obvious once a song title
-        // widens the box.
-        animation: "aura-skip-toast-pop 220ms cubic-bezier(0.34, 1.56, 0.64, 1)",
-        textShadow: "0 1px 4px rgba(0,0,0,0.85)",
-        // Arbitrary value on purpose: tailwind.config REPLACES the maxWidth
-        // scale, so max-w-md and friends emit no CSS at all and a long song
-        // title would run this box off the right edge of the screen.
-        maxWidth: "min(30rem, calc(100vw - 3rem))",
-      }}
-    >
+    <PlayerStackSlot isFullscreen={isFullscreen} visible={visible} reserveSlot={withControls}>
       <div className="flex items-center justify-between gap-4 mb-1">
         <div className="text-[12px] uppercase tracking-[0.22em] text-white/55">
           Skip {kindLabel.toLowerCase()}
@@ -4608,14 +4837,21 @@ function SkipPromptToast({
         {confidence && <SkipConfidenceBadge level={confidence.level} size="md" />}
       </div>
       <div className="text-[20px] font-medium tracking-wide">
-        Press{" "}
-        <kbd className="inline-flex items-center justify-center
-                        min-w-[28px] h-[28px] px-2 mx-0.5
-                        rounded-md border border-white/35 bg-white/12
-                        text-white font-mono text-[15px] align-middle">
-          X
-        </kbd>{" "}
-        to skip the {kindLabel}
+        {keyLabel ? (
+          <>
+            Press{" "}
+            <kbd className="inline-flex items-center justify-center
+                            min-w-[28px] h-[28px] px-2 mx-0.5
+                            rounded-md border border-white/35 bg-white/12
+                            text-white font-mono text-[15px] align-middle">
+              {keyLabel}
+            </kbd>{" "}
+            to skip the {kindLabel}
+          </>
+        ) : (
+          // Skip Segment unbound: the control bar's Skip button is the way.
+          <>Skip the {kindLabel} from the control bar</>
+        )}
       </div>
       {/* The song, when it was identified with certainty. Secondary to the
           "press X" affordance above rather than replacing it: the prompt's
@@ -4637,7 +4873,13 @@ function SkipPromptToast({
       {heldLine && (
         <div className="text-[13px] text-white/50 mt-1.5">Auto-skip is on, but {heldLine}.</div>
       )}
-    </div>
+      {matchRows.length > 0 && (
+        <div className="mt-3 pt-3 border-t border-white/10">
+          <div className="text-[11px] uppercase tracking-[0.22em] text-white/45 mb-2">Theme check</div>
+          <SkipMatchRows rows={matchRows} />
+        </div>
+      )}
+    </PlayerStackSlot>
   );
 }
 
@@ -4658,8 +4900,10 @@ function songLine(w: AuraSkipWindow): string | null {
  *  top of PlayerOverlay so its `keydown` listeners stay alive even
  *  when the bottom control bar is hidden by the auto-fade timer. */
 function SkipController({
-  time, duration, seekAbsolute, isFullscreen, loadKey, controlsVisible, ready, skipModes,
+  time, duration, seekAbsolute, isFullscreen, loadKey, skipKey, controlsVisible, ready, skipModes,
 }: {
+  /** The Skip Segment binding (useKeybindings spec). */
+  skipKey: string;
   time: number;
   /** Only used to keep a skip from seeking onto the last frame - see
    *  `skipSeekTarget`. 0 while the file is still loading. */
@@ -4692,7 +4936,12 @@ function SkipController({
 }) {
   const windows = useSkipWindows();
   const active   = ready ? (windows.find((w) => time >= w.start && time < w.end) ?? null) : null;
-  const upcoming = ready ? (windows.find((w) => w.start > time && (w.start - time) <= 30) ?? null) : null;
+  const allMatchRows = useSkipMatchRows();
+  // A kind switched Off mid-load is no longer the user's concern.
+  const matchRows = useMemo(
+    () => allMatchRows.filter((r) => skipModes?.[r.kind] !== "off"),
+    [allMatchRows, skipModes],
+  );
 
   // Per-window "we already handled this one" list, scoped to the current
   // LOAD. Matched by kind with both edges within LAYER1_CONFLICT_SECONDS
@@ -4727,16 +4976,14 @@ function SkipController({
    *  window that was demoted past its midpoint. */
   const promptMode = !!active && (!active.auto || demoted);
 
-  // Refs that the always-on Shift+X listener reads. The listener is
-  // installed once and never re-bound — capturing `active` / `upcoming`
-  // / `seekAbsolute` directly would freeze them at install time.
+  // Refs that the skip-key listener reads. The listener is installed per
+  // binding and never re-bound per tick: capturing `active` / `seekAbsolute`
+  // directly would freeze them at install time.
   const activeRef    = useRef(active);
-  const upcomingRef  = useRef(upcoming);
   const seekRef      = useRef(seekAbsolute);
   const timeRef      = useRef(time);
   const durationRef  = useRef(duration);
   useEffect(() => { activeRef.current   = active; },   [active]);
-  useEffect(() => { upcomingRef.current = upcoming; }, [upcoming]);
   useEffect(() => { seekRef.current     = seekAbsolute; }, [seekAbsolute]);
   useEffect(() => { timeRef.current     = time; },     [time]);
   useEffect(() => { durationRef.current = duration; }, [duration]);
@@ -4789,67 +5036,40 @@ function SkipController({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active?.start, active?.end, active?.auto, loadKey]);
 
-  // Prompt-mode key 'x': only bound while in a prompt window (or an auto
-  // window demoted past its midpoint).
-  useEffect(() => {
-    if (!active || !promptMode) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return;
-      if (e.key.toLowerCase() !== "x") return;
-      // Don't intercept if the user is typing in an input field.
-      const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase();
-      if (tag === "input" || tag === "textarea") return;
-      e.preventDefault();
-      e.stopPropagation();
-      mark(firedRef.current, active);
-      // timeRef / durationRef, not the captured values: this handler outlives
-      // the render it was installed in (`time` is deliberately not a dep).
-      if (performSkip(active, durationRef.current, timeRef.current, seekAbsolute)) {
-        fireToast(`Skipped ${skipKindLabel(active.type)}`);
-      }
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-    // `duration` / `time` are read through refs inside the handler, so they
-    // are deliberately not dependencies: re-installing a capture-phase
-    // keydown listener on every time tick would be absurd.
-  }, [active?.start, active?.end, active?.auto, promptMode, seekAbsolute]);
-
-  // Force-skip Shift+X — always active, anywhere in playback. Inside a
-  // window: skip it. Within 30 s of the next window's start: pre-skip.
-  // Otherwise: feedback toast.
+  // The Skip Segment key: skips the window playing NOW, whatever its mode.
+  // It used to answer only a visible prompt, so inside an auto window the
+  // user had sought back into (handled, so no prompt) the key did nothing and
+  // only the control bar's button or a separate Shift+X "force skip" worked.
+  // Outside a window the key is not consumed, so a binding shared with
+  // another action still reaches it.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return;
-      if (e.key.toLowerCase() !== "x") return;
-      const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase();
-      if (tag === "input" || tag === "textarea") return;
-      e.preventDefault();
-      e.stopPropagation();
+      if (!bindingMatches(skipKey, e)) return;
+      if (isTypingTarget(e.target)) return;
       const a = activeRef.current;
-      const u = upcomingRef.current;
-      if (a) {
-        mark(firedRef.current, a);
-        if (performSkip(a, durationRef.current, timeRef.current, seekRef.current)) {
-          fireToast(`Skipped ${skipKindLabel(a.type)}`);
-        }
-      } else if (u) {
-        mark(firedRef.current, u);
-        if (performSkip(u, durationRef.current, timeRef.current, seekRef.current)) {
-          fireToast(`Skipped upcoming ${skipKindLabel(u.type)}`);
-        }
-      } else {
-        fireToast("No skip window nearby");
+      if (!a) return;
+      e.preventDefault();
+      e.stopPropagation();
+      // Held down: one skip, not one per auto-repeat.
+      if (e.repeat) return;
+      mark(firedRef.current, a);
+      // Refs, not captured values: this handler outlives the render it was
+      // installed in.
+      if (performSkip(a, durationRef.current, timeRef.current, seekRef.current)) {
+        fireToast(`Skipped ${skipKindLabel(a.type)}`);
       }
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, []);
+  }, [skipKey]);
 
   // After 10 s in the same prompt window, fade the toast out — but
-  // unhide it again whenever the player chrome reappears. The 'x'
-  // keybind above is bound to `active`, not the toast's visibility,
-  // so the skip still works while the prompt is hidden.
+  // unhide it again whenever the player chrome reappears. The skip key
+  // above is bound to `active`, not the toast's visibility,
+  // so the skip still works while the prompt is hidden. A Risky ending's
+  // prompt does not pop up at all: it shows only with the player chrome, as
+  // does the Next Up card it raises (nextUpGate rule 5), since the ending may
+  // be wrong and sit over story. X still skips it.
   const promptKey = promptMode ? activeKey : null;
   const [autoHidden, setAutoHidden] = useState(false);
   useEffect(() => {
@@ -4859,11 +5079,17 @@ function SkipController({
     return () => clearTimeout(t);
   }, [promptKey]);
 
-  if (!active || !promptMode) return null;
+  // No prompt to carry it: the theme match's readout takes the prompt's slot.
+  const matchStatus = ready && matchRows.length > 0
+    ? <SkipMatchStatus rows={matchRows} isFullscreen={isFullscreen} visible={controlsVisible} />
+    : null;
+  if (!active || !promptMode) return matchStatus;
   // Suppress the toast after firing: a handled window (or its refinement) is
   // the cleanest way to know "user already accepted, hide the prompt".
-  if (handledIn(firedRef.current, active)) return null;
-  const visible = !autoHidden || controlsVisible;
+  if (handledIn(firedRef.current, active)) return matchStatus;
+  const withControls = skipKindGroup(active.type) === "ed"
+    && skipConfidenceInfo(active)?.level === "risky";
+  const visible = withControls ? controlsVisible : !autoHidden || controlsVisible;
   // A Risky window's note already says what could go wrong; the held line
   // then only says why it asked instead of skipping.
   const held = demoted
@@ -4878,6 +5104,9 @@ function SkipController({
       isFullscreen={isFullscreen}
       visible={visible}
       heldLine={heldLine}
+      skipKey={skipKey}
+      withControls={withControls}
+      matchRows={matchRows}
     />
   );
 }

@@ -427,6 +427,10 @@ pub fn default_keybindings() -> HashMap<String, String> {
     // and the bind looked dead; 'c' reliably arrives. Rebindable in
     // Settings -> Keybindings.
     m.insert("screenshot".into(),         "KeyC".into());
+    // Skip the current OP / ED / recap / preview (the skip prompt's key), and
+    // play the next episode from the Next Up card: Shift + the skip key.
+    m.insert("skip-segment".into(),       "KeyX".into());
+    m.insert("play-next-episode".into(),  "Shift+KeyX".into());
     // Anime4K v4 chord defaults — match the Stremio Community v5
     // bindings the user is migrating from. Ctrl+0 disables upscaling
     // entirely (sets profile 0 / "None").

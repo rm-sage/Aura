@@ -7,38 +7,72 @@
 // Pure (plus one module-level value, the detected media end of the playing
 // file) and import-free, so a node check can load it directly.
 //
-// The rules (skipdetect spec, "Next-Up / auto-advance"):
+// The rules:
 //
 //   1. Nothing auto-advances before end of stream. The corner card NEVER runs a
 //      countdown: unattended advance happens only on the EOS path (mpv's
 //      keep-open pause -> EosSpotlight). After-credits scenes and previews
-//      therefore always play unless the user presses something. The old card
-//      armed at the ED START and fired 5-30 s later, which lost every
+//      therefore always play unless the user presses something. The card that
+//      armed a countdown at the ED start and fired 5-30 s later lost every
 //      after-credits scene and preview (TYBW 3:1 has 169 s of story after its
-//      ending).
-//   2. One trigger expression. With a TRUSTED ending (Layer 1, the AnimeThemes
-//      match, including a Transition-only match, whose END is trusted even
-//      though its start is the song's, and a partially Over match, which is
-//      prompt-only but located by the same evidence; the published ending that replaced a
-//      match counts when its end agrees with the match's; agreed Layer 2 once
-//      it ships) the card appears at
-//      max(ed_end, end - lead): never inside the ending, and when story follows
-//      the ending it waits for the plain lead time instead of covering that
-//      story. When the ending is the last thing in the file (nothing follows
-//      it within ED_LAST_SLACK_S) it appears at ed_end. Without a trusted
-//      ending: the lead trigger only. A crowd, chapter or Layer 3 ED START is
-//      never a trigger.
-//   3. "end" is the MEDIA end (last decoded audio, from the detector), else
+//      ending); the START was never the problem, the countdown was.
+//   2. The card appears when the ending STARTS: the ending `nextUpEnding`
+//      (skipWindows.ts) elects, at any level (Verified, then Likely, then
+//      Risky), unless it lies in the first half of the file or starts within
+//      ED_LAST_SLACK_S of the end (nothing left to show). A Risky ending
+//      raises it as well, together with its prompt: a Transition-only theme's
+//      start can sit minutes inside the story (Cowboy Bebop 13's 280 s) and a
+//      lone AniSkip ending is wrong 8 times in 13, but a card without a
+//      countdown only sits there, while waiting for the trusted END put it up
+//      in the last seconds of every Transition-only ending that runs to the
+//      end of the file (To Be Hero X E07, 1246-1415 s of 1422 s). Waiting for
+//      the ending's END instead (v2.2.2) put the card on
+//      screen a fraction of a second before the end screen covered it on
+//      every episode whose ending runs to the end of the file.
+//   3. Without a credible start, the v2.2.2 expression: with a TRUSTED ending
+//      (Layer 1, the AnimeThemes match, including a Transition-only match,
+//      whose END is trusted even though its start is the song's, and a
+//      partially Over match; the published ending that replaced a match
+//      counts when its end agrees with the match's) the card appears at
+//      max(ed_end, end - lead), or at ed_end when nothing follows it within
+//      ED_LAST_SLACK_S. Without a trusted ending: the lead trigger only.
+//   4. What follows the ending is SAID, never guessed (`nextUpTailNote`): a
+//      preview chapter that fills it is a preview; otherwise only its length,
+//      and only when a trusted ending end and a MEASURED media end (TAIL read
+//      to EOF, else the probe's DURATION tag; never the container duration)
+//      bound it. The banner is a warning about what Play would skip, so it
+//      goes once the ending is over: the user is then watching it. A crowd or chapter ending's end is not enough
+//      (AniSkip ending rows ran 32-38 s early on TYBW 3:9-3:11, which would
+//      invent a tail).
+//   5. A card that went up while the PLAYHEAD was before the ending's end
+//      fades with the player controls once the playhead passes it
+//      (`nextUpFadeFrom`): the user stayed for whatever follows. That includes
+//      an ending auto-skipped straight past (the user chose to skip it). A
+//      card that first went up at or after that point (the rule 3 fallback, a
+//      resume or a seek into the tail) stays up, as it did in v2.2.2: born
+//      faded, it would never be seen by a viewer who is not moving the mouse.
+//      A card raised by a RISKY ending's start follows the controls from the
+//      moment it goes up (`nextUpFollowsControls`), like that ending's prompt
+//      (user's call, 2026-10-20): the ending may be wrong and sit over story,
+//      so neither pops up on its own. Their keys work while they are hidden.
+//   6. "end" is the MEDIA end (last decoded audio, from the detector), else
 //      the container duration. A container can run ~29 s past its media.
-//   4. The card hides again only when the playhead moves back more than
-//      HIDE_MARGIN_S before the trigger, so the hide rule cannot take down a
-//      card raised at the ED end.
+//   7. The card hides again only when the playhead moves back more than
+//      HIDE_MARGIN_S before the trigger. While the trigger is a rule 3
+//      fallback, that is measured from the EARLIEST trigger the card was
+//      raised at, so a later stamp that withdraws the ending cannot take it
+//      down in the middle of the credits. A credible start (rule 2) is always
+//      measured from itself: a stamp that replaced a wrong ending with the
+//      real, later one takes down a card that went up over story.
 // ---------------------------------------------------------------------------
 
 /** An ending that finishes within this of the end is the last content. */
 export const ED_LAST_SLACK_S = 5;
 /** Seeking back past the trigger by more than this takes the card away. */
 export const HIDE_MARGIN_S = 5;
+/** An ending that starts before this fraction of the file raises no card: a
+ *  crowd or chapter "ending" that early is not the credits. */
+export const ED_START_MIN_FRACTION = 0.5;
 /** A detected media end further than this below the container duration is
  *  not trusted (measured gaps: 0.95-29.09 s). */
 export const MEDIA_END_MAX_GAP_S = 60;
@@ -58,6 +92,40 @@ export interface NextUpTiming {
   trustedEdEnd: number | null;
   /** The detector's media end (final or early estimate), or null. */
   mediaEnd: number | null;
+  /** The media end as MEASURED: the value read at TAIL EOF, else the probe's
+   *  mapped-track DURATION tag; never the container duration the early
+   *  estimate can be. The banner's tail length rests on this. */
+  mediaEndMeasured: number | null;
+  /** Start and end of the ending whose START raises the card (any level and
+   *  source: `nextUpEnding`), or null. */
+  edStart: number | null;
+  edEnd: number | null;
+  /** That ending is Risky (`skipConfidence`): a card it raises shows only
+   *  with the player controls (rule 5). */
+  edRisky: boolean;
+  /** The file's preview window (a titled preview chapter), or null. */
+  previewStart: number | null;
+  previewEnd: number | null;
+}
+
+/** Nothing known yet: the state at every load. A fresh object per call. */
+export function emptyNextUpTiming(): NextUpTiming {
+  return {
+    trustedEdEnd: null, mediaEnd: null, mediaEndMeasured: null,
+    edStart: null, edEnd: null, edRisky: false, previewStart: null, previewEnd: null,
+  };
+}
+
+const finitePos = (v: number | null | undefined): v is number =>
+  v != null && Number.isFinite(v) && v > 0;
+
+/** Rule 2's trigger: the ending's start, when it is credible and in the
+ *  second half of the file, or null. One that starts within the slack of the
+ *  end has nothing to show. */
+function credibleStart(timing: NextUpTiming, end: number): number | null {
+  const start = timing.edStart;
+  return finitePos(start) && start >= end * ED_START_MIN_FRACTION && start < end - ED_LAST_SLACK_S
+    ? start : null;
 }
 
 /** The playback position at which the card may appear, or null when the
@@ -69,9 +137,11 @@ export function nextUpTriggerAt(
 ): number | null {
   if (!(leadSeconds > 0) || !(duration > 0)) return null;
   const end = playableEnd(duration, timing.mediaEnd);
+  const start = credibleStart(timing, end);
+  if (start != null) return start;
   const leadAt = end - leadSeconds;
   const ed = timing.trustedEdEnd;
-  if (ed != null && Number.isFinite(ed) && ed > 0) {
+  if (finitePos(ed)) {
     // An ending that reaches within the slack of the end (including one
     // clamped exactly TO the end, or past it against a container end) is the
     // last content: the card waits for it, never the lead time inside it.
@@ -92,15 +162,96 @@ export function nextUpShouldShow(
   return at != null && time >= at && time < duration;
 }
 
-/** Should a card that is up be taken down at `time`? Only a real move back. */
+/** Should a card that is up be taken down at `time`? Only a real move back
+ *  (rule 7): from the earliest trigger it was raised at (`shownAt`) while the
+ *  trigger is a fallback, from the trigger itself while it is a credible
+ *  ending start. */
 export function nextUpShouldHide(
   time: number,
   timing: NextUpTiming,
   duration: number,
   leadSeconds: number,
+  shownAt: number | null = null,
 ): boolean {
   const at = nextUpTriggerAt(timing, duration, leadSeconds);
-  return at == null || time < at - HIDE_MARGIN_S;
+  if (at == null) return true;
+  const floor = credibleStart(timing, playableEnd(duration, timing.mediaEnd)) != null
+    ? at : Math.min(at, shownAt ?? at);
+  return time < floor - HIDE_MARGIN_S;
+}
+
+/** What the card's banner says follows the ending, or null for nothing to
+ *  say (and from the moment the ending is over). `preview`: a preview chapter
+ *  fills it. `more`: `seconds` of something after the ending, measured from a
+ *  trusted ending end to a measured media end; `withPreview` when a preview
+ *  chapter is part of it. */
+export type NextUpTailNote =
+  | { kind: "preview" }
+  | { kind: "more"; seconds: number; withPreview: boolean };
+
+export function nextUpTailNote(
+  timing: NextUpTiming,
+  duration: number,
+  time: number,
+): NextUpTailNote | null {
+  if (!(duration > 0)) return null;
+  // Where the ending stops, as well as it is known.
+  const trusted = finitePos(timing.trustedEdEnd) ? timing.trustedEdEnd : null;
+  const after = trusted ?? (finitePos(timing.edEnd) ? timing.edEnd : null);
+  // Once the ending is over the user is watching what follows: nothing left
+  // to warn about.
+  if (after == null || !(time < after)) return null;
+  // A length is said only when both of its ends are measured: a trusted
+  // ending end, and a measured media end playableEnd keeps. The early
+  // estimate can be the container duration, which can run ~29 s past the
+  // media and would invent a tail.
+  // One a few ms past the container duration (audio a frame past an MKV's
+  // segment duration) is still measured, clamped to it.
+  const m = timing.mediaEndMeasured;
+  const measured = !finitePos(m) ? null
+    : m >= duration ? duration
+      : playableEnd(duration, m) === m ? m : null;
+  const end = measured ?? playableEnd(duration, timing.mediaEnd);
+  // A preview chapter that FILLS what follows the ending: it starts where the
+  // ending stops and runs to the end (the container end bounds that from
+  // above when the media end is not measured). Anything less leaves an
+  // unlabelled stretch the word "preview" would hide.
+  const ps = timing.previewStart, pe = timing.previewEnd;
+  const preview = finitePos(ps) && finitePos(pe) && pe > ps
+    && ps >= after - ED_LAST_SLACK_S ? { start: ps, end: pe } : null;
+  const fills = preview != null
+    && preview.start - after <= ED_LAST_SLACK_S && end - preview.end <= ED_LAST_SLACK_S;
+  if (trusted != null && measured != null) {
+    if (!(end - trusted > ED_LAST_SLACK_S)) return null;
+    if (fills) return { kind: "preview" };
+    return { kind: "more", seconds: Math.round(end - trusted), withPreview: preview != null };
+  }
+  return fills ? { kind: "preview" } : null;
+}
+
+/** The playback position from which the card fades with the player controls
+ *  (the end of the ending: the trusted one, else the electing one), or null
+ *  for a card that stays up. `raisedAt` is the PLAYHEAD when the card went
+ *  up: only a card up BEFORE the ending ended fades (rule 5). */
+export function nextUpFadeFrom(timing: NextUpTiming, raisedAt: number | null): number | null {
+  const from = finitePos(timing.trustedEdEnd) ? timing.trustedEdEnd
+    : finitePos(timing.edEnd) ? timing.edEnd : null;
+  if (from == null || raisedAt == null || !(raisedAt < from)) return null;
+  return from;
+}
+
+/** Whether the card (or its tail note) shows only while the player controls
+ *  do at `time`: raised by a Risky ending's start, or past the fade point of
+ *  rule 5. */
+export function nextUpFollowsControls(
+  timing: NextUpTiming,
+  duration: number,
+  time: number,
+  raisedAt: number | null,
+): boolean {
+  if (timing.edRisky && credibleStart(timing, playableEnd(duration, timing.mediaEnd)) != null) return true;
+  const from = nextUpFadeFrom(timing, raisedAt);
+  return from != null && time >= from;
 }
 
 // ---------------------------------------------------------------------------

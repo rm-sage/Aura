@@ -34,7 +34,6 @@ export interface StreamMenuContext {
   streamId: string;
   naming: DownloadNaming;
   onCopy: (text: string) => void;
-  onPlayExternal: (url: string) => void;
 }
 
 interface PlannedPath {
@@ -153,7 +152,6 @@ function buildTitle(n: DownloadNaming): string {
 export function buildStreamMenu(
   stream: StreamEntry,
   ctx: StreamMenuContext,
-  externalIcon?: React.ReactNode,
 ): ContextMenuItem[] {
   const items: ContextMenuItem[] = [];
 
@@ -166,13 +164,9 @@ export function buildStreamMenu(
       onClick: () => ctx.onCopy(`magnet:?xt=urn:btih:${stream.info_hash}`),
     });
   }
-  if (stream.url) {
-    items.push({
-      label: "Play externally",
-      icon: externalIcon,
-      onClick: () => ctx.onPlayExternal(stream.url!),
-    });
-  }
+  // No "Play externally": it handed the stream URL to the OS, which opens it
+  // in the browser and so did what Download does. Copy stream link is the way
+  // into another player.
 
   items.push({ kind: "divider" });
   items.push(downloadItem(stream, ctx));

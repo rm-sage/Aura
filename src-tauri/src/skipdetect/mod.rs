@@ -81,6 +81,8 @@ pub use job::{JobState, Request, Snapshot};
 
 /// Event carrying every snapshot change of the CURRENT detect.
 pub const UPDATE_EVENT: &str = "skipdetect-update";
+/// Event carrying the current detect's decode progress (`job::Progress`).
+pub const PROGRESS_EVENT: &str = "skipdetect-progress";
 
 /// Bumped by every Detect and Cancel; a job publishes only while it is current.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -269,6 +271,7 @@ async fn detect(app: AppHandle, req: Request) -> Result<SkipDetectReply, String>
         return unavailable("ffmpeg unavailable".into());
     }
     let publish_app = app.clone();
+    let progress_app = app.clone();
     let ctx = job::Ctx {
         ffmpeg: crate::silencedetect::ffmpeg_bin(&app),
         data_dir: data_dir(&app),
@@ -279,6 +282,11 @@ async fn detect(app: AppHandle, req: Request) -> Result<SkipDetectReply, String>
             }
             store_latest(s);
             let _ = publish_app.emit(UPDATE_EVENT, s);
+        }),
+        progress: Arc::new(move |p: &job::Progress| {
+            if is_current(p.generation) {
+                let _ = progress_app.emit(PROGRESS_EVENT, p);
+            }
         }),
         #[cfg(test)]
         replay: None,

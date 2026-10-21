@@ -4,7 +4,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { openExternalUrl } from "../externalUrl";
 import type {
   AddonEntry,
   MetaPreview,
@@ -276,11 +275,6 @@ const ArrowBackIcon = () => (
 const ArrowBackSm = () => (
   <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
     <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20z" />
-  </svg>
-);
-const ExternalIcon = () => (
-  <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-    <path d="M14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7zM19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7z" />
   </svg>
 );
 const BackdropIcon = () => (
@@ -2881,7 +2875,6 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                 episode_title: activeVideo?.title ?? null,
               },
               onCopy: (text: string) => navigator.clipboard.writeText(text).catch(() => {}),
-              onPlayExternal: (url: string) => openExternalUrl(url),
             }}
             scrollToVideoId={scrollOnceTo}
             highlightVideoId={ringEpisodeId}
@@ -5091,36 +5084,50 @@ function EpisodesPanel({
         ) : (
           <>
             {/* Arc breadcrumb, replacing the season dropdown while an arc is
-                open. Same vertical rhythm so the list below does not shift. */}
-            {arcMode && openArc && (
-              <div className="flex items-center justify-center gap-3.5 mb-4">
-                <button
-                  type="button"
-                  onClick={() => setOpenArcId(null)}
-                  className="flex items-center gap-1.5 px-3 h-7 rounded-lg text-[12px] font-medium
-                             text-white/70 hover:text-white bg-white/6 hover:bg-white/12 transition-colors"
-                >
-                  <span aria-hidden>&larr;</span>
-                  <span className="truncate max-w-[22rem]">{openArc.name}</span>
-                </button>
-                <EpisodeCountChip
-                  label={`${inArc.length} ${inArc.length === 1 ? "ep" : "eps"}`}
-                  showBreakdown={showHasFillerRecap}
-                  canon={arcCanon}
-                  filler={arcFiller}
-                  recap={arcRecap}
-                  scope="this arc"
-                />
-                {arcYearRange(openArc) && (
-                  <span className="text-[12px] text-white/40">{arcYearRange(openArc)}</span>
-                )}
-                {openArcChapters && (
-                  <span className="text-[12px] text-white/40 font-mono tabular-nums whitespace-nowrap" title="Manga chapters this arc adapts">
-                    {openArcChapters}
-                  </span>
-                )}
-              </div>
-            )}
+                open. The arc's years and manga chapters sit on their own
+                centred line under the name and count, always (a long arc name
+                pushed them past the panel's edge when they shared the row);
+                the name truncates before the count chip gives way. */}
+            {arcMode && openArc && (() => {
+              const years = arcYearRange(openArc);
+              return (
+                <div className="flex flex-col items-center gap-1.5 mb-4 px-3 min-w-0">
+                  <div className="flex items-center justify-center gap-3.5 max-w-full min-w-0">
+                    <button
+                      type="button"
+                      onClick={() => setOpenArcId(null)}
+                      title={openArc.name}
+                      className="flex items-center gap-1.5 px-3 h-7 min-w-0 rounded-lg text-[12px] font-medium
+                                 text-white/70 hover:text-white bg-white/6 hover:bg-white/12 transition-colors"
+                    >
+                      <span aria-hidden>&larr;</span>
+                      <span className="truncate min-w-0 max-w-[22rem]">{openArc.name}</span>
+                    </button>
+                    <div className="shrink-0">
+                      <EpisodeCountChip
+                        label={`${inArc.length} ${inArc.length === 1 ? "ep" : "eps"}`}
+                        showBreakdown={showHasFillerRecap}
+                        canon={arcCanon}
+                        filler={arcFiller}
+                        recap={arcRecap}
+                        scope="this arc"
+                      />
+                    </div>
+                  </div>
+                  {(years || openArcChapters) && (
+                    <div className="flex items-center gap-2 text-[12px] text-white/40 whitespace-nowrap">
+                      {years && <span>{years}</span>}
+                      {years && openArcChapters && <span aria-hidden className="text-white/20">&middot;</span>}
+                      {openArcChapters && (
+                        <span className="font-mono tabular-nums" title="Manga chapters this arc adapts">
+                          {openArcChapters}
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
 
             {/* Season dropdown + per-season episode count, centred as a
                 group with a clear gap between them. The count is a standout
@@ -6013,7 +6020,7 @@ function RawStreamRow({
         e.preventDefault();
         openContextMenu(
           e.clientX, e.clientY,
-          buildStreamMenu(stream, menuCtx, <ExternalIcon />),
+          buildStreamMenu(stream, menuCtx),
         );
       }}
       title={stream.filename ?? undefined}
@@ -6111,7 +6118,7 @@ function StreamRow({
         e.preventDefault();
         openContextMenu(
           e.clientX, e.clientY,
-          buildStreamMenu(stream, menuCtx, <ExternalIcon />),
+          buildStreamMenu(stream, menuCtx),
         );
       }}
       className={[

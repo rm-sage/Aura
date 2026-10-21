@@ -42,10 +42,11 @@ pub mod hls;
 pub mod media_server;
 pub mod transcode;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
+use tauri::Emitter;
 
 /// Default Media Receiver — Google's built-in receiver app. Plays
 /// MP4/WebM/HLS/TS with no registration. (The reference implementation's
@@ -87,6 +88,34 @@ pub struct CastStatus {
     pub transcoding: bool,
 }
 
+/// What `cast_load` reports beyond success. Rust -> React, field names as-is.
+#[derive(Clone, Debug, Serialize)]
+pub struct CastLoadResult {
+    /// A DLNA renderer refused the jump to the resume point twice, so it is
+    /// playing from the start. The UI says so instead of leaving the user to
+    /// discover it.
+    pub resume_failed: bool,
+}
+
+/// Progress of a `cast_load`, emitted as `cast-load-progress` so the picker
+/// can say what a slow pick is waiting on (a format probe, a transcode
+/// warming up, a renderer that needs a beat before it seeks) instead of
+/// showing a bare spinner that reads as a dead button.
+#[derive(Clone, Serialize)]
+struct CastLoadProgress<'a> {
+    device_id: &'a str,
+    /// "probing" | "preparing" | "connecting" | "resuming"
+    stage: &'a str,
+}
+
+fn emit_progress(app: &tauri::AppHandle, device_id: &str, stage: &str) {
+    let _ = app.emit("cast-load-progress", CastLoadProgress { device_id, stage });
+}
+
+/// How long a DLNA renderer gets before the one retry of a refused resume
+/// seek. Some renderers answer Seek with an error until their buffer fills.
+const DLNA_SEEK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
 // ---------------------------------------------------------------------------
 // Active session bookkeeping
 // ---------------------------------------------------------------------------
@@ -123,6 +152,27 @@ static ACTIVE: OnceLock<Mutex<Option<ActiveSession>>> = OnceLock::new();
 
 fn active_slot() -> &'static Mutex<Option<ActiveSession>> {
     ACTIVE.get_or_init(|| Mutex::new(None))
+}
+
+/// Serialises cast_load / cast_stop. The picker leaves every device but the
+/// connecting one clickable, so a second pick can arrive while the first load
+/// is mid-flight: unserialised, both ran stop_active_session before either
+/// stored a session, the second's clear_all killed the first's transcode, and
+/// the second store overwrote the first session without stopping it (the
+/// first TV kept playing with a heartbeat thread nothing could reach).
+static OP_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+fn op_lock() -> &'static tokio::sync::Mutex<()> {
+    OP_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Bumped by every cast_load / cast_stop BEFORE it waits on OP_LOCK, so an
+/// in-flight transmux pre-warm (up to 45 s) sees it was superseded and bails
+/// instead of making the newer request wait it out.
+static LOAD_GEN: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn load_superseded(gen: u64) -> bool {
+    LOAD_GEN.load(Ordering::Acquire) != gen
 }
 
 // ---------------------------------------------------------------------------
@@ -181,20 +231,28 @@ pub(super) fn locate_tool(name: &str) -> Option<std::path::PathBuf> {
 ///   `application/octet-stream`.
 /// * Receiver-incompatible containers (MKV/AVI/…) on Chromecast → ffmpeg
 ///   HLS transmux (`hls::register_transcode`), when ffmpeg+ffprobe exist.
+/// * A url that names no container (debrid `/download/<id>` links) on
+///   Chromecast is PROBED first (`transcode::route_for_probe`), since the
+///   extension cannot say whether it needs the transmux. The probe costs a
+///   second or more, and the picker shows it (`cast-load-progress`).
 #[tauri::command]
 pub async fn cast_load(
+    app: tauri::AppHandle,
     device: CastDeviceInfo,
     url: String,
     title: Option<String>,
     poster: Option<String>,
     start_seconds: Option<f64>,
-) -> Result<(), String> {
+) -> Result<CastLoadResult, String> {
     crate::devlog!(
         info, "cast",
         "cast_load → {} ({}) url={}",
         device.name, device.kind,
         crate::stremio::redact_sensitive_url(&url),
     );
+
+    let gen = LOAD_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+    let _op = op_lock().lock().await;
 
     // One session at a time — stop whatever is active first, then drop any
     // proxy / transcode sessions it left behind (a finished transcode's
@@ -204,23 +262,60 @@ pub async fn cast_load(
     hls::clear_all_async().await;
 
     let resume = start_seconds.filter(|v| v.is_finite() && *v > 0.0).unwrap_or(0.0);
-    let is_hls = url.split('?').next().unwrap_or("").to_ascii_lowercase().ends_with(".m3u8");
+    let mut is_hls = transcode::url_path(&url).ends_with(".m3u8");
+    let ffmpeg_ok = cast_ffmpeg_present();
     // Phase-4 transmux: containers the Default Media Receiver can't open
     // directly (MKV/AVI/…) are re-segmented to HLS via ffmpeg — but only
     // for Chromecast. Most DLNA TVs decode them natively, so DLNA always
     // direct-plays (no needless transcode load). ffmpeg/ffprobe absent ⇒
     // fall back to direct-play (the device may still cope, or report an
     // error the user can act on).
-    let transmux = !is_hls
+    let mut transmux = !is_hls
         && device.kind == "chromecast"
         && transcode::should_transmux(&url)
-        && cast_ffmpeg_present();
+        && ffmpeg_ok;
+    // The direct-play Content-Type, unless a probe below learns better.
+    let mut direct_type = guess_content_type(&url, is_hls);
+    // Codecs a probe already read, handed to the transmux so it does not
+    // probe the same url twice.
+    let mut probed: Option<transcode::Codecs> = None;
+    if device.kind == "chromecast" && ffmpeg_ok && !transcode::names_container(&url) {
+        emit_progress(&app, &device.id, "probing");
+        let up = url.clone();
+        let codecs = tauri::async_runtime::spawn_blocking(move || transcode::probe(&up))
+            .await
+            .map_err(|e| e.to_string())?;
+        if load_superseded(gen) {
+            return Err("cast load superseded".into());
+        }
+        let route = transcode::route_for_probe(&codecs);
+        crate::devlog!(
+            info, "cast",
+            "no container in the url: probed format={:?} video={:?} audio={:?} -> {route:?}",
+            codecs.format, codecs.video, codecs.audio,
+        );
+        match route {
+            transcode::ProbedRoute::Hls => {
+                is_hls = true;
+                direct_type = guess_content_type(&url, true);
+            }
+            transcode::ProbedRoute::Direct(ct) => direct_type = ct,
+            transcode::ProbedRoute::Transmux => transmux = true,
+            // An unreadable probe keeps the old guess: direct-play as MP4.
+            transcode::ProbedRoute::Unknown => {}
+        }
+        probed = Some(codecs);
+    }
     let (media_url, content_type): (String, &'static str) = if is_hls {
-        (url.clone(), guess_content_type(&url, true))
+        (url.clone(), direct_type)
     } else if transmux {
-        (hls::register_transcode(&url, &device.host, resume).await?, "application/x-mpegurl")
+        emit_progress(&app, &device.id, "preparing");
+        (
+            hls::register_transcode(&url, &device.host, resume, gen, probed).await?,
+            "application/x-mpegurl",
+        )
     } else {
-        (media_server::register_cast(&url, &device.host).await?, guess_content_type(&url, false))
+        (media_server::register_cast(&url, &device.host).await?, direct_type)
     };
     // A transmux input-seeks ffmpeg to `resume`, so its HLS timeline starts at
     // 0; the device is told currentTime=0 and we add the offset back for
@@ -228,6 +323,8 @@ pub async fn cast_load(
     // position). Direct-play / HLS seek the real file, so the device gets the
     // real resume position and there's no offset.
     let (device_start, tx_offset) = if transmux { (0.0, resume) } else { (resume, 0.0) };
+    emit_progress(&app, &device.id, "connecting");
+    let mut resume_failed = false;
 
     let result: Result<(), String> = match device.kind.as_str() {
         "chromecast" => {
@@ -256,9 +353,25 @@ pub async fn cast_load(
                     .ok_or("DLNA device has no AVTransport control URL")?;
                 dlna::load(&control_url, &media_url, content_type, title.as_deref()).await?;
                 if device_start > 1.0 {
+                    emit_progress(&app, &device.id, "resuming");
                     // Some renderers need a beat between Play and Seek.
                     tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-                    let _ = dlna::seek(&control_url, device_start).await;
+                    if let Err(e) = dlna::seek(&control_url, device_start).await {
+                        // One retry: a renderer still filling its buffer can
+                        // refuse the first Seek and take the second.
+                        crate::devlog!(
+                            warn, "cast",
+                            "dlna resume seek to {device_start:.0}s failed, retrying once: {e}",
+                        );
+                        tokio::time::sleep(DLNA_SEEK_RETRY_DELAY).await;
+                        if let Err(e) = dlna::seek(&control_url, device_start).await {
+                            crate::devlog!(
+                                warn, "cast",
+                                "dlna resume seek to {device_start:.0}s failed again, playing from the start: {e}",
+                            );
+                            resume_failed = true;
+                        }
+                    }
                 }
                 *active_slot().lock().unwrap() = Some(ActiveSession::Dlna(DlnaSession {
                     device_name: device.name.clone(),
@@ -279,7 +392,7 @@ pub async fn cast_load(
         media_server::clear_sessions();
         hls::clear_all_async().await;
     }
-    result
+    result.map(|()| CastLoadResult { resume_failed })
 }
 
 #[tauri::command]
@@ -342,6 +455,8 @@ pub async fn cast_seek(position_sec: f64) -> Result<(), String> {
 /// known position so the caller can resume local playback there.
 #[tauri::command]
 pub async fn cast_stop() -> Result<f64, String> {
+    LOAD_GEN.fetch_add(1, Ordering::AcqRel);
+    let _op = op_lock().lock().await;
     let last_pos = match current_status_inner().await {
         Ok(s) => s.position_sec,
         Err(_) => 0.0,
@@ -688,7 +803,7 @@ fn guess_content_type(url: &str, is_hls: bool) -> &'static str {
     if is_hls {
         return "application/x-mpegurl";
     }
-    let path = url.split('?').next().unwrap_or("").to_ascii_lowercase();
+    let path = transcode::url_path(url);
     if path.ends_with(".webm") {
         "video/webm"
     } else if path.ends_with(".mkv") {

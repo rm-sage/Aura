@@ -144,6 +144,7 @@ let leaderTimer: ReturnType<typeof setInterval> | null = null;
 let userLeft = false; // distinguishes a deliberate leave from a dropped socket
 let roomNotFound = false; // set on a `room-not-found` frame so onclose doesn't reconnect
 let reconnectAttempts = 0;
+let reconnecting = false; // the live connect() came from the reconnect path, not a user action
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let bridge: PlaybackBridge | null = null;
 let lastApplyAt = 0; // throttles applied remote seeks (APPLY_MIN_INTERVAL_MS)
@@ -328,6 +329,7 @@ function connect(code: string, intent: "join" | "create", isReconnect = false): 
   // Without this a NEW party inherits an exhausted counter from a prior failed
   // session and gets zero reconnects on its first transient drop.
   if (!isReconnect) reconnectAttempts = 0;
+  reconnecting = isReconnect;
   ui.status = "connecting";
   ui.roomCode = code;
   ui.pendingCode = null;
@@ -371,7 +373,7 @@ function connect(code: string, intent: "join" | "create", isReconnect = false): 
     // code 4404 — settle into not-found (don't reconnect, which would auto-
     // create). This is the reliable signal even if the room-not-found frame
     // didn't flush before the close.
-    if (ev.code === 4404) { enterNotFound(ui.roomCode); return; }
+    if (ev.code === 4404) { handleNotFound(ui.roomCode); return; }
     // Clear the SHARED staging/sync flags so the pause gate (wtStagedHold reads
     // ui.staging && ui.inSync) lifts in lock-step with the banner hiding during
     // the "connecting" window — otherwise the host sees the banner vanish (it's
@@ -446,6 +448,25 @@ function setError(msg: string) {
   ui.status = "error";
   ui.error = msg;
   emit();
+}
+
+/** The relay found nobody hosting. A user's join settles at once. A RECONNECT
+ *  may just have beaten the host back: a relay redeploy / DO recycle drops every
+ *  socket together and every member retries on the same 1.5 s step, so a
+ *  follower reaching the empty DO first would strand on "no one is hosting"
+ *  while the host re-creates the room a moment later. Retry (still as a join,
+ *  never resurrecting the room) within the normal budget before settling. */
+function handleNotFound(code: string | null) {
+  if (reconnecting && reconnectAttempts < RECONNECT_MAX && ui.roomCode) {
+    const room = ui.roomCode;
+    teardown(); // nulls the handlers, so the trailing 4404 close is not handled twice
+    reconnectAttempts += 1;
+    ui.status = "connecting";
+    emit();
+    reconnectTimer = setTimeout(() => connect(room, "join", true), 1500 * reconnectAttempts);
+    return;
+  }
+  enterNotFound(code);
 }
 
 /** Settle into the "no one is hosting this code" state (the Lobby then offers
@@ -635,7 +656,7 @@ function handleMessage(data: string) {
     case "room-not-found":
       // A join found no host — surface the "create it instead" affordance. (The
       // 4404 close code in onclose is the fallback if this frame doesn't land.)
-      enterNotFound(msg.code || ui.roomCode);
+      handleNotFound(msg.code || ui.roomCode);
       break;
     default:
       break;

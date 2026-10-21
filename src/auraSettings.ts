@@ -240,6 +240,16 @@ export interface AuraSettings {
    *  Trakt / AniList as watched. An unattended skip marks locally and sends
    *  nothing. See skipActions.ts for the rule set. */
   nextUpSkipFillerRecap: "none" | "filler" | "recap" | "both";
+  /** When the Next Up card offers a skip past filler / recap, the Play Next
+   *  Episode key must be HELD (2 s, the card previewing the canon episode
+   *  meanwhile) to skip; off, one press skips. Without a skip on offer the
+   *  key always plays the next episode on one press. Default on. */
+  nextUpHoldToSkip: boolean;
+  /** While the player's Upscaler menu recommends a profile and none is on, a
+   *  rainbow light traces the Upscaler pill and the Rec. tags in the menu.
+   *  Switched in the Upscaler menu itself, not in Settings. Never animates
+   *  under reduced motion. Default on. */
+  upscalerRecHighlight: boolean;
   /** Use Aura Cloud's shared release-search feed for library /
    *  calendar reconciliation instead of probing addons per-user.
    *  Phase 9 — cloud-side poller computes the signal once per imdb-id
@@ -334,6 +344,8 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   motionInterpolation: true,
   interpolationTscale: "mitchell",
   nextUpSkipFillerRecap: "none",
+  nextUpHoldToSkip: true,
+  upscalerRecHighlight: true,
   releaseSearchEnabled: true,
   metaPanelActivation: "hover",
   metaPanelBindButton: 1,
@@ -445,6 +457,12 @@ function readFromStorage(): AuraSettings {
           || parsed.nextUpSkipFillerRecap === "both"
           ? parsed.nextUpSkipFillerRecap
           : "none",
+      nextUpHoldToSkip: typeof parsed.nextUpHoldToSkip === "boolean"
+        ? parsed.nextUpHoldToSkip
+        : true,
+      upscalerRecHighlight: typeof parsed.upscalerRecHighlight === "boolean"
+        ? parsed.upscalerRecHighlight
+        : true,
       releaseSearchEnabled: typeof parsed.releaseSearchEnabled === "boolean"
         ? parsed.releaseSearchEnabled
         : true,

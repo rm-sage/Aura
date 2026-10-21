@@ -267,6 +267,9 @@ function useLibraryRowWindow(
   // and refreshed on resize so the scroll handler never pays a
   // getBoundingClientRect (forced reflow) per scroll event.
   const gridTopRef = useRef(0);
+  // Viewport height: a taller window at the same column count changes no
+  // other input, so the rows it uncovers stayed unmounted until a scroll.
+  const [viewH, setViewH] = useState(0);
 
   // Measure layout BEFORE paint (useLayoutEffect, not useEffect) so the
   // first frame already has the right column count + row stride — otherwise
@@ -296,6 +299,8 @@ function useLibraryRowWindow(
       const wrapRect = wrapper.getBoundingClientRect();
       const scrollRect = scroll.getBoundingClientRect();
       gridTopRef.current = wrapRect.top - scrollRect.top + scroll.scrollTop;
+      const vh = scroll.clientHeight;
+      setViewH((prev) => (prev === vh ? prev : vh));
     };
     measure();
     const ro = new ResizeObserver(measure);
@@ -326,7 +331,7 @@ function useLibraryRowWindow(
     compute();
     scroll.addEventListener("scroll", compute, { passive: true });
     return () => scroll.removeEventListener("scroll", compute);
-  }, [scrollRef, cols, rowStride, itemCount]);
+  }, [scrollRef, cols, rowStride, itemCount, viewH]);
 
   const totalRows = Math.ceil(itemCount / cols);
   const totalHeight = totalRows > 0 ? totalRows * rowStride - LIB_GRID_GAP : 0;

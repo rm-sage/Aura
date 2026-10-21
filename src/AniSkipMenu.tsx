@@ -702,16 +702,19 @@ export default function AniSkipMenu({
             </div>
             {/* Live-apply feedback. auto<->prompt re-stamps the CURRENT episode's
                 windows instantly (App.tsx listens for aura:settings-changed); the
-                one case that can't apply live is re-enabling a segment turned fully
-                off, because its window was dropped from the active payload. */}
+                one case that can't apply live is turning on a segment that was Off
+                when the episode started, because nothing was gathered for it (not
+                an ending while the Next-Up card was on: the chain gathers endings
+                for the card even on Off). */}
             <p className="text-white/55 text-[12px] leading-relaxed mt-2.5 px-3 pb-1">
               Some segments always ask first, even on Auto: hover "Prompt only"
               for why. Only Verified and Likely segments can skip on their own;
               Risky ones always ask first. A level can change while a prompt is
               showing, as the theme match finishes checking the episode. Ending
               Off also hides previews. Changes apply to this episode instantly,
-              except turning a segment fully off and back on, which takes effect
-              from the next stream load.
+              except turning on a segment that was Off when the episode started,
+              which takes effect from the next stream load (an ending is ready at
+              once while the Next Up card is on).
             </p>
           </div>
 

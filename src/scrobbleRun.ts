@@ -170,7 +170,8 @@ function isTransient(message: string): boolean {
 /** Does this failure look like a rate limit specifically? Those additionally
  *  widen the run's spacing for everything that follows. */
 function isRateLimit(message: string): boolean {
-  return /429|too many|rate limit/i.test(message);
+  // `rate[- ]limit`: AniList's exhausted 429 reaches here as "rate-limited".
+  return /429|too many|rate[- ]limit/i.test(message);
 }
 
 /**

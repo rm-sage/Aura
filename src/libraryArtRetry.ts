@@ -55,6 +55,11 @@ export function useLibraryArtRetry(
   addonsRef.current = addons;
   const applyRef = useRef(applyPoster);
   applyRef.current = applyPoster;
+  const runRef = useRef<(() => Promise<void>) | null>(null);
+  // Flips once both inputs are there. A sign-in or a slow cold start can land
+  // the library or the addons well after mount, and the hourly interval alone
+  // would then leave poster-less items blank for the whole first hour.
+  const ready = library.length > 0 && !!addons && addons.length > 0;
 
   useEffect(() => {
     const run = async () => {
@@ -98,10 +103,19 @@ export function useLibraryArtRetry(
         running.current = false;
       }
     };
-    // Initial run shortly after mount, then hourly. Refs keep library/addons
+    // Hourly; the first run waits for `ready` below. Refs keep library/addons
     // fresh without resetting the timer.
-    const t = setTimeout(run, 4000);
+    runRef.current = run;
     const id = setInterval(run, HOUR_MS);
-    return () => { clearTimeout(t); clearInterval(id); };
+    return () => { clearInterval(id); runRef.current = null; };
   }, []);
+
+  // First run shortly after the library and addons are both present (and
+  // again after a sign-out / sign-in empties and refills them); the per-id
+  // throttle keeps a repeat from refetching anything tried within the hour.
+  useEffect(() => {
+    if (!ready) return;
+    const t = setTimeout(() => { void runRef.current?.(); }, 4000);
+    return () => clearTimeout(t);
+  }, [ready]);
 }

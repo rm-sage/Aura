@@ -461,6 +461,10 @@ export type KeybindAction =
   | "toggle-pause"
   | "seek-back"
   | "seek-forward"
+  // Handled outside useKeybindings: SkipController (PlayerOverlay) owns the
+  // skip key, NextUpCta the next-episode key (it needs keyup for the hold).
+  | "skip-segment"
+  | "play-next-episode"
   | "volume-up"
   | "volume-down"
   | "toggle-osd"
@@ -488,8 +492,10 @@ export const KEYBIND_ACTIONS: { id: KeybindAction; label: string; description: s
   // (Playback), so naming one here would go stale the moment it is changed.
   { id: "seek-back",        label: "Seek Back",            description: "Skip backward by the seek step" },
   { id: "seek-forward",     label: "Seek Forward",         description: "Skip forward by the seek step" },
-  { id: "volume-up",        label: "Volume Up",            description: "Increase volume by 2%" },
-  { id: "volume-down",      label: "Volume Down",          description: "Decrease volume by 2%" },
+  { id: "skip-segment",     label: "Skip Segment",         description: "Skip the opening, ending, recap or preview playing now, whether it was prompted, auto-skipped earlier or neither. The skip prompt shows this key." },
+  { id: "play-next-episode", label: "Play Next Episode",   description: "While the Next Up card is showing, play the next episode. When the card offers a skip past filler or recap, this skips to the canon episode instead: hold the key for 2 seconds (the card shows where it lands), or press it once if the hold is turned off just below." },
+  { id: "volume-up",        label: "Volume Up",            description: "Increase volume by 5%" },
+  { id: "volume-down",      label: "Volume Down",          description: "Decrease volume by 5%" },
   { id: "toggle-osd",       label: "Toggle Performance OSD", description: "Show or hide the perf overlay" },
   { id: "cycle-shader",     label: "Cycle Shader Profile", description: "Step through upscaling profiles" },
   { id: "toggle-subtitles", label: "Toggle Subtitles",     description: "Open or close the subtitle picker" },

@@ -40,19 +40,19 @@ static ACTIVE_PROFILE: AtomicU8 = AtomicU8::new(0);
 type ShaderChain = &'static [&'static str];
 const PROFILES: &[(u8, &str, ShaderChain, &str)] = &[
     (0, "None",           &[],
-        "No upscaling — source frames pass through untouched. Best for already-sharp 4K content or low-end GPUs."),
+        "Off. Use it when the video already matches your screen (4K on a 4K screen, 1080p on a 1080p one), or on a weak GPU."),
     (1, "Anime4K",         &["Anime4K.glsl"],
-        "Line-art-preserving upscaler tuned for animation. Sharpens edges and reduces ringing in 2D anime; not ideal for live-action."),
+        "Legacy single-pass Anime4K. The Anime4K modes replace it."),
     (2, "FSR",             &["FSR.glsl"],
-        "AMD FidelityFX Super Resolution. Fast, light on GPU, broadly safe for live-action and animation. Solid default for 1080p → 4K."),
+        "Live action on a laptop or weak GPU. Fast and clean, with a little less detail than FSRCNNX."),
     (3, "FSRCNNX",         &["FSRCNNX.glsl"],
-        "Neural-net upscaler trained on real footage. Heavier than FSR but produces noticeably crisper detail on live-action."),
+        "The sharpest pick for live action below your screen's resolution, such as 1080p on a 4K screen. Needs a mid-range GPU or better: if playback stutters, use RAVU or FSR."),
     (4, "KrigBilateral",   &["KrigBilateral.glsl"],
-        "Edge-aware chroma upscaler. Best paired with another luma scaler — fixes the soft / blocky colour you sometimes see on older transfers."),
+        "Colour only: sharpens colour edges and leaves detail as it is. For older or low-bitrate video whose colours look smeared or blocky around edges."),
     (5, "RAVU",            &["ravu.hook"],
-        "Rapid Anti-Aliasing Upscaler — sharper than FSR with a lower GPU cost than FSRCNNX. Great middle-ground default."),
+        "Live action on a mid-range GPU: sharper than FSR, lighter than FSRCNNX. Also a fallback for anime when Anime4K stutters."),
     (6, "SSimSuperRes",    &["SSimSuperRes.glsl"],
-        "Detail-recovery shader that reduces softness from compression. Layer on top of any other upscaler; minimal cost."),
+        "A light touch-up of mpv's own scaling that brings back a little sharpness. For a weak GPU when even FSR is too heavy."),
 
     // Anime4K v4 reference chains — match the Stremio Community v5
     // bindings the user asked for. Each chain is applied in array order
@@ -73,7 +73,7 @@ const PROFILES: &[(u8, &str, ShaderChain, &str)] = &[
             "Anime4K_AutoDownscalePre_x4.glsl",
             "Anime4K_Upscale_CNN_x2_M.glsl",
         ],
-        "Anime4K v4 — Mode A. High-quality restore + upscale. Best for clean line-art at native 1080p. Heaviest of the four anime modes."),
+        "For 1080p anime, the most common source. Removes the softness most 1080p anime has from being drawn below 1080p."),
     (8,  "Anime4K Mode B",
         &[
             "Anime4K_Clamp_Highlights.glsl",
@@ -83,7 +83,7 @@ const PROFILES: &[(u8, &str, ShaderChain, &str)] = &[
             "Anime4K_AutoDownscalePre_x4.glsl",
             "Anime4K_Upscale_CNN_x2_M.glsl",
         ],
-        "Anime4K v4 — Mode B. Softer restore than Mode A — better for noisy / heavily-compressed source material."),
+        "For 720p anime, or 1080p anime that looks jagged or has halos around lines rather than soft. A gentler restore than Mode A."),
     (9,  "Anime4K Mode A+A",
         &[
             "Anime4K_Clamp_Highlights.glsl",
@@ -94,7 +94,7 @@ const PROFILES: &[(u8, &str, ShaderChain, &str)] = &[
             "Anime4K_Restore_CNN_M.glsl",
             "Anime4K_Upscale_CNN_x2_M.glsl",
         ],
-        "Anime4K v4 — Mode A+A. Double-restore variant for very low-quality sources. Maximum detail recovery; GPU cost is significant."),
+        "Mode A with a second restore pass: sharper on soft 1080p anime, but needs a strong GPU and can over-sharpen."),
     (10, "Anime4K Mode B+B",
         &[
             "Anime4K_Clamp_Highlights.glsl",
@@ -105,7 +105,7 @@ const PROFILES: &[(u8, &str, ShaderChain, &str)] = &[
             "Anime4K_Restore_CNN_Soft_M.glsl",
             "Anime4K_Upscale_CNN_x2_M.glsl",
         ],
-        "Anime4K v4 — Mode B+B. Double-soft-restore for noisy material that needs aggressive cleanup before upscale."),
+        "Mode B with a second restore pass, for 720p anime on a strong GPU. Can over-sharpen."),
     // Mode C and C+C used to reference Anime4K_Restore_GAN_*.glsl, but
     // the canonical Anime4K v4 release doesn't ship a "Restore_GAN" step
     // — Mode C uses the combined upscale+denoise shader
@@ -121,7 +121,7 @@ const PROFILES: &[(u8, &str, ShaderChain, &str)] = &[
             "Anime4K_AutoDownscalePre_x4.glsl",
             "Anime4K_Upscale_CNN_x2_M.glsl",
         ],
-        "Anime4K v4 — Mode C. Combined denoise + upscale in one step. Sharpest of the single-pass modes; best for clean Blu-ray sources where fine detail is already present."),
+        "For 480p and DVD anime, or any noisy, blocky low-quality anime video. Cleans up noise while it upscales."),
     (12, "Anime4K Mode C+C",
         &[
             "Anime4K_Clamp_Highlights.glsl",
@@ -130,7 +130,7 @@ const PROFILES: &[(u8, &str, ShaderChain, &str)] = &[
             "Anime4K_AutoDownscalePre_x4.glsl",
             "Anime4K_Upscale_Denoise_CNN_x2_M.glsl",
         ],
-        "Anime4K v4 — Mode C+C. Double denoise + upscale chain. Heaviest GPU cost; use only on a strong dGPU. Maximum sharpness on already-clean source material."),
+        "Mode C with a second denoise and upscale pass, for very low-quality 480p anime on a strong GPU. Smooths away fine texture."),
 ];
 
 #[derive(Serialize, Clone)]

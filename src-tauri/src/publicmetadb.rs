@@ -32,6 +32,13 @@ use serde::{Deserialize, Serialize};
 const PUBLICMETADB_URL: &str = "https://publicmetadb.com/api/external/skips";
 const AURA_PUBLICMETADB_KEY: &str = env!("AURA_PUBLICMETADB_KEY");
 const NEGATIVE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// A yuna.moe resolve that failed to ASK (network, 5xx, 429, bad body) is held
+/// only briefly: long enough not to pay the timeout on every load during an
+/// outage, short enough that a blip does not disable the fallback for a day.
+const TRANSIENT_TTL: Duration = Duration::from_secs(10 * 60);
+/// Bounded like every other cache in the app; the oldest quarter goes on
+/// overflow. Applies to both maps in this module.
+const CACHE_CAP: usize = 600;
 
 /// One skip row from publicmetadb's `items[]`. Every field is optional —
 /// a row may carry only an intro, only credits, or neither.
@@ -70,9 +77,9 @@ pub struct PublicmetadbSkips {
 }
 
 // ---------------------------------------------------------------------------
-// Cache — positive results kept indefinitely (skip data for a given
-// episode is stable once submitted); 404 / empty negatives expire after
-// 24 h. Keyed by tmdb_id:media_type:season:episode.
+// Cache: positive results kept until evicted by the size cap (skip data
+// for a given episode is stable once submitted); 404 / empty negatives
+// expire after 24 h. Keyed by tmdb_id:media_type:season:episode.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -85,6 +92,25 @@ static CACHE: OnceLock<Mutex<HashMap<String, CacheEntry>>> = OnceLock::new();
 
 fn cache() -> &'static Mutex<HashMap<String, CacheEntry>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Make room for `key` in a capped map by dropping its oldest quarter.
+fn evict_for<V>(map: &mut HashMap<String, V>, key: &str, cached_at: impl Fn(&V) -> Instant) {
+    if map.len() < CACHE_CAP || map.contains_key(key) {
+        return;
+    }
+    let mut ages: Vec<(String, Instant)> =
+        map.iter().map(|(k, v)| (k.clone(), cached_at(v))).collect();
+    ages.sort_by_key(|(_, t)| *t);
+    for (k, _) in ages.into_iter().take(CACHE_CAP / 4) {
+        map.remove(&k);
+    }
+}
+
+fn cache_insert(key: String, entry: CacheEntry) {
+    let mut lock = cache().lock().unwrap();
+    evict_for(&mut lock, &key, |e| e.cached_at);
+    lock.insert(key, entry);
 }
 
 fn cache_key(tmdb_id: i64, media_type: &str, season: u32, episode: u32) -> String {
@@ -238,7 +264,7 @@ pub async fn fetch_publicmetadb_skips(
         // 404 = "no data for this episode" — negative-cache it. Other
         // HTTP errors (5xx, 429) are transient — don't cache.
         if status == reqwest::StatusCode::NOT_FOUND {
-            cache().lock().unwrap().insert(key, CacheEntry {
+            cache_insert(key, CacheEntry {
                 payload: empty.clone(), cached_at: Instant::now(),
             });
         }
@@ -291,7 +317,7 @@ pub async fn fetch_publicmetadb_skips(
 
     // Cache positive AND "200-but-empty" results — an empty 200 is a
     // genuine "no skip data" answer; the 24 h negative TTL applies to it.
-    cache().lock().unwrap().insert(key.clone(), CacheEntry {
+    cache_insert(key.clone(), CacheEntry {
         payload:   payload.clone(),
         cached_at: Instant::now(),
     });
@@ -315,7 +341,8 @@ pub async fn fetch_publicmetadb_skips(
 //
 // Isolated as its own command + cache here (rather than retrofitting
 // aniskip.rs::resolve_mal_id) so the change is contained. yuna.moe
-// mappings are static — positives cached forever, negatives 24 h.
+// mappings are static: positives kept until evicted by the size cap,
+// negatives 24 h, failures to ask 10 min.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
@@ -328,6 +355,8 @@ struct YunaTmdbResponse {
 struct TmdbResolveEntry {
     tmdb_id:   Option<i64>,
     cached_at: Instant,
+    /// The ask failed rather than answered: expires after TRANSIENT_TTL.
+    transient: bool,
 }
 
 static TMDB_RESOLVE_CACHE: OnceLock<Mutex<HashMap<String, TmdbResolveEntry>>> = OnceLock::new();
@@ -349,8 +378,8 @@ pub async fn resolve_anime_tmdb_id(source: String, id: u32) -> Option<i64> {
     {
         let lock = tmdb_resolve_cache().lock().unwrap();
         if let Some(entry) = lock.get(&key) {
-            let stale = entry.tmdb_id.is_none()
-                && entry.cached_at.elapsed() >= NEGATIVE_TTL;
+            let ttl = if entry.transient { TRANSIENT_TTL } else { NEGATIVE_TTL };
+            let stale = entry.tmdb_id.is_none() && entry.cached_at.elapsed() >= ttl;
             if !stale {
                 return entry.tmdb_id;
             }
@@ -358,21 +387,33 @@ pub async fn resolve_anime_tmdb_id(source: String, id: u32) -> Option<i64> {
     }
 
     let url = format!("https://relations.yuna.moe/api/ids?source={src}&id={id}");
-    let tmdb_id: Option<i64> = async {
-        let resp = client().get(&url).send().await.ok()?;
-        if !resp.status().is_success() {
-            return None;
+    // Err = failed to ask (network, 5xx, 429, unreadable body); a 404 or a
+    // null `themoviedb` is a real "no mapping" answer.
+    let answer: Result<Option<i64>, ()> = async {
+        let resp = client().get(&url).send().await.map_err(|_| ())?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
         }
-        let parsed: YunaTmdbResponse = resp.json().await.ok()?;
+        if !resp.status().is_success() {
+            return Err(());
+        }
+        let parsed: YunaTmdbResponse = resp.json().await.map_err(|_| ())?;
         // yuna.moe returns themoviedb as a number or null.
-        parsed.themoviedb.as_ref().and_then(|v| v.as_i64())
+        Ok(parsed.themoviedb.as_ref().and_then(|v| v.as_i64()))
     }
     .await;
+    let transient = answer.is_err();
+    let tmdb_id = answer.unwrap_or(None);
 
-    tmdb_resolve_cache().lock().unwrap().insert(key, TmdbResolveEntry {
-        tmdb_id,
-        cached_at: Instant::now(),
-    });
+    {
+        let mut lock = tmdb_resolve_cache().lock().unwrap();
+        evict_for(&mut lock, &key, |e| e.cached_at);
+        lock.insert(key, TmdbResolveEntry {
+            tmdb_id,
+            cached_at: Instant::now(),
+            transient,
+        });
+    }
     crate::devlog!(
         info, "publicmetadb",
         "resolve_anime_tmdb_id {src}={id} → {tmdb_id:?}",

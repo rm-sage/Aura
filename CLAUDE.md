@@ -326,7 +326,8 @@ after-credits scene on 10 of the 11 episodes that have one.
 - **Layer 1's verdict holds the crowd (`op_l1` / `ed_l1`).** Every snapshot carries a STRUCTURED
   per-kind state (`L1State`: pending, matched, informative, no_themes, unavailable, not_requested;
   never parse a note string). The frontend starts a kind "pending" when the detector will decide it
-  (MAL id, detection on, a stream, kind not off) and `composeSkipWindows` (`src/skipWindows.ts`, the
+  (MAL id, detection on, a stream, kind gathered: an ending on Off still is while the Next-Up card
+  is on) and `composeSkipWindows` (`src/skipWindows.ts`, the
   ONE stamp function App.tsx and the e2e harness share) applies holds that ride the window as
   `hold`, so the re-stamp cannot re-arm them: pending = crowd rows (AniSkip, IntroDB, PublicMetaDB)
   of that kind only PROMPT ("l1-pending"), unless the provisional opening already starts within 3 s
@@ -419,18 +420,74 @@ after-credits scene on 10 of the 11 episodes that have one.
   never borrow an ED from neighbour episodes (that borrow put a phantom ED inside TYBW 3:10's
   after-credits scene and is retired; the OP borrow remains), and never gate an ED's existence on a
   "last N seconds" band (TYBW 3:14's ED starts 418 s before EOF, 3:1's 290 s).
-- **Next-Up**: the corner card (`NextUpCta.tsx`) has NO countdown. Unattended advance happens only
-  at end of stream, through the EOS Spotlight, so after-credits scenes and previews always play. The
-  card appears at `max(trusted ED end, end - lead)` (at the ED end when nothing follows it), else at
-  `end - lead`; only a Layer 1 ED END is trusted (a Transition-only match's end counts, so does a
-  partially Over match's, prompt-only but located by the same evidence: Pop Team Epic 1:5, and so
-  does the end of the published ending that replaced a match when the two ends agree within 3 s:
-  Solo Leveling E1, Cowboy Bebop 13), and an ED START never triggers it. "end" is the
-  detector's media end when known. The keep-open, stale-heartbeat and eof EOS detectors test against
+- **Next-Up**: the card (`NextUpCta.tsx`) has NO countdown. Unattended advance happens only
+  at end of stream, through the EOS Spotlight, so after-credits scenes and previews always play
+  unless the user presses Play. The card appears as the ending STARTS when `nextUpEnding`
+  (`skipWindows.ts`) elects an ending (any source and level; Verified, then Likely, then Risky,
+  then the LATEST) and that ending starts in the second half of the file and more than 5 s before
+  its end.
+  It reads the stamp BEFORE skip
+  modes, so a mid-play mode change does not move the card. Endings set to Off are still GATHERED while
+  the card is on (lead time > 0): `gatherFor` in the chain maps an Off ending / preview to prompt
+  for every fetch, chapter derivation, the Layer 1 pending state and the detector's `detect_ed`,
+  while publishing stays on `modeFor`. The PAYLOAD is a second `composeSkipWindows` over the
+  mode-filtered base AND detected windows, never `full` filtered afterwards: a Layer 1 ending
+  outranks an opening in the cross-kind rule and would drop the user's opening. The card-only ending
+  read never downloads ffmpeg (no toast), is not requested on a file under 1140 s (600 + 480 + 60:
+  below that TAIL can reach HEAD's audio, and Rust's `no_ed_inside_the_opening` withdraws a
+  continuity opening together with a continuity ED overlapping it, at ANY length), and is not
+  requested without a MAL id (it could only be Layer 3, Risky). Only an Off ending / preview while
+  the card is on is left out of the payload compose up front; an opening or recap turned Off
+  mid-episode is composed and dropped by `applySkipModes` as before, since it is still the file's
+  evidence (a matched opening corroborates a recap). Every kind Off with the card
+  off is still the probe-only path. A Risky ending raises the card too, with its prompt (user's
+  call, 2026-10-20): a Transition-only start can sit 280 s into the story (Cowboy Bebop 13) and 8
+  of 13 lone AniSkip endings were wrong, but a card with no countdown only sits there, while
+  waiting for the trusted END put the card up in the last 7 s of To Be Hero X E07, whose
+  Transition-only ending runs to the end of the file. Under a Risky ending the prompt, the card
+  and the tail pill show ONLY with the player controls, never popping up on their own (user's
+  call, 2026-10-20; `edRisky` on the timing, `nextUpFollowsControls`, the prompt's
+  `withControls`, which keeps its stack slot while hidden so the card does not slide); the Skip
+  Segment and Play Next Episode keys work while they are hidden. v2.2.2 waited for
+  the ED END instead, which put the card up a fraction of a second before the end screen on every
+  episode whose ending runs to the end of the file; the countdown, not the start, was what lost
+  after-credits scenes. Without a credible start: `max(trusted ED end, end - lead)` (at the ED end
+  when nothing follows it), else `end - lead`; only a Layer 1 ED END is trusted (a Transition-only
+  match's end counts, so does a partially Over match's, prompt-only but located by the same
+  evidence: Pop Team Epic 1:5, and so does the end of the published ending that replaced a match
+  when the two ends agree within 3 s: Solo Leveling E1, Cowboy Bebop 13). Because the card is up
+  during the credits, a banner on it says what Play would skip (`nextUpTailNote`): "Preview after
+  the credits" when a preview chapter FILLS the tail (starts within 5 s of the ED end, ends within
+  5 s of the end), else "m:ss more after the credits", from a TRUSTED ED end to a MEASURED media
+  end (TAIL EOF, else the probe's DURATION tag; never a crowd / chapter end, never the container
+  duration the early estimate can be), and nothing otherwise. The banner goes once the ending is
+  over (the user is watching what follows), so a card first raised after it has none. It never calls an unlabelled tail a scene or a preview: Aura cannot tell them apart.
+  With no card to carry it (`nextUpInfo` null: no next episode, or the lookup failed), the same
+  note shows alone in the card's place (`NextUpTailPill`), under the card's own gate (lead time
+  above 0, not dismissed, not truncated); it takes no clicks and never fades, since it only ever
+  shows during the ending. Card and pill sit TOP LEFT, under the skip prompt: the prompt
+  publishes its bottom edge as a CSS variable on `<html>` while it is visible and the card's `top`
+  reads it (`src/playerStack.ts`), sliding up into the prompt's place when it fades or goes. All
+  three share the prompt's surface (`.aura-stack-surface`, App.css) and entry; card and pill fade
+  OUT through `StackPresence` (`NextUpCta.tsx`), which keeps the last element mounted, marked
+  `exiting` (key unbound, no clicks), for 200 ms. The
+  Play Next Episode keybinding (default Shift+X, handled inside `NextUpCta` because it needs keyup)
+  presses the card while it is up: Play, or with a skip to canon on offer Skip, held 2 s with the
+  canon preview showing unless `nextUpHoldToSkip` is off. The Skip Segment keybinding (default X,
+  `SkipController`) skips any window playing now, handled or not; the old always-on Shift+X force
+  skip is gone (it existed only because X answered visible prompts alone).
+  Only a card that went up while the PLAYHEAD was before the ED end (`nextUpRaisedTimeRef`, an
+  auto-skipped ending included) fades with the player controls past it (`nextUpFadeFrom`, stays
+  while hovered): one first raised by the fallback, a resume or a seek into the tail would be born
+  invisible. While the trigger is a fallback, the hide rule measures a seek-back from the EARLIEST
+  trigger the card was raised at (`nextUpShownAtRef`), so a stamp that withdraws the ending cannot
+  take the card down mid-credits; a credible start is measured from itself, so a stamp that
+  replaced a wrong early ending takes down a card that went up over story. "end" is the detector's
+  media end when known. The keep-open, stale-heartbeat and eof EOS detectors test against
   `eosEnd(duration)` (the FINAL media end, else the probe's mapped-track DURATION tag, never the
   container duration), so a container longer than its media still reaches the end card instead of a
-  false "stream lost". A series load that detects no kind (ED off, everything supplied, detection
-  switched off) still runs a PROBE-ONLY detect for that tag when ffmpeg is present, and so does every
+  false "stream lost". A series load that detects no kind (everything supplied, detection switched
+  off, ED off without a MAL id or with the Next-Up card off) still runs a PROBE-ONLY detect for that tag when ffmpeg is present, and so does every
   MOVIE load. The detected media end belongs to the FILE: it is cleared with the load token and on
   exit, never in `notifyNewLoad`, because EOS Replay, the VOD auto-retry and the recovery Reload
   re-run loadfile on the same url without re-running the skip chain.
@@ -449,6 +506,14 @@ after-credits scene on 10 of the 11 episodes that have one.
   windows by kind with both edges within 3 s (`handledIn`), so a refinement of a skipped opening is
   not re-prompted or re-skipped. The Detect (and Prefetch) action's kind switches travel as `detect_op` / `detect_ed`,
   because the action enum is tagged `op`. A Prefetch is not cancelled by a Detect.
+- **Theme-match readout.** `stream_region` reports how far HEAD / TAIL has decoded (per whole
+  percent, held under 100 until the region ends) as its OWN event, `skipdetect-progress`
+  (`job::Progress`, same generation filter), never a Snapshot field: every snapshot re-stamps the
+  skip windows. `src/skipMatchProgress.ts` turns it plus the snapshots' `op_l1` / `ed_l1` into one
+  row per kind that is really being theme matched (the catalogue has a candidate of the kind, Layer
+  1 pending, mode not Off; never a card-only ending, a probe-only run or a cache hit), and the
+  verdicts linger 4 s. Shown inside the skip prompt under a divider, else in the prompt's slot
+  (`SkipMatchStatus`, only with the player controls, so it never sits over a cold open).
 - **Confidence levels (Verified / Likely / Risky)** on the skip prompt, the scrubber's hover card,
   the AuraSkip menu rows, the auto-skip toast and a Settings legend. `composeSkipWindows` stamps a
   `basis` on every window it publishes (`SkipBasis`, `skipBasisFor`: what the POSITION rests on,
@@ -706,7 +771,9 @@ Tooltips, context menus and submenus, the Home search bar and its recents dropdo
 pills, the notifications panel and thought bubble, the profile popover, the watch-together panel,
 the source popup, the subtitle picker, and the detail page's Back / Close / Library / Queue /
 Trailer buttons all already route through it. New floating UI should too, rather than inventing a
-sixth glass recipe.
+sixth glass recipe. The one deliberate exception is the player's top-left stack (skip prompt, Next-Up
+card, tail pill): `.aura-stack-surface`, near-opaque black so the prompt's large type reads over any
+frame.
 
 What it is and why, because both halves are load-bearing:
 
@@ -1154,8 +1221,12 @@ creep degrades the experience. When adding ANY feature:
   the mapped audio track, S and the read origin, the media end, and every theme tried (run, BER,
   margin, soft42, verdict). An abstain is usually a gate doing its job; do not loosen a gate to make
   one episode match (the margin and soft42 thresholds are measured, see "Skip detection").
-- "Next-Up card appears / auto-advances too early" -> `src/nextUpGate.ts`. The card has no
-  countdown; an advance before EOS means a countdown was put back into `NextUpCta.tsx`.
+- "Next-Up card appears / auto-advances too early" -> `src/nextUpGate.ts`. The card appearing at
+  the ED start is intended; an advance before EOS means a countdown was put back into
+  `NextUpCta.tsx`. A card raised well before the credits means `nextUpEnding` elected a wrong
+  ending: the `[next-up] timing` line prints the elected ending's source and `[basis: level]`
+  (the `[auraskip]` stamp line shows only the payload, so it never has an ending gathered while
+  Endings is Off).
 - "A skip only PROMPTS although its kind is on Auto" -> the `[auraskip]` stamp line prints each
   window's `hold`, its `[basis: level]` (every Risky window only prompts) and the theme match's
   per-kind state; `skipPromptOnlyReason` (`src/skipSource.ts`)
@@ -1273,7 +1344,8 @@ old-format and new-format samples and diff the field sets. Node runs the `.ts` f
   `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[ratings]`, `[rpc]`, `[win32]`, `[smtc]`,
   `[scrobble]`, `[publicmetadb]`, `[mpv]` (the playback engine), `[cast]`, `[iptv]`, `[sync]`,
   `[aniskip]`, `[introdb]`, `[skipdetect]` (the layered OP/ED detector), `[arcs]`, `[subsync]`, `[downloads]`, `[tenrai]` (the MyAnimeList client), `[manga]` (manga chapters: MangaUpdates + Fandom), `[extras]` (frontend,
-  the anime metadata tabs on the detail page).
+  the anime metadata tabs on the detail page), `[next-up]` (frontend, the Next-Up card's timing
+  inputs: the elected ending with its source and level, trusted end, preview, media end).
 - libmpv writes its own verbose log to `%USERPROFILE%\aura-mpv.log` (truncated each MPV init, rotated
   to `.old` past 50 MB). The last few lines usually pinpoint a STATUS_ACCESS_VIOLATION.
 - Discord RPC uses application ID `1499651271357890610` (`window_logic.rs`). Browse states are gated

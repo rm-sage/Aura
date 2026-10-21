@@ -276,6 +276,9 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
   // re-render on a flip, so a state would just churn the tree.
   const popupSuppressedRef = useRef(false);
   const queuedPopupRef = useRef<Notification | null>(null);
+  // The candidate a pending popupTimerRef will show, so a suppress that
+  // cancels the timer can queue it instead of losing it.
+  const pendingPopupRef = useRef<Notification | null>(null);
 
   // Persist on every change. Cheap (≤200 items) and saves us from re-deriving
   // the list on remount. Also fires the change event the cloud sync layer
@@ -431,9 +434,11 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
         : 0;
       const wait = Math.max(bootWait, POPUP_COALESCE_MS);
       if (popupTimerRef.current) clearTimeout(popupTimerRef.current);
+      pendingPopupRef.current = popupCandidate;
       popupTimerRef.current = setTimeout(() => {
         setPopup(popupCandidate);
         popupTimerRef.current = null;
+        pendingPopupRef.current = null;
       }, wait);
     }
   }, []);
@@ -451,9 +456,11 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
       const queued = queuedPopupRef.current;
       queuedPopupRef.current = null;
       if (popupTimerRef.current) clearTimeout(popupTimerRef.current);
+      pendingPopupRef.current = queued;
       popupTimerRef.current = setTimeout(() => {
         setPopup(queued);
         popupTimerRef.current = null;
+        pendingPopupRef.current = null;
       }, POPUP_COALESCE_MS);
     } else if (suppressed && popupTimerRef.current) {
       // Suppressing while a deferred (timer-pending) popup is armed:
@@ -462,6 +469,8 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
       // INTO the player.
       clearTimeout(popupTimerRef.current);
       popupTimerRef.current = null;
+      queuedPopupRef.current = pendingPopupRef.current;
+      pendingPopupRef.current = null;
     }
   }, []);
 
@@ -470,6 +479,7 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
     if (popupTimerRef.current) {
       clearTimeout(popupTimerRef.current);
       popupTimerRef.current = null;
+      pendingPopupRef.current = null;
     }
   }, []);
 

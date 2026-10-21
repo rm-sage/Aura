@@ -229,8 +229,8 @@ function EosSpotlight({
   // Bound for the whole lifetime and in the CAPTURE phase - see the matching
   // comment in NextUpCta. Binding on `remaining !== null` threw away every
   // cancel signal during the "Resolving stream..." phase, and a bubble-phase
-  // listener never saw x / Shift+X at all because SkipController's own
-  // window-capture handlers stop the event there.
+  // listener misses any key a window-capture handler stops (SkipController's
+  // Skip Segment key inside a window, for one).
   useEffect(() => {
     const cancel = () => {
       if (cancelledRef.current) return;

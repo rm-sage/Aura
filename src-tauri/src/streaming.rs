@@ -95,10 +95,11 @@ async fn proxy_stream(
     AxumPath(encoded): AxumPath<String>,
     req_headers: axum::http::HeaderMap,
 ) -> Response {
-    let url = match percent_decode(&encoded) {
-        Some(u) => u,
-        None => return (StatusCode::BAD_REQUEST, "Invalid URL encoding").into_response(),
-    };
+    // axum's `Path` extractor has already percent-decoded the wildcard, so
+    // `encoded` IS the original URL. Decoding it a second time turned a literal
+    // `+` into a space and `%2F` / `%25` into different bytes (a base64 token
+    // with `+` reached the origin altered).
+    let url = encoded;
 
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return (StatusCode::BAD_REQUEST, "Only http/https stream URLs are supported")
@@ -300,27 +301,6 @@ pub fn start_in_process() {
     });
 }
 
-/// Percent-decode the path-segment encoding `percent_encode` produces.
-/// Accumulates raw BYTES and decodes as UTF-8 once — a per-byte `as char`
-/// cast would map each byte to a Latin-1 code point and corrupt multi-byte
-/// UTF-8 characters in the URL.
-fn percent_decode(s: &str) -> Option<String> {
-    let s = s.replace('+', " ");
-    let mut out: Vec<u8> = Vec::with_capacity(s.len());
-    let mut bytes = s.bytes();
-    while let Some(b) = bytes.next() {
-        if b == b'%' {
-            let hi = bytes.next()? as char;
-            let lo = bytes.next()? as char;
-            let code = u8::from_str_radix(&format!("{hi}{lo}"), 16).ok()?;
-            out.push(code);
-        } else {
-            out.push(b);
-        }
-    }
-    Some(String::from_utf8_lossy(&out).into_owned())
-}
-
 // ---------------------------------------------------------------------------
 // Tauri command — resolve a stream URL to a bridge-proxied URL
 // ---------------------------------------------------------------------------
@@ -400,16 +380,18 @@ pub async fn resolve_stream(raw_url: String, via_proxy: Option<bool>) -> Result<
     Ok(raw_url)
 }
 
-/// HLS manifest? Decided by the path extension, ignoring any query string
-/// (`…/517527.m3u8?token=…`). HLS must bypass the bridge — see resolve_stream.
+/// HLS manifest? Decided by the path extension, ignoring any query string or
+/// fragment (`…/517527.m3u8?token=…`). HLS must bypass the bridge: see resolve_stream.
 fn is_hls(lower_url: &str) -> bool {
-    let path = lower_url.split('?').next().unwrap_or(lower_url);
+    let path = lower_url.split(['?', '#']).next().unwrap_or(lower_url);
     path.ends_with(".m3u8") || path.ends_with(".m3u")
 }
 
 // ---------------------------------------------------------------------------
 // Percent-encode helper — produces the path-segment encoding the bridge
-// expects on its /proxy/* and /magnet/* routes.
+// expects on its /proxy/* and /magnet/* routes. `?` MUST be escaped: left
+// bare it starts the BRIDGE's own query string, the wildcard captures only
+// the part before it, and the origin is fetched without its `?token=…`.
 // ---------------------------------------------------------------------------
 
 fn percent_encode(s: &str) -> String {
@@ -417,7 +399,7 @@ fn percent_encode(s: &str) -> String {
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' | b'/' | b':' | b'?' | b'=' | b'&' => {
+            | b'-' | b'_' | b'.' | b'~' | b'/' | b':' | b'=' | b'&' => {
                 out.push(b as char)
             }
             _ => {

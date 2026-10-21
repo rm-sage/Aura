@@ -47,6 +47,12 @@ export function parseXmltv(xml: string, relevant?: Set<string>): EpgProgram[] {
     if (open === -1) break;
     const openEnd = xml.indexOf(">", open);
     if (openEnd === -1) break;
+    // Self-closing <programme .../> has no title: skip it rather than pair it
+    // with the NEXT programme's </programme> (same guard as <channel> below).
+    if (xml[openEnd - 1] === "/") {
+      from = openEnd + 1;
+      continue;
+    }
     const close = xml.indexOf("</programme>", openEnd);
     if (close === -1) break;
     from = close + "</programme>".length;

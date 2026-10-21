@@ -9,7 +9,7 @@
 // ---------------------------------------------------------------------------
 
 import { useEffect } from "react";
-import type { CastDeviceInfo } from "./cast";
+import type { CastDeviceInfo, CastLoadStage } from "./cast";
 
 interface CastMenuProps {
   open: boolean;
@@ -19,12 +19,15 @@ interface CastMenuProps {
   onRescan: () => void;
   onPick: (d: CastDeviceInfo) => void;
   connectingId: string | null;
+  /** What the connecting device is waiting on (useCastSession). */
+  connectingStage: CastLoadStage | null;
   error: string | null;
   isFullscreen: boolean;
 }
 
 export default function CastMenu({
-  open, onClose, devices, scanning, onRescan, onPick, connectingId, error, isFullscreen,
+  open, onClose, devices, scanning, onRescan, onPick, connectingId, connectingStage, error,
+  isFullscreen,
 }: CastMenuProps) {
   useEffect(() => {
     if (!open) return;
@@ -92,11 +95,23 @@ export default function CastMenu({
                     <p className="text-white/90 text-[13.5px] font-medium leading-snug truncate">
                       {d.name}
                     </p>
-                    <p className="text-white/40 text-[11px] leading-snug truncate">
-                      {d.kind === "chromecast" ? "Chromecast" : "DLNA"}
-                      {d.model ? ` · ${d.model}` : ""}
-                      {d.audio_only ? " · audio only" : ""}
-                    </p>
+                    {connecting && connectingStage ? (
+                      // A slow pick says what it waits on, so a probe or a
+                      // transcode warming up never reads as a dead button.
+                      <p
+                        key={connectingStage}
+                        className="aura-cast-stage text-sky-200/80 text-[11px] leading-snug truncate"
+                        aria-live="polite"
+                      >
+                        {stageLabel(connectingStage, d)}
+                      </p>
+                    ) : (
+                      <p className="text-white/40 text-[11px] leading-snug truncate">
+                        {d.kind === "chromecast" ? "Chromecast" : "DLNA"}
+                        {d.model ? ` · ${d.model}` : ""}
+                        {d.audio_only ? " · audio only" : ""}
+                      </p>
+                    )}
                   </div>
                   {connecting && <Spinner small />}
                 </button>
@@ -114,6 +129,19 @@ export default function CastMenu({
       </div>
     </div>
   );
+}
+
+function stageLabel(stage: CastLoadStage, d: CastDeviceInfo): string {
+  switch (stage) {
+    case "probing":
+      return "Checking the file's format…";
+    case "preparing":
+      return `Converting the file for ${d.kind === "chromecast" ? "Chromecast" : "your TV"}, this can take a moment…`;
+    case "resuming":
+      return "Jumping to where you left off…";
+    default:
+      return `Connecting to ${d.name}…`;
+  }
 }
 
 function TvIcon({ kind }: { kind: string }) {

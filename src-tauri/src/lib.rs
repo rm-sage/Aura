@@ -1950,9 +1950,13 @@ pub fn run() {
             #[cfg(target_os = "windows")]
             {
                 use window_vibrancy::{apply_acrylic, apply_mica};
-                apply_mica(&window, Some(true))
+                // Cosmetic only: Windows 10 before 1809 (and Server 2016) has
+                // neither backdrop, so log and launch without one.
+                if let Err(e) = apply_mica(&window, Some(true))
                     .or_else(|_| apply_acrylic(&window, Some((0, 0, 0, 180))))
-                    .expect("Failed to apply Windows vibrancy");
+                {
+                    crate::devlog!(warn, "win", "window vibrancy unavailable: {e}");
+                }
 
                 // ── One-shot recovery: if the previous session left the
                 // window persisted at the full monitor rect with no

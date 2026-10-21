@@ -19,10 +19,11 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   castFfmpegPresent, castLoad, castPause, castPlay, castSeek, castStatus,
-  castStop, discoverCastDevices, needsTransmux,
-  type CastDeviceInfo, type CastStatus,
+  castStop, discoverCastDevices, namesContainer, needsTransmux,
+  type CastDeviceInfo, type CastLoadProgress, type CastLoadStage, type CastStatus,
 } from "./cast";
 import { showAppToast } from "./AppToast";
 import { isWindowHidden } from "./windowVisibility";
@@ -48,12 +49,23 @@ export interface CastSession {
   activeDevice: CastDeviceInfo | null;
   /** Device currently mid-connect (spinner in the picker). */
   connectingId: string | null;
+  /** What that connect is waiting on, worded under the device's name. */
+  connectingStage: CastLoadStage | null;
   status: CastStatus | null;
   error: string | null;
   pickDevice: (d: CastDeviceInfo) => void;
   stopCasting: () => void;
   togglePlayPause: () => void;
   seekBy: (deltaSec: number) => void;
+}
+
+/** Seconds as m:ss or h:mm:ss, for the resume toast. */
+function clock(sec: number): string {
+  const s = Math.max(0, Math.floor(sec));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = String(s % 60).padStart(2, "0");
+  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${ss}` : `${m}:${ss}`;
 }
 
 export function useCastSession({
@@ -64,6 +76,7 @@ export function useCastSession({
   const [scanning, setScanning] = useState(false);
   const [activeDevice, setActiveDevice] = useState<CastDeviceInfo | null>(null);
   const [connectingId, setConnectingId] = useState<string | null>(null);
+  const [connectingStage, setConnectingStage] = useState<CastLoadStage | null>(null);
   const [status, setStatus] = useState<CastStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -100,6 +113,28 @@ export function useCastSession({
     return () => window.removeEventListener("aura:open-cast-menu", onOpen);
   }, [rescan]);
 
+  // Rust reports each stage of a slow pick (a format probe, a transcode
+  // warming up, a DLNA renderer's resume seek), so the spinner says what it
+  // waits on. Only the device being connected is shown.
+  const connectingRef = useRef<string | null>(null);
+  connectingRef.current = connectingId;
+  useEffect(() => {
+    if (!connectingId) {
+      setConnectingStage(null);
+      return;
+    }
+    let disposed = false;
+    const p = listen<CastLoadProgress>("cast-load-progress", ({ payload }) => {
+      if (!disposed && payload.device_id === connectingRef.current) {
+        setConnectingStage(payload.stage);
+      }
+    });
+    return () => {
+      disposed = true;
+      p.then((un) => un()).catch(() => {});
+    };
+  }, [connectingId]);
+
   // Actually begin a session. (pickDevice wraps this with the Chromecast
   // FFmpeg pre-flight below.)
   const startCast = useCallback((device: CastDeviceInfo, url: string) => {
@@ -108,21 +143,29 @@ export function useCastSession({
     // second or two, and a user toggling local playback meanwhile must
     // not make the post-load handoff re-toggle the wrong way.
     const pausedAtPick = pausedRef.current;
+    const startSeconds = timeRef.current > 1 ? timeRef.current : 0;
     setConnectingId(device.id);
+    setConnectingStage("connecting");
     setError(null);
     castLoad({
       device,
       url,
       title: titleRef.current,
-      startSeconds: timeRef.current > 1 ? timeRef.current : 0,
+      startSeconds,
     })
-      .then(() => {
+      .then((res) => {
         if (genRef.current !== gen) return;
         setActiveDevice(device);
         setMenuOpen(false);
         // Hand off: quiet the local player while the TV plays.
         if (!pausedAtPick) {
           invoke("toggle_pause").catch(() => {});
+        }
+        if (res?.resume_failed) {
+          showAppToast(
+            `${device.name} would not jump to ${clock(startSeconds)}, so it is playing from the start. Seek with the cast controls.`,
+            { tone: "danger", duration: 7000 },
+          );
         }
       })
       .catch((e) => {
@@ -209,11 +252,13 @@ export function useCastSession({
     let becameLive = false;
     let ended = false;
 
-    const recover = (msg: string) => {
+    // The message may still be worked out (the FFmpeg hint below); the
+    // session stops at once either way.
+    const recover = (msg: string | Promise<string>) => {
       if (ended) return;
       ended = true;
       stopCasting();
-      showAppToast(msg, { tone: "danger" });
+      void Promise.resolve(msg).then((m) => showAppToast(m, { tone: "danger", duration: 7000 }));
     };
 
     const id = window.setInterval(() => {
@@ -240,7 +285,20 @@ export function useCastSession({
             // than latching "connecting..." / a stale 0:00 forever.
             nonLivePolls += 1;
             if (nonLivePolls >= 9) {
-              recover(`${device.name} didn't start playing - resumed local playback`);
+              const url = urlRef.current;
+              if (device.kind === "chromecast" && url && !namesContainer(url)) {
+                // A url with no container in it is probed only when FFmpeg
+                // and FFprobe are installed; without them an MKV behind it
+                // went to the receiver as is, and that is the likely cause.
+                recover(castFfmpegPresent()
+                  .catch(() => true)
+                  .then((present) => present
+                    ? `${device.name} didn't start playing - resumed local playback`
+                    : `${device.name} didn't start playing - resumed local playback. ` +
+                      "If this file is MKV, installing FFmpeg and FFprobe (Settings, Optional Components, with Show advanced settings on) lets Aura convert it."));
+              } else {
+                recover(`${device.name} didn't start playing - resumed local playback`);
+              }
             }
           }
         })
@@ -263,6 +321,7 @@ export function useCastSession({
     rescan,
     activeDevice,
     connectingId,
+    connectingStage,
     status,
     error,
     pickDevice,

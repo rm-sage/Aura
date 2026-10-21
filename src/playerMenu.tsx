@@ -234,21 +234,24 @@ export function PlayerMenuToggle({
   );
 }
 
-type ChipTone = "neutral" | "accent";
+type ChipTone = "neutral" | "accent" | "good";
 const CHIP_TONES: Record<ChipTone, string> = {
   neutral: "bg-white/6 text-white/80 border-white/14",
   accent:  "bg-ln-accent/15 text-ln-accent border-ln-accent/30",
+  // A suggestion, kept apart from the accent that marks the selection.
+  good:    "bg-emerald-400/12 text-emerald-200 border-emerald-300/30",
 };
 
 /** A small tag, the size and shape of the stream-quality chips. */
-export function PlayerMenuChip({ tone = "neutral", children, title }: {
-  tone?: ChipTone; children: ReactNode; title?: string;
+export function PlayerMenuChip({ tone = "neutral", children, title, className, style }: {
+  tone?: ChipTone; children: ReactNode; title?: string; className?: string; style?: CSSProperties;
 }) {
   return (
     <span
       title={title}
       className={`inline-block px-1.5 py-[1px] rounded border text-[10.5px] font-medium tracking-wide
-                  font-mono ${CHIP_TONES[tone]}`}
+                  font-mono ${CHIP_TONES[tone]} ${className ?? ""}`}
+      style={style}
     >
       {children}
     </span>
