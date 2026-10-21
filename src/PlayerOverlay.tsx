@@ -40,6 +40,7 @@ import {
   PlayerMenuSection, PlayerMenuSlider, PlayerMenuToggle, MenuCheckIcon, useMenuWheelScroll,
 } from "./playerMenu";
 import { recommendUpscaler } from "./upscalerRecommend";
+import { noteEndingAutoSkipSeek } from "./nextUpGate";
 import { copyTextToClipboard } from "./clipboard";
 
 // Max volume the slider / wheel / keys can reach. mpv's `volume-max` init option
@@ -395,13 +396,19 @@ function RecChip({ traced, title, children }: {
   );
 }
 
-function ShaderPicker({ activeTarget, isAnime, readGate }: {
+function ShaderPicker({ activeTarget, loadKey, isAnime, readGate, controlsVisible }: {
   activeTarget: ActiveScrobbleTarget | null;
+  /** The overlay's per-load key (title, stream url, reload nonce): a source
+   *  switch or a recovery reload keeps the title but can change the size. */
+  loadKey: string;
   /** Anime or live action, for the "Recommended" tag. */
   isAnime: boolean;
   /** Safe to read the video's size: duration known, first frame shown, not
    *  buffering or seeking (the same gate as the stats OSD, landmine 3). */
   readGate: boolean;
+  /** The bar hides with opacity only, so the trace would otherwise animate
+   *  every frame for the whole of playback. */
+  controlsVisible: boolean;
 }) {
   const [open, setOpen] = useState(false);
   // The playing video's display size (never polled), for the "Recommended"
@@ -497,6 +504,14 @@ function ShaderPicker({ activeTarget, isAnime, readGate }: {
 
   useEffect(() => () => cancelClose(), [cancelClose]);
 
+  // A new title, stream or reload: the old size says nothing about the next
+  // one. Declared before the read so it runs first in the same commit; the
+  // read then waits for readGate to come back for the new load.
+  useEffect(() => {
+    sizeKnownRef.current = false;
+    setVideoSize({ w: 0, h: 0 });
+  }, [loadKey]);
+
   useEffect(() => {
     if (!readGate || (!open && sizeKnownRef.current)) return;
     let cancelled = false;
@@ -510,12 +525,6 @@ function ShaderPicker({ activeTarget, isAnime, readGate }: {
     });
     return () => { cancelled = true; };
   }, [open, readGate]);
-
-  // A new title or stream: the old size says nothing about the next one.
-  useEffect(() => {
-    sizeKnownRef.current = false;
-    setVideoSize({ w: 0, h: 0 });
-  }, [activeTarget?.id]);
 
   useEffect(() => {
     invoke<ShaderProfileInfo[]>("list_shader_profiles").then(setProfiles).catch(() => {});
@@ -671,9 +680,12 @@ function ShaderPicker({ activeTarget, isAnime, readGate }: {
   // tags read as the reason the pill lit up.
   const highlightRec = recHighlightOn && active === 0
     && recommended != null && recommended.profileId !== 0;
-  // Taken when the trace goes on (see recTraceDelay); the menu's tags mount
-  // later and take their own from the same clock.
-  const pillTraceStyle = useMemo(() => (highlightRec ? recTraceDelay() : undefined), [highlightRec]);
+  // The pill animates only while it can be seen (the menu's tags mount only
+  // while it is open). Taken when the trace goes on (see recTraceDelay), so a
+  // pill brought back with the controls rejoins the shared clock; the menu's
+  // tags mount later and take their own from the same clock.
+  const traceOn = highlightRec && (controlsVisible || open);
+  const pillTraceStyle = useMemo(() => (traceOn ? recTraceDelay() : undefined), [traceOn]);
   const recChip = (label: React.ReactNode) => (
     <RecChip traced={highlightRec} title={recommended?.reason}>{label}</RecChip>
   );
@@ -715,7 +727,7 @@ function ShaderPicker({ activeTarget, isAnime, readGate }: {
         title={highlightRec ? `Upscaler: ${recommended.reason}` : "Upscaling / Shader Profile"}
         style={pillTraceStyle}
         className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-xs font-medium
-                    transition-all duration-150 border ${highlightRec ? "aura-rec-trace" : ""}
+                    transition-all duration-150 border ${traceOn ? "aura-rec-trace" : ""}
                     ${open || active !== 0
                       ? "bg-ln-accent/20 text-ln-accent border-ln-accent/30"
                       : "bg-white/5 text-white/55 border-white/10 hover:bg-white/10 hover:text-white/85"
@@ -2889,8 +2901,10 @@ export default function PlayerOverlay({
             {/* Shader / upscaler */}
             <ShaderPicker
               activeTarget={activeTarget}
+              loadKey={loadKey}
               isAnime={isAnime}
               readGate={duration > 0 && firstFrameSeen && !buffering && !seekLoading}
+              controlsVisible={controlsVisible}
             />
 
             {/* Panscan / fill-screen toggle — for ultrawide vs 16:9 mismatches.
@@ -5025,6 +5039,7 @@ function SkipController({
       return;
     }
     console.info(`[auraskip] auto-skip ${desc} → ${target.toFixed(1)}s`);
+    if (active.type === "ed" || active.type === "mixed-ed") noteEndingAutoSkipSeek(active.start, target);
     seekAbsolute(target);
     // The level rides along so an automatic skip says how sure it was.
     const conf = skipConfidenceInfo(active);

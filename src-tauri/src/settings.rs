@@ -444,6 +444,54 @@ pub fn default_keybindings() -> HashMap<String, String> {
     m
 }
 
+/// Canonical form of a binding spec, mirroring `parseBinding` +
+/// `formatBinding` in `useKeybindings.ts`: modifiers in Ctrl, Alt, Shift,
+/// Meta order, then the code. `None` for an empty or unparseable spec.
+fn canonical_binding(spec: &str) -> Option<String> {
+    let mut parts: Vec<&str> = spec.split('+').map(str::trim).filter(|p| !p.is_empty()).collect();
+    let code = parts.pop()?;
+    let (mut ctrl, mut alt, mut shift, mut meta) = (false, false, false, false);
+    for p in parts {
+        match p {
+            "Ctrl" => ctrl = true,
+            "Alt" => alt = true,
+            "Shift" => shift = true,
+            "Meta" => meta = true,
+            _ => return None,
+        }
+    }
+    let mut out = String::new();
+    for (on, name) in [(ctrl, "Ctrl+"), (alt, "Alt+"), (shift, "Shift+"), (meta, "Meta+")] {
+        if on {
+            out.push_str(name);
+        }
+    }
+    out.push_str(code);
+    Some(out)
+}
+
+/// Add every default action the map lacks. Only MISSING keys are filled, so
+/// an explicit "" (the user unbound it) stays unbound. A default whose key
+/// another action already holds goes in as "" instead: the user's binding
+/// wins and the new row shows Unbound, so one key never runs two actions.
+/// Returns true when anything was inserted.
+fn fill_missing_default_keybindings(map: &mut HashMap<String, String>) -> bool {
+    let mut defaults: Vec<(String, String)> = default_keybindings().into_iter().collect();
+    defaults.sort();
+    let mut inserted = false;
+    for (action, default_spec) in defaults {
+        if map.contains_key(&action) {
+            continue;
+        }
+        let canon = canonical_binding(&default_spec);
+        let taken = canon.is_some()
+            && map.values().any(|v| canonical_binding(v) == canon);
+        map.insert(action, if taken { String::new() } else { default_spec });
+        inserted = true;
+    }
+    inserted
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -769,16 +817,7 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> AppSettings {
             // existing binding. If we filled any in, persist the
             // settings so subsequent loads see the merged map and
             // the user's settings.json reflects what they're using.
-            let defaults = default_keybindings();
-            let mut merged_any = false;
-            for (action, default_spec) in defaults {
-                if let std::collections::hash_map::Entry::Vacant(e) =
-                    parsed.keybindings.entry(action)
-                {
-                    e.insert(default_spec);
-                    merged_any = true;
-                }
-            }
+            let mut merged_any = fill_missing_default_keybindings(&mut parsed.keybindings);
 
             // One-time keybinding fix: the screenshot action briefly
             // defaulted to "PrintScreen", which Windows intercepts (Snipping
@@ -966,8 +1005,11 @@ pub async fn update_settings<R: Runtime>(
         }
     }
 
-    let next: AppSettings =
+    let mut next: AppSettings =
         serde_json::from_value(current).map_err(|e| format!("Invalid settings patch: {e}"))?;
+    // A patch REPLACES the whole keybindings map, and a blob or export from an
+    // older build lacks the newer actions: fill them as load() does.
+    fill_missing_default_keybindings(&mut next.keybindings);
 
     if !VALID_THEMES.contains(&next.theme.as_str()) {
         return Err(format!("Unknown theme: {}", next.theme));

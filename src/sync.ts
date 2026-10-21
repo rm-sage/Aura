@@ -1234,7 +1234,7 @@ export function installSyncTriggers(): void {
     const detail = (e as CustomEvent<{ fromCloud?: boolean }>).detail;
     if (!detail?.fromCloud) debouncedPush("settings");
   });
-  window.addEventListener("aura:keybindings-changed",     () => debouncedPush("settings"));
+  window.addEventListener("aura:keybindings-changed", () => { bumpSettingsUpdatedAt(); debouncedPush("settings"); });
   window.addEventListener("aura:history-changed",         () => debouncedPush("history"));
   // API-key changes ride along with the settings blob (the
   // encrypted api_keys field is built inside readSettingsBlob).

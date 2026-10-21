@@ -1,4 +1,4 @@
-// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// Aura - © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // ---------------------------------------------------------------------------

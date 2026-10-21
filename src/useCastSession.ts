@@ -115,17 +115,16 @@ export function useCastSession({
 
   // Rust reports each stage of a slow pick (a format probe, a transcode
   // warming up, a DLNA renderer's resume seek), so the spinner says what it
-  // waits on. Only the device being connected is shown.
+  // waits on. Only the device being connected is shown. Subscribed once on
+  // mount, not per pick: a pick that calls cast_load in the same tick as
+  // setConnectingId would otherwise emit its first stage before the listener
+  // exists, and Tauri drops events nobody listens for.
   const connectingRef = useRef<string | null>(null);
   connectingRef.current = connectingId;
   useEffect(() => {
-    if (!connectingId) {
-      setConnectingStage(null);
-      return;
-    }
     let disposed = false;
     const p = listen<CastLoadProgress>("cast-load-progress", ({ payload }) => {
-      if (!disposed && payload.device_id === connectingRef.current) {
+      if (!disposed && connectingRef.current && payload.device_id === connectingRef.current) {
         setConnectingStage(payload.stage);
       }
     });
@@ -133,6 +132,9 @@ export function useCastSession({
       disposed = true;
       p.then((un) => un()).catch(() => {});
     };
+  }, []);
+  useEffect(() => {
+    if (!connectingId) setConnectingStage(null);
   }, [connectingId]);
 
   // Actually begin a session. (pickDevice wraps this with the Chromecast

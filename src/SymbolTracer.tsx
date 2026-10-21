@@ -633,9 +633,30 @@ export default function SymbolTracer({ capSeconds = 7, label = "Discovering stre
     ro.observe(host);
     resize();
 
+    // A DPR change alone (dragging to a monitor with another scale, or changing
+    // the display scale) leaves the CSS size unchanged, so the content-box
+    // observer never fires. A resolution media query does; it matches only the
+    // DPR it was built for, so it is re-armed after every change.
+    let mq: MediaQueryList | null = null;
+    const onDpr = () => {
+      armDpr();
+      resize();
+      if (still) drawStatic();
+    };
+    const armDpr = () => {
+      mq?.removeEventListener("change", onDpr);
+      mq = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+      mq.addEventListener("change", onDpr);
+    };
+    armDpr();
+    const stopDpr = () => {
+      mq?.removeEventListener("change", onDpr);
+      mq = null;
+    };
+
     if (still) {
       drawStatic();
-      return () => { ro.disconnect(); };
+      return () => { ro.disconnect(); stopDpr(); };
     }
 
     // THE HIDDEN GATE, which this file already claimed to have. `hidden` was
@@ -646,7 +667,7 @@ export default function SymbolTracer({ capSeconds = 7, label = "Discovering stre
     // the canvas is correctly sized the instant the window comes back, and the
     // effect re-runs on restore with fresh locals, so `resize()` re-measures
     // and clears before any new loop starts.
-    if (hidden) return () => { ro.disconnect(); };
+    if (hidden) return () => { ro.disconnect(); stopDpr(); };
 
     const frame = (ts: number) => {
       if (!start) start = ts;
@@ -731,6 +752,7 @@ export default function SymbolTracer({ capSeconds = 7, label = "Discovering stre
     return () => {
       cancelAnimationFrame(raf);
       ro.disconnect();
+      stopDpr();
     };
     // `hidden` is a dependency on purpose: going hidden tears the loop down
     // entirely and coming back builds a fresh one. Nothing is composited while

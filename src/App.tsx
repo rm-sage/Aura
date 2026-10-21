@@ -107,7 +107,7 @@ import {
 } from "./skipWindows";
 import {
   emptyNextUpTiming, eosEnd, nextUpFollowsControls, nextUpShouldHide, nextUpShouldShow, nextUpTailNote,
-  nextUpTriggerAt, setDetectedMediaEnd, type NextUpTiming,
+  nextUpTriggerAt, setDetectedMediaEnd, nextUpFadeTime, clearEndingAutoSkipSeek, type NextUpTiming,
 } from "./nextUpGate";
 import { applyReducedMotionAttribute, loadAuraSettings, streamQueryAddons } from "./auraSettings";
 import { electAddons } from "./addonElection";
@@ -507,6 +507,19 @@ async function fetchPublicmetadbWindows(
 // arms auto-skip and must not sit behind a slow host. A late answer still lands
 // in the caches for the next load.
 const INTRODB_WAIT_MS = 5000;
+
+// Shortest file the detector reads the ending of for the Next-Up card alone
+// (Endings set to Off): only one long enough that TAIL (the last 480 s, from
+// the smaller of the container and the track's DURATION tag) cannot reach
+// HEAD's 600 s. Where they overlap, a continuity ending found over the opening
+// is withdrawn WITH a continuity opening (Rust `no_ed_inside_the_opening`, at
+// any length: Kaiju No. 8's 224 s special), so an ending nobody skips could
+// cost the user their opening. 600 + 480, plus 60 s for a tag below the
+// container (the gaps measured were at most 29 s; Rust does not bound it, so
+// this is a margin, not a guarantee). A card-only continuity ending could
+// never raise the card anyway (Risky). The skip chain's `wantEdFor` and the
+// next-episode theme prefetch both read it.
+const CARD_ONLY_ED_MIN_DURATION_S = 600 + 480 + 60;
 
 /** The first positive mpv `duration` of the CURRENT load, read from the
  *  `playback-update` events (never a get_property poll: landmine 3). `known`
@@ -3011,6 +3024,7 @@ export default function App() {
           // and the previous release's credits position would keep timing the
           // card. The load token is the right lifetime, so clear them here.
           nextUpTimingRef.current = emptyNextUpTiming();
+          clearEndingAutoSkipSeek();
           setDetectedMediaEnd(null);
           // A detector still reading the PREVIOUS file must stop now (its
           // ffmpeg is killed and anything it would still publish is dropped).
@@ -3103,17 +3117,7 @@ export default function App() {
             // The ending is gathered for the card alone (its mode is Off).
             const edCardOnly = (): boolean => modeFor("ed") === "off";
             // Whether the detector reads the ending. For the card alone, only
-            // on a file long enough that TAIL (the last 480 s, from the
-            // smaller of the container and the track's DURATION tag) cannot
-            // reach HEAD's 600 s: where they overlap, a continuity ending found
-            // over the opening is withdrawn WITH a continuity opening (Rust
-            // `no_ed_inside_the_opening`, at any length: Kaiju No. 8's 224 s
-            // special), so an ending nobody skips could cost the user their
-            // opening. 600 + 480, plus 60 s for a tag below the container (the
-            // gaps measured were at most 29 s; Rust does not bound it, so this
-            // is a margin, not a guarantee). A card-only continuity ending
-            // could never raise the card anyway (Risky).
-            const CARD_ONLY_ED_MIN_DURATION_S = 600 + 480 + 60;
+            // on a file of at least CARD_ONLY_ED_MIN_DURATION_S (see there).
             const wantEdFor = (duration: number): boolean =>
               modeFor("ed") !== "off"
               || (gatherFor("ed") !== "off" && duration >= CARD_ONLY_ED_MIN_DURATION_S);
@@ -5133,6 +5137,7 @@ export default function App() {
     setAutoAdvanceCancelled(false);
     nextUpResolvedFor.current = null;
     nextUpTimingRef.current = emptyNextUpTiming();
+    clearEndingAutoSkipSeek();
     // Don't reset nextUpDismissedFor here — App.tsx unmounts the
     // PlayerOverlay on exit which clears activeTarget; clearing the
     // dismiss ref on EVERY target change would re-show the CTA after
@@ -5161,16 +5166,19 @@ export default function App() {
   // (AIOMetadata), else the playing cour when the next video is simply the
   // following episode of the same season. Skipped with detection off or
   // without ffmpeg (it never triggers the ffmpeg download). The ending is
-  // always warmed: this runs only while the Next-Up card is on (the
-  // pre-resolve effect returns at a lead time of 0), and the card times
-  // itself from the ending even with Endings set to Off.
+  // warmed when its mode is on, or with Endings set to Off for the card alone
+  // (this runs only while the card is on: the pre-resolve effect returns at a
+  // lead time of 0) on a file of at least CARD_ONLY_ED_MIN_DURATION_S,
+  // matching the chain's `wantEdFor`; the playing file's duration stands in
+  // for the next episode's.
   // Typical cost: one paced AnimeThemes GET when the list is not cached and
   // about 2 MB per theme not already fingerprinted; the audio is dropped.
-  const prefetchNextThemes = useCallback((nextVideo: VideoEntry, currentId: string): void => {
+  const prefetchNextThemes = useCallback((nextVideo: VideoEntry, currentId: string, playingDuration: number): void => {
     if (loadAuraSettings().autoSkipDetect === false) return;
     const modes = skipModesRef.current;
     const wantOp = modes.op !== "off";
-    const wantEd = true;
+    const wantEd = modes.ed !== "off" || playingDuration >= CARD_ONLY_ED_MIN_DURATION_S;
+    if (!wantOp && !wantEd) return;
     let malId: number | null = null;
     let malEpisode: number | null = null;
     let how = "";
@@ -5234,6 +5242,7 @@ export default function App() {
     const seriesId = activeTarget.series_id ?? activeTarget.id;
     const mediaType = activeTarget.media_type;
     const currentId = activeTarget.id;
+    const playingDuration = duration;
 
     void (async () => {
       let next: Awaited<ReturnType<typeof resolveNextEpisode>> = null;
@@ -5259,7 +5268,7 @@ export default function App() {
         // navigates to a different episode.
         return;
       }
-      if (nextUpResolvedFor.current === currentId) prefetchNextThemes(next.next, currentId);
+      if (nextUpResolvedFor.current === currentId) prefetchNextThemes(next.next, currentId, playingDuration);
       // Pre-fetch the first stream so the user's click feels instant.
       // If this returns null we still show the CTA but with a
       // "no stream found" hint rather than a play button. In parallel,
@@ -10798,7 +10807,7 @@ export default function App() {
           // a Risky ending shows only with the controls from the start, like
           // that ending's prompt (nextUpGate rule 5).
           fadeWithControls={nextUpFollowsControls(
-            nextUpTimingRef.current, duration, time, nextUpRaisedTimeRef.current,
+            nextUpTimingRef.current, duration, nextUpFadeTime(nextUpTimingRef.current, time), nextUpRaisedTimeRef.current,
           )}
           controlsVisible={playerControlsVisible}
           top={playerStackTop(isFullscreen)}

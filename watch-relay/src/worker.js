@@ -140,9 +140,10 @@ export class Room {
     const rawCid = (url.searchParams.get("cid") || "").replace(/[^A-Za-z0-9]/g, "").slice(0, 16);
     let memberId = rawCid || crypto.randomUUID().slice(0, 8);
     let provenHash = null; // set when the cid is proven by its secret; bound after the room-full check
+    const storedHash = rawCid ? this.meta.secrets[rawCid] ?? null : null;
     if (rawCid) {
       const { grant, hash } = await authorizeCid(
-        this.meta.secrets[rawCid] ?? null,
+        storedHash,
         url.searchParams.get("cs") || "",
       );
       if (!grant) {
@@ -155,9 +156,10 @@ export class Room {
     // with the same cid while its old socket is still OPEN here: without this
     // the roster lists the member twice until the stale socket times out. The
     // client holds one socket at a time, so a same-cid socket is always stale.
-    // Only a secret-PROVEN cid may evict (a legacy unbound cid could be spoofed
-    // to kick its owner).
-    if (provenHash) {
+    // Only a cid proven against a secret bound BEFORE this request may evict: a
+    // first-use bind proves nothing, so an unbound cid could be claimed with any
+    // secret to kick its owner.
+    if (provenHash && storedHash) {
       for (const s of this.state.getWebSockets()) {
         if (s.readyState !== 1 || (s.deserializeAttachment() || {}).id !== memberId) continue;
         this.rates.delete(s);

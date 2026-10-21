@@ -309,7 +309,9 @@ export default function NextUpCta({
   const inert = faded || exiting;
   // A card that first appears already faded (an ending auto-skipped straight
   // into what follows it, controls hidden) skips the rise: the keyframes end
-  // at full opacity and would flash it on screen for their 220 ms.
+  // at full opacity and would flash it on screen for their 220 ms. App judges
+  // that fade against the auto-skip's seek target while the seek is in flight
+  // (`nextUpFadeTime`), so the card mounts faded here instead of rising.
   const [mountedFaded] = useState(faded);
   // Anti-spoiler blur. This card shows the NEXT episode's still, which is
   // exactly the thing "Blur unwatched episode thumbnails" exists to hide, but

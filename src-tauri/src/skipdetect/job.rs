@@ -1685,6 +1685,10 @@ impl<'a> Job<'a> {
             if let Some(f) = side.take() {
                 let (d, fork) = f.await;
                 self.join_fork(Kind::Op, d, fork);
+                // TAIL's last progress event predates the merge: re-send it so
+                // an ending whose only candidates came from sibling cours gets
+                // its row before the ED decision.
+                self.report_progress(Which::Tail, 1.0);
             }
             let d = self.d.decide_kind(Kind::Ed, &region, self.media_end_now()).await;
             self.apply(Kind::Ed, d);

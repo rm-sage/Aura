@@ -255,6 +255,54 @@ export function nextUpFollowsControls(
 }
 
 // ---------------------------------------------------------------------------
+// An ending auto-skip whose seek has not landed yet.
+//
+// The SkipController seeks on the first time update inside an Auto ending, and
+// the gate raises the card in the same commit, but mpv reports the new
+// position only once the seek lands (100 ms to over 1 s on a debrid stream).
+// Judged on the old time the card mounted visible, rose, and then faded with
+// the hidden controls: a 0.5-2 s flash on every auto-skipped ending. The fade
+// is judged against the seek's TARGET while it is pending (`nextUpFadeTime`);
+// raisedAt stays the playhead at the raise, so rule 5 is unchanged. Bounded:
+// one entry, dropped once the playhead reaches the fade point, on a seek back
+// before the ending, after 3 s, or on a new load.
+// ---------------------------------------------------------------------------
+
+const AUTO_SKIP_SEEK_TTL_MS = 3000;
+let endingSkipSeek: { start: number; target: number; at: number } | null = null;
+
+/** The SkipController is about to auto-seek past an ending (`start` is the
+ *  window's start, `target` where the seek lands). */
+export function noteEndingAutoSkipSeek(start: number, target: number): void {
+  endingSkipSeek = Number.isFinite(start) && Number.isFinite(target)
+    ? { start, target, at: Date.now() } : null;
+}
+
+export function clearEndingAutoSkipSeek(): void {
+  endingSkipSeek = null;
+}
+
+/** `time` for the card's fade decision: the pending auto-skip's target while
+ *  that seek is in flight for the electing ending (start within 3 s), else
+ *  `time`. Only the fade reads it; the gate and the tail note keep `time`. */
+export function nextUpFadeTime(timing: NextUpTiming, time: number): number {
+  const p = endingSkipSeek;
+  if (p == null) return time;
+  // The seek lands at the end of that same ending; a refined end a fraction
+  // past the target must not leave the card judged inside it once the seek
+  // HAS landed, so the entry holds until the playhead reaches that fade point.
+  const end = finitePos(timing.trustedEdEnd) ? timing.trustedEdEnd : timing.edEnd;
+  const landed = finitePos(end) && Math.abs(end - p.target) <= 3 ? Math.max(end, p.target) : p.target;
+  if (Date.now() - p.at > AUTO_SKIP_SEEK_TTL_MS || time >= landed || time < p.start - 1) {
+    endingSkipSeek = null;
+    return time;
+  }
+  const start = timing.edStart;
+  if (!finitePos(start) || Math.abs(start - p.start) > 3) return time;
+  return landed;
+}
+
+// ---------------------------------------------------------------------------
 // The playing file's detected media end, for the end-of-stream detectors.
 //
 // mpv's `duration` is the CONTAINER duration; when the container runs past the

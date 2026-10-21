@@ -45,7 +45,9 @@ impl Drop for HlsSession {
         // handle so we don't leave a zombie even if taskkill missed.
         #[cfg(target_os = "windows")]
         {
+            use std::os::windows::process::CommandExt;
             let _ = Command::new("taskkill")
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW
                 .args(["/F", "/T", "/PID", &self.child.id().to_string()])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -116,7 +118,15 @@ pub(super) async fn register_transcode(
     let dir2 = dir.clone();
 
     let args = super::transcode::build_hls_args(upstream, &codecs, &dir2, start_seconds);
-    let child = Command::new(ffmpeg)
+    let mut cmd = Command::new(ffmpeg);
+    // CREATE_NO_WINDOW: a release build has no console, so without it the
+    // transmux holds a console window open for the whole cast.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let child = cmd
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

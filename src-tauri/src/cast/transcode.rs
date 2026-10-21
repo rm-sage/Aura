@@ -157,7 +157,15 @@ pub(super) fn route_for_probe(c: &Codecs) -> ProbedRoute {
 /// `-rw_timeout` so a dead URL can't hang the call.
 pub(super) fn probe(url: &str) -> Codecs {
     let Some(ffprobe) = ffprobe_path() else { return Codecs::default() };
-    let out = Command::new(ffprobe)
+    let mut cmd = Command::new(ffprobe);
+    // CREATE_NO_WINDOW: a release build has no console, so without it every
+    // probe flashes a console window over Aura.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let out = cmd
         .args([
             "-hide_banner", "-v", "error",
             // Bound every protocol read/write at 15 s so a stalled upstream
