@@ -147,6 +147,17 @@ export interface AuraSettings {
    *  probe-only detect (no HEAD / TAIL) when ffmpeg is already installed, for
    *  the end-of-stream media end. */
   autoSkipDetect: boolean;
+  /** Pre-scan the next episode: while an anime episode plays, run the skip
+   *  detector on the stream Next-Up pre-resolved for the next episode, in the
+   *  background (its first ten and last eight minutes), so that episode's
+   *  opening and ending are cached the moment it starts (nextPrescan.ts).
+   *  Only with autoSkipDetect on, the Next-Up card on (next_up_lead_seconds
+   *  > 0: its pre-resolve supplies the next stream), ffmpeg already installed
+   *  and a MAL id for the next episode's cour (the canon one when Next-Up
+   *  skips filler / recap). It waits for the playing episode's own detect,
+   *  is cancelled (and retried, at most 3 starts) while the playing stream
+   *  buffers or runs low, and never runs while casting. Default true. */
+  prescanNextEpisode: boolean;
   /** Blur the selected episode's per-episode synopsis on the detail
    *  page until the user clicks to reveal. Spoiler protection for
    *  per-episode overview text. Watched episodes are NEVER blurred
@@ -339,6 +350,7 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   seekStepSeconds: 5,
   stillWatchingGate: true,
   autoSkipDetect: true,
+  prescanNextEpisode: true,
   blurEpisodeSynopsis: false,
   loudnessNormalization: false,
   motionInterpolation: true,
@@ -433,6 +445,9 @@ function readFromStorage(): AuraSettings {
         : true,
       autoSkipDetect: typeof parsed.autoSkipDetect === "boolean"
         ? parsed.autoSkipDetect
+        : true,
+      prescanNextEpisode: typeof parsed.prescanNextEpisode === "boolean"
+        ? parsed.prescanNextEpisode
         : true,
       blurEpisodeSynopsis: typeof parsed.blurEpisodeSynopsis === "boolean"
         ? parsed.blurEpisodeSynopsis

@@ -483,6 +483,24 @@ export function peekRichestCachedDetailById(id: string): MetaDetail | null {
   return best;
 }
 
+/** Every fresh cached detail for an id, one per addon (and media type) that
+ *  answered. No network, one pass over the cache, the same freshness rule as
+ *  the peeks above. For the airing check (useAiringStreamCheck.ts), which must
+ *  see every addon's air dates: the addon whose date is late is the one that
+ *  matters, and it need not be the richest answer. Bounded by the cache. */
+export function peekCachedDetailsById(id: string): MetaDetail[] {
+  if (!id) return [];
+  const suffix = `::${id}`;
+  const now = Date.now();
+  const out: MetaDetail[] = [];
+  for (const [k, v] of cache) {
+    if (!v.detail || !k.endsWith(suffix)) continue;
+    if (now - v.ts >= ttlFor(k.split("::")[1] ?? "")) continue;
+    out.push(v.detail);
+  }
+  return out;
+}
+
 /** Every fresh cached `background` for an id, one row per cache entry that
  *  carries one: so one per addon that answered, or two when an addon answered
  *  under two media types. No network, one pass over the cache, and the same

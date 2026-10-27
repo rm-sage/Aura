@@ -168,6 +168,8 @@ async fn detect(args: &Value, data_dir: &PathBuf) -> Result<Value, String> {
             }));
         }),
         progress: Arc::new(|_: &job::Progress| {}),
+        background: false,
+        pre_probe: None,
         replay: replay.as_ref().map(|(r, _)| r.clone()),
         fake_theme_load: None,
     };

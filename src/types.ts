@@ -1,6 +1,8 @@
 // Aura - © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { releasedMs } from "./availableEarly";
+
 export interface AddonEntry {
   url: string;
   name: string;
@@ -315,10 +317,11 @@ export interface VideoEntry {
  *      50-episode threshold should consider aired-only count so a
  *      show with 14 future eps still on the schedule doesn't pivot
  *      to the long-runner gradient prematurely. */
-export function isVideoAired(v: { released?: string | null }): boolean {
-  if (!v.released) return true;
-  const t = Date.parse(v.released);
-  return !Number.isFinite(t) || t <= Date.now();
+export function isVideoAired(v: { id?: string | null; released?: string | null }): boolean {
+  // releasedMs: the listed date, or when streams for it were seen if earlier
+  // (availableEarly.ts). Null = undated or unparseable, which counts as aired.
+  const t = releasedMs(v);
+  return t == null || t <= Date.now();
 }
 
 export interface StreamEntry {
@@ -492,18 +495,18 @@ export const KEYBIND_ACTIONS: { id: KeybindAction; label: string; description: s
   // (Playback), so naming one here would go stale the moment it is changed.
   { id: "seek-back",        label: "Seek Back",            description: "Skip backward by the seek step" },
   { id: "seek-forward",     label: "Seek Forward",         description: "Skip forward by the seek step" },
-  { id: "skip-segment",     label: "Skip Segment",         description: "Skip the opening, ending, recap or preview playing now, whether it was prompted, auto-skipped earlier or neither. The skip prompt shows this key." },
-  { id: "play-next-episode", label: "Play Next Episode",   description: "While the Next Up card is showing, play the next episode. When the card offers a skip past filler or recap, this skips to the canon episode instead: hold the key for 2 seconds (the card shows where it lands), or press it once if the hold is turned off just below." },
+  { id: "skip-segment",     label: "Skip Segment",         description: "Skip the opening, ending, recap or preview playing now, prompted or not" },
+  { id: "play-next-episode", label: "Play Next Episode",   description: "While the Next Up card is up, play the next episode, or skip to the next canon episode when the card offers that (hold 2 s unless turned off below)" },
   { id: "volume-up",        label: "Volume Up",            description: "Increase volume by 5%" },
   { id: "volume-down",      label: "Volume Down",          description: "Decrease volume by 5%" },
   { id: "toggle-osd",       label: "Toggle Performance OSD", description: "Show or hide the perf overlay" },
   { id: "cycle-shader",     label: "Cycle Shader Profile", description: "Step through upscaling profiles" },
   { id: "toggle-subtitles", label: "Toggle Subtitles",     description: "Open or close the subtitle picker" },
-  { id: "fullscreen",       label: "Toggle Fullscreen",    description: "Enter or leave fullscreen while a stream is playing (no effect outside the player)" },
-  { id: "toggle-panscan",   label: "Toggle Panscan (Fill Screen)", description: "Zoom-and-crop the video to fill the screen on its constrained axis - useful for 21:9 content on a 16:9 monitor (or vice-versa). Off = letterbox / pillarbox." },
-  { id: "frame-step-back",    label: "Step One Frame Back",    description: "Nudge playback back by exactly one frame and pause. Useful for catching subtitle timing, screenshot precision, or anime sakuga inspection." },
-  { id: "frame-step-forward", label: "Step One Frame Forward", description: "Advance playback by exactly one frame and pause. Pair with the back-step binding to scrub frame-by-frame." },
-  { id: "screenshot",       label: "Save Screenshot",      description: "Save a PNG of the current frame to your screenshots folder (configurable in Settings; default is Pictures\Aura). HDR is tonemapped to SDR (it looks like what's on screen), with any visible subtitles included." },
+  { id: "fullscreen",       label: "Toggle Fullscreen",    description: "Enter or leave fullscreen during playback" },
+  { id: "toggle-panscan",   label: "Toggle Panscan (Fill Screen)", description: "Zoom and crop to fill the screen instead of showing black bars (e.g. 21:9 video on a 16:9 monitor)" },
+  { id: "frame-step-back",    label: "Step One Frame Back",    description: "Go back exactly one frame and pause" },
+  { id: "frame-step-forward", label: "Step One Frame Forward", description: "Advance exactly one frame and pause" },
+  { id: "screenshot",       label: "Save Screenshot",      description: "Save a PNG of the frame as you see it, subtitles included (HDR tonemapped). Saves to Pictures\\Aura unless you set a Screenshot folder (Video & Audio, with Show advanced settings on)" },
   { id: "anime4k-a",        label: "Anime4K · Mode A",     description: "High-quality restore + upscale" },
   { id: "anime4k-b",        label: "Anime4K · Mode B",     description: "Soft restore for noisy sources" },
   { id: "anime4k-c",        label: "Anime4K · Mode C",     description: "Combined denoise + upscale in one pass - sharpest of the single-pass modes" },

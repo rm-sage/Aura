@@ -3,7 +3,7 @@
 
 import { useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { markIneligible, markIneligibleMany, markScrobbledMany } from "./scrobbledStore";
+import { isScrobbled, markIneligible, markIneligibleMany, markScrobbledMany } from "./scrobbledStore";
 import {
   HISTORY_COMMAND,
   isRowHistoryService,
@@ -276,8 +276,9 @@ export async function startScrobbleRun(
           }
           // A verdict about the item, not the attempt: retire it so it is not
           // re-sent (and re-reported as a failure) on every future run. Reported
-          // once, here, so the user still learns about it.
-          if (isPermanentFailure(message)) {
+          // once, here, so the user still learns about it. Never for a repeat the
+          // user chose to send: the service took this item before.
+          if (isPermanentFailure(message) && !isScrobbled(scope, service, entry.id, entry.played_at)) {
             markIneligible(scope, service, entry.id);
           }
           const retryable = isTransient(message) && attempt < MAX_ATTEMPTS;
@@ -325,8 +326,10 @@ export async function startScrobbleRun(
             return;
           }
           // Same rule as a PERMANENT_PREFIX failure: a verdict about the item
-          // retires it, so it is not re-sent and re-reported on every run.
-          if (r.status === "not_found" || r.status === "skipped") refused.push(entry.id);
+          // retires it, so it is not re-sent and re-reported on every run (a
+          // repeat excepted: Simkl took this item before).
+          if ((r.status === "not_found" || r.status === "skipped")
+              && !isScrobbled(scope, "simkl", entry.id, entry.played_at)) refused.push(entry.id);
           failed++;
           if (!firstError) firstError = `${entry.name}: ${r.message}`;
         });

@@ -199,9 +199,8 @@ export function knownScrobbleServicesAvailable(): ReadonlySet<ScrobbleService> |
  *  plus the account context. */
 export interface ScrobbleConn extends Record<ScrobbleService, boolean> {
   scope: string;
-  /** "Aura may scrobble automatically right now": the MASTER `scrobble_enabled`
-   *  switch AND the `auto_scrobble_enabled` preference, not the latter alone.
-   *  Gates every push the user did not explicitly ask for by pressing a
+  /** "Aura may scrobble automatically right now": the `auto_scrobble_enabled`
+   *  preference (the one scrobbling switch). Gates every push the user did not explicitly ask for by pressing a
    *  scrobble button (the History tab's per-row buttons are that explicit ask
    *  and bypass this). */
   autoScrobbleEnabled: boolean;
@@ -275,21 +274,14 @@ async function resolve(): Promise<void> {
   let autoScrobbleEnabled = false;
   try {
     const settings = await invoke<{
-      scrobble_enabled?: boolean;
       auto_scrobble_enabled?: boolean;
     }>("get_settings");
-    // BOTH switches, ANDed, because `scrobble_enabled` is the MASTER over all
-    // scrobbling and `auto_scrobble_enabled` only covers the automatic half.
-    // Reading the second alone meant turning scrobbling off entirely still let
-    // a user-initiated skip push plays to Trakt / AniList: skipActions.ts gates
-    // on this one field, and the commands it calls
-    // (`scrobble_history_trakt` / `_anilist`) deliberately do not re-check the
-    // preference, because their other caller is the History tab's explicit
-    // per-row button. Rust's automatic path already requires both
-    // (scrobble.rs `!s.scrobble_enabled || !s.auto_scrobble_enabled`); this
-    // makes the frontend gate agree with it.
-    autoScrobbleEnabled =
-      settings?.scrobble_enabled === true && settings?.auto_scrobble_enabled === true;
+    // The same switch Rust's automatic path reads (scrobble.rs
+    // `!s.auto_scrobble_enabled`). skipActions.ts gates a user-initiated
+    // skip's push on this, since the commands it calls
+    // (`scrobble_history_trakt` / `_anilist`) deliberately do not re-check it:
+    // their other caller is the History tab's explicit per-row button.
+    autoScrobbleEnabled = settings?.auto_scrobble_enabled === true;
   } catch { /* treat unknown as OFF: never push on a guess */ }
 
   // A token for a service this build cannot use (a Simkl sign-in kept from a

@@ -92,7 +92,7 @@ import {
 import { useWatchTogether } from "./watchTogether/useWatchTogether";
 import { streamLabel, streamMatchKey } from "./watchTogether/streamMatch";
 import { parseStream } from "./streamMeta";
-import { resolveNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPreviousEpisode, resolveCanonSkipTarget, autoSkipApplies, formatEpisodeTag } from "./nextUp";
+import { resolveNextEpisode, probeNextEpisode, pickFirstStreamForEpisode, findNextEpisode, findPreviousEpisode, resolveCanonSkipTarget, autoSkipApplies, formatEpisodeTag } from "./nextUp";
 import { arcPositionOf, fetchStoryArcs, loadArcMode } from "./storyArcs";
 import { getMetaDetailFallback, getRichestMetaDetail, peekCachedDetailById, peekRichestCachedDetailById, peekFreshestPostersByIds } from "./metaCache";
 import { PersistentCache } from "./persistentCache";
@@ -109,6 +109,13 @@ import {
   emptyNextUpTiming, eosEnd, nextUpFollowsControls, nextUpShouldHide, nextUpShouldShow, nextUpTailNote,
   nextUpTriggerAt, setDetectedMediaEnd, nextUpFadeTime, clearEndingAutoSkipSeek, type NextUpTiming,
 } from "./nextUpGate";
+import {
+  CARD_ONLY_ED_MIN_DURATION_S, PRESCAN_MAX_ATTEMPTS, parsePrescanOutcome, prescanAfterOutcome, prescanCanAttempt,
+  prescanCourEligible, prescanHealthStreak, prescanHealthyLongEnough, prescanHealthyMsLeft, prescanKey, prescanKinds,
+  prescanLiveSettled, prescanShouldAbort, prescanStaleWhilePlaying,
+  prescanStaticBlocker, prescanWantsEarlyResolve, type PrescanBudget,
+} from "./nextPrescan";
+import { resolveSkipCour } from "./skipCour";
 import { applyReducedMotionAttribute, loadAuraSettings, streamQueryAddons } from "./auraSettings";
 import { electAddons } from "./addonElection";
 import {
@@ -205,6 +212,7 @@ import { NotificationsProvider, useNotifications } from "./NotificationsContext"
 import NotificationsBell from "./NotificationsBell";
 import AccountButton from "./AccountButton";
 import NotificationsScanner, { clearScannerState } from "./NotificationsScanner";
+import { useAiringStreamCheck } from "./useAiringStreamCheck";
 import { getTitleState, titleStateKey } from "./titleState";
 import { isAnimeMeta, markAnimeId } from "./aiometadata";
 import { setSkipMarksScope } from "./skipMarks";
@@ -215,6 +223,7 @@ import type {
   AddonEntry,
   ExternalSubtitle,
   LibraryItem,
+  MetaDetail,
   MetaPreview,
   StreamEntry,
   StreamFetchResult,
@@ -508,18 +517,9 @@ async function fetchPublicmetadbWindows(
 // in the caches for the next load.
 const INTRODB_WAIT_MS = 5000;
 
-// Shortest file the detector reads the ending of for the Next-Up card alone
-// (Endings set to Off): only one long enough that TAIL (the last 480 s, from
-// the smaller of the container and the track's DURATION tag) cannot reach
-// HEAD's 600 s. Where they overlap, a continuity ending found over the opening
-// is withdrawn WITH a continuity opening (Rust `no_ed_inside_the_opening`, at
-// any length: Kaiju No. 8's 224 s special), so an ending nobody skips could
-// cost the user their opening. 600 + 480, plus 60 s for a tag below the
-// container (the gaps measured were at most 29 s; Rust does not bound it, so
-// this is a margin, not a guarantee). A card-only continuity ending could
-// never raise the card anyway (Risky). The skip chain's `wantEdFor` and the
-// next-episode theme prefetch both read it.
-const CARD_ONLY_ED_MIN_DURATION_S = 600 + 480 + 60;
+// CARD_ONLY_ED_MIN_DURATION_S (nextPrescan.ts): the shortest file the
+// detector reads the ending of for the Next-Up card alone. The skip chain's
+// `wantEdFor`, the next-episode theme prefetch and the pre-scan read it.
 
 /** The first positive mpv `duration` of the CURRENT load, read from the
  *  `playback-update` events (never a get_property poll: landmine 3). `known`
@@ -770,6 +770,19 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
   // Demuxer readahead buffered ahead of the playhead, seconds ("amount cached
   // in the demuxer"). Shown on the loading overlay + broadcast per-member.
   const [cacheSeconds, setCacheSeconds] = useState<number | null>(null);
+  // The demuxer has read the playing stream to its end (`demux_eof` from the
+  // same cache poll). Read by the next-episode pre-scan's health gate only
+  // (nextPrescan.ts): a fully read file leaves the link free.
+  const [demuxEof, setDemuxEof] = useState(false);
+  // Wall clock of the last cache reading (a playback-update carrying
+  // cache_seconds or demux_eof); 0 after a seek starts and on a new load. A
+  // ref, not state: the pre-scan's healthy streak reads it to tell a fresh
+  // reading from one that stopped updating (a hidden window), and a state
+  // would re-render App on every poll even when the numbers did not move.
+  const cacheSampleAtRef = useRef(0);
+  // Bumped by every notifyNewLoad, so the pre-scan's healthy streak can never
+  // span two loads (an advance, EOS Replay, the VOD auto-retry, a Reload).
+  const loadEpochRef = useRef(0);
   // Once-per-playback latch: flips true the first time MPV reports
   // time-pos > 0 (i.e. real frames are flowing). The loading overlay
   // stays up until this flips, regardless of `duration` / `buffering`,
@@ -1151,7 +1164,10 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
         // On seek start, the pre-seek cache stats are stale for the new position —
         // clear them so the overlay shows "Seeking…" until the post-seek poll
         // reports fresh numbers for where we landed.
-        if (payload.seeking) { setBufferPct(null); setCacheSeconds(null); }
+        if (payload.seeking) {
+          setBufferPct(null); setCacheSeconds(null); setDemuxEof(false);
+          cacheSampleAtRef.current = 0;
+        }
       }
       // Real cache telemetry from the engine's gated poll: drive the loading
       // overlay's % + readahead, and broadcast our buffer to the party.
@@ -1192,6 +1208,9 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
           lastCacheSecondsRef.current = cs;
         }
       }
+      if (typeof payload.cache_seconds === "number" || typeof payload.demux_eof === "boolean") {
+        cacheSampleAtRef.current = Date.now();
+      }
       if (typeof payload.cache_pct === "number" || typeof payload.cache_seconds === "number") {
         notifyLocalBuffer({
           pct: typeof payload.cache_pct === "number" ? payload.cache_pct : null,
@@ -1206,6 +1225,7 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
       // never rides along (it is an observed property on its own partial
       // payload), hence lastPosRef.
       if (typeof payload.demux_eof === "boolean") {
+        setDemuxEof(payload.demux_eof);
         const dur = lastPosRef.current.duration;
         const end = typeof payload.cache_end === "number"
           ? payload.cache_end
@@ -1796,6 +1816,8 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
     lastBufferProgressAtRef.current = 0;
     lastCachePctRef.current = 0;
     lastCachePctAtRef.current = 0;
+    cacheSampleAtRef.current = 0;
+    loadEpochRef.current += 1;
     nearEndEosFiredRef.current = false;
     userPausedNearEndRef.current = false;
     // The detected media end is NOT cleared here. It belongs to the FILE,
@@ -1821,6 +1843,7 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
     setTime(0);
     setDuration(0);
     setEof(false);
+    setDemuxEof(false);
     // Reset paused to false at load time. MPV's default behaviour on
     // loadfile is "play immediately"; on this libmpv build the initial
     // pause property fires `paused=true` during loadfile then no follow-
@@ -1893,6 +1916,7 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
 
   return {
     time, duration, paused, volume, speed, buffering, bufferPct, cacheSeconds, seekLoading, eof, firstFrameSeen,
+    demuxEof, seeking, cacheSampleAtRef, loadEpochRef,
     streamBroken, setStreamBroken,
     togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
     notifyNewLoad, logLoadEvent,
@@ -2166,6 +2190,11 @@ export default function App() {
    *  the previous one's timings. Claimed synchronously before the first await
    *  and re-checked before every stamp. */
   const skipChainSeqRef = useRef(0);
+  /** The load token whose detect has SETTLED (ran to its end, or the chain
+   *  exited without one); compared against skipChainSeqRef. The tick re-runs
+   *  the next-episode pre-scan effect when it moves (nextPrescan.ts). */
+  const skipDetectSettledSeqRef = useRef<number | null>(null);
+  const [skipDetectSettledTick, setSkipDetectSettledTick] = useState(0);
   /** The running skip chain's serialised `stamp`, while that chain owns the
    *  current load (null otherwise). A mid-play skip-mode change re-stamps
    *  THROUGH it (see restampSkipModes), so it can never race the chain's own
@@ -2220,6 +2249,10 @@ export default function App() {
   const downloadsPanelPhase = useDownloadsPanelPhase();
   // Rust owns the job list; this only subscribes the projection to it.
   useEffect(() => startDownloadsStore(), []);
+
+  // An airing show's next episode listed within a day: ask the stream addons
+  // whether it is out already (useAiringStreamCheck.ts). Never while playing.
+  useAiringStreamCheck({ library, addons, playing: activeTarget != null });
   // Mirror of PlayerOverlay's auto-hide `controlsVisible` so the sibling
   // PlayerPartyHud pill can fade in lockstep with the player chrome.
   const [playerControlsVisible, setPlayerControlsVisible] = useState(true);
@@ -2278,6 +2311,7 @@ export default function App() {
   //     runs while a stream is loaded.
   const {
     time, duration, paused, volume, speed, buffering, bufferPct, seekLoading, firstFrameSeen,
+    cacheSeconds, demuxEof, seeking: playbackSeeking, cacheSampleAtRef, loadEpochRef,
     streamBroken, setStreamBroken,
     togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
     notifyNewLoad, logLoadEvent,
@@ -3030,6 +3064,20 @@ export default function App() {
           // ffmpeg is killed and anything it would still publish is dropped).
           // Every load, including a movie or a channel, which run no detector.
           void invoke("skip_detect", { action: { op: "cancel" } }).catch(() => {});
+          // A next-episode pre-scan must not compete with the stream about to
+          // load (when this IS the pre-scanned episode, the live Detect would
+          // preempt it anyway). Exit playback, by contrast, lets it finish.
+          void invoke("skip_detect", { action: { op: "prescan_cancel" } }).catch(() => {});
+          // This file's detect has settled (it ran to its end, or the chain
+          // exited without one): the next-episode pre-scan waits for it
+          // (nextPrescan.ts), so it never shares the link with this file's
+          // own HEAD / TAIL read. A stale chain never marks.
+          let finishEntered = false;
+          const markDetectSettled = (): void => {
+            if (stale()) return;
+            skipDetectSettledSeqRef.current = skipSeq;
+            setSkipDetectSettledTick((n) => n + 1);
+          };
           (async () => {
             // Reset first so non-anime / no-data cases don't leave
             // stale windows from the previous load.
@@ -3152,6 +3200,10 @@ export default function App() {
                 probeOnly?: boolean;
               },
             ): Promise<void> => {
+              finishEntered = true;
+              // Declared outside the try so the finally below can tell when
+              // this file's detect has settled.
+              let detectRun: Promise<void> | null = null;
               // A duration mpv reports only AFTER the chapter poll gave up (a
               // slow debrid open can outlast its ~6 s) still starts the
               // detector: `loadDuration` is the chain's one watch of the
@@ -3366,7 +3418,6 @@ export default function App() {
                 // instant. Gated by the autoSkipDetect setting (default on).
                 const url = opts.streamUrl;
                 const autoDetect = loadAuraSettings().autoSkipDetect !== false;
-                let detectRun: Promise<void> | null = null;
                 // Layer 1 decides a kind on this load when the cour's MAL id is
                 // known, detection is on, there is a stream and the kind is
                 // gathered (the same conditions runDetect asks it under; an
@@ -3713,6 +3764,12 @@ export default function App() {
                 if (!stale()) releaseLayer1("no detect ran");
               } catch (err) {
                 console.warn(`[auraskip] finish/chapter merge failed: ${String(err)}`);
+              } finally {
+                // Every exit, the early ones included: a detect still running
+                // (started from the duration watch) settles when it ends.
+                const running = detectRun as Promise<void> | null;
+                if (running) void running.then(markDetectSettled, markDetectSettled);
+                else markDetectSettled();
               }
             };
 
@@ -3765,46 +3822,6 @@ export default function App() {
               const idb = await introDbPromise;
               return idb.length === 0 ? base : [...base, ...idb];
             };
-            // Resolution cascade — first id-based via yuna.moe, then a
-            // title-based Jikan lookup as a last resort. The id-based
-            // path is preferred because it's exact and free of false
-            // positives, but for IMDb-keyed anime (the common case —
-            // tt22248376 = Frieren via Stremio) AIOMetadata's response
-            // typically has NO anime ids populated. Without the title
-            // fallback the AniSkip feature silently does nothing for
-            // most series.
-            // Resolve the COUR-SPECIFIC MAL id. AniSkip keys by MAL
-            // anime id and MAL splits multi-cour shows into separate
-            // entries — Frieren's cour 1 is MAL 52991 (eps 1-28), cour
-            // 2 is MAL 59978 (eps 1-10 LOCAL). Querying cour 1's MAL
-            // id with the absolute episode 37 returns 404 (cour 1 ends
-            // at 28); querying cour 2's MAL id with local episode 9
-            // returns the correct timings.
-            //
-            // Resolution priority:
-            //   0. The playing video's own cour ids from the addon
-            //      (mal_id/mal_episode, else anilist_id/anilist_episode),
-            //      used only as a whole pair.
-            //   1. Anime-prefix video id (kitsu/mal/anidb/anilist) →
-            //      extract the cour-specific show id from target.id
-            //      and resolve via yuna.moe. AIOMetadata's cour-
-            //      aggregation patch encodes the cour-specific
-            //      provider id directly, so this is exact.
-            //   2. detail.mal_id / detail.kitsu_id / detail.anidb_id /
-            //      detail.anilist_id — show-root anime ids from the
-            //      meta detail. These are typically cour 1's ids for
-            //      multi-cour shows, so they only match for cour 1
-            //      playback.
-            //   3. Title-based search: last-resort exact-title match.
-            // 2 and 3 never run for a tt-keyed season > 1 (laterSeasonTt):
-            // they name the first cour.
-            let malId: number | null = null;
-            const tryResolve = async (src: "kitsu" | "anidb" | "anilist", id: number | null | undefined) => {
-              if (!id) return null;
-              try {
-                return await invoke<number | null>("resolve_mal_id", { source: src, id });
-              } catch { return null; }
-            };
             // TMDB id for PublicMetaDB on an anime: the detail's own, else
             // resolved through yuna.moe from whichever anime id the detail
             // has (AIOMetadata's anime `_tmdbId` is unreliable). Shared by the
@@ -3827,125 +3844,14 @@ export default function App() {
               }
               return tmdb;
             };
-            // Step 0: the playing episode's OWN cour ids, from the addon.
-            // AIOMetadata stamps every video with the MAL entry of its cour
-            // (`_malId` / `_malEpisode`, parsed as mal_id / mal_episode) and
-            // the AniList one (anilistId / anilistEpisode). Either pair names
-            // the exact AniSkip entry and its LOCAL episode, so it beats every
-            // step below. A pair is used only whole: a cour id with some other
-            // episode number is the very mis-pairing this exists to prevent.
-            // Read from detail.videos, not `target`: the enrichment effect
-            // stamps the AniList pair onto activeTarget only later.
-            let courEpisode: number | null = null;
-            const playingVideo = detail?.videos?.find((v) => v.id === target.id) ?? null;
-            // Where the cour MAL id came from, for the detector's log:
-            // "aiometadata" (the video's own pair), "anilist" (its AniList pair
-            // resolved), else "aniskip" (this pipeline's AniSkip resolution).
-            let malSource: string | null = null;
-            if (playingVideo?.mal_id && playingVideo.mal_episode) {
-              malId = playingVideo.mal_id;
-              courEpisode = playingVideo.mal_episode;
-              malSource = "aiometadata";
-            } else if (playingVideo?.anilist_id && playingVideo.anilist_episode) {
-              const viaAnilist = await tryResolve("anilist", playingVideo.anilist_id);
-              if (viaAnilist) {
-                malId = viaAnilist;
-                courEpisode = playingVideo.anilist_episode;
-                malSource = "anilist";
-              }
-            }
-            if (malId) {
-              console.info(
-                `[aniskip] per-episode ids from the addon -> mal=${malId} ep=${courEpisode}`,
-              );
-            }
-            // Step 1 — parse cour-specific show id from target.id.
-            // `kitsu:49240:9` → ("kitsu", 49240); `mal:59978:9` is
-            // already the MAL id (no round-trip needed).
-            const idSegments = target.id.split(":");
-            if (!malId && idSegments.length === 3) {
-              const provider = idSegments[0].toLowerCase();
-              const showId = Number(idSegments[1]);
-              if (Number.isFinite(showId)) {
-                if (provider === "mal") {
-                  malId = showId;
-                } else if (provider === "kitsu" || provider === "anidb" || provider === "anilist") {
-                  malId = await tryResolve(provider as "kitsu" | "anidb" | "anilist", showId);
-                }
-              }
-            }
-            // Step 1.5 — SEASON-AWARE resolver for IMDb-keyed multi-season
-            // anime. `detail.mal_id` (Step 2) is the SERIES-ROOT entry, which
-            // MAL treats as season 1: for a season-2 IMDb id (tt…:2:E) it would
-            // pair season 1's MAL id with a season-local episode and fetch
-            // season 1's OP/ED — applied to season 2 those land mid-content and
-            // (with OP on auto) yank the playhead partway through the episode.
-            // `resolve_mal_for_aniskip` keys Fribb by (imdb, season) and returns
-            // the SEASON-specific entry — the exact resolver the in-player
-            // AniSkip menu already uses, which is why the menu showed the correct
-            // mal=55825 for Hell's Paradise S2 while this auto-stamp used 46569
-            // (S1). Gated to tt-style ids with season > 1: season 1 and anime-
-            // prefix ids (Step 1) already resolve correctly. When it fails, the
-            // series-level steps below are SKIPPED for these ids (see
-            // laterSeasonTt): every one of them names the first cour.
-            const laterSeasonTt = target.id.startsWith("tt")
-              && Number.isFinite(target.season as number) && (target.season as number) > 1;
-            if (!malId && laterSeasonTt) {
-              const seriesImdb = target.series_id?.startsWith("tt")
-                ? target.series_id
-                : target.id.split(":")[0];
-              try {
-                malId = await invoke<number | null>("resolve_mal_for_aniskip", {
-                  targetId:   target.id,
-                  seriesImdb,
-                  season:     target.season ?? null,
-                  title:      detail?.name ?? null,
-                });
-                if (malId) {
-                  console.info(
-                    `[aniskip] season-aware resolve (s${target.season}) → mal=${malId} ` +
-                    `(overrides series-root detail.mal_id=${detail?.mal_id ?? "none"})`,
-                  );
-                }
-              } catch (e) {
-                console.warn(`[aniskip] season-aware resolve threw: ${String(e)}`);
-              }
-              if (!malId) {
-                console.info(
-                  `[aniskip] no cour-specific MAL id for ${target.id} (season ${target.season}); ` +
-                  `not borrowing the series-level id, which names the first cour`,
-                );
-              }
-            }
-            // Step 2: meta-detail anime ids. Only hit when nothing above
-            // resolved (legacy tt-style ids or unrecognised prefix), and
-            // NEVER for a tt-keyed season > 1: every id here (mal, kitsu,
-            // anidb, anilist, and the title search) is the SERIES entry,
-            // which MAL treats as the first cour, and pairing it with a later
-            // season's local episode fetched another cour's timings. Bleach
-            // TYBW S3E7 (part 3) was stamped with part 1 ep 7's opening, tens
-            // of seconds off. No window beats a wrong auto-skip.
-            if (!malId && !laterSeasonTt) {
-              malId = detail?.mal_id ?? null;
-            }
-            if (!malId && !laterSeasonTt) {
-              malId = await tryResolve("kitsu",   detail?.kitsu_id)
-                   ?? await tryResolve("anidb",   detail?.anidb_id)
-                   ?? await tryResolve("anilist", (detail as { anilist_id?: number | null } | null)?.anilist_id);
-            }
-            if (!malId && !laterSeasonTt && detail?.name) {
-              // Year hint from `release_info` ("2023" or "2023-2024").
-              // Jikan's TV-only filter plus exact-title scoring keeps
-              // false positives at bay; we never accept a fuzzy match.
-              const yearMatch = (detail.release_info ?? "").match(/\b(19|20)\d{2}\b/);
-              const year = yearMatch ? Number(yearMatch[0]) : null;
-              try {
-                malId = await invoke<number | null>("resolve_mal_id_by_title", {
-                  title: detail.name,
-                  year,
-                });
-              } catch { /* leave null, falls through to skip log */ }
-            }
+            // Resolve the COUR-SPECIFIC MAL id (resolveSkipCour, skipCour.ts: the
+            // cascade from the addon's per-video pair down to the title search,
+            // with its rules for a tt-keyed later season). The next-episode
+            // pre-scan runs the same function, so both name the same cour and the
+            // detector's result cache serves this load. The cascade logs; the
+            // load's side effects (markAnimeId, skipCourRef) stay below.
+            const cour = await resolveSkipCour(target, detail ?? null);
+            const { malId, malSource, laterSeasonTt } = cour;
             if (!malId) {
               // Live-action, or anime we couldn't resolve to a MAL id.
               // publicmetadb is the PRIMARY skip source here — keyed by
@@ -4038,18 +3944,12 @@ export default function App() {
             // trailing segment for shows whose VideoEntry lacks the
             // field.
             const idParts = target.id.split(":");
-            const idEpisode = Number(idParts[idParts.length - 1]);
-            // Two numbers, never mixed. `seasonEpisodeNum` is the addon's own,
-            // within its season (TVDB / TMDB shaped): PublicMetaDB is keyed by
-            // it. `episodeNum` is LOCAL to the MAL entry: AniSkip, its cache
-            // key, skip_ref, the neighbour profile and theme songs are keyed by
-            // it, and the addon's cour-local number (Step 0) wins when used.
-            // They differ whenever one season spans several MAL entries
-            // (Spy x Family 1:15 is MAL Part 2 ep 3).
-            const seasonEpisodeNum = Number.isFinite(target.episode_num as number)
-              ? (target.episode_num as number)
-              : idEpisode;
-            const episodeNum = courEpisode != null ? courEpisode : seasonEpisodeNum;
+            // Two numbers, never mixed (skipCourEpisodes, skipCour.ts):
+            // `seasonEpisodeNum` is the addon's own, within its season, and
+            // keys PublicMetaDB; `episodeNum` is LOCAL to the MAL entry and
+            // keys AniSkip, skip_ref, the neighbour profile, theme songs and
+            // the detector's mal_episode.
+            const { idEpisode, seasonEpisodeNum, episodeNum } = cour;
             skipCourRef.current = {
               targetId: target.id,
               malId,
@@ -4188,7 +4088,11 @@ export default function App() {
               episodeNum,
               treatMixed,
             });
-          })();
+          })().finally(() => {
+            // An exit that never reached finishWithChapters (live TV, a
+            // trailer, a throw before it) has no detect to wait for.
+            if (!finishEntered) markDetectSettled();
+          });
         }
         // Stash the DIRECT raw URL (not the bridge-proxied form) so Copy /
         // Download / External-player open the genuine source — proxying
@@ -4628,6 +4532,9 @@ export default function App() {
         skipModesRef.current = { op: opMode, ed: edMode, recap: recapMode };
         // Unrelated settings (theme, ...) leave the payload alone.
         if (prev.op === opMode && prev.ed === edMode && prev.recap === recapMode) return;
+        // The next-episode pre-scan re-reads the kinds it wants from the ref:
+        // its own settings bump ran before this read landed.
+        setPrescanTick((n) => n + 1);
         // A skip chain owns this load: re-stamp through ITS serialised queue,
         // which recomposes from the chain's own inputs with the modes above.
         // The read-modify-write below, run beside the chain, could land
@@ -4925,7 +4832,9 @@ export default function App() {
   // fetch_streams against multiple addons takes 5–30 s):
   //
   //   1. PRE-RESOLVE  — once playback crosses 50 % progress (or
-  //      remaining < 2× leadSeconds, whichever comes first), kick off
+  //      remaining < 2× leadSeconds, whichever comes first; for an anime
+  //      episode the next-episode pre-scan will read, as soon as its own
+  //      skip detection settled), kick off
   //      the meta + streams resolution in the background. Result is
   //      cached in state and READY by the time the display gate trips.
   //
@@ -4955,6 +4864,10 @@ export default function App() {
        *  both ends of the span are known. */
       skipped: VideoEntry[];
     } | null;
+    /** The series meta the next episode was resolved from (resolveNextEpisode's
+     *  `detail`): the next-episode pre-scan resolves its cour from it, the same
+     *  object the live chain's getMetaDetailFallback returns. */
+    detail?:  MetaDetail | null;
   } | null>(null);
   /** Per-episode dismiss flag. Keyed by the CURRENT episode's id (not
    *  the next-up id) so dismissing while watching S01E05 only suppresses
@@ -5006,6 +4919,9 @@ export default function App() {
    *  (or determined there isn't one) for the active target, don't keep
    *  poking the addons every tick. Reset on activeTarget change. */
   const nextUpResolvedFor = useRef<string | null>(null);
+  /** The episode whose pre-resolve already ran EARLY for the next-episode
+   *  pre-scan (before 50 %); a failed early lookup waits for the 50 % mark. */
+  const nextUpEarlyTriedFor = useRef<string | null>(null);
   /** The Next-Up gate's inputs for the loaded FILE, announced by the skip
    *  chain inside handlePlayStream (`aura:next-up-timing`): the end of a
    *  TRUSTED ending (Layer 1 only), the detector's media end, the ending whose
@@ -5136,6 +5052,7 @@ export default function App() {
     setEosActive(false);
     setAutoAdvanceCancelled(false);
     nextUpResolvedFor.current = null;
+    nextUpEarlyTriedFor.current = null;
     nextUpTimingRef.current = emptyNextUpTiming();
     clearEndingAutoSkipSeek();
     // Don't reset nextUpDismissedFor here — App.tsx unmounts the
@@ -5235,14 +5152,43 @@ export default function App() {
     const remaining = duration - time;
     // Trigger pre-resolve at 50 % ratio OR remaining ≤ leadSeconds*2,
     // whichever fires first. The lead*2 floor catches resumed-near-end
-    // sessions where the user joined past the 50 % mark.
-    if (ratio < 0.5 && remaining > nextUpLeadSeconds * 2) return;
+    // sessions where the user joined past the 50 % mark. When the
+    // next-episode pre-scan could follow, it runs as soon as this file's
+    // live detect settled instead (prescanWantsEarlyResolve), so the pre-scan
+    // can start once the playing stream is healthy. The casting ref, not the
+    // state: both are declared below this effect.
+    if (ratio < 0.5 && remaining > nextUpLeadSeconds * 2) {
+      const s = loadAuraSettings();
+      const cour = skipCourRef.current;
+      const early = prescanWantsEarlyResolve({
+        autoSkipDetect: s.autoSkipDetect !== false,
+        prescanSetting: s.prescanNextEpisode !== false,
+        casting: prescanCastingRef.current,
+        mediaType: activeTarget.media_type,
+        playingHasMal: cour != null && cour.targetId === activeTarget.id && prescanCourEligible(cour.malId),
+        liveSettled: prescanLiveSettled(skipDetectSettledSeqRef.current, skipChainSeqRef.current),
+        kinds: prescanKinds(skipModesRef.current, true, duration),
+      });
+      // One early try per episode: a failed lookup falls back to the 50 %
+      // mark rather than retrying on every playback tick.
+      if (!early || nextUpEarlyTriedFor.current === activeTarget.id) return;
+      nextUpEarlyTriedFor.current = activeTarget.id;
+      console.info(`[next-up] pre-resolving ${activeTarget.id}'s next episode early, for the next-episode pre-scan`);
+    }
 
     nextUpResolvedFor.current = activeTarget.id;
     const seriesId = activeTarget.series_id ?? activeTarget.id;
     const mediaType = activeTarget.media_type;
     const currentId = activeTarget.id;
     const playingDuration = duration;
+    // The early (pre-scan) lookup runs minutes into the episode, when the
+    // next one is least likely to be listed or indexed yet: a miss there
+    // must not stick for the episode, so it hands over to the 50 % mark.
+    const wasEarly = ratio < 0.5 && remaining > nextUpLeadSeconds * 2;
+    const retryAtHalf = (why: string) => {
+      if (nextUpResolvedFor.current === currentId) nextUpResolvedFor.current = null;
+      console.info(`[next-up] early pre-resolve for ${currentId} ${why}; trying again at the 50 % mark`);
+    };
 
     void (async () => {
       let next: Awaited<ReturnType<typeof resolveNextEpisode>> = null;
@@ -5266,6 +5212,7 @@ export default function App() {
         // No further aired episode — leave the CTA unmounted. The
         // resolved-for guard prevents another lookup until the user
         // navigates to a different episode.
+        if (wasEarly) retryAtHalf("found no aired next episode");
         return;
       }
       if (nextUpResolvedFor.current === currentId) prefetchNextThemes(next.next, currentId, playingDuration);
@@ -5276,17 +5223,347 @@ export default function App() {
       // episode + its stream so the card can offer a one-tap "skip to
       // canon" (null when next isn't filler/recap or no canon lies ahead).
       const [stream, canon] = await Promise.all([
-        pickFirstStreamForEpisode(addons, mediaType, next.next.id, next.next),
+        // The caught-up probe already picked it (resolveNextEpisode).
+        next.stream !== undefined ? next.stream : pickFirstStreamForEpisode(addons, mediaType, next.next.id, next.next),
         resolveCanonSkipTarget(addons, next.detail, mediaType, currentId, next.next),
       ]);
+      // Judged by the stream the advance will use: the canon one when the end
+      // screen auto-takes the skip, else the next episode's own.
+      const toCanon = !!canon && autoSkipApplies(loadAuraSettings().nextUpSkipFillerRecap, next.next);
+      if (wasEarly && !(toCanon ? canon?.stream : stream)) {
+        retryAtHalf("found no stream");
+        return;
+      }
       // Guard against state changes during the await — only commit if
       // the active target hasn't moved on (user could have hit Next /
       // Back during the resolution).
       if (nextUpResolvedFor.current === currentId) {
-        setNextUpInfo({ episode: next.next, stream, canon });
+        setNextUpInfo({ episode: next.next, stream, canon, detail: next.detail });
       }
     })();
-  }, [activeTarget, time, duration, addons, nextUpLeadSeconds, prefetchNextThemes]);
+  }, [activeTarget, time, duration, addons, nextUpLeadSeconds, prefetchNextThemes, skipDetectSettledTick]);
+
+  // ── Next-episode pre-scan ──
+  // While an anime episode plays, the REAL skip detector runs on the stream
+  // Next-Up pre-resolved for the next episode (`skip_detect` action
+  // `prescan`), in the background, so its result lands in the detector's
+  // per-file result cache and that episode's load is a cache hit: windows,
+  // theme-match states and the media end there at once, no HEAD / TAIL
+  // decode. Decisions live in nextPrescan.ts; this effect only drives them.
+  // Once per (playing episode, next episode, stream url), with at most
+  // PRESCAN_MAX_ATTEMPTS starts: a preempted or cancelled run (a live Detect,
+  // a load's prescan_cancel, the health abort below) is retried once the
+  // playing stream is healthy and its own detect has settled; busy (a live
+  // detect running) waits for that detect to settle; done, cached and
+  // unavailable end it. Rust preempts it for any live Detect and lowers its
+  // ffmpeg priority; a new load sends prescan_cancel (handlePlayStream), exit
+  // playback does not (the user may watch the next episode later). It aims at
+  // the episode the unattended advance will play (the canon one when the end
+  // screen skips filler / recap), and is cancelled when the playing stream
+  // turns unhealthy, its readings stop, a cast starts, the setting (or what it
+  // needs) is switched off, or the next episode changes.
+  const prescanRef = useRef<{
+    key: string;
+    currentId: string;
+    nextId: string;
+    budget: PrescanBudget;
+    phase: "idle" | "starting" | "running" | "waiting-settle" | "ended";
+    /** The settled tick a busy reply waits to see move. */
+    busyAtTick: number;
+    /** The running attempt was cancelled by the health abort. */
+    healthAborted: boolean;
+    /** The cour, resolved once per key (resolveSkipCour, as the live chain
+     *  will resolve it at load). */
+    cour: Awaited<ReturnType<typeof resolveSkipCour>> | null;
+  } | null>(null);
+  // Re-runs the effect after a reply (or a busy wait's fallback timer).
+  const [prescanTick, setPrescanTick] = useState(0);
+  // A cast session (active or connecting), mirrored from useCastSession below
+  // (declared after this effect): the device pulls the stream the user
+  // watches and no health signal here measures it, so no pre-scan starts or
+  // keeps running while casting. The ref serves the re-check after the awaits.
+  const [prescanCasting, setPrescanCasting] = useState(false);
+  const prescanCastingRef = useRef(false);
+  // The latest health, for the re-check after the async steps.
+  const prescanHealthRef = useRef({
+    buffering: true, streamBroken: false, streamTruncated: false, demuxEof: false, cacheSeconds: null as number | null,
+    seeking: false,
+  });
+  // The healthy streak (prescanHealthStreak): when the playing stream became
+  // continuously healthy, for which load. A start needs PRESCAN_HEALTHY_FOR_MS
+  // of it; any unhealthy sample, a seek, stale cache data or a new load ends it.
+  const prescanStreakRef = useRef<{ since: number | null; epoch: number }>({ since: null, epoch: -1 });
+  const prescanWatching = activeTarget != null;
+  useEffect(() => {
+    if (!prescanWatching) return;
+    // A settings change (the pre-scan or Automatic skip detection switched
+    // off, every kind to Off) re-runs the effect at once, so a running
+    // pre-scan stops even when no playback state moves.
+    const bump = () => setPrescanTick((n) => n + 1);
+    window.addEventListener("aura:settings-changed", bump);
+    // Frozen cache readings re-run nothing: while a pre-scan runs, look once a
+    // second for readings that stopped and re-run the effect, which cancels it.
+    const watch = window.setInterval(() => {
+      const st = prescanRef.current;
+      if (!st || st.phase !== "running" || st.healthAborted) return;
+      const h = prescanHealthRef.current;
+      if (prescanStaleWhilePlaying(cacheSampleAtRef.current, pausedRef.current, h.seeking, h.demuxEof, Date.now())) bump();
+    }, 1000);
+    return () => {
+      window.removeEventListener("aura:settings-changed", bump);
+      window.clearInterval(watch);
+    };
+  }, [prescanWatching]);
+  useEffect(() => {
+    const health = { buffering, streamBroken, streamTruncated, demuxEof, cacheSeconds, seeking: playbackSeeking };
+    prescanHealthRef.current = health;
+    // Folds the latest sample into the streak and answers whether it is long
+    // enough. Run on every pass (before any early return, so an unhealthy
+    // sample always breaks it) and again after the async steps below.
+    const streakNow = (): { ok: boolean; msLeft: number | null } => {
+      const now = Date.now();
+      const epoch = loadEpochRef.current;
+      const prev = prescanStreakRef.current.epoch === epoch ? prescanStreakRef.current.since : null;
+      // Casting breaks it: the paused local player's full cache says nothing
+      // about the stream the device pulls.
+      const since = activeTarget && !prescanCastingRef.current
+        ? prescanHealthStreak(prev, { ...prescanHealthRef.current, cacheAt: cacheSampleAtRef.current }, now)
+        : null;
+      prescanStreakRef.current = { since, epoch };
+      return { ok: prescanHealthyLongEnough(since, now), msLeft: prescanHealthyMsLeft(since, now) };
+    };
+    const streak = streakNow();
+    const cur = activeTarget;
+    const info = nextUpInfo;
+    if (!cur) return;
+    let st = prescanRef.current;
+    // Health abort: the playing stream comes first. Only while that episode is
+    // still the one playing (a new load already cancelled it), and whether or
+    // not the Next-Up card is up: truncation and a dismissal clear nextUpInfo
+    // while a run goes on.
+    if (st && st.phase === "running" && !st.healthAborted && st.currentId === cur.id) {
+      const stale = prescanStaleWhilePlaying(
+        cacheSampleAtRef.current, pausedRef.current, health.seeking, health.demuxEof, Date.now(),
+      );
+      // A switch turned off counts here too (the Next-Up card, or every kind
+      // Off): with nextUpInfo cleared the blocker check below never runs.
+      const s0 = loadAuraSettings();
+      const switchedOff = s0.autoSkipDetect === false || s0.prescanNextEpisode === false
+        || nextUpLeadSeconds <= 0
+        || prescanKinds(skipModesRef.current, nextUpLeadSeconds > 0, duration) == null;
+      if (switchedOff || prescanCasting || stale || prescanShouldAbort(health)) {
+        st.healthAborted = true;
+        const why = switchedOff ? "no longer wanted (switched off)"
+          : prescanCasting ? "being cast"
+          : stale ? "unmonitored (no fresh cache reading)"
+          : health.buffering ? "buffering"
+          : health.streamBroken ? "lost" : health.streamTruncated ? "truncated"
+          : `low on readahead (${(health.cacheSeconds ?? 0).toFixed(0)}s)`;
+        console.info(`[skipdetect] next-episode prescan ${st.nextId}: cancelling, the playing stream is ${why}`);
+        void invoke("skip_detect", { action: { op: "prescan_cancel" } }).catch(() => {});
+        return;
+      }
+    }
+    if (!info) return;
+    const settings = loadAuraSettings();
+    const kinds = prescanKinds(skipModesRef.current, nextUpLeadSeconds > 0, duration);
+    // The episode the unattended advance will play: the canon one when the
+    // end screen's countdown presses Skip (the predicate the card is given).
+    const toCanon = !!info.canon && autoSkipApplies(settings.nextUpSkipFillerRecap, info.episode);
+    const preEp = toCanon && info.canon ? info.canon.episode : info.episode;
+    const preStream = toCanon && info.canon ? info.canon.stream : info.stream;
+    const url = preStream?.url ?? null;
+    const blocker = prescanStaticBlocker({
+      autoSkipDetect: settings.autoSkipDetect !== false,
+      prescanSetting: settings.prescanNextEpisode !== false,
+      nextUpOn: nextUpLeadSeconds > 0,
+      mediaType: cur.media_type,
+      streamUrl: url,
+      kinds,
+      casting: prescanCasting,
+    });
+    if (blocker || !kinds || !url || !preStream) {
+      // Switched off mid-play (the setting, Automatic skip detection, every
+      // kind Off) or a cast began: end a claim that is starting or running.
+      // Dropping it makes live() false, so a starting attempt stops at its
+      // next await and a running one's reply is logged as no longer current.
+      if (blocker && st && st.currentId === cur.id && (st.phase === "starting" || st.phase === "running")) {
+        const cancelRun = st.phase === "running" && !st.healthAborted;
+        console.info(`[skipdetect] next-episode prescan ${st.nextId}: cancelling, ${blocker}`);
+        prescanRef.current = null;
+        if (cancelRun) void invoke("skip_detect", { action: { op: "prescan_cancel" } }).catch(() => {});
+      }
+      return;
+    }
+    const key = prescanKey(cur.id, preEp.id, url);
+    if (!st || st.key !== key) {
+      // A run for the old key would go unwatched until a new start superseded
+      // it in Rust, which the streak or the budget may hold back: cancel it.
+      // Its reply no longer matches and is dropped.
+      if (st && st.phase === "running" && !st.healthAborted) {
+        console.info(`[skipdetect] next-episode prescan ${st.nextId}: cancelling, superseded by ${preEp.id}`);
+        void invoke("skip_detect", { action: { op: "prescan_cancel" } }).catch(() => {});
+      }
+      st = {
+        key, currentId: cur.id, nextId: preEp.id, budget: { attempts: 0, busy: 0 },
+        phase: "idle", busyAtTick: -1, healthAborted: false, cour: null,
+      };
+      prescanRef.current = st;
+    }
+    if (st.phase === "waiting-settle") {
+      if (skipDetectSettledTick === st.busyAtTick) return;
+      st.phase = "idle";
+    }
+    if (st.phase !== "idle") return;
+    if (!prescanCanAttempt(st.budget)) { st.phase = "ended"; return; }
+    if (!prescanLiveSettled(skipDetectSettledSeqRef.current, skipChainSeqRef.current)) return;
+    if (!streak.ok) {
+      // A streak that is running but short: re-check when it would be long
+      // enough, because a paused, fully buffered file can send samples that
+      // move no state (and so re-run nothing). The re-check folds in the
+      // cache reading's age, so a hidden window's stale numbers end it.
+      if (streak.msLeft == null) return;
+      const timer = window.setTimeout(() => setPrescanTick((n) => n + 1), streak.msLeft + 50);
+      return () => window.clearTimeout(timer);
+    }
+
+    // Claimed before the first await, so the per-poll re-runs cannot fan out.
+    const claim = st;
+    claim.phase = "starting";
+    claim.budget = { ...claim.budget, attempts: claim.budget.attempts + 1 };
+    const tickAtStart = skipDetectSettledTick;
+    const nextEp = preEp;
+    const nextStream = preStream;
+    const seriesId = cur.series_id ?? cur.id;
+    // Built the way advanceToEpisode builds the next load's target.
+    const target = {
+      id:          nextEp.id,
+      series_id:   seriesId,
+      media_type:  cur.media_type,
+      season:      nextEp.season ?? undefined,
+      episode_num: nextEp.episode ?? undefined,
+    };
+    const live = () => prescanRef.current === claim;
+    const settle = (phase: "idle" | "ended", giveBack: boolean): void => {
+      if (!live()) return;
+      if (giveBack) claim.budget = { ...claim.budget, attempts: Math.max(0, claim.budget.attempts - 1) };
+      claim.phase = phase;
+    };
+    void (async () => {
+      if (!claim.cour) {
+        // The same detail the live chain will read at load (resolveNextEpisode's,
+        // from the same cache), so both resolve the same cour.
+        const detail = info.detail ?? await getMetaDetailFallback(addons, cur.media_type, seriesId).catch(() => null);
+        if (!live()) return;
+        claim.cour = await resolveSkipCour(target, detail ?? null, { log: false });
+        if (!live()) return;
+      }
+      const cour = claim.cour;
+      if (!prescanCourEligible(cour.malId)) {
+        console.info(`[skipdetect] next-episode prescan ${target.media_type}/${target.id}: no MAL id, not pre-scanned`);
+        settle("ended", true);
+        return;
+      }
+      // Never downloads ffmpeg: the playing episode's detect already did when
+      // it needed it.
+      const present = await runtimeDepPresent("ffmpeg.exe").catch(() => false);
+      if (!live()) return;
+      if (!present) {
+        console.info(`[skipdetect] next-episode prescan ${target.media_type}/${target.id}: no ffmpeg, not pre-scanned`);
+        settle("ended", true);
+        return;
+      }
+      // The awaits above can outlast a switch: with nextUpInfo cleared no
+      // blocker check drops this claim, so read the switches again.
+      const s1 = loadAuraSettings();
+      if (
+        s1.autoSkipDetect === false || s1.prescanNextEpisode === false
+        || prescanKinds(skipModesRef.current, nextUpLeadSeconds > 0, duration) == null
+      ) {
+        settle("idle", true);
+        return;
+      }
+      // The awaits above can outlast the health that started this: check
+      // again (the streak, with the cache reading's age as of now), and give
+      // the attempt back when it no longer holds.
+      if (
+        !streakNow().ok
+        || !prescanLiveSettled(skipDetectSettledSeqRef.current, skipChainSeqRef.current)
+      ) {
+        settle("idle", true);
+        setPrescanTick((n) => n + 1);
+        return;
+      }
+      claim.phase = "running";
+      claim.healthAborted = false;
+      const startedAt = Date.now();
+      const malEpisode = Number.isFinite(cour.episodeNum) ? cour.episodeNum : null;
+      console.info(
+        `[skipdetect] next-episode prescan ${target.media_type}/${target.id} op=${kinds.op} ed=${kinds.ed} `
+        + `mal=${cour.malId} (${cour.malSource ?? "aniskip"}) ep=${malEpisode ?? "?"} `
+        + `addon=${nextStream.addon_name || "?"} attempt ${claim.budget.attempts}/${PRESCAN_MAX_ATTEMPTS}: starting`,
+      );
+      let outcome: ReturnType<typeof parsePrescanOutcome> = null;
+      let note: string | null = null;
+      try {
+        const r = await invoke<{ result?: string; outcome?: unknown; note?: string | null }>("skip_detect", {
+          action: {
+            op: "prescan",
+            url,
+            stremio_id: target.id,
+            media_type: target.media_type ?? null,
+            addon: nextStream.addon_name || null,
+            release: nextStream.filename ?? null,
+            mal_id: cour.malId,
+            mal_source: cour.malSource ?? "aniskip",
+            mal_episode: malEpisode,
+            anime: true,
+            // Not `op` / `ed`: the action is tagged `op`.
+            detect_op: kinds.op,
+            detect_ed: kinds.ed,
+          },
+        });
+        if (r?.result === "prescan") {
+          outcome = parsePrescanOutcome(r.outcome);
+          note = typeof r.note === "string" && r.note ? r.note : null;
+        }
+      } catch (e) {
+        console.warn(`[skipdetect] next-episode prescan ${target.id} failed: ${String(e)}`);
+      }
+      const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
+      if (!live()) {
+        console.info(`[skipdetect] next-episode prescan ${target.id}: ${outcome ?? "failed"} after ${secs}s (no longer current)`);
+        return;
+      }
+      const healthAborted = claim.healthAborted;
+      const decided = prescanAfterOutcome(outcome, claim.budget);
+      claim.budget = decided.budget;
+      claim.phase = decided.next === "end" ? "ended" : decided.next === "retry" ? "idle" : "waiting-settle";
+      if (decided.next === "retry-after-settle") {
+        claim.busyAtTick = tickAtStart;
+        // Fallback: a live detect that settles without this file's chain
+        // noticing (an older load's detect finishing in Rust) moves no tick.
+        window.setTimeout(() => {
+          if (live() && claim.phase === "waiting-settle") {
+            claim.phase = "idle";
+            setPrescanTick((n) => n + 1);
+          }
+        }, 20_000);
+      }
+      console.info(
+        `[skipdetect] next-episode prescan ${target.media_type}/${target.id}: ${outcome ?? "failed"}`
+        + `${healthAborted ? " (cancelled for the playing stream)" : ""}${note ? ` (${note})` : ""} after ${secs}s; `
+        + (decided.next === "end" ? "done for this episode"
+          : decided.next === "retry" ? `will retry (${decided.budget.attempts}/${PRESCAN_MAX_ATTEMPTS} used)`
+          : "will retry once the live detect settles"),
+      );
+      setPrescanTick((n) => n + 1);
+    })().catch((e) => {
+      console.warn(`[skipdetect] next-episode prescan failed: ${String(e)}`);
+      settle("ended", false);
+    });
+  }, [activeTarget, nextUpInfo, buffering, cacheSeconds, demuxEof, streamBroken, streamTruncated, playbackSeeking,
+      duration, nextUpLeadSeconds, skipDetectSettledTick, prescanTick, prescanCasting, addons]);
 
   // The latch lives exactly as long as the card is up: every path that takes
   // it down (seek back, dismissal, a new load, truncation, EOS) clears it.
@@ -5853,16 +6130,18 @@ export default function App() {
     const currentId = activeTarget.id;
     let cancelled = false;
     void (async () => {
-      // "none" always, matching the Next-Up resolver above.
-      const res = await resolveNextEpisode(addons, mediaType, seriesId, currentId, "none");
+      // "none" always, matching the Next-Up resolver above. No caught-up probe
+      // here: its stream fan-out would hold the end screen on a spinner. It
+      // runs after the caught-up card is up (below).
+      const res = await resolveNextEpisode(addons, mediaType, seriesId, currentId, "none", { probe: false });
       if (cancelled) return;
       if (res) {
         const [stream, canon] = await Promise.all([
-          pickFirstStreamForEpisode(addons, mediaType, res.next.id, res.next),
+          res.stream !== undefined ? res.stream : pickFirstStreamForEpisode(addons, mediaType, res.next.id, res.next),
           resolveCanonSkipTarget(addons, res.detail, mediaType, currentId, res.next),
         ]);
         if (cancelled) return;
-        setNextUpInfo({ episode: res.next, stream, canon });
+        setNextUpInfo({ episode: res.next, stream, canon, detail: res.detail });
         setEosResolve("ready");
         return;
       }
@@ -5950,6 +6229,25 @@ export default function App() {
       setEosCaughtUpUnaired(caughtUp);
       setEosNextAirMs(effectiveNextAirMs);
       setEosResolve("none");
+      // Caught up on an airing show: the next episode may be out under a late
+      // listing (availableEarly.ts). A hit swaps the caught-up card for the
+      // Next-Up one (nextUpInfo set -> "ready" above).
+      // Its own catch: a failure here must not replace the caught-up card
+      // with the finale one (the outer catch below).
+      if (!caughtUp) return;
+      try {
+        const found = await probeNextEpisode(addons, mediaType, seriesId, currentId, detail);
+        if (cancelled || !found) return;
+        const [stream, canon] = await Promise.all([
+          found.stream !== undefined ? found.stream : pickFirstStreamForEpisode(addons, mediaType, found.next.id, found.next),
+          resolveCanonSkipTarget(addons, found.detail, mediaType, currentId, found.next),
+        ]);
+        if (cancelled) return;
+        console.info(`[eos] ${found.next.id} turned out to be out already: offering it`);
+        setNextUpInfo({ episode: found.next, stream, canon, detail: found.detail });
+      } catch (e) {
+        console.warn(`[eos] caught-up probe failed for ${currentId}: ${String(e)}`);
+      }
     })().catch((e) => {
       // A THROW anywhere in the walk (addon fetch, richest-meta fetch, stream
       // pick) used to reject this IIFE silently, leaving `eosResolve` on
@@ -8514,6 +8812,13 @@ export default function App() {
     currentTime: time,
     paused,
   });
+  // The next-episode pre-scan's cast gate (declared above, before `cast`
+  // exists). Connecting counts: cast_load already pulls the source.
+  const castBusy = cast.activeDevice != null || cast.connectingId != null;
+  useEffect(() => {
+    prescanCastingRef.current = castBusy;
+    setPrescanCasting(castBusy);
+  }, [castBusy]);
 
   useEffect(() => {
     const p = listen<string>("smtc-event", ({ payload }) => {

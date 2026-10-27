@@ -630,7 +630,19 @@ async function applyBackendSettings(s: BackendSettingsLite): Promise<void> {
     // That is why machine-local paths have to be stripped explicitly below
     // rather than merely left out of the portable field lists, which gate
     // file export/import only.
-    await invoke("update_settings", { patch: s });
+    //
+    // The retired `scrobble_enabled` master is dropped too: a device still on
+    // 2.2.3 pushes its untouched default (false) with every blob, and
+    // update_settings would fold that into auto_scrobble_enabled = false, so
+    // this device could never keep automatic scrobbling on. Its meaning was
+    // already applied here by the local load() migration.
+    const { scrobble_enabled: _retired, ...patch } = s;
+    if (Object.keys(patch).length === 0) return;
+    await invoke("update_settings", { patch });
+    // scrobbleConn caches the automatic-scrobbling switch.
+    if ("auto_scrobble_enabled" in patch) {
+      window.dispatchEvent(new Event("aura:scrobble-settings-changed"));
+    }
   } catch (e) {
     console.warn("[sync] applyBackendSettings failed:", e);
   }

@@ -241,7 +241,7 @@ no flags at all and an arc-level check would misread that as "no data".
 ### Skip detection: layered, and an ED end is never EOF
 
 `src-tauri/src/skipdetect/` (Rust, one tagged command `skip_detect` with `detect` / `cancel` /
-`status` / `prefetch`, events `skipdetect-update`) plus the pure frontend half in `src/skipWindows.ts` (chapter
+`status` / `prefetch` / `prescan` / `prescan_cancel`, events `skipdetect-update`) plus the pure frontend half in `src/skipWindows.ts` (chapter
 titles, ranking, modes, media-end clamp) and `src/nextUpGate.ts` (when the Next-Up card may appear,
 and the detected media end the end-of-stream detectors use). Both TS modules are import-free so a
 node check can load them. Devlog label `[skipdetect]`. It was designed against a 31-episode corpus
@@ -322,6 +322,24 @@ after-credits scene on 10 of the 11 episodes that have one.
   fingerprint per kind for the episode Next-Up pre-resolved (its own MAL pair, else the playing cour
   when it is the next episode of the same season); never episode audio, never with detection off or
   without ffmpeg, one at a time.
+- **Next-episode pre-scan (`prescan`, `src/nextPrescan.ts` decisions, the App.tsx effect drives
+  them; setting `prescanNextEpisode`, advanced).** The SAME detect job runs on the stream Next-Up
+  pre-resolved (the canon episode when the end screen will skip filler / recap), so that episode's
+  load is a result-cache hit. It never publishes a snapshot or progress event and shows NOTHING on
+  the player (DevConsole `[skipdetect]` only); its probe and region ffmpeg run at BELOW_NORMAL
+  priority. It starts only after THIS file's live detect settled, the playing stream has been
+  continuously healthy for 15 s (fresh cache readings, no seek, readahead >= 30 s or demuxer at
+  EOF), not while casting, anime with a MAL id, ffmpeg already installed, and the Next-Up card on
+  (lead time > 0: its pre-resolve is the only stream source). For such an episode (a MAL cour, both
+  switches on, a kind wanted, not casting) that pre-resolve runs as soon as this file's live detect
+  settled instead of at 50 % (`prescanWantsEarlyResolve`; one early try per episode, a failed one
+  waits for 50 %), so the pre-scan starts minutes into the episode. It is cancelled when the playing
+  stream buffers, breaks, is truncated, drops under 10 s of readahead, its cache readings stop while
+  it plays (a cloaked window), a cast starts, the setting is switched off or the next episode
+  changes; a cancelled run starts over (at most 3 starts per key). It has its own slot in Rust:
+  every live Detect preempts it, a cancel that arrives before it reached the slot is not lost
+  (`PRESCAN_CANCEL_EPOCH`), and `PRESCANNED` is a session record (cap 64, 1 h) of what was already
+  pre-scanned.
 - **Layer 2 (blind pairing) is not shipped**; the `pairing` source and its priority slot are reserved.
 - **Layer 1's verdict holds the crowd (`op_l1` / `ed_l1`).** Every snapshot carries a STRUCTURED
   per-kind state (`L1State`: pending, matched, informative, no_themes, unavailable, not_requested;
@@ -505,7 +523,10 @@ after-credits scene on 10 of the 11 episodes that have one.
   (`liveSkipStampRef`), never with a read-modify-write beside it. The SkipController matches handled
   windows by kind with both edges within 3 s (`handledIn`), so a refinement of a skipped opening is
   not re-prompted or re-skipped. The Detect (and Prefetch) action's kind switches travel as `detect_op` / `detect_ed`,
-  because the action enum is tagged `op`. A Prefetch is not cancelled by a Detect.
+  because the action enum is tagged `op`. A Prefetch is not cancelled by a Detect. A pre-scan IS
+  preempted by every Detect, is NOT stopped by Cancel (exit playback: the next episode may be
+  watched later), and is stopped by `prescan_cancel` (every load, the health abort), `cancel_all`
+  (page reload), the Storage clear and a newer pre-scan.
 - **Theme-match readout.** `stream_region` reports how far HEAD / TAIL has decoded (per whole
   percent, held under 100 until the region ends) as its OWN event, `skipdetect-progress`
   (`job::Progress`, same generation filter), never a Snapshot field: every snapshot re-stamps the
@@ -1065,11 +1086,37 @@ Bound every cache (see Performance & memory).
   `animethemes-v1.json` (MAL -> theme list; hits 7 d, misses 1 d, network errors never cached, cap
   300), `theme-fp/<audio_id>.bin` (fingerprint + valid mask + length + audible lead / trail, never
   the audio; 90 d, cap 400) and `skipdetect-v1.json` (the final per-file result keyed by Stremio id,
-  release identity and duration to 0.1 s; 30 d, an abstention 24 h; a Layer 3 window standing in for
+  release identity and duration to 0.1 s, a duration within 0.03 s of a bucket boundary also
+  reading the ONE adjacent bucket, accepted only when that entry was keyed within the same 0.03 s
+  (`cache::neighbour_duration`, `Snapshot::keyed_duration`); 30 d, an abstention 24 h; a Layer 3 window standing in for
   a theme the cour's list does not have lives no longer than that list answer: 24 h after a list miss,
   7 d when the list answered without a theme of that kind; cap 2000). An entry records the kinds and MAL id it was computed
-  for and answers only a request it covers. The result cache is the only fix for a slow link. No in-memory mirror, so Settings > Storage's "Skip detection cache"
-  clear cannot be undone by a stale copy. Excluded from backups by construction.
+  for and answers only a request it covers. The result cache is the only fix for a slow link. No in-memory mirror of results, so Settings > Storage's "Skip detection cache"
+  clear cannot be undone by a stale copy; the one in-memory state is the pre-scan's `PRESCANNED`
+  session record (what was pre-scanned, never results), which the clear empties through
+  `forget_prescanned`; any new path that deletes `skipdetect-v1.json` must call it too. A result
+  write from a job that started before a clear is refused (`cache::put_result_since`, the clear
+  generation checked under the cache lock), so a write already in flight cannot refill it. Excluded from backups by construction.
+- **Episodes available early** (`aura:available-early:v1`, `src/availableEarly.ts`, cap 200, device-local):
+  an episode whose stream fetch (detail page, Next-Up pre-resolve) returned streams while its listed
+  `released` was still ahead, by at most 4 days. `releasedMs` (the date every aired / next-to-air read
+  goes through: `isVideoAired`, `nextAiringEpisode`, `airingInfo`, Next-Up, the CW countdown) then
+  counts it aired from that moment; an entry is dropped once its listed date passes. Why: AIOMetadata
+  dated TYBW S4E10 1.5 days after Cinemeta, and CW counted down to an episode the user could play.
+  Read new aired checks through `releasedMs`, never a bare `Date.parse(v.released)`.
+  The airing check (`src/airingCheck.ts` pass, `src/useAiringStreamCheck.ts` hook in App.tsx) feeds it
+  without the user opening anything: every 10 min while visible, never while playing or hidden, a library
+  series whose next main-run episode is LISTED within 24 h gets one `fetch_streams` for it, at most once
+  an hour per episode, 6 queries and 10 meta fetches per pass (a show without a cached detail is fetched
+  only when it is in Continue Watching or the cloud's next_aired is in the window). Each query is a full
+  stream-addon fan-out (debrid checks included): keep those caps. DevConsole `[airing-check]`.
+  During playback (a binge, when the check is paused) `resolveNextEpisode` covers it: caught up, it probes
+  the next episode listed within 24 h (`probeListedNext`, at most every 5 min per episode, so the early
+  pre-scan lookup, the 50 % retry and the end screen each get one) and hands the stream it picked on, so a
+  hit costs one fan-out, not two. The end screen never waits on it: it shows its caught-up card from the
+  cached meta (`{ probe: false }`), then runs `probeNextEpisode` and swaps in the Next-Up card on a hit.
+  The cloud's `next_aired` ids follow the cloud's own source's numbering, not the local meta addon's, so "is the cloud's next episode already out" goes through `cloudNextIsOut`
+  (by id, else by date against a recorded local episode), never a bare `availableEarlyAt(sig.id)`.
 - **Calendar meta**: 24-hour module-level `Map` keyed by `${addonUrl}::${type}::${id}`.
 - **sessionRoute.ts** (`sessionStorage`): active nav tab + open detail target so Ctrl+R/F5 restores
   the page you were on; cleared on app close (cold start opens Home).
@@ -1343,7 +1390,8 @@ old-format and new-format samples and diff the field sets. Node runs the `.ts` f
 - Rust log labels to grep in the DevConsole or `aura-mpv.log`: `[bridge]`, `[player]`, `[streams]`,
   `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[ratings]`, `[rpc]`, `[win32]`, `[smtc]`,
   `[scrobble]`, `[publicmetadb]`, `[mpv]` (the playback engine), `[cast]`, `[iptv]`, `[sync]`,
-  `[aniskip]`, `[introdb]`, `[skipdetect]` (the layered OP/ED detector), `[arcs]`, `[subsync]`, `[downloads]`, `[tenrai]` (the MyAnimeList client), `[manga]` (manga chapters: MangaUpdates + Fandom), `[extras]` (frontend,
+  `[aniskip]`, `[introdb]`, `[skipdetect]` (the layered OP/ED detector), `[arcs]`, `[subsync]`, `[downloads]`, `[tenrai]` (the MyAnimeList client), `[manga]` (manga chapters: MangaUpdates + Fandom), `[airing-check]` (frontend, the stream check for an
+  airing show's next episode), `[extras]` (frontend,
   the anime metadata tabs on the detail page), `[next-up]` (frontend, the Next-Up card's timing
   inputs: the elected ending with its source and level, trusted end, preview, media end).
 - libmpv writes its own verbose log to `%USERPROFILE%\aura-mpv.log` (truncated each MPV init, rotated

@@ -4,7 +4,8 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import type { LibraryItem, VideoEntry } from "./types";
 import { getManualWatchedState, onManualWatchedChange, useManualWatchedVersion } from "./manualWatched";
-import { airingInfo } from "./releaseCountdown";
+import { airingInfo, useAvailableEarlyVersion } from "./releaseCountdown";
+import { releasedMs } from "./availableEarly";
 import { libraryItemSeriesId } from "./libraryNormalize";
 
 // ---------------------------------------------------------------------------
@@ -291,6 +292,7 @@ export function useEpisodesBehind(
   seriesId: string | null | undefined,
 ): number | null {
   void useManualWatchedVersion();
+  void useAvailableEarlyVersion(); // an episode found out early counts as aired
   // Resolve the CANONICAL series id from the episode ids in `videos`, not the
   // passed `seriesId`. A duplicate per-cour catalog entry (e.g. AIOMetadata's
   // "... Season 3" listing) has its OWN id that your library / resume progress
@@ -321,7 +323,7 @@ export function useEpisodesBehind(
     // Count ONLY episodes with a parseable air date in the past, so watchedAired
     // and airedMain cover the SAME set. Using isVideoAired here would over-count:
     // it treats undated episodes as aired, breaking watchedAired <= airedMain.
-    const t = v.released ? Date.parse(v.released) : NaN;
+    const t = releasedMs(v) ?? NaN;
     if (!Number.isFinite(t) || t > now) continue;
     airedMain += 1;
     const manual = getManualWatchedState(v.id);

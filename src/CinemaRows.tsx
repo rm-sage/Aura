@@ -16,7 +16,8 @@ import { getMetaDetailFallback, useCanonicalReleaseYear } from "./metaCache";
 import { closeHoverNow } from "./catalogHoverStore";
 import { useHoverCardActivation } from "./useHoverCardActivation";
 import { getReleaseSignal, useReleaseSignalsVersion } from "./releaseSignalStore";
-import { formatCountdown, formatTargetDate, airingInfo, nextAiringEpisode, useCountdownNow } from "./releaseCountdown";
+import { formatCountdown, formatTargetDate, airingInfo, nextAiringEpisode, useAvailableEarlyVersion, useCountdownNow } from "./releaseCountdown";
+import { cloudNextIsOut } from "./availableEarly";
 import { useLandscapeArt, LANDSCAPE_CARD_WIDTH } from "./landscapeArt";
 import { findAIOMetadataAddon, isAnimeMeta } from "./aiometadata";
 import { shrinkPoster } from "./posterSize";
@@ -795,7 +796,8 @@ function CWReleaseCountdown({ seriesId, episodes }: { seriesId: string; episodes
   // Cloud fallback ignores specials (season 0): a finished show with only an
   // upcoming special must not show a "next episode" countdown.
   const cloudNext = getReleaseSignal(seriesId)?.next_aired;
-  const cloudMs = cloudNext && cloudNext.season !== 0 && cloudNext.aired_at
+  // Nor one whose streams already came back (availableEarly.ts).
+  const cloudMs = cloudNext && cloudNext.season !== 0 && cloudNext.aired_at && !cloudNextIsOut(cloudNext, episodes)
     ? Date.parse(cloudNext.aired_at)
     : NaN;
   const targetMs = metaNextMs ?? cloudMs;
@@ -874,6 +876,9 @@ export const ContinueWatchingCard = memo(function ContinueWatchingCard(
   // marks, so the badge stayed stuck until an automatic progress write.
   const signalsVersion = useReleaseSignalsVersion();
   const manualVersion = useManualWatchedVersion();
+  // An episode found available ahead of its listed date re-reads as aired
+  // (the bar's segments, the badge and the countdown).
+  const availableVersion = useAvailableEarlyVersion();
 
   // The season the bar should show + the next episode to watch, resolved from
   // the watched state (manual marks OR the resume pointer) across ALL seasons.
@@ -917,13 +922,14 @@ export const ContinueWatchingCard = memo(function ContinueWatchingCard(
     if (nextUpId) return nextUpId;
     const sigNext = getReleaseSignal(item.id)?.next_aired;
     const sigMs = sigNext?.aired_at ? Date.parse(sigNext.aired_at) : NaN;
-    if (sigNext && sigNext.season !== 0 && Number.isFinite(sigMs) && sigMs > Date.now()) {
+    if (sigNext && sigNext.season !== 0 && Number.isFinite(sigMs) && sigMs > Date.now()
+        && !cloudNextIsOut(sigNext, cwDetail?.videos)) {
       return sigNext.id ?? null;
     }
     return null;
     // signalsVersion in deps so the badge fills in the instant cloud signals land.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nextUpId, item.id, signalsVersion]);
+  }, [nextUpId, item.id, signalsVersion, availableVersion, cwDetail]);
   // Prefer the VideoEntry's (season, episode) for a uniform `S01E06` badge
   // regardless of whether the id is IMDb-shape (`tt…:1:6`) or anime-prefix-
   // shape (`kitsu:50023:6`). badgeVideoId may live in a different season than

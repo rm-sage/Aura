@@ -244,6 +244,172 @@ pub async fn prefetch(ffmpeg: &std::ffi::OsStr, data_dir: &std::path::Path, req:
     out
 }
 
+/// Run the REAL detect on the stream Next-Up pre-resolved for the next
+/// episode, in the background, so its final result is in the result cache
+/// when that episode plays (`prescan`). The same fields and wire names as
+/// `Request` minus `duration`: the pre-scan takes it from its own probe
+/// (ffmpeg's container `Duration:`), and a live detect of the same file later
+/// finds the entry through `lookup_result`'s one-neighbour tolerance.
+#[derive(Clone, Debug, Deserialize)]
+pub struct PrescanRequest {
+    pub url: String,
+    pub stremio_id: String,
+    #[serde(default)]
+    pub media_type: Option<String>,
+    #[serde(default)]
+    pub addon: Option<String>,
+    #[serde(default)]
+    pub release: Option<String>,
+    #[serde(default)]
+    pub mal_id: Option<u32>,
+    #[serde(default)]
+    pub mal_source: Option<String>,
+    #[serde(default)]
+    pub mal_episode: Option<u32>,
+    #[serde(default)]
+    pub anime: bool,
+    /// Same wire names as Detect (the action enum is tagged `op`).
+    #[serde(default = "yes", rename = "detect_op")]
+    pub op: bool,
+    #[serde(default = "yes", rename = "detect_ed")]
+    pub ed: bool,
+}
+
+/// The duration a validated pre-scan carries until its probe answers: any
+/// value `Request::validate` accepts (it is replaced before the job runs).
+const PRESCAN_PLACEHOLDER_DURATION: f64 = 1.0;
+
+impl PrescanRequest {
+    /// `Request`'s rules (http(s) only, bounds, cleaning), plus a MAL id and
+    /// at least one kind: a pre-scan without Layer 1 would only spend the
+    /// next file's bandwidth on Layer 3. The `Request` it returns carries a
+    /// placeholder duration; `prescan` sets the probe's before running.
+    pub fn validate(self) -> Result<Request, String> {
+        let r = Request {
+            url: self.url,
+            audio_url: None,
+            stremio_id: self.stremio_id,
+            media_type: self.media_type,
+            addon: self.addon,
+            release: self.release,
+            duration: PRESCAN_PLACEHOLDER_DURATION,
+            mal_id: self.mal_id,
+            mal_source: self.mal_source,
+            mal_episode: self.mal_episode,
+            anime: self.anime,
+            sibling_mal_ids: None,
+            op: self.op,
+            ed: self.ed,
+        }
+        .validate()?;
+        if r.mal_id.is_none() {
+            return Err("missing MAL id".into());
+        }
+        if !(r.op || r.ed) {
+            return Err("no kind wanted".into());
+        }
+        Ok(r)
+    }
+}
+
+/// How a pre-scan ended. Wire: snake_case (`"done"`, `"cached"`, ...).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrescanOutcome {
+    /// Ran to the end (its result is in the cache when it was cacheable).
+    Done,
+    /// The result cache (or this session's pre-scan record) already answers it.
+    Cached,
+    /// A live Detect started and aborted it; it may be retried later.
+    Preempted,
+    /// `prescan_cancel`, a page reload, a storage clear, or a newer pre-scan.
+    Cancelled,
+    /// A live detect is running: not started.
+    Busy,
+    /// Could not run (no ffmpeg, no data dir, invalid request, probe failed,
+    /// no container duration, no release identity to key a result by).
+    Unavailable,
+}
+
+/// What `prescan` returns: the outcome, a note (never a URL), the final
+/// snapshot when the job ran, and whether that result was written.
+#[derive(Clone, Debug)]
+pub struct PrescanResult {
+    pub outcome: PrescanOutcome,
+    pub note: Option<String>,
+    pub snapshot: Option<Snapshot>,
+    pub stored: bool,
+}
+
+/// One pre-scan, end to end: probe once (under the pass gate, at the
+/// context's priority), key the request by the probe's container duration,
+/// then the unchanged `run` with that probe handed in (`Ctx::pre_probe`), so
+/// the stream is opened for the probe exactly once. `req` comes from
+/// `PrescanRequest::validate`. The caller's `ctx` should publish nowhere and
+/// carry generation 0: nothing a pre-scan finds reaches the player.
+/// Cancellation is the caller's, as for `run`: dropping this future releases
+/// the gate and kills ffmpeg, and an aborted run writes nothing.
+pub async fn prescan(mut ctx: Ctx, mut req: Request) -> PrescanResult {
+    let unavailable = |note: String| PrescanResult {
+        outcome: PrescanOutcome::Unavailable,
+        note: Some(note),
+        snapshot: None,
+        stored: false,
+    };
+    // Every log line of the job carries the marker (`who` starts with the addon).
+    req.addon = Some(match req.addon.take() {
+        Some(a) => format!("prescan {a}"),
+        None => "prescan".into(),
+    });
+    let who = req.who();
+    if ctx.data_dir.is_none() {
+        return unavailable("no data directory".into());
+    }
+    if req.release_identity().is_none() {
+        return unavailable("no release identity to key a result by".into());
+    }
+    crate::devlog!(
+        info, "skipdetect",
+        "{who} next-episode prescan start, mal {} ({}), ep {}",
+        req.mal_id.map_or("-".to_string(), |m| m.to_string()),
+        req.mal_source.as_deref().unwrap_or("-"),
+        req.mal_episode.map_or("-".to_string(), |e| e.to_string()),
+    );
+    let input = req.audio_url.clone().unwrap_or_else(|| req.url.clone());
+    // Tests only: a replay's recorded probe, as `run` uses it.
+    #[cfg(test)]
+    let replayed = ctx.replay.as_ref().map(|r| r.probe.clone());
+    #[cfg(not(test))]
+    let replayed: Option<probe::ProbeInfo> = None;
+    let probe = match replayed {
+        Some(p) => Ok(p),
+        None => {
+            // Released before `run` starts: its passes take the gate per pass.
+            let Ok(_permit) = PASS_GATE.acquire().await else {
+                return unavailable("pass gate closed".into());
+            };
+            audio::run_probe_with(&ctx.ffmpeg, &input, ctx.background).await
+        }
+    };
+    let probe = match probe {
+        Ok(p) => p,
+        Err(e) => return unavailable(e.note()),
+    };
+    let Some(c) = probe.container_duration.filter(|c| c.is_finite() && *c > 0.0 && *c < 6.0 * 3600.0) else {
+        return unavailable("probe found no container duration".into());
+    };
+    req.duration = c;
+    let req = match req.validate() {
+        Ok(r) => r,
+        Err(e) => return unavailable(e),
+    };
+    ctx.pre_probe = Some(probe);
+    let (snap, stored) = run_stored(&ctx, &req).await;
+    let outcome = if snap.from_cache { PrescanOutcome::Cached } else { PrescanOutcome::Done };
+    let note = (outcome == PrescanOutcome::Done && !stored).then(|| "result not cacheable; not stored".to_string());
+    PrescanResult { outcome, note, snapshot: Some(snap), stored }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
@@ -392,6 +558,13 @@ pub struct Snapshot {
     /// (`cached_serves`): it would replay mapping A's edges for a month.
     #[serde(default)]
     pub edge_rule: u32,
+    /// The request duration a STORED result was keyed by (set on write; None
+    /// on the live snapshots and on entries written before it existed). A
+    /// lookup that falls through to the adjacent 0.1 s bucket accepts an
+    /// entry only when this is within `cache::NEIGHBOUR_TOL_S` of its own
+    /// duration (`lookup_result`); an exact-bucket hit never reads it.
+    #[serde(default)]
+    pub keyed_duration: Option<f64>,
 }
 
 /// The current Layer 1 edge rule: 1 = the audible start and the episode-gated
@@ -466,6 +639,13 @@ pub struct Ctx {
     pub publish: Arc<dyn Fn(&Snapshot) + Send + Sync>,
     /// Called as a region decodes (see `Progress`).
     pub progress: Arc<dyn Fn(&Progress) + Send + Sync>,
+    /// The probe and region ffmpeg run at BELOW_NORMAL priority (the
+    /// next-episode pre-scan). False for a live detect.
+    pub background: bool,
+    /// A probe the caller already ran on this input (the pre-scan probes once
+    /// to learn the duration its result is keyed by): returned instead of
+    /// probing again. None for a live detect.
+    pub pre_probe: Option<probe::ProbeInfo>,
     /// Tests only: replay cached PCM and a recorded probe instead of running
     /// ffmpeg on a stream (`replay.rs`). Everything else is the real job.
     #[cfg(test)]
@@ -1253,8 +1433,43 @@ struct Job<'a> {
     tag_known: bool,
 }
 
+/// The stored result that answers `req` (keyed by Stremio id, `release` and
+/// `req.duration`), and whether ANY entry was found under the keys tried. The
+/// exact bucket first; then, when `req.duration` sits within
+/// `cache::NEIGHBOUR_TOL_S` of a bucket boundary, the ONE adjacent bucket,
+/// whose entry is accepted only when it was keyed within that tolerance of
+/// `req.duration` (`Snapshot::keyed_duration`; an entry written before that
+/// field existed never answers through a neighbour). Either entry must also
+/// cover the request (`cached_serves`). Blocking (reads the JSON cache).
+fn lookup_result(dir: &std::path::Path, release: &str, req: &Request) -> (Option<Snapshot>, bool) {
+    let mut found = false;
+    let exact = cache::get_result::<Snapshot>(dir, &cache::result_key(&req.stremio_id, release, req.duration));
+    if let Some(s) = exact {
+        found = true;
+        if cached_serves(&s, req) {
+            return (Some(s), true);
+        }
+    }
+    let Some(nd) = cache::neighbour_duration(req.duration) else { return (None, found) };
+    let Some(s) = cache::get_result::<Snapshot>(dir, &cache::result_key(&req.stremio_id, release, nd)) else {
+        return (None, found);
+    };
+    if !s.keyed_duration.is_some_and(|c| (c - req.duration).abs() <= cache::NEIGHBOUR_TOL_S) {
+        return (None, found);
+    }
+    let serves = cached_serves(&s, req);
+    (serves.then_some(s), true)
+}
+
 /// Run one detect. Returns the final snapshot (state Done or Unavailable).
 pub async fn run(ctx: &Ctx, req: &Request) -> Snapshot {
+    run_stored(ctx, req).await.0
+}
+
+/// `run`, plus whether the final result was written to the result cache.
+async fn run_stored(ctx: &Ctx, req: &Request) -> (Snapshot, bool) {
+    // A Settings > Storage clear after this point wins over the write below.
+    let since = cache::clear_generation();
     let who = req.who();
     crate::devlog!(
         info, "skipdetect",
@@ -1266,11 +1481,13 @@ pub async fn run(ctx: &Ctx, req: &Request) -> Snapshot {
         if req.op { "op" } else { "-" },
         if req.ed { "+ed" } else { "" },
     );
-    let key = req.release_identity().map(|r| cache::result_key(&req.stremio_id, &r, req.duration));
-    if let (Some(dir), Some(k)) = (ctx.data_dir.clone(), key.clone()) {
-        let hit = tokio::task::spawn_blocking(move || cache::get_result::<Snapshot>(&dir, &k)).await.ok().flatten();
+    let release = req.release_identity();
+    let key = release.as_ref().map(|r| cache::result_key(&req.stremio_id, r, req.duration));
+    if let (Some(dir), Some(rel)) = (ctx.data_dir.clone(), release.clone()) {
+        let r = req.clone();
+        let hit = tokio::task::spawn_blocking(move || lookup_result(&dir, &rel, &r)).await.ok().unwrap_or((None, false));
         match hit {
-            Some(mut s) if cached_serves(&s, req) => {
+            (Some(mut s), _) => {
                 // A fuller entry answers a narrower request with exactly what a
                 // fresh run of that request would have produced.
                 if !req.op {
@@ -1296,20 +1513,24 @@ pub async fn run(ctx: &Ctx, req: &Request) -> Snapshot {
                     }
                 }
                 s.state = JobState::Done;
+                let adjacent = s
+                    .keyed_duration
+                    .is_some_and(|c| cache::duration_bucket(c) != cache::duration_bucket(req.duration));
                 crate::devlog!(
                     info, "skipdetect",
-                    "{who} result cache hit: op {} ed {} media_end {:?}",
+                    "{who} result cache hit{}: op {} ed {} media_end {:?}",
+                    if adjacent { " (adjacent duration bucket)" } else { "" },
                     fmt_win(&s.op),
                     fmt_win(&s.ed),
                     s.media_end
                 );
                 (ctx.publish)(&s);
-                return s;
+                return (s, false);
             }
-            Some(_) => {
+            (None, true) => {
                 crate::devlog!(debug, "skipdetect", "{who} result cache entry does not cover this request; detecting");
             }
-            None => {}
+            (None, false) => {}
         }
     }
     let mut job = Job {
@@ -1364,10 +1585,12 @@ pub async fn run(ctx: &Ctx, req: &Request) -> Snapshot {
     }
     job.snap.state = JobState::Done;
     (ctx.publish)(&job.snap);
+    let mut written = false;
     if job.d.cacheable {
         if let (Some(dir), Some(k)) = (ctx.data_dir.clone(), key) {
             let mut stored = job.snap.clone();
             stored.generation = 0;
+            stored.keyed_duration = Some(req.duration);
             let ttl = result_ttl(&stored, &job.d.l3_list_ttl);
             if stored.has_window() && ttl < cache::RESULT_TTL {
                 crate::devlog!(
@@ -1377,10 +1600,12 @@ pub async fn run(ctx: &Ctx, req: &Request) -> Snapshot {
                     ttl / (24 * 3600)
                 );
             }
-            let _ = tokio::task::spawn_blocking(move || cache::put_result(&dir, &k, stored, ttl)).await;
+            written = tokio::task::spawn_blocking(move || cache::put_result_since(&dir, &k, stored, ttl, since))
+                .await
+                .unwrap_or(false);
         }
     }
-    job.snap
+    (job.snap, written)
 }
 
 fn fmt_win(w: &Option<WindowOut>) -> String {
@@ -1561,8 +1786,11 @@ impl<'a> Job<'a> {
             if let Some(r) = &ctx.replay {
                 return Some(Ok(r.probe.clone()));
             }
+            if let Some(p) = &ctx.pre_probe {
+                return Some(Ok(p.clone()));
+            }
             let _permit = PASS_GATE.acquire().await.ok()?;
-            Some(audio::run_probe(&ctx.ffmpeg, &input).await)
+            Some(audio::run_probe_with(&ctx.ffmpeg, &input, ctx.background).await)
         };
         let list_fut = async {
             match req.mal_id {
@@ -1607,9 +1835,19 @@ impl<'a> Job<'a> {
                 self.set_note(Kind::Ed, note);
                 return;
             }
-            None => return,
+            None => {
+                // The pass gate closed: the region was never read, so this is
+                // no fact about the file (never cached as an empty result).
+                self.d.cacheable = false;
+                return;
+            }
         };
-        let Some((n, why)) = probe::pick_track(&probe.audio) else { return };
+        let Some((n, why)) = probe::pick_track(&probe.audio) else {
+            // No audio track to analyse: undecided, never cached (an entry
+            // with both kinds Unavailable would answer every play for a day).
+            self.d.cacheable = false;
+            return;
+        };
         let track = &probe.audio[n];
         let tag = track.duration_tag;
         self.tag_known = tag.is_some();
@@ -1900,12 +2138,12 @@ impl<'a> Job<'a> {
             {
                 match &self.d.ctx.replay {
                     Some(r) => Ok(Source::Replay(r.pass(which == Which::Head, &args))),
-                    None => RegionPass::spawn(&self.d.ctx.ffmpeg, &args, rebase).map(Source::Ff),
+                    None => RegionPass::spawn_with(&self.d.ctx.ffmpeg, &args, rebase, self.d.ctx.background).map(Source::Ff),
                 }
             }
             #[cfg(not(test))]
             {
-                RegionPass::spawn(&self.d.ctx.ffmpeg, &args, rebase).map(Source::Ff)
+                RegionPass::spawn_with(&self.d.ctx.ffmpeg, &args, rebase, self.d.ctx.background).map(Source::Ff)
             }
         };
         let mut pass = match spawned {
@@ -2383,6 +2621,9 @@ mod tests {
 
     #[test]
     fn region_worker_publishes_the_early_opening_and_stops_on_request() {
+        // The worker reports its progress to replay.rs' process-wide counter:
+        // never beside a replayed job, whose pacing reads it.
+        let _g = replay_lock();
         // HEAD with an eligible theme: fires about 12 s in.
         let ev = run_worker(true, true, Some(60.0));
         let Some(&(at, EarlyEvent::Fire { window, .. })) = ev.first() else { panic!("no early fire: {ev:?}") };
@@ -2602,6 +2843,8 @@ mod tests {
             generation: 1,
             publish: Arc::new(|_: &Snapshot| {}),
             progress: Arc::new(|_: &Progress| {}),
+            background: false,
+            pre_probe: None,
             replay: None,
             fake_theme_load: Some(Arc::new(move |r: &ThemeRec| {
                 c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2826,5 +3069,328 @@ mod tests {
         streaming.levels.clear();
         let (s2, e2) = published_window(&m, Some(tfp.audible), Kind::Ed, &streaming, 2000.0).unwrap();
         assert_eq!((s2, e2), (s, e_a));
+    }
+
+    // ── the result cache's duration tolerance and the next-episode pre-scan ──
+
+    /// Serialises the tests below: they drive the real job over a replay (one
+    /// replayed region at a time: replay.rs' worker counter and the pass gate
+    /// are process-wide) and one of them asserts the gate is free.
+    static REPLAY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn replay_lock() -> std::sync::MutexGuard<'static, ()> {
+        REPLAY_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn tmp_dir() -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "aura-skipdetect-job-test-{}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_lookup_reads_one_neighbour_bucket_only_for_an_entry_keyed_within_tolerance() {
+        let dir = tmp_dir();
+        let rel = "BLEACH.S03E01.mkv";
+        let mut q = req("https://x/y").validate().unwrap();
+        let put = |c: f64, keyed: Option<f64>| {
+            let mut s = stored(true, true, Some(56784));
+            s.keyed_duration = keyed;
+            cache::put_result(&dir, &cache::result_key(&q.stremio_id, rel, c), s, cache::RESULT_TTL);
+        };
+        // The pre-scan wrote under ffmpeg's 1430.15 ("1430.2").
+        put(1430.15, Some(1430.15));
+        q.duration = 1430.15;
+        assert!(lookup_result(&dir, rel, &q).0.is_some(), "exact key");
+        // mpv's 1430.148 keys "1430.1": served from the adjacent bucket.
+        q.duration = 1430.148;
+        assert!(lookup_result(&dir, rel, &q).0.is_some(), "neighbour, keyed 2 ms away");
+        // ...but only for a request that entry covers.
+        let mut other = q.clone();
+        other.mal_id = Some(1);
+        assert_eq!(lookup_result(&dir, rel, &other), (None, true));
+        // Far from a boundary: the neighbour is never read.
+        q.duration = 1430.11;
+        assert_eq!(lookup_result(&dir, rel, &q), (None, false));
+        // Same neighbour bucket, keyed 0.092 s away: rejected.
+        let _ = std::fs::remove_file(dir.join(cache::RESULT_FILE));
+        put(1430.24, Some(1430.24));
+        q.duration = 1430.148;
+        assert_eq!(lookup_result(&dir, rel, &q), (None, false));
+        // An entry with no keyed duration (written before it existed) never
+        // answers through a neighbour, but still answers its own bucket.
+        let _ = std::fs::remove_file(dir.join(cache::RESULT_FILE));
+        put(1430.15, None);
+        q.duration = 1430.148;
+        assert_eq!(lookup_result(&dir, rel, &q), (None, false));
+        q.duration = 1430.16;
+        assert!(lookup_result(&dir, rel, &q).0.is_some(), "an old entry still answers its exact bucket");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const PRESCAN_MAL: u32 = 41_000;
+
+    /// A 200 s episode: an opening theme at 10 s, an ending theme at 120 s,
+    /// over low noise. Returns the episode PCM and the two themes' fingerprints.
+    fn synthetic_episode() -> (Arc<Vec<i16>>, Arc<ThemeFp>, Arc<ThemeFp>) {
+        let op = tone(70.0, 5);
+        let ed = tone(70.0, 21);
+        let mut ep: Vec<f64> = tone(200.0, 9).iter().map(|v| v * 0.1).collect();
+        for (i, v) in op.iter().enumerate() {
+            ep[i + 11025 * 10] += v * 0.8;
+        }
+        for (i, v) in ed.iter().enumerate() {
+            ep[i + 11025 * 120] += v * 0.8;
+        }
+        let (op_rec, ed_rec) = theme_recs();
+        let op_fp = Arc::new(animethemes::theme_fp_from_pcm(&op_rec, &pcm(&op, 0.8)));
+        let ed_fp = Arc::new(animethemes::theme_fp_from_pcm(&ed_rec, &pcm(&ed, 0.8)));
+        (Arc::new(pcm(&ep, 0.9)), op_fp, ed_fp)
+    }
+
+    fn theme_recs() -> (ThemeRec, ThemeRec) {
+        let mut op = rec("OP1", true, false, false);
+        op.audio_id = 901;
+        let mut ed = rec("ED1", false, false, false);
+        ed.audio_id = 902;
+        (op, ed)
+    }
+
+    /// A replay of the synthetic episode: the probe reports `container`
+    /// (ffmpeg's printed `Duration:`) and a DURATION tag of the PCM length.
+    fn replay_of(ep: &Arc<Vec<i16>>, container: f64, audio: bool, pace_head: f64) -> Arc<super::super::replay::Replay> {
+        use super::super::probe::{AudioTrack, ProbeInfo};
+        use super::super::replay::{Clock, RegionData, Replay};
+        let tag = ep.len() as f64 / SR as f64;
+        let region = || Some(RegionData { pcm: ep.clone(), t0: 0.0, silences: Vec::new() });
+        Arc::new(Replay {
+            probe: ProbeInfo {
+                container_duration: Some(container),
+                start: 0.0,
+                audio: if audio {
+                    vec![AudioTrack {
+                        rel: 0,
+                        abs: 1,
+                        lang: Some("jpn".into()),
+                        dispositions: vec!["default".into()],
+                        duration_tag: Some(tag),
+                        title: None,
+                    }]
+                } else {
+                    Vec::new()
+                },
+            },
+            head: region(),
+            tail: region(),
+            head_first_pts: 0.0,
+            keep_up: true,
+            pace_head,
+            pace_tail: 0.0,
+            startup_s: 0.0,
+            clock: Arc::new(std::sync::Mutex::new(Clock::default())),
+            notes: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// A context on `dir` whose theme loads answer from memory (no network).
+    fn ctx_on(dir: &std::path::Path, replay: Option<Arc<super::super::replay::Replay>>, op: Arc<ThemeFp>, ed: Arc<ThemeFp>) -> Ctx {
+        Ctx {
+            ffmpeg: OsString::from("ffmpeg-not-used"),
+            data_dir: Some(dir.to_path_buf()),
+            generation: 0,
+            publish: Arc::new(|_: &Snapshot| {}),
+            progress: Arc::new(|_: &Progress| {}),
+            background: true,
+            pre_probe: None,
+            replay,
+            fake_theme_load: Some(Arc::new(move |r: &ThemeRec| {
+                (Ok((if r.op { op.clone() } else { ed.clone() }, false)), 0)
+            })),
+        }
+    }
+
+    /// What the frontend sends (`op: "prescan"`), validated, with sibling
+    /// cours pinned to none so no MyAnimeList lookup is made.
+    fn prescan_template(mal: u32) -> Request {
+        let p: PrescanRequest = serde_json::from_value(serde_json::json!({
+            "url": "https://replay.invalid/Show.S01E02.mkv", "stremio_id": "tt0000001:1:2", "media_type": "series",
+            "addon": "AIOStreams", "release": "Show.S01E02.mkv", "mal_id": mal, "mal_source": "aiometadata",
+            "mal_episode": 2, "anime": true, "detect_op": true, "detect_ed": true
+        }))
+        .unwrap();
+        let mut r = p.validate().unwrap();
+        r.sibling_mal_ids = Some(Vec::new());
+        r
+    }
+
+    /// The live Detect for the same episode later: mpv's duration `d`.
+    fn live_req(d: f64, mal: u32, op: bool, ed: bool) -> Request {
+        let mut r = prescan_template(mal);
+        r.duration = d;
+        r.op = op;
+        r.ed = ed;
+        r.validate().unwrap()
+    }
+
+    fn seed_theme_lists(dir: &std::path::Path) {
+        let (op, ed) = theme_recs();
+        cache::put_theme_list(dir, PRESCAN_MAL, Some(vec![op, ed]));
+    }
+
+    #[test]
+    fn a_prescan_result_answers_the_live_detect_across_a_bucket_boundary() {
+        let _g = replay_lock();
+        // Its stored write must not race a parallel test's clear.
+        let _c = cache::clear_test_lock();
+        let dir = tmp_dir();
+        seed_theme_lists(&dir);
+        // A different cour, listed with nothing (cached miss): no network.
+        cache::put_theme_list::<Vec<ThemeRec>>(&dir, PRESCAN_MAL + 1, None);
+        let (ep, op_fp, ed_fp) = synthetic_episode();
+        let c = 200.15;
+        let rt = rt();
+        let pre = rt.block_on(prescan(
+            ctx_on(&dir, Some(replay_of(&ep, c, true, 0.0)), op_fp.clone(), ed_fp.clone()),
+            prescan_template(PRESCAN_MAL),
+        ));
+        assert_eq!(pre.outcome, PrescanOutcome::Done, "{:?}", pre.note);
+        assert!(pre.stored, "{:?}", pre.note);
+        let fin = pre.snapshot.clone().unwrap();
+        assert!(!fin.from_cache);
+        // What the cache holds: the same snapshot through JSON (serde_json's
+        // float parse may move a value by one ULP, the same way every time).
+        let fin: Snapshot = serde_json::from_str(&serde_json::to_string(&fin).unwrap()).unwrap();
+        assert!(fin.op.as_ref().is_some_and(|w| w.source == "animethemes"), "opening matched: {:?}", fin.op_note);
+        assert!(fin.ed.as_ref().is_some_and(|w| w.source == "animethemes"), "ending matched: {:?}", fin.ed_note);
+        assert!(fin.media_end_final);
+        // mpv's duration within 4 ms of ffmpeg's, on the OTHER side of a
+        // bucket boundary (the case the exact key missed).
+        let d = [c - 0.004, c + 0.004]
+            .into_iter()
+            .find(|d| cache::duration_bucket(*d) != cache::duration_bucket(c))
+            .expect("c sits within 4 ms of a boundary");
+        // What a cache hit does to a stored Layer 1 window (its edges are final).
+        let refined = |w: &Option<WindowOut>| {
+            w.clone().map(|mut w| {
+                if w.source == "animethemes" {
+                    w.refined = true;
+                }
+                w
+            })
+        };
+        // The live run has no replay: a cache miss would try to probe and fail.
+        let live = |r: Request| {
+            let ctx = ctx_on(&dir, None, op_fp.clone(), ed_fp.clone());
+            rt.block_on(async move { run(&ctx, &r).await })
+        };
+        let s = live(live_req(d, PRESCAN_MAL, true, true));
+        assert!(s.from_cache, "the live detect is served by the pre-scan's entry");
+        assert_eq!(s.op, refined(&fin.op));
+        assert_eq!(s.ed, refined(&fin.ed));
+        assert_eq!((s.op_l1, s.ed_l1), (fin.op_l1, fin.ed_l1));
+        assert_eq!((s.op_region, s.ed_region), (fin.op_region, fin.ed_region));
+        assert_eq!((s.media_end, s.media_end_final), (fin.media_end, fin.media_end_final));
+        // OP-only and ED-only live requests are served too.
+        let s = live(live_req(d, PRESCAN_MAL, true, false));
+        assert!(s.from_cache && s.ed.is_none() && s.ed_l1 == L1State::NotRequested);
+        assert_eq!((s.op, s.op_l1, s.op_region), (refined(&fin.op), fin.op_l1, fin.op_region));
+        let s = live(live_req(d, PRESCAN_MAL, false, true));
+        assert!(s.from_cache && s.op.is_none() && s.op_l1 == L1State::NotRequested);
+        assert_eq!((s.ed, s.ed_l1, s.ed_region), (refined(&fin.ed), fin.ed_l1, fin.ed_region));
+        // Another cour's request is not.
+        let s = live(live_req(d, PRESCAN_MAL + 1, true, true));
+        assert!(!s.from_cache);
+        // A second pre-scan of the same file is answered by the cache.
+        let again = rt.block_on(prescan(
+            ctx_on(&dir, Some(replay_of(&ep, c, true, 0.0)), op_fp.clone(), ed_fp.clone()),
+            prescan_template(PRESCAN_MAL),
+        ));
+        assert_eq!(again.outcome, PrescanOutcome::Cached);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_aborted_prescan_writes_nothing_and_frees_the_pass_gate() {
+        let _g = replay_lock();
+        let dir = tmp_dir();
+        seed_theme_lists(&dir);
+        let (ep, op_fp, ed_fp) = synthetic_episode();
+        let c = 200.15;
+        // HEAD paced at 20 ms per audio second: about 4 s for the region.
+        let replay = replay_of(&ep, c, true, 0.02);
+        let clock = replay.clock.clone();
+        let rt = rt();
+        rt.block_on(async {
+            let task = tokio::spawn(prescan(ctx_on(&dir, Some(replay), op_fp, ed_fp), prescan_template(PRESCAN_MAL)));
+            let t = std::time::Instant::now();
+            loop {
+                let (region, delivered) = clock.lock().map(|c| (c.region, c.delivered_s)).unwrap();
+                if region == "head" && delivered >= 20.0 {
+                    break;
+                }
+                assert!(t.elapsed().as_secs() < 60, "HEAD never started");
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        });
+        assert!(PASS_GATE.try_acquire().is_ok(), "the aborted pass released the gate");
+        let key = cache::result_key("tt0000001:1:2", "Show.S01E02.mkv", c);
+        assert!(cache::get_result::<Snapshot>(&dir, &key).is_none(), "nothing written");
+        assert!(!dir.join(cache::RESULT_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_probe_with_no_audio_track_is_never_cached() {
+        let _g = replay_lock();
+        let dir = tmp_dir();
+        seed_theme_lists(&dir);
+        let (ep, op_fp, ed_fp) = synthetic_episode();
+        let c = 200.15;
+        let r = live_req(c, PRESCAN_MAL, true, true);
+        let ctx = ctx_on(&dir, Some(replay_of(&ep, c, false, 0.0)), op_fp, ed_fp);
+        let (s, written) = rt().block_on(async { run_stored(&ctx, &r).await });
+        assert!(!written, "an undecided run is not a fact about the file");
+        assert_eq!((s.op_l1, s.ed_l1), (L1State::Unavailable, L1State::Unavailable));
+        assert!(!dir.join(cache::RESULT_FILE).exists());
+        // Through the pre-scan entry point: ran, nothing stored.
+        let ctx = ctx_on(&dir, Some(replay_of(&ep, c, false, 0.0)), theme_of(70.0, 5), theme_of(70.0, 6));
+        let pre = rt().block_on(prescan(ctx, prescan_template(PRESCAN_MAL)));
+        assert_eq!(pre.outcome, PrescanOutcome::Done);
+        assert!(!pre.stored && pre.note.is_some());
+        assert!(!dir.join(cache::RESULT_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_prescan_request_needs_a_mal_id_and_a_kind() {
+        let base = serde_json::json!({"url": "https://x.invalid/a.mkv", "stremio_id": "tt1:1:2", "mal_id": 5});
+        let parse = |v: serde_json::Value| serde_json::from_value::<PrescanRequest>(v).unwrap().validate();
+        let r = parse(base.clone()).unwrap();
+        assert!(r.op && r.ed && r.mal_id == Some(5));
+        let mut v = base.clone();
+        v["mal_id"] = serde_json::json!(0);
+        assert!(parse(v).is_err());
+        let mut v = base.clone();
+        v.as_object_mut().unwrap().remove("mal_id");
+        assert!(parse(v).is_err());
+        let mut v = base.clone();
+        v["detect_op"] = serde_json::json!(false);
+        v["detect_ed"] = serde_json::json!(false);
+        assert!(parse(v).is_err());
+        let mut v = base.clone();
+        v["url"] = serde_json::json!("file:///c:/a.mkv");
+        assert!(parse(v).is_err());
+        // The probe's duration replaces the placeholder; a wire duration is ignored.
+        let mut v = base;
+        v["duration"] = serde_json::json!(1400.0);
+        assert_eq!(parse(v).unwrap().duration, PRESCAN_PLACEHOLDER_DURATION);
     }
 }

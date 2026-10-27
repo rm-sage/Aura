@@ -60,16 +60,16 @@ export const THEME_LABELS: Record<ThemeId, string> = {
 export const THEME_DESCRIPTIONS: Record<ThemeId, string> = {
   mica:     "Leverages the native Windows 11 translucent backdrop.",
   glass:    "Custom high-blur frosted layers, more vivid translucency.",
-  midnight: "Pure black, high contrast — designed for OLED displays.",
-  ember:    "Warm amber accent on charcoal — cosy late-evening palette.",
-  forest:   "Emerald accent on deep slate — calm, naturalistic feel.",
-  rose:     "Soft rose accent on plum-grey — muted and warm.",
-  amethyst: "Violet accent on indigo-black — moody and saturated.",
-  ocean:    "Teal accent on midnight blue — cool and crisp.",
-  solar:    "Golden sunburst accent on warm dark — bright accent, dim base.",
-  crimson:  "Ruby-red accent on a deep dark base — bold and warm.",
-  contrast: "Maximum legibility — pure black, white text, vivid gold accent.",
-  "contrast-azure": "Maximum legibility — pure black, white text, vivid cyan accent.",
+  midnight: "Pure black, high contrast, made for OLED displays.",
+  ember:    "Warm amber accent on charcoal, a cosy late-evening palette.",
+  forest:   "Emerald accent on deep slate, calm and natural.",
+  rose:     "Soft rose accent on plum-grey, muted and warm.",
+  amethyst: "Violet accent on indigo-black, moody and saturated.",
+  ocean:    "Teal accent on midnight blue, cool and crisp.",
+  solar:    "Bright golden sunburst accent on a dim, warm dark base.",
+  crimson:  "Ruby-red accent on a deep dark base, bold and warm.",
+  contrast: "Maximum legibility: pure black, white text, vivid gold accent.",
+  "contrast-azure": "Maximum legibility: pure black, white text, vivid cyan accent.",
 };
 
 const VALID_THEME_IDS: readonly ThemeId[] = [

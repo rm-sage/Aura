@@ -273,7 +273,7 @@ struct Pass {
 
 async fn read_pass(ff: &OsString, args: &[String], rebase: f64) -> Pass {
     let t = Instant::now();
-    let mut pass = RegionPass::spawn(ff, args, rebase).expect("spawn ffmpeg");
+    let mut pass = RegionPass::spawn_with(ff, args, rebase, false).expect("spawn ffmpeg");
     let mut pcm = Vec::new();
     loop {
         match pass.next_pcm().await {
@@ -364,7 +364,7 @@ async fn skipdetect_runtime_parity() {
         println!("[rt] ===== {id} ({})", ep.info["release"]["name"].as_str().unwrap_or("?"));
 
         // Probe and the track rule.
-        let p = audio::run_probe(&ff, &url).await.unwrap_or_else(|e| panic!("{id}: {}", e.note()));
+        let p = audio::run_probe_with(&ff, &url, false).await.unwrap_or_else(|e| panic!("{id}: {}", e.note()));
         let (n, why) = probe::pick_track(&p.audio).expect("audio track");
         let tr = &p.audio[n];
         let want_abs = ep.info["analysis_audio_stream"].as_u64().unwrap() as usize;
@@ -561,6 +561,8 @@ async fn skipdetect_runtime_detect() {
                 generation: 1 + round,
                 publish: Arc::new(move |s: &Snapshot| seen2.lock().unwrap().push((t.elapsed().as_secs_f64(), s.clone()))),
                 progress: Arc::new(|_: &super::job::Progress| {}),
+                background: false,
+                pre_probe: None,
                 replay: None,
                 fake_theme_load: None,
             };
@@ -708,7 +710,7 @@ async fn skipdetect_runtime_detect() {
         }))
         .unwrap();
         let req = req.validate().unwrap();
-        let ctx = Ctx { ffmpeg: ff.clone(), data_dir: Some(dir.clone()), generation: 9, publish: Arc::new(|_: &Snapshot| {}), progress: Arc::new(|_: &super::job::Progress| {}), replay: None, fake_theme_load: None };
+        let ctx = Ctx { ffmpeg: ff.clone(), data_dir: Some(dir.clone()), generation: 9, publish: Arc::new(|_: &Snapshot| {}), progress: Arc::new(|_: &super::job::Progress| {}), background: false, pre_probe: None, replay: None, fake_theme_load: None };
         let t = Instant::now();
         let s = job::run(&ctx, &req).await;
         let row = cont["episodes"].as_array().unwrap().iter().find(|r| r["id"] == id.as_str()).cloned().unwrap_or(Value::Null);
@@ -781,4 +783,419 @@ async fn skipdetect_runtime_prefetch() {
     assert!(!tmp_left, "a .tmp was left behind");
     println!("[rt-prefetch] cache {bytes} bytes (fingerprints only, no audio)");
     assert!(bytes < 200_000, "the cache holds fingerprints, never audio ({bytes} bytes)");
+}
+
+// -- next-episode pre-scan against real streams ------------------------------
+//
+//   skipdetect_runtime_prescan  needs
+//     AURA_PRESCAN_RT_FILE     JSON {"<stremio id>": {url, release, mal_id,
+//                              mal_episode, mpv_duration}} written by the
+//                              scratchpad resolver (AIOStreams + AIOMetadata)
+//                              and libmpv (first positive observed duration)
+//     AURA_PRESCAN_RT_ONLY     optional comma list of ids for the round trip
+//     AURA_PRESCAN_RT_PREEMPT  optional "<prescan id>,<live id>" (default the
+//                              first two ids; "off" skips the phase)
+//     AURA_FFMPEG              optional; default the runtime-deps ffmpeg
+//   Per episode: the production pre-scan (`job::prescan` in the mod.rs slot,
+//   background priority, real probe / HEAD / TAIL / AnimeThemes) into a temp
+//   data dir, then a live-style `job::run` keyed by mpv's duration, which must
+//   come from the result cache; the hit is reported as exact or adjacent
+//   bucket. Then, where the probe's duration lies within the tolerance of a
+//   bucket boundary, a live request nudged across it (must hit through the
+//   neighbour), one 0.1 s off (must miss: bounded to 3 s, then dropped), and
+//   OP-only / ED-only requests. Last, preemption: a pre-scan on one episode,
+//   a live detect on another ~8 s later; how long until the pre-scan future
+//   (and with it its pass-gate permit) is gone, the live probe's latency
+//   against a standalone probe of the same url, and that the aborted
+//   pre-scan wrote no result. Nothing printed is a URL.
+
+fn rt_ctx(ff: &OsString, dir: &Path, background: bool, generation: u64, publish: Arc<dyn Fn(&Snapshot) + Send + Sync>, progress: Arc<dyn Fn(&job::Progress) + Send + Sync>) -> Ctx {
+    Ctx {
+        ffmpeg: ff.clone(),
+        data_dir: Some(dir.to_path_buf()),
+        generation,
+        publish,
+        progress,
+        background,
+        pre_probe: None,
+        replay: None,
+        fake_theme_load: None,
+    }
+}
+
+fn rt_quiet() -> (Arc<dyn Fn(&Snapshot) + Send + Sync>, Arc<dyn Fn(&job::Progress) + Send + Sync>) {
+    (Arc::new(|_: &Snapshot| {}), Arc::new(|_: &job::Progress| {}))
+}
+
+fn rt_base(id: &str, e: &Value) -> Value {
+    // AIOMetadata sends `_malId` / `_malEpisode` as strings.
+    let num = |v: &Value| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()));
+    serde_json::json!({
+        "url": e["url"],
+        "stremio_id": id,
+        "media_type": "series",
+        "addon": "rt",
+        "release": e["release"],
+        "mal_id": num(&e["mal_id"]),
+        "mal_source": "aiometadata",
+        "mal_episode": num(&e["mal_episode"]),
+        "anime": true,
+        "detect_op": true,
+        "detect_ed": true,
+    })
+}
+
+fn rt_win(w: &Option<job::WindowOut>) -> String {
+    w.as_ref().map_or("-".into(), |w| format!("[{:.2}, {:.2}] {}{}", w.start, w.end, w.source, if w.auto_eligible { " auto" } else { "" }))
+}
+
+/// The priority class of every running ffmpeg.exe (informational: proves
+/// the background flag reached the process).
+async fn rt_ffmpeg_priorities() -> String {
+    let out = tokio::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", "(Get-Process ffmpeg -ErrorAction SilentlyContinue | ForEach-Object { $_.PriorityClass }) -join ','"])
+        .output()
+        .await;
+    out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_else(|e| format!("? {e}"))
+}
+
+/// A live request of `base` keyed by `d`, run under a live guard (as
+/// `detect` does). None when it did not answer within `limit` (it was
+/// detecting: no cache hit); the run is dropped then (writes nothing).
+async fn rt_live(ff: &OsString, dir: &Path, base: &Value, d: f64, op: bool, ed: bool, limit: f64) -> Option<(Snapshot, f64)> {
+    let mut v = base.clone();
+    v["duration"] = serde_json::json!(d);
+    v["detect_op"] = serde_json::json!(op);
+    v["detect_ed"] = serde_json::json!(ed);
+    let req: Request = serde_json::from_value(v).unwrap();
+    let req = req.validate().unwrap();
+    let (p, g) = rt_quiet();
+    let ctx = rt_ctx(ff, dir, false, 1, p, g);
+    let _live = super::live_begin();
+    let t = Instant::now();
+    let r = tokio::time::timeout(std::time::Duration::from_secs_f64(limit), job::run(&ctx, &req)).await.ok();
+    r.map(|s| (s, t.elapsed().as_secs_f64()))
+}
+
+fn rt_same(a: &Snapshot, b: &Snapshot, op: bool, ed: bool) -> Vec<String> {
+    let mut d = Vec::new();
+    let pos = |w: &Option<job::WindowOut>| w.as_ref().map(|w| ((w.start * 1e6).round() as i64, (w.end * 1e6).round() as i64, w.source.clone(), w.auto_eligible));
+    // The cached copy went through a JSON round trip: serde_json's float parse
+    // can move a value by one ULP (99.83854875283447 -> ...448).
+    let reg = |r: Option<(f64, f64)>| r.map(|(x, y)| ((x * 1e6).round() as i64, (y * 1e6).round() as i64));
+    if op {
+        if pos(&a.op) != pos(&b.op) {
+            d.push(format!("op {} vs {}", rt_win(&a.op), rt_win(&b.op)));
+        }
+        if a.op_l1 != b.op_l1 {
+            d.push(format!("op_l1 {:?} vs {:?}", a.op_l1, b.op_l1));
+        }
+        if reg(a.op_region) != reg(b.op_region) {
+            d.push(format!("op_region {:?} vs {:?}", a.op_region, b.op_region));
+        }
+    } else if a.op.is_some() || a.op_l1 != job::L1State::NotRequested {
+        d.push(format!("op served to an ED-only request: {} {:?}", rt_win(&a.op), a.op_l1));
+    }
+    if ed {
+        if pos(&a.ed) != pos(&b.ed) {
+            d.push(format!("ed {} vs {}", rt_win(&a.ed), rt_win(&b.ed)));
+        }
+        if a.ed_l1 != b.ed_l1 {
+            d.push(format!("ed_l1 {:?} vs {:?}", a.ed_l1, b.ed_l1));
+        }
+        if reg(a.ed_region) != reg(b.ed_region) {
+            d.push(format!("ed_region {:?} vs {:?}", a.ed_region, b.ed_region));
+        }
+    } else if a.ed.is_some() || a.ed_l1 != job::L1State::NotRequested {
+        d.push(format!("ed served to an OP-only request: {} {:?}", rt_win(&a.ed), a.ed_l1));
+    }
+    if a.media_end.map(|x| (x * 1e6).round()) != b.media_end.map(|x| (x * 1e6).round()) {
+        d.push(format!("media_end {:?} vs {:?}", a.media_end, b.media_end));
+    }
+    d
+}
+
+/// A duration within the tolerance of `c` on the other side of a bucket
+/// boundary, whose one neighbour is `c`'s bucket. None when `c` is farther
+/// than the tolerance from every boundary.
+fn rt_nudge(c: f64) -> Option<f64> {
+    use super::cache::{duration_bucket, neighbour_duration, NEIGHBOUR_TOL_S};
+    let own = duration_bucket(c);
+    (1..=29).flat_map(|k| [c + k as f64 * 0.001, c - k as f64 * 0.001]).find(|d| {
+        (d - c).abs() <= NEIGHBOUR_TOL_S - 1e-6
+            && duration_bucket(*d) != own
+            && neighbour_duration(*d).map(duration_bucket).as_deref() == Some(own.as_str())
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs AURA_PRESCAN_RT_FILE (real streams, AnimeThemes GETs) and ffmpeg"]
+async fn skipdetect_runtime_prescan() {
+    use super::cache::{duration_bucket, result_key, RESULT_FILE};
+    // A cache clear elsewhere refuses this test's result writes, and the slot
+    // tests assert on the live / pre-scan slots this test drives.
+    let _clear = super::cache::clear_test_lock();
+    let _slots = super::slot_test_lock();
+    let ff = ffmpeg();
+    let raw = std::fs::read_to_string(std::env::var("AURA_PRESCAN_RT_FILE").expect("AURA_PRESCAN_RT_FILE not set")).unwrap();
+    let eps: serde_json::Map<String, Value> = serde_json::from_str(&raw).expect("AURA_PRESCAN_RT_FILE is not a JSON object");
+    let mut ids: Vec<String> = eps.keys().cloned().collect();
+    ids.sort();
+    let only: Option<Vec<String>> =
+        std::env::var("AURA_PRESCAN_RT_ONLY").ok().map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect());
+    let root = std::env::temp_dir().join(format!("aura-prescan-rt-{}", std::process::id()));
+    let dir = root.join("roundtrip");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut fails: Vec<String> = Vec::new();
+    let mut rows: Vec<String> = Vec::new();
+    let mut keyed: HashMap<String, f64> = HashMap::new();
+
+    for id in &ids {
+        if only.as_ref().is_some_and(|o| !o.contains(id)) {
+            continue;
+        }
+        let e = &eps[id];
+        let Some(mpv_d) = e["mpv_duration"].as_f64() else {
+            fails.push(format!("{id}: no mpv duration in the input"));
+            continue;
+        };
+        let base = rt_base(id, e);
+        let preq: job::PrescanRequest = serde_json::from_value(base.clone()).unwrap();
+        let preq = preq.validate().unwrap();
+        let rel = preq.release_identity().expect("release identity");
+        let (p, g) = rt_quiet();
+        let ctx = rt_ctx(&ff, &dir, true, 0, p, g);
+        let t = Instant::now();
+        let first = ids.iter().find(|x| only.as_ref().map_or(true, |o| o.contains(x))) == Some(id);
+        let prio = first.then(|| tokio::spawn(async {
+            let mut seen = std::collections::BTreeSet::new();
+            for _ in 0..10 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                for p in rt_ffmpeg_priorities().await.split(',').filter(|p| !p.is_empty()) {
+                    seen.insert(p.to_string());
+                }
+            }
+            seen.into_iter().collect::<Vec<_>>().join(",")
+        }));
+        let res = super::run_in_prescan_slot(job::prescan(ctx, preq), super::PRESCAN_CANCEL_EPOCH.load(std::sync::atomic::Ordering::SeqCst)).await;
+        let wall = t.elapsed().as_secs_f64();
+        if let Some(h) = prio {
+            println!("[rt-prescan] {id}: ffmpeg priorities seen every 2 s over the first 20 s of the pre-scan: {}", h.await.unwrap_or_default());
+        }
+        let r = match res {
+            Ok(r) => r,
+            Err(o) => {
+                fails.push(format!("{id}: prescan ended {o:?} after {wall:.1}s"));
+                continue;
+            }
+        };
+        let Some(ps) = r.snapshot.clone() else {
+            fails.push(format!("{id}: prescan {:?} with no snapshot ({:?})", r.outcome, r.note));
+            continue;
+        };
+        println!(
+            "[rt-prescan] {id}: prescan {:?} stored {} in {wall:.1}s note {:?}; op {} ({:?}) ed {} ({:?}) media_end {:?} final {} op_region {:?} ed_region {:?} keyed {:?}",
+            r.outcome, r.stored, r.note, rt_win(&ps.op), ps.op_l1, rt_win(&ps.ed), ps.ed_l1, ps.media_end, ps.media_end_final, ps.op_region, ps.ed_region, ps.keyed_duration
+        );
+        if r.outcome != job::PrescanOutcome::Done || !r.stored {
+            fails.push(format!("{id}: prescan {:?} stored {} ({:?})", r.outcome, r.stored, r.note));
+        }
+        // The returned snapshot carries no keyed_duration (only the stored
+        // copy does): find the stored entry among the buckets near mpv's
+        // duration (the probe's is within a few centiseconds of it) and read
+        // the probe duration it was keyed by.
+        let stored: Option<Snapshot> = [-0.1, -0.05, 0.0, 0.05, 0.1]
+            .iter()
+            .map(|k| duration_bucket(mpv_d + k))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|b| super::cache::get_result::<Snapshot>(&dir, &result_key(id, &rel, b.parse::<f64>().unwrap())))
+            .find(|s| s.keyed_duration.is_some_and(|c| (c - mpv_d).abs() < 1.0));
+        let stored_ok = stored.is_some();
+        let Some(c) = stored.as_ref().and_then(|s| s.keyed_duration) else {
+            fails.push(format!("{id}: no stored entry with a keyed_duration near the mpv duration"));
+            continue;
+        };
+        if ps.keyed_duration.is_some() {
+            println!("[rt-prescan] {id}: the returned snapshot carries keyed_duration {:?}", ps.keyed_duration);
+        }
+        println!("[rt-prescan] {id}: stored entry keyed by probe duration {c} (bucket {})", duration_bucket(c));
+        keyed.insert(id.clone(), c);
+        let kind = if duration_bucket(mpv_d) == duration_bucket(c) { "exact" } else { "adjacent" };
+
+        // The live request, keyed by mpv's duration.
+        let live = rt_live(&ff, &dir, &base, mpv_d, true, true, 10.0).await;
+        let (live_ok, live_s) = match &live {
+            Some((s, secs)) => {
+                println!("[rt-prescan] {id}: live d {mpv_d} ({}) vs probe {c} ({}): from_cache {} in {:.3}s", duration_bucket(mpv_d), duration_bucket(c), s.from_cache, secs);
+                if !s.from_cache {
+                    fails.push(format!("{id}: live run not from the cache"));
+                }
+                for d in rt_same(s, &ps, true, true) {
+                    fails.push(format!("{id}: live vs prescan {d}"));
+                }
+                (s.from_cache, *secs)
+            }
+            None => {
+                fails.push(format!("{id}: live run did not answer within 10 s (it was detecting: no cache hit)"));
+                (false, f64::NAN)
+            }
+        };
+
+        // Narrower live requests.
+        for (op, ed) in [(true, false), (false, true)] {
+            match rt_live(&ff, &dir, &base, mpv_d, op, ed, 10.0).await {
+                Some((s, _)) if s.from_cache => {
+                    for d in rt_same(&s, &ps, op, ed) {
+                        fails.push(format!("{id} op {op} ed {ed}: {d}"));
+                    }
+                }
+                other => fails.push(format!("{id} op {op} ed {ed}: not from the cache ({:?})", other.map(|x| x.0.state))),
+            }
+        }
+
+        // Across the boundary (through the neighbour), and 0.1 s off (a miss).
+        let nudge = match rt_nudge(c) {
+            Some(d) => match rt_live(&ff, &dir, &base, d, true, true, 10.0).await {
+                Some((s, _)) if s.from_cache => {
+                    for x in rt_same(&s, &ps, true, true) {
+                        fails.push(format!("{id} nudged {d:.3}: {x}"));
+                    }
+                    format!("{d:.3} ({}) hit", duration_bucket(d))
+                }
+                _ => {
+                    fails.push(format!("{id}: nudged duration {d:.3} across the boundary did not hit"));
+                    format!("{d:.3} ({}) MISS", duration_bucket(d))
+                }
+            },
+            None => "n/a (probe duration not within 0.03 s of a boundary)".into(),
+        };
+        let far = c + 0.1;
+        let far_res = match rt_live(&ff, &dir, &base, far, true, true, 3.0).await {
+            Some((s, _)) if s.from_cache => {
+                fails.push(format!("{id}: duration {far:.3} (0.1 s off) was served from the cache"));
+                "HIT (wrong)"
+            }
+            _ => "miss (ok)",
+        };
+        rows.push(format!(
+            "| {id} | {c:.2} | {mpv_d} | {kind} | {wall:.1} | {} | {} | {} | {live_ok} ({live_s:.3}s) | stored {stored_ok} | nudge {nudge} | far {far_res} |",
+            rt_win(&ps.op),
+            rt_win(&ps.ed),
+            format!("{:?}/{:?}", ps.op_l1, ps.ed_l1),
+        ));
+    }
+
+    // Preemption.
+    let pre = std::env::var("AURA_PRESCAN_RT_PREEMPT").unwrap_or_default();
+    let pair_ids: Option<(String, String)> = if pre == "off" {
+        None
+    } else if let Some((a, b)) = pre.split_once(',') {
+        Some((a.trim().into(), b.trim().into()))
+    } else {
+        (ids.len() >= 2).then(|| (ids[0].clone(), ids[1].clone()))
+    };
+    if let Some((a, b)) = pair_ids {
+        let (ea, eb) = (&eps[&a], &eps[&b]);
+        let dir_p = root.join("preempt-prescan");
+        let dir_l = root.join("preempt-live");
+        std::fs::create_dir_all(&dir_p).unwrap();
+        std::fs::create_dir_all(&dir_l).unwrap();
+        // Baseline: a standalone probe of the live url (no gate, nothing else running).
+        let t = Instant::now();
+        let bp = audio::run_probe_with(&ff, eb["url"].as_str().unwrap(), false).await;
+        let base_probe = t.elapsed().as_secs_f64();
+        println!("[rt-preempt] baseline probe of {b}: {:.2}s ok {}", base_probe, bp.is_ok());
+        let preq: job::PrescanRequest = serde_json::from_value(rt_base(&a, ea)).unwrap();
+        let preq = preq.validate().unwrap();
+        let rel_a = preq.release_identity().expect("release identity");
+        let (p, g) = rt_quiet();
+        let ctx = rt_ctx(&ff, &dir_p, true, 0, p, g);
+        let pre_task = tokio::spawn(async move {
+            let r = super::run_in_prescan_slot(job::prescan(ctx, preq), super::PRESCAN_CANCEL_EPOCH.load(std::sync::atomic::Ordering::SeqCst)).await;
+            (r.map(|r| r.outcome), Instant::now())
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        let running = super::PRESCAN.lock().unwrap().is_some();
+        println!("[rt-preempt] prescan of {a} running after 8 s: {running}; ffmpeg priority {}", rt_ffmpeg_priorities().await);
+        if !running {
+            fails.push(format!("preempt: the prescan of {a} was not running 8 s in"));
+        }
+        // The live detect on the other url, as `detect` begins one.
+        let mut v = rt_base(&b, eb);
+        v["duration"] = eb["mpv_duration"].clone();
+        let req: Request = serde_json::from_value(v).unwrap();
+        let req = req.validate().unwrap();
+        let probed: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let progressed: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let (p2, g2) = (probed.clone(), progressed.clone());
+        let publish: Arc<dyn Fn(&Snapshot) + Send + Sync> = Arc::new(move |s: &Snapshot| {
+            if s.media_end.is_some() {
+                p2.lock().unwrap().get_or_insert_with(Instant::now);
+            }
+        });
+        let progress: Arc<dyn Fn(&job::Progress) + Send + Sync> = Arc::new(move |_: &job::Progress| {
+            g2.lock().unwrap().get_or_insert_with(Instant::now);
+        });
+        let lctx = rt_ctx(&ff, &dir_l, false, 7, publish, progress);
+        let t0 = Instant::now();
+        let guard = super::live_begin();
+        let live_task = tokio::spawn(async move { job::run(&lctx, &req).await });
+        let (outcome, done_at) = pre_task.await.unwrap();
+        let t_gone = done_at.duration_since(t0).as_secs_f64();
+        println!("[rt-preempt] prescan outcome {outcome:?}, future gone {:.1} ms after the live detect began", t_gone * 1e3);
+        if outcome != Err(job::PrescanOutcome::Preempted) {
+            fails.push(format!("preempt: prescan outcome {outcome:?}"));
+        }
+        if t_gone > 1.0 {
+            fails.push(format!("preempt: the prescan took {t_gone:.3}s to go"));
+        }
+        // Let the live detect reach its probe and HEAD, then stop it (bandwidth).
+        let deadline = Instant::now() + std::time::Duration::from_secs(40);
+        while Instant::now() < deadline && progressed.lock().unwrap().is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let prio_live = rt_ffmpeg_priorities().await;
+        live_task.abort();
+        let _ = live_task.await;
+        drop(guard);
+        let tp = probed.lock().unwrap().map(|x| x.duration_since(t0).as_secs_f64());
+        let tg = progressed.lock().unwrap().map(|x| x.duration_since(t0).as_secs_f64());
+        println!(
+            "[rt-preempt] live {b}: probe done {:?}s after start (standalone probe {base_probe:.2}s; excess {:?}s), first HEAD progress {:?}s; ffmpeg priority during live HEAD {prio_live}",
+            tp, tp.map(|x| x - base_probe), tg
+        );
+        match tp {
+            None => fails.push("preempt: the live probe never completed within 40 s".into()),
+            Some(x) if x - base_probe > 1.0 + 0.5 * base_probe => {
+                fails.push(format!("preempt: live probe {x:.2}s vs standalone {base_probe:.2}s"))
+            }
+            _ => {}
+        }
+        // The aborted prescan wrote no result (its dir held nothing else).
+        let wrote = dir_p.join(RESULT_FILE).exists();
+        let tmp = std::fs::read_dir(&dir_p).unwrap().filter_map(|e| e.ok()).any(|e| e.path().extension().is_some_and(|x| x == "tmp"));
+        let entry = keyed.get(&a).and_then(|c| super::cache::get_result::<Snapshot>(&dir_p, &result_key(&a, &rel_a, *c)));
+        println!("[rt-preempt] aborted prescan: result file {wrote}, tmp {tmp}, entry {}; dir holds {:?}", entry.is_some(),
+            std::fs::read_dir(&dir_p).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect::<Vec<_>>());
+        if wrote || tmp || entry.is_some() {
+            fails.push("preempt: the aborted prescan wrote a result".into());
+        }
+        let slot_empty = super::PRESCAN.lock().unwrap().is_none();
+        if !slot_empty || super::live_active() {
+            fails.push(format!("preempt: slot empty {slot_empty}, live active {}", super::live_active()));
+        }
+    }
+
+    println!("| id | probe c | mpv d | hit | prescan s | op | ed | l1 | live from_cache | stored | nudge | far |");
+    for r in &rows {
+        println!("{r}");
+    }
+    let bytes = super::cache::total_bytes(&dir);
+    println!("[rt-prescan] round-trip cache {bytes} bytes");
+    let _ = std::fs::remove_dir_all(&root);
+    for f in &fails {
+        println!("[rt-prescan] FAIL {f}");
+    }
+    assert!(fails.is_empty(), "{} prescan runtime failure(s)", fails.len());
 }

@@ -42,6 +42,7 @@ import {
 } from "./manualWatched";
 import { markAutoBumped } from "./autoBumped";
 import { getSortedEpisodes as sortedEpisodes } from "./episodeSort";
+import { releasedMs } from "./availableEarly";
 
 /** True when the episode's release date is in the past (or unknown).
  *  Future-dated episodes are considered upcoming and don't count
@@ -54,9 +55,9 @@ import { getSortedEpisodes as sortedEpisodes } from "./episodeSort";
  *  per-episode dates from some addons, and skipping them would
  *  prevent the gate from ever closing on those titles. */
 function isEpisodeAired(v: VideoEntry, now = Date.now()): boolean {
-  if (!v.released) return true;
-  const t = Date.parse(v.released);
-  if (Number.isNaN(t)) return true;
+  // Listed date, or when its streams were seen if earlier (availableEarly.ts).
+  const t = releasedMs(v);
+  if (t == null) return true;
   return t <= now;
 }
 

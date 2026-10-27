@@ -28,13 +28,15 @@ import type { AddonEntry, MetaDetail, StreamEntry, VideoEntry } from "./types";
 import { getMetaDetailFallback } from "./metaCache";
 import { streamQueryAddons } from "./auraSettings";
 import { getSortedEpisodes as sortedEpisodes } from "./episodeSort";
+import { availableEarlyAt, countEpisodeEvidence, noteStreamsFound, releasedMs } from "./availableEarly";
+import { CHECK_WINDOW_MS } from "./airingCheck";
 
 /** True when the episode's release date is in the past (or unknown).
  *  Mirrors autoAdvance.ts:isEpisodeAired. */
 function isEpisodeAired(v: VideoEntry, now = Date.now()): boolean {
-  if (!v.released) return true;
-  const t = Date.parse(v.released);
-  if (Number.isNaN(t)) return true;
+  // Listed date, or when its streams were seen if earlier (availableEarly.ts).
+  const t = releasedMs(v);
+  if (t == null) return true;
   return t <= now;
 }
 
@@ -240,6 +242,7 @@ export async function pickFirstStreamForEpisode(
       id: episodeId,
     });
     const streams = Array.isArray(result?.streams) ? result.streams : [];
+    if (video && video.id === episodeId) noteStreamsFound(video, countEpisodeEvidence(streams));
     return streams[0] ?? null;
   } catch (err) {
     console.warn("[next-up] fetch_streams failed:", err);
@@ -256,12 +259,87 @@ export async function resolveNextEpisode(
   seriesId: string,
   currentEpisodeId: string,
   skipMode: SkipFillerRecapMode = "none",
-): Promise<{ detail: MetaDetail; next: VideoEntry } | null> {
+  /** False: answer from the cached meta only, never wait on the caught-up
+   *  stream probe (the end screen, which runs `probeNextEpisode` after it has
+   *  shown its caught-up card). */
+  opts?: { probe?: boolean },
+): Promise<{ detail: MetaDetail; next: VideoEntry; stream?: StreamEntry | null } | null> {
   const detail = await getMetaDetailFallback(addons, mediaType, seriesId);
   if (!detail) return null;
   const next = findNextEpisode(detail, currentEpisodeId, Date.now(), skipMode);
+  if (next) return { detail, next };
+  // Caught up: the next episode may already be out under a late listing, and
+  // the airing check does not run while something plays (a binge). Ask.
+  if (opts?.probe === false) return null;
+  return probeWithDetail(addons, mediaType, detail, currentEpisodeId, skipMode);
+}
+
+/** The caught-up probe alone: the next episode, when one listed within 24 h
+ *  turns out to be out already, with the stream the probe picked. */
+export async function probeNextEpisode(
+  addons: AddonEntry[],
+  mediaType: string,
+  seriesId: string,
+  currentEpisodeId: string,
+  /** The episode list the caller already judged by (the end screen's richest
+   *  detail): a leaner first-addon answer can omit the very episode it found. */
+  known?: MetaDetail | null,
+): Promise<{ detail: MetaDetail; next: VideoEntry; stream?: StreamEntry | null } | null> {
+  const detail = known ?? await getMetaDetailFallback(addons, mediaType, seriesId);
+  if (!detail) return null;
+  return probeWithDetail(addons, mediaType, detail, currentEpisodeId, "none");
+}
+
+async function probeWithDetail(
+  addons: AddonEntry[],
+  mediaType: string,
+  detail: MetaDetail,
+  currentEpisodeId: string,
+  skipMode: SkipFillerRecapMode,
+): Promise<{ detail: MetaDetail; next: VideoEntry; stream?: StreamEntry | null } | null> {
+  const probe = await probeListedNext(addons, mediaType, detail, currentEpisodeId, skipMode);
+  if (!probe) return null;
+  const next = findNextEpisode(detail, currentEpisodeId, Date.now(), skipMode);
+  // The probe's answer IS the stream pick for that episode: hand it on so the
+  // caller does not fan out a second time.
   if (!next) return null;
-  return { detail, next };
+  return next.id === probe.id ? { detail, next, stream: probe.stream } : { detail, next };
+}
+
+/** Per-episode time of the last caught-up probe. Short on purpose: the early
+ *  (pre-scan) lookup, the 50 % retry and the end screen each get their own
+ *  ask (a few per episode), but a burst of calls shares one. Bounded. */
+const listedProbeAt = new Map<string, number>();
+const LISTED_PROBE_CAP = 50;
+const LISTED_PROBE_MIN_GAP_MS = 5 * 60_000;
+
+/** One stream query for the next not-yet-aired episode when its listed date
+ *  is within the airing check's window, at most once per
+ *  LISTED_PROBE_MIN_GAP_MS per episode. The episode id and the stream picked
+ *  when that recorded it as out (availableEarly.ts), else null. */
+async function probeListedNext(
+  addons: AddonEntry[],
+  mediaType: string,
+  detail: MetaDetail,
+  currentEpisodeId: string,
+  skipMode: SkipFillerRecapMode,
+): Promise<{ id: string; stream: StreamEntry | null } | null> {
+  const now = Date.now();
+  const cand = findNextEpisode(detail, currentEpisodeId, now, skipMode, true);
+  if (!cand || (cand.streams?.length ?? 0) > 0) return null;
+  const listed = cand.released ? Date.parse(cand.released) : NaN;
+  if (!Number.isFinite(listed) || listed <= now || listed - now > CHECK_WINDOW_MS) return null;
+  const last = listedProbeAt.get(cand.id);
+  if (last != null && now - last < LISTED_PROBE_MIN_GAP_MS) return null;
+  listedProbeAt.delete(cand.id);
+  listedProbeAt.set(cand.id, now);
+  while (listedProbeAt.size > LISTED_PROBE_CAP) {
+    const oldest = listedProbeAt.keys().next().value;
+    if (oldest === undefined) break;
+    listedProbeAt.delete(oldest);
+  }
+  const stream = await pickFirstStreamForEpisode(addons, mediaType, cand.id, cand);
+  return availableEarlyAt(cand.id) != null ? { id: cand.id, stream } : null;
 }
 
 /**

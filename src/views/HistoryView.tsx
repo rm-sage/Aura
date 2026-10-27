@@ -43,7 +43,7 @@ import { openContextMenu } from "../ContextMenu";
 import { shrinkPoster } from "../posterSize";
 import ErrorBoundary from "../ErrorBoundary";
 import { showAppToast } from "../AppToast";
-import { useConfirm } from "../ConfirmDialog";
+import { askConfirm, useConfirm } from "../ConfirmDialog";
 import { typeLabel, isAnimeMeta } from "../aiometadata";
 
 // Which scrobble services are connected for the active account. Drives
@@ -200,8 +200,9 @@ function HistoryViewBody({ onSelectMeta }: Props) {
   // selection bar) calls THIS, so they cannot drift apart.
   //
   // DUPLICATE PROTECTION, in layers:
-  //   1. We skip any (entry, service) already recorded in scrobbledStore, so a
-  //      re-run does not even make the call.
+  //   1. Any (entry, service) already recorded in scrobbledStore is a REPEAT:
+  //      it is sent again only when the user says so in a prompt that says it
+  //      is one (repeatPrompt), otherwise skipped without a call.
   //   2. The commands themselves are the real gate, and are the SAME ones the
   //      per-row buttons use: Trakt's /sync/history is idempotent on the
   //      `watched_at` we send (the entry's exact played_at), and AniList's
@@ -238,24 +239,57 @@ function HistoryViewBody({ onSelectMeta }: Props) {
         trakt: [], anilist: [], simkl: [],
       };
       const items = new Set<string>();
-      let alreadyDone = 0;
+      // Already-scrobbled pushes, held back until the user decides on them.
+      const repeats: Array<{ entry: HistoryEntry; service: ScrobbleService }> = [];
       let retired = 0;
       for (const entry of list) {
         for (const service of servicesFor(entry, conn)) {
           if (only && service !== only) continue;
-          if (isScrobbled(conn.scope, service, entry.id, entry.played_at)) {
-            alreadyDone++;
-            continue;
-          }
           // The service has already told us, definitively, that it cannot take this
           // item (Trakt has no catalog entry for it; AniList cannot resolve it).
           // Sending it again would fail identically and re-report the same error.
+          // Checked before the repeat test, as the row's pill is: a retired id is
+          // never offered as a repeat.
           if (isIneligible(conn.scope, service, entry.id)) {
             retired++;
             continue;
           }
+          if (isScrobbled(conn.scope, service, entry.id, entry.played_at)) {
+            repeats.push({ entry, service });
+            continue;
+          }
           items.add(keyOf(entry));
           pendingBy[service].push(entry);
+        }
+      }
+
+      // REPEATS. Asked about on their own, before the run's own confirmation,
+      // so the prompt can say plainly that these were sent already. With only
+      // repeats in the run that one prompt is the confirmation; with fresh
+      // pushes too, declining it (or Escape) still scrobbles the fresh ones.
+      let alreadyDone = repeats.length;
+      const onlyRepeats = items.size === 0 && repeats.length > 0;
+      if (repeats.length > 0) {
+        const repeatItems = new Set(repeats.map((r) => keyOf(r.entry))).size;
+        const services = SCROBBLE_SERVICES.filter((sv) => repeats.some((r) => r.service === sv))
+          .map((sv) => SCROBBLE_LABELS[sv]);
+        const again = await ask({
+          title: onlyRepeats ? "Scrobble again?" : "Include repeats?",
+          message: onlyRepeats
+            ? `Everything eligible in ${what} is already scrobbled${only ? ` to ${SCROBBLE_LABELS[only]}` : ""}. Send ${repeatItems} item${repeatItems === 1 ? "" : "s"} again as a repeat?`
+            : `${repeatItems} item${repeatItems === 1 ? " was" : "s were"} already scrobbled (${repeats.length} push${repeats.length === 1 ? "" : "es"}). Send ${repeatItems === 1 ? "it" : "them"} again as a repeat?`,
+          detail: repeatDetail(services),
+          confirmLabel: onlyRepeats ? "Scrobble again" : "Include repeats",
+          cancelLabel: onlyRepeats ? "Cancel" : "Skip repeats",
+          tone: "accent",
+        });
+        if (onlyRepeats && !again) return;
+        if (again) {
+          for (const r of repeats) {
+            items.add(keyOf(r.entry));
+            pendingBy[r.service].push(r.entry);
+          }
+          alreadyDone = 0;
         }
       }
 
@@ -354,7 +388,7 @@ function HistoryViewBody({ onSelectMeta }: Props) {
           ? ` ${retired} item${retired === 1 ? "" : "s"} the service has already refused (no catalog match) ${retired === 1 ? "is" : "are"} skipped too.`
           : "");
 
-      const confirmed = await ask({
+      const confirmed = onlyRepeats || await ask({
         title: "Scrobble history",
         message: `Scrobble ${n} item${n === 1 ? "" : "s"} from ${what}${only ? ` to ${SCROBBLE_LABELS[only]}` : ""}?`,
         detail,
@@ -956,8 +990,31 @@ const HistoryCard = memo(function HistoryCard({
   const showAnilist = eligible.includes("anilist");
   const showSimkl = eligible.includes("simkl");
 
+  const epLabel = entry.season != null && entry.episode != null
+    ? `S${String(entry.season).padStart(2, "0")}E${String(entry.episode).padStart(2, "0")}`
+    : entry.episode != null
+      ? `EP${String(entry.episode).padStart(2, "0")}`
+      : null;
+
+  /** A push for a service already recorded on this row is a repeat: say so
+   *  and let the user confirm it (the shared dialog: the card has no hook of
+   *  its own). False when declined. */
+  const confirmRepeat = async (service: ScrobbleService): Promise<boolean> => {
+    if (!isScrobbled(conn.scope, service, entry.id, entry.played_at)) return true;
+    const label = SCROBBLE_LABELS[service];
+    return askConfirm({
+      title: "Scrobble again?",
+      message: `${entry.name}${epLabel ? ` ${epLabel}` : ""} is already scrobbled to ${label}. Send it again as a repeat?`,
+      detail: repeatDetail([label]),
+      confirmLabel: "Scrobble again",
+      tone: "accent",
+    });
+  };
+
   const scrobble = async (service: RowHistoryService) => {
     if (busy) return;
+    const repeat = isScrobbled(conn.scope, service, entry.id, entry.played_at);
+    if (!(await confirmRepeat(service))) return;
     setBusy(service);
     try {
       // Tauri maps these camelCase keys onto the Rust command's
@@ -983,7 +1040,8 @@ const HistoryCard = memo(function HistoryCard({
       const raw = String(err);
       // Same retirement rule as the bulk runner: a verdict about the item means a
       // bulk run should stop re-sending it too. The marker never reaches the user.
-      if (isPermanentFailure(raw)) {
+      // Never for a repeat: the service took this item before.
+      if (isPermanentFailure(raw) && !repeat) {
         markIneligible(conn.scope, service, entry.id);
       }
       showAppToast(cleanFailureMessage(raw), { tone: "danger", duration: 6000 });
@@ -998,6 +1056,8 @@ const HistoryCard = memo(function HistoryCard({
   // the row, failed is left for a retry.
   const scrobbleSimkl = async () => {
     if (busy) return;
+    const repeat = isScrobbled(conn.scope, "simkl", entry.id, entry.played_at);
+    if (!(await confirmRepeat("simkl"))) return;
     setBusy("simkl");
     try {
       const [result] = await pushSimklHistory(conn.scope, [simklItemFromEntry(entry)]);
@@ -1006,7 +1066,7 @@ const HistoryCard = memo(function HistoryCard({
         showAppToast(result.message, { tone: "success" });
         return;
       }
-      if (result.status === "not_found" || result.status === "skipped") {
+      if ((result.status === "not_found" || result.status === "skipped") && !repeat) {
         markIneligible(conn.scope, "simkl", entry.id);
       }
       showAppToast(result.message, { tone: "danger", duration: 6000 });
@@ -1016,12 +1076,6 @@ const HistoryCard = memo(function HistoryCard({
       setBusy(null);
     }
   };
-
-  const epLabel = entry.season != null && entry.episode != null
-    ? `S${String(entry.season).padStart(2, "0")}E${String(entry.episode).padStart(2, "0")}`
-    : entry.episode != null
-      ? `EP${String(entry.episode).padStart(2, "0")}`
-      : null;
 
   const meta: MetaPreview = {
     id:           entry.parent_id ?? entry.id,
@@ -1112,9 +1166,9 @@ const HistoryCard = memo(function HistoryCard({
 
       {/* Hover-revealed scrobble actions. Each service is only offered when the
           account has it connected (AniList additionally gated to anime). A
-          service already recorded for this row renders as a done tick instead of
-          a live button — the service would no-op the write anyway, so there is
-          nothing to gain from firing it again. Suppressed entirely while a
+          service already recorded for this row renders as a done tick that can
+          still be pressed: it sends the push again after a prompt that says it
+          is a repeat (confirmRepeat). Suppressed entirely while a
           selection is active, so the checkboxes own the hover surface. */}
       {(showTrakt || showAnilist || showSimkl) && !selectionActive && (
         <div
@@ -1186,10 +1240,31 @@ const HistoryCard = memo(function HistoryCard({
   );
 });
 
+/** What a repeat push does, for the prompts that offer one. Aura re-sends
+ *  through the same commands, so each service answers a repeat its own way:
+ *  AniList keeps one progress number (save_progress no-ops when it is already
+ *  there), Trakt and Simkl get the same play, with the same watched time,
+ *  again. */
+function repeatDetail(services: string[]): string {
+  const others = services.filter((s) => s !== SCROBBLE_LABELS.anilist);
+  const parts: string[] = [];
+  if (others.length > 0) {
+    parts.push(
+      `${others.join(" and ")} ${others.length === 1 ? "gets" : "get"} the same play again, with the same watched time: `
+      + "useful when it was removed there, and the service decides whether it counts twice.",
+    );
+  }
+  if (services.includes(SCROBBLE_LABELS.anilist)) {
+    parts.push("AniList keeps one progress number per show, so it changes only if your progress there is now lower.");
+  }
+  return parts.join(" ");
+}
+
 // ---------------------------------------------------------------------------
 // Scrobble action pill, shared by the Trakt / AniList / Simkl buttons on a card.
 // Shows a spinner while its push is in flight; disabled while EITHER
-// service on the row is running. `done` renders the already-scrobbled state.
+// service on the row is running. `done` renders the already-scrobbled state,
+// still pressable for a repeat.
 // ---------------------------------------------------------------------------
 
 function ScrobbleButton({
@@ -1205,17 +1280,17 @@ function ScrobbleButton({
   unavailable?: boolean;
   onClick: () => void;
 }) {
-  const title = done
-    ? `Already scrobbled to ${label}`
-    : unavailable
-      ? `${label} has no catalog match for this item`
+  const title = unavailable
+    ? `${label} has no catalog match for this item`
+    : done
+      ? `Already scrobbled to ${label}. Click to send it again`
       : `Scrobble to ${label}`;
   return (
     <button
       type="button"
       title={title}
       aria-label={title}
-      disabled={disabled || done || unavailable}
+      disabled={disabled || unavailable}
       onClick={(e) => {
         e.stopPropagation();
         e.preventDefault();
@@ -1225,10 +1300,10 @@ function ScrobbleButton({
                   text-[10.5px] font-medium leading-none
                   backdrop-blur-md transition-colors
                   disabled:cursor-default
-                  ${done
-                    ? "bg-emerald-400/15 text-emerald-200 border border-emerald-300/35"
-                    : unavailable
-                      ? "bg-white/5 text-white/30 border border-white/10 line-through"
+                  ${unavailable
+                    ? "bg-white/5 text-white/30 border border-white/10 line-through"
+                    : done
+                      ? "bg-emerald-400/15 text-emerald-200 border border-emerald-300/35 hover:bg-emerald-400/25 disabled:opacity-50"
                       : "bg-white/10 text-white/85 border border-white/20 hover:bg-ln-accent/25 hover:text-white hover:border-ln-accent/50 disabled:opacity-50"}`}
     >
       {busy ? (

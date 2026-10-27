@@ -20,7 +20,10 @@
 //                        and so is a Layer 3 window that stood in for a
 //                        theme-list miss. An entry records the kinds and MAL
 //                        id it was computed for and answers only requests it
-//                        covers (job.rs `cached_serves`).
+//                        covers (job.rs `cached_serves`). A lookup near a
+//                        bucket boundary may also read the ONE adjacent
+//                        bucket (`neighbour_duration`), accepted only for an
+//                        entry keyed within 0.03 s; writes use the exact key.
 //                        This cache is the only fix for slow links.
 //
 // The JSON caches are read and rewritten per detect (a few hundred KB at
@@ -61,6 +64,25 @@ pub const RESULT_CAP: usize = 2000;
 
 /// Serialises every cache read-modify-write in the process.
 static LOCK: Mutex<()> = Mutex::new(());
+/// Bumped by `clear_all` under `LOCK`. A result write carrying an older value
+/// (`put_result_since`) is dropped, so a job that started before a Settings >
+/// Storage clear cannot write its result back into the cleared cache, even
+/// when its blocking write was already queued.
+static CLEAR_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current clear generation (read at the start of a job).
+pub fn clear_generation() -> u64 {
+    CLEAR_GEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Tests only: `CLEAR_GEN` is process-wide while every test has its own cache
+/// dir, so a test that clears and a test that asserts a stored result hold this
+/// rather than race on the counter under parallel `cargo test`.
+#[cfg(test)]
+pub(crate) fn clear_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static L: Mutex<()> = Mutex::new(());
+    L.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 pub fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -111,7 +133,25 @@ fn get_entry<T: DeserializeOwned>(path: &Path, key: &str, now: u64) -> Option<T>
 }
 
 fn put_entry<T: Serialize + DeserializeOwned>(path: &Path, key: &str, value: T, ttl: u64, cap: usize, now: u64) {
-    let Ok(_g) = LOCK.lock() else { return };
+    put_entry_since(path, key, value, ttl, cap, now, None);
+}
+
+/// `put_entry`, refused (false) when `since` names a clear generation older
+/// than the current one. Checked under `LOCK`, which `clear_all` holds while
+/// it bumps the generation.
+fn put_entry_since<T: Serialize + DeserializeOwned>(
+    path: &Path,
+    key: &str,
+    value: T,
+    ttl: u64,
+    cap: usize,
+    now: u64,
+    since: Option<u64>,
+) -> bool {
+    let Ok(_g) = LOCK.lock() else { return false };
+    if since.is_some_and(|g| g != clear_generation()) {
+        return false;
+    }
     let mut map = load_map::<T>(path);
     map.retain(|_, e| now.saturating_sub(e.saved_at) < e.ttl);
     map.insert(key.to_string(), Entry { saved_at: now, ttl, value });
@@ -126,6 +166,7 @@ fn put_entry<T: Serialize + DeserializeOwned>(path: &Path, key: &str, value: T, 
     if let Ok(bytes) = serde_json::to_vec(&map) {
         let _ = write_atomic(path, &bytes);
     }
+    true
 }
 
 // ── theme lists ─────────────────────────────────────────────────────────────
@@ -150,8 +191,31 @@ pub fn result_key(stremio_id: &str, release: &str, duration: f64) -> String {
     h.update([0u8]);
     h.update(release.as_bytes());
     h.update([0u8]);
-    h.update(format!("{:.1}", duration).as_bytes());
+    h.update(duration_bucket(duration).as_bytes());
     hex::encode(&h.finalize()[..16])
+}
+
+/// The 0.1 s bucket a duration keys under (`{:.1}`: the exact binary value,
+/// ties to even, so 1436.25 is "1436.2").
+pub fn duration_bucket(duration: f64) -> String {
+    format!("{:.1}", duration)
+}
+
+/// How far apart two durations of the SAME file may be read. The pre-scan
+/// keys on ffmpeg's printed `Duration:` (rounded half up to 0.01 s), a live
+/// detect on mpv's full-precision `duration`; MPEG-TS adds one AAC frame
+/// (21.3 ms measured). 0.03 s covers both.
+pub const NEIGHBOUR_TOL_S: f64 = 0.03;
+
+/// The ONE adjacent bucket a lookup of `duration` may also try: when
+/// `duration` is within `NEIGHBOUR_TOL_S` of a bucket boundary, a duration on
+/// the other side of it (feed it to `result_key`), else None. A bucket is
+/// 0.1 s wide, so at most one side can cross: never more than one neighbour.
+/// The caller still accepts a neighbour's entry only when it was keyed within
+/// the tolerance (`Snapshot::keyed_duration`).
+pub fn neighbour_duration(duration: f64) -> Option<f64> {
+    let own = duration_bucket(duration);
+    [duration - NEIGHBOUR_TOL_S, duration + NEIGHBOUR_TOL_S].into_iter().find(|d| duration_bucket(*d) != own)
 }
 
 pub fn get_result<T: DeserializeOwned>(dir: &Path, key: &str) -> Option<T> {
@@ -161,9 +225,18 @@ pub fn get_result<T: DeserializeOwned>(dir: &Path, key: &str) -> Option<T> {
 /// `ttl` in seconds, chosen by the job (`job::result_ttl`): `RESULT_TTL` for
 /// a result holding a window, `RESULT_ABSTAIN_TTL` for an abstention, and no
 /// longer than the theme-list answer for a Layer 3 window standing in for a
-/// theme AnimeThemes does not list. Capped at `RESULT_TTL`.
+/// theme AnimeThemes does not list. Capped at `RESULT_TTL`. Tests seed the
+/// cache with it; the job writes through `put_result_since`.
+#[cfg(test)]
 pub fn put_result<T: Serialize + DeserializeOwned>(dir: &Path, key: &str, value: T, ttl: u64) {
     put_entry(&dir.join(RESULT_FILE), key, value, ttl.min(RESULT_TTL), RESULT_CAP, now_secs());
+}
+
+/// The job's result write (`ttl` as for `put_result`), from a job that read
+/// `since = clear_generation()` when it started: false (nothing written) when
+/// the cache was cleared since.
+pub fn put_result_since<T: Serialize + DeserializeOwned>(dir: &Path, key: &str, value: T, ttl: u64, since: u64) -> bool {
+    put_entry_since(&dir.join(RESULT_FILE), key, value, ttl.min(RESULT_TTL), RESULT_CAP, now_secs(), Some(since))
 }
 
 // ── theme fingerprints ──────────────────────────────────────────────────────
@@ -306,6 +379,7 @@ pub fn total_bytes(dir: &Path) -> u64 {
 /// Delete every skipdetect cache. Missing files are not an error.
 pub fn clear_all(dir: &Path) -> std::io::Result<()> {
     let _g = LOCK.lock().map_err(|_| std::io::Error::other("cache lock poisoned"))?;
+    CLEAR_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     for f in [THEME_LIST_FILE, RESULT_FILE] {
         match std::fs::remove_file(dir.join(f)) {
             Ok(()) => {}
@@ -369,6 +443,7 @@ mod tests {
 
     #[test]
     fn fp_store_size_check_and_cap() {
+        let _c = clear_test_lock();
         let d = tmp();
         let t = theme(7, 100);
         put_theme_fp(&d, &t);
@@ -403,6 +478,7 @@ mod tests {
 
     #[test]
     fn ttl_cap_and_atomic_json() {
+        let _c = clear_test_lock();
         let d = tmp();
         let p = d.join(RESULT_FILE);
         put_entry(&p, "a", 1u32, 100, 3, 1000);
@@ -433,6 +509,25 @@ mod tests {
     }
 
     #[test]
+    fn a_result_write_from_before_a_clear_is_refused() {
+        let _c = clear_test_lock();
+        let d = tmp();
+        // A job that started before a clear (its generation is stale).
+        let stale = clear_generation().wrapping_sub(1);
+        assert!(!put_result_since(&d, "k", 1u32, 100, stale));
+        assert!(!d.join(RESULT_FILE).exists(), "the cleared cache stays empty");
+        // A current one writes.
+        assert!(put_result_since(&d, "k", 2u32, 100, clear_generation()));
+        assert_eq!(get_result::<u32>(&d, "k"), Some(2));
+        let before = clear_generation();
+        clear_all(&d).unwrap();
+        assert!(clear_generation() > before);
+        assert!(!put_result_since(&d, "k", 3u32, 100, before));
+        assert_eq!(get_result::<u32>(&d, "k"), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn failed_write_leaves_no_tmp() {
         let d = tmp();
         // The target is a non-empty directory: the final rename fails.
@@ -456,5 +551,45 @@ mod tests {
         assert_ne!(a, result_key("tt14986406:3:1", "BLEACH.S03E01.mkv", 1436.36));
         assert_ne!(a, result_key("tt14986406:3:1", "OTHER.mkv", 1436.24));
         assert!(!a.contains("BLEACH"));
+    }
+
+    #[test]
+    fn a_duration_near_a_bucket_boundary_has_exactly_one_neighbour() {
+        let b = duration_bucket;
+        let nb = |d: f64| neighbour_duration(d).map(b);
+        // The measured mp4: mpv 1430.148 keys "1430.1", ffmpeg's printed
+        // 1430.15 keys "1430.2". Each one's neighbour is the other's bucket.
+        assert_eq!(b(1430.148), "1430.1");
+        assert_eq!(b(1430.15), "1430.2");
+        assert_eq!(nb(1430.148).as_deref(), Some("1430.2"));
+        assert_eq!(nb(1430.15).as_deref(), Some("1430.1"));
+        assert_eq!(
+            result_key("tt1:1:1", "a.mp4", neighbour_duration(1430.148).unwrap()),
+            result_key("tt1:1:1", "a.mp4", 1430.15)
+        );
+        // Ties to even on the exact binary value: 1436.25 is "1436.2"; its
+        // neighbour is the bucket above, where an mpv 1436.254 keys.
+        assert_eq!(b(1436.25), "1436.2");
+        assert_eq!(b(1436.254), "1436.3");
+        assert_eq!(nb(1436.25).as_deref(), Some("1436.3"));
+        assert_eq!(nb(1436.254).as_deref(), Some("1436.2"));
+        // MPEG-TS: mpv one AAC frame (21.3 ms) shorter than the container.
+        let c = 1400.16;
+        let d = c - 0.021_333;
+        assert_ne!(b(d), b(c));
+        assert_eq!(nb(d), Some(b(c)));
+        // Far from a boundary: no neighbour is ever tried.
+        for d in [1436.0, 1436.1, 1436.19, 1436.11, 1480.0, 0.5] {
+            assert_eq!(neighbour_duration(d), None, "{d}");
+        }
+        // Never more than one adjacent bucket, and always an adjacent one.
+        for i in 0..20_000 {
+            let d = 1300.0 + i as f64 * 0.0173;
+            if let Some(n) = neighbour_duration(d) {
+                assert!((n - d).abs() <= NEIGHBOUR_TOL_S + 1e-9);
+                let (own, other): (f64, f64) = (b(d).parse().unwrap(), b(n).parse().unwrap());
+                assert!(((own - other).abs() - 0.1).abs() < 1e-6, "{d}: {own} vs {other}");
+            }
+        }
     }
 }

@@ -19,6 +19,7 @@ import { libraryItemSeriesId } from "./libraryNormalize";
 import { episodeIsBeforeResume } from "./LibraryContext";
 import { getManualWatchedState } from "./manualWatched";
 import { isAnimeMeta } from "./aiometadata";
+import { cloudNextIsOut, releasedMs } from "./availableEarly";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -45,6 +46,9 @@ export function isAiring(item: LibraryItem, detail?: MetaDetail | null): boolean
   // must be MAIN-RUN (season != 0). An upcoming SPECIAL doesn't make a finished
   // show airing (My Hero Academia after its final season). airingInfo above is
   // already main-run-only, so the meta path agrees.
+  // Deliberately the cloud's own date, not releasedMs: a next episode that
+  // came out early (availableEarly.ts) keeps the show airing until that date,
+  // and a record must not keep a finished show airing past it.
   const sig = getReleaseSignal(rootId(item))?.next_aired;
   return sig != null && sig.season !== 0 && sig.aired_at != null && Date.parse(sig.aired_at) > Date.now();
 }
@@ -58,7 +62,9 @@ export function airingNextMs(item: LibraryItem, detail?: MetaDetail | null): num
     : null;
   if (metaMs != null) return metaMs;
   const sig = getReleaseSignal(rootId(item))?.next_aired;
-  const cloud = sig && sig.season !== 0 && sig.aired_at ? Date.parse(sig.aired_at) : NaN;
+  const cloud = sig && sig.season !== 0 && sig.aired_at && !cloudNextIsOut(sig, detail?.videos)
+    ? Date.parse(sig.aired_at)
+    : NaN;
   // "Next" is future by definition — never surface a stale/past cloud date.
   return Number.isFinite(cloud) && cloud > Date.now() ? cloud : null;
 }
@@ -70,7 +76,7 @@ export function airingLastAiredMs(item: LibraryItem, detail?: MetaDetail | null)
   let best = -Infinity;
   for (const v of detail?.videos ?? []) {
     if (v.season === 0) continue;
-    const t = v.released ? Date.parse(v.released) : NaN;
+    const t = releasedMs(v) ?? NaN;
     if (Number.isFinite(t) && t <= now && t > best) best = t;
   }
   if (best > -Infinity) return best;
@@ -109,7 +115,7 @@ export function episodesBehind(
   let watchedAired = 0;
   for (const v of videos) {
     if (v.season === 0) continue;
-    const t = v.released ? Date.parse(v.released) : NaN;
+    const t = releasedMs(v) ?? NaN;
     if (!Number.isFinite(t) || t > now) continue;
     airedMain += 1;
     if (getManualWatchedState(v.id) === "watched") { watchedAired += 1; continue; }

@@ -31,6 +31,7 @@
 // ---------------------------------------------------------------------------
 
 import type { MetaDetail, VideoEntry } from "./types";
+import { releasedMs } from "./availableEarly";
 
 export type CountdownKind = "premiere" | "next-episode" | "cinematic" | "digital";
 
@@ -84,7 +85,7 @@ function nextEpisodeRelease(
   let earliestFuture: number | null = null;
   let anyAired = false;
   for (const v of videos ?? []) {
-    const t = parseMs(v.released);
+    const t = releasedMs(v);
     if (t == null) continue;
     if (t <= nowMs) {
       anyAired = true;
@@ -197,7 +198,7 @@ export function nextAiringEpisode(
   let best: { id: string; targetMs: number } | null = null;
   for (const v of videos ?? []) {
     if (mainRunOnly && v.season === 0) continue;
-    const t = parseMs(v.released);
+    const t = releasedMs(v);
     if (t == null || t <= nowMs) continue;
     if (best == null || t < best.targetMs) best = { id: v.id, targetMs: t };
   }
@@ -227,7 +228,7 @@ export function airingInfo(
   let latestAiredMs = -Infinity;
   for (const v of videos ?? []) {
     if (v.season === 0) continue; // specials never count as the show airing
-    const t = parseMs(v.released);
+    const t = releasedMs(v);
     if (t == null) continue;
     if (t <= nowMs) {
       airedCount += 1;
@@ -338,8 +339,15 @@ export function formatTargetDate(targetMs: number): string {
 //     anyway (see windowVisibility.ts).
 // ---------------------------------------------------------------------------
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useSyncExternalStore } from "react";
 import { useWindowHidden } from "./windowVisibility";
+import { getAvailableEarlyVersion, subscribeAvailableEarly } from "./availableEarly";
+
+/** Re-renders the caller when an episode is found available ahead of its
+ *  listed air date (availableEarly.ts), so an aired / unaired read updates. */
+export function useAvailableEarlyVersion(): number {
+  return useSyncExternalStore(subscribeAvailableEarly, getAvailableEarlyVersion);
+}
 
 /** Tick used only when the smallest VISIBLE unit is minutes. 30 s is a 2x
  *  oversample of a 60 s display unit, so the minute is never more than ~30 s

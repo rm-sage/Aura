@@ -133,19 +133,8 @@ pub struct AppSettings {
     /// When empty, scrobble events become no-ops.
     #[serde(default)]
     pub scrobble_addon_url: String,
-    /// Master switch for outbound scrobble traffic. When false NO request
-    /// is sent regardless of `scrobble_addon_url` — user can keep the URL
-    /// configured but pause scrobbling without re-entering it later.
-    /// Default false on fresh installs; load() migrates pre-existing
-    /// settings.json files (which had no toggle but a URL) by inferring
-    /// enabled=true so existing scrobble flows aren't silently disabled.
-    #[serde(default)]
-    pub scrobble_enabled: bool,
-
-    /// Whether Aura scrobbles AUTOMATICALLY as you finish things.
-    ///
-    /// Distinct from `scrobble_enabled`, which is the master switch over ALL
-    /// scrobble traffic. This one governs only the playback-driven path (the
+    /// Whether Aura scrobbles AUTOMATICALLY as you finish things: the only
+    /// scrobbling switch. It governs the playback-driven path (the
     /// completion push at end-of-file, and the shutdown flush). Turning it off
     /// leaves the History page's manual and bulk scrobbling fully working, for
     /// people who would rather decide what gets recorded than have it happen for
@@ -505,7 +494,6 @@ impl Default for AppSettings {
             close_on_exit:               true,
             minimize_to_tray_on_close:   false,
             scrobble_addon_url:          String::new(),
-            scrobble_enabled:            false,
             auto_scrobble_enabled:       true,
             opensubtitles_api_key:       String::new(),
             hdr_enabled:                 true,
@@ -832,23 +820,19 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> AppSettings {
                 merged_any = true;
             }
 
-            // Scrobble enabled-flag migration: pre-existing settings.json
-            // files predate the toggle and have no `scrobble_enabled` key.
-            // Serde's #[serde(default)] gives us `false` for both "field
-            // absent" and "field explicitly false", so we re-parse the
-            // raw JSON as a Value to distinguish them. If the field was
-            // genuinely absent AND a URL is configured, infer enabled=true
-            // so existing scrobble flows aren't silently disabled by the
-            // upgrade. Save the inferred value so future loads see it.
+            // The retired `scrobble_enabled` master switch: automatic
+            // scrobbling used to need it AND `auto_scrobble_enabled`, so a file
+            // that still carries it as false keeps scrobbling off by turning
+            // the remaining switch off. Saving drops the key (the field is
+            // gone), so this runs once per file. A key arriving later from an
+            // older build's cloud blob or export gets the same fold in
+            // update_settings (`fold_retired_scrobble_master`).
             let raw_value: serde_json::Value =
                 serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
-            let scrobble_enabled_explicit =
-                raw_value.get("scrobble_enabled").is_some();
-            if !scrobble_enabled_explicit
-                && !parsed.scrobble_addon_url.trim().is_empty()
-                && !parsed.scrobble_enabled
-            {
-                parsed.scrobble_enabled = true;
+            if let Some(master) = raw_value.get("scrobble_enabled") {
+                if master.as_bool() == Some(false) && parsed.auto_scrobble_enabled {
+                    parsed.auto_scrobble_enabled = false;
+                }
                 merged_any = true;
             }
 
@@ -1003,6 +987,7 @@ pub async fn update_settings<R: Runtime>(
         for (k, v) in updates {
             target.insert(k.clone(), v.clone());
         }
+        fold_retired_scrobble_master(target, updates);
     }
 
     let mut next: AppSettings =
@@ -1017,6 +1002,22 @@ pub async fn update_settings<R: Runtime>(
 
     save(&app, &next)?;
     Ok(next)
+}
+
+/// A patch from an older build (a settings export it wrote) may still carry
+/// the retired `scrobble_enabled` master switch, which deserialize would drop
+/// while keeping the `auto_scrobble_enabled: true` it arrived with. Under that
+/// build the pair meant "nothing is sent automatically", so the master's false
+/// turns the remaining switch off, as load() does for a file. Cloud pulls strip
+/// the key before they get here (sync.ts applyBackendSettings): an older
+/// device pushes its untouched default with every blob, which is not a choice.
+fn fold_retired_scrobble_master(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    patch: &serde_json::Map<String, serde_json::Value>,
+) {
+    if patch.get("scrobble_enabled").and_then(|v| v.as_bool()) == Some(false) {
+        target.insert("auto_scrobble_enabled".into(), serde_json::Value::Bool(false));
+    }
 }
 
 /// Reset every backend setting to its defaults — wipes theme, audio /
@@ -1054,6 +1055,25 @@ pub async fn set_settings_scope<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_older_patch_with_the_master_off_keeps_auto_scrobbling_off() {
+        let fold = |patch: serde_json::Value| {
+            let mut target = serde_json::Map::new();
+            target.insert("auto_scrobble_enabled".into(), serde_json::Value::Bool(true));
+            for (k, v) in patch.as_object().unwrap() {
+                target.insert(k.clone(), v.clone());
+            }
+            fold_retired_scrobble_master(&mut target, patch.as_object().unwrap());
+            target["auto_scrobble_enabled"].as_bool().unwrap()
+        };
+        // A v2.2.3 blob at its defaults: nothing was sent automatically.
+        assert!(!fold(serde_json::json!({ "scrobble_enabled": false, "auto_scrobble_enabled": true })));
+        // Master on: the auto switch meant what it said.
+        assert!(fold(serde_json::json!({ "scrobble_enabled": true, "auto_scrobble_enabled": true })));
+        // A current patch never carries the key.
+        assert!(fold(serde_json::json!({ "auto_scrobble_enabled": true })));
+    }
 
     #[test]
     fn cold_cache_follows_render_json() {

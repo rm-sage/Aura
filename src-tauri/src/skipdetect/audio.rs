@@ -75,6 +75,25 @@ fn command(bin: &OsStr) -> tokio::process::Command {
     crate::silencedetect::ffmpeg_command_at(bin)
 }
 
+/// `command`, at BELOW_NORMAL priority when `background` (the next-episode
+/// pre-scan's probe and region passes: playback, and Aura's own raised
+/// priority class, keep the CPU first). A live detect passes false and spawns
+/// exactly as before.
+fn command_with(bin: &OsStr, background: bool) -> tokio::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = command(bin);
+    #[cfg(target_os = "windows")]
+    if background {
+        // CREATE_NO_WINDOW (0x08000000, as ffmpeg_command_at sets) OR
+        // BELOW_NORMAL_PRIORITY_CLASS (0x00004000): creation_flags replaces
+        // the flag word, so both are passed together.
+        cmd.creation_flags(0x0800_0000 | 0x0000_4000);
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = background;
+    cmd
+}
+
 /// `ffmpeg ... -i pipe:0 -vn -ac 1 -ar 11025 -f s16le pipe:1`: decode one
 /// in-memory theme file. Measured bit-identical to the reference's file
 /// decode (`-i <path> -vn -ac 1 -ar 11025 -c:a pcm_s16le`) on 16 of 16 corpus
@@ -237,8 +256,8 @@ impl ProbeError {
     }
 }
 
-async fn probe_once(bin: &OsStr, url: &str) -> Result<(Option<i32>, String), ProbeError> {
-    let mut cmd = command(bin);
+async fn probe_once(bin: &OsStr, url: &str, background: bool) -> Result<(Option<i32>, String), ProbeError> {
+    let mut cmd = command_with(bin, background);
     cmd.args(probe::probe_args(url))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -259,10 +278,11 @@ async fn probe_once(bin: &OsStr, url: &str) -> Result<(Option<i32>, String), Pro
 /// The probe with the spec's failure policy: an HTTP 4xx other than 403 / 404
 /// retries ONCE after 1.5 s; 403 / 404, a map error, a second failure or no
 /// audio line abstain. Exit 1 with streams listed is the normal result.
-pub async fn run_probe(bin: &OsStr, url: &str) -> Result<ProbeInfo, ProbeError> {
+/// ffmpeg runs at BELOW_NORMAL priority when `background` (the pre-scan).
+pub async fn run_probe_with(bin: &OsStr, url: &str, background: bool) -> Result<ProbeInfo, ProbeError> {
     let mut retried = false;
     loop {
-        let (code, stderr) = probe_once(bin, url).await?;
+        let (code, stderr) = probe_once(bin, url, background).await?;
         let info = probe::parse_probe(&stderr);
         if !info.audio.is_empty() {
             return Ok(info);
@@ -309,8 +329,9 @@ pub struct RegionPass {
 
 impl RegionPass {
     /// Spawn ffmpeg with `args` (from `probe::head_args` / `probe::tail_args`).
-    pub fn spawn(bin: &OsStr, args: &[String], rebase: f64) -> std::io::Result<Self> {
-        let mut cmd = command(bin);
+    /// ffmpeg runs at BELOW_NORMAL priority when `background` (the pre-scan).
+    pub fn spawn_with(bin: &OsStr, args: &[String], rebase: f64, background: bool) -> std::io::Result<Self> {
+        let mut cmd = command_with(bin, background);
         cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -597,7 +618,7 @@ mod tests {
     #[ignore = "needs the runtime-deps ffmpeg"]
     async fn region_pass_on_synthetic_audio() {
         let ff = local_ffmpeg();
-        let mut p = RegionPass::spawn(&ff, &lavfi_region_args(), 0.0).unwrap();
+        let mut p = RegionPass::spawn_with(&ff, &lavfi_region_args(), 0.0, false).unwrap();
         let mut n = 0usize;
         while let Some(c) = p.next_pcm().await.unwrap() {
             n += c.len();
@@ -609,7 +630,7 @@ mod tests {
         assert_eq!(end.silences.len(), 1, "{:?}", end.silences);
         assert!((end.silences[0].start - 8.0).abs() < 0.05 && (end.silences[0].end - 10.0).abs() < 0.05);
         // A kill mid-stream reaps the child and keeps what stderr had.
-        let mut p = RegionPass::spawn(&ff, &lavfi_region_args(), 0.0).unwrap();
+        let mut p = RegionPass::spawn_with(&ff, &lavfi_region_args(), 0.0, false).unwrap();
         let _ = p.next_pcm().await.unwrap();
         let end = p.kill().await;
         assert!(!end.success);

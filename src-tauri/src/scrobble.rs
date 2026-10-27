@@ -444,6 +444,14 @@ enum TraktSyncOutcome {
     /// their catalog under that numbering. Caller may retry with an
     /// alternate (season, number) tuple.
     NotFound,
+    /// Trakt parsed the payload and reported zero added AND zero not_found:
+    /// it already holds a play of this item at this `watched_at` (the
+    /// History page's repeat of a row still on Trakt). Trusted as such only
+    /// for a top-level target (movie, episode by Trakt id), where Trakt lists
+    /// a miss in not_found; for the nested shows/seasons/episodes shape Trakt
+    /// can also answer zero/zero when it found the show but not that season
+    /// or episode, so there it counts as a miss (`post_target_with_refresh`).
+    AlreadyPresent,
     /// HTTP-level failure (4xx other than 401, 5xx, network blip, etc.).
     /// Distinct from NotFound: doesn't trigger the dual-numbering retry
     /// because the cause isn't a metadata mismatch.
@@ -460,6 +468,7 @@ enum TraktSyncOutcome {
 pub enum TraktSyncResult {
     Fired,        // Primary or fallback added a row.
     NotFound,     // Both attempts (or single attempt with no fallback) returned not_found.
+    AlreadyPresent, // Trakt already had this play at this watched_at; nothing added.
     Skipped,      // No token / unsupported id / movie pre-checks failed.
     Failed,       // HTTP error or network blip.
 }
@@ -563,18 +572,17 @@ async fn trakt_sync_history_once(
                 );
                 TraktSyncOutcome::NotFound
             } else {
-                // Successfully parsed but both counters are zero. This
-                // shouldn't happen with Trakt's documented response
-                // shape, but if it does, surface the body and treat
-                // as not_found so we don't silently mark unwritten
-                // scrobbles as "fired".
-                let preview: String = raw.chars().take(400).collect();
+                // Successfully parsed but both counters are zero: usually
+                // Trakt already holds a play at this watched_at
+                // (sync/history is idempotent on it). Never "fired";
+                // post_target_with_refresh decides per target shape
+                // whether it can also be a catalog miss.
                 crate::devlog!(
-                    warn, "scrobble",
-                    "Trakt /sync/history returned zero added AND zero not_found (status={}) for {}: {} — treating as not_found",
-                    status, sess.imdb_id, preview,
+                    info, "scrobble",
+                    "Trakt /sync/history added nothing and listed no miss (status={}) for {}",
+                    status, sess.imdb_id,
                 );
-                TraktSyncOutcome::NotFound
+                TraktSyncOutcome::AlreadyPresent
             }
         }
         Ok(r) if r.status().as_u16() == 401 => {
@@ -932,6 +940,32 @@ async fn post_target_with_refresh(
             PostStep::Final(TraktSyncResult::Failed)
         }
         TraktSyncOutcome::HttpError => PostStep::Final(TraktSyncResult::Failed),
+        // Zero/zero on the nested shows/seasons/episodes shape is ambiguous:
+        // Trakt answers that way both for a duplicate and for a show it found
+        // whose season or episode it does not have, so the show's own season
+        // list (public, cached per show) settles it: the episode exists = a
+        // duplicate (the History page's repeat of a row still on Trakt), it
+        // does not = a miss and the walk goes on. A list that cannot be read
+        // is a failure, never a miss: walking on could add the play under
+        // another numbering, a different episode.
+        TraktSyncOutcome::AlreadyPresent => match target {
+            TraktTarget::Episode { show_imdb, season, number } => match trakt_season_list(show_imdb).await {
+                Some(eps) if eps.iter().any(|(s, n, _)| s == season && n == number) => {
+                    PostStep::Final(TraktSyncResult::AlreadyPresent)
+                }
+                Some(_) => PostStep::NotFound,
+                None => {
+                    crate::devlog!(
+                        warn, "scrobble",
+                        "Trakt added nothing for {show_imdb} S{season}E{number} and its season list could not be read: not retrying under another numbering",
+                    );
+                    PostStep::Final(TraktSyncResult::Failed)
+                }
+            },
+            TraktTarget::Movie { .. } | TraktTarget::EpisodeByTraktId { .. } => {
+                PostStep::Final(TraktSyncResult::AlreadyPresent)
+            }
+        },
         TraktSyncOutcome::NotFound => PostStep::NotFound,
     }
 }
@@ -1481,13 +1515,6 @@ pub async fn scrobble_end<R: Runtime>(
     let Some(sess) = taken else { return Ok(()); };
 
     let s = settings::snapshot();
-    if !s.scrobble_enabled {
-        // Master switch off — keep the local session bookkeeping but
-        // skip the wire call. Useful for users debugging "did my
-        // history just get nuked?" who want to silence Aura without
-        // disconnecting their accounts.
-        return Ok(());
-    }
     if !s.auto_scrobble_enabled {
         // Automatic scrobbling is off. This is the END-OF-PLAYBACK push, i.e. the
         // automatic path — so it stands down. The History page's manual and bulk
@@ -1680,6 +1707,7 @@ pub async fn scrobble_test_fire<R: Runtime>(
                 let trakt_msg = match trakt_result {
                     TraktSyncResult::Fired    => "fired".to_string(),
                     TraktSyncResult::NotFound => "not_found (S/E mismatch with Trakt catalog)".to_string(),
+                    TraktSyncResult::AlreadyPresent => "already in history".to_string(),
                     TraktSyncResult::Skipped  => "skipped (no token or unsupported id)".to_string(),
                     TraktSyncResult::Failed   => "failed (network or HTTP error)".to_string(),
                 };
@@ -1842,6 +1870,7 @@ pub async fn scrobble_history_trakt<R: Runtime>(
     // synthetic completion pair.
     match trakt_sync_history(&scope, &sess, 100.0, 100.0, watched_at).await {
         TraktSyncResult::Fired    => Ok("Added to Trakt history".into()),
+        TraktSyncResult::AlreadyPresent => Ok("Already in Trakt history at this time".into()),
         // Both of these are verdicts about the ITEM, not about this attempt: Trakt's
         // catalog does not contain it under this numbering, or there is no IMDb id to
         // key on. Retrying changes nothing, so they carry PERMANENT_PREFIX and the
@@ -1971,9 +2000,9 @@ pub fn shutdown_blocking<R: Runtime>(app: &AppHandle<R>) {
     let Some(sess) = taken else { return; };
 
     let s = settings::snapshot();
-    // Same pair of gates as scrobble_end: this shutdown flush IS the automatic
-    // path, just fired from the close handler instead of end-of-file.
-    if !s.scrobble_enabled || !s.auto_scrobble_enabled { return; }
+    // Same gate as scrobble_end: this shutdown flush IS the automatic path,
+    // just fired from the close handler instead of end-of-file.
+    if !s.auto_scrobble_enabled { return; }
 
     let (time, duration) = last_playback_slot()
         .lock()

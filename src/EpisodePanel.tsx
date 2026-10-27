@@ -37,7 +37,7 @@ import FillerRecapTags from "./FillerRecapTags";
 import { isSkipped, useSkipMarksVersion } from "./skipMarks";
 import { useReleaseSignal } from "./releaseSignalStore";
 import { isVideoAired } from "./types";
-import { nextAiringEpisode, formatTargetDate } from "./releaseCountdown";
+import { nextAiringEpisode, formatTargetDate, useAvailableEarlyVersion } from "./releaseCountdown";
 import EpisodeAirChip from "./EpisodeAirChip";
 import { PlayerMenuChip } from "./playerMenu";
 import ArcGrid, { ArcGridSkeleton } from "./ArcGrid";
@@ -249,9 +249,12 @@ function EpisodePanel({
 
   // Next-to-air episode across ALL seasons — its row shows the live
   // countdown chip. No per-second tick here; the chip owns its own.
+  // An episode whose streams came back ahead of its listed date reads as aired.
+  const availableVersion = useAvailableEarlyVersion();
   const nextAiringId = useMemo(
     () => nextAiringEpisode(sorted)?.id ?? null,
-    [sorted],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [sorted, availableVersion],
   );
 
   const blurThumbs = loadAuraSettings().blurUnwatchedThumbnails;

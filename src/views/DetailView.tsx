@@ -15,7 +15,8 @@ import type {
   VideoEntry,
 } from "../types";
 import { isVideoAired } from "../types";
-import { computeReleaseCountdowns, formatCountdown, formatTargetDate, isInTheaters, nextAiringEpisode, useCountdownNow } from "../releaseCountdown";
+import { computeReleaseCountdowns, formatCountdown, formatTargetDate, isInTheaters, nextAiringEpisode, useAvailableEarlyVersion, useCountdownNow } from "../releaseCountdown";
+import { countEpisodeEvidence, noteStreamsFound } from "../availableEarly";
 import { useMovieReleaseDates } from "../releaseDates";
 import EpisodeAirChip from "../EpisodeAirChip";
 import { loadAuraSettings, saveAuraSettings, streamQueryAddons } from "../auraSettings";
@@ -723,6 +724,7 @@ function ProgressBlock({
   // fires its own event.
   const manualVersion = useManualWatchedVersion();
   const skipVersion = useSkipMarksVersion();
+  const availableVersion = useAvailableEarlyVersion();
   // One mousemove-driven label for the whole bar rather than a `title` per
   // segment: a 1000-episode show would otherwise mount 1000 tooltip owners, and
   // the native tooltip cannot be styled to match the Continue Watching bar.
@@ -754,7 +756,7 @@ function ProgressBlock({
     const skipped = segments.filter((x) => x.kind === "skipped").length;
     return { segments, watched, skipped, total: main.length };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [videos, byId, seriesId, manualVersion, skipVersion]);
+  }, [videos, byId, seriesId, manualVersion, skipVersion, availableVersion]);
 
   // ELEMENT IDENTITY is the point, and this must stay above the early return
   // below or the hook count changes between renders. React skips reconciling a
@@ -1706,6 +1708,11 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
       .then((r) => {
         if (superseded()) return;
         streamCachePut(queryKey, r);
+        // Streams for an episode listed as not yet aired: it has (availableEarly.ts).
+        if (isEpisodic) {
+          const list = Array.isArray(r) ? r : r.streams ?? [];
+          noteStreamsFound(detailVideos?.find((v) => v.id === targetId) ?? null, countEpisodeEvidence(list));
+        }
         // Tauri may emit either the new `{ streams, metadata }` envelope or
         // (for the brief moment a stale dev build is running) the legacy
         // `StreamEntry[]` array. Defensive-decode either shape so a hot
@@ -3874,6 +3881,7 @@ const EpisodeRow = ({
   // unparseable dates as aired, so undated specials stay untouched. The
   // next-airing row (flagged by the panel) shows the live countdown chip;
   // later unaired rows show a static "Airs <date>" + the same dim veil.
+  useAvailableEarlyVersion(); // streams found ahead of the listed date: aired
   const unaired = !isVideoAired(video);
   const airMs = unaired && video.released ? Date.parse(video.released) : null;
 
@@ -4924,9 +4932,11 @@ function EpisodesPanel({
   // displayed) — its row gets the live countdown chip. Recomputed only
   // when the video list changes; no per-second tick here (the chip owns
   // its own tick) so the list never re-renders on the clock.
+  const availableVersion = useAvailableEarlyVersion();
   const nextAiringId = useMemo(
     () => nextAiringEpisode(videos)?.id ?? null,
-    [videos],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [videos, availableVersion],
   );
 
   // Scroll the requested video to the top of the list once it's

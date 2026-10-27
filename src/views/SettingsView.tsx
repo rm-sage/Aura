@@ -108,7 +108,6 @@ interface BackendSettings {
   close_on_exit: boolean;
   minimize_to_tray_on_close: boolean;
   scrobble_addon_url: string;
-  scrobble_enabled: boolean;
   auto_scrobble_enabled: boolean;
   opensubtitles_api_key: string;
   /** Legacy HDR toggle. Kept on the wire so older settings survive the
@@ -344,7 +343,7 @@ function SettingDropdown({
 }: DropdownProps) {
   return (
     <div
-      className="space-y-2"
+      className={`space-y-2 ${disabled ? "opacity-40" : ""}`}
       data-settings-row=""
       data-settings-label={label}
       data-settings-description={description}
@@ -363,7 +362,7 @@ function SettingDropdown({
         className={`w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5
                    text-sm outline-none focus:border-white/25
                    transition-colors appearance-none cursor-pointer
-                   ${disabled ? "opacity-60 cursor-not-allowed" : ""}`}
+                   ${disabled ? "cursor-not-allowed" : ""}`}
         style={{
           color: "var(--text-primary)",
           backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='rgba(255,255,255,0.3)'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E")`,
@@ -410,16 +409,35 @@ function SettingToggle({ label, description, value, onChange, disabled = false }
   );
 }
 
+/** Settings that only refine the row directly above them (a parent switch,
+ *  dropdown or key), indented under it in one box instead of standing as
+ *  peers. Each child keeps its own data-settings-* attributes, so search
+ *  finds it like any row. Put a divider between two children; an advanced
+ *  child goes in its own <AdvancedOnly> inside the box, and a box whose
+ *  children are ALL advanced goes inside one <AdvancedOnly> so no empty box
+ *  is left when they hide. */
+function AttachedSettings({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="ml-5 rounded-lg border border-white/8 bg-white/[0.02] px-3 py-2.5 space-y-3">
+      {children}
+    </div>
+  );
+}
+
 /** The three skip confidence levels, as the player shows them. A plain
  *  explanation row (searchable like any other), not a control. */
 const SKIP_CONFIDENCE_LEGEND: Record<SkipConfidence, string> = {
-  verified: "Found in this episode itself: its theme song matched in the audio, or the file's own chapters mark an opening or preview of a usual length. It should cut no more than a second or two of the story, but it can stop short of the segment's end (a title card after the song, for example).",
-  likely:   "Usually right, but its exact edges are not confirmed: AniSkip, IntroDB or PublicMetaDB times (one source or two that agree), an ending marked by the file's chapters, or a theme match that is still being measured or runs unusually long. It can be off, occasionally by more than a few seconds. On Auto these skip by themselves.",
-  risky:    "A guess, or times nothing in the episode backs up: AniSkip endings, IntroDB times not yet confirmed, times from a different cut or that the theme match contradicts or has not checked yet, a chapter only named Intro or Outro, a song that starts over the story, or an ending chapter that runs to the end of the file. May cut into the story, so these always ask first, even on Auto.",
+  verified: "Found in this episode itself: its theme song matched in the audio, or an opening or preview chapter of a usual length. Cuts at most a second or two of story, but can stop a little short.",
+  likely:   "Usually right, but the edges are not confirmed: AniSkip, IntroDB or PublicMetaDB times, an ending chapter, or a theme match still being measured. Can be off, sometimes by more than a few seconds. On Auto these can skip by themselves.",
+  risky:    "A guess, or times nothing in the episode backs up (for example AniSkip endings, unconfirmed IntroDB times, a chapter only named Intro or Outro, or a song that starts over the story). May cut into the story, so these always ask first, even on Auto.",
 };
 
+/** The legend's intro, shown on the page and searched, so the two cannot drift. */
+const SKIP_CONFIDENCE_INTRO =
+  "Skip prompts, the AuraSkip menu and the timeline's hover card show how sure Aura is that a segment holds only what it names. A level can change as the theme match finishes.";
+
 const SKIP_CONFIDENCE_DESCRIPTION =
-  "Every skip prompt, the AuraSkip menu and the timeline's hover card show how sure Aura is that a segment holds only what it names. A level can change while a prompt is showing, as the theme match finishes checking the episode. "
+  `${SKIP_CONFIDENCE_INTRO} `
   + `Verified: ${SKIP_CONFIDENCE_LEGEND.verified} Likely: ${SKIP_CONFIDENCE_LEGEND.likely} Risky: ${SKIP_CONFIDENCE_LEGEND.risky}`;
 
 function SkipConfidenceLegend() {
@@ -431,12 +449,7 @@ function SkipConfidenceLegend() {
       data-settings-description={SKIP_CONFIDENCE_DESCRIPTION}
     >
       <p className="text-white/75 text-sm font-medium">Skip confidence</p>
-      <p className="text-white/35 text-xs mt-0.5">
-        Every skip prompt, the AuraSkip menu and the timeline's hover card show
-        how sure Aura is that a segment holds only what it names. A level can
-        change while a prompt is showing, as the theme match finishes checking
-        the episode. Rows another source replaced carry no level.
-      </p>
+      <p className="text-white/35 text-xs mt-0.5">{SKIP_CONFIDENCE_INTRO}</p>
       <div className="mt-2 space-y-1.5">
         {levels.map((l) => (
           <div key={l} className="flex items-start gap-2.5">
@@ -521,7 +534,7 @@ function SettingText({
   const validState = validate && value.length > 0 ? validate(value) : null;
   return (
     <div
-      className="space-y-2"
+      className={`space-y-2 ${disabled ? "opacity-40" : ""}`}
       data-settings-row=""
       data-settings-label={label}
       data-settings-description={description}
@@ -548,7 +561,7 @@ function SettingText({
                         : validState === "invalid"
                         ? "border-red-400/40 focus:border-red-400/60"
                         : "border-white/10 focus:border-white/25"}
-                      ${disabled ? "opacity-60 cursor-not-allowed" : ""}`}
+                      ${disabled ? "cursor-not-allowed" : ""}`}
           style={{ color: "var(--text-primary)" }}
         />
         {validState && (
@@ -667,11 +680,16 @@ function SubLangFilterInput({
   };
 
   return (
-    <div className="space-y-2">
+    <div
+      className="space-y-2"
+      data-settings-row=""
+      data-settings-label="Subtitle picker languages"
+      data-settings-description="Only these languages show in the player's subtitle picker. Comma-separated codes (en, es, ja); empty shows every language."
+    >
       <p className="text-white/75 text-sm font-medium">Subtitle picker languages</p>
       <p className="text-white/35 text-xs -mt-1">
-        Comma-separated 2-letter ISO codes (en, es, ja). Limits which languages
-        appear in the in-player subtitle picker. Empty shows every language.
+        Only these languages show in the player's subtitle picker. Comma-separated
+        codes (en, es, ja); empty shows every language.
       </p>
       <input
         type="text"
@@ -728,13 +746,17 @@ function AudioPriorityInput({
   };
 
   return (
-    <div className="space-y-2">
+    <div
+      className="space-y-2"
+      data-settings-row=""
+      data-settings-label="Audio language priority"
+      data-settings-description="Languages to prefer, in order. original means the title's original language (needs AIOMetadata); codes like en, ja, es match a track's language. English is always the last fallback. Default: original, en."
+    >
       <p className="text-white/75 text-sm font-medium">Audio language priority</p>
       <p className="text-white/35 text-xs -mt-1">
-        Ordered list. <span className="font-mono text-white/55">original</span> resolves to the
-        title's <span className="font-mono">originalLanguage</span> from AIOMetadata; ISO 639-1
-        codes (en, ja, es) match by language tag. English is always appended as a
-        final fallback. Default: <span className="font-mono">original, en</span>.
+        Languages to prefer, in order. <span className="font-mono text-white/55">original</span> means
+        the title's original language (needs AIOMetadata); codes like en, ja, es match a track's language.
+        English is always the last fallback. Default: <span className="font-mono">original, en</span>.
       </p>
       <input
         type="text"
@@ -893,16 +915,13 @@ function HeroCatalogPicker({
       className="space-y-2"
       data-settings-row=""
       data-settings-label="Hero Carousel Source"
-      data-settings-description="Catalog whose items rotate in the Home hero band. Hidden-from-home catalogs are valid picks, useful for surfacing curated lists (AIOMetadata's AI Recommendations, mdblist, Trakt user lists) as the hero source. Default falls back to your first browseable row. Choose Disable to hide the hero entirely."
+      data-settings-description="Catalog whose items rotate in the Home hero band. Catalogs hidden from Home work too (e.g. AIOMetadata's AI Recommendations or a Trakt list). Default uses your first row; Disable hides the hero."
     >
       <p className="text-white/85 text-sm font-medium">Hero Carousel Source</p>
       <p className="text-white/40 text-xs leading-relaxed">
-        Catalog whose items rotate in the Home hero band. Hidden-from-home
-        catalogs are valid picks, useful for surfacing curated lists
-        (AIOMetadata's AI Recommendations, mdblist, Trakt user lists)
-        as the hero source without cluttering the grid below. Default
-        falls back to your first browseable row. Choose <span className="text-white/65">Disable</span> to
-        hide the hero entirely.
+        Catalog whose items rotate in the Home hero band. Catalogs hidden from
+        Home work too (e.g. AIOMetadata's AI Recommendations or a Trakt list).
+        Default uses your first row; <span className="text-white/65">Disable</span> hides the hero.
       </p>
       <div className="flex flex-wrap gap-2 items-center">
         <select
@@ -1327,12 +1346,9 @@ function BackupRestoreSection({
   return (
     <Section id="sec-backup" title="Backup & Restore">
       <p className="text-white/55 text-xs leading-relaxed">
-        Export portable settings (theme, audio / subtitles, keybindings, Discord
-        RPC, anime-skip modes, etc.) as a file or pasteable string. Your catalog,
-        stream, and search-provider choices ride along too, encoded by addon id
-        rather than URL: on import, any addon you don't have installed is skipped
-        and counted in the result, so an import on a fresh install never points
-        at addons that aren't there.
+        Save your settings (theme, audio and subtitles, keybindings, skip modes
+        and more) as a file or a string to paste. Addon choices are included; on
+        import, any addon you have not installed is skipped.
       </p>
 
       {/* ── Export ── */}
@@ -1346,9 +1362,8 @@ function BackupRestoreSection({
             className="mt-0.5 accent-ln-accent"
           />
           <span>
-            Include my API keys (OpenSubtitles, TMDB). Off by default because the
-            export is shareable: only turn this on to move settings to another of
-            your OWN devices, and do not paste that export anywhere public.
+            Include my API keys (OpenSubtitles, TMDB, IntroDB). Only for moving to
+            another device of your own: never share an export made with this on.
           </span>
         </label>
         <div className="flex gap-2">
@@ -1479,14 +1494,12 @@ function BackupRestoreSection({
           className="space-y-2"
           data-settings-row=""
           data-settings-label="Reset all settings"
-          data-settings-description="Wipes every setting back to defaults: theme, audio / subtitle prefs, keybindings, Discord RPC, anime-skip modes, and your catalog / stream / search provider lists. Installed addons themselves are not removed. There is no undo."
+          data-settings-description="Returns every setting to its default, including your catalog, stream and search provider choices. Installed addons are kept. There is no undo."
         >
           <p className="text-rose-300/95 text-sm font-medium">Reset all settings<AdvancedTag /></p>
           <p className="text-white/45 text-xs leading-relaxed">
-            Wipes every setting back to defaults: theme, audio / subtitle prefs,
-            keybindings, Discord RPC, anime-skip modes, and your catalog /
-            stream / search provider lists. Installed addons themselves are not
-            removed. There is no undo.
+            Returns every setting to its default, including your catalog, stream
+            and search provider choices. Installed addons are kept. There is no undo.
           </p>
           <button
             type="button"
@@ -1710,19 +1723,10 @@ function LocalDataBackupsSubsection() {
         <p className="text-white/75 text-sm font-medium">Local user-data backups</p>
         <p className="text-white/40 text-xs leading-relaxed mt-0.5">
           Snapshots of your <strong>Queue</strong>, watch <strong>History</strong>,
-          manual <em>watched / in-progress / planned</em> marks, which episodes
-          you marked <em>skipped</em>, auto-bumped series, and your device-wide
-          Aura UI preferences (shared by every account on this PC). Stored on
-          disk under
+          watched / planned / skipped marks and Aura's UI preferences, saved under
           <code className="font-mono text-white/55 mx-1">backups/</code>
-          in Aura's app-data folder.
-          {" "}<strong className="text-white/65">Manual</strong> snapshots
-          (Create snapshot now, plus pre-restore safety copies) live in a
-          separate ledger from{" "}
-          <strong className="text-white/65">auto</strong> snapshots
-          (every 30 s after a change), so the auto sweep can never
-          push a manual entry off the cliff. Each ledger keeps the
-          most recent 10 per account.
+          in Aura's app data. Aura keeps the last 10 automatic snapshots (taken
+          30 s after a change) and the last 10 manual ones, per account.
         </p>
       </div>
 
@@ -1792,7 +1796,7 @@ function LocalDataBackupsSubsection() {
         <ConfirmModal
           tone="warning"
           title="Restore snapshot?"
-          message={`Restore the snapshot from ${fmtTimestamp(confirmRestore.createdAtMs)}? Your current Queue / History / manual marks will be overwritten. A pre-restore safety snapshot is taken automatically before the swap.`}
+          message={`Restore the snapshot from ${fmtTimestamp(confirmRestore.createdAtMs)}? It replaces your current Queue, History, marks and Aura UI preferences. Aura saves a safety snapshot first.`}
           confirmLabel="Restore"
           onConfirm={() => performRestore(confirmRestore)}
           onCancel={() => setConfirmRestore(null)}
@@ -1903,16 +1907,14 @@ function HdrPeakNitsRow({
       className="space-y-2"
       data-settings-row=""
       data-settings-label="HDR display peak (nits)"
-      data-settings-description="Passthrough only: the brightness mpv tone-maps HDR content down to. Leave on Auto unless highlights look blown out - that means Windows is reporting a higher peak than your panel's current mode can show (common on OLEDs in DisplayHDR True Black mode; try 400-465)."
+      data-settings-description="Passthrough only: the peak brightness HDR is tone-mapped to. Leave on Auto unless highlights look blown out (common on OLEDs in DisplayHDR True Black mode; try 400-465)."
     >
       <div>
         <p className="text-white/75 text-sm font-medium">HDR display peak (nits)</p>
         <p className="text-white/35 text-xs mt-0.5">
-          The brightness mpv tone-maps HDR content down to in Passthrough
-          mode. Leave on Auto unless highlights look blown out - that means
-          Windows is reporting a higher peak than your panel's current mode
-          can actually show (common on OLEDs in DisplayHDR True Black mode;
-          try 400-465).
+          The peak brightness HDR is tone-mapped to in Passthrough. Leave on
+          Auto unless highlights look blown out (common on OLEDs in DisplayHDR
+          True Black mode; try 400-465).
         </p>
       </div>
       <div className="flex items-center gap-2 flex-wrap">
@@ -1966,19 +1968,15 @@ function NextUpLeadTimeRow({
       className="space-y-2"
       data-settings-row=""
       data-settings-label="Next-Up lead time"
-      data-settings-description="Seconds before an episode ends to surface the Next Up card during series / anime playback, when Aura has not located a reliable start of the ending. When it has, the card appears as the ending begins and, when Aura can tell, says what still plays after the credits. When it only knows where a matched ending stops, the card waits for that point or this lead time, whichever is later. Set to 0 to disable the prompt entirely. The card never appears for movies or for the last aired episode of a series."
+      data-settings-description="Seconds before an episode ends to show the Next Up card, when Aura has not found where the ending starts (otherwise the card appears as the ending begins). 0 turns the card off, and with it the next-episode pre-scan (under Show advanced settings)."
     >
       <div>
         <p className="text-white/75 text-sm font-medium">Next-Up lead time</p>
         <p className="text-white/35 text-xs mt-0.5">
-          Seconds before an episode ends to surface the "Next Up" card
-          during series / anime playback, when Aura has not located a
-          reliable start of the ending. When it has, the card appears as the
-          ending begins and, when Aura can tell, says what still plays after
-          the credits. When it only knows where a matched ending stops, the
-          card waits for that point or this lead time, whichever is later.
-          Set to 0 to disable the prompt entirely. The card never appears for
-          movies or for the last aired episode of a series.
+          Seconds before an episode ends to show the Next Up card, when Aura
+          has not found where the ending starts (otherwise the card appears as
+          the ending begins). 0 turns the card off, and with it the
+          next-episode pre-scan (under Show advanced settings).
         </p>
       </div>
       <div className="flex items-center gap-2 flex-wrap">
@@ -2031,23 +2029,23 @@ function NextUpLeadTimeRow({
  *  no better than pressing play. Default 10 is a comfortable middle ground
  *  that gives time to grab the remote / mouse. */
 function AutoAdvanceDelayRow({
-  value, onChange,
-}: { value: number; onChange: (v: number) => void }) {
+  value, onChange, disabled = false,
+}: { value: number; onChange: (v: number) => void; disabled?: boolean }) {
   const PRESETS = [5, 10, 15, 20, 30];
   const clamped = Math.max(5, Math.min(30, value));
   return (
-    <div
-      className="space-y-2"
+    <fieldset
+      disabled={disabled}
+      className={`space-y-2 min-w-0 ${disabled ? "opacity-40" : ""}`}
       data-settings-row=""
       data-settings-label="Auto-advance delay"
-      data-settings-description="Seconds the end-of-episode screen counts down before starting the next episode. Any mouse / keyboard / scroll input cancels the countdown."
+      data-settings-description="How long the end-of-episode countdown runs before the next episode starts. Any mouse, key or scroll input cancels it."
     >
       <div>
         <p className="text-white/75 text-sm font-medium">Auto-advance delay</p>
         <p className="text-white/35 text-xs mt-0.5">
-          Seconds the end-of-episode screen counts down before
-          starting the next episode. Any mouse / keyboard / scroll
-          input cancels the countdown.
+          How long the end-of-episode countdown runs before the next
+          episode starts. Any mouse, key or scroll input cancels it.
         </p>
       </div>
       <div className="flex items-center gap-2 flex-wrap">
@@ -2086,7 +2084,7 @@ function AutoAdvanceDelayRow({
           <span className="text-white/40">seconds</span>
         </div>
       </div>
-    </div>
+    </fieldset>
   );
 }
 
@@ -2361,20 +2359,14 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
         <div
           data-settings-row=""
           data-settings-label="Cloud Sync"
-          data-settings-description="Aura Cloud sync - requires Stremio sign-in to enable per-account state sync."
+          data-settings-description="Aura Cloud: sign in to Stremio to sync your settings, queue, watched and skipped marks, watch history, recent searches, per-title preferences and notifications across devices. Aura Cloud knows you only by a hash made on this device, never your account id or auth key."
           className="space-y-2"
         >
           <p className="text-white/55 text-sm leading-relaxed">
-            Cloud Sync requires a Stremio account. Sign in to keep your
-            settings, queue, manual watched marks, skipped episodes, watch
-            history, recent searches, per-title preferences, AniList ID cache,
-            and notifications in sync across devices.
+            Sign in to Stremio to sync your settings, queue, watched and skipped marks, watch history, recent searches, per-title preferences and notifications across devices.
           </p>
           <p className="text-white/35 text-xs leading-relaxed">
-            Your Stremio library and resume positions are not synced here -
-            Stremio's own cloud handles those. The Aura proxy never sees your
-            account id or your auth_key; a SHA-256 hash computed locally is what
-            authenticates each request.
+            Your library and resume positions sync through Stremio itself. Aura Cloud knows you only by a hash made on this device, never your account id or auth key.
           </p>
           <button
             type="button"
@@ -2455,7 +2447,7 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
         {/* Approaching-quota hint */}
         {quotaPctTotal >= 95 && (
           <p className="text-amber-300/85 text-[11px]">
-            Approaching the {formatBytes(status.quota)} per-account quota. Consider clearing old data via the destructive action below.
+            Nearly at the {formatBytes(status.quota)} per-account limit. Clear cloud sync data below to free space.
           </p>
         )}
 
@@ -2524,11 +2516,7 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
 
         {/* Privacy footer */}
         <p className="text-white/35 text-[10.5px] leading-relaxed pt-2 border-t border-white/6">
-          Cloud Sync uses a derived hash of your Stremio account id (SHA-256,
-          computed locally, never sent) as the storage key. Neither your raw
-          account id nor your auth_key ever reaches the proxy. Your Stremio
-          library and resume positions are not synced here - Stremio's own cloud
-          handles those.
+          Aura Cloud stores your data under a hash of your Stremio account id made on this device; your account id and auth key never reach it. Your library and resume positions sync through Stremio itself.
         </p>
 
         {/* Purge confirm modal */}
@@ -2538,10 +2526,7 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
                             shadow-[0_18px_42px_-12px_rgba(0,0,0,0.75)]">
               <h3 className="text-white/95 text-sm font-semibold tracking-wide">Clear cloud sync data?</h3>
               <p className="text-white/55 text-xs leading-relaxed">
-                This permanently deletes all your synced data on the Aura Cloud proxy.
-                Local state stays intact - your settings, queue, and marks remain on
-                this device. Other devices will pull this device's state on their next
-                sync.
+                Permanently deletes everything synced to Aura Cloud. This device keeps its settings, queue and marks, and other devices get this device's copy on their next sync.
               </p>
               <div className="flex items-center justify-end gap-2 pt-2">
                 <button
@@ -2824,12 +2809,7 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
         </div>
 
         <p className="text-white/55 text-xs leading-relaxed">
-          Diagnostic surface for the mpv playback engine. Live state
-          refreshes once per second; the drop-rate test reads mpv's own
-          counters at the start and end of a timed window. If nothing is
-          playing when you click Run, the test auto-loads a synthetic
-          SMPTE-bars pattern via mpv's lavfi source so you don't have
-          to set up a stream first.
+          Live playback engine state, refreshed every second, plus a timed frame-drop test. If nothing is playing, the test loads a built-in test pattern.
         </p>
 
       {/* Engine + window */}
@@ -2941,13 +2921,7 @@ function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void })
           Off-focus drop test
         </p>
         <p className="text-white/55 text-[12px] leading-relaxed">
-          Click <span className="text-white/80">Run test</span> - if nothing
-          is playing, a synthetic SMPTE-bars pattern auto-loads via mpv's
-          lavfi source (no file, no network). Then move Aura to the state
-          you want to measure (alt-tab away, drag to another monitor,
-          minimise, etc.) and leave it there until the timer expires. The
-          result captures total drops and rate over the window, plus the
-          present-mode at start and end.
+          Click <span className="text-white/80">Run test</span>, then leave Aura in the state you want to measure (alt-tabbed away, minimised, on another monitor) until the timer ends. Shows drops, drop rate and present mode at start and end.
         </p>
         <div className="mt-3 flex items-center gap-3 flex-wrap">
           <label className="text-white/55 text-[12px]">Duration</label>
@@ -4016,12 +3990,15 @@ const MOUSE_BTN_LABELS: Record<number, string> = {
  *  rejected - left selects/navigates, right is the card context menu.
  *  Esc cancels capture. Mirrors KeybindRow's capture UX. */
 function MouseBindRow({
-  label, description, button, onChange,
+  label, description, button, onChange, bare = false,
 }: {
   label: string;
   description: string;
   button: number;
   onChange: (next: 1 | 3 | 4) => void;
+  /** Inside an AttachedSettings box: no border of its own, so it does not
+   *  read as a box inside a box. */
+  bare?: boolean;
 }) {
   const [capturing, setCapturing] = useState(false);
 
@@ -4053,11 +4030,14 @@ function MouseBindRow({
   return (
     <button
       onClick={() => setCapturing(true)}
+      data-settings-row=""
+      data-settings-label={label}
+      data-settings-description={description}
       className={`w-full flex items-center justify-between gap-4 px-3 py-2.5 rounded-lg
                   text-left transition-colors
                   ${capturing
                     ? "bg-ln-accent/15 border border-ln-accent/40"
-                    : "hover:bg-white/5 border border-white/8"
+                    : bare ? "hover:bg-white/5 border border-transparent" : "hover:bg-white/5 border border-white/8"
                   }`}
     >
       <div className="flex-1 min-w-0">
@@ -4111,16 +4091,16 @@ const USES_DEVICE_FLOW: Record<ScrobbleService, boolean> = {
  *  deadline passing (180 days with no silent refresh), not its 7-day access
  *  token, which renews itself. */
 const EXPIRED_COPY: Record<ScrobbleService, string> = {
-  trakt: "Trakt token expired. Click Connect to re-authorize.",
-  anilist: "AniList token expired. AniList does not support refresh, so click Connect to re-authorize.",
-  simkl: "Simkl sign-in has lapsed after months without a scrobble. Click Reconnect to sign in again.",
+  trakt: "Trakt sign-in expired. Click Reconnect.",
+  anilist: "AniList sign-in expired (AniList cannot renew it automatically). Click Reconnect.",
+  simkl: "Simkl sign-in lapsed after months without a scrobble. Click Reconnect.",
 };
 
 /** The row's line for a token inside its provider's stale window. */
 const STALE_COPY: Record<ScrobbleService, string> = {
   trakt: "Token expires soon. Aura renews it automatically on the next scrobble; reconnect only if it lapses first.",
   anilist: "AniList token expires within a week. Reconnect to extend (no automatic renewal).",
-  simkl: "Simkl will ask you to sign in again within a week. Finishing anything with scrobbling on renews it; otherwise reconnect when convenient.",
+  simkl: "Simkl will ask you to sign in again within a week. Finishing anything with scrobbling on renews it.",
 };
 
 /** Format a Unix-seconds expiry into a "Mon DD, YYYY · HH:MM" string in
@@ -4764,9 +4744,7 @@ function ScrobbleAuthRow({
                         p-3 flex flex-col sm:flex-row sm:items-center gap-3">
           <div className="flex-1 min-w-0">
             <p className="text-white/70 text-[11px] leading-snug mb-1">
-              Trakt has opened in your browser - enter this code there to
-              authorize Aura, or scan the QR to approve from your phone.
-              Aura connects itself once you click Allow.
+              Enter this code on the Trakt page in your browser, or scan the QR to approve on your phone. Aura connects once you click Allow.
             </p>
             <div className="flex items-center gap-2">
               <code className="font-mono tracking-[0.25em] text-[15px]
@@ -4837,8 +4815,7 @@ function ScrobbleAuthRow({
       {pending && !deviceFlow && (
         <div className="mt-2 rounded-lg border border-ln-accent/25 bg-ln-accent/[0.06] p-3">
           <p className="text-white/70 text-[11px] leading-snug">
-            Finish signing in to {label} in your browser. Aura will connect
-            itself the moment you approve - you can leave this page open.
+            Finish signing in to {label} in your browser. Aura connects as soon as you approve.
           </p>
           <button
             type="button"
@@ -5239,7 +5216,7 @@ export default function SettingsView({ addons, session }: Props) {
   // `matchedIds` is a DOM-position index into the row NodeList; we
   // re-query the rows here rather than holding refs because rows
   // can unmount/remount across renders (conditionally-rendered
-  // sections like AutoAdvanceDelayRow).
+  // rows like HdrPeakNitsRow or the meta panel button).
   useEffect(() => {
     if (currentMatchIdx < 0) return;
     const idxStr = matchedIds[currentMatchIdx];
@@ -5443,7 +5420,7 @@ export default function SettingsView({ addons, session }: Props) {
             </AdvancedOnly>
             <SettingToggle
               label="Aura stream formatting"
-              description="Parse addon stream details into tidy chips (built for AIOStreams' TamTaro format). Turn off to show the addon's raw output, like Stremio. Also toggleable from the cog in the stream list, where Aura flags non-TamTaro output automatically."
+              description="Shows addon stream details as tidy chips (built for AIOStreams' TamTaro format). Off shows the addon's raw text, like Stremio. Also on the cog in the stream list."
               value={aura.useAuraStreamFormatter}
               onChange={(v) => setLocal({ useAuraStreamFormatter: v })}
             />
@@ -5492,42 +5469,42 @@ export default function SettingsView({ addons, session }: Props) {
           <Section id="sec-spoilers" title="Spoilers">
             <SettingToggle
               label="Hide the Main cast badge"
-              description="Some shows treat regular vs. guest billing as a plot beat (deaths, returns, surprise cameos): a face badged Main is a face that sticks around. When on, that badge is hidden from live-action cast tiles, leaving just the name and role. Anime character tiles carry their own Main badge from a different source and are unaffected."
+              description="Hides the Main badge on live-action cast tiles, since billing can give away who sticks around. Anime character tiles keep theirs."
               value={aura.hideCastSpoilers}
               onChange={(v) => setLocal({ hideCastSpoilers: v })}
             />
             <div className="h-px bg-white/6" />
             <SettingToggle
               label="Blur unwatched episode thumbnails"
-              description="Hide episode thumbnails behind a blur until the episode is marked watched (manually or auto-derived from playback progress). Useful for thrillers, mystery shows, and anime where the thumbnail itself spoils the episode."
+              description="Blurs episode thumbnails until the episode is watched (marked by you or from playback progress), on the detail page and in the player."
               value={aura.blurUnwatchedThumbnails}
               onChange={(v) => setLocal({ blurUnwatchedThumbnails: v })}
             />
             <div className="h-px bg-white/6" />
             <SettingToggle
               label="Blur selected episode synopsis"
-              description="Hide the per-episode synopsis text that appears below the show synopsis when you select an episode. Click to reveal per episode. Watched episodes always show their synopsis without blur - the content's no longer a spoiler. Useful for mystery / thriller / weekly-airing anime where the per-episode description gives away plot beats."
+              description="Blurs the selected episode's synopsis until you click it. Watched episodes are never blurred."
               value={aura.blurEpisodeSynopsis}
               onChange={(v) => setLocal({ blurEpisodeSynopsis: v })}
             />
             <div className="h-px bg-white/6" />
             <SettingToggle
               label="Blur theme song episode ranges"
-              description="Hide which episodes each opening and ending covers in an anime's Songs tab, until you click to reveal. Song titles and artists always stay visible. The range is the spoiler, since it gives away where a cour or story arc boundary falls."
+              description="Blurs which episodes each opening and ending covers in an anime's Songs tab until clicked, since ranges reveal where arcs end. Titles and artists stay visible."
               value={aura.blurThemeEpisodeRanges}
               onChange={(v) => setLocal({ blurThemeEpisodeRanges: v })}
             />
             <div className="h-px bg-white/6" />
             <SettingToggle
               label="Blur character portraits"
-              description="Hide character art and names in an anime's Cast tab until you click to reveal. Character art routinely gives away a later form, a redesign or a reveal, and a name can spoil that someone turns up at all."
+              description="Blurs character art and names in an anime's Cast tab until clicked. Both can give away later forms, reveals or who turns up."
               value={aura.blurCharacterArt}
               onChange={(v) => setLocal({ blurCharacterArt: v })}
             />
             <div className="h-px bg-white/6" />
             <SettingToggle
               label="Match artwork to your current story arc"
-              description="Use story-arc key art for Continue Watching tiles and the detail page backdrop, following the latest arc you have progress in. Adds spoiler risk rather than removing it: arc artwork can show a character, form or event you have not reached yet. Arc artwork comes from each show's fan wiki, so only some shows have it; everything else keeps its usual artwork."
+              description="Uses key art from the latest story arc you have progress in on Continue Watching tiles and the detail backdrop. Adds spoiler risk: arc art can show what you have not reached. Only some shows have it (from their fan wiki)."
               value={aura.arcAwareArt}
               onChange={(v) => setLocal({ arcAwareArt: v })}
             />
@@ -5543,7 +5520,7 @@ export default function SettingsView({ addons, session }: Props) {
           <Section id="sec-hover-panel" title="Hover Meta Panel">
             <SettingDropdown
               label="How the meta panel opens"
-              description="The mini-meta panel (poster, ratings, plot, cast) beside a catalog card. Hover opens it on mouse-over; Mouse button opens it on a bound button press; Press & hold opens it on a long-press of a poster - best for trackpads."
+              description="When the mini-meta panel beside a catalog card opens: on hover, on a mouse button you choose, or on a long press of a poster (best for trackpads)."
               value={aura.metaPanelActivation}
               required
               options={[
@@ -5556,25 +5533,24 @@ export default function SettingsView({ addons, session }: Props) {
               }}
             />
             {aura.metaPanelActivation === "button" && (
-              <>
-                <div className="h-px bg-white/6" />
+              <AttachedSettings>
                 <MouseBindRow
                   label="Meta panel button"
-                  description="Mouse button that opens / dismisses the panel. Middle, Back, or Forward only - left stays select/navigate and right stays the context menu. Click the chip, then press the button. Esc cancels."
+                  description="The button that opens and closes the panel (Middle, Back or Forward). Click the chip, then press that button; Esc cancels."
+                  bare
                   button={aura.metaPanelBindButton}
                   onChange={(b) => setLocal({ metaPanelBindButton: b })}
                 />
-              </>
+              </AttachedSettings>
             )}
             {aura.metaPanelActivation === "hold" && (
-              <>
-                <div className="h-px bg-white/6" />
+              <AttachedSettings>
                 <p className="text-white/40 text-xs leading-relaxed px-0.5">
                   Press and hold the left button (or tap-and-hold on a trackpad) on a poster
                   for about 0.4&nbsp;s to open the panel. A quick click still selects. Esc or a
                   click elsewhere closes it.
                 </p>
-              </>
+              </AttachedSettings>
             )}
           </Section>
 
@@ -5586,7 +5562,7 @@ export default function SettingsView({ addons, session }: Props) {
           <Section id="sec-open-links" title="Open Links">
             <SettingToggle
               label="Open external links in my browser"
-              description="When on, the right-click “Open in…” links (IMDb, MyAnimeList, Trakt, etc.) open in your default system browser instead of Aura's in-app popup. Off by default - links stay in-app."
+              description="Opens the right-click “Open in…” links (IMDb, MyAnimeList, Trakt and more) in your default browser instead of Aura's in-app popup."
               value={aura.openLinksExternally}
               onChange={(v) => setLocal({ openLinksExternally: v })}
             />
@@ -5605,7 +5581,7 @@ export default function SettingsView({ addons, session }: Props) {
                 description={
                   // Keep this short - the user reading this is debugging
                   // playback colour, not learning colour science.
-                  "Pick what to do with HDR sources. \"Tone-map for SDR\" is the safe default for laptop / desktop monitors. \"Passthrough\" outputs HDR (requires HDR enabled in Windows) with mpv tone-mapping to your panel's peak - set the nits below to your panel's real peak if highlights clip. Mode changes fully apply from the next playback. \"Off\" disables all HDR processing."
+                  "How to handle HDR video. Tone-map (recommended) converts it to SDR for a normal monitor. Passthrough sends HDR to an HDR display (turn HDR on in Windows first) and adds a peak-brightness (nits) setting for clipped highlights. Off skips HDR processing. Changes apply fully from the next playback."
                 }
                 value={(() => {
                   const m = (backend.hdr_mode ?? "").trim().toLowerCase();
@@ -5628,8 +5604,7 @@ export default function SettingsView({ addons, session }: Props) {
                 }}
               />
               {(backend.hdr_mode ?? "").trim().toLowerCase() === "passthrough" && (
-                <>
-                  <div className="h-px bg-white/6" />
+                <AttachedSettings>
                   <HdrPeakNitsRow
                     value={backend.hdr_target_peak_nits ?? 0}
                     onChange={async (v) => {
@@ -5641,12 +5616,12 @@ export default function SettingsView({ addons, session }: Props) {
                       invoke("apply_hdr_settings", { mode: "passthrough" }).catch(() => {});
                     }}
                   />
-                </>
+                </AttachedSettings>
               )}
               <div className="h-px bg-white/6" />
               <SettingSlider
                 label="Seek step"
-                description="How far one press of Seek Back / Seek Forward moves the playhead. Applies to the arrow keys (or whatever you have those actions bound to) and to the two skip buttons either side of Play, which relabel themselves to match. Default 5 seconds: 10 tends to overshoot the line of dialogue you were going back for."
+                description="How far Seek Back / Seek Forward jump, from the arrow keys (or your bindings) and the skip buttons beside Play. Default 5 s."
                 value={aura.seekStepSeconds}
                 min={1}
                 max={60}
@@ -5662,31 +5637,58 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Auto-advance to next episode"
-                description="At the end of an episode, start the next one automatically after a short countdown on the end-of-episode screen. After-credits scenes and previews always play first. Mouse movement, any key press or scrolling cancels the countdown, and closing the Next Up card turns it off for that episode. Default off."
+                description="Starts the next episode after a countdown on the end screen. After-credits scenes and previews play first. Any mouse, key or scroll input cancels it; closing the Next Up card turns it off for that episode."
                 value={aura.autoAdvanceNextEpisode}
                 onChange={(v) => setLocal({ autoAdvanceNextEpisode: v })}
               />
-              {aura.autoAdvanceNextEpisode && (
-                <>
-                  <div className="h-px bg-white/6" />
-                  <AutoAdvanceDelayRow
-                    value={aura.autoAdvanceDelaySeconds}
-                    onChange={(v) => setLocal({ autoAdvanceDelaySeconds: v })}
-                  />
-                  <div className="h-px bg-white/6" />
-                  <SettingToggle
-                    label={'"Still watching?" check'}
-                    description="Once a few episodes have auto-played in a row with no input, pause and ask if you're still watching instead of starting the next one - so a binge chain doesn't run all night against your debrid quota. Resets the moment you continue or exit. Default on."
-                    value={aura.stillWatchingGate}
-                    onChange={(v) => setLocal({ stillWatchingGate: v })}
-                  />
-                </>
-              )}
+              {/* The delay and the "Still watching?" check act only through
+                  the end-of-episode countdown, so they grey out with
+                  auto-advance off rather than unmount (an unmounted row cannot
+                  be searched). The filler / recap dropdown stays live: it also
+                  picks the canon episode the pre-scan reads, the Next Up card's
+                  Autoplay line and the caught-up vs finale call. */}
+              <AttachedSettings>
+                <AutoAdvanceDelayRow
+                  value={aura.autoAdvanceDelaySeconds}
+                  disabled={!aura.autoAdvanceNextEpisode}
+                  onChange={(v) => setLocal({ autoAdvanceDelaySeconds: v })}
+                />
+                <div className="h-px bg-white/6" />
+                <SettingToggle
+                  label={'"Still watching?" check'}
+                  description="After a few episodes auto-play in a row with no input, asks if you're still watching instead of starting the next, so a binge does not run all night on your debrid."
+                  value={aura.stillWatchingGate}
+                  disabled={!aura.autoAdvanceNextEpisode}
+                  onChange={(v) => setLocal({ stillWatchingGate: v })}
+                />
+                <div className="h-px bg-white/6" />
+                {/* Picks which button the unattended countdown presses
+                    (nextUp.ts autoSkipApplies). Requires AIOMetadata's
+                    per-episode `episodeKind` field; older metadata addons
+                    emit nothing for it and the filter becomes a no-op. */}
+                <SettingDropdown
+                  label="Auto-skip filler / recap during autoplay"
+                  description="When the next episode is filler or recap, autoplay skips to the next canon episode instead, marking the episodes in between as Skipped. Needs AIOMetadata's filler and recap flags."
+                  value={aura.nextUpSkipFillerRecap}
+                  required
+                  options={[
+                    { value: "none",   label: "Never auto-skip" },
+                    { value: "filler", label: "Auto-skip filler" },
+                    { value: "recap",  label: "Auto-skip recap" },
+                    { value: "both",   label: "Auto-skip both" },
+                  ]}
+                  onChange={(v) => {
+                    if (v === "none" || v === "filler" || v === "recap" || v === "both") {
+                      setLocal({ nextUpSkipFillerRecap: v });
+                    }
+                  }}
+                />
+              </AttachedSettings>
               <AdvancedOnly>
                 <div className="h-px bg-white/6" />
                 <SettingToggle
                   label="Audio passthrough (bitstream)"
-                  description="WASAPI exclusive mode + AC3/DTS/TrueHD bitstream output to an AVR or soundbar. Other audio apps will lose device access while Aura is open. Takes effect on next app restart."
+                  description="Sends AC3 / DTS / TrueHD untouched to an AVR or soundbar (WASAPI exclusive mode). Other apps lose the audio device while Aura is open. Needs a restart."
                   value={backend.audio_passthrough}
                   onChange={(v) => patchBackend({ audio_passthrough: v })}
                 />
@@ -5704,9 +5706,9 @@ export default function SettingsView({ addons, session }: Props) {
                   // screen, so the copy names the switch that brings it back.
                   backend.audio_passthrough
                     ? aura.showAdvancedSettings
-                      ? "Disabled while audio passthrough is active - bitstream output bypasses the audio filter chain. Turn passthrough off to use loudness normalization."
-                      : "Disabled while audio passthrough is active - bitstream output bypasses the audio filter chain. To use loudness normalization, turn on Show advanced settings, then turn Audio passthrough off."
-                    : "Evens out volume across sources so a quiet dialogue scene and a loud trailer sit at similar levels. Uses a real-time adaptive gain filter (mpv's dynaudnorm) that keeps working through seeks instead of re-settling after every skip. Installed when the player starts, so it applies from the first frame."
+                      ? "Unavailable while Audio passthrough is on (bitstream skips audio filters). Turn passthrough off to use it."
+                      : "Unavailable while Audio passthrough is on (bitstream skips audio filters). To use it, turn on Show advanced settings, then turn Audio passthrough off."
+                    : "Evens out volume so quiet dialogue and loud scenes sit at similar levels, and keeps working through seeks."
                 }
                 value={aura.loudnessNormalization && !backend.audio_passthrough}
                 onChange={(v) => {
@@ -5718,7 +5720,7 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SettingDropdown
                 label="Trailer quality"
-                description="Preferred quality for the Watch Trailer player. Video and audio usually arrive as separate DASH streams that the player muxes together, falling back to a single muxed file when the trailer has no DASH. Auto picks the best available. Falls back to the best the trailer offers, and you can change it per trailer from the player's quality menu."
+                description="Preferred quality for Watch Trailer. A trailer without it plays the best it offers; change it per trailer from the player's quality menu."
                 required
                 value={backend.trailer_quality ?? "1080"}
                 options={[
@@ -5734,7 +5736,7 @@ export default function SettingsView({ addons, session }: Props) {
                 <div className="h-px bg-white/6" />
                 <SettingSlider
                   label="Forward buffer (seconds)"
-                  description="How many seconds of video to buffer ahead (mpv cache + readahead). Higher = smoother on bursty / high-latency links, at the cost of RAM. Most people never need to touch this. Applies immediately, including to a stream that is already playing."
+                  description="Seconds of video to buffer ahead (cache). Higher rides out slow or bursty links but uses more RAM. Applies immediately, even mid-stream."
                   value={backend.cache_secs ?? 180}
                   min={30}
                   max={600}
@@ -5745,21 +5747,20 @@ export default function SettingsView({ addons, session }: Props) {
                     invoke("apply_buffer_settings", { cacheSecs: v, readaheadSecs: ra, maxMib: backend.demuxer_max_mib ?? 768 }).catch(() => {});
                   }}
                 />
-              </AdvancedOnly>
-              <AdvancedOnly>
-                <div className="h-px bg-white/6" />
-                <SettingSlider
-                  label="Forward buffer memory cap"
-                  description="Hard ceiling on buffered-ahead RAM (mpv demuxer-max-bytes). The seconds value above is usually the binding limit; raise this only if 4K remuxes underrun mid-playback. Each step is real memory. Applies immediately."
-                  value={backend.demuxer_max_mib ?? 768}
-                  min={128}
-                  max={2048}
-                  suffix=" MiB"
-                  onChange={(v) => {
-                    patchBackend({ demuxer_max_mib: v });
-                    invoke("apply_buffer_settings", { cacheSecs: backend.cache_secs ?? 180, readaheadSecs: backend.demuxer_readahead_secs ?? 120, maxMib: v }).catch(() => {});
-                  }}
-                />
+                <AttachedSettings>
+                  <SettingSlider
+                    label="Forward buffer memory cap"
+                    description="Most RAM the forward buffer may use. The seconds above usually limit first; raise this only if 4K remuxes stall mid-playback. Applies immediately."
+                    value={backend.demuxer_max_mib ?? 768}
+                    min={128}
+                    max={2048}
+                    suffix=" MiB"
+                    onChange={(v) => {
+                      patchBackend({ demuxer_max_mib: v });
+                      invoke("apply_buffer_settings", { cacheSecs: backend.cache_secs ?? 180, readaheadSecs: backend.demuxer_readahead_secs ?? 120, maxMib: v }).catch(() => {});
+                    }}
+                  />
+                </AttachedSettings>
               </AdvancedOnly>
               <AdvancedOnly>
                 <div className="h-px bg-white/6" />
@@ -5807,7 +5808,7 @@ export default function SettingsView({ addons, session }: Props) {
                 <div className="h-px bg-white/6" />
                 <SettingToggle
                   label="Motion interpolation"
-                  description="mpv's built-in GPU frame interpolation (video-sync=display-resample). Smooths low-frame-rate content (24 fps film, anime) on a high-refresh display. GPU-cheap. Tune the look with the kernel dropdown below. Applies to anime only - it is skipped on live-action, where it adds judder."
+                  description="Smooths anime on a high-refresh display with light GPU frame interpolation. Anime only: skipped on live action, where it adds judder. Also in the player's menu."
                   value={!!aura.motionInterpolation}
                   onChange={(v) => {
                     // Persist ONLY - do not apply live from Settings. Interp is
@@ -5820,27 +5821,30 @@ export default function SettingsView({ addons, session }: Props) {
                     setLocal({ motionInterpolation: v });
                   }}
                 />
-                <SettingDropdown
-                  label="Interpolation kernel (smoothness)"
-                  description="The tscale kernel - the smoothness dial. 'oversample' only fixes cadence judder and synthesises no in-between motion, so it looks barely interpolated (especially when your refresh rate is an exact multiple of the video fps). The blending kernels add visibly smoother motion with progressively more softening. Takes effect on the next stream you start; use the player's three-dots menu to change what is playing now."
-                  value={aura.interpolationTscale ?? "mitchell"}
-                  options={[
-                    { value: "oversample",  label: "Oversample - sharpest · judder-fix only (least obvious)" },
-                    { value: "catmull_rom", label: "Catmull-Rom - sharp · light smoothing" },
-                    { value: "mitchell",    label: "Mitchell - balanced smoothing (recommended)" },
-                    { value: "gaussian",    label: "Gaussian - smooth · soft" },
-                    { value: "bicubic",     label: "Bicubic - smoothest · softest" },
-                  ]}
-                  required
-                  onChange={(v) => {
-                    const k = v || "mitchell";
-                    // Persist ONLY - see the Motion-interpolation toggle above.
-                    // Applying live here would push interpolation onto whatever
-                    // is playing without the anime gate; the kernel takes effect
-                    // on the next play via the gated load path.
-                    setLocal({ interpolationTscale: k });
-                  }}
-                />
+                <AttachedSettings>
+                  <SettingDropdown
+                    label="Interpolation kernel (smoothness)"
+                    description="How smooth interpolated motion looks. Oversample only fixes judder; the others add smoother motion with more softening. Applies from the next stream you start."
+                    value={aura.interpolationTscale ?? "mitchell"}
+                    options={[
+                      { value: "oversample",  label: "Oversample - sharpest · judder-fix only (least obvious)" },
+                      { value: "catmull_rom", label: "Catmull-Rom - sharp · light smoothing" },
+                      { value: "mitchell",    label: "Mitchell - balanced smoothing (recommended)" },
+                      { value: "gaussian",    label: "Gaussian - smooth · soft" },
+                      { value: "bicubic",     label: "Bicubic - smoothest · softest" },
+                    ]}
+                    required
+                    disabled={!aura.motionInterpolation}
+                    onChange={(v) => {
+                      const k = v || "mitchell";
+                      // Persist ONLY - see the Motion-interpolation toggle above.
+                      // Applying live here would push interpolation onto whatever
+                      // is playing without the anime gate; the kernel takes effect
+                      // on the next play via the gated load path.
+                      setLocal({ interpolationTscale: k });
+                    }}
+                  />
+                </AttachedSettings>
               </AdvancedOnly>
             </Section>
           )}
@@ -5855,14 +5859,14 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Avoid dubs"
-                description="Heavily penalise audio tracks whose title indicates a dub. Use when you want the title's original audio even when a dub matches your preferred language list."
+                description="Prefers the original audio over tracks titled as dubs, even when a dub matches your language list."
                 value={backend.avoid_dubs}
                 onChange={(v) => patchBackend({ avoid_dubs: v })}
               />
               <div className="h-px bg-white/6" />
               <SettingText
                 label="Your region (optional)"
-                description="ISO 3166-1 alpha-2 (e.g. US, GB, MX). Used as a tiebreaker when picking between regional dialect variants of the same language and the title's productionCountries don't disambiguate. Leave empty for no preference."
+                description="Two-letter ISO country code (e.g. US, GB, MX). Breaks ties between regional versions of one language when the title's own country does not decide."
                 value={backend.user_region}
                 placeholder="e.g. US"
                 onChange={(v) => patchBackend({ user_region: v.trim().toUpperCase() })}
@@ -5901,7 +5905,7 @@ export default function SettingsView({ addons, session }: Props) {
             <Section id="sec-subtitle-style" title="Subtitle Style">
               <SettingSlider
                 label="Font size"
-                description="Glyph height in MPV units. 45 is the default; bump up for ultrawide / TV viewing."
+                description="Subtitle text size. Default 45; raise it for TV or ultrawide viewing."
                 value={backend.subtitle_font_size}
                 min={20}
                 max={100}
@@ -5910,7 +5914,7 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SettingSlider
                 label="Vertical position"
-                description="0 = pinned to top, 100 = baseline at frame bottom, up to 150 to push past the natural bottom (useful for some ASS-styled tracks that add their own bottom margin)."
+                description="0 is the top of the frame, 100 the bottom. Go past 100 for styled (ASS) tracks that add their own bottom margin."
                 value={backend.subtitle_position}
                 min={0}
                 max={150}
@@ -5939,7 +5943,7 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SettingSlider
                 label="Subtitle brightness"
-                description="Dims white subtitles so they don't sear at peak brightness on HDR / OLED. 100 = the glyph colour above unchanged; lower it if subs glow too hot on bright scenes."
+                description="Dims subtitles so white text does not glare on HDR or OLED screens. 100 leaves the glyph colour unchanged."
                 value={backend.subtitle_brightness}
                 min={20}
                 max={100}
@@ -5971,95 +5975,70 @@ export default function SettingsView({ addons, session }: Props) {
           {backend && (
             <Section id="sec-anime-skip" title="Anime OP / ED Skip">
               <p className="text-white/40 text-xs">
-                Aura sources opening / ending / recap timestamps from the
-                AniSkip community database (anime with a MyAnimeList id),
-                IntroDB, the PublicMetaDB skip database, the file's own
-                chapters, and an on-device audio scan. For anime the scan
-                matches the show's theme songs (the "theme match"), and other
-                timings for that segment that disagree with a match are
-                dropped. A missing auto-skip beats a wrong one, so anything
-                Aura is not sure of only ever asks first. The modes below apply on anime and
-                live-action alike, except that some segments only ever prompt:
-                next-episode previews, Aura's own guesses, timings borrowed
-                from other episodes, openings that play over story scenes,
-                IntroDB timings not yet confirmed by several submissions, and
-                AniSkip endings (their timing can be off by about half a
-                minute). A theme-matched ending stops where the song does, so
-                an after-credits scene still plays. The audio scan is the
-                Automatic skip detection switch below (turn on Show advanced
-                settings to see it).
-                Per-type modes: <span className="text-white/65">off</span> offers
-                no skip for that segment, <span className="text-white/65">prompt</span> shows
-                a "Press X to skip" toast, <span className="text-white/65">auto</span> skips
-                without asking (once you are past a segment's halfway point, it
-                asks instead). The Skip Segment key (X by default, under
-                Keybindings) skips any segment playing now, including one
-                already auto-skipped that you went back into.
+                Skip times come from AniSkip, IntroDB, PublicMetaDB, chapters and Aura's own
+                audio scan (Automatic skip detection: turn on Show advanced settings). The
+                modes apply to live action too.{" "}
+                <span className="text-white/65">Off</span> offers no skip,{" "}
+                <span className="text-white/65">Prompt</span> shows a "Press X to skip" toast,{" "}
+                <span className="text-white/65">Auto</span> skips by itself, but anything uncertain,
+                or a segment you are past halfway through, asks first. The Skip Segment key (X by
+                default, under Keybindings) skips whatever is playing now.
               </p>
               <SkipConfidenceLegend />
               <div className="h-px bg-white/6" />
               <SkipModeRow
                 label="Openings (OP)"
-                description="The opening theme. Prompt by default. On Auto, an opening skips by itself when its timing is trusted. It asks instead when, for example, the opening plays over story scenes, is borrowed from other episodes or guessed, comes from IntroDB timings not yet confirmed by several submissions, was timed on a different cut of the episode, or (on a title with no theme match, such as live action) nothing else confirms it, and while the theme match is still checking it. The prompt says why when it asks."
+                description="Prompt by default. On Auto, an opening skips by itself only when its timing is trusted; otherwise (an uncertain source, or while the theme match is still checking) it asks, and the prompt says why."
                 value={backend.skip_op_mode}
                 onChange={(v) => patchBackend({ skip_op_mode: v })}
               />
+              {/* Advanced child of a visible row: the AdvancedOnly wraps the
+                  whole box, so hiding it leaves no empty box behind. */}
+              <AdvancedOnly>
+                <AttachedSettings>
+                  <SettingToggle
+                    label="Treat mixed-OP as OP"
+                    description="Label AniSkip's mixed-op times (a recap bundled into the opening) as an opening. Either way they follow your OP mode."
+                    value={backend.skip_treat_mixed_op_as_op}
+                    onChange={(v) => patchBackend({ skip_treat_mixed_op_as_op: v })}
+                  />
+                </AttachedSettings>
+              </AdvancedOnly>
               <div className="h-px bg-white/6" />
               <SkipModeRow
                 label="Endings (ED)"
-                description="Endings often contain next-episode previews; prompt by default. On Auto, an ending skips by itself when it comes from the theme match (unless its song also plays over story), a chapter named as the ending, IntroDB or PublicMetaDB; AniSkip endings, guesses, IntroDB timings not yet confirmed by several submissions and an ending chapter that runs to the very end of the file (it may hold a scene after the credits) are among the cases that only prompt, and the prompt says why. A theme-matched ending stops where the song does, so an after-credits scene still plays. When the file's chapters mark a next-episode preview, it gets its own Skip Preview prompt, never skips by itself, and is hidden while this is Off. Off never skips or prompts an ending, but while the Next Up card is on Aura still finds it, so the card can appear as the ending begins."
+                description="Prompt by default. On Auto, a trusted ending skips by itself; uncertain ones (such as AniSkip endings) only ask. A theme-matched ending stops where the song does, so after-credits scenes still play. Previews get their own Skip Preview prompt, never automatic. Off hides both prompts; the Next Up card still uses the ending."
                 value={backend.skip_ed_mode}
                 onChange={(v) => patchBackend({ skip_ed_mode: v })}
               />
               <div className="h-px bg-white/6" />
               <SkipModeRow
                 label="Recaps"
-                description="Pure recap segments at episode start. Prompt by default for first-time viewers. On Auto, a recap skips by itself only when a chapter or a second source agrees on it, or it runs right up to a matched opening; otherwise it asks."
+                description="Prompt by default. On Auto, a recap skips by itself only when a chapter or a second source agrees, or it ends right where a matched opening starts; otherwise it asks."
                 value={backend.skip_recap_mode}
                 onChange={(v) => patchBackend({ skip_recap_mode: v })}
               />
               <AdvancedOnly>
                 <div className="h-px bg-white/6" />
                 <SettingToggle
-                  label="Treat mixed-OP as OP"
-                  description="AniSkip's `mixed-op` results bundle a recap into the opening. This only controls whether they are labelled as an opening; either way they are handled with your OP mode."
-                  value={backend.skip_treat_mixed_op_as_op}
-                  onChange={(v) => patchBackend({ skip_treat_mixed_op_as_op: v })}
-                />
-              </AdvancedOnly>
-              <AdvancedOnly>
-                <div className="h-px bg-white/6" />
-                <SettingToggle
                   label="Automatic skip detection"
-                  description="Find the opening and ending in the episode's own audio. For anime Aura can identify on MyAnimeList, it matches the show's theme songs from AnimeThemes on every episode: a match can auto-skip, and other timings more than 3 seconds away from it are dropped. Each theme song is downloaded once and only a fingerprint of it is kept. Where there is no theme song to match (most other series, or a season AnimeThemes does not list), Aura guesses a part nothing else covered from the audio, and a guess only ever prompts. Reads up to the first ten minutes and the last eight of the stream, leaving out an opening you set to Off; an ending set to Off is still read while the Next Up card is on, to time the card (anime Aura can identify on MyAnimeList, episodes of 19 minutes or more, and never a reason to download ffmpeg). On a first play the full match needs most of the song read first; before that, as soon as the song's first seconds match, an opening shows a Skip prompt, and it only skips by itself once the whole song is confirmed. Replays use the cache. When Aura looks up the next episode, it also fetches that episode's theme songs ahead of time (about 2 MB each; only the fingerprint is kept). ffmpeg downloads once (~97 MB) the first time it is needed. Turned off, Aura still reads the stream's header once when ffmpeg is already installed, to find where the episode really ends for autoplay. Per-type auto / prompt / off is still set above."
+                  description="Finds the opening and ending in the episode's own audio. For anime on MyAnimeList it matches the show's theme songs from AnimeThemes (a match can auto-skip); elsewhere it can only guess, and a guess only prompts. Reads the first 10 and last 8 minutes of the stream. Needs ffmpeg (~97 MB, downloaded once)."
                   value={aura.autoSkipDetect}
                   onChange={(v) => setLocal({ autoSkipDetect: v })}
                 />
+                {/* The pre-scan runs the same detector, and reads the stream
+                    the Next-Up card pre-resolves, so it means nothing with
+                    either off. Both rows are advanced: one unit. */}
+                <AttachedSettings>
+                  <SettingToggle
+                    label="Pre-scan the next episode"
+                    description="Reads the next anime episode's stream in the background once this episode's skip detection is done and its stream is steady, so its skips are ready when it starts. Uses extra bandwidth and a second debrid connection: turn it off on a slow or metered link. Needs Next-Up lead time above 0 (Video & Audio)."
+                    value={aura.prescanNextEpisode}
+                    disabled={!aura.autoSkipDetect || (backend.next_up_lead_seconds ?? 60) <= 0}
+                    onChange={(v) => setLocal({ prescanNextEpisode: v })}
+                  />
+                </AttachedSettings>
               </AdvancedOnly>
-              <div className="h-px bg-white/6" />
-              {/* Next-Up filler/recap skip - lives here because users
-                  who care about OP/ED skipping typically also care
-                  about not auto-advancing into filler. Requires
-                  AIOMetadata's per-episode `episodeKind` field; older
-                  metadata addons emit nothing for this field and the
-                  filter becomes a no-op (every candidate passes). */}
-              <SettingDropdown
-                label="Auto-skip filler / recap during autoplay"
-                description="Decides which button the end-of-episode countdown presses when the next episode is filler or recap. Off, it counts down on Play next and the filler plays. Set to filler, recap or both, it counts down on Skip instead and jumps to the next canon episode. Either way the buttons are always both there, so you can override it for any single episode. Skipping marks every episode it jumped as Skipped and logs them to History; if you pressed Skip yourself and automatic scrobbling is on they are also sent to your connected scrobbling services as watched, since none of them can represent a skip. An unattended skip marks locally and sends nothing. Requires AIOMetadata per-episode filler and recap flags; without them nothing is ever flagged and no skip button appears."
-                value={aura.nextUpSkipFillerRecap}
-                required
-                options={[
-                  { value: "none",   label: "Never auto-skip" },
-                  { value: "filler", label: "Auto-skip filler" },
-                  { value: "recap",  label: "Auto-skip recap" },
-                  { value: "both",   label: "Auto-skip both" },
-                ]}
-                onChange={(v) => {
-                  if (v === "none" || v === "filler" || v === "recap" || v === "both") {
-                    setLocal({ nextUpSkipFillerRecap: v });
-                  }
-                }}
-              />
             </Section>
           )}
 
@@ -6099,14 +6078,14 @@ export default function SettingsView({ addons, session }: Props) {
                   {/* The hold option belongs to this key, so it sits under
                       its row rather than among the Next Up settings. */}
                   {a.id === "play-next-episode" && (
-                    <div className="ml-5 rounded-lg border border-white/8 bg-white/[0.02] px-3 py-2.5">
+                    <AttachedSettings>
                       <SettingToggle
                         label="Hold to skip filler / recap"
-                        description="When the Next Up card offers a skip past filler or recap, this key has to be held for 2 seconds to skip, with the card showing the episode it will land on, so a skip that marks several episodes is never a slip of the finger. Off, one press skips. Default on."
+                        description="When the Next Up card offers to skip filler or recap, hold this key for 2 seconds to skip (the card shows where it will land). Off, one press skips. With automatic scrobbling on, episodes you skip are sent to your scrobbling services as watched."
                         value={aura.nextUpHoldToSkip}
                         onChange={(v) => setLocal({ nextUpHoldToSkip: v })}
                       />
-                    </div>
+                    </AttachedSettings>
                   )}
                   </Fragment>
                 ))}
@@ -6137,7 +6116,7 @@ export default function SettingsView({ addons, session }: Props) {
                 so OS-pref users never see the BootSplash sweep. */}
             <SettingDropdown
               label="Reduce motion"
-              description="Disable Aura's decorative ambient animations (title-bar sweep, backdrop drift, sidebar glow pulse, bell ring + bounce). Auto follows the OS setting; Always forces motion off regardless of OS; Never forces motion on even if the OS asked for reduce."
+              description="Turns off decorative ambient animations (title-bar sweep, backdrop drift, glow pulses, bell ring). Auto follows your OS setting."
               value={aura.reduceMotion}
               options={[
                 { value: "auto",   label: "Auto - follow OS setting" },
@@ -6154,7 +6133,7 @@ export default function SettingsView({ addons, session }: Props) {
             <Section id="sec-window" title="Window & System">
               <SettingToggle
                 label="Minimize to tray on close"
-                description="Hide Aura to a tray icon when you click the close button instead of exiting. Click the tray icon to bring the window back, or right-click it for Quit. To exit without going to the tray first, press and hold the close button for a second."
+                description="Closing hides Aura to the tray instead of quitting. Click the tray icon to reopen it, or right-click it for Quit. Hold the close button for a second to quit anyway."
                 value={backend.minimize_to_tray_on_close}
                 onChange={(v) => patchBackend({ minimize_to_tray_on_close: v })}
               />
@@ -6164,13 +6143,16 @@ export default function SettingsView({ addons, session }: Props) {
           {/* Downloads */}
           {backend && (
             <Section id="sec-downloads" title="Downloads">
-              <div className="px-1 py-3" data-settings-label="Download folder">
+              <div
+                className="px-1 py-3"
+                data-settings-row=""
+                data-settings-label="Download folder"
+                data-settings-description="Where downloaded files are saved. Leave blank to be asked on your first download. It stays on this computer and is never synced."
+              >
                 <p className="text-white/75 text-sm font-medium">Download folder</p>
                 <p className="text-white/45 text-[12.5px] leading-snug mt-0.5 mb-2">
-                  Where files saved from a title's source list are written. If you
-                  leave this blank, Aura asks the first time you download something.
-                  This folder stays on this computer: it is never synced to your
-                  other devices, since a drive letter rarely means the same thing twice.
+                  Where downloaded files are saved. Leave blank to be asked on your first
+                  download. It stays on this computer and is never synced.
                 </p>
                 <div className="flex items-center gap-2">
                   <input
@@ -6214,7 +6196,7 @@ export default function SettingsView({ addons, session }: Props) {
               <div className="h-px bg-white/6" />
               <SettingToggle
                 label="Sort downloads into folders"
-                description="Save as Show Name/Season 01/Show Name - S01E07 - Episode Title.mkv, and movies as Dune (2021)/Dune (2021).mkv. This is the layout Plex and Jellyfin expect, so the folder stays useful outside Aura. Turn it off to drop every file straight into the download folder under its original release name."
+                description="Saves episodes as Show/Season 01/Show - S01E07 - Title.mkv and movies as Dune (2021)/Dune (2021).mkv, the layout Plex and Jellyfin expect. Off, files keep their release name in the download folder."
                 value={backend.download_organise ?? true}
                 onChange={(v) => patchBackend({ download_organise: v })}
               />
@@ -6228,37 +6210,41 @@ export default function SettingsView({ addons, session }: Props) {
             <Section id="sec-discord" title="Discord Rich Presence">
               <SettingToggle
                 label="Show what I'm watching"
-                description="Publish playback details to Discord."
+                description="Publishes playback details to Discord. Set the options below first to keep titles private."
                 value={backend.discord_rpc_enabled}
                 onChange={(v) => patchBackend({ discord_rpc_enabled: v })}
               />
-              <div className="h-px bg-white/6" />
-              <SettingToggle
-                label="Show titles in presence"
-                description="When off, playback shows only 'Watching Aura' with no title or artwork. Browse states are unaffected - turn those off separately below."
-                value={backend.discord_rpc_show_titles}
-                onChange={(v) => patchBackend({ discord_rpc_show_titles: v })}
-              />
-              <div className="h-px bg-white/6" />
-              <SettingToggle
-                label="Show what I'm browsing"
-                description="Publish presence for every non-playback screen: Home, Discover, Library, Queue, Airing, Live TV, Calendar, History, Add-ons, Settings, Search and Detail. When off, Discord only lights up while a stream is playing."
-                value={backend.discord_rpc_browse_states}
-                onChange={(v) => patchBackend({ discord_rpc_browse_states: v })}
-              />
-              <div className="h-px bg-white/6" />
-              <SettingText
-                label="Privacy: blocked titles"
-                description="Comma-separated list. These titles never appear in your Discord status."
-                value={backend.discord_rpc_blocked_titles.join(", ")}
-                placeholder="e.g. Sensitive Show, Another Title"
-                onChange={(v) => patchBackend({
-                  discord_rpc_blocked_titles: v
-                    .split(",")
-                    .map((s) => s.trim())
-                    .filter((s) => s.length > 0),
-                })}
-              />
+              {/* window_logic.rs clears all presence before reading any of
+                  these when the master switch is off. They stay live anyway,
+                  so a user can hide titles BEFORE turning presence on. */}
+              <AttachedSettings>
+                <SettingToggle
+                  label="Show titles in presence"
+                  description="Off, playback shows only 'Watching Aura' with no title or artwork. Browsing has its own switch."
+                  value={backend.discord_rpc_show_titles}
+                  onChange={(v) => patchBackend({ discord_rpc_show_titles: v })}
+                />
+                <div className="h-px bg-white/6" />
+                <SettingToggle
+                  label="Show what I'm browsing"
+                  description="Also show presence on screens other than the player (Home, Library, Search and the rest). Off, Discord only shows Aura while something plays."
+                  value={backend.discord_rpc_browse_states}
+                  onChange={(v) => patchBackend({ discord_rpc_browse_states: v })}
+                />
+                <div className="h-px bg-white/6" />
+                <SettingText
+                  label="Privacy: blocked titles"
+                  description="Comma-separated list. These titles never appear in your Discord status."
+                  value={backend.discord_rpc_blocked_titles.join(", ")}
+                  placeholder="e.g. Sensitive Show, Another Title"
+                  onChange={(v) => patchBackend({
+                    discord_rpc_blocked_titles: v
+                      .split(",")
+                      .map((s) => s.trim())
+                      .filter((s) => s.length > 0),
+                  })}
+                />
+              </AttachedSettings>
             </Section>
           )}
 
@@ -6274,41 +6260,33 @@ export default function SettingsView({ addons, session }: Props) {
               The ScrobbleAuthRows (Simkl included) add no AppSettings /
               AuraSettings field: the connections live in the keyring, per
               account, so export/import and cloud sync carry nothing for
-              them. The two toggles below (scrobble_enabled,
-              auto_scrobble_enabled) ARE backend settings, listed in
-              PORTABLE_BACKEND_FIELDS. */}
+              them. The toggle below (auto_scrobble_enabled) IS a backend
+              setting, listed in PORTABLE_BACKEND_FIELDS. */}
           {backend && (
             <Section id="sec-scrobble" title="Scrobbling">
               <ScrobbleAuthRow
                 service="trakt"
                 authKey={session?.auth_key ?? null}
-                description="Trakt receives playback progress for movies and series. Aura logs in directly via OAuth, no addon required. Nothing is sent while you watch: Aura adds the item to your Trakt history once, on completion (80 % progress with at least 5 min watched). The first 120 s of playback are a local preview window, so a stream you back out of never reaches your history. Marking an episode Skipped is the one exception: it sends immediately, with nothing played, because a skip is a decision that the episode is finished with."
+                description="Adds movies and episodes to your Trakt history once you finish them (80% through, with at least 5 minutes watched). Nothing is sent while you watch, except an episode you mark Skipped, which is sent right away."
               />
               <div className="h-px bg-white/6" />
               <ScrobbleAuthRow
                 service="anilist"
                 authKey={session?.auth_key ?? null}
-                description="AniList tracks anime episode progress. When connected, Aura updates your AniList list as you finish episodes; anime detection is automatic. AniList is additional to Trakt, not instead of it: an anime episode with an IMDb id is sent to both connected services."
+                description="Updates your AniList list as you finish anime episodes. Works alongside Trakt: an anime episode with an IMDb id goes to both."
               />
               <div className="h-px bg-white/6" />
               <ScrobbleAuthRow
                 service="simkl"
                 authKey={session?.auth_key ?? null}
-                description="Simkl keeps a history of the movies, series and anime you finish. Like Trakt, nothing is sent while you watch: Aura adds each item to your Simkl history once, on completion, and an episode you mark Skipped is sent straight away. Simkl is additional to the others, not instead of them: an anime episode goes to both AniList and Simkl, and a movie or series to both Trakt and Simkl."
+                description="Adds what you finish to your Simkl history, once per item (an episode marked Skipped is sent right away). Works alongside the others: anime also goes to AniList, movies and series to Trakt."
               />
               <div className="h-px bg-white/6" />
               <SettingToggle
-                label="Enable scrobbling"
-                description="Master switch. When off, Aura sends nothing automatically to any provider, useful for pausing without disconnecting your accounts. The History page's per-row and bulk scrobble buttons still send when you press them."
-                value={backend.scrobble_enabled}
-                onChange={(v) => patchBackend({ scrobble_enabled: v })}
-              />
-              <SettingToggle
                 label="Scrobble automatically"
-                description="On by default: Aura records what you watch as you finish it, and episodes you mark as Skipped. Turn this off to decide what gets recorded yourself - nothing is sent automatically, and the History page's per-item and bulk scrobbling keeps working either way."
+                description="Sends what you finish, and episodes you mark Skipped, to your connected services as you go. Off, nothing is sent until you press a scrobble button on the History page. Your accounts stay connected either way."
                 value={backend.auto_scrobble_enabled}
                 onChange={(v) => patchBackend({ auto_scrobble_enabled: v })}
-                disabled={!backend.scrobble_enabled}
               />
             </Section>
           )}
@@ -6335,7 +6313,7 @@ export default function SettingsView({ addons, session }: Props) {
                 endpoints require a signed-in scope hash. */}
             <SettingToggle
               label="Use Aura Cloud's shared release feed"
-              description="When on, Aura asks the cloud service whether new episodes have aired instead of probing addons from your machine. Faster library refresh and lower bandwidth, but the release feed sends Aura Cloud the imdb-ids in your library (the feed itself never sees streams or your Debrid keys). Signed-in only."
+              description="Asks Aura Cloud whether new episodes have aired instead of probing addons from this machine: faster and lighter, but it sends Aura Cloud the IMDb ids in your library (never streams or Debrid keys). Signed-in only."
               value={aura.releaseSearchEnabled}
               onChange={(v) => setLocal({ releaseSearchEnabled: v })}
             />
@@ -6351,19 +6329,19 @@ export default function SettingsView({ addons, session }: Props) {
               <KeyringApiKeyInput
                 name="opensubtitles"
                 label="OpenSubtitles API key"
-                description="Unlocks the in-player subtitle picker that queries OpenSubtitles' REST API. Register a free account at opensubtitles.com (the .com REST API, not the legacy .org XML-RPC) and find your key under Profile → Consumer. Leave empty to disable; addon-supplied subtitles still work without it. Stored securely in the OS keyring."
+                description="Turns on the player's OpenSubtitles search. Get a free key at opensubtitles.com (the .com site, not .org) under Profile → Consumer. Addon subtitles work without it. Stored in the OS keyring."
                 placeholder="e.g. 1a2b3c4dXyZ…"
               />
               <KeyringApiKeyInput
                 name="tmdb"
                 label="TMDB API key (optional)"
-                description="Powers the Seasons / Arcs toggle on anime that have story arcs (One Piece, Naruto, Bleach, and roughly thirty others). Aura ships with its own key, so you only need this if you would rather spend your own quota. Get a free one at themoviedb.org under Settings → API. Stored securely in the OS keyring."
+                description="Powers the Seasons / Arcs toggle on anime with story arcs (One Piece, Naruto, Bleach and more). Aura has its own key; add yours only to use your own quota (free at themoviedb.org under Settings → API). Stored in the OS keyring."
                 placeholder="e.g. 8a1b2c3d4e5f…"
               />
               <KeyringApiKeyInput
                 name="introdb"
                 label="IntroDB API key (optional)"
-                description="Lets the AuraSkip menu in the player also send the intro, recap and ending times you enter to IntroDB, a shared skip database that works for any show with an IMDb id. Reading IntroDB needs no key, so skip times from it work without this. Stored securely in the OS keyring."
+                description="Lets the AuraSkip menu send the skip times you enter to IntroDB, a shared database for any show with an IMDb id. Reading IntroDB needs no key. Stored in the OS keyring."
                 placeholder="e.g. idb_…"
                 link={{ label: "Get a key at introdb.app", url: "https://introdb.app" }}
               />
@@ -6380,7 +6358,7 @@ export default function SettingsView({ addons, session }: Props) {
             <Section id="sec-crash-reporting" title="Crash Reporting">
               <SettingToggle
                 label="Send crash reports"
-                description="When enabled, Aura sends anonymised diagnostics (error message, stack trace, console warnings and errors, OS / app version) to the developer's Sentry endpoint, plus a masked session replay: a recording of UI interactions and network metadata for every session that hits an error and for roughly one in ten sessions that don't. All text is masked and all media blocked in the replay, so it never captures a password, a title or a stream URL. Before an event leaves your machine Aura clears the Sentry user record (username, email, account id), pins the IP to 0.0.0.0, and drops the geolocation and request blocks. The crash text itself is not rewritten, so it can still contain whatever the failing code was handling. Takes effect on next app restart."
+                description="Sends anonymised error reports (stack trace, console warnings and errors, OS and app version) to the developer's Sentry, plus a masked UI replay with network metadata (text masked, media blocked) for sessions with an error and about 1 in 10 others. Account details, IP and location are removed; the error text is not, so it can hold what the failing code was handling. Applies after a restart."
                 value={crashConfig.consent === true}
                 onChange={(v) => patchCrashConfig({ consent: v })}
               />
@@ -6407,7 +6385,7 @@ export default function SettingsView({ addons, session }: Props) {
             <Section id="sec-performance" title="Performance">
               <SettingToggle
                 label="Hardware acceleration"
-                description="Lets WebView2 use the GPU for rendering. Turn off if you see laggy scrolling on a multi-monitor / ultrawide setup with low CPU and GPU usage; that's a sign the OS compositor is the bottleneck rather than render workload. Restart Aura after toggling."
+                description="Lets WebView2 use the GPU to draw the interface. Turn off if scrolling lags on a multi-monitor or ultrawide setup while CPU and GPU usage stay low. Takes effect after a restart."
                 value={backend.gpu_acceleration}
                 onChange={(v) => patchBackend({ gpu_acceleration: v })}
               />

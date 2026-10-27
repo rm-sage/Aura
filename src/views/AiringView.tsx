@@ -22,6 +22,7 @@ import { useEpisodesBehind } from "../LibraryContext";
 import { libraryItemSeriesId } from "../libraryNormalize";
 import { useReleaseSignalsVersion, hasAnyReleaseSignal, getReleaseSignal } from "../releaseSignalStore";
 import { useManualWatchedVersion } from "../manualWatched";
+import { useAvailableEarlyVersion } from "../releaseCountdown";
 import {
   isAiring, isAiringSeriesLike, isAnimeItem,
   airingNextMs, airingLastAiredMs, airWindow, episodesBehind,
@@ -76,12 +77,15 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
   const [tileSize, setTileSize] = useState<TileSize>(() => loadAuraSettings().airingTileSize);
   const signalsVersion = useReleaseSignalsVersion();
   const manualVersion = useManualWatchedVersion();
+  // An episode found out early (availableEarly.ts) moves a show's next air
+  // time, its airing state and its behind count.
+  const availableVersion = useAvailableEarlyVersion();
 
   // Cheap candidate pre-filter (no network). With cloud signals we trust
   // next_aired; without them (guest / release-search off) we scan every
   // series/anime and confirm via meta below.
   const candidates = useMemo(() => {
-    void signalsVersion; // re-derive as signals land
+    void signalsVersion; void availableVersion; // re-derive as signals land
     const seriesLike = library.filter(isAiringSeriesLike);
     if (!hasAnyReleaseSignal()) return seriesLike; // no cloud → scan every series/anime
     // Keep items the cloud says are returning (future next_aired via isAiring)
@@ -94,7 +98,7 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
       const sig = getReleaseSignal(libraryItemSeriesId(i.id) || i.id);
       return sig === undefined || isAiring(i);
     });
-  }, [library, signalsVersion]);
+  }, [library, signalsVersion, availableVersion]);
 
   // Progressive, soonest-first meta fetch for the candidate subset (mirrors
   // CalendarView: throttled batched flush, concurrency 8) so tiles paint as
@@ -145,8 +149,8 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
   // Confirm airing: cloud candidates pass immediately (next_aired); fallback-scan
   // candidates only appear once their fetched meta reports airingInfo.isAiring.
   const airingItems = useMemo(
-    () => candidates.filter((i) => isAiring(i, details.get(i.id))),
-    [candidates, details],
+    () => { void availableVersion; return candidates.filter((i) => isAiring(i, details.get(i.id))); },
+    [candidates, details, availableVersion],
   );
 
   const now = Date.now();
@@ -163,7 +167,7 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
   // (canonical series root from the episode ids, not the item's raw
   // state.video_id) so the sort and the badge agree for per-cour duplicates.
   const sortKeys = useMemo(() => {
-    void manualVersion; void signalsVersion;
+    void manualVersion; void signalsVersion; void availableVersion;
     const keys = new Map<string, { next: number; last: number; behind: number }>();
     for (const item of airingItems) {
       const detail = details.get(item.id);
@@ -181,7 +185,7 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
     }
     return keys;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [airingItems, details, libById, manualVersion, signalsVersion]);
+  }, [airingItems, details, libById, manualVersion, signalsVersion, availableVersion]);
 
   const sorted = useMemo(() => {
     const arr = [...airingItems];
@@ -217,7 +221,7 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
     }
     return [{ key: "all", label: "", items: sorted }];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sorted, groupBy, details]);
+  }, [sorted, groupBy, details, availableVersion]);
 
   const setGroup = (g: GroupBy) => { setGroupBy(g); saveAuraSettings({ ...loadAuraSettings(), airingGroupBy: g }); };
   const setSortMode = (m: SortMode) => { setSort(m); saveAuraSettings({ ...loadAuraSettings(), airingSort: m }); };

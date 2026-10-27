@@ -101,7 +101,6 @@ const PORTABLE_BACKEND_FIELDS = [
   "cache_secs",
   "demuxer_readahead_secs",
   "demuxer_max_mib",
-  "scrobble_enabled",
   "auto_scrobble_enabled",
   // Organised vs flat download layout. A real preference, so it travels.
   // `download_dir` deliberately does NOT: it is a machine-local path, like
@@ -132,6 +131,7 @@ const PORTABLE_AURA_FIELDS = [
   "seekStepSeconds",
   "stillWatchingGate",
   "autoSkipDetect",
+  "prescanNextEpisode",
   "nextUpSkipFillerRecap",
   "nextUpHoldToSkip",
   "upscalerRecHighlight",
@@ -390,6 +390,10 @@ export function parseImportInput(raw: string): SettingsBlob | null {
   for (const key of PORTABLE_BACKEND_FIELDS) {
     if (key in backendRaw) backend[key] = backendRaw[key];
   }
+  // An export from before the "Enable scrobbling" master switch was retired:
+  // with it off nothing was sent automatically, whatever the auto switch said,
+  // so keep that meaning (the same fold settings.rs applies to a file or patch).
+  if (backendRaw.scrobble_enabled === false) backend.auto_scrobble_enabled = false;
 
   const auraRaw = obj.aura && typeof obj.aura === "object"
     ? obj.aura as Record<string, unknown>
