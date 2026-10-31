@@ -31,7 +31,7 @@ mod imp {
         use tauri::Manager;
         let app = super::super::manager::app()?;
         let win = app.get_webview_window("main")?;
-        win.hwnd().ok()
+        win.hwnd().ok().map(|handle| HWND(handle.0))
     }
 
     pub fn apply(state: u32, permille: u64) {
