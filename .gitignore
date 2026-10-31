@@ -12,7 +12,6 @@ out/
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
 src-tauri/target/
 src-tauri/binaries/
 src-tauri/gen/
